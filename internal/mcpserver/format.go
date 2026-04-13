@@ -13,23 +13,64 @@ func formatProjectList(data []byte) string {
 	if err := json.Unmarshal(data, &projects); err != nil {
 		return string(data)
 	}
-
 	if len(projects) == 0 {
 		return "No projects found."
 	}
 
 	var b strings.Builder
-	b.WriteString("Enju Projects\n\n")
-
+	b.WriteString("Enju Projects (long-lived workspaces)\n\n")
 	for _, p := range projects {
+		name, _ := p["name"].(string)
+		desc, _ := p["description"].(string)
+		runCount, _ := p["run_count"].(float64)
+		id := jsonID(p["id"])
+
+		b.WriteString(fmt.Sprintf("  #%s  %-30s  %d runs", id, name, int(runCount)))
+		if desc != "" {
+			b.WriteString(fmt.Sprintf("  — %s", desc))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\nTip: A project holds many runs over time. Use enju_list_runs to see all runs, or filter to a project.")
+	return b.String()
+}
+
+func formatCreateProjectResult(data []byte) string {
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := result["error"].(string); ok {
+		return fmt.Sprintf("✗ Failed to create project: %s", errMsg)
+	}
+	name, _ := result["name"].(string)
+	id := jsonID(result["id"])
+	return fmt.Sprintf("✓ Project #%s created: %s", id, name)
+}
+
+func formatRunList(data []byte) string {
+	var runs []map[string]interface{}
+	if err := json.Unmarshal(data, &runs); err != nil {
+		return string(data)
+	}
+
+	if len(runs) == 0 {
+		return "No runs found."
+	}
+
+	var b strings.Builder
+	b.WriteString("Enju Runs\n\n")
+
+	for _, p := range runs {
 		name, _ := p["name"].(string)
 		state, _ := p["state"].(string)
 		taskCount, _ := p["task_count"].(float64)
-		id := jsonID(p["id"])
+		projectID := jsonID(p["project_id"])
+		seq, _ := p["seq"].(float64)
 
 		icon := stateIcon(state)
-		b.WriteString(fmt.Sprintf("  %s #%s  %-40s [%s]  %d tasks\n",
-			icon, id, name, state, int(taskCount)))
+		b.WriteString(fmt.Sprintf("  %s project #%s → run #%d  %-30s [%s]  %d tasks\n",
+			icon, projectID, int(seq), name, state, int(taskCount)))
 	}
 
 	return b.String()
@@ -48,33 +89,96 @@ func formatReadyTasks(data []byte) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Available tasks (%d)\n\n", len(tasks)))
 
+	// Group tasks by run for clarity
+	byRun := map[string][]map[string]interface{}{}
+	runOrder := []string{}
 	for _, t := range tasks {
-		id, _ := t["id"].(string)
-		_ = t["project_id"] // used via jsonID above
-		prompt, _ := t["prompt"].(string)
-		mode, _ := t["mode"].(string)
-		deps, _ := t["depends_on"].(string)
-		instanceKey, _ := t["instance_key"].(string)
+		runNum := jsonID(t["run_id"])
+		if _, seen := byRun[runNum]; !seen {
+			runOrder = append(runOrder, runNum)
+		}
+		byRun[runNum] = append(byRun[runNum], t)
+	}
 
-		seq, _ := t["seq"].(float64)
-		projectNum := jsonID(t["project_id"])
-		b.WriteString(fmt.Sprintf("  → #%d [%s]\n", int(seq), id))
-		b.WriteString(fmt.Sprintf("    Project: #%s", projectNum))
-		if instanceKey != "" {
-			b.WriteString(fmt.Sprintf("    Instance: %s", instanceKey))
+	for _, runNum := range runOrder {
+		b.WriteString(fmt.Sprintf("── Run #%s ──\n", runNum))
+		for _, t := range byRun[runNum] {
+			id, _ := t["id"].(string)
+			prompt, _ := t["prompt"].(string)
+			mode, _ := t["mode"].(string)
+			deps, _ := t["depends_on"].(string)
+			instanceKey, _ := t["instance_key"].(string)
+			seq, _ := t["seq"].(float64)
+
+			b.WriteString(fmt.Sprintf("  → #%d [%s]", int(seq), id))
+			if instanceKey != "" {
+				b.WriteString(fmt.Sprintf("  instance:%s", instanceKey))
+			}
+			if mode == "assisted" {
+				b.WriteString("  [assisted]")
+			}
+			b.WriteString("\n")
+			if deps != "" {
+				b.WriteString(fmt.Sprintf("    upstream: %s ✓\n", deps))
+			}
+			b.WriteString(fmt.Sprintf("    \"%s\"\n", truncate(prompt, 120)))
 		}
-		if mode == "assisted" {
-			b.WriteString("    Mode: assisted (human input needed)")
-		}
-		b.WriteString("\n")
-		if deps != "" {
-			b.WriteString(fmt.Sprintf("    Upstream: %s ✓\n", deps))
-		}
-		b.WriteString(fmt.Sprintf("    Prompt: \"%s\"\n", truncate(prompt, 120)))
 		b.WriteString("\n")
 	}
 
 	return b.String()
+}
+
+// formatRequirements renders the task environment requirements for display.
+// Returns empty string if no requirements declared.
+func formatRequirements(reqRaw string) string {
+	if reqRaw == "" {
+		return ""
+	}
+	var reqs map[string]interface{}
+	if json.Unmarshal([]byte(reqRaw), &reqs) != nil || len(reqs) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n── Environment Requirements ─────────────────\n")
+	b.WriteString("Before claiming, verify your environment has these. You can use bash to check.\n\n")
+
+	// Render categories in a consistent order
+	categoryOrder := []string{"tools", "packages", "mcp_servers", "env_vars", "files", "network", "resources", "custom"}
+	seen := map[string]bool{}
+
+	for _, cat := range categoryOrder {
+		if v, ok := reqs[cat]; ok {
+			writeRequirementCategory(&b, cat, v)
+			seen[cat] = true
+		}
+	}
+	// Any other keys not in the standard list
+	for k, v := range reqs {
+		if !seen[k] {
+			writeRequirementCategory(&b, k, v)
+		}
+	}
+
+	b.WriteString("────────────────────────────────────────────\n")
+	return b.String()
+}
+
+func writeRequirementCategory(b *strings.Builder, name string, value interface{}) {
+	b.WriteString(fmt.Sprintf("  %s:\n", name))
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for k, val := range v {
+			b.WriteString(fmt.Sprintf("    %s: %v\n", k, val))
+		}
+	case []interface{}:
+		for _, item := range v {
+			b.WriteString(fmt.Sprintf("    - %v\n", item))
+		}
+	default:
+		b.WriteString(fmt.Sprintf("    %v\n", v))
+	}
 }
 
 // formatOutputsSchema renders the named outputs schema for display.
@@ -142,6 +246,11 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 		b.WriteString("  Mode: assisted (your input will be structured by LLM)\n")
 	}
 
+	// Show environment requirements if present
+	if reqRaw, ok := task["requirements"].(string); ok && reqRaw != "" {
+		b.WriteString(formatRequirements(reqRaw))
+	}
+
 	// Show outputs schema if present
 	if outputsRaw, ok := task["outputs"].(string); ok && outputsRaw != "" {
 		b.WriteString(formatOutputsSchema(outputsRaw))
@@ -200,12 +309,12 @@ func formatSubmitResult(data []byte, taskID string) string {
 
 	status, _ := result["status"].(string)
 	newlyReady, _ := result["newly_ready"].(float64)
-	completed, _ := result["project_completed"].(bool)
+	completed, _ := result["run_completed"].(bool)
 
 	b.WriteString(fmt.Sprintf("✓ Result accepted: %s\n", taskID))
 
 	if completed {
-		b.WriteString("\n🎉 Project completed! All tasks are done.\n")
+		b.WriteString("\n🎉 Run completed! All tasks are done.\n")
 	} else if newlyReady > 0 {
 		b.WriteString(fmt.Sprintf("\nImpact: %d new task(s) unlocked and ready for work.\n", int(newlyReady)))
 	}
@@ -214,10 +323,10 @@ func formatSubmitResult(data []byte, taskID string) string {
 	return b.String()
 }
 
-func formatProjectStatus(projectData []byte, tasksData []byte) string {
-	var project map[string]interface{}
-	if err := json.Unmarshal(projectData, &project); err != nil {
-		return string(projectData)
+func formatRunStatus(runData []byte, tasksData []byte) string {
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return string(runData)
 	}
 
 	var tasks []map[string]interface{}
@@ -227,9 +336,10 @@ func formatProjectStatus(projectData []byte, tasksData []byte) string {
 
 	var b strings.Builder
 
-	name, _ := project["name"].(string)
-	state, _ := project["state"].(string)
-	id := jsonID(project["id"])
+	name, _ := run["name"].(string)
+	state, _ := run["state"].(string)
+	projectID := jsonID(run["project_id"])
+	seq, _ := run["seq"].(float64)
 
 	// Count by state
 	counts := map[string]int{}
@@ -240,7 +350,7 @@ func formatProjectStatus(projectData []byte, tasksData []byte) string {
 	total := len(tasks)
 	done := counts["accepted"]
 
-	b.WriteString(fmt.Sprintf("Project #%s: %s\n", id, name))
+	b.WriteString(fmt.Sprintf("Project #%s → Run #%d: %s\n", projectID, int(seq), name))
 	b.WriteString(fmt.Sprintf("Status: %s    Progress: %d/%d\n", state, done, total))
 	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
 
@@ -301,7 +411,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	var b strings.Builder
 
 	id, _ := task["id"].(string)
-	projectID := jsonID(task["project_id"])
+	runID := jsonID(task["run_id"])
 	state, _ := task["state"].(string)
 	prompt, _ := task["prompt"].(string)
 	userPrompt, _ := task["user_prompt"].(string)
@@ -314,7 +424,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	seq, _ := task["seq"].(float64)
 	icon := stateIcon(state)
 	b.WriteString(fmt.Sprintf("Task #%d: %s %s\n", int(seq), id, icon))
-	b.WriteString(fmt.Sprintf("  Project:  #%s\n", projectID))
+	b.WriteString(fmt.Sprintf("  Run:  #%s\n", runID))
 	b.WriteString(fmt.Sprintf("  Action:   %s\n", friendlyActionLabel(action)))
 	b.WriteString(fmt.Sprintf("  State:    %s\n", stateLabel(state)))
 	if instanceKey != "" {
@@ -328,6 +438,11 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	}
 	if deps != "" {
 		b.WriteString(fmt.Sprintf("  Depends:  %s\n", deps))
+	}
+
+	// Show environment requirements if present
+	if reqRaw, ok := task["requirements"].(string); ok {
+		b.WriteString(formatRequirements(reqRaw))
 	}
 
 	// Show named outputs schema if present
@@ -376,24 +491,25 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	return b.String()
 }
 
-func formatCreateProject(data []byte) string {
+func formatCreateRun(data []byte) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return string(data)
 	}
 
 	if errMsg, ok := result["error"].(string); ok {
-		return fmt.Sprintf("✗ Failed to create project: %s", errMsg)
+		return fmt.Sprintf("✗ Failed to create run: %s", errMsg)
 	}
 
 	name, _ := result["name"].(string)
-	id := jsonID(result["id"])
+	projectID := jsonID(result["project_id"])
+	seq, _ := result["seq"].(float64)
 	taskCount, _ := result["task_count"].(float64)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("✓ Project #%s created: %s\n", id, name))
+	b.WriteString(fmt.Sprintf("✓ Run created in project #%s as run #%d: %s\n", projectID, int(seq), name))
 	b.WriteString(fmt.Sprintf("  Tasks: %d\n", int(taskCount)))
-	b.WriteString(fmt.Sprintf("\nUse enju_list_ready_tasks(project_id=\"%s\") to see available tasks.", id))
+	b.WriteString(fmt.Sprintf("\nUse enju_run_status(project_id=%s, run_id=%d) or enju_list_ready_tasks to see tasks.", projectID, int(seq)))
 	return b.String()
 }
 
@@ -438,8 +554,8 @@ func formatDashboard(data []byte) string {
 			tm, _ := t.(map[string]interface{})
 			tid, _ := tm["id"].(string)
 			seq, _ := tm["seq"].(float64)
-			projectID := jsonID(tm["project_id"])
-			b.WriteString(fmt.Sprintf("  ⏳ #%d [%s]    project #%s\n", int(seq), tid, projectID))
+			runID := jsonID(tm["run_id"])
+			b.WriteString(fmt.Sprintf("  ⏳ #%d [%s]    run #%s\n", int(seq), tid, runID))
 		}
 	} else {
 		b.WriteString("\nNo active claims. Use enju_list_ready_tasks to find work.\n")
@@ -452,8 +568,8 @@ func formatDashboard(data []byte) string {
 			tm, _ := t.(map[string]interface{})
 			tid, _ := tm["id"].(string)
 			seq, _ := tm["seq"].(float64)
-			projectID := jsonID(tm["project_id"])
-			b.WriteString(fmt.Sprintf("  ✓ #%d [%s]    project #%s\n", int(seq), tid, projectID))
+			runID := jsonID(tm["run_id"])
+			b.WriteString(fmt.Sprintf("  ✓ #%d [%s]    run #%s\n", int(seq), tid, runID))
 		}
 	}
 

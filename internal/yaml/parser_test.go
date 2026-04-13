@@ -12,7 +12,7 @@ func sorted(s []string) []string {
 
 func TestParseSimple(t *testing.T) {
 	yamlData := []byte(`
-name: "Test Project"
+name: "Test Run"
 version: 1
 tasks:
   - id: step1
@@ -29,8 +29,8 @@ tasks:
 		t.Fatal(err)
 	}
 
-	if parsed.Project.Name != "Test Project" {
-		t.Fatalf("expected name 'Test Project', got %q", parsed.Project.Name)
+	if parsed.Run.Name != "Test Run" {
+		t.Fatalf("expected name 'Test Run', got %q", parsed.Run.Name)
 	}
 	if parsed.DAG.NodeCount() != 2 {
 		t.Fatalf("expected 2 nodes, got %d", parsed.DAG.NodeCount())

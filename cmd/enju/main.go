@@ -51,8 +51,8 @@ func printUsage() {
 Usage:
   enju serve      Start the coordinator server
   enju mcp        Start the MCP server (for Claude Desktop/Code)
-  enju submit     Submit a project YAML to the coordinator
-  enju status     Check project status
+  enju submit     Submit a run YAML to the coordinator
+  enju status     Check run status
   enju version    Print version
 
 Run 'enju <command> -h' for command-specific help.`)
@@ -187,7 +187,7 @@ func cmdSubmit(args []string) {
 	fs.Parse(flagArgs)
 
 	if yamlPath == "" {
-		fmt.Fprintln(os.Stderr, "Usage: enju submit <project.yaml> [-coordinator URL]")
+		fmt.Fprintln(os.Stderr, "Usage: enju submit <run.yaml> [-coordinator URL]")
 		os.Exit(1)
 	}
 	yamlData, err := os.ReadFile(yamlPath)
@@ -200,7 +200,7 @@ func cmdSubmit(args []string) {
 		"yaml": string(yamlData),
 	})
 
-	resp, err := http.Post(*coordinator+"/api/v1/projects", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(*coordinator+"/api/v1/runs", "application/json", bytes.NewReader(body))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error submitting: %v\n", err)
 		os.Exit(1)
@@ -221,8 +221,8 @@ func cmdStatus(args []string) {
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		// List all projects
-		resp, err := http.Get(*coordinator + "/api/v1/projects")
+		// List all runs
+		resp, err := http.Get(*coordinator + "/api/v1/runs")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -235,9 +235,9 @@ func cmdStatus(args []string) {
 		return
 	}
 
-	// Get specific project + tasks
-	projectID := fs.Arg(0)
-	resp, err := http.Get(*coordinator + "/api/v1/projects/" + projectID + "/tasks")
+	// Get specific run + tasks
+	runID := fs.Arg(0)
+	resp, err := http.Get(*coordinator + "/api/v1/runs/" + runID + "/tasks")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

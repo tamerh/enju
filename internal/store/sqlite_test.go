@@ -19,9 +19,7 @@ func createTestProject(t *testing.T, s *Store) int64 {
 	t.Helper()
 	now := time.Now()
 	id, err := s.CreateProject(&ProjectRecord{
-		Name:      "Test Project",
-		YAMLData:  "name: test",
-		State:     ProjectActive,
+		Name:      "test-project",
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
@@ -31,16 +29,34 @@ func createTestProject(t *testing.T, s *Store) int64 {
 	return id
 }
 
-func TestCreateAndGetProject(t *testing.T) {
-	s := newTestStore(t)
-	pid := createTestProject(t, s)
-
-	p, err := s.GetProject(pid)
+func createTestRun(t *testing.T, s *Store) int64 {
+	t.Helper()
+	projectID := createTestProject(t, s)
+	now := time.Now()
+	id, _, err := s.CreateRun(&RunRecord{
+		ProjectID: projectID,
+		Name:      "Test Run",
+		YAMLData:  "name: test",
+		State:     RunActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Name != "Test Project" {
-		t.Fatalf("expected 'Test Project', got %q", p.Name)
+	return id
+}
+
+func TestCreateAndGetRun(t *testing.T) {
+	s := newTestStore(t)
+	pid := createTestRun(t, s)
+
+	p, err := s.GetRun(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "Test Run" {
+		t.Fatalf("expected 'Test Run', got %q", p.Name)
 	}
 	if p.ID != pid {
 		t.Fatalf("expected id %d, got %d", pid, p.ID)
@@ -49,11 +65,11 @@ func TestCreateAndGetProject(t *testing.T) {
 
 func TestCreateAndClaimTask(t *testing.T) {
 	s := newTestStore(t)
-	pid := createTestProject(t, s)
+	pid := createTestRun(t, s)
 	now := time.Now()
 
 	s.CreateTask(&TaskRecord{
-		ID: "task-1", ProjectID: pid, Seq: 1, TaskDefID: "step1",
+		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
@@ -89,11 +105,11 @@ func TestCreateAndClaimTask(t *testing.T) {
 
 func TestSubmitResult(t *testing.T) {
 	s := newTestStore(t)
-	pid := createTestProject(t, s)
+	pid := createTestRun(t, s)
 	now := time.Now()
 
 	s.CreateTask(&TaskRecord{
-		ID: "task-1", ProjectID: pid, Seq: 1, TaskDefID: "step1",
+		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
@@ -122,22 +138,22 @@ func TestSubmitResult(t *testing.T) {
 
 func TestUpdateReadyTasks(t *testing.T) {
 	s := newTestStore(t)
-	pid := createTestProject(t, s)
+	pid := createTestRun(t, s)
 	now := time.Now()
 
 	// a (ready) -> b (pending) -> c (pending, depends on a,b)
 	s.CreateTask(&TaskRecord{
-		ID: "a", ProjectID: pid, Seq: 1, TaskDefID: "a",
+		ID: "a", RunID: pid, Seq: 1, TaskDefID: "a",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
 	s.CreateTask(&TaskRecord{
-		ID: "b", ProjectID: pid, Seq: 2, TaskDefID: "b",
+		ID: "b", RunID: pid, Seq: 2, TaskDefID: "b",
 		Action: "answer", ResultType: "text",
 		State: TaskPending, DependsOn: "a", CreatedAt: now,
 	})
 	s.CreateTask(&TaskRecord{
-		ID: "c", ProjectID: pid, Seq: 3, TaskDefID: "c",
+		ID: "c", RunID: pid, Seq: 3, TaskDefID: "c",
 		Action: "answer", ResultType: "text",
 		State: TaskPending, DependsOn: "a,b", CreatedAt: now,
 	})
@@ -181,11 +197,11 @@ func TestUpdateReadyTasks(t *testing.T) {
 
 func TestReleaseTask(t *testing.T) {
 	s := newTestStore(t)
-	pid := createTestProject(t, s)
+	pid := createTestRun(t, s)
 	now := time.Now()
 
 	s.CreateTask(&TaskRecord{
-		ID: "task-1", ProjectID: pid, Seq: 1, TaskDefID: "step1",
+		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
@@ -209,12 +225,12 @@ func TestReleaseTask(t *testing.T) {
 
 func TestInvalidateTask(t *testing.T) {
 	s := newTestStore(t)
-	pid := createTestProject(t, s)
+	pid := createTestRun(t, s)
 	now := time.Now()
 
 	for i, id := range []string{"a", "b", "c"} {
 		s.CreateTask(&TaskRecord{
-			ID: id, ProjectID: pid, Seq: i + 1, TaskDefID: id,
+			ID: id, RunID: pid, Seq: i + 1, TaskDefID: id,
 			Action: "answer", ResultType: "text",
 			State: TaskAccepted, CreatedAt: now,
 		})

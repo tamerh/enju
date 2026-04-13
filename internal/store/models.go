@@ -18,23 +18,36 @@ const (
 	TaskInvalidated TaskState = "invalidated"
 )
 
-// ProjectState represents the state of a project.
-type ProjectState string
+// RunState represents the state of a run.
+type RunState string
 
 const (
-	ProjectActive    ProjectState = "active"
-	ProjectCompleted ProjectState = "completed"
-	ProjectFailed    ProjectState = "failed"
+	RunActive    RunState = "active"
+	RunCompleted RunState = "completed"
+	RunFailed    RunState = "failed"
 )
 
-// ProjectRecord is a project stored in the database.
+// ProjectRecord is a long-lived project container stored in the database.
+// A project holds many runs over time, plus shared artifacts.
 type ProjectRecord struct {
-	ID        int64
+	ID          int64
+	Name        string
+	Description string
+	CreatedBy   string // citizen ID
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// RunRecord is a run stored in the database.
+type RunRecord struct {
+	ID        int64  // global primary key (auto-increment)
+	ProjectID int64  // the long-lived project this run belongs to
+	Seq       int    // sequential run number within the project (#1, #2, #3)
 	Name      string
 	Ref       string // external reference (GitHub issue URL, etc.)
 	YAMLData  string // raw YAML content
 	RepoURL   string
-	State     ProjectState
+	State     RunState
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -42,8 +55,8 @@ type ProjectRecord struct {
 // TaskRecord is a task instance stored in the database.
 type TaskRecord struct {
 	ID          string // full ID (e.g., "endometriosis:foundation")
-	ProjectID   int64
-	Seq         int    // sequential number within project (1-based, for quick reference)
+	RunID   int64
+	Seq         int    // sequential number within run (1-based, for quick reference)
 	TaskDefID   string // original task ID from YAML
 	InstanceKey string // for_each key (e.g., "endometriosis"), empty if no for_each
 	Ref         string // external reference (URL)
@@ -51,8 +64,9 @@ type TaskRecord struct {
 	Prompt      string
 	UserPrompt  string
 	Script      string
-	Outputs     string // JSON: map of output name -> description
-	ResultType  string
+	Outputs      string // JSON: map of output name -> description/file/format
+	Requirements string // JSON: categorized environment requirements
+	ResultType   string
 	Timeout     string
 	State       TaskState
 	ClaimedBy   string

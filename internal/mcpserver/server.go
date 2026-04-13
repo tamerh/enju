@@ -37,17 +37,19 @@ func New(cfg Config) *server.MCPServer {
 	}
 
 	// Register tools
-	s.AddTool(toolListProjects(), client.handleListProjects)
+	s.AddTool(toolListRuns(), client.handleListRuns)
 	s.AddTool(toolListReadyTasks(), client.handleListReadyTasks)
 	s.AddTool(toolClaimTask(), client.handleClaimTask)
 	s.AddTool(toolGetTaskInputs(), client.handleGetTaskInputs)
 	s.AddTool(toolSubmitResult(), client.handleSubmitResult)
 	s.AddTool(toolReleaseTask(), client.handleReleaseTask)
 	s.AddTool(toolGetTask(), client.handleGetTask)
-	s.AddTool(toolProjectStatus(), client.handleProjectStatus)
-	s.AddTool(toolCreateProject(), client.handleCreateProject)
+	s.AddTool(toolRunStatus(), client.handleRunStatus)
+	s.AddTool(toolCreateRun(), client.handleCreateRun)
 	s.AddTool(toolMyDashboard(), client.handleMyDashboard)
 	s.AddTool(toolUpdateProfile(), client.handleUpdateProfile)
+	s.AddTool(toolListProjects(), client.handleListProjects)
+	s.AddTool(toolCreateProject(), client.handleCreateProject)
 
 	return s
 }
@@ -111,17 +113,23 @@ func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]
 
 // --- Tool Definitions ---
 
-func toolListProjects() mcp.Tool {
-	return mcp.NewTool("enju_list_projects",
-		mcp.WithDescription("List all available projects and their status."),
+func toolListRuns() mcp.Tool {
+	return mcp.NewTool("enju_list_runs",
+		mcp.WithDescription("List runs. Optionally filter by project."),
+		mcp.WithNumber("project_id",
+			mcp.Description("Filter by project ID (integer, optional)"),
+		),
 	)
 }
 
 func toolListReadyTasks() mcp.Tool {
 	return mcp.NewTool("enju_list_ready_tasks",
-		mcp.WithDescription("List tasks that are ready to be claimed. Optionally filter by project ID."),
-		mcp.WithString("project_id",
+		mcp.WithDescription("List tasks that are ready to be claimed. Optionally filter by project and run."),
+		mcp.WithNumber("project_id",
 			mcp.Description("Filter by project ID (optional)"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Description("Filter by run ID within project (optional, requires project_id)"),
 		),
 	)
 }
@@ -186,36 +194,65 @@ func toolGetTask() mcp.Tool {
 	)
 }
 
-func toolProjectStatus() mcp.Tool {
-	return mcp.NewTool("enju_project_status",
-		mcp.WithDescription("Get the status of a project including all its tasks and their states."),
-		mcp.WithString("project_id",
+func toolRunStatus() mcp.Tool {
+	return mcp.NewTool("enju_run_status",
+		mcp.WithDescription("Get the status of a run including all its tasks. Run is addressed by project_id + run_id (per-project sequence)."),
+		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The ID of the project"),
+			mcp.Description("The project ID"),
 		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project (#1, #2, #3)"),
+		),
+	)
+}
+
+func toolCreateRun() mcp.Tool {
+	return mcp.NewTool("enju_create_run",
+		mcp.WithDescription(`Create a new Enju run by submitting a YAML definition. The run must belong to an existing project.
+
+The YAML format:
+  name: "Run name"
+  version: 1
+  ref: "https://github.com/..." (optional)
+  for_each:
+    variable: [value1, value2] (optional, for parallel expansion)
+  tasks:
+    - id: task_name
+      action: answer
+      prompt: "The prompt. Use {{other_task.content}} to reference upstream results."
+
+Dependencies are inferred automatically from {{task_id.content}} references.
+Tasks without references to other tasks run in parallel.
+
+If you don't have a project yet, create one first with enju_create_project.`),
+		mcp.WithString("yaml",
+			mcp.Required(),
+			mcp.Description("The run definition in YAML format"),
+		),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID to create this run in (use enju_list_projects to see existing projects)"),
+		),
+	)
+}
+
+func toolListProjects() mcp.Tool {
+	return mcp.NewTool("enju_list_projects",
+		mcp.WithDescription("List all long-lived projects. A project is a workspace that holds many runs over time."),
 	)
 }
 
 func toolCreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription(`Create a new Enju project by submitting a YAML definition.
-
-The YAML format:
-  name: "Project name"
-  version: 1
-  ref: "https://github.com/..." (optional, link to issue/ticket)
-  for_each:
-    variable: [value1, value2] (optional, for parallel expansion)
-  tasks:
-    - id: task_name
-      type: llm_prompt
-      prompt: "The prompt text. Use {{other_task.content}} to reference upstream results."
-
-Dependencies are inferred automatically from {{task_id.content}} references in prompts.
-Tasks without references to other tasks run in parallel.`),
-		mcp.WithString("yaml",
+		mcp.WithDescription("Create a new long-lived project (workspace). Projects hold runs and artifacts over time."),
+		mcp.WithString("name",
 			mcp.Required(),
-			mcp.Description("The project definition in YAML format"),
+			mcp.Description("Unique project name"),
+		),
+		mcp.WithString("description",
+			mcp.Description("Optional project description"),
 		),
 	)
 }
@@ -269,14 +306,6 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Profile updated: %s", name)), nil
 }
 
-func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/citizens/"+c.citizenID+"/dashboard")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	return mcp.NewToolResultText(formatDashboard(data)), nil
-}
-
 func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	data, err := c.get(ctx, "/api/v1/projects")
 	if err != nil {
@@ -285,10 +314,51 @@ func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequ
 	return mcp.NewToolResultText(formatProjectList(data)), nil
 }
 
+func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, err := req.RequireString("name")
+	if err != nil {
+		return mcp.NewToolResultError("name is required"), nil
+	}
+	description := req.GetString("description", "")
+
+	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
+		"name":        name,
+		"description": description,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
+}
+
+func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	data, err := c.get(ctx, "/api/v1/citizens/"+c.citizenID+"/dashboard")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatDashboard(data)), nil
+}
+
+func (c *apiClient) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var data []byte
+	var err error
+	if pid := req.GetInt("project_id", 0); pid != 0 {
+		data, err = c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", pid))
+	} else {
+		data, err = c.get(ctx, "/api/v1/runs")
+	}
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatRunList(data)), nil
+}
+
 func (c *apiClient) handleListReadyTasks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	path := "/api/v1/tasks/ready"
-	if pid := req.GetString("project_id", ""); pid != "" {
-		path += "?project_id=" + pid
+	pid := req.GetInt("project_id", 0)
+	rid := req.GetInt("run_id", 0)
+	if pid > 0 && rid > 0 {
+		path += fmt.Sprintf("?project_id=%d&run_id=%d", pid, rid)
 	}
 	data, err := c.get(ctx, path)
 	if err != nil {
@@ -375,7 +445,14 @@ func (c *apiClient) handleReleaseTask(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatJSON(data)), nil
+
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) == nil {
+		if errMsg, ok := result["error"].(string); ok {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Released task: %s", taskID)), nil
 }
 
 func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -395,39 +472,49 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 	return mcp.NewToolResultText(formatTaskDetail(data, inputs)), nil
 }
 
-func (c *apiClient) handleProjectStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	projectID, err := req.RequireString("project_id")
+func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
 
-	project, err := c.get(ctx, "/api/v1/projects/"+projectID)
+	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
+	run, err := c.get(ctx, base)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	tasks, err := c.get(ctx, "/api/v1/projects/"+projectID+"/tasks")
+	tasks, err := c.get(ctx, base+"/tasks")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return mcp.NewToolResultText(formatProjectStatus(project, tasks)), nil
+	return mcp.NewToolResultText(formatRunStatus(run, tasks)), nil
 }
 
-func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	yamlContent, err := req.RequireString("yaml")
 	if err != nil {
 		return mcp.NewToolResultError("yaml is required"), nil
 	}
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required — create a project first with enju_create_project"), nil
+	}
 
-	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
+	path := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
+	data, err := c.post(ctx, path, map[string]interface{}{
 		"yaml": yamlContent,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return mcp.NewToolResultText(formatCreateProject(data)), nil
+	return mcp.NewToolResultText(formatCreateRun(data)), nil
 }
 
 // --- Helpers ---

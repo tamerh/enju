@@ -11,11 +11,12 @@ import (
 )
 
 // resultDir constructs the directory path for a task's result files.
-func resultDir(projectID, instanceKey, taskDefID string) string {
+// runIDPath is the path segment — for hierarchical storage it's "projectID/runSeq".
+func resultDir(runIDPath, instanceKey, taskDefID string) string {
 	if instanceKey != "" {
-		return filepath.Join("results", projectID, instanceKey, taskDefID)
+		return filepath.Join("projects", runIDPath, instanceKey, taskDefID)
 	}
-	return filepath.Join("results", projectID, taskDefID)
+	return filepath.Join("projects", runIDPath, taskDefID)
 }
 
 // contentExtension returns the file extension based on result type.
@@ -30,8 +31,8 @@ func contentExtension(resultType string) string {
 
 // writeResult writes the content and metadata as separate files.
 // Returns the result directory path (stored in DB as result_path).
-func writeResult(gw *enjuGit.Writer, projectID, instanceKey, taskDefID string, content string, resultType string, metadata map[string]interface{}) (string, error) {
-	dir := resultDir(projectID, instanceKey, taskDefID)
+func writeResult(gw *enjuGit.Writer, runID, instanceKey, taskDefID string, content string, resultType string, metadata map[string]interface{}) (string, error) {
+	dir := resultDir(runID, instanceKey, taskDefID)
 
 	// Write content file — raw, no JSON wrapping, no escaping
 	ext := contentExtension(resultType)
@@ -56,8 +57,8 @@ func writeResult(gw *enjuGit.Writer, projectID, instanceKey, taskDefID string, c
 // writeMultiFileResult writes named outputs as separate files based on the output schema.
 // Each output name → file is declared in the schema; the values map contains the content.
 // Returns the result directory path.
-func writeMultiFileResult(gw *enjuGit.Writer, projectID, instanceKey, taskDefID string, schema map[string]outputFileSpec, values map[string]string, metadata map[string]interface{}) (string, error) {
-	dir := resultDir(projectID, instanceKey, taskDefID)
+func writeMultiFileResult(gw *enjuGit.Writer, runID, instanceKey, taskDefID string, schema map[string]outputFileSpec, values map[string]string, metadata map[string]interface{}) (string, error) {
+	dir := resultDir(runID, instanceKey, taskDefID)
 
 	fileIndex := map[string]string{} // output name -> file path
 
@@ -179,8 +180,8 @@ func isJSON(s string) bool {
 }
 
 // Legacy functions kept for compatibility — remove after full migration
-func buildResultPath(projectID, instanceKey, taskDefID string) string {
-	return resultDir(projectID, instanceKey, taskDefID)
+func buildResultPath(runID, instanceKey, taskDefID string) string {
+	return resultDir(runID, instanceKey, taskDefID)
 }
 
 func readResultFile(gitDir, resultPath string) (map[string]interface{}, error) {

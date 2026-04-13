@@ -23,8 +23,8 @@ import (
 // Server holds the coordinator state and dependencies.
 type Server struct {
 	store    *store.Store
-	dags     map[int64]*dag.DAG // projectID -> DAG (in-memory for fast queries)
-	projects map[int64]*enjuYaml.ParsedProject
+	dags     map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
+	runs map[int64]*enjuYaml.ParsedRun
 	git      *enjuGit.Writer
 	logger   *slog.Logger
 }
@@ -34,7 +34,7 @@ func NewServer(st *store.Store, gitWriter *enjuGit.Writer, logger *slog.Logger) 
 	return &Server{
 		store:    st,
 		dags:     make(map[int64]*dag.DAG),
-		projects: make(map[int64]*enjuYaml.ParsedProject),
+		runs: make(map[int64]*enjuYaml.ParsedRun),
 		git:      gitWriter,
 		logger:   logger,
 	}
@@ -52,11 +52,20 @@ func (s *Server) Router() http.Handler {
 	r.Get("/health", s.handleHealth)
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// Projects
+		// Projects (long-lived containers)
 		r.Post("/projects", s.handleCreateProject)
 		r.Get("/projects", s.handleListProjects)
 		r.Get("/projects/{projectID}", s.handleGetProject)
-		r.Get("/projects/{projectID}/tasks", s.handleListProjectTasks)
+		r.Get("/projects/{projectID}/runs", s.handleListProjectRuns)
+
+		// Runs — hierarchical under projects
+		// Address runs by project_id + run_seq (per-project numbering)
+		r.Post("/projects/{projectID}/runs", s.handleCreateRun)
+		r.Get("/projects/{projectID}/runs/{runSeq}", s.handleGetRun)
+		r.Get("/projects/{projectID}/runs/{runSeq}/tasks", s.handleListRunTasks)
+
+		// Legacy flat listing — still useful for dashboards
+		r.Get("/runs", s.handleListRuns)
 
 		// Tasks
 		r.Get("/tasks/ready", s.handleListReadyTasks)
@@ -83,23 +92,153 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// --- Projects ---
+// --- Projects (long-lived containers) ---
 
 type createProjectRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+type projectResponse struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	RunCount    int    `json:"run_count"`
+	CreatedAt   string `json:"created_at"`
+}
+
+func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	var req createProjectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	// Check uniqueness
+	existing, _ := s.store.GetProjectByName(req.Name)
+	if existing != nil {
+		writeError(w, http.StatusConflict, "a project with this name already exists")
+		return
+	}
+
+	now := time.Now()
+	id, err := s.store.CreateProject(&store.ProjectRecord{
+		Name:        req.Name,
+		Description: req.Description,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create project: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, projectResponse{
+		ID:        id,
+		Name:      req.Name,
+		CreatedAt: now.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.store.ListProjects()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list projects")
+		return
+	}
+
+	resp := make([]projectResponse, 0, len(projects))
+	for _, p := range projects {
+		runs, _ := s.store.ListRunsByProject(p.ID)
+		resp = append(resp, projectResponse{
+			ID:          p.ID,
+			Name:        p.Name,
+			Description: p.Description,
+			RunCount:    len(runs),
+			CreatedAt:   p.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	p, err := s.store.GetProject(projectID)
+	if err != nil || p == nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+
+	runs, _ := s.store.ListRunsByProject(p.ID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":          p.ID,
+		"name":        p.Name,
+		"description": p.Description,
+		"run_count":   len(runs),
+		"created_at":  p.CreatedAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runs, err := s.store.ListRunsByProject(projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list runs")
+		return
+	}
+
+	resp := make([]runResponse, 0, len(runs))
+	for _, run := range runs {
+		tasks, _ := s.store.ListTasksByRun(run.ID)
+		resp = append(resp, runResponse{
+			ID:        run.ID,
+			ProjectID: run.ProjectID,
+			Seq:       run.Seq,
+			Name:      run.Name,
+			State:     string(run.State),
+			TaskCount: len(tasks),
+			CreatedAt: run.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- Runs ---
+
+type createRunRequest struct {
 	YAML    string `json:"yaml"`
 	RepoURL string `json:"repo_url,omitempty"`
 }
 
-type projectResponse struct {
-	ID        int64  `json:"id"`
+type runResponse struct {
+	ID        int64  `json:"id"`                   // global DB ID
+	ProjectID int64  `json:"project_id,omitempty"` // parent project
+	Seq       int    `json:"seq"`                  // sequence within project (this is the user-facing run #)
 	Name      string `json:"name"`
 	State     string `json:"state"`
 	TaskCount int    `json:"task_count"`
 	CreatedAt string `json:"created_at"`
 }
 
-func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
-	var req createProjectRequest
+func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	// Verify project exists
+	proj, err := s.store.GetProject(projectID)
+	if err != nil || proj == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("project %d not found", projectID))
+		return
+	}
+
+	var req createRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -113,31 +252,33 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	// Parse and validate the YAML
 	parsed, err := enjuYaml.Parse([]byte(req.YAML))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid project definition: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid run definition: "+err.Error())
 		return
 	}
 
 	now := time.Now()
-
-	// Store project
 	repoURL := req.RepoURL
 
-	projectID, err := s.store.CreateProject(&store.ProjectRecord{
-		Name:      parsed.Project.Name,
-		Ref:       parsed.Project.Ref,
+	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
+		ProjectID: projectID,
+		Name:      parsed.Run.Name,
+		Ref:       parsed.Run.Ref,
 		YAMLData:  req.YAML,
 		RepoURL:   repoURL,
-		State:     store.ProjectActive,
+		State:     store.RunActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
 	if err != nil {
-		s.logger.Error("creating project", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to create project")
+		s.logger.Error("creating run", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to create run: "+err.Error())
 		return
 	}
 
-	// Create task records from expanded DAG
+	// Create task records from expanded DAG.
+	// Task IDs are prefixed with {project_id}:{run_seq}: to make them globally unique
+	// and addressable within the per-project hierarchy.
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, runSeq)
 	taskCount := 0
 	taskSeq := 0
 	for instanceKey, tasks := range parsed.ExpandedTasks {
@@ -149,13 +290,13 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 			}
 			timeout := ti.Timeout
 			if timeout == "" {
-				timeout = parsed.Project.Defaults.Timeout
+				timeout = parsed.Run.Defaults.Timeout
 			}
 
-			// Build depends_on as comma-separated full IDs
+			// Build depends_on as comma-separated full IDs with run prefix
 			var deps []string
 			for _, dep := range ti.DependsOn {
-				deps = append(deps, enjuYaml.MakeFullID(instanceKey, dep))
+				deps = append(deps, runPrefix+enjuYaml.MakeFullID(instanceKey, dep))
 			}
 
 			// Determine initial state
@@ -165,8 +306,8 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 			}
 
 			err := s.store.CreateTask(&store.TaskRecord{
-				ID:          ti.FullID,
-				ProjectID:   projectID,
+				ID:          runPrefix + ti.FullID,
+				RunID:       runID,
 				Seq:         taskSeq,
 				TaskDefID:   ti.ID,
 				InstanceKey: instanceKey,
@@ -174,9 +315,10 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 				Action:      ti.Action,
 				Prompt:      ti.Prompt,
 				UserPrompt:  ti.UserPrompt,
-				Script:      ti.Script,
-				Outputs:     marshalOutputs(ti.Outputs),
-				ResultType:  resultType,
+				Script:       ti.Script,
+				Outputs:      marshalOutputs(ti.Outputs),
+				Requirements: marshalRequirements(ti.Requirements),
+				ResultType:   resultType,
 				Timeout:     timeout,
 				State:       state,
 				DependsOn:   strings.Join(deps, ","),
@@ -191,33 +333,37 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cache DAG and parsed project in memory
-	s.dags[projectID] = parsed.DAG
-	s.projects[projectID] = parsed
+	// Cache DAG and parsed run in memory
+	s.dags[runID] = parsed.DAG
+	s.runs[runID] = parsed
 
-	s.logger.Info("project created", "id", projectID, "name", parsed.Project.Name, "tasks", taskCount)
+	s.logger.Info("run created", "id", runID, "project_id", projectID, "seq", runSeq, "name", parsed.Run.Name, "tasks", taskCount)
 
-	writeJSON(w, http.StatusCreated, projectResponse{
-		ID:        projectID,
-		Name:      parsed.Project.Name,
-		State:     string(store.ProjectActive),
+	writeJSON(w, http.StatusCreated, runResponse{
+		ID:        runID,
+		ProjectID: projectID,
+		Seq:       runSeq,
+		Name:      parsed.Run.Name,
+		State:     string(store.RunActive),
 		TaskCount: taskCount,
 		CreatedAt: now.Format(time.RFC3339),
 	})
 }
 
-func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	projects, err := s.store.ListProjects()
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.store.ListRuns()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list projects")
+		writeError(w, http.StatusInternalServerError, "failed to list runs")
 		return
 	}
 
-	var resp []projectResponse
-	for _, p := range projects {
-		tasks, _ := s.store.ListTasksByProject(p.ID)
-		resp = append(resp, projectResponse{
+	var resp []runResponse
+	for _, p := range runs {
+		tasks, _ := s.store.ListTasksByRun(p.ID)
+		resp = append(resp, runResponse{
 			ID:        p.ID,
+			ProjectID: p.ProjectID,
+			Seq:       p.Seq,
 			Name:      p.Name,
 			State:     string(p.State),
 			TaskCount: len(tasks),
@@ -228,22 +374,26 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
-	p, err := s.store.GetProject(projectID)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+
+	p, err := s.store.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	if p == nil {
-		writeError(w, http.StatusNotFound, "project not found")
+		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
 
-	tasks, _ := s.store.ListTasksByProject(p.ID)
+	tasks, _ := s.store.ListTasksByRun(p.ID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":         p.ID,
+		"project_id": p.ProjectID,
+		"seq":        p.Seq,
 		"name":       p.Name,
 		"state":      p.State,
 		"repo_url":   p.RepoURL,
@@ -252,31 +402,42 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListRunTasks(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
-	tasks, err := s.store.ListTasksByProject(projectID)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	tasks, err := s.store.ListTasksByRun(run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list tasks")
 		return
 	}
-	writeJSON(w, http.StatusOK, toTaskResponses(tasks))
+	writeJSON(w, http.StatusOK, s.toTaskResponses(tasks))
 }
 
 // --- Tasks ---
 
 type taskResponse struct {
-	ID          string  `json:"id"`
-	ProjectID   int64   `json:"project_id"`
-	Seq         int     `json:"seq"`
-	TaskDefID   string  `json:"task_def_id"`
+	ID          string `json:"id"`
+	RunID       int64  `json:"run_id"`     // global run ID
+	RunSeq      int    `json:"run_seq"`    // per-project run sequence
+	ProjectID   int64  `json:"project_id"` // parent project
+	Seq         int    `json:"seq"`        // task sequence within run
+	TaskDefID   string `json:"task_def_id"`
 	InstanceKey string  `json:"instance_key,omitempty"`
 	Ref         string  `json:"ref,omitempty"`
 	Action      string  `json:"action"`
-	Prompt      string  `json:"prompt,omitempty"`
-	UserPrompt  string  `json:"user_prompt,omitempty"`
-	Script      string  `json:"script,omitempty"`
-	Outputs     string  `json:"outputs,omitempty"`
-	ResultType  string  `json:"result_type"`
+	Prompt       string `json:"prompt,omitempty"`
+	UserPrompt   string `json:"user_prompt,omitempty"`
+	Script       string `json:"script,omitempty"`
+	Outputs      string `json:"outputs,omitempty"`
+	Requirements string `json:"requirements,omitempty"`
+	ResultType   string `json:"result_type"`
 	State       string  `json:"state"`
 	ClaimedBy   string  `json:"claimed_by,omitempty"`
 	ResultPath  string  `json:"result_path,omitempty"`
@@ -285,12 +446,22 @@ type taskResponse struct {
 
 func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(r.URL.Query().Get("project_id"), 10, 64)
-	tasks, err := s.store.ListReadyTasks(projectID)
+	runSeq, _ := strconv.Atoi(r.URL.Query().Get("run_id"))
+
+	var runGlobalID int64
+	if projectID > 0 && runSeq > 0 {
+		run, _ := s.store.GetRunByProjectSeq(projectID, runSeq)
+		if run != nil {
+			runGlobalID = run.ID
+		}
+	}
+
+	tasks, err := s.store.ListReadyTasks(runGlobalID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list tasks")
 		return
 	}
-	writeJSON(w, http.StatusOK, toTaskResponses(tasks))
+	writeJSON(w, http.StatusOK, s.toTaskResponses(tasks))
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
@@ -304,7 +475,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, toTaskResponse(*task))
+	writeJSON(w, http.StatusOK, s.toTaskResponse(*task))
 }
 
 type claimRequest struct {
@@ -350,7 +521,7 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	// Return task with full details
 	updatedTask, _ := s.store.GetTask(taskID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"task":     toTaskResponse(*updatedTask),
+		"task":     s.toTaskResponse(*updatedTask),
 		"deadline": deadline.Format(time.RFC3339),
 	})
 }
@@ -444,7 +615,14 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var resultPath string
-	projectIDStr := fmt.Sprintf("%d", task.ProjectID)
+	// Result directory path: projects/{project_id}/runs/{run_seq}/tasks/{task_def_id}
+	// We need to look up the run's project_id and seq
+	run, runErr := s.store.GetRun(task.RunID)
+	if runErr != nil || run == nil {
+		writeError(w, http.StatusInternalServerError, "run not found for task")
+		return
+	}
+	runIDStr := fmt.Sprintf("%d/%d", run.ProjectID, run.Seq)
 
 	if len(req.Outputs) > 0 {
 		// Multi-file or JSON outputs
@@ -486,16 +664,16 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		if hasFileOutputs {
 			// Write each output to its declared file
 			metadata["named_outputs"] = true
-			resultPath, err = writeMultiFileResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, schema, req.Outputs, metadata)
+			resultPath, err = writeMultiFileResult(s.git, runIDStr, task.InstanceKey, task.TaskDefID, schema, req.Outputs, metadata)
 		} else {
 			// Legacy: everything in one JSON blob
 			outputsJSON, _ := json.MarshalIndent(req.Outputs, "", "  ")
 			metadata["named_outputs"] = true
-			resultPath, err = writeResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, string(outputsJSON), "json", metadata)
+			resultPath, err = writeResult(s.git, runIDStr, task.InstanceKey, task.TaskDefID, string(outputsJSON), "json", metadata)
 		}
 	} else {
 		// Simple text result
-		resultPath, err = writeResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, req.Content, resultType, metadata)
+		resultPath, err = writeResult(s.git, runIDStr, task.InstanceKey, task.TaskDefID, req.Content, resultType, metadata)
 	}
 	if err != nil {
 		s.logger.Error("writing result", "error", err)
@@ -516,12 +694,12 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update ready tasks — newly unblocked tasks become READY
-	readied, _ := s.store.UpdateReadyTasks(task.ProjectID)
+	readied, _ := s.store.UpdateReadyTasks(task.RunID)
 
-	// Check if all tasks are done — mark project as completed
-	completed, _ := s.store.CheckAndCompleteProject(task.ProjectID)
+	// Check if all tasks are done — mark run as completed
+	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
 	if completed {
-		s.logger.Info("project completed", "project_id", task.ProjectID)
+		s.logger.Info("run completed", "run_id", task.RunID)
 	}
 
 	s.logger.Info("result submitted", "task_id", taskID, "path", resultPath, "newly_ready", readied)
@@ -532,7 +710,7 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		"newly_ready":  readied,
 	}
 	if completed {
-		resp["project_completed"] = true
+		resp["run_completed"] = true
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -573,9 +751,9 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find descendants using the in-memory DAG
-	d, ok := s.dags[task.ProjectID]
+	d, ok := s.dags[task.RunID]
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "DAG not loaded for this project")
+		writeError(w, http.StatusInternalServerError, "DAG not loaded for this run")
 		return
 	}
 
@@ -719,8 +897,8 @@ func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) 
 			"tokens_contributed": citizen.TokensContrib,
 			"registered_at":     citizen.RegisteredAt.Format(time.RFC3339),
 		},
-		"active_tasks":  toTaskResponses(active),
-		"recent_tasks":  toTaskResponses(recent),
+		"active_tasks":  s.toTaskResponses(active),
+		"recent_tasks":  s.toTaskResponses(recent),
 	})
 }
 
@@ -738,31 +916,53 @@ func marshalOutputs(outputs map[string]enjuYaml.OutputSpec) string {
 	return string(data)
 }
 
-func toTaskResponse(t store.TaskRecord) taskResponse {
+// marshalRequirements serializes task environment requirements to JSON.
+func marshalRequirements(reqs map[string]interface{}) string {
+	if len(reqs) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(reqs)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
+	// Look up the run to get project_id and run_seq
+	var projectID int64
+	var runSeq int
+	if run, _ := s.store.GetRun(t.RunID); run != nil {
+		projectID = run.ProjectID
+		runSeq = run.Seq
+	}
 	return taskResponse{
-		ID:          t.ID,
-		ProjectID:   t.ProjectID,
-		Seq:         t.Seq,
-		TaskDefID:   t.TaskDefID,
-		InstanceKey: t.InstanceKey,
-		Ref:         t.Ref,
-		Action:      t.Action,
-		Prompt:      t.Prompt,
-		UserPrompt:  t.UserPrompt,
-		Script:      t.Script,
-		Outputs:     t.Outputs,
-		ResultType:  t.ResultType,
-		State:       string(t.State),
-		ClaimedBy:   t.ClaimedBy,
-		ResultPath:  t.ResultPath,
-		DependsOn:   t.DependsOn,
+		ID:           t.ID,
+		RunID:        t.RunID,
+		RunSeq:       runSeq,
+		ProjectID:    projectID,
+		Seq:          t.Seq,
+		TaskDefID:    t.TaskDefID,
+		InstanceKey:  t.InstanceKey,
+		Ref:          t.Ref,
+		Action:       t.Action,
+		Prompt:       t.Prompt,
+		UserPrompt:   t.UserPrompt,
+		Script:       t.Script,
+		Outputs:      t.Outputs,
+		Requirements: t.Requirements,
+		ResultType:   t.ResultType,
+		State:        string(t.State),
+		ClaimedBy:    t.ClaimedBy,
+		ResultPath:   t.ResultPath,
+		DependsOn:    t.DependsOn,
 	}
 }
 
-func toTaskResponses(tasks []store.TaskRecord) []taskResponse {
+func (s *Server) toTaskResponses(tasks []store.TaskRecord) []taskResponse {
 	resp := make([]taskResponse, 0, len(tasks))
 	for _, t := range tasks {
-		resp = append(resp, toTaskResponse(t))
+		resp = append(resp, s.toTaskResponse(t))
 	}
 	return resp
 }

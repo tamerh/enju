@@ -41,18 +41,30 @@ func (s *Store) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS projects (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		description TEXT,
+		created_by TEXT,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS runs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL REFERENCES projects(id),
+		seq INTEGER NOT NULL,
 		name TEXT NOT NULL,
 		ref TEXT,
 		yaml_data TEXT,
 		repo_url TEXT,
 		state TEXT NOT NULL DEFAULT 'active',
 		created_at TIMESTAMP NOT NULL,
-		updated_at TIMESTAMP NOT NULL
+		updated_at TIMESTAMP NOT NULL,
+		UNIQUE(project_id, seq)
 	);
 
 	CREATE TABLE IF NOT EXISTS tasks (
 		id TEXT PRIMARY KEY,
-		project_id INTEGER NOT NULL REFERENCES projects(id),
+		run_id INTEGER NOT NULL REFERENCES runs(id),
 		seq INTEGER NOT NULL DEFAULT 0,
 		task_def_id TEXT NOT NULL,
 		instance_key TEXT NOT NULL DEFAULT '',
@@ -62,6 +74,7 @@ func (s *Store) migrate() error {
 		user_prompt TEXT,
 		script TEXT,
 		outputs TEXT,
+		requirements TEXT,
 		result_type TEXT NOT NULL DEFAULT 'text',
 		timeout TEXT,
 		state TEXT NOT NULL DEFAULT 'pending',
@@ -99,24 +112,26 @@ func (s *Store) migrate() error {
 		submitted_at TIMESTAMP
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
 	CREATE INDEX IF NOT EXISTS idx_citizens_token ON citizens(token);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE email IS NOT NULL AND email != '';
+	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 	`
 	_, err := s.db.Exec(schema)
 	return err
 }
 
-// --- Projects ---
+// --- Projects (long-lived containers) ---
 
+// CreateProject creates a new long-lived project.
 func (s *Store) CreateProject(p *ProjectRecord) (int64, error) {
 	result, err := s.db.Exec(
-		`INSERT INTO projects (name, ref, yaml_data, repo_url, state, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO projects (name, description, created_by, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		p.Name, p.Description, p.CreatedBy, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, err
@@ -124,21 +139,45 @@ func (s *Store) CreateProject(p *ProjectRecord) (int64, error) {
 	return result.LastInsertId()
 }
 
+// GetProject retrieves a project by ID.
 func (s *Store) GetProject(id int64) (*ProjectRecord, error) {
 	var p ProjectRecord
-	var ref sql.NullString
+	var desc, createdBy sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM projects WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, name, description, created_by, created_at, updated_at FROM projects WHERE id = ?`, id,
+	).Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	p.Ref = ref.String
-	return &p, err
+	if err != nil {
+		return nil, err
+	}
+	p.Description = desc.String
+	p.CreatedBy = createdBy.String
+	return &p, nil
 }
 
+// GetProjectByName retrieves a project by its unique name.
+func (s *Store) GetProjectByName(name string) (*ProjectRecord, error) {
+	var p ProjectRecord
+	var desc, createdBy sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, name, description, created_by, created_at, updated_at FROM projects WHERE name = ?`, name,
+	).Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Description = desc.String
+	p.CreatedBy = createdBy.String
+	return &p, nil
+}
+
+// ListProjects returns all projects.
 func (s *Store) ListProjects() ([]ProjectRecord, error) {
-	rows, err := s.db.Query(`SELECT id, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM projects ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, name, description, created_by, created_at, updated_at FROM projects ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -147,35 +186,151 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 	var projects []ProjectRecord
 	for rows.Next() {
 		var p ProjectRecord
-		var ref sql.NullString
-		if err := rows.Scan(&p.ID, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		var desc, createdBy sql.NullString
+		if err := rows.Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
-		p.Ref = ref.String
+		p.Description = desc.String
+		p.CreatedBy = createdBy.String
 		projects = append(projects, p)
 	}
 	return projects, rows.Err()
 }
 
-func (s *Store) UpdateProjectState(id int64, state ProjectState) error {
+// ListRunsByProject returns all runs in a project, ordered by seq.
+func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at
+		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []RunRecord
+	for rows.Next() {
+		var r RunRecord
+		var ref sql.NullString
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		r.Ref = ref.String
+		runs = append(runs, r)
+	}
+	return runs, rows.Err()
+}
+
+// --- Runs ---
+
+// CreateRun inserts a new run. The run's sequence number within its project
+// is computed automatically. Returns (global_id, project_seq).
+func (s *Store) CreateRun(p *RunRecord) (int64, int, error) {
+	if p.ProjectID == 0 {
+		return 0, 0, fmt.Errorf("project_id is required")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	// Compute next seq within this project
+	var maxSeq sql.NullInt64
+	err = tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM runs WHERE project_id = ?`, p.ProjectID).Scan(&maxSeq)
+	if err != nil {
+		return 0, 0, err
+	}
+	nextSeq := int(maxSeq.Int64) + 1
+
+	result, err := tx.Exec(
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.CreatedAt, p.UpdatedAt,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return id, nextSeq, nil
+}
+
+// GetRun retrieves a run by its global ID.
+func (s *Store) GetRun(id int64) (*RunRecord, error) {
+	var p RunRecord
+	var ref sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	p.Ref = ref.String
+	return &p, err
+}
+
+// GetRunByProjectSeq retrieves a run by (project_id, seq).
+func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error) {
+	var p RunRecord
+	var ref sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at
+		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	p.Ref = ref.String
+	return &p, err
+}
+
+func (s *Store) ListRuns() ([]RunRecord, error) {
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM runs ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []RunRecord
+	for rows.Next() {
+		var p RunRecord
+		var ref sql.NullString
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		p.Ref = ref.String
+		runs = append(runs, p)
+	}
+	return runs, rows.Err()
+}
+
+func (s *Store) UpdateRunState(id int64, state RunState) error {
 	_, err := s.db.Exec(
-		`UPDATE projects SET state = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE runs SET state = ?, updated_at = ? WHERE id = ?`,
 		state, time.Now(), id,
 	)
 	return err
 }
 
-func (s *Store) CheckAndCompleteProject(projectID int64) (bool, error) {
+func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 	var total, accepted int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*), COUNT(CASE WHEN state = 'accepted' THEN 1 END) FROM tasks WHERE project_id = ?`,
-		projectID,
+		`SELECT COUNT(*), COUNT(CASE WHEN state = 'accepted' THEN 1 END) FROM tasks WHERE run_id = ?`,
+		runID,
 	).Scan(&total, &accepted)
 	if err != nil {
 		return false, err
 	}
 	if total > 0 && total == accepted {
-		err = s.UpdateProjectState(projectID, ProjectCompleted)
+		err = s.UpdateRunState(runID, RunCompleted)
 		return err == nil, err
 	}
 	return false, nil
@@ -183,14 +338,14 @@ func (s *Store) CheckAndCompleteProject(projectID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, project_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, depends_on, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, depends_on, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, project_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, result_type, timeout, state, depends_on, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectID, t.Seq, t.TaskDefID, t.InstanceKey, t.Ref, t.Action,
-		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.ResultType, t.Timeout,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.Ref, t.Action,
+		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.CreatedAt,
 	)
 	return err
@@ -199,11 +354,11 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
 	var claimedAt, submittedAt sql.NullTime
-	var claimedBy, resultPath, prompt, userPrompt, script, outputs, timeout, ref sql.NullString
+	var claimedBy, resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
 	err := s.db.QueryRow(
 		`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id,
-	).Scan(&t.ID, &t.ProjectID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
-		&prompt, &userPrompt, &script, &outputs, &t.ResultType, &timeout,
+	).Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
+		&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 		&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.DependsOn, &t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -216,6 +371,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	t.UserPrompt = userPrompt.String
 	t.Script = script.String
 	t.Outputs = outputs.String
+	t.Requirements = requirements.String
 	t.Timeout = timeout.String
 	t.ClaimedBy = claimedBy.String
 	t.ResultPath = resultPath.String
@@ -228,19 +384,19 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	return &t, nil
 }
 
-// GetTaskBySeq finds a task by project ID and sequence number.
-func (s *Store) GetTaskBySeq(projectID string, seq int) (*TaskRecord, error) {
+// GetTaskBySeq finds a task by run ID and sequence number.
+func (s *Store) GetTaskBySeq(runID string, seq int) (*TaskRecord, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM tasks WHERE project_id = ? AND seq = ?`, projectID, seq).Scan(&id)
+	err := s.db.QueryRow(`SELECT id FROM tasks WHERE run_id = ? AND seq = ?`, runID, seq).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 	return s.GetTask(id)
 }
 
-func (s *Store) ListTasksByProject(projectID int64) ([]TaskRecord, error) {
+func (s *Store) ListTasksByRun(runID int64) ([]TaskRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT `+taskColumns+` FROM tasks WHERE project_id = ? ORDER BY created_at`, projectID,
+		`SELECT `+taskColumns+` FROM tasks WHERE run_id = ? ORDER BY created_at`, runID,
 	)
 	if err != nil {
 		return nil, err
@@ -249,12 +405,12 @@ func (s *Store) ListTasksByProject(projectID int64) ([]TaskRecord, error) {
 	return scanTasks(rows)
 }
 
-func (s *Store) ListReadyTasks(projectID int64) ([]TaskRecord, error) {
+func (s *Store) ListReadyTasks(runID int64) ([]TaskRecord, error) {
 	query := `SELECT ` + taskColumns + ` FROM tasks WHERE state = 'ready'`
 	args := []interface{}{}
-	if projectID > 0 {
-		query += " AND project_id = ?"
-		args = append(args, projectID)
+	if runID > 0 {
+		query += " AND run_id = ?"
+		args = append(args, runID)
 	}
 	query += " ORDER BY created_at"
 
@@ -403,9 +559,9 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) error {
 	return tx.Commit()
 }
 
-func (s *Store) UpdateReadyTasks(projectID int64) (int, error) {
+func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	rows, err := s.db.Query(
-		`SELECT id, depends_on FROM tasks WHERE project_id = ? AND state = 'pending'`, projectID,
+		`SELECT id, depends_on FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
 	)
 	if err != nil {
 		return 0, err
@@ -429,7 +585,7 @@ func (s *Store) UpdateReadyTasks(projectID int64) (int, error) {
 	}
 
 	acceptedRows, err := s.db.Query(
-		`SELECT id FROM tasks WHERE project_id = ? AND state = 'accepted'`, projectID,
+		`SELECT id FROM tasks WHERE run_id = ? AND state = 'accepted'`, runID,
 	)
 	if err != nil {
 		return 0, err
@@ -647,9 +803,9 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 	for rows.Next() {
 		var t TaskRecord
 		var claimedAt, submittedAt sql.NullTime
-		var claimedBy, resultPath, prompt, userPrompt, script, outputs, timeout, ref sql.NullString
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
-			&prompt, &userPrompt, &script, &outputs, &t.ResultType, &timeout,
+		var claimedBy, resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
+			&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.DependsOn, &t.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -658,6 +814,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 		t.UserPrompt = userPrompt.String
 		t.Script = script.String
 		t.Outputs = outputs.String
+		t.Requirements = requirements.String
 		t.Timeout = timeout.String
 		t.ClaimedBy = claimedBy.String
 		t.ResultPath = resultPath.String

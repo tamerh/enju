@@ -1,4 +1,4 @@
-// Package yaml parses Cedar project definition files.
+// Package yaml parses Cedar run definition files.
 package yaml
 
 import (
@@ -11,14 +11,15 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
-// Project is the top-level structure of a project.yaml file.
-type Project struct {
-	Name    string            `yaml:"name"`
-	Version int               `yaml:"version"`
-	Ref     string            `yaml:"ref,omitempty"` // external reference (URL to issue, ticket, etc.)
-	ForEach map[string][]string `yaml:"for_each,omitempty"`
-	Defaults TaskDefaults      `yaml:"defaults,omitempty"`
-	Tasks   []TaskDef         `yaml:"tasks"`
+// Run is the top-level structure of a run.yaml file.
+type Run struct {
+	Name         string                 `yaml:"name"`
+	Version      int                    `yaml:"version"`
+	Ref          string                 `yaml:"ref,omitempty"`
+	ForEach      map[string][]string    `yaml:"for_each,omitempty"`
+	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`
+	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // project-level requirements, inherited by tasks
+	Tasks        []TaskDef              `yaml:"tasks"`
 }
 
 // TaskDefaults holds default values for all tasks.
@@ -71,14 +72,15 @@ type TaskDef struct {
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
 	Gather     bool              `yaml:"gather,omitempty"`
-	Outputs    map[string]OutputSpec `yaml:"outputs,omitempty"`
-	Config     map[string]interface{} `yaml:"config,omitempty"`
+	Outputs      map[string]OutputSpec  `yaml:"outputs,omitempty"`
+	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
+	Config       map[string]interface{} `yaml:"config,omitempty"`
 }
 
-// ParsedProject is the result of parsing and validating a project file.
+// ParsedRun is the result of parsing and validating a run file.
 // It contains the original definition plus the constructed DAG.
-type ParsedProject struct {
-	Project  *Project
+type ParsedRun struct {
+	Run  *Run
 	DAG      *dag.DAG
 	// ExpandedTasks maps instance_key -> []TaskInstance for for_each expansion.
 	// If no for_each, there's a single instance with key "".
@@ -93,8 +95,8 @@ type TaskInstance struct {
 	FullID      string            // e.g., "endometriosis:foundation" or just "foundation"
 }
 
-// ParseFile reads and parses a project YAML file.
-func ParseFile(path string) (*ParsedProject, error) {
+// ParseFile reads and parses a run YAML file.
+func ParseFile(path string) (*ParsedRun, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading file: %w", err)
@@ -102,9 +104,9 @@ func ParseFile(path string) (*ParsedProject, error) {
 	return Parse(data)
 }
 
-// Parse parses project YAML bytes.
-func Parse(data []byte) (*ParsedProject, error) {
-	var prob Project
+// Parse parses run YAML bytes.
+func Parse(data []byte) (*ParsedRun, error) {
+	var prob Run
 	if err := yamlv3.Unmarshal(data, &prob); err != nil {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
@@ -128,10 +130,10 @@ func resolveAction(t *TaskDef) {
 	}
 }
 
-// validate checks the project definition for errors.
-func validate(p *Project) error {
+// validate checks the run definition for errors.
+func validate(p *Run) error {
 	if p.Name == "" {
-		return fmt.Errorf("project name is required")
+		return fmt.Errorf("run name is required")
 	}
 	if len(p.Tasks) == 0 {
 		return fmt.Errorf("at least one task is required")
@@ -192,12 +194,12 @@ func validate(p *Project) error {
 }
 
 // build constructs the DAG and expands for_each parameters.
-func build(p *Project) (*ParsedProject, error) {
+func build(p *Run) (*ParsedRun, error) {
 	// Determine instance keys from for_each
 	instances := expandForEach(p.ForEach)
 
-	result := &ParsedProject{
-		Project:       p,
+	result := &ParsedRun{
+		Run:       p,
 		DAG:           dag.New(),
 		ExpandedTasks: make(map[string][]TaskInstance),
 	}
@@ -240,6 +242,10 @@ func build(p *Project) (*ParsedProject, error) {
 			ti.UserPrompt = resolvedUserPrompt
 			// Store merged dependencies
 			ti.DependsOn = allDeps
+			// Inherit run requirements if task doesn't have its own
+			if ti.Requirements == nil {
+				ti.Requirements = p.Requirements
+			}
 
 			taskInstances = append(taskInstances, ti)
 
