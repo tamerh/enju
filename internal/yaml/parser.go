@@ -1,4 +1,4 @@
-// Package yaml parses Cedar problem definition files.
+// Package yaml parses Cedar project definition files.
 package yaml
 
 import (
@@ -7,13 +7,15 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/dag"
+	"github.com/enju-ai/enju/internal/template"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
-// Problem is the top-level structure of a problem.yaml file.
-type Problem struct {
+// Project is the top-level structure of a project.yaml file.
+type Project struct {
 	Name    string            `yaml:"name"`
 	Version int               `yaml:"version"`
+	Ref     string            `yaml:"ref,omitempty"` // external reference (URL to issue, ticket, etc.)
 	ForEach map[string][]string `yaml:"for_each,omitempty"`
 	Defaults TaskDefaults      `yaml:"defaults,omitempty"`
 	Tasks   []TaskDef         `yaml:"tasks"`
@@ -24,27 +26,59 @@ type TaskDefaults struct {
 	Timeout string `yaml:"timeout,omitempty"` // e.g., "30m", "2h"
 }
 
+// OutputSpec describes a single named output.
+// Supports two YAML formats:
+//   outputs:
+//     name: "Description"                              # simple string
+//   outputs:
+//     name:                                            # object form
+//       description: "Description"
+//       file: "result.csv"                             # optional file
+//       format: csv                                    # optional format
+type OutputSpec struct {
+	Description string `yaml:"description,omitempty"`
+	File        string `yaml:"file,omitempty"`
+	Format      string `yaml:"format,omitempty"`
+}
+
+// UnmarshalYAML supports both string and object forms.
+func (o *OutputSpec) UnmarshalYAML(value *yamlv3.Node) error {
+	// Try string form first
+	if value.Kind == yamlv3.ScalarNode {
+		o.Description = value.Value
+		return nil
+	}
+	// Object form
+	type alias OutputSpec
+	var a alias
+	if err := value.Decode(&a); err != nil {
+		return err
+	}
+	*o = OutputSpec(a)
+	return nil
+}
+
 // TaskDef is a single task definition from the YAML.
 type TaskDef struct {
 	ID         string            `yaml:"id"`
-	Type       string            `yaml:"type"`                  // "llm_prompt" or "script"
-	Mode       string            `yaml:"mode,omitempty"`        // "autonomous" (default) or "assisted"
+	Action     string            `yaml:"action"`                  // "answer", "contribute", "compute", "review", "vote"
+	Ref        string            `yaml:"ref,omitempty"`
 	DependsOn  []string          `yaml:"depends_on,omitempty"`
 	Prompt     string            `yaml:"prompt,omitempty"`
-	UserPrompt string            `yaml:"user_prompt,omitempty"` // for assisted mode
+	UserPrompt string            `yaml:"user_prompt,omitempty"`
 	Script     string            `yaml:"script,omitempty"`
-	ScriptSource string          `yaml:"script_source,omitempty"` // "predefined" or "participant"
-	ResultType string            `yaml:"result_type,omitempty"`   // "text" (default), "json", "file"
+	ScriptSource string          `yaml:"script_source,omitempty"`
+	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
-	Gather     bool              `yaml:"gather,omitempty"`        // collect all for_each instances
-	Outputs    map[string]string `yaml:"outputs,omitempty"`
+	Gather     bool              `yaml:"gather,omitempty"`
+	Outputs    map[string]OutputSpec `yaml:"outputs,omitempty"`
 	Config     map[string]interface{} `yaml:"config,omitempty"`
 }
 
-// ParsedProblem is the result of parsing and validating a problem file.
+// ParsedProject is the result of parsing and validating a project file.
 // It contains the original definition plus the constructed DAG.
-type ParsedProblem struct {
-	Problem  *Problem
+type ParsedProject struct {
+	Project  *Project
 	DAG      *dag.DAG
 	// ExpandedTasks maps instance_key -> []TaskInstance for for_each expansion.
 	// If no for_each, there's a single instance with key "".
@@ -59,8 +93,8 @@ type TaskInstance struct {
 	FullID      string            // e.g., "endometriosis:foundation" or just "foundation"
 }
 
-// ParseFile reads and parses a problem YAML file.
-func ParseFile(path string) (*ParsedProblem, error) {
+// ParseFile reads and parses a project YAML file.
+func ParseFile(path string) (*ParsedProject, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading file: %w", err)
@@ -68,9 +102,9 @@ func ParseFile(path string) (*ParsedProblem, error) {
 	return Parse(data)
 }
 
-// Parse parses problem YAML bytes.
-func Parse(data []byte) (*ParsedProblem, error) {
-	var prob Problem
+// Parse parses project YAML bytes.
+func Parse(data []byte) (*ParsedProject, error) {
+	var prob Project
 	if err := yamlv3.Unmarshal(data, &prob); err != nil {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
@@ -87,17 +121,31 @@ func Parse(data []byte) (*ParsedProblem, error) {
 	return parsed, nil
 }
 
-// validate checks the problem definition for errors.
-func validate(p *Problem) error {
+// resolveAction sets default action if not specified.
+func resolveAction(t *TaskDef) {
+	if t.Action == "" {
+		t.Action = "answer"
+	}
+}
+
+// validate checks the project definition for errors.
+func validate(p *Project) error {
 	if p.Name == "" {
-		return fmt.Errorf("problem name is required")
+		return fmt.Errorf("project name is required")
 	}
 	if len(p.Tasks) == 0 {
 		return fmt.Errorf("at least one task is required")
 	}
 
+	validActions := map[string]bool{
+		"answer": true, "contribute": true, "compute": true,
+		"review": true, "vote": true,
+	}
+
 	ids := make(map[string]bool)
-	for _, t := range p.Tasks {
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+
 		if t.ID == "" {
 			return fmt.Errorf("task ID is required")
 		}
@@ -106,33 +154,28 @@ func validate(p *Problem) error {
 		}
 		ids[t.ID] = true
 
-		if t.Type == "" {
-			return fmt.Errorf("task %q: type is required", t.ID)
-		}
-		if t.Type != "llm_prompt" && t.Type != "script" {
-			return fmt.Errorf("task %q: invalid type %q (must be 'llm_prompt' or 'script')", t.ID, t.Type)
+		// Set default action
+		resolveAction(t)
+
+		// Validate action
+		if !validActions[t.Action] {
+			return fmt.Errorf("task %q: invalid action %q (must be answer, contribute, compute, review, or vote)", t.ID, t.Action)
 		}
 
-		if t.Type == "llm_prompt" && t.Prompt == "" {
-			return fmt.Errorf("task %q: prompt is required for llm_prompt tasks", t.ID)
-		}
-		if t.Type == "script" && t.Script == "" {
-			return fmt.Errorf("task %q: script is required for script tasks", t.ID)
-		}
-
-		if t.Mode != "" && t.Mode != "autonomous" && t.Mode != "assisted" {
-			return fmt.Errorf("task %q: invalid mode %q (must be 'autonomous' or 'assisted')", t.ID, t.Mode)
+		// Validate required fields based on action
+		switch t.Action {
+		case "answer", "contribute", "review":
+			if t.Prompt == "" {
+				return fmt.Errorf("task %q: prompt is required for %s action", t.ID, t.Action)
+			}
+		case "compute":
+			if t.Script == "" {
+				return fmt.Errorf("task %q: script is required for compute action", t.ID)
+			}
 		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
-		}
-
-		// Check depends_on references exist
-		for _, dep := range t.DependsOn {
-			if !ids[dep] {
-				// Could be defined later — we'll check again after all tasks are parsed
-			}
 		}
 	}
 
@@ -149,14 +192,20 @@ func validate(p *Problem) error {
 }
 
 // build constructs the DAG and expands for_each parameters.
-func build(p *Problem) (*ParsedProblem, error) {
+func build(p *Project) (*ParsedProject, error) {
 	// Determine instance keys from for_each
 	instances := expandForEach(p.ForEach)
 
-	result := &ParsedProblem{
-		Problem:       p,
+	result := &ParsedProject{
+		Project:       p,
 		DAG:           dag.New(),
 		ExpandedTasks: make(map[string][]TaskInstance),
+	}
+
+	// Collect task IDs for dependency validation
+	taskIDs := make(map[string]bool)
+	for _, t := range p.Tasks {
+		taskIDs[t.ID] = true
 	}
 
 	// Build task instances and DAG nodes for each instance
@@ -166,12 +215,32 @@ func build(p *Problem) (*ParsedProblem, error) {
 		for _, taskDef := range p.Tasks {
 			fullID := MakeFullID(inst.key, taskDef.ID)
 
+			// Resolve for_each params in prompt at creation time
+			resolvedPrompt := template.ResolveParams(taskDef.Prompt, inst.params)
+			resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, inst.params)
+
+			// Infer dependencies from template references, merge with explicit depends_on
+			allDeps := template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt)
+
+			// Validate inferred deps exist
+			for _, dep := range allDeps {
+				if !taskIDs[dep] {
+					return nil, fmt.Errorf("task %q references %q which does not exist", taskDef.ID, dep)
+				}
+			}
+
 			ti := TaskInstance{
 				TaskDef:     taskDef,
 				InstanceKey: inst.key,
 				Params:      inst.params,
 				FullID:      fullID,
 			}
+			// Override prompt with resolved version
+			ti.Prompt = resolvedPrompt
+			ti.UserPrompt = resolvedUserPrompt
+			// Store merged dependencies
+			ti.DependsOn = allDeps
+
 			taskInstances = append(taskInstances, ti)
 
 			// Add node to DAG
@@ -179,15 +248,15 @@ func build(p *Problem) (*ParsedProblem, error) {
 				"instance_key": inst.key,
 				"task_def_id":  taskDef.ID,
 			}
-			if err := result.DAG.AddNode(fullID, taskDef.Type, data); err != nil {
+			if err := result.DAG.AddNode(fullID, taskDef.Action, data); err != nil {
 				return nil, fmt.Errorf("adding node %q: %w", fullID, err)
 			}
 		}
 
-		// Add edges within this instance
-		for _, taskDef := range p.Tasks {
-			childID := MakeFullID(inst.key, taskDef.ID)
-			for _, dep := range taskDef.DependsOn {
+		// Add edges from merged dependencies (explicit + inferred)
+		for _, ti := range taskInstances {
+			childID := ti.FullID
+			for _, dep := range ti.DependsOn {
 				parentID := MakeFullID(inst.key, dep)
 				if err := result.DAG.AddEdge(parentID, childID); err != nil {
 					return nil, fmt.Errorf("adding edge %s -> %s: %w", parentID, childID, err)

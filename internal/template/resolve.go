@@ -1,0 +1,216 @@
+// Package template handles prompt template parsing and resolution.
+// Templates use {{variable}} syntax:
+//   - {{param_name}}         — for_each parameter, resolved at creation time
+//   - {{task_id.content}}    — upstream task result, resolved at claim time
+//   - {{task_id.field_name}} — upstream task named output, resolved at claim time
+package template
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+)
+
+// Reference pattern: {{word.word}} or {{word}}
+var refPattern = regexp.MustCompile(`\{\{(\w+)(?:\.(\w+))?\}\}`)
+
+// Reference represents a parsed template reference.
+type Reference struct {
+	TaskID string // e.g., "foundation"
+	Field  string // e.g., "content", "gene_list", or "" for bare {{param}}
+	Raw    string // original match e.g., "{{foundation.content}}"
+}
+
+// ExtractReferences finds all {{task_id.field}} references in a prompt.
+// Returns only task references (those with a dot), not bare {{param}} references.
+func ExtractReferences(prompt string) []Reference {
+	matches := refPattern.FindAllStringSubmatch(prompt, -1)
+	var refs []Reference
+	for _, m := range matches {
+		if m[2] != "" {
+			// Has a dot: {{task_id.field}} — this is a task reference
+			refs = append(refs, Reference{
+				TaskID: m[1],
+				Field:  m[2],
+				Raw:    m[0],
+			})
+		}
+	}
+	return refs
+}
+
+// InferDependencies extracts unique task IDs referenced in a prompt.
+// These are the tasks this prompt depends on.
+func InferDependencies(prompt string) []string {
+	refs := ExtractReferences(prompt)
+	seen := make(map[string]bool)
+	var deps []string
+	for _, ref := range refs {
+		if !seen[ref.TaskID] {
+			seen[ref.TaskID] = true
+			deps = append(deps, ref.TaskID)
+		}
+	}
+	return deps
+}
+
+// ResolveParams replaces {{param_name}} with values from the params map.
+// Only replaces bare references (no dot), leaving task references untouched.
+func ResolveParams(prompt string, params map[string]string) string {
+	return refPattern.ReplaceAllStringFunc(prompt, func(match string) string {
+		sub := refPattern.FindStringSubmatch(match)
+		if sub[2] == "" {
+			// Bare {{param}} — check if it's in params
+			if val, ok := params[sub[1]]; ok {
+				return val
+			}
+		}
+		// Task reference or unknown param — leave as-is
+		return match
+	})
+}
+
+// ResolveUpstream replaces {{task_id.field}} references with actual upstream results.
+// The inputs map is: task_def_id -> result content (raw JSON bytes or parsed map).
+func ResolveUpstream(prompt string, inputs map[string]interface{}) string {
+	return refPattern.ReplaceAllStringFunc(prompt, func(match string) string {
+		sub := refPattern.FindStringSubmatch(match)
+		if sub[2] == "" {
+			// Bare {{param}} — not an upstream reference, leave as-is
+			return match
+		}
+
+		taskID := sub[1]
+		field := sub[2]
+
+		result, ok := inputs[taskID]
+		if !ok {
+			return match // upstream not found, leave placeholder
+		}
+
+		return extractField(result, field)
+	})
+}
+
+// extractField gets a specific field from a result.
+// Result can be:
+//   - map with "content" key (simple result): {{task.content}} returns the content string
+//   - map with "content" as object (named outputs): {{task.field}} returns content[field]
+func extractField(result interface{}, field string) string {
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return fmt.Sprintf("%v", result)
+	}
+
+	content, hasContent := resultMap["content"]
+
+	if field == "content" {
+		// {{task.content}} — return the content directly
+		switch v := content.(type) {
+		case string:
+			return v
+		case map[string]interface{}:
+			// Named outputs stored as object — return JSON representation
+			b, _ := json.MarshalIndent(v, "", "  ")
+			return string(b)
+		default:
+			return fmt.Sprintf("%v", content)
+		}
+	}
+
+	if field == "responses" {
+		// {{task.responses}} — for multi-citizen tasks (future)
+		if responses, ok := resultMap["responses"]; ok {
+			b, _ := json.MarshalIndent(responses, "", "  ")
+			return string(b)
+		}
+		return match(result, field)
+	}
+
+	// {{task.field_name}} — look in content object for named output
+	if hasContent {
+		if contentMap, ok := content.(map[string]interface{}); ok {
+			if val, ok := contentMap[field]; ok {
+				switch v := val.(type) {
+				case string:
+					return v
+				default:
+					b, _ := json.MarshalIndent(v, "", "  ")
+					return string(b)
+				}
+			}
+		}
+	}
+
+	// Field not found in content — try top-level result
+	if val, ok := resultMap[field]; ok {
+		return fmt.Sprintf("%v", val)
+	}
+
+	return fmt.Sprintf("{{%s.%s}}", taskID(resultMap), field)
+}
+
+func match(result interface{}, field string) string {
+	return fmt.Sprintf("%v", result)
+}
+
+func taskID(m map[string]interface{}) string {
+	if id, ok := m["task_id"]; ok {
+		return fmt.Sprintf("%v", id)
+	}
+	return "unknown"
+}
+
+// MergeDependencies combines explicitly declared depends_on with inferred dependencies.
+// Explicit deps take precedence; inferred deps are added if not already present.
+func MergeDependencies(explicit []string, prompt string) []string {
+	inferred := InferDependencies(prompt)
+
+	seen := make(map[string]bool)
+	var merged []string
+
+	for _, dep := range explicit {
+		if !seen[dep] {
+			seen[dep] = true
+			merged = append(merged, dep)
+		}
+	}
+
+	for _, dep := range inferred {
+		if !seen[dep] {
+			seen[dep] = true
+			merged = append(merged, dep)
+		}
+	}
+
+	return merged
+}
+
+// HasUnresolvedReferences checks if a prompt still contains {{}} references.
+func HasUnresolvedReferences(prompt string) bool {
+	return refPattern.MatchString(prompt)
+}
+
+// HasUnresolvedTaskReferences checks if a prompt still has {{task.field}} references.
+func HasUnresolvedTaskReferences(prompt string) bool {
+	for _, ref := range ExtractReferences(prompt) {
+		if ref.Field != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ListParams extracts bare {{param}} references (no dot) from a prompt.
+func ListParams(prompt string) []string {
+	matches := refPattern.FindAllStringSubmatch(prompt, -1)
+	seen := make(map[string]bool)
+	var params []string
+	for _, m := range matches {
+		if m[2] == "" && !seen[m[1]] {
+			seen[m[1]] = true
+			params = append(params, m[1])
+		}
+	}
+	return params
+}

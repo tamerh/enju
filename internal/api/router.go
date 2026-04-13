@@ -1,4 +1,4 @@
-// Package api provides the REST API for the Cedar coordinator.
+// Package api provides the REST API for the Enju coordinator.
 package api
 
 import (
@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/dag"
-	cedarGit "github.com/enju-ai/enju/internal/git"
+	enjuGit "github.com/enju-ai/enju/internal/git"
 	"github.com/enju-ai/enju/internal/store"
-	cedarYaml "github.com/enju-ai/enju/internal/yaml"
+	"github.com/enju-ai/enju/internal/template"
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
@@ -21,18 +23,18 @@ import (
 // Server holds the coordinator state and dependencies.
 type Server struct {
 	store    *store.Store
-	dags     map[string]*dag.DAG // problemID -> DAG (in-memory for fast queries)
-	problems map[string]*cedarYaml.ParsedProblem
-	git      *cedarGit.Writer
+	dags     map[int64]*dag.DAG // projectID -> DAG (in-memory for fast queries)
+	projects map[int64]*enjuYaml.ParsedProject
+	git      *enjuGit.Writer
 	logger   *slog.Logger
 }
 
 // NewServer creates a new API server.
-func NewServer(st *store.Store, gitWriter *cedarGit.Writer, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, gitWriter *enjuGit.Writer, logger *slog.Logger) *Server {
 	return &Server{
 		store:    st,
-		dags:     make(map[string]*dag.DAG),
-		problems: make(map[string]*cedarYaml.ParsedProblem),
+		dags:     make(map[int64]*dag.DAG),
+		projects: make(map[int64]*enjuYaml.ParsedProject),
 		git:      gitWriter,
 		logger:   logger,
 	}
@@ -50,11 +52,11 @@ func (s *Server) Router() http.Handler {
 	r.Get("/health", s.handleHealth)
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// Problems
-		r.Post("/problems", s.handleCreateProblem)
-		r.Get("/problems", s.handleListProblems)
-		r.Get("/problems/{problemID}", s.handleGetProblem)
-		r.Get("/problems/{problemID}/tasks", s.handleListProblemTasks)
+		// Projects
+		r.Post("/projects", s.handleCreateProject)
+		r.Get("/projects", s.handleListProjects)
+		r.Get("/projects/{projectID}", s.handleGetProject)
+		r.Get("/projects/{projectID}/tasks", s.handleListProjectTasks)
 
 		// Tasks
 		r.Get("/tasks/ready", s.handleListReadyTasks)
@@ -65,8 +67,11 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
 
-		// Participants
-		r.Post("/participants/register", s.handleRegisterParticipant)
+		// Citizens
+		r.Post("/citizens/register", s.handleRegisterCitizen)
+		r.Get("/citizens/{citizenID}/dashboard", s.handleCitizenDashboard)
+		r.Put("/citizens/{citizenID}/profile", s.handleUpdateProfile)
+		r.Get("/citizens/{citizenID}", s.handleGetCitizen)
 	})
 
 	return r
@@ -78,23 +83,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// --- Problems ---
+// --- Projects ---
 
-type createProblemRequest struct {
+type createProjectRequest struct {
 	YAML    string `json:"yaml"`
 	RepoURL string `json:"repo_url,omitempty"`
 }
 
-type problemResponse struct {
-	ID        string `json:"id"`
+type projectResponse struct {
+	ID        int64  `json:"id"`
 	Name      string `json:"name"`
 	State     string `json:"state"`
 	TaskCount int    `json:"task_count"`
 	CreatedAt string `json:"created_at"`
 }
 
-func (s *Server) handleCreateProblem(w http.ResponseWriter, r *http.Request) {
-	var req createProblemRequest
+func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	var req createProjectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -106,54 +111,51 @@ func (s *Server) handleCreateProblem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse and validate the YAML
-	parsed, err := cedarYaml.Parse([]byte(req.YAML))
+	parsed, err := enjuYaml.Parse([]byte(req.YAML))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid problem definition: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid project definition: "+err.Error())
 		return
 	}
 
-	problemID := uuid.New().String()[:8]
 	now := time.Now()
 
-	// Store problem
+	// Store project
 	repoURL := req.RepoURL
 
-	err = s.store.CreateProblem(&store.ProblemRecord{
-		ID:        problemID,
-		Name:      parsed.Problem.Name,
+	projectID, err := s.store.CreateProject(&store.ProjectRecord{
+		Name:      parsed.Project.Name,
+		Ref:       parsed.Project.Ref,
 		YAMLData:  req.YAML,
 		RepoURL:   repoURL,
-		State:     store.ProblemActive,
+		State:     store.ProjectActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
 	if err != nil {
-		s.logger.Error("creating problem", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to create problem")
+		s.logger.Error("creating project", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to create project")
 		return
 	}
 
 	// Create task records from expanded DAG
 	taskCount := 0
+	taskSeq := 0
 	for instanceKey, tasks := range parsed.ExpandedTasks {
 		for _, ti := range tasks {
-			mode := ti.Mode
-			if mode == "" {
-				mode = "autonomous"
-			}
+			taskSeq++
 			resultType := ti.ResultType
 			if resultType == "" {
 				resultType = "text"
 			}
 			timeout := ti.Timeout
 			if timeout == "" {
-				timeout = parsed.Problem.Defaults.Timeout
+				timeout = parsed.Project.Defaults.Timeout
 			}
 
 			// Build depends_on as comma-separated full IDs
 			var deps []string
 			for _, dep := range ti.DependsOn {
-				deps = append(deps, cedarYaml.MakeFullID(instanceKey, dep))
+				deps = append(deps, enjuYaml.MakeFullID(instanceKey, dep))
 			}
 
 			// Determine initial state
@@ -164,14 +166,16 @@ func (s *Server) handleCreateProblem(w http.ResponseWriter, r *http.Request) {
 
 			err := s.store.CreateTask(&store.TaskRecord{
 				ID:          ti.FullID,
-				ProblemID:   problemID,
+				ProjectID:   projectID,
+				Seq:         taskSeq,
 				TaskDefID:   ti.ID,
 				InstanceKey: instanceKey,
-				Type:        ti.Type,
-				Mode:        mode,
+				Ref:         ti.Ref,
+				Action:      ti.Action,
 				Prompt:      ti.Prompt,
 				UserPrompt:  ti.UserPrompt,
 				Script:      ti.Script,
+				Outputs:     marshalOutputs(ti.Outputs),
 				ResultType:  resultType,
 				Timeout:     timeout,
 				State:       state,
@@ -187,32 +191,32 @@ func (s *Server) handleCreateProblem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cache DAG and parsed problem in memory
-	s.dags[problemID] = parsed.DAG
-	s.problems[problemID] = parsed
+	// Cache DAG and parsed project in memory
+	s.dags[projectID] = parsed.DAG
+	s.projects[projectID] = parsed
 
-	s.logger.Info("problem created", "id", problemID, "name", parsed.Problem.Name, "tasks", taskCount)
+	s.logger.Info("project created", "id", projectID, "name", parsed.Project.Name, "tasks", taskCount)
 
-	writeJSON(w, http.StatusCreated, problemResponse{
-		ID:        problemID,
-		Name:      parsed.Problem.Name,
-		State:     string(store.ProblemActive),
+	writeJSON(w, http.StatusCreated, projectResponse{
+		ID:        projectID,
+		Name:      parsed.Project.Name,
+		State:     string(store.ProjectActive),
 		TaskCount: taskCount,
 		CreatedAt: now.Format(time.RFC3339),
 	})
 }
 
-func (s *Server) handleListProblems(w http.ResponseWriter, r *http.Request) {
-	problems, err := s.store.ListProblems()
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.store.ListProjects()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list problems")
+		writeError(w, http.StatusInternalServerError, "failed to list projects")
 		return
 	}
 
-	var resp []problemResponse
-	for _, p := range problems {
-		tasks, _ := s.store.ListTasksByProblem(p.ID)
-		resp = append(resp, problemResponse{
+	var resp []projectResponse
+	for _, p := range projects {
+		tasks, _ := s.store.ListTasksByProject(p.ID)
+		resp = append(resp, projectResponse{
 			ID:        p.ID,
 			Name:      p.Name,
 			State:     string(p.State),
@@ -224,19 +228,19 @@ func (s *Server) handleListProblems(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleGetProblem(w http.ResponseWriter, r *http.Request) {
-	problemID := chi.URLParam(r, "problemID")
-	p, err := s.store.GetProblem(problemID)
+func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	p, err := s.store.GetProject(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	if p == nil {
-		writeError(w, http.StatusNotFound, "problem not found")
+		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
 
-	tasks, _ := s.store.ListTasksByProblem(p.ID)
+	tasks, _ := s.store.ListTasksByProject(p.ID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":         p.ID,
@@ -248,9 +252,9 @@ func (s *Server) handleGetProblem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleListProblemTasks(w http.ResponseWriter, r *http.Request) {
-	problemID := chi.URLParam(r, "problemID")
-	tasks, err := s.store.ListTasksByProblem(problemID)
+func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	tasks, err := s.store.ListTasksByProject(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list tasks")
 		return
@@ -262,14 +266,16 @@ func (s *Server) handleListProblemTasks(w http.ResponseWriter, r *http.Request) 
 
 type taskResponse struct {
 	ID          string  `json:"id"`
-	ProblemID   string  `json:"problem_id"`
+	ProjectID   int64   `json:"project_id"`
+	Seq         int     `json:"seq"`
 	TaskDefID   string  `json:"task_def_id"`
 	InstanceKey string  `json:"instance_key,omitempty"`
-	Type        string  `json:"type"`
-	Mode        string  `json:"mode"`
+	Ref         string  `json:"ref,omitempty"`
+	Action      string  `json:"action"`
 	Prompt      string  `json:"prompt,omitempty"`
 	UserPrompt  string  `json:"user_prompt,omitempty"`
 	Script      string  `json:"script,omitempty"`
+	Outputs     string  `json:"outputs,omitempty"`
 	ResultType  string  `json:"result_type"`
 	State       string  `json:"state"`
 	ClaimedBy   string  `json:"claimed_by,omitempty"`
@@ -278,8 +284,8 @@ type taskResponse struct {
 }
 
 func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
-	problemID := r.URL.Query().Get("problem_id")
-	tasks, err := s.store.ListReadyTasks(problemID)
+	projectID, _ := strconv.ParseInt(r.URL.Query().Get("project_id"), 10, 64)
+	tasks, err := s.store.ListReadyTasks(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list tasks")
 		return
@@ -302,7 +308,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type claimRequest struct {
-	ParticipantID string `json:"participant_id"`
+	CitizenID string `json:"citizen_id"`
 }
 
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
@@ -313,8 +319,8 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.ParticipantID == "" {
-		writeError(w, http.StatusBadRequest, "participant_id is required")
+	if req.CitizenID == "" {
+		writeError(w, http.StatusBadRequest, "citizen_id is required")
 		return
 	}
 
@@ -334,12 +340,12 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 	deadline := time.Now().Add(timeout)
 
-	if err := s.store.ClaimTask(taskID, req.ParticipantID, deadline); err != nil {
+	if err := s.store.ClaimTask(taskID, req.CitizenID, deadline); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
-	s.store.TouchParticipant(req.ParticipantID)
+	s.store.TouchCitizen(req.CitizenID)
 
 	// Return task with full details
 	updatedTask, _ := s.store.GetTask(taskID)
@@ -376,7 +382,7 @@ func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {
 
 		// Read result content from git repo
 		if depTask.ResultPath != "" {
-			data, err := s.git.ReadFile(depTask.ResultPath)
+			result, err := readResultForTemplate(s.git, depTask.ResultPath, depTask.TaskDefID)
 			if err != nil {
 				s.logger.Warn("reading upstream result", "path", depTask.ResultPath, "error", err)
 				inputs[depTask.TaskDefID] = map[string]interface{}{
@@ -385,29 +391,26 @@ func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			var content map[string]interface{}
-			if err := json.Unmarshal(data, &content); err != nil {
-				inputs[depTask.TaskDefID] = map[string]interface{}{
-					"status": "error",
-					"error":  "failed to parse result JSON",
-				}
-				continue
-			}
-			inputs[depTask.TaskDefID] = content
+			inputs[depTask.TaskDefID] = result
 		}
 	}
 
+	// Resolve the prompt template with upstream results
+	resolvedPrompt := template.ResolveUpstream(task.Prompt, inputs)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"task_id": taskID,
-		"inputs":  inputs,
+		"task_id":         taskID,
+		"resolved_prompt": resolvedPrompt,
+		"inputs":          inputs,
 	})
 }
 
 type submitResultRequest struct {
-	Content    string `json:"content"`
-	ResultType string `json:"result_type,omitempty"`
-	TokensUsed int64  `json:"tokens_used,omitempty"`
-	Model      string `json:"model,omitempty"`
+	Content    string            `json:"content"`              // text content (for simple results)
+	Outputs    map[string]string `json:"outputs,omitempty"`    // named outputs — values are content strings
+	ResultType string            `json:"result_type,omitempty"`
+	TokensUsed int64             `json:"tokens_used,omitempty"`
+	Model      string            `json:"model,omitempty"`
 }
 
 func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
@@ -425,30 +428,77 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Determine result file path
-	resultPath := buildResultPath(task.ProblemID, task.InstanceKey, task.TaskDefID)
+	// Write result as separate files (content + metadata)
+	resultType := req.ResultType
+	if resultType == "" {
+		resultType = "text"
+	}
 
-	// Write result to git repo
-	resultData := map[string]interface{}{
+	metadata := map[string]interface{}{
 		"task_id":     taskID,
-		"result_type": req.ResultType,
-		"content":     req.Content,
-		"metadata": map[string]interface{}{
-			"participant":  task.ClaimedBy,
-			"model":        req.Model,
-			"tokens_used":  req.TokensUsed,
-			"timestamp":    time.Now().Format(time.RFC3339),
-		},
+		"citizen":     task.ClaimedBy,
+		"model":       req.Model,
+		"tokens_used": req.TokensUsed,
+		"result_type": resultType,
+		"timestamp":   time.Now().Format(time.RFC3339),
 	}
 
-	jsonBytes, err := json.MarshalIndent(resultData, "", "  ")
+	var resultPath string
+	projectIDStr := fmt.Sprintf("%d", task.ProjectID)
+
+	if len(req.Outputs) > 0 {
+		// Multi-file or JSON outputs
+		// Parse task's output schema to know file layouts
+		schema := map[string]outputFileSpec{}
+		if task.Outputs != "" {
+			var rawSchema map[string]interface{}
+			if err := json.Unmarshal([]byte(task.Outputs), &rawSchema); err == nil {
+				for name, v := range rawSchema {
+					switch val := v.(type) {
+					case string:
+						schema[name] = outputFileSpec{Description: val}
+					case map[string]interface{}:
+						spec := outputFileSpec{}
+						if d, ok := val["Description"].(string); ok {
+							spec.Description = d
+						}
+						if f, ok := val["File"].(string); ok {
+							spec.File = f
+						}
+						if fmt, ok := val["Format"].(string); ok {
+							spec.Format = fmt
+						}
+						schema[name] = spec
+					}
+				}
+			}
+		}
+
+		// Check if any output has a file declared
+		hasFileOutputs := false
+		for _, s := range schema {
+			if s.File != "" {
+				hasFileOutputs = true
+				break
+			}
+		}
+
+		if hasFileOutputs {
+			// Write each output to its declared file
+			metadata["named_outputs"] = true
+			resultPath, err = writeMultiFileResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, schema, req.Outputs, metadata)
+		} else {
+			// Legacy: everything in one JSON blob
+			outputsJSON, _ := json.MarshalIndent(req.Outputs, "", "  ")
+			metadata["named_outputs"] = true
+			resultPath, err = writeResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, string(outputsJSON), "json", metadata)
+		}
+	} else {
+		// Simple text result
+		resultPath, err = writeResult(s.git, projectIDStr, task.InstanceKey, task.TaskDefID, req.Content, resultType, metadata)
+	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to marshal result")
-		return
-	}
-
-	if err := s.git.WriteFile(resultPath, jsonBytes); err != nil {
-		s.logger.Error("writing result file", "path", resultPath, "error", err)
+		s.logger.Error("writing result", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to write result")
 		return
 	}
@@ -457,7 +507,6 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	commitMsg := fmt.Sprintf("Result: %s (by %s)", taskID, task.ClaimedBy)
 	if err := s.git.CommitAndPush(commitMsg); err != nil {
 		s.logger.Warn("git commit/push failed", "error", err)
-		// Non-fatal — result file is written, state will update
 	}
 
 	// Update task state
@@ -467,29 +516,39 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update ready tasks — newly unblocked tasks become READY
-	readied, _ := s.store.UpdateReadyTasks(task.ProblemID)
+	readied, _ := s.store.UpdateReadyTasks(task.ProjectID)
+
+	// Check if all tasks are done — mark project as completed
+	completed, _ := s.store.CheckAndCompleteProject(task.ProjectID)
+	if completed {
+		s.logger.Info("project completed", "project_id", task.ProjectID)
+	}
 
 	s.logger.Info("result submitted", "task_id", taskID, "path", resultPath, "newly_ready", readied)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"status":       "accepted",
 		"result_path":  resultPath,
 		"newly_ready":  readied,
-	})
+	}
+	if completed {
+		resp["project_completed"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleReleaseTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 
 	var req struct {
-		ParticipantID string `json:"participant_id"`
+		CitizenID string `json:"citizen_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if err := s.store.ReleaseTask(taskID, req.ParticipantID); err != nil {
+	if err := s.store.ReleaseTask(taskID, req.CitizenID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to release task")
 		return
 	}
@@ -514,9 +573,9 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find descendants using the in-memory DAG
-	d, ok := s.dags[task.ProblemID]
+	d, ok := s.dags[task.ProjectID]
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "DAG not loaded for this problem")
+		writeError(w, http.StatusInternalServerError, "DAG not loaded for this project")
 		return
 	}
 
@@ -536,13 +595,14 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- Participants ---
+// --- Citizens ---
 
 type registerRequest struct {
-	Name string `json:"name"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
 }
 
-func (s *Server) handleRegisterParticipant(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -557,38 +617,140 @@ func (s *Server) handleRegisterParticipant(w http.ResponseWriter, r *http.Reques
 	token := uuid.New().String()
 	now := time.Now()
 
-	err := s.store.CreateParticipant(&store.ParticipantRecord{
+	err := s.store.CreateCitizen(&store.CitizenRecord{
 		ID:           id,
 		Name:         req.Name,
+		Email:        req.Email,
+		Role:         "citizen",
 		Token:        token,
 		RegisteredAt: now,
 		LastSeen:     now,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "email already exists") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to register")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]string{
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"id":    id,
 		"name":  req.Name,
+		"email": req.Email,
+		"role":  "citizen",
 		"token": token,
+	})
+}
+
+func (s *Server) handleGetCitizen(w http.ResponseWriter, r *http.Request) {
+	citizenID := chi.URLParam(r, "citizenID")
+
+	citizen, err := s.store.GetCitizen(citizenID)
+	if err != nil || citizen == nil {
+		writeError(w, http.StatusNotFound, "citizen not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                citizen.ID,
+		"name":              citizen.Name,
+		"email":             citizen.Email,
+		"role":              citizen.Role,
+		"score":             citizen.Score,
+		"tasks_completed":   citizen.TasksCompleted,
+		"tasks_timed_out":   citizen.TasksTimedOut,
+		"registered_at":     citizen.RegisteredAt.Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
+	citizenID := chi.URLParam(r, "citizenID")
+
+	var req struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	if err := s.store.UpdateCitizenProfile(citizenID, req.Name, req.Email); err != nil {
+		if strings.Contains(err.Error(), "email already exists") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update profile")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) {
+	citizenID := chi.URLParam(r, "citizenID")
+
+	citizen, err := s.store.GetCitizen(citizenID)
+	if err != nil || citizen == nil {
+		writeError(w, http.StatusNotFound, "citizen not found")
+		return
+	}
+
+	active, _ := s.store.ListCitizenActiveTasks(citizenID)
+	recent, _ := s.store.ListCitizenCompletedTasks(citizenID, 5)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"citizen": map[string]interface{}{
+			"id":                citizen.ID,
+			"name":              citizen.Name,
+			"email":             citizen.Email,
+			"role":              citizen.Role,
+			"score":             citizen.Score,
+			"tasks_completed":   citizen.TasksCompleted,
+			"tasks_timed_out":   citizen.TasksTimedOut,
+			"tasks_released":    citizen.TasksReleased,
+			"tokens_contributed": citizen.TokensContrib,
+			"registered_at":     citizen.RegisteredAt.Format(time.RFC3339),
+		},
+		"active_tasks":  toTaskResponses(active),
+		"recent_tasks":  toTaskResponses(recent),
 	})
 }
 
 // --- Helpers ---
 
+// marshalOutputs serializes named outputs to JSON.
+func marshalOutputs(outputs map[string]enjuYaml.OutputSpec) string {
+	if len(outputs) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(outputs)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 func toTaskResponse(t store.TaskRecord) taskResponse {
 	return taskResponse{
 		ID:          t.ID,
-		ProblemID:   t.ProblemID,
+		ProjectID:   t.ProjectID,
+		Seq:         t.Seq,
 		TaskDefID:   t.TaskDefID,
 		InstanceKey: t.InstanceKey,
-		Type:        t.Type,
-		Mode:        t.Mode,
+		Ref:         t.Ref,
+		Action:      t.Action,
 		Prompt:      t.Prompt,
 		UserPrompt:  t.UserPrompt,
 		Script:      t.Script,
+		Outputs:     t.Outputs,
 		ResultType:  t.ResultType,
 		State:       string(t.State),
 		ClaimedBy:   t.ClaimedBy,

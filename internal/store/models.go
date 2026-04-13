@@ -18,22 +18,23 @@ const (
 	TaskInvalidated TaskState = "invalidated"
 )
 
-// ProblemState represents the state of a problem.
-type ProblemState string
+// ProjectState represents the state of a project.
+type ProjectState string
 
 const (
-	ProblemActive    ProblemState = "active"
-	ProblemCompleted ProblemState = "completed"
-	ProblemFailed    ProblemState = "failed"
+	ProjectActive    ProjectState = "active"
+	ProjectCompleted ProjectState = "completed"
+	ProjectFailed    ProjectState = "failed"
 )
 
-// ProblemRecord is a problem stored in the database.
-type ProblemRecord struct {
-	ID        string
+// ProjectRecord is a project stored in the database.
+type ProjectRecord struct {
+	ID        int64
 	Name      string
+	Ref       string // external reference (GitHub issue URL, etc.)
 	YAMLData  string // raw YAML content
 	RepoURL   string
-	State     ProblemState
+	State     ProjectState
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -41,14 +42,16 @@ type ProblemRecord struct {
 // TaskRecord is a task instance stored in the database.
 type TaskRecord struct {
 	ID          string // full ID (e.g., "endometriosis:foundation")
-	ProblemID   string
+	ProjectID   int64
+	Seq         int    // sequential number within project (1-based, for quick reference)
 	TaskDefID   string // original task ID from YAML
 	InstanceKey string // for_each key (e.g., "endometriosis"), empty if no for_each
-	Type        string // "llm_prompt" or "script"
-	Mode        string // "autonomous" or "assisted"
+	Ref         string // external reference (URL)
+	Action      string // "answer", "contribute", "compute", "review", "vote"
 	Prompt      string
 	UserPrompt  string
 	Script      string
+	Outputs     string // JSON: map of output name -> description
 	ResultType  string
 	Timeout     string
 	State       TaskState
@@ -60,10 +63,12 @@ type TaskRecord struct {
 	CreatedAt   time.Time
 }
 
-// ParticipantRecord is a participant stored in the database.
-type ParticipantRecord struct {
+// CitizenRecord is a citizen stored in the database.
+type CitizenRecord struct {
 	ID              string
 	Name            string
+	Email           string
+	Role            string // "citizen", "author", "reviewer"
 	Token           string
 	Score           float64
 	TasksCompleted  int
@@ -79,7 +84,7 @@ type ParticipantRecord struct {
 type TaskClaimRecord struct {
 	ID            int64
 	TaskID        string
-	ParticipantID string
+	CitizenID string
 	ClaimedAt     time.Time
 	Deadline      time.Time
 	Outcome       string // "completed", "timed_out", "released", "rejected"
