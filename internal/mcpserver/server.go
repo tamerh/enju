@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type Config struct {
 	CoordinatorURL string
 	Username       string // citizen's username (stable handle)
 	CitizenName    string // display name, for greetings
+	CitizenEmail   string // email used when re-registering after a DB wipe, optional
 	// Workspace is the per-client git workspace used by the
 	// iteration A.2 fat-client path. When non-nil and a project
 	// has a remote_url, the MCP client writes task results to a
@@ -33,6 +35,15 @@ type Config struct {
 	// coordinator, bypassing the legacy content-over-wire path.
 	// When nil, only the legacy path is used.
 	Workspace *mcpgit.Workspace
+	// SaveCredentials is called after a successful auto re-register
+	// so the new server-side identity is persisted to disk. The
+	// username passed back may be the same (DB wipe case) or new
+	// (unusual — shouldn't happen with stable-handle registration).
+	// Email is passed through so future GitHub integration work
+	// can rely on the persisted address staying present across
+	// re-registrations. If nil, auto re-register still updates
+	// in-memory state but won't persist.
+	SaveCredentials func(username, name, email string)
 	// Logger is used for client-side diagnostic output. If nil,
 	// a slog.Default() is used.
 	Logger *slog.Logger
@@ -52,11 +63,14 @@ func New(cfg Config) *server.MCPServer {
 	}
 
 	client := &apiClient{
-		baseURL:    cfg.CoordinatorURL,
-		username:   cfg.Username,
-		workspace:  cfg.Workspace,
-		logger:     logger,
-		httpClient: &http.Client{},
+		baseURL:       cfg.CoordinatorURL,
+		username:      cfg.Username,
+		citizenName:   cfg.CitizenName,
+		citizenEmail:  cfg.CitizenEmail,
+		saveCreds:     cfg.SaveCredentials,
+		workspace:     cfg.Workspace,
+		logger:        logger,
+		httpClient:    &http.Client{},
 	}
 
 	// Register tools
@@ -76,6 +90,7 @@ func New(cfg Config) *server.MCPServer {
 	s.AddTool(toolSetProjectRemote(), client.handleSetProjectRemote)
 	s.AddTool(toolProjectRemoteStatus(), client.handleProjectRemoteStatus)
 	s.AddTool(toolProjectSync(), client.handleProjectSync)
+	s.AddTool(toolLeaveProject(), client.handleLeaveProject)
 	s.AddTool(toolListArtifacts(), client.handleListArtifacts)
 	s.AddTool(toolGetArtifact(), client.handleGetArtifact)
 	s.AddTool(toolGetArtifactHistory(), client.handleGetArtifactHistory)
@@ -88,11 +103,19 @@ func New(cfg Config) *server.MCPServer {
 // --- API Client ---
 
 type apiClient struct {
-	baseURL    string
-	username   string // caller's citizen username
-	workspace  *mcpgit.Workspace
-	logger     *slog.Logger
-	httpClient *http.Client
+	baseURL      string
+	username     string // caller's citizen username — stable across auto re-registers
+	citizenName  string // display name, used when re-registering after a DB wipe
+	citizenEmail string // optional, passed to the register endpoint
+	saveCreds    func(username, name, email string)
+	workspace    *mcpgit.Workspace
+	logger       *slog.Logger
+	httpClient   *http.Client
+
+	// reRegisterMu serializes re-registration attempts so concurrent
+	// tool calls only trigger one refresh. Acquired by
+	// ensureCitizenFresh before firing the register POST.
+	reRegisterMu sync.Mutex
 
 	// Cached citizen profile (name + email) used to populate git
 	// commit author fields on the fat-client submit path. Fetched
@@ -108,16 +131,13 @@ type apiClient struct {
 }
 
 func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("coordinator unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		return c.httpClient.Do(req)
+	})
 }
 
 func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]byte, error) {
@@ -125,17 +145,14 @@ func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]b
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "PUT", c.baseURL+path, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("coordinator unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "PUT", c.baseURL+path, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return c.httpClient.Do(req)
+	})
 }
 
 func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]byte, error) {
@@ -143,17 +160,121 @@ func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+path, bytes.NewReader(jsonBody))
+	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+path, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return c.httpClient.Do(req)
+	})
+}
+
+// doWithAutoReregister runs an HTTP request closure and, if the
+// response body signals that the caller's citizen record no longer
+// exists on the coordinator (typically: the server DB was wiped),
+// re-registers with the same username + display name and replays
+// the request once. Registering with a stable username is
+// idempotent — the coordinator recreates a citizen with the same
+// handle, so URLs embedding c.username and request bodies built
+// from c.username stay valid across the retry.
+//
+// Only one retry is attempted. If the retry also fails (for any
+// reason), the retry's response is returned as-is.
+func (c *apiClient) doWithAutoReregister(ctx context.Context, do func() (*http.Response, error)) ([]byte, error) {
+	resp, err := do()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("coordinator unreachable: %w", err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !isStaleCitizenResponse(resp.StatusCode, data) {
+		return data, nil
+	}
+	if c.citizenName == "" {
+		// No display name to re-register with — the caller
+		// invoked `enju mcp` with only a username, which means
+		// we can't recreate the record automatically. Return
+		// the original response so the handler surfaces the
+		// coordinator's error.
+		c.logger.Warn("stale citizen detected but CitizenName is empty; cannot auto re-register",
+			"username", c.username)
+		return data, nil
+	}
+	if err := c.ensureCitizenFresh(ctx); err != nil {
+		c.logger.Warn("auto re-register failed", "username", c.username, "error", err)
+		return data, nil
+	}
+	c.logger.Info("auto re-registered stale citizen, retrying request", "username", c.username)
+	resp2, err := do()
+	if err != nil {
+		return nil, fmt.Errorf("coordinator unreachable (after re-register): %w", err)
+	}
+	data2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	return data2, nil
+}
+
+// isStaleCitizenResponse tells whether the response body looks like
+// a coordinator "citizen not found" error. Matches the two error
+// message forms writeError currently emits from
+// internal/api/router.go: `citizen "foo" not found` and the plain
+// `citizen not found`. Only considers 404 responses to avoid
+// misidentifying a 200 that happens to contain the phrase.
+func isStaleCitizenResponse(status int, body []byte) bool {
+	if status != http.StatusNotFound {
+		return false
+	}
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "citizen") && strings.Contains(s, "not found")
+}
+
+// ensureCitizenFresh POSTs /citizens/register with the client's
+// cached username + display name. Used by the auto-reregister flow
+// to recreate a citizen record after a coordinator DB wipe.
+// Serialized by reRegisterMu so concurrent tool calls only fire
+// one register.
+func (c *apiClient) ensureCitizenFresh(ctx context.Context) error {
+	c.reRegisterMu.Lock()
+	defer c.reRegisterMu.Unlock()
+	body := map[string]string{"name": c.citizenName}
+	if c.username != "" {
+		body["username"] = c.username
+	}
+	if c.citizenEmail != "" {
+		body["email"] = c.citizenEmail
+	}
+	jsonBody, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/citizens/register", bytes.NewReader(jsonBody))
+	if err != nil {
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("coordinator unreachable: %w", err)
+		return fmt.Errorf("coordinator unreachable: %w", err)
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("register returned %d: %s", resp.StatusCode, string(data))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return fmt.Errorf("decoding register response: %w", err)
+	}
+	if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+		return fmt.Errorf("%s", errMsg)
+	}
+	got, _ := result["username"].(string)
+	if got == "" {
+		return fmt.Errorf("register response missing username")
+	}
+	c.username = got
+	if c.saveCreds != nil {
+		c.saveCreds(got, c.citizenName, c.citizenEmail)
+	}
+	return nil
 }
 
 // --- Tool Definitions ---
@@ -387,15 +508,24 @@ func toolProjectSync() mcp.Tool {
 	)
 }
 
+func toolLeaveProject() mcp.Tool {
+	return mcp.NewTool("enju_leave_project",
+		mcp.WithDescription("Forget a project's local clone and delete its workspace directory. Use this to reclaim disk space when you're done working on a project, or to recover from a corrupted local clone. The remote repo is untouched — this is a local cache wipe only. The next time you touch the project (claim a task, read an artifact, etc.) it will be re-cloned from the remote."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose local clone should be deleted"),
+		),
+	)
+}
+
 func toolUpdateProfile() mcp.Tool {
 	return mcp.NewTool("enju_update_profile",
-		mcp.WithDescription("Update your citizen profile — name and email."),
+		mcp.WithDescription("Update your citizen profile. Merge semantics: any field you omit from the call is left untouched on both the server and in your local credentials file. Pass only what you want to change. At least one of name or email must be provided."),
 		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Your display name"),
+			mcp.Description("Your display name. Omit this field to leave the current name unchanged; passing an empty string is rejected."),
 		),
 		mcp.WithString("email",
-			mcp.Description("Your email (optional, must be unique)"),
+			mcp.Description("Your email (must be unique). Omit this field to leave the current email unchanged; pass an empty string to explicitly clear it."),
 		),
 	)
 }
@@ -432,16 +562,34 @@ Only tasks in the 'accepted' state can be invalidated. Use this when you notice 
 // --- Tool Handlers ---
 
 func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	name, err := req.RequireString("name")
-	if err != nil {
-		return mcp.NewToolResultError("name is required"), nil
+	// Merge semantics: only include fields the caller actually
+	// provided in the request. Omitted fields stay untouched on
+	// both the server and in credentials.json. This prevents
+	// update_profile(name="X") from silently clearing email.
+	args := req.GetArguments()
+	body := map[string]interface{}{}
+	var providedName, providedEmail string
+	var haveName, haveEmail bool
+	if v, ok := args["name"]; ok {
+		s, _ := v.(string)
+		if s == "" {
+			return mcp.NewToolResultError("name cannot be empty"), nil
+		}
+		body["name"] = s
+		providedName = s
+		haveName = true
 	}
-	email := req.GetString("email", "")
+	if v, ok := args["email"]; ok {
+		s, _ := v.(string)
+		body["email"] = s
+		providedEmail = s
+		haveEmail = true
+	}
+	if len(body) == 0 {
+		return mcp.NewToolResultError("at least one of name or email must be provided"), nil
+	}
 
-	data, err := c.put(ctx, "/api/v1/citizens/by-username/"+c.username+"/profile", map[string]string{
-		"name":  name,
-		"email": email,
-	})
+	data, err := c.put(ctx, "/api/v1/citizens/by-username/"+c.username+"/profile", body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -453,10 +601,30 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
-	// Update local credentials file
-	updateLocalCredentials(name)
+	// Local credentials file: same merge semantics — only touch
+	// fields the caller actually provided.
+	updateLocalCredentials(haveName, providedName, haveEmail, providedEmail)
 
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Profile updated: %s", name)), nil
+	// Show the authoritative current display name in the response.
+	// When the caller provided a name, we echo theirs; when they
+	// only changed email, we re-fetch the profile so the user
+	// sees their existing display name instead of the username
+	// handle.
+	label := providedName
+	if !haveName {
+		if profileData, perr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username); perr == nil {
+			var prof map[string]interface{}
+			if json.Unmarshal(profileData, &prof) == nil {
+				if n, _ := prof["name"].(string); n != "" {
+					label = n
+				}
+			}
+		}
+		if label == "" {
+			label = c.username
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Profile updated: %s", label)), nil
 }
 
 func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -639,7 +807,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 
 	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
 	if err != nil {
-		return mcp.NewToolResultError("opening local clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	cmp, err := proj.CompareToRemote()
 	if err != nil {
@@ -692,7 +860,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 
 	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
 	if err != nil {
-		return mcp.NewToolResultError("opening local clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	proj.Lock()
@@ -757,6 +925,41 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 	}
 	data, _ := json.Marshal(resp)
 	return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+}
+
+// handleLeaveProject deletes the local clone of a project from the
+// MCP client's workspace. Purely local — the coordinator and the
+// remote repo are untouched. Re-clones on next access.
+//
+// Validates that the project actually exists on the coordinator
+// before removing anything, so a typo'd project_id returns a
+// crisp "not found" error instead of silently pretending the
+// no-op succeeded.
+func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("leave project is only available in MCP client mode"), nil
+	}
+	// Existence check. fetchProjectMeta returns an error if the
+	// coordinator's GET /projects/{id} responds with 404 (or any
+	// other error); surface it verbatim.
+	if _, err := c.fetchProjectMeta(ctx, int64(projectID)); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("✗ Project #%d not found", projectID)), nil
+	}
+	hadClone := c.workspace.HasLocalClone(int64(projectID))
+	if err := c.workspace.LeaveProject(int64(projectID)); err != nil {
+		return mcp.NewToolResultError("removing local clone: " + err.Error()), nil
+	}
+	var line string
+	if hadClone {
+		line = fmt.Sprintf("✓ Project #%d: local clone removed — next access will re-clone from the remote", projectID)
+	} else {
+		line = fmt.Sprintf("• Project #%d: no clone to remove (already absent)", projectID)
+	}
+	return mcp.NewToolResultText(line), nil
 }
 
 // handleSetProjectRemote updates a project's remote URL in the
@@ -1014,15 +1217,16 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 
 	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
 	if err != nil {
-		return nil, fmt.Errorf("opening project clone: %w", err)
+		return nil, err
 	}
 	proj.Lock()
 	defer proj.Unlock()
 	if err := proj.Pull(); err != nil {
-		return nil, fmt.Errorf("pulling: %w", err)
+		return nil, fmt.Errorf("refreshing local clone before resolving task %s: %w", meta.ID, err)
 	}
 
 	input := mcpgit.ResolveInput{
+		TaskID:             meta.ID,
 		PromptTemplate:     desc.PromptTemplate,
 		UserPromptTemplate: desc.UserPromptTemplate,
 		ForEachParams:      desc.ForEachParams,
@@ -1161,7 +1365,7 @@ func (c *apiClient) submitResultFatClient(
 ) (*mcp.CallToolResult, error) {
 	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
 	if err != nil {
-		return mcp.NewToolResultError("opening project clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	resultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
@@ -1276,9 +1480,34 @@ func (c *apiClient) submitResultFatClient(
 		return mcp.NewToolResultError("reporting commit: " + err.Error()), nil
 	}
 	if errMsg := extractErrorString(data); errMsg != "" {
-		return mcp.NewToolResultError("coordinator rejected report: " + errMsg), nil
+		return mcp.NewToolResultError(decorateCoordinatorRejection(errMsg)), nil
 	}
 	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
+}
+
+// decorateCoordinatorRejection wraps a raw coordinator error string
+// with an actionable hint when the rejection looks like a
+// stale-state issue (commit SHA mismatch, unknown commit, state
+// transition conflict, etc.). For unrelated rejections it returns
+// the original message unchanged.
+func decorateCoordinatorRejection(errMsg string) string {
+	lower := strings.ToLower(errMsg)
+	staleSignals := []string{
+		"stale",
+		"unknown commit",
+		"commit not found",
+		"invalid state transition",
+		"not in state",
+		"already accepted",
+		"superseded",
+	}
+	for _, sig := range staleSignals {
+		if strings.Contains(lower, sig) {
+			return "coordinator rejected report: " + errMsg +
+				" (hint: your local clone may be out of sync — try enju_project_sync and re-claim the task)"
+		}
+	}
+	return "coordinator rejected report: " + errMsg
 }
 
 // sortStringsStable is a tiny wrapper so server.go doesn't need its
@@ -1379,7 +1608,7 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 	remoteURL, _ := c.fetchProjectMeta(ctx, int64(projectID))
 	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
 	if err != nil {
-		return mcp.NewToolResultError("opening local clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	proj.Lock()
 	_ = proj.Pull()
@@ -1460,7 +1689,7 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 	}
 	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
 	if err != nil {
-		return mcp.NewToolResultError("opening local clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	proj.Lock()
 	_ = proj.Pull()
@@ -1681,8 +1910,13 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 // --- Helpers ---
 
-// updateLocalCredentials updates the name in ~/.enju/credentials.json
-func updateLocalCredentials(name string) {
+// updateLocalCredentials merges the caller-provided identity
+// fields into ~/.enju/credentials.json via a read-modify-write
+// pass that preserves unknown fields. Fields not provided by the
+// caller (haveName/haveEmail false) are left untouched, so
+// update_profile(name=X) doesn't silently clear a previously-set
+// email on disk.
+func updateLocalCredentials(haveName bool, name string, haveEmail bool, email string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
@@ -1696,7 +1930,12 @@ func updateLocalCredentials(name string) {
 	if json.Unmarshal(data, &creds) != nil {
 		return
 	}
-	creds["name"] = name
+	if haveName {
+		creds["name"] = name
+	}
+	if haveEmail {
+		creds["email"] = email
+	}
 	updated, _ := json.MarshalIndent(creds, "", "  ")
 	os.WriteFile(path, updated, 0600)
 }

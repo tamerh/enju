@@ -61,6 +61,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/gofrs/flock"
 )
 
 // Workspace manages a directory that holds one local clone per
@@ -118,6 +119,37 @@ func (ws *Workspace) HasLocalClone(projectID int64) bool {
 	return err == nil && gitStat.IsDir()
 }
 
+// LeaveProject forgets the cached Project handle (if any) and
+// removes the on-disk clone directory. The next ForProject call for
+// this project will re-clone from the remote. Safe to call even if
+// the project was never opened in this process — a missing clone
+// directory is not an error.
+//
+// Use cases: reclaiming disk space for a project the citizen is
+// done with, or recovering from a corrupted local clone. The remote
+// is untouched; this is purely a local cache wipe.
+func (ws *Workspace) LeaveProject(projectID int64) error {
+	if projectID == 0 {
+		return fmt.Errorf("projectID is required")
+	}
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if p, ok := ws.clients[projectID]; ok {
+		// Hold the project lock briefly to make sure no in-flight
+		// submit is mid-write. Once we have it, drop the map entry
+		// and release — nobody else can acquire this handle since
+		// we're also holding the workspace lock.
+		p.mu.Lock()
+		p.mu.Unlock() //nolint:staticcheck // barrier against in-flight writers
+		delete(ws.clients, projectID)
+	}
+	workDir := ws.projectDir(projectID)
+	if err := os.RemoveAll(workDir); err != nil {
+		return fmt.Errorf("removing clone at %s: %w", workDir, err)
+	}
+	return nil
+}
+
 // ForProject returns a handle to the local clone of the given project,
 // cloning it from remoteURL on first access. Subsequent calls for the
 // same projectID return the cached handle. If remoteURL is empty, the
@@ -140,17 +172,40 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string) (*Project, er
 	workDir := ws.projectDir(projectID)
 	p, err := openOrClone(workDir, remoteURL, ws.logger)
 	if err != nil {
-		return nil, fmt.Errorf("opening project %d: %w", projectID, err)
+		// No extra "opening project N:" wrap — openOrClone's
+		// inner error (from friendlyGitError or
+		// PlainInit/PlainOpen) already carries enough context,
+		// and the caller in server.go adds "opening local
+		// clone:" on top.
+		return nil, err
 	}
 	// openOrClone is project-agnostic; stamp the projectID in so
 	// path helpers (ArtifactPath, etc.) can namespace by project.
 	p.projectID = projectID
+	// Attach the cross-process file lock. Lives at the workspace
+	// root (one level above the clone dir) so it survives
+	// LeaveProject's RemoveAll(workDir) and doesn't risk being
+	// stepped on by go-git operations inside the clone. A
+	// workspace shared across multiple MCP processes will converge
+	// on the same lock path for the same projectID.
+	lockPath := filepath.Join(ws.rootDir, fmt.Sprintf("project-%d.lock", projectID))
+	p.fileLock = flock.New(lockPath)
 	ws.clients[projectID] = p
 	return p, nil
 }
 
 // Project is a handle to one project's local clone. All writes for
-// this project are serialized through the per-project mutex.
+// this project are serialized through a two-layer lock:
+//
+//   - The in-process sync.Mutex serializes concurrent callers
+//     within this Workspace (one goroutine at a time).
+//   - The on-disk flock serializes writes across MCP processes
+//     that share the same ~/.enju/workspaces/{id}/ directory —
+//     common when a citizen has both Claude Desktop and Claude
+//     Code running, each spawning its own `enju mcp` stdio
+//     process that points at the same workspace root. Without the
+//     flock, two processes can race on .git/index.lock and
+//     corrupt the clone.
 type Project struct {
 	projectID int64
 	workDir   string
@@ -158,7 +213,8 @@ type Project struct {
 	repo      *gogit.Repository
 	logger    *slog.Logger
 
-	mu sync.Mutex // serializes writes within this project
+	mu       sync.Mutex   // in-process serialization
+	fileLock *flock.Flock // cross-process serialization (optional)
 
 	// Push status bookkeeping — in-memory only, per process
 	// lifetime. Updated by pushInternal on both success and
@@ -181,11 +237,42 @@ func (p *Project) WorkDir() string { return p.workDir }
 // for local-only clones.
 func (p *Project) RemoteURL() string { return p.remoteURL }
 
-// Lock acquires the per-project write mutex. Callers performing a
-// sequence of WriteFile + Commit + Push operations should hold this
-// across the whole sequence.
-func (p *Project) Lock()   { p.mu.Lock() }
-func (p *Project) Unlock() { p.mu.Unlock() }
+// Lock acquires the per-project write mutex AND the on-disk
+// flock. Callers performing a sequence of WriteFile + Commit +
+// Push operations must hold this across the whole sequence so
+// neither intra-process goroutines nor cross-process MCP
+// instances can race on .git/index.lock.
+//
+// The flock is blocking: if another process is mid-submit against
+// the same clone, Lock() waits for it to finish. This matches the
+// intuition of "two Claude sessions trying to submit at the same
+// time should queue up, not corrupt the clone."
+//
+// Lock panics if the file lock cannot be acquired for reasons
+// other than a peer holding it — e.g. the workspace directory
+// became unwritable. This is intentional: silently falling back
+// to intra-process-only locking would reintroduce the corruption
+// risk the flock exists to prevent.
+func (p *Project) Lock() {
+	p.mu.Lock()
+	if p.fileLock != nil {
+		if err := p.fileLock.Lock(); err != nil {
+			p.mu.Unlock()
+			panic(fmt.Sprintf("mcpgit: acquiring project flock at %s: %v",
+				p.fileLock.Path(), err))
+		}
+	}
+}
+
+// Unlock releases the flock first, then the in-process mutex. The
+// reverse order of Lock, mirroring a standard stacked-lock
+// release.
+func (p *Project) Unlock() {
+	if p.fileLock != nil {
+		_ = p.fileLock.Unlock()
+	}
+	p.mu.Unlock()
+}
 
 // openOrClone opens an existing project clone or creates a fresh one
 // by cloning from remoteURL. If workDir exists and is a valid git
@@ -294,7 +381,7 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, erro
 				logger:    logger,
 			}, nil
 		}
-		return nil, fmt.Errorf("cloning %s: %w", remoteURL, err)
+		return nil, friendlyGitError("clone", remoteURL, err)
 	}
 	logger.Info("cloned project", "url", remoteURL, "path", workDir)
 	return &Project{
@@ -324,7 +411,7 @@ func (p *Project) Pull() error {
 		SingleBranch:  true,
 	})
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		return fmt.Errorf("pulling: %w", err)
+		return friendlyGitError("pull", p.remoteURL, err)
 	}
 	return nil
 }
@@ -352,7 +439,7 @@ func (p *Project) RemoteHeadHash() (string, error) {
 	}
 	refs, err := rem.List(&gogit.ListOptions{})
 	if err != nil {
-		return "", fmt.Errorf("ls-remote: %w", err)
+		return "", friendlyGitError("check remote status", p.remoteURL, err)
 	}
 	for _, r := range refs {
 		if r.Name() == plumbing.ReferenceName("refs/heads/main") {
@@ -502,11 +589,15 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 
 	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths)
 
-	var lastErr error
+	var (
+		lastErr  error
+		lastStep string
+	)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Sync to latest remote state before applying our changes.
 		if err := p.resetToRemote(); err != nil {
-			lastErr = fmt.Errorf("sync before submit: %w", err)
+			lastErr = err
+			lastStep = "sync"
 			continue
 		}
 
@@ -525,19 +616,21 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		sha, err := p.commit(commitMsg, req.AuthorName, req.AuthorEmail)
 		if err != nil {
 			lastErr = err
+			lastStep = "commit"
 			continue
 		}
 		if err := p.push(); err != nil {
 			lastErr = err
+			lastStep = "push"
 			// Push failed — could be non-ff. Loop and try again.
 			continue
 		}
 		return &SubmitResult{CommitSHA: sha, Attempts: attempt}, nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("push failed after %d attempts (no error captured)", maxRetries)
+		return nil, fmt.Errorf("submit failed after %d attempts (no error captured)", maxRetries)
 	}
-	return nil, fmt.Errorf("submit failed after %d attempts: %w", maxRetries, lastErr)
+	return nil, fmt.Errorf("submit failed after %d attempts (last failure during %s step): %w", maxRetries, lastStep, lastErr)
 }
 
 // resetToRemote fetches origin and hard-resets the local branch to
@@ -565,7 +658,7 @@ func (p *Project) resetToRemote() error {
 			// remote's main branch.
 			return nil
 		default:
-			return fmt.Errorf("fetching: %w", err)
+			return friendlyGitError("fetch origin", p.remoteURL, err)
 		}
 	}
 	// Look up origin/main and reset HEAD to it.
@@ -668,7 +761,7 @@ func (p *Project) pushInternal(force bool) error {
 	p.lastPushAt = time.Now()
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
 		p.lastPushError = err.Error()
-		return fmt.Errorf("pushing: %w", err)
+		return friendlyGitError("push", p.remoteURL, err)
 	}
 	p.lastPushError = ""
 	return nil
@@ -1146,4 +1239,86 @@ func BuildNamedOutputFiles(resultDir string, schema map[string]NamedOutputSpec, 
 		fileIndex[name] = fileName
 	}
 	return files, fileIndex
+}
+
+// friendlyGitError wraps a raw go-git error with an actionable hint
+// based on the operation being performed (clone/push/pull/fetch/
+// ls-remote) and a best-effort classification of the underlying cause
+// (auth, network, unknown host, non-fast-forward). The original error
+// is wrapped with %w so callers can still errors.Is/As against it.
+//
+// op is a short verb phrase like "clone", "push", "fetch origin" that
+// appears at the start of the message. remoteURL is optional; when
+// set it's included so the user sees which remote failed.
+func friendlyGitError(op, remoteURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	var hint string
+	switch {
+	case strings.Contains(msg, "ssh:") ||
+		strings.Contains(msg, "handshake failed") ||
+		strings.Contains(msg, "publickey") ||
+		strings.Contains(msg, "unable to authenticate"):
+		hint = "check that your SSH agent has the right key loaded (`ssh-add -l`) and that the key is authorized on the remote"
+	case strings.Contains(msg, "authentication required") ||
+		strings.Contains(msg, "authorization failed") ||
+		strings.Contains(msg, "401") ||
+		strings.Contains(msg, "403"):
+		hint = "check your git credential helper or ~/.netrc — HTTPS remotes need a valid token/password"
+	case strings.Contains(msg, "non-fast-forward") ||
+		strings.Contains(msg, "fetch first") ||
+		strings.Contains(msg, "rejected"):
+		hint = "remote has advanced — run enju_project_sync to refresh, or retry the submit"
+	case strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "network is unreachable"):
+		hint = "network/DNS issue — check connectivity to the git host"
+	case strings.Contains(msg, "repository not found") ||
+		strings.Contains(msg, "does not exist"):
+		if isLocalGitPath(remoteURL) {
+			hint = "verify the path exists and points to a valid bare repository"
+		} else {
+			hint = "verify the remote URL and that your account has access"
+		}
+	}
+	where := ""
+	if remoteURL != "" {
+		where = " " + remoteURL
+	}
+	if hint == "" {
+		return fmt.Errorf("%s%s: %w", op, where, err)
+	}
+	return fmt.Errorf("%s%s: %w (hint: %s)", op, where, err, hint)
+}
+
+// isLocalGitPath returns true if remoteURL looks like a local
+// filesystem path rather than a network URL. Used to pick the
+// right "not found" hint: network URLs want a credentials/URL
+// hint, local paths want a "does the path exist" hint.
+func isLocalGitPath(remoteURL string) bool {
+	if remoteURL == "" {
+		return false
+	}
+	// Network URL schemes: https://, git://, ssh://, file:// (which
+	// is technically local but conventionally accessed by URL).
+	if strings.Contains(remoteURL, "://") {
+		return false
+	}
+	// SCP-style SSH remote: user@host:path. The ":" is the
+	// distinguishing marker — local paths with ":" are vanishingly
+	// rare on Unix (and a windows "C:\" path won't match since the
+	// leading char is alpha-colon-backslash, not alpha-colon-alpha).
+	if i := strings.Index(remoteURL, ":"); i > 0 {
+		// Make sure the pre-colon part doesn't start with "/" or
+		// "." (which would mean it's an absolute or relative
+		// path, not user@host). user@host form requires an `@`.
+		if strings.Contains(remoteURL[:i], "@") {
+			return false
+		}
+	}
+	return true
 }

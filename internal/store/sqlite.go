@@ -1016,21 +1016,36 @@ func (s *Store) SetCitizenRole(id int64, role string) error {
 	return err
 }
 
-// UpdateCitizenProfile updates a citizen's name and email. Username is
-// intentionally immutable once set — that's enforced here by not
-// touching the column.
-func (s *Store) UpdateCitizenProfile(id int64, name, email string) error {
-	if email != "" {
+// UpdateCitizenProfile updates a citizen's name and/or email with
+// merge semantics: nil pointers mean "leave this column alone",
+// non-nil pointers mean "set to the pointed-at value (which may
+// be the empty string if the caller explicitly wants to clear it)".
+// Username is intentionally immutable — never touched.
+func (s *Store) UpdateCitizenProfile(id int64, name, email *string) error {
+	if name == nil && email == nil {
+		return nil
+	}
+	if email != nil && *email != "" {
 		var count int
-		s.db.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ? AND id != ?`, email, id).Scan(&count)
+		s.db.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ? AND id != ?`, *email, id).Scan(&count)
 		if count > 0 {
 			return fmt.Errorf("a citizen with this email already exists")
 		}
 	}
-
+	sets := []string{}
+	args := []interface{}{}
+	if name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *name)
+	}
+	if email != nil {
+		sets = append(sets, "email = ?")
+		args = append(args, *email)
+	}
+	args = append(args, id)
 	_, err := s.db.Exec(
-		`UPDATE citizens SET name = ?, email = ? WHERE id = ?`,
-		name, email, id,
+		"UPDATE citizens SET "+strings.Join(sets, ", ")+" WHERE id = ?",
+		args...,
 	)
 	return err
 }

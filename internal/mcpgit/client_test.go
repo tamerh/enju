@@ -636,3 +636,305 @@ func TestResolveMissingArtifact(t *testing.T) {
 		t.Errorf("expected placeholder to survive for missing artifact; got: %q", resolved.Prompt)
 	}
 }
+
+// TestPushForceOverwritesDivergedRemote covers the force-push
+// recovery path used by the explicit force-sync MCP tool. We simulate
+// a diverged remote by pointing two independently-seeded clients at
+// the same bare repo, then verify that PushForce from the second
+// client overwrites the first client's commit.
+func TestPushForceOverwritesDivergedRemote(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	// Client A writes and pushes normally to bare.
+	wsA, _ := NewWorkspace(t.TempDir(), nullLogger())
+	projA, err := wsA.ForProject(60, bare)
+	if err != nil {
+		t.Fatalf("clone A: %v", err)
+	}
+	projA.Lock()
+	if _, err := projA.SubmitTaskResult(SubmitRequest{
+		TaskID:   "1:1:a",
+		Username: "alice",
+		Files: []FileWrite{
+			{RepoRelPath: filepath.Join(ResultDir(60, 1, "", "a"), "result.md"), Content: []byte("alice v1")},
+		},
+	}); err != nil {
+		t.Fatalf("A submit: %v", err)
+	}
+	projA.Unlock()
+
+	// Client B starts on an unrelated bare (same seed, different
+	// history). Write + commit locally so HEAD is a real commit.
+	bareB := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bareB)
+	wsB, _ := NewWorkspace(t.TempDir(), nullLogger())
+	projB, err := wsB.ForProject(60, bareB)
+	if err != nil {
+		t.Fatalf("clone B: %v", err)
+	}
+	projB.Lock()
+	if _, err := projB.SubmitTaskResult(SubmitRequest{
+		TaskID:   "1:1:b",
+		Username: "bob",
+		Files: []FileWrite{
+			{RepoRelPath: filepath.Join(ResultDir(60, 1, "", "b"), "result.md"), Content: []byte("bob v1")},
+		},
+	}); err != nil {
+		t.Fatalf("B initial submit: %v", err)
+	}
+	projB.Unlock()
+
+	// Repoint B at A's bare. Normal Push should fail (divergent
+	// histories), PushForce should win.
+	if err := projB.repo.DeleteRemote("origin"); err != nil {
+		t.Fatalf("delete origin: %v", err)
+	}
+	if _, err := projB.repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{bare},
+	}); err != nil {
+		t.Fatalf("recreate origin: %v", err)
+	}
+	projB.remoteURL = bare
+
+	projB.Lock()
+	if err := projB.Push(); err == nil {
+		t.Fatal("expected normal Push to fail against diverged remote")
+	}
+	if err := projB.PushForce(); err != nil {
+		t.Fatalf("PushForce: %v", err)
+	}
+	projB.Unlock()
+
+	verifyDir := t.TempDir()
+	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
+		t.Fatalf("verify clone: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(60, 1, "", "a"), "result.md")); !os.IsNotExist(err) {
+		t.Errorf("expected A's file to be gone after force push, stat err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(60, 1, "", "b"), "result.md")); err != nil {
+		t.Errorf("expected B's file on remote after force push: %v", err)
+	}
+}
+
+// TestSubmitRetryExhaustionNamesStep verifies that when retries are
+// exhausted, the final error names which step (sync/commit/push)
+// failed last — not just the raw underlying error. Covers the B1a
+// retry labeling improvement.
+func TestSubmitRetryExhaustionNamesStep(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	proj, err := ws.ForProject(61, bare)
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	// Point the project at a bogus remote so every fetch fails —
+	// exercises the "sync" failure path inside the retry loop.
+	if err := proj.repo.DeleteRemote("origin"); err != nil {
+		t.Fatalf("delete origin: %v", err)
+	}
+	bogus := filepath.Join(t.TempDir(), "nonexistent.git")
+	if _, err := proj.repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{bogus},
+	}); err != nil {
+		t.Fatalf("recreate origin: %v", err)
+	}
+	proj.remoteURL = bogus
+
+	proj.Lock()
+	_, err = proj.SubmitTaskResult(SubmitRequest{
+		TaskID:     "1:1:x",
+		Username:   "alice",
+		MaxRetries: 2,
+		Files: []FileWrite{
+			{RepoRelPath: filepath.Join(ResultDir(61, 1, "", "x"), "result.md"), Content: []byte("data")},
+		},
+	})
+	proj.Unlock()
+	if err == nil {
+		t.Fatal("expected submit to fail against bogus remote")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "submit failed after 2 attempts") {
+		t.Errorf("expected attempt count in error, got: %q", msg)
+	}
+	if !strings.Contains(msg, "sync step") {
+		t.Errorf("expected 'sync step' label in error, got: %q", msg)
+	}
+}
+
+// TestFriendlyGitErrorHints covers the auth/network hint helper
+// added in B1a — each branch of the pattern match should produce a
+// distinguishable hint when given a representative error string.
+func TestFriendlyGitErrorHints(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantHint string
+	}{
+		{"ssh", errStr("ssh: handshake failed: no supported methods"), "SSH agent"},
+		{"publickey", errStr("publickey denied"), "SSH agent"},
+		{"https 401", errStr("authentication required: HTTP 401"), "credential helper"},
+		{"403", errStr("remote: HTTP 403 forbidden"), "credential helper"},
+		{"non-ff", errStr("non-fast-forward update rejected"), "enju_project_sync"},
+		{"dns", errStr("dial tcp: lookup git.example: no such host"), "network/DNS"},
+		{"timeout", errStr("i/o timeout on fetch"), "network/DNS"},
+		{"not found", errStr("repository not found"), "verify the remote URL"},
+	}
+	// Local path variant — same underlying error, different hint.
+	t.Run("local path not found", func(t *testing.T) {
+		got := friendlyGitError("clone", "/tmp/does-not-exist.git", errStr("repository not found"))
+		if got == nil {
+			t.Fatal("nil error")
+		}
+		if !strings.Contains(got.Error(), "valid bare repository") {
+			t.Errorf("expected local-path hint, got: %q", got.Error())
+		}
+		if strings.Contains(got.Error(), "your account has access") {
+			t.Errorf("local-path error should NOT include credentials hint, got: %q", got.Error())
+		}
+	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := friendlyGitError("push", "git@example:foo.git", tc.err)
+			if got == nil {
+				t.Fatalf("nil error")
+			}
+			if !strings.Contains(got.Error(), tc.wantHint) {
+				t.Errorf("expected hint containing %q, got: %q", tc.wantHint, got.Error())
+			}
+			if !strings.Contains(got.Error(), "push") {
+				t.Errorf("expected op name 'push' in message, got: %q", got.Error())
+			}
+		})
+	}
+
+	// Unclassified errors pass through without a hint suffix.
+	plain := friendlyGitError("clone", "", errStr("some random non-matching failure"))
+	if strings.Contains(plain.Error(), "hint:") {
+		t.Errorf("unclassified error should not carry a hint, got: %q", plain.Error())
+	}
+}
+
+// TestCrossWorkspaceFlockSerialization verifies that two Workspace
+// instances pointed at the same root dir (simulating two MCP
+// processes running against the same ~/.enju/workspaces) serialize
+// their Project.Lock() calls via the on-disk flock. The second
+// Lock must block until the first Unlock happens.
+func TestCrossWorkspaceFlockSerialization(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	sharedRoot := t.TempDir()
+
+	wsA, _ := NewWorkspace(sharedRoot, nullLogger())
+	projA, err := wsA.ForProject(80, bare)
+	if err != nil {
+		t.Fatalf("wsA ForProject: %v", err)
+	}
+
+	wsB, _ := NewWorkspace(sharedRoot, nullLogger())
+	projB, err := wsB.ForProject(80, bare)
+	if err != nil {
+		t.Fatalf("wsB ForProject: %v", err)
+	}
+
+	// Sanity: different in-process handles (each workspace has its
+	// own clients map), but pointing at the same clone on disk.
+	if projA == projB {
+		t.Fatal("expected distinct Project instances across Workspaces")
+	}
+	if projA.WorkDir() != projB.WorkDir() {
+		t.Fatalf("expected same work dir across Workspaces, got %q vs %q",
+			projA.WorkDir(), projB.WorkDir())
+	}
+
+	// A locks first.
+	projA.Lock()
+
+	// B tries to lock — should block until A unlocks. Run it in a
+	// goroutine and observe it's still waiting after a short
+	// moment.
+	done := make(chan struct{})
+	go func() {
+		projB.Lock()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("projB.Lock() returned while projA was still holding the lock")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: B is blocked on A.
+	}
+
+	projA.Unlock()
+
+	select {
+	case <-done:
+		// Good: B acquired once A released.
+	case <-time.After(2 * time.Second):
+		t.Fatal("projB.Lock() never returned after projA.Unlock()")
+	}
+	projB.Unlock()
+}
+
+// TestLeaveProjectRemovesClone verifies that LeaveProject drops the
+// cached handle and wipes the on-disk clone, and that a subsequent
+// ForProject call re-clones from the remote cleanly.
+func TestLeaveProjectRemovesClone(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	wsDir := t.TempDir()
+	ws, _ := NewWorkspace(wsDir, nullLogger())
+	proj, err := ws.ForProject(70, bare)
+	if err != nil {
+		t.Fatalf("first clone: %v", err)
+	}
+	workDir := proj.WorkDir()
+	if _, err := os.Stat(workDir); err != nil {
+		t.Fatalf("expected clone dir to exist: %v", err)
+	}
+	if !ws.HasLocalClone(70) {
+		t.Fatal("expected HasLocalClone to report true before leave")
+	}
+
+	if err := ws.LeaveProject(70); err != nil {
+		t.Fatalf("LeaveProject: %v", err)
+	}
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("expected clone dir to be gone, stat err: %v", err)
+	}
+	if ws.HasLocalClone(70) {
+		t.Error("expected HasLocalClone to report false after leave")
+	}
+
+	// Leaving a project that was never opened should be a no-op, not an error.
+	if err := ws.LeaveProject(999); err != nil {
+		t.Errorf("LeaveProject on unknown project: %v", err)
+	}
+
+	// Next ForProject should re-clone successfully.
+	proj2, err := ws.ForProject(70, bare)
+	if err != nil {
+		t.Fatalf("reclone after leave: %v", err)
+	}
+	if proj2.WorkDir() != workDir {
+		t.Errorf("expected same work dir after reclone, got %s vs %s", proj2.WorkDir(), workDir)
+	}
+}
+
+// errStr is a tiny test helper: build an error from a literal string
+// without pulling in errors.New at every call site.
+func errStr(s string) error { return &stringErr{s} }
+
+type stringErr struct{ msg string }
+
+func (e *stringErr) Error() string { return e.msg }

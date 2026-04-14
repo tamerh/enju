@@ -20,6 +20,11 @@ import (
 // model the coordinator only returns the descriptor; the client
 // reads the files and substitutes them locally.
 type ResolveInput struct {
+	// TaskID identifies the task being resolved. Used only to
+	// annotate error messages so a citizen seeing a missing-upstream
+	// or missing-artifact error knows which task triggered it.
+	// Optional — resolver still works with an empty TaskID.
+	TaskID string
 	// PromptTemplate is the raw prompt with `{{task.content}}`,
 	// `{{param}}`, and `{{artifact:path}}` references still in
 	// place.
@@ -134,12 +139,16 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 	// fan-in upstreams the value is a synthetic aggregated result
 	// whose "content" is the Option 4 block. The resolver doesn't
 	// need to know the difference.
+	taskCtx := ""
+	if input.TaskID != "" {
+		taskCtx = fmt.Sprintf(" (while resolving task %s)", input.TaskID)
+	}
 	inputs := make(map[string]interface{})
 	for taskDefID, deps := range grouped {
 		if len(deps) == 1 {
 			result, err := p.readResultForTemplate(deps[0])
 			if err != nil {
-				return nil, fmt.Errorf("reading upstream %q: %w", taskDefID, err)
+				return nil, fmt.Errorf("reading upstream %q%s: %w", taskDefID, taskCtx, err)
 			}
 			inputs[taskDefID] = result
 			continue
@@ -154,7 +163,7 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 			fmt.Fprintf(&b, "### iteration: %s\n", label)
 			result, err := p.readResultForTemplate(d)
 			if err != nil {
-				return nil, fmt.Errorf("reading upstream %q iteration %q: %w", taskDefID, d.InstanceKey, err)
+				return nil, fmt.Errorf("reading upstream %q iteration %q%s: %w", taskDefID, d.InstanceKey, taskCtx, err)
 			}
 			b.WriteString(extractContentForAggregation(result))
 			b.WriteString("\n")

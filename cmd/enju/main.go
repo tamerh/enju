@@ -97,12 +97,23 @@ func cmdMCP(args []string) {
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	fs.Parse(args)
 
-	// Try loading saved credentials — bound to a (coordinator, username) pair.
+	// Load saved credentials. Persistent values beat CLI args —
+	// ~/.enju/credentials.json is the source of truth for a user's
+	// identity, and the CLI args exist mostly as bootstrap metadata
+	// for the very first registration. Overriding persistent state
+	// with launcher metadata leads to profiles that drift away
+	// from what the user set in their last enju_update_profile
+	// call.
 	creds := loadCredentials(*coordinator)
-	if creds != nil && *username == "" {
-		*username = creds.Username
-		if *name == "" {
+	if creds != nil {
+		if creds.Username != "" {
+			*username = creds.Username
+		}
+		if creds.Name != "" {
 			*name = creds.Name
+		}
+		if creds.Email != "" {
+			*email = creds.Email
 		}
 		fmt.Fprintf(os.Stderr, "Welcome back, %s (@%s)\n", creds.Name, creds.Username)
 	}
@@ -122,7 +133,7 @@ func cmdMCP(args []string) {
 			os.Exit(1)
 		}
 		*username = gotUsername
-		saveCredentials(*coordinator, *username, *name)
+		saveCredentials(*coordinator, *username, *name, *email)
 		fmt.Fprintf(os.Stderr, "Registered as @%s (%s)\n", *username, *name)
 	}
 
@@ -135,15 +146,21 @@ func cmdMCP(args []string) {
 	ws, err := mcpgit.NewWorkspace(*workspaceDir, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create MCP workspace: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Hint: the workspace directory (default ~/.enju/workspaces) must be writable and have free disk space. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
 		os.Exit(1)
 	}
 
+	coordURL := *coordinator
 	s := mcpserver.New(mcpserver.Config{
-		CoordinatorURL: *coordinator,
+		CoordinatorURL: coordURL,
 		Username:       *username,
 		CitizenName:    *name,
+		CitizenEmail:   *email,
 		Workspace:      ws,
 		Logger:         logger,
+		SaveCredentials: func(gotUsername, gotName, gotEmail string) {
+			saveCredentials(coordURL, gotUsername, gotName, gotEmail)
+		},
 	})
 
 	if err := server.ServeStdio(s); err != nil {
@@ -162,6 +179,7 @@ type credentials struct {
 	Coordinator string `json:"coordinator"`
 	Username    string `json:"username"`
 	Name        string `json:"name"`
+	Email       string `json:"email,omitempty"`
 }
 
 func credentialsPath() string {
@@ -184,16 +202,29 @@ func loadCredentials(coordinator string) *credentials {
 	return &creds
 }
 
-func saveCredentials(coordinator, username, name string) {
-	creds := credentials{
-		Coordinator: coordinator,
-		Username:    username,
-		Name:        name,
+// saveCredentials writes the given identity into
+// ~/.enju/credentials.json using a read-modify-write pass so
+// unknown fields stay intact. Future versions may add optional
+// keys (OAuth tokens, GitHub handle, etc.) and operators may
+// hand-edit credentials.json — neither should be wiped just
+// because auto re-register fires a save with a typed struct that
+// doesn't know about those fields.
+func saveCredentials(coordinator, username, name, email string) {
+	path := credentialsPath()
+	creds := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &creds) // tolerate missing/malformed
+	}
+	creds["coordinator"] = coordinator
+	creds["username"] = username
+	creds["name"] = name
+	if email != "" {
+		creds["email"] = email
 	}
 	data, _ := json.MarshalIndent(creds, "", "  ")
-	dir := filepath.Dir(credentialsPath())
+	dir := filepath.Dir(path)
 	os.MkdirAll(dir, 0755)
-	os.WriteFile(credentialsPath(), data, 0600)
+	os.WriteFile(path, data, 0600)
 }
 
 // registerCitizen POSTs a registration request and returns the

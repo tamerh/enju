@@ -1486,17 +1486,23 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge semantics: omitted fields are nil pointers and must be
+	// left untouched. An explicit empty string is respected (the
+	// caller wants to clear the value). Requires json.Decoder with
+	// a pointer-typed struct.
 	var req struct {
-		Name  string `json:"name"`
-		Email string `json:"email"`
+		Name  *string `json:"name"`
+		Email *string `json:"email"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+	// Name can't be cleared — enforcing this matches the register
+	// flow where name is required.
+	if req.Name != nil && *req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name cannot be empty")
 		return
 	}
 

@@ -1210,7 +1210,7 @@ func formatProfile(data []byte) string {
 	var b strings.Builder
 	b.WriteString("── Profile ─────────────────────────────────\n")
 	b.WriteString(fmt.Sprintf("Username:   @%s\n", username))
-	if name != "" && !strings.EqualFold(name, username) {
+	if name != "" {
 		b.WriteString(fmt.Sprintf("Display:    %s\n", name))
 	}
 	if email != "" {
