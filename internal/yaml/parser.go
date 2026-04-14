@@ -4,6 +4,7 @@ package yaml
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/enju-ai/enju/internal/dag"
@@ -94,6 +95,15 @@ type TaskDef struct {
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
 	Config       map[string]interface{} `yaml:"config,omitempty"`
 
+	// ForEach expands a single task into N parallel instances. Mutually
+	// exclusive with the run-level for_each — a run either uses the
+	// run-level matrix form (every task expanded together) or declares
+	// for_each on individual tasks with singletons aggregating results.
+	// All tasks in the same run that declare for_each must share the
+	// same variables and values; differing task-level for_each blocks
+	// in the same run are rejected at parse time.
+	ForEach map[string][]string `yaml:"for_each,omitempty"`
+
 	// Artifact access (Phase C). Repo-relative paths under artifacts/.
 	// ReadsArtifacts can be inferred from {{artifact:path}} prompt
 	// references — the parser will merge inferred reads with any
@@ -183,7 +193,13 @@ func validate(p *Run) error {
 		"review": true, "vote": true,
 	}
 
+	// Validate run-level for_each shape (strict: no empty lists).
+	if err := validateForEachMap("run", p.ForEach); err != nil {
+		return err
+	}
+
 	ids := make(map[string]bool)
+	hasTaskLevelForEach := false
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
 
@@ -218,6 +234,46 @@ func validate(p *Run) error {
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
 		}
+
+		if len(t.ForEach) > 0 {
+			hasTaskLevelForEach = true
+			if err := validateForEachMap("task "+t.ID, t.ForEach); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Run-level and task-level for_each are mutually exclusive. Keeping
+	// them separate makes the two shapes unambiguous: run-level matrix
+	// runs stay exactly as before, task-level runs opt in by declaring
+	// for_each only on the tasks that need it.
+	if len(p.ForEach) > 0 && hasTaskLevelForEach {
+		return fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
+	}
+
+	// If multiple tasks declare for_each, they must all agree on the
+	// same variable space. A single run only supports one iteration
+	// dimension at a time (the common "analyze each X, then summarize"
+	// pattern). Differing task-level for_each groups in one run are
+	// rejected so users get a clear signal instead of a silently
+	// weird DAG.
+	if hasTaskLevelForEach {
+		var firstID string
+		var firstFE map[string][]string
+		for i := range p.Tasks {
+			t := &p.Tasks[i]
+			if len(t.ForEach) == 0 {
+				continue
+			}
+			if firstFE == nil {
+				firstID = t.ID
+				firstFE = t.ForEach
+				continue
+			}
+			if !forEachEqual(firstFE, t.ForEach) {
+				return fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and values", t.ID, firstID)
+			}
+		}
 	}
 
 	// Second pass: verify all depends_on references exist
@@ -229,45 +285,262 @@ func validate(p *Run) error {
 		}
 	}
 
+	// Third pass — strict template checks (bugs 2/3/4 from feedback):
+	//   - every bare {{var}} must resolve against a declared for_each
+	//     variable (run-level OR task-level on that specific task)
+	//   - every declared for_each variable must be referenced by at
+	//     least one task prompt in its visible scope, otherwise it
+	//     silently multiplies task count
+	//   - every {{task.field}} reference must target a known task id
+	//
+	// Under run-level for_each, the visible variable scope for every
+	// task is the run-level map. Under task-level for_each, the scope
+	// for an expanded task is its own for_each map; for a singleton,
+	// no variables are visible (bare {{var}} is always an error).
+	if err := validateTemplateReferences(p, ids); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-// build constructs the DAG and expands for_each parameters.
+// validateForEachMap rejects empty for_each variable lists. Each list
+// must have at least one value — an empty list silently produces zero
+// iterations and therefore zero tasks, which is almost always a bug in
+// the upstream process that generated the YAML.
+func validateForEachMap(scope string, fe map[string][]string) error {
+	for name, values := range fe {
+		if len(values) == 0 {
+			return fmt.Errorf("%s for_each: variable %q has an empty list — declare at least one value or remove the variable", scope, name)
+		}
+		for i, v := range values {
+			if v == "" {
+				return fmt.Errorf("%s for_each: variable %q has an empty string at index %d", scope, name, i)
+			}
+		}
+	}
+	return nil
+}
+
+// forEachEqual returns true if two for_each maps declare the same
+// variables with the same ordered value lists. Used to enforce that all
+// task-level for_each blocks in one run share the same iteration space.
+func forEachEqual(a, b map[string][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if len(va) != len(vb) {
+			return false
+		}
+		for i := range va {
+			if va[i] != vb[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// builtinTemplateVar returns true for bare {{name}} placeholders that
+// are reserved runtime substitutions rather than for_each variables.
+func builtinTemplateVar(name string) bool {
+	switch name {
+	case "user_input":
+		return true
+	}
+	return false
+}
+
+// validateTemplateReferences walks every task's prompt and user_prompt
+// and enforces:
+//   - bare {{var}} must match a for_each variable in scope
+//   - {{task.field}} must name a real task id
+//   - every declared for_each variable must be used by at least one
+//     prompt in its scope
+//
+// Together these catch typos and unused iteration dimensions before
+// they leak into a silent-miscount runtime state.
+func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
+	runScope := p.ForEach
+
+	// Track which for_each variables we've actually seen referenced.
+	// Key: scope label ("run" or "task:id"), value: set of referenced
+	// variable names. A scope with declared variables but no matching
+	// references means some variable is unused — flagged below.
+	runScopeReferenced := make(map[string]bool)
+	taskScopeReferenced := make(map[string]map[string]bool)
+
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		// Variables visible to this task: run-level OR its own task-level.
+		var visible map[string][]string
+		var scopeLabel string
+		if len(runScope) > 0 {
+			visible = runScope
+			scopeLabel = "run"
+		} else if len(t.ForEach) > 0 {
+			visible = t.ForEach
+			scopeLabel = "task:" + t.ID
+			if taskScopeReferenced[scopeLabel] == nil {
+				taskScopeReferenced[scopeLabel] = make(map[string]bool)
+			}
+		}
+
+		for _, field := range []string{t.Prompt, t.UserPrompt} {
+			if field == "" {
+				continue
+			}
+			for _, name := range template.ListParams(field) {
+				// Built-in runtime placeholders are always allowed —
+				// they're substituted by the client at submission
+				// time, not the parser. See docs/task-lifecycle.md.
+				if builtinTemplateVar(name) {
+					continue
+				}
+				if _, ok := visible[name]; !ok {
+					// Build a friendly list of what WOULD have matched.
+					var declared []string
+					for k := range visible {
+						declared = append(declared, k)
+					}
+					sort.Strings(declared)
+					var upstreamIDs []string
+					for id := range taskIDs {
+						upstreamIDs = append(upstreamIDs, id)
+					}
+					sort.Strings(upstreamIDs)
+					return fmt.Errorf(
+						"task %q: prompt references undefined variable {{%s}}; declared for_each variables in scope: %v; known task ids: %v",
+						t.ID, name, declared, upstreamIDs,
+					)
+				}
+				if scopeLabel == "run" {
+					runScopeReferenced[name] = true
+				} else {
+					taskScopeReferenced[scopeLabel][name] = true
+				}
+			}
+			// {{task.field}} references must target a known task id.
+			for _, ref := range template.ExtractReferences(field) {
+				if !taskIDs[ref.TaskID] {
+					return fmt.Errorf(
+						"task %q: prompt references unknown task id {{%s.%s}}",
+						t.ID, ref.TaskID, ref.Field,
+					)
+				}
+			}
+		}
+	}
+
+	// Unused variable check — any declared for_each variable that
+	// never appears in a prompt in its scope is a silent cost
+	// multiplier (Cartesian product with no effect on content).
+	if len(runScope) > 0 {
+		for name := range runScope {
+			if !runScopeReferenced[name] {
+				return fmt.Errorf(
+					"run-level for_each variable %q is declared but never referenced in any task prompt — remove it or reference it via {{%s}}",
+					name, name,
+				)
+			}
+		}
+	}
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		if len(t.ForEach) == 0 {
+			continue
+		}
+		label := "task:" + t.ID
+		seen := taskScopeReferenced[label]
+		for name := range t.ForEach {
+			if !seen[name] {
+				return fmt.Errorf(
+					"task %q: for_each variable %q is declared but never referenced in its prompt",
+					t.ID, name,
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+// build constructs the DAG and expands for_each parameters. There are
+// two mutually-exclusive expansion modes, selected purely by where
+// for_each is declared:
+//
+//  1. Run-level (p.ForEach set): every task is expanded N times — one
+//     per iteration — and dependencies within an iteration stay scoped
+//     to that iteration (per-iteration binding). This is the original
+//     matrix-style model, untouched here so existing runs keep working
+//     exactly as before.
+//
+//  2. Task-level (any task.ForEach set): only tasks that declare their
+//     own for_each are expanded; others remain singletons. A singleton
+//     depending on an expanded task receives all iterations as a
+//     fan-in (resolved to an aggregated block at claim time). An
+//     expanded task depending on a singleton sees the same singleton
+//     across every iteration.
 func build(p *Run) (*ParsedRun, error) {
-	// Determine instance keys from for_each
+	if hasAnyTaskForEach(p.Tasks) {
+		return buildTaskLevel(p)
+	}
+	return buildRunLevel(p)
+}
+
+// hasAnyTaskForEach returns true if any task declares its own for_each.
+func hasAnyTaskForEach(tasks []TaskDef) bool {
+	for i := range tasks {
+		if len(tasks[i].ForEach) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildRunLevel is the original expansion: every task gets one instance
+// per run-level iteration. Preserved as-is so existing run-level
+// for_each users get identical behavior after this change.
+func buildRunLevel(p *Run) (*ParsedRun, error) {
 	instances := expandForEach(p.ForEach)
 
 	result := &ParsedRun{
-		Run:       p,
+		Run:           p,
 		DAG:           dag.New(),
 		ExpandedTasks: make(map[string][]TaskInstance),
 	}
 
-	// Collect task IDs for dependency validation
 	taskIDs := make(map[string]bool)
 	for _, t := range p.Tasks {
 		taskIDs[t.ID] = true
 	}
 
-	// Build task instances and DAG nodes for each instance
 	for _, inst := range instances {
 		var taskInstances []TaskInstance
 
 		for _, taskDef := range p.Tasks {
 			fullID := MakeFullID(inst.key, taskDef.ID)
 
-			// Resolve for_each params in prompt at creation time
 			resolvedPrompt := template.ResolveParams(taskDef.Prompt, inst.params)
 			resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, inst.params)
 
-			// Infer dependencies from template references, merge with explicit depends_on
 			allDeps := template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt)
-
-			// Validate inferred deps exist
 			for _, dep := range allDeps {
 				if !taskIDs[dep] {
 					return nil, fmt.Errorf("task %q references %q which does not exist", taskDef.ID, dep)
 				}
+			}
+
+			// Dependencies in run-level mode resolve within the current
+			// iteration: foundation depends on prior-same-iteration tasks.
+			resolvedDeps := make([]string, 0, len(allDeps))
+			for _, dep := range allDeps {
+				resolvedDeps = append(resolvedDeps, MakeFullID(inst.key, dep))
 			}
 
 			ti := TaskInstance{
@@ -276,21 +549,16 @@ func build(p *Run) (*ParsedRun, error) {
 				Params:      inst.params,
 				FullID:      fullID,
 			}
-			// Override prompt with resolved version
 			ti.Prompt = resolvedPrompt
 			ti.UserPrompt = resolvedUserPrompt
-			// Store merged dependencies
-			ti.DependsOn = allDeps
-			// Inherit run requirements if task doesn't have its own
+			ti.DependsOn = resolvedDeps
 			if ti.Requirements == nil {
 				ti.Requirements = p.Requirements
 			}
-			// Merge inferred {{artifact:path}} reads with explicit declarations.
 			ti.ReadsArtifacts = template.MergeArtifactReads(taskDef.ReadsArtifacts, taskDef.Prompt)
 
 			taskInstances = append(taskInstances, ti)
 
-			// Add node to DAG
 			data := map[string]interface{}{
 				"instance_key": inst.key,
 				"task_def_id":  taskDef.ID,
@@ -300,13 +568,10 @@ func build(p *Run) (*ParsedRun, error) {
 			}
 		}
 
-		// Add edges from merged dependencies (explicit + inferred)
 		for _, ti := range taskInstances {
-			childID := ti.FullID
-			for _, dep := range ti.DependsOn {
-				parentID := MakeFullID(inst.key, dep)
-				if err := result.DAG.AddEdge(parentID, childID); err != nil {
-					return nil, fmt.Errorf("adding edge %s -> %s: %w", parentID, childID, err)
+			for _, parentID := range ti.DependsOn {
+				if err := result.DAG.AddEdge(parentID, ti.FullID); err != nil {
+					return nil, fmt.Errorf("adding edge %s -> %s: %w", parentID, ti.FullID, err)
 				}
 			}
 		}
@@ -314,7 +579,176 @@ func build(p *Run) (*ParsedRun, error) {
 		result.ExpandedTasks[inst.key] = taskInstances
 	}
 
-	// Validate the constructed DAG
+	if err := result.DAG.Validate(); err != nil {
+		return nil, fmt.Errorf("DAG validation: %w", err)
+	}
+
+	return result, nil
+}
+
+// buildTaskLevel handles the task-level for_each mode. Tasks with
+// for_each become N instances sharing an iteration dimension; tasks
+// without for_each become singletons. Dependency wiring depends on
+// both sides being expanded (per-iteration binding) or either side
+// being a singleton (fan-in / fan-out).
+func buildTaskLevel(p *Run) (*ParsedRun, error) {
+	// Find the shared iteration space (already validated to be
+	// uniform across all tasks that declare for_each).
+	var shared map[string][]string
+	for i := range p.Tasks {
+		if len(p.Tasks[i].ForEach) > 0 {
+			shared = p.Tasks[i].ForEach
+			break
+		}
+	}
+	iterations := expandForEach(shared)
+
+	result := &ParsedRun{
+		Run:           p,
+		DAG:           dag.New(),
+		ExpandedTasks: make(map[string][]TaskInstance),
+	}
+
+	taskIDs := make(map[string]bool)
+	expandedTaskDef := make(map[string]bool) // which task_def_ids are fan-out
+	for i := range p.Tasks {
+		taskIDs[p.Tasks[i].ID] = true
+		if len(p.Tasks[i].ForEach) > 0 {
+			expandedTaskDef[p.Tasks[i].ID] = true
+		}
+	}
+
+	// Step 1 — create every TaskInstance (without dep wiring yet), add
+	// DAG nodes, and group by instanceKey so the downstream loop in
+	// handleCreateRun sees the same [instanceKey]->[]TaskInstance shape
+	// as the run-level path. Singletons live under key "".
+	singletons := make([]TaskInstance, 0)
+	// expanded[taskDefID][iterationKey] = short fullID
+	expanded := make(map[string]map[string]string)
+
+	createInstance := func(taskDef TaskDef, iter forEachInstance) TaskInstance {
+		fullID := MakeFullID(iter.key, taskDef.ID)
+		resolvedPrompt := template.ResolveParams(taskDef.Prompt, iter.params)
+		resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, iter.params)
+		ti := TaskInstance{
+			TaskDef:     taskDef,
+			InstanceKey: iter.key,
+			Params:      iter.params,
+			FullID:      fullID,
+		}
+		ti.Prompt = resolvedPrompt
+		ti.UserPrompt = resolvedUserPrompt
+		if ti.Requirements == nil {
+			ti.Requirements = p.Requirements
+		}
+		ti.ReadsArtifacts = template.MergeArtifactReads(taskDef.ReadsArtifacts, taskDef.Prompt)
+		return ti
+	}
+
+	for _, taskDef := range p.Tasks {
+		if len(taskDef.ForEach) == 0 {
+			// Singleton.
+			singleton := forEachInstance{key: "", params: map[string]string{}}
+			ti := createInstance(taskDef, singleton)
+			singletons = append(singletons, ti)
+			data := map[string]interface{}{
+				"instance_key": "",
+				"task_def_id":  taskDef.ID,
+			}
+			if err := result.DAG.AddNode(ti.FullID, taskDef.Action, data); err != nil {
+				return nil, fmt.Errorf("adding node %q: %w", ti.FullID, err)
+			}
+			continue
+		}
+		// Expanded.
+		expanded[taskDef.ID] = make(map[string]string, len(iterations))
+		for _, iter := range iterations {
+			ti := createInstance(taskDef, iter)
+			result.ExpandedTasks[iter.key] = append(result.ExpandedTasks[iter.key], ti)
+			expanded[taskDef.ID][iter.key] = ti.FullID
+			data := map[string]interface{}{
+				"instance_key": iter.key,
+				"task_def_id":  taskDef.ID,
+			}
+			if err := result.DAG.AddNode(ti.FullID, taskDef.Action, data); err != nil {
+				return nil, fmt.Errorf("adding node %q: %w", ti.FullID, err)
+			}
+		}
+	}
+	if len(singletons) > 0 {
+		result.ExpandedTasks[""] = singletons
+	}
+
+	// Step 2 — resolve dependencies into concrete short IDs and wire
+	// DAG edges. For a given TaskInstance (child) and each declared
+	// dep task_def_id (parent):
+	//
+	//   parent expanded, child expanded → per-iteration binding:
+	//     parent at child.InstanceKey → child
+	//   parent expanded, child singleton → fan-in:
+	//     every instance of parent → child
+	//   parent singleton, child expanded → fan-out:
+	//     parent → every instance of child (handled per child)
+	//   parent singleton, child singleton → straight edge
+	wireDeps := func(ti *TaskInstance) error {
+		allDeps := template.MergeDependencies(ti.TaskDef.DependsOn, ti.TaskDef.Prompt)
+		for _, dep := range allDeps {
+			if !taskIDs[dep] {
+				return fmt.Errorf("task %q references %q which does not exist", ti.TaskDef.ID, dep)
+			}
+		}
+
+		var resolved []string
+		for _, dep := range allDeps {
+			parentExpanded := expandedTaskDef[dep]
+			childExpanded := ti.InstanceKey != ""
+
+			switch {
+			case parentExpanded && childExpanded:
+				// Per-iteration binding.
+				parentID := expanded[dep][ti.InstanceKey]
+				if parentID == "" {
+					return fmt.Errorf("task %q iteration %q: missing expected upstream %q", ti.TaskDef.ID, ti.InstanceKey, dep)
+				}
+				resolved = append(resolved, parentID)
+			case parentExpanded && !childExpanded:
+				// Fan-in into the singleton. Deterministic iteration
+				// order is critical so the aggregated result at claim
+				// time is reproducible run-over-run.
+				keys := make([]string, 0, len(expanded[dep]))
+				for k := range expanded[dep] {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					resolved = append(resolved, expanded[dep][k])
+				}
+			default:
+				// parent is a singleton — one edge regardless of child side.
+				resolved = append(resolved, dep)
+			}
+		}
+		ti.DependsOn = resolved
+		for _, parentID := range resolved {
+			if err := result.DAG.AddEdge(parentID, ti.FullID); err != nil {
+				return fmt.Errorf("adding edge %s -> %s: %w", parentID, ti.FullID, err)
+			}
+		}
+		return nil
+	}
+
+	// Walk instances in the same order as step 1 so errors mention a
+	// predictable "first bad" task if any.
+	for key, list := range result.ExpandedTasks {
+		for i := range list {
+			ti := &list[i]
+			if err := wireDeps(ti); err != nil {
+				return nil, err
+			}
+		}
+		result.ExpandedTasks[key] = list
+	}
+
 	if err := result.DAG.Validate(); err != nil {
 		return nil, fmt.Errorf("DAG validation: %w", err)
 	}
@@ -350,14 +784,20 @@ func expandForEach(forEach map[string][]string) []forEachInstance {
 		}
 	}
 
-	// Multi-variable: cartesian product
-	// For now, concatenate all variable expansions
-	// TODO: implement proper cartesian product if needed
-	var keys []string
-	var vals [][]string
-	for k, v := range forEach {
+	// Multi-variable: cartesian product. Sort variable names so the
+	// order of dimensions within the generated slug — and therefore
+	// the task IDs, iteration labels, and sort order of run_status —
+	// is deterministic across runs. Without this, Go's randomized map
+	// iteration leaks through: a run with gene+tissue might produce
+	// `BRCA1_breast` one time and `breast_BRCA1` the next.
+	keys := make([]string, 0, len(forEach))
+	for k := range forEach {
 		keys = append(keys, k)
-		vals = append(vals, v)
+	}
+	sort.Strings(keys)
+	vals := make([][]string, len(keys))
+	for i, k := range keys {
+		vals[i] = forEach[k]
 	}
 
 	return cartesianProduct(keys, vals)

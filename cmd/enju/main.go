@@ -5,16 +5,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/api"
-	enjuGit "github.com/enju-ai/enju/internal/git"
+	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
 	"github.com/enju-ai/enju/internal/scheduler"
 	"github.com/enju-ai/enju/internal/store"
@@ -32,10 +30,6 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
-	case "submit":
-		cmdSubmit(os.Args[2:])
-	case "status":
-		cmdStatus(os.Args[2:])
 	case "version":
 		fmt.Println("enju v0.1.0-dev")
 	default:
@@ -51,8 +45,6 @@ func printUsage() {
 Usage:
   enju serve      Start the coordinator server
   enju mcp        Start the MCP server (for Claude Desktop/Code)
-  enju submit     Submit a run YAML to the coordinator
-  enju status     Check run status
   enju version    Print version
 
 Run 'enju <command> -h' for command-specific help.`)
@@ -64,20 +56,9 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 8000, "Port to listen on")
 	dbPath := fs.String("db", "enju.db", "Path to SQLite database")
-	gitDir := fs.String("git-dir", "", "Base directory for per-project git repos")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	if *gitDir == "" {
-		home, _ := os.UserHomeDir()
-		*gitDir = filepath.Join(home, ".enju", "results")
-	}
-
-	if err := os.MkdirAll(*gitDir, 0755); err != nil {
-		logger.Error("creating git base directory", "path", *gitDir, "error", err)
-		os.Exit(1)
-	}
 
 	st, err := store.New(*dbPath)
 	if err != nil {
@@ -86,33 +67,17 @@ func cmdServe(args []string) {
 	}
 	defer st.Close()
 
-	registry, err := enjuGit.NewRegistry(*gitDir, logger)
-	if err != nil {
-		logger.Error("initializing git registry", "error", err)
-		os.Exit(1)
-	}
-
-	// Startup health check — warn if any project's repo is missing.
-	if projects, perr := st.ListProjects(); perr == nil {
-		ids := make([]int64, 0, len(projects))
-		for _, p := range projects {
-			ids = append(ids, p.ID)
-		}
-		registry.HealthCheck(ids)
-	}
-
-	// Start task reaper
+	// Start task reaper.
 	reaper := scheduler.NewReaper(st, 60*time.Second, logger)
 	reaper.Start()
 	defer reaper.Stop()
 
-	srv := api.NewServer(st, registry, logger)
+	srv := api.NewServer(st, logger)
 
 	addr := fmt.Sprintf(":%d", *port)
 	logger.Info("Enju coordinator starting",
 		"port", *port,
 		"db", *dbPath,
-		"git_dir", *gitDir,
 	)
 
 	if err := http.ListenAndServe(addr, srv.Router()); err != nil {
@@ -129,6 +94,7 @@ func cmdMCP(args []string) {
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
+	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	fs.Parse(args)
 
 	// Try loading saved credentials — bound to a (coordinator, username) pair.
@@ -160,101 +126,30 @@ func cmdMCP(args []string) {
 		fmt.Fprintf(os.Stderr, "Registered as @%s (%s)\n", *username, *name)
 	}
 
+	// Build a client-side git workspace. Used for iteration A.2's
+	// fat-client write path when the project has a remote_url.
+	// Self-hosted projects without a remote fall back to the
+	// legacy coordinator-writes path; this workspace stays unused
+	// for them but the creation itself is cheap and safe.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ws, err := mcpgit.NewWorkspace(*workspaceDir, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create MCP workspace: %v\n", err)
+		os.Exit(1)
+	}
+
 	s := mcpserver.New(mcpserver.Config{
 		CoordinatorURL: *coordinator,
 		Username:       *username,
 		CitizenName:    *name,
+		Workspace:      ws,
+		Logger:         logger,
 	})
 
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-// --- submit ---
-
-func cmdSubmit(args []string) {
-	// Extract the YAML file path from args (can be anywhere in the arg list)
-	var yamlPath string
-	var flagArgs []string
-	for i := 0; i < len(args); i++ {
-		if strings.HasPrefix(args[i], "-") {
-			flagArgs = append(flagArgs, args[i])
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				flagArgs = append(flagArgs, args[i+1])
-				i++
-			}
-		} else {
-			yamlPath = args[i]
-		}
-	}
-
-	fs := flag.NewFlagSet("submit", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
-	fs.Parse(flagArgs)
-
-	if yamlPath == "" {
-		fmt.Fprintln(os.Stderr, "Usage: enju submit <run.yaml> [-coordinator URL]")
-		os.Exit(1)
-	}
-	yamlData, err := os.ReadFile(yamlPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-		os.Exit(1)
-	}
-
-	body, _ := json.Marshal(map[string]string{
-		"yaml": string(yamlData),
-	})
-
-	resp, err := http.Post(*coordinator+"/api/v1/runs", "application/json", bytes.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error submitting: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
-	var pretty bytes.Buffer
-	json.Indent(&pretty, data, "", "  ")
-	fmt.Println(pretty.String())
-}
-
-// --- status ---
-
-func cmdStatus(args []string) {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
-	fs.Parse(args)
-
-	if fs.NArg() < 1 {
-		// List all runs
-		resp, err := http.Get(*coordinator + "/api/v1/runs")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-		data, _ := io.ReadAll(resp.Body)
-		var pretty bytes.Buffer
-		json.Indent(&pretty, data, "", "  ")
-		fmt.Println(pretty.String())
-		return
-	}
-
-	// Get specific run + tasks
-	runID := fs.Arg(0)
-	resp, err := http.Get(*coordinator + "/api/v1/runs/" + runID + "/tasks")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	var pretty bytes.Buffer
-	json.Indent(&pretty, data, "", "  ")
-	fmt.Println(pretty.String())
 }
 
 // --- helpers ---

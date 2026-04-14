@@ -430,6 +430,206 @@ tasks:
 	}
 }
 
+// --- Task-level for_each (iteration 5) ---
+
+func TestParseTaskLevelForEach(t *testing.T) {
+	yamlData := []byte(`
+name: "Gene Analysis"
+version: 1
+tasks:
+  - id: analyze
+    action: answer
+    for_each:
+      gene: [BRCA1, TP53, EGFR]
+    prompt: "Analyze {{gene}}."
+  - id: report
+    action: answer
+    prompt: "Summarize findings: {{analyze.content}}"
+`)
+
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3 analyze instances + 1 report = 4 nodes
+	if parsed.DAG.NodeCount() != 4 {
+		t.Fatalf("expected 4 nodes, got %d", parsed.DAG.NodeCount())
+	}
+
+	// report is a singleton under key ""
+	singletons := parsed.ExpandedTasks[""]
+	if len(singletons) != 1 || singletons[0].TaskDef.ID != "report" {
+		t.Fatalf("expected singleton 'report', got %v", singletons)
+	}
+	report := singletons[0]
+
+	// report must depend on all 3 analyze instances (fan-in)
+	if len(report.DependsOn) != 3 {
+		t.Fatalf("expected report to depend on 3 analyze instances, got %v", report.DependsOn)
+	}
+	depSet := map[string]bool{}
+	for _, d := range report.DependsOn {
+		depSet[d] = true
+	}
+	for _, gene := range []string{"BRCA1", "TP53", "EGFR"} {
+		want := "" + gene + ":analyze"
+		if !depSet[want] {
+			t.Fatalf("expected report to depend on %q, got %v", want, report.DependsOn)
+		}
+	}
+
+	// analyze instances are expanded with their own prompt substitution
+	for _, gene := range []string{"BRCA1", "TP53", "EGFR"} {
+		list := parsed.ExpandedTasks[gene]
+		if len(list) != 1 {
+			t.Fatalf("expected 1 task under iteration %s, got %d", gene, len(list))
+		}
+		if list[0].Prompt != "Analyze "+gene+"." {
+			t.Fatalf("expected prompt 'Analyze %s.', got %q", gene, list[0].Prompt)
+		}
+	}
+}
+
+func TestParseTaskLevelForEachFanOut(t *testing.T) {
+	yamlData := []byte(`
+name: "Fan-out from singleton"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Prepare the context."
+  - id: analyze
+    action: answer
+    for_each:
+      gene: [BRCA1, TP53]
+    prompt: "Using {{setup.content}}, analyze {{gene}}."
+`)
+
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every analyze iteration should depend on the singleton setup
+	for _, gene := range []string{"BRCA1", "TP53"} {
+		inst := parsed.ExpandedTasks[gene][0]
+		if len(inst.DependsOn) != 1 || inst.DependsOn[0] != "setup" {
+			t.Fatalf("expected %s:analyze to depend on [setup], got %v", gene, inst.DependsOn)
+		}
+	}
+}
+
+func TestParseRejectsRunLevelAndTaskLevelBoth(t *testing.T) {
+	yamlData := []byte(`
+name: "Mixed"
+version: 1
+for_each:
+  name: [A, B]
+tasks:
+  - id: greet
+    action: answer
+    for_each:
+      role: [admin, user]
+    prompt: "Hi {{name}} {{role}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting run-level + task-level for_each together")
+	}
+}
+
+func TestParseRejectsDifferingTaskLevelForEach(t *testing.T) {
+	yamlData := []byte(`
+name: "Conflicting task-level for_each"
+version: 1
+tasks:
+  - id: a
+    action: answer
+    for_each:
+      x: [1, 2]
+    prompt: "A {{x}}"
+  - id: b
+    action: answer
+    for_each:
+      x: [1, 2, 3]
+    prompt: "B {{x}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error for differing task-level for_each groups")
+	}
+}
+
+// --- Strict for_each validation (iteration 5 bugs 2/3/4) ---
+
+func TestParseRejectsEmptyForEachList(t *testing.T) {
+	yamlData := []byte(`
+name: "Empty list"
+version: 1
+for_each:
+  name: []
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi {{name}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting empty for_each list")
+	}
+}
+
+func TestParseRejectsUndefinedTemplateVariable(t *testing.T) {
+	yamlData := []byte(`
+name: "Typo"
+version: 1
+for_each:
+  name: [Alice]
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi {{name}} — also mention {{oops}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting undefined variable {{oops}}")
+	}
+}
+
+func TestParseRejectsUnusedForEachVariable(t *testing.T) {
+	yamlData := []byte(`
+name: "Unused variable"
+version: 1
+for_each:
+  name: [Alice, Bob]
+  unused: [x, y]
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi {{name}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting unused for_each variable 'unused'")
+	}
+}
+
+func TestParseRejectsUnknownTaskReference(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad task ref"
+version: 1
+tasks:
+  - id: one
+    action: answer
+    prompt: "See {{missing.content}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting unknown task id in {{missing.content}}")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

@@ -5,21 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/enju-ai/enju/internal/api"
-	enjuGit "github.com/enju-ai/enju/internal/git"
+	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/store"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // TestMain cleans the shared output directory before running tests.
@@ -50,21 +55,62 @@ func answer(t *testing.T, prompt string, canned string) string {
 	return result
 }
 
-// testServer wraps a running Enju coordinator for testing.
+// testServer wraps a running Enju coordinator for testing. Post the
+// iteration A orchestrator rewrite, the coordinator holds no git
+// state of its own — each project gets a bare repo under
+// `bareBaseDir` which acts as the project's "remote", and submits
+// are routed through a mcpgit.Workspace under `workspaceDir` so the
+// test client exercises the exact same fat-client code path the
+// real MCP server uses.
 type testServer struct {
 	t             *testing.T
 	server        *httptest.Server
 	url           string
-	gitBaseDir    string       // base directory containing per-project git repos
+	bareBaseDir   string // base directory containing per-project bare remotes
+	workspaceDir  string // base directory for fat-client working clones
+	workspace     *mcpgit.Workspace
 	store         *store.Store // direct store access for testing reaper/internals
 	lastRunID     string       // "projectID:runSeq" of last submitted run
 	lastProjectID int64
 	lastRunSeq    int
+
+	// Per-project cached remote URLs so the submit helpers can pass
+	// them to the workspace without re-hitting the API.
+	muRemotes sync.Mutex
+	remotes   map[int64]string
 }
 
-// projectRepoDir returns the on-disk directory of a project's git repo.
-func (s *testServer) projectRepoDir(projectID int64) string {
-	return filepath.Join(s.gitBaseDir, fmt.Sprintf("%d", projectID))
+// bareRemotePath returns the on-disk path of the bare repo acting
+// as a project's "remote". Used by test helpers that need to verify
+// what actually landed in the "remote".
+func (s *testServer) bareRemotePath(projectID int64) string {
+	return filepath.Join(s.bareBaseDir, fmt.Sprintf("%d", projectID))
+}
+
+// rememberRemote caches a project's remote URL so subsequent
+// submit/claim helpers can open the fat-client workspace without an
+// extra API round-trip.
+func (s *testServer) rememberRemote(projectID int64, url string) {
+	s.muRemotes.Lock()
+	defer s.muRemotes.Unlock()
+	s.remotes[projectID] = url
+}
+
+// remoteFor returns the cached remote URL for a project, fetching
+// it from the coordinator the first time if not yet cached.
+func (s *testServer) remoteFor(projectID int64) string {
+	s.muRemotes.Lock()
+	u, ok := s.remotes[projectID]
+	s.muRemotes.Unlock()
+	if ok {
+		return u
+	}
+	p := s.get(fmt.Sprintf("/api/v1/projects/%d", projectID))
+	if u, ok := p["remote_url"].(string); ok && u != "" {
+		s.rememberRemote(projectID, u)
+		return u
+	}
+	return ""
 }
 
 // testOutputDir is a fixed temp directory that gets symlinked into the run.
@@ -79,7 +125,10 @@ func newTestServer(t *testing.T) *testServer {
 	os.MkdirAll(testDir, 0755)
 
 	dbPath := filepath.Join(testDir, "test.db")
-	gitBaseDir := filepath.Join(testDir, "results")
+	bareBaseDir := filepath.Join(testDir, "bare-remotes")
+	workspaceDir := filepath.Join(testDir, "workspaces")
+	os.MkdirAll(bareBaseDir, 0755)
+	os.MkdirAll(workspaceDir, 0755)
 
 	// Ensure the symlink exists: test/output -> /tmp/enju-test-output
 	outputLink := filepath.Join(".", "output")
@@ -96,16 +145,25 @@ func newTestServer(t *testing.T) *testServer {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	registry, err := enjuGit.NewRegistry(gitBaseDir, logger)
+	ws, err := mcpgit.NewWorkspace(workspaceDir, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := api.NewServer(st, registry, logger)
+	srv := api.NewServer(st, logger)
 	ts := httptest.NewServer(srv.Router())
 	t.Cleanup(ts.Close)
 
-	return &testServer{t: t, server: ts, url: ts.URL, gitBaseDir: gitBaseDir, store: st}
+	return &testServer{
+		t:            t,
+		server:       ts,
+		url:          ts.URL,
+		bareBaseDir:  bareBaseDir,
+		workspaceDir: workspaceDir,
+		workspace:    ws,
+		store:        st,
+		remotes:      make(map[int64]string),
+	}
 }
 
 func (s *testServer) get(path string) map[string]interface{} {
@@ -202,17 +260,90 @@ func (s *testServer) updateProfile(username, name, email string) map[string]inte
 	return result
 }
 
-// createTestProject creates a fresh test project per call (unique name to avoid conflicts).
+// createTestProject creates a fresh test project per call (unique
+// name to avoid conflicts). In the iteration A model, every project
+// needs a remote — the test helper spins up a bare repo on disk and
+// passes its path as remote_url, so the fat-client submit path has
+// somewhere to push.
 func (s *testServer) createTestProject() int64 {
 	s.t.Helper()
 	// Unique name — timestamp + counter-ish from test server
 	name := fmt.Sprintf("test-%d", time.Now().UnixNano())
-	resp := s.post("/api/v1/projects", map[string]string{"name": name})
+
+	// Pick a bare-remote path unique to this project. We don't know
+	// the project ID yet so hash the timestamp suffix.
+	barePath := filepath.Join(s.bareBaseDir, name)
+	if _, err := gogit.PlainInitWithOptions(barePath, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+		Bare: true,
+	}); err != nil {
+		s.t.Fatalf("init bare remote: %v", err)
+	}
+	// Seed with an empty README commit on main so clones and pushes
+	// have a base to work from.
+	seedDir, err := os.MkdirTemp(s.bareBaseDir, "seed-")
+	if err != nil {
+		s.t.Fatalf("mkdir seed: %v", err)
+	}
+	defer os.RemoveAll(seedDir)
+	sRepo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		s.t.Fatalf("init seed: %v", err)
+	}
+	if _, err := sRepo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{barePath},
+	}); err != nil {
+		s.t.Fatalf("create seed remote: %v", err)
+	}
+	wt, _ := sRepo.Worktree()
+	readme := filepath.Join(seedDir, "README.md")
+	_ = os.WriteFile(readme, []byte("# "+name+"\n"), 0644)
+	_, _ = wt.Add("README.md")
+	sig := &object.Signature{Name: "Test", Email: "test@localhost", When: time.Unix(1700000000, 0)}
+	if _, err := wt.Commit("initial", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
+		s.t.Fatalf("seed commit: %v", err)
+	}
+	if err := sRepo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
+		s.t.Fatalf("seed push: %v", err)
+	}
+
+	resp := s.post("/api/v1/projects", map[string]string{
+		"name":       name,
+		"remote_url": barePath,
+	})
 	id, _ := resp["id"].(float64)
 	if id == 0 {
 		s.t.Fatalf("failed to create test project: %v", resp)
 	}
-	return int64(id)
+	projectID := int64(id)
+	s.rememberRemote(projectID, barePath)
+	return projectID
+}
+
+// createTestProjectAt creates a project at a specific bare remote
+// path. Used by tests that need to share a remote across calls or
+// verify external remote behavior. For the normal per-test case
+// just call createTestProject().
+func (s *testServer) createTestProjectAt(name, barePath string) int64 {
+	s.t.Helper()
+	resp := s.post("/api/v1/projects", map[string]string{
+		"name":       name,
+		"remote_url": barePath,
+	})
+	id, _ := resp["id"].(float64)
+	if id == 0 {
+		s.t.Fatalf("failed to create test project: %v", resp)
+	}
+	projectID := int64(id)
+	s.rememberRemote(projectID, barePath)
+	return projectID
 }
 
 func (s *testServer) submitYAML(path string) string {
@@ -286,45 +417,177 @@ func (s *testServer) claim(taskID, username string) map[string]interface{} {
 	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/claim", map[string]string{"username": username})
 }
 
+// submit writes a text result via the fat-client path: compute the
+// task's expected result layout, write result.md + metadata.json to
+// the project's local clone, commit+push via mcpgit, then POST the
+// report with commit_sha to the coordinator. This exercises the
+// exact code path the real MCP client uses.
 func (s *testServer) submit(taskID, content string) map[string]interface{} {
 	s.t.Helper()
-	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/result", map[string]interface{}{
-		"content":     content,
-		"result_type": "text",
-		"tokens_used": 100,
-	})
+	return s.fatClientSubmit(taskID, content, nil, nil)
 }
 
-// submitWithArtifacts submits a result that also writes one or more artifacts.
-// Returns the raw response (which includes "artifacts_written" on success).
+// submitWithArtifacts is submit + artifact writes in one atomic commit.
 func (s *testServer) submitWithArtifacts(taskID, content string, artifacts map[string]string) map[string]interface{} {
 	s.t.Helper()
-	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/result", map[string]interface{}{
-		"content":     content,
-		"artifacts":   artifacts,
-		"tokens_used": 100,
+	return s.fatClientSubmit(taskID, content, nil, artifacts)
+}
+
+// submitOutputs submits a named-outputs result. Named outputs are
+// serialized as a single result.json for the A.3 first cut; the
+// follow-up iteration will support multi-file named output schemas.
+func (s *testServer) submitOutputs(taskID string, outputs map[string]string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmit(taskID, "", outputs, nil)
+}
+
+// fatClientSubmit is the shared helper that performs the full
+// iteration A write path: open the project's local clone, write
+// result files + artifacts, commit + push to the project's bare
+// remote, then POST the metadata report to the coordinator.
+func (s *testServer) fatClientSubmit(taskIDShort, content string, outputs, artifacts map[string]string) map[string]interface{} {
+	s.t.Helper()
+	fullTaskID := s.taskID(taskIDShort)
+
+	// Fetch task metadata so we know run_seq, task_def_id,
+	// instance_key, project_id (all needed to compute the result
+	// layout).
+	task := s.get("/api/v1/tasks/" + fullTaskID)
+	if errMsg, ok := task["error"].(string); ok {
+		s.t.Fatalf("fetchTask %q: %s", fullTaskID, errMsg)
+	}
+	projectID := int64(task["project_id"].(float64))
+	runSeq := int(task["run_seq"].(float64))
+	taskDefID, _ := task["task_def_id"].(string)
+	instanceKey, _ := task["instance_key"].(string)
+
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		s.t.Fatalf("project %d has no remote_url configured", projectID)
+	}
+
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		s.t.Fatalf("open project %d: %v", projectID, err)
+	}
+
+	resultDir := mcpgit.ResultDir(projectID, runSeq, instanceKey, taskDefID)
+	files := []mcpgit.FileWrite{}
+	metadata := map[string]interface{}{
+		"task_id":     fullTaskID,
+		"model":       "test",
+		"result_type": "text",
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	if content != "" {
+		files = append(files, mcpgit.FileWrite{
+			RepoRelPath: filepath.Join(resultDir, "result.md"),
+			Content:     []byte(content),
+		})
+	}
+	if outputs != nil {
+		metadata["result_type"] = "json"
+		metadata["named_outputs"] = true
+		// If the task declares a schema with file: specs, write
+		// each output to its own file per the schema. Otherwise
+		// serialize the outputs map as a single result.json.
+		schemaJSON, _ := task["outputs"].(string)
+		schema := mcpgit.ParseNamedOutputSchema(schemaJSON)
+		hasFileSpec := false
+		for _, sp := range schema {
+			if sp.File != "" {
+				hasFileSpec = true
+				break
+			}
+		}
+		if hasFileSpec {
+			outFiles, fileIndex := mcpgit.BuildNamedOutputFiles(resultDir, schema, outputs)
+			files = append(files, outFiles...)
+			metadata["output_files"] = fileIndex
+		} else {
+			outBytes, _ := json.MarshalIndent(outputs, "", "  ")
+			files = append(files, mcpgit.FileWrite{
+				RepoRelPath: filepath.Join(resultDir, "result.json"),
+				Content:     outBytes,
+			})
+		}
+	}
+	if content == "" && outputs == nil && len(artifacts) == 0 {
+		s.t.Fatalf("submit with no content, outputs, or artifacts")
+	}
+	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
+	files = append(files, mcpgit.FileWrite{
+		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+		Content:     metaBytes,
+	})
+	var artifactPaths []string
+	if len(artifacts) > 0 {
+		for p := range artifacts {
+			artifactPaths = append(artifactPaths, p)
+		}
+		// Deterministic ordering so commit message body matches.
+		for i := 1; i < len(artifactPaths); i++ {
+			for j := i; j > 0 && artifactPaths[j-1] > artifactPaths[j]; j-- {
+				artifactPaths[j-1], artifactPaths[j] = artifactPaths[j], artifactPaths[j-1]
+			}
+		}
+		for _, p := range artifactPaths {
+			files = append(files, mcpgit.FileWrite{
+				RepoRelPath: mcpgit.ArtifactPath(projectID, p),
+				Content:     []byte(artifacts[p]),
+			})
+		}
+	}
+
+	proj.Lock()
+	res, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:        fullTaskID,
+		Username:      "test",
+		AuthorName:    "Test Citizen",
+		AuthorEmail:   "test@enju.local",
+		Files:         files,
+		ArtifactPaths: artifactPaths,
+	})
+	proj.Unlock()
+	if err != nil {
+		s.t.Fatalf("fat-client submit for %q: %v", fullTaskID, err)
+	}
+
+	// Report the commit to the coordinator so state machine +
+	// artifact index get updated.
+	return s.post("/api/v1/tasks/"+fullTaskID+"/result", map[string]interface{}{
+		"commit_sha":        res.CommitSHA,
+		"result_path":       resultDir,
+		"artifacts_written": artifactPaths,
+		"tokens_used":       100,
+		"model":             "test",
 	})
 }
 
-// readArtifactFile reads an artifact file directly from the project's
-// repo on disk, returning the content and whether the file exists.
+// readArtifactFile reads an artifact's content from the project's
+// bare remote. Clones the bare into a throwaway dir to retrieve the
+// file. Path is the user-facing artifact path (no prefix); the
+// helper adds the `projects/{id}/artifacts/` namespace prefix that
+// iteration A.5 introduced.
 func (s *testServer) readArtifactFile(projectID int64, path string) (string, bool) {
 	s.t.Helper()
-	full := filepath.Join(s.projectRepoDir(projectID), "artifacts", path)
-	data, err := os.ReadFile(full)
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		return "", false
+	}
+	cloneDir, err := os.MkdirTemp("", "read-artifact-")
+	if err != nil {
+		return "", false
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile(filepath.Join(cloneDir, mcpgit.ArtifactPath(projectID, path)))
 	if err != nil {
 		return "", false
 	}
 	return string(data), true
-}
-
-func (s *testServer) submitOutputs(taskID string, outputs map[string]string) map[string]interface{} {
-	s.t.Helper()
-	taskID = s.taskID(taskID)
-	return s.post("/api/v1/tasks/"+taskID+"/result", map[string]interface{}{
-		"outputs":     outputs,
-		"tokens_used": 100,
-	})
 }
 
 func (s *testServer) release(taskID, username string) map[string]interface{} {
@@ -345,9 +608,121 @@ func (s *testServer) taskGet(taskID string) map[string]interface{} {
 	return s.get("/api/v1/tasks/" + s.taskID(taskID))
 }
 
+// taskInputs returns a resolved-prompt view of a task, matching the
+// legacy response shape: `resolved_prompt`, `artifacts`,
+// `missing_artifacts`. In the iteration A model the coordinator only
+// serves the dependency descriptor; the test helper does the
+// client-side resolution via mcpgit.Project.Resolve so existing
+// tests can keep asserting on `resolved_prompt`.
 func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 	s.t.Helper()
-	return s.get("/api/v1/tasks/" + s.taskID(taskID) + "/inputs")
+	fullTaskID := s.taskID(taskID)
+	desc := s.get("/api/v1/tasks/" + fullTaskID + "/inputs?client_mode=true")
+	if errMsg, ok := desc["error"].(string); ok {
+		s.t.Fatalf("taskInputs descriptor: %s", errMsg)
+	}
+
+	// Marshal the dependency descriptor back into the mcpgit types
+	// so we can use the shared resolver. JSON → struct is the
+	// simplest path that doesn't re-implement the resolver.
+	raw, _ := json.Marshal(desc)
+	var d struct {
+		PromptTemplate     string                   `json:"prompt_template"`
+		UserPromptTemplate string                   `json:"user_prompt_template"`
+		ForEachParams      map[string]string        `json:"for_each_params"`
+		Dependencies       []map[string]interface{} `json:"dependencies"`
+		ArtifactReads      []map[string]interface{} `json:"artifact_reads"`
+		ProjectRemoteURL   string                   `json:"project_remote_url"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		s.t.Fatalf("decode descriptor: %v", err)
+	}
+
+	// Fetch project metadata so we can open the local workspace
+	// clone.
+	task := s.get("/api/v1/tasks/" + fullTaskID)
+	projectID := int64(task["project_id"].(float64))
+
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		// No remote? Return the raw descriptor — tests that rely
+		// on this path will surface the issue loudly.
+		return desc
+	}
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		s.t.Fatalf("open project: %v", err)
+	}
+	proj.Lock()
+	_ = proj.Pull()
+	proj.Unlock()
+
+	input := mcpgit.ResolveInput{
+		PromptTemplate:     d.PromptTemplate,
+		UserPromptTemplate: d.UserPromptTemplate,
+		ForEachParams:      d.ForEachParams,
+	}
+	for _, dep := range d.Dependencies {
+		paramsRaw, _ := dep["instance_params"].(map[string]interface{})
+		params := make(map[string]string, len(paramsRaw))
+		for k, v := range paramsRaw {
+			if sv, ok := v.(string); ok {
+				params[k] = sv
+			}
+		}
+		ref := mcpgit.DependencyRef{
+			TaskDefID:      asString(dep["task_def_id"]),
+			InstanceKey:    asString(dep["instance_key"]),
+			InstanceParams: params,
+			CommitSHA:      asString(dep["commit_sha"]),
+			ResultPath:     asString(dep["result_path"]),
+		}
+		input.Dependencies = append(input.Dependencies, ref)
+	}
+	for _, a := range d.ArtifactReads {
+		input.ArtifactReads = append(input.ArtifactReads, mcpgit.ArtifactRef{
+			Path:      asString(a["path"]),
+			CommitSHA: asString(a["commit_sha"]),
+		})
+	}
+
+	resolved, err := proj.Resolve(input)
+	if err != nil {
+		s.t.Fatalf("resolve: %v", err)
+	}
+
+	out := map[string]interface{}{
+		"task_id":         fullTaskID,
+		"resolved_prompt": resolved.Prompt,
+	}
+	if resolved.UserPrompt != "" {
+		out["resolved_user_prompt"] = resolved.UserPrompt
+	}
+	if len(resolved.ResolvedArtifacts) > 0 {
+		// Match legacy shape: map[string]string
+		as := make(map[string]interface{}, len(resolved.ResolvedArtifacts))
+		for k, v := range resolved.ResolvedArtifacts {
+			as[k] = v
+		}
+		out["artifacts"] = as
+	}
+	if len(resolved.MissingArtifacts) > 0 {
+		miss := make([]interface{}, 0, len(resolved.MissingArtifacts))
+		for _, p := range resolved.MissingArtifacts {
+			miss = append(miss, p)
+		}
+		out["missing_artifacts"] = miss
+	}
+	return out
+}
+
+// asString is a safe map-value-to-string coercion for the
+// descriptor decode path.
+func asString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // runPath converts a composite "projectID:runSeq" runID into the URL path segment
@@ -370,18 +745,34 @@ func (s *testServer) runTasks(runID string) []interface{} {
 	return s.getList("/api/v1/" + runPath(runID) + "/tasks")
 }
 
-// assertResultFile checks that a result file exists and contains expected content.
-// runID is a composite "projectID:runSeq" string. Results live under
-// {gitBaseDir}/{projectID}/runs/{runSeq}/{instanceKey?}/{taskDefID}/.
+// assertResultFile checks that a task's result file was written to
+// the project's bare remote with the expected content. Clones the
+// bare on demand into a throwaway directory — this is slow but
+// matches the reality of "content lives on the user's git host" in
+// the orchestrator model.
 func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedContent string) {
 	s.t.Helper()
 	parts := strings.SplitN(runID, ":", 2)
 	if len(parts) != 2 {
 		s.t.Fatalf("assertResultFile: bad runID %q (want projectID:runSeq)", runID)
 	}
-	projectIDStr, runSeqStr := parts[0], parts[1]
+	projectIDInt, _ := strconv.ParseInt(parts[0], 10, 64)
+	runSeq := parts[1]
 
-	dir := filepath.Join(s.gitBaseDir, projectIDStr, "runs", runSeqStr)
+	remoteURL := s.remoteFor(projectIDInt)
+	if remoteURL == "" {
+		s.t.Fatalf("assertResultFile: project %d has no remote_url", projectIDInt)
+	}
+	cloneDir, err := os.MkdirTemp("", "assert-result-")
+	if err != nil {
+		s.t.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		s.t.Fatalf("clone bare: %v", err)
+	}
+
+	dir := filepath.Join(cloneDir, "projects", parts[0], "runs", runSeq)
 	if instanceKey != "" {
 		dir = filepath.Join(dir, instanceKey, taskDefID)
 	} else {
@@ -391,7 +782,7 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 	resultPath := filepath.Join(dir, "result.md")
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
-		s.t.Fatalf("result file not found: %s", resultPath)
+		s.t.Fatalf("result file not found on remote: %s", resultPath)
 	}
 	content := string(data)
 	if expectedContent != "" && !strings.Contains(content, expectedContent) {
@@ -401,7 +792,7 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 	metaPath := filepath.Join(dir, "metadata.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
-		s.t.Fatalf("metadata file not found: %s", metaPath)
+		s.t.Fatalf("metadata file not found on remote: %s", metaPath)
 	}
 	var meta map[string]interface{}
 	if err := json.Unmarshal(metaData, &meta); err != nil {
@@ -410,24 +801,21 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 	if meta["task_id"] == nil {
 		s.t.Fatal("metadata missing task_id")
 	}
-	if meta["citizen"] == nil {
-		s.t.Fatal("metadata missing citizen")
-	}
 }
 
-// assertGitCommits checks the number of commits in a project's repo.
-// projectID is the project to inspect; under per-project repos each
-// project has its own history.
+// assertGitCommits checks the number of commits in a project's
+// bare remote. Uses `git log` against the bare — fast because the
+// bare is on local disk.
 func (s *testServer) assertGitCommits(projectID int64, expected int) {
 	s.t.Helper()
-	repoDir := s.projectRepoDir(projectID)
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
-		s.t.Fatalf("no git repo at %s: %v", repoDir, err)
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		s.t.Fatalf("assertGitCommits: project %d has no remote_url", projectID)
 	}
-	cmd := exec.Command("git", "-C", repoDir, "log", "--oneline")
+	cmd := exec.Command("git", "--git-dir", remoteURL, "log", "--oneline")
 	out, err := cmd.Output()
 	if err != nil {
-		s.t.Fatalf("git log failed: %v", err)
+		s.t.Fatalf("git log failed on bare %s: %v", remoteURL, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) != expected {
@@ -1196,13 +1584,22 @@ func TestMultiFileOutputs(t *testing.T) {
 		t.Fatalf("expected accepted, got %v", result)
 	}
 
-	// Verify files exist on disk with correct content.
-	// Per-project repo layout: {gitBaseDir}/{projectID}/runs/{runSeq}/analyze
-	resultsDir := filepath.Join(
-		s.projectRepoDir(s.lastProjectID),
-		"runs",
-		fmt.Sprintf("%d", s.lastRunSeq),
-		"analyze")
+	// Verify files exist on the project's bare remote with the
+	// right content. The iteration A fat-client submit wrote them;
+	// we clone the bare and read directly.
+	cloneDir, err := os.MkdirTemp("", "mfo-verify-")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(cloneDir)
+	remoteURL := s.remoteFor(s.lastProjectID)
+	if remoteURL == "" {
+		t.Fatal("no remote url for multi-file-outputs project")
+	}
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		t.Fatalf("clone bare: %v", err)
+	}
+	resultsDir := filepath.Join(cloneDir, "projects", fmt.Sprintf("%d", s.lastProjectID), "runs", fmt.Sprintf("%d", s.lastRunSeq), "analyze")
 
 	// genes.csv should contain the CSV
 	csvData, err := os.ReadFile(filepath.Join(resultsDir, "genes.csv"))
@@ -1469,14 +1866,20 @@ func TestArtifactListAndGetEndpoints(t *testing.T) {
 		t.Fatalf("expected last_writer %q, got %v", alice, first["last_writer"])
 	}
 
-	// Get one
+	// Get one — the coordinator only returns metadata (commit SHA,
+	// provenance); content reading is the client's job in the
+	// orchestrator model, so we read the bare remote directly.
 	getURL := fmt.Sprintf("/api/v1/projects/%d/artifacts/src/hello.py", s.lastProjectID)
 	a := s.get(getURL)
-	if !strings.Contains(a["content"].(string), "hello") {
-		t.Fatalf("expected content to contain 'hello', got %v", a["content"])
-	}
 	if a["last_writer"] != alice {
 		t.Fatalf("expected last_writer %q, got %v", alice, a["last_writer"])
+	}
+	content, ok := s.readArtifactFile(s.lastProjectID, "src/hello.py")
+	if !ok {
+		t.Fatal("expected artifact src/hello.py to exist on remote")
+	}
+	if !strings.Contains(content, "hello") {
+		t.Fatalf("expected content to contain 'hello', got %q", content)
 	}
 
 	// Missing artifact returns an error
@@ -2033,16 +2436,11 @@ tasks:
 		t.Fatalf("expected restore from write_v1, got %v", restoredTask)
 	}
 
-	// On-disk content should be v1 again.
-	contentAfter, ok := s.readArtifactFile(pid, "notes/intro.md")
-	if !ok {
-		t.Fatal("artifact missing after rollback")
-	}
-	if contentAfter != "version ONE" {
-		t.Fatalf("expected v1 after rollback, got %q", contentAfter)
-	}
-
-	// Artifact index should now point to write_v1.
+	// Iteration A orchestrator model: git history is immutable. The
+	// v2 commit stays on the remote forever. What changes is the
+	// DB's artifact index — after rollback it should point at
+	// write_v1's commit SHA, and client-side template resolution
+	// will read v1 content from that commit via the `readAt` path.
 	list := s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
 	if len(list) != 1 {
 		t.Fatalf("expected 1 artifact in index, got %d", len(list))
@@ -2053,8 +2451,9 @@ tasks:
 		t.Fatalf("expected last_task_id to be write_v1 after rollback, got %v", lastTask)
 	}
 
-	// Re-claim write_v2 and check its inputs block. It should now see
-	// v1 content, not v2.
+	// Re-claim write_v2 and check its inputs block. Client-side
+	// resolution via taskInputs should read the file at write_v1's
+	// commit SHA (not the v2 commit that's still in git history).
 	s.claim("write_v2", alice)
 	inputs := s.taskInputs("write_v2")
 	artifacts, _ := inputs["artifacts"].(map[string]interface{})
@@ -2096,12 +2495,14 @@ tasks:
 		"config/settings.yaml": "key: value",
 	})
 
-	// Sanity: file exists.
+	// Sanity: file exists on the remote.
 	if _, ok := s.readArtifactFile(pid, "config/settings.yaml"); !ok {
 		t.Fatal("expected config file to exist before invalidation")
 	}
 
-	// Invalidate — no prior writer, expect deletion.
+	// Invalidate — no prior writer, expect the DB index row to be
+	// dropped. The file remains in git history (immutable append
+	// log) but the coordinator no longer knows where to find it.
 	resp := s.invalidate("create", "bad config")
 	rolled, _ := resp["artifacts_rolled_back"].([]interface{})
 	if len(rolled) != 1 {
@@ -2112,12 +2513,8 @@ tasks:
 		t.Fatalf("expected deletion (no prior writer), got %v", rbEntry)
 	}
 
-	// File should be gone from the working tree.
-	if _, ok := s.readArtifactFile(pid, "config/settings.yaml"); ok {
-		t.Fatal("expected config file to be deleted after rollback")
-	}
-
-	// Artifact index row should be gone.
+	// Artifact index row should be gone. (Git history preserves
+	// the old commit; the coordinator just drops its DB pointer.)
 	list := s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
 	if len(list) != 0 {
 		t.Fatalf("expected empty artifact index after deletion, got %d entries", len(list))
@@ -2171,19 +2568,27 @@ tasks:
 	s.claim("write_v2", alice)
 	s.submitWithArtifacts("write_v2", "second", map[string]string{"notes/intro.md": "version TWO"})
 
-	// Confirm v2 is current.
-	if c, _ := s.readArtifactFile(pid, "notes/intro.md"); c != "version TWO" {
-		t.Fatalf("expected v2 on disk, got %q", c)
+	// Confirm the DB index currently points at write_v2.
+	list := s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
+	if len(list) != 1 {
+		t.Fatalf("expected 1 artifact in index, got %d", len(list))
+	}
+	if lt, _ := list[0].(map[string]interface{})["last_task_id"].(string); !strings.HasSuffix(lt, ":write_v2") {
+		t.Fatalf("expected last_task_id to be write_v2 before invalidation, got %v", lt)
 	}
 
-	// Invalidate write_v2. Should roll back to v1. write_v2 is now READY.
+	// Invalidate write_v2. DB index should switch to write_v1.
 	s.lastRunSeq = 2
 	resp := s.invalidate("write_v2", "wrong")
 	if resp["status"] != "invalidated" {
 		t.Fatalf("first invalidate failed: %v", resp)
 	}
-	if c, _ := s.readArtifactFile(pid, "notes/intro.md"); c != "version ONE" {
-		t.Fatalf("expected v1 after first rollback, got %q", c)
+	list = s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
+	if len(list) != 1 {
+		t.Fatalf("expected 1 artifact in index after first rollback, got %d", len(list))
+	}
+	if lt, _ := list[0].(map[string]interface{})["last_task_id"].(string); !strings.HasSuffix(lt, ":write_v1") {
+		t.Fatalf("expected last_task_id to be write_v1 after first rollback, got %v", lt)
 	}
 
 	// Sanity: write_v2 should now be READY, write_v1 still ACCEPTED.
@@ -2215,13 +2620,11 @@ tasks:
 		t.Fatalf("expected artifact DELETED (no valid prior writer), got %v", rbEntry)
 	}
 
-	// File should be gone.
-	if _, ok := s.readArtifactFile(pid, "notes/intro.md"); ok {
-		t.Fatal("expected artifact deleted from disk after second invalidation")
-	}
-
-	// Artifact index row should be gone.
-	list := s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
+	// Artifact index row should be gone — the DB no longer has a
+	// pointer to any version. (Git history still contains both
+	// write_v1's and write_v2's commits; invalidation doesn't
+	// touch git in the orchestrator model.)
+	list = s.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", pid))
 	if len(list) != 0 {
 		t.Fatalf("expected empty index after deletion, got %d entries: %v", len(list), list)
 	}
@@ -2295,26 +2698,19 @@ tasks:
 		t.Fatalf("expected summarize in artifact_readers, got %v", readers[0])
 	}
 
-	// summarize should no longer be ACCEPTED. Currently it lands in
-	// READY rather than PENDING because cross-run readers have no
-	// task-level depends_on — UpdateReadyTasks auto-promotes any
-	// PENDING task with empty task deps. The correctness contract is
-	// still satisfied:
-	//   - not in accepted state
-	//   - result_path cleared
-	//   - run flipped from completed to active
-	//   - visible in list_ready_tasks as new work
-	//
-	// Teaching the scheduler about artifact dependencies so
-	// cross-run readers stay in a blocked-until-re-consumed state is
-	// a future refinement tracked in the buildout plan.
+	// summarize should no longer be ACCEPTED. The artifact-aware
+	// scheduler (iteration 4) keeps it in PENDING because the artifact
+	// it reads was rolled back and no longer exists in the index —
+	// promotion to READY is blocked until a new writer lands. Before
+	// iteration 4 this task auto-promoted to READY immediately, which
+	// let citizens claim a task whose declared reads were missing.
 	s.lastRunSeq = 2
 	state := s.taskGet("summarize")["state"]
 	if state == "accepted" {
 		t.Fatalf("expected summarize to NOT be accepted after cross-run cascade, got accepted")
 	}
-	if state != "ready" {
-		t.Fatalf("expected summarize READY (auto-promoted from PENDING) after cross-run cascade, got %v", state)
+	if state != "pending" {
+		t.Fatalf("expected summarize PENDING (blocked by missing artifact) after cross-run cascade, got %v", state)
 	}
 
 	// Result path should have been cleared.

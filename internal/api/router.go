@@ -6,37 +6,37 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/dag"
-	enjuGit "github.com/enju-ai/enju/internal/git"
 	"github.com/enju-ai/enju/internal/store"
-	"github.com/enju-ai/enju/internal/template"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 )
 
-// Server holds the coordinator state and dependencies.
+// Server holds the coordinator state and dependencies. Post the
+// iteration A orchestrator rewrite, the coordinator holds no git
+// state of its own — clients own their own clones, and the
+// coordinator is pure DAG/state/index metadata.
 type Server struct {
-	store    *store.Store
-	dags     map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
-	runs     map[int64]*enjuYaml.ParsedRun
-	registry *enjuGit.Registry
-	logger   *slog.Logger
+	store  *store.Store
+	dags   map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
+	runs   map[int64]*enjuYaml.ParsedRun
+	logger *slog.Logger
 }
 
 // NewServer creates a new API server.
-func NewServer(st *store.Store, registry *enjuGit.Registry, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, logger *slog.Logger) *Server {
 	return &Server{
-		store:    st,
-		dags:     make(map[int64]*dag.DAG),
-		runs:     make(map[int64]*enjuYaml.ParsedRun),
-		registry: registry,
-		logger:   logger,
+		store:  st,
+		dags:   make(map[int64]*dag.DAG),
+		runs:   make(map[int64]*enjuYaml.ParsedRun),
+		logger: logger,
 	}
 }
 
@@ -56,6 +56,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/projects", s.handleCreateProject)
 		r.Get("/projects", s.handleListProjects)
 		r.Get("/projects/{projectID}", s.handleGetProject)
+		r.Put("/projects/{projectID}/remote", s.handleSetProjectRemote)
 		r.Get("/projects/{projectID}/runs", s.handleListProjectRuns)
 		r.Get("/projects/{projectID}/artifacts", s.handleListArtifacts)
 		r.Get("/projects/{projectID}/artifacts/*", s.handleGetArtifact)
@@ -99,12 +100,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 type createProjectRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	RemoteURL   string `json:"remote_url,omitempty"`
+}
+
+type setProjectRemoteRequest struct {
+	RemoteURL string `json:"remote_url"`
 }
 
 type projectResponse struct {
 	ID          int64  `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	RemoteURL   string `json:"remote_url,omitempty"`
 	RunCount    int    `json:"run_count"`
 	CreatedAt   string `json:"created_at"`
 }
@@ -127,10 +134,17 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Iteration A: the coordinator never creates a git repo. The
+	// project metadata goes into the DB and that's it — clients
+	// own their local clones and the project's data lives in the
+	// citizen's configured remote (remote_url). If remote_url is
+	// empty, the project is a local-only project handled entirely
+	// by the MCP client's workspace.
 	now := time.Now()
 	id, err := s.store.CreateProject(&store.ProjectRecord{
 		Name:        req.Name,
 		Description: req.Description,
+		RemoteURL:   req.RemoteURL,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	})
@@ -139,22 +153,45 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Initialize the per-project git repo. On failure, roll back the DB
-	// row so the system doesn't end up with a project that has no repo.
-	if _, err := s.registry.CreateProjectRepo(id, req.Name); err != nil {
-		s.logger.Error("initializing project repo", "project_id", id, "error", err)
-		if delErr := s.store.DeleteProject(id); delErr != nil {
-			s.logger.Error("rolling back project after repo init failure",
-				"project_id", id, "error", delErr)
-		}
-		writeError(w, http.StatusInternalServerError, "failed to initialize project repo: "+err.Error())
-		return
-	}
-
 	writeJSON(w, http.StatusCreated, projectResponse{
 		ID:        id,
 		Name:      req.Name,
+		RemoteURL: req.RemoteURL,
 		CreatedAt: now.Format(time.RFC3339),
+	})
+}
+
+// handleSetProjectRemote updates the project's remote URL in the DB.
+// Reconfiguring the MCP client's local clone to point at the new
+// remote happens on the client side (see the MCP tool handler in
+// internal/mcpserver/server.go).
+func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+
+	var req setProjectRemoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	p, err := s.store.GetProject(projectID)
+	if err != nil || p == nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+
+	if err := s.store.SetProjectRemoteURL(projectID, req.RemoteURL); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist remote url")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"project_id": projectID,
+		"remote_url": req.RemoteURL,
 	})
 }
 
@@ -168,15 +205,22 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	resp := make([]projectResponse, 0, len(projects))
 	for _, p := range projects {
 		runs, _ := s.store.ListRunsByProject(p.ID)
-		resp = append(resp, projectResponse{
-			ID:          p.ID,
-			Name:        p.Name,
-			Description: p.Description,
-			RunCount:    len(runs),
-			CreatedAt:   p.CreatedAt.Format(time.RFC3339),
-		})
+		resp = append(resp, toProjectResponse(p, len(runs)))
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// toProjectResponse builds the wire projectResponse from a store
+// record + a pre-computed run count.
+func toProjectResponse(p store.ProjectRecord, runCount int) projectResponse {
+	return projectResponse{
+		ID:          p.ID,
+		Name:        p.Name,
+		Description: p.Description,
+		RemoteURL:   p.RemoteURL,
+		RunCount:    runCount,
+		CreatedAt:   p.CreatedAt.Format(time.RFC3339),
+	}
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -188,14 +232,15 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	runs, _ := s.store.ListRunsByProject(p.ID)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":          p.ID,
-		"name":        p.Name,
-		"description": p.Description,
-		"run_count":   len(runs),
-		"created_at":  p.CreatedAt.Format(time.RFC3339),
-	})
+	writeJSON(w, http.StatusOK, toProjectResponse(*p, len(runs)))
 }
+
+// handleProjectRemoteStatus / handleProjectSync were deleted during
+// the iteration A orchestrator rewrite. The coordinator no longer
+// owns a clone to compare or push from — the MCP client runs these
+// diagnostics against its own local clone via mcpgit. The MCP tool
+// names are unchanged; see internal/mcpserver/server.go for the new
+// implementations.
 
 func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
@@ -273,6 +318,11 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleGetArtifact returns the artifacts index metadata for one
+// artifact path: who wrote it, in what task, at what commit SHA.
+// File content reading has moved to the MCP client side, which
+// reads directly from its local clone at the commit SHA this
+// endpoint returns.
 func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if projectID == 0 {
@@ -288,34 +338,23 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gw, err := s.registry.For(projectID)
+	meta, err := s.store.GetArtifact(projectID, path)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to access project repo")
+		writeError(w, http.StatusInternalServerError, "failed to read artifact index")
 		return
 	}
-
-	content, ok, err := readArtifact(gw, path)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to read artifact")
-		return
-	}
-	if !ok {
+	if meta == nil {
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
 	}
-
-	meta, _ := s.store.GetArtifact(projectID, path)
-	resp := map[string]interface{}{
-		"path":    path,
-		"content": content,
-	}
-	if meta != nil {
-		resp["last_writer"] = s.citizenUsername(meta.LastWriter)
-		resp["last_task_id"] = meta.LastTaskID
-		resp["last_run_id"] = meta.LastRunID
-		resp["updated_at"] = meta.UpdatedAt.Format(time.RFC3339)
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"path":         path,
+		"last_writer":  s.citizenUsername(meta.LastWriter),
+		"last_task_id": meta.LastTaskID,
+		"last_run_id":  meta.LastRunID,
+		"commit_sha":   meta.CommitSHA,
+		"updated_at":   meta.UpdatedAt.Format(time.RFC3339),
+	})
 }
 
 // --- Runs ---
@@ -436,7 +475,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	runPrefix := fmt.Sprintf("%d:%d:", projectID, runSeq)
 	taskCount := 0
 	taskSeq := 0
-	for instanceKey, tasks := range parsed.ExpandedTasks {
+	// Iterate ExpandedTasks in sorted-key order so the seq column (and
+	// therefore downstream display order in run_status) is
+	// deterministic across processes — Go map iteration is not.
+	instanceKeys := make([]string, 0, len(parsed.ExpandedTasks))
+	for k := range parsed.ExpandedTasks {
+		instanceKeys = append(instanceKeys, k)
+	}
+	sort.Strings(instanceKeys)
+	for _, instanceKey := range instanceKeys {
+		tasks := parsed.ExpandedTasks[instanceKey]
 		for _, ti := range tasks {
 			taskSeq++
 			resultType := ti.ResultType
@@ -448,10 +496,13 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				timeout = parsed.Run.Defaults.Timeout
 			}
 
-			// Build depends_on as comma-separated full IDs with run prefix
+			// build() populates ti.DependsOn with short IDs already
+			// resolved against the current expansion mode (singletons,
+			// per-iteration binding, or fan-in). We just prepend the
+			// run prefix to get fully-qualified store IDs.
 			var deps []string
 			for _, dep := range ti.DependsOn {
-				deps = append(deps, runPrefix+enjuYaml.MakeFullID(instanceKey, dep))
+				deps = append(deps, runPrefix+dep)
 			}
 
 			// Determine initial state
@@ -460,12 +511,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				state = store.TaskReady
 			}
 
+			paramsJSON := ""
+			if len(ti.Params) > 0 {
+				if b, err := json.Marshal(ti.Params); err == nil {
+					paramsJSON = string(b)
+				}
+			}
 			err := s.store.CreateTask(&store.TaskRecord{
-				ID:          runPrefix + ti.FullID,
-				RunID:       runID,
-				Seq:         taskSeq,
-				TaskDefID:   ti.ID,
-				InstanceKey: instanceKey,
+				ID:             runPrefix + ti.FullID,
+				RunID:          runID,
+				Seq:            taskSeq,
+				TaskDefID:      ti.ID,
+				InstanceKey:    instanceKey,
+				InstanceParams: paramsJSON,
 				Ref:         ti.Ref,
 				Action:      ti.Action,
 				Prompt:      ti.Prompt,
@@ -582,13 +640,15 @@ func (s *Server) handleListRunTasks(w http.ResponseWriter, r *http.Request) {
 // --- Tasks ---
 
 type taskResponse struct {
-	ID              string   `json:"id"`
-	RunID           int64    `json:"run_id"`     // global run ID
-	RunSeq          int      `json:"run_seq"`    // per-project run sequence
-	ProjectID       int64    `json:"project_id"` // parent project
-	Seq             int      `json:"seq"`        // task sequence within run
+	ID               string `json:"id"`
+	RunID            int64  `json:"run_id"`                       // global run ID
+	RunSeq           int    `json:"run_seq"`                      // per-project run sequence
+	ProjectID        int64  `json:"project_id"`                   // parent project
+	ProjectRemoteURL string `json:"project_remote_url,omitempty"` // parent project's git remote (for fat clients)
+	Seq              int    `json:"seq"`                          // task sequence within run
 	TaskDefID       string   `json:"task_def_id"`
 	InstanceKey     string   `json:"instance_key,omitempty"`
+	IterationLabel  string   `json:"iteration_label,omitempty"` // "gene=BRCA1, tissue=breast" — human-readable for_each context
 	Ref             string   `json:"ref,omitempty"`
 	Action          string   `json:"action"`
 	Prompt          string   `json:"prompt,omitempty"`
@@ -600,6 +660,7 @@ type taskResponse struct {
 	State           string   `json:"state"`
 	ClaimedBy       string   `json:"claimed_by,omitempty"` // username of the claimer
 	ResultPath      string   `json:"result_path,omitempty"`
+	CommitSHA       string   `json:"commit_sha,omitempty"` // git SHA of the accepted result (iteration A+)
 	DependsOn       string   `json:"depends_on,omitempty"`
 	ReadsArtifacts  []string `json:"reads_artifacts,omitempty"`
 	WritesArtifacts []string `json:"writes_artifacts,omitempty"`
@@ -715,6 +776,12 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetTaskInputs returns the structured dependency descriptor
+// that client-side template resolvers (mcpgit.Project.Resolve)
+// consume. The coordinator never reads files — it just reads DB rows
+// and emits commit SHAs + paths. This replaces the legacy path that
+// resolved templates server-side by reading upstream result files
+// from a coordinator-owned working tree.
 func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	task, err := s.store.GetTask(taskID)
@@ -722,100 +789,40 @@ func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
-
-	// Look up the run's project so we know which repo to read from.
 	run, err := s.store.GetRun(task.RunID)
 	if err != nil || run == nil {
 		writeError(w, http.StatusInternalServerError, "run not found for task")
 		return
 	}
-	gw, err := s.registry.For(run.ProjectID)
-	if err != nil {
-		s.logger.Error("getting project writer", "project_id", run.ProjectID, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to access project repo")
-		return
-	}
-
-	// Collect upstream task results (if any deps).
-	inputs := make(map[string]interface{})
-	if task.DependsOn != "" {
-		deps := strings.Split(task.DependsOn, ",")
-		for _, depID := range deps {
-			depID = strings.TrimSpace(depID)
-			depTask, err := s.store.GetTask(depID)
-			if err != nil || depTask == nil {
-				continue
-			}
-
-			// depTask.ResultPath is repo-relative (e.g. "runs/2/foundation").
-			if depTask.ResultPath != "" {
-				result, err := readResultForTemplate(gw, depTask.ResultPath, depTask.TaskDefID)
-				if err != nil {
-					s.logger.Warn("reading upstream result", "path", depTask.ResultPath, "error", err)
-					inputs[depTask.TaskDefID] = map[string]interface{}{
-						"status": "error",
-						"error":  err.Error(),
-					}
-					continue
-				}
-				inputs[depTask.TaskDefID] = result
-			}
-		}
-	}
-
-	// Collect declared artifact reads (snapshot at claim time — last
-	// write wins, see Phase C plan). Missing paths are tracked
-	// separately so the claim response can warn about declared
-	// inputs that don't exist on disk — a state that can happen
-	// legitimately after a cascade rollback that deleted the
-	// artifact, or when a YAML author declared a read to a path
-	// that was never written.
-	artifacts := make(map[string]string)
-	var missingArtifacts []string
-	for _, p := range unmarshalStringSlice(task.ReadsArtifacts) {
-		content, ok, err := readArtifact(gw, p)
-		if err != nil {
-			s.logger.Warn("reading artifact", "path", p, "error", err)
-			missingArtifacts = append(missingArtifacts, p)
-			continue
-		}
-		if ok {
-			artifacts[p] = content
-		} else {
-			missingArtifacts = append(missingArtifacts, p)
-		}
-	}
-
-	// Resolve {{task.field}} first, then {{artifact:path}}.
-	// Unresolved {{artifact:...}} references stay literal in the
-	// resolved prompt as a visible secondary signal that the input
-	// was missing.
-	resolvedPrompt := template.ResolveUpstream(task.Prompt, inputs)
-	resolvedPrompt = template.ResolveArtifacts(resolvedPrompt, artifacts)
-
-	resp := map[string]interface{}{
-		"task_id":         taskID,
-		"resolved_prompt": resolvedPrompt,
-		"inputs":          inputs,
-	}
-	if len(artifacts) > 0 {
-		resp["artifacts"] = artifacts
-	}
-	if len(missingArtifacts) > 0 {
-		resp["missing_artifacts"] = missingArtifacts
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.handleGetTaskInputsDescriptor(w, r, task, run)
 }
 
+// submitResultRequest is the iteration A shape: the client has
+// already written the result + artifact files to its local clone,
+// committed atomically, and pushed to the project's remote. The
+// coordinator only receives metadata — no file content crosses the
+// wire.
 type submitResultRequest struct {
-	Content    string            `json:"content"`              // text content (for simple results)
-	Outputs    map[string]string `json:"outputs,omitempty"`    // named outputs — values are content strings
-	Artifacts  map[string]string `json:"artifacts,omitempty"`  // user-facing path -> new content
-	ResultType string            `json:"result_type,omitempty"`
-	TokensUsed int64             `json:"tokens_used,omitempty"`
-	Model      string            `json:"model,omitempty"`
+	// CommitSHA identifies the commit the client pushed to the
+	// project's remote. Required.
+	CommitSHA string `json:"commit_sha"`
+	// ResultPath is the repo-relative directory holding this
+	// task's result files. Must match the expected layout for the
+	// task (runs/{seq}/{instance_key}/{task_def_id}) — the
+	// coordinator validates this.
+	ResultPath string `json:"result_path"`
+	// ArtifactsWritten lists the user-facing artifact paths the
+	// client wrote in the same commit. All share CommitSHA.
+	ArtifactsWritten []string `json:"artifacts_written,omitempty"`
+
+	TokensUsed int64  `json:"tokens_used,omitempty"`
+	Model      string `json:"model,omitempty"`
 }
 
+// handleSubmitResult is the metadata-only submit path. The client
+// has already done the git work; the coordinator just validates the
+// report, updates the state machine, updates the artifact index,
+// runs the scheduler, and checks run completion.
 func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 
@@ -824,116 +831,133 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if req.CommitSHA == "" {
+		writeError(w, http.StatusBadRequest, "commit_sha is required — the coordinator no longer writes result files, clients must write + push + report")
+		return
+	}
 
 	task, err := s.store.GetTask(taskID)
 	if err != nil || task == nil {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
+	s.handleSubmitResultReport(w, r, task, &req)
+}
 
-	// Write result as separate files (content + metadata)
-	resultType := req.ResultType
-	if resultType == "" {
-		resultType = "text"
+// handleGetTaskInputsDescriptor is the client-writes claim-time
+// endpoint (iteration A.2). It returns the structured dependency
+// descriptor that the client-side template resolver in mcpgit
+// consumes. No file reads happen on the coordinator side.
+//
+// Response shape mirrors mcpgit.ResolveInput:
+//
+//	{
+//	  "task_id": "1:2:analyze",
+//	  "prompt_template": "Analyze {{gather.content}} for {{gene}}",
+//	  "user_prompt_template": "",
+//	  "for_each_params": {"gene": "BRCA1"},
+//	  "dependencies": [
+//	    {"task_def_id": "gather", "instance_key": "",
+//	     "instance_params": {}, "commit_sha": "abc...",
+//	     "result_path": "runs/1/gather"}
+//	  ],
+//	  "artifact_reads": [
+//	    {"path": "notes/intro.md", "commit_sha": "def..."}
+//	  ]
+//	}
+func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, run *store.RunRecord) {
+	deps := []map[string]interface{}{}
+	if task.DependsOn != "" {
+		for _, depID := range strings.Split(task.DependsOn, ",") {
+			depID = strings.TrimSpace(depID)
+			depTask, err := s.store.GetTask(depID)
+			if err != nil || depTask == nil {
+				continue
+			}
+			var params map[string]string
+			if depTask.InstanceParams != "" {
+				_ = json.Unmarshal([]byte(depTask.InstanceParams), &params)
+			}
+			deps = append(deps, map[string]interface{}{
+				"task_def_id":     depTask.TaskDefID,
+				"instance_key":    depTask.InstanceKey,
+				"instance_params": params,
+				"commit_sha":      depTask.CommitSHA,
+				"result_path":     depTask.ResultPath,
+			})
+		}
 	}
 
-	metadata := map[string]interface{}{
-		"task_id":     taskID,
-		"citizen":     task.ClaimedBy,
-		"model":       req.Model,
-		"tokens_used": req.TokensUsed,
-		"result_type": resultType,
-		"timestamp":   time.Now().Format(time.RFC3339),
+	artifactReads := []map[string]interface{}{}
+	for _, p := range unmarshalStringSlice(task.ReadsArtifacts) {
+		art, err := s.store.GetArtifact(run.ProjectID, p)
+		if err != nil || art == nil {
+			// Missing artifact — the client's resolver will
+			// surface this via MissingArtifacts in its
+			// ResolvedPrompt. We still send the path so the
+			// client knows it was declared.
+			artifactReads = append(artifactReads, map[string]interface{}{
+				"path":       p,
+				"commit_sha": "",
+			})
+			continue
+		}
+		artifactReads = append(artifactReads, map[string]interface{}{
+			"path":       p,
+			"commit_sha": art.CommitSHA,
+		})
 	}
 
-	// Look up the run to find which project's repo to write into.
-	run, runErr := s.store.GetRun(task.RunID)
-	if runErr != nil || run == nil {
+	var forEachParams map[string]string
+	if task.InstanceParams != "" {
+		_ = json.Unmarshal([]byte(task.InstanceParams), &forEachParams)
+	}
+
+	// Include the project's remote URL so the client knows where to
+	// pull/push. This is the same URL the client already has from
+	// the task/claim response; duplicating it here keeps the
+	// descriptor self-contained.
+	var remoteURL string
+	if p, _ := s.store.GetProject(run.ProjectID); p != nil {
+		remoteURL = p.RemoteURL
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id":              task.ID,
+		"prompt_template":      task.Prompt,
+		"user_prompt_template": task.UserPrompt,
+		"for_each_params":      forEachParams,
+		"dependencies":         deps,
+		"artifact_reads":       artifactReads,
+		"project_id":           run.ProjectID,
+		"project_remote_url":   remoteURL,
+	})
+}
+
+// handleSubmitResultReport is the client-writes submit path
+// (iteration A.2). The client has already written result files +
+// artifacts and pushed them to the project's remote. We just update
+// metadata: result_path, commit_sha, state machine, artifact index,
+// scheduler re-evaluation, run completion. No git operations here.
+func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, req *submitResultRequest) {
+	taskID := task.ID
+
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
 		writeError(w, http.StatusInternalServerError, "run not found for task")
 		return
 	}
 
-	gw, err := s.registry.For(run.ProjectID)
-	if err != nil {
-		s.logger.Error("getting project writer", "project_id", run.ProjectID, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to access project repo")
-		return
-	}
-
-	// Hold the per-project writer lock across all writes + commit + push
-	// so the submission lands as one atomic git commit.
-	gw.Lock()
-	defer gw.Unlock()
-
-	var resultPath string
-
-	if len(req.Outputs) > 0 {
-		// Parse task's output schema to know file layouts
-		schema := map[string]outputFileSpec{}
-		if task.Outputs != "" {
-			var rawSchema map[string]interface{}
-			if err := json.Unmarshal([]byte(task.Outputs), &rawSchema); err == nil {
-				for name, v := range rawSchema {
-					switch val := v.(type) {
-					case string:
-						schema[name] = outputFileSpec{Description: val}
-					case map[string]interface{}:
-						spec := outputFileSpec{}
-						if d, ok := val["Description"].(string); ok {
-							spec.Description = d
-						}
-						if f, ok := val["File"].(string); ok {
-							spec.File = f
-						}
-						if fmt, ok := val["Format"].(string); ok {
-							spec.Format = fmt
-						}
-						schema[name] = spec
-					}
-				}
-			}
-		}
-
-		// Check if any output has a file declared
-		hasFileOutputs := false
-		for _, s := range schema {
-			if s.File != "" {
-				hasFileOutputs = true
-				break
-			}
-		}
-
-		if hasFileOutputs {
-			metadata["named_outputs"] = true
-			resultPath, err = writeMultiFileResult(gw, run.Seq, task.InstanceKey, task.TaskDefID, schema, req.Outputs, metadata)
-		} else {
-			outputsJSON, _ := json.MarshalIndent(req.Outputs, "", "  ")
-			metadata["named_outputs"] = true
-			resultPath, err = writeResult(gw, run.Seq, task.InstanceKey, task.TaskDefID, string(outputsJSON), "json", metadata)
-		}
-	} else {
-		resultPath, err = writeResult(gw, run.Seq, task.InstanceKey, task.TaskDefID, req.Content, resultType, metadata)
-	}
-	if err != nil {
-		s.logger.Error("writing result", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to write result")
-		return
-	}
-
-	// --- Artifacts ---
-	// writes_artifacts is an upper bound: the citizen MAY write any
-	// subset of declared paths, but never anything outside the list.
-	writtenArtifacts := []string{}
-	if len(req.Artifacts) > 0 {
+	// Validate declared artifacts against the task's writes_artifacts
+	// allowlist — same contract as the legacy path, just without
+	// writing any files.
+	if len(req.ArtifactsWritten) > 0 {
 		declared := unmarshalStringSlice(task.WritesArtifacts)
 		allowed := make(map[string]bool, len(declared))
 		for _, p := range declared {
 			allowed[p] = true
 		}
-		// Validate every submitted artifact: must be in the allow-list,
-		// must pass path validation. Validate all up front so a bad
-		// submission fails before any writes happen.
-		for path := range req.Artifacts {
+		for _, path := range req.ArtifactsWritten {
 			if err := validateArtifactPath(path); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid artifact path %q: %v", path, err))
 				return
@@ -943,71 +967,100 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// All good — write each one to the project repo.
-		for path, content := range req.Artifacts {
-			if err := writeArtifact(gw, path, []byte(content)); err != nil {
-				s.logger.Error("writing artifact", "path", path, "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to write artifact "+path)
-				return
-			}
-			writtenArtifacts = append(writtenArtifacts, path)
-		}
 	}
 
-	claimerUsername := s.citizenUsername(task.ClaimedBy)
-	commitMsg := fmt.Sprintf("Task %s by @%s: result", taskID, claimerUsername)
-	if len(writtenArtifacts) > 0 {
-		commitMsg = fmt.Sprintf("Task %s by @%s: result + %d artifact(s)\n\nArtifacts: %s",
-			taskID, claimerUsername, len(writtenArtifacts), strings.Join(writtenArtifacts, ", "))
+	// The client computed the result_path itself. Verify it's the
+	// expected form for this task so we don't accept arbitrary
+	// paths.
+	// Expected result layout since iteration A.5 — projects are
+	// namespaced by project ID so two projects sharing a remote
+	// don't collide on runs/1/foo/... etc.
+	expectedResultPath := fmt.Sprintf("projects/%d/runs/%d", run.ProjectID, run.Seq)
+	if task.InstanceKey != "" {
+		expectedResultPath += "/" + task.InstanceKey
 	}
-	if err := gw.CommitAndPush(commitMsg); err != nil {
-		s.logger.Warn("git commit/push failed", "error", err)
+	expectedResultPath += "/" + task.TaskDefID
+	if req.ResultPath != "" && req.ResultPath != expectedResultPath {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("result_path %q does not match expected %q for this task", req.ResultPath, expectedResultPath))
+		return
+	}
+	resultPath := expectedResultPath
+
+	// Update state machine — this also updates task_claims and
+	// citizen score counters, same as the legacy path.
+	if err := s.store.SubmitTaskResult(taskID, resultPath, req.CommitSHA, req.TokensUsed); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
+		return
 	}
 
-	// Upsert artifact index rows AFTER the commit succeeds, so the DB
-	// only reflects state that actually made it into git.
-	if len(writtenArtifacts) > 0 {
+	// Update artifacts index. All reported paths share the same
+	// commit SHA because the client committed them atomically.
+	if len(req.ArtifactsWritten) > 0 {
 		now := time.Now()
-		for _, path := range writtenArtifacts {
+		for _, path := range req.ArtifactsWritten {
 			if err := s.store.UpsertArtifact(&store.ArtifactRecord{
 				ProjectID:  run.ProjectID,
 				Path:       path,
 				LastWriter: task.ClaimedBy,
 				LastTaskID: taskID,
 				LastRunID:  task.RunID,
+				CommitSHA:  req.CommitSHA,
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}); err != nil {
 				s.logger.Error("upserting artifact index", "path", path, "error", err)
-				// Don't fail the request — git is the source of truth.
+				// Don't fail the request — git is the source of
+				// truth, the index is just a cache.
 			}
 		}
 	}
 
-	// Update task state
-	if err := s.store.SubmitTaskResult(taskID, resultPath, req.TokensUsed); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
-		return
-	}
-
-	// Update ready tasks — newly unblocked tasks become READY
+	// Update ready tasks — newly unblocked tasks become READY.
 	readied, _ := s.store.UpdateReadyTasks(task.RunID)
 
-	// Check if all tasks are done — mark run as completed
+	// Cross-run artifact propagation, same as the legacy path.
+	if len(req.ArtifactsWritten) > 0 {
+		otherRuns := map[int64]bool{}
+		for _, path := range req.ArtifactsWritten {
+			readers, err := s.store.ListTasksReadingArtifact(run.ProjectID, path, false)
+			if err != nil {
+				s.logger.Warn("listing cross-run readers", "path", path, "error", err)
+				continue
+			}
+			for _, rd := range readers {
+				if rd.RunID != task.RunID {
+					otherRuns[rd.RunID] = true
+				}
+			}
+		}
+		for rid := range otherRuns {
+			if n, err := s.store.UpdateReadyTasks(rid); err == nil {
+				readied += n
+			}
+		}
+	}
+
+	// Mark run completed if all tasks accepted.
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
 	if completed {
 		s.logger.Info("run completed", "run_id", task.RunID)
 	}
 
-	s.logger.Info("result submitted", "task_id", taskID, "path", resultPath, "newly_ready", readied)
+	s.logger.Info("result reported",
+		"task_id", taskID,
+		"path", resultPath,
+		"commit", req.CommitSHA,
+		"newly_ready", readied,
+	)
 
 	resp := map[string]interface{}{
-		"status":       "accepted",
-		"result_path":  resultPath,
-		"newly_ready":  readied,
+		"status":      "accepted",
+		"result_path": resultPath,
+		"commit_sha":  req.CommitSHA,
+		"newly_ready": readied,
 	}
-	if len(writtenArtifacts) > 0 {
-		resp["artifacts_written"] = writtenArtifacts
+	if len(req.ArtifactsWritten) > 0 {
+		resp["artifacts_written"] = req.ArtifactsWritten
 	}
 	if completed {
 		resp["run_completed"] = true
@@ -1182,52 +1235,86 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// --- Artifact rollback ---
+	// --- DB-only artifact rollback (iteration A orchestrator model) ---
 	//
-	// Roll back declared writes to a valid prior version (a commit
-	// whose author task is currently ACCEPTED and not in the
-	// invalidated set). The walker's accepted-state check catches
-	// previously-invalidated tasks — a bug from iteration 3.1 where
-	// the walker would resurrect ghost revisions.
-	var rollbacks []artifactRollback
-	if len(writtenPaths) > 0 {
-		gw, err := s.registry.For(run.ProjectID)
+	// Phase 1's rollback walked git history to rewrite files in a
+	// coordinator-owned working tree. The orchestrator model never
+	// rewrites git history; instead, git is an immutable append log
+	// and the "current" version of any artifact is a DB pointer
+	// (artifacts.last_task_id / commit_sha). Invalidation finds a
+	// new pointer for each affected path: the most recent task in
+	// the same project whose state is ACCEPTED and which is not in
+	// the invalidated set, and which declared the path in its
+	// writes_artifacts. If no such task exists, the index row is
+	// deleted — the artifact's content may still live in git
+	// history but the DB no longer knows where.
+	type rollbackOutcome struct {
+		Path              string
+		Deleted           bool
+		RestoredFromTask  string
+		RestoredCommitSHA string
+	}
+	var rollbacks []rollbackOutcome
+	for _, p := range writtenPaths {
+		art, _ := s.store.GetArtifact(run.ProjectID, p)
+		if art == nil || !invalidatedSet[art.LastTaskID] {
+			// Current pointer isn't one of the invalidated tasks;
+			// leave the index alone.
+			continue
+		}
+		// Find the next-most-recent prior writer (still ACCEPTED,
+		// not in invalidated set). The store doesn't have a
+		// dedicated "prior writers of this path" query; we iterate
+		// all tasks in the project that declare this path in
+		// writes_artifacts, filter to ACCEPTED + not-invalidated,
+		// and pick the most recent by submitted_at.
+		priorTasks, err := s.store.ListTasksWritingArtifact(run.ProjectID, p, true)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to access project repo")
-			return
+			s.logger.Warn("listing prior writers", "path", p, "error", err)
+			continue
 		}
-		gw.Lock()
-		defer gw.Unlock()
-
-		rollbacks, err = rollbackArtifactsForInvalidation(gw, s.store, invalidatedSet, writtenPaths)
-		if err != nil {
-			s.logger.Error("rolling back artifacts", "task_id", taskID, "error", err)
-			writeError(w, http.StatusInternalServerError, "failed to roll back artifacts: "+err.Error())
-			return
-		}
-
-		// Commit the rollback as one atomic git commit so the history
-		// clearly shows where the artifact state came from.
-		commitMsg := fmt.Sprintf("Rollback: invalidated %s", taskID)
-		if req.Reason != "" {
-			commitMsg += " — " + req.Reason
-		}
-		if len(rollbacks) > 0 {
-			parts := make([]string, 0, len(rollbacks))
-			for _, rb := range rollbacks {
-				if rb.Deleted {
-					parts = append(parts, rb.Path+" (deleted)")
-				} else {
-					parts = append(parts, rb.Path+" ← "+rb.RestoredTask)
-				}
+		var pick *store.TaskRecord
+		for i := range priorTasks {
+			t := &priorTasks[i]
+			if invalidatedSet[t.ID] {
+				continue
 			}
-			commitMsg += "\n\nArtifacts: " + strings.Join(parts, ", ")
+			if t.CommitSHA == "" {
+				// Legacy rows without a commit SHA can't be used
+				// as a rollback target in the new model.
+				continue
+			}
+			if pick == nil || (t.SubmittedAt != nil && pick.SubmittedAt != nil && t.SubmittedAt.After(*pick.SubmittedAt)) {
+				pick = t
+			}
 		}
-		if err := gw.Commit(commitMsg); err != nil {
-			s.logger.Error("committing rollback", "error", err)
-			writeError(w, http.StatusInternalServerError, "failed to commit rollback")
-			return
+		if pick == nil {
+			// No prior writer — drop the index row.
+			if err := s.store.DeleteArtifact(run.ProjectID, p); err != nil {
+				s.logger.Warn("deleting artifact index row", "path", p, "error", err)
+			}
+			rollbacks = append(rollbacks, rollbackOutcome{Path: p, Deleted: true})
+			continue
 		}
+		// Point the index at the prior writer's commit.
+		now := time.Now()
+		if err := s.store.UpsertArtifact(&store.ArtifactRecord{
+			ProjectID:  run.ProjectID,
+			Path:       p,
+			LastWriter: pick.ClaimedBy,
+			LastTaskID: pick.ID,
+			LastRunID:  pick.RunID,
+			CommitSHA:  pick.CommitSHA,
+			CreatedAt:  now, // upsert preserves created_at via ON CONFLICT
+			UpdatedAt:  now,
+		}); err != nil {
+			s.logger.Warn("updating artifact index after rollback", "path", p, "error", err)
+		}
+		rollbacks = append(rollbacks, rollbackOutcome{
+			Path:              p,
+			RestoredFromTask:  pick.ID,
+			RestoredCommitSHA: pick.CommitSHA,
+		})
 	}
 
 	// Combine DAG descendants + cross-run artifact readers into a
@@ -1241,40 +1328,6 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-
-	// Update the artifacts index rows to match the rolled-back state.
-	// For rolled-back files we point `last_writer` at the task we
-	// restored from; for deleted files we drop the index row entirely.
-	// If the index update fails we log and move on — git is the source
-	// of truth, the index is just a cache.
-	now := time.Now()
-	for _, rb := range rollbacks {
-		if rb.Deleted {
-			if err := s.store.DeleteArtifact(run.ProjectID, rb.Path); err != nil {
-				s.logger.Warn("deleting artifact index row", "path", rb.Path, "error", err)
-			}
-			continue
-		}
-		// Find the citizen id for the restored owner username so the
-		// artifacts.last_writer int fk stays correct.
-		var writerID int64
-		if rb.RestoredOwner != "" {
-			if c, _ := s.store.GetCitizenByUsername(rb.RestoredOwner); c != nil {
-				writerID = c.ID
-			}
-		}
-		if err := s.store.UpsertArtifact(&store.ArtifactRecord{
-			ProjectID:  run.ProjectID,
-			Path:       rb.Path,
-			LastWriter: writerID,
-			LastTaskID: rb.RestoredTask,
-			LastRunID:  task.RunID, // best effort — we don't re-lookup the original run
-			CreatedAt:  now,        // upsert preserves created_at via ON CONFLICT
-			UpdatedAt:  now,
-		}); err != nil {
-			s.logger.Warn("updating artifact index after rollback", "path", rb.Path, "error", err)
-		}
 	}
 
 	// Every affected run needs UpdateReadyTasks to reflect the new
@@ -1316,8 +1369,8 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 			if rb.Deleted {
 				item["deleted"] = true
 			} else {
-				item["restored_from_task"] = rb.RestoredTask
-				item["restored_from_commit"] = rb.RestoredHash
+				item["restored_from_task"] = rb.RestoredFromTask
+				item["restored_from_commit"] = rb.RestoredCommitSHA
 			}
 			rbView = append(rbView, item)
 		}
@@ -1559,22 +1612,35 @@ func (s *Server) checkTaskAccess(task *store.TaskRecord, caller *store.CitizenRe
 }
 
 func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
-	// Look up the run to get project_id and run_seq
+	// Look up the run to get project_id and run_seq, and the
+	// project to get the remote URL so fat clients know whether
+	// this task's content should be written locally (client-side)
+	// or via the legacy coordinator-writes path.
 	var projectID int64
 	var runSeq int
+	var remoteURL string
 	if run, _ := s.store.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
+		if p, _ := s.store.GetProject(projectID); p != nil {
+			remoteURL = p.RemoteURL
+		}
+	}
+	iterationLabel := ""
+	if t.InstanceKey != "" {
+		iterationLabel = formatIterationLabel(t.InstanceParams, t.InstanceKey)
 	}
 	return taskResponse{
-		ID:              t.ID,
-		RunID:           t.RunID,
-		RunSeq:          runSeq,
-		ProjectID:       projectID,
-		Seq:             t.Seq,
-		TaskDefID:       t.TaskDefID,
-		InstanceKey:     t.InstanceKey,
-		Ref:             t.Ref,
+		ID:               t.ID,
+		RunID:            t.RunID,
+		RunSeq:           runSeq,
+		ProjectID:        projectID,
+		ProjectRemoteURL: remoteURL,
+		Seq:              t.Seq,
+		TaskDefID:        t.TaskDefID,
+		InstanceKey:      t.InstanceKey,
+		IterationLabel:   iterationLabel,
+		Ref:              t.Ref,
 		Action:          t.Action,
 		Prompt:          t.Prompt,
 		UserPrompt:      t.UserPrompt,
@@ -1585,6 +1651,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		State:           string(t.State),
 		ClaimedBy:       s.citizenUsername(t.ClaimedBy),
 		ResultPath:      t.ResultPath,
+		CommitSHA:       t.CommitSHA,
 		DependsOn:       t.DependsOn,
 		ReadsArtifacts:  unmarshalStringSlice(t.ReadsArtifacts),
 		WritesArtifacts: unmarshalStringSlice(t.WritesArtifacts),

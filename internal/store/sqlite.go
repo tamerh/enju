@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -98,6 +99,7 @@ func (s *Store) migrate() error {
 		name TEXT NOT NULL UNIQUE,
 		description TEXT,
 		created_by TEXT,
+		remote_url TEXT,
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL
 	);
@@ -192,18 +194,50 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 	CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id);
 	`
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Idempotent column additions for pre-existing databases. SQLite's
+	// CREATE TABLE IF NOT EXISTS leaves existing tables untouched, so
+	// new columns go in via ALTER TABLE. A duplicate-column error is
+	// expected on every run after the first and is swallowed here.
+	altered := []string{
+		`ALTER TABLE projects ADD COLUMN remote_url TEXT`,
+		// Note: projects.last_push_at / last_push_error were added
+		// by iteration 4 for coordinator-side push status tracking.
+		// Iteration A moved pushes to the client, iteration A.8
+		// dropped the Go-side references. The columns still exist
+		// on databases that were migrated through iteration 4 but
+		// the coordinator no longer reads or writes them; they're
+		// harmless dead columns pending a future schema migration.
+		`ALTER TABLE tasks ADD COLUMN instance_params TEXT NOT NULL DEFAULT ''`,
+		// Iteration A.2 — client-side writes. Populated by the new
+		// report submit path; empty for tasks submitted via the
+		// legacy coordinator-writes path.
+		`ALTER TABLE tasks ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE artifacts ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, q := range altered {
+		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("schema alter %q: %w", q, err)
+		}
+	}
+	return nil
 }
 
 // --- Projects (long-lived containers) ---
 
 // CreateProject creates a new long-lived project.
 func (s *Store) CreateProject(p *ProjectRecord) (int64, error) {
+	var remote sql.NullString
+	if p.RemoteURL != "" {
+		remote = sql.NullString{String: p.RemoteURL, Valid: true}
+	}
 	result, err := s.db.Exec(
-		`INSERT INTO projects (name, description, created_by, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		p.Name, p.Description, p.CreatedBy, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO projects (name, description, created_by, remote_url, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		p.Name, p.Description, p.CreatedBy, remote, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, err
@@ -211,53 +245,72 @@ func (s *Store) CreateProject(p *ProjectRecord) (int64, error) {
 	return result.LastInsertId()
 }
 
+// SetProjectRemoteURL updates a project's external git remote URL.
+// Passing an empty string clears the remote.
+func (s *Store) SetProjectRemoteURL(projectID int64, remoteURL string) error {
+	var remote sql.NullString
+	if remoteURL != "" {
+		remote = sql.NullString{String: remoteURL, Valid: true}
+	}
+	_, err := s.db.Exec(
+		`UPDATE projects SET remote_url = ?, updated_at = ? WHERE id = ?`,
+		remote, time.Now(), projectID,
+	)
+	return err
+}
+
+// projectSelectColumns is the canonical SELECT list for project rows,
+// kept in one place so every scanner pulls the same set in the same
+// order.
+const projectSelectColumns = `id, name, description, created_by, remote_url, created_at, updated_at`
+
+// scanProject reads one project row from a scanner into p.
+func scanProject(row interface {
+	Scan(dest ...interface{}) error
+}, p *ProjectRecord) error {
+	var desc, createdBy, remote sql.NullString
+	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		return err
+	}
+	p.Description = desc.String
+	p.CreatedBy = createdBy.String
+	p.RemoteURL = remote.String
+	return nil
+}
+
 // GetProject retrieves a project by ID.
 func (s *Store) GetProject(id int64) (*ProjectRecord, error) {
 	var p ProjectRecord
-	var desc, createdBy sql.NullString
-	err := s.db.QueryRow(
-		`SELECT id, name, description, created_by, created_at, updated_at FROM projects WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt)
+	err := scanProject(s.db.QueryRow(
+		`SELECT `+projectSelectColumns+` FROM projects WHERE id = ?`, id,
+	), &p)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	p.Description = desc.String
-	p.CreatedBy = createdBy.String
 	return &p, nil
 }
 
 // GetProjectByName retrieves a project by its unique name.
 func (s *Store) GetProjectByName(name string) (*ProjectRecord, error) {
 	var p ProjectRecord
-	var desc, createdBy sql.NullString
-	err := s.db.QueryRow(
-		`SELECT id, name, description, created_by, created_at, updated_at FROM projects WHERE name = ?`, name,
-	).Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt)
+	err := scanProject(s.db.QueryRow(
+		`SELECT `+projectSelectColumns+` FROM projects WHERE name = ?`, name,
+	), &p)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	p.Description = desc.String
-	p.CreatedBy = createdBy.String
 	return &p, nil
 }
 
 // ListProjects returns all projects.
-// DeleteProject removes a project row by ID. Used for rolling back a
-// project creation when the per-project repo init fails. This is a hard
-// delete — only safe when the project has no runs yet.
-func (s *Store) DeleteProject(id int64) error {
-	_, err := s.db.Exec(`DELETE FROM projects WHERE id = ?`, id)
-	return err
-}
-
 func (s *Store) ListProjects() ([]ProjectRecord, error) {
-	rows, err := s.db.Query(`SELECT id, name, description, created_by, created_at, updated_at FROM projects ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT ` + projectSelectColumns + ` FROM projects ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -266,12 +319,9 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 	var projects []ProjectRecord
 	for rows.Next() {
 		var p ProjectRecord
-		var desc, createdBy sql.NullString
-		if err := rows.Scan(&p.ID, &p.Name, &desc, &createdBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := scanProject(rows, &p); err != nil {
 			return nil, err
 		}
-		p.Description = desc.String
-		p.CreatedBy = createdBy.String
 		projects = append(projects, p)
 	}
 	return projects, rows.Err()
@@ -418,13 +468,15 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
+	// commit_sha is never set at create time; it's populated by the
+	// submit path. Omitting it here lets the column default ('') fire.
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.Ref, t.Action,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.CreatedAt,
@@ -439,9 +491,9 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
 	err := s.db.QueryRow(
 		`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id,
-	).Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
+	).Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &t.InstanceParams, &ref, &t.Action,
 		&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
-		&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.DependsOn,
+		&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -479,8 +531,12 @@ func (s *Store) GetTaskBySeq(runID string, seq int) (*TaskRecord, error) {
 }
 
 func (s *Store) ListTasksByRun(runID int64) ([]TaskRecord, error) {
+	// Sort by seq (assigned in a deterministic creation order) with id
+	// as a tiebreaker. Using created_at alone leaks Go's map iteration
+	// order into the output because all tasks created in a single
+	// run-creation burst share a timestamp.
 	rows, err := s.db.Query(
-		`SELECT `+taskColumns+` FROM tasks WHERE run_id = ? ORDER BY created_at`, runID,
+		`SELECT `+taskColumns+` FROM tasks WHERE run_id = ? ORDER BY seq, id`, runID,
 	)
 	if err != nil {
 		return nil, err
@@ -543,7 +599,14 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 	return tx.Commit()
 }
 
-func (s *Store) SubmitTaskResult(taskID, resultPath string, tokensUsed int64) error {
+// SubmitTaskResult records a task's accepted result — the
+// result_path (repo-relative directory the client wrote to), the
+// commit SHA that landed on the remote, and the token count.
+// Callers that don't know or care about a commit SHA (e.g. unit
+// tests that fake the git side) pass an empty string; the field
+// stays empty in the DB and the template resolver falls back to
+// the working tree instead of reading at a specific commit.
+func (s *Store) SubmitTaskResult(taskID, resultPath, commitSHA string, tokensUsed int64) error {
 	now := time.Now()
 
 	tx, err := s.db.Begin()
@@ -563,8 +626,8 @@ func (s *Store) SubmitTaskResult(taskID, resultPath string, tokensUsed int64) er
 	}
 
 	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ? WHERE id = ?`,
-		now, resultPath, taskID,
+		`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ? WHERE id = ?`,
+		now, resultPath, commitSHA, taskID,
 	)
 	if err != nil {
 		return err
@@ -717,8 +780,16 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 }
 
 func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
+	// Pull project_id once for this run — every pending task in the run
+	// belongs to the same project, and we need it to check whether any
+	// reads_artifacts have been produced yet.
+	var projectID int64
+	if err := s.db.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
+		return 0, fmt.Errorf("loading run project: %w", err)
+	}
+
 	rows, err := s.db.Query(
-		`SELECT id, depends_on FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
+		`SELECT id, depends_on, reads_artifacts FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
 	)
 	if err != nil {
 		return 0, err
@@ -726,13 +797,14 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	defer rows.Close()
 
 	type pendingTask struct {
-		id        string
-		dependsOn string
+		id             string
+		dependsOn      string
+		readsArtifacts string
 	}
 	var pending []pendingTask
 	for rows.Next() {
 		var pt pendingTask
-		if err := rows.Scan(&pt.id, &pt.dependsOn); err != nil {
+		if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts); err != nil {
 			return 0, err
 		}
 		pending = append(pending, pt)
@@ -760,23 +832,43 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 
 	count := 0
 	for _, pt := range pending {
-		if pt.dependsOn == "" {
-			_, err := s.db.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
-			if err != nil {
-				return count, err
+		allDone := true
+
+		if pt.dependsOn != "" {
+			for _, dep := range strings.Split(pt.dependsOn, ",") {
+				if !accepted[strings.TrimSpace(dep)] {
+					allDone = false
+					break
+				}
 			}
-			count++
-			continue
 		}
 
-		deps := strings.Split(pt.dependsOn, ",")
-		allDone := true
-		for _, dep := range deps {
-			if !accepted[strings.TrimSpace(dep)] {
-				allDone = false
-				break
+		// Artifact-aware gating: a task that declares reads_artifacts
+		// stays PENDING until every declared path exists in the
+		// project's artifacts index. This covers (a) fresh tasks in
+		// the run that read not-yet-written artifacts and (b) tasks
+		// in other runs that read artifacts from this one. Without
+		// this, cross-run readers land in READY immediately (the
+		// known limitation from iteration 3.2).
+		if allDone && pt.readsArtifacts != "" {
+			var paths []string
+			if err := json.Unmarshal([]byte(pt.readsArtifacts), &paths); err == nil {
+				for _, p := range paths {
+					if p == "" {
+						continue
+					}
+					a, err := s.GetArtifact(projectID, p)
+					if err != nil {
+						return count, fmt.Errorf("checking artifact %s: %w", p, err)
+					}
+					if a == nil {
+						allDone = false
+						break
+					}
+				}
 			}
 		}
+
 		if allDone {
 			_, err := s.db.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
 			if err != nil {
@@ -1003,9 +1095,9 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 		var claimedAt, submittedAt sql.NullTime
 		var claimedBy sql.NullInt64
 		var resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
-		if err := rows.Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &ref, &t.Action,
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &t.InstanceParams, &ref, &t.Action,
 			&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
-			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.DependsOn,
+			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.CreatedAt); err != nil {
 			return nil, err
@@ -1034,21 +1126,22 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 
 // UpsertArtifact records that a task wrote an artifact at the given path.
 // On first write the row is created; on subsequent writes the provenance
-// fields (last_writer, last_task_id, last_run_id, updated_at) are
-// refreshed and created_at is preserved.
+// fields (last_writer, last_task_id, last_run_id, commit_sha,
+// updated_at) are refreshed and created_at is preserved.
 func (s *Store) UpsertArtifact(a *ArtifactRecord) error {
 	if a.ProjectID == 0 || a.Path == "" {
 		return fmt.Errorf("UpsertArtifact: project_id and path are required")
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO artifacts (project_id, path, last_writer, last_task_id, last_run_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO artifacts (project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(project_id, path) DO UPDATE SET
 		   last_writer  = excluded.last_writer,
 		   last_task_id = excluded.last_task_id,
 		   last_run_id  = excluded.last_run_id,
+		   commit_sha   = excluded.commit_sha,
 		   updated_at   = excluded.updated_at`,
-		a.ProjectID, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID,
+		a.ProjectID, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA,
 		a.CreatedAt, a.UpdatedAt,
 	)
 	return err
@@ -1061,10 +1154,10 @@ func (s *Store) GetArtifact(projectID int64, path string) (*ArtifactRecord, erro
 	var lastTaskID sql.NullString
 	var lastWriter, lastRunID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT project_id, path, last_writer, last_task_id, last_run_id, created_at, updated_at
+		`SELECT project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
 		 FROM artifacts WHERE project_id = ? AND path = ?`,
 		projectID, path,
-	).Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1075,6 +1168,31 @@ func (s *Store) GetArtifact(projectID int64, path string) (*ArtifactRecord, erro
 	a.LastTaskID = lastTaskID.String
 	a.LastRunID = lastRunID.Int64
 	return &a, nil
+}
+
+// ListTasksWritingArtifact returns tasks in a project whose
+// writes_artifacts declaration contains the given path. Mirror of
+// ListTasksReadingArtifact but targeting the writer side — used by
+// the iteration A DB-only invalidation to find candidate prior
+// writers when the current artifact index pointer is being
+// invalidated.
+func (s *Store) ListTasksWritingArtifact(projectID int64, path string, acceptedOnly bool) ([]TaskRecord, error) {
+	pattern := `%"` + path + `"%`
+	query := `SELECT ` + taskColumns + ` FROM tasks
+	          WHERE writes_artifacts LIKE ?
+	            AND run_id IN (SELECT id FROM runs WHERE project_id = ?)`
+	args := []interface{}{pattern, projectID}
+	if acceptedOnly {
+		query += ` AND state = 'accepted'`
+	}
+	query += ` ORDER BY submitted_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTasks(rows)
 }
 
 // ListTasksReadingArtifact returns tasks in a project whose
@@ -1124,7 +1242,7 @@ func (s *Store) DeleteArtifact(projectID int64, path string) error {
 // path. If pathPrefix is non-empty, only artifacts whose path starts with
 // it are returned (useful for listing a directory subtree).
 func (s *Store) ListArtifactsByProject(projectID int64, pathPrefix string) ([]ArtifactRecord, error) {
-	query := `SELECT project_id, path, last_writer, last_task_id, last_run_id, created_at, updated_at
+	query := `SELECT project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
 	          FROM artifacts WHERE project_id = ?`
 	args := []interface{}{projectID}
 	if pathPrefix != "" {
@@ -1144,7 +1262,7 @@ func (s *Store) ListArtifactsByProject(projectID int64, pathPrefix string) ([]Ar
 		var a ArtifactRecord
 		var lastTaskID sql.NullString
 		var lastWriter, lastRunID sql.NullInt64
-		if err := rows.Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.LastWriter = lastWriter.Int64

@@ -31,9 +31,172 @@ func formatProjectList(data []byte) string {
 			b.WriteString(fmt.Sprintf("  — %s", desc))
 		}
 		b.WriteString("\n")
+
+		// Surface git remote + push status so silent divergence
+		// from the remote is visible ambiently. Added in iteration 6
+		// after the iteration 4 feedback flagged the silent-failure
+		// operational hazard.
+		if remote, _ := p["remote_url"].(string); remote != "" {
+			pushErr, _ := p["last_push_error"].(string)
+			lastPush, _ := p["last_push_at"].(string)
+			if pushErr != "" {
+				b.WriteString(fmt.Sprintf("      remote: %s  ⚠ last push failed: %s\n", remote, pushErr))
+				if lastPush != "" {
+					b.WriteString(fmt.Sprintf("      last attempt: %s — use enju_project_remote_status for details, enju_project_sync to retry\n", lastPush))
+				}
+			} else {
+				line := "      remote: " + remote
+				if lastPush != "" {
+					line += "  ✓ last push: " + lastPush
+				}
+				b.WriteString(line + "\n")
+			}
+		}
 	}
 	b.WriteString("\nTip: A project holds many runs over time. Use enju_list_runs to see all runs, or filter to a project.")
 	return b.String()
+}
+
+// formatProjectRemoteStatus renders the live remote-status diagnostic
+// returned by GET /projects/{id}/remote/status. Renders different
+// guidance for ahead vs diverged so the user knows whether a plain
+// sync is safe or whether force-push would be destructive.
+func formatProjectRemoteStatus(data []byte) string {
+	var r map[string]interface{}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := r["error"].(string); ok {
+		return "✗ " + errMsg
+	}
+	projectID := jsonID(r["project_id"])
+	remote, _ := r["remote_url"].(string)
+	status, _ := r["status"].(string)
+	ahead := intFromJSON(r["ahead_by"])
+	behind := intFromJSON(r["behind_by"])
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Project #%s remote status\n", projectID))
+	if remote == "" {
+		b.WriteString("  (no remote configured)\n")
+		return b.String()
+	}
+	b.WriteString("  remote:    " + remote + "\n")
+	b.WriteString("  status:    " + humanRemoteStatus(status, ahead, behind) + "\n")
+	if localHead, ok := r["local_head"].(string); ok && localHead != "" {
+		short := localHead
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		b.WriteString("  local:     " + short + "\n")
+	}
+	if remoteHead, ok := r["remote_head"].(string); ok && remoteHead != "" {
+		short := remoteHead
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		b.WriteString("  remote @:  " + short + "\n")
+	}
+	if lastPush, ok := r["last_push_at"].(string); ok && lastPush != "" {
+		b.WriteString("  last push: " + lastPush + "\n")
+	}
+	if pushErr, ok := r["last_push_error"].(string); ok && pushErr != "" {
+		b.WriteString("  ⚠ error:   " + pushErr + "\n")
+	}
+	if remoteErr, ok := r["remote_error"].(string); ok && remoteErr != "" {
+		b.WriteString("  ⚠ unreachable: " + remoteErr + "\n")
+	}
+
+	// Action guidance — spelled out so the user knows what to do
+	// next without having to interpret the status code.
+	switch status {
+	case "ahead":
+		b.WriteString("  → enju_project_sync will fast-forward the remote safely\n")
+	case "behind":
+		b.WriteString("  → nothing to push; remote is already ahead of local\n")
+	case "diverged":
+		b.WriteString("  ⚠ local and remote both have unique commits\n")
+		b.WriteString("  → fetch + merge/rebase manually, or enju_project_sync(force=true) to overwrite the remote (destructive)\n")
+	case "unrelated":
+		b.WriteString("  ⚠ local and remote share no history\n")
+		b.WriteString("  → only enju_project_sync(force=true) will succeed, and it will replace the remote\n")
+	case "remote_empty":
+		b.WriteString("  → enju_project_sync will populate the empty remote\n")
+	}
+	return b.String()
+}
+
+// formatProjectSyncResult renders the outcome of a sync attempt,
+// including the non-error "refused" and "noop" paths where the
+// server declined to push for safety reasons.
+func formatProjectSyncResult(data []byte) string {
+	var r map[string]interface{}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return string(data)
+	}
+	projectID := jsonID(r["project_id"])
+	remote, _ := r["remote_url"].(string)
+	result, _ := r["result"].(string)
+	message, _ := r["message"].(string)
+
+	switch result {
+	case "pushed":
+		return fmt.Sprintf("✓ Project #%s pushed to %s", projectID, remote)
+	case "force_pushed":
+		return fmt.Sprintf("✓ Project #%s force-pushed to %s (remote was overwritten)", projectID, remote)
+	case "noop":
+		return fmt.Sprintf("• Project #%s: %s", projectID, message)
+	case "refused":
+		return fmt.Sprintf("⚠ Project #%s refused: %s", projectID, message)
+	case "failed":
+		if errMsg, ok := r["error"].(string); ok {
+			return fmt.Sprintf("✗ Project #%s sync failed: %s", projectID, errMsg)
+		}
+		return fmt.Sprintf("✗ Project #%s sync failed", projectID)
+	}
+	// Fallback: earlier error shape from other handlers
+	if errMsg, ok := r["error"].(string); ok {
+		return "✗ " + errMsg
+	}
+	return fmt.Sprintf("Project #%s sync: %s", projectID, result)
+}
+
+// humanRemoteStatus translates the structured RemoteComparison
+// status code into a human-readable label with ahead/behind counts
+// where applicable.
+func humanRemoteStatus(code string, ahead, behind int) string {
+	switch code {
+	case "in_sync":
+		return "in sync"
+	case "ahead":
+		return fmt.Sprintf("ahead by %d commit(s) — fast-forwardable", ahead)
+	case "behind":
+		return fmt.Sprintf("behind by %d commit(s) — nothing to push", behind)
+	case "diverged":
+		return fmt.Sprintf("diverged — local ahead by %d, behind by %d", ahead, behind)
+	case "unrelated":
+		return "unrelated — local and remote share no history"
+	case "remote_empty":
+		return "remote has no refs/heads/main yet (new remote)"
+	case "local_empty":
+		return "local has no HEAD yet"
+	case "unreachable":
+		return "unreachable — ls-remote failed"
+	case "no_remote":
+		return "no remote configured"
+	default:
+		return code
+	}
+}
+
+// intFromJSON coerces a numeric JSON field (always decoded as
+// float64 by encoding/json) into an int. Returns 0 if the field is
+// missing or not a number.
+func intFromJSON(v interface{}) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
 }
 
 func formatCreateProjectResult(data []byte) string {
@@ -478,6 +641,9 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 
 	b.WriteString(fmt.Sprintf("✓ Claimed: #%d [%s]\n", int(seq), taskID))
 	b.WriteString(fmt.Sprintf("  Deadline: %s\n", deadline))
+	if iterationLabel, _ := task["iteration_label"].(string); iterationLabel != "" {
+		b.WriteString(fmt.Sprintf("  Iteration: %s\n", iterationLabel))
+	}
 	if mode == "assisted" {
 		b.WriteString("  Mode: assisted (your input will be structured by LLM)\n")
 	}
@@ -754,6 +920,54 @@ func formatArtifactDetail(data []byte) string {
 	return b.String()
 }
 
+// formatArtifactHistory renders the git commit history of one artifact.
+func formatArtifactHistory(data []byte) string {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := resp["error"].(string); ok {
+		return "✗ " + errMsg
+	}
+	path, _ := resp["path"].(string)
+	history, _ := resp["history"].([]interface{})
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("History: %s  (%d commit(s))\n", path, len(history)))
+	if len(history) == 0 {
+		b.WriteString("\n(no commits recorded for this path)\n")
+		return b.String()
+	}
+	b.WriteString("\n")
+	for i, raw := range history {
+		entry, _ := raw.(map[string]interface{})
+		hash, _ := entry["hash"].(string)
+		subject, _ := entry["subject"].(string)
+		t, _ := entry["time"].(string)
+		taskID, _ := entry["task_id"].(string)
+		owner, _ := entry["owner"].(string)
+		annotation, _ := entry["annotation"].(string)
+
+		short := hash
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		// A.5 polish: render the current-pointer / invalidated
+		// annotation inline in the header line so users can see
+		// which version is active at a glance.
+		annotationSuffix := ""
+		if annotation != "" {
+			annotationSuffix = "  [" + annotation + "]"
+		}
+		b.WriteString(fmt.Sprintf("%d. %s  %s%s\n", i+1, short, t, annotationSuffix))
+		if taskID != "" {
+			b.WriteString(fmt.Sprintf("   task %s by @%s\n", taskID, owner))
+		}
+		b.WriteString(fmt.Sprintf("   %s\n", subject))
+	}
+	return b.String()
+}
+
 func formatRunStatus(runData []byte, tasksData []byte) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
@@ -850,6 +1064,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	deps, _ := task["depends_on"].(string)
 	ref, _ := task["ref"].(string)
 	instanceKey, _ := task["instance_key"].(string)
+	iterationLabel, _ := task["iteration_label"].(string)
 	action, _ := task["action"].(string)
 
 	seq, _ := task["seq"].(float64)
@@ -858,7 +1073,9 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	b.WriteString(fmt.Sprintf("  Run:  #%s\n", runID))
 	b.WriteString(fmt.Sprintf("  Action:   %s\n", friendlyActionLabel(action)))
 	b.WriteString(fmt.Sprintf("  State:    %s\n", stateLabel(state)))
-	if instanceKey != "" {
+	if iterationLabel != "" {
+		b.WriteString(fmt.Sprintf("  Iteration: %s\n", iterationLabel))
+	} else if instanceKey != "" {
 		b.WriteString(fmt.Sprintf("  Instance: %s\n", instanceKey))
 	}
 	if ref != "" {

@@ -34,6 +34,7 @@ type ProjectRecord struct {
 	Name        string
 	Description string
 	CreatedBy   string // citizen ID
+	RemoteURL   string // optional external git remote (push target after each commit)
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -59,6 +60,13 @@ type TaskRecord struct {
 	Seq         int    // sequential number within run (1-based, for quick reference)
 	TaskDefID   string // original task ID from YAML
 	InstanceKey string // for_each key (e.g., "endometriosis"), empty if no for_each
+	// InstanceParams is a JSON-encoded map of for_each variable name ->
+	// value for this instance, e.g. `{"gene":"BRCA1","tissue":"breast"}`.
+	// Empty string for non-expanded tasks. Stored separately from
+	// InstanceKey so iteration metadata can be rendered with real
+	// variable names (gene=BRCA1) instead of reverse-parsing the slug,
+	// and so underscore-in-value collisions are harmless.
+	InstanceParams string
 	Ref         string // external reference (URL)
 	Action      string // "answer", "contribute", "compute", "review", "vote"
 	Prompt      string
@@ -73,6 +81,12 @@ type TaskRecord struct {
 	ClaimedAt   *time.Time
 	SubmittedAt *time.Time
 	ResultPath  string // path in git repo
+	// CommitSHA is the git commit that landed this task's result.
+	// Populated by the iteration A.2 client-side-writes path;
+	// empty for tasks submitted via the legacy coordinator-writes
+	// path (which uses the working tree's current state as the
+	// implicit version).
+	CommitSHA   string
 	DependsOn   string // comma-separated list of dependency full IDs
 	// ReadsArtifacts and WritesArtifacts are JSON arrays of repo-relative
 	// artifact paths (e.g., ["src/analyze.py", "data/genes.csv"]). Reads
@@ -101,6 +115,11 @@ type ArtifactRecord struct {
 	LastWriter   int64  // citizens.id of the last writer, 0 if never written
 	LastTaskID   string // fully-qualified task ID that last wrote it
 	LastRunID    int64  // run that did the last write
+	// CommitSHA is the git commit that currently holds this artifact's
+	// content. Used by the client-side template resolver (iteration
+	// A.2) to read the exact version the index points at rather than
+	// whatever happens to be in the working tree right now.
+	CommitSHA string
 	UpdatedAt    time.Time
 	CreatedAt    time.Time
 }
