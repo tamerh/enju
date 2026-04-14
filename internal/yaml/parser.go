@@ -27,6 +27,24 @@ type TaskDefaults struct {
 	Timeout string `yaml:"timeout,omitempty"` // e.g., "30m", "2h"
 }
 
+// yamlStringList accepts either a scalar or a list in YAML and exposes
+// the result as a []string. Used for fields like assign_to where
+// `assign_to: tamer` and `assign_to: [tamer, alice]` should both work.
+type yamlStringList []string
+
+func (s *yamlStringList) UnmarshalYAML(value *yamlv3.Node) error {
+	if value.Kind == yamlv3.ScalarNode {
+		*s = yamlStringList{value.Value}
+		return nil
+	}
+	var xs []string
+	if err := value.Decode(&xs); err != nil {
+		return err
+	}
+	*s = yamlStringList(xs)
+	return nil
+}
+
 // OutputSpec describes a single named output.
 // Supports two YAML formats:
 //   outputs:
@@ -75,6 +93,27 @@ type TaskDef struct {
 	Outputs      map[string]OutputSpec  `yaml:"outputs,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
 	Config       map[string]interface{} `yaml:"config,omitempty"`
+
+	// Artifact access (Phase C). Repo-relative paths under artifacts/.
+	// ReadsArtifacts can be inferred from {{artifact:path}} prompt
+	// references — the parser will merge inferred reads with any
+	// explicitly declared paths. WritesArtifacts is always explicit.
+	ReadsArtifacts  []string `yaml:"reads_artifacts,omitempty"`
+	WritesArtifacts []string `yaml:"writes_artifacts,omitempty"`
+
+	// Assignment and access control (iteration 1 of build-out plan).
+	// Both are optional — the default is open: any registered citizen
+	// can claim any task. When set, they narrow who can claim.
+	//
+	// AssignTo is a list of citizen IDs (not names). The YAML accepts
+	// either a scalar (`assign_to: 5bc8c414`) or a list
+	// (`assign_to: [5bc8c414, c2f1f36d]`) via yamlStringList.
+	//
+	// RequireRole checks the claimer's global citizens.role value
+	// ("citizen", "author", "reviewer"). Per-project roles are a
+	// Phase 2 feature that depends on project membership.
+	AssignTo    yamlStringList `yaml:"assign_to,omitempty"`
+	RequireRole string         `yaml:"require_role,omitempty"`
 }
 
 // ParsedRun is the result of parsing and validating a run file.
@@ -246,6 +285,8 @@ func build(p *Run) (*ParsedRun, error) {
 			if ti.Requirements == nil {
 				ti.Requirements = p.Requirements
 			}
+			// Merge inferred {{artifact:path}} reads with explicit declarations.
+			ti.ReadsArtifacts = template.MergeArtifactReads(taskDef.ReadsArtifacts, taskDef.Prompt)
 
 			taskInstances = append(taskInstances, ti)
 

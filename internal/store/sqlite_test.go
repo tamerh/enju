@@ -1,9 +1,56 @@
 package store
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestValidateUsername(t *testing.T) {
+	good := []string{"a", "tamer", "tamer-gur", "octocat-42", "x1", strings.Repeat("a", 39)}
+	for _, u := range good {
+		if err := ValidateUsername(u); err != nil {
+			t.Errorf("expected %q to validate, got %v", u, err)
+		}
+	}
+
+	bad := []string{
+		"",                       // empty
+		"-leading",               // leading hyphen
+		"trailing-",              // trailing hyphen
+		"With-Caps",              // uppercase
+		"spaces in it",           // spaces
+		"under_score",            // underscore
+		"dot.ed",                 // dot
+		strings.Repeat("a", 40),  // too long
+	}
+	for _, u := range bad {
+		if err := ValidateUsername(u); err == nil {
+			t.Errorf("expected %q to fail validation, got nil", u)
+		}
+	}
+}
+
+func TestSlugifyName(t *testing.T) {
+	cases := map[string]string{
+		"alice":              "alice",
+		"Alice":              "alice",
+		"Tamer Gur":          "tamer-gur",
+		"  weird  spacing  ": "weird-spacing",
+		"mixed_ _ underscores":  "mixed-underscores",
+		"with.dots.here":     "with-dots-here",
+		"UPPER CASE":         "upper-case",
+		"trailing-":          "trailing",
+		"---leading---":      "leading",
+		"":                   "",
+		"!!!":                "",
+	}
+	for in, want := range cases {
+		if got := SlugifyName(in); got != want {
+			t.Errorf("SlugifyName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -47,6 +94,24 @@ func createTestRun(t *testing.T, s *Store) int64 {
 	return id
 }
 
+// createTestCitizen creates a citizen with the given username and a
+// unique token, returning the generated int64 primary key.
+func createTestCitizen(t *testing.T, s *Store, username, token string) int64 {
+	t.Helper()
+	now := time.Now()
+	id, err := s.CreateCitizen(&CitizenRecord{
+		Username:     username,
+		Name:         username,
+		Token:        token,
+		RegisteredAt: now,
+		LastSeen:     now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func TestCreateAndGetRun(t *testing.T) {
 	s := newTestStore(t)
 	pid := createTestRun(t, s)
@@ -74,13 +139,11 @@ func TestCreateAndClaimTask(t *testing.T) {
 		State: TaskReady, CreatedAt: now,
 	})
 
-	s.CreateCitizen(&CitizenRecord{
-		ID: "user-1", Name: "alice", Token: "tok-123",
-		RegisteredAt: now, LastSeen: now,
-	})
+	alice := createTestCitizen(t, s, "alice", "tok-123")
+	bob := createTestCitizen(t, s, "bob", "tok-456")
 
 	deadline := now.Add(30 * time.Minute)
-	err := s.ClaimTask("task-1", "user-1", deadline)
+	err := s.ClaimTask("task-1", alice, deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,12 +155,12 @@ func TestCreateAndClaimTask(t *testing.T) {
 	if task.State != TaskClaimed {
 		t.Fatalf("expected claimed, got %s", task.State)
 	}
-	if task.ClaimedBy != "user-1" {
-		t.Fatalf("expected claimed by user-1, got %q", task.ClaimedBy)
+	if task.ClaimedBy != alice {
+		t.Fatalf("expected claimed by %d, got %d", alice, task.ClaimedBy)
 	}
 
 	// Can't claim again
-	err = s.ClaimTask("task-1", "user-2", deadline)
+	err = s.ClaimTask("task-1", bob, deadline)
 	if err == nil {
 		t.Fatal("expected error claiming already claimed task")
 	}
@@ -113,12 +176,9 @@ func TestSubmitResult(t *testing.T) {
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
-	s.CreateCitizen(&CitizenRecord{
-		ID: "user-1", Name: "alice", Token: "tok-123",
-		RegisteredAt: now, LastSeen: now,
-	})
+	alice := createTestCitizen(t, s, "alice", "tok-123")
 
-	s.ClaimTask("task-1", "user-1", now.Add(30*time.Minute))
+	s.ClaimTask("task-1", alice, now.Add(30*time.Minute))
 
 	err := s.SubmitTaskResult("task-1", "results/step1", 1500)
 	if err != nil {
@@ -158,10 +218,7 @@ func TestUpdateReadyTasks(t *testing.T) {
 		State: TaskPending, DependsOn: "a,b", CreatedAt: now,
 	})
 
-	s.CreateCitizen(&CitizenRecord{
-		ID: "user-1", Name: "alice", Token: "tok-123",
-		RegisteredAt: now, LastSeen: now,
-	})
+	alice := createTestCitizen(t, s, "alice", "tok-123")
 
 	// Nothing accepted — no tasks should become ready
 	count, err := s.UpdateReadyTasks(pid)
@@ -173,7 +230,7 @@ func TestUpdateReadyTasks(t *testing.T) {
 	}
 
 	// Accept a → b should become ready, c still pending
-	s.ClaimTask("a", "user-1", now.Add(30*time.Minute))
+	s.ClaimTask("a", alice, now.Add(30*time.Minute))
 	s.SubmitTaskResult("a", "results/a", 100)
 
 	count, err = s.UpdateReadyTasks(pid)
@@ -205,14 +262,11 @@ func TestReleaseTask(t *testing.T) {
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
-	s.CreateCitizen(&CitizenRecord{
-		ID: "user-1", Name: "alice", Token: "tok-123",
-		RegisteredAt: now, LastSeen: now,
-	})
+	alice := createTestCitizen(t, s, "alice", "tok-123")
 
-	s.ClaimTask("task-1", "user-1", now.Add(30*time.Minute))
+	s.ClaimTask("task-1", alice, now.Add(30*time.Minute))
 
-	err := s.ReleaseTask("task-1", "user-1")
+	err := s.ReleaseTask("task-1", alice)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +282,8 @@ func TestInvalidateTask(t *testing.T) {
 	pid := createTestRun(t, s)
 	now := time.Now()
 
+	// Three accepted tasks with descendants a → b → c (modeled via
+	// the descendantIDs argument rather than a real DAG).
 	for i, id := range []string{"a", "b", "c"} {
 		s.CreateTask(&TaskRecord{
 			ID: id, RunID: pid, Seq: i + 1, TaskDefID: id,
@@ -236,18 +292,101 @@ func TestInvalidateTask(t *testing.T) {
 		})
 	}
 
-	err := s.InvalidateTask("a", []string{"b", "c"})
+	changed, err := s.InvalidateTask("a", []string{"b", "c"})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	taskA, _ := s.GetTask("a")
-	if taskA.State != TaskInvalid {
-		t.Fatalf("expected a invalid, got %s", taskA.State)
+	// 1 target + 2 descendants = 3
+	if changed != 3 {
+		t.Fatalf("expected 3 tasks changed, got %d", changed)
 	}
 
-	taskB, _ := s.GetTask("b")
-	if taskB.State != TaskInvalidated {
-		t.Fatalf("expected b invalidated, got %s", taskB.State)
+	// Target transitions ACCEPTED → READY (not INVALID). It's ready to
+	// re-claim now that the bad result is invalidated.
+	taskA, _ := s.GetTask("a")
+	if taskA.State != TaskReady {
+		t.Fatalf("expected a to be READY after invalidation, got %s", taskA.State)
+	}
+
+	// Descendants transition ACCEPTED → PENDING, waiting for a to
+	// re-complete. They'll be promoted back to READY by
+	// UpdateReadyTasks once a is re-accepted.
+	for _, id := range []string{"b", "c"} {
+		task, _ := s.GetTask(id)
+		if task.State != TaskPending {
+			t.Fatalf("expected %s to be PENDING after cascade, got %s", id, task.State)
+		}
+	}
+}
+
+// TestInvalidateTaskRejectsNonAcceptedTarget verifies you can't
+// invalidate a task that isn't in the ACCEPTED state.
+func TestInvalidateTaskRejectsNonAcceptedTarget(t *testing.T) {
+	s := newTestStore(t)
+	pid := createTestRun(t, s)
+	now := time.Now()
+
+	s.CreateTask(&TaskRecord{
+		ID: "p", RunID: pid, Seq: 1, TaskDefID: "p",
+		Action: "answer", ResultType: "text",
+		State: TaskPending, CreatedAt: now,
+	})
+
+	_, err := s.InvalidateTask("p", nil)
+	if err == nil {
+		t.Fatal("expected error invalidating pending task, got nil")
+	}
+}
+
+// TestInvalidateTaskClearsClaims verifies that a cascade wipes claim
+// fields on both the target and any descendants that were
+// claimed/running when the cascade happened.
+func TestInvalidateTaskClearsClaims(t *testing.T) {
+	s := newTestStore(t)
+	pid := createTestRun(t, s)
+	now := time.Now()
+
+	alice := createTestCitizen(t, s, "alice", "tok-a")
+
+	// Target is accepted by alice.
+	acceptedAt := now
+	s.CreateTask(&TaskRecord{
+		ID: "target", RunID: pid, Seq: 1, TaskDefID: "target",
+		Action: "answer", ResultType: "text",
+		State:       TaskAccepted,
+		ClaimedBy:   alice,
+		ClaimedAt:   &acceptedAt,
+		SubmittedAt: &acceptedAt,
+		ResultPath:  "runs/1/target",
+		CreatedAt:   now,
+	})
+	// Descendant is currently claimed by alice (in-progress).
+	s.CreateTask(&TaskRecord{
+		ID: "descendant", RunID: pid, Seq: 2, TaskDefID: "descendant",
+		Action: "answer", ResultType: "text",
+		State:     TaskClaimed,
+		ClaimedBy: alice,
+		ClaimedAt: &acceptedAt,
+		CreatedAt: now,
+	})
+
+	if _, err := s.InvalidateTask("target", []string{"descendant"}); err != nil {
+		t.Fatal(err)
+	}
+
+	target, _ := s.GetTask("target")
+	if target.State != TaskReady {
+		t.Fatalf("expected target READY, got %s", target.State)
+	}
+	if target.ClaimedBy != 0 || target.ClaimedAt != nil || target.ResultPath != "" {
+		t.Fatalf("expected target claim fields cleared, got %+v", target)
+	}
+
+	desc, _ := s.GetTask("descendant")
+	if desc.State != TaskPending {
+		t.Fatalf("expected descendant PENDING, got %s", desc.State)
+	}
+	if desc.ClaimedBy != 0 || desc.ClaimedAt != nil {
+		t.Fatalf("expected descendant claim fields cleared, got %+v", desc)
 	}
 }

@@ -1,0 +1,19 @@
+name: "Artifact write/read run"
+version: 1
+tasks:
+  - id: bootstrap
+    action: answer
+    writes_artifacts:
+      - src/hello.py
+    prompt: |
+      Write a tiny Python hello-world script. Describe what you wrote.
+
+  - id: refactor
+    action: answer
+    writes_artifacts:
+      - src/hello.py
+    prompt: |
+      Current code:
+      {{artifact:src/hello.py}}
+
+      Refactor for clarity, then explain what changed.

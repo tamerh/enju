@@ -69,17 +69,52 @@ type TaskRecord struct {
 	ResultType   string
 	Timeout     string
 	State       TaskState
-	ClaimedBy   string
+	ClaimedBy   int64 // citizens.id, 0 if unclaimed
 	ClaimedAt   *time.Time
 	SubmittedAt *time.Time
 	ResultPath  string // path in git repo
 	DependsOn   string // comma-separated list of dependency full IDs
-	CreatedAt   time.Time
+	// ReadsArtifacts and WritesArtifacts are JSON arrays of repo-relative
+	// artifact paths (e.g., ["src/analyze.py", "data/genes.csv"]). Reads
+	// can be inferred from {{artifact:path}} prompt references; writes
+	// must be declared explicitly.
+	ReadsArtifacts  string
+	WritesArtifacts string
+
+	// Assignment and access control. Both optional — the default is
+	// open: any registered citizen can claim. When set they narrow who
+	// can claim. AssignTo is a JSON array of citizen IDs; RequireRole
+	// is a role name checked against citizens.role. See
+	// docs/task-assignment.md.
+	AssignTo    string
+	RequireRole string
+
+	CreatedAt time.Time
+}
+
+// ArtifactRecord is the index row for one mutable file inside a project's
+// repository. The file content itself lives only in git — this record
+// just tracks who wrote it last and when, for provenance and listings.
+type ArtifactRecord struct {
+	ProjectID    int64
+	Path         string // repo-relative path under artifacts/
+	LastWriter   int64  // citizens.id of the last writer, 0 if never written
+	LastTaskID   string // fully-qualified task ID that last wrote it
+	LastRunID    int64  // run that did the last write
+	UpdatedAt    time.Time
+	CreatedAt    time.Time
 }
 
 // CitizenRecord is a citizen stored in the database.
+//
+// Identity is a three-layer model:
+//   - ID: internal integer primary key, never surfaced in user-facing output
+//   - Username: immutable handle shown everywhere (assign_to, errors,
+//     provenance). GitHub-compatible regex, unique.
+//   - Name: freely mutable display name ("Tamer Gur"), used in greetings.
 type CitizenRecord struct {
-	ID              string
+	ID              int64
+	Username        string
 	Name            string
 	Email           string
 	Role            string // "citizen", "author", "reviewer"
@@ -98,9 +133,13 @@ type CitizenRecord struct {
 type TaskClaimRecord struct {
 	ID            int64
 	TaskID        string
-	CitizenID string
+	CitizenID     int64
 	ClaimedAt     time.Time
 	Deadline      time.Time
 	Outcome       string // "completed", "timed_out", "released", "rejected"
 	SubmittedAt   *time.Time
 }
+
+// ArtifactRecord is the index row for one mutable file inside a project's
+// repository. The file content itself lives only in git — this record
+// just tracks who wrote it last and when, for provenance and listings.

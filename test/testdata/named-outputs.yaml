@@ -1,0 +1,22 @@
+name: "Named Outputs Test"
+version: 1
+tasks:
+  - id: gene_analysis
+    action: answer
+    prompt: "Analyze genes and produce structured output"
+    outputs:
+      gene_list: "List of identified genes"
+      pathways: "Pathway associations"
+      stats: "Statistical summary"
+
+  - id: drug_targets
+    action: answer
+    prompt: |
+      Find drug targets using just the gene list:
+      {{gene_analysis.gene_list}}
+
+  - id: pathway_viz
+    action: answer
+    prompt: |
+      Visualize using pathways:
+      {{gene_analysis.pathways}}

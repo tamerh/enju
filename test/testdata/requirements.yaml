@@ -1,0 +1,30 @@
+name: "Requirements Test"
+version: 1
+
+# Project-level requirements — inherited by tasks that don't override
+requirements:
+  tools:
+    python: ">=3.10"
+  packages:
+    python:
+      - pandas
+      - biopython
+
+tasks:
+  - id: simple_task
+    action: answer
+    prompt: "A task that inherits project requirements"
+
+  - id: custom_task
+    action: answer
+    prompt: "A task with its own requirements"
+    requirements:
+      tools:
+        node: ">=20"
+      mcp_servers:
+        - chembl
+
+  - id: no_reqs_task
+    action: answer
+    prompt: "A task that opts out of project requirements"
+    requirements: {}

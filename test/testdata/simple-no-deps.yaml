@@ -1,0 +1,9 @@
+name: "Simple No Dependencies"
+version: 1
+tasks:
+  - id: task_a
+    action: answer
+    prompt: "List 3 colors."
+  - id: task_b
+    action: answer
+    prompt: "List 3 animals."

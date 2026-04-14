@@ -3,20 +3,27 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	enjuGit "github.com/enju-ai/enju/internal/git"
+	"github.com/enju-ai/enju/internal/store"
 )
 
-// resultDir constructs the directory path for a task's result files.
-// runIDPath is the path segment — for hierarchical storage it's "projectID/runSeq".
-func resultDir(runIDPath, instanceKey, taskDefID string) string {
+// resultDir constructs the repo-relative directory path for a task's
+// result files. The returned path is relative to the project's git repo
+// root (which the caller already has via the per-project Writer).
+//
+// Layout:
+//   runs/{runSeq}/{taskDefID}/                     (no for_each)
+//   runs/{runSeq}/{instanceKey}/{taskDefID}/       (with for_each)
+func resultDir(runSeq int, instanceKey, taskDefID string) string {
+	base := filepath.Join("runs", fmt.Sprintf("%d", runSeq))
 	if instanceKey != "" {
-		return filepath.Join("projects", runIDPath, instanceKey, taskDefID)
+		return filepath.Join(base, instanceKey, taskDefID)
 	}
-	return filepath.Join("projects", runIDPath, taskDefID)
+	return filepath.Join(base, taskDefID)
 }
 
 // contentExtension returns the file extension based on result type.
@@ -30,9 +37,10 @@ func contentExtension(resultType string) string {
 }
 
 // writeResult writes the content and metadata as separate files.
-// Returns the result directory path (stored in DB as result_path).
-func writeResult(gw *enjuGit.Writer, runID, instanceKey, taskDefID string, content string, resultType string, metadata map[string]interface{}) (string, error) {
-	dir := resultDir(runID, instanceKey, taskDefID)
+// Returns the repo-relative result directory path (stored in DB as result_path).
+// gw must be the writer for the project that owns the run.
+func writeResult(gw *enjuGit.Writer, runSeq int, instanceKey, taskDefID string, content string, resultType string, metadata map[string]interface{}) (string, error) {
+	dir := resultDir(runSeq, instanceKey, taskDefID)
 
 	// Write content file — raw, no JSON wrapping, no escaping
 	ext := contentExtension(resultType)
@@ -56,9 +64,9 @@ func writeResult(gw *enjuGit.Writer, runID, instanceKey, taskDefID string, conte
 
 // writeMultiFileResult writes named outputs as separate files based on the output schema.
 // Each output name → file is declared in the schema; the values map contains the content.
-// Returns the result directory path.
-func writeMultiFileResult(gw *enjuGit.Writer, runID, instanceKey, taskDefID string, schema map[string]outputFileSpec, values map[string]string, metadata map[string]interface{}) (string, error) {
-	dir := resultDir(runID, instanceKey, taskDefID)
+// Returns the repo-relative result directory path.
+func writeMultiFileResult(gw *enjuGit.Writer, runSeq int, instanceKey, taskDefID string, schema map[string]outputFileSpec, values map[string]string, metadata map[string]interface{}) (string, error) {
+	dir := resultDir(runSeq, instanceKey, taskDefID)
 
 	fileIndex := map[string]string{} // output name -> file path
 
@@ -179,29 +187,250 @@ func isJSON(s string) bool {
 		(strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]"))
 }
 
-// Legacy functions kept for compatibility — remove after full migration
-func buildResultPath(runID, instanceKey, taskDefID string) string {
-	return resultDir(runID, instanceKey, taskDefID)
+// --- Artifact helpers (Phase C) ---
+
+// artifactDirPrefix is the directory inside each project repo that holds
+// all artifacts. Authors write paths relative to this prefix (e.g.
+// "src/analyze.py") and the system prepends the prefix when touching the
+// disk.
+const artifactDirPrefix = "artifacts"
+
+// validateArtifactPath enforces the rules from the Phase C plan:
+//   - non-empty
+//   - relative (no leading slash)
+//   - no .. traversal
+//   - no .git escape hatch
+//   - valid UTF-8 (always true for Go strings, but checked for clarity)
+//   - doesn't end with /
+//
+// Path is the user-facing form (without the "artifacts/" prefix).
+func validateArtifactPath(p string) error {
+	if p == "" {
+		return fmt.Errorf("path is empty")
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("path must be relative")
+	}
+	if strings.HasSuffix(p, "/") {
+		return fmt.Errorf("path must not end with /")
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	if cleaned != p {
+		return fmt.Errorf("path is not in canonical form (got %q, want %q)", p, cleaned)
+	}
+	if strings.HasPrefix(cleaned, "../") || cleaned == ".." || strings.Contains(cleaned, "/../") {
+		return fmt.Errorf("path traversal not allowed")
+	}
+	if cleaned == ".git" || strings.HasPrefix(cleaned, ".git/") {
+		return fmt.Errorf(".git is reserved")
+	}
+	return nil
 }
 
-func readResultFile(gitDir, resultPath string) (map[string]interface{}, error) {
-	// Try new format (directory with result.md + metadata.json)
-	contentPath := filepath.Join(gitDir, resultPath, "result.md")
-	if data, err := os.ReadFile(contentPath); err == nil {
-		return map[string]interface{}{
-			"content": string(data),
-		}, nil
-	}
+// artifactRepoPath returns the repo-relative path (under artifacts/) for
+// a user-facing artifact path. The caller has already validated `p`.
+func artifactRepoPath(p string) string {
+	return filepath.Join(artifactDirPrefix, p)
+}
 
-	// Fall back to old format (single .json file)
-	fullPath := filepath.Join(gitDir, resultPath)
-	data, err := os.ReadFile(fullPath)
+// readArtifact reads the current content of an artifact from a project's
+// git repo. Returns (content, true) if found, ("", false) if missing.
+func readArtifact(gw *enjuGit.Writer, p string) (string, bool, error) {
+	data, err := gw.ReadFile(artifactRepoPath(p))
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", fullPath, err)
+		// Distinguish "missing" from "real error" — for now, treat any
+		// read error as missing. The git package returns an os error
+		// either way and we don't have a typed not-found.
+		return "", false, nil
 	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("parsing: %w", err)
+	return string(data), true, nil
+}
+
+// writeArtifact writes new content for an artifact via the per-project
+// git writer. The caller MUST hold the writer's lock.
+func writeArtifact(gw *enjuGit.Writer, p string, content []byte) error {
+	return gw.WriteFile(artifactRepoPath(p), content)
+}
+
+// marshalStringSlice serializes a []string for storage in a TEXT column.
+// Empty/nil slices become "" (so the DEFAULT '' constraint holds).
+func marshalStringSlice(xs []string) string {
+	if len(xs) == 0 {
+		return ""
 	}
-	return result, nil
+	b, err := json.Marshal(xs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// unmarshalStringSlice parses the storage form back to a slice. An empty
+// string yields nil (no entries).
+func unmarshalStringSlice(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var xs []string
+	if err := json.Unmarshal([]byte(s), &xs); err != nil {
+		return nil
+	}
+	return xs
+}
+
+// --- Artifact rollback on invalidation ---
+//
+// When a task with writes_artifacts is invalidated, the artifact
+// content on disk still reflects what that task wrote. Without a
+// rollback step, the re-claimed task would see its own (invalidated)
+// output in its reads_artifacts, which breaks re-runnability.
+//
+// The fix walks git history for each artifact path, finds the most
+// recent commit by a task that is NOT in the invalidated set, and
+// restores the file to that state. If no prior writer exists, the
+// file is deleted. The rollback is committed as one git commit
+// before the DB state transition runs.
+
+// commitTaskSubjectRe matches the subject line of commits we generate
+// for task submissions. The format is:
+//
+//     Task {taskID} by @{username}: result (+ N artifact(s))
+//
+// See handleSubmitResult for the source of truth on the commit format.
+var commitTaskSubjectRe = regexp.MustCompile(`^Task (\S+) by @(\S+):`)
+
+// parseTaskCommitMessage extracts the task ID and username from a
+// commit message subject. Returns empty strings if the commit wasn't
+// produced by a task submission (e.g., the initial project README
+// commit, or a rollback commit).
+func parseTaskCommitMessage(msg string) (taskID, username string) {
+	// Take only the first line of the message.
+	if idx := strings.Index(msg, "\n"); idx >= 0 {
+		msg = msg[:idx]
+	}
+	m := commitTaskSubjectRe.FindStringSubmatch(msg)
+	if m == nil {
+		return "", ""
+	}
+	return m[1], m[2]
+}
+
+// artifactRollback describes a single path's rollback outcome. Used to
+// update the artifacts index after the git-level restore.
+type artifactRollback struct {
+	Path          string // user-facing artifact path (no "artifacts/" prefix)
+	Deleted       bool   // true if no prior writer was found — file removed
+	RestoredHash  string // git commit SHA we restored from (if !Deleted)
+	RestoredTask  string // fully-qualified task ID of the restored commit
+	RestoredOwner string // username of the restored commit's author (from message)
+}
+
+// rollbackArtifactsForInvalidation walks git history for each artifact
+// path in `paths` and restores it to the most recent version written
+// by a task that is:
+//
+//   (a) NOT in `invalidatedTaskIDs` (the tasks being invalidated right
+//       now), AND
+//   (b) currently in ACCEPTED state in the DB.
+//
+// The second check matters because a task that was invalidated in a
+// previous round is now in READY state — its committed version of the
+// file is a ghost revision and must not be used as a rollback target.
+// This bug surfaced during iteration 3.1 poke testing.
+//
+// If no valid rollback target exists for a path, the file is deleted
+// from the working tree.
+//
+// The caller MUST hold the per-project writer lock and is responsible
+// for committing the resulting changes.
+func rollbackArtifactsForInvalidation(
+	gw *enjuGit.Writer,
+	st *store.Store,
+	invalidatedTaskIDs map[string]bool,
+	paths []string,
+) ([]artifactRollback, error) {
+	out := make([]artifactRollback, 0, len(paths))
+	for _, path := range paths {
+		repoPath := artifactRepoPath(path)
+		history, err := gw.LogFile(repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading git log for %s: %w", path, err)
+		}
+
+		// Find the first commit whose author task is:
+		//  - parseable (skip rollback commits and the initial README)
+		//  - not in the invalidated-right-now set
+		//  - currently ACCEPTED in the DB (skip previously-invalidated
+		//    tasks still in READY)
+		var (
+			restoreHash  string
+			restoreTask  string
+			restoreOwner string
+		)
+		for _, c := range history {
+			taskID, owner := parseTaskCommitMessage(c.Message)
+			if taskID == "" {
+				continue
+			}
+			if invalidatedTaskIDs[taskID] {
+				continue
+			}
+			t, err := st.GetTask(taskID)
+			if err != nil || t == nil {
+				continue
+			}
+			if t.State != store.TaskAccepted {
+				// Previously invalidated, currently re-running, or in
+				// any other non-accepted state — this commit is a
+				// ghost revision from the walker's perspective.
+				continue
+			}
+			restoreHash = c.Hash
+			restoreTask = taskID
+			restoreOwner = owner
+			break
+		}
+
+		if restoreHash == "" {
+			// No prior writer found. The invalidated task created this
+			// artifact; roll back by deleting it.
+			if err := gw.RemoveFile(repoPath); err != nil {
+				return nil, fmt.Errorf("deleting %s: %w", path, err)
+			}
+			out = append(out, artifactRollback{
+				Path:    path,
+				Deleted: true,
+			})
+			continue
+		}
+
+		// Restore the file to its state at the earlier commit.
+		content, exists, err := gw.ReadFileAtCommit(restoreHash, repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s at %s: %w", path, restoreHash, err)
+		}
+		if !exists {
+			// Defensive: LogFile returned a commit but the file wasn't
+			// in its tree. Shouldn't happen — treat as delete.
+			if err := gw.RemoveFile(repoPath); err != nil {
+				return nil, fmt.Errorf("deleting %s: %w", path, err)
+			}
+			out = append(out, artifactRollback{
+				Path:    path,
+				Deleted: true,
+			})
+			continue
+		}
+
+		if err := gw.WriteFile(repoPath, content); err != nil {
+			return nil, fmt.Errorf("restoring %s: %w", path, err)
+		}
+		out = append(out, artifactRollback{
+			Path:          path,
+			RestoredHash:  restoreHash,
+			RestoredTask:  restoreTask,
+			RestoredOwner: restoreOwner,
+		})
+	}
+	return out, nil
 }

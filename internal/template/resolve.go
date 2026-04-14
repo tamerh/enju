@@ -1,8 +1,9 @@
 // Package template handles prompt template parsing and resolution.
 // Templates use {{variable}} syntax:
-//   - {{param_name}}         — for_each parameter, resolved at creation time
-//   - {{task_id.content}}    — upstream task result, resolved at claim time
-//   - {{task_id.field_name}} — upstream task named output, resolved at claim time
+//   - {{param_name}}            — for_each parameter, resolved at creation time
+//   - {{task_id.content}}       — upstream task result, resolved at claim time
+//   - {{task_id.field_name}}    — upstream task named output, resolved at claim time
+//   - {{artifact:path/to/file}} — current state of a project artifact, resolved at claim time
 package template
 
 import (
@@ -13,6 +14,10 @@ import (
 
 // Reference pattern: {{word.word}} or {{word}}
 var refPattern = regexp.MustCompile(`\{\{(\w+)(?:\.(\w+))?\}\}`)
+
+// Artifact reference pattern: {{artifact:path/to/file}}
+// The path can contain alphanumerics, slashes, dots, hyphens and underscores.
+var artifactRefPattern = regexp.MustCompile(`\{\{artifact:([A-Za-z0-9_./\-]+)\}\}`)
 
 // Reference represents a parsed template reference.
 type Reference struct {
@@ -213,4 +218,63 @@ func ListParams(prompt string) []string {
 		}
 	}
 	return params
+}
+
+// --- Artifact references ---
+
+// InferArtifactReads extracts the unique artifact paths referenced via
+// {{artifact:path}} in a prompt. These become implicit reads_artifacts
+// declarations on the task.
+func InferArtifactReads(prompt string) []string {
+	matches := artifactRefPattern.FindAllStringSubmatch(prompt, -1)
+	seen := make(map[string]bool)
+	var paths []string
+	for _, m := range matches {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			paths = append(paths, m[1])
+		}
+	}
+	return paths
+}
+
+// MergeArtifactReads combines explicitly declared reads_artifacts with
+// paths inferred from {{artifact:path}} references in the prompt.
+// Order: explicit first (preserved), then inferred extras.
+func MergeArtifactReads(explicit []string, prompt string) []string {
+	inferred := InferArtifactReads(prompt)
+
+	seen := make(map[string]bool)
+	var merged []string
+
+	for _, p := range explicit {
+		if !seen[p] {
+			seen[p] = true
+			merged = append(merged, p)
+		}
+	}
+	for _, p := range inferred {
+		if !seen[p] {
+			seen[p] = true
+			merged = append(merged, p)
+		}
+	}
+	return merged
+}
+
+// ResolveArtifacts replaces {{artifact:path}} references with the
+// corresponding artifact contents. Paths not found in the map are left
+// as-is so the caller can detect unresolved references.
+func ResolveArtifacts(prompt string, artifacts map[string]string) string {
+	return artifactRefPattern.ReplaceAllStringFunc(prompt, func(match string) string {
+		sub := artifactRefPattern.FindStringSubmatch(match)
+		if sub == nil {
+			return match
+		}
+		path := sub[1]
+		if content, ok := artifacts[path]; ok {
+			return content
+		}
+		return match
+	})
 }

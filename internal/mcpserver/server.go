@@ -18,8 +18,8 @@ import (
 // Config holds the MCP server configuration.
 type Config struct {
 	CoordinatorURL string
-	CitizenID  string
-	CitizenName string
+	Username       string // citizen's username (stable handle)
+	CitizenName    string // display name, for greetings
 }
 
 // New creates and configures the MCP server with all Enju tools.
@@ -31,9 +31,9 @@ func New(cfg Config) *server.MCPServer {
 	)
 
 	client := &apiClient{
-		baseURL:       cfg.CoordinatorURL,
-		citizenID: cfg.CitizenID,
-		httpClient:    &http.Client{},
+		baseURL:    cfg.CoordinatorURL,
+		username:   cfg.Username,
+		httpClient: &http.Client{},
 	}
 
 	// Register tools
@@ -50,6 +50,10 @@ func New(cfg Config) *server.MCPServer {
 	s.AddTool(toolUpdateProfile(), client.handleUpdateProfile)
 	s.AddTool(toolListProjects(), client.handleListProjects)
 	s.AddTool(toolCreateProject(), client.handleCreateProject)
+	s.AddTool(toolListArtifacts(), client.handleListArtifacts)
+	s.AddTool(toolGetArtifact(), client.handleGetArtifact)
+	s.AddTool(toolMyProfile(), client.handleMyProfile)
+	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
 
 	return s
 }
@@ -57,9 +61,9 @@ func New(cfg Config) *server.MCPServer {
 // --- API Client ---
 
 type apiClient struct {
-	baseURL       string
-	citizenID string
-	httpClient    *http.Client
+	baseURL    string
+	username   string // caller's citizen username
+	httpClient *http.Client
 }
 
 func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {
@@ -159,8 +163,9 @@ func toolSubmitResult() mcp.Tool {
 		mcp.WithDescription(`Submit a result for a claimed task. The task must be claimed by you first.
 
 For simple tasks: provide 'content' as a string.
-For tasks with named outputs: provide 'outputs' as a JSON object mapping output names to their values.
-The task detail shows which format to use (check the 'outputs' schema in the task).`),
+For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
+For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
+The task detail shows the schema (outputs and writes_artifacts) so you know what's expected.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task"),
@@ -170,6 +175,36 @@ The task detail shows which format to use (check the 'outputs' schema in the tas
 		),
 		mcp.WithString("outputs_json",
 			mcp.Description(`For tasks with named outputs: a JSON string of the outputs object. Example: '{"gene_list": "BRCA1, TP53", "pathways": "KEGG:hsa04110"}'`),
+		),
+		mcp.WithString("artifacts_json",
+			mcp.Description(`For tasks with writes_artifacts: a JSON string mapping each artifact path to its new content. Example: '{"src/analyze.py": "def analyze():\n    pass\n"}'. Paths must be in the task's writes_artifacts list.`),
+		),
+	)
+}
+
+func toolListArtifacts() mcp.Tool {
+	return mcp.NewTool("enju_list_artifacts",
+		mcp.WithDescription("List artifacts in a project's repository. Artifacts are mutable project-scoped files (source code, datasets, templates, docs) shared across all runs in the project."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to list artifacts from"),
+		),
+		mcp.WithString("prefix",
+			mcp.Description("Optional path prefix filter (e.g., 'src/' or 'data/')"),
+		),
+	)
+}
+
+func toolGetArtifact() mcp.Tool {
+	return mcp.NewTool("enju_get_artifact",
+		mcp.WithDescription("Read the current content of an artifact in a project's repository, plus its provenance (who last wrote it, in which task and run)."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project the artifact belongs to"),
+		),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("The artifact path relative to the artifacts/ directory (e.g., 'src/analyze.py')"),
 		),
 	)
 }
@@ -276,6 +311,29 @@ func toolMyDashboard() mcp.Tool {
 	)
 }
 
+func toolMyProfile() mcp.Tool {
+	return mcp.NewTool("enju_my_profile",
+		mcp.WithDescription("Show your own citizen profile — username (the stable handle used in assign_to and everywhere user-facing), display name, email, and role. Use this to confirm your handle before asking someone to put you in assign_to."),
+	)
+}
+
+func toolInvalidateTask() mcp.Tool {
+	return mcp.NewTool("enju_invalidate_task",
+		mcp.WithDescription(`Mark an accepted task as invalid because its result turned out to be wrong. Cascades to all downstream dependents — they transition back to PENDING and wait for the target to re-complete. The target itself goes back to READY so any citizen can re-claim and re-run it.
+
+Git history preserves the previous result; the new one overwrites it when submitted.
+
+Only tasks in the 'accepted' state can be invalidated. Use this when you notice a task produced a bad result after the fact (hallucination, wrong data, missing piece).`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The fully-qualified ID of the task to invalidate"),
+		),
+		mcp.WithString("reason",
+			mcp.Description("Short explanation for the invalidation — shown in logs and the response"),
+		),
+	)
+}
+
 // --- Tool Handlers ---
 
 func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -285,7 +343,7 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 	}
 	email := req.GetString("email", "")
 
-	data, err := c.put(ctx, "/api/v1/citizens/"+c.citizenID+"/profile", map[string]string{
+	data, err := c.put(ctx, "/api/v1/citizens/by-username/"+c.username+"/profile", map[string]string{
 		"name":  name,
 		"email": email,
 	})
@@ -331,8 +389,32 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
 }
 
+func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatProfile(data)), nil
+}
+
+func (c *apiClient) handleInvalidateTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	reason := req.GetString("reason", "")
+
+	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/invalidate", map[string]string{
+		"reason": reason,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatInvalidateResult(data, taskID)), nil
+}
+
 func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/citizens/"+c.citizenID+"/dashboard")
+	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/dashboard")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -374,7 +456,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
-		"citizen_id": c.citizenID,
+		"username": c.username,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -407,9 +489,10 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 
 	content := req.GetString("content", "")
 	outputsJSON := req.GetString("outputs_json", "")
+	artifactsJSON := req.GetString("artifacts_json", "")
 
-	if content == "" && outputsJSON == "" {
-		return mcp.NewToolResultError("either 'content' or 'outputs_json' is required"), nil
+	if content == "" && outputsJSON == "" && artifactsJSON == "" {
+		return mcp.NewToolResultError("at least one of 'content', 'outputs_json', or 'artifacts_json' is required"), nil
 	}
 
 	body := map[string]interface{}{
@@ -422,8 +505,16 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 			return mcp.NewToolResultError("outputs_json must be valid JSON object: " + err.Error()), nil
 		}
 		body["outputs"] = outputs
-	} else {
+	}
+	if content != "" {
 		body["content"] = content
+	}
+	if artifactsJSON != "" {
+		var artifacts map[string]string
+		if err := json.Unmarshal([]byte(artifactsJSON), &artifacts); err != nil {
+			return mcp.NewToolResultError("artifacts_json must be valid JSON object: " + err.Error()), nil
+		}
+		body["artifacts"] = artifacts
 	}
 
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", body)
@@ -433,6 +524,38 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
 }
 
+func (c *apiClient) handleListArtifacts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID)
+	if prefix := req.GetString("prefix", ""); prefix != "" {
+		path += "?prefix=" + prefix
+	}
+	data, err := c.get(ctx, path)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatArtifactList(data, int64(projectID))), nil
+}
+
+func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	path, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required"), nil
+	}
+	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(formatArtifactDetail(data)), nil
+}
+
 func (c *apiClient) handleReleaseTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
 	if err != nil {
@@ -440,7 +563,7 @@ func (c *apiClient) handleReleaseTask(ctx context.Context, req mcp.CallToolReque
 	}
 
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/release", map[string]string{
-		"citizen_id": c.citizenID,
+		"username": c.username,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil

@@ -210,3 +210,95 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// --- Artifact reference tests ---
+
+func TestInferArtifactReads(t *testing.T) {
+	prompt := `Refactor the analyzer:
+
+{{artifact:src/analyze.py}}
+
+Reference data:
+{{artifact:data/genes.csv}}
+
+And the sibling helper {{artifact:src/helpers.py}} too. Note: {{artifact:src/analyze.py}} again.`
+
+	reads := InferArtifactReads(prompt)
+	sort.Strings(reads)
+
+	expected := []string{"data/genes.csv", "src/analyze.py", "src/helpers.py"}
+	if len(reads) != len(expected) {
+		t.Fatalf("expected %v, got %v", expected, reads)
+	}
+	for i, p := range expected {
+		if reads[i] != p {
+			t.Fatalf("expected %v, got %v", expected, reads)
+		}
+	}
+}
+
+func TestInferArtifactReadsNoMatches(t *testing.T) {
+	// {{disease}} and {{task.field}} should not be picked up as artifacts.
+	prompt := "Analyze {{disease}} using {{foundation.content}}."
+	reads := InferArtifactReads(prompt)
+	if len(reads) != 0 {
+		t.Fatalf("expected no artifact reads, got %v", reads)
+	}
+}
+
+func TestMergeArtifactReadsExplicitWins(t *testing.T) {
+	// Explicit reads come first; inferred extras are appended.
+	prompt := "{{artifact:src/main.py}} and {{artifact:data/input.csv}}"
+	merged := MergeArtifactReads([]string{"data/input.csv", "scripts/setup.sh"}, prompt)
+
+	expected := []string{"data/input.csv", "scripts/setup.sh", "src/main.py"}
+	if len(merged) != len(expected) {
+		t.Fatalf("expected %v, got %v", expected, merged)
+	}
+	for i, p := range expected {
+		if merged[i] != p {
+			t.Fatalf("expected %v, got %v", expected, merged)
+		}
+	}
+}
+
+func TestResolveArtifactsBasic(t *testing.T) {
+	prompt := `Current code:
+{{artifact:src/analyze.py}}
+
+Refactor it.`
+
+	artifacts := map[string]string{
+		"src/analyze.py": "def analyze(): pass\n",
+	}
+
+	out := ResolveArtifacts(prompt, artifacts)
+	if !contains(out, "def analyze(): pass") {
+		t.Fatalf("expected resolved artifact content, got: %s", out)
+	}
+	if contains(out, "{{artifact:src/analyze.py}}") {
+		t.Fatalf("expected reference to be replaced, got: %s", out)
+	}
+}
+
+func TestResolveArtifactsLeavesUnknownUntouched(t *testing.T) {
+	prompt := "Need {{artifact:src/missing.py}}"
+	out := ResolveArtifacts(prompt, map[string]string{})
+	if !contains(out, "{{artifact:src/missing.py}}") {
+		t.Fatalf("expected unresolved reference to be preserved, got: %s", out)
+	}
+}
+
+func TestResolveArtifactsDoesNotTouchTaskReferences(t *testing.T) {
+	// {{task.field}} should pass through ResolveArtifacts unchanged.
+	prompt := "{{foundation.content}} plus {{artifact:src/analyze.py}}"
+	out := ResolveArtifacts(prompt, map[string]string{
+		"src/analyze.py": "code",
+	})
+	if !contains(out, "{{foundation.content}}") {
+		t.Fatalf("task reference should be untouched, got: %s", out)
+	}
+	if !contains(out, "code") {
+		t.Fatalf("artifact should be resolved, got: %s", out)
+	}
+}

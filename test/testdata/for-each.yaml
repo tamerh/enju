@@ -1,0 +1,11 @@
+name: "ForEach Expansion"
+version: 1
+for_each:
+  lang: [Python, Go, Rust]
+tasks:
+  - id: pros
+    action: answer
+    prompt: "List 2 advantages of {{lang}}."
+  - id: summary
+    action: answer
+    prompt: "Summarize: {{pros.content}}"

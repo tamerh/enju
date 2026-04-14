@@ -1,0 +1,22 @@
+name: "Access control test run"
+version: 1
+tasks:
+  - id: open_task
+    action: answer
+    prompt: "Anyone can claim this."
+
+  - id: assigned_task
+    action: answer
+    assign_to: __CITIZEN_ALICE__
+    prompt: "Only alice can claim this."
+
+  - id: role_task
+    action: answer
+    require_role: reviewer
+    prompt: "Only citizens with the 'reviewer' role can claim this."
+
+  - id: both_task
+    action: answer
+    assign_to: [__CITIZEN_ALICE__, __CITIZEN_BOB__]
+    require_role: reviewer
+    prompt: "Must be alice/bob AND have reviewer role."

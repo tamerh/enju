@@ -1,0 +1,16 @@
+name: "Branching with Inferred Deps"
+version: 1
+tasks:
+  - id: python_pros
+    action: answer
+    prompt: "List 3 advantages of Python for CLI tools. One sentence each."
+  - id: go_pros
+    action: answer
+    prompt: "List 3 advantages of Go for CLI tools. One sentence each."
+  - id: comparison
+    action: answer
+    prompt: |
+      Compare based on:
+      Python: {{python_pros.content}}
+      Go: {{go_pros.content}}
+      Recommend one in 2 sentences.

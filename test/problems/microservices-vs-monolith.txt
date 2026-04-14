@@ -1,0 +1,6 @@
+Analyze whether microservices or monolith architecture is better for an early-stage startup.
+
+Create 3-4 tasks. Start by listing pros/cons of each approach independently,
+then compare tradeoffs, then give a final recommendation.
+
+Keep prompts short — 1-2 sentences each.

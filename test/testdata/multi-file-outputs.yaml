@@ -1,0 +1,27 @@
+name: "Multi-file Outputs Test"
+version: 1
+tasks:
+  - id: analyze
+    action: answer
+    prompt: "Analyze and produce multiple output files"
+    outputs:
+      gene_list:
+        description: "Gene list as CSV"
+        file: "genes.csv"
+        format: csv
+      pathways:
+        description: "Pathway network as JSON"
+        file: "pathways.json"
+        format: json
+      summary:
+        description: "Summary report"
+        file: "summary.md"
+        format: markdown
+
+  - id: use_genes
+    action: answer
+    prompt: "Process gene list: {{analyze.gene_list}}"
+
+  - id: use_pathways
+    action: answer
+    prompt: "Visualize pathways: {{analyze.pathways}}"

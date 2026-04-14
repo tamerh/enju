@@ -1,0 +1,8 @@
+name: "Short Timeout Test"
+version: 1
+defaults:
+  timeout: 1s
+tasks:
+  - id: quick_task
+    action: answer
+    prompt: "Answer quickly"
