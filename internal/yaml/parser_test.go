@@ -1082,3 +1082,387 @@ func searchString(s, substr string) bool {
 	}
 	return false
 }
+
+// TestParseRunLevelParams covers the new top-level params: block
+// added in Phase H.1. A run can declare parameters that get
+// substituted into {{param}} references at submission time. The
+// same YAML file is both runnable and reusable as a template —
+// location (under templates/) signals intent, not schema.
+func TestParseRunLevelParams(t *testing.T) {
+	yamlData := []byte(`
+name: "GWAS recipe"
+description: "Analyze GWAS summary stats for a disease."
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "The disease to analyze (e.g. endometriosis, PCOS)"
+  - name: tissue
+    type: string
+    default: "whole blood"
+    description: "Primary tissue for expression analysis"
+tasks:
+  - id: gwas
+    action: answer
+    prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if parsed.Run.Description == "" {
+		t.Error("expected Description to be populated")
+	}
+	if len(parsed.Run.Params) != 2 {
+		t.Fatalf("expected 2 params, got %d", len(parsed.Run.Params))
+	}
+	disease := parsed.Run.Params[0]
+	if disease.Name != "disease" || disease.Type != "string" || !disease.Required {
+		t.Errorf("disease param wrong: %+v", disease)
+	}
+	tissue := parsed.Run.Params[1]
+	if tissue.Default != "whole blood" {
+		t.Errorf("tissue default wrong: %+v", tissue.Default)
+	}
+}
+
+// TestParseRejectsDuplicateParamName — uniqueness is a hard
+// parser error, not a warning. Two params with the same name
+// would make the substitution order-dependent.
+func TestParseRejectsDuplicateParamName(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "first"
+  - name: disease
+    type: string
+    required: true
+    description: "second"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{disease}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected duplicate-name error, got nil")
+	}
+	if !searchString(err.Error(), "duplicate") {
+		t.Errorf("expected duplicate error, got: %v", err)
+	}
+}
+
+// TestParseRejectsUnknownParamType — strict type vocabulary;
+// unknown types fail fast so authors notice the typo.
+func TestParseRejectsUnknownParamType(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+params:
+  - name: count
+    type: integer
+    required: true
+    description: "count"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{count}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected invalid-type error, got nil")
+	}
+	if !searchString(err.Error(), "invalid type") {
+		t.Errorf("expected invalid-type error, got: %v", err)
+	}
+}
+
+// TestParseRejectsRequiredWithDefault — required + default is a
+// contradiction. If there's a default, it's not required.
+func TestParseRejectsRequiredWithDefault(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    default: "pcos"
+    description: "disease"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{disease}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected required+default error, got nil")
+	}
+	if !searchString(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutually-exclusive error, got: %v", err)
+	}
+}
+
+// TestParseRejectsBadDefaultType — default values get type-
+// checked at parse time.
+func TestParseRejectsBadDefaultType(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+params:
+  - name: count
+    type: int
+    default: "not a number"
+    description: "count"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{count}}"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected type-mismatch error, got nil")
+	}
+	if !searchString(err.Error(), "whole number") {
+		t.Errorf("expected whole-number error, got: %v", err)
+	}
+}
+
+// TestParseWithParamsHappyPath — ParseWithParams substitutes
+// supplied values into task prompts. Required params are
+// provided; optional params fall back to their declared
+// default. After substitution, no {{param}} placeholders
+// remain in the resolved prompt.
+func TestParseWithParamsHappyPath(t *testing.T) {
+	yamlData := []byte(`
+name: "GWAS recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "The disease to analyze"
+  - name: tissue
+    type: string
+    default: "whole blood"
+    description: "Primary tissue"
+tasks:
+  - id: gwas
+    action: answer
+    prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
+`)
+	parsed, err := ParseWithParams(yamlData, map[string]interface{}{
+		"disease": "PCOS",
+	})
+	if err != nil {
+		t.Fatalf("ParseWithParams failed: %v", err)
+	}
+	got := parsed.Run.Tasks[0].Prompt
+	want := "Analyze GWAS data for PCOS in whole blood"
+	if got != want {
+		t.Errorf("prompt substitution wrong\n  got:  %q\n  want: %q", got, want)
+	}
+}
+
+// TestParseWithParamsMissingRequired — omitting a required
+// param produces a natural-language error that the LLM can
+// turn into a follow-up question for the user.
+func TestParseWithParamsMissingRequired(t *testing.T) {
+	yamlData := []byte(`
+name: "GWAS recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "The disease to analyze (e.g. endometriosis, PCOS)"
+tasks:
+  - id: gwas
+    action: answer
+    prompt: "Analyze {{disease}}"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{})
+	if err == nil {
+		t.Fatal("expected missing-required error, got nil")
+	}
+	if !searchString(err.Error(), "missing required parameter") {
+		t.Errorf("expected 'missing required parameter', got: %v", err)
+	}
+	// The description must appear — that's the whole point of
+	// the natural-language phrasing.
+	if !searchString(err.Error(), "The disease to analyze") {
+		t.Errorf("expected description in error, got: %v", err)
+	}
+}
+
+// TestParseWithParamsUnknownName — a typo'd param name errors
+// as "unknown parameter" rather than masking the typo as a
+// missing-required error on the correctly-named one.
+func TestParseWithParamsUnknownName(t *testing.T) {
+	yamlData := []byte(`
+name: "Recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "d"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{disease}}"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{
+		"diesase": "PCOS",
+	})
+	if err == nil {
+		t.Fatal("expected unknown-param error, got nil")
+	}
+	if !searchString(err.Error(), "unknown parameter") {
+		t.Errorf("expected 'unknown parameter', got: %v", err)
+	}
+}
+
+// TestParseWithParamsTypeMismatch — a supplied value of the
+// wrong type errors with a param-named message.
+func TestParseWithParamsTypeMismatch(t *testing.T) {
+	yamlData := []byte(`
+name: "Recipe"
+version: 1
+params:
+  - name: count
+    type: int
+    required: true
+    description: "how many"
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{count}}"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{
+		"count": "not a number",
+	})
+	if err == nil {
+		t.Fatal("expected type-mismatch error, got nil")
+	}
+	if !searchString(err.Error(), "count") {
+		t.Errorf("expected error to mention 'count', got: %v", err)
+	}
+}
+
+// TestParseWithParamsListSubstitution — list<string> params
+// are substituted as one value per line (readable in an LLM
+// prompt).
+func TestParseWithParamsListSubstitution(t *testing.T) {
+	yamlData := []byte(`
+name: "Recipe"
+version: 1
+params:
+  - name: genes
+    type: list<string>
+    required: true
+    description: "Genes to analyze"
+tasks:
+  - id: t
+    action: answer
+    prompt: "Analyze:\n{{genes}}"
+`)
+	parsed, err := ParseWithParams(yamlData, map[string]interface{}{
+		"genes": []interface{}{"BRCA1", "TP53", "EGFR"},
+	})
+	if err != nil {
+		t.Fatalf("ParseWithParams failed: %v", err)
+	}
+	got := parsed.Run.Tasks[0].Prompt
+	want := "Analyze:\nBRCA1\nTP53\nEGFR"
+	if got != want {
+		t.Errorf("list substitution wrong\n  got:  %q\n  want: %q", got, want)
+	}
+}
+
+// TestParseWithParamsRejectsExtraForPlainRun — passing params
+// to a run that declares none is a mismatch, not a silent
+// accept. Surfaces path/template mixups.
+func TestParseWithParamsRejectsExtraForPlainRun(t *testing.T) {
+	yamlData := []byte(`
+name: "Plain run"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "Hello"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{
+		"disease": "PCOS",
+	})
+	if err == nil {
+		t.Fatal("expected 'does not declare any parameters' error, got nil")
+	}
+	if !searchString(err.Error(), "does not declare") {
+		t.Errorf("expected 'does not declare' error, got: %v", err)
+	}
+}
+
+// TestParseLeavesParamPlaceholdersWhenCalledDirectly — plain
+// Parse() does not substitute. Leaves {{param}} refs literal
+// so a linter or description tool can inspect a template
+// without supplying values.
+func TestParseLeavesParamPlaceholdersWhenCalledDirectly(t *testing.T) {
+	yamlData := []byte(`
+name: "Recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "d"
+tasks:
+  - id: t
+    action: answer
+    prompt: "Analyze {{disease}}"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if !searchString(parsed.Run.Tasks[0].Prompt, "{{disease}}") {
+		t.Errorf("expected placeholder to remain literal, got: %q", parsed.Run.Tasks[0].Prompt)
+	}
+}
+
+// TestParseMissingDescriptionWarning — missing description is
+// non-fatal but emits a warning. The LLM needs prose to turn
+// the param into a user-facing question.
+func TestParseMissingDescriptionWarning(t *testing.T) {
+	yamlData := []byte(`
+name: "Recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+tasks:
+  - id: t
+    action: answer
+    prompt: "x {{disease}}"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	foundWarning := false
+	for _, w := range parsed.Warnings {
+		if searchString(w, "no description") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected 'no description' warning, got: %v", parsed.Warnings)
+	}
+}

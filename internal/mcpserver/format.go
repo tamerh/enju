@@ -1231,6 +1231,13 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		progressLine += fmt.Sprintf(" (%d accepted, %d skipped)", counts["accepted"], counts["skipped"])
 	}
 	b.WriteString(fmt.Sprintf("Project #%s → Run #%d: %s\n", projectID, int(seq), name))
+	if sourcePath, _ := run["source_path"].(string); sourcePath != "" {
+		line := fmt.Sprintf("Source: %s", sourcePath)
+		if sourceSHA, _ := run["source_commit_sha"].(string); sourceSHA != "" {
+			line += fmt.Sprintf(" @%s", shortSHA(sourceSHA))
+		}
+		b.WriteString(line + "\n")
+	}
 	b.WriteString(progressLine + "\n")
 	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
 
@@ -1520,6 +1527,133 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	return b.String()
 }
 
+// formatListTemplates renders the enju_list_templates response
+// as a scannable menu. Each entry includes the template's path,
+// name, one-line description snippet, and a compact param
+// summary ("disease, tissue=whole blood") so the LLM can pick
+// a recipe without drilling into each one.
+func formatListTemplates(data []byte) string {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := resp["error"].(string); ok {
+		return "✗ " + errMsg
+	}
+	templates, _ := resp["templates"].([]interface{})
+	if len(templates) == 0 {
+		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under templates/*.yaml in the project git repo. To add one, commit a YAML file to templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into templates/."
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("── Templates (%d) — enju_list_templates ──\n", len(templates)))
+	for _, t := range templates {
+		m, _ := t.(map[string]interface{})
+		path, _ := m["path"].(string)
+		name, _ := m["name"].(string)
+		desc, _ := m["description"].(string)
+		params, _ := m["params"].([]interface{})
+
+		b.WriteString(fmt.Sprintf("▸ %s\n", path))
+		if name != "" {
+			b.WriteString(fmt.Sprintf("  Name:   %s\n", name))
+		}
+		if desc != "" {
+			// Show the first line of the description as a preview;
+			// full text comes from enju_describe_template.
+			first := strings.SplitN(strings.TrimSpace(desc), "\n", 2)[0]
+			b.WriteString(fmt.Sprintf("  About:  %s\n", first))
+		}
+		if len(params) > 0 {
+			var parts []string
+			for _, p := range params {
+				pm, _ := p.(map[string]interface{})
+				pname, _ := pm["name"].(string)
+				required, _ := pm["required"].(bool)
+				def := pm["default"]
+				switch {
+				case required:
+					parts = append(parts, pname+"*")
+				case def != nil:
+					parts = append(parts, fmt.Sprintf("%s=%v", pname, def))
+				default:
+					parts = append(parts, pname)
+				}
+			}
+			b.WriteString(fmt.Sprintf("  Params: %s\n", strings.Join(parts, ", ")))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("────────────────────────────────────────────\n")
+	b.WriteString("Starred params (*) are required. Call enju_describe_template <path> for full parameter docs, or enju_create_run path=... params={...} to instantiate.")
+	return b.String()
+}
+
+// formatDescribeTemplate renders the full metadata for one
+// template as a drill-down view. This is what the LLM reads
+// right before gathering param values from the user: it has
+// the full description prose, plus every param's type,
+// default, and human-readable description.
+func formatDescribeTemplate(data []byte) string {
+	var tmpl map[string]interface{}
+	if err := json.Unmarshal(data, &tmpl); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := tmpl["error"].(string); ok {
+		return "✗ " + errMsg
+	}
+	path, _ := tmpl["path"].(string)
+	name, _ := tmpl["name"].(string)
+	desc, _ := tmpl["description"].(string)
+	params, _ := tmpl["params"].([]interface{})
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("── Template: %s ──\n", path))
+	if name != "" {
+		b.WriteString(fmt.Sprintf("Name:        %s\n", name))
+	}
+	if desc != "" {
+		b.WriteString("Description:\n")
+		for _, line := range strings.Split(strings.TrimSpace(desc), "\n") {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	if len(params) == 0 {
+		b.WriteString("\nThis template declares no parameters — it can be instantiated with enju_create_run path=" + path + " and no params.")
+		return b.String()
+	}
+	b.WriteString(fmt.Sprintf("\nParameters (%d):\n", len(params)))
+	for _, p := range params {
+		m, _ := p.(map[string]interface{})
+		pname, _ := m["name"].(string)
+		ptype, _ := m["type"].(string)
+		required, _ := m["required"].(bool)
+		def := m["default"]
+		pdesc, _ := m["description"].(string)
+
+		marker := "  "
+		if required {
+			marker = "* "
+		}
+		b.WriteString(fmt.Sprintf("\n%s%s (%s", marker, pname, ptype))
+		if required {
+			b.WriteString(", required")
+		} else if def != nil {
+			b.WriteString(fmt.Sprintf(", default=%v", def))
+		} else {
+			b.WriteString(", optional")
+		}
+		b.WriteString(")\n")
+		if pdesc != "" {
+			for _, line := range strings.Split(strings.TrimSpace(pdesc), "\n") {
+				b.WriteString("    " + line + "\n")
+			}
+		}
+	}
+	b.WriteString("\nStarred (*) parameters are required.\n")
+	b.WriteString(fmt.Sprintf("To instantiate: enju_create_run project_id=<N> path=%s params={...}", path))
+	return b.String()
+}
+
 func formatCreateRun(data []byte) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
@@ -1534,12 +1668,30 @@ func formatCreateRun(data []byte) string {
 	projectID := jsonID(result["project_id"])
 	seq, _ := result["seq"].(float64)
 	taskCount, _ := result["task_count"].(float64)
+	sourcePath, _ := result["source_path"].(string)
+	sourceSHA, _ := result["source_commit_sha"].(string)
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("✓ Run created in project #%s as run #%d: %s\n", projectID, int(seq), name))
 	b.WriteString(fmt.Sprintf("  Tasks: %d\n", int(taskCount)))
+	if sourcePath != "" {
+		line := fmt.Sprintf("  Source: %s", sourcePath)
+		if sourceSHA != "" {
+			line += fmt.Sprintf(" @%s", shortSHA(sourceSHA))
+		}
+		b.WriteString(line + "\n")
+	}
 	b.WriteString(fmt.Sprintf("\nUse enju_run_status(project_id=%s, run_id=%d) or enju_list_ready_tasks to see tasks.", projectID, int(seq)))
 	return b.String()
+}
+
+// shortSHA returns the first 7 chars of a git commit SHA, the
+// standard abbreviation. Leaves short inputs alone.
+func shortSHA(sha string) string {
+	if len(sha) <= 7 {
+		return sha
+	}
+	return sha[:7]
 }
 
 // --- Helpers ---

@@ -66,8 +66,24 @@ type RunRecord struct {
 	YAMLData  string // raw YAML content
 	RepoURL   string
 	State     RunState
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	// SourcePath is the repo-relative template path this run was
+	// instantiated from, if any. Populated when the run was
+	// created via enju_create_run with a `path:` pointing at a
+	// templates/*.yaml file. Empty for inline-YAML submissions.
+	// Used for provenance display ("this run came from
+	// templates/gwas.yaml") and by future tooling that wants to
+	// surface "all runs from template X."
+	SourcePath string
+	// SourceCommitSHA is the project HEAD at template
+	// instantiation time. Captured so future reproducibility
+	// tooling can answer "which commit of templates/gwas.yaml
+	// produced this run?" — the file on disk may have changed
+	// between runs, but given this SHA the original version is
+	// always reachable via `git show SHA:templates/gwas.yaml`.
+	// Empty for inline-YAML submissions.
+	SourceCommitSHA string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // TaskRecord is a task instance stored in the database.

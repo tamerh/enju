@@ -4294,5 +4294,110 @@ tasks:
 	}
 }
 
+// TestCreateRunWithParams — Phase H.1 happy path. A run YAML
+// with a top-level params: block can be submitted alongside a
+// params map. The coordinator calls ParseWithParams, substitutes
+// the supplied values into task prompts, and creates the run
+// normally. After submission, the task's prompt has the
+// substituted values, not the {{param}} placeholders.
+func TestCreateRunWithParams(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	projectID := s.createTestProject()
+	yamlContent := `name: "GWAS recipe"
+description: "Template for GWAS analysis"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "The disease to analyze"
+  - name: tissue
+    type: string
+    default: "whole blood"
+    description: "Primary tissue"
+tasks:
+  - id: gwas
+    action: answer
+    prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+		"params": map[string]interface{}{
+			"disease": "PCOS",
+		},
+		"source_path": "templates/gwas.yaml",
+	})
+	seq, _ := resp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	if got, _ := resp["source_path"].(string); got != "templates/gwas.yaml" {
+		t.Errorf("expected source_path echoed back, got %q", got)
+	}
+
+	// Verify the substituted prompt lands in the task record.
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+	task := s.taskGet("gwas")
+	prompt, _ := task["prompt"].(string)
+	want := "Analyze GWAS data for PCOS in whole blood"
+	if prompt != want {
+		t.Errorf("prompt substitution wrong\n  got:  %q\n  want: %q", prompt, want)
+	}
+
+	// Run list should surface the source_path too.
+	runsResp := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if len(runsResp) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runsResp))
+	}
+	run := runsResp[0].(map[string]interface{})
+	if sp, _ := run["source_path"].(string); sp != "templates/gwas.yaml" {
+		t.Errorf("run list source_path wrong: %q", sp)
+	}
+}
+
+// TestCreateRunWithParamsMissingRequired — submitting a
+// params-declaring run without all required params produces a
+// natural-language error from the parser, no run is created.
+func TestCreateRunWithParamsMissingRequired(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	yamlContent := `name: "GWAS recipe"
+version: 1
+params:
+  - name: disease
+    type: string
+    required: true
+    description: "The disease to analyze (e.g. endometriosis, PCOS)"
+tasks:
+  - id: gwas
+    action: answer
+    prompt: "Analyze {{disease}}"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml":   yamlContent,
+		"params": map[string]interface{}{},
+	})
+	errMsg, _ := resp["error"].(string)
+	if errMsg == "" {
+		t.Fatalf("expected error, got success: %v", resp)
+	}
+	if !strings.Contains(errMsg, "missing required parameter") {
+		t.Errorf("expected 'missing required parameter', got: %q", errMsg)
+	}
+	if !strings.Contains(errMsg, "The disease to analyze") {
+		t.Errorf("expected description in error, got: %q", errMsg)
+	}
+
+	// Make sure no run was persisted.
+	runs := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if len(runs) != 0 {
+		t.Errorf("expected no runs after failed submission, got %d", len(runs))
+	}
+}
+
 // Suppress unused import
 var _ = enjuYaml.Parse

@@ -97,6 +97,8 @@ func New(cfg Config) *server.MCPServer {
 	s.AddTool(toolMyProfile(), client.handleMyProfile)
 	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
 	s.AddTool(toolTallyTask(), client.handleTallyTask)
+	s.AddTool(toolListTemplates(), client.handleListTemplates)
+	s.AddTool(toolDescribeTemplate(), client.handleDescribeTemplate)
 
 	return s
 }
@@ -430,30 +432,82 @@ func toolRunStatus() mcp.Tool {
 
 func toolCreateRun() mcp.Tool {
 	return mcp.NewTool("enju_create_run",
-		mcp.WithDescription(`Create a new Enju run by submitting a YAML definition. The run must belong to an existing project.
+		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
-The YAML format:
+1. WRITE IT DIRECTLY: pass "yaml" with the full run definition — use this for one-off runs the user is authoring from scratch.
+2. FROM A SAVED TEMPLATE: pass "path" pointing at a templates/*.yaml recipe in the project clone, plus "params" with the values that template asks for. Use this whenever a user's request matches a known recipe — see enju_list_templates.
+3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a template file first.
+
+YAML format (same for inline and template files):
   name: "Run name"
+  description: "Optional prose — shown in template menus"
   version: 1
-  ref: "https://github.com/..." (optional)
+  params:                       # optional; makes the YAML reusable
+    - name: disease
+      type: string               # string | int | bool | list<string>
+      required: true
+      description: "The disease to analyze"
   for_each:
-    variable: [value1, value2] (optional, for parallel expansion)
+    variable: [value1, value2]   # optional, for parallel expansion
   tasks:
     - id: task_name
       action: answer
-      prompt: "The prompt. Use {{other_task.content}} to reference upstream results."
+      prompt: "Analyze {{disease}} using {{other_task.content}}."
 
-Dependencies are inferred automatically from {{task_id.content}} references.
-Tasks without references to other tasks run in parallel.
+To browse available templates in a project, call enju_list_templates first. To see a specific template's parameter docs before filling them in, call enju_describe_template.
+
+Dependencies between tasks are inferred automatically from {{task_id.content}} references. Tasks without references to other tasks run in parallel.
 
 If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithString("yaml",
-			mcp.Required(),
-			mcp.Description("The run definition in YAML format"),
+			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),
+		),
+		mcp.WithString("path",
+			mcp.Description("Repo-relative path to a template under templates/, e.g. 'templates/gwas.yaml'. The template is read from the local project clone. Mutually exclusive with 'yaml'."),
+		),
+		mcp.WithObject("params",
+			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_template to see what a template expects."),
 		),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID to create this run in (use enju_list_projects to see existing projects)"),
+		),
+	)
+}
+
+// toolListTemplates is the LLM's template-discovery entry
+// point. Returns every YAML file under the project clone's
+// templates/ directory with its name, description, and
+// parameter summary so the LLM can pick a recipe that fits
+// the user's request without reading each file.
+func toolListTemplates() mcp.Tool {
+	return mcp.NewTool("enju_list_templates",
+		mcp.WithDescription(`List the reusable run recipes (templates) available in a project. Each entry shows the template's name, description, and its declared parameters. Use this first when a user asks to do something that matches a known recipe — the template saves them from hand-writing a run YAML.
+
+Templates are just regular run YAML files that live under templates/ in the project git repo. Any run can be promoted to a template by copying its YAML file into templates/; no conversion step.
+
+To see full parameter docs for one template (types, defaults, descriptions), call enju_describe_template <path>. To instantiate a template into a run, call enju_create_run with 'path' and 'params'.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose templates/ directory to scan"),
+		),
+	)
+}
+
+// toolDescribeTemplate returns the full parameter block for a
+// single template so the LLM can turn each param into a
+// user-facing question ("which disease?", "which tissue?")
+// before filling in values and calling enju_create_run.
+func toolDescribeTemplate() mcp.Tool {
+	return mcp.NewTool("enju_describe_template",
+		mcp.WithDescription(`Show the full metadata for one template: name, description, and every declared parameter with its type, default, and prose description. Use this when a user picks a template from enju_list_templates and you need to gather the parameter values before calling enju_create_run.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose template to describe"),
+		),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Repo-relative template path, e.g. 'templates/gwas.yaml'"),
 		),
 	)
 }
@@ -2250,24 +2304,174 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	yamlContent, err := req.RequireString("yaml")
-	if err != nil {
-		return mcp.NewToolResultError("yaml is required"), nil
-	}
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required — create a project first with enju_create_project"), nil
 	}
 
-	path := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
-	data, err := c.post(ctx, path, map[string]interface{}{
+	// Phase H.1: three input shapes —
+	//   1. yaml (inline definition, no params)
+	//   2. path (template file under templates/, optional params)
+	//   3. yaml + params (inline definition with a declared params: block)
+	//
+	// Exactly one of (yaml, path) must be set. Params are optional in
+	// all cases; if set, the coordinator calls ParseWithParams and
+	// substitutes before validating.
+	yamlContent := req.GetString("yaml", "")
+	templatePath := req.GetString("path", "")
+	params := req.GetArguments()["params"]
+	var paramMap map[string]interface{}
+	if params != nil {
+		if m, ok := params.(map[string]interface{}); ok {
+			paramMap = m
+		} else {
+			return mcp.NewToolResultError("params must be an object mapping parameter names to values"), nil
+		}
+	}
+
+	if yamlContent == "" && templatePath == "" {
+		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under templates/) is required"), nil
+	}
+	if yamlContent != "" && templatePath != "" {
+		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
+	}
+
+	var sourceCommitSHA string
+	if templatePath != "" {
+		// Template mode: pull the project's local clone so new
+		// templates pushed by other citizens show up, then read
+		// the file and capture the project HEAD for provenance.
+		// Substitution + validation happen server-side in the
+		// coordinator's parser (consistent with the existing
+		// inline-YAML path).
+		if c.workspace == nil {
+			return mcp.NewToolResultError("enju_create_run with 'path' requires a local workspace (MCP client mode)"), nil
+		}
+		remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		// Best-effort pull. If the remote is unreachable or has
+		// diverged, fall through and scan whatever's on disk —
+		// the loader will surface a clear "template not found"
+		// if the file truly isn't there yet.
+		proj.Lock()
+		_ = proj.Pull()
+		proj.Unlock()
+		loaded, err := proj.LoadTemplate(templatePath)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		yamlContent = string(loaded.Raw)
+		if head, herr := proj.HeadHash(); herr == nil {
+			sourceCommitSHA = head
+		}
+	}
+
+	body := map[string]interface{}{
 		"yaml": yamlContent,
-	})
+	}
+	if paramMap != nil {
+		body["params"] = paramMap
+	}
+	if templatePath != "" {
+		body["source_path"] = templatePath
+		if sourceCommitSHA != "" {
+			body["source_commit_sha"] = sourceCommitSHA
+		}
+	}
+
+	apiPath := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
+	data, err := c.post(ctx, apiPath, body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	return mcp.NewToolResultText(formatCreateRun(data)), nil
+}
+
+// handleListTemplates — pure client-side tool. Walks the
+// project's templates/ directory in the local clone and
+// returns one entry per YAML file with its metadata.
+func (c *apiClient) handleListTemplates(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_list_templates requires a local workspace (MCP client mode)"), nil
+	}
+	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// Best-effort pull so templates pushed by other citizens
+	// since the local clone was last updated show up in the
+	// menu. A failed pull (offline, diverged, auth, etc.) is
+	// logged and we scan whatever's currently on disk — the
+	// user still gets a menu, and the error surfaces on the
+	// next tool call if it's load-bearing.
+	proj.Lock()
+	if perr := proj.Pull(); perr != nil {
+		c.logger.Debug("list_templates pull failed, scanning local state", "err", perr)
+	}
+	proj.Unlock()
+	templates, err := proj.ListTemplates()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"project_id": projectID,
+		"templates":  templates,
+	})
+	return mcp.NewToolResultText(formatListTemplates(data)), nil
+}
+
+// handleDescribeTemplate — pure client-side tool. Loads one
+// template file from the local clone and returns its full
+// metadata + param documentation.
+func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	templatePath, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required (e.g. 'templates/gwas.yaml')"), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_describe_template requires a local workspace (MCP client mode)"), nil
+	}
+	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// Best-effort pull: surface templates pushed after the
+	// clone was last updated. Same fallback as list_templates
+	// — on failure, read whatever's on disk.
+	proj.Lock()
+	if perr := proj.Pull(); perr != nil {
+		c.logger.Debug("describe_template pull failed, reading local state", "err", perr)
+	}
+	proj.Unlock()
+	loaded, err := proj.LoadTemplate(templatePath)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	data, _ := json.Marshal(loaded.Summary)
+	return mcp.NewToolResultText(formatDescribeTemplate(data)), nil
 }
 
 // --- Helpers ---

@@ -113,6 +113,8 @@ func (s *Store) migrate() error {
 		yaml_data TEXT,
 		repo_url TEXT,
 		state TEXT NOT NULL DEFAULT 'active',
+		source_path TEXT NOT NULL DEFAULT '',
+		source_commit_sha TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL,
 		UNIQUE(project_id, seq)
@@ -256,6 +258,12 @@ func (s *Store) migrate() error {
 		// usernames).
 		`ALTER TABLE tasks ADD COLUMN anonymize INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT ''`,
+		// Phase H.1 — template provenance. Records the
+		// repo-relative templates/*.yaml path this run was
+		// instantiated from. Empty string for inline-YAML
+		// submissions.
+		`ALTER TABLE runs ADD COLUMN source_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN source_commit_sha TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -369,7 +377,7 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 // ListRunsByProject returns all runs in a project, ordered by seq.
 func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at
 		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
 	)
 	if err != nil {
@@ -381,7 +389,7 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Ref = ref.String
@@ -414,9 +422,9 @@ func (s *Store) CreateRun(p *RunRecord) (int64, int, error) {
 	nextSeq := int(maxSeq.Int64) + 1
 
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err
@@ -437,8 +445,8 @@ func (s *Store) GetRun(id int64) (*RunRecord, error) {
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM runs WHERE id = ?`, id,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -451,9 +459,9 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -462,7 +470,7 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 }
 
 func (s *Store) ListRuns() ([]RunRecord, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, created_at, updated_at FROM runs ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at FROM runs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +480,7 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	for rows.Next() {
 		var p RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Ref = ref.String

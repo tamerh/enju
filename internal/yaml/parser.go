@@ -18,12 +18,31 @@ import (
 // Run is the top-level structure of a run.yaml file.
 type Run struct {
 	Name         string                 `yaml:"name"`
+	Description  string                 `yaml:"description,omitempty"` // human-readable — surfaced to LLM for template discovery
 	Version      int                    `yaml:"version"`
 	Ref          string                 `yaml:"ref,omitempty"`
+	Params       []ParamDef             `yaml:"params,omitempty"` // top-level run params, substituted into {{param}} refs at submission
 	ForEach      map[string][]string    `yaml:"for_each,omitempty"`
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // project-level requirements, inherited by tasks
 	Tasks        []TaskDef              `yaml:"tasks"`
+}
+
+// ParamDef declares a single top-level run parameter. A run with
+// `params:` declared is a reusable recipe: the same YAML file can
+// be submitted directly (with values provided at submission time)
+// or dropped under `templates/` for the LLM to instantiate on
+// behalf of a user via enju_list_templates + enju_submit_run.
+//
+// The prose Description is the field the LLM reads when turning
+// a template into a conversation with the user — keep it
+// user-facing, not implementation-facing.
+type ParamDef struct {
+	Name        string      `yaml:"name"`
+	Type        string      `yaml:"type"`                  // string | int | bool | list<string>
+	Required    bool        `yaml:"required,omitempty"`
+	Default     interface{} `yaml:"default,omitempty"`
+	Description string      `yaml:"description,omitempty"` // natural-language description for the LLM
 }
 
 // TaskDefaults holds default values for all tasks.
@@ -239,8 +258,32 @@ func ParseFile(path string) (*ParsedRun, error) {
 	return Parse(data)
 }
 
-// Parse parses run YAML bytes.
+// Parse parses run YAML bytes without substituting any top-level
+// `params:` values. Any {{param}} references in task prompts are
+// left as literal placeholders — this is the right entry point
+// for linting a template file before it's instantiated.
+//
+// To instantiate a template with actual values, use
+// ParseWithParams.
 func Parse(data []byte) (*ParsedRun, error) {
+	return parseInternal(data, nil, false)
+}
+
+// ParseWithParams parses run YAML bytes and substitutes the
+// supplied parameter values into every `{{param}}` reference in
+// task prompts. Required params with no supplied value and no
+// declared default produce a natural-language error; unknown
+// param names produce an error; type mismatches produce an
+// error. Optional params fall back to their declared default.
+//
+// This is the entry point for the "run a template" path
+// (enju_run_from_template) and the direct-submission path when
+// the caller passes values inline.
+func ParseWithParams(data []byte, paramValues map[string]interface{}) (*ParsedRun, error) {
+	return parseInternal(data, paramValues, true)
+}
+
+func parseInternal(data []byte, paramValues map[string]interface{}, substitute bool) (*ParsedRun, error) {
 	var prob Run
 	dec := yamlv3.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -253,6 +296,12 @@ func Parse(data []byte) (*ParsedRun, error) {
 		return nil, fmt.Errorf("validation: %w", err)
 	}
 
+	if substitute {
+		if err := applyParamValues(&prob, paramValues); err != nil {
+			return nil, err
+		}
+	}
+
 	parsed, err := build(&prob)
 	if err != nil {
 		return nil, fmt.Errorf("building DAG: %w", err)
@@ -260,6 +309,132 @@ func Parse(data []byte) (*ParsedRun, error) {
 	parsed.Warnings = warnings
 
 	return parsed, nil
+}
+
+// applyParamValues merges supplied parameter values with declared
+// defaults, validates required params are present and types
+// match, and substitutes `{{param}}` references in every task
+// prompt. Errors are phrased in natural language so the LLM can
+// forward them to the user as conversational follow-ups.
+func applyParamValues(p *Run, supplied map[string]interface{}) error {
+	// If the run declares no params, the caller should not be
+	// passing any either — that usually means a template path
+	// mixup.
+	if len(p.Params) == 0 {
+		if len(supplied) > 0 {
+			var keys []string
+			for k := range supplied {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			return fmt.Errorf("this run does not declare any parameters, but values were supplied for: %s", strings.Join(keys, ", "))
+		}
+		return nil
+	}
+
+	declared := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		declared[p.Params[i].Name] = &p.Params[i]
+	}
+
+	// Reject unknown param names first — a typo in a param name
+	// should surface as "unknown parameter 'diesase'" rather than
+	// "missing required parameter 'disease'" (which hides the
+	// typo).
+	for name := range supplied {
+		if _, ok := declared[name]; !ok {
+			var known []string
+			for k := range declared {
+				known = append(known, k)
+			}
+			sort.Strings(known)
+			return fmt.Errorf("unknown parameter %q — this run declares: %s", name, strings.Join(known, ", "))
+		}
+	}
+
+	// Build the merged value map: defaults first, then supplied
+	// (so supplied values win). Type-check supplied values as we
+	// go so the error mentions the param name naturally.
+	merged := make(map[string]interface{}, len(p.Params))
+	for _, pp := range p.Params {
+		if pp.Default != nil {
+			merged[pp.Name] = pp.Default
+		}
+	}
+	for name, v := range supplied {
+		pp := declared[name]
+		if err := checkParamValueType(name, pp.Type, v); err != nil {
+			return err
+		}
+		merged[name] = v
+	}
+
+	// Required-but-missing check. Phrase the error as a bullet
+	// list the LLM can turn into a follow-up question per param.
+	var missing []string
+	for _, pp := range p.Params {
+		if !pp.Required {
+			continue
+		}
+		if _, ok := merged[pp.Name]; !ok {
+			line := fmt.Sprintf("%s (%s)", pp.Name, pp.Type)
+			if pp.Description != "" {
+				line += " — " + pp.Description
+			}
+			missing = append(missing, line)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required parameter(s):\n  - %s", strings.Join(missing, "\n  - "))
+	}
+
+	// Substitute into task prompts. We stringify each value with
+	// a type-aware formatter so an int param lands as "42", a
+	// bool as "true", and a list<string> as one value per line
+	// (readable in an LLM prompt).
+	strMap := make(map[string]string, len(merged))
+	for k, v := range merged {
+		strMap[k] = stringifyParamValue(v)
+	}
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		if t.Prompt != "" {
+			t.Prompt = template.ResolveParams(t.Prompt, strMap)
+		}
+		if t.UserPrompt != "" {
+			t.UserPrompt = template.ResolveParams(t.UserPrompt, strMap)
+		}
+	}
+	return nil
+}
+
+// stringifyParamValue renders a YAML-decoded parameter value as
+// a string suitable for in-prompt substitution. The goal is a
+// readable result in the final LLM prompt, not a round-trippable
+// encoding.
+func stringifyParamValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case []interface{}:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			parts = append(parts, stringifyParamValue(item))
+		}
+		return strings.Join(parts, "\n")
+	case []string:
+		return strings.Join(x, "\n")
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // resolveAction sets default action if not specified.
@@ -287,6 +462,38 @@ func validate(p *Run) ([]string, error) {
 	// Validate run-level for_each shape (strict: no empty lists).
 	if err := validateForEachMap("run", p.ForEach); err != nil {
 		return nil, err
+	}
+
+	// Validate top-level params: names unique, types recognized,
+	// required + default are mutually exclusive (a required param
+	// with a default makes no sense — the default would mask the
+	// "missing value" error). Descriptions aren't required by the
+	// parser, but a warning fires later if one is missing — the
+	// LLM needs the prose to turn the param into a question.
+	paramNames := make(map[string]bool, len(p.Params))
+	for i := range p.Params {
+		pp := &p.Params[i]
+		if pp.Name == "" {
+			return nil, fmt.Errorf("params[%d]: name is required", i)
+		}
+		if paramNames[pp.Name] {
+			return nil, fmt.Errorf("params[%d]: duplicate name %q", i, pp.Name)
+		}
+		paramNames[pp.Name] = true
+		if !isValidParamType(pp.Type) {
+			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, or list<string>)", pp.Name, pp.Type)
+		}
+		if pp.Required && pp.Default != nil {
+			return nil, fmt.Errorf("param %q: required and default are mutually exclusive", pp.Name)
+		}
+		if pp.Default != nil {
+			if err := checkParamValueType(pp.Name, pp.Type, pp.Default); err != nil {
+				return nil, err
+			}
+		}
+		if pp.Description == "" {
+			warnings = append(warnings, fmt.Sprintf("param %q has no description — the LLM needs prose to turn this into a question for the user", pp.Name))
+		}
 	}
 
 	ids := make(map[string]bool)
@@ -704,6 +911,16 @@ func builtinTemplateVar(name string) bool {
 func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 	runScope := p.ForEach
 
+	// Run-level params (Phase H.1) are visible to every task's
+	// prompt, alongside any for_each variables in scope. They're
+	// resolved at submission time, not at parse time, so the
+	// parser only needs to know *which* names are legal.
+	paramInScope := make(map[string]bool, len(p.Params))
+	for _, pp := range p.Params {
+		paramInScope[pp.Name] = true
+	}
+	paramReferenced := make(map[string]bool, len(p.Params))
+
 	// Track which for_each variables we've actually seen referenced.
 	// Key: scope label ("run" or "task:id"), value: set of referenced
 	// variable names. A scope with declared variables but no matching
@@ -738,6 +955,13 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 				if builtinTemplateVar(name) {
 					continue
 				}
+				// Run-level params (Phase H.1) are always in scope
+				// for every task. They're substituted at submission
+				// time from the caller-supplied values (or defaults).
+				if paramInScope[name] {
+					paramReferenced[name] = true
+					continue
+				}
 				if _, ok := visible[name]; !ok {
 					// Build a friendly list of what WOULD have matched.
 					var declared []string
@@ -750,9 +974,14 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 						upstreamIDs = append(upstreamIDs, id)
 					}
 					sort.Strings(upstreamIDs)
+					var runParams []string
+					for k := range paramInScope {
+						runParams = append(runParams, k)
+					}
+					sort.Strings(runParams)
 					return fmt.Errorf(
-						"task %q: prompt references undefined variable {{%s}}; declared for_each variables in scope: %v; known task ids: %v",
-						t.ID, name, declared, upstreamIDs,
+						"task %q: prompt references undefined variable {{%s}}; declared for_each variables in scope: %v; run-level params in scope: %v; known task ids: %v",
+						t.ID, name, declared, runParams, upstreamIDs,
 					)
 				}
 				if scopeLabel == "run" {
@@ -1235,3 +1464,97 @@ func validateReviewThreshold(s string) error {
 // call site. Parsing a duration is cheap; the point of the helper
 // is that tests and callers can refer to it by name.
 var _ = time.ParseDuration
+
+// isValidParamType reports whether s is a recognized top-level
+// run parameter type. We deliberately keep the type vocabulary
+// small — richer types (enums, JSON schema, cross-param
+// constraints) are future work. What's here is enough for the
+// LLM to build a natural-language interview out of a param
+// block.
+func isValidParamType(s string) bool {
+	switch s {
+	case "string", "int", "bool", "list<string>":
+		return true
+	}
+	return false
+}
+
+// checkParamValueType reports whether v is assignable to a param
+// declared as paramType. Used both for default-value validation
+// at parse time and for supplied-value validation at submission
+// time. YAML decoding yields int for `1`, bool for `true`,
+// string for `"pcos"`, []interface{} for `[a, b]` — we accept
+// those shapes.
+//
+// Error messages use natural-English type names ("a number",
+// "true/false") and quote the offending value so the LLM can
+// forward them to the user as conversation turns. Go-level
+// type names like `float64` never appear in user-facing output.
+func checkParamValueType(name, paramType string, v interface{}) error {
+	switch paramType {
+	case "string":
+		if _, ok := v.(string); !ok {
+			return fmt.Errorf("param %q: expected a string, got %s", name, describeValue(v))
+		}
+	case "int":
+		switch v.(type) {
+		case int, int64:
+			return nil
+		case float64:
+			// YAML/JSON decode whole numbers as float64. Accept
+			// them if they're integral; reject if they're not.
+			f := v.(float64)
+			if f == float64(int64(f)) {
+				return nil
+			}
+			return fmt.Errorf("param %q: expected a whole number, got a decimal (%v)", name, v)
+		}
+		return fmt.Errorf("param %q: expected a whole number, got %s", name, describeValue(v))
+	case "bool":
+		if _, ok := v.(bool); !ok {
+			return fmt.Errorf("param %q: expected true or false, got %s", name, describeValue(v))
+		}
+	case "list<string>":
+		xs, ok := v.([]interface{})
+		if !ok {
+			if _, isStringSlice := v.([]string); isStringSlice {
+				return nil
+			}
+			return fmt.Errorf("param %q: expected a list of strings, got %s", name, describeValue(v))
+		}
+		for i, item := range xs {
+			if _, ok := item.(string); !ok {
+				return fmt.Errorf("param %q: list item #%d is not a string — %s", name, i+1, describeValue(item))
+			}
+		}
+	}
+	return nil
+}
+
+// describeValue renders a value the way a user would describe
+// it in English ("a string ('foo')", "a number (123)",
+// "true/false (false)"), not the way Go's %T reflects on it.
+// Used in param type-mismatch errors so the LLM can forward
+// them verbatim without exposing Go-internal type names like
+// `float64` or `[]interface {}`.
+func describeValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return fmt.Sprintf("a string (%q)", x)
+	case bool:
+		return fmt.Sprintf("a boolean (%v)", x)
+	case int:
+		return fmt.Sprintf("a number (%d)", x)
+	case int64:
+		return fmt.Sprintf("a number (%d)", x)
+	case float64:
+		return fmt.Sprintf("a number (%v)", x)
+	case []interface{}, []string:
+		return "a list"
+	case map[string]interface{}:
+		return "an object"
+	case nil:
+		return "null"
+	}
+	return "an unrecognized value"
+}

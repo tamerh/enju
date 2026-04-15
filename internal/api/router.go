@@ -255,13 +255,14 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 	for _, run := range runs {
 		tasks, _ := s.store.ListTasksByRun(run.ID)
 		resp = append(resp, runResponse{
-			ID:        run.ID,
-			ProjectID: run.ProjectID,
-			Seq:       run.Seq,
-			Name:      run.Name,
-			State:     string(run.State),
-			TaskCount: len(tasks),
-			CreatedAt: run.CreatedAt.Format(time.RFC3339),
+			ID:         run.ID,
+			ProjectID:  run.ProjectID,
+			Seq:        run.Seq,
+			Name:       run.Name,
+			State:      string(run.State),
+			TaskCount:  len(tasks),
+			CreatedAt:  run.CreatedAt.Format(time.RFC3339),
+			SourcePath: run.SourcePath,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -361,19 +362,24 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 // --- Runs ---
 
 type createRunRequest struct {
-	YAML    string `json:"yaml"`
-	RepoURL string `json:"repo_url,omitempty"`
+	YAML            string                 `json:"yaml"`
+	RepoURL         string                 `json:"repo_url,omitempty"`
+	Params          map[string]interface{} `json:"params,omitempty"`            // Phase H.1 — values for top-level params: block
+	SourcePath      string                 `json:"source_path,omitempty"`       // Phase H.1 — repo-relative template path for provenance
+	SourceCommitSHA string                 `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
 }
 
 type runResponse struct {
-	ID        int64    `json:"id"`                   // global DB ID
-	ProjectID int64    `json:"project_id,omitempty"` // parent project
-	Seq       int      `json:"seq"`                  // sequence within project (this is the user-facing run #)
-	Name      string   `json:"name"`
-	State     string   `json:"state"`
-	TaskCount int      `json:"task_count"`
-	CreatedAt string   `json:"created_at"`
-	Warnings  []string `json:"warnings,omitempty"` // non-fatal advisories from the parser
+	ID              int64    `json:"id"`                   // global DB ID
+	ProjectID       int64    `json:"project_id,omitempty"` // parent project
+	Seq             int      `json:"seq"`                  // sequence within project (this is the user-facing run #)
+	Name            string   `json:"name"`
+	State           string   `json:"state"`
+	TaskCount       int      `json:"task_count"`
+	CreatedAt       string   `json:"created_at"`
+	SourcePath      string   `json:"source_path,omitempty"`       // Phase H.1 — template this run came from, if any
+	SourceCommitSHA string   `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
+	Warnings        []string `json:"warnings,omitempty"`          // non-fatal advisories from the parser
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -401,8 +407,18 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse and validate the YAML
-	parsed, err := enjuYaml.Parse([]byte(req.YAML))
+	// Parse and validate the YAML. If the caller supplied
+	// top-level params (Phase H.1), use ParseWithParams to
+	// substitute them into task prompts before validation/DAG
+	// construction. Calls with no params take the plain Parse
+	// path so inline-YAML submissions keep their existing
+	// semantics.
+	var parsed *enjuYaml.ParsedRun
+	if req.Params != nil {
+		parsed, err = enjuYaml.ParseWithParams([]byte(req.YAML), req.Params)
+	} else {
+		parsed, err = enjuYaml.Parse([]byte(req.YAML))
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid run definition: "+err.Error())
 		return
@@ -456,14 +472,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	repoURL := req.RepoURL
 
 	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
-		ProjectID: projectID,
-		Name:      parsed.Run.Name,
-		Ref:       parsed.Run.Ref,
-		YAMLData:  req.YAML,
-		RepoURL:   repoURL,
-		State:     store.RunActive,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ProjectID:       projectID,
+		Name:            parsed.Run.Name,
+		Ref:             parsed.Run.Ref,
+		YAMLData:        req.YAML,
+		RepoURL:         repoURL,
+		State:           store.RunActive,
+		SourcePath:      req.SourcePath,
+		SourceCommitSHA: req.SourceCommitSHA,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	})
 	if err != nil {
 		s.logger.Error("creating run", "error", err)
@@ -572,14 +590,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, runResponse{
-		ID:        runID,
-		ProjectID: projectID,
-		Seq:       runSeq,
-		Name:      parsed.Run.Name,
-		State:     string(store.RunActive),
-		TaskCount: taskCount,
-		CreatedAt: now.Format(time.RFC3339),
-		Warnings:  parsed.Warnings,
+		ID:              runID,
+		ProjectID:       projectID,
+		Seq:             runSeq,
+		Name:            parsed.Run.Name,
+		State:           string(store.RunActive),
+		TaskCount:       taskCount,
+		CreatedAt:       now.Format(time.RFC3339),
+		SourcePath:      req.SourcePath,
+		SourceCommitSHA: req.SourceCommitSHA,
+		Warnings:        parsed.Warnings,
 	})
 }
 
@@ -594,13 +614,14 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, p := range runs {
 		tasks, _ := s.store.ListTasksByRun(p.ID)
 		resp = append(resp, runResponse{
-			ID:        p.ID,
-			ProjectID: p.ProjectID,
-			Seq:       p.Seq,
-			Name:      p.Name,
-			State:     string(p.State),
-			TaskCount: len(tasks),
-			CreatedAt: p.CreatedAt.Format(time.RFC3339),
+			ID:         p.ID,
+			ProjectID:  p.ProjectID,
+			Seq:        p.Seq,
+			Name:       p.Name,
+			State:      string(p.State),
+			TaskCount:  len(tasks),
+			CreatedAt:  p.CreatedAt.Format(time.RFC3339),
+			SourcePath: p.SourcePath,
 		})
 	}
 
@@ -623,7 +644,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 	tasks, _ := s.store.ListTasksByRun(p.ID)
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":         p.ID,
 		"project_id": p.ProjectID,
 		"seq":        p.Seq,
@@ -632,7 +653,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		"repo_url":   p.RepoURL,
 		"task_count": len(tasks),
 		"created_at": p.CreatedAt.Format(time.RFC3339),
-	})
+	}
+	if p.SourcePath != "" {
+		resp["source_path"] = p.SourcePath
+	}
+	if p.SourceCommitSHA != "" {
+		resp["source_commit_sha"] = p.SourceCommitSHA
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleListRunTasks(w http.ResponseWriter, r *http.Request) {
