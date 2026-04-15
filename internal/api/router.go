@@ -539,6 +539,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
 				AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
 				RequireRole:     ti.RequireRole,
+				ReviewsTarget:   ti.Reviews,
 				CreatedAt:   now,
 			})
 			if err != nil {
@@ -666,6 +667,8 @@ type taskResponse struct {
 	WritesArtifacts []string `json:"writes_artifacts,omitempty"`
 	AssignTo        []string `json:"assign_to,omitempty"` // usernames
 	RequireRole     string   `json:"require_role,omitempty"`
+	ReviewsTarget   string   `json:"reviews_target,omitempty"`   // Phase E: target task id this review evaluates
+	ReviewDecision  string   `json:"review_decision,omitempty"`  // Phase E: approve/reject once submitted
 }
 
 func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
@@ -817,6 +820,12 @@ type submitResultRequest struct {
 
 	TokensUsed int64  `json:"tokens_used,omitempty"`
 	Model      string `json:"model,omitempty"`
+
+	// Decision is the review verdict for action:review tasks. One
+	// of "approve" / "reject". Ignored on non-review tasks. An empty
+	// string on a review task is rejected up front — the reviewer
+	// has to say something.
+	Decision string `json:"decision,omitempty"`
 }
 
 // handleSubmitResult is the metadata-only submit path. The client
@@ -986,9 +995,27 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	}
 	resultPath := expectedResultPath
 
+	// Review tasks must carry an explicit decision. Non-review
+	// tasks that happen to send one are tolerated: the column stays
+	// empty-by-default for them because we only persist it for
+	// action:review.
+	decision := ""
+	if task.Action == "review" {
+		switch req.Decision {
+		case "approve", "reject":
+			decision = req.Decision
+		case "":
+			writeError(w, http.StatusBadRequest, `decision is required on action:review tasks (must be "approve" or "reject")`)
+			return
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(`decision %q is invalid (must be "approve" or "reject")`, req.Decision))
+			return
+		}
+	}
+
 	// Update state machine — this also updates task_claims and
 	// citizen score counters, same as the legacy path.
-	if err := s.store.SubmitTaskResult(taskID, resultPath, req.CommitSHA, req.TokensUsed); err != nil {
+	if err := s.store.SubmitTaskResult(taskID, resultPath, req.CommitSHA, decision, req.TokensUsed); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
 		return
 	}
@@ -1040,6 +1067,36 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Review reject cascade. The review task itself was just
+	// accepted normally — that's the contract for "I have finished
+	// reviewing." On a `reject` verdict the coordinator now also
+	// fires the invalidation cascade on the reviewed target so it
+	// bounces back to READY and the author can re-submit. The
+	// existing cascade machinery handles the rest: the review task
+	// (which depends on its target) auto-invalidates via the
+	// descendant walk so the next submission can carry a fresh
+	// decision.
+	var rejectResult *invalidationResult
+	if task.Action == "review" && decision == "reject" && task.ReviewsTarget != "" {
+		targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+		res, err := s.performInvalidate(targetFullID)
+		if err != nil {
+			s.logger.Error("review-reject cascade failed",
+				"review_task", taskID, "target", targetFullID, "error", err)
+			// Don't fail the submit — the review decision is
+			// already stored and the author can still invoke
+			// enju_invalidate_task manually. Logging is enough.
+		} else {
+			rejectResult = res
+			s.logger.Info("review rejected target task",
+				"review_task", taskID,
+				"target", targetFullID,
+				"descendants", len(res.Descendants),
+				"changed", res.Changed,
+			)
+		}
+	}
+
 	// Mark run completed if all tasks accepted.
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
 	if completed {
@@ -1058,6 +1115,16 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		"result_path": resultPath,
 		"commit_sha":  req.CommitSHA,
 		"newly_ready": readied,
+	}
+	if decision != "" {
+		resp["decision"] = decision
+	}
+	if rejectResult != nil {
+		resp["review_cascade"] = map[string]interface{}{
+			"target":      task.ReviewsTarget,
+			"descendants": rejectResult.Descendants,
+			"changed":     rejectResult.Changed,
+		}
 	}
 	if len(req.ArtifactsWritten) > 0 {
 		resp["artifacts_written"] = req.ArtifactsWritten
@@ -1119,36 +1186,46 @@ func (s *Server) getOrLoadDAG(runID int64) (*dag.DAG, error) {
 	return parsed.DAG, nil
 }
 
-func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
-	taskID := chi.URLParam(r, "taskID")
+// invalidationResult summarizes what performInvalidate actually
+// changed on a single invocation. Used by the HTTP handler to
+// render the response body and by the review-reject path in
+// handleSubmitResultReport to log what happened.
+type invalidationResult struct {
+	Task            *store.TaskRecord
+	Descendants     []string
+	CrossRunReaders []string
+	Changed         int
+	Rollbacks       []rollbackOutcome
+	AffectedRuns    map[int64]bool
+}
 
-	var req invalidateRequest
-	json.NewDecoder(r.Body).Decode(&req)
+type rollbackOutcome struct {
+	Path              string
+	Deleted           bool
+	RestoredFromTask  string
+	RestoredCommitSHA string
+}
 
+// performInvalidate is the shared cascade-invalidation implementation
+// used by handleInvalidateTask (external API) and the review-reject
+// path inside handleSubmitResultReport. Walks the DAG for
+// intra-run descendants, rolls back the artifact index for
+// cross-run readers, and calls Store.InvalidateTask to flip states
+// atomically. Returns nil + error only on hard failures; soft
+// failures (artifact index misses, etc.) are logged and the cascade
+// continues.
+func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	task, err := s.store.GetTask(taskID)
 	if err != nil || task == nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
+		return nil, fmt.Errorf("task %q not found", taskID)
 	}
-
-	// Load the DAG lazily. After a coordinator restart the in-memory
-	// cache is empty — we rehydrate from the run's stored YAML on
-	// first access so features like this stay restart-safe.
 	d, err := s.getOrLoadDAG(task.RunID)
 	if err != nil {
-		s.logger.Error("loading DAG for invalidation", "run_id", task.RunID, "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to load DAG")
-		return
+		return nil, fmt.Errorf("loading DAG for run %d: %w", task.RunID, err)
 	}
-
-	// The DAG indexes nodes by {instanceKey:taskDefID} short form, not
-	// the fully-qualified store form ({projectID:runSeq:...}). Convert
-	// on the way in and out so the cascade walk matches the right
-	// nodes, then returns store-form IDs the client can actually use.
 	run, err := s.store.GetRun(task.RunID)
 	if err != nil || run == nil {
-		writeError(w, http.StatusInternalServerError, "run not found for task")
-		return
+		return nil, fmt.Errorf("run not found for task %q", taskID)
 	}
 	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
 	dagNodeID := enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID)
@@ -1159,28 +1236,12 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		descendants = append(descendants, runPrefix+short)
 	}
 
-	// --- Build the invalidation set ---
-	//
-	// Two sources of cascading:
-	//  1. Intra-run DAG descendants (target's downstream via
-	//     {{task.content}} references or explicit depends_on).
-	//  2. Cross-run artifact readers — tasks in any run whose
-	//     reads_artifacts contains a path written by a task in the
-	//     invalidation set, where that task is currently the
-	//     most recent accepted writer of the path.
-	//
-	// We build the full set of affected task IDs before any state
-	// transitions so the rollback walker and the store transition
-	// get a consistent view.
 	invalidatedSet := make(map[string]bool, 1+len(descendants))
 	invalidatedSet[taskID] = true
-	for _, d := range descendants {
-		invalidatedSet[d] = true
+	for _, dd := range descendants {
+		invalidatedSet[dd] = true
 	}
 
-	// Collect unique artifact paths written by any task in the
-	// initial invalidation set. These are the candidate rollback
-	// targets.
 	writtenPaths := make([]string, 0)
 	seenPath := make(map[string]bool)
 	collectWrites := func(t *store.TaskRecord) {
@@ -1200,16 +1261,6 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		collectWrites(dt)
 	}
 
-	// --- Cross-run cascade via artifact edges ---
-	//
-	// For each path in writtenPaths, check whether the artifact's
-	// current last_task_id is still in the invalidated set. If so,
-	// every ACCEPTED task in the project that reads that path will
-	// see the artifact rolled back and must be cascaded.
-	//
-	// Note: this is non-recursive — we cascade direct readers, not
-	// their intra-run descendants. That's a known limitation; see
-	// the buildout plan.
 	var crossRunReaders []string
 	affectedRunIDs := map[int64]bool{task.RunID: true}
 	for _, p := range writtenPaths {
@@ -1235,39 +1286,12 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// --- DB-only artifact rollback (iteration A orchestrator model) ---
-	//
-	// Phase 1's rollback walked git history to rewrite files in a
-	// coordinator-owned working tree. The orchestrator model never
-	// rewrites git history; instead, git is an immutable append log
-	// and the "current" version of any artifact is a DB pointer
-	// (artifacts.last_task_id / commit_sha). Invalidation finds a
-	// new pointer for each affected path: the most recent task in
-	// the same project whose state is ACCEPTED and which is not in
-	// the invalidated set, and which declared the path in its
-	// writes_artifacts. If no such task exists, the index row is
-	// deleted — the artifact's content may still live in git
-	// history but the DB no longer knows where.
-	type rollbackOutcome struct {
-		Path              string
-		Deleted           bool
-		RestoredFromTask  string
-		RestoredCommitSHA string
-	}
 	var rollbacks []rollbackOutcome
 	for _, p := range writtenPaths {
 		art, _ := s.store.GetArtifact(run.ProjectID, p)
 		if art == nil || !invalidatedSet[art.LastTaskID] {
-			// Current pointer isn't one of the invalidated tasks;
-			// leave the index alone.
 			continue
 		}
-		// Find the next-most-recent prior writer (still ACCEPTED,
-		// not in invalidated set). The store doesn't have a
-		// dedicated "prior writers of this path" query; we iterate
-		// all tasks in the project that declare this path in
-		// writes_artifacts, filter to ACCEPTED + not-invalidated,
-		// and pick the most recent by submitted_at.
 		priorTasks, err := s.store.ListTasksWritingArtifact(run.ProjectID, p, true)
 		if err != nil {
 			s.logger.Warn("listing prior writers", "path", p, "error", err)
@@ -1280,8 +1304,6 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if t.CommitSHA == "" {
-				// Legacy rows without a commit SHA can't be used
-				// as a rollback target in the new model.
 				continue
 			}
 			if pick == nil || (t.SubmittedAt != nil && pick.SubmittedAt != nil && t.SubmittedAt.After(*pick.SubmittedAt)) {
@@ -1289,14 +1311,12 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if pick == nil {
-			// No prior writer — drop the index row.
 			if err := s.store.DeleteArtifact(run.ProjectID, p); err != nil {
 				s.logger.Warn("deleting artifact index row", "path", p, "error", err)
 			}
 			rollbacks = append(rollbacks, rollbackOutcome{Path: p, Deleted: true})
 			continue
 		}
-		// Point the index at the prior writer's commit.
 		now := time.Now()
 		if err := s.store.UpsertArtifact(&store.ArtifactRecord{
 			ProjectID:  run.ProjectID,
@@ -1305,7 +1325,7 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 			LastTaskID: pick.ID,
 			LastRunID:  pick.RunID,
 			CommitSHA:  pick.CommitSHA,
-			CreatedAt:  now, // upsert preserves created_at via ON CONFLICT
+			CreatedAt:  now,
 			UpdatedAt:  now,
 		}); err != nil {
 			s.logger.Warn("updating artifact index after rollback", "path", p, "error", err)
@@ -1317,52 +1337,68 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Combine DAG descendants + cross-run artifact readers into a
-	// single cascade list for the store transition. The store treats
-	// them uniformly (all → PENDING, claim fields cleared).
 	cascadeIDs := make([]string, 0, len(descendants)+len(crossRunReaders))
 	cascadeIDs = append(cascadeIDs, descendants...)
 	cascadeIDs = append(cascadeIDs, crossRunReaders...)
 
 	changed, err := s.store.InvalidateTask(taskID, cascadeIDs)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return nil, err
 	}
-
-	// Every affected run needs UpdateReadyTasks to reflect the new
-	// state, and any run that was 'completed' should flip back to
-	// 'active'. affectedRunIDs started with the target's run and was
-	// augmented with each cross-run reader's run above.
 	for runID := range affectedRunIDs {
 		_, _ = s.store.UpdateReadyTasks(runID)
 		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
 			_ = s.store.UpdateRunState(runID, store.RunActive)
 		}
 	}
+	return &invalidationResult{
+		Task:            task,
+		Descendants:     descendants,
+		CrossRunReaders: crossRunReaders,
+		Changed:         changed,
+		Rollbacks:       rollbacks,
+		AffectedRuns:    affectedRunIDs,
+	}, nil
+}
+
+func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+
+	var req invalidateRequest
+	json.NewDecoder(r.Body).Decode(&req)
+
+	result, err := s.performInvalidate(taskID)
+	if err != nil {
+		// Not-found vs bad-state vs internal are indistinguishable
+		// from the helper's single error return. Use 400 as the
+		// generic "can't invalidate this" code; the message carries
+		// the specific reason.
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	s.logger.Info("task invalidated",
 		"task_id", taskID,
-		"descendants", len(descendants),
-		"cross_run_readers", len(crossRunReaders),
-		"changed", changed,
-		"artifacts_rolled_back", len(rollbacks),
+		"descendants", len(result.Descendants),
+		"cross_run_readers", len(result.CrossRunReaders),
+		"changed", result.Changed,
+		"artifacts_rolled_back", len(result.Rollbacks),
 		"reason", req.Reason,
 	)
 
 	resp := map[string]interface{}{
 		"status":      "invalidated",
 		"task_id":     taskID,
-		"descendants": descendants,
-		"changed":     changed,
+		"descendants": result.Descendants,
+		"changed":     result.Changed,
 		"reason":      req.Reason,
 	}
-	if len(crossRunReaders) > 0 {
-		resp["artifact_readers"] = crossRunReaders
+	if len(result.CrossRunReaders) > 0 {
+		resp["artifact_readers"] = result.CrossRunReaders
 	}
-	if len(rollbacks) > 0 {
-		rbView := make([]map[string]interface{}, 0, len(rollbacks))
-		for _, rb := range rollbacks {
+	if len(result.Rollbacks) > 0 {
+		rbView := make([]map[string]interface{}, 0, len(result.Rollbacks))
+		for _, rb := range result.Rollbacks {
 			item := map[string]interface{}{
 				"path": rb.Path,
 			}
@@ -1663,6 +1699,8 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		WritesArtifacts: unmarshalStringSlice(t.WritesArtifacts),
 		AssignTo:        unmarshalStringSlice(t.AssignTo),
 		RequireRole:     t.RequireRole,
+		ReviewsTarget:   t.ReviewsTarget,
+		ReviewDecision:  t.ReviewDecision,
 	}
 }
 

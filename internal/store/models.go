@@ -103,6 +103,16 @@ type TaskRecord struct {
 	AssignTo    string
 	RequireRole string
 
+	// Review action fields (Phase E). ReviewsTarget is the task def
+	// id this review task evaluates, copied from YAML `reviews:`.
+	// ReviewDecision is populated on submit for review-action tasks:
+	// "approve" or "reject". Both are empty for non-review tasks.
+	// On invalidation, ReviewDecision is cleared so a re-run of the
+	// review can land a fresh verdict without the old one leaking
+	// through.
+	ReviewsTarget  string
+	ReviewDecision string
+
 	CreatedAt time.Time
 }
 

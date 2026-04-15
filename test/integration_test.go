@@ -441,11 +441,28 @@ func (s *testServer) submitOutputs(taskID string, outputs map[string]string) map
 	return s.fatClientSubmit(taskID, "", outputs, nil)
 }
 
+// submitReview is the review-action variant of submit: writes the
+// reviewer's comment as result.md, commits/pushes, and posts the
+// report with decision:approve or decision:reject. Mirrors what
+// the MCP client sends on a real review submission.
+func (s *testServer) submitReview(taskID, comment, decision string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecision(taskID, comment, nil, nil, decision)
+}
+
 // fatClientSubmit is the shared helper that performs the full
 // iteration A write path: open the project's local clone, write
 // result files + artifacts, commit + push to the project's bare
 // remote, then POST the metadata report to the coordinator.
 func (s *testServer) fatClientSubmit(taskIDShort, content string, outputs, artifacts map[string]string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecision(taskIDShort, content, outputs, artifacts, "")
+}
+
+// fatClientSubmitWithDecision is fatClientSubmit with a review
+// decision attached. Review tasks pass "approve" / "reject"; other
+// actions pass an empty string.
+func (s *testServer) fatClientSubmitWithDecision(taskIDShort, content string, outputs, artifacts map[string]string, decision string) map[string]interface{} {
 	s.t.Helper()
 	fullTaskID := s.taskID(taskIDShort)
 
@@ -478,6 +495,19 @@ func (s *testServer) fatClientSubmit(taskIDShort, content string, outputs, artif
 		"model":       "test",
 		"result_type": "text",
 		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	// Phase E review-action audit trail. Mirror what
+	// submitResultFatClient does in production: when the task is
+	// action:review, embed action + decision + reviews_target in
+	// metadata.json so `git show` on the commit tells the full
+	// verdict story without touching the coordinator DB.
+	action, _ := task["action"].(string)
+	if action == "review" {
+		metadata["action"] = "review"
+		metadata["decision"] = decision
+		if rt, _ := task["reviews_target"].(string); rt != "" {
+			metadata["reviews_target"] = rt
+		}
 	}
 	if content != "" {
 		files = append(files, mcpgit.FileWrite{
@@ -555,13 +585,17 @@ func (s *testServer) fatClientSubmit(taskIDShort, content string, outputs, artif
 
 	// Report the commit to the coordinator so state machine +
 	// artifact index get updated.
-	return s.post("/api/v1/tasks/"+fullTaskID+"/result", map[string]interface{}{
+	reportBody := map[string]interface{}{
 		"commit_sha":        res.CommitSHA,
 		"result_path":       resultDir,
 		"artifacts_written": artifactPaths,
 		"tokens_used":       100,
 		"model":             "test",
-	})
+	}
+	if decision != "" {
+		reportBody["decision"] = decision
+	}
+	return s.post("/api/v1/tasks/"+fullTaskID+"/result", reportBody)
 }
 
 // readArtifactFile reads an artifact's content from the project's
@@ -588,6 +622,31 @@ func (s *testServer) readArtifactFile(projectID int64, path string) (string, boo
 		return "", false
 	}
 	return string(data), true
+}
+
+// readRepoFile reads any repo-relative file from a project's bare
+// remote. Thin wrapper around a throwaway clone. Used by tests that
+// need to peek at per-task result files like metadata.json or
+// result.md without knowing the artifact path-mapping convention.
+func (s *testServer) readRepoFile(projectID int64, repoRelPath string) ([]byte, bool) {
+	s.t.Helper()
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		return nil, false
+	}
+	cloneDir, err := os.MkdirTemp("", "read-repo-")
+	if err != nil {
+		return nil, false
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(cloneDir, repoRelPath))
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 func (s *testServer) release(taskID, username string) map[string]interface{} {
@@ -2956,6 +3015,265 @@ func cleanYAML(raw string) string {
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// TestReviewApprovePath exercises the happy path of an action:review
+// task: author drafts, reviewer approves, downstream unlocks. No
+// cascade fires.
+func TestReviewApprovePath(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	pid := s.submitYAML("testdata/review.yaml")
+
+	// Only the draft should be ready at start; check depends on
+	// draft via the auto-inserted reviews-edge, and publish depends
+	// on check.
+	ready := s.readyTasks(pid)
+	if len(ready) != 1 {
+		t.Fatalf("expected 1 ready task (draft), got %d", len(ready))
+	}
+
+	// Alice drafts.
+	s.claim("draft", alice)
+	drafted := answer(t, "Write a one-sentence summary of enju.", "Enju is a DAG-based task coordinator.")
+	if r := s.submit("draft", drafted); r["status"] != "accepted" {
+		t.Fatalf("draft submit not accepted: %v", r)
+	}
+
+	// Review becomes ready. Bob claims + approves.
+	s.claim("check", bob)
+	verdict := answer(t, "Does the draft hold up?", "Looks good to me.")
+	reviewRes := s.submitReview("check", verdict, "approve")
+	if reviewRes["status"] != "accepted" {
+		t.Fatalf("review submit not accepted: %v", reviewRes)
+	}
+	if reviewRes["decision"] != "approve" {
+		t.Fatalf("expected decision=approve in response, got %v", reviewRes["decision"])
+	}
+	if _, has := reviewRes["review_cascade"]; has {
+		t.Fatalf("approve should NOT carry review_cascade, got %v", reviewRes["review_cascade"])
+	}
+
+	// The draft task should still be accepted (not invalidated).
+	draftTask := s.taskGet("draft")
+	if draftTask["state"] != "accepted" {
+		t.Fatalf("draft should still be accepted after approve, got %v", draftTask["state"])
+	}
+
+	// Publish becomes ready.
+	ready = s.readyTasks(pid)
+	found := false
+	for _, r := range ready {
+		if m, ok := r.(map[string]interface{}); ok {
+			if tdid, _ := m["task_def_id"].(string); tdid == "publish" {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("publish should be ready after approve, ready: %v", ready)
+	}
+}
+
+// TestReviewRejectCascade exercises the reject path: author drafts,
+// reviewer rejects, draft bounces back to READY, review task is
+// also reset via the existing dep cascade, publish stays blocked.
+// Then author re-submits a fixed draft, new review approves, and
+// the run completes.
+func TestReviewRejectCascade(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	pid := s.submitYAML("testdata/review.yaml")
+
+	// Round 1: alice drafts badly.
+	s.claim("draft", alice)
+	bad := answer(t, "Write a one-sentence summary of enju.", "This is a bad draft.")
+	s.submit("draft", bad)
+
+	// Bob reviews and rejects.
+	s.claim("check", bob)
+	rejectComment := answer(t, "Does the draft hold up?", "Too vague — try again.")
+	rejectRes := s.submitReview("check", rejectComment, "reject")
+	if rejectRes["status"] != "accepted" {
+		t.Fatalf("reject submit not accepted: %v", rejectRes)
+	}
+	if rejectRes["decision"] != "reject" {
+		t.Fatalf("expected decision=reject in response, got %v", rejectRes["decision"])
+	}
+	cascade, ok := rejectRes["review_cascade"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected review_cascade on reject, got %v", rejectRes)
+	}
+	if cascade["target"] != "draft" {
+		t.Fatalf("expected cascade target=draft, got %v", cascade["target"])
+	}
+
+	// Draft should be back to READY.
+	draftTask := s.taskGet("draft")
+	if draftTask["state"] != "ready" {
+		t.Fatalf("draft should be ready after reject, got %v", draftTask["state"])
+	}
+	// The review task itself should have been reset via the
+	// existing dep cascade (check depends on draft, so invalidating
+	// draft cascades to check → pending).
+	checkTask := s.taskGet("check")
+	if checkTask["state"] != "pending" {
+		t.Fatalf("check should be pending after reject cascade, got %v", checkTask["state"])
+	}
+	// Publish should still be pending.
+	publishTask := s.taskGet("publish")
+	if publishTask["state"] != "pending" {
+		t.Fatalf("publish should be pending, got %v", publishTask["state"])
+	}
+
+	// Round 2: alice re-drafts, bob re-reviews and approves.
+	s.claim("draft", alice)
+	good := answer(t, "Write a one-sentence summary of enju.", "Enju is a DAG-based task coordinator.")
+	s.submit("draft", good)
+
+	s.claim("check", bob)
+	s.submitReview("check", "Better.", "approve")
+
+	// Draft should still report no decision; check should report approve.
+	checkTask = s.taskGet("check")
+	if d, _ := checkTask["review_decision"].(string); d != "approve" {
+		t.Fatalf("expected check.review_decision=approve, got %q", d)
+	}
+
+	// Publish now ready, complete it so the run ends.
+	s.claim("publish", alice)
+	s.submit("publish", "Published.")
+
+	status := s.runStatus(pid)
+	if status["state"] != "completed" {
+		t.Fatalf("expected completed run, got %v", status["state"])
+	}
+}
+
+// TestReviewMetadataAuditTrail verifies that the commit landed by
+// a review submission records decision + reviews_target + action
+// inside metadata.json. The DB's review_decision column is mutable
+// (cleared on invalidation) but the git commit is permanent, so
+// git-log archaeology must be able to reconstruct the verdict
+// trail without talking to the coordinator DB at all.
+func TestReviewMetadataAuditTrail(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	s.submitYAML("testdata/review.yaml")
+	pid := s.lastProjectID
+
+	// Drive the full flow once with an explicit approve.
+	s.claim("draft", alice)
+	s.submit("draft", "Enju is a DAG-based task coordinator.")
+	s.claim("check", bob)
+	s.submitReview("check", "Looks accurate.", "approve")
+
+	// Fetch the run seq so we can build the metadata.json path.
+	// The review.yaml run is the project's run #1.
+	runSeq := 1
+	metaPath := filepath.Join(
+		fmt.Sprintf("projects/%d/runs/%d/check", pid, runSeq),
+		"metadata.json",
+	)
+	raw, ok := s.readRepoFile(pid, metaPath)
+	if !ok {
+		t.Fatalf("metadata.json not found at %s on bare remote", metaPath)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("metadata.json malformed: %v — raw: %s", err, raw)
+	}
+	if action, _ := meta["action"].(string); action != "review" {
+		t.Errorf("expected metadata.action=review, got %v", meta["action"])
+	}
+	if decision, _ := meta["decision"].(string); decision != "approve" {
+		t.Errorf("expected metadata.decision=approve, got %v", meta["decision"])
+	}
+	if target, _ := meta["reviews_target"].(string); target != "draft" {
+		t.Errorf("expected metadata.reviews_target=draft, got %v", meta["reviews_target"])
+	}
+
+	// Non-review tasks should NOT carry decision/reviews_target
+	// keys. The draft's metadata.json is the control case.
+	draftPath := filepath.Join(
+		fmt.Sprintf("projects/%d/runs/%d/draft", pid, runSeq),
+		"metadata.json",
+	)
+	rawDraft, ok := s.readRepoFile(pid, draftPath)
+	if !ok {
+		t.Fatalf("draft metadata.json not found at %s", draftPath)
+	}
+	var draftMeta map[string]interface{}
+	if err := json.Unmarshal(rawDraft, &draftMeta); err != nil {
+		t.Fatalf("draft metadata.json malformed: %v", err)
+	}
+	if _, leaks := draftMeta["decision"]; leaks {
+		t.Error("draft metadata should not include decision field")
+	}
+	if _, leaks := draftMeta["reviews_target"]; leaks {
+		t.Error("draft metadata should not include reviews_target field")
+	}
+	if _, leaks := draftMeta["action"]; leaks {
+		// Non-review tasks don't carry action in metadata today —
+		// that field is only surfaced for review-task audits.
+		t.Error("draft metadata should not include action field (review-only)")
+	}
+}
+
+// TestReviewRejectMetadataCarriesVerdict is the reject-path twin of
+// the audit test: after a rejection the review task's metadata.json
+// must record decision=reject alongside the same action + target
+// keys. Critical because the DB's review_decision is cleared as
+// part of the invalidation cascade — the immutable commit is the
+// only place the rejection survives for audit.
+func TestReviewRejectMetadataCarriesVerdict(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	s.submitYAML("testdata/review.yaml")
+	pid := s.lastProjectID
+
+	s.claim("draft", alice)
+	s.submit("draft", "A draft that will be rejected.")
+	s.claim("check", bob)
+	s.submitReview("check", "Needs more detail.", "reject")
+
+	runSeq := 1
+	metaPath := filepath.Join(
+		fmt.Sprintf("projects/%d/runs/%d/check", pid, runSeq),
+		"metadata.json",
+	)
+	raw, ok := s.readRepoFile(pid, metaPath)
+	if !ok {
+		t.Fatalf("metadata.json not found at %s", metaPath)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("metadata.json malformed: %v", err)
+	}
+	if decision, _ := meta["decision"].(string); decision != "reject" {
+		t.Errorf("expected metadata.decision=reject, got %v", meta["decision"])
+	}
+	if target, _ := meta["reviews_target"].(string); target != "draft" {
+		t.Errorf("expected metadata.reviews_target=draft, got %v", meta["reviews_target"])
+	}
+
+	// Sanity check: after the reject cascade, the review task's
+	// DB row should have its decision column CLEARED (because
+	// the review was re-invalidated via the dep edge), but the
+	// metadata.json on disk still carries "reject". That
+	// divergence is the whole point of the audit trail — the DB
+	// is mutable, git is forever.
+	checkTask := s.taskGet("check")
+	if dbDecision, _ := checkTask["review_decision"].(string); dbDecision != "" {
+		t.Errorf("expected check.review_decision cleared after cascade, got %q", dbDecision)
+	}
 }
 
 // Suppress unused import

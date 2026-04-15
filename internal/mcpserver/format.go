@@ -501,6 +501,49 @@ func formatResolvedArtifactsBlock(artifacts map[string]interface{}, missing []st
 	return b.String()
 }
 
+// formatReviewingBlock renders the target's content for an
+// action:review claim so the reviewer can see what they're
+// evaluating without a second enju_get_task call. Mirrors the
+// resolved-artifacts block in shape: header line + indented
+// content, truncated with a pointer to a richer tool for large
+// payloads.
+func formatReviewingBlock(reviewing map[string]interface{}) string {
+	if len(reviewing) == 0 {
+		return ""
+	}
+	targetID, _ := reviewing["target_def_id"].(string)
+	claimedBy, _ := reviewing["claimed_by"].(string)
+	content, _ := reviewing["content"].(string)
+
+	var b strings.Builder
+	b.WriteString("── Reviewing ───────────────────────────────\n")
+
+	header := "▸ " + targetID
+	if claimedBy != "" {
+		header += " (by @" + claimedBy + ")"
+	}
+	header += fmt.Sprintf(" — %d chars", len(content))
+
+	truncated := false
+	display := content
+	if len(display) > artifactInlineLimit {
+		display = display[:artifactInlineLimit]
+		truncated = true
+		header += ", truncated — use enju_get_task for full content"
+	}
+
+	b.WriteString(header)
+	b.WriteString("\n\n")
+	indented := "  " + strings.ReplaceAll(display, "\n", "\n  ")
+	b.WriteString(indented)
+	if !strings.HasSuffix(display, "\n") {
+		b.WriteString("\n")
+	}
+	_ = truncated
+	b.WriteString("────────────────────────────────────────────\n")
+	return b.String()
+}
+
 // sortStrings sorts a slice of strings in place. Tiny helper to avoid
 // pulling sort into format.go for a single call site.
 func sortStrings(xs []string) {
@@ -713,6 +756,17 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 			if len(resolvedArtifacts) > 0 || len(missingArtifacts) > 0 {
 				b.WriteString(formatResolvedArtifactsBlock(resolvedArtifacts, missingArtifacts))
 			}
+
+			// Review tasks: surface the reviewed target's content
+			// inline. fetchAndResolveLocally attaches a "reviewing"
+			// block to the inputs response for action:review tasks,
+			// populated from the local clone at the target's
+			// accepted commit_sha. Mirrors the reads_artifacts
+			// block — the claimer shouldn't need a second
+			// round-trip to see what they're evaluating.
+			if reviewing, ok := inputs["reviewing"].(map[string]interface{}); ok {
+				b.WriteString(formatReviewingBlock(reviewing))
+			}
 		}
 	} else {
 		if deps == "" {
@@ -817,8 +871,26 @@ func formatSubmitResult(data []byte, taskID string) string {
 	newlyReady, _ := result["newly_ready"].(float64)
 	completed, _ := result["run_completed"].(bool)
 	artifactsWritten, _ := result["artifacts_written"].([]interface{})
+	decision, _ := result["decision"].(string)
+	reviewCascade, _ := result["review_cascade"].(map[string]interface{})
 
-	b.WriteString(fmt.Sprintf("✓ Result accepted: %s\n", taskID))
+	// Review tasks get a decision-first summary so the reviewer
+	// sees the outcome of their own submit at a glance.
+	switch decision {
+	case "approve":
+		b.WriteString(fmt.Sprintf("✓ Review approved: %s\n", taskID))
+	case "reject":
+		b.WriteString(fmt.Sprintf("✗ Review rejected: %s\n", taskID))
+		if reviewCascade != nil {
+			target, _ := reviewCascade["target"].(string)
+			changed, _ := reviewCascade["changed"].(float64)
+			if target != "" {
+				b.WriteString(fmt.Sprintf("  → target %q invalidated and bounced back to READY (%d task(s) reset)\n", target, int(changed)))
+			}
+		}
+	default:
+		b.WriteString(fmt.Sprintf("✓ Result accepted: %s\n", taskID))
+	}
 
 	if len(artifactsWritten) > 0 {
 		b.WriteString("\nArtifacts written:\n")
@@ -1086,6 +1158,22 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	}
 	if deps != "" {
 		b.WriteString(fmt.Sprintf("  Depends:  %s\n", deps))
+	}
+
+	// Review-action metadata. Reviews target is set at run creation;
+	// decision only after submit.
+	if reviewsTarget, _ := task["reviews_target"].(string); reviewsTarget != "" {
+		b.WriteString(fmt.Sprintf("  Reviews:  %s\n", reviewsTarget))
+	}
+	if decision, _ := task["review_decision"].(string); decision != "" {
+		switch decision {
+		case "approve":
+			b.WriteString("  Decision: ✓ approved\n")
+		case "reject":
+			b.WriteString("  Decision: ✗ rejected (target invalidated)\n")
+		default:
+			b.WriteString(fmt.Sprintf("  Decision: %s\n", decision))
+		}
 	}
 
 	// Show environment requirements if present

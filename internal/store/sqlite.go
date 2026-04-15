@@ -160,6 +160,8 @@ func (s *Store) migrate() error {
 		writes_artifacts TEXT NOT NULL DEFAULT '',
 		assign_to TEXT NOT NULL DEFAULT '',
 		require_role TEXT NOT NULL DEFAULT '',
+		reviews_target TEXT NOT NULL DEFAULT '',
+		review_decision TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -217,6 +219,11 @@ func (s *Store) migrate() error {
 		// legacy coordinator-writes path.
 		`ALTER TABLE tasks ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE artifacts ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
+		// Phase E — review action. Target is the task def id this
+		// review evaluates; decision is approve/reject, populated
+		// on submit and cleared on invalidation.
+		`ALTER TABLE tasks ADD COLUMN reviews_target TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN review_decision TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -468,18 +475,20 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
-	// commit_sha is never set at create time; it's populated by the
-	// submit path. Omitting it here lets the column default ('') fire.
+	// commit_sha and review_decision are never set at create time;
+	// they're populated by the submit path. Omitting them here lets
+	// the column defaults ('') fire. reviews_target IS set at create
+	// time from the YAML `reviews:` field.
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
-		t.AssignTo, t.RequireRole, t.CreatedAt,
+		t.AssignTo, t.RequireRole, t.ReviewsTarget, t.CreatedAt,
 	)
 	return err
 }
@@ -495,7 +504,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 		&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 		&t.ReadsArtifacts, &t.WritesArtifacts,
-		&t.AssignTo, &t.RequireRole, &t.CreatedAt)
+		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision, &t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -606,7 +615,13 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 // tests that fake the git side) pass an empty string; the field
 // stays empty in the DB and the template resolver falls back to
 // the working tree instead of reading at a specific commit.
-func (s *Store) SubmitTaskResult(taskID, resultPath, commitSHA string, tokensUsed int64) error {
+//
+// decision is the optional review verdict ("approve" or "reject")
+// for review-action tasks. Non-review submits pass an empty
+// string and the column stays empty. The coordinator reads this
+// column after the accept lands to decide whether to cascade an
+// invalidation on the review target.
+func (s *Store) SubmitTaskResult(taskID, resultPath, commitSHA, decision string, tokensUsed int64) error {
 	now := time.Now()
 
 	tx, err := s.db.Begin()
@@ -626,8 +641,8 @@ func (s *Store) SubmitTaskResult(taskID, resultPath, commitSHA string, tokensUse
 	}
 
 	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ? WHERE id = ?`,
-		now, resultPath, commitSHA, taskID,
+		`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ? WHERE id = ?`,
+		now, resultPath, commitSHA, decision, taskID,
 	)
 	if err != nil {
 		return err
@@ -717,9 +732,11 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 	changed := 0
 
 	// Target: ACCEPTED → READY. Clear all claim/result fields so a
-	// fresh citizen sees no stale provenance when they claim.
+	// fresh citizen sees no stale provenance when they claim. Also
+	// clears review_decision so a re-run of a review task lands a
+	// fresh verdict instead of re-using the previous "reject."
 	if _, err = tx.Exec(
-		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL WHERE id = ?`,
+		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '' WHERE id = ?`,
 		taskID,
 	); err != nil {
 		return 0, err
@@ -757,7 +774,7 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 			continue
 		}
 		if _, err := tx.Exec(
-			`UPDATE tasks SET state = 'pending', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL WHERE id = ?`,
+			`UPDATE tasks SET state = 'pending', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '' WHERE id = ?`,
 			descID,
 		); err != nil {
 			return 0, err
@@ -1114,7 +1131,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 			&t.ReadsArtifacts, &t.WritesArtifacts,
-			&t.AssignTo, &t.RequireRole, &t.CreatedAt); err != nil {
+			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		t.Ref = ref.String

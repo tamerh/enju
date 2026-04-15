@@ -1,0 +1,14 @@
+name: "Review Flow"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a one-sentence summary of enju."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Read the draft and decide whether it's good enough."
+  - id: publish
+    action: answer
+    depends_on: [check]
+    prompt: "Publish the approved draft: {{draft.content}}"

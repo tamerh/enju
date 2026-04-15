@@ -180,7 +180,7 @@ func TestSubmitResult(t *testing.T) {
 
 	s.ClaimTask("task-1", alice, now.Add(30*time.Minute))
 
-	err := s.SubmitTaskResult("task-1", "results/step1", "", 1500)
+	err := s.SubmitTaskResult("task-1", "results/step1", "", "", 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestUpdateReadyTasks(t *testing.T) {
 
 	// Accept a → b should become ready, c still pending
 	s.ClaimTask("a", alice, now.Add(30*time.Minute))
-	s.SubmitTaskResult("a", "results/a", "", 100)
+	s.SubmitTaskResult("a", "results/a", "", "", 100)
 
 	count, err = s.UpdateReadyTasks(pid)
 	if err != nil {

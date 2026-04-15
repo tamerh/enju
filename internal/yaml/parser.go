@@ -111,6 +111,15 @@ type TaskDef struct {
 	ReadsArtifacts  []string `yaml:"reads_artifacts,omitempty"`
 	WritesArtifacts []string `yaml:"writes_artifacts,omitempty"`
 
+	// Reviews names the task this one reviews. Required on
+	// `action: review` tasks, ignored elsewhere. The reviewer reads
+	// the target's output, makes an approve/reject decision, and
+	// submits — a reject triggers the existing invalidation cascade
+	// on the target. The review task must depend on its target
+	// (parser auto-inserts the edge so authors don't have to write
+	// it twice). See docs/task-actions.md for the full flow.
+	Reviews string `yaml:"reviews,omitempty"`
+
 	// Assignment and access control (iteration 1 of build-out plan).
 	// Both are optional — the default is open: any registered citizen
 	// can claim any task. When set, they narrow who can claim.
@@ -231,6 +240,18 @@ func validate(p *Run) error {
 			}
 		}
 
+		// Review tasks need an explicit target.
+		if t.Action == "review" {
+			if t.Reviews == "" {
+				return fmt.Errorf("task %q: reviews: <target_task_id> is required on review-action tasks", t.ID)
+			}
+			if t.Reviews == t.ID {
+				return fmt.Errorf("task %q: reviews cannot reference the review task itself", t.ID)
+			}
+		} else if t.Reviews != "" {
+			return fmt.Errorf("task %q: reviews is only valid on action: review tasks", t.ID)
+		}
+
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
 		}
@@ -276,11 +297,30 @@ func validate(p *Run) error {
 		}
 	}
 
-	// Second pass: verify all depends_on references exist
-	for _, t := range p.Tasks {
+	// Second pass: verify all depends_on references exist.
+	// Also auto-insert a dependency on the reviews: target so
+	// review tasks always run after whatever they review — authors
+	// don't have to declare the same relationship twice.
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
 		for _, dep := range t.DependsOn {
 			if !ids[dep] {
 				return fmt.Errorf("task %q depends on %q which does not exist", t.ID, dep)
+			}
+		}
+		if t.Reviews != "" {
+			if !ids[t.Reviews] {
+				return fmt.Errorf("task %q: reviews target %q does not exist", t.ID, t.Reviews)
+			}
+			hasDep := false
+			for _, dep := range t.DependsOn {
+				if dep == t.Reviews {
+					hasDep = true
+					break
+				}
+			}
+			if !hasDep {
+				t.DependsOn = append(t.DependsOn, t.Reviews)
 			}
 		}
 	}

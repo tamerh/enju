@@ -630,6 +630,126 @@ tasks:
 	}
 }
 
+// TestParseReviewAction covers the Phase E review-action validator:
+// required reviews: field, target-must-exist, self-reference
+// rejection, auto-inserted dep edge, and the non-review task
+// rejecting a stray reviews: field.
+func TestParseReviewAction(t *testing.T) {
+	t.Run("happy path auto-inserts dep", func(t *testing.T) {
+		parsed, err := Parse([]byte(`
+name: "Review happy"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a summary."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Approve or reject."
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		// Review task's depends_on should include the target even
+		// though the YAML didn't list it.
+		var checkDeps []string
+		for _, tk := range parsed.Run.Tasks {
+			if tk.ID == "check" {
+				checkDeps = tk.DependsOn
+				break
+			}
+		}
+		found := false
+		for _, d := range checkDeps {
+			if d == "draft" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected parser to auto-insert 'draft' into check.depends_on, got %v", checkDeps)
+		}
+	})
+
+	t.Run("missing reviews field", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Review missing"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: check
+    action: review
+    prompt: "Check it."
+`))
+		if err == nil {
+			t.Fatal("expected error for missing reviews: field")
+		}
+		if !contains(err.Error(), "reviews:") {
+			t.Errorf("error should mention reviews:, got %q", err.Error())
+		}
+	})
+
+	t.Run("self reference rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Review self"
+version: 1
+tasks:
+  - id: check
+    action: review
+    reviews: check
+    prompt: "Review myself."
+`))
+		if err == nil {
+			t.Fatal("expected error for reviews: self")
+		}
+		if !contains(err.Error(), "itself") {
+			t.Errorf("error should mention self-reference, got %q", err.Error())
+		}
+	})
+
+	t.Run("dangling reviews target", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Review dangling"
+version: 1
+tasks:
+  - id: check
+    action: review
+    reviews: nonexistent
+    prompt: "Review a ghost."
+`))
+		if err == nil {
+			t.Fatal("expected error for dangling reviews target")
+		}
+		if !contains(err.Error(), "nonexistent") {
+			t.Errorf("error should name the dangling target, got %q", err.Error())
+		}
+	})
+
+	t.Run("reviews on non-review action rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Reviews on answer"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: check
+    action: answer
+    reviews: draft
+    prompt: "Do a thing."
+`))
+		if err == nil {
+			t.Fatal("expected error for reviews: on non-review task")
+		}
+		if !contains(err.Error(), "review") {
+			t.Errorf("error should mention review-only, got %q", err.Error())
+		}
+	})
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

@@ -327,7 +327,8 @@ func toolSubmitResult() mcp.Tool {
 For simple tasks: provide 'content' as a string.
 For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
 For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
-The task detail shows the schema (outputs and writes_artifacts) so you know what's expected.`),
+For action:review tasks: provide 'decision' as "approve" or "reject". Your prose content is the reviewer's comment. A reject verdict automatically invalidates the target task (the one named in its 'reviews:' field) so the author can re-submit a fixed version.
+The task detail shows the schema (outputs, writes_artifacts, reviews target) so you know what's expected.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task"),
@@ -340,6 +341,9 @@ The task detail shows the schema (outputs and writes_artifacts) so you know what
 		),
 		mcp.WithString("artifacts_json",
 			mcp.Description(`For tasks with writes_artifacts: a JSON string mapping each artifact path to its new content. Example: '{"src/analyze.py": "def analyze():\n    pass\n"}'. Paths must be in the task's writes_artifacts list.`),
+		),
+		mcp.WithString("decision",
+			mcp.Description(`Required for action:review tasks: "approve" or "reject". Ignored on non-review tasks. A reject cascades an invalidation on the reviewed target task, bouncing it back to READY so the author can re-submit.`),
 		),
 	)
 }
@@ -1076,6 +1080,17 @@ type taskMeta struct {
 	RunSeq           int
 	TaskDefID        string
 	InstanceKey      string
+	// Action is the task's action type ("answer", "review", etc).
+	// Used by the fat-client submit helper to pre-validate
+	// action-specific fields (e.g. decision on review) BEFORE
+	// touching the local clone, so a rejected submission never
+	// leaves a phantom commit in git history.
+	Action string
+	// ReviewsTarget is the short task id this review task
+	// evaluates. Empty for non-review tasks. Surfaced so the
+	// client-side formatter can show the reviewer what they're
+	// reviewing without a separate fetch.
+	ReviewsTarget string
 	// OutputsSchemaJSON is the serialized outputs schema from the
 	// task's YAML, or empty if the task has no named outputs.
 	// Parsed via mcpgit.ParseNamedOutputSchema by the fat-client
@@ -1116,6 +1131,12 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["outputs"].(string); ok {
 		meta.OutputsSchemaJSON = v
+	}
+	if v, ok := raw["action"].(string); ok {
+		meta.Action = v
+	}
+	if v, ok := raw["reviews_target"].(string); ok {
+		meta.ReviewsTarget = v
 	}
 	return meta, nil
 }
@@ -1267,6 +1288,58 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 	if len(resolved.MissingArtifacts) > 0 {
 		out["missing_artifacts"] = resolved.MissingArtifacts
 	}
+
+	// Review-task surfacing: when the caller is claiming an
+	// action:review task, show the reviewed target's content
+	// inline in the claim response. The reviewer shouldn't need a
+	// separate enju_get_task round-trip just to see what they're
+	// evaluating. The target is always in Dependencies (the
+	// parser auto-inserts the reviews: edge), and the fat-client
+	// has already pulled the commit to the local clone above, so
+	// this is a plain file read.
+	if meta.Action == "review" && meta.ReviewsTarget != "" {
+		for _, d := range desc.Dependencies {
+			if d.TaskDefID != meta.ReviewsTarget {
+				continue
+			}
+			contentPath := filepath.Join(d.ResultPath, "result.md")
+			data, ok, rerr := proj.ReadFileAtCommit(d.CommitSHA, contentPath)
+			if rerr != nil || !ok {
+				// Non-fatal — we'd rather show a partial claim
+				// response than fail the claim over a formatter
+				// nicety. Log and move on.
+				c.logger.Warn("reading reviewed target content",
+					"review_task", meta.ID,
+					"target", meta.ReviewsTarget,
+					"path", contentPath,
+					"commit", d.CommitSHA,
+					"error", rerr,
+				)
+				break
+			}
+			reviewingBlock := map[string]interface{}{
+				"target_def_id": meta.ReviewsTarget,
+				"commit_sha":    d.CommitSHA,
+				"content":       string(data),
+			}
+			// Fetch the target task to pick up the claimer's
+			// username so the block can render "(by @alice)".
+			// One extra GET per review claim — negligible, and
+			// the output is much more useful with it.
+			runPrefix := fmt.Sprintf("%d:%d:", meta.ProjectID, meta.RunSeq)
+			targetFullID := runPrefix + meta.ReviewsTarget
+			if targetData, terr := c.get(ctx, "/api/v1/tasks/"+targetFullID); terr == nil {
+				var targetRaw map[string]interface{}
+				if json.Unmarshal(targetData, &targetRaw) == nil {
+					if u, _ := targetRaw["claimed_by"].(string); u != "" {
+						reviewingBlock["claimed_by"] = u
+					}
+				}
+			}
+			out["reviewing"] = reviewingBlock
+			break
+		}
+	}
 	return json.Marshal(out)
 }
 
@@ -1306,9 +1379,16 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	content := req.GetString("content", "")
 	outputsJSON := req.GetString("outputs_json", "")
 	artifactsJSON := req.GetString("artifacts_json", "")
+	decision := req.GetString("decision", "")
 
 	if content == "" && outputsJSON == "" && artifactsJSON == "" {
 		return mcp.NewToolResultError("at least one of 'content', 'outputs_json', or 'artifacts_json' is required"), nil
+	}
+	// Any non-empty decision must be valid, regardless of action.
+	// The "required for review" check happens in the fat-client
+	// pre-validation and on the coordinator.
+	if decision != "" && decision != "approve" && decision != "reject" {
+		return mcp.NewToolResultError(invalidDecisionMessage(decision)), nil
 	}
 
 	var outputs map[string]string
@@ -1328,7 +1408,7 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	// the project has a remote_url configured.
 	meta, _ := c.fetchTaskMeta(ctx, taskID)
 	if c.useFatClient(meta) {
-		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, artifacts)
+		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, artifacts, decision)
 	}
 
 	// Legacy coordinator-writes path.
@@ -1343,6 +1423,9 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	}
 	if artifacts != nil {
 		body["artifacts"] = artifacts
+	}
+	if decision != "" {
+		body["decision"] = decision
 	}
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", body)
 	if err != nil {
@@ -1362,7 +1445,20 @@ func (c *apiClient) submitResultFatClient(
 	content string,
 	outputs map[string]string,
 	artifacts map[string]string,
+	decision string,
 ) (*mcp.CallToolResult, error) {
+	// Pre-validate action-specific invariants BEFORE touching the
+	// local clone. The fat-client submit does commit+push before
+	// the coordinator sees the report, so any server-side reject
+	// after that point would leave a phantom commit stranded in
+	// git history (append-only, nothing to roll back). Anything
+	// the client can check up front belongs here.
+	if meta != nil && meta.Action == "review" {
+		if msg := validateReviewDecision(decision); msg != "" {
+			return mcp.NewToolResultError(msg), nil
+		}
+	}
+
 	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -1382,6 +1478,19 @@ func (c *apiClient) submitResultFatClient(
 		"model":       "claude",
 		"result_type": resultType,
 		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	// Review-action metadata: persist decision + target into
+	// metadata.json so git-log archaeology can reconstruct the
+	// verdict without the coordinator DB. The coordinator also
+	// records the decision in tasks.review_decision, but that's
+	// mutable (invalidation clears it) — the git commit is the
+	// immutable audit record.
+	if meta != nil && meta.Action == "review" {
+		metadata["action"] = "review"
+		metadata["decision"] = decision
+		if meta.ReviewsTarget != "" {
+			metadata["reviews_target"] = meta.ReviewsTarget
+		}
 	}
 
 	files := []mcpgit.FileWrite{}
@@ -1468,12 +1577,18 @@ func (c *apiClient) submitResultFatClient(
 
 	// Report the commit to the coordinator so it can update the
 	// state machine, result_path, commit_sha, and artifact index.
+	// For action:review tasks the decision field rides along in the
+	// same report; the coordinator validates and (on reject) fires
+	// the cascade on the reviewed target.
 	reportBody := map[string]interface{}{
 		"commit_sha":        submitRes.CommitSHA,
 		"result_path":       resultDir,
 		"artifacts_written": artifactPaths,
 		"tokens_used":       0,
 		"model":             "claude",
+	}
+	if decision != "" {
+		reportBody["decision"] = decision
 	}
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
 	if err != nil {
@@ -1483,6 +1598,31 @@ func (c *apiClient) submitResultFatClient(
 		return mcp.NewToolResultError(decorateCoordinatorRejection(errMsg)), nil
 	}
 	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
+}
+
+// validateReviewDecision returns an empty string when the decision
+// is acceptable for a review-action task ("approve" or "reject"),
+// or a single-sentence error message otherwise. Centralized so the
+// missing/invalid variants share identical phrasing — the bug
+// tripped on three different messages being emitted from three
+// different places.
+func validateReviewDecision(decision string) string {
+	switch decision {
+	case "approve", "reject":
+		return ""
+	case "":
+		return "decision is required on action:review tasks (must be \"approve\" or \"reject\")"
+	default:
+		return invalidDecisionMessage(decision)
+	}
+}
+
+// invalidDecisionMessage renders the shared phrasing for an
+// unrecognized decision value — same copy everywhere so users
+// don't see three slightly-different wordings from three
+// different validation points.
+func invalidDecisionMessage(decision string) string {
+	return fmt.Sprintf("decision %q is invalid (must be \"approve\" or \"reject\")", decision)
 }
 
 // decorateCoordinatorRejection wraps a raw coordinator error string
