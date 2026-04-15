@@ -768,7 +768,41 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 				b.WriteString(formatReviewingBlock(reviewing))
 			}
 		}
-	} else {
+	}
+
+	// Vote tasks: render the declared options list inline so
+	// the voter sees what they're choosing between without a
+	// separate task-detail fetch. Independent of the inputs
+	// branch because options live on the task record itself,
+	// not in the resolved prompt.
+	if voteOptsRaw, _ := task["vote_options"].(string); voteOptsRaw != "" {
+		if opts := parseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
+			b.WriteString(formatVoteOptionsBlock(opts, task))
+		}
+	}
+
+	// Multi-citizen voting / review status block — shown on
+	// claim so the newly-arrived citizen sees the group state
+	// before submitting: who else has voted/reviewed, the live
+	// tally, and whether quorum is still outstanding.
+	if citizensFloat, _ := task["citizens"].(float64); citizensFloat > 1 {
+		citizens := int(citizensFloat)
+		minQuorum := 0
+		if q, _ := task["min_quorum"].(float64); q > 0 {
+			minQuorum = int(q)
+		}
+		threshold, _ := task["vote_threshold"].(string)
+		if threshold == "" {
+			threshold = "plurality"
+		}
+		voteSubs, _ := task["vote_submissions"].([]interface{})
+		activeClaimants := stringSliceFromAny(task["active_claimants"])
+		state, _ := task["state"].(string)
+		taskAction, _ := task["action"].(string)
+		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaimants))
+	}
+
+	if inputsData == nil {
 		if deps == "" {
 			b.WriteString("── Prompt ──────────────────────────────────\n")
 			b.WriteString(prompt)
@@ -873,13 +907,29 @@ func formatSubmitResult(data []byte, taskID string) string {
 	artifactsWritten, _ := result["artifacts_written"].([]interface{})
 	decision, _ := result["decision"].(string)
 	reviewCascade, _ := result["review_cascade"].(map[string]interface{})
+	voteRes, _ := result["vote_resolution"].(map[string]interface{})
+	topStatus, _ := result["status"].(string)
 
-	// Review tasks get a decision-first summary so the reviewer
-	// sees the outcome of their own submit at a glance.
-	switch decision {
-	case "approve":
+	// Detect a collecting-mode vote submission: the task is
+	// still waiting for more citizens before the tally can
+	// resolve.
+	collectingVote := false
+	if voteRes != nil {
+		if c, _ := voteRes["collecting"].(bool); c {
+			collectingVote = true
+		}
+	}
+	if topStatus == "collecting" {
+		collectingVote = true
+	}
+
+	// Review / vote tasks get an outcome-first summary so the
+	// submitter sees what happened at a glance. Regular tasks
+	// fall through to the generic "Result accepted" headline.
+	switch {
+	case decision == "approve":
 		b.WriteString(fmt.Sprintf("✓ Review approved: %s\n", taskID))
-	case "reject":
+	case decision == "reject":
 		b.WriteString(fmt.Sprintf("✗ Review rejected: %s\n", taskID))
 		if reviewCascade != nil {
 			target, _ := reviewCascade["target"].(string)
@@ -887,6 +937,34 @@ func formatSubmitResult(data []byte, taskID string) string {
 			if target != "" {
 				b.WriteString(fmt.Sprintf("  → target %q invalidated and bounced back to READY (%d task(s) reset)\n", target, int(changed)))
 			}
+		}
+	case collectingVote && voteRes != nil:
+		votesSoFar, _ := voteRes["votes_so_far"].(float64)
+		reason, _ := voteRes["reason"].(string)
+		b.WriteString(fmt.Sprintf("⏳ Vote recorded: %s — still collecting (%d vote(s) so far)\n", taskID, int(votesSoFar)))
+		if reason != "" {
+			b.WriteString(fmt.Sprintf("  Waiting: %s\n", reason))
+		}
+		if counts, ok := voteRes["counts"].(map[string]interface{}); ok && len(counts) > 0 {
+			b.WriteString("  Current tally: ")
+			first := true
+			for id, c := range counts {
+				if !first {
+					b.WriteString(", ")
+				}
+				b.WriteString(fmt.Sprintf("%s=%v", id, c))
+				first = false
+			}
+			b.WriteString("\n")
+		}
+	case voteRes != nil:
+		winning, _ := voteRes["winning_option"].(string)
+		b.WriteString(fmt.Sprintf("✓ Vote resolved: %s — winning option: %s\n", taskID, winning))
+		if votesTallied, _ := voteRes["votes_tallied"].(float64); votesTallied > 0 {
+			b.WriteString(fmt.Sprintf("  (tallied %d vote(s))\n", int(votesTallied)))
+		}
+		if skippedCount, _ := voteRes["skipped_count"].(float64); skippedCount > 0 {
+			b.WriteString(fmt.Sprintf("  → %d task(s) on losing branches flipped to SKIPPED\n", int(skippedCount)))
 		}
 	default:
 		b.WriteString(fmt.Sprintf("✓ Result accepted: %s\n", taskID))
@@ -1045,6 +1123,18 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return string(runData)
 	}
+	// Pretty-print coordinator error responses instead of leaking
+	// the raw {"error": "..."} shape. Matches the vocabulary the
+	// other tool formatters use. If the server's error message is
+	// a literal restatement of "run not found", don't echo it —
+	// "✗ Run not found: run not found" reads as a duplication bug.
+	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
+		lower := strings.ToLower(strings.TrimSpace(errMsg))
+		if lower == "run not found" {
+			return "✗ Run not found"
+		}
+		return fmt.Sprintf("✗ Run not found: %s", errMsg)
+	}
 
 	var tasks []map[string]interface{}
 	if err := json.Unmarshal(tasksData, &tasks); err != nil {
@@ -1065,10 +1155,18 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		counts[s]++
 	}
 	total := len(tasks)
-	done := counts["accepted"]
+	// SKIPPED tasks are terminal (losing branch of a vote) — they
+	// count as "done" for progress purposes so the bar agrees with
+	// the run state. Otherwise a completed run with skipped tasks
+	// shows 75% and confuses the user.
+	done := counts["accepted"] + counts["skipped"]
 
+	progressLine := fmt.Sprintf("Status: %s    Progress: %d/%d", state, done, total)
+	if counts["skipped"] > 0 {
+		progressLine += fmt.Sprintf(" (%d accepted, %d skipped)", counts["accepted"], counts["skipped"])
+	}
 	b.WriteString(fmt.Sprintf("Project #%s → Run #%d: %s\n", projectID, int(seq), name))
-	b.WriteString(fmt.Sprintf("Status: %s    Progress: %d/%d\n", state, done, total))
+	b.WriteString(progressLine + "\n")
 	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
 
 	// Build task list
@@ -1079,26 +1177,58 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		claimedBy, _ := t["claimed_by"].(string)
 		deps, _ := t["depends_on"].(string)
 		prompt, _ := t["prompt"].(string)
+		citizensF, _ := t["citizens"].(float64)
+		citizens := int(citizensF)
 
 		seq, _ := t["seq"].(float64)
 		icon := stateIcon(tstate)
 
-		// Task ID line with number for quick reference
-		b.WriteString(fmt.Sprintf("  %s #%d [%s] %s\n", icon, int(seq), tid, stateLabel(tstate)))
+		// For multi-citizen vote tasks, derive a phase-aware
+		// label instead of the generic "available" / "in
+		// progress" strings. The three phases are:
+		//   1. accepting claims    (0 < claimed < citizens, 0 submitted)
+		//   2. collecting votes    (some submitted, tally not resolved)
+		//   3. resolved            (state = accepted or skipped)
+		label := stateLabel(tstate)
+		if citizens > 1 && t["action"] == "vote" {
+			voteSubs, _ := t["vote_submissions"].([]interface{})
+			activeClaimants := stringSliceFromAny(t["active_claimants"])
+			submitted := len(voteSubs)
+			claimed := submitted + len(activeClaimants)
+			switch tstate {
+			case "accepted":
+				label = fmt.Sprintf("resolved (%d/%d votes)", submitted, citizens)
+			case "collecting":
+				label = fmt.Sprintf("collecting votes (%d/%d claimed, %d/%d submitted)", claimed, citizens, submitted, citizens)
+			case "ready":
+				if claimed == 0 {
+					label = fmt.Sprintf("accepting claims (0/%d claimed)", citizens)
+				} else {
+					label = fmt.Sprintf("accepting claims (%d/%d claimed, %d/%d submitted)", claimed, citizens, submitted, citizens)
+				}
+			}
+		}
 
-		switch tstate {
-		case "accepted":
-			if claimedBy != "" {
-				b.WriteString(fmt.Sprintf("    Completed by: %s\n", claimedBy))
+		// Task ID line with number for quick reference
+		b.WriteString(fmt.Sprintf("  %s #%d [%s] %s\n", icon, int(seq), tid, label))
+
+		if citizens <= 1 || t["action"] != "vote" {
+			switch tstate {
+			case "accepted":
+				if claimedBy != "" {
+					b.WriteString(fmt.Sprintf("    Completed by: %s\n", claimedBy))
+				}
+			case "claimed":
+				if claimedBy != "" {
+					b.WriteString(fmt.Sprintf("    Working: %s\n", claimedBy))
+				}
+			case "pending":
+				if deps != "" {
+					b.WriteString(fmt.Sprintf("    Blocked by: %s\n", deps))
+				}
 			}
-		case "claimed":
-			if claimedBy != "" {
-				b.WriteString(fmt.Sprintf("    Working: %s\n", claimedBy))
-			}
-		case "pending":
-			if deps != "" {
-				b.WriteString(fmt.Sprintf("    Blocked by: %s\n", deps))
-			}
+		} else if tstate == "pending" && deps != "" {
+			b.WriteString(fmt.Sprintf("    Blocked by: %s\n", deps))
 		}
 
 		// Prompt preview — hide template vars for blocked tasks
@@ -1153,7 +1283,16 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 	if ref != "" {
 		b.WriteString(fmt.Sprintf("  Ref:      %s\n", ref))
 	}
-	if claimedBy != "" {
+	// For single-citizen tasks, show the one-line "Claimed: X"
+	// field. For multi-citizen tasks, suppress it — the Voting
+	// block below renders the full voter list and status so a
+	// single `claimed_by` display (just the most recent
+	// claimer) would be misleading.
+	multiCitizen := false
+	if cf, _ := task["citizens"].(float64); cf > 1 {
+		multiCitizen = true
+	}
+	if claimedBy != "" && !multiCitizen {
 		b.WriteString(fmt.Sprintf("  Claimed:  %s\n", claimedBy))
 	}
 	if deps != "" {
@@ -1174,6 +1313,60 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 		default:
 			b.WriteString(fmt.Sprintf("  Decision: %s\n", decision))
 		}
+	}
+
+	// Vote-action metadata — options list + winning choice if
+	// the task has resolved. Declared once at run creation,
+	// vote_choice set at submit time, cleared on invalidation.
+	if voteOptsRaw, _ := task["vote_options"].(string); voteOptsRaw != "" {
+		if opts := parseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
+			winningID, _ := task["vote_choice"].(string)
+			b.WriteString("  Options:\n")
+			for _, o := range opts {
+				marker := "  "
+				if o.ID == winningID {
+					marker = "✓ "
+				}
+				line := fmt.Sprintf("    %s%s", marker, o.ID)
+				if o.Label != "" && o.Label != o.ID {
+					line += " — " + o.Label
+				}
+				if len(o.Activates) > 0 {
+					line += fmt.Sprintf("  (activates: %s)", strings.Join(o.Activates, ", "))
+				}
+				b.WriteString(line + "\n")
+			}
+			if winningID != "" {
+				b.WriteString(fmt.Sprintf("  Winning:  %s\n", winningID))
+			}
+		}
+	}
+	if threshold, _ := task["vote_threshold"].(string); threshold != "" {
+		b.WriteString(fmt.Sprintf("  Threshold: %s\n", threshold))
+	}
+	if deadline, _ := task["vote_deadline"].(string); deadline != "" {
+		b.WriteString(fmt.Sprintf("  Deadline:  %s\n", deadline))
+	}
+
+	// Multi-citizen voting / review block: citizens count,
+	// quorum, live tally, active claimants, and per-voter
+	// ballots. Renders for action:vote OR action:review when
+	// citizens > 1.
+	if citizensFloat, _ := task["citizens"].(float64); citizensFloat > 1 {
+		citizens := int(citizensFloat)
+		minQuorum := 0
+		if q, _ := task["min_quorum"].(float64); q > 0 {
+			minQuorum = int(q)
+		}
+		threshold, _ := task["vote_threshold"].(string)
+		if threshold == "" {
+			threshold = "plurality"
+		}
+		voteSubs, _ := task["vote_submissions"].([]interface{})
+		activeClaims := stringSliceFromAny(task["active_claimants"])
+		state, _ := task["state"].(string)
+		taskAction, _ := task["action"].(string)
+		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaims))
 	}
 
 	// Show environment requirements if present
@@ -1410,6 +1603,212 @@ func jsonID(v interface{}) string {
 	}
 }
 
+// formatVotingBlock renders the multi-citizen voting / review
+// status for citizens > 1 tasks: citizens count, quorum,
+// effective rule, live tally, per-voter ballots, and any
+// still-claimed-but-not-submitted citizens. Action-aware so
+// review tasks get "Review" header + "approves/rejects" tally
+// shape instead of raw option counts.
+func formatVotingBlock(action string, citizens, minQuorum int, threshold, state string, voteSubs []interface{}, activeClaimants []string) string {
+	var b strings.Builder
+	isReview := action == "review"
+	if isReview {
+		b.WriteString("── Review ──────────────────────────────────\n")
+	} else {
+		b.WriteString("── Voting ──────────────────────────────────\n")
+	}
+
+	// Effective threshold label. Review tasks don't use the
+	// vote_threshold column; they're hardcoded to the
+	// any-reject-kills / all-approve rule for now.
+	effectiveThreshold := threshold
+	if effectiveThreshold == "" {
+		effectiveThreshold = "plurality"
+	}
+	if isReview {
+		effectiveThreshold = "unanimous-approve (any reject vetoes)"
+	}
+
+	// Effective quorum. When the task author didn't set one
+	// explicitly, the tally function defaults to `citizens`
+	// for multi-citizen tasks (wait for everyone). Show the
+	// effective value on every render so the voter sees the
+	// bar they have to clear, not just the YAML-provided
+	// override.
+	effectiveQuorum := minQuorum
+	if effectiveQuorum <= 0 {
+		effectiveQuorum = citizens
+	}
+
+	// Header summarizes the rules.
+	header := fmt.Sprintf("  Citizens: %d slots, quorum %d, threshold %s",
+		citizens, effectiveQuorum, effectiveThreshold)
+	b.WriteString(header + "\n")
+
+	submitted := len(voteSubs)
+	// Tally counts per option and per-voter list.
+	counts := map[string]int{}
+	type ballot struct{ user, option string }
+	ballots := make([]ballot, 0, submitted)
+	for _, v := range voteSubs {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		user, _ := m["username"].(string)
+		option, _ := m["option"].(string)
+		counts[option]++
+		ballots = append(ballots, ballot{user: user, option: option})
+	}
+
+	// Status line varies by state. For review tasks, use the
+	// word "reviews" instead of "votes."
+	label := "votes"
+	if isReview {
+		label = "reviews"
+	}
+	switch state {
+	case "accepted":
+		b.WriteString(fmt.Sprintf("  Status:   ✓ resolved (%d/%d %s)\n", submitted, citizens, label))
+	case "collecting":
+		b.WriteString(fmt.Sprintf("  Status:   ⏳ collecting (%d/%d %s)\n", submitted, citizens, label))
+	case "ready":
+		claimed := len(activeClaimants) + submitted
+		verb := "submitted"
+		if isReview {
+			verb = "reviewed"
+		}
+		b.WriteString(fmt.Sprintf("  Status:   → accepting claims (%d/%d claimed, %d/%d %s)\n", claimed, citizens, submitted, citizens, verb))
+	default:
+		b.WriteString(fmt.Sprintf("  Status:   %s (%d/%d %s)\n", state, submitted, citizens, label))
+	}
+
+	// Tally line — only show when there's at least one vote.
+	if len(counts) > 0 {
+		// Sort option ids for stable rendering.
+		keys := make([]string, 0, len(counts))
+		for k := range counts {
+			keys = append(keys, k)
+		}
+		sortStrings(keys)
+		tally := make([]string, 0, len(keys))
+		for _, k := range keys {
+			tally = append(tally, fmt.Sprintf("%s=%d", k, counts[k]))
+		}
+		b.WriteString("  Tally:    " + strings.Join(tally, ", ") + "\n")
+	}
+
+	// Per-voter ballots.
+	if len(ballots) > 0 {
+		parts := make([]string, 0, len(ballots))
+		for _, b := range ballots {
+			parts = append(parts, fmt.Sprintf("%s→%s", b.user, b.option))
+		}
+		if isReview {
+			b.WriteString("  Reviewers: " + strings.Join(parts, ", ") + "\n")
+		} else {
+			b.WriteString("  Voters:   " + strings.Join(parts, ", ") + "\n")
+		}
+	}
+
+	// Active claimants (claimed but haven't submitted yet).
+	if len(activeClaimants) > 0 {
+		suffix := "not yet voted"
+		if isReview {
+			suffix = "not yet reviewed"
+		}
+		b.WriteString("  Claimed:  " + strings.Join(activeClaimants, ", ") + " (" + suffix + ")\n")
+	}
+
+	b.WriteString("────────────────────────────────────────────\n")
+	return b.String()
+}
+
+// formatVoteOptionsBlock renders a vote task's declared options as
+// a `── Options ──` block for inclusion in the claim response,
+// mirroring formatReviewingBlock. Highlights the winning option
+// if one has already been recorded (vote_choice is populated),
+// labels each option, and surfaces `activates:` targets so the
+// voter can see the structural consequences of each choice.
+// When vote_threshold / vote_deadline / min_quorum are set, they
+// ride along as a trailing summary line.
+func formatVoteOptionsBlock(opts []voteOptionView, task map[string]interface{}) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("── Options ─────────────────────────────────\n")
+	winningID, _ := task["vote_choice"].(string)
+	for _, o := range opts {
+		marker := "  "
+		if o.ID == winningID {
+			marker = "✓ "
+		}
+		// Only render the "— label" suffix when the label adds
+		// information beyond the id. When label is empty or
+		// identical to the id, showing "foo — foo" is noise.
+		line := fmt.Sprintf("%s%s", marker, o.ID)
+		if o.Label != "" && o.Label != o.ID {
+			line += " — " + o.Label
+		}
+		if len(o.Activates) > 0 {
+			line += fmt.Sprintf("  (activates: %s)", strings.Join(o.Activates, ", "))
+		}
+		b.WriteString(line + "\n")
+	}
+	// Trailing rules summary — only shown when any of the
+	// fields is set. Keeps simple votes visually clean.
+	var rules []string
+	if threshold, _ := task["vote_threshold"].(string); threshold != "" {
+		rules = append(rules, "threshold="+threshold)
+	}
+	if deadline, _ := task["vote_deadline"].(string); deadline != "" {
+		rules = append(rules, "deadline="+deadline)
+	}
+	if minQuorum, _ := task["min_quorum"].(float64); minQuorum > 0 {
+		rules = append(rules, fmt.Sprintf("min_quorum=%d", int(minQuorum)))
+	}
+	if len(rules) > 0 {
+		b.WriteString("  (" + strings.Join(rules, ", ") + ")\n")
+	}
+	b.WriteString("────────────────────────────────────────────\n")
+	return b.String()
+}
+
+// voteOptionView is a display-only projection of a declared vote
+// option. Lives in format.go rather than yaml/api because the
+// formatter needs a minimal, loosely-typed view and shouldn't
+// pull in the yaml package.
+type voteOptionView struct {
+	ID        string
+	Label     string
+	Activates []string
+}
+
+// parseVoteOptionsForDisplay decodes the JSON-encoded vote_options
+// column into the display projection. Returns nil on any parse
+// failure rather than propagating an error — the formatter
+// should degrade gracefully if the column is malformed (a
+// storage-side consistency bug is surfaced elsewhere).
+func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
+	if optionsJSON == "" {
+		return nil
+	}
+	var raw []struct {
+		ID        string   `json:"id"`
+		Label     string   `json:"label,omitempty"`
+		Activates []string `json:"activates,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(optionsJSON), &raw); err != nil {
+		return nil
+	}
+	out := make([]voteOptionView, len(raw))
+	for i, r := range raw {
+		out[i] = voteOptionView{ID: r.ID, Label: r.Label, Activates: r.Activates}
+	}
+	return out
+}
+
 func stateIcon(state string) string {
 	switch state {
 	case "accepted", "completed":
@@ -1418,8 +1817,19 @@ func stateIcon(state string) string {
 		return "→"
 	case "claimed", "running":
 		return "⏳"
+	case "collecting":
+		// Phase E.2 session 2a — multi-citizen task in the
+		// middle of gathering submissions. Same hourglass as
+		// CLAIMED since it's conceptually "work in progress,"
+		// just with multiple people.
+		return "⏳"
 	case "pending":
 		return "○"
+	case "skipped":
+		// Phase E.2 — terminal state for branches a vote
+		// resolved against. Dim dot distinguishes from
+		// active/terminal-pass states.
+		return "•"
 	case "invalid", "invalidated", "rejected":
 		return "✗"
 	default:
@@ -1457,6 +1867,10 @@ func stateLabel(state string) string {
 		return "blocked"
 	case "invalid", "invalidated":
 		return "invalidated"
+	case "collecting":
+		return "collecting — waiting for more submissions"
+	case "skipped":
+		return "skipped — losing branch of a vote"
 	default:
 		return state
 	}

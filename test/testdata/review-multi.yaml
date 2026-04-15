@@ -1,0 +1,15 @@
+name: "Multi-reviewer"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a one-sentence summary."
+  - id: check
+    action: review
+    reviews: draft
+    citizens: 3
+    prompt: "Three reviewers evaluate the draft."
+  - id: publish
+    action: answer
+    depends_on: [check]
+    prompt: "Publish the approved draft: {{draft.content}}"

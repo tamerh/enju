@@ -750,6 +750,262 @@ tasks:
 	})
 }
 
+// TestParseVoteAction covers the Phase E.2 vote-action validator
+// and dep-edge auto-insertion.
+func TestParseVoteAction(t *testing.T) {
+	t.Run("happy path auto-inserts reverse dep", func(t *testing.T) {
+		parsed, err := Parse([]byte(`
+name: "Vote happy"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "Pick a direction."
+    options:
+      - id: py
+        label: "Python"
+        activates: [build_py]
+      - id: rs
+        label: "Rust"
+        activates: [build_rs]
+  - id: build_py
+    action: answer
+    prompt: "Build with Python."
+  - id: build_rs
+    action: answer
+    prompt: "Build with Rust."
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		// Both build tasks should now depend on the vote task
+		// even though the YAML didn't list that edge explicitly.
+		for _, want := range []string{"build_py", "build_rs"} {
+			var deps []string
+			for _, tk := range parsed.Run.Tasks {
+				if tk.ID == want {
+					deps = tk.DependsOn
+					break
+				}
+			}
+			found := false
+			for _, d := range deps {
+				if d == "pick" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected %s to auto-depend on pick, got depends_on=%v", want, deps)
+			}
+		}
+	})
+
+	t.Run("fewer than 2 options rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "One option"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    options:
+      - {id: only}
+`))
+		if err == nil {
+			t.Fatal("expected error for single-option vote")
+		}
+		if !contains(err.Error(), "at least 2") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("duplicate option ids rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Dup"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    options:
+      - {id: a, label: A}
+      - {id: a, label: B}
+`))
+		if err == nil {
+			t.Fatal("expected error for duplicate option ids")
+		}
+	})
+
+	t.Run("unknown activates target rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Bad activates"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    options:
+      - {id: a, activates: [nonexistent]}
+      - {id: b, label: B}
+`))
+		if err == nil {
+			t.Fatal("expected error for dangling activates target")
+		}
+		if !contains(err.Error(), "nonexistent") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("citizens greater than 1 accepted", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Multi voter"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    citizens: 3
+    threshold: majority
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err != nil {
+			t.Fatalf("citizens:3 should parse now that session 2a landed: %v", err)
+		}
+	})
+
+	t.Run("min_quorum exceeds citizens rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Bad quorum"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    citizens: 3
+    min_quorum: 5
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err == nil {
+			t.Fatal("expected error for min_quorum > citizens")
+		}
+		if !contains(err.Error(), "min_quorum") {
+			t.Errorf("error should mention min_quorum, got: %v", err)
+		}
+	})
+
+	t.Run("options forbidden on non-vote action", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Stray options"
+version: 1
+tasks:
+  - id: step
+    action: answer
+    prompt: "x"
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err == nil {
+			t.Fatal("expected error for options on non-vote task")
+		}
+	})
+
+	t.Run("threshold parsed", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "With threshold"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    threshold: majority
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+	})
+
+	t.Run("invalid threshold rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Bad threshold"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    threshold: largestMinority
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err == nil {
+			t.Fatal("expected error for unknown threshold")
+		}
+	})
+
+	t.Run("percent threshold parsed", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Percent"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    threshold: "percent:60"
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+	})
+
+	t.Run("deadline parses as duration", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Deadline"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    deadline: 2h
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+	})
+
+	t.Run("invalid deadline rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name: "Bad deadline"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "x"
+    deadline: "1 fortnight"
+    options:
+      - {id: a}
+      - {id: b}
+`))
+		if err == nil {
+			t.Fatal("expected error for unparseable deadline")
+		}
+	})
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

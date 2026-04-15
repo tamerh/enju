@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 )
 
 // --- Artifact helpers ---
@@ -52,6 +54,35 @@ func marshalStringSlice(xs []string) string {
 		return ""
 	}
 	b, err := json.Marshal(xs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// marshalVoteOptions serializes a YAML vote options list into the
+// JSON form stored in tasks.vote_options. Keeping this helper in
+// the api package (not yaml) avoids a circular dep — the store
+// treats the column as opaque JSON.
+func marshalVoteOptions(options []enjuYaml.VoteOption) string {
+	if len(options) == 0 {
+		return ""
+	}
+	// Round-trip through an anonymous struct with lowercase JSON
+	// tags so the stored shape matches what the router's submit
+	// handler decodes. yaml.VoteOption's field tags are yaml:...,
+	// not json:..., so re-shaping here is simpler than adding
+	// json tags upstream.
+	type wire struct {
+		ID        string   `json:"id"`
+		Label     string   `json:"label,omitempty"`
+		Activates []string `json:"activates,omitempty"`
+	}
+	out := make([]wire, len(options))
+	for i, o := range options {
+		out[i] = wire{ID: o.ID, Label: o.Label, Activates: o.Activates}
+	}
+	b, err := json.Marshal(out)
 	if err != nil {
 		return ""
 	}

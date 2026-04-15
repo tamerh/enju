@@ -540,6 +540,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
 				RequireRole:     ti.RequireRole,
 				ReviewsTarget:   ti.Reviews,
+				VoteOptions:     marshalVoteOptions(ti.Options),
+				Citizens:        ti.Citizens,
+				MinQuorum:       ti.MinQuorum,
+				VoteThreshold:   ti.Threshold,
+				VoteDeadline:    ti.Deadline,
 				CreatedAt:   now,
 			})
 			if err != nil {
@@ -669,6 +674,32 @@ type taskResponse struct {
 	RequireRole     string   `json:"require_role,omitempty"`
 	ReviewsTarget   string   `json:"reviews_target,omitempty"`   // Phase E: target task id this review evaluates
 	ReviewDecision  string   `json:"review_decision,omitempty"`  // Phase E: approve/reject once submitted
+	VoteOptions     string   `json:"vote_options,omitempty"`     // Phase E.2: declared options JSON
+	VoteChoice      string   `json:"vote_choice,omitempty"`      // Phase E.2: winning option id
+	Citizens        int      `json:"citizens,omitempty"`         // Phase E.2: invited voter count
+	MinQuorum       int      `json:"min_quorum,omitempty"`       // Phase E.2: required submitted count
+	VoteThreshold   string   `json:"vote_threshold,omitempty"`   // Phase E.2: agreement rule
+	VoteDeadline    string   `json:"vote_deadline,omitempty"`    // Phase E.2: voting-closes duration
+	// VoteSubmissions is the per-citizen voting history for
+	// multi-citizen vote tasks — one entry per submitted vote,
+	// in submission order. Populated lazily only for citizens>1
+	// vote tasks; empty for single-citizen tasks or non-vote
+	// actions.
+	VoteSubmissions []voteSubmissionRef `json:"vote_submissions,omitempty"`
+	// ActiveClaimants lists citizens who currently hold open
+	// claim slots on a multi-citizen task (claimed but not yet
+	// submitted). Empty for citizens=1 tasks — those use the
+	// ClaimedBy field.
+	ActiveClaimants []string `json:"active_claimants,omitempty"`
+}
+
+// voteSubmissionRef is one citizen's submitted vote on a
+// multi-citizen task, rendered for the task response so
+// formatters can show the tally without a separate fetch.
+type voteSubmissionRef struct {
+	Username    string `json:"username"`
+	Option      string `json:"option"`
+	SubmittedAt string `json:"submitted_at,omitempty"`
 }
 
 func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
@@ -821,11 +852,32 @@ type submitResultRequest struct {
 	TokensUsed int64  `json:"tokens_used,omitempty"`
 	Model      string `json:"model,omitempty"`
 
+	// Username identifies the submitting citizen. Required for
+	// multi-citizen tasks so the server can credit the right
+	// task_claims slot; optional for single-citizen tasks where
+	// tasks.claimed_by is already the implicit claimer.
+	Username string `json:"username,omitempty"`
+
 	// Decision is the review verdict for action:review tasks. One
 	// of "approve" / "reject". Ignored on non-review tasks. An empty
 	// string on a review task is rejected up front — the reviewer
 	// has to say something.
 	Decision string `json:"decision,omitempty"`
+
+	// Option is the chosen option id for action:vote tasks. Must
+	// match one of the declared options' ids. Ignored on
+	// non-vote tasks. Session 1 ships single-voter vote so one
+	// submit resolves the task; session 2 multi-voter will tally
+	// across N submissions.
+	Option string `json:"option,omitempty"`
+
+	// Content is the citizen's prose commentary for multi-
+	// citizen tasks (vote/review). Stored on task_claims.content
+	// so {{task.responses}} can render it without a git read.
+	// The fat-client path also writes this to
+	// citizen-<username>/result.md, but the DB column is the
+	// authoritative source for responses rendering.
+	Content string `json:"content,omitempty"`
 }
 
 // handleSubmitResult is the metadata-only submit path. The client
@@ -840,16 +892,58 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CommitSHA == "" {
+
+	// Task existence check FIRST — otherwise a submit to a
+	// deleted/wiped task falls through the commit_sha validator
+	// and surfaces "commit_sha is required" as if that were the
+	// root cause.
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("task %q not found", taskID))
+		return
+	}
+
+	// Claim validity check comes next — a submit from someone
+	// who never claimed the task has no legitimate path, and
+	// reporting "commit_sha is required" would hide the actual
+	// "you don't own a slot on this task" error. For
+	// single-citizen tasks the claimant is tasks.claimed_by; for
+	// multi-citizen tasks it's any row in task_claims for the
+	// submitting username.
+	if task.Citizens > 1 {
+		if req.Username == "" {
+			writeError(w, http.StatusBadRequest, "username is required on multi-citizen task submissions")
+			return
+		}
+		citizen, cerr := s.store.GetCitizenByUsername(req.Username)
+		if cerr != nil || citizen == nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown citizen %q", req.Username))
+			return
+		}
+		hasClaim, _ := s.store.HasActiveClaim(taskID, citizen.ID)
+		if !hasClaim {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("no open claim on task %q for user %q — claim it with enju_claim_task first", taskID, req.Username))
+			return
+		}
+	} else if task.ClaimedBy == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q has no active claimant — claim it with enju_claim_task first", taskID))
+		return
+	}
+
+	// commit_sha is required for action types that actually
+	// ship prose/code/data to git (answer / contribute /
+	// compute). Vote and review are decisions — the
+	// authoritative storage for their submissions is the
+	// task_claims row's content column, not a git file.
+	// Making commit_sha optional for vote/review removes a
+	// class of ordering bugs and matches the tools' real
+	// contracts: "git is how tasks ship their work; votes and
+	// reviews have nothing to ship."
+	if req.CommitSHA == "" && task.Action != "vote" && task.Action != "review" {
 		writeError(w, http.StatusBadRequest, "commit_sha is required — the coordinator no longer writes result files, clients must write + push + report")
 		return
 	}
 
-	task, err := s.store.GetTask(taskID)
-	if err != nil || task == nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
 	s.handleSubmitResultReport(w, r, task, &req)
 }
 
@@ -887,13 +981,39 @@ func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Re
 			if depTask.InstanceParams != "" {
 				_ = json.Unmarshal([]byte(depTask.InstanceParams), &params)
 			}
-			deps = append(deps, map[string]interface{}{
+			depEntry := map[string]interface{}{
 				"task_def_id":     depTask.TaskDefID,
 				"instance_key":    depTask.InstanceKey,
 				"instance_params": params,
 				"commit_sha":      depTask.CommitSHA,
 				"result_path":     depTask.ResultPath,
-			})
+				// Phase E.2: upstream vote tasks carry their
+				// winning option id so downstream prompts can
+				// reference it via {{task.winning_option}}.
+				// Non-vote upstreams send an empty string.
+				"vote_choice":     depTask.VoteChoice,
+			}
+			// Phase E.2 session 2b — multi-citizen upstreams
+			// (vote or review with citizens > 1) also carry
+			// the per-citizen submission list so downstream
+			// prompts can render {{task.responses}}. Only
+			// populated when the upstream has citizens > 1
+			// and has resolved, otherwise there's nothing to
+			// render.
+			if depTask.Citizens > 1 {
+				if submissions, err := s.store.ListVoteSubmissions(depTask.ID); err == nil && len(submissions) > 0 {
+					perCitizen := make([]map[string]interface{}, 0, len(submissions))
+					for _, sub := range submissions {
+						perCitizen = append(perCitizen, map[string]interface{}{
+							"username": s.citizenUsername(sub.CitizenID),
+							"option":   sub.Option,
+							"content":  sub.Content,
+						})
+					}
+					depEntry["responses"] = perCitizen
+				}
+			}
+			deps = append(deps, depEntry)
 		}
 	}
 
@@ -989,17 +1109,32 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		expectedResultPath += "/" + task.InstanceKey
 	}
 	expectedResultPath += "/" + task.TaskDefID
+	// Multi-citizen tasks (Phase E.2 session 2a) write each
+	// submission into its own `citizen-<username>/` subdirectory
+	// under the task's base result path. The submitted result_path
+	// is expected to be either the base (session 1 single-citizen
+	// shape) or base + citizen subdir (multi-citizen shape).
 	if req.ResultPath != "" && req.ResultPath != expectedResultPath {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("result_path %q does not match expected %q for this task", req.ResultPath, expectedResultPath))
-		return
+		allowedCitizenSubdir := false
+		if task.Citizens > 1 && strings.HasPrefix(req.ResultPath, expectedResultPath+"/citizen-") {
+			allowedCitizenSubdir = true
+		}
+		if !allowedCitizenSubdir {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("result_path %q does not match expected %q for this task", req.ResultPath, expectedResultPath))
+			return
+		}
 	}
+	// Store the task-level result path (the common parent) on
+	// the tasks row so downstream template resolution can find
+	// the base dir. Per-citizen subdirs live underneath it.
 	resultPath := expectedResultPath
 
-	// Review tasks must carry an explicit decision. Non-review
-	// tasks that happen to send one are tolerated: the column stays
-	// empty-by-default for them because we only persist it for
-	// action:review.
+	// Review tasks must carry an explicit decision; vote tasks
+	// must carry an option id. Non-matching tasks that happen to
+	// send either field are tolerated — the columns stay empty
+	// for them because we only persist per-action.
 	decision := ""
+	voteChoice := ""
 	if task.Action == "review" {
 		switch req.Decision {
 		case "approve", "reject":
@@ -1012,10 +1147,78 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	if task.Action == "vote" {
+		// Validate the option id against the declared list on the
+		// task row. VoteOptions stores the JSON-encoded options
+		// array from YAML; we re-decode here instead of piping
+		// through yaml.TaskDef so the router has one source of
+		// truth.
+		var declared []struct {
+			ID        string   `json:"id"`
+			Label     string   `json:"label,omitempty"`
+			Activates []string `json:"activates,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(task.VoteOptions), &declared); err != nil || len(declared) == 0 {
+			writeError(w, http.StatusInternalServerError, "vote task has no declared options — this is a storage inconsistency")
+			return
+		}
+		known := make([]string, len(declared))
+		for i, o := range declared {
+			known[i] = o.ID
+		}
+		if req.Option == "" {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(`option is required on action:vote tasks (must be one of: %s)`, strings.Join(known, ", ")))
+			return
+		}
+		ok := false
+		for _, id := range known {
+			if id == req.Option {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(`option %q is invalid (must be one of: %s)`, req.Option, strings.Join(known, ", ")))
+			return
+		}
+		voteChoice = req.Option
+	}
 
-	// Update state machine — this also updates task_claims and
-	// citizen score counters, same as the legacy path.
-	if err := s.store.SubmitTaskResult(taskID, resultPath, req.CommitSHA, decision, req.TokensUsed); err != nil {
+	// Resolve the submitting citizen. For single-citizen tasks
+	// this is optional — tasks.claimed_by tells us who has the
+	// exclusive claim. For multi-citizen tasks the caller MUST
+	// identify themselves so the right task_claims slot gets
+	// credited.
+	var submitterID int64
+	if task.Citizens > 1 {
+		if req.Username == "" {
+			writeError(w, http.StatusBadRequest, "username is required on multi-citizen task submissions")
+			return
+		}
+		citizen, err := s.store.GetCitizenByUsername(req.Username)
+		if err != nil || citizen == nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown citizen %q", req.Username))
+			return
+		}
+		submitterID = citizen.ID
+	} else {
+		submitterID = task.ClaimedBy
+	}
+
+	// Update state machine. For single-citizen tasks this also
+	// transitions to ACCEPTED in one shot; for multi-citizen
+	// tasks it records the citizen's vote and transitions to
+	// COLLECTING (tally runs below).
+	submitRes, err := s.store.SubmitTaskResult(taskID, submitterID, resultPath, req.CommitSHA, decision, voteChoice, req.Content, req.TokensUsed)
+	if err != nil {
+		// Terminal-state rejections (late submits) are a
+		// client-visible 400, not a server-side 500 — the
+		// caller raced with the tally and lost. Everything
+		// else is still a 500.
+		if strings.Contains(err.Error(), "already resolved") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
 		return
 	}
@@ -1042,12 +1245,17 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// Update ready tasks — newly unblocked tasks become READY.
-	readied, _ := s.store.UpdateReadyTasks(task.RunID)
-
 	// Cross-run artifact propagation, same as the legacy path.
+	// We collect affected runs now but defer the readiness sweep
+	// until AFTER any action-specific cascades (review reject,
+	// vote skip) have run. Otherwise the initial readiness pass
+	// would promote losing-branch tasks to READY and the skip
+	// cascade would immediately flip them back to SKIPPED — the
+	// user-facing `readied` count would double-count those as
+	// "newly unlocked" even though they never actually entered
+	// the work queue.
+	otherRuns := map[int64]bool{}
 	if len(req.ArtifactsWritten) > 0 {
-		otherRuns := map[int64]bool{}
 		for _, path := range req.ArtifactsWritten {
 			readers, err := s.store.ListTasksReadingArtifact(run.ProjectID, path, false)
 			if err != nil {
@@ -1060,40 +1268,143 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 				}
 			}
 		}
-		for rid := range otherRuns {
-			if n, err := s.store.UpdateReadyTasks(rid); err == nil {
-				readied += n
+	}
+
+	// Review resolution — three paths:
+	//
+	//   1. Single-reviewer review (citizens = 1): SubmitTaskResult
+	//      already flipped the task to ACCEPTED. If the decision
+	//      was "reject", fire the invalidation cascade on the
+	//      target task directly. (Session E.1 behavior.)
+	//
+	//   2. Multi-reviewer review (citizens > 1): SubmitTaskResult
+	//      recorded the reviewer's verdict on their task_claims
+	//      row and moved the task to COLLECTING. Run the review
+	//      tally: any-reject-kills means the first reject
+	//      resolves the task as rejected immediately; all-approve
+	//      with quorum met resolves as accepted.
+	//
+	// The existing review-reject cascade machinery is reused for
+	// both paths — the difference is just who triggers it (one
+	// reviewer vs. the tally on the Nth vote).
+	var rejectResult *invalidationResult
+	var reviewTally *reviewTallyOutcome
+	if task.Action == "review" && task.ReviewsTarget != "" {
+		shouldReject := false
+		shouldAccept := false
+
+		if submitRes != nil && submitRes.Resolved {
+			// Single-reviewer — decision already committed to
+			// tasks.review_decision. Fire the cascade on reject.
+			shouldReject = decision == "reject"
+			shouldAccept = decision == "approve"
+		} else if submitRes != nil && submitRes.Collecting {
+			// Multi-reviewer — run the tally.
+			outcome, err := s.evaluateReviewTally(task)
+			if err != nil {
+				s.logger.Error("review tally failed", "review_task", taskID, "error", err)
+			} else {
+				reviewTally = outcome
+				if outcome != nil && outcome.Resolved {
+					if outcome.Verdict == "reject" {
+						shouldReject = true
+						// Roll up the tally verdict into the
+						// task record so the formatter can see
+						// "✗ rejected by majority/any-reject".
+						_ = s.store.ResolveMultiCitizenReview(taskID, "reject", req.CommitSHA)
+					} else {
+						shouldAccept = true
+						_ = s.store.ResolveMultiCitizenReview(taskID, "approve", req.CommitSHA)
+					}
+				}
+			}
+		}
+
+		if shouldReject {
+			targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+			res, err := s.performInvalidate(targetFullID)
+			if err != nil {
+				s.logger.Error("review-reject cascade failed",
+					"review_task", taskID, "target", targetFullID, "error", err)
+			} else {
+				rejectResult = res
+				s.logger.Info("review rejected target task",
+					"review_task", taskID,
+					"target", targetFullID,
+					"descendants", len(res.Descendants),
+					"changed", res.Changed,
+				)
+			}
+		}
+		_ = shouldAccept // reserved for future "approve side-effect" hook
+	}
+
+	// Vote resolution. Two paths:
+	//
+	//   1. Single-voter vote (citizens = 1): SubmitTaskResult
+	//      already flipped the task to ACCEPTED with voteChoice
+	//      as the winning option. We fire the skip cascade here.
+	//
+	//   2. Multi-voter vote (citizens > 1): SubmitTaskResult
+	//      recorded the citizen's vote and moved the task to
+	//      COLLECTING. We run the tally now — if it resolves,
+	//      we flip to ACCEPTED + fire the skip cascade. If not,
+	//      we leave the task in COLLECTING for more submissions.
+	var skipResult *skipCascadeResult
+	var tallyOutcome *voteTallyOutcome
+	if task.Action == "vote" {
+		if submitRes != nil && submitRes.Resolved && voteChoice != "" {
+			// Single-voter fast path — SubmitTaskResult already
+			// transitioned to ACCEPTED. Fire the cascade.
+			res, err := s.performSkipCascade(task, voteChoice)
+			if err != nil {
+				s.logger.Error("vote skip cascade failed",
+					"vote_task", taskID, "choice", voteChoice, "error", err)
+			} else {
+				skipResult = res
+			}
+		} else if submitRes != nil && submitRes.Collecting {
+			// Multi-voter collecting path — run the tally.
+			outcome, err := s.evaluateVoteTally(task)
+			if err != nil {
+				s.logger.Error("vote tally failed",
+					"vote_task", taskID, "error", err)
+			} else {
+				tallyOutcome = outcome
+				if outcome != nil && outcome.Resolved {
+					// Winning option found — transition to
+					// ACCEPTED and fire the skip cascade.
+					if err := s.store.ResolveMultiCitizenVote(taskID, outcome.WinningOption, req.CommitSHA); err != nil {
+						s.logger.Error("resolving multi-citizen vote",
+							"vote_task", taskID, "error", err)
+					} else {
+						// Re-load the task so performSkipCascade
+						// sees the updated row with the winning
+						// option set.
+						updated, _ := s.store.GetTask(taskID)
+						if updated != nil {
+							res, err := s.performSkipCascade(updated, outcome.WinningOption)
+							if err != nil {
+								s.logger.Error("vote skip cascade failed",
+									"vote_task", taskID, "error", err)
+							} else {
+								skipResult = res
+							}
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// Review reject cascade. The review task itself was just
-	// accepted normally — that's the contract for "I have finished
-	// reviewing." On a `reject` verdict the coordinator now also
-	// fires the invalidation cascade on the reviewed target so it
-	// bounces back to READY and the author can re-submit. The
-	// existing cascade machinery handles the rest: the review task
-	// (which depends on its target) auto-invalidates via the
-	// descendant walk so the next submission can carry a fresh
-	// decision.
-	var rejectResult *invalidationResult
-	if task.Action == "review" && decision == "reject" && task.ReviewsTarget != "" {
-		targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
-		res, err := s.performInvalidate(targetFullID)
-		if err != nil {
-			s.logger.Error("review-reject cascade failed",
-				"review_task", taskID, "target", targetFullID, "error", err)
-			// Don't fail the submit — the review decision is
-			// already stored and the author can still invoke
-			// enju_invalidate_task manually. Logging is enough.
-		} else {
-			rejectResult = res
-			s.logger.Info("review rejected target task",
-				"review_task", taskID,
-				"target", targetFullID,
-				"descendants", len(res.Descendants),
-				"changed", res.Changed,
-			)
+	// Now the action-specific cascades have settled, run the
+	// readiness sweep. Losing-branch tasks are already SKIPPED so
+	// they won't enter the "newly ready" count; only tasks that
+	// genuinely transitioned from PENDING to READY get reported.
+	readied, _ := s.store.UpdateReadyTasks(task.RunID)
+	for rid := range otherRuns {
+		if n, err := s.store.UpdateReadyTasks(rid); err == nil {
+			readied += n
 		}
 	}
 
@@ -1110,8 +1421,14 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		"newly_ready", readied,
 	)
 
+	status := "accepted"
+	voteStillCollecting := tallyOutcome != nil && !tallyOutcome.Resolved
+	reviewStillCollecting := reviewTally != nil && !reviewTally.Resolved
+	if submitRes != nil && submitRes.Collecting && (voteStillCollecting || reviewStillCollecting || (tallyOutcome == nil && reviewTally == nil)) {
+		status = "collecting"
+	}
 	resp := map[string]interface{}{
-		"status":      "accepted",
+		"status":      status,
 		"result_path": resultPath,
 		"commit_sha":  req.CommitSHA,
 		"newly_ready": readied,
@@ -1124,6 +1441,38 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			"target":      task.ReviewsTarget,
 			"descendants": rejectResult.Descendants,
 			"changed":     rejectResult.Changed,
+		}
+	}
+	if reviewTally != nil {
+		resp["review_tally"] = map[string]interface{}{
+			"resolved":      reviewTally.Resolved,
+			"verdict":       reviewTally.Verdict,
+			"approves":      reviewTally.Approves,
+			"rejects":       reviewTally.Rejects,
+			"total_reviews": reviewTally.TotalReviews,
+			"reason":        reviewTally.Reason,
+		}
+	}
+	if task.Action == "vote" {
+		voteResp := map[string]interface{}{}
+		if tallyOutcome != nil && tallyOutcome.Resolved {
+			voteResp["winning_option"] = tallyOutcome.WinningOption
+			voteResp["votes_tallied"] = tallyOutcome.TotalVotes
+			voteResp["counts"] = tallyOutcome.Counts
+		} else if submitRes != nil && submitRes.Resolved && voteChoice != "" {
+			voteResp["winning_option"] = voteChoice
+		} else if tallyOutcome != nil {
+			voteResp["collecting"] = true
+			voteResp["votes_so_far"] = tallyOutcome.TotalVotes
+			voteResp["counts"] = tallyOutcome.Counts
+			voteResp["reason"] = tallyOutcome.Reason
+		}
+		if skipResult != nil {
+			voteResp["skipped"] = skipResult.Skipped
+			voteResp["skipped_count"] = len(skipResult.Skipped)
+		}
+		if len(voteResp) > 0 {
+			resp["vote_resolution"] = voteResp
 		}
 	}
 	if len(req.ArtifactsWritten) > 0 {
@@ -1358,6 +1707,337 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		Changed:         changed,
 		Rollbacks:       rollbacks,
 		AffectedRuns:    affectedRunIDs,
+	}, nil
+}
+
+// reviewTallyOutcome describes the result of evaluating a
+// multi-reviewer review task's submissions against the default
+// any-reject-kills policy: any "reject" vote immediately
+// resolves the task as rejected; all "approve" votes (with
+// quorum met) resolve as accepted; otherwise the task stays in
+// COLLECTING waiting for more reviewers.
+type reviewTallyOutcome struct {
+	Resolved bool
+	// Verdict is "approve" or "reject" when Resolved is true;
+	// empty otherwise.
+	Verdict      string
+	Approves     int
+	Rejects      int
+	TotalReviews int
+	Reason       string
+}
+
+// evaluateReviewTally walks the per-citizen review submissions
+// and applies the any-reject-kills rule. If any reviewer rejected,
+// the task resolves immediately as "reject" (the first dissenter
+// wins under the default policy). Otherwise we check whether
+// quorum has been met and every submission is "approve"; if so
+// the task resolves as "approve." Missing quorum or a mixed
+// incomplete set leaves the task in COLLECTING.
+func (s *Server) evaluateReviewTally(task *store.TaskRecord) (*reviewTallyOutcome, error) {
+	submissions, err := s.store.ListVoteSubmissions(task.ID)
+	if err != nil {
+		return nil, fmt.Errorf("listing review submissions: %w", err)
+	}
+	out := &reviewTallyOutcome{TotalReviews: len(submissions)}
+	for _, sub := range submissions {
+		switch sub.Option {
+		case "approve":
+			out.Approves++
+		case "reject":
+			out.Rejects++
+		}
+	}
+
+	// Any reject immediately wins under the default dissent
+	// policy. This matches real-world code review: one "you
+	// can't ship this" kills the submission.
+	if out.Rejects > 0 {
+		out.Resolved = true
+		out.Verdict = "reject"
+		return out, nil
+	}
+
+	// No rejects so far. We need all reviewers to weigh in
+	// before we can declare "approve." Quorum defaults to the
+	// task's citizens count.
+	needed := task.MinQuorum
+	if needed <= 0 {
+		needed = task.Citizens
+		if needed <= 0 {
+			needed = 1
+		}
+	}
+	if out.Approves < needed {
+		out.Reason = fmt.Sprintf("approvals not yet at quorum (%d of %d)", out.Approves, needed)
+		return out, nil
+	}
+	out.Resolved = true
+	out.Verdict = "approve"
+	return out, nil
+}
+
+// voteTallyOutcome describes the result of evaluating the current
+// set of submitted votes against a multi-citizen vote task's
+// threshold + min_quorum + deadline rules. Resolved is true when
+// the task should transition to ACCEPTED; WinningOption is set in
+// that case. When Resolved is false the task stays in COLLECTING
+// and waits for more submissions (or a deadline trigger).
+type voteTallyOutcome struct {
+	Resolved      bool
+	WinningOption string
+	// Counts is the per-option vote count at evaluation time,
+	// useful for logging and formatter output.
+	Counts map[string]int
+	// TotalVotes is the number of submissions that contributed.
+	TotalVotes int
+	// Reason explains why a non-resolved tally didn't resolve
+	// (e.g. "quorum not met", "threshold not met"). Empty on
+	// resolved outcomes.
+	Reason string
+}
+
+// evaluateVoteTally applies the task's threshold + quorum rules
+// to the current set of submitted votes. It never mutates state
+// — it only reports whether the submissions so far justify a
+// resolution. The caller (handleSubmitResultReport) decides
+// what to do with the result.
+func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, error) {
+	submissions, err := s.store.ListVoteSubmissions(task.ID)
+	if err != nil {
+		return nil, fmt.Errorf("listing submissions: %w", err)
+	}
+	counts := make(map[string]int, len(submissions))
+	for _, sub := range submissions {
+		if sub.Option == "" {
+			continue
+		}
+		counts[sub.Option]++
+	}
+	total := len(submissions)
+
+	// Decode declared options in stable order for tie-breaking.
+	var declared []struct {
+		ID        string   `json:"id"`
+		Label     string   `json:"label,omitempty"`
+		Activates []string `json:"activates,omitempty"`
+	}
+	if task.VoteOptions != "" {
+		_ = json.Unmarshal([]byte(task.VoteOptions), &declared)
+	}
+
+	// Quorum check. Explicit min_quorum takes precedence;
+	// otherwise default to citizens count for multi-voter tasks
+	// (wait for everyone) and 1 for single-voter tasks. This
+	// matches the intuition "3 citizens can vote" → all 3
+	// should vote before resolution unless the author opts
+	// into a smaller quorum explicitly.
+	minQuorum := task.MinQuorum
+	if minQuorum <= 0 {
+		if task.Citizens > 1 {
+			minQuorum = task.Citizens
+		} else {
+			minQuorum = 1
+		}
+	}
+	if total < minQuorum {
+		return &voteTallyOutcome{
+			Counts:     counts,
+			TotalVotes: total,
+			Reason:     fmt.Sprintf("quorum not met (%d of %d)", total, minQuorum),
+		}, nil
+	}
+
+	// Pick a winner based on the threshold rule.
+	threshold := task.VoteThreshold
+	if threshold == "" {
+		threshold = "plurality"
+	}
+	winner, reason := pickWinner(declared, counts, total, threshold)
+	if winner == "" {
+		return &voteTallyOutcome{
+			Counts:     counts,
+			TotalVotes: total,
+			Reason:     reason,
+		}, nil
+	}
+	return &voteTallyOutcome{
+		Resolved:      true,
+		WinningOption: winner,
+		Counts:        counts,
+		TotalVotes:    total,
+	}, nil
+}
+
+// pickWinner returns the winning option id given the current
+// counts and the threshold rule. Returns an empty string + a
+// reason when no winner can be declared (tally stays open).
+// Ties under plurality/majority are broken by the order in which
+// options were declared in YAML — the first-declared option wins
+// a tie.
+func pickWinner(declared []struct {
+	ID        string   `json:"id"`
+	Label     string   `json:"label,omitempty"`
+	Activates []string `json:"activates,omitempty"`
+}, counts map[string]int, total int, threshold string) (string, string) {
+	if total == 0 {
+		return "", "no votes cast"
+	}
+
+	// Find max count.
+	maxCount := 0
+	for _, c := range counts {
+		if c > maxCount {
+			maxCount = c
+		}
+	}
+	if maxCount == 0 {
+		return "", "no votes cast"
+	}
+
+	// Leaders in declaration order — first one is our tie-break
+	// winner for plurality/majority.
+	var leaders []string
+	for _, opt := range declared {
+		if counts[opt.ID] == maxCount {
+			leaders = append(leaders, opt.ID)
+		}
+	}
+	if len(leaders) == 0 {
+		return "", "no declared option matched the top count"
+	}
+	winner := leaders[0]
+
+	lower := strings.ToLower(threshold)
+	switch {
+	case lower == "plurality":
+		return winner, ""
+	case lower == "majority":
+		if maxCount*2 > total {
+			return winner, ""
+		}
+		return "", fmt.Sprintf("majority not met (%d of %d)", maxCount, total)
+	case lower == "unanimous":
+		if maxCount == total && len(leaders) == 1 {
+			return winner, ""
+		}
+		return "", fmt.Sprintf("unanimous not met (%d of %d agree)", maxCount, total)
+	case strings.HasPrefix(lower, "percent:"):
+		pctStr := strings.TrimPrefix(lower, "percent:")
+		pct, err := strconv.Atoi(pctStr)
+		if err != nil || pct < 1 || pct > 100 {
+			return "", fmt.Sprintf("invalid percent threshold %q", threshold)
+		}
+		// Need winner's share ≥ pct% of total.
+		if maxCount*100 >= pct*total {
+			return winner, ""
+		}
+		return "", fmt.Sprintf("percent:%d not met (%d of %d = %d%%)", pct, maxCount, total, (maxCount*100)/total)
+	}
+	return "", fmt.Sprintf("unknown threshold %q", threshold)
+}
+
+// skipCascadeResult summarizes the outcome of performSkipCascade
+// for logging and response rendering.
+type skipCascadeResult struct {
+	WinningOption string
+	// Skipped is the list of full task ids that transitioned to
+	// SKIPPED as a result of this vote's resolution.
+	Skipped []string
+}
+
+// performSkipCascade applies Phase E.2's gate routing after a vote
+// task has been accepted. The rule:
+//
+//	winning_set = winning_activates ∪ descendants(winning_activates)
+//	losing_set  = ⋃ losing_activates ∪ descendants(losing_activates)
+//	skip_set    = losing_set − winning_set
+//
+// Tasks in skip_set transition to SKIPPED. Tasks in winning_set
+// stay alive. Tasks in neither set are unrelated to any branch
+// and are untouched. Merge points reachable from both sides stay
+// alive because the winning path still reaches them.
+//
+// Called from handleSubmitResultReport after the DB state flip to
+// ACCEPTED has landed. Returns nil with no error when the vote
+// has no activates (pure-decision votes); callers can still use
+// the decision as data but no routing happens.
+func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID string) (*skipCascadeResult, error) {
+	// Decode the declared options.
+	var declared []struct {
+		ID        string   `json:"id"`
+		Label     string   `json:"label,omitempty"`
+		Activates []string `json:"activates,omitempty"`
+	}
+	if task.VoteOptions == "" {
+		return nil, fmt.Errorf("task %q has no vote_options", task.ID)
+	}
+	if err := json.Unmarshal([]byte(task.VoteOptions), &declared); err != nil {
+		return nil, fmt.Errorf("decoding vote_options: %w", err)
+	}
+
+	// Short-circuit: if no option has activates, there's no
+	// skip cascade to run — pure decision vote.
+	anyActivates := false
+	for _, o := range declared {
+		if len(o.Activates) > 0 {
+			anyActivates = true
+			break
+		}
+	}
+	if !anyActivates {
+		return &skipCascadeResult{WinningOption: winningOptionID}, nil
+	}
+
+	// Load the DAG so we can walk descendants of activates roots.
+	d, err := s.getOrLoadDAG(task.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("loading DAG: %w", err)
+	}
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, fmt.Errorf("loading run: %w", err)
+	}
+	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
+
+	// Build the winning set and the losing set. Both are
+	// expressed as full task ids ({projectID:runSeq:...}) since
+	// that's what the store uses.
+	winningSet := make(map[string]bool)
+	losingSet := make(map[string]bool)
+	for _, o := range declared {
+		target := winningSet
+		if o.ID != winningOptionID {
+			target = losingSet
+		}
+		for _, shortID := range o.Activates {
+			full := runPrefix + shortID
+			target[full] = true
+			for _, desc := range d.Descendants(shortID) {
+				target[runPrefix+desc] = true
+			}
+		}
+	}
+
+	// skip_set = losing_set − winning_set
+	skipIDs := make([]string, 0, len(losingSet))
+	for id := range losingSet {
+		if winningSet[id] {
+			continue
+		}
+		skipIDs = append(skipIDs, id)
+	}
+	if len(skipIDs) == 0 {
+		return &skipCascadeResult{WinningOption: winningOptionID}, nil
+	}
+
+	// Flip them to SKIPPED in one go.
+	if _, err := s.store.MarkTasksSkipped(skipIDs); err != nil {
+		return nil, fmt.Errorf("marking tasks skipped: %w", err)
+	}
+	return &skipCascadeResult{
+		WinningOption: winningOptionID,
+		Skipped:       skipIDs,
 	}, nil
 }
 
@@ -1672,7 +2352,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	if t.InstanceKey != "" {
 		iterationLabel = formatIterationLabel(t.InstanceParams, t.InstanceKey)
 	}
-	return taskResponse{
+	resp := taskResponse{
 		ID:               t.ID,
 		RunID:            t.RunID,
 		RunSeq:           runSeq,
@@ -1701,7 +2381,41 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		RequireRole:     t.RequireRole,
 		ReviewsTarget:   t.ReviewsTarget,
 		ReviewDecision:  t.ReviewDecision,
+		VoteOptions:     t.VoteOptions,
+		VoteChoice:      t.VoteChoice,
+		Citizens:        t.Citizens,
+		MinQuorum:       t.MinQuorum,
+		VoteThreshold:   t.VoteThreshold,
+		VoteDeadline:    t.VoteDeadline,
 	}
+	// Phase E.2 session 2a/2b — surface per-citizen claim and
+	// submission state for multi-citizen vote AND review tasks
+	// so MCP formatters can render the Voting / Review block
+	// without an extra round trip.
+	if (t.Action == "vote" || t.Action == "review") && t.Citizens > 1 {
+		if submissions, err := s.store.ListVoteSubmissions(t.ID); err == nil {
+			for _, sub := range submissions {
+				uname := s.citizenUsername(sub.CitizenID)
+				ref := voteSubmissionRef{
+					Username: uname,
+					Option:   sub.Option,
+				}
+				if sub.SubmittedAt != nil {
+					ref.SubmittedAt = sub.SubmittedAt.Format(time.RFC3339)
+				}
+				resp.VoteSubmissions = append(resp.VoteSubmissions, ref)
+			}
+		}
+		if claims, err := s.store.ListActiveClaims(t.ID); err == nil {
+			for _, c := range claims {
+				uname := s.citizenUsername(c.CitizenID)
+				if uname != "" {
+					resp.ActiveClaimants = append(resp.ActiveClaimants, uname)
+				}
+			}
+		}
+	}
+	return resp
 }
 
 func (s *Server) toTaskResponses(tasks []store.TaskRecord) []taskResponse {

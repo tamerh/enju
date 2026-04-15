@@ -1,0 +1,21 @@
+name: "Deliberation with responses"
+version: 1
+tasks:
+  - id: gather
+    action: vote
+    citizens: 3
+    min_quorum: 3
+    threshold: plurality
+    prompt: "Propose a database."
+    options:
+      - {id: duckdb, label: "DuckDB"}
+      - {id: sqlite, label: "SQLite"}
+
+  - id: synthesize
+    action: answer
+    depends_on: [gather]
+    prompt: |
+      The group voted. Winning option: {{gather.winning_option}}
+      Per-voter responses:
+      {{gather.responses}}
+      Synthesize the discussion into a decision summary.

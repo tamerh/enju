@@ -470,6 +470,66 @@ func TestResolveSingletonUpstream(t *testing.T) {
 	}
 }
 
+// TestResolveWinningOption covers Phase E.2's
+// {{task.winning_option}} accessor: an upstream vote task's
+// VoteChoice gets surfaced on the dependency ref, the resolver
+// attaches it to the result map, and the template substitution
+// hits the top-level field lookup in extractField.
+func TestResolveWinningOption(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	proj, err := ws.ForProject(90, bare)
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	// Seed a vote task's "accepted" commit: the voter's
+	// commentary is the result.md; the winning option id rides
+	// along on the DependencyRef (mirroring what the coordinator
+	// would populate from tasks.vote_choice).
+	proj.Lock()
+	res, err := proj.SubmitTaskResult(SubmitRequest{
+		TaskID:   "1:1:pick_db",
+		Username: "alice",
+		Files: []FileWrite{
+			{
+				RepoRelPath: filepath.Join(ResultDir(90, 1, "", "pick_db"), "result.md"),
+				Content:     []byte("DuckDB fits the workload best."),
+			},
+		},
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	resolved, err := proj.Resolve(ResolveInput{
+		PromptTemplate: "Rationale for {{pick_db.winning_option}}: {{pick_db.content}}",
+		Dependencies: []DependencyRef{
+			{
+				TaskDefID:  "pick_db",
+				CommitSHA:  res.CommitSHA,
+				ResultPath: ResultDir(90, 1, "", "pick_db"),
+				VoteChoice: "duckdb",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !strings.Contains(resolved.Prompt, "duckdb") {
+		t.Errorf("expected winning_option to resolve to 'duckdb', got: %q", resolved.Prompt)
+	}
+	if !strings.Contains(resolved.Prompt, "DuckDB fits the workload best") {
+		t.Errorf("expected commentary content to still resolve via {{task.content}}, got: %q", resolved.Prompt)
+	}
+	if strings.Contains(resolved.Prompt, "{{") {
+		t.Errorf("unresolved placeholder: %q", resolved.Prompt)
+	}
+}
+
 // TestResolveForEachParams covers bare {{param}} substitution from
 // the task's own for_each params.
 func TestResolveForEachParams(t *testing.T) {

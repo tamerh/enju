@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // Reference pattern: {{word.word}} or {{word}}
@@ -124,10 +125,14 @@ func extractField(result interface{}, field string) string {
 	}
 
 	if field == "responses" {
-		// {{task.responses}} — for multi-citizen tasks (future)
+		// {{task.responses}} — multi-citizen tasks. Expected
+		// shape: [{username, option, content}, ...] populated
+		// by the client-side resolver from per-citizen
+		// result.md files at the upstream's accepted commit.
+		// Render as markdown blocks so the downstream prompt
+		// gets human-readable output instead of raw JSON.
 		if responses, ok := resultMap["responses"]; ok {
-			b, _ := json.MarshalIndent(responses, "", "  ")
-			return string(b)
+			return renderResponsesMarkdown(responses)
 		}
 		return match(result, field)
 	}
@@ -157,6 +162,55 @@ func extractField(result interface{}, field string) string {
 
 func match(result interface{}, field string) string {
 	return fmt.Sprintf("%v", result)
+}
+
+// renderResponsesMarkdown renders a multi-citizen `responses`
+// array as a human-readable markdown block. Expected shape is
+// []interface{} of map[string]interface{} entries with keys
+// "username", "option", and "content". Missing fields render as
+// empty strings; unknown shapes fall back to JSON.
+func renderResponsesMarkdown(responses interface{}) string {
+	// Accept both []interface{} (what the JSON-decoded
+	// descriptor path produces) and []map[string]interface{}
+	// (what the in-Go resolver produces directly). The two
+	// paths converge here so template substitution works for
+	// both the fat-client resolver and any future caller that
+	// builds the input map manually.
+	var entries []map[string]interface{}
+	switch v := responses.(type) {
+	case []map[string]interface{}:
+		entries = v
+	case []interface{}:
+		for _, e := range v {
+			if m, ok := e.(map[string]interface{}); ok {
+				entries = append(entries, m)
+			}
+		}
+	default:
+		b, _ := json.MarshalIndent(responses, "", "  ")
+		return string(b)
+	}
+	var out strings.Builder
+	for i, m := range entries {
+		username, _ := m["username"].(string)
+		option, _ := m["option"].(string)
+		content, _ := m["content"].(string)
+		if i > 0 {
+			out.WriteString("\n\n---\n\n")
+		}
+		header := "### "
+		if username != "" {
+			header += "@" + username
+		} else {
+			header += "(anonymous)"
+		}
+		if option != "" {
+			header += " — " + option
+		}
+		out.WriteString(header + "\n\n")
+		out.WriteString(content)
+	}
+	return out.String()
 }
 
 func taskID(m map[string]interface{}) string {

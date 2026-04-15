@@ -328,7 +328,8 @@ For simple tasks: provide 'content' as a string.
 For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
 For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
 For action:review tasks: provide 'decision' as "approve" or "reject". Your prose content is the reviewer's comment. A reject verdict automatically invalidates the target task (the one named in its 'reviews:' field) so the author can re-submit a fixed version.
-The task detail shows the schema (outputs, writes_artifacts, reviews target) so you know what's expected.`),
+For action:vote tasks: provide 'option' as one of the declared option ids from the task's 'options:' list. Your prose content is free-form commentary. If the winning option has 'activates:' set, the DAG routes down that branch and tasks on losing branches flip to SKIPPED. Votes without 'activates:' are pure decisions — downstream tasks can still read the choice via {{task.winning_option}}.
+The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task"),
@@ -344,6 +345,9 @@ The task detail shows the schema (outputs, writes_artifacts, reviews target) so 
 		),
 		mcp.WithString("decision",
 			mcp.Description(`Required for action:review tasks: "approve" or "reject". Ignored on non-review tasks. A reject cascades an invalidation on the reviewed target task, bouncing it back to READY so the author can re-submit.`),
+		),
+		mcp.WithString("option",
+			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
 		),
 	)
 }
@@ -1080,6 +1084,13 @@ type taskMeta struct {
 	RunSeq           int
 	TaskDefID        string
 	InstanceKey      string
+	// State is the task's current lifecycle state. Populated
+	// from the coordinator's task record so the fat-client
+	// submit helper can pre-reject submissions against tasks
+	// that are already in a terminal state, avoiding a
+	// phantom-commit-style round-trip (commit+push → server
+	// rejects with "task cannot accept result").
+	State string
 	// Action is the task's action type ("answer", "review", etc).
 	// Used by the fat-client submit helper to pre-validate
 	// action-specific fields (e.g. decision on review) BEFORE
@@ -1091,6 +1102,19 @@ type taskMeta struct {
 	// client-side formatter can show the reviewer what they're
 	// reviewing without a separate fetch.
 	ReviewsTarget string
+	// VoteOptionsJSON is the declared options list for
+	// action:vote tasks, copied verbatim from the coordinator's
+	// task record. Used by client-side pre-validation (to
+	// reject unknown option ids before any git write) and by
+	// the claim-response formatter (to show the voter what the
+	// choices are). Empty for non-vote tasks.
+	VoteOptionsJSON string
+	// Citizens is the declared citizens count for multi-voter /
+	// multi-reviewer tasks. Defaults to 1. When > 1, the
+	// fat-client submit path writes to per-citizen result
+	// subdirectories so parallel submissions don't race on the
+	// same result.md file.
+	Citizens int
 	// OutputsSchemaJSON is the serialized outputs schema from the
 	// task's YAML, or empty if the task has no named outputs.
 	// Parsed via mcpgit.ParseNamedOutputSchema by the fat-client
@@ -1137,6 +1161,15 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["reviews_target"].(string); ok {
 		meta.ReviewsTarget = v
+	}
+	if v, ok := raw["vote_options"].(string); ok {
+		meta.VoteOptionsJSON = v
+	}
+	if v, ok := raw["state"].(string); ok {
+		meta.State = v
+	}
+	if v, ok := raw["citizens"].(float64); ok {
+		meta.Citizens = int(v)
 	}
 	return meta, nil
 }
@@ -1253,13 +1286,22 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 		ForEachParams:      desc.ForEachParams,
 	}
 	for _, d := range desc.Dependencies {
-		input.Dependencies = append(input.Dependencies, mcpgit.DependencyRef{
+		ref := mcpgit.DependencyRef{
 			TaskDefID:      d.TaskDefID,
 			InstanceKey:    d.InstanceKey,
 			InstanceParams: d.InstanceParams,
 			CommitSHA:      d.CommitSHA,
 			ResultPath:     d.ResultPath,
-		})
+			VoteChoice:     d.VoteChoice,
+		}
+		for _, r := range d.Responses {
+			ref.Responses = append(ref.Responses, mcpgit.CitizenResponseRef{
+				Username: r.Username,
+				Option:   r.Option,
+				Content:  r.Content,
+			})
+		}
+		input.Dependencies = append(input.Dependencies, ref)
 	}
 	for _, a := range desc.ArtifactReads {
 		input.ArtifactReads = append(input.ArtifactReads, mcpgit.ArtifactRef{
@@ -1349,6 +1391,22 @@ type descDependencyRef struct {
 	InstanceParams map[string]string `json:"instance_params"`
 	CommitSHA      string            `json:"commit_sha"`
 	ResultPath     string            `json:"result_path"`
+	// VoteChoice is the upstream vote task's winning option id
+	// (Phase E.2). Empty for non-vote upstreams.
+	VoteChoice string `json:"vote_choice,omitempty"`
+	// Responses is the per-citizen submission list for
+	// multi-citizen upstreams (Phase E.2 session 2b). Each
+	// entry has a username + option; the client-side resolver
+	// reads the per-citizen result.md from the local clone
+	// and attaches the content before substituting into the
+	// downstream prompt via {{task.responses}}.
+	Responses []descResponseRef `json:"responses,omitempty"`
+}
+
+type descResponseRef struct {
+	Username string `json:"username"`
+	Option   string `json:"option"`
+	Content  string `json:"content,omitempty"`
 }
 
 type descArtifactRef struct {
@@ -1380,9 +1438,16 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	outputsJSON := req.GetString("outputs_json", "")
 	artifactsJSON := req.GetString("artifacts_json", "")
 	decision := req.GetString("decision", "")
+	option := req.GetString("option", "")
 
-	if content == "" && outputsJSON == "" && artifactsJSON == "" {
-		return mcp.NewToolResultError("at least one of 'content', 'outputs_json', or 'artifacts_json' is required"), nil
+	// Primary-field presence check. A vote task can submit with
+	// just `option`, a review task with just `decision` — those
+	// actions treat the action-specific field as the primary
+	// signal and prose content is optional commentary. Without
+	// the decision/option here the check emits a misleading
+	// "content is required" error on an option-only vote.
+	if content == "" && outputsJSON == "" && artifactsJSON == "" && decision == "" && option == "" {
+		return mcp.NewToolResultError("at least one of 'content', 'outputs_json', 'artifacts_json', 'decision' (review), or 'option' (vote) is required"), nil
 	}
 	// Any non-empty decision must be valid, regardless of action.
 	// The "required for review" check happens in the fat-client
@@ -1404,11 +1469,18 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
-	// Decide between fat-client and legacy paths based on whether
-	// the project has a remote_url configured.
-	meta, _ := c.fetchTaskMeta(ctx, taskID)
+	// Task-existence check up front. fetchTaskMeta returns an
+	// error if the coordinator can't find the task (typo, wiped
+	// DB, wrong ID). Surface that as a clean "task not found"
+	// instead of letting the legacy fallback path POST into a
+	// void and surface the server's internal "commit_sha is
+	// required" contract error as if it were the real problem.
+	meta, metaErr := c.fetchTaskMeta(ctx, taskID)
+	if metaErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, metaErr)), nil
+	}
 	if c.useFatClient(meta) {
-		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, artifacts, decision)
+		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, artifacts, decision, option)
 	}
 
 	// Legacy coordinator-writes path.
@@ -1426,6 +1498,9 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	}
 	if decision != "" {
 		body["decision"] = decision
+	}
+	if option != "" {
+		body["option"] = option
 	}
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", body)
 	if err != nil {
@@ -1446,6 +1521,7 @@ func (c *apiClient) submitResultFatClient(
 	outputs map[string]string,
 	artifacts map[string]string,
 	decision string,
+	option string,
 ) (*mcp.CallToolResult, error) {
 	// Pre-validate action-specific invariants BEFORE touching the
 	// local clone. The fat-client submit does commit+push before
@@ -1453,8 +1529,34 @@ func (c *apiClient) submitResultFatClient(
 	// after that point would leave a phantom commit stranded in
 	// git history (append-only, nothing to roll back). Anything
 	// the client can check up front belongs here.
+	//
+	// Task-state gate: a submission against an already-terminal
+	// task (accepted / skipped / invalidated / rejected) has no
+	// legitimate landing state. Reject it client-side with a
+	// task-specific message — mirrors the server's existing
+	// "task X cannot accept result (state: Y)" but saves a git
+	// round-trip.
+	if meta != nil && meta.State != "" {
+		switch meta.State {
+		case "accepted", "skipped", "invalid", "invalidated", "rejected":
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"task %s is already in terminal state %q — re-open it with enju_invalidate_task first if you need to resubmit",
+				taskID, meta.State,
+			)), nil
+		case "pending", "ready":
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"task %s is in state %q — claim it with enju_claim_task before submitting",
+				taskID, meta.State,
+			)), nil
+		}
+	}
 	if meta != nil && meta.Action == "review" {
 		if msg := validateReviewDecision(decision); msg != "" {
+			return mcp.NewToolResultError(msg), nil
+		}
+	}
+	if meta != nil && meta.Action == "vote" {
+		if msg := validateVoteOption(option, meta.VoteOptionsJSON); msg != "" {
 			return mcp.NewToolResultError(msg), nil
 		}
 	}
@@ -1464,7 +1566,17 @@ func (c *apiClient) submitResultFatClient(
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	resultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	// Multi-citizen tasks route each citizen's submission into
+	// its own `citizen-<username>/` subdirectory so parallel
+	// submitters don't race on the same result.md. Single-
+	// citizen tasks keep the flat `runs/{seq}/{task}/` layout.
+	// The task's declared citizens count is stored on the DB
+	// row and surfaced via taskMeta.Citizens.
+	baseResultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	resultDir := baseResultDir
+	if meta.Citizens > 1 {
+		resultDir = filepath.Join(baseResultDir, "citizen-"+c.username)
+	}
 
 	// Build the metadata.json that accompanies every submit.
 	// Result type defaults to text; it gets flipped to json
@@ -1490,6 +1602,24 @@ func (c *apiClient) submitResultFatClient(
 		metadata["decision"] = decision
 		if meta.ReviewsTarget != "" {
 			metadata["reviews_target"] = meta.ReviewsTarget
+		}
+	}
+	// Vote-action metadata: mirror the review audit shape so
+	// git-log archaeology on vote tasks reveals the winning
+	// option plus the declared options list (so an auditor can
+	// see what the choices were, not just which one won).
+	if meta != nil && meta.Action == "vote" {
+		metadata["action"] = "vote"
+		metadata["option"] = option
+		if meta.VoteOptionsJSON != "" {
+			// Embed the parsed options as a structured field so
+			// the commit's metadata.json is self-describing —
+			// no need to reference the coordinator DB or the
+			// original run YAML.
+			var parsed interface{}
+			if json.Unmarshal([]byte(meta.VoteOptionsJSON), &parsed) == nil {
+				metadata["options"] = parsed
+			}
 		}
 	}
 
@@ -1586,9 +1716,25 @@ func (c *apiClient) submitResultFatClient(
 		"artifacts_written": artifactPaths,
 		"tokens_used":       0,
 		"model":             "claude",
+		// Username identifies the submitting citizen for
+		// multi-citizen task bookkeeping (so the coordinator
+		// credits the right task_claims row). Single-citizen
+		// tasks tolerate it but use tasks.claimed_by as the
+		// implicit claimer.
+		"username": c.username,
+		// Content rides along so the coordinator can persist
+		// the citizen's prose on task_claims.content for
+		// multi-citizen vote/review tasks. The fat-client
+		// already wrote this prose to the per-citizen
+		// result.md, but the DB column is the authoritative
+		// source for {{task.responses}} rendering.
+		"content": content,
 	}
 	if decision != "" {
 		reportBody["decision"] = decision
+	}
+	if option != "" {
+		reportBody["option"] = option
 	}
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
 	if err != nil {
@@ -1623,6 +1769,49 @@ func validateReviewDecision(decision string) string {
 // different validation points.
 func invalidDecisionMessage(decision string) string {
 	return fmt.Sprintf("decision %q is invalid (must be \"approve\" or \"reject\")", decision)
+}
+
+// validateVoteOption is the client-side pre-validation guard for
+// action:vote submissions. Returns an empty string when the
+// option is acceptable, or a single-sentence error message
+// otherwise. Runs BEFORE any git write in submitResultFatClient
+// so a bad option id can't strand a phantom commit in the
+// append-only history.
+//
+// optionsJSON is the serialized options list from the task's
+// vote_options column. An empty JSON (e.g. a storage row that
+// somehow lost its declared options) falls through as a
+// coordinator-side consistency error rather than a vote-option
+// UX error — we don't try to second-guess the DB.
+func validateVoteOption(option, optionsJSON string) string {
+	if optionsJSON == "" {
+		// Don't block the submit client-side if we can't see
+		// the declared options; let the coordinator respond
+		// with its own consistency error. Better to surface
+		// one error from one place than two slightly different
+		// ones.
+		return ""
+	}
+	var declared []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(optionsJSON), &declared); err != nil || len(declared) == 0 {
+		return ""
+	}
+	known := make([]string, 0, len(declared))
+	for _, o := range declared {
+		known = append(known, o.ID)
+	}
+	if option == "" {
+		return fmt.Sprintf(`option is required on action:vote tasks (must be one of: %s)`, strings.Join(known, ", "))
+	}
+	for _, id := range known {
+		if id == option {
+			return ""
+		}
+	}
+	return fmt.Sprintf(`option %q is invalid (must be one of: %s)`,
+		option, strings.Join(known, ", "))
 }
 
 // decorateCoordinatorRejection wraps a raw coordinator error string

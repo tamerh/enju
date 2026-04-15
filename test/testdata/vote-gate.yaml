@@ -1,0 +1,36 @@
+name: "Vote Gate"
+version: 1
+tasks:
+  - id: analysis
+    action: answer
+    prompt: "Summarize the tradeoffs."
+
+  - id: pick
+    action: vote
+    depends_on: [analysis]
+    prompt: "Pick a direction based on: {{analysis.content}}"
+    options:
+      - id: python
+        label: "Go with Python"
+        activates: [build_python, ship_python]
+      - id: rust
+        label: "Go with Rust"
+        activates: [build_rust, ship_rust]
+
+  - id: build_python
+    action: answer
+    prompt: "Build the Python service."
+
+  - id: ship_python
+    action: answer
+    depends_on: [build_python]
+    prompt: "Ship the Python service."
+
+  - id: build_rust
+    action: answer
+    prompt: "Build the Rust service."
+
+  - id: ship_rust
+    action: answer
+    depends_on: [build_rust]
+    prompt: "Ship the Rust service."

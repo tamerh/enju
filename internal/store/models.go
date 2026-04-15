@@ -7,15 +7,32 @@ import "time"
 type TaskState string
 
 const (
-	TaskPending     TaskState = "pending"
-	TaskReady       TaskState = "ready"
-	TaskClaimed     TaskState = "claimed"
-	TaskRunning     TaskState = "running"
-	TaskSubmitted   TaskState = "submitted"
-	TaskAccepted    TaskState = "accepted"
-	TaskRejected    TaskState = "rejected"
-	TaskInvalid     TaskState = "invalid"
+	TaskPending    TaskState = "pending"
+	TaskReady      TaskState = "ready"
+	TaskClaimed    TaskState = "claimed"
+	TaskRunning    TaskState = "running"
+	TaskSubmitted  TaskState = "submitted"
+	TaskAccepted   TaskState = "accepted"
+	TaskRejected   TaskState = "rejected"
+	TaskInvalid    TaskState = "invalid"
 	TaskInvalidated TaskState = "invalidated"
+	// TaskCollecting is Phase E.2 session 2a's intermediate state
+	// for multi-citizen tasks. A task with `citizens: N > 1`
+	// enters COLLECTING on first submission and stays there until
+	// the tally resolves (quorum + threshold met, or deadline
+	// forces resolution). During COLLECTING: additional citizens
+	// can still claim slots, additional submissions are accepted,
+	// and the task is NOT terminal (run completion waits on it,
+	// dependent tasks stay blocked).
+	TaskCollecting TaskState = "collecting"
+	// TaskSkipped is a terminal state introduced in Phase E.2
+	// for vote skip cascades. When an `action: vote` task resolves
+	// with an option that has `activates:`, tasks reachable only
+	// through *losing* options flip to SKIPPED. The scheduler
+	// treats SKIPPED identically to ACCEPTED for run-completion
+	// counting and dependency satisfaction — a skipped task is
+	// "done, not taken," not "failed" or "pending."
+	TaskSkipped TaskState = "skipped"
 )
 
 // RunState represents the state of a run.
@@ -113,6 +130,22 @@ type TaskRecord struct {
 	ReviewsTarget  string
 	ReviewDecision string
 
+	// Vote action fields (Phase E.2). VoteOptions is the JSON-
+	// encoded list of declared options with their id/label/activates
+	// lists, copied from YAML at run-creation time. VoteChoice is
+	// the submitted option id, populated on submit and cleared on
+	// invalidation so a re-run lands a fresh choice. Citizens,
+	// MinQuorum, VoteThreshold, and VoteDeadline are the tally-
+	// rule fields parsed from YAML; VoteDeadline is stored as a
+	// Go duration string ("2h", "24h"). All zero-value for
+	// non-vote tasks.
+	VoteOptions   string
+	VoteChoice    string
+	Citizens      int
+	MinQuorum     int
+	VoteThreshold string
+	VoteDeadline  string
+
 	CreatedAt time.Time
 }
 
@@ -158,15 +191,28 @@ type CitizenRecord struct {
 	LastSeen        time.Time
 }
 
-// TaskClaimRecord tracks the history of task claims.
+// TaskClaimRecord tracks the history of task claims. In multi-
+// citizen tasks (citizens > 1), one row per (task, citizen) pair —
+// the table functions as the per-citizen submission log. The Option
+// column carries the citizen's vote choice for vote-action tasks,
+// populated on submit alongside SubmittedAt and outcome.
 type TaskClaimRecord struct {
-	ID            int64
-	TaskID        string
-	CitizenID     int64
-	ClaimedAt     time.Time
-	Deadline      time.Time
-	Outcome       string // "completed", "timed_out", "released", "rejected"
-	SubmittedAt   *time.Time
+	ID          int64
+	TaskID      string
+	CitizenID   int64
+	ClaimedAt   time.Time
+	Deadline    time.Time
+	Outcome     string // "completed", "timed_out", "released", "rejected"
+	SubmittedAt *time.Time
+	// Option is the citizen's submitted choice on a vote-action
+	// task. Empty for non-vote submissions and for claims that
+	// haven't submitted yet.
+	Option string
+	// Content is the citizen's prose commentary (best-effort,
+	// stored denormalized from git for quick tally rendering).
+	// Kept short — formatters that need the full prose still read
+	// from the per-citizen result.md in the project's git repo.
+	Content string
 }
 
 // ArtifactRecord is the index row for one mutable file inside a project's

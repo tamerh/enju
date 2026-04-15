@@ -70,6 +70,34 @@ type DependencyRef struct {
 	// upstream's result files (e.g. "runs/2/gather" or
 	// "runs/2/BRCA1/gather").
 	ResultPath string
+	// VoteChoice is the upstream vote task's winning option id.
+	// Populated only when the upstream is an action:vote task
+	// that has resolved; empty otherwise. When non-empty, the
+	// resolver attaches it as a `winning_option` field on the
+	// result map so downstream prompts can reference it via
+	// `{{task.winning_option}}`.
+	VoteChoice string
+	// Responses is the per-citizen submission list for
+	// multi-citizen upstreams. Each entry has a username + the
+	// citizen's choice (option id for vote tasks,
+	// "approve"/"reject" for review tasks). The resolver reads
+	// the content from the per-citizen result.md subdirectory
+	// and attaches the array to the result map so
+	// `{{task.responses}}` renders a markdown block with each
+	// voter's verdict + commentary.
+	Responses []CitizenResponseRef
+}
+
+// CitizenResponseRef is one citizen's submission on a multi-
+// citizen upstream task. Content comes from the coordinator
+// descriptor (sourced from task_claims.content) — the
+// authoritative storage for multi-citizen responses. The
+// resolver uses it directly instead of reading per-citizen
+// result.md from git.
+type CitizenResponseRef struct {
+	Username string
+	Option   string
+	Content  string
 }
 
 // ArtifactRef is one artifact the task declares reading.
@@ -233,6 +261,52 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 func (p *Project) readResultForTemplate(dep DependencyRef) (map[string]interface{}, error) {
 	result := map[string]interface{}{
 		"task_id": dep.TaskDefID,
+	}
+
+	// Phase E.2 — vote task upstreams expose their winning
+	// option id via `{{task.winning_option}}` in downstream
+	// prompts. Set both the Phase-E-facing "winning_option" key
+	// and a legacy-friendly "vote_choice" alias so either reference
+	// form resolves. Non-vote upstreams leave both blank.
+	if dep.VoteChoice != "" {
+		result["winning_option"] = dep.VoteChoice
+		result["vote_choice"] = dep.VoteChoice
+	}
+
+	// Phase E.2 session 2b — multi-citizen upstreams carry a
+	// per-citizen response list. Read each voter's commentary
+	// from `citizen-<username>/result.md` at the dep's commit
+	// and attach the array as a `responses` field so downstream
+	// prompts can render `{{task.responses}}` as a markdown
+	// block with each voter's verdict + prose.
+	if len(dep.Responses) > 0 {
+		responses := make([]map[string]interface{}, 0, len(dep.Responses))
+		for _, r := range dep.Responses {
+			// Content comes from the descriptor (sourced from
+			// task_claims.content on the coordinator), not
+			// from reading per-citizen result.md via git.
+			// The DB column is the authoritative source for
+			// multi-citizen submissions since commit_sha is
+			// now optional on vote/review actions and not
+			// every submit results in a git commit.
+			responses = append(responses, map[string]interface{}{
+				"username": r.Username,
+				"option":   r.Option,
+				"content":  r.Content,
+			})
+		}
+		result["responses"] = responses
+		// Multi-citizen upstreams don't have a single
+		// task-level result.md — the per-citizen subdirs are
+		// the only on-disk content. Fall out early with the
+		// responses map attached, since the normal read-
+		// metadata-then-result-file path would fail on the
+		// missing base file. {{task.content}} on a
+		// multi-citizen upstream returns an empty string;
+		// authors who want per-citizen content reference
+		// {{task.responses}} instead.
+		result["content"] = ""
+		return result, nil
 	}
 
 	// Read metadata first so we can distinguish single-file results

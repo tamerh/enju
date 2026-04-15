@@ -1,0 +1,23 @@
+name: "Multi-voter Gate"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    citizens: 3
+    threshold: majority
+    prompt: "Pick a database."
+    options:
+      - id: duckdb
+        label: "DuckDB"
+        activates: [build_duckdb]
+      - id: sqlite
+        label: "SQLite"
+        activates: [build_sqlite]
+
+  - id: build_duckdb
+    action: answer
+    prompt: "Build with DuckDB."
+
+  - id: build_sqlite
+    action: answer
+    prompt: "Build with SQLite."

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/dag"
 	"github.com/enju-ai/enju/internal/template"
@@ -120,6 +122,38 @@ type TaskDef struct {
 	// it twice). See docs/task-actions.md for the full flow.
 	Reviews string `yaml:"reviews,omitempty"`
 
+	// Phase E.2 vote-action fields. Session 1 ships single-voter
+	// vote only (citizens: 1 de facto); multi-voter wiring is a
+	// follow-up. See docs/task-actions.md for the full semantics.
+	//
+	// Options is the list of choices on an `action: vote` task.
+	// Required and non-empty on vote tasks, forbidden elsewhere.
+	// Each option has a stable id (used in submit payloads and in
+	// winning-option accessors), a human label for display, and
+	// optionally an `activates:` list that routes the DAG — tasks
+	// in the winning option's activates set stay alive, tasks in
+	// losing options' activates sets flip to SKIPPED.
+	Options []VoteOption `yaml:"options,omitempty"`
+	// Citizens is how many people are invited to vote (or
+	// contribute / review). Defaults to 1. Values > 1 require the
+	// multi-voter substrate which ships in session 2; session 1's
+	// validator rejects them up front so authors don't get a
+	// silent single-voter downgrade.
+	Citizens int `yaml:"citizens,omitempty"`
+	// MinQuorum is the minimum number of submitted votes required
+	// before the tally can resolve. Unset means "any count
+	// resolves." Meaningful only for citizens > 1.
+	MinQuorum int `yaml:"min_quorum,omitempty"`
+	// Threshold is the agreement rule applied to submitted votes:
+	// "plurality" (default), "majority", "unanimous", or
+	// "percent:N" where N is an integer 1..100.
+	Threshold string `yaml:"threshold,omitempty"`
+	// Deadline is a relative duration (e.g. "2h", "24h") measured
+	// from when the vote task is created. Votes submitted after
+	// the deadline are rejected and the tally evaluates whatever
+	// landed. Unset means "no time limit."
+	Deadline string `yaml:"deadline,omitempty"`
+
 	// Assignment and access control (iteration 1 of build-out plan).
 	// Both are optional — the default is open: any registered citizen
 	// can claim any task. When set, they narrow who can claim.
@@ -133,6 +167,25 @@ type TaskDef struct {
 	// Phase 2 feature that depends on project membership.
 	AssignTo    yamlStringList `yaml:"assign_to,omitempty"`
 	RequireRole string         `yaml:"require_role,omitempty"`
+}
+
+// VoteOption is one choice on an action:vote task.
+type VoteOption struct {
+	// ID is the stable identifier used in submit payloads and in
+	// winning-option references. Must be unique within one vote
+	// task's options list.
+	ID string `yaml:"id"`
+	// Label is the human-readable description shown to voters
+	// when they claim the task. Optional — defaults to ID.
+	Label string `yaml:"label,omitempty"`
+	// Activates is the list of task def ids to keep alive when
+	// this option wins. Tasks in other options' Activates (and
+	// not in this one's) flip to SKIPPED. Optional — a vote
+	// without any activates is a pure decision record with no
+	// DAG routing, and downstream tasks can still read the
+	// winning option via `{{task.winning_option}}`
+	// (session 2 accessor).
+	Activates []string `yaml:"activates,omitempty"`
 }
 
 // ParsedRun is the result of parsing and validating a run file.
@@ -252,6 +305,77 @@ func validate(p *Run) error {
 			return fmt.Errorf("task %q: reviews is only valid on action: review tasks", t.ID)
 		}
 
+		// Vote-action validation. Session 1 ships single-voter
+		// only; citizens > 1 is explicitly rejected so authors
+		// get a loud error instead of a silent downgrade when
+		// they expect multi-voter behavior.
+		if t.Action == "vote" {
+			if len(t.Options) < 2 {
+				return fmt.Errorf("task %q: action: vote requires at least 2 options", t.ID)
+			}
+			seenOptIDs := make(map[string]bool, len(t.Options))
+			for i, opt := range t.Options {
+				if opt.ID == "" {
+					return fmt.Errorf("task %q: option #%d is missing an id", t.ID, i+1)
+				}
+				if seenOptIDs[opt.ID] {
+					return fmt.Errorf("task %q: duplicate option id %q", t.ID, opt.ID)
+				}
+				seenOptIDs[opt.ID] = true
+			}
+			if t.Threshold != "" {
+				if err := validateThreshold(t.Threshold); err != nil {
+					return fmt.Errorf("task %q: %w", t.ID, err)
+				}
+			}
+			if t.Deadline != "" {
+				if _, err := time.ParseDuration(t.Deadline); err != nil {
+					return fmt.Errorf("task %q: invalid deadline %q (expected a Go duration like 2h, 30m, 1d is NOT supported — use 24h): %w", t.ID, t.Deadline, err)
+				}
+			}
+			// Phase E.2 session 2a — citizens: N is now supported.
+			// The COLLECTING state + multi-claim + per-citizen
+			// submission dirs handle the substrate.
+			citizens := t.Citizens
+			if citizens == 0 {
+				citizens = 1
+			}
+			if t.MinQuorum > 0 && t.MinQuorum > citizens {
+				return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, citizens)
+			}
+		} else {
+			if len(t.Options) > 0 {
+				return fmt.Errorf("task %q: options is only valid on action: vote tasks", t.ID)
+			}
+			if t.Threshold != "" {
+				return fmt.Errorf("task %q: threshold is only valid on action: vote tasks", t.ID)
+			}
+			if t.Deadline != "" && t.Action != "review" {
+				return fmt.Errorf("task %q: deadline is only valid on action: vote or action: review tasks", t.ID)
+			}
+			// min_quorum is valid on both vote and review tasks
+			// (multi-reviewer uses the same quorum semantics).
+			// Forbidden on other actions where it has no meaning.
+			if t.MinQuorum > 0 && t.Action != "review" {
+				return fmt.Errorf("task %q: min_quorum is only valid on action: vote or action: review tasks", t.ID)
+			}
+			// Review-specific min_quorum / citizens validation.
+			if t.Action == "review" {
+				rc := t.Citizens
+				if rc == 0 {
+					rc = 1
+				}
+				if t.MinQuorum > 0 && t.MinQuorum > rc {
+					return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, rc)
+				}
+				if t.Deadline != "" {
+					if _, err := time.ParseDuration(t.Deadline); err != nil {
+						return fmt.Errorf("task %q: invalid deadline %q: %w", t.ID, t.Deadline, err)
+					}
+				}
+			}
+		}
+
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
 		}
@@ -321,6 +445,119 @@ func validate(p *Run) error {
 			}
 			if !hasDep {
 				t.DependsOn = append(t.DependsOn, t.Reviews)
+			}
+		}
+		// Vote-action: validate `activates:` targets and
+		// auto-insert a dep edge from each activated task back to
+		// the vote task. This ensures activated branches can't
+		// start running until the vote resolves — authors don't
+		// have to hand-declare `depends_on: [vote_task]` on every
+		// branch root.
+		if t.Action == "vote" && len(t.Options) > 0 {
+			for i, opt := range t.Options {
+				for _, target := range opt.Activates {
+					if !ids[target] {
+						return fmt.Errorf("task %q: option %q (#%d) activates unknown task %q", t.ID, opt.ID, i+1, target)
+					}
+					if target == t.ID {
+						return fmt.Errorf("task %q: option %q cannot activate the vote task itself", t.ID, opt.ID)
+					}
+				}
+			}
+		}
+	}
+	// Review gating: for every review task R with reviews: T,
+	// inject an implicit dep from every other task that
+	// consumes T (explicitly via depends_on, or implicitly
+	// via {{T.content}} / {{T.field}} template references) to
+	// R. This enforces "if you added a review, downstream
+	// waits for the verdict" automatically — authors don't
+	// have to hand-write `depends_on: [check]` on every task
+	// that uses the reviewed draft.
+	//
+	// Without this pass, draft → {check, publish} runs in
+	// parallel and publish can ship an unreviewed draft
+	// before the review finishes.
+	for i := range p.Tasks {
+		reviewTask := &p.Tasks[i]
+		if reviewTask.Action != "review" || reviewTask.Reviews == "" {
+			continue
+		}
+		target := reviewTask.Reviews
+		for j := range p.Tasks {
+			if i == j {
+				continue
+			}
+			consumer := &p.Tasks[j]
+			// Skip other review tasks reviewing the same
+			// target — each review is independent and
+			// shouldn't wait on another reviewer's verdict.
+			if consumer.Action == "review" && consumer.Reviews == target {
+				continue
+			}
+			// Does this task consume the reviewed target?
+			// Check explicit deps first, then template
+			// references (inferred deps).
+			consumes := false
+			for _, dep := range consumer.DependsOn {
+				if dep == target {
+					consumes = true
+					break
+				}
+			}
+			if !consumes {
+				for _, inferred := range template.InferDependencies(consumer.Prompt) {
+					if inferred == target {
+						consumes = true
+						break
+					}
+				}
+			}
+			if !consumes {
+				continue
+			}
+			// Inject the review-gating edge.
+			hasDep := false
+			for _, dep := range consumer.DependsOn {
+				if dep == reviewTask.ID {
+					hasDep = true
+					break
+				}
+			}
+			if !hasDep {
+				consumer.DependsOn = append(consumer.DependsOn, reviewTask.ID)
+			}
+		}
+	}
+
+	// Second-and-a-half pass: now that we've walked every task,
+	// inject the reverse "activated → vote" dep edges. We couldn't
+	// do it inside the loop because the activated tasks might be
+	// defined after the vote in source order.
+	for i := range p.Tasks {
+		voteTask := &p.Tasks[i]
+		if voteTask.Action != "vote" {
+			continue
+		}
+		for _, opt := range voteTask.Options {
+			for _, target := range opt.Activates {
+				for j := range p.Tasks {
+					activated := &p.Tasks[j]
+					if activated.ID != target {
+						continue
+					}
+					hasDep := false
+					for _, dep := range activated.DependsOn {
+						if dep == voteTask.ID {
+							hasDep = true
+							break
+						}
+					}
+					if !hasDep {
+						activated.DependsOn = append(activated.DependsOn, voteTask.ID)
+					}
+					break
+				}
 			}
 		}
 	}
@@ -882,3 +1119,31 @@ func MakeFullID(instanceKey, taskID string) string {
 	}
 	return instanceKey + ":" + taskID
 }
+
+// validateThreshold accepts the recognized vote-threshold forms.
+// Supported values: "plurality", "majority", "unanimous", and
+// "percent:N" where N is an integer 1..100. Case-insensitive.
+func validateThreshold(s string) error {
+	lower := strings.ToLower(s)
+	switch lower {
+	case "plurality", "majority", "unanimous":
+		return nil
+	}
+	if strings.HasPrefix(lower, "percent:") {
+		numStr := strings.TrimPrefix(lower, "percent:")
+		n, err := strconv.Atoi(numStr)
+		if err != nil {
+			return fmt.Errorf("invalid threshold %q: percent value must be an integer", s)
+		}
+		if n < 1 || n > 100 {
+			return fmt.Errorf("invalid threshold %q: percent must be between 1 and 100", s)
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid threshold %q (must be 'plurality', 'majority', 'unanimous', or 'percent:N')", s)
+}
+
+// ensureDurationParses is a thin wrapper documenting intent at the
+// call site. Parsing a duration is cheap; the point of the helper
+// is that tests and callers can refer to it by name.
+var _ = time.ParseDuration

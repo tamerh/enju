@@ -225,6 +225,7 @@ func TestSubmitReviewPreValidationBlocksGit(t *testing.T) {
 				nil,
 				nil,
 				tc.decision,
+				"", // option (non-vote task)
 			)
 			if err != nil {
 				t.Fatalf("handler should return tool error, not Go error: %v", err)

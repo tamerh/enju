@@ -162,6 +162,12 @@ func (s *Store) migrate() error {
 		require_role TEXT NOT NULL DEFAULT '',
 		reviews_target TEXT NOT NULL DEFAULT '',
 		review_decision TEXT NOT NULL DEFAULT '',
+		vote_options TEXT NOT NULL DEFAULT '',
+		vote_choice TEXT NOT NULL DEFAULT '',
+		citizens INTEGER NOT NULL DEFAULT 1,
+		min_quorum INTEGER NOT NULL DEFAULT 0,
+		vote_threshold TEXT NOT NULL DEFAULT '',
+		vote_deadline TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -183,7 +189,9 @@ func (s *Store) migrate() error {
 		claimed_at TIMESTAMP NOT NULL,
 		deadline TIMESTAMP NOT NULL,
 		outcome TEXT,
-		submitted_at TIMESTAMP
+		submitted_at TIMESTAMP,
+		option TEXT NOT NULL DEFAULT '',
+		content TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
@@ -224,6 +232,23 @@ func (s *Store) migrate() error {
 		// on submit and cleared on invalidation.
 		`ALTER TABLE tasks ADD COLUMN reviews_target TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN review_decision TEXT NOT NULL DEFAULT ''`,
+		// Phase E.2 — vote action. VoteOptions is the declared
+		// options list (JSON), VoteChoice is the submitted option
+		// id. Citizens / MinQuorum / VoteThreshold / VoteDeadline
+		// carry the tally-rule fields from YAML. Session 1 ships
+		// single-voter only; citizens defaults to 1.
+		`ALTER TABLE tasks ADD COLUMN vote_options TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN vote_choice TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN citizens INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE tasks ADD COLUMN min_quorum INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tasks ADD COLUMN vote_threshold TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN vote_deadline TEXT NOT NULL DEFAULT ''`,
+		// Phase E.2 session 2a — multi-citizen tasks carry
+		// per-claim vote choices and short commentary on the
+		// task_claims rows so the tally and dashboard renders
+		// don't need to fetch git content on every call.
+		`ALTER TABLE task_claims ADD COLUMN option TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE task_claims ADD COLUMN content TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -458,15 +483,19 @@ func (s *Store) UpdateRunState(id int64, state RunState) error {
 }
 
 func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
-	var total, accepted int
+	var total, terminal int
+	// SKIPPED tasks count as terminal alongside ACCEPTED — a run
+	// completes when every task has reached a "done" state, and
+	// "skipped by a gate vote" is one of those. This mirrors the
+	// invariant UpdateReadyTasks relies on for dep satisfaction.
 	err := s.db.QueryRow(
-		`SELECT COUNT(*), COUNT(CASE WHEN state = 'accepted' THEN 1 END) FROM tasks WHERE run_id = ?`,
+		`SELECT COUNT(*), COUNT(CASE WHEN state IN ('accepted', 'skipped') THEN 1 END) FROM tasks WHERE run_id = ?`,
 		runID,
-	).Scan(&total, &accepted)
+	).Scan(&total, &terminal)
 	if err != nil {
 		return false, err
 	}
-	if total > 0 && total == accepted {
+	if total > 0 && total == terminal {
 		err = s.UpdateRunState(runID, RunCompleted)
 		return err == nil, err
 	}
@@ -475,20 +504,27 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
-	// commit_sha and review_decision are never set at create time;
-	// they're populated by the submit path. Omitting them here lets
-	// the column defaults ('') fire. reviews_target IS set at create
-	// time from the YAML `reviews:` field.
+	// commit_sha / review_decision / vote_choice are never set at
+	// create time; they're populated by the submit path. Omitting
+	// them here lets the column defaults fire. reviews_target and
+	// vote_options (and the rest of the vote config) ARE set at
+	// create time from YAML.
+	citizens := t.Citizens
+	if citizens == 0 {
+		citizens = 1
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
-		t.AssignTo, t.RequireRole, t.ReviewsTarget, t.CreatedAt,
+		t.AssignTo, t.RequireRole, t.ReviewsTarget,
+		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
+		t.CreatedAt,
 	)
 	return err
 }
@@ -504,7 +540,9 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 		&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 		&t.ReadsArtifacts, &t.WritesArtifacts,
-		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision, &t.CreatedAt)
+		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
+		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
+		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -579,20 +617,74 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 	defer tx.Rollback()
 
 	var state string
-	err = tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state)
+	var citizens int
+	err = tx.QueryRow(`SELECT state, citizens FROM tasks WHERE id = ?`, taskID).Scan(&state, &citizens)
 	if err != nil {
 		return fmt.Errorf("task %q not found: %w", taskID, err)
 	}
-	if TaskState(state) != TaskReady {
-		return fmt.Errorf("task %q is not ready (state: %s)", taskID, state)
+	if citizens <= 0 {
+		citizens = 1
+	}
+
+	// Single-citizen tasks: must be READY, exclusive claim via
+	// tasks.claimed_by. Same as before.
+	if citizens == 1 {
+		if TaskState(state) != TaskReady {
+			return fmt.Errorf("task %q is not ready (state: %s)", taskID, state)
+		}
+	} else {
+		// Multi-citizen tasks: READY or COLLECTING is fine —
+		// additional citizens can join while the task is still
+		// collecting submissions. Check own-slot existence
+		// BEFORE the cap count so a citizen who's already
+		// claimed gets a specific "you already hold a slot"
+		// error rather than a misleading "cap reached" one.
+		if TaskState(state) != TaskReady && TaskState(state) != TaskCollecting {
+			return fmt.Errorf("task %q is not accepting claims (state: %s)", taskID, state)
+		}
+		var mine int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+			taskID, citizenID,
+		).Scan(&mine); err != nil {
+			return err
+		}
+		if mine > 0 {
+			return fmt.Errorf("you already have an active claim on task %q (one slot per citizen)", taskID)
+		}
+		var active int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM task_claims WHERE task_id = ? AND outcome IS NULL`,
+			taskID,
+		).Scan(&active); err != nil {
+			return err
+		}
+		if active >= citizens {
+			return fmt.Errorf("task %q has reached its citizens cap (%d active claim(s))", taskID, active)
+		}
 	}
 
 	now := time.Now()
 
-	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ?`,
-		citizenID, now, taskID,
-	)
+	// tasks.claimed_by is only meaningful for citizens=1 tasks.
+	// For multi-citizen tasks we leave it as whatever the most
+	// recent claimer is — the task_claims table is the source of
+	// truth for who's actually working on it.
+	if citizens == 1 {
+		_, err = tx.Exec(
+			`UPDATE tasks SET state = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ?`,
+			citizenID, now, taskID,
+		)
+	} else {
+		// For multi-citizen tasks, don't flip the state on
+		// claim — stay in READY/COLLECTING until a submission
+		// arrives. Track the most recent claimer for
+		// convenience but don't transition.
+		_, err = tx.Exec(
+			`UPDATE tasks SET claimed_by = ?, claimed_at = ? WHERE id = ?`,
+			citizenID, now, taskID,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -608,70 +700,368 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 	return tx.Commit()
 }
 
-// SubmitTaskResult records a task's accepted result — the
-// result_path (repo-relative directory the client wrote to), the
-// commit SHA that landed on the remote, and the token count.
-// Callers that don't know or care about a commit SHA (e.g. unit
-// tests that fake the git side) pass an empty string; the field
-// stays empty in the DB and the template resolver falls back to
-// the working tree instead of reading at a specific commit.
+// SubmitResult is the outcome of a single submission on a task.
+// Callers read Resolved to know whether the task transitioned to
+// a terminal state this submission, or whether it's still
+// collecting more submissions from other citizens.
+type SubmitResult struct {
+	// Resolved is true when this submission transitioned the task
+	// to ACCEPTED. False for intermediate submissions on a
+	// multi-citizen task that hasn't yet met quorum+threshold.
+	Resolved bool
+	// Collecting is true when the task is in COLLECTING state
+	// after this submission — a multi-citizen task that has
+	// received at least one submission but is still waiting for
+	// more.
+	Collecting bool
+}
+
+// SubmitTaskResult records a task's submission. For single-citizen
+// tasks (citizens = 1) this is the classic "claim → submit →
+// accepted" path and Resolved is always true on success. For
+// multi-citizen tasks (citizens > 1) this records the caller's
+// individual submission on their task_claims row, transitions the
+// task to COLLECTING if it was still READY, and leaves the final
+// ACCEPTED transition to a separate tally step driven by the
+// caller (router) that runs the threshold rule against the
+// collected votes.
+//
+// citizenID identifies which claim slot this submission fills for
+// multi-citizen tasks. Ignored for single-citizen tasks (they use
+// tasks.claimed_by as the implicit claimer).
 //
 // decision is the optional review verdict ("approve" or "reject")
-// for review-action tasks. Non-review submits pass an empty
-// string and the column stays empty. The coordinator reads this
-// column after the accept lands to decide whether to cascade an
-// invalidation on the review target.
-func (s *Store) SubmitTaskResult(taskID, resultPath, commitSHA, decision string, tokensUsed int64) error {
+// for review-action tasks.
+//
+// voteChoice is the selected option id for vote-action tasks.
+// Recorded on the citizen's task_claims row for multi-voter
+// tasks; also copied to tasks.vote_choice for single-voter tasks
+// so the session-1 single-voter path keeps working unchanged.
+//
+// content is the citizen's prose commentary (for multi-citizen
+// vote/review tasks). Stored on the task_claims row so the
+// coordinator can surface it via {{task.responses}} without
+// reading per-citizen result.md from git — this is the
+// authoritative location for multi-citizen submissions (git may
+// or may not have a commit, commit_sha is optional for
+// vote/review actions).
+func (s *Store) SubmitTaskResult(taskID string, citizenID int64, resultPath, commitSHA, decision, voteChoice, content string, tokensUsed int64) (*SubmitResult, error) {
 	now := time.Now()
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var state string
+	var citizens int
+	var claimedBy sql.NullInt64
+	err = tx.QueryRow(`SELECT state, citizens, claimed_by FROM tasks WHERE id = ?`, taskID).Scan(&state, &citizens, &claimedBy)
+	if err != nil {
+		return nil, fmt.Errorf("task %q not found: %w", taskID, err)
+	}
+	if citizens <= 0 {
+		citizens = 1
+	}
+
+	// Single-citizen path: exactly the pre-session-2a behavior.
+	// One submit flips the task to ACCEPTED; tally runs trivially
+	// with a single vote.
+	if citizens == 1 {
+		if TaskState(state) != TaskClaimed && TaskState(state) != TaskRunning {
+			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, state)
+		}
+		_, err = tx.Exec(
+			`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
+			now, resultPath, commitSHA, decision, voteChoice, taskID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		_, err = tx.Exec(
+			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ? WHERE task_id = ? AND outcome IS NULL`,
+			now, voteChoice, taskID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if claimedBy.Valid {
+			_, err = tx.Exec(
+				`UPDATE citizens SET
+					tasks_completed = tasks_completed + 1,
+					tokens_contributed = tokens_contributed + ?,
+					score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
+					last_seen = ?
+				WHERE id = ?`,
+				tokensUsed, now, claimedBy.Int64,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return &SubmitResult{Resolved: true}, nil
+	}
+
+	// Multi-citizen path. The task must be READY (first submit)
+	// or COLLECTING (subsequent submits). If the task has
+	// already resolved (ACCEPTED / SKIPPED / terminal), a late
+	// submit from a citizen who had an open claim gets a
+	// clean state error rather than a 500 from downstream
+	// code that assumes the state is still mutable. This races
+	// with the Nth-submit resolution — two citizens hitting
+	// the tally concurrently can both see "collecting" at the
+	// start of their transactions, one wins and transitions,
+	// the other's transition is caught here on its second
+	// check.
+	switch TaskState(state) {
+	case TaskReady, TaskCollecting:
+		// OK, proceed.
+	case TaskAccepted, TaskSkipped:
+		return nil, fmt.Errorf("task %q already resolved (state: %s) — your submission arrived after the tally closed", taskID, state)
+	default:
+		return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, state)
+	}
+	var claimRow sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT id FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+		taskID, citizenID,
+	).Scan(&claimRow); err != nil || !claimRow.Valid {
+		return nil, fmt.Errorf("task %q has no open claim for this citizen — claim it first", taskID)
+	}
+
+	// Transition to COLLECTING on first submission; stay there on
+	// subsequent ones. Result path stays at the task's root for
+	// now (the actual per-citizen subdirs live under result_path
+	// on disk; the task's result_path is the common parent).
+	_, err = tx.Exec(
+		`UPDATE tasks SET state = 'collecting', result_path = ? WHERE id = ?`,
+		resultPath, taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// Mark this citizen's claim as completed. The `option`
+	// column carries whatever "choice" this citizen made:
+	//   - vote tasks: the selected option id
+	//   - review tasks: "approve" or "reject"
+	// The router's tally function interprets the column
+	// depending on task.Action. `content` stores the prose
+	// commentary so {{task.responses}} can render it without
+	// reading git — for multi-citizen submits with no
+	// commit_sha (votes/reviews don't strictly need one),
+	// this row is the only place the prose lives.
+	choice := voteChoice
+	if choice == "" {
+		choice = decision
+	}
+	_, err = tx.Exec(
+		`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ? WHERE id = ?`,
+		now, choice, content, claimRow.Int64,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// Score accounting on the submitting citizen alone — don't
+	// increment tasks_completed until the tally actually resolves
+	// (score should reflect "I completed a task," not "I
+	// submitted a vote that's still being tallied"). Token
+	// contribution can still be credited per submit.
+	_, err = tx.Exec(
+		`UPDATE citizens SET tokens_contributed = tokens_contributed + ?, last_seen = ? WHERE id = ?`,
+		tokensUsed, now, citizenID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &SubmitResult{Collecting: true}, nil
+}
+
+// ResolveMultiCitizenVote transitions a task from COLLECTING to
+// ACCEPTED with the given winning option. Called by the router
+// after the tally function says "winner found." Also credits the
+// completed task to every citizen who submitted (score rolls up
+// once the group decision lands, not per-vote).
+func (s *Store) ResolveMultiCitizenVote(taskID, winningOption, commitSHA string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	now := time.Now()
 
 	var state string
-	var claimedBy sql.NullInt64
-	err = tx.QueryRow(`SELECT state, claimed_by FROM tasks WHERE id = ?`, taskID).Scan(&state, &claimedBy)
-	if err != nil {
+	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state); err != nil {
 		return fmt.Errorf("task %q not found: %w", taskID, err)
 	}
-	if TaskState(state) != TaskClaimed && TaskState(state) != TaskRunning {
-		return fmt.Errorf("task %q cannot accept result (state: %s)", taskID, state)
+	if TaskState(state) != TaskCollecting {
+		return fmt.Errorf("task %q is not in collecting state (state: %s)", taskID, state)
 	}
-
 	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ? WHERE id = ?`,
-		now, resultPath, commitSHA, decision, taskID,
+		`UPDATE tasks SET state = 'accepted', submitted_at = ?, vote_choice = ?, commit_sha = ? WHERE id = ?`,
+		now, winningOption, commitSHA, taskID,
 	)
 	if err != nil {
 		return err
 	}
-
-	_, err = tx.Exec(
-		`UPDATE task_claims SET outcome = 'completed', submitted_at = ? WHERE task_id = ? AND outcome IS NULL`,
+	// Credit every submitting citizen.
+	if _, err := tx.Exec(
+		`UPDATE citizens SET
+			tasks_completed = tasks_completed + 1,
+			score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
+			last_seen = ?
+		WHERE id IN (SELECT citizen_id FROM task_claims WHERE task_id = ? AND outcome = 'completed')`,
 		now, taskID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ResolveMultiCitizenReview transitions a multi-reviewer review
+// task from COLLECTING to ACCEPTED, recording the tally's final
+// verdict ("approve" or "reject") on the task's review_decision
+// column. Credits the completed task to every submitting reviewer
+// (score rolls up once the group decision lands, same as the
+// vote path). Called by the router after the review tally
+// resolves. The caller then fires the existing reject cascade if
+// the verdict was "reject".
+func (s *Store) ResolveMultiCitizenReview(taskID, verdict, commitSHA string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state); err != nil {
+		return fmt.Errorf("task %q not found: %w", taskID, err)
+	}
+	if TaskState(state) != TaskCollecting {
+		return fmt.Errorf("task %q is not in collecting state (state: %s)", taskID, state)
+	}
+	_, err = tx.Exec(
+		`UPDATE tasks SET state = 'accepted', submitted_at = ?, review_decision = ?, commit_sha = ? WHERE id = ?`,
+		now, verdict, commitSHA, taskID,
 	)
 	if err != nil {
 		return err
 	}
-
-	if claimedBy.Valid {
-		_, err = tx.Exec(
-			`UPDATE citizens SET
-				tasks_completed = tasks_completed + 1,
-				tokens_contributed = tokens_contributed + ?,
-				score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
-				last_seen = ?
-			WHERE id = ?`,
-			tokensUsed, now, claimedBy.Int64,
-		)
-		if err != nil {
-			return err
-		}
+	if _, err := tx.Exec(
+		`UPDATE citizens SET
+			tasks_completed = tasks_completed + 1,
+			score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
+			last_seen = ?
+		WHERE id IN (SELECT citizen_id FROM task_claims WHERE task_id = ? AND outcome = 'completed')`,
+		now, taskID,
+	); err != nil {
+		return err
 	}
-
 	return tx.Commit()
+}
+
+// ListVoteSubmissions returns the per-citizen votes cast so far on
+// a multi-citizen vote task. One row per submitted claim, in
+// submission order. Used by the router's tally function and by
+// formatters that render collection progress.
+func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content
+		 FROM task_claims
+		 WHERE task_id = ? AND outcome = 'completed'
+		 ORDER BY submitted_at`,
+		taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskClaimRecord
+	for rows.Next() {
+		var r TaskClaimRecord
+		var outcome sql.NullString
+		var submittedAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content); err != nil {
+			return nil, err
+		}
+		if outcome.Valid {
+			r.Outcome = outcome.String
+		}
+		if submittedAt.Valid {
+			r.SubmittedAt = &submittedAt.Time
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListActiveClaims returns every open (outcome = NULL) claim row
+// for a task. Used by the task response marshaller so MCP
+// formatters can show "active claimants" on multi-citizen tasks
+// that haven't resolved yet.
+func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content
+		 FROM task_claims
+		 WHERE task_id = ? AND outcome IS NULL
+		 ORDER BY claimed_at`,
+		taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskClaimRecord
+	for rows.Next() {
+		var r TaskClaimRecord
+		var outcome sql.NullString
+		var submittedAt sql.NullTime
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content); err != nil {
+			return nil, err
+		}
+		if outcome.Valid {
+			r.Outcome = outcome.String
+		}
+		if submittedAt.Valid {
+			r.SubmittedAt = &submittedAt.Time
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// HasActiveClaim returns true when the given citizen holds an
+// open (outcome = NULL) claim row on the task. Used by the
+// submit handler to reject submissions from citizens who never
+// claimed the task — the check runs before the commit_sha
+// validator so a drive-by submit gets a claim-specific error
+// rather than a misleading contract error.
+func (s *Store) HasActiveClaim(taskID string, citizenID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+		taskID, citizenID,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// CountActiveClaims returns the number of open (outcome = NULL)
+// claim slots on a task. Used by the router to cap multi-citizen
+// claims at the declared citizens count.
+func (s *Store) CountActiveClaims(taskID string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM task_claims WHERE task_id = ? AND outcome IS NULL`,
+		taskID,
+	).Scan(&n)
+	return n, err
 }
 
 func (s *Store) ReleaseTask(taskID string, citizenID int64) error {
@@ -697,6 +1087,75 @@ func (s *Store) ReleaseTask(taskID string, citizenID int64) error {
 		return err
 	}
 
+	return tx.Commit()
+}
+
+// MarkTasksSkipped is the Phase E.2 skip-cascade's state flip.
+// Called by performSkipCascade after a vote resolves with an
+// `activates:` option that leaves some branch tasks stranded.
+// Each task in skipIDs transitions to SKIPPED (terminal) and has
+// its claim/result fields cleared so stale provenance doesn't
+// leak into subsequent re-runs if the vote is later invalidated.
+// Tasks already in a terminal state (accepted / skipped / invalid)
+// are left alone — only non-terminal rows flip.
+func (s *Store) MarkTasksSkipped(skipIDs []string) (int, error) {
+	if len(skipIDs) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	count := 0
+	for _, id := range skipIDs {
+		var state string
+		err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, id).Scan(&state)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		switch TaskState(state) {
+		case TaskAccepted, TaskSkipped, TaskInvalid, TaskInvalidated:
+			// Already terminal — leave alone.
+			continue
+		}
+		if _, err := tx.Exec(
+			`UPDATE tasks SET state = 'skipped', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL WHERE id = ?`,
+			id,
+		); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	return count, tx.Commit()
+}
+
+// ResetSkippedTasksToPending flips every SKIPPED task in the given
+// set back to PENDING. Used during invalidation cascade when a
+// previously-resolved vote gets invalidated — the branches that
+// were dead because of the vote need to reconsider themselves.
+// The scheduler's UpdateReadyTasks will then re-evaluate them
+// from PENDING and promote to READY once their deps line up.
+func (s *Store) ResetSkippedTasksToPending(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(
+			`UPDATE tasks SET state = 'pending' WHERE id = ? AND state = 'skipped'`,
+			id,
+		); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -733,10 +1192,11 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 
 	// Target: ACCEPTED → READY. Clear all claim/result fields so a
 	// fresh citizen sees no stale provenance when they claim. Also
-	// clears review_decision so a re-run of a review task lands a
-	// fresh verdict instead of re-using the previous "reject."
+	// clears review_decision and vote_choice so a re-run of a
+	// review/vote task lands a fresh verdict instead of re-using
+	// the previous one.
 	if _, err = tx.Exec(
-		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '' WHERE id = ?`,
+		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '', vote_choice = '' WHERE id = ?`,
 		taskID,
 	); err != nil {
 		return 0, err
@@ -774,7 +1234,7 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 			continue
 		}
 		if _, err := tx.Exec(
-			`UPDATE tasks SET state = 'pending', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '' WHERE id = ?`,
+			`UPDATE tasks SET state = 'pending', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '', vote_choice = '' WHERE id = ?`,
 			descID,
 		); err != nil {
 			return 0, err
@@ -830,8 +1290,16 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 		return 0, err
 	}
 
+	// "Satisfied" parents for dependency readiness include both
+	// ACCEPTED (the normal terminal) AND SKIPPED (the Phase E.2
+	// vote skip-cascade terminal). A task whose parent was
+	// skipped-by-gate is still unblocked — the gate decided that
+	// branch is done, not pending. If the child references a
+	// skipped parent's content via a template, resolution will
+	// fail loudly at claim time; that's an author-error, not a
+	// scheduler concern.
 	acceptedRows, err := s.db.Query(
-		`SELECT id FROM tasks WHERE run_id = ? AND state = 'accepted'`, runID,
+		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
 	)
 	if err != nil {
 		return 0, err
@@ -1131,7 +1599,9 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 			&t.ReadsArtifacts, &t.WritesArtifacts,
-			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision, &t.CreatedAt); err != nil {
+			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
+			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
+			&t.CreatedAt); err != nil {
 			return nil, err
 		}
 		t.Ref = ref.String
