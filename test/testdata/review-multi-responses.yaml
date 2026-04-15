@@ -1,0 +1,20 @@
+name: "Multi-reviewer synthesis"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a short proposal."
+
+  - id: peer_review
+    action: review
+    reviews: draft
+    citizens: 3
+    threshold: majority-approve
+    prompt: "Review the draft and share your view."
+
+  - id: synthesize
+    action: answer
+    prompt: |
+      Here are the reviewers' verdicts on {{draft.content}}:
+      {{peer_review.responses}}
+      Summarize the consensus and any dissent.

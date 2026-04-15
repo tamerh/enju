@@ -2,6 +2,7 @@
 package yaml
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sort"
@@ -154,6 +155,21 @@ type TaskDef struct {
 	// landed. Unset means "no time limit."
 	Deadline string `yaml:"deadline,omitempty"`
 
+	// Anonymize hides citizen usernames in {{task.responses}}
+	// and in the task-detail Voting/Review block. When true,
+	// voters render as "citizen-1", "citizen-2", etc. Used
+	// for blind-review and blind-voting flows. Optional,
+	// defaults to false. Valid on action:vote and action:review.
+	Anonymize bool `yaml:"anonymize,omitempty"`
+	// Visibility controls whether citizens can see sibling
+	// ballots while the task is still COLLECTING. "open"
+	// (default) surfaces every submission to every claimer
+	// in real time; "blind" hides sibling ballots until the
+	// task resolves to ACCEPTED, at which point everyone
+	// sees the full tally. Valid on action:vote and
+	// action:review.
+	Visibility string `yaml:"visibility,omitempty"`
+
 	// Assignment and access control (iteration 1 of build-out plan).
 	// Both are optional — the default is open: any registered citizen
 	// can claim any task. When set, they narrow who can claim.
@@ -196,6 +212,14 @@ type ParsedRun struct {
 	// ExpandedTasks maps instance_key -> []TaskInstance for for_each expansion.
 	// If no for_each, there's a single instance with key "".
 	ExpandedTasks map[string][]TaskInstance
+	// Warnings are non-fatal advisories raised during
+	// validation. Authors can still create the run; the
+	// coordinator logs and surfaces them in the creation
+	// response. Examples: a review task whose target has no
+	// downstream consumers (the review runs but gates
+	// nothing), a for_each variable with only one value
+	// (equivalent to a singleton), etc.
+	Warnings []string
 }
 
 // TaskInstance is a concrete task instance after for_each expansion.
@@ -218,11 +242,14 @@ func ParseFile(path string) (*ParsedRun, error) {
 // Parse parses run YAML bytes.
 func Parse(data []byte) (*ParsedRun, error) {
 	var prob Run
-	if err := yamlv3.Unmarshal(data, &prob); err != nil {
+	dec := yamlv3.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&prob); err != nil {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
 
-	if err := validate(&prob); err != nil {
+	warnings, err := validate(&prob)
+	if err != nil {
 		return nil, fmt.Errorf("validation: %w", err)
 	}
 
@@ -230,6 +257,7 @@ func Parse(data []byte) (*ParsedRun, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building DAG: %w", err)
 	}
+	parsed.Warnings = warnings
 
 	return parsed, nil
 }
@@ -242,12 +270,13 @@ func resolveAction(t *TaskDef) {
 }
 
 // validate checks the run definition for errors.
-func validate(p *Run) error {
+func validate(p *Run) ([]string, error) {
+	var warnings []string
 	if p.Name == "" {
-		return fmt.Errorf("run name is required")
+		return nil, fmt.Errorf("run name is required")
 	}
 	if len(p.Tasks) == 0 {
-		return fmt.Errorf("at least one task is required")
+		return nil, fmt.Errorf("at least one task is required")
 	}
 
 	validActions := map[string]bool{
@@ -257,7 +286,7 @@ func validate(p *Run) error {
 
 	// Validate run-level for_each shape (strict: no empty lists).
 	if err := validateForEachMap("run", p.ForEach); err != nil {
-		return err
+		return nil, err
 	}
 
 	ids := make(map[string]bool)
@@ -266,10 +295,10 @@ func validate(p *Run) error {
 		t := &p.Tasks[i]
 
 		if t.ID == "" {
-			return fmt.Errorf("task ID is required")
+			return nil, fmt.Errorf("task ID is required")
 		}
 		if ids[t.ID] {
-			return fmt.Errorf("duplicate task ID %q", t.ID)
+			return nil, fmt.Errorf("duplicate task ID %q", t.ID)
 		}
 		ids[t.ID] = true
 
@@ -278,31 +307,31 @@ func validate(p *Run) error {
 
 		// Validate action
 		if !validActions[t.Action] {
-			return fmt.Errorf("task %q: invalid action %q (must be answer, contribute, compute, review, or vote)", t.ID, t.Action)
+			return nil, fmt.Errorf("task %q: invalid action %q (must be answer, contribute, compute, review, or vote)", t.ID, t.Action)
 		}
 
 		// Validate required fields based on action
 		switch t.Action {
 		case "answer", "contribute", "review":
 			if t.Prompt == "" {
-				return fmt.Errorf("task %q: prompt is required for %s action", t.ID, t.Action)
+				return nil, fmt.Errorf("task %q: prompt is required for %s action", t.ID, t.Action)
 			}
 		case "compute":
 			if t.Script == "" {
-				return fmt.Errorf("task %q: script is required for compute action", t.ID)
+				return nil, fmt.Errorf("task %q: script is required for compute action", t.ID)
 			}
 		}
 
 		// Review tasks need an explicit target.
 		if t.Action == "review" {
 			if t.Reviews == "" {
-				return fmt.Errorf("task %q: reviews: <target_task_id> is required on review-action tasks", t.ID)
+				return nil, fmt.Errorf("task %q: reviews: <target_task_id> is required on review-action tasks", t.ID)
 			}
 			if t.Reviews == t.ID {
-				return fmt.Errorf("task %q: reviews cannot reference the review task itself", t.ID)
+				return nil, fmt.Errorf("task %q: reviews cannot reference the review task itself", t.ID)
 			}
 		} else if t.Reviews != "" {
-			return fmt.Errorf("task %q: reviews is only valid on action: review tasks", t.ID)
+			return nil, fmt.Errorf("task %q: reviews is only valid on action: review tasks", t.ID)
 		}
 
 		// Vote-action validation. Session 1 ships single-voter
@@ -311,26 +340,26 @@ func validate(p *Run) error {
 		// they expect multi-voter behavior.
 		if t.Action == "vote" {
 			if len(t.Options) < 2 {
-				return fmt.Errorf("task %q: action: vote requires at least 2 options", t.ID)
+				return nil, fmt.Errorf("task %q: action: vote requires at least 2 options", t.ID)
 			}
 			seenOptIDs := make(map[string]bool, len(t.Options))
 			for i, opt := range t.Options {
 				if opt.ID == "" {
-					return fmt.Errorf("task %q: option #%d is missing an id", t.ID, i+1)
+					return nil, fmt.Errorf("task %q: option #%d is missing an id", t.ID, i+1)
 				}
 				if seenOptIDs[opt.ID] {
-					return fmt.Errorf("task %q: duplicate option id %q", t.ID, opt.ID)
+					return nil, fmt.Errorf("task %q: duplicate option id %q", t.ID, opt.ID)
 				}
 				seenOptIDs[opt.ID] = true
 			}
 			if t.Threshold != "" {
 				if err := validateThreshold(t.Threshold); err != nil {
-					return fmt.Errorf("task %q: %w", t.ID, err)
+					return nil, fmt.Errorf("task %q: %w", t.ID, err)
 				}
 			}
 			if t.Deadline != "" {
 				if _, err := time.ParseDuration(t.Deadline); err != nil {
-					return fmt.Errorf("task %q: invalid deadline %q (expected a Go duration like 2h, 30m, 1d is NOT supported — use 24h): %w", t.ID, t.Deadline, err)
+					return nil, fmt.Errorf("task %q: invalid deadline %q (expected a Go duration like 2h, 30m, 1d is NOT supported — use 24h): %w", t.ID, t.Deadline, err)
 				}
 			}
 			// Phase E.2 session 2a — citizens: N is now supported.
@@ -341,49 +370,66 @@ func validate(p *Run) error {
 				citizens = 1
 			}
 			if t.MinQuorum > 0 && t.MinQuorum > citizens {
-				return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, citizens)
+				return nil, fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, citizens)
+			}
+			if t.Visibility != "" && t.Visibility != "open" && t.Visibility != "blind" {
+				return nil, fmt.Errorf("task %q: invalid visibility %q (must be 'open' or 'blind')", t.ID, t.Visibility)
 			}
 		} else {
 			if len(t.Options) > 0 {
-				return fmt.Errorf("task %q: options is only valid on action: vote tasks", t.ID)
+				return nil, fmt.Errorf("task %q: options is only valid on action: vote tasks", t.ID)
 			}
-			if t.Threshold != "" {
-				return fmt.Errorf("task %q: threshold is only valid on action: vote tasks", t.ID)
+			if t.Threshold != "" && t.Action != "review" {
+				return nil, fmt.Errorf("task %q: threshold is only valid on action: vote or action: review tasks", t.ID)
 			}
 			if t.Deadline != "" && t.Action != "review" {
-				return fmt.Errorf("task %q: deadline is only valid on action: vote or action: review tasks", t.ID)
+				return nil, fmt.Errorf("task %q: deadline is only valid on action: vote or action: review tasks", t.ID)
 			}
-			// min_quorum is valid on both vote and review tasks
-			// (multi-reviewer uses the same quorum semantics).
-			// Forbidden on other actions where it has no meaning.
 			if t.MinQuorum > 0 && t.Action != "review" {
-				return fmt.Errorf("task %q: min_quorum is only valid on action: vote or action: review tasks", t.ID)
+				return nil, fmt.Errorf("task %q: min_quorum is only valid on action: vote or action: review tasks", t.ID)
 			}
-			// Review-specific min_quorum / citizens validation.
+			// Review-specific field validation. Review tasks
+			// may carry their own threshold (dissent policy),
+			// deadline, and min_quorum.
 			if t.Action == "review" {
 				rc := t.Citizens
 				if rc == 0 {
 					rc = 1
 				}
 				if t.MinQuorum > 0 && t.MinQuorum > rc {
-					return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, rc)
+					return nil, fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, rc)
 				}
 				if t.Deadline != "" {
 					if _, err := time.ParseDuration(t.Deadline); err != nil {
-						return fmt.Errorf("task %q: invalid deadline %q: %w", t.ID, t.Deadline, err)
+						return nil, fmt.Errorf("task %q: invalid deadline %q: %w", t.ID, t.Deadline, err)
 					}
+				}
+				if t.Threshold != "" {
+					if err := validateReviewThreshold(t.Threshold); err != nil {
+						return nil, fmt.Errorf("task %q: %w", t.ID, err)
+					}
+				}
+				if t.Visibility != "" && t.Visibility != "open" && t.Visibility != "blind" {
+					return nil, fmt.Errorf("task %q: invalid visibility %q (must be 'open' or 'blind')", t.ID, t.Visibility)
+				}
+			} else {
+				if t.Anonymize {
+					return nil, fmt.Errorf("task %q: anonymize is only valid on action: vote or action: review tasks", t.ID)
+				}
+				if t.Visibility != "" {
+					return nil, fmt.Errorf("task %q: visibility is only valid on action: vote or action: review tasks", t.ID)
 				}
 			}
 		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
-			return fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
+			return nil, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
 		}
 
 		if len(t.ForEach) > 0 {
 			hasTaskLevelForEach = true
 			if err := validateForEachMap("task "+t.ID, t.ForEach); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -393,7 +439,7 @@ func validate(p *Run) error {
 	// runs stay exactly as before, task-level runs opt in by declaring
 	// for_each only on the tasks that need it.
 	if len(p.ForEach) > 0 && hasTaskLevelForEach {
-		return fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
+		return nil, fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
 	}
 
 	// If multiple tasks declare for_each, they must all agree on the
@@ -416,7 +462,7 @@ func validate(p *Run) error {
 				continue
 			}
 			if !forEachEqual(firstFE, t.ForEach) {
-				return fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and values", t.ID, firstID)
+				return nil, fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and values", t.ID, firstID)
 			}
 		}
 	}
@@ -429,12 +475,12 @@ func validate(p *Run) error {
 		t := &p.Tasks[i]
 		for _, dep := range t.DependsOn {
 			if !ids[dep] {
-				return fmt.Errorf("task %q depends on %q which does not exist", t.ID, dep)
+				return nil, fmt.Errorf("task %q depends on %q which does not exist", t.ID, dep)
 			}
 		}
 		if t.Reviews != "" {
 			if !ids[t.Reviews] {
-				return fmt.Errorf("task %q: reviews target %q does not exist", t.ID, t.Reviews)
+				return nil, fmt.Errorf("task %q: reviews target %q does not exist", t.ID, t.Reviews)
 			}
 			hasDep := false
 			for _, dep := range t.DependsOn {
@@ -457,10 +503,10 @@ func validate(p *Run) error {
 			for i, opt := range t.Options {
 				for _, target := range opt.Activates {
 					if !ids[target] {
-						return fmt.Errorf("task %q: option %q (#%d) activates unknown task %q", t.ID, opt.ID, i+1, target)
+						return nil, fmt.Errorf("task %q: option %q (#%d) activates unknown task %q", t.ID, opt.ID, i+1, target)
 					}
 					if target == t.ID {
-						return fmt.Errorf("task %q: option %q cannot activate the vote task itself", t.ID, opt.ID)
+						return nil, fmt.Errorf("task %q: option %q cannot activate the vote task itself", t.ID, opt.ID)
 					}
 				}
 			}
@@ -478,12 +524,18 @@ func validate(p *Run) error {
 	// Without this pass, draft → {check, publish} runs in
 	// parallel and publish can ship an unreviewed draft
 	// before the review finishes.
+	//
+	// Along the way, track which review tasks have zero
+	// downstream consumers so we can emit a non-fatal warning
+	// (review runs but gates nothing — probably an authoring
+	// mistake).
 	for i := range p.Tasks {
 		reviewTask := &p.Tasks[i]
 		if reviewTask.Action != "review" || reviewTask.Reviews == "" {
 			continue
 		}
 		target := reviewTask.Reviews
+		consumersCount := 0
 		for j := range p.Tasks {
 			if i == j {
 				continue
@@ -516,6 +568,7 @@ func validate(p *Run) error {
 			if !consumes {
 				continue
 			}
+			consumersCount++
 			// Inject the review-gating edge.
 			hasDep := false
 			for _, dep := range consumer.DependsOn {
@@ -527,6 +580,12 @@ func validate(p *Run) error {
 			if !hasDep {
 				consumer.DependsOn = append(consumer.DependsOn, reviewTask.ID)
 			}
+		}
+		if consumersCount == 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"task %q reviews %q but %q has no downstream consumers — the review runs but gates nothing (possibly an authoring mistake)",
+				reviewTask.ID, target, target,
+			))
 		}
 	}
 
@@ -575,10 +634,10 @@ func validate(p *Run) error {
 	// for an expanded task is its own for_each map; for a singleton,
 	// no variables are visible (bare {{var}} is always an error).
 	if err := validateTemplateReferences(p, ids); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return warnings, nil
 }
 
 // validateForEachMap rejects empty for_each variable lists. Each list
@@ -1141,6 +1200,35 @@ func validateThreshold(s string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid threshold %q (must be 'plurality', 'majority', 'unanimous', or 'percent:N')", s)
+}
+
+// validateReviewThreshold accepts the dissent-policy shapes for
+// action:review tasks. Supported values: "any-reject-kills"
+// (default, first reject resolves as reject), "majority-approve"
+// (more than half must approve), "unanimous-approve" (all must
+// approve), and "percent:N" where N is 1..100 (at least N% must
+// approve). Case-insensitive. Left as a separate function from
+// validateThreshold because vote and review threshold vocabularies
+// are disjoint — "plurality" doesn't mean anything for a
+// binary-verdict review.
+func validateReviewThreshold(s string) error {
+	lower := strings.ToLower(s)
+	switch lower {
+	case "any-reject-kills", "majority-approve", "unanimous-approve":
+		return nil
+	}
+	if strings.HasPrefix(lower, "percent:") {
+		numStr := strings.TrimPrefix(lower, "percent:")
+		n, err := strconv.Atoi(numStr)
+		if err != nil {
+			return fmt.Errorf("invalid review threshold %q: percent value must be an integer", s)
+		}
+		if n < 1 || n > 100 {
+			return fmt.Errorf("invalid review threshold %q: percent must be between 1 and 100", s)
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid review threshold %q (must be 'any-reject-kills', 'majority-approve', 'unanimous-approve', or 'percent:N')", s)
 }
 
 // ensureDurationParses is a thin wrapper documenting intent at the

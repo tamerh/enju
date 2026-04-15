@@ -78,6 +78,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/result", s.handleSubmitResult)
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
+		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
 
 		// Citizens
 		r.Post("/citizens/register", s.handleRegisterCitizen)
@@ -365,13 +366,14 @@ type createRunRequest struct {
 }
 
 type runResponse struct {
-	ID        int64  `json:"id"`                   // global DB ID
-	ProjectID int64  `json:"project_id,omitempty"` // parent project
-	Seq       int    `json:"seq"`                  // sequence within project (this is the user-facing run #)
-	Name      string `json:"name"`
-	State     string `json:"state"`
-	TaskCount int    `json:"task_count"`
-	CreatedAt string `json:"created_at"`
+	ID        int64    `json:"id"`                   // global DB ID
+	ProjectID int64    `json:"project_id,omitempty"` // parent project
+	Seq       int      `json:"seq"`                  // sequence within project (this is the user-facing run #)
+	Name      string   `json:"name"`
+	State     string   `json:"state"`
+	TaskCount int      `json:"task_count"`
+	CreatedAt string   `json:"created_at"`
+	Warnings  []string `json:"warnings,omitempty"` // non-fatal advisories from the parser
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -545,6 +547,8 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				MinQuorum:       ti.MinQuorum,
 				VoteThreshold:   ti.Threshold,
 				VoteDeadline:    ti.Deadline,
+				Anonymize:       ti.Anonymize,
+				Visibility:      ti.Visibility,
 				CreatedAt:   now,
 			})
 			if err != nil {
@@ -562,6 +566,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("run created", "id", runID, "project_id", projectID, "seq", runSeq, "name", parsed.Run.Name, "tasks", taskCount)
 
+	if len(parsed.Warnings) > 0 {
+		s.logger.Info("run created with warnings",
+			"id", runID, "warnings", parsed.Warnings)
+	}
+
 	writeJSON(w, http.StatusCreated, runResponse{
 		ID:        runID,
 		ProjectID: projectID,
@@ -570,6 +579,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		State:     string(store.RunActive),
 		TaskCount: taskCount,
 		CreatedAt: now.Format(time.RFC3339),
+		Warnings:  parsed.Warnings,
 	})
 }
 
@@ -680,6 +690,9 @@ type taskResponse struct {
 	MinQuorum       int      `json:"min_quorum,omitempty"`       // Phase E.2: required submitted count
 	VoteThreshold   string   `json:"vote_threshold,omitempty"`   // Phase E.2: agreement rule
 	VoteDeadline    string   `json:"vote_deadline,omitempty"`    // Phase E.2: voting-closes duration
+	VoteDeadlineAt  string   `json:"vote_deadline_at,omitempty"` // Phase E.2: absolute expiry (ISO), empty until first claim
+	Anonymize       bool     `json:"anonymize,omitempty"`        // Phase E.2: hide citizen usernames
+	Visibility      string   `json:"visibility,omitempty"`       // Phase E.2: open|blind during collection
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -733,7 +746,65 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
+	// Lazy deadline check: if this is a collecting vote task
+	// whose deadline has passed, evaluate the tally now — no
+	// new submission is needed for the polls to close. When
+	// the tally resolves, transition to ACCEPTED and fire the
+	// skip cascade so downstream consumers unblock without
+	// waiting for an external nudge.
+	s.maybeResolveDeadlineVote(task)
+	// Re-read the task in case the resolution above mutated
+	// state. Cheap (one DB query) and keeps the response
+	// consistent with the new state.
+	if updated, _ := s.store.GetTask(taskID); updated != nil {
+		task = updated
+	}
 	writeJSON(w, http.StatusOK, s.toTaskResponse(*task))
+}
+
+// maybeResolveDeadlineVote runs the deadline-triggered tally
+// resolution for a collecting vote task whose deadline has
+// passed. Called from GET paths as a lazy sweep — we don't run
+// a background reaper for this in R1; the task resolves the
+// next time anyone looks at it. Soft-failures are logged, not
+// surfaced: if the resolution can't run, the task stays in
+// COLLECTING and the next touch retries.
+func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
+	if task == nil {
+		return
+	}
+	if task.Action != "vote" || store.TaskState(task.State) != store.TaskCollecting {
+		return
+	}
+	if task.VoteDeadline == "" {
+		return
+	}
+	passed, err := s.voteDeadlinePassed(task)
+	if err != nil || !passed {
+		return
+	}
+	outcome, err := s.evaluateVoteTally(task)
+	if err != nil || outcome == nil || !outcome.Resolved {
+		return
+	}
+	if err := s.store.ResolveMultiCitizenVote(task.ID, outcome.WinningOption, task.CommitSHA); err != nil {
+		s.logger.Warn("deadline-triggered vote resolve failed",
+			"task_id", task.ID, "error", err)
+		return
+	}
+	// Re-load so the skip cascade sees the winning option in
+	// the task record.
+	updated, _ := s.store.GetTask(task.ID)
+	if updated != nil {
+		if _, err := s.performSkipCascade(updated, outcome.WinningOption); err != nil {
+			s.logger.Warn("deadline-triggered skip cascade failed",
+				"task_id", task.ID, "error", err)
+		}
+	}
+	// Re-run readiness so downstream tasks unblock.
+	_, _ = s.store.UpdateReadyTasks(task.RunID)
+	s.logger.Info("vote resolved via deadline sweep",
+		"task_id", task.ID, "winning_option", outcome.WinningOption)
 }
 
 // claimRequest identifies the caller by username. Internally the
@@ -884,6 +955,113 @@ type submitResultRequest struct {
 // has already done the git work; the coordinator just validates the
 // report, updates the state machine, updates the artifact index,
 // runs the scheduler, and checks run completion.
+// handleTallyTask forces a tally evaluation on a collecting
+// vote or review task. Any user can trigger it; it runs the
+// same tally logic as a submission would, resolves if the
+// threshold + quorum permit, and reports the outcome. Useful
+// when a vote is stuck past its deadline or has enough
+// submissions to short-circuit but nobody has submitted lately
+// to re-trigger the evaluation.
+func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("task %q not found", taskID))
+		return
+	}
+	if task.Action != "vote" && task.Action != "review" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("tally is only valid on action:vote or action:review tasks (got %q)", task.Action))
+		return
+	}
+	if store.TaskState(task.State) == store.TaskAccepted {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":  "already_resolved",
+			"task_id": taskID,
+			"state":   task.State,
+			"message": "task is already accepted — nothing to tally",
+		})
+		return
+	}
+	if store.TaskState(task.State) != store.TaskCollecting {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q is not in collecting state (state: %s) — nothing to tally yet", taskID, task.State))
+		return
+	}
+
+	resp := map[string]interface{}{
+		"task_id": taskID,
+		"state":   task.State,
+	}
+
+	if task.Action == "vote" {
+		outcome, err := s.evaluateVoteTally(task)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "tally failed: "+err.Error())
+			return
+		}
+		resp["tally"] = map[string]interface{}{
+			"resolved":    outcome.Resolved,
+			"total_votes": outcome.TotalVotes,
+			"counts":      outcome.Counts,
+			"reason":      outcome.Reason,
+		}
+		if outcome.Resolved {
+			if err := s.store.ResolveMultiCitizenVote(taskID, outcome.WinningOption, task.CommitSHA); err != nil {
+				writeError(w, http.StatusInternalServerError, "resolve failed: "+err.Error())
+				return
+			}
+			updated, _ := s.store.GetTask(taskID)
+			if updated != nil {
+				if skipRes, err := s.performSkipCascade(updated, outcome.WinningOption); err == nil && skipRes != nil {
+					resp["skipped"] = skipRes.Skipped
+				}
+			}
+			readied, _ := s.store.UpdateReadyTasks(task.RunID)
+			resp["status"] = "resolved"
+			resp["winning_option"] = outcome.WinningOption
+			resp["newly_ready"] = readied
+		} else {
+			resp["status"] = "collecting"
+		}
+	} else { // review
+		outcome, err := s.evaluateReviewTally(task)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "tally failed: "+err.Error())
+			return
+		}
+		resp["tally"] = map[string]interface{}{
+			"resolved":      outcome.Resolved,
+			"verdict":       outcome.Verdict,
+			"approves":      outcome.Approves,
+			"rejects":       outcome.Rejects,
+			"total_reviews": outcome.TotalReviews,
+			"reason":        outcome.Reason,
+		}
+		if outcome.Resolved {
+			if err := s.store.ResolveMultiCitizenReview(taskID, outcome.Verdict, task.CommitSHA); err != nil {
+				writeError(w, http.StatusInternalServerError, "resolve failed: "+err.Error())
+				return
+			}
+			if outcome.Verdict == "reject" && task.ReviewsTarget != "" {
+				run, _ := s.store.GetRun(task.RunID)
+				if run != nil {
+					targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+					if _, err := s.performInvalidate(targetFullID); err != nil {
+						s.logger.Warn("tally review-reject cascade failed",
+							"review_task", taskID, "target", targetFullID, "error", err)
+					}
+				}
+			}
+			readied, _ := s.store.UpdateReadyTasks(task.RunID)
+			resp["status"] = "resolved"
+			resp["verdict"] = outcome.Verdict
+			resp["newly_ready"] = readied
+		} else {
+			resp["status"] = "collecting"
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 
@@ -942,6 +1120,14 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	if req.CommitSHA == "" && task.Action != "vote" && task.Action != "review" {
 		writeError(w, http.StatusBadRequest, "commit_sha is required — the coordinator no longer writes result files, clients must write + push + report")
 		return
+	}
+
+	if task.Action == "vote" || task.Action == "review" {
+		passed, derr := s.voteDeadlinePassed(task)
+		if derr == nil && passed {
+			writeError(w, http.StatusConflict, fmt.Sprintf("task %q voting deadline has expired — submission rejected, run enju_tally_task to resolve", taskID))
+			return
+		}
 	}
 
 	s.handleSubmitResultReport(w, r, task, &req)
@@ -1003,9 +1189,19 @@ func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Re
 			if depTask.Citizens > 1 {
 				if submissions, err := s.store.ListVoteSubmissions(depTask.ID); err == nil && len(submissions) > 0 {
 					perCitizen := make([]map[string]interface{}, 0, len(submissions))
-					for _, sub := range submissions {
+					for idx, sub := range submissions {
+						username := s.citizenUsername(sub.CitizenID)
+						if depTask.Anonymize {
+							// Replace the real username with
+							// citizen-N where N is the stable
+							// submission order index. Downstream
+							// prompts rendering {{task.responses}}
+							// never see real identities for
+							// blind-review flows.
+							username = fmt.Sprintf("citizen-%d", idx+1)
+						}
 						perCitizen = append(perCitizen, map[string]interface{}{
-							"username": s.citizenUsername(sub.CitizenID),
+							"username": username,
 							"option":   sub.Option,
 							"content":  sub.Content,
 						})
@@ -1728,12 +1924,25 @@ type reviewTallyOutcome struct {
 }
 
 // evaluateReviewTally walks the per-citizen review submissions
-// and applies the any-reject-kills rule. If any reviewer rejected,
-// the task resolves immediately as "reject" (the first dissenter
-// wins under the default policy). Otherwise we check whether
-// quorum has been met and every submission is "approve"; if so
-// the task resolves as "approve." Missing quorum or a mixed
-// incomplete set leaves the task in COLLECTING.
+// and applies the task's dissent-policy threshold. Supported
+// policies:
+//
+//   - "any-reject-kills" (default): first reject resolves as
+//     reject. Matches real-world code review: one "you can't
+//     ship this" kills the submission.
+//   - "majority-approve": strictly more than half of submitted
+//     reviews must be approve. Short-circuits when it becomes
+//     mathematically impossible.
+//   - "unanimous-approve": every reviewer must approve;
+//     equivalent to any-reject-kills for the reject path, but
+//     also requires the full set to weigh in before approving.
+//   - "percent:N": at least N% of the citizens target must
+//     approve. Differs from majority in that a higher bar
+//     (e.g. 75%) needs explicit agreement from enough people.
+//
+// Quorum (min_quorum or default citizens) gates when the
+// approve-path can resolve. The reject-path short-circuits
+// regardless of quorum under any-reject-kills.
 func (s *Server) evaluateReviewTally(task *store.TaskRecord) (*reviewTallyOutcome, error) {
 	submissions, err := s.store.ListVoteSubmissions(task.ID)
 	if err != nil {
@@ -1749,18 +1958,13 @@ func (s *Server) evaluateReviewTally(task *store.TaskRecord) (*reviewTallyOutcom
 		}
 	}
 
-	// Any reject immediately wins under the default dissent
-	// policy. This matches real-world code review: one "you
-	// can't ship this" kills the submission.
-	if out.Rejects > 0 {
-		out.Resolved = true
-		out.Verdict = "reject"
-		return out, nil
+	policy := strings.ToLower(task.VoteThreshold)
+	if policy == "" {
+		policy = "any-reject-kills"
 	}
 
-	// No rejects so far. We need all reviewers to weigh in
-	// before we can declare "approve." Quorum defaults to the
-	// task's citizens count.
+	// Quorum defaults to the task's citizens count; explicit
+	// min_quorum overrides.
 	needed := task.MinQuorum
 	if needed <= 0 {
 		needed = task.Citizens
@@ -1768,12 +1972,90 @@ func (s *Server) evaluateReviewTally(task *store.TaskRecord) (*reviewTallyOutcom
 			needed = 1
 		}
 	}
-	if out.Approves < needed {
-		out.Reason = fmt.Sprintf("approvals not yet at quorum (%d of %d)", out.Approves, needed)
-		return out, nil
+
+	// Dispatch to the policy. Each branch sets out.Resolved
+	// and out.Verdict when a terminal decision is reached, or
+	// fills out.Reason to explain why we're still collecting.
+	switch {
+	case policy == "any-reject-kills":
+		if out.Rejects > 0 {
+			out.Resolved = true
+			out.Verdict = "reject"
+			return out, nil
+		}
+		if out.Approves < needed {
+			out.Reason = fmt.Sprintf("approvals not yet at quorum (%d of %d)", out.Approves, needed)
+			return out, nil
+		}
+		out.Resolved = true
+		out.Verdict = "approve"
+	case policy == "unanimous-approve":
+		// Same as any-reject-kills — one reject means not
+		// unanimous, so the task can't pass. All approves
+		// with quorum met → approve.
+		if out.Rejects > 0 {
+			out.Resolved = true
+			out.Verdict = "reject"
+			return out, nil
+		}
+		if out.Approves < needed {
+			out.Reason = fmt.Sprintf("unanimous approval not yet at quorum (%d of %d)", out.Approves, needed)
+			return out, nil
+		}
+		out.Resolved = true
+		out.Verdict = "approve"
+	case policy == "majority-approve":
+		// More than half of `needed` reviews must be approves
+		// for the task to pass. Resolves as soon as the
+		// outcome is mathematically decided — no need to wait
+		// for remaining ballots that can't change the verdict.
+		if out.Approves*2 > needed {
+			out.Resolved = true
+			out.Verdict = "approve"
+			return out, nil
+		}
+		if out.Rejects*2 >= needed {
+			out.Resolved = true
+			out.Verdict = "reject"
+			return out, nil
+		}
+		pending := needed - out.TotalReviews
+		if pending < 0 {
+			pending = 0
+		}
+		out.Reason = fmt.Sprintf("majority not yet decidable (%d approve, %d reject, waiting for %d more)",
+			out.Approves, out.Rejects, pending)
+	case strings.HasPrefix(policy, "percent:"):
+		pctStr := strings.TrimPrefix(policy, "percent:")
+		pct, err := strconv.Atoi(pctStr)
+		if err != nil || pct < 1 || pct > 100 {
+			out.Reason = fmt.Sprintf("invalid percent threshold %q", task.VoteThreshold)
+			return out, nil
+		}
+		// Need at least pct% of `needed` reviewers to approve.
+		// Use integer math: approves*100 >= pct*needed.
+		requiredApproves := (pct*needed + 99) / 100 // ceil
+		if out.Approves >= requiredApproves {
+			out.Resolved = true
+			out.Verdict = "approve"
+			return out, nil
+		}
+		// Resolve early as reject if even all remaining
+		// reviewers couldn't push approves past the bar.
+		pending := needed - out.TotalReviews
+		if pending < 0 {
+			pending = 0
+		}
+		if out.Approves+pending < requiredApproves {
+			out.Resolved = true
+			out.Verdict = "reject"
+			return out, nil
+		}
+		out.Reason = fmt.Sprintf("percent:%d not yet met (%d of %d needed)",
+			pct, out.Approves, requiredApproves)
+	default:
+		out.Reason = fmt.Sprintf("unknown review threshold %q", task.VoteThreshold)
 	}
-	out.Resolved = true
-	out.Verdict = "approve"
 	return out, nil
 }
 
@@ -1826,12 +2108,26 @@ func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, e
 		_ = json.Unmarshal([]byte(task.VoteOptions), &declared)
 	}
 
+	// Deadline check. Polls close `deadline` after the first
+	// citizen claims. Past the deadline, we skip the min_quorum
+	// check and tally whatever landed — but the threshold rule
+	// still applies, so an under-threshold tally stays stuck
+	// (human intervenes). Before the deadline, the normal
+	// quorum + threshold checks apply.
+	deadlinePassed, err := s.voteDeadlinePassed(task)
+	if err != nil {
+		return nil, err
+	}
+
 	// Quorum check. Explicit min_quorum takes precedence;
 	// otherwise default to citizens count for multi-voter tasks
 	// (wait for everyone) and 1 for single-voter tasks. This
 	// matches the intuition "3 citizens can vote" → all 3
 	// should vote before resolution unless the author opts
 	// into a smaller quorum explicitly.
+	//
+	// Deadline override: once the deadline has passed, quorum
+	// drops to 1 — we tally whatever arrived.
 	minQuorum := task.MinQuorum
 	if minQuorum <= 0 {
 		if task.Citizens > 1 {
@@ -1840,11 +2136,18 @@ func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, e
 			minQuorum = 1
 		}
 	}
+	if deadlinePassed {
+		minQuorum = 1
+	}
 	if total < minQuorum {
+		reason := fmt.Sprintf("quorum not met (%d of %d)", total, minQuorum)
+		if deadlinePassed {
+			reason = "deadline passed with zero submissions"
+		}
 		return &voteTallyOutcome{
 			Counts:     counts,
 			TotalVotes: total,
-			Reason:     fmt.Sprintf("quorum not met (%d of %d)", total, minQuorum),
+			Reason:     reason,
 		}, nil
 	}
 
@@ -1855,6 +2158,9 @@ func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, e
 	}
 	winner, reason := pickWinner(declared, counts, total, threshold)
 	if winner == "" {
+		if deadlinePassed {
+			reason = "deadline passed, " + reason
+		}
 		return &voteTallyOutcome{
 			Counts:     counts,
 			TotalVotes: total,
@@ -1867,6 +2173,36 @@ func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, e
 		Counts:        counts,
 		TotalVotes:    total,
 	}, nil
+}
+
+// voteDeadlinePassed reports whether the task's voting deadline
+// has elapsed. The clock starts when the first citizen claims
+// (earliest task_claims.claimed_at), not when the task was
+// created — a vote can sit waiting for deps to resolve, and the
+// deadline should only start ticking when voting actually opens.
+// Tasks with no deadline set always return false.
+func (s *Server) voteDeadlinePassed(task *store.TaskRecord) (bool, error) {
+	if task.VoteDeadline == "" {
+		return false, nil
+	}
+	d, err := time.ParseDuration(task.VoteDeadline)
+	if err != nil {
+		// Parser validated the string at run creation, but be
+		// defensive at tally time — if it's malformed now,
+		// treat as "no deadline" rather than erroring out.
+		s.logger.Warn("invalid vote deadline", "task_id", task.ID, "deadline", task.VoteDeadline, "error", err)
+		return false, nil
+	}
+	firstClaim, err := s.store.EarliestClaimTime(task.ID)
+	if err != nil {
+		return false, fmt.Errorf("earliest claim lookup: %w", err)
+	}
+	if firstClaim.IsZero() {
+		// Nobody has claimed yet — voting hasn't opened, so
+		// the deadline isn't ticking.
+		return false, nil
+	}
+	return time.Now().After(firstClaim.Add(d)), nil
 }
 
 // pickWinner returns the winning option id given the current
@@ -2387,15 +2723,27 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		MinQuorum:       t.MinQuorum,
 		VoteThreshold:   t.VoteThreshold,
 		VoteDeadline:    t.VoteDeadline,
+		Anonymize:       t.Anonymize,
+		Visibility:      t.Visibility,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks
 	// so MCP formatters can render the Voting / Review block
 	// without an extra round trip.
 	if (t.Action == "vote" || t.Action == "review") && t.Citizens > 1 {
+		if t.VoteDeadline != "" {
+			if d, derr := time.ParseDuration(t.VoteDeadline); derr == nil {
+				if first, ferr := s.store.EarliestClaimTime(t.ID); ferr == nil && !first.IsZero() {
+					resp.VoteDeadlineAt = first.Add(d).Format(time.RFC3339)
+				}
+			}
+		}
 		if submissions, err := s.store.ListVoteSubmissions(t.ID); err == nil {
-			for _, sub := range submissions {
+			for idx, sub := range submissions {
 				uname := s.citizenUsername(sub.CitizenID)
+				if t.Anonymize {
+					uname = fmt.Sprintf("citizen-%d", idx+1)
+				}
 				ref := voteSubmissionRef{
 					Username: uname,
 					Option:   sub.Option,
@@ -2407,11 +2755,15 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 			}
 		}
 		if claims, err := s.store.ListActiveClaims(t.ID); err == nil {
-			for _, c := range claims {
+			for idx, c := range claims {
 				uname := s.citizenUsername(c.CitizenID)
-				if uname != "" {
-					resp.ActiveClaimants = append(resp.ActiveClaimants, uname)
+				if uname == "" {
+					continue
 				}
+				if t.Anonymize {
+					uname = fmt.Sprintf("active-citizen-%d", idx+1)
+				}
+				resp.ActiveClaimants = append(resp.ActiveClaimants, uname)
 			}
 		}
 	}

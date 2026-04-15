@@ -1006,6 +1006,70 @@ tasks:
 	})
 }
 
+// TestParseReviewWithNoConsumersWarning — a review on a task
+// that has no downstream consumers is not an error, but the
+// parser emits a non-fatal warning so authors see the "runs
+// but gates nothing" situation when they create the run.
+func TestParseReviewWithNoConsumersWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Orphan review"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a thing."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Review it."
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(parsed.Warnings) == 0 {
+		t.Fatal("expected a warning for review with no downstream consumers")
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "has no downstream consumers") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'no downstream consumers' warning, got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseReviewWithConsumerNoWarning — the same task with a
+// downstream that references {{draft.content}} should NOT emit
+// the warning.
+func TestParseReviewWithConsumerNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Good review"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a thing."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Review it."
+  - id: publish
+    action: answer
+    prompt: "Publish {{draft.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "no downstream consumers") {
+			t.Errorf("unexpected orphan-review warning: %s", w)
+		}
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

@@ -168,6 +168,8 @@ func (s *Store) migrate() error {
 		min_quorum INTEGER NOT NULL DEFAULT 0,
 		vote_threshold TEXT NOT NULL DEFAULT '',
 		vote_deadline TEXT NOT NULL DEFAULT '',
+		anonymize INTEGER NOT NULL DEFAULT 0,
+		visibility TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -249,6 +251,11 @@ func (s *Store) migrate() error {
 		// don't need to fetch git content on every call.
 		`ALTER TABLE task_claims ADD COLUMN option TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE task_claims ADD COLUMN content TEXT NOT NULL DEFAULT ''`,
+		// Phase E.2 session 2c — anonymize + visibility fields
+		// for vote/review tasks (blind voting, hidden voter
+		// usernames).
+		`ALTER TABLE tasks ADD COLUMN anonymize INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -504,7 +511,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -516,14 +523,19 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 	if citizens == 0 {
 		citizens = 1
 	}
+	anonymize := 0
+	if t.Anonymize {
+		anonymize = 1
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
+		anonymize, t.Visibility,
 		t.CreatedAt,
 	)
 	return err
@@ -534,6 +546,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var claimedAt, submittedAt sql.NullTime
 	var claimedBy sql.NullInt64
 	var resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
+	var anonymizeInt int
 	err := s.db.QueryRow(
 		`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id,
 	).Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &t.InstanceParams, &ref, &t.Action,
@@ -542,6 +555,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
+		&anonymizeInt, &t.Visibility,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -549,6 +563,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.Anonymize = anonymizeInt != 0
 	t.Ref = ref.String
 	t.Prompt = prompt.String
 	t.UserPrompt = userPrompt.String
@@ -1035,6 +1050,35 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// EarliestClaimTime returns the timestamp of the first claim
+// on a task — used by the vote deadline-enforcement path as
+// the "voting opened" anchor. Returns the zero time if no
+// citizen has ever claimed.
+//
+// NOTE: the SQLite driver doesn't automatically parse MIN()
+// aggregate results back into time.Time (MIN returns the raw
+// stored string representation, not a TIMESTAMP column value).
+// So we ORDER BY + LIMIT 1 instead of MIN() — scanning a
+// regular column goes through the driver's time.Time unmarshal
+// path correctly.
+func (s *Store) EarliestClaimTime(taskID string) (time.Time, error) {
+	var t sql.NullTime
+	err := s.db.QueryRow(
+		`SELECT claimed_at FROM task_claims WHERE task_id = ? ORDER BY claimed_at ASC LIMIT 1`,
+		taskID,
+	).Scan(&t)
+	if err == sql.ErrNoRows {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time, nil
 }
 
 // HasActiveClaim returns true when the given citizen holds an
@@ -1595,15 +1639,18 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 		var claimedAt, submittedAt sql.NullTime
 		var claimedBy sql.NullInt64
 		var resultPath, prompt, userPrompt, script, outputs, requirements, timeout, ref sql.NullString
+		var anonymizeInt int
 		if err := rows.Scan(&t.ID, &t.RunID, &t.Seq, &t.TaskDefID, &t.InstanceKey, &t.InstanceParams, &ref, &t.Action,
 			&prompt, &userPrompt, &script, &outputs, &requirements, &t.ResultType, &timeout,
 			&t.State, &claimedBy, &claimedAt, &submittedAt, &resultPath, &t.CommitSHA, &t.DependsOn,
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
+			&anonymizeInt, &t.Visibility,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}
+		t.Anonymize = anonymizeInt != 0
 		t.Ref = ref.String
 		t.Prompt = prompt.String
 		t.UserPrompt = userPrompt.String

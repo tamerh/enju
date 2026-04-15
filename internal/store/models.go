@@ -145,6 +145,16 @@ type TaskRecord struct {
 	MinQuorum     int
 	VoteThreshold string
 	VoteDeadline  string
+	// Anonymize hides citizen usernames in {{task.responses}}
+	// and in the task-detail voting/review block. Valid on
+	// action:vote and action:review. Copied from the YAML
+	// `anonymize:` field at run creation.
+	Anonymize bool
+	// Visibility is "open" (default) or "blind". "blind"
+	// hides sibling ballots from a claimer while the task is
+	// still COLLECTING; once ACCEPTED everyone sees the full
+	// tally. Copied from the YAML `visibility:` field.
+	Visibility string
 
 	CreatedAt time.Time
 }

@@ -137,7 +137,11 @@ func newTestServer(t *testing.T) *testServer {
 		os.Symlink(testOutputBase, outputLink)
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logWriter io.Writer = io.Discard
+	if os.Getenv("ENJU_TEST_VERBOSE") != "" {
+		logWriter = os.Stderr
+	}
+	logger := slog.New(slog.NewTextHandler(logWriter, nil))
 
 	st, err := store.New(dbPath)
 	if err != nil {
@@ -4119,6 +4123,174 @@ func TestReviewImplicitGating(t *testing.T) {
 	publishTask := s.taskGet("publish")
 	if publishTask["state"] != "ready" {
 		t.Errorf("expected publish ready after approve, got %v", publishTask["state"])
+	}
+}
+
+// TestReviewLateSubmitAfterResolve — multi-reviewer review
+// with any-reject-kills default. The first reject resolves the
+// task immediately; a second reviewer who tries to submit after
+// that point must get a clean 400 "already resolved", not a 500.
+// Parallel to TestVoteLateSubmitAfterResolve.
+func TestReviewLateSubmitAfterResolve(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	charlie := s.register("charlie")
+
+	yaml := `name: "Late review submit"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: check
+    action: review
+    reviews: draft
+    citizens: 3
+    prompt: "Review."
+`
+	projectID := s.createTestProject()
+	fixture := filepath.Join(t.TempDir(), "late-review.yaml")
+	if err := os.WriteFile(fixture, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.submitYAMLToProject(fixture, projectID)
+
+	s.claim("draft", alice)
+	s.submit("draft", "A draft.")
+
+	s.claim("check", alice)
+	s.claim("check", bob)
+	s.claim("check", charlie)
+
+	// Alice approves first.
+	r1 := s.submitReviewAs("check", alice, "LGTM.", "approve")
+	if r1["status"] != "collecting" {
+		t.Fatalf("expected collecting after alice approve, got %v", r1["status"])
+	}
+	// Bob rejects — any-reject-kills fires, task resolves.
+	r2 := s.submitReviewAs("check", bob, "Nope.", "reject")
+	if r2["status"] != "accepted" {
+		t.Fatalf("expected accepted after bob reject, got %v", r2)
+	}
+	// Charlie tries to submit after the task already resolved.
+	// Must be a clean 400 with the "already resolved" message,
+	// not a 500 from the store.
+	r3 := s.submitReviewAs("check", charlie, "Too late.", "approve")
+	errMsg, _ := r3["error"].(string)
+	if errMsg == "" {
+		t.Fatalf("expected error on late review submit, got %v", r3)
+	}
+	if !strings.Contains(errMsg, "already resolved") &&
+		!strings.Contains(errMsg, "no open claim") {
+		t.Errorf("unexpected error phrasing: %q", errMsg)
+	}
+}
+
+// TestReviewResponsesTemplate — a downstream task reads
+// {{peer_review.responses}} from a multi-reviewer upstream and
+// sees each reviewer's verdict + commentary rendered as a
+// markdown block. Parallel to TestVoteResponsesTemplate but for
+// reviews.
+func TestReviewResponsesTemplate(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	charlie := s.register("charlie")
+	s.submitYAML("testdata/review-multi-responses.yaml")
+
+	s.claim("draft", alice)
+	s.submit("draft", "A proposal to adopt DuckDB.")
+
+	s.claim("peer_review", alice)
+	s.claim("peer_review", bob)
+	s.claim("peer_review", charlie)
+	s.submitReviewAs("peer_review", charlie, "I'd prefer Postgres.", "reject")
+	s.submitReviewAs("peer_review", alice, "Works for me.", "approve")
+	s.submitReviewAs("peer_review", bob, "Concerns about tooling.", "approve")
+
+	// Majority-approve rule: 2 approves out of 3 → approve.
+	// Draft stays accepted, synthesize becomes ready.
+	reviewTask := s.taskGet("peer_review")
+	if reviewTask["state"] != "accepted" {
+		t.Fatalf("expected peer_review accepted (2-of-3 majority), got %v", reviewTask["state"])
+	}
+
+	// Claim synthesize and verify the resolved prompt contains
+	// each reviewer's commentary + verdict via {{task.responses}}.
+	s.claim("synthesize", alice)
+	inputs := s.taskInputs("synthesize")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if resolved == "" {
+		t.Fatal("expected resolved prompt on synthesize claim")
+	}
+	for _, want := range []string{
+		"@alice", "@bob", "@charlie",
+		"approve",
+		"reject",
+		"Works for me.",
+		"Concerns about tooling.",
+		"I'd prefer Postgres.",
+	} {
+		if !strings.Contains(resolved, want) {
+			t.Errorf("expected %q in resolved prompt, got: %s", want, resolved)
+		}
+	}
+}
+
+// TestVoteDeadlineLazyResolve — reproduces the bug the user
+// hit: vote with a short deadline, one submission lands
+// below min_quorum, deadline passes, next GET on the task
+// should trigger the lazy resolution via maybeResolveDeadlineVote.
+func TestVoteDeadlineLazyResolve(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	charlie := s.register("charlie")
+
+	yaml := `name: "Deadline test"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    citizens: 3
+    deadline: 100ms
+    threshold: majority
+    prompt: "Pick."
+    options:
+      - {id: a, label: "A"}
+      - {id: b, label: "B"}
+`
+	projectID := s.createTestProject()
+	fixture := filepath.Join(t.TempDir(), "deadline.yaml")
+	if err := os.WriteFile(fixture, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.submitYAMLToProject(fixture, projectID)
+
+	s.claim("pick", alice)
+	s.claim("pick", bob)
+	s.claim("pick", charlie)
+
+	// Alice votes — below default quorum (3), task stays
+	// collecting.
+	r1 := s.submitVoteAs("pick", alice, "A please.", "a")
+	if r1["status"] != "collecting" {
+		t.Fatalf("expected collecting after 1 vote, got %v", r1["status"])
+	}
+
+	// Wait past the deadline.
+	time.Sleep(250 * time.Millisecond)
+
+	// GET on the task should trigger the lazy resolution:
+	// deadline passed → drop quorum to 1 → 1 vote for "a"
+	// wins majority → resolve.
+	pick := s.taskGet("pick")
+	if pick["state"] != "accepted" {
+		t.Fatalf("expected accepted after deadline lazy resolve, got %v", pick["state"])
+	}
+	if pick["vote_choice"] != "a" {
+		t.Errorf("expected vote_choice=a, got %v", pick["vote_choice"])
 	}
 }
 

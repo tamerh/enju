@@ -661,7 +661,7 @@ func formatOutputsSchema(outputsRaw string) string {
 	return b.String()
 }
 
-func formatClaimResult(claimData []byte, inputsData []byte) string {
+func formatClaimResult(claimData []byte, inputsData []byte, viewer string) string {
 	var claim map[string]interface{}
 	if err := json.Unmarshal(claimData, &claim); err != nil {
 		return string(claimData)
@@ -792,14 +792,15 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 			minQuorum = int(q)
 		}
 		threshold, _ := task["vote_threshold"].(string)
-		if threshold == "" {
-			threshold = "plurality"
-		}
 		voteSubs, _ := task["vote_submissions"].([]interface{})
 		activeClaimants := stringSliceFromAny(task["active_claimants"])
 		state, _ := task["state"].(string)
 		taskAction, _ := task["action"].(string)
-		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaimants))
+		visibility, _ := task["visibility"].(string)
+		anonymize, _ := task["anonymize"].(bool)
+		deadline, _ := task["vote_deadline"].(string)
+		deadlineAt, _ := task["vote_deadline_at"].(string)
+		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaimants, visibility, viewer, anonymize, deadline, deadlineAt))
 	}
 
 	if inputsData == nil {
@@ -811,6 +812,70 @@ func formatClaimResult(claimData []byte, inputsData []byte) string {
 	}
 
 	b.WriteString("\nSubmit your result when ready.")
+	return b.String()
+}
+
+// formatTallyResult renders the response from
+// /tasks/{id}/tally as a short status summary. Distinguishes
+// "resolved → winning option/verdict + cascade" from
+// "still collecting → reason + current counts".
+func formatTallyResult(data []byte, taskID string) string {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return string(data)
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return fmt.Sprintf("✗ Tally failed: %s", errMsg)
+	}
+	var b strings.Builder
+	status, _ := resp["status"].(string)
+	switch status {
+	case "resolved":
+		if winning, _ := resp["winning_option"].(string); winning != "" {
+			b.WriteString(fmt.Sprintf("✓ Vote resolved: %s — winning option: %s\n", taskID, winning))
+		} else if verdict, _ := resp["verdict"].(string); verdict != "" {
+			icon := "✓"
+			if verdict == "reject" {
+				icon = "✗"
+			}
+			b.WriteString(fmt.Sprintf("%s Review resolved: %s — verdict: %s\n", icon, taskID, verdict))
+		} else {
+			b.WriteString(fmt.Sprintf("✓ Task resolved: %s\n", taskID))
+		}
+		if skipped, _ := resp["skipped"].([]interface{}); len(skipped) > 0 {
+			b.WriteString(fmt.Sprintf("  → %d task(s) on losing branches flipped to SKIPPED\n", len(skipped)))
+		}
+		if nr, _ := resp["newly_ready"].(float64); nr > 0 {
+			b.WriteString(fmt.Sprintf("  → %d downstream task(s) newly ready\n", int(nr)))
+		}
+	case "already_resolved":
+		b.WriteString(fmt.Sprintf("• Task already resolved: %s\n", taskID))
+	case "collecting":
+		b.WriteString(fmt.Sprintf("⏳ Still collecting: %s\n", taskID))
+		if tally, _ := resp["tally"].(map[string]interface{}); tally != nil {
+			if reason, _ := tally["reason"].(string); reason != "" {
+				b.WriteString("  Reason: " + reason + "\n")
+			}
+			if counts, _ := tally["counts"].(map[string]interface{}); len(counts) > 0 {
+				b.WriteString("  Counts: ")
+				parts := make([]string, 0, len(counts))
+				for k, v := range counts {
+					parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+				}
+				sortStrings(parts)
+				b.WriteString(strings.Join(parts, ", "))
+				b.WriteString("\n")
+			}
+			if approves, hasApproves := tally["approves"].(float64); hasApproves {
+				rejects, _ := tally["rejects"].(float64)
+				total, _ := tally["total_reviews"].(float64)
+				b.WriteString(fmt.Sprintf("  Reviews: %d approve / %d reject / %d total\n",
+					int(approves), int(rejects), int(total)))
+			}
+		}
+	default:
+		b.WriteString(fmt.Sprintf("Tally result for %s: %s\n", taskID, status))
+	}
 	return b.String()
 }
 
@@ -1245,7 +1310,7 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	return b.String()
 }
 
-func formatTaskDetail(taskData []byte, inputsData []byte) string {
+func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string {
 	var task map[string]interface{}
 	if err := json.Unmarshal(taskData, &task); err != nil {
 		return string(taskData)
@@ -1341,11 +1406,21 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 			}
 		}
 	}
-	if threshold, _ := task["vote_threshold"].(string); threshold != "" {
-		b.WriteString(fmt.Sprintf("  Threshold: %s\n", threshold))
+	// Threshold / deadline: only show at top-level for
+	// single-citizen tasks. For citizens > 1 these are rendered
+	// inside the Voting / Review block (with relative-time
+	// deadline), so don't duplicate them here.
+	isMulti := false
+	if c, _ := task["citizens"].(float64); c > 1 {
+		isMulti = true
 	}
-	if deadline, _ := task["vote_deadline"].(string); deadline != "" {
-		b.WriteString(fmt.Sprintf("  Deadline:  %s\n", deadline))
+	if !isMulti {
+		if threshold, _ := task["vote_threshold"].(string); threshold != "" {
+			b.WriteString(fmt.Sprintf("  Threshold: %s\n", threshold))
+		}
+		if deadline, _ := task["vote_deadline"].(string); deadline != "" {
+			b.WriteString(fmt.Sprintf("  Deadline:  %s\n", deadline))
+		}
 	}
 
 	// Multi-citizen voting / review block: citizens count,
@@ -1359,14 +1434,15 @@ func formatTaskDetail(taskData []byte, inputsData []byte) string {
 			minQuorum = int(q)
 		}
 		threshold, _ := task["vote_threshold"].(string)
-		if threshold == "" {
-			threshold = "plurality"
-		}
 		voteSubs, _ := task["vote_submissions"].([]interface{})
 		activeClaims := stringSliceFromAny(task["active_claimants"])
 		state, _ := task["state"].(string)
 		taskAction, _ := task["action"].(string)
-		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaims))
+		visibility, _ := task["visibility"].(string)
+		anonymize, _ := task["anonymize"].(bool)
+		deadline, _ := task["vote_deadline"].(string)
+		deadlineAt, _ := task["vote_deadline_at"].(string)
+		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaims, visibility, viewer, anonymize, deadline, deadlineAt))
 	}
 
 	// Show environment requirements if present
@@ -1609,7 +1685,37 @@ func jsonID(v interface{}) string {
 // still-claimed-but-not-submitted citizens. Action-aware so
 // review tasks get "Review" header + "approves/rejects" tally
 // shape instead of raw option counts.
-func formatVotingBlock(action string, citizens, minQuorum int, threshold, state string, voteSubs []interface{}, activeClaimants []string) string {
+//
+// visibility is the task's visibility policy ("open" or "blind").
+// Blind collecting-state tasks hide sibling ballots from the
+// current viewer; once the task resolves everyone sees
+// everything regardless. viewerUsername identifies the caller
+// so the blind filter can still show their own submission.
+func formatVotingBlock(action string, citizens, minQuorum int, threshold, state string, voteSubs []interface{}, activeClaimants []string, visibility, viewerUsername string, anonymize bool, deadline, deadlineAt string) string {
+	// Blind-collection filter: during COLLECTING, hide sibling
+	// ballots from the current viewer. They can still see
+	// their own submission (if any) so the claim response
+	// can confirm "your vote landed." Once the task resolves
+	// to accepted, everyone sees everything.
+	totalSubmitted := len(voteSubs)
+	hiddenSiblings := 0
+	if visibility == "blind" && state == "collecting" {
+		filtered := make([]interface{}, 0, len(voteSubs))
+		for _, v := range voteSubs {
+			m, ok := v.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			user, _ := m["username"].(string)
+			if user == viewerUsername && viewerUsername != "" {
+				filtered = append(filtered, v)
+			} else {
+				hiddenSiblings++
+			}
+		}
+		voteSubs = filtered
+	}
+
 	var b strings.Builder
 	isReview := action == "review"
 	if isReview {
@@ -1618,15 +1724,13 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 		b.WriteString("── Voting ──────────────────────────────────\n")
 	}
 
-	// Effective threshold label. Review tasks don't use the
-	// vote_threshold column; they're hardcoded to the
-	// any-reject-kills / all-approve rule for now.
 	effectiveThreshold := threshold
 	if effectiveThreshold == "" {
-		effectiveThreshold = "plurality"
-	}
-	if isReview {
-		effectiveThreshold = "unanimous-approve (any reject vetoes)"
+		if isReview {
+			effectiveThreshold = "any-reject-kills"
+		} else {
+			effectiveThreshold = "plurality"
+		}
 	}
 
 	// Effective quorum. When the task author didn't set one
@@ -1643,9 +1747,31 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 	// Header summarizes the rules.
 	header := fmt.Sprintf("  Citizens: %d slots, quorum %d, threshold %s",
 		citizens, effectiveQuorum, effectiveThreshold)
+	if visibility != "" && visibility != "open" {
+		header += ", visibility " + visibility
+	}
+	if anonymize {
+		header += ", anonymous"
+	}
 	b.WriteString(header + "\n")
+	if deadline != "" {
+		line := "  Deadline: " + deadline
+		if deadlineAt != "" {
+			if t, err := time.Parse(time.RFC3339, deadlineAt); err == nil {
+				rem := time.Until(t)
+				if rem >= 0 {
+					line += fmt.Sprintf(" (expires in %s)", rem.Round(time.Second))
+				} else {
+					line += fmt.Sprintf(" (expired %s ago)", (-rem).Round(time.Second))
+				}
+			}
+		} else {
+			line += " (not yet started — ticks from first claim)"
+		}
+		b.WriteString(line + "\n")
+	}
 
-	submitted := len(voteSubs)
+	submitted := totalSubmitted
 	// Tally counts per option and per-voter list.
 	counts := map[string]int{}
 	type ballot struct{ user, option string }
@@ -1718,6 +1844,15 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 			suffix = "not yet reviewed"
 		}
 		b.WriteString("  Claimed:  " + strings.Join(activeClaimants, ", ") + " (" + suffix + ")\n")
+	}
+
+	if hiddenSiblings > 0 {
+		noun := "ballot"
+		if hiddenSiblings != 1 {
+			noun = "ballots"
+		}
+		b.WriteString(fmt.Sprintf("  (%d sibling %s hidden — blind mode until task resolves)\n",
+			hiddenSiblings, noun))
 	}
 
 	b.WriteString("────────────────────────────────────────────\n")

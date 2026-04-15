@@ -96,6 +96,7 @@ func New(cfg Config) *server.MCPServer {
 	s.AddTool(toolGetArtifactHistory(), client.handleGetArtifactHistory)
 	s.AddTool(toolMyProfile(), client.handleMyProfile)
 	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
+	s.AddTool(toolTallyTask(), client.handleTallyTask)
 
 	return s
 }
@@ -563,6 +564,23 @@ Only tasks in the 'accepted' state can be invalidated. Use this when you notice 
 		),
 		mcp.WithString("reason",
 			mcp.Description("Short explanation for the invalidation — shown in logs and the response"),
+		),
+	)
+}
+
+func toolTallyTask() mcp.Tool {
+	return mcp.NewTool("enju_tally_task",
+		mcp.WithDescription(`Force a tally evaluation on a multi-citizen vote or review task that is currently in the 'collecting' state. Runs the same tally logic as a submission would: counts the per-citizen submissions, applies the task's threshold + quorum + deadline rules, and resolves the task to 'accepted' if a winner emerges. Reports the current tally state either way.
+
+Use this when:
+- A vote/review task is stuck in collecting and you want to check whether it has enough votes to resolve under its threshold rule
+- The deadline has passed and you want to force the past-deadline resolution (the server's lazy check fires on the next task read, but this tool makes the trigger explicit)
+- You're the run author and want to check "is this ready to go?" without waiting for another submission
+
+The tally response includes the current counts, whether the task resolved, and if it resolved the winning option (vote) or verdict (review) + any newly-unlocked downstream tasks.`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The fully-qualified ID of the vote or review task to tally"),
 		),
 	)
 }
@@ -1037,6 +1055,21 @@ func (c *apiClient) handleInvalidateTask(ctx context.Context, req mcp.CallToolRe
 	return mcp.NewToolResultText(formatInvalidateResult(data, taskID)), nil
 }
 
+func (c *apiClient) handleTallyTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/tally", map[string]interface{}{})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if errMsg := extractErrorString(data); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	return mcp.NewToolResultText(formatTallyResult(data, taskID)), nil
+}
+
 func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/dashboard")
 	if err != nil {
@@ -1213,7 +1246,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 		inputs, _ = c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
 	}
 
-	return mcp.NewToolResultText(formatClaimResult(data, inputs)), nil
+	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username)), nil
 }
 
 func (c *apiClient) handleGetTaskInputs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2189,7 +2222,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 	// Also fetch inputs if task has dependencies
 	inputs, _ := c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
 
-	return mcp.NewToolResultText(formatTaskDetail(data, inputs)), nil
+	return mcp.NewToolResultText(formatTaskDetail(data, inputs, c.username)), nil
 }
 
 func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
