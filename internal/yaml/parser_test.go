@@ -1438,6 +1438,241 @@ tasks:
 // TestParseMissingDescriptionWarning — missing description is
 // non-fatal but emits a warning. The LLM needs prose to turn
 // the param into a user-facing question.
+// TestParseDynamicForEach — Phase J.1 core parse path.
+// A task declares for_each whose list comes from an
+// upstream task's list<string> output. The parser accepts
+// it, produces zero instances for the deferred task, and
+// records deferred metadata naming the upstream + field.
+// Downstream singletons that depend on the deferred task
+// are transitively deferred.
+func TestParseDynamicForEach(t *testing.T) {
+	yamlData := []byte(`
+name: "Per-gene analysis"
+version: 1
+tasks:
+  - id: discover_genes
+    action: answer
+    prompt: "List 3 candidate genes for endometriosis, one per line."
+    outputs:
+      gene_symbols:
+        description: "Gene symbols to analyze."
+        format: list<string>
+
+  - id: analyze_gene
+    action: answer
+    for_each:
+      gene: "{{discover_genes.gene_symbols}}"
+    prompt: "Analyze gene {{gene}}."
+
+  - id: synthesize
+    action: answer
+    prompt: "Combine findings: {{analyze_gene.content}}"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	// The discover_genes singleton should materialize. The
+	// analyze_gene def should NOT — it's dynamic. synthesize
+	// should also be deferred because it consumes a deferred
+	// upstream.
+	singletonIDs := make(map[string]bool)
+	for _, tasks := range parsed.ExpandedTasks {
+		for _, ti := range tasks {
+			singletonIDs[ti.TaskDef.ID] = true
+		}
+	}
+	if !singletonIDs["discover_genes"] {
+		t.Error("expected discover_genes to materialize")
+	}
+	if singletonIDs["analyze_gene"] {
+		t.Error("expected analyze_gene to be deferred (no instances)")
+	}
+	if singletonIDs["synthesize"] {
+		t.Error("expected synthesize to be transitively deferred")
+	}
+
+	// DeferredTaskDefs should contain both analyze_gene
+	// (directly dynamic) and synthesize (transitive).
+	deferredByID := make(map[string]DeferredTaskDef)
+	for _, d := range parsed.DeferredTaskDefs {
+		deferredByID[d.TaskDefID] = d
+	}
+	analyze, ok := deferredByID["analyze_gene"]
+	if !ok {
+		t.Fatal("expected analyze_gene in DeferredTaskDefs")
+	}
+	if analyze.TransitivelyDeferred {
+		t.Error("analyze_gene is directly dynamic, not transitive")
+	}
+	ref, ok := analyze.ForEachRefs["gene"]
+	if !ok {
+		t.Fatal("expected analyze_gene to record a ForEachRef for 'gene'")
+	}
+	if ref.TaskID != "discover_genes" || ref.Field != "gene_symbols" {
+		t.Errorf("wrong ForEachRef: %+v", ref)
+	}
+
+	synth, ok := deferredByID["synthesize"]
+	if !ok {
+		t.Fatal("expected synthesize in DeferredTaskDefs")
+	}
+	if !synth.TransitivelyDeferred {
+		t.Error("synthesize should be marked transitively deferred")
+	}
+}
+
+// TestParseDynamicForEachRejectsUnknownUpstream — a
+// {{undefined.field}} reference fails at parse time with
+// a clear "unknown upstream task" error.
+func TestParseDynamicForEachRejectsUnknownUpstream(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+tasks:
+  - id: analyze
+    action: answer
+    for_each:
+      item: "{{missing.items}}"
+    prompt: "Analyze {{item}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected unknown-upstream error, got nil")
+	}
+	if !searchString(err.Error(), "unknown upstream task") {
+		t.Errorf("expected 'unknown upstream task' error, got: %v", err)
+	}
+}
+
+// TestParseDynamicForEachRejectsMissingField — the upstream
+// exists but doesn't declare the referenced output field.
+func TestParseDynamicForEachRejectsMissingField(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+tasks:
+  - id: produce
+    action: answer
+    prompt: "x"
+    outputs:
+      other_field:
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      item: "{{produce.items}}"
+    prompt: "Analyze {{item}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected missing-field error, got nil")
+	}
+	if !searchString(err.Error(), "does not declare an output field") {
+		t.Errorf("expected 'does not declare an output field' error, got: %v", err)
+	}
+}
+
+// TestParseDynamicForEachRejectsNonListOutput — the
+// referenced field exists but isn't declared as
+// list<string>. Dynamic for_each needs a typed iterable
+// source.
+func TestParseDynamicForEachRejectsNonListOutput(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+tasks:
+  - id: produce
+    action: answer
+    prompt: "x"
+    outputs:
+      summary:
+        format: text
+
+  - id: analyze
+    action: answer
+    for_each:
+      item: "{{produce.summary}}"
+    prompt: "Analyze {{item}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected non-list-output error, got nil")
+	}
+	if !searchString(err.Error(), "list<string>") {
+		t.Errorf("expected 'list<string>' error, got: %v", err)
+	}
+}
+
+// TestParseDynamicForEachRejectsSelfReference — a task
+// can't fan out over its own output.
+func TestParseDynamicForEachRejectsSelfReference(t *testing.T) {
+	yamlData := []byte(`
+name: "Bad recipe"
+version: 1
+tasks:
+  - id: analyze
+    action: answer
+    for_each:
+      item: "{{analyze.items}}"
+    outputs:
+      items:
+        format: list<string>
+    prompt: "Analyze {{item}}."
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected self-reference error, got nil")
+	}
+	if !searchString(err.Error(), "references itself") {
+		t.Errorf("expected 'references itself' error, got: %v", err)
+	}
+}
+
+// TestParseDynamicForEachPerInstanceChain — two tasks share
+// the same dynamic for_each reference (the canonical
+// per-instance review pattern). Both are deferred and
+// treated as the same iteration dimension.
+func TestParseDynamicForEachPerInstanceChain(t *testing.T) {
+	yamlData := []byte(`
+name: "Per-gene analysis + review"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List genes"
+    outputs:
+      genes:
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{discover.genes}}"
+    prompt: "Analyze {{gene}}."
+
+  - id: review
+    action: review
+    reviews: analyze
+    for_each:
+      gene: "{{discover.genes}}"
+    prompt: "Review the analysis of {{gene}}."
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	deferredByID := make(map[string]bool)
+	for _, d := range parsed.DeferredTaskDefs {
+		deferredByID[d.TaskDefID] = true
+	}
+	if !deferredByID["analyze"] || !deferredByID["review"] {
+		t.Errorf("expected both analyze and review deferred, got: %v", deferredByID)
+	}
+}
+
 func TestParseMissingDescriptionWarning(t *testing.T) {
 	yamlData := []byte(`
 name: "Recipe"

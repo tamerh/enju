@@ -13,6 +13,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/dag"
 	"github.com/enju-ai/enju/internal/store"
+	"github.com/enju-ai/enju/internal/template"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -977,6 +978,18 @@ type submitResultRequest struct {
 	// citizen-<username>/result.md, but the DB column is the
 	// authoritative source for responses rendering.
 	Content string `json:"content,omitempty"`
+
+	// OutputLists carries the *values* of named outputs that
+	// are declared as format: list<string> on the submitting
+	// task. Populated by the fat client at submit time so the
+	// coordinator can use them for dynamic for_each
+	// materialization (Phase J.1) without having to read git.
+	// Keyed by output field name.
+	//
+	// Other named-output values (plain strings) stay in the
+	// task's git-committed result files — only list<string>
+	// outputs need to round-trip through the coordinator.
+	OutputLists map[string][]string `json:"output_lists,omitempty"`
 }
 
 // handleSubmitResult is the metadata-only submit path. The client
@@ -1621,6 +1634,27 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Phase J.1 — materialize dynamic for_each downstreams.
+	// If this task's accept produced output lists that a
+	// deferred downstream reads, expand the deferred task into
+	// concrete rows right here so the readiness sweep below
+	// picks them up in the same submit round-trip.
+	//
+	// Only runs when (a) the task actually reached ACCEPTED
+	// (not COLLECTING) and (b) the request carries output_lists
+	// and (c) the run has DeferredTaskDefs waiting on this
+	// task's outputs.
+	if submitRes != nil && submitRes.Resolved && len(req.OutputLists) > 0 {
+		if err := s.materializeDeferredTasks(task, run, req.OutputLists); err != nil {
+			s.logger.Error("materializing deferred tasks",
+				"task_id", taskID, "error", err)
+			// Not a hard failure — the upstream is already
+			// accepted, and downstream materialization is a
+			// best-effort follow-up. Log and proceed so the
+			// submit response still reflects the state flip.
+		}
+	}
+
 	// Now the action-specific cascades have settled, run the
 	// readiness sweep. Losing-branch tasks are already SKIPPED so
 	// they won't enter the "newly ready" count; only tasks that
@@ -1743,6 +1777,21 @@ func (s *Server) getOrLoadDAG(runID int64) (*dag.DAG, error) {
 	if d, ok := s.dags[runID]; ok {
 		return d, nil
 	}
+	if _, err := s.getOrLoadParsedRun(runID); err != nil {
+		return nil, err
+	}
+	return s.dags[runID], nil
+}
+
+// getOrLoadParsedRun is getOrLoadDAG's richer sibling: it
+// returns the full ParsedRun so callers that need the
+// original YAML's task defs, warnings, or Phase J.1 deferred
+// task metadata can reach them. Loads + caches lazily on
+// first access.
+func (s *Server) getOrLoadParsedRun(runID int64) (*enjuYaml.ParsedRun, error) {
+	if p, ok := s.runs[runID]; ok {
+		return p, nil
+	}
 	run, err := s.store.GetRun(runID)
 	if err != nil {
 		return nil, fmt.Errorf("loading run: %w", err)
@@ -1756,7 +1805,7 @@ func (s *Server) getOrLoadDAG(runID int64) (*dag.DAG, error) {
 	}
 	s.dags[runID] = parsed.DAG
 	s.runs[runID] = parsed
-	return parsed.DAG, nil
+	return parsed, nil
 }
 
 // invalidationResult summarizes what performInvalidate actually
@@ -1767,9 +1816,17 @@ type invalidationResult struct {
 	Task            *store.TaskRecord
 	Descendants     []string
 	CrossRunReaders []string
-	Changed         int
-	Rollbacks       []rollbackOutcome
-	AffectedRuns    map[int64]bool
+	// Dematerialized lists task IDs that were deleted
+	// rather than flipped to PENDING. Populated for
+	// invalidations of dynamic-for_each sources — the
+	// materialized descendants can't preserve their
+	// instance keys across a re-accept, so they're removed
+	// entirely and re-created on the next accept. See
+	// [docs/dynamic-outputs.md] for the rationale.
+	Dematerialized []string
+	Changed        int
+	Rollbacks      []rollbackOutcome
+	AffectedRuns   map[int64]bool
 }
 
 type rollbackOutcome struct {
@@ -1910,14 +1967,103 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		})
 	}
 
-	cascadeIDs := make([]string, 0, len(descendants)+len(crossRunReaders))
-	cascadeIDs = append(cascadeIDs, descendants...)
+	// Phase J.1 — dematerialize dynamic descendants.
+	//
+	// If this task is the source for any dynamic for_each
+	// (i.e. some deferred task's for_each ref points at this
+	// task def), every deferred task in the run needs to be
+	// DELETED rather than flipped to PENDING. The rationale:
+	// their instance keys match the previous accept's output
+	// list. On re-accept, the new list may have different
+	// items, so preserving the old rows creates a dangling
+	// state where a citizen could still claim a task whose
+	// upstream list no longer contains its key.
+	//
+	// Instances of deferred defs are deleted by task_def_id,
+	// which catches every materialized row regardless of
+	// instance key. The normal cascade (for non-dynamic
+	// descendants) proceeds unchanged.
+	parsed, _ := s.getOrLoadParsedRun(task.RunID)
+	dematerializeDefs := make(map[string]bool)
+	if parsed != nil && len(parsed.DeferredTaskDefs) > 0 {
+		isDynamicSource := false
+		for _, d := range parsed.DeferredTaskDefs {
+			for _, ref := range d.ForEachRefs {
+				if ref.TaskID == task.TaskDefID {
+					isDynamicSource = true
+					break
+				}
+			}
+			if isDynamicSource {
+				break
+			}
+		}
+		if isDynamicSource {
+			for _, d := range parsed.DeferredTaskDefs {
+				dematerializeDefs[d.TaskDefID] = true
+			}
+		}
+	}
+
+	// Split descendants: if its task_def is in the
+	// dematerialize set, it's a dynamic descendant and will
+	// be deleted below. Otherwise it goes through the normal
+	// InvalidateTask state-flip cascade.
+	var dematerializedIDs []string
+	var regularDescendants []string
+	for _, descID := range descendants {
+		dt, err := s.store.GetTask(descID)
+		if err != nil || dt == nil {
+			continue
+		}
+		if dematerializeDefs[dt.TaskDefID] {
+			dematerializedIDs = append(dematerializedIDs, descID)
+		} else {
+			regularDescendants = append(regularDescendants, descID)
+		}
+	}
+
+	cascadeIDs := make([]string, 0, len(regularDescendants)+len(crossRunReaders))
+	cascadeIDs = append(cascadeIDs, regularDescendants...)
 	cascadeIDs = append(cascadeIDs, crossRunReaders...)
 
 	changed, err := s.store.InvalidateTask(taskID, cascadeIDs)
 	if err != nil {
 		return nil, err
 	}
+	// Delete the dematerialized rows. Use DeleteTasksByDefInRun
+	// for each affected def so all instance rows go at once
+	// (including any the DAG walk may have missed if the
+	// in-memory cache got out of sync with the store).
+	dematerializedByDef := make(map[string]bool)
+	for _, id := range dematerializedIDs {
+		dt, _ := s.store.GetTask(id)
+		if dt == nil {
+			continue
+		}
+		dematerializedByDef[dt.TaskDefID] = true
+	}
+	for defID := range dematerializedByDef {
+		if err := s.store.DeleteTasksByDefInRun(task.RunID, defID); err != nil {
+			s.logger.Error("deleting dynamic descendants on invalidation",
+				"def", defID, "run", task.RunID, "error", err)
+		}
+	}
+	// Invalidate the run cache so the next getOrLoadDAG
+	// rebuilds from YAML (without the now-deleted materialized
+	// nodes). Essential so a subsequent re-accept sees a clean
+	// DAG and re-materializes fresh.
+	if len(dematerializedByDef) > 0 {
+		delete(s.dags, task.RunID)
+		delete(s.runs, task.RunID)
+	}
+
+	// The "changed" count from InvalidateTask only covers
+	// rows that were state-flipped. Add the dematerialized
+	// rows to the total so the caller-visible number
+	// reflects the full effect of the invalidation.
+	changed += len(dematerializedIDs)
+
 	for runID := range affectedRunIDs {
 		_, _ = s.store.UpdateReadyTasks(runID)
 		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
@@ -1925,12 +2071,13 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		}
 	}
 	return &invalidationResult{
-		Task:            task,
-		Descendants:     descendants,
-		CrossRunReaders: crossRunReaders,
-		Changed:         changed,
-		Rollbacks:       rollbacks,
-		AffectedRuns:    affectedRunIDs,
+		Task:             task,
+		Descendants:      regularDescendants,
+		CrossRunReaders:  crossRunReaders,
+		Dematerialized:   dematerializedIDs,
+		Changed:          changed,
+		Rollbacks:        rollbacks,
+		AffectedRuns:     affectedRunIDs,
 	}, nil
 }
 
@@ -2319,6 +2466,576 @@ type skipCascadeResult struct {
 //
 // Tasks in skip_set transition to SKIPPED. Tasks in winning_set
 // stay alive. Tasks in neither set are unrelated to any branch
+// materializeDeferredTasks is the Phase J.1 entry point for
+// dynamic for_each fan-out. When a task with list<string>
+// outputs accepts and the run has deferred downstream tasks
+// whose for_each lists reference those outputs, this creates
+// the concrete task rows for every resolved instance.
+//
+// The algorithm:
+//
+//  1. Load the ParsedRun (cached from run creation or
+//     lazily re-parsed from stored YAML).
+//  2. For each DeferredTaskDef whose for_each refs point at
+//     this accepting task, resolve the list values from
+//     req.OutputLists and run for_each expansion.
+//  3. Insert one task row per expanded instance via
+//     store.CreateTask, with depends_on computed against
+//     the instance key (matching siblings for per-instance
+//     chaining).
+//  4. For transitively-deferred tasks (singletons that
+//     consume the dynamic upstream via fan-in), materialize
+//     them with depends_on listing every newly-inserted
+//     instance ID for the upstream.
+//  5. Add nodes + edges to the cached in-memory DAG so
+//     cascade-invalidation walks see the new rows.
+//
+// Non-atomic: runs after the upstream's SubmitTaskResult
+// transaction has committed. A failure here leaves the
+// upstream accepted and the deferred downstream un-
+// materialized — recoverable by invalidate + re-accept. For
+// first slice this is acceptable; a future iteration can
+// move it inside the submit transaction.
+func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.RunRecord, outputLists map[string][]string) error {
+	parsed, err := s.getOrLoadParsedRun(task.RunID)
+	if err != nil {
+		return fmt.Errorf("loading parsed run: %w", err)
+	}
+	if len(parsed.DeferredTaskDefs) == 0 {
+		return nil // nothing deferred in this run
+	}
+
+	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
+
+	// Identify the deferred task defs that directly reference
+	// this accepting task. Each one's for_each has one or more
+	// variables pointing at this task's outputs; we resolve the
+	// lists from the supplied OutputLists and check we have
+	// values for every variable.
+	type resolvedRef struct {
+		def      *enjuYaml.DeferredTaskDef
+		forEach  map[string][]string // per-variable resolved list
+	}
+	var directlyReady []resolvedRef
+	for i := range parsed.DeferredTaskDefs {
+		d := &parsed.DeferredTaskDefs[i]
+		if d.TransitivelyDeferred {
+			continue
+		}
+		// Check every ref on this def — they may point to
+		// different upstreams. We only materialize when ALL
+		// refs are resolvable right now. If some point to this
+		// task and others don't, we skip (materialize later on
+		// the other upstream's accept).
+		allReady := true
+		resolved := make(map[string][]string, len(d.ForEachRefs))
+		for varName, ref := range d.ForEachRefs {
+			if ref.TaskID != task.TaskDefID {
+				allReady = false
+				break
+			}
+			list, ok := outputLists[ref.Field]
+			if !ok {
+				s.logger.Warn("deferred task missing output list",
+					"deferred", d.TaskDefID, "field", ref.Field)
+				allReady = false
+				break
+			}
+			resolved[varName] = list
+		}
+		if !allReady {
+			continue
+		}
+		directlyReady = append(directlyReady, resolvedRef{def: d, forEach: resolved})
+	}
+	if len(directlyReady) == 0 {
+		return nil
+	}
+
+	// Look up the original task defs by ID so we can copy
+	// the full shape (prompt, action, outputs, timeout, etc.)
+	// into each expanded instance.
+	taskDefByID := make(map[string]*enjuYaml.TaskDef, len(parsed.Run.Tasks))
+	for i := range parsed.Run.Tasks {
+		taskDefByID[parsed.Run.Tasks[i].ID] = &parsed.Run.Tasks[i]
+	}
+
+	// For each directly-ready deferred task def, expand and
+	// create rows. Track newly-created instance IDs per
+	// task_def so the transitively-deferred pass below can
+	// resolve its depends_on.
+	newInstances := make(map[string][]materializedInstance)
+	// Find the max seq currently in this run so new rows
+	// continue the numbering cleanly.
+	existingTasks, _ := s.store.ListTasksByRun(task.RunID)
+	nextSeq := 0
+	for _, t := range existingTasks {
+		if t.Seq > nextSeq {
+			nextSeq = t.Seq
+		}
+	}
+
+	// Re-run cleanup: if we're re-materializing after an
+	// upstream invalidation + re-accept (e.g. discover was
+	// invalidated and submitted again with a different gene
+	// list), any existing rows for the deferred task defs
+	// are stale. Delete them now so the two-pass allocation
+	// below starts from a clean slate. Also cleans up the
+	// transitively-deferred defs below.
+	deferredDefIDs := make(map[string]bool)
+	for _, rr := range directlyReady {
+		deferredDefIDs[rr.def.TaskDefID] = true
+	}
+	for i := range parsed.DeferredTaskDefs {
+		d := &parsed.DeferredTaskDefs[i]
+		if d.TransitivelyDeferred {
+			deferredDefIDs[d.TaskDefID] = true
+		}
+	}
+	for defID := range deferredDefIDs {
+		if err := s.store.DeleteTasksByDefInRun(task.RunID, defID); err != nil {
+			return fmt.Errorf("cleaning up stale instances for %q: %w", defID, err)
+		}
+	}
+
+	// Two-pass allocation so per-instance dep wiring can
+	// cross-reference siblings. Pass 1 computes the full ID
+	// for every instance about to be materialized so pass 2
+	// can resolve deps like "check:BRCA1 depends on
+	// analyze:BRCA1" without ordering constraints on the
+	// deferred-tasks list.
+	//
+	// Note the two namespaces: "short" IDs (no run prefix)
+	// go into the in-memory DAG cache — the parser builds
+	// the rest of the DAG with short IDs too. "Full" IDs
+	// (runPrefix-qualified) go into the store's tasks table
+	// and task_claims. The cache and the store are two
+	// different key spaces; mixing them breaks cascade
+	// walks.
+	type plannedInstance struct {
+		def     *enjuYaml.TaskDef
+		inst    forEachInstance
+		shortID string
+		fullID  string
+	}
+	var plans []plannedInstance
+	// instanceIndex[def.ID][instance_key] -> (shortID, fullID)
+	// for per-instance matching during dep resolution.
+	instanceIndex := make(map[string]map[string]struct {
+		short string
+		full  string
+	})
+	for _, rr := range directlyReady {
+		def, ok := taskDefByID[rr.def.TaskDefID]
+		if !ok {
+			return fmt.Errorf("deferred task %q not found in parsed run", rr.def.TaskDefID)
+		}
+		instances := expandResolvedForEach(rr.forEach)
+		if instanceIndex[def.ID] == nil {
+			instanceIndex[def.ID] = make(map[string]struct {
+				short string
+				full  string
+			}, len(instances))
+		}
+		for _, inst := range instances {
+			shortID := enjuYaml.MakeFullID(inst.key, def.ID)
+			fullID := runPrefix + shortID
+			plans = append(plans, plannedInstance{def: def, inst: inst, shortID: shortID, fullID: fullID})
+			instanceIndex[def.ID][inst.key] = struct {
+				short string
+				full  string
+			}{short: shortID, full: fullID}
+		}
+	}
+	// Set of every fullID about to be created — used to
+	// decide READY vs PENDING for instances whose deps point
+	// at siblings in the same batch.
+	inBatch := make(map[string]bool)
+	for _, ids := range instanceIndex {
+		for _, ids2 := range ids {
+			inBatch[ids2.full] = true
+		}
+	}
+
+	now := time.Now()
+	for _, plan := range plans {
+		def := plan.def
+		inst := plan.inst
+		shortID := plan.shortID
+		fullID := plan.fullID
+		nextSeq++
+		ti := buildDeferredInstance(def, inst, parsed.Run)
+
+		// Resolve depends_on per-instance. Walk the def's
+		// declared deps (explicit + inferred from prompt), map
+		// each to a concrete task ID based on whether the dep
+		// is a sibling being materialized right now (→ match
+		// by instance_key), the accepting upstream (→ skip,
+		// already ACCEPTED), or a static singleton already in
+		// the store (→ runPrefix+def_id).
+		//
+		// The `dagParents` slice tracks the edges to add to
+		// the in-memory DAG for cascade walks — it includes
+		// the accepting upstream (so Descendants(discover)
+		// finds its materialized instances) even though the
+		// store-side depends_on skips it.
+		//
+		// IMPORTANT: the for_each source task is an *implicit*
+		// parent even though it doesn't appear in allDeps (a
+		// `for_each: {gene: "{{discover.gene_symbols}}"}`
+		// doesn't cause discover to be listed in
+		// template.MergeDependencies, which only scans the
+		// prompt for task.content refs). Seed dagParents with
+		// every ForEachRef source before walking allDeps so
+		// the cascade walk finds these instances.
+		allDeps := template.MergeDependencies(def.DependsOn, def.Prompt)
+		var resolvedDeps []string
+		var dagParents []string
+		seenDAGParent := make(map[string]bool)
+		addDAGParent := func(short string) {
+			if seenDAGParent[short] {
+				return
+			}
+			seenDAGParent[short] = true
+			dagParents = append(dagParents, short)
+		}
+		// Seed with the for_each sources for this def so the
+		// DAG always has an edge from source → instance even
+		// when the prompt doesn't explicitly reference it.
+		for _, dd := range parsed.DeferredTaskDefs {
+			if dd.TaskDefID != def.ID {
+				continue
+			}
+			for _, ref := range dd.ForEachRefs {
+				addDAGParent(ref.TaskID)
+			}
+			break
+		}
+		for _, dep := range allDeps {
+			if dep == task.TaskDefID {
+				// The accepting upstream is the task that
+				// triggered materialization — don't add it to
+				// depends_on, it's already accepted and the
+				// scheduler would see a dangling satisfied
+				// dep on every instance. DO add a DAG edge so
+				// invalidation cascades find this instance
+				// when the author invalidates the upstream.
+				addDAGParent(enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID))
+				continue
+			}
+			if ids, ok := instanceIndex[dep]; ok {
+				// Sibling in the current batch — per-instance
+				// match on shared instance_key. This is what
+				// wires check:BRCA1 to analyze:BRCA1 in the
+				// canonical review chain.
+				if matched, ok := ids[inst.key]; ok {
+					resolvedDeps = append(resolvedDeps, matched.full)
+					addDAGParent(matched.short)
+					continue
+				}
+			}
+			// Static singleton (already in the store).
+			resolvedDeps = append(resolvedDeps, runPrefix+dep)
+			addDAGParent(dep)
+		}
+
+		// Review-target rewriting: the parser stores
+		// ReviewsTarget as the task_def_id (e.g. "analyze").
+		// For a dynamic per-instance review we want the
+		// target to be the matched sibling's full ID so the
+		// review cascade and display both see a real row
+		// (e.g. "1:2:BRCA1:analyze" instead of "analyze").
+		reviewsTarget := ti.Reviews
+		if reviewsTarget != "" {
+			if ids, ok := instanceIndex[reviewsTarget]; ok {
+				if matched, ok := ids[inst.key]; ok {
+					reviewsTarget = matched.full
+				}
+			}
+		}
+
+		// State: READY if every resolved dep is outside the
+		// current batch (meaning it's already in the store in
+		// a settled state, usually ACCEPTED because that's
+		// what triggered us). PENDING if any dep is a sibling
+		// being materialized right now — the scheduler will
+		// promote us when those siblings accept.
+		state := store.TaskReady
+		for _, d := range resolvedDeps {
+			if inBatch[d] {
+				state = store.TaskPending
+				break
+			}
+		}
+		_ = shortID // used below for DAG operations
+
+		rec := &store.TaskRecord{
+			ID:             fullID,
+			RunID:          task.RunID,
+			Seq:            nextSeq,
+			TaskDefID:      def.ID,
+			InstanceKey:    inst.key,
+			InstanceParams: marshalParams(inst.params),
+			Action:         ti.Action,
+			Prompt:         ti.Prompt,
+			UserPrompt:     ti.UserPrompt,
+			Script:         ti.Script,
+			Outputs:        marshalOutputs(ti.Outputs),
+			Requirements:   marshalRequirements(ti.Requirements),
+			ResultType:     ti.ResultType,
+			Timeout:        ti.Timeout,
+			State:          state,
+			DependsOn:      strings.Join(resolvedDeps, ","),
+			ReadsArtifacts: marshalStringSlice(ti.ReadsArtifacts),
+			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
+			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
+			RequireRole:     ti.RequireRole,
+			ReviewsTarget:   reviewsTarget,
+			VoteOptions:     marshalVoteOptions(ti.Options),
+			Citizens:        ti.Citizens,
+			MinQuorum:       ti.MinQuorum,
+			VoteThreshold:   ti.Threshold,
+			VoteDeadline:    ti.Deadline,
+			Anonymize:       ti.Anonymize,
+			Visibility:      ti.Visibility,
+			CreatedAt:       now,
+		}
+		if err := s.store.CreateTask(rec); err != nil {
+			return fmt.Errorf("creating materialized task %s: %w", fullID, err)
+		}
+		newInstances[def.ID] = append(newInstances[def.ID], materializedInstance{
+			FullID:      fullID,
+			InstanceKey: inst.key,
+			Params:      inst.params,
+		})
+		// Add to the in-memory DAG so cascade walks find it.
+		// DAG uses SHORT IDs (no run prefix) — same namespace
+		// the parser uses for static nodes. Edges include the
+		// accepting upstream (so Descendants(discover) finds
+		// this instance) plus per-instance sibling edges so
+		// review cascades propagate correctly.
+		nodeData := map[string]interface{}{
+			"instance_key": inst.key,
+			"task_def_id":  def.ID,
+		}
+		if err := parsed.DAG.AddNode(shortID, def.Action, nodeData); err != nil {
+			s.logger.Warn("DAG AddNode for materialized task", "id", shortID, "err", err)
+		}
+		for _, parentShort := range dagParents {
+			if err := parsed.DAG.AddEdge(parentShort, shortID); err != nil {
+				s.logger.Warn("DAG AddEdge for materialized task", "parent", parentShort, "child", shortID, "err", err)
+			}
+		}
+	}
+
+	// Transitively-deferred pass: materialize singletons (and
+	// task-level siblings) whose dependencies are now all
+	// resolvable. For first slice we only handle the common
+	// case: a singleton downstream of one newly-materialized
+	// dynamic upstream.
+	for i := range parsed.DeferredTaskDefs {
+		d := &parsed.DeferredTaskDefs[i]
+		if !d.TransitivelyDeferred {
+			continue
+		}
+		def, ok := taskDefByID[d.TaskDefID]
+		if !ok {
+			continue
+		}
+		// Singletons only in first slice.
+		if len(def.ForEach) > 0 {
+			continue
+		}
+		// Gather deps: every {{upstream.content}} reference +
+		// explicit depends_on. For newly-materialized upstreams
+		// we need a full list of instance IDs; for static
+		// upstreams (already in the store) we use the task_def_id.
+		//
+		// Like the direct pass above, dagParents uses the
+		// short-ID namespace while resolved uses the full
+		// (runPrefix-qualified) store-side namespace.
+		allDeps := template.MergeDependencies(def.DependsOn, def.Prompt)
+		var resolved []string
+		var dagParents []string
+		for _, dep := range allDeps {
+			if instances, ok := newInstances[dep]; ok {
+				for _, m := range instances {
+					resolved = append(resolved, m.FullID)
+					// Recover the short ID from the full ID
+					// by trimming the run prefix.
+					dagParents = append(dagParents, strings.TrimPrefix(m.FullID, runPrefix))
+				}
+				continue
+			}
+			// Static upstream — singleton already in the
+			// store at fullID = runPrefix + task_def_id.
+			resolved = append(resolved, runPrefix+dep)
+			dagParents = append(dagParents, dep)
+		}
+
+		nextSeq++
+		ti := buildDeferredInstance(def, forEachInstance{key: "", params: map[string]string{}}, parsed.Run)
+		shortID := def.ID
+		fullID := runPrefix + shortID
+		rec := &store.TaskRecord{
+			ID:             fullID,
+			RunID:          task.RunID,
+			Seq:            nextSeq,
+			TaskDefID:      def.ID,
+			InstanceKey:    "",
+			InstanceParams: "",
+			Action:         ti.Action,
+			Prompt:         ti.Prompt,
+			UserPrompt:     ti.UserPrompt,
+			Script:         ti.Script,
+			Outputs:        marshalOutputs(ti.Outputs),
+			Requirements:   marshalRequirements(ti.Requirements),
+			ResultType:     ti.ResultType,
+			Timeout:        ti.Timeout,
+			State:          store.TaskPending,
+			DependsOn:      strings.Join(resolved, ","),
+			ReadsArtifacts: marshalStringSlice(ti.ReadsArtifacts),
+			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
+			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
+			RequireRole:     ti.RequireRole,
+			ReviewsTarget:   ti.Reviews,
+			VoteOptions:     marshalVoteOptions(ti.Options),
+			Citizens:        ti.Citizens,
+			MinQuorum:       ti.MinQuorum,
+			VoteThreshold:   ti.Threshold,
+			VoteDeadline:    ti.Deadline,
+			Anonymize:       ti.Anonymize,
+			Visibility:      ti.Visibility,
+			CreatedAt:       now,
+		}
+		if err := s.store.CreateTask(rec); err != nil {
+			return fmt.Errorf("creating transitively-deferred task %s: %w", fullID, err)
+		}
+		nodeData := map[string]interface{}{
+			"instance_key": "",
+			"task_def_id":  def.ID,
+		}
+		if err := parsed.DAG.AddNode(shortID, def.Action, nodeData); err != nil {
+			s.logger.Warn("DAG AddNode for transitively-deferred task", "id", shortID, "err", err)
+		}
+		for _, parentShort := range dagParents {
+			if err := parsed.DAG.AddEdge(parentShort, shortID); err != nil {
+				s.logger.Warn("DAG AddEdge for transitively-deferred task", "parent", parentShort, "child", shortID, "err", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// materializedInstance records one newly-created task row so
+// transitively-deferred downstreams can be wired correctly.
+type materializedInstance struct {
+	FullID      string
+	InstanceKey string
+	Params      map[string]string
+}
+
+// forEachInstance mirrors the parser-internal type — duplicated
+// here to keep the materializer self-contained without exporting
+// the parser's helper.
+type forEachInstance struct {
+	key    string
+	params map[string]string
+}
+
+// expandResolvedForEach is the router-side expansion for a
+// dynamic for_each that's been resolved to concrete string
+// lists. Mirrors the parser's static expansion logic. Single
+// variable → one instance per list element; multiple variables
+// → cartesian product (sorted variable order for determinism).
+func expandResolvedForEach(forEach map[string][]string) []forEachInstance {
+	if len(forEach) == 0 {
+		return []forEachInstance{{key: "", params: map[string]string{}}}
+	}
+	if len(forEach) == 1 {
+		for name, values := range forEach {
+			out := make([]forEachInstance, 0, len(values))
+			for _, v := range values {
+				out = append(out, forEachInstance{
+					key:    v,
+					params: map[string]string{name: v},
+				})
+			}
+			return out
+		}
+	}
+	keys := make([]string, 0, len(forEach))
+	for k := range forEach {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	vals := make([][]string, len(keys))
+	for i, k := range keys {
+		vals[i] = forEach[k]
+	}
+	var result []forEachInstance
+	var walk func(depth int, acc map[string]string)
+	walk = func(depth int, acc map[string]string) {
+		if depth == len(keys) {
+			copyAcc := make(map[string]string, len(acc))
+			var parts []string
+			for _, k := range keys {
+				copyAcc[k] = acc[k]
+				parts = append(parts, acc[k])
+			}
+			result = append(result, forEachInstance{
+				key:    strings.Join(parts, "_"),
+				params: copyAcc,
+			})
+			return
+		}
+		for _, v := range vals[depth] {
+			acc[keys[depth]] = v
+			walk(depth+1, acc)
+		}
+	}
+	walk(0, make(map[string]string, len(keys)))
+	return result
+}
+
+// buildDeferredInstance clones a task def into an instance-
+// ready shape with {{var}} references substituted from the
+// resolved for_each params. Minimal — only touches the fields
+// the materializer persists.
+func buildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInstance, run *enjuYaml.Run) enjuYaml.TaskInstance {
+	ti := enjuYaml.TaskInstance{
+		TaskDef:     *def,
+		InstanceKey: inst.key,
+		Params:      inst.params,
+	}
+	ti.Prompt = template.ResolveParams(def.Prompt, inst.params)
+	ti.UserPrompt = template.ResolveParams(def.UserPrompt, inst.params)
+	if ti.Requirements == nil {
+		ti.Requirements = run.Requirements
+	}
+	if ti.ResultType == "" {
+		ti.ResultType = "text"
+	}
+	if ti.Timeout == "" {
+		ti.Timeout = run.Defaults.Timeout
+	}
+	return ti
+}
+
+// marshalParams serializes a resolved for_each param map for
+// storage in tasks.instance_params.
+func marshalParams(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // and are untouched. Merge points reachable from both sides stay
 // alive because the winning path still reaches them.
 //
@@ -2439,6 +3156,9 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(result.CrossRunReaders) > 0 {
 		resp["artifact_readers"] = result.CrossRunReaders
+	}
+	if len(result.Dematerialized) > 0 {
+		resp["dematerialized"] = result.Dematerialized
 	}
 	if len(result.Rollbacks) > 0 {
 		rbView := make([]map[string]interface{}, 0, len(result.Rollbacks))

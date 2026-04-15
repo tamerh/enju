@@ -1783,6 +1783,53 @@ func (s *Store) ListTasksReadingArtifact(projectID int64, path string, acceptedO
 	return scanTasks(rows)
 }
 
+// DeleteTasksByDefInRun removes every task row in the given
+// run whose task_def_id matches. Used by the Phase J.1
+// dynamic for_each materializer to clean up stale instances
+// before re-materializing after an upstream invalidation +
+// re-accept with a different output list. Also removes any
+// associated task_claims rows so the re-materialization
+// starts from a clean slate.
+func (s *Store) DeleteTasksByDefInRun(runID int64, defID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Find the affected task IDs first so we can also delete
+	// their task_claims rows (foreign-key-style cleanup even
+	// though SQLite isn't enforcing it here).
+	rows, err := tx.Query(
+		`SELECT id FROM tasks WHERE run_id = ? AND task_def_id = ?`,
+		runID, defID,
+	)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := tx.Exec(`DELETE FROM task_claims WHERE task_id = ?`, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM tasks WHERE run_id = ? AND task_def_id = ?`,
+		runID, defID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // DeleteArtifact removes an artifact's index row by (project_id, path).
 // Used by the rollback path when an invalidated task was the file's
 // first writer — the artifact stops existing entirely. Git history

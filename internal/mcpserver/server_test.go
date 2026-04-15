@@ -224,6 +224,7 @@ func TestSubmitReviewPreValidationBlocksGit(t *testing.T) {
 				"some review comment",
 				nil,
 				nil,
+				nil,
 				tc.decision,
 				"", // option (non-vote task)
 			)

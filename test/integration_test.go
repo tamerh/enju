@@ -4399,5 +4399,594 @@ tasks:
 	}
 }
 
+// TestDynamicForEachMaterializes — Phase J.1 end-to-end:
+// submit a run with dynamic for_each, accept the upstream
+// with a concrete list<string> output, and verify that the
+// deferred downstream expands into N real task rows the
+// scheduler promotes to READY. Also covers the transitively-
+// deferred singleton ("synthesize") which should materialize
+// in the same pass with depends_on listing every newly-
+// created instance.
+func TestDynamicForEachMaterializes(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	projectID := s.createTestProject()
+	yamlContent := `name: "Dynamic fan-out"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List 3 candidate genes."
+    outputs:
+      gene_symbols:
+        description: "Genes to analyze."
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Analyze {{gene}}"
+
+  - id: synthesize
+    action: answer
+    prompt: "Combine: {{analyze.content}}"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+	})
+	seq, _ := resp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+
+	// Before the upstream submits, only discover should exist
+	// as a task row. analyze/synthesize are deferred.
+	beforeTasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if len(beforeTasks) != 1 {
+		t.Fatalf("expected 1 task (discover) before materialization, got %d: %v",
+			len(beforeTasks), beforeTasks)
+	}
+
+	// Claim + submit discover with a 3-gene output list. The
+	// coordinator should materialize 3 analyze instances +
+	// 1 synthesize task in response to the accept.
+	s.claim("discover", alice)
+	fullTaskID := s.taskID("discover")
+	resultDir := mcpgit.ResultDir(projectID, int(seq), "", "discover")
+	remoteURL := s.remoteFor(projectID)
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		t.Fatalf("open project: %v", err)
+	}
+	proj.Lock()
+	writeRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:      fullTaskID,
+		Username:    "alice",
+		AuthorName:  "Alice",
+		AuthorEmail: "alice@test",
+		Files: []mcpgit.FileWrite{
+			{
+				RepoRelPath: filepath.Join(resultDir, "result.md"),
+				Content:     []byte("BRCA1\nTP53\nEGFR"),
+			},
+			{
+				RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+				Content:     []byte(`{"task_def_id":"discover"}`),
+			},
+		},
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("fat-client submit: %v", err)
+	}
+
+	// Report with output_lists — the coordinator reads this
+	// to resolve the deferred for_each.
+	submitResp := s.post("/api/v1/tasks/"+fullTaskID+"/result", map[string]interface{}{
+		"commit_sha":  writeRes.CommitSHA,
+		"result_path": resultDir,
+		"output_lists": map[string]interface{}{
+			"gene_symbols": []interface{}{"BRCA1", "TP53", "EGFR"},
+		},
+	})
+	if status, _ := submitResp["status"].(string); status != "accepted" {
+		t.Fatalf("expected accepted, got: %v", submitResp)
+	}
+
+	// Now the run should contain discover + 3 analyze
+	// instances + 1 synthesize.
+	afterTasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if len(afterTasks) != 5 {
+		t.Errorf("expected 5 tasks after materialization, got %d: %v",
+			len(afterTasks), afterTasks)
+	}
+	byDef := map[string]int{}
+	byID := map[string]map[string]interface{}{}
+	for _, raw := range afterTasks {
+		tk, _ := raw.(map[string]interface{})
+		def, _ := tk["task_def_id"].(string)
+		id, _ := tk["id"].(string)
+		byDef[def]++
+		byID[id] = tk
+	}
+	if byDef["analyze"] != 3 {
+		t.Errorf("expected 3 analyze instances, got %d", byDef["analyze"])
+	}
+	if byDef["synthesize"] != 1 {
+		t.Errorf("expected 1 synthesize task, got %d", byDef["synthesize"])
+	}
+
+	// Each analyze instance should have the gene value
+	// substituted into its prompt.
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, int(seq))
+	expectedPrompts := map[string]string{
+		runPrefix + "BRCA1:analyze": "Analyze BRCA1",
+		runPrefix + "TP53:analyze":  "Analyze TP53",
+		runPrefix + "EGFR:analyze":  "Analyze EGFR",
+	}
+	for id, want := range expectedPrompts {
+		tk, ok := byID[id]
+		if !ok {
+			t.Errorf("missing expected analyze instance %q", id)
+			continue
+		}
+		got, _ := tk["prompt"].(string)
+		if got != want {
+			t.Errorf("%s prompt: got %q, want %q", id, got, want)
+		}
+		state, _ := tk["state"].(string)
+		if state != "ready" {
+			t.Errorf("%s state: got %q, want 'ready'", id, state)
+		}
+	}
+
+	// Synthesize should be PENDING with depends_on listing
+	// all three analyze instances.
+	synthID := runPrefix + "synthesize"
+	synth, ok := byID[synthID]
+	if !ok {
+		t.Fatal("missing synthesize task")
+	}
+	synthState, _ := synth["state"].(string)
+	if synthState != "pending" {
+		t.Errorf("synthesize state: got %q, want 'pending'", synthState)
+	}
+}
+
+// TestDynamicForEachPerInstanceReviewChain — Phase J.1
+// regression test for the per-instance review bug. An
+// analyze task fans out dynamically, and a review task
+// declared with `reviews: analyze` and the same dynamic
+// for_each should produce one review per analyze instance,
+// each bound to its matching analyze:GENE (not the generic
+// task_def_id). The review should be PENDING until its
+// target analyze instance accepts — not claimable on
+// creation.
+func TestDynamicForEachPerInstanceReviewChain(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	projectID := s.createTestProject()
+	yamlContent := `name: "Dynamic review chain"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List 2 genes."
+    outputs:
+      gene_symbols:
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Analyze {{gene}}"
+
+  - id: check
+    action: review
+    reviews: analyze
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Is the analysis of {{gene}} accurate?"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+	})
+	seq, _ := resp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+
+	s.claim("discover", alice)
+	fullTaskID := s.taskID("discover")
+	resultDir := mcpgit.ResultDir(projectID, int(seq), "", "discover")
+	remoteURL := s.remoteFor(projectID)
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		t.Fatalf("open project: %v", err)
+	}
+	proj.Lock()
+	writeRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:      fullTaskID,
+		Username:    "alice",
+		AuthorName:  "Alice",
+		AuthorEmail: "alice@test",
+		Files: []mcpgit.FileWrite{
+			{
+				RepoRelPath: filepath.Join(resultDir, "result.md"),
+				Content:     []byte("BRCA1\nMYC"),
+			},
+			{
+				RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+				Content:     []byte(`{"task_def_id":"discover"}`),
+			},
+		},
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("fat-client submit: %v", err)
+	}
+	s.post("/api/v1/tasks/"+fullTaskID+"/result", map[string]interface{}{
+		"commit_sha":  writeRes.CommitSHA,
+		"result_path": resultDir,
+		"output_lists": map[string]interface{}{
+			"gene_symbols": []interface{}{"BRCA1", "MYC"},
+		},
+	})
+
+	// After materialization the run should contain:
+	//   discover (accepted), analyze:BRCA1 (ready),
+	//   analyze:MYC (ready), check:BRCA1 (pending),
+	//   check:MYC (pending).
+	tasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	byID := map[string]map[string]interface{}{}
+	for _, raw := range tasks {
+		tk, _ := raw.(map[string]interface{})
+		id, _ := tk["id"].(string)
+		byID[id] = tk
+	}
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, int(seq))
+
+	for _, gene := range []string{"BRCA1", "MYC"} {
+		analyzeID := runPrefix + gene + ":analyze"
+		checkID := runPrefix + gene + ":check"
+
+		analyze, ok := byID[analyzeID]
+		if !ok {
+			t.Errorf("missing %s", analyzeID)
+			continue
+		}
+		if state, _ := analyze["state"].(string); state != "ready" {
+			t.Errorf("%s state: got %q, want ready", analyzeID, state)
+		}
+
+		check, ok := byID[checkID]
+		if !ok {
+			t.Errorf("missing %s", checkID)
+			continue
+		}
+		// The core regression: check should be PENDING
+		// waiting on its analyze sibling, NOT READY /
+		// claimable on creation.
+		if state, _ := check["state"].(string); state != "pending" {
+			t.Errorf("%s state: got %q, want pending (should wait on %s)",
+				checkID, state, analyzeID)
+		}
+		// The reviews_target should be the instance-matched
+		// full ID, not the unscoped task_def_id.
+		if rt, _ := check["reviews_target"].(string); rt != analyzeID {
+			t.Errorf("%s reviews_target: got %q, want %q",
+				checkID, rt, analyzeID)
+		}
+		// Depends_on is serialized as a comma-separated
+		// string in the task response. Look for the matching
+		// analyze instance in that list.
+		depsStr, _ := check["depends_on"].(string)
+		found := false
+		for _, d := range strings.Split(depsStr, ",") {
+			if strings.TrimSpace(d) == analyzeID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s depends_on: want %q, got %q", checkID, analyzeID, depsStr)
+		}
+	}
+}
+
+// TestDynamicForEachInvalidationCascade — Phase J.1 step 5.
+// Invalidate the discover task after its accept has
+// materialized analyze + check instances. The expected
+// behavior:
+//   1. discover bounces back to READY.
+//   2. The materialized analyze/check instances are cleaned
+//      up (or flipped to PENDING and then re-materialized on
+//      re-accept).
+//   3. Re-claiming discover and submitting a DIFFERENT gene
+//      list produces fresh instances matching the new list,
+//      with no stale rows from the first round.
+func TestDynamicForEachInvalidationCascade(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	projectID := s.createTestProject()
+	yamlContent := `name: "Invalidation test"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List genes."
+    outputs:
+      gene_symbols:
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Analyze {{gene}}"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+	})
+	seq, _ := resp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+
+	// Round 1: discover → accept → materialize {BRCA1, TP53}.
+	s.claim("discover", alice)
+	s.submitDiscoverWithList(t, projectID, int(seq), []string{"BRCA1", "TP53"})
+
+	// Confirm 2 analyze instances exist.
+	round1 := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if got := countTasksByDef(round1, "analyze"); got != 2 {
+		t.Fatalf("round 1: expected 2 analyze instances, got %d", got)
+	}
+
+	// Invalidate discover.
+	invalResp := s.post("/api/v1/tasks/"+s.taskID("discover")+"/invalidate", map[string]string{
+		"reason": "re-run with different gene list",
+	})
+	if status, _ := invalResp["status"].(string); status != "invalidated" {
+		t.Fatalf("invalidation failed: %v", invalResp)
+	}
+
+	// Round 2: re-claim discover, re-submit with a DIFFERENT
+	// list. After accept, the run should have fresh analyze
+	// instances for the new gene list and NO stale instances
+	// from round 1.
+	s.claim("discover", alice)
+	s.submitDiscoverWithList(t, projectID, int(seq), []string{"EGFR", "MYC", "KRAS"})
+
+	round2 := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if got := countTasksByDef(round2, "analyze"); got != 3 {
+		t.Errorf("round 2: expected 3 analyze instances (EGFR, MYC, KRAS), got %d", got)
+	}
+	// Verify no stale BRCA1/TP53 instances from round 1.
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, int(seq))
+	for _, staleGene := range []string{"BRCA1", "TP53"} {
+		staleID := runPrefix + staleGene + ":analyze"
+		for _, raw := range round2 {
+			tk, _ := raw.(map[string]interface{})
+			if id, _ := tk["id"].(string); id == staleID {
+				t.Errorf("stale instance from round 1 still present: %s", staleID)
+			}
+		}
+	}
+	// Verify the new instances are present and READY.
+	for _, gene := range []string{"EGFR", "MYC", "KRAS"} {
+		wantID := runPrefix + gene + ":analyze"
+		found := false
+		for _, raw := range round2 {
+			tk, _ := raw.(map[string]interface{})
+			if id, _ := tk["id"].(string); id == wantID {
+				found = true
+				if state, _ := tk["state"].(string); state != "ready" {
+					t.Errorf("%s state: got %q, want ready", wantID, state)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected new instance %s, not found", wantID)
+		}
+	}
+}
+
+// submitDiscoverWithList is a test helper that does the
+// full fat-client submit + report dance for a `discover`-
+// style task with a list<string> output.
+func (s *testServer) submitDiscoverWithList(t *testing.T, projectID int64, runSeq int, genes []string) {
+	t.Helper()
+	fullTaskID := s.taskID("discover")
+	resultDir := mcpgit.ResultDir(projectID, runSeq, "", "discover")
+	remoteURL := s.remoteFor(projectID)
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		t.Fatalf("open project: %v", err)
+	}
+	proj.Lock()
+	writeRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:      fullTaskID,
+		Username:    "alice",
+		AuthorName:  "Alice",
+		AuthorEmail: "alice@test",
+		Files: []mcpgit.FileWrite{
+			{
+				RepoRelPath: filepath.Join(resultDir, "result.md"),
+				Content:     []byte(strings.Join(genes, "\n")),
+			},
+			{
+				RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+				Content:     []byte(`{"task_def_id":"discover"}`),
+			},
+		},
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("fat-client submit: %v", err)
+	}
+	list := make([]interface{}, len(genes))
+	for i, g := range genes {
+		list[i] = g
+	}
+	resp := s.post("/api/v1/tasks/"+fullTaskID+"/result", map[string]interface{}{
+		"commit_sha":  writeRes.CommitSHA,
+		"result_path": resultDir,
+		"output_lists": map[string]interface{}{
+			"gene_symbols": list,
+		},
+	})
+	if status, _ := resp["status"].(string); status != "accepted" {
+		t.Fatalf("discover submit: %v", resp)
+	}
+}
+
+func countTasksByDef(tasks []interface{}, defID string) int {
+	n := 0
+	for _, raw := range tasks {
+		tk, _ := raw.(map[string]interface{})
+		if id, _ := tk["task_def_id"].(string); id == defID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDynamicForEachEagerDematerialization — after the
+// review-chain bug was fixed, the remaining invalidation
+// gap was that invalidating the dynamic source (discover)
+// left all its materialized descendants in their post-
+// submit state, still claimable. Expected behavior: the
+// descendants should be DELETED (dematerialized) so a
+// citizen can't claim a task whose upstream is invalidated.
+func TestDynamicForEachEagerDematerialization(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	projectID := s.createTestProject()
+	yamlContent := `name: "Dematerialization test"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List genes."
+    outputs:
+      gene_symbols:
+        format: list<string>
+
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Analyze {{gene}}"
+
+  - id: check
+    action: review
+    reviews: analyze
+    for_each:
+      gene: "{{discover.gene_symbols}}"
+    prompt: "Check {{gene}}"
+
+  - id: synthesize
+    action: answer
+    prompt: "Combine: {{analyze.content}}"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+	})
+	seq, _ := resp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+
+	// Submit discover with 2 genes → should materialize
+	// 2 analyze + 2 check + 1 synthesize = 5 descendants.
+	s.claim("discover", alice)
+	s.submitDiscoverWithList(t, projectID, int(seq), []string{"BRCA1", "TP53"})
+
+	postMaterializeTasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if len(postMaterializeTasks) != 6 {
+		t.Fatalf("expected 6 tasks (discover + 2 analyze + 2 check + 1 synthesize), got %d",
+			len(postMaterializeTasks))
+	}
+
+	// Invalidate discover. Dynamic descendants should be
+	// deleted, not flipped to PENDING.
+	invalResp := s.post("/api/v1/tasks/"+s.taskID("discover")+"/invalidate", map[string]string{
+		"reason": "test dematerialization",
+	})
+	if status, _ := invalResp["status"].(string); status != "invalidated" {
+		t.Fatalf("invalidation failed: %v", invalResp)
+	}
+
+	// The response should list 5 dematerialized IDs.
+	dematerialized, _ := invalResp["dematerialized"].([]interface{})
+	if len(dematerialized) != 5 {
+		t.Errorf("expected 5 dematerialized, got %d: %v",
+			len(dematerialized), dematerialized)
+	}
+
+	// Post-invalidation, only discover should remain and it
+	// should be READY.
+	postInvalTasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	if len(postInvalTasks) != 1 {
+		t.Errorf("expected 1 task (discover) after invalidation, got %d", len(postInvalTasks))
+	}
+	if len(postInvalTasks) > 0 {
+		tk, _ := postInvalTasks[0].(map[string]interface{})
+		defID, _ := tk["task_def_id"].(string)
+		state, _ := tk["state"].(string)
+		if defID != "discover" || state != "ready" {
+			t.Errorf("expected discover/ready, got %s/%s", defID, state)
+		}
+	}
+
+	// Critical: stale descendants should not be findable
+	// via GetTask either — they've been deleted.
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, int(seq))
+	for _, staleID := range []string{
+		runPrefix + "BRCA1:analyze",
+		runPrefix + "TP53:analyze",
+		runPrefix + "BRCA1:check",
+		runPrefix + "TP53:check",
+		runPrefix + "synthesize",
+	} {
+		resp := s.get("/api/v1/tasks/" + staleID)
+		if errMsg, _ := resp["error"].(string); errMsg == "" {
+			t.Errorf("stale task %s still exists after invalidation", staleID)
+		}
+	}
+
+	// Re-claim discover and re-submit with a DIFFERENT
+	// list. Fresh instances should materialize matching the
+	// new list.
+	s.claim("discover", alice)
+	s.submitDiscoverWithList(t, projectID, int(seq), []string{"EGFR"})
+
+	reMatTasks := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, int(seq)))
+	// discover + 1 analyze + 1 check + 1 synthesize = 4
+	if len(reMatTasks) != 4 {
+		t.Errorf("expected 4 tasks after re-submit with 1 gene, got %d", len(reMatTasks))
+	}
+}
+
 // Suppress unused import
 var _ = enjuYaml.Parse

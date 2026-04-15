@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -634,31 +635,82 @@ func formatOutputsSchema(outputsRaw string) string {
 		return ""
 	}
 
+	// Collect (name, description, file, format) tuples in
+	// stable sort order so the example JSON and the field
+	// listing always agree.
+	type outField struct {
+		name   string
+		desc   string
+		file   string
+		format string
+	}
+	fields := make([]outField, 0, len(outputs))
+	for name, rawSpec := range outputs {
+		f := outField{name: name}
+		switch v := rawSpec.(type) {
+		case string:
+			f.desc = v
+		case map[string]interface{}:
+			f.desc, _ = v["Description"].(string)
+			f.file, _ = v["File"].(string)
+			f.format, _ = v["Format"].(string)
+		}
+		fields = append(fields, f)
+	}
+	sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+
 	var b strings.Builder
 	b.WriteString("\n── Expected Outputs ─────────────────────────\n")
 	b.WriteString("This task has named outputs. Submit using outputs_json:\n\n")
-	for name, rawSpec := range outputs {
-		switch v := rawSpec.(type) {
-		case string:
-			b.WriteString(fmt.Sprintf("  %s — %s\n", name, v))
-		case map[string]interface{}:
-			desc, _ := v["Description"].(string)
-			file, _ := v["File"].(string)
-			format, _ := v["Format"].(string)
-			line := fmt.Sprintf("  %s — %s", name, desc)
-			if file != "" {
-				line += fmt.Sprintf("  →  %s", file)
-			}
-			if format != "" {
-				line += fmt.Sprintf(" (%s)", format)
-			}
-			b.WriteString(line + "\n")
+	for _, f := range fields {
+		// Start with the name, then add description if
+		// present (prefixed with em-dash), then file spec
+		// with arrow, then type in parens. The previous
+		// implementation always emitted the em-dash even
+		// when the description was empty, which produced
+		// `name —  (list<string>)` with a double space.
+		line := "  " + f.name
+		if f.desc != "" {
+			line += " — " + f.desc
 		}
+		if f.file != "" {
+			line += "  →  " + f.file
+		}
+		if f.format != "" {
+			line += " (" + f.format + ")"
+		}
+		b.WriteString(line + "\n")
+	}
+	// Build a type-aware example JSON object using the
+	// task's actual output names so the LLM gets something
+	// directly copy-pasteable instead of
+	// output_name_1/output_name_2 placeholders.
+	var pairs []string
+	for _, f := range fields {
+		pairs = append(pairs, fmt.Sprintf("%q: %s", f.name, exampleValueForFormat(f.format)))
 	}
 	b.WriteString("\nExample:\n")
-	b.WriteString("  outputs_json='{\"output_name_1\":\"content here\",\"output_name_2\":\"more content\"}'\n")
+	b.WriteString("  outputs_json='{" + strings.Join(pairs, ", ") + "}'\n")
 	b.WriteString("────────────────────────────────────────────\n")
 	return b.String()
+}
+
+// exampleValueForFormat returns a JSON-literal example value
+// matching the declared format. Used in the outputs_json
+// example so the LLM sees a shape-correct template instead
+// of a generic "content here" placeholder.
+func exampleValueForFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "list<string>":
+		return `["item1", "item2"]`
+	case "int", "integer":
+		return "42"
+	case "bool", "boolean":
+		return "true"
+	case "json":
+		return `{"key": "value"}`
+	}
+	return `"content here"`
 }
 
 func formatClaimResult(claimData []byte, inputsData []byte, viewer string) string {
@@ -897,18 +949,25 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	descendants, _ := result["descendants"].([]interface{})
 	readers, _ := result["artifact_readers"].([]interface{})
 	rollbacks, _ := result["artifacts_rolled_back"].([]interface{})
+	dematerialized, _ := result["dematerialized"].([]interface{})
 
 	b.WriteString(fmt.Sprintf("✓ Invalidated: %s\n", taskID))
 	if reason != "" {
 		b.WriteString(fmt.Sprintf("  Reason: %s\n", reason))
 	}
 
-	// Compose a summary line that distinguishes the two cascade
-	// categories so the user can see at a glance why each task was
-	// affected.
+	// Compose a summary line that distinguishes the cascade
+	// categories so the user can see at a glance why each
+	// task was affected. Dynamic-for_each descendants are
+	// listed separately because they were DELETED, not just
+	// flipped to PENDING — the caller may want to know that
+	// those tasks ceased to exist.
 	b.WriteString(fmt.Sprintf("\n%d task(s) changed state (target", int(changed)))
 	if len(descendants) > 0 {
 		b.WriteString(fmt.Sprintf(" + %d task descendant(s)", len(descendants)))
+	}
+	if len(dematerialized) > 0 {
+		b.WriteString(fmt.Sprintf(" + %d dynamic descendant(s) dematerialized", len(dematerialized)))
 	}
 	if len(readers) > 0 {
 		b.WriteString(fmt.Sprintf(" + %d artifact-reader descendant(s)", len(readers)))
@@ -919,6 +978,18 @@ func formatInvalidateResult(data []byte, taskID string) string {
 		b.WriteString("\nCascaded to PENDING (will re-promote to READY as upstreams re-complete):\n")
 		for _, d := range descendants {
 			b.WriteString(fmt.Sprintf("  ↩ %v\n", d))
+		}
+	}
+
+	// Dynamic descendants: they were materialized from the
+	// invalidated source's output list and have been deleted
+	// entirely. On re-accept the source will re-materialize
+	// fresh instances matching whatever the new list
+	// contains.
+	if len(dematerialized) > 0 {
+		b.WriteString("\nDematerialized (deleted — will be re-created on re-accept):\n")
+		for _, d := range dematerialized {
+			b.WriteString(fmt.Sprintf("  ✗ %v\n", d))
 		}
 	}
 

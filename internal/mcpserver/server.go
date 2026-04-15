@@ -1543,10 +1543,44 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(invalidDecisionMessage(decision)), nil
 	}
 
+	// Parse outputs_json into two buckets: plain string
+	// values (the existing named-outputs path, one file per
+	// output) and list<string> values (Phase J.1 — routed to
+	// the coordinator so dynamic for_each can materialize
+	// downstream instances from the resolved list). Accepting
+	// interface{} here keeps the tool's input JSON shape
+	// natural — a list param is a JSON array, a string param
+	// is a JSON string.
 	var outputs map[string]string
+	var outputLists map[string][]string
 	if outputsJSON != "" {
-		if err := json.Unmarshal([]byte(outputsJSON), &outputs); err != nil {
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(outputsJSON), &raw); err != nil {
 			return mcp.NewToolResultError("outputs_json must be valid JSON object: " + err.Error()), nil
+		}
+		for name, v := range raw {
+			switch val := v.(type) {
+			case string:
+				if outputs == nil {
+					outputs = make(map[string]string)
+				}
+				outputs[name] = val
+			case []interface{}:
+				list := make([]string, 0, len(val))
+				for i, item := range val {
+					s, ok := item.(string)
+					if !ok {
+						return mcp.NewToolResultError(fmt.Sprintf("outputs_json[%q][%d]: list items must be strings", name, i)), nil
+					}
+					list = append(list, s)
+				}
+				if outputLists == nil {
+					outputLists = make(map[string][]string)
+				}
+				outputLists[name] = list
+			default:
+				return mcp.NewToolResultError(fmt.Sprintf("outputs_json[%q]: value must be a string or a list of strings", name)), nil
+			}
 		}
 	}
 	var artifacts map[string]string
@@ -1567,7 +1601,7 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, metaErr)), nil
 	}
 	if c.useFatClient(meta) {
-		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, artifacts, decision, option)
+		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, outputLists, artifacts, decision, option)
 	}
 
 	// Legacy coordinator-writes path.
@@ -1606,6 +1640,7 @@ func (c *apiClient) submitResultFatClient(
 	meta *taskMeta,
 	content string,
 	outputs map[string]string,
+	outputLists map[string][]string,
 	artifacts map[string]string,
 	decision string,
 	option string,
@@ -1720,6 +1755,23 @@ func (c *apiClient) submitResultFatClient(
 		})
 	}
 
+	// Phase J.1 — list<string> named outputs are stringified
+	// to newline-joined text for on-disk storage so the
+	// existing file-per-output path and downstream
+	// `{{task.field}}` template resolution keep working
+	// unchanged. The structured list value is separately
+	// carried to the coordinator via reportBody.output_lists
+	// so dynamic for_each materialization doesn't need to
+	// re-parse the git file.
+	if len(outputLists) > 0 {
+		if outputs == nil {
+			outputs = make(map[string]string, len(outputLists))
+		}
+		for name, list := range outputLists {
+			outputs[name] = strings.Join(list, "\n")
+		}
+	}
+
 	// Named outputs path: if the task declares an outputs schema
 	// with per-output `file:` specs, each output lands in its own
 	// file per the schema and metadata.json carries an
@@ -1816,6 +1868,13 @@ func (c *apiClient) submitResultFatClient(
 		// result.md, but the DB column is the authoritative
 		// source for {{task.responses}} rendering.
 		"content": content,
+	}
+	if len(outputLists) > 0 {
+		// Phase J.1 — carry list<string> named output
+		// values through to the coordinator so it can
+		// materialize dynamic for_each downstreams from
+		// the resolved lists.
+		reportBody["output_lists"] = outputLists
 	}
 	if decision != "" {
 		reportBody["decision"] = decision

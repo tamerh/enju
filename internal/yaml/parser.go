@@ -68,6 +68,87 @@ func (s *yamlStringList) UnmarshalYAML(value *yamlv3.Node) error {
 	return nil
 }
 
+// ForEachSource is the source of values for one for_each
+// variable. Exactly one of Values or Ref is populated.
+//
+// - Values:  a literal list from YAML (`gene: [BRCA1, TP53]`)
+// - Ref:     a template reference resolved at submit time
+//            (`gene: "{{discover.gene_symbols}}"`)
+//
+// Phase J.1 adds Ref to support dynamic fan-out — a task
+// whose for_each list comes from an upstream task's named
+// output. The author-facing YAML syntax is the same keyword
+// (`for_each:`) whether the values are static or dynamic;
+// only the per-variable shape (list vs scalar) changes.
+type ForEachSource struct {
+	Values []string
+	Ref    string
+}
+
+// ForEachMap is a map from for_each variable name to its
+// source. Supports a custom YAML unmarshaller so each
+// variable's value can be either a scalar template reference
+// or a literal list of strings.
+type ForEachMap map[string]ForEachSource
+
+// UnmarshalYAML splits each key's value into either a literal
+// list or a template reference scalar. Anything else is
+// rejected with a clear error.
+func (f *ForEachMap) UnmarshalYAML(node *yamlv3.Node) error {
+	if node.Kind != yamlv3.MappingNode {
+		return fmt.Errorf("for_each: must be a map of variable names to values")
+	}
+	out := make(ForEachMap, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		val := node.Content[i+1]
+		var src ForEachSource
+		switch val.Kind {
+		case yamlv3.ScalarNode:
+			src.Ref = strings.TrimSpace(val.Value)
+			if src.Ref == "" {
+				return fmt.Errorf("for_each %q: value is empty", key)
+			}
+		case yamlv3.SequenceNode:
+			if err := val.Decode(&src.Values); err != nil {
+				return fmt.Errorf("for_each %q: %w", key, err)
+			}
+		default:
+			return fmt.Errorf("for_each %q: must be a list of values or a template reference string", key)
+		}
+		out[key] = src
+	}
+	*f = out
+	return nil
+}
+
+// IsDynamic reports whether any for_each variable in the map
+// references an upstream task's output (deferred expansion).
+// A map where every source is a literal list is static and
+// can be expanded at parse time.
+func (f ForEachMap) IsDynamic() bool {
+	for _, src := range f {
+		if src.Ref != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// StaticValues returns a map[string][]string view of the
+// literal sources only, for callers that only need the
+// static data (e.g. the existing expansion code path).
+// Dynamic entries are omitted.
+func (f ForEachMap) StaticValues() map[string][]string {
+	out := make(map[string][]string, len(f))
+	for k, src := range f {
+		if src.Ref == "" {
+			out[k] = src.Values
+		}
+	}
+	return out
+}
+
 // OutputSpec describes a single named output.
 // Supports two YAML formats:
 //   outputs:
@@ -117,14 +198,19 @@ type TaskDef struct {
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
 	Config       map[string]interface{} `yaml:"config,omitempty"`
 
-	// ForEach expands a single task into N parallel instances. Mutually
-	// exclusive with the run-level for_each — a run either uses the
-	// run-level matrix form (every task expanded together) or declares
-	// for_each on individual tasks with singletons aggregating results.
-	// All tasks in the same run that declare for_each must share the
-	// same variables and values; differing task-level for_each blocks
-	// in the same run are rejected at parse time.
-	ForEach map[string][]string `yaml:"for_each,omitempty"`
+	// ForEach expands a single task into N parallel instances.
+	// Mutually exclusive with the run-level for_each — a run
+	// either uses the run-level matrix form or declares
+	// for_each on individual tasks with singletons aggregating.
+	// All tasks in the same run that declare task-level
+	// for_each must share the same variables and sources so
+	// downstream per-instance chaining works.
+	//
+	// Each variable's value can be a literal list (static) or
+	// a template reference like "{{upstream.field}}" (dynamic,
+	// Phase J.1). Dynamic tasks produce zero instances at
+	// parse time and materialize on upstream acceptance.
+	ForEach ForEachMap `yaml:"for_each,omitempty"`
 
 	// Artifact access (Phase C). Repo-relative paths under artifacts/.
 	// ReadsArtifacts can be inferred from {{artifact:path}} prompt
@@ -231,6 +317,13 @@ type ParsedRun struct {
 	// ExpandedTasks maps instance_key -> []TaskInstance for for_each expansion.
 	// If no for_each, there's a single instance with key "".
 	ExpandedTasks map[string][]TaskInstance
+	// DeferredTaskDefs lists task defs whose instances are
+	// not materialized at parse time because their for_each
+	// list (or a transitive upstream's) comes from a runtime
+	// value. The coordinator materializes these at submit
+	// time when the upstream providing the list accepts.
+	// Empty for runs with no dynamic for_each.
+	DeferredTaskDefs []DeferredTaskDef
 	// Warnings are non-fatal advisories raised during
 	// validation. Authors can still create the run; the
 	// coordinator logs and surfaces them in the creation
@@ -239,6 +332,32 @@ type ParsedRun struct {
 	// nothing), a for_each variable with only one value
 	// (equivalent to a singleton), etc.
 	Warnings []string
+}
+
+// DeferredTaskDef records a task def whose expansion (or
+// materialization) waits for an upstream task to accept.
+// Populated by buildTaskLevel when the run uses dynamic
+// for_each. Consumed at submit time to materialize instances.
+type DeferredTaskDef struct {
+	// TaskDefID is the task def awaiting materialization.
+	TaskDefID string
+	// ForEachRefs maps each dynamic for_each variable name
+	// to the upstream task ID and field it reads. Empty when
+	// this task is deferred transitively (downstream of a
+	// deferred task without its own dynamic for_each).
+	ForEachRefs map[string]ForEachRef
+	// TransitivelyDeferred is true when this task is
+	// deferred because one of its ancestors is deferred, not
+	// because it has its own dynamic for_each.
+	TransitivelyDeferred bool
+}
+
+// ForEachRef identifies an upstream task and one of its
+// named output fields. Populated from a parsed
+// "{{task.field}}" reference in a for_each variable source.
+type ForEachRef struct {
+	TaskID string
+	Field  string
 }
 
 // TaskInstance is a concrete task instance after for_each expansion.
@@ -460,7 +579,9 @@ func validate(p *Run) ([]string, error) {
 	}
 
 	// Validate run-level for_each shape (strict: no empty lists).
-	if err := validateForEachMap("run", p.ForEach); err != nil {
+	// Run-level for_each stays static-only in Phase J.1 —
+	// dynamic references are a task-level feature.
+	if err := validateForEachLiteralMap("run", p.ForEach); err != nil {
 		return nil, err
 	}
 
@@ -657,7 +778,7 @@ func validate(p *Run) ([]string, error) {
 	// weird DAG.
 	if hasTaskLevelForEach {
 		var firstID string
-		var firstFE map[string][]string
+		var firstFE ForEachMap
 		for i := range p.Tasks {
 			t := &p.Tasks[i]
 			if len(t.ForEach) == 0 {
@@ -669,7 +790,7 @@ func validate(p *Run) ([]string, error) {
 				continue
 			}
 			if !forEachEqual(firstFE, t.ForEach) {
-				return nil, fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and values", t.ID, firstID)
+				return nil, fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and sources", t.ID, firstID)
 			}
 		}
 	}
@@ -844,14 +965,74 @@ func validate(p *Run) ([]string, error) {
 		return nil, err
 	}
 
+	// Phase J.1 — validate dynamic for_each references. Each
+	// {{task.field}} in a for_each variable source must point
+	// at an existing task in this run, and that task must
+	// declare a named output of type list<string> with the
+	// matching field name. We do this AFTER the static
+	// validation passes so any errors land in a deterministic
+	// order.
+	if err := validateDynamicForEach(p, ids); err != nil {
+		return nil, err
+	}
+
 	return warnings, nil
 }
 
-// validateForEachMap rejects empty for_each variable lists. Each list
-// must have at least one value — an empty list silently produces zero
-// iterations and therefore zero tasks, which is almost always a bug in
-// the upstream process that generated the YAML.
-func validateForEachMap(scope string, fe map[string][]string) error {
+// validateDynamicForEach checks every dynamic for_each
+// variable: the upstream task exists, the upstream declares
+// the referenced output field, and the output is typed as
+// list<string>. Errors are phrased so the LLM can forward
+// them as natural-language feedback.
+func validateDynamicForEach(p *Run, taskIDs map[string]bool) error {
+	// Build a quick lookup of outputs per task def.
+	taskByID := make(map[string]*TaskDef, len(p.Tasks))
+	for i := range p.Tasks {
+		taskByID[p.Tasks[i].ID] = &p.Tasks[i]
+	}
+
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		if len(t.ForEach) == 0 || !t.ForEach.IsDynamic() {
+			continue
+		}
+		for name, src := range t.ForEach {
+			if src.Ref == "" {
+				continue
+			}
+			upstreamID, field, ok := parseForEachRef(src.Ref)
+			if !ok {
+				return fmt.Errorf("task %q: for_each variable %q: value %q is not a valid template reference (expected \"{{upstream_task.field_name}}\")", t.ID, name, src.Ref)
+			}
+			upstream, found := taskByID[upstreamID]
+			if !found {
+				return fmt.Errorf("task %q: for_each variable %q references unknown upstream task %q", t.ID, name, upstreamID)
+			}
+			if upstreamID == t.ID {
+				return fmt.Errorf("task %q: for_each variable %q references itself — a task cannot fan out over its own output", t.ID, name)
+			}
+			outSpec, hasOutput := upstream.Outputs[field]
+			if !hasOutput {
+				return fmt.Errorf("task %q: for_each variable %q references {{%s.%s}}, but task %q does not declare an output field %q", t.ID, name, upstreamID, field, upstreamID, field)
+			}
+			// OutputSpec format can be either a plain string
+			// description (simple form) or the full object
+			// with a Format field. Phase J.1 requires the full
+			// object form with format: list<string> so we can
+			// tell the coordinator it's iterable.
+			format := strings.ToLower(strings.TrimSpace(outSpec.Format))
+			if format != "list<string>" {
+				return fmt.Errorf("task %q: for_each variable %q references {{%s.%s}}, but that output must be declared with format: list<string> (got %q) — dynamic for_each needs a typed list source", t.ID, name, upstreamID, field, outSpec.Format)
+			}
+		}
+	}
+	return nil
+}
+
+// validateForEachLiteralMap rejects empty for_each variable
+// lists. Used for run-level for_each (which is always static)
+// and for literal task-level variables after unpacking.
+func validateForEachLiteralMap(scope string, fe map[string][]string) error {
 	for name, values := range fe {
 		if len(values) == 0 {
 			return fmt.Errorf("%s for_each: variable %q has an empty list — declare at least one value or remove the variable", scope, name)
@@ -865,23 +1046,110 @@ func validateForEachMap(scope string, fe map[string][]string) error {
 	return nil
 }
 
-// forEachEqual returns true if two for_each maps declare the same
-// variables with the same ordered value lists. Used to enforce that all
-// task-level for_each blocks in one run share the same iteration space.
-func forEachEqual(a, b map[string][]string) bool {
+// validateForEachMap validates a task-level ForEachMap. Each
+// variable's source is either a literal list (must be
+// non-empty) or a template reference scalar (must point at a
+// known upstream task's list<string> output — the upstream
+// check happens later in validateTemplateReferences once the
+// task ID table is built).
+func validateForEachMap(scope string, fe ForEachMap) error {
+	for name, src := range fe {
+		switch {
+		case src.Ref != "":
+			// Reference shape is checked by extractForEachRef
+			// below so we fail at parse time on
+			// non-template-reference scalars.
+			if _, _, ok := parseForEachRef(src.Ref); !ok {
+				return fmt.Errorf("%s for_each: variable %q: %q is not a template reference — expected \"{{task.field}}\" pointing at an upstream list output", scope, name, src.Ref)
+			}
+		case len(src.Values) == 0:
+			return fmt.Errorf("%s for_each: variable %q has an empty list — declare at least one value, a \"{{upstream.field}}\" reference, or remove the variable", scope, name)
+		default:
+			for i, v := range src.Values {
+				if v == "" {
+					return fmt.Errorf("%s for_each: variable %q has an empty string at index %d", scope, name, i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// collectDeferred builds the DeferredTaskDefs slice for the
+// parsed run. For each task def in the deferred set, records
+// whether it has its own dynamic for_each (directly deferred)
+// or was pulled in transitively, and extracts the
+// upstream-output references from its for_each block.
+func collectDeferred(p *Run, deferred map[string]bool) []DeferredTaskDef {
+	if len(deferred) == 0 {
+		return nil
+	}
+	// Preserve task def order for reproducibility.
+	out := make([]DeferredTaskDef, 0, len(deferred))
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		if !deferred[t.ID] {
+			continue
+		}
+		entry := DeferredTaskDef{TaskDefID: t.ID}
+		if len(t.ForEach) > 0 && t.ForEach.IsDynamic() {
+			entry.ForEachRefs = make(map[string]ForEachRef, len(t.ForEach))
+			for name, src := range t.ForEach {
+				if src.Ref == "" {
+					continue
+				}
+				taskID, field, ok := parseForEachRef(src.Ref)
+				if !ok {
+					continue // validation should have caught this
+				}
+				entry.ForEachRefs[name] = ForEachRef{TaskID: taskID, Field: field}
+			}
+		} else {
+			entry.TransitivelyDeferred = true
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// parseForEachRef extracts (taskID, field) from a template
+// reference string like "{{discover.gene_symbols}}". Returns
+// the parts plus an ok flag. A non-reference scalar (or a
+// bare "{{param}}" with no dot) returns ok=false.
+func parseForEachRef(s string) (taskID, field string, ok bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{{") || !strings.HasSuffix(s, "}}") {
+		return "", "", false
+	}
+	inner := strings.TrimSpace(s[2 : len(s)-2])
+	dot := strings.Index(inner, ".")
+	if dot <= 0 || dot == len(inner)-1 {
+		return "", "", false
+	}
+	return inner[:dot], inner[dot+1:], true
+}
+
+// forEachEqual returns true if two ForEachMaps declare the
+// same variables with matching sources. For literal sources,
+// the value lists must match in order. For reference sources,
+// the refs must match exactly.
+func forEachEqual(a, b ForEachMap) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for k, va := range a {
-		vb, ok := b[k]
+	for k, sa := range a {
+		sb, ok := b[k]
 		if !ok {
 			return false
 		}
-		if len(va) != len(vb) {
+		if sa.Ref != sb.Ref {
 			return false
 		}
-		for i := range va {
-			if va[i] != vb[i] {
+		if len(sa.Values) != len(sb.Values) {
+			return false
+		}
+		for i := range sa.Values {
+			if sa.Values[i] != sb.Values[i] {
 				return false
 			}
 		}
@@ -930,14 +1198,22 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
-		// Variables visible to this task: run-level OR its own task-level.
-		var visible map[string][]string
+		// Variables visible to this task: run-level OR its own
+		// task-level. For validation we only need the NAMES —
+		// the source (static list vs dynamic ref) doesn't
+		// change visibility; a dynamic for_each variable is
+		// still a valid placeholder the prompt can reference.
+		visible := make(map[string]bool)
 		var scopeLabel string
 		if len(runScope) > 0 {
-			visible = runScope
+			for name := range runScope {
+				visible[name] = true
+			}
 			scopeLabel = "run"
 		} else if len(t.ForEach) > 0 {
-			visible = t.ForEach
+			for name := range t.ForEach {
+				visible[name] = true
+			}
 			scopeLabel = "task:" + t.ID
 			if taskScopeReferenced[scopeLabel] == nil {
 				taskScopeReferenced[scopeLabel] = make(map[string]bool)
@@ -1156,22 +1432,79 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 // without for_each become singletons. Dependency wiring depends on
 // both sides being expanded (per-iteration binding) or either side
 // being a singleton (fan-in / fan-out).
+//
+// Phase J.1 adds support for dynamic for_each: a task whose for_each
+// list comes from an upstream task's named output. When the shared
+// for_each is dynamic, tasks that declare it produce zero instances
+// at parse time — they're "deferred" until the upstream accepts and
+// the coordinator materializes instances based on the resolved list.
+// Task defs that depend on a deferred task are transitively deferred
+// so their depends_on can be wired correctly at materialization time.
 func buildTaskLevel(p *Run) (*ParsedRun, error) {
 	// Find the shared iteration space (already validated to be
 	// uniform across all tasks that declare for_each).
-	var shared map[string][]string
+	var shared ForEachMap
 	for i := range p.Tasks {
 		if len(p.Tasks[i].ForEach) > 0 {
 			shared = p.Tasks[i].ForEach
 			break
 		}
 	}
-	iterations := expandForEach(shared)
+
+	// Deferred-task detection (Phase J.1).
+	//
+	// Any task with a dynamic for_each variable is deferred; so is
+	// any task that depends (transitively) on a deferred task def.
+	// Deferred tasks don't get instances materialized at parse time;
+	// the coordinator creates them when the upstream providing the
+	// dynamic list accepts (handled in step 4 of Phase J.1).
+	deferred := make(map[string]bool)
+	sharedIsDynamic := shared != nil && shared.IsDynamic()
+	if sharedIsDynamic {
+		for i := range p.Tasks {
+			if len(p.Tasks[i].ForEach) > 0 {
+				deferred[p.Tasks[i].ID] = true
+			}
+		}
+		// Transitively mark any task whose dependencies touch a
+		// deferred task def. We walk repeatedly until the set is
+		// stable — simple but adequate for a one-run DAG.
+		for {
+			changed := false
+			for i := range p.Tasks {
+				t := &p.Tasks[i]
+				if deferred[t.ID] {
+					continue
+				}
+				allDeps := template.MergeDependencies(t.DependsOn, t.Prompt)
+				for _, dep := range allDeps {
+					if deferred[dep] {
+						deferred[t.ID] = true
+						changed = true
+						break
+					}
+				}
+			}
+			if !changed {
+				break
+			}
+		}
+	}
+
+	var iterations []forEachInstance
+	if sharedIsDynamic {
+		iterations = nil // deferred tasks produce zero instances
+	} else if len(shared) == 0 {
+		iterations = expandForEach(nil)
+	} else {
+		iterations = expandForEach(shared.StaticValues())
+	}
 
 	result := &ParsedRun{
-		Run:           p,
-		DAG:           dag.New(),
-		ExpandedTasks: make(map[string][]TaskInstance),
+		Run:              p,
+		DAG:              dag.New(),
+		ExpandedTasks:    make(map[string][]TaskInstance),
+		DeferredTaskDefs: collectDeferred(p, deferred),
 	}
 
 	taskIDs := make(map[string]bool)
@@ -1211,6 +1544,12 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 	}
 
 	for _, taskDef := range p.Tasks {
+		// Deferred task defs produce zero instances at parse
+		// time. The coordinator materializes them when the
+		// upstream providing their for_each list accepts.
+		if deferred[taskDef.ID] {
+			continue
+		}
 		if len(taskDef.ForEach) == 0 {
 			// Singleton.
 			singleton := forEachInstance{key: "", params: map[string]string{}}
