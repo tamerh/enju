@@ -537,7 +537,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 	// base result directory so parallel submitters don't race
 	// on the same result.md. Session-1 single-citizen tasks
 	// keep the flat layout.
-	baseResultDir := mcpgit.ResultDir(projectID, runSeq, instanceKey, taskDefID)
+	baseResultDir := mcpgit.ResultDir(runSeq, instanceKey, taskDefID)
 	resultDir := baseResultDir
 	citizens := int64(1)
 	if v, ok := task["citizens"].(float64); ok {
@@ -634,7 +634,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 		for _, p := range artifactPaths {
 			files = append(files, mcpgit.FileWrite{
-				RepoRelPath: mcpgit.ArtifactPath(projectID, p),
+				RepoRelPath: mcpgit.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
 		}
@@ -697,7 +697,7 @@ func (s *testServer) readArtifactFile(projectID int64, path string) (string, boo
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		return "", false
 	}
-	data, err := os.ReadFile(filepath.Join(cloneDir, mcpgit.ArtifactPath(projectID, path)))
+	data, err := os.ReadFile(filepath.Join(cloneDir, mcpgit.ArtifactPath(path)))
 	if err != nil {
 		return "", false
 	}
@@ -926,7 +926,7 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 		s.t.Fatalf("clone bare: %v", err)
 	}
 
-	dir := filepath.Join(cloneDir, "projects", parts[0], "runs", runSeq)
+	dir := filepath.Join(cloneDir, "runs", runSeq)
 	if instanceKey != "" {
 		dir = filepath.Join(dir, instanceKey, taskDefID)
 	} else {
@@ -1753,7 +1753,7 @@ func TestMultiFileOutputs(t *testing.T) {
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		t.Fatalf("clone bare: %v", err)
 	}
-	resultsDir := filepath.Join(cloneDir, "projects", fmt.Sprintf("%d", s.lastProjectID), "runs", fmt.Sprintf("%d", s.lastRunSeq), "analyze")
+	resultsDir := filepath.Join(cloneDir, "runs", fmt.Sprintf("%d", s.lastRunSeq), "analyze")
 
 	// genes.csv should contain the CSV
 	csvData, err := os.ReadFile(filepath.Join(resultsDir, "genes.csv"))
@@ -3273,7 +3273,7 @@ func TestReviewMetadataAuditTrail(t *testing.T) {
 	// The review.yaml run is the project's run #1.
 	runSeq := 1
 	metaPath := filepath.Join(
-		fmt.Sprintf("projects/%d/runs/%d/check", pid, runSeq),
+		fmt.Sprintf("runs/%d/check", runSeq),
 		"metadata.json",
 	)
 	raw, ok := s.readRepoFile(pid, metaPath)
@@ -3297,7 +3297,7 @@ func TestReviewMetadataAuditTrail(t *testing.T) {
 	// Non-review tasks should NOT carry decision/reviews_target
 	// keys. The draft's metadata.json is the control case.
 	draftPath := filepath.Join(
-		fmt.Sprintf("projects/%d/runs/%d/draft", pid, runSeq),
+		fmt.Sprintf("runs/%d/draft", runSeq),
 		"metadata.json",
 	)
 	rawDraft, ok := s.readRepoFile(pid, draftPath)
@@ -3341,7 +3341,7 @@ func TestReviewRejectMetadataCarriesVerdict(t *testing.T) {
 
 	runSeq := 1
 	metaPath := filepath.Join(
-		fmt.Sprintf("projects/%d/runs/%d/check", pid, runSeq),
+		fmt.Sprintf("runs/%d/check", runSeq),
 		"metadata.json",
 	)
 	raw, ok := s.readRepoFile(pid, metaPath)
@@ -4056,7 +4056,7 @@ func TestReviewCommitShaOptional(t *testing.T) {
 	s.claim("check", bob)
 	fullID := s.taskID("check")
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": "projects/" + fmt.Sprintf("%d", s.lastProjectID) + "/runs/1/check",
+		"result_path": "runs/1/check",
 		"commit_sha":  "",
 		"decision":    "approve",
 		"username":    "bob",
@@ -4457,7 +4457,7 @@ tasks:
 	// 1 synthesize task in response to the accept.
 	s.claim("discover", alice)
 	fullTaskID := s.taskID("discover")
-	resultDir := mcpgit.ResultDir(projectID, int(seq), "", "discover")
+	resultDir := mcpgit.ResultDir(int(seq), "", "discover")
 	remoteURL := s.remoteFor(projectID)
 	proj, err := s.workspace.ForProject(projectID, remoteURL)
 	if err != nil {
@@ -4608,7 +4608,7 @@ tasks:
 
 	s.claim("discover", alice)
 	fullTaskID := s.taskID("discover")
-	resultDir := mcpgit.ResultDir(projectID, int(seq), "", "discover")
+	resultDir := mcpgit.ResultDir(int(seq), "", "discover")
 	remoteURL := s.remoteFor(projectID)
 	proj, err := s.workspace.ForProject(projectID, remoteURL)
 	if err != nil {
@@ -4813,7 +4813,7 @@ tasks:
 func (s *testServer) submitDiscoverWithList(t *testing.T, projectID int64, runSeq int, genes []string) {
 	t.Helper()
 	fullTaskID := s.taskID("discover")
-	resultDir := mcpgit.ResultDir(projectID, runSeq, "", "discover")
+	resultDir := mcpgit.ResultDir(runSeq, "", "discover")
 	remoteURL := s.remoteFor(projectID)
 	proj, err := s.workspace.ForProject(projectID, remoteURL)
 	if err != nil {

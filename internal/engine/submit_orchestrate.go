@@ -56,7 +56,7 @@ func (e *Engine) ValidateSubmitRequest(
 	}
 
 	// Result path verification.
-	expectedResultPath := fmt.Sprintf("projects/%d/runs/%d", run.ProjectID, run.Seq)
+	expectedResultPath := fmt.Sprintf("runs/%d", run.Seq)
 	if task.InstanceKey != "" {
 		expectedResultPath += "/" + task.InstanceKey
 	}

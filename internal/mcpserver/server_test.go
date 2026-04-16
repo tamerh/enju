@@ -16,6 +16,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/mcpgit"
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -317,7 +318,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed remote: %v", err)
 	}
-	draftPath := filepath.Join(seedDir, "projects/7/runs/1/draft/result.md")
+	draftPath := filepath.Join(seedDir, "runs/1/draft/result.md")
 	if err := os.MkdirAll(filepath.Dir(draftPath), 0o755); err != nil {
 		t.Fatalf("mkdir seed: %v", err)
 	}
@@ -325,7 +326,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 		t.Fatalf("write draft: %v", err)
 	}
 	wt, _ := seedRepo.Worktree()
-	if _, err := wt.Add("projects/7/runs/1/draft/result.md"); err != nil {
+	if _, err := wt.Add("runs/1/draft/result.md"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	sig := &object.Signature{Name: "Seeder", Email: "seed@localhost", When: time.Unix(1700000000, 0)}
@@ -355,7 +356,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 					"instance_key": "",
 					"instance_params": {},
 					"commit_sha": "` + draftCommitSHA + `",
-					"result_path": "projects/7/runs/1/draft"
+					"result_path": "runs/1/draft"
 				}
 			],
 			"artifact_reads": [],
@@ -447,5 +448,86 @@ func TestStaleCitizenDetection(t *testing.T) {
 					tc.status, tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestEagerCloneOnCreateProject verifies that handleCreateProject
+// clones the workspace directory immediately, so it exists before
+// any task is claimed.
+func TestEagerCloneOnCreateProject(t *testing.T) {
+	// 1. Seed a bare repo to act as the project's remote.
+	bareDir := t.TempDir()
+	mcpgit.InitBareWithSeed(bareDir)
+
+	// 2. Fake coordinator: POST /projects returns id=1,
+	//    GET /projects/1 returns remote_url + name.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"my-cool-project"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"my-cool-project","remote_url":"` + bareDir + `"}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// 3. Real workspace.
+	wsDir := t.TempDir()
+	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new workspace: %v", err)
+	}
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	// Before: no clone exists.
+	if ws.HasLocalClone(1) {
+		t.Fatal("expected no clone before create")
+	}
+
+	// Call handleCreateProject via the MCP tool handler.
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "enju_create_project",
+			Arguments: map[string]interface{}{"name": "my-cool-project"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleCreateProject: %v", err)
+	}
+	if result == nil {
+		t.Fatal("nil result from handleCreateProject")
+	}
+
+	// After: clone should exist with the slug-named directory.
+	if !ws.HasLocalClone(1) {
+		t.Fatal("expected clone to exist immediately after create")
+	}
+	// Verify slug naming.
+	entries, _ := os.ReadDir(wsDir)
+	found := false
+	for _, e := range entries {
+		if e.IsDir() && strings.Contains(e.Name(), "my-cool-project") {
+			found = true
+		}
+	}
+	if !found {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("expected slug-named dir containing 'my-cool-project', got: %v", names)
 	}
 }

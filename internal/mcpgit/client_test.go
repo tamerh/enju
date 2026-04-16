@@ -113,7 +113,7 @@ func TestWorkspaceCloneAndSubmit(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	resultDir := ResultDir(42, 1, "", "hello")
+	resultDir := ResultDir(1, "", "hello")
 	proj.Lock()
 	res, err := proj.SubmitTaskResult(SubmitRequest{
 		TaskID:   "1:1:hello",
@@ -167,7 +167,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	resultDir := ResultDir(43, 1, "", "write")
+	resultDir := ResultDir(1, "", "write")
 	proj.Lock()
 	res, err := proj.SubmitTaskResult(SubmitRequest{
 		TaskID:   "1:1:write",
@@ -178,7 +178,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 				Content:     []byte("done"),
 			},
 			{
-				RepoRelPath: ArtifactPath(43, "notes/intro.md"),
+				RepoRelPath: ArtifactPath("notes/intro.md"),
 				Content:     []byte("# Intro\n"),
 			},
 		},
@@ -210,7 +210,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 	}
 
 	// Verify the artifact file is on disk at the expected path.
-	data, err := os.ReadFile(filepath.Join(verifyDir, ArtifactPath(43, "notes/intro.md")))
+	data, err := os.ReadFile(filepath.Join(verifyDir, ArtifactPath("notes/intro.md")))
 	if err != nil {
 		t.Fatalf("read artifact: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestSubmitRetryOnConcurrentPush(t *testing.T) {
 		TaskID:   "1:1:a",
 		Username: "alice",
 		Files: []FileWrite{
-			{RepoRelPath: filepath.Join(ResultDir(44, 1, "", "a"), "result.md"), Content: []byte("alice result")},
+			{RepoRelPath: filepath.Join(ResultDir(1, "", "a"), "result.md"), Content: []byte("alice result")},
 		},
 	}); err != nil {
 		t.Fatalf("A submit: %v", err)
@@ -263,7 +263,7 @@ func TestSubmitRetryOnConcurrentPush(t *testing.T) {
 		TaskID:   "1:1:b",
 		Username: "bob",
 		Files: []FileWrite{
-			{RepoRelPath: filepath.Join(ResultDir(44, 1, "", "b"), "result.md"), Content: []byte("bob result")},
+			{RepoRelPath: filepath.Join(ResultDir(1, "", "b"), "result.md"), Content: []byte("bob result")},
 		},
 	})
 	projB.Unlock()
@@ -280,10 +280,10 @@ func TestSubmitRetryOnConcurrentPush(t *testing.T) {
 	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
 		t.Fatalf("verify clone: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(44, 1, "", "a"), "result.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(1, "", "a"), "result.md")); err != nil {
 		t.Fatalf("A's file missing after B submit: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(44, 1, "", "b"), "result.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(1, "", "b"), "result.md")); err != nil {
 		t.Fatalf("B's file missing after B submit: %v", err)
 	}
 }
@@ -341,7 +341,7 @@ func TestResolveFanIn(t *testing.T) {
 			Username: "alice",
 			Files: []FileWrite{
 				{
-					RepoRelPath: filepath.Join(ResultDir(46, 1, g, "analyze"), "result.md"),
+					RepoRelPath: filepath.Join(ResultDir(1, g, "analyze"), "result.md"),
 					Content:     []byte("analysis of " + g),
 				},
 			},
@@ -362,21 +362,21 @@ func TestResolveFanIn(t *testing.T) {
 				InstanceKey:    "BRCA1",
 				InstanceParams: map[string]string{"gene": "BRCA1"},
 				CommitSHA:      commitSHAs["BRCA1"],
-				ResultPath:     ResultDir(46, 1, "BRCA1", "analyze"),
+				ResultPath:     ResultDir(1, "BRCA1", "analyze"),
 			},
 			{
 				TaskDefID:      "analyze",
 				InstanceKey:    "TP53",
 				InstanceParams: map[string]string{"gene": "TP53"},
 				CommitSHA:      commitSHAs["TP53"],
-				ResultPath:     ResultDir(46, 1, "TP53", "analyze"),
+				ResultPath:     ResultDir(1, "TP53", "analyze"),
 			},
 			{
 				TaskDefID:      "analyze",
 				InstanceKey:    "EGFR",
 				InstanceParams: map[string]string{"gene": "EGFR"},
 				CommitSHA:      commitSHAs["EGFR"],
-				ResultPath:     ResultDir(46, 1, "EGFR", "analyze"),
+				ResultPath:     ResultDir(1, "EGFR", "analyze"),
 			},
 		},
 	}
@@ -439,7 +439,7 @@ func TestResolveSingletonUpstream(t *testing.T) {
 		Username: "alice",
 		Files: []FileWrite{
 			{
-				RepoRelPath: filepath.Join(ResultDir(47, 1, "", "gather"), "result.md"),
+				RepoRelPath: filepath.Join(ResultDir(1, "", "gather"), "result.md"),
 				Content:     []byte("raw data"),
 			},
 		},
@@ -455,7 +455,7 @@ func TestResolveSingletonUpstream(t *testing.T) {
 			{
 				TaskDefID:  "gather",
 				CommitSHA:  res.CommitSHA,
-				ResultPath: ResultDir(47, 1, "", "gather"),
+				ResultPath: ResultDir(1, "", "gather"),
 			},
 		},
 	})
@@ -495,7 +495,7 @@ func TestResolveWinningOption(t *testing.T) {
 		Username: "alice",
 		Files: []FileWrite{
 			{
-				RepoRelPath: filepath.Join(ResultDir(90, 1, "", "pick_db"), "result.md"),
+				RepoRelPath: filepath.Join(ResultDir(1, "", "pick_db"), "result.md"),
 				Content:     []byte("DuckDB fits the workload best."),
 			},
 		},
@@ -511,7 +511,7 @@ func TestResolveWinningOption(t *testing.T) {
 			{
 				TaskDefID:  "pick_db",
 				CommitSHA:  res.CommitSHA,
-				ResultPath: ResultDir(90, 1, "", "pick_db"),
+				ResultPath: ResultDir(1, "", "pick_db"),
 				VoteChoice: "duckdb",
 			},
 		},
@@ -576,11 +576,11 @@ func TestResolveArtifactRead(t *testing.T) {
 		Username: "alice",
 		Files: []FileWrite{
 			{
-				RepoRelPath: filepath.Join(ResultDir(49, 1, "", "writer"), "result.md"),
+				RepoRelPath: filepath.Join(ResultDir(1, "", "writer"), "result.md"),
 				Content:     []byte("done"),
 			},
 			{
-				RepoRelPath: ArtifactPath(49, "notes/intro.md"),
+				RepoRelPath: ArtifactPath("notes/intro.md"),
 				Content:     []byte("# Intro\n\nThe intro content."),
 			},
 		},
@@ -636,7 +636,7 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 		AuthorEmail: "alice@example.com",
 		Files: []FileWrite{
 			{
-				RepoRelPath: filepath.Join(ResultDir(51, 1, "", "alice_task"), "result.md"),
+				RepoRelPath: filepath.Join(ResultDir(1, "", "alice_task"), "result.md"),
 				Content:     []byte("alice's result"),
 			},
 		},
@@ -676,7 +676,7 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 		ModelName:   "claude-sonnet-4-20250514",
 		Files: []FileWrite{
 			{
-				RepoRelPath: filepath.Join(ResultDir(51, 1, "", "bot_task"), "result.md"),
+				RepoRelPath: filepath.Join(ResultDir(1, "", "bot_task"), "result.md"),
 				Content:     []byte("bot's result"),
 			},
 		},
@@ -750,7 +750,7 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 		TaskID:   "1:1:a",
 		Username: "alice",
 		Files: []FileWrite{
-			{RepoRelPath: filepath.Join(ResultDir(60, 1, "", "a"), "result.md"), Content: []byte("alice v1")},
+			{RepoRelPath: filepath.Join(ResultDir(1, "", "a"), "result.md"), Content: []byte("alice v1")},
 		},
 	}); err != nil {
 		t.Fatalf("A submit: %v", err)
@@ -771,7 +771,7 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 		TaskID:   "1:1:b",
 		Username: "bob",
 		Files: []FileWrite{
-			{RepoRelPath: filepath.Join(ResultDir(60, 1, "", "b"), "result.md"), Content: []byte("bob v1")},
+			{RepoRelPath: filepath.Join(ResultDir(1, "", "b"), "result.md"), Content: []byte("bob v1")},
 		},
 	}); err != nil {
 		t.Fatalf("B initial submit: %v", err)
@@ -804,10 +804,10 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
 		t.Fatalf("verify clone: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(60, 1, "", "a"), "result.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(1, "", "a"), "result.md")); !os.IsNotExist(err) {
 		t.Errorf("expected A's file to be gone after force push, stat err: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(60, 1, "", "b"), "result.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(verifyDir, ResultDir(1, "", "b"), "result.md")); err != nil {
 		t.Errorf("expected B's file on remote after force push: %v", err)
 	}
 }
@@ -846,7 +846,7 @@ func TestSubmitRetryExhaustionNamesStep(t *testing.T) {
 		Username:   "alice",
 		MaxRetries: 2,
 		Files: []FileWrite{
-			{RepoRelPath: filepath.Join(ResultDir(61, 1, "", "x"), "result.md"), Content: []byte("data")},
+			{RepoRelPath: filepath.Join(ResultDir(1, "", "x"), "result.md"), Content: []byte("data")},
 		},
 	})
 	proj.Unlock()

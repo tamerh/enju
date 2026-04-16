@@ -923,6 +923,25 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
+	// Eagerly clone into the workspace so the project directory
+	// exists immediately after creation — not lazily on first
+	// claim. This gives the citizen a visible workspace to browse
+	// and confirms the git remote is reachable.
+	if c.workspace != nil {
+		var result map[string]interface{}
+		if json.Unmarshal(data, &result) == nil {
+			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+				remote, projName, _ := c.fetchProjectMetaFull(ctx, projectID)
+				if remote != "" {
+					if _, err := c.workspace.ForProject(projectID, remote, projName); err != nil {
+						c.logger.Warn("eager clone failed (will retry on first task)",
+							"project_id", projectID, "error", err)
+					}
+				}
+			}
+		}
+	}
+
 	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
 }
 
@@ -1871,7 +1890,7 @@ func (c *apiClient) submitResultFatClient(
 	// citizen tasks keep the flat `runs/{seq}/{task}/` layout.
 	// The task's declared citizens count is stored on the DB
 	// row and surfaced via taskMeta.Citizens.
-	baseResultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	baseResultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
 	resultDir := baseResultDir
 	if meta.Citizens > 1 {
 		resultDir = filepath.Join(baseResultDir, "citizen-"+c.username)
@@ -2000,7 +2019,7 @@ func (c *apiClient) submitResultFatClient(
 		sortStringsStable(artifactPaths)
 		for _, p := range artifactPaths {
 			files = append(files, mcpgit.FileWrite{
-				RepoRelPath: mcpgit.ArtifactPath(meta.ProjectID, p),
+				RepoRelPath: mcpgit.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
 		}
@@ -2269,42 +2288,22 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 
 	// Read at the indexed commit SHA if available so the content
 	// matches what the coordinator's index points at. Fall back
-	// to the working tree when no commit SHA is recorded. A.7
-	// backward compat: try the new namespaced layout
-	// (`projects/{id}/artifacts/...`) first, then the pre-A.5
-	// flat layout (`artifacts/...`) so projects created before
-	// the namespacing still resolve.
+	// to the working tree when no commit SHA is recorded.
 	commitSHA, _ := meta["commit_sha"].(string)
-	primaryPath := mcpgit.ArtifactPath(int64(projectID), path)
-	legacyPath := mcpgit.LegacyArtifactPath(path)
+	repoPath := mcpgit.ArtifactPath(path)
 	var content []byte
-	tryPaths := []string{primaryPath, legacyPath}
 	if commitSHA != "" {
-		var found bool
-		for _, p := range tryPaths {
-			data, ok, rerr := proj.ReadFileAtCommit(commitSHA, p)
-			if rerr == nil && ok {
-				content = data
-				found = true
-				break
-			}
+		data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)
+		if rerr != nil || !ok {
+			return mcp.NewToolResultError(fmt.Sprintf("artifact %q not found at commit %s", path, commitSHA)), nil
 		}
-		if !found {
-			return mcp.NewToolResultError(fmt.Sprintf("artifact %q not found at commit %s (tried new and legacy layouts)", path, commitSHA)), nil
-		}
+		content = data
 	} else {
-		var found bool
-		for _, p := range tryPaths {
-			data, rerr := proj.ReadFile(p)
-			if rerr == nil {
-				content = data
-				found = true
-				break
-			}
+		data, rerr := proj.ReadFile(repoPath)
+		if rerr != nil {
+			return mcp.NewToolResultError("reading artifact from working tree: not found"), nil
 		}
-		if !found {
-			return mcp.NewToolResultError("reading artifact from working tree: not found at new or legacy path"), nil
-		}
+		content = data
 	}
 	meta["path"] = path
 	meta["content"] = string(content)
@@ -2352,15 +2351,9 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 	// path, fall back to the pre-A.5 flat layout if the primary
 	// lookup returns no history (which is what happens for
 	// projects created before the namespacing).
-	history, err := proj.LogFile(mcpgit.ArtifactPath(int64(projectID), path))
+	history, err := proj.LogFile(mcpgit.ArtifactPath(path))
 	if err != nil {
 		return mcp.NewToolResultError("reading git history: " + err.Error()), nil
-	}
-	if len(history) == 0 {
-		legacyHistory, legacyErr := proj.LogFile(mcpgit.LegacyArtifactPath(path))
-		if legacyErr == nil && len(legacyHistory) > 0 {
-			history = legacyHistory
-		}
 	}
 
 	// Fetch the coordinator's current artifact index pointer for
@@ -2705,7 +2698,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	proj.Unlock()
 
 	workDir := proj.WorkDir()
-	resultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
 
 	// Build environment variables.
 	env := os.Environ()

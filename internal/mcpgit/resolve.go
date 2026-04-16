@@ -226,14 +226,8 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 		// their files at the legacy location even though the
 		// DB index now reports their path in the unprefixed
 		// user-facing form.
-		repoPath := ArtifactPath(p.projectID, ref.Path)
+		repoPath := ArtifactPath(ref.Path)
 		content, ok, err := p.readArtifactVersion(ref.CommitSHA, repoPath)
-		if err == nil && ok {
-			artifacts[ref.Path] = content
-			continue
-		}
-		legacyPath := LegacyArtifactPath(ref.Path)
-		content, ok, err = p.readArtifactVersion(ref.CommitSHA, legacyPath)
 		if err != nil || !ok {
 			missing = append(missing, ref.Path)
 			continue

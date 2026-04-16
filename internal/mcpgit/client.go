@@ -1182,20 +1182,16 @@ func buildCommitMessage(taskID, username string, artifactPaths []string, modelNa
 // ProjectDir returns the repo-relative root directory for all of a
 // project's content. Used by callers that want to know where a
 // project's data lives in the shared remote.
-func ProjectDir(projectID int64) string {
-	return filepath.Join("projects", fmt.Sprintf("%d", projectID))
-}
-
 // ResultDir returns the repo-relative directory for a task's result
 // files. Layout:
 //
-//	projects/{projectID}/runs/{runSeq}/{taskDefID}/                 (no for_each)
-//	projects/{projectID}/runs/{runSeq}/{instanceKey}/{taskDefID}/   (with for_each)
+//	runs/{runSeq}/{taskDefID}/                 (no for_each)
+//	runs/{runSeq}/{instanceKey}/{taskDefID}/   (with for_each)
 //
-// Kept in this package so the client, coordinator, and test helpers
-// share one source of truth for layout.
-func ResultDir(projectID int64, runSeq int, instanceKey, taskDefID string) string {
-	base := filepath.Join(ProjectDir(projectID), "runs", fmt.Sprintf("%d", runSeq))
+// Each workspace clone holds exactly one project, so there is no
+// per-project prefix in the repo tree.
+func ResultDir(runSeq int, instanceKey, taskDefID string) string {
+	base := filepath.Join("runs", fmt.Sprintf("%d", runSeq))
 	if instanceKey != "" {
 		return filepath.Join(base, instanceKey, taskDefID)
 	}
@@ -1203,21 +1199,10 @@ func ResultDir(projectID int64, runSeq int, instanceKey, taskDefID string) strin
 }
 
 // ArtifactPath returns the repo-relative path for a user-facing
-// artifact path under a given project. Validation (no ../, no
-// .git, etc.) is the caller's responsibility; this is just path
-// concatenation with the standard `projects/{id}/artifacts/`
-// prefix.
-func ArtifactPath(projectID int64, userPath string) string {
-	return filepath.Join(ProjectDir(projectID), "artifacts", userPath)
-}
-
-// LegacyArtifactPath returns the pre-iteration-A.5 artifact path
-// (without the per-project namespace — just `artifacts/...`).
-// Callers use this as a fallback when the primary ArtifactPath
-// lookup fails, so projects created under the old layout can
-// still be read. The fallback is read-only; new writes always
-// use the namespaced path.
-func LegacyArtifactPath(userPath string) string {
+// artifact. Validation (no ../, no .git, etc.) is the caller's
+// responsibility; this is just path concatenation with the
+// standard `artifacts/` prefix.
+func ArtifactPath(userPath string) string {
 	return filepath.Join("artifacts", userPath)
 }
 
