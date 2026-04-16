@@ -250,11 +250,17 @@ func (c *apiClient) doWithAutoReregister(ctx context.Context, do func() (*http.R
 // `citizen not found`. Only considers 404 responses to avoid
 // misidentifying a 200 that happens to contain the phrase.
 func isStaleCitizenResponse(status int, body []byte) bool {
-	if status != http.StatusNotFound {
-		return false
-	}
 	s := strings.ToLower(string(body))
-	return strings.Contains(s, "citizen") && strings.Contains(s, "not found")
+	// 404 with "citizen not found" — DB wiped, citizen record gone.
+	if status == http.StatusNotFound {
+		return strings.Contains(s, "citizen") && strings.Contains(s, "not found")
+	}
+	// 401 with "invalid or expired token" — DB wiped, token
+	// no longer valid. Re-register will get a fresh token.
+	if status == http.StatusUnauthorized {
+		return strings.Contains(s, "invalid") && strings.Contains(s, "token")
+	}
+	return false
 }
 
 // ensureCitizenFresh POSTs /citizens/register with the client's
@@ -893,18 +899,24 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	// If auto-local, create the bare repo + set it as remote.
 	if autoLocal {
 		var result map[string]interface{}
-		if json.Unmarshal(data, &result) == nil {
-			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
-				home, _ := os.UserHomeDir()
-				repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
-				if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err == nil {
-					if err := mcpgit.InitBareWithSeed(repoDir); err == nil {
-						// Set the remote on the coordinator.
-						c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
-							map[string]string{"remote_url": repoDir})
-						c.logger.Info("auto-created local repo",
-							"project_id", projectID, "path", repoDir)
-					}
+		if err := json.Unmarshal(data, &result); err != nil {
+			c.logger.Error("auto-local: failed to parse project response", "error", err)
+		} else if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+			home, _ := os.UserHomeDir()
+			repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
+			if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
+				c.logger.Error("auto-local: failed to create repos dir", "error", err)
+			} else if err := mcpgit.InitBareWithSeed(repoDir); err != nil {
+				c.logger.Error("auto-local: failed to init bare repo", "path", repoDir, "error", err)
+			} else {
+				// Set the remote on the coordinator.
+				_, putErr := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
+					map[string]string{"remote_url": repoDir})
+				if putErr != nil {
+					c.logger.Error("auto-local: failed to set remote", "error", putErr)
+				} else {
+					c.logger.Info("auto-created local repo",
+						"project_id", projectID, "path", repoDir)
 				}
 			}
 		}
