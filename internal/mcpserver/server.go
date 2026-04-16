@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
-	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -899,7 +898,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 				home, _ := os.UserHomeDir()
 				repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
 				if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err == nil {
-					if _, err := gogit.PlainInit(repoDir, true); err == nil {
+					if err := mcpgit.InitBareWithSeed(repoDir); err == nil {
 						// Set the remote on the coordinator.
 						c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
 							map[string]string{"remote_url": repoDir})
