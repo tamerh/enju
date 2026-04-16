@@ -5068,5 +5068,61 @@ func TestTokenAuthAllowsValidToken(t *testing.T) {
 	_ = citizen
 }
 
+// TestAutoLocalRepoOnProjectCreate — when a project is
+// created without a remote_url, the system should still
+// allow full claim/submit workflow (the MCP client auto-
+// creates a local bare repo). This test simulates the
+// coordinator side: a project with a local bare repo as
+// remote should work for the full fat-client path.
+func TestSubmitWorksWithLocalBareRemote(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+
+	// Create a bare repo manually (simulating what the MCP
+	// client's auto-create does).
+	bareDir := filepath.Join(t.TempDir(), "auto.git")
+	_, err := gogit.PlainInit(bareDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create project with the local bare as remote.
+	projectResp := s.post("/api/v1/projects", map[string]string{
+		"name":       "auto-local-test",
+		"remote_url": bareDir,
+	})
+	projectID := int64(projectResp["id"].(float64))
+	if projectID == 0 {
+		t.Fatalf("project creation failed: %v", projectResp)
+	}
+
+	// Submit a run.
+	yamlContent := `name: "Local test"
+version: 1
+tasks:
+  - id: hello
+    action: answer
+    prompt: "Say hello"
+`
+	runResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]interface{}{
+		"yaml": yamlContent,
+	})
+	seq, _ := runResp["seq"].(float64)
+	if seq == 0 {
+		t.Fatalf("run creation failed: %v", runResp)
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seq)
+
+	// Claim + submit via fat client — this is the path that
+	// fails with "commit_sha is required" when there's no
+	// remote.
+	s.claim("hello", alice)
+	result := s.submit("hello", "Hello from local repo!")
+	if status, _ := result["status"].(string); status != "accepted" {
+		t.Fatalf("expected accepted, got: %v", result)
+	}
+}
+
 // Suppress unused import
 var _ = enjuYaml.Parse

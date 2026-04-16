@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
+	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -869,6 +870,18 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	description := req.GetString("description", "")
 	remoteURL := req.GetString("remote_url", "")
 
+	// Auto-create a local bare repo when no remote is
+	// specified. This ensures the fat-client path always
+	// activates (every project has a remote, at minimum a
+	// local one). The citizen can later upgrade to a real
+	// remote via enju_set_project_remote.
+	autoLocal := false
+	if remoteURL == "" && c.workspace != nil {
+		// Create the project first to get the ID, then
+		// create the bare repo and set the remote.
+		autoLocal = true
+	}
+
 	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
 		"name":        name,
 		"description": description,
@@ -877,6 +890,27 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+
+	// If auto-local, create the bare repo + set it as remote.
+	if autoLocal {
+		var result map[string]interface{}
+		if json.Unmarshal(data, &result) == nil {
+			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+				home, _ := os.UserHomeDir()
+				repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
+				if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err == nil {
+					if _, err := gogit.PlainInit(repoDir, true); err == nil {
+						// Set the remote on the coordinator.
+						c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
+							map[string]string{"remote_url": repoDir})
+						c.logger.Info("auto-created local repo",
+							"project_id", projectID, "path", repoDir)
+					}
+				}
+			}
+		}
+	}
+
 	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
 }
 
