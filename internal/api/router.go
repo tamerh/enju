@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/dag"
+	"github.com/enju-ai/enju/internal/engine"
 	"github.com/enju-ai/enju/internal/store"
-	"github.com/enju-ai/enju/internal/template"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -39,6 +38,13 @@ func NewServer(st *store.Store, logger *slog.Logger) *Server {
 		runs:   make(map[int64]*enjuYaml.ParsedRun),
 		logger: logger,
 	}
+}
+
+// engine creates a lightweight Engine instance for
+// pure-computation calls. One per request — no caching
+// needed since Engine holds no state.
+func (s *Server) engine() *engine.Engine {
+	return engine.New(s.store, s.logger)
 }
 
 // Router returns the chi router with all endpoints registered.
@@ -71,6 +77,14 @@ func (s *Server) Router() http.Handler {
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
 
+		// Unified write endpoint — the coordinator's ONE
+		// write path. Accepts a Plan (ordered mutations),
+		// validates each against current DB state, and
+		// applies atomically. Steps 7b-7g will migrate
+		// existing tools to produce Plans client-side and
+		// POST them here.
+		r.Post("/apply", s.handleApply)
+
 		// Tasks
 		r.Get("/tasks/ready", s.handleListReadyTasks)
 		r.Post("/tasks/{taskID}/claim", s.handleClaimTask)
@@ -84,6 +98,7 @@ func (s *Server) Router() http.Handler {
 		// Citizens
 		r.Post("/citizens/register", s.handleRegisterCitizen)
 		r.Get("/citizens/by-username/{username}/dashboard", s.handleCitizenDashboard)
+		r.Get("/citizens/by-username/{username}/contributions", s.handleCitizenContributions)
 		r.Put("/citizens/by-username/{username}/profile", s.handleUpdateProfile)
 		r.Get("/citizens/by-username/{username}", s.handleGetCitizenByUsername)
 	})
@@ -92,6 +107,36 @@ func (s *Server) Router() http.Handler {
 }
 
 // --- Health ---
+
+// handleApply is the unified write endpoint. Accepts a
+// serialized Plan, validates the engine version, and calls
+// store.ApplyPlan to execute all mutations atomically.
+// Returns the ApplyResult as JSON.
+func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
+	var plan store.Plan
+	if err := json.NewDecoder(r.Body).Decode(&plan); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid plan: "+err.Error())
+		return
+	}
+
+	// Version gate: reject plans from mismatched engine
+	// versions so a stale client can't submit plans the
+	// coordinator doesn't understand.
+	if plan.Version != engine.EngineVersion {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("engine version mismatch: client=%q, coordinator=%q — update your enju binary",
+				plan.Version, engine.EngineVersion))
+		return
+	}
+
+	result, err := s.store.ApplyPlan(plan)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "plan rejected: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -425,59 +470,22 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// === Pre-flight validation ===
-	//
-	// Walk every expanded task and validate declared paths, usernames,
-	// etc. BEFORE touching the database. This keeps run creation atomic
-	// from the caller's perspective: a failed submission never leaves a
-	// ghost run with partial tasks behind, and the per-project run
-	// sequence counter doesn't advance on rejected submissions.
-	//
-	// Anything that could plausibly reject the submission belongs in
-	// this loop, not in the second (writing) loop below.
-	for _, tasks := range parsed.ExpandedTasks {
-		for _, ti := range tasks {
-			for _, p := range ti.ReadsArtifacts {
-				if err := validateArtifactPath(p); err != nil {
-					writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q: invalid reads_artifacts path %q: %v", ti.ID, p, err))
-					return
-				}
-			}
-			for _, p := range ti.WritesArtifacts {
-				if err := validateArtifactPath(p); err != nil {
-					writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q: invalid writes_artifacts path %q: %v", ti.ID, p, err))
-					return
-				}
-			}
-			for _, uname := range ti.AssignTo {
-				if err := store.ValidateUsername(uname); err != nil {
-					writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q: invalid assign_to username %q: %v", ti.ID, uname, err))
-					return
-				}
-				c, _ := s.store.GetCitizenByUsername(uname)
-				if c == nil {
-					writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q: assign_to citizen %q is not registered", ti.ID, uname))
-					return
-				}
-			}
-		}
+	// Pre-flight validation via engine (artifact paths +
+	// citizen usernames). Runs before CreateRun so a failed
+	// validation never leaves a ghost run behind.
+	if err := s.engine().ValidateRunCreation(parsed); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	// === Creation ===
-	//
-	// All validations passed. Now create the run and its tasks. Both
-	// steps touch the database, but by this point we've done everything
-	// we can to ensure success without a transaction. CreateTask
-	// failures at this point are genuine DB errors and get logged.
+	// Create the run record.
 	now := time.Now()
-	repoURL := req.RepoURL
-
 	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
 		ProjectID:       projectID,
 		Name:            parsed.Run.Name,
 		Ref:             parsed.Run.Ref,
 		YAMLData:        req.YAML,
-		RepoURL:         repoURL,
+		RepoURL:         req.RepoURL,
 		State:           store.RunActive,
 		SourcePath:      req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
@@ -490,96 +498,26 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create task records from expanded DAG.
-	// Task IDs are prefixed with {project_id}:{run_seq}: to make them globally unique
-	// and addressable within the per-project hierarchy.
-	runPrefix := fmt.Sprintf("%d:%d:", projectID, runSeq)
-	taskCount := 0
-	taskSeq := 0
-	// Iterate ExpandedTasks in sorted-key order so the seq column (and
-	// therefore downstream display order in run_status) is
-	// deterministic across processes — Go map iteration is not.
-	instanceKeys := make([]string, 0, len(parsed.ExpandedTasks))
-	for k := range parsed.ExpandedTasks {
-		instanceKeys = append(instanceKeys, k)
+	// Build task records via engine and apply atomically.
+	taskRecords := engine.BuildRunTasks(parsed, runID, projectID, runSeq)
+	var mutations []store.Mutation
+	for i := range taskRecords {
+		mutations = append(mutations, store.CreateTask{Task: taskRecords[i]})
 	}
-	sort.Strings(instanceKeys)
-	for _, instanceKey := range instanceKeys {
-		tasks := parsed.ExpandedTasks[instanceKey]
-		for _, ti := range tasks {
-			taskSeq++
-			resultType := ti.ResultType
-			if resultType == "" {
-				resultType = "text"
-			}
-			timeout := ti.Timeout
-			if timeout == "" {
-				timeout = parsed.Run.Defaults.Timeout
-			}
-
-			// build() populates ti.DependsOn with short IDs already
-			// resolved against the current expansion mode (singletons,
-			// per-iteration binding, or fan-in). We just prepend the
-			// run prefix to get fully-qualified store IDs.
-			var deps []string
-			for _, dep := range ti.DependsOn {
-				deps = append(deps, runPrefix+dep)
-			}
-
-			// Determine initial state
-			state := store.TaskPending
-			if len(ti.DependsOn) == 0 {
-				state = store.TaskReady
-			}
-
-			paramsJSON := ""
-			if len(ti.Params) > 0 {
-				if b, err := json.Marshal(ti.Params); err == nil {
-					paramsJSON = string(b)
-				}
-			}
-			err := s.store.CreateTask(&store.TaskRecord{
-				ID:             runPrefix + ti.FullID,
-				RunID:          runID,
-				Seq:            taskSeq,
-				TaskDefID:      ti.ID,
-				InstanceKey:    instanceKey,
-				InstanceParams: paramsJSON,
-				Ref:         ti.Ref,
-				Action:      ti.Action,
-				Prompt:      ti.Prompt,
-				UserPrompt:  ti.UserPrompt,
-				Script:       ti.Script,
-				Outputs:      marshalOutputs(ti.Outputs),
-				Requirements: marshalRequirements(ti.Requirements),
-				ResultType:   resultType,
-				Timeout:     timeout,
-				State:       state,
-				DependsOn:   strings.Join(deps, ","),
-				ReadsArtifacts:  marshalStringSlice(ti.ReadsArtifacts),
-				WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
-				AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
-				RequireRole:     ti.RequireRole,
-				ReviewsTarget:   ti.Reviews,
-				VoteOptions:     marshalVoteOptions(ti.Options),
-				Citizens:        ti.Citizens,
-				MinQuorum:       ti.MinQuorum,
-				VoteThreshold:   ti.Threshold,
-				VoteDeadline:    ti.Deadline,
-				Anonymize:       ti.Anonymize,
-				Visibility:      ti.Visibility,
-				CreatedAt:   now,
-			})
-			if err != nil {
-				s.logger.Error("creating task", "task_id", ti.FullID, "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to create tasks")
-				return
-			}
-			taskCount++
+	if len(mutations) > 0 {
+		plan := store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: mutations,
+		}
+		if _, err := s.store.ApplyPlan(plan); err != nil {
+			s.logger.Error("creating tasks", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to create tasks: "+err.Error())
+			return
 		}
 	}
+	taskCount := len(taskRecords)
 
-	// Cache DAG and parsed run in memory
+	// Cache DAG and parsed run in memory.
 	s.dags[runID] = parsed.DAG
 	s.runs[runID] = parsed
 
@@ -808,15 +746,25 @@ func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
 	if task.VoteDeadline == "" {
 		return
 	}
-	passed, err := s.voteDeadlinePassed(task)
+	passed, err := s.engine().DeadlinePassed(task)
 	if err != nil || !passed {
 		return
 	}
-	outcome, err := s.evaluateVoteTally(task)
+	outcome, err := s.engine().EvaluateVoteTally(task)
 	if err != nil || outcome == nil || !outcome.Resolved {
 		return
 	}
-	if err := s.store.ResolveMultiCitizenVote(task.ID, outcome.WinningOption, task.CommitSHA); err != nil {
+	if _, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetTaskState{
+				TaskID:     task.ID,
+				NewState:   store.TaskAccepted,
+				VoteChoice: outcome.WinningOption,
+				CommitSHA:  task.CommitSHA,
+			},
+		},
+	}); err != nil {
 		s.logger.Warn("deadline-triggered vote resolve failed",
 			"task_id", task.ID, "error", err)
 		return
@@ -878,10 +826,8 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Access control: assign_to and require_role are optional. When
-	// unset the task is open to any registered citizen (default).
-	// When set they narrow who can claim.
-	if err := s.checkTaskAccess(task, caller); err != nil {
+	// Access control: assign_to and require_role are optional.
+	if err := engine.CheckTaskAccess(task, caller); err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -895,7 +841,13 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 	deadline := time.Now().Add(timeout)
 
-	if err := s.store.ClaimTask(taskID, caller.ID, deadline); err != nil {
+	// Engine validates (state, slots, cap) → returns Plan.
+	plan, err := s.engine().ComputeClaim(taskID, caller.ID, deadline)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if _, err := s.store.ApplyPlan(*plan); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -1034,7 +986,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if task.Action == "vote" {
-		outcome, err := s.evaluateVoteTally(task)
+		outcome, err := s.engine().EvaluateVoteTally(task)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "tally failed: "+err.Error())
 			return
@@ -1046,25 +998,41 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 			"reason":      outcome.Reason,
 		}
 		if outcome.Resolved {
-			if err := s.store.ResolveMultiCitizenVote(taskID, outcome.WinningOption, task.CommitSHA); err != nil {
+			// Build a Plan and apply atomically.
+			plan := store.Plan{
+				Version: engine.EngineVersion,
+				Mutations: []store.Mutation{
+					store.SetTaskState{
+						TaskID:     taskID,
+						NewState:   store.TaskAccepted,
+						VoteChoice: outcome.WinningOption,
+						CommitSHA:  task.CommitSHA,
+					},
+					store.UpdateReadyTasks{RunID: task.RunID},
+					store.CompleteRun{RunID: task.RunID},
+				},
+			}
+			result, err := s.store.ApplyPlan(plan)
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, "resolve failed: "+err.Error())
 				return
 			}
+			// Skip cascade still uses the old path for now
+			// (it's complex and touches the DAG cache).
 			updated, _ := s.store.GetTask(taskID)
 			if updated != nil {
 				if skipRes, err := s.performSkipCascade(updated, outcome.WinningOption); err == nil && skipRes != nil {
 					resp["skipped"] = skipRes.Skipped
 				}
 			}
-			readied, _ := s.store.UpdateReadyTasks(task.RunID)
 			resp["status"] = "resolved"
 			resp["winning_option"] = outcome.WinningOption
-			resp["newly_ready"] = readied
+			resp["newly_ready"] = result.TasksReadied
 		} else {
 			resp["status"] = "collecting"
 		}
 	} else { // review
-		outcome, err := s.evaluateReviewTally(task)
+		outcome, err := s.engine().EvaluateReviewTally(task)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "tally failed: "+err.Error())
 			return
@@ -1078,10 +1046,24 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 			"reason":        outcome.Reason,
 		}
 		if outcome.Resolved {
-			if err := s.store.ResolveMultiCitizenReview(taskID, outcome.Verdict, task.CommitSHA); err != nil {
+			// Build a Plan and apply atomically.
+			plan := store.Plan{
+				Version: engine.EngineVersion,
+				Mutations: []store.Mutation{
+					store.SetTaskState{
+						TaskID:   taskID,
+						NewState: store.TaskAccepted,
+					},
+					store.UpdateReadyTasks{RunID: task.RunID},
+					store.CompleteRun{RunID: task.RunID},
+				},
+			}
+			_, err := s.store.ApplyPlan(plan)
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, "resolve failed: "+err.Error())
 				return
 			}
+			// Review-reject cascade still uses the old path.
 			if outcome.Verdict == "reject" && task.ReviewsTarget != "" {
 				run, _ := s.store.GetRun(task.RunID)
 				if run != nil {
@@ -1164,7 +1146,7 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if task.Action == "vote" || task.Action == "review" {
-		passed, derr := s.voteDeadlinePassed(task)
+		passed, derr := s.engine().DeadlinePassed(task)
 		if derr == nil && passed {
 			writeError(w, http.StatusConflict, fmt.Sprintf("task %q voting deadline has expired — submission rejected, run enju_tally_task to resolve", taskID))
 			return
@@ -1196,108 +1178,12 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 //	  ]
 //	}
 func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, run *store.RunRecord) {
-	deps := []map[string]interface{}{}
-	if task.DependsOn != "" {
-		for _, depID := range strings.Split(task.DependsOn, ",") {
-			depID = strings.TrimSpace(depID)
-			depTask, err := s.store.GetTask(depID)
-			if err != nil || depTask == nil {
-				continue
-			}
-			var params map[string]string
-			if depTask.InstanceParams != "" {
-				_ = json.Unmarshal([]byte(depTask.InstanceParams), &params)
-			}
-			depEntry := map[string]interface{}{
-				"task_def_id":     depTask.TaskDefID,
-				"instance_key":    depTask.InstanceKey,
-				"instance_params": params,
-				"commit_sha":      depTask.CommitSHA,
-				"result_path":     depTask.ResultPath,
-				// Phase E.2: upstream vote tasks carry their
-				// winning option id so downstream prompts can
-				// reference it via {{task.winning_option}}.
-				// Non-vote upstreams send an empty string.
-				"vote_choice":     depTask.VoteChoice,
-			}
-			// Phase E.2 session 2b — multi-citizen upstreams
-			// (vote or review with citizens > 1) also carry
-			// the per-citizen submission list so downstream
-			// prompts can render {{task.responses}}. Only
-			// populated when the upstream has citizens > 1
-			// and has resolved, otherwise there's nothing to
-			// render.
-			if depTask.Citizens > 1 {
-				if submissions, err := s.store.ListVoteSubmissions(depTask.ID); err == nil && len(submissions) > 0 {
-					perCitizen := make([]map[string]interface{}, 0, len(submissions))
-					for idx, sub := range submissions {
-						username := s.citizenUsername(sub.CitizenID)
-						if depTask.Anonymize {
-							// Replace the real username with
-							// citizen-N where N is the stable
-							// submission order index. Downstream
-							// prompts rendering {{task.responses}}
-							// never see real identities for
-							// blind-review flows.
-							username = fmt.Sprintf("citizen-%d", idx+1)
-						}
-						perCitizen = append(perCitizen, map[string]interface{}{
-							"username": username,
-							"option":   sub.Option,
-							"content":  sub.Content,
-						})
-					}
-					depEntry["responses"] = perCitizen
-				}
-			}
-			deps = append(deps, depEntry)
-		}
+	desc, err := s.engine().BuildInputsDescriptor(task, run)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "building descriptor: "+err.Error())
+		return
 	}
-
-	artifactReads := []map[string]interface{}{}
-	for _, p := range unmarshalStringSlice(task.ReadsArtifacts) {
-		art, err := s.store.GetArtifact(run.ProjectID, p)
-		if err != nil || art == nil {
-			// Missing artifact — the client's resolver will
-			// surface this via MissingArtifacts in its
-			// ResolvedPrompt. We still send the path so the
-			// client knows it was declared.
-			artifactReads = append(artifactReads, map[string]interface{}{
-				"path":       p,
-				"commit_sha": "",
-			})
-			continue
-		}
-		artifactReads = append(artifactReads, map[string]interface{}{
-			"path":       p,
-			"commit_sha": art.CommitSHA,
-		})
-	}
-
-	var forEachParams map[string]string
-	if task.InstanceParams != "" {
-		_ = json.Unmarshal([]byte(task.InstanceParams), &forEachParams)
-	}
-
-	// Include the project's remote URL so the client knows where to
-	// pull/push. This is the same URL the client already has from
-	// the task/claim response; duplicating it here keeps the
-	// descriptor self-contained.
-	var remoteURL string
-	if p, _ := s.store.GetProject(run.ProjectID); p != nil {
-		remoteURL = p.RemoteURL
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"task_id":              task.ID,
-		"prompt_template":      task.Prompt,
-		"user_prompt_template": task.UserPrompt,
-		"for_each_params":      forEachParams,
-		"dependencies":         deps,
-		"artifact_reads":       artifactReads,
-		"project_id":           run.ProjectID,
-		"project_remote_url":   remoteURL,
-	})
+	writeJSON(w, http.StatusOK, desc)
 }
 
 // handleSubmitResultReport is the client-writes submit path
@@ -1307,6 +1193,7 @@ func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Re
 // scheduler re-evaluation, run completion. No git operations here.
 func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, req *submitResultRequest) {
 	taskID := task.ID
+	eng := s.engine()
 
 	run, err := s.store.GetRun(task.RunID)
 	if err != nil || run == nil {
@@ -1314,375 +1201,132 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Validate declared artifacts against the task's writes_artifacts
-	// allowlist — same contract as the legacy path, just without
-	// writing any files.
-	if len(req.ArtifactsWritten) > 0 {
-		declared := unmarshalStringSlice(task.WritesArtifacts)
-		allowed := make(map[string]bool, len(declared))
-		for _, p := range declared {
-			allowed[p] = true
-		}
-		for _, path := range req.ArtifactsWritten {
-			if err := validateArtifactPath(path); err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid artifact path %q: %v", path, err))
-				return
-			}
-			if !allowed[path] {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("artifact %q not in writes_artifacts for this task", path))
-				return
-			}
-		}
+	// 1. Engine validates request (artifacts, paths, decision,
+	//    option, citizen).
+	engineReq := &engine.SubmitRequest{
+		TaskID:           taskID,
+		ResultPath:       req.ResultPath,
+		CommitSHA:        req.CommitSHA,
+		Decision:         req.Decision,
+		Option:           req.Option,
+		Username:         req.Username,
+		Content:          req.Content,
+		TokensUsed:       req.TokensUsed,
+		ArtifactsWritten: req.ArtifactsWritten,
+		OutputLists:      req.OutputLists,
 	}
-
-	// The client computed the result_path itself. Verify it's the
-	// expected form for this task so we don't accept arbitrary
-	// paths.
-	// Expected result layout since iteration A.5 — projects are
-	// namespaced by project ID so two projects sharing a remote
-	// don't collide on runs/1/foo/... etc.
-	expectedResultPath := fmt.Sprintf("projects/%d/runs/%d", run.ProjectID, run.Seq)
-	if task.InstanceKey != "" {
-		expectedResultPath += "/" + task.InstanceKey
-	}
-	expectedResultPath += "/" + task.TaskDefID
-	// Multi-citizen tasks (Phase E.2 session 2a) write each
-	// submission into its own `citizen-<username>/` subdirectory
-	// under the task's base result path. The submitted result_path
-	// is expected to be either the base (session 1 single-citizen
-	// shape) or base + citizen subdir (multi-citizen shape).
-	if req.ResultPath != "" && req.ResultPath != expectedResultPath {
-		allowedCitizenSubdir := false
-		if task.Citizens > 1 && strings.HasPrefix(req.ResultPath, expectedResultPath+"/citizen-") {
-			allowedCitizenSubdir = true
-		}
-		if !allowedCitizenSubdir {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("result_path %q does not match expected %q for this task", req.ResultPath, expectedResultPath))
-			return
-		}
-	}
-	// Store the task-level result path (the common parent) on
-	// the tasks row so downstream template resolution can find
-	// the base dir. Per-citizen subdirs live underneath it.
-	resultPath := expectedResultPath
-
-	// Review tasks must carry an explicit decision; vote tasks
-	// must carry an option id. Non-matching tasks that happen to
-	// send either field are tolerated — the columns stay empty
-	// for them because we only persist per-action.
-	decision := ""
-	voteChoice := ""
-	if task.Action == "review" {
-		switch req.Decision {
-		case "approve", "reject":
-			decision = req.Decision
-		case "":
-			writeError(w, http.StatusBadRequest, `decision is required on action:review tasks (must be "approve" or "reject")`)
-			return
-		default:
-			writeError(w, http.StatusBadRequest, fmt.Sprintf(`decision %q is invalid (must be "approve" or "reject")`, req.Decision))
-			return
-		}
-	}
-	if task.Action == "vote" {
-		// Validate the option id against the declared list on the
-		// task row. VoteOptions stores the JSON-encoded options
-		// array from YAML; we re-decode here instead of piping
-		// through yaml.TaskDef so the router has one source of
-		// truth.
-		var declared []struct {
-			ID        string   `json:"id"`
-			Label     string   `json:"label,omitempty"`
-			Activates []string `json:"activates,omitempty"`
-		}
-		if err := json.Unmarshal([]byte(task.VoteOptions), &declared); err != nil || len(declared) == 0 {
-			writeError(w, http.StatusInternalServerError, "vote task has no declared options — this is a storage inconsistency")
-			return
-		}
-		known := make([]string, len(declared))
-		for i, o := range declared {
-			known[i] = o.ID
-		}
-		if req.Option == "" {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf(`option is required on action:vote tasks (must be one of: %s)`, strings.Join(known, ", ")))
-			return
-		}
-		ok := false
-		for _, id := range known {
-			if id == req.Option {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf(`option %q is invalid (must be one of: %s)`, req.Option, strings.Join(known, ", ")))
-			return
-		}
-		voteChoice = req.Option
-	}
-
-	// Resolve the submitting citizen. For single-citizen tasks
-	// this is optional — tasks.claimed_by tells us who has the
-	// exclusive claim. For multi-citizen tasks the caller MUST
-	// identify themselves so the right task_claims slot gets
-	// credited.
-	var submitterID int64
-	if task.Citizens > 1 {
-		if req.Username == "" {
-			writeError(w, http.StatusBadRequest, "username is required on multi-citizen task submissions")
-			return
-		}
-		citizen, err := s.store.GetCitizenByUsername(req.Username)
-		if err != nil || citizen == nil {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown citizen %q", req.Username))
-			return
-		}
-		submitterID = citizen.ID
-	} else {
-		submitterID = task.ClaimedBy
-	}
-
-	// Update state machine. For single-citizen tasks this also
-	// transitions to ACCEPTED in one shot; for multi-citizen
-	// tasks it records the citizen's vote and transitions to
-	// COLLECTING (tally runs below).
-	submitRes, err := s.store.SubmitTaskResult(taskID, submitterID, resultPath, req.CommitSHA, decision, voteChoice, req.Content, req.TokensUsed)
+	resultPath, decision, voteChoice, submitterID, err := eng.ValidateSubmitRequest(task, run, engineReq)
 	if err != nil {
-		// Terminal-state rejections (late submits) are a
-		// client-visible 400, not a server-side 500 — the
-		// caller raced with the tally and lost. Everything
-		// else is still a 500.
-		if strings.Contains(err.Error(), "already resolved") {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 2. Engine computes submission → Plan.
+	submitOutcome, err := eng.ComputeSubmission(
+		taskID, submitterID, resultPath, req.CommitSHA,
+		decision, voteChoice, req.Content, req.TokensUsed,
+	)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.store.ApplyPlan(submitOutcome.Plan); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
 		return
 	}
 
-	// Update artifacts index. All reported paths share the same
-	// commit SHA because the client committed them atomically.
-	if len(req.ArtifactsWritten) > 0 {
-		now := time.Now()
-		for _, path := range req.ArtifactsWritten {
-			if err := s.store.UpsertArtifact(&store.ArtifactRecord{
-				ProjectID:  run.ProjectID,
-				Path:       path,
-				LastWriter: task.ClaimedBy,
-				LastTaskID: taskID,
-				LastRunID:  task.RunID,
-				CommitSHA:  req.CommitSHA,
-				CreatedAt:  now,
-				UpdatedAt:  now,
-			}); err != nil {
-				s.logger.Error("upserting artifact index", "path", path, "error", err)
-				// Don't fail the request — git is the source of
-				// truth, the index is just a cache.
-			}
+	// Record contribution events (append-only, never fails
+	// the submit — best-effort logging). Inject model name
+	// from the submit request — the engine doesn't have it
+	// because it's a client-side config.
+	for i := range submitOutcome.Events {
+		evt := &submitOutcome.Events[i]
+		if evt.ProjectID == 0 {
+			evt.ProjectID = run.ProjectID
+		}
+		if req.Model != "" && evt.Metadata != "" {
+			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, req.Model)
+		}
+		if err := s.store.RecordContributionEvent(evt); err != nil {
+			s.logger.Warn("recording contribution event", "error", err)
 		}
 	}
 
-	// Cross-run artifact propagation, same as the legacy path.
-	// We collect affected runs now but defer the readiness sweep
-	// until AFTER any action-specific cascades (review reject,
-	// vote skip) have run. Otherwise the initial readiness pass
-	// would promote losing-branch tasks to READY and the skip
-	// cascade would immediately flip them back to SKIPPED — the
-	// user-facing `readied` count would double-count those as
-	// "newly unlocked" even though they never actually entered
-	// the work queue.
-	otherRuns := map[int64]bool{}
-	if len(req.ArtifactsWritten) > 0 {
-		for _, path := range req.ArtifactsWritten {
-			readers, err := s.store.ListTasksReadingArtifact(run.ProjectID, path, false)
-			if err != nil {
-				s.logger.Warn("listing cross-run readers", "path", path, "error", err)
-				continue
-			}
-			for _, rd := range readers {
-				if rd.RunID != task.RunID {
-					otherRuns[rd.RunID] = true
-				}
-			}
+	// 3. Engine computes post-submit actions (artifacts,
+	//    tally, resolution decisions).
+	actions, err := eng.ComputePostSubmitActions(task, run, submitOutcome, engineReq, decision, voteChoice)
+	if err != nil {
+		s.logger.Error("post-submit actions failed", "task_id", taskID, "error", err)
+	}
+
+	// 4. Apply artifact mutations.
+	if actions != nil && len(actions.ArtifactMutations) > 0 {
+		if _, err := s.store.ApplyPlan(store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: actions.ArtifactMutations,
+		}); err != nil {
+			s.logger.Error("upserting artifact index", "error", err)
 		}
 	}
 
-	// Review resolution — three paths:
-	//
-	//   1. Single-reviewer review (citizens = 1): SubmitTaskResult
-	//      already flipped the task to ACCEPTED. If the decision
-	//      was "reject", fire the invalidation cascade on the
-	//      target task directly. (Session E.1 behavior.)
-	//
-	//   2. Multi-reviewer review (citizens > 1): SubmitTaskResult
-	//      recorded the reviewer's verdict on their task_claims
-	//      row and moved the task to COLLECTING. Run the review
-	//      tally: any-reject-kills means the first reject
-	//      resolves the task as rejected immediately; all-approve
-	//      with quorum met resolves as accepted.
-	//
-	// The existing review-reject cascade machinery is reused for
-	// both paths — the difference is just who triggers it (one
-	// reviewer vs. the tally on the Nth vote).
+	// 5. Apply review/vote resolution + fire cascades.
 	var rejectResult *invalidationResult
-	var reviewTally *reviewTallyOutcome
-	if task.Action == "review" && task.ReviewsTarget != "" {
-		shouldReject := false
-		shouldAccept := false
-
-		if submitRes != nil && submitRes.Resolved {
-			// Single-reviewer — decision already committed to
-			// tasks.review_decision. Fire the cascade on reject.
-			shouldReject = decision == "reject"
-			shouldAccept = decision == "approve"
-		} else if submitRes != nil && submitRes.Collecting {
-			// Multi-reviewer — run the tally.
-			outcome, err := s.evaluateReviewTally(task)
-			if err != nil {
-				s.logger.Error("review tally failed", "review_task", taskID, "error", err)
-			} else {
-				reviewTally = outcome
-				if outcome != nil && outcome.Resolved {
-					if outcome.Verdict == "reject" {
-						shouldReject = true
-						// Roll up the tally verdict into the
-						// task record so the formatter can see
-						// "✗ rejected by majority/any-reject".
-						_ = s.store.ResolveMultiCitizenReview(taskID, "reject", req.CommitSHA)
-					} else {
-						shouldAccept = true
-						_ = s.store.ResolveMultiCitizenReview(taskID, "approve", req.CommitSHA)
-					}
-				}
-			}
+	var skipResult *skipCascadeResult
+	if actions != nil {
+		if actions.ReviewResolvePlan != nil {
+			s.store.ApplyPlan(*actions.ReviewResolvePlan)
 		}
-
-		if shouldReject {
-			targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
-			res, err := s.performInvalidate(targetFullID)
+		if actions.ShouldRejectTarget && actions.RejectTargetID != "" {
+			res, err := s.performInvalidate(actions.RejectTargetID)
 			if err != nil {
-				s.logger.Error("review-reject cascade failed",
-					"review_task", taskID, "target", targetFullID, "error", err)
+				s.logger.Error("review-reject cascade", "target", actions.RejectTargetID, "error", err)
 			} else {
 				rejectResult = res
-				s.logger.Info("review rejected target task",
-					"review_task", taskID,
-					"target", targetFullID,
-					"descendants", len(res.Descendants),
-					"changed", res.Changed,
-				)
 			}
 		}
-		_ = shouldAccept // reserved for future "approve side-effect" hook
-	}
-
-	// Vote resolution. Two paths:
-	//
-	//   1. Single-voter vote (citizens = 1): SubmitTaskResult
-	//      already flipped the task to ACCEPTED with voteChoice
-	//      as the winning option. We fire the skip cascade here.
-	//
-	//   2. Multi-voter vote (citizens > 1): SubmitTaskResult
-	//      recorded the citizen's vote and moved the task to
-	//      COLLECTING. We run the tally now — if it resolves,
-	//      we flip to ACCEPTED + fire the skip cascade. If not,
-	//      we leave the task in COLLECTING for more submissions.
-	var skipResult *skipCascadeResult
-	var tallyOutcome *voteTallyOutcome
-	if task.Action == "vote" {
-		if submitRes != nil && submitRes.Resolved && voteChoice != "" {
-			// Single-voter fast path — SubmitTaskResult already
-			// transitioned to ACCEPTED. Fire the cascade.
-			res, err := s.performSkipCascade(task, voteChoice)
-			if err != nil {
-				s.logger.Error("vote skip cascade failed",
-					"vote_task", taskID, "choice", voteChoice, "error", err)
-			} else {
-				skipResult = res
-			}
-		} else if submitRes != nil && submitRes.Collecting {
-			// Multi-voter collecting path — run the tally.
-			outcome, err := s.evaluateVoteTally(task)
-			if err != nil {
-				s.logger.Error("vote tally failed",
-					"vote_task", taskID, "error", err)
-			} else {
-				tallyOutcome = outcome
-				if outcome != nil && outcome.Resolved {
-					// Winning option found — transition to
-					// ACCEPTED and fire the skip cascade.
-					if err := s.store.ResolveMultiCitizenVote(taskID, outcome.WinningOption, req.CommitSHA); err != nil {
-						s.logger.Error("resolving multi-citizen vote",
-							"vote_task", taskID, "error", err)
-					} else {
-						// Re-load the task so performSkipCascade
-						// sees the updated row with the winning
-						// option set.
-						updated, _ := s.store.GetTask(taskID)
-						if updated != nil {
-							res, err := s.performSkipCascade(updated, outcome.WinningOption)
-							if err != nil {
-								s.logger.Error("vote skip cascade failed",
-									"vote_task", taskID, "error", err)
-							} else {
-								skipResult = res
-							}
-						}
-					}
+		if actions.VoteResolvePlan != nil {
+			s.store.ApplyPlan(*actions.VoteResolvePlan)
+		}
+		if actions.ShouldSkipCascade {
+			updated, _ := s.store.GetTask(taskID)
+			if updated != nil {
+				res, err := s.performSkipCascade(updated, actions.WinningOption)
+				if err != nil {
+					s.logger.Error("skip cascade", "error", err)
+				} else {
+					skipResult = res
 				}
 			}
 		}
 	}
 
-	// Phase J.1 — materialize dynamic for_each downstreams.
-	// If this task's accept produced output lists that a
-	// deferred downstream reads, expand the deferred task into
-	// concrete rows right here so the readiness sweep below
-	// picks them up in the same submit round-trip.
-	//
-	// Only runs when (a) the task actually reached ACCEPTED
-	// (not COLLECTING) and (b) the request carries output_lists
-	// and (c) the run has DeferredTaskDefs waiting on this
-	// task's outputs.
-	if submitRes != nil && submitRes.Resolved && len(req.OutputLists) > 0 {
+	// 6. Dynamic materialization.
+	if submitOutcome.Resolved && len(req.OutputLists) > 0 {
 		if err := s.materializeDeferredTasks(task, run, req.OutputLists); err != nil {
-			s.logger.Error("materializing deferred tasks",
-				"task_id", taskID, "error", err)
-			// Not a hard failure — the upstream is already
-			// accepted, and downstream materialization is a
-			// best-effort follow-up. Log and proceed so the
-			// submit response still reflects the state flip.
+			s.logger.Error("materializing deferred tasks", "task_id", taskID, "error", err)
 		}
 	}
 
-	// Now the action-specific cascades have settled, run the
-	// readiness sweep. Losing-branch tasks are already SKIPPED so
-	// they won't enter the "newly ready" count; only tasks that
-	// genuinely transitioned from PENDING to READY get reported.
+	// 7. Ready-task sweep + run completion.
 	readied, _ := s.store.UpdateReadyTasks(task.RunID)
-	for rid := range otherRuns {
-		if n, err := s.store.UpdateReadyTasks(rid); err == nil {
-			readied += n
+	if actions != nil {
+		for rid := range actions.CrossRunIDs {
+			if n, err := s.store.UpdateReadyTasks(rid); err == nil {
+				readied += n
+			}
 		}
 	}
-
-	// Mark run completed if all tasks accepted.
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
-	if completed {
-		s.logger.Info("run completed", "run_id", task.RunID)
-	}
 
-	s.logger.Info("result reported",
-		"task_id", taskID,
-		"path", resultPath,
-		"commit", req.CommitSHA,
-		"newly_ready", readied,
-	)
+	// 8. Build response.
+	s.logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", req.CommitSHA, "newly_ready", readied)
 
 	status := "accepted"
+	reviewTally := actions.ReviewTally
+	tallyOutcome := actions.VoteTally
 	voteStillCollecting := tallyOutcome != nil && !tallyOutcome.Resolved
 	reviewStillCollecting := reviewTally != nil && !reviewTally.Resolved
-	if submitRes != nil && submitRes.Collecting && (voteStillCollecting || reviewStillCollecting || (tallyOutcome == nil && reviewTally == nil)) {
+	if submitOutcome.Collecting && (voteStillCollecting || reviewStillCollecting || (tallyOutcome == nil && reviewTally == nil)) {
 		status = "collecting"
 	}
 	resp := map[string]interface{}{
@@ -1690,6 +1334,13 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		"result_path": resultPath,
 		"commit_sha":  req.CommitSHA,
 		"newly_ready": readied,
+	}
+	// Contribution counter — "Contribution #N".
+	if submitterID > 0 {
+		contribCount, _ := s.store.CountContributionEvents(submitterID)
+		projectsThisMonth, _ := s.store.CountProjectsThisMonth(submitterID)
+		resp["contribution_number"] = contribCount
+		resp["projects_this_month"] = projectsThisMonth
 	}
 	if decision != "" {
 		resp["decision"] = decision
@@ -1703,12 +1354,9 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	}
 	if reviewTally != nil {
 		resp["review_tally"] = map[string]interface{}{
-			"resolved":      reviewTally.Resolved,
-			"verdict":       reviewTally.Verdict,
-			"approves":      reviewTally.Approves,
-			"rejects":       reviewTally.Rejects,
-			"total_reviews": reviewTally.TotalReviews,
-			"reason":        reviewTally.Reason,
+			"resolved": reviewTally.Resolved, "verdict": reviewTally.Verdict,
+			"approves": reviewTally.Approves, "rejects": reviewTally.Rejects,
+			"total_reviews": reviewTally.TotalReviews, "reason": reviewTally.Reason,
 		}
 	}
 	if task.Action == "vote" {
@@ -1717,7 +1365,7 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			voteResp["winning_option"] = tallyOutcome.WinningOption
 			voteResp["votes_tallied"] = tallyOutcome.TotalVotes
 			voteResp["counts"] = tallyOutcome.Counts
-		} else if submitRes != nil && submitRes.Resolved && voteChoice != "" {
+		} else if submitOutcome.Resolved && voteChoice != "" {
 			voteResp["winning_option"] = voteChoice
 		} else if tallyOutcome != nil {
 			voteResp["collecting"] = true
@@ -1838,12 +1486,12 @@ type rollbackOutcome struct {
 
 // performInvalidate is the shared cascade-invalidation implementation
 // used by handleInvalidateTask (external API) and the review-reject
-// path inside handleSubmitResultReport. Walks the DAG for
-// intra-run descendants, rolls back the artifact index for
-// cross-run readers, and calls Store.InvalidateTask to flip states
-// atomically. Returns nil + error only on hard failures; soft
-// failures (artifact index misses, etc.) are logged and the cascade
-// continues.
+// path inside handleSubmitResultReport.
+//
+// The computation (DAG walk, artifact rollback decisions, dynamic
+// descendant identification) is delegated to engine.ComputeInvalidation.
+// This function applies the outcome's mutations to the store and
+// manages the in-memory DAG cache.
 func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	task, err := s.store.GetTask(taskID)
 	if err != nil || task == nil {
@@ -1857,596 +1505,106 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	if err != nil || run == nil {
 		return nil, fmt.Errorf("run not found for task %q", taskID)
 	}
-	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
-	dagNodeID := enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID)
-
-	shortDescendants := d.Descendants(dagNodeID)
-	descendants := make([]string, 0, len(shortDescendants))
-	for _, short := range shortDescendants {
-		descendants = append(descendants, runPrefix+short)
-	}
-
-	invalidatedSet := make(map[string]bool, 1+len(descendants))
-	invalidatedSet[taskID] = true
-	for _, dd := range descendants {
-		invalidatedSet[dd] = true
-	}
-
-	writtenPaths := make([]string, 0)
-	seenPath := make(map[string]bool)
-	collectWrites := func(t *store.TaskRecord) {
-		for _, p := range unmarshalStringSlice(t.WritesArtifacts) {
-			if !seenPath[p] {
-				seenPath[p] = true
-				writtenPaths = append(writtenPaths, p)
-			}
-		}
-	}
-	collectWrites(task)
-	for _, descID := range descendants {
-		dt, err := s.store.GetTask(descID)
-		if err != nil || dt == nil {
-			continue
-		}
-		collectWrites(dt)
-	}
-
-	var crossRunReaders []string
-	affectedRunIDs := map[int64]bool{task.RunID: true}
-	for _, p := range writtenPaths {
-		art, _ := s.store.GetArtifact(run.ProjectID, p)
-		if art == nil {
-			continue
-		}
-		if !invalidatedSet[art.LastTaskID] {
-			continue
-		}
-		readers, err := s.store.ListTasksReadingArtifact(run.ProjectID, p, true)
-		if err != nil {
-			s.logger.Warn("listing artifact readers", "path", p, "error", err)
-			continue
-		}
-		for _, r := range readers {
-			if invalidatedSet[r.ID] {
-				continue
-			}
-			invalidatedSet[r.ID] = true
-			crossRunReaders = append(crossRunReaders, r.ID)
-			affectedRunIDs[r.RunID] = true
-		}
-	}
-
-	var rollbacks []rollbackOutcome
-	for _, p := range writtenPaths {
-		art, _ := s.store.GetArtifact(run.ProjectID, p)
-		if art == nil || !invalidatedSet[art.LastTaskID] {
-			continue
-		}
-		priorTasks, err := s.store.ListTasksWritingArtifact(run.ProjectID, p, true)
-		if err != nil {
-			s.logger.Warn("listing prior writers", "path", p, "error", err)
-			continue
-		}
-		var pick *store.TaskRecord
-		for i := range priorTasks {
-			t := &priorTasks[i]
-			if invalidatedSet[t.ID] {
-				continue
-			}
-			if t.CommitSHA == "" {
-				continue
-			}
-			if pick == nil || (t.SubmittedAt != nil && pick.SubmittedAt != nil && t.SubmittedAt.After(*pick.SubmittedAt)) {
-				pick = t
-			}
-		}
-		if pick == nil {
-			if err := s.store.DeleteArtifact(run.ProjectID, p); err != nil {
-				s.logger.Warn("deleting artifact index row", "path", p, "error", err)
-			}
-			rollbacks = append(rollbacks, rollbackOutcome{Path: p, Deleted: true})
-			continue
-		}
-		now := time.Now()
-		if err := s.store.UpsertArtifact(&store.ArtifactRecord{
-			ProjectID:  run.ProjectID,
-			Path:       p,
-			LastWriter: pick.ClaimedBy,
-			LastTaskID: pick.ID,
-			LastRunID:  pick.RunID,
-			CommitSHA:  pick.CommitSHA,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-		}); err != nil {
-			s.logger.Warn("updating artifact index after rollback", "path", p, "error", err)
-		}
-		rollbacks = append(rollbacks, rollbackOutcome{
-			Path:              p,
-			RestoredFromTask:  pick.ID,
-			RestoredCommitSHA: pick.CommitSHA,
-		})
-	}
-
-	// Phase J.1 — dematerialize dynamic descendants.
-	//
-	// If this task is the source for any dynamic for_each
-	// (i.e. some deferred task's for_each ref points at this
-	// task def), every deferred task in the run needs to be
-	// DELETED rather than flipped to PENDING. The rationale:
-	// their instance keys match the previous accept's output
-	// list. On re-accept, the new list may have different
-	// items, so preserving the old rows creates a dangling
-	// state where a citizen could still claim a task whose
-	// upstream list no longer contains its key.
-	//
-	// Instances of deferred defs are deleted by task_def_id,
-	// which catches every materialized row regardless of
-	// instance key. The normal cascade (for non-dynamic
-	// descendants) proceeds unchanged.
 	parsed, _ := s.getOrLoadParsedRun(task.RunID)
-	dematerializeDefs := make(map[string]bool)
-	if parsed != nil && len(parsed.DeferredTaskDefs) > 0 {
-		isDynamicSource := false
-		for _, d := range parsed.DeferredTaskDefs {
-			for _, ref := range d.ForEachRefs {
-				if ref.TaskID == task.TaskDefID {
-					isDynamicSource = true
-					break
-				}
-			}
-			if isDynamicSource {
-				break
-			}
-		}
-		if isDynamicSource {
-			for _, d := range parsed.DeferredTaskDefs {
-				dematerializeDefs[d.TaskDefID] = true
-			}
-		}
-	}
 
-	// Split descendants: if its task_def is in the
-	// dematerialize set, it's a dynamic descendant and will
-	// be deleted below. Otherwise it goes through the normal
-	// InvalidateTask state-flip cascade.
-	var dematerializedIDs []string
-	var regularDescendants []string
-	for _, descID := range descendants {
-		dt, err := s.store.GetTask(descID)
-		if err != nil || dt == nil {
-			continue
-		}
-		if dematerializeDefs[dt.TaskDefID] {
-			dematerializedIDs = append(dematerializedIDs, descID)
-		} else {
-			regularDescendants = append(regularDescendants, descID)
-		}
-	}
-
-	cascadeIDs := make([]string, 0, len(regularDescendants)+len(crossRunReaders))
-	cascadeIDs = append(cascadeIDs, regularDescendants...)
-	cascadeIDs = append(cascadeIDs, crossRunReaders...)
-
-	changed, err := s.store.InvalidateTask(taskID, cascadeIDs)
+	// Engine computes — reads state, never writes.
+	outcome, err := s.engine().ComputeInvalidation(task, run, d, parsed)
 	if err != nil {
 		return nil, err
 	}
-	// Delete the dematerialized rows. Use DeleteTasksByDefInRun
-	// for each affected def so all instance rows go at once
-	// (including any the DAG walk may have missed if the
-	// in-memory cache got out of sync with the store).
-	dematerializedByDef := make(map[string]bool)
-	for _, id := range dematerializedIDs {
-		dt, _ := s.store.GetTask(id)
-		if dt == nil {
-			continue
+
+	// Build a Plan from the engine's outcome.
+	var mutations []store.Mutation
+
+	// 1. Artifact rollbacks.
+	var rollbacks []rollbackOutcome
+	for _, rb := range outcome.ArtifactRollbacks {
+		if rb.Delete {
+			mutations = append(mutations, store.DeleteArtifact{
+				ProjectID: rb.ProjectID,
+				Path:      rb.Path,
+			})
+			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
+		} else if rb.RestoreTo != nil {
+			mutations = append(mutations, store.MoveArtifact{
+				Artifact: *rb.RestoreTo,
+			})
+			rollbacks = append(rollbacks, rollbackOutcome{
+				Path:              rb.Path,
+				RestoredFromTask:  rb.RestoreTo.LastTaskID,
+				RestoredCommitSHA: rb.RestoreTo.CommitSHA,
+			})
 		}
-		dematerializedByDef[dt.TaskDefID] = true
 	}
-	for defID := range dematerializedByDef {
-		if err := s.store.DeleteTasksByDefInRun(task.RunID, defID); err != nil {
-			s.logger.Error("deleting dynamic descendants on invalidation",
-				"def", defID, "run", task.RunID, "error", err)
-		}
+
+	// 2. Target: ACCEPTED → READY with claim clear.
+	mutations = append(mutations, store.SetTaskState{
+		TaskID:     taskID,
+		NewState:   store.TaskReady,
+		ClearClaim: true,
+	})
+
+	// 3. Regular descendants → PENDING with claim clear.
+	for _, descID := range outcome.RegularDescendants {
+		mutations = append(mutations, store.SetTaskState{
+			TaskID:     descID,
+			NewState:   store.TaskPending,
+			ClearClaim: true,
+		})
 	}
-	// Invalidate the run cache so the next getOrLoadDAG
-	// rebuilds from YAML (without the now-deleted materialized
-	// nodes). Essential so a subsequent re-accept sees a clean
-	// DAG and re-materializes fresh.
-	if len(dematerializedByDef) > 0 {
+
+	// 4. Cross-run readers → PENDING with claim clear.
+	for _, readerID := range outcome.CrossRunReaders {
+		mutations = append(mutations, store.SetTaskState{
+			TaskID:     readerID,
+			NewState:   store.TaskPending,
+			ClearClaim: true,
+		})
+	}
+
+	// 5. Dematerialized dynamic descendants → delete.
+	for _, descID := range outcome.DematerializedIDs {
+		mutations = append(mutations, store.DeleteTask{TaskID: descID})
+	}
+
+	plan := store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: mutations,
+	}
+	result, err := s.store.ApplyPlan(plan)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wipe DAG cache if we dematerialized dynamic descendants.
+	if len(outcome.DematerializedDefs) > 0 {
 		delete(s.dags, task.RunID)
 		delete(s.runs, task.RunID)
 	}
 
-	// The "changed" count from InvalidateTask only covers
-	// rows that were state-flipped. Add the dematerialized
-	// rows to the total so the caller-visible number
-	// reflects the full effect of the invalidation.
-	changed += len(dematerializedIDs)
-
-	for runID := range affectedRunIDs {
+	// Ready-task sweeps + run reactivation AFTER the plan
+	// transaction commits (SQLite doesn't support nested
+	// write transactions, so these run as separate calls).
+	for runID := range outcome.AffectedRunIDs {
 		_, _ = s.store.UpdateReadyTasks(runID)
 		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
 			_ = s.store.UpdateRunState(runID, store.RunActive)
 		}
 	}
+
+	changed := result.Changed + result.TasksDeleted
+
 	return &invalidationResult{
-		Task:             task,
-		Descendants:      regularDescendants,
-		CrossRunReaders:  crossRunReaders,
-		Dematerialized:   dematerializedIDs,
-		Changed:          changed,
-		Rollbacks:        rollbacks,
-		AffectedRuns:     affectedRunIDs,
+		Task:            task,
+		Descendants:     outcome.RegularDescendants,
+		CrossRunReaders: outcome.CrossRunReaders,
+		Dematerialized:  outcome.DematerializedIDs,
+		Changed:         changed,
+		Rollbacks:       rollbacks,
+		AffectedRuns:    outcome.AffectedRunIDs,
 	}, nil
 }
 
-// reviewTallyOutcome describes the result of evaluating a
-// multi-reviewer review task's submissions against the default
-// any-reject-kills policy: any "reject" vote immediately
-// resolves the task as rejected; all "approve" votes (with
-// quorum met) resolve as accepted; otherwise the task stays in
-// COLLECTING waiting for more reviewers.
-type reviewTallyOutcome struct {
-	Resolved bool
-	// Verdict is "approve" or "reject" when Resolved is true;
-	// empty otherwise.
-	Verdict      string
-	Approves     int
-	Rejects      int
-	TotalReviews int
-	Reason       string
-}
-
-// evaluateReviewTally walks the per-citizen review submissions
-// and applies the task's dissent-policy threshold. Supported
-// policies:
-//
-//   - "any-reject-kills" (default): first reject resolves as
-//     reject. Matches real-world code review: one "you can't
-//     ship this" kills the submission.
-//   - "majority-approve": strictly more than half of submitted
-//     reviews must be approve. Short-circuits when it becomes
-//     mathematically impossible.
-//   - "unanimous-approve": every reviewer must approve;
-//     equivalent to any-reject-kills for the reject path, but
-//     also requires the full set to weigh in before approving.
-//   - "percent:N": at least N% of the citizens target must
-//     approve. Differs from majority in that a higher bar
-//     (e.g. 75%) needs explicit agreement from enough people.
-//
-// Quorum (min_quorum or default citizens) gates when the
-// approve-path can resolve. The reject-path short-circuits
-// regardless of quorum under any-reject-kills.
-func (s *Server) evaluateReviewTally(task *store.TaskRecord) (*reviewTallyOutcome, error) {
-	submissions, err := s.store.ListVoteSubmissions(task.ID)
-	if err != nil {
-		return nil, fmt.Errorf("listing review submissions: %w", err)
-	}
-	out := &reviewTallyOutcome{TotalReviews: len(submissions)}
-	for _, sub := range submissions {
-		switch sub.Option {
-		case "approve":
-			out.Approves++
-		case "reject":
-			out.Rejects++
-		}
-	}
-
-	policy := strings.ToLower(task.VoteThreshold)
-	if policy == "" {
-		policy = "any-reject-kills"
-	}
-
-	// Quorum defaults to the task's citizens count; explicit
-	// min_quorum overrides.
-	needed := task.MinQuorum
-	if needed <= 0 {
-		needed = task.Citizens
-		if needed <= 0 {
-			needed = 1
-		}
-	}
-
-	// Dispatch to the policy. Each branch sets out.Resolved
-	// and out.Verdict when a terminal decision is reached, or
-	// fills out.Reason to explain why we're still collecting.
-	switch {
-	case policy == "any-reject-kills":
-		if out.Rejects > 0 {
-			out.Resolved = true
-			out.Verdict = "reject"
-			return out, nil
-		}
-		if out.Approves < needed {
-			out.Reason = fmt.Sprintf("approvals not yet at quorum (%d of %d)", out.Approves, needed)
-			return out, nil
-		}
-		out.Resolved = true
-		out.Verdict = "approve"
-	case policy == "unanimous-approve":
-		// Same as any-reject-kills — one reject means not
-		// unanimous, so the task can't pass. All approves
-		// with quorum met → approve.
-		if out.Rejects > 0 {
-			out.Resolved = true
-			out.Verdict = "reject"
-			return out, nil
-		}
-		if out.Approves < needed {
-			out.Reason = fmt.Sprintf("unanimous approval not yet at quorum (%d of %d)", out.Approves, needed)
-			return out, nil
-		}
-		out.Resolved = true
-		out.Verdict = "approve"
-	case policy == "majority-approve":
-		// More than half of `needed` reviews must be approves
-		// for the task to pass. Resolves as soon as the
-		// outcome is mathematically decided — no need to wait
-		// for remaining ballots that can't change the verdict.
-		if out.Approves*2 > needed {
-			out.Resolved = true
-			out.Verdict = "approve"
-			return out, nil
-		}
-		if out.Rejects*2 >= needed {
-			out.Resolved = true
-			out.Verdict = "reject"
-			return out, nil
-		}
-		pending := needed - out.TotalReviews
-		if pending < 0 {
-			pending = 0
-		}
-		out.Reason = fmt.Sprintf("majority not yet decidable (%d approve, %d reject, waiting for %d more)",
-			out.Approves, out.Rejects, pending)
-	case strings.HasPrefix(policy, "percent:"):
-		pctStr := strings.TrimPrefix(policy, "percent:")
-		pct, err := strconv.Atoi(pctStr)
-		if err != nil || pct < 1 || pct > 100 {
-			out.Reason = fmt.Sprintf("invalid percent threshold %q", task.VoteThreshold)
-			return out, nil
-		}
-		// Need at least pct% of `needed` reviewers to approve.
-		// Use integer math: approves*100 >= pct*needed.
-		requiredApproves := (pct*needed + 99) / 100 // ceil
-		if out.Approves >= requiredApproves {
-			out.Resolved = true
-			out.Verdict = "approve"
-			return out, nil
-		}
-		// Resolve early as reject if even all remaining
-		// reviewers couldn't push approves past the bar.
-		pending := needed - out.TotalReviews
-		if pending < 0 {
-			pending = 0
-		}
-		if out.Approves+pending < requiredApproves {
-			out.Resolved = true
-			out.Verdict = "reject"
-			return out, nil
-		}
-		out.Reason = fmt.Sprintf("percent:%d not yet met (%d of %d needed)",
-			pct, out.Approves, requiredApproves)
-	default:
-		out.Reason = fmt.Sprintf("unknown review threshold %q", task.VoteThreshold)
-	}
-	return out, nil
-}
-
-// voteTallyOutcome describes the result of evaluating the current
-// set of submitted votes against a multi-citizen vote task's
-// threshold + min_quorum + deadline rules. Resolved is true when
-// the task should transition to ACCEPTED; WinningOption is set in
-// that case. When Resolved is false the task stays in COLLECTING
-// and waits for more submissions (or a deadline trigger).
-type voteTallyOutcome struct {
-	Resolved      bool
-	WinningOption string
-	// Counts is the per-option vote count at evaluation time,
-	// useful for logging and formatter output.
-	Counts map[string]int
-	// TotalVotes is the number of submissions that contributed.
-	TotalVotes int
-	// Reason explains why a non-resolved tally didn't resolve
-	// (e.g. "quorum not met", "threshold not met"). Empty on
-	// resolved outcomes.
-	Reason string
-}
-
-// evaluateVoteTally applies the task's threshold + quorum rules
-// to the current set of submitted votes. It never mutates state
-// — it only reports whether the submissions so far justify a
-// resolution. The caller (handleSubmitResultReport) decides
-// what to do with the result.
-func (s *Server) evaluateVoteTally(task *store.TaskRecord) (*voteTallyOutcome, error) {
-	submissions, err := s.store.ListVoteSubmissions(task.ID)
-	if err != nil {
-		return nil, fmt.Errorf("listing submissions: %w", err)
-	}
-	counts := make(map[string]int, len(submissions))
-	for _, sub := range submissions {
-		if sub.Option == "" {
-			continue
-		}
-		counts[sub.Option]++
-	}
-	total := len(submissions)
-
-	// Decode declared options in stable order for tie-breaking.
-	var declared []struct {
-		ID        string   `json:"id"`
-		Label     string   `json:"label,omitempty"`
-		Activates []string `json:"activates,omitempty"`
-	}
-	if task.VoteOptions != "" {
-		_ = json.Unmarshal([]byte(task.VoteOptions), &declared)
-	}
-
-	// Deadline check. Polls close `deadline` after the first
-	// citizen claims. Past the deadline, we skip the min_quorum
-	// check and tally whatever landed — but the threshold rule
-	// still applies, so an under-threshold tally stays stuck
-	// (human intervenes). Before the deadline, the normal
-	// quorum + threshold checks apply.
-	deadlinePassed, err := s.voteDeadlinePassed(task)
-	if err != nil {
-		return nil, err
-	}
-
-	// Quorum check. Explicit min_quorum takes precedence;
-	// otherwise default to citizens count for multi-voter tasks
-	// (wait for everyone) and 1 for single-voter tasks. This
-	// matches the intuition "3 citizens can vote" → all 3
-	// should vote before resolution unless the author opts
-	// into a smaller quorum explicitly.
-	//
-	// Deadline override: once the deadline has passed, quorum
-	// drops to 1 — we tally whatever arrived.
-	minQuorum := task.MinQuorum
-	if minQuorum <= 0 {
-		if task.Citizens > 1 {
-			minQuorum = task.Citizens
-		} else {
-			minQuorum = 1
-		}
-	}
-	if deadlinePassed {
-		minQuorum = 1
-	}
-	if total < minQuorum {
-		reason := fmt.Sprintf("quorum not met (%d of %d)", total, minQuorum)
-		if deadlinePassed {
-			reason = "deadline passed with zero submissions"
-		}
-		return &voteTallyOutcome{
-			Counts:     counts,
-			TotalVotes: total,
-			Reason:     reason,
-		}, nil
-	}
-
-	// Pick a winner based on the threshold rule.
-	threshold := task.VoteThreshold
-	if threshold == "" {
-		threshold = "plurality"
-	}
-	winner, reason := pickWinner(declared, counts, total, threshold)
-	if winner == "" {
-		if deadlinePassed {
-			reason = "deadline passed, " + reason
-		}
-		return &voteTallyOutcome{
-			Counts:     counts,
-			TotalVotes: total,
-			Reason:     reason,
-		}, nil
-	}
-	return &voteTallyOutcome{
-		Resolved:      true,
-		WinningOption: winner,
-		Counts:        counts,
-		TotalVotes:    total,
-	}, nil
-}
-
-// voteDeadlinePassed reports whether the task's voting deadline
-// has elapsed. The clock starts when the first citizen claims
-// (earliest task_claims.claimed_at), not when the task was
-// created — a vote can sit waiting for deps to resolve, and the
-// deadline should only start ticking when voting actually opens.
-// Tasks with no deadline set always return false.
-func (s *Server) voteDeadlinePassed(task *store.TaskRecord) (bool, error) {
-	if task.VoteDeadline == "" {
-		return false, nil
-	}
-	d, err := time.ParseDuration(task.VoteDeadline)
-	if err != nil {
-		// Parser validated the string at run creation, but be
-		// defensive at tally time — if it's malformed now,
-		// treat as "no deadline" rather than erroring out.
-		s.logger.Warn("invalid vote deadline", "task_id", task.ID, "deadline", task.VoteDeadline, "error", err)
-		return false, nil
-	}
-	firstClaim, err := s.store.EarliestClaimTime(task.ID)
-	if err != nil {
-		return false, fmt.Errorf("earliest claim lookup: %w", err)
-	}
-	if firstClaim.IsZero() {
-		// Nobody has claimed yet — voting hasn't opened, so
-		// the deadline isn't ticking.
-		return false, nil
-	}
-	return time.Now().After(firstClaim.Add(d)), nil
-}
-
-// pickWinner returns the winning option id given the current
-// counts and the threshold rule. Returns an empty string + a
-// reason when no winner can be declared (tally stays open).
-// Ties under plurality/majority are broken by the order in which
-// options were declared in YAML — the first-declared option wins
-// a tie.
-func pickWinner(declared []struct {
-	ID        string   `json:"id"`
-	Label     string   `json:"label,omitempty"`
-	Activates []string `json:"activates,omitempty"`
-}, counts map[string]int, total int, threshold string) (string, string) {
-	if total == 0 {
-		return "", "no votes cast"
-	}
-
-	// Find max count.
-	maxCount := 0
-	for _, c := range counts {
-		if c > maxCount {
-			maxCount = c
-		}
-	}
-	if maxCount == 0 {
-		return "", "no votes cast"
-	}
-
-	// Leaders in declaration order — first one is our tie-break
-	// winner for plurality/majority.
-	var leaders []string
-	for _, opt := range declared {
-		if counts[opt.ID] == maxCount {
-			leaders = append(leaders, opt.ID)
-		}
-	}
-	if len(leaders) == 0 {
-		return "", "no declared option matched the top count"
-	}
-	winner := leaders[0]
-
-	lower := strings.ToLower(threshold)
-	switch {
-	case lower == "plurality":
-		return winner, ""
-	case lower == "majority":
-		if maxCount*2 > total {
-			return winner, ""
-		}
-		return "", fmt.Sprintf("majority not met (%d of %d)", maxCount, total)
-	case lower == "unanimous":
-		if maxCount == total && len(leaders) == 1 {
-			return winner, ""
-		}
-		return "", fmt.Sprintf("unanimous not met (%d of %d agree)", maxCount, total)
-	case strings.HasPrefix(lower, "percent:"):
-		pctStr := strings.TrimPrefix(lower, "percent:")
-		pct, err := strconv.Atoi(pctStr)
-		if err != nil || pct < 1 || pct > 100 {
-			return "", fmt.Sprintf("invalid percent threshold %q", threshold)
-		}
-		// Need winner's share ≥ pct% of total.
-		if maxCount*100 >= pct*total {
-			return winner, ""
-		}
-		return "", fmt.Sprintf("percent:%d not met (%d of %d = %d%%)", pct, maxCount, total, (maxCount*100)/total)
-	}
-	return "", fmt.Sprintf("unknown threshold %q", threshold)
-}
 
 // skipCascadeResult summarizes the outcome of performSkipCascade
 // for logging and response rendering.
@@ -2501,541 +1659,50 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 	if err != nil {
 		return fmt.Errorf("loading parsed run: %w", err)
 	}
-	if len(parsed.DeferredTaskDefs) == 0 {
-		return nil // nothing deferred in this run
-	}
 
-	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
-
-	// Identify the deferred task defs that directly reference
-	// this accepting task. Each one's for_each has one or more
-	// variables pointing at this task's outputs; we resolve the
-	// lists from the supplied OutputLists and check we have
-	// values for every variable.
-	type resolvedRef struct {
-		def      *enjuYaml.DeferredTaskDef
-		forEach  map[string][]string // per-variable resolved list
+	// Engine computes the materialization plan.
+	outcome, err := s.engine().ComputeMaterialization(parsed, task, run, outputLists)
+	if err != nil {
+		return err
 	}
-	var directlyReady []resolvedRef
-	for i := range parsed.DeferredTaskDefs {
-		d := &parsed.DeferredTaskDefs[i]
-		if d.TransitivelyDeferred {
-			continue
-		}
-		// Check every ref on this def — they may point to
-		// different upstreams. We only materialize when ALL
-		// refs are resolvable right now. If some point to this
-		// task and others don't, we skip (materialize later on
-		// the other upstream's accept).
-		allReady := true
-		resolved := make(map[string][]string, len(d.ForEachRefs))
-		for varName, ref := range d.ForEachRefs {
-			if ref.TaskID != task.TaskDefID {
-				allReady = false
-				break
-			}
-			list, ok := outputLists[ref.Field]
-			if !ok {
-				s.logger.Warn("deferred task missing output list",
-					"deferred", d.TaskDefID, "field", ref.Field)
-				allReady = false
-				break
-			}
-			resolved[varName] = list
-		}
-		if !allReady {
-			continue
-		}
-		directlyReady = append(directlyReady, resolvedRef{def: d, forEach: resolved})
-	}
-	if len(directlyReady) == 0 {
+	if outcome == nil {
 		return nil
 	}
 
-	// Look up the original task defs by ID so we can copy
-	// the full shape (prompt, action, outputs, timeout, etc.)
-	// into each expanded instance.
-	taskDefByID := make(map[string]*enjuYaml.TaskDef, len(parsed.Run.Tasks))
-	for i := range parsed.Run.Tasks {
-		taskDefByID[parsed.Run.Tasks[i].ID] = &parsed.Run.Tasks[i]
-	}
-
-	// For each directly-ready deferred task def, expand and
-	// create rows. Track newly-created instance IDs per
-	// task_def so the transitively-deferred pass below can
-	// resolve its depends_on.
-	newInstances := make(map[string][]materializedInstance)
-	// Find the max seq currently in this run so new rows
-	// continue the numbering cleanly.
-	existingTasks, _ := s.store.ListTasksByRun(task.RunID)
-	nextSeq := 0
-	for _, t := range existingTasks {
-		if t.Seq > nextSeq {
-			nextSeq = t.Seq
-		}
-	}
-
-	// Re-run cleanup: if we're re-materializing after an
-	// upstream invalidation + re-accept (e.g. discover was
-	// invalidated and submitted again with a different gene
-	// list), any existing rows for the deferred task defs
-	// are stale. Delete them now so the two-pass allocation
-	// below starts from a clean slate. Also cleans up the
-	// transitively-deferred defs below.
-	deferredDefIDs := make(map[string]bool)
-	for _, rr := range directlyReady {
-		deferredDefIDs[rr.def.TaskDefID] = true
-	}
-	for i := range parsed.DeferredTaskDefs {
-		d := &parsed.DeferredTaskDefs[i]
-		if d.TransitivelyDeferred {
-			deferredDefIDs[d.TaskDefID] = true
-		}
-	}
-	for defID := range deferredDefIDs {
+	// Apply: clean up stale rows + create new tasks via
+	// ApplyPlan so all mutations happen atomically.
+	// Stale cleanup still uses the existing helper (it
+	// deletes by def ID across the whole run, which is a
+	// broader sweep than individual DeleteTask mutations).
+	for _, defID := range outcome.DefIDsToCleanUp {
 		if err := s.store.DeleteTasksByDefInRun(task.RunID, defID); err != nil {
 			return fmt.Errorf("cleaning up stale instances for %q: %w", defID, err)
 		}
 	}
-
-	// Two-pass allocation so per-instance dep wiring can
-	// cross-reference siblings. Pass 1 computes the full ID
-	// for every instance about to be materialized so pass 2
-	// can resolve deps like "check:BRCA1 depends on
-	// analyze:BRCA1" without ordering constraints on the
-	// deferred-tasks list.
-	//
-	// Note the two namespaces: "short" IDs (no run prefix)
-	// go into the in-memory DAG cache — the parser builds
-	// the rest of the DAG with short IDs too. "Full" IDs
-	// (runPrefix-qualified) go into the store's tasks table
-	// and task_claims. The cache and the store are two
-	// different key spaces; mixing them breaks cascade
-	// walks.
-	type plannedInstance struct {
-		def     *enjuYaml.TaskDef
-		inst    forEachInstance
-		shortID string
-		fullID  string
-	}
-	var plans []plannedInstance
-	// instanceIndex[def.ID][instance_key] -> (shortID, fullID)
-	// for per-instance matching during dep resolution.
-	instanceIndex := make(map[string]map[string]struct {
-		short string
-		full  string
-	})
-	for _, rr := range directlyReady {
-		def, ok := taskDefByID[rr.def.TaskDefID]
-		if !ok {
-			return fmt.Errorf("deferred task %q not found in parsed run", rr.def.TaskDefID)
+	if len(outcome.TasksToCreate) > 0 {
+		var createMuts []store.Mutation
+		for i := range outcome.TasksToCreate {
+			createMuts = append(createMuts, store.CreateTask{Task: outcome.TasksToCreate[i]})
 		}
-		instances := expandResolvedForEach(rr.forEach)
-		if instanceIndex[def.ID] == nil {
-			instanceIndex[def.ID] = make(map[string]struct {
-				short string
-				full  string
-			}, len(instances))
-		}
-		for _, inst := range instances {
-			shortID := enjuYaml.MakeFullID(inst.key, def.ID)
-			fullID := runPrefix + shortID
-			plans = append(plans, plannedInstance{def: def, inst: inst, shortID: shortID, fullID: fullID})
-			instanceIndex[def.ID][inst.key] = struct {
-				short string
-				full  string
-			}{short: shortID, full: fullID}
+		if _, err := s.store.ApplyPlan(store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: createMuts,
+		}); err != nil {
+			return fmt.Errorf("creating materialized tasks: %w", err)
 		}
 	}
-	// Set of every fullID about to be created — used to
-	// decide READY vs PENDING for instances whose deps point
-	// at siblings in the same batch.
-	inBatch := make(map[string]bool)
-	for _, ids := range instanceIndex {
-		for _, ids2 := range ids {
-			inBatch[ids2.full] = true
+	for _, node := range outcome.DAGNodes {
+		if err := parsed.DAG.AddNode(node.ShortID, node.Action, node.Data); err != nil {
+			s.logger.Warn("DAG AddNode", "id", node.ShortID, "err", err)
 		}
 	}
-
-	now := time.Now()
-	for _, plan := range plans {
-		def := plan.def
-		inst := plan.inst
-		shortID := plan.shortID
-		fullID := plan.fullID
-		nextSeq++
-		ti := buildDeferredInstance(def, inst, parsed.Run)
-
-		// Resolve depends_on per-instance. Walk the def's
-		// declared deps (explicit + inferred from prompt), map
-		// each to a concrete task ID based on whether the dep
-		// is a sibling being materialized right now (→ match
-		// by instance_key), the accepting upstream (→ skip,
-		// already ACCEPTED), or a static singleton already in
-		// the store (→ runPrefix+def_id).
-		//
-		// The `dagParents` slice tracks the edges to add to
-		// the in-memory DAG for cascade walks — it includes
-		// the accepting upstream (so Descendants(discover)
-		// finds its materialized instances) even though the
-		// store-side depends_on skips it.
-		//
-		// IMPORTANT: the for_each source task is an *implicit*
-		// parent even though it doesn't appear in allDeps (a
-		// `for_each: {gene: "{{discover.gene_symbols}}"}`
-		// doesn't cause discover to be listed in
-		// template.MergeDependencies, which only scans the
-		// prompt for task.content refs). Seed dagParents with
-		// every ForEachRef source before walking allDeps so
-		// the cascade walk finds these instances.
-		allDeps := template.MergeDependencies(def.DependsOn, def.Prompt)
-		var resolvedDeps []string
-		var dagParents []string
-		seenDAGParent := make(map[string]bool)
-		addDAGParent := func(short string) {
-			if seenDAGParent[short] {
-				return
-			}
-			seenDAGParent[short] = true
-			dagParents = append(dagParents, short)
-		}
-		// Seed with the for_each sources for this def so the
-		// DAG always has an edge from source → instance even
-		// when the prompt doesn't explicitly reference it.
-		for _, dd := range parsed.DeferredTaskDefs {
-			if dd.TaskDefID != def.ID {
-				continue
-			}
-			for _, ref := range dd.ForEachRefs {
-				addDAGParent(ref.TaskID)
-			}
-			break
-		}
-		for _, dep := range allDeps {
-			if dep == task.TaskDefID {
-				// The accepting upstream is the task that
-				// triggered materialization — don't add it to
-				// depends_on, it's already accepted and the
-				// scheduler would see a dangling satisfied
-				// dep on every instance. DO add a DAG edge so
-				// invalidation cascades find this instance
-				// when the author invalidates the upstream.
-				addDAGParent(enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID))
-				continue
-			}
-			if ids, ok := instanceIndex[dep]; ok {
-				// Sibling in the current batch — per-instance
-				// match on shared instance_key. This is what
-				// wires check:BRCA1 to analyze:BRCA1 in the
-				// canonical review chain.
-				if matched, ok := ids[inst.key]; ok {
-					resolvedDeps = append(resolvedDeps, matched.full)
-					addDAGParent(matched.short)
-					continue
-				}
-			}
-			// Static singleton (already in the store).
-			resolvedDeps = append(resolvedDeps, runPrefix+dep)
-			addDAGParent(dep)
-		}
-
-		// Review-target rewriting: the parser stores
-		// ReviewsTarget as the task_def_id (e.g. "analyze").
-		// For a dynamic per-instance review we want the
-		// target to be the matched sibling's full ID so the
-		// review cascade and display both see a real row
-		// (e.g. "1:2:BRCA1:analyze" instead of "analyze").
-		reviewsTarget := ti.Reviews
-		if reviewsTarget != "" {
-			if ids, ok := instanceIndex[reviewsTarget]; ok {
-				if matched, ok := ids[inst.key]; ok {
-					reviewsTarget = matched.full
-				}
-			}
-		}
-
-		// State: READY if every resolved dep is outside the
-		// current batch (meaning it's already in the store in
-		// a settled state, usually ACCEPTED because that's
-		// what triggered us). PENDING if any dep is a sibling
-		// being materialized right now — the scheduler will
-		// promote us when those siblings accept.
-		state := store.TaskReady
-		for _, d := range resolvedDeps {
-			if inBatch[d] {
-				state = store.TaskPending
-				break
-			}
-		}
-		_ = shortID // used below for DAG operations
-
-		rec := &store.TaskRecord{
-			ID:             fullID,
-			RunID:          task.RunID,
-			Seq:            nextSeq,
-			TaskDefID:      def.ID,
-			InstanceKey:    inst.key,
-			InstanceParams: marshalParams(inst.params),
-			Action:         ti.Action,
-			Prompt:         ti.Prompt,
-			UserPrompt:     ti.UserPrompt,
-			Script:         ti.Script,
-			Outputs:        marshalOutputs(ti.Outputs),
-			Requirements:   marshalRequirements(ti.Requirements),
-			ResultType:     ti.ResultType,
-			Timeout:        ti.Timeout,
-			State:          state,
-			DependsOn:      strings.Join(resolvedDeps, ","),
-			ReadsArtifacts: marshalStringSlice(ti.ReadsArtifacts),
-			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
-			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
-			RequireRole:     ti.RequireRole,
-			ReviewsTarget:   reviewsTarget,
-			VoteOptions:     marshalVoteOptions(ti.Options),
-			Citizens:        ti.Citizens,
-			MinQuorum:       ti.MinQuorum,
-			VoteThreshold:   ti.Threshold,
-			VoteDeadline:    ti.Deadline,
-			Anonymize:       ti.Anonymize,
-			Visibility:      ti.Visibility,
-			CreatedAt:       now,
-		}
-		if err := s.store.CreateTask(rec); err != nil {
-			return fmt.Errorf("creating materialized task %s: %w", fullID, err)
-		}
-		newInstances[def.ID] = append(newInstances[def.ID], materializedInstance{
-			FullID:      fullID,
-			InstanceKey: inst.key,
-			Params:      inst.params,
-		})
-		// Add to the in-memory DAG so cascade walks find it.
-		// DAG uses SHORT IDs (no run prefix) — same namespace
-		// the parser uses for static nodes. Edges include the
-		// accepting upstream (so Descendants(discover) finds
-		// this instance) plus per-instance sibling edges so
-		// review cascades propagate correctly.
-		nodeData := map[string]interface{}{
-			"instance_key": inst.key,
-			"task_def_id":  def.ID,
-		}
-		if err := parsed.DAG.AddNode(shortID, def.Action, nodeData); err != nil {
-			s.logger.Warn("DAG AddNode for materialized task", "id", shortID, "err", err)
-		}
-		for _, parentShort := range dagParents {
-			if err := parsed.DAG.AddEdge(parentShort, shortID); err != nil {
-				s.logger.Warn("DAG AddEdge for materialized task", "parent", parentShort, "child", shortID, "err", err)
-			}
+	for _, edge := range outcome.DAGEdges {
+		if err := parsed.DAG.AddEdge(edge.From, edge.To); err != nil {
+			s.logger.Warn("DAG AddEdge", "from", edge.From, "to", edge.To, "err", err)
 		}
 	}
-
-	// Transitively-deferred pass: materialize singletons (and
-	// task-level siblings) whose dependencies are now all
-	// resolvable. For first slice we only handle the common
-	// case: a singleton downstream of one newly-materialized
-	// dynamic upstream.
-	for i := range parsed.DeferredTaskDefs {
-		d := &parsed.DeferredTaskDefs[i]
-		if !d.TransitivelyDeferred {
-			continue
-		}
-		def, ok := taskDefByID[d.TaskDefID]
-		if !ok {
-			continue
-		}
-		// Singletons only in first slice.
-		if len(def.ForEach) > 0 {
-			continue
-		}
-		// Gather deps: every {{upstream.content}} reference +
-		// explicit depends_on. For newly-materialized upstreams
-		// we need a full list of instance IDs; for static
-		// upstreams (already in the store) we use the task_def_id.
-		//
-		// Like the direct pass above, dagParents uses the
-		// short-ID namespace while resolved uses the full
-		// (runPrefix-qualified) store-side namespace.
-		allDeps := template.MergeDependencies(def.DependsOn, def.Prompt)
-		var resolved []string
-		var dagParents []string
-		for _, dep := range allDeps {
-			if instances, ok := newInstances[dep]; ok {
-				for _, m := range instances {
-					resolved = append(resolved, m.FullID)
-					// Recover the short ID from the full ID
-					// by trimming the run prefix.
-					dagParents = append(dagParents, strings.TrimPrefix(m.FullID, runPrefix))
-				}
-				continue
-			}
-			// Static upstream — singleton already in the
-			// store at fullID = runPrefix + task_def_id.
-			resolved = append(resolved, runPrefix+dep)
-			dagParents = append(dagParents, dep)
-		}
-
-		nextSeq++
-		ti := buildDeferredInstance(def, forEachInstance{key: "", params: map[string]string{}}, parsed.Run)
-		shortID := def.ID
-		fullID := runPrefix + shortID
-		rec := &store.TaskRecord{
-			ID:             fullID,
-			RunID:          task.RunID,
-			Seq:            nextSeq,
-			TaskDefID:      def.ID,
-			InstanceKey:    "",
-			InstanceParams: "",
-			Action:         ti.Action,
-			Prompt:         ti.Prompt,
-			UserPrompt:     ti.UserPrompt,
-			Script:         ti.Script,
-			Outputs:        marshalOutputs(ti.Outputs),
-			Requirements:   marshalRequirements(ti.Requirements),
-			ResultType:     ti.ResultType,
-			Timeout:        ti.Timeout,
-			State:          store.TaskPending,
-			DependsOn:      strings.Join(resolved, ","),
-			ReadsArtifacts: marshalStringSlice(ti.ReadsArtifacts),
-			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
-			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
-			RequireRole:     ti.RequireRole,
-			ReviewsTarget:   ti.Reviews,
-			VoteOptions:     marshalVoteOptions(ti.Options),
-			Citizens:        ti.Citizens,
-			MinQuorum:       ti.MinQuorum,
-			VoteThreshold:   ti.Threshold,
-			VoteDeadline:    ti.Deadline,
-			Anonymize:       ti.Anonymize,
-			Visibility:      ti.Visibility,
-			CreatedAt:       now,
-		}
-		if err := s.store.CreateTask(rec); err != nil {
-			return fmt.Errorf("creating transitively-deferred task %s: %w", fullID, err)
-		}
-		nodeData := map[string]interface{}{
-			"instance_key": "",
-			"task_def_id":  def.ID,
-		}
-		if err := parsed.DAG.AddNode(shortID, def.Action, nodeData); err != nil {
-			s.logger.Warn("DAG AddNode for transitively-deferred task", "id", shortID, "err", err)
-		}
-		for _, parentShort := range dagParents {
-			if err := parsed.DAG.AddEdge(parentShort, shortID); err != nil {
-				s.logger.Warn("DAG AddEdge for transitively-deferred task", "parent", parentShort, "child", shortID, "err", err)
-			}
-		}
-	}
-
 	return nil
 }
-
-// materializedInstance records one newly-created task row so
-// transitively-deferred downstreams can be wired correctly.
-type materializedInstance struct {
-	FullID      string
-	InstanceKey string
-	Params      map[string]string
-}
-
-// forEachInstance mirrors the parser-internal type — duplicated
-// here to keep the materializer self-contained without exporting
-// the parser's helper.
-type forEachInstance struct {
-	key    string
-	params map[string]string
-}
-
-// expandResolvedForEach is the router-side expansion for a
-// dynamic for_each that's been resolved to concrete string
-// lists. Mirrors the parser's static expansion logic. Single
-// variable → one instance per list element; multiple variables
-// → cartesian product (sorted variable order for determinism).
-func expandResolvedForEach(forEach map[string][]string) []forEachInstance {
-	if len(forEach) == 0 {
-		return []forEachInstance{{key: "", params: map[string]string{}}}
-	}
-	if len(forEach) == 1 {
-		for name, values := range forEach {
-			out := make([]forEachInstance, 0, len(values))
-			for _, v := range values {
-				out = append(out, forEachInstance{
-					key:    v,
-					params: map[string]string{name: v},
-				})
-			}
-			return out
-		}
-	}
-	keys := make([]string, 0, len(forEach))
-	for k := range forEach {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	vals := make([][]string, len(keys))
-	for i, k := range keys {
-		vals[i] = forEach[k]
-	}
-	var result []forEachInstance
-	var walk func(depth int, acc map[string]string)
-	walk = func(depth int, acc map[string]string) {
-		if depth == len(keys) {
-			copyAcc := make(map[string]string, len(acc))
-			var parts []string
-			for _, k := range keys {
-				copyAcc[k] = acc[k]
-				parts = append(parts, acc[k])
-			}
-			result = append(result, forEachInstance{
-				key:    strings.Join(parts, "_"),
-				params: copyAcc,
-			})
-			return
-		}
-		for _, v := range vals[depth] {
-			acc[keys[depth]] = v
-			walk(depth+1, acc)
-		}
-	}
-	walk(0, make(map[string]string, len(keys)))
-	return result
-}
-
-// buildDeferredInstance clones a task def into an instance-
-// ready shape with {{var}} references substituted from the
-// resolved for_each params. Minimal — only touches the fields
-// the materializer persists.
-func buildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInstance, run *enjuYaml.Run) enjuYaml.TaskInstance {
-	ti := enjuYaml.TaskInstance{
-		TaskDef:     *def,
-		InstanceKey: inst.key,
-		Params:      inst.params,
-	}
-	ti.Prompt = template.ResolveParams(def.Prompt, inst.params)
-	ti.UserPrompt = template.ResolveParams(def.UserPrompt, inst.params)
-	if ti.Requirements == nil {
-		ti.Requirements = run.Requirements
-	}
-	if ti.ResultType == "" {
-		ti.ResultType = "text"
-	}
-	if ti.Timeout == "" {
-		ti.Timeout = run.Defaults.Timeout
-	}
-	return ti
-}
-
-// marshalParams serializes a resolved for_each param map for
-// storage in tasks.instance_params.
-func marshalParams(params map[string]string) string {
-	if len(params) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(params)
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
 // and are untouched. Merge points reachable from both sides stay
 // alive because the winning path still reaches them.
 //
@@ -3112,8 +1779,18 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 		return &skipCascadeResult{WinningOption: winningOptionID}, nil
 	}
 
-	// Flip them to SKIPPED in one go.
-	if _, err := s.store.MarkTasksSkipped(skipIDs); err != nil {
+	// Flip them to SKIPPED via ApplyPlan.
+	var skipMuts []store.Mutation
+	for _, id := range skipIDs {
+		skipMuts = append(skipMuts, store.SetTaskState{
+			TaskID:   id,
+			NewState: store.TaskSkipped,
+		})
+	}
+	if _, err := s.store.ApplyPlan(store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: skipMuts,
+	}); err != nil {
 		return nil, fmt.Errorf("marking tasks skipped: %w", err)
 	}
 	return &skipCascadeResult{
@@ -3318,6 +1995,44 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
+func (s *Server) handleCitizenContributions(w http.ResponseWriter, r *http.Request) {
+	username := chi.URLParam(r, "username")
+	citizen, err := s.store.GetCitizenByUsername(username)
+	if err != nil || citizen == nil {
+		writeError(w, http.StatusNotFound, "citizen not found")
+		return
+	}
+	summary, err := s.store.GetContributionSummary(citizen.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get contributions")
+		return
+	}
+	totalEvents, _ := s.store.CountContributionEvents(citizen.ID)
+	projectsThisMonth, _ := s.store.CountProjectsThisMonth(citizen.ID)
+	downstreamTasks, downstreamProjects, _ := s.store.GetDownstreamImpact(citizen.ID)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"username":           username,
+		"tasks_completed":    summary.TasksCompleted,
+		"tasks_rejected":     summary.TasksRejected,
+		"tasks_timed_out":    summary.TasksTimedOut,
+		"tasks_released":     summary.TasksReleased,
+		"reviews_given":      summary.ReviewsGiven,
+		"review_approves":    summary.ReviewApproves,
+		"review_rejects":     summary.ReviewRejects,
+		"votes_cast":         summary.VotesCast,
+		"runs_created":       summary.RunsCreated,
+		"tokens_total":       summary.TokensTotal,
+		"project_count":      summary.ProjectCount,
+		"total_contributions": totalEvents,
+		"projects_this_month": projectsThisMonth,
+		"downstream_impact": map[string]interface{}{
+			"tasks":    downstreamTasks,
+			"projects": downstreamProjects,
+		},
+	})
+}
+
 func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) {
 	username := chi.URLParam(r, "username")
 
@@ -3391,31 +2106,6 @@ func marshalRequirements(reqs map[string]interface{}) string {
 //
 // task.AssignTo stores citizen usernames (resolved at run submission
 // time), so we compare against caller.Username directly.
-func (s *Server) checkTaskAccess(task *store.TaskRecord, caller *store.CitizenRecord) error {
-	// AssignTo narrows to a specific set of citizen usernames.
-	if assignees := unmarshalStringSlice(task.AssignTo); len(assignees) > 0 {
-		allowed := false
-		for _, u := range assignees {
-			if u == caller.Username {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("task is assigned to %s — you are not in the list", strings.Join(assignees, ", "))
-		}
-	}
-
-	// RequireRole checks the caller's global citizens.role. Per-project
-	// roles are a Phase 2 feature that depends on project membership.
-	if task.RequireRole != "" {
-		if caller.Role != task.RequireRole {
-			return fmt.Errorf("task requires role %q — your role is %q", task.RequireRole, caller.Role)
-		}
-	}
-
-	return nil
-}
 
 func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	// Look up the run to get project_id and run_seq, and the

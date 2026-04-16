@@ -198,6 +198,23 @@ func (s *Store) migrate() error {
 		content TEXT NOT NULL DEFAULT ''
 	);
 
+	-- Phase G: contribution events log. Append-only — events
+	-- are never deleted, even when the underlying task is
+	-- invalidated (the invalidation is recorded as a separate
+	-- event). This mirrors the append-only git philosophy and
+	-- gives future scoring functions a complete audit trail.
+	CREATE TABLE IF NOT EXISTS contribution_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		citizen_id INTEGER NOT NULL,
+		event_type TEXT NOT NULL,
+		event_subtype TEXT NOT NULL DEFAULT '',
+		task_id TEXT NOT NULL DEFAULT '',
+		run_id INTEGER NOT NULL DEFAULT 0,
+		project_id INTEGER NOT NULL DEFAULT 0,
+		metadata TEXT NOT NULL DEFAULT '{}',
+		created_at TIMESTAMP NOT NULL
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
@@ -207,6 +224,8 @@ func (s *Store) migrate() error {
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_username ON citizens(username);
 	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 	CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id);
+	CREATE INDEX IF NOT EXISTS idx_contribution_events_citizen ON contribution_events(citizen_id);
+	CREATE INDEX IF NOT EXISTS idx_contribution_events_type ON contribution_events(event_type);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
 		return err

@@ -241,6 +241,30 @@ type TaskClaimRecord struct {
 	Content string
 }
 
-// ArtifactRecord is the index row for one mutable file inside a project's
-// repository. The file content itself lives only in git — this record
-// just tracks who wrote it last and when, for provenance and listings.
+
+// ContributionEvent records a single scoreable action by a
+// citizen. The events log is append-only — events are never
+// deleted, even when the underlying task is invalidated
+// (recorded as a separate event). This gives future scoring
+// functions a complete audit trail and mirrors the append-
+// only git philosophy.
+//
+// Event types:
+//   - task_completed (subtype: action, e.g. "answer")
+//   - review_given (subtype: "approve" or "reject")
+//   - vote_cast (subtype: the chosen option id)
+//   - run_created (subtype: empty)
+//   - task_rejected (subtype: empty — task was invalidated)
+//   - task_timed_out (subtype: empty)
+//   - task_released (subtype: empty)
+type ContributionEvent struct {
+	ID           int64
+	CitizenID    int64
+	EventType    string
+	EventSubtype string
+	TaskID       string
+	RunID        int64
+	ProjectID    int64
+	Metadata     string // JSON blob (tokens, compute time, etc.)
+	CreatedAt    time.Time
+}

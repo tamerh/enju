@@ -1119,6 +1119,17 @@ func formatSubmitResult(data []byte, taskID string) string {
 		b.WriteString(fmt.Sprintf("\nImpact: %d new task(s) unlocked and ready for work.\n", int(newlyReady)))
 	}
 
+	// Contribution counter — attribution, not scoring.
+	contribNum := int(jsonFloat(result["contribution_number"]))
+	projectsMonth := int(jsonFloat(result["projects_this_month"]))
+	if contribNum > 0 {
+		line := fmt.Sprintf("Contribution #%d", contribNum)
+		if projectsMonth > 0 {
+			line += fmt.Sprintf(" — %d project(s) this month", projectsMonth)
+		}
+		b.WriteString("\n" + line + "\n")
+	}
+
 	_ = status
 	return b.String()
 }
@@ -1767,11 +1778,11 @@ func shortSHA(sha string) string {
 
 // --- Helpers ---
 
-// formatProfile renders a citizen's profile — their stable handle,
-// display name, role, email, and summary stats. This is what
-// enju_my_profile returns so citizens can discover their own username
-// without spelunking provenance.
-func formatProfile(data []byte) string {
+// formatProfile renders a citizen's profile with their
+// contribution record. Phase G: no scoring formula, just
+// factual counts from the contribution-events log.
+// contribData may be nil (best-effort fetch).
+func formatProfile(data []byte, contribData []byte) string {
 	var c map[string]interface{}
 	if err := json.Unmarshal(data, &c); err != nil {
 		return string(data)
@@ -1784,8 +1795,6 @@ func formatProfile(data []byte) string {
 	name, _ := c["name"].(string)
 	email, _ := c["email"].(string)
 	role, _ := c["role"].(string)
-	score, _ := c["score"].(float64)
-	completed, _ := c["tasks_completed"].(float64)
 
 	var b strings.Builder
 	b.WriteString("── Profile ─────────────────────────────────\n")
@@ -1799,11 +1808,72 @@ func formatProfile(data []byte) string {
 	if role != "" {
 		b.WriteString(fmt.Sprintf("Role:       %s\n", role))
 	}
-	b.WriteString(fmt.Sprintf("Score:      %.0f\n", score))
-	b.WriteString(fmt.Sprintf("Completed:  %.0f task(s)\n", completed))
+	if model, _ := c["model"].(string); model != "" {
+		b.WriteString(fmt.Sprintf("Model:      %s\n", model))
+	}
+
+	// Contribution record from the events log.
+	if contribData != nil {
+		var contrib map[string]interface{}
+		if json.Unmarshal(contribData, &contrib) == nil {
+			completed := int(jsonFloat(contrib["tasks_completed"]))
+			rejected := int(jsonFloat(contrib["tasks_rejected"]))
+			released := int(jsonFloat(contrib["tasks_released"]))
+			reviews := int(jsonFloat(contrib["reviews_given"]))
+			approves := int(jsonFloat(contrib["review_approves"]))
+			rejects := int(jsonFloat(contrib["review_rejects"]))
+			votes := int(jsonFloat(contrib["votes_cast"]))
+			tokens := int64(jsonFloat(contrib["tokens_total"]))
+			projects := int(jsonFloat(contrib["project_count"]))
+
+			b.WriteString("\n── Contributions ───────────────────────────\n")
+			b.WriteString(fmt.Sprintf("Tasks:     %d completed", completed))
+			if rejected > 0 {
+				b.WriteString(fmt.Sprintf(", %d rejected", rejected))
+			}
+			if released > 0 {
+				b.WriteString(fmt.Sprintf(", %d released", released))
+			}
+			b.WriteString("\n")
+			if reviews > 0 {
+				b.WriteString(fmt.Sprintf("Reviews:   %d given (%d approve, %d reject)\n", reviews, approves, rejects))
+			}
+			if votes > 0 {
+				b.WriteString(fmt.Sprintf("Votes:     %d cast\n", votes))
+			}
+			if tokens > 0 {
+				b.WriteString(fmt.Sprintf("Tokens:    %d contributed\n", tokens))
+			}
+			if projects > 0 {
+				b.WriteString(fmt.Sprintf("Projects:  %d active\n", projects))
+			}
+
+			// Downstream impact — show per-project breakdown
+			// when multiple projects are involved.
+			if impact, ok := contrib["downstream_impact"].(map[string]interface{}); ok {
+				impactTasks := int(jsonFloat(impact["tasks"]))
+				impactProjects := int(jsonFloat(impact["projects"]))
+				if impactTasks > 0 {
+					if impactProjects > 1 {
+						b.WriteString(fmt.Sprintf("\nImpact:\n  Your outputs were used by %d downstream task(s)\n  across %d projects.\n", impactTasks, impactProjects))
+					} else {
+						b.WriteString(fmt.Sprintf("\nImpact:\n  Your outputs were used by %d downstream task(s).\n", impactTasks))
+					}
+				}
+			}
+		}
+	}
+
 	b.WriteString("────────────────────────────────────────────\n\n")
 	b.WriteString(fmt.Sprintf("Others reference you as: %s  (this is what goes in `assign_to:`)\n", username))
 	return b.String()
+}
+
+func jsonFloat(v interface{}) float64 {
+	if f, ok := v.(float64); ok {
+		return f
+	}
+	return 0
 }
 
 func formatDashboard(data []byte) string {

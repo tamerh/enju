@@ -44,6 +44,11 @@ type Config struct {
 	// re-registrations. If nil, auto re-register still updates
 	// in-memory state but won't persist.
 	SaveCredentials func(username, name, email string)
+	// ModelName is the LLM model used by this citizen, for
+	// contribution tracking (e.g. "claude-opus-4", "gpt-4o").
+	// Optional — when set, included in contribution event
+	// metadata so cost analysis can segment by model.
+	ModelName string
 	// Logger is used for client-side diagnostic output. If nil,
 	// a slog.Default() is used.
 	Logger *slog.Logger
@@ -67,6 +72,7 @@ func New(cfg Config) *server.MCPServer {
 		username:      cfg.Username,
 		citizenName:   cfg.CitizenName,
 		citizenEmail:  cfg.CitizenEmail,
+		modelName:    cfg.ModelName,
 		saveCreds:     cfg.SaveCredentials,
 		workspace:     cfg.Workspace,
 		logger:        logger,
@@ -110,6 +116,7 @@ type apiClient struct {
 	username     string // caller's citizen username — stable across auto re-registers
 	citizenName  string // display name, used when re-registering after a DB wipe
 	citizenEmail string // optional, passed to the register endpoint
+	modelName   string // LLM model for contribution tracking
 	saveCreds    func(username, name, email string)
 	workspace    *mcpgit.Workspace
 	logger       *slog.Logger
@@ -1090,7 +1097,23 @@ func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatProfile(data)), nil
+	// Inject model name from client config so the profile
+	// display shows which model this session is using.
+	if c.modelName != "" {
+		var profileMap map[string]interface{}
+		if json.Unmarshal(data, &profileMap) == nil {
+			profileMap["model"] = c.modelName
+			data, _ = json.Marshal(profileMap)
+		}
+	}
+	// Fetch contribution summary for the enriched profile.
+	contribData, contribErr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/contributions")
+	if contribErr != nil {
+		// Contributions are best-effort — show the basic
+		// profile if contributions endpoint fails.
+		contribData = nil
+	}
+	return mcp.NewToolResultText(formatProfile(data, contribData)), nil
 }
 
 func (c *apiClient) handleInvalidateTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1606,7 +1629,7 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 
 	// Legacy coordinator-writes path.
 	body := map[string]interface{}{
-		"model": "claude",
+		"model": c.modelName,
 	}
 	if outputs != nil {
 		body["outputs"] = outputs
@@ -1709,7 +1732,7 @@ func (c *apiClient) submitResultFatClient(
 	}
 	metadata := map[string]interface{}{
 		"task_id":     taskID,
-		"model":       "claude",
+		"model":       c.modelName,
 		"result_type": resultType,
 		"timestamp":   time.Now().Format(time.RFC3339),
 	}
@@ -1854,7 +1877,7 @@ func (c *apiClient) submitResultFatClient(
 		"result_path":       resultDir,
 		"artifacts_written": artifactPaths,
 		"tokens_used":       0,
-		"model":             "claude",
+		"model":             c.modelName,
 		// Username identifies the submitting citizen for
 		// multi-citizen task bookkeeping (so the coordinator
 		// credits the right task_claims row). Single-citizen

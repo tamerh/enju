@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -91,20 +92,65 @@ func cmdServe(args []string) {
 func cmdMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	localMode := fs.Bool("local", false, "Run in local-only mode: embed the coordinator in this process (no separate enju serve needed)")
+	localDB := fs.String("db", "", "SQLite path for local mode (default ~/.enju/local.db)")
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
+	model := fs.String("model", "", "LLM model name for contribution tracking (e.g. claude-opus-4, gpt-4o)")
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	fs.Parse(args)
+
+	// Local-only mode: start an embedded coordinator in the
+	// same process on a random port. The MCP client talks to
+	// it over localhost — same code paths, no separate
+	// `enju serve` process needed.
+	if *localMode {
+		dbPath := *localDB
+		if dbPath == "" {
+			home, _ := os.UserHomeDir()
+			dbPath = filepath.Join(home, ".enju", "local.db")
+			os.MkdirAll(filepath.Dir(dbPath), 0755)
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		st, err := store.New(dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open local database: %v\n", err)
+			os.Exit(1)
+		}
+		defer st.Close()
+
+		reaper := scheduler.NewReaper(st, 60*time.Second, logger)
+		reaper.Start()
+		defer reaper.Stop()
+
+		srv := api.NewServer(st, logger)
+
+		// Find an available port.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to find a free port: %v\n", err)
+			os.Exit(1)
+		}
+		localAddr := ln.Addr().String()
+		go http.Serve(ln, srv.Router())
+		*coordinator = "http://" + localAddr
+		fmt.Fprintf(os.Stderr, "Local mode: embedded coordinator on %s (db: %s)\n", *coordinator, dbPath)
+	}
+
+	// For local mode, use a fixed sentinel as the coordinator
+	// key in credentials.json so the identity persists across
+	// sessions (the actual port changes every run).
+	credsKey := *coordinator
+	if *localMode {
+		credsKey = "local"
+	}
 
 	// Load saved credentials. Persistent values beat CLI args —
 	// ~/.enju/credentials.json is the source of truth for a user's
 	// identity, and the CLI args exist mostly as bootstrap metadata
-	// for the very first registration. Overriding persistent state
-	// with launcher metadata leads to profiles that drift away
-	// from what the user set in their last enju_update_profile
-	// call.
-	creds := loadCredentials(*coordinator)
+	// for the very first registration.
+	creds := loadCredentials(credsKey)
 	if creds != nil {
 		if creds.Username != "" {
 			*username = creds.Username
@@ -133,7 +179,7 @@ func cmdMCP(args []string) {
 			os.Exit(1)
 		}
 		*username = gotUsername
-		saveCredentials(*coordinator, *username, *name, *email)
+		saveCredentials(credsKey, *username, *name, *email)
 		fmt.Fprintf(os.Stderr, "Registered as @%s (%s)\n", *username, *name)
 	}
 
@@ -150,23 +196,25 @@ func cmdMCP(args []string) {
 		os.Exit(1)
 	}
 
-	coordURL := *coordinator
 	s := mcpserver.New(mcpserver.Config{
-		CoordinatorURL: coordURL,
+		CoordinatorURL: *coordinator,
 		Username:       *username,
 		CitizenName:    *name,
 		CitizenEmail:   *email,
+		ModelName:      *model,
 		Workspace:      ws,
 		Logger:         logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail string) {
-			saveCredentials(coordURL, gotUsername, gotName, gotEmail)
+			saveCredentials(credsKey, gotUsername, gotName, gotEmail)
 		},
 	})
 
+	fmt.Fprintf(os.Stderr, "MCP server starting (stdio mode)...\n")
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stderr, "MCP server exited cleanly\n")
 }
 
 // --- helpers ---
