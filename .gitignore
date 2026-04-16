@@ -1,0 +1,15 @@
+# Binary
+enju
+
+# Database
+*.db
+
+# Test output (symlink to /tmp/enju-test-output)
+test/output
+
+# MCP config (contains local paths)
+.mcp.json
+
+# IDE
+.idea/
+.vscode/
