@@ -1,4 +1,20 @@
 // Package api provides the REST API for the Enju coordinator.
+//
+// This package is a THIN HTTP layer. It contains zero business
+// logic — every computation (tallies, cascades, claim/submit
+// validation, materialization, access control, fail checks)
+// lives in internal/engine/. Every state mutation goes through
+// store.ApplyPlan.
+//
+// A handler's job is strictly:
+//   1. Parse the HTTP request
+//   2. Call engine.ComputeX() for the decision
+//   3. Call store.ApplyPlan() for the write
+//   4. Record contribution events (best-effort)
+//   5. Format and return the response
+//
+// If you find yourself writing an if-else that decides "what
+// should happen" in this file, it belongs in the engine.
 package api
 
 import (
@@ -1310,35 +1326,18 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := s.store.GetTask(taskID)
-	if err != nil || task == nil {
-		writeError(w, http.StatusNotFound, "task not found")
+	// Engine validates + builds the Plan.
+	plan, err := s.engine().ComputeFailTask(taskID, req.Reason)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Can only fail tasks that are in an active state.
-	switch store.TaskState(task.State) {
-	case store.TaskClaimed, store.TaskReady, store.TaskCollecting:
-		// OK.
-	default:
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q cannot be failed (state: %s)", taskID, task.State))
-		return
-	}
-
-	// Set task to FAILED with reason via ApplyPlan.
-	plan := store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.SetTaskState{
-				TaskID:     taskID,
-				NewState:   store.TaskFailed,
-				FailReason: req.Reason,
-			},
-		},
-	}
-	if _, err := s.store.ApplyPlan(plan); err != nil {
+	if _, err := s.store.ApplyPlan(*plan); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	task, _ := s.store.GetTask(taskID)
 
 	// Record contribution event.
 	if task.ClaimedBy > 0 {
