@@ -172,15 +172,19 @@ func cmdMCP(args []string) {
 
 	// Register if we don't have a username yet. The server generates one
 	// from the display name if we don't provide one.
+	var token string
 	if creds == nil {
-		gotUsername, err := registerCitizen(*coordinator, *name, *username, *email)
+		gotUsername, gotToken, err := registerCitizen(*coordinator, *name, *username, *email)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to register: %v\n", err)
 			os.Exit(1)
 		}
 		*username = gotUsername
-		saveCredentials(credsKey, *username, *name, *email)
+		token = gotToken
+		saveCredentials(credsKey, *username, *name, *email, token)
 		fmt.Fprintf(os.Stderr, "Registered as @%s (%s)\n", *username, *name)
+	} else {
+		token = creds.Token
 	}
 
 	// Build a client-side git workspace. Used for iteration A.2's
@@ -202,10 +206,11 @@ func cmdMCP(args []string) {
 		CitizenName:    *name,
 		CitizenEmail:   *email,
 		ModelName:      *model,
+		AuthToken:      token,
 		Workspace:      ws,
 		Logger:         logger,
-		SaveCredentials: func(gotUsername, gotName, gotEmail string) {
-			saveCredentials(credsKey, gotUsername, gotName, gotEmail)
+		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
+			saveCredentials(credsKey, gotUsername, gotName, gotEmail, gotToken)
 		},
 	})
 
@@ -228,6 +233,7 @@ type credentials struct {
 	Username    string `json:"username"`
 	Name        string `json:"name"`
 	Email       string `json:"email,omitempty"`
+	Token       string `json:"token,omitempty"` // auth token from registration
 }
 
 func credentialsPath() string {
@@ -257,7 +263,7 @@ func loadCredentials(coordinator string) *credentials {
 // hand-edit credentials.json — neither should be wiped just
 // because auto re-register fires a save with a typed struct that
 // doesn't know about those fields.
-func saveCredentials(coordinator, username, name, email string) {
+func saveCredentials(coordinator, username, name, email, token string) {
 	path := credentialsPath()
 	creds := map[string]interface{}{}
 	if data, err := os.ReadFile(path); err == nil {
@@ -269,6 +275,9 @@ func saveCredentials(coordinator, username, name, email string) {
 	if email != "" {
 		creds["email"] = email
 	}
+	if token != "" {
+		creds["token"] = token
+	}
 	data, _ := json.MarshalIndent(creds, "", "  ")
 	dir := filepath.Dir(path)
 	os.MkdirAll(dir, 0755)
@@ -278,7 +287,7 @@ func saveCredentials(coordinator, username, name, email string) {
 // registerCitizen POSTs a registration request and returns the
 // server-assigned username (generated from the name if the caller
 // didn't pass one).
-func registerCitizen(coordinatorURL, name, username, email string) (string, error) {
+func registerCitizen(coordinatorURL, name, username, email string) (string, string, error) {
 	reqBody := map[string]string{"name": name}
 	if username != "" {
 		reqBody["username"] = username
@@ -289,20 +298,21 @@ func registerCitizen(coordinatorURL, name, username, email string) (string, erro
 	body, _ := json.Marshal(reqBody)
 	resp, err := http.Post(coordinatorURL+"/api/v1/citizens/register", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if errMsg, ok := result["error"].(string); ok {
-		return "", fmt.Errorf("%s", errMsg)
+		return "", "", fmt.Errorf("%s", errMsg)
 	}
 	got, _ := result["username"].(string)
 	if got == "" {
-		return "", fmt.Errorf("server did not return username")
+		return "", "", fmt.Errorf("server did not return username")
 	}
-	return got, nil
+	token, _ := result["token"].(string)
+	return got, token, nil
 }

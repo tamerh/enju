@@ -74,7 +74,7 @@ func TestAutoReregisterOnStaleCitizen(t *testing.T) {
 		citizenEmail: "alice@example.com",
 		httpClient:   &http.Client{},
 		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		saveCreds: func(u, n, e string) {
+		saveCreds: func(u, n, e, t string) {
 			savedUser = u
 			savedName = n
 			savedEmail = e

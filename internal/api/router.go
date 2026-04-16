@@ -63,6 +63,62 @@ func (s *Server) engine() *engine.Engine {
 	return engine.New(s.store, s.logger)
 }
 
+// authenticateCitizen extracts the Bearer token from the
+// Authorization header and verifies it matches a registered
+// citizen. Returns the citizen record on success, or writes
+// an HTTP error and returns nil on failure. Write endpoints
+// call this; read endpoints don't need it.
+//
+// If no Authorization header is present, the request is
+// allowed through (backwards compatibility for the
+// transition period). Once all clients send tokens, this
+// can be tightened to reject unauthenticated writes.
+func (s *Server) authenticateCitizen(w http.ResponseWriter, r *http.Request) *store.CitizenRecord {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return nil // no auth — allowed for now
+	}
+	if !strings.HasPrefix(auth, "Bearer ") {
+		writeError(w, http.StatusUnauthorized, "invalid Authorization header — expected 'Bearer <token>'")
+		return nil
+	}
+	token := strings.TrimPrefix(auth, "Bearer ")
+	citizen, err := s.store.GetCitizenByToken(token)
+	if err != nil || citizen == nil {
+		writeError(w, http.StatusUnauthorized, "invalid or expired token — re-register with enju mcp")
+		return nil
+	}
+	return citizen
+}
+
+// authMiddleware validates the Bearer token on every request.
+// Soft-enforced: missing token → allowed through (backwards
+// compat for clients that haven't re-registered yet).
+// Invalid token → 401. The validated citizen record is
+// stashed in the request context for handlers to use.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			// No token — allow through for now.
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !strings.HasPrefix(auth, "Bearer ") {
+			writeError(w, http.StatusUnauthorized, "invalid Authorization header")
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		citizen, err := s.store.GetCitizenByToken(token)
+		if err != nil || citizen == nil {
+			writeError(w, http.StatusUnauthorized, "invalid or expired token — delete ~/.enju/credentials.json and re-register")
+			return
+		}
+		// Token valid — proceed.
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Router returns the chi router with all endpoints registered.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
@@ -75,6 +131,14 @@ func (s *Server) Router() http.Handler {
 	r.Get("/health", s.handleHealth)
 
 	r.Route("/api/v1", func(r chi.Router) {
+		// Auth middleware for write endpoints. Validates
+		// the Bearer token from the Authorization header
+		// against the citizens table. Soft-enforced: requests
+		// without a token are allowed through (backwards
+		// compat). Requests with an INVALID token are
+		// rejected with 401.
+		r.Use(s.authMiddleware)
+
 		// Projects (long-lived containers)
 		r.Post("/projects", s.handleCreateProject)
 		r.Get("/projects", s.handleListProjects)

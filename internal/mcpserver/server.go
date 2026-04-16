@@ -44,12 +44,15 @@ type Config struct {
 	// can rely on the persisted address staying present across
 	// re-registrations. If nil, auto re-register still updates
 	// in-memory state but won't persist.
-	SaveCredentials func(username, name, email string)
+	SaveCredentials func(username, name, email, token string)
 	// ModelName is the LLM model used by this citizen, for
 	// contribution tracking (e.g. "claude-opus-4", "gpt-4o").
-	// Optional — when set, included in contribution event
-	// metadata so cost analysis can segment by model.
 	ModelName string
+	// AuthToken is the citizen's registration token. Sent
+	// with every write request so the coordinator can verify
+	// the citizen's identity. Prevents impersonation after
+	// registration.
+	AuthToken string
 	// Logger is used for client-side diagnostic output. If nil,
 	// a slog.Default() is used.
 	Logger *slog.Logger
@@ -74,6 +77,7 @@ func New(cfg Config) *server.MCPServer {
 		citizenName:   cfg.CitizenName,
 		citizenEmail:  cfg.CitizenEmail,
 		modelName:    cfg.ModelName,
+		authToken:    cfg.AuthToken,
 		saveCreds:     cfg.SaveCredentials,
 		workspace:     cfg.Workspace,
 		logger:        logger,
@@ -121,7 +125,8 @@ type apiClient struct {
 	citizenName  string // display name, used when re-registering after a DB wipe
 	citizenEmail string // optional, passed to the register endpoint
 	modelName   string // LLM model for contribution tracking
-	saveCreds    func(username, name, email string)
+	authToken   string // registration token for identity verification
+	saveCreds    func(username, name, email, token string)
 	workspace    *mcpgit.Workspace
 	logger       *slog.Logger
 	httpClient   *http.Client
@@ -150,6 +155,9 @@ func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		}
 		return c.httpClient.Do(req)
 	})
 }
@@ -165,6 +173,9 @@ func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]b
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		}
 		return c.httpClient.Do(req)
 	})
 }
@@ -180,6 +191,9 @@ func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		}
 		return c.httpClient.Do(req)
 	})
 }
@@ -284,9 +298,13 @@ func (c *apiClient) ensureCitizenFresh(ctx context.Context) error {
 	if got == "" {
 		return fmt.Errorf("register response missing username")
 	}
+	gotToken, _ := result["token"].(string)
 	c.username = got
+	if gotToken != "" {
+		c.authToken = gotToken
+	}
 	if c.saveCreds != nil {
-		c.saveCreds(got, c.citizenName, c.citizenEmail)
+		c.saveCreds(got, c.citizenName, c.citizenEmail, gotToken)
 	}
 	return nil
 }
