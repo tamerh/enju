@@ -100,8 +100,48 @@ func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 func (ws *Workspace) RootDir() string { return ws.rootDir }
 
 // projectDir returns the on-disk path for one project's local clone.
-func (ws *Workspace) projectDir(projectID int64) string {
-	return filepath.Join(ws.rootDir, fmt.Sprintf("%d", projectID))
+// When projectName is non-empty, the directory is named "{slug}-{id}"
+// (e.g. "battle-test-7") for human readability. When empty, falls
+// back to the numeric ID (e.g. "7").
+//
+// If a legacy numeric-only directory exists and a name is now known,
+// projectDir renames it to the slug form so existing clones survive.
+func (ws *Workspace) projectDir(projectID int64, projectName string) string {
+	numericDir := filepath.Join(ws.rootDir, fmt.Sprintf("%d", projectID))
+	if projectName == "" {
+		return numericDir
+	}
+	slug := slugify(projectName)
+	if slug == "" {
+		return numericDir
+	}
+	namedDir := filepath.Join(ws.rootDir, fmt.Sprintf("%s-%d", slug, projectID))
+	// Migrate: if the old numeric dir exists but the named dir
+	// doesn't, rename for a seamless upgrade.
+	if _, err := os.Stat(numericDir); err == nil {
+		if _, err := os.Stat(namedDir); os.IsNotExist(err) {
+			_ = os.Rename(numericDir, namedDir)
+		}
+	}
+	return namedDir
+}
+
+// slugify turns a project name into a filesystem-safe slug:
+// lowercase, non-alphanumeric runs replaced with a single hyphen,
+// trimmed of leading/trailing hyphens.
+func slugify(name string) string {
+	var b strings.Builder
+	prevDash := true // suppress leading dash
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // HasLocalClone returns true if a clone for the given project
@@ -110,13 +150,35 @@ func (ws *Workspace) projectDir(projectID int64) string {
 // with local state WITHOUT triggering a fresh clone as a side
 // effect of the listing call.
 func (ws *Workspace) HasLocalClone(projectID int64) bool {
-	stat, err := os.Stat(ws.projectDir(projectID))
-	if err != nil || !stat.IsDir() {
-		return false
+	dir := ws.findProjectDir(projectID)
+	return dir != ""
+}
+
+// findProjectDir locates the on-disk clone directory for a project,
+// checking both the slug-based ("{slug}-{id}") and legacy numeric
+// ("{id}") naming conventions. Returns empty string if no clone
+// exists. This is used by callers that don't know the project name.
+func (ws *Workspace) findProjectDir(projectID int64) string {
+	suffix := fmt.Sprintf("-%d", projectID)
+	numericName := fmt.Sprintf("%d", projectID)
+	entries, err := os.ReadDir(ws.rootDir)
+	if err != nil {
+		return ""
 	}
-	// A valid clone has a .git subdirectory.
-	gitStat, err := os.Stat(filepath.Join(ws.projectDir(projectID), ".git"))
-	return err == nil && gitStat.IsDir()
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Match "{slug}-{id}" or plain "{id}".
+		if name == numericName || strings.HasSuffix(name, suffix) {
+			gitDir := filepath.Join(ws.rootDir, name, ".git")
+			if st, err := os.Stat(gitDir); err == nil && st.IsDir() {
+				return filepath.Join(ws.rootDir, name)
+			}
+		}
+	}
+	return ""
 }
 
 // LeaveProject forgets the cached Project handle (if any) and
@@ -143,7 +205,11 @@ func (ws *Workspace) LeaveProject(projectID int64) error {
 		p.mu.Unlock() //nolint:staticcheck // barrier against in-flight writers
 		delete(ws.clients, projectID)
 	}
-	workDir := ws.projectDir(projectID)
+	// Find whichever directory format exists (slug or numeric).
+	workDir := ws.findProjectDir(projectID)
+	if workDir == "" {
+		return nil // nothing to remove
+	}
 	if err := os.RemoveAll(workDir); err != nil {
 		return fmt.Errorf("removing clone at %s: %w", workDir, err)
 	}
@@ -157,7 +223,11 @@ func (ws *Workspace) LeaveProject(projectID int64) error {
 // must already exist on disk — this supports a future degenerate mode
 // where a self-hosted user keeps everything in a local working tree
 // without a remote at all.
-func (ws *Workspace) ForProject(projectID int64, remoteURL string) (*Project, error) {
+//
+// projectName is optional — when provided, the on-disk directory uses
+// a human-readable "{slug}-{id}" format (e.g. "battle-test-7") instead
+// of a bare numeric id. Pass "" when the name isn't available.
+func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName ...string) (*Project, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
 	}
@@ -169,7 +239,11 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string) (*Project, er
 		return p, nil
 	}
 
-	workDir := ws.projectDir(projectID)
+	name := ""
+	if len(projectName) > 0 {
+		name = projectName[0]
+	}
+	workDir := ws.projectDir(projectID, name)
 	p, err := openOrClone(workDir, remoteURL, ws.logger)
 	if err != nil {
 		// No extra "opening project N:" wrap — openOrClone's
@@ -535,6 +609,11 @@ type SubmitRequest struct {
 	// pass both fields.
 	AuthorName  string
 	AuthorEmail string
+	// ModelName, when non-empty, indicates this submission was made
+	// by an AI citizen. It's appended as a git trailer
+	// (`AI-Model: <value>`) so `git log --format='%(trailers)'`
+	// can distinguish AI vs human contributions.
+	ModelName string
 	// Files is the full set of files this commit writes — result
 	// files AND any artifact writes in one batch. Order is not
 	// significant.
@@ -605,7 +684,7 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		maxRetries = 3
 	}
 
-	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths)
+	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths, req.ModelName)
 
 	var (
 		lastErr  error
@@ -1075,12 +1154,18 @@ func (p *Project) SetRemote(url string) error {
 //	Task {taskID} by @{username}: result + N artifact(s)
 //
 //	Artifacts: path1, path2, ...
-func buildCommitMessage(taskID, username string, artifactPaths []string) string {
+func buildCommitMessage(taskID, username string, artifactPaths []string, modelName string) string {
+	var subject string
 	if len(artifactPaths) == 0 {
-		return fmt.Sprintf("Task %s by @%s: result", taskID, username)
+		subject = fmt.Sprintf("Task %s by @%s: result", taskID, username)
+	} else {
+		subject = fmt.Sprintf("Task %s by @%s: result + %d artifact(s)\n\nArtifacts: %s",
+			taskID, username, len(artifactPaths), strings.Join(artifactPaths, ", "))
 	}
-	return fmt.Sprintf("Task %s by @%s: result + %d artifact(s)\n\nArtifacts: %s",
-		taskID, username, len(artifactPaths), strings.Join(artifactPaths, ", "))
+	if modelName != "" {
+		subject += "\n\nAI-Model: " + modelName
+	}
+	return subject
 }
 
 // --- standard path helpers ---

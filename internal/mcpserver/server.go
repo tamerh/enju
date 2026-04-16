@@ -844,7 +844,8 @@ func (c *apiClient) decorateProjectListWithPushStatus(data []byte) []byte {
 		if !c.workspace.HasLocalClone(projectID) {
 			continue
 		}
-		proj, err := c.workspace.ForProject(projectID, remoteURL)
+		pName, _ := p["name"].(string)
+		proj, err := c.workspace.ForProject(projectID, remoteURL, pName)
 		if err != nil {
 			continue
 		}
@@ -968,21 +969,31 @@ func (c *apiClient) commitAuthor(ctx context.Context) (name, email string) {
 // get_artifact / get_artifact_history / set_project_remote handlers
 // that need the project's remote_url to open the local clone.
 func (c *apiClient) fetchProjectMeta(ctx context.Context, projectID int64) (remoteURL string, err error) {
+	remoteURL, _, err = c.fetchProjectMetaFull(ctx, projectID)
+	return
+}
+
+// fetchProjectMetaFull is like fetchProjectMeta but also returns the
+// human-readable project name for workspace directory naming.
+func (c *apiClient) fetchProjectMetaFull(ctx context.Context, projectID int64) (remoteURL, name string, err error) {
 	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d", projectID))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("parsing project: %w", err)
+		return "", "", fmt.Errorf("parsing project: %w", err)
 	}
 	if errMsg, ok := raw["error"].(string); ok {
-		return "", fmt.Errorf("%s", errMsg)
+		return "", "", fmt.Errorf("%s", errMsg)
 	}
 	if v, ok := raw["remote_url"].(string); ok {
 		remoteURL = v
 	}
-	return remoteURL, nil
+	if v, ok := raw["name"].(string); ok {
+		name = v
+	}
+	return remoteURL, name, nil
 }
 
 // handleProjectRemoteStatus runs the remote-status diagnostic
@@ -999,7 +1010,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 	if c.workspace == nil {
 		return mcp.NewToolResultError("remote status is only available in MCP client mode"), nil
 	}
-	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1014,7 +1025,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 		return mcp.NewToolResultText(formatProjectRemoteStatus(data)), nil
 	}
 
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1059,7 +1070,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 	}
 	force := req.GetBool("force", false)
 
-	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1067,7 +1078,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("project has no remote configured"), nil
 	}
 
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1313,6 +1324,7 @@ type taskMeta struct {
 	ID               string
 	ProjectID        int64
 	ProjectRemoteURL string
+	ProjectName      string
 	RunSeq           int
 	TaskDefID        string
 	InstanceKey      string
@@ -1377,6 +1389,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["project_remote_url"].(string); ok {
 		meta.ProjectRemoteURL = v
+	}
+	if v, ok := raw["project_name"].(string); ok {
+		meta.ProjectName = v
 	}
 	if v, ok := raw["run_seq"].(float64); ok {
 		meta.RunSeq = int(v)
@@ -1506,7 +1521,7 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
+	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
 	if err != nil {
 		return nil, err
 	}
@@ -1845,7 +1860,7 @@ func (c *apiClient) submitResultFatClient(
 		}
 	}
 
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
+	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1998,6 +2013,7 @@ func (c *apiClient) submitResultFatClient(
 		Username:      c.username,
 		AuthorName:    authorName,
 		AuthorEmail:   authorEmail,
+		ModelName:     c.modelName,
 		Files:         files,
 		ArtifactPaths: artifactPaths,
 	})
@@ -2242,8 +2258,8 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	remoteURL, _ := c.fetchProjectMeta(ctx, int64(projectID))
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, int64(projectID))
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2320,11 +2336,11 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError("get_artifact_history requires a local workspace (MCP client mode)"), nil
 	}
 
-	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2568,11 +2584,11 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if c.workspace == nil {
 			return mcp.NewToolResultError("enju_create_run with 'path' requires a local workspace (MCP client mode)"), nil
 		}
-		remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+		remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+		proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -2680,7 +2696,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	}
 
 	// Open the project workspace.
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
+	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2782,6 +2798,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		Username:    c.username,
 		AuthorName:  c.citizenName,
 		AuthorEmail: c.citizenEmail,
+		ModelName:   c.modelName,
 		Files:       files,
 	})
 	proj.Unlock()
@@ -2852,10 +2869,11 @@ func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest
 	json.Unmarshal(tasksData, &tasks)
 
 	// Read each accepted task's result from the local clone.
-	var remoteURL string
+	var remoteURL, projName string
 	if c.workspace != nil {
-		if meta, err := c.fetchProjectMeta(ctx, int64(projectID)); err == nil {
-			remoteURL = meta
+		if u, n, err := c.fetchProjectMetaFull(ctx, int64(projectID)); err == nil {
+			remoteURL = u
+			projName = n
 		}
 	}
 
@@ -2888,7 +2906,7 @@ func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest
 		// as context below the result.
 		resultShown := false
 		if tstate == "accepted" && commitSHA != "" && c.workspace != nil && remoteURL != "" {
-			if proj, err := c.workspace.ForProject(int64(projectID), remoteURL); err == nil {
+			if proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName); err == nil {
 				resultFile := resultPath + "/result.md"
 				if defID != "" && resultPath != "" {
 					content, found, err := proj.ReadFileAtCommit(commitSHA, resultFile)
@@ -2922,11 +2940,11 @@ func (c *apiClient) handleListTemplates(ctx context.Context, req mcp.CallToolReq
 	if c.workspace == nil {
 		return mcp.NewToolResultError("enju_list_templates requires a local workspace (MCP client mode)"), nil
 	}
-	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2967,11 +2985,11 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 	if c.workspace == nil {
 		return mcp.NewToolResultError("enju_describe_template requires a local workspace (MCP client mode)"), nil
 	}
-	remoteURL, err := c.fetchProjectMeta(ctx, int64(projectID))
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL)
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

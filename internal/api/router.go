@@ -100,7 +100,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
-			// No token — allow through for now.
+			// Soft enforcement: no token → allowed through.
+			// This is intentional for the transition period
+			// while clients upgrade. Monitor these in logs
+			// and tighten to hard-reject after battle tests.
+			if r.Method != "GET" {
+				s.logger.Debug("auth: no token on write request",
+					"method", r.Method, "path", r.URL.Path)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -111,10 +118,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		token := strings.TrimPrefix(auth, "Bearer ")
 		citizen, err := s.store.GetCitizenByToken(token)
 		if err != nil || citizen == nil {
+			s.logger.Warn("auth: invalid token rejected",
+				"method", r.Method, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "invalid or expired token — delete ~/.enju/credentials.json and re-register")
 			return
 		}
-		// Token valid — proceed.
 		next.ServeHTTP(w, r)
 	})
 }
@@ -806,6 +814,7 @@ type taskResponse struct {
 	RunSeq           int    `json:"run_seq"`                      // per-project run sequence
 	ProjectID        int64  `json:"project_id"`                   // parent project
 	ProjectRemoteURL string `json:"project_remote_url,omitempty"` // parent project's git remote (for fat clients)
+	ProjectName      string `json:"project_name,omitempty"`       // human-readable project name (for workspace dirs)
 	Seq              int    `json:"seq"`                          // task sequence within run
 	TaskDefID       string   `json:"task_def_id"`
 	InstanceKey     string   `json:"instance_key,omitempty"`
@@ -2366,11 +2375,13 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	var projectID int64
 	var runSeq int
 	var remoteURL string
+	var projectName string
 	if run, _ := s.store.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
 		if p, _ := s.store.GetProject(projectID); p != nil {
 			remoteURL = p.RemoteURL
+			projectName = p.Name
 		}
 	}
 	iterationLabel := ""
@@ -2383,6 +2394,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		RunSeq:           runSeq,
 		ProjectID:        projectID,
 		ProjectRemoteURL: remoteURL,
+		ProjectName:      projectName,
 		Seq:              t.Seq,
 		TaskDefID:        t.TaskDefID,
 		InstanceKey:      t.InstanceKey,

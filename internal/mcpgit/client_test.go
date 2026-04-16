@@ -661,11 +661,44 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 	if c1.Author.Email != "alice@example.com" {
 		t.Errorf("expected author email 'alice@example.com', got %q", c1.Author.Email)
 	}
+	// Human commit (no ModelName) should NOT have AI-Model trailer.
+	if strings.Contains(c1.Message, "AI-Model:") {
+		t.Errorf("human commit should not have AI-Model trailer, got: %s", c1.Message)
+	}
 
-	// The empty-AuthorName/AuthorEmail fallback to the generic
-	// `Enju Client` placeholder is exercised implicitly by every
-	// other test in this file that doesn't pass AuthorName /
-	// AuthorEmail, so no separate assertion is needed here.
+	// Case 2: AI citizen has ModelName — commit gets AI-Model trailer.
+	proj.Lock()
+	res2, err := proj.SubmitTaskResult(SubmitRequest{
+		TaskID:      "1:1:bot_task",
+		Username:    "claude-bot",
+		AuthorName:  "Claude Bot",
+		AuthorEmail: "claude@enju.local",
+		ModelName:   "claude-sonnet-4-20250514",
+		Files: []FileWrite{
+			{
+				RepoRelPath: filepath.Join(ResultDir(51, 1, "", "bot_task"), "result.md"),
+				Content:     []byte("bot's result"),
+			},
+		},
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("submit bot: %v", err)
+	}
+
+	// Re-clone to pick up the new commit.
+	verifyDir2 := t.TempDir()
+	vRepo2, err := gogit.PlainClone(verifyDir2, false, &gogit.CloneOptions{URL: bare})
+	if err != nil {
+		t.Fatalf("verify clone 2: %v", err)
+	}
+	c2, err := vRepo2.CommitObject(plumbingHash(res2.CommitSHA))
+	if err != nil {
+		t.Fatalf("load bot commit: %v", err)
+	}
+	if !strings.Contains(c2.Message, "AI-Model: claude-sonnet-4-20250514") {
+		t.Errorf("AI commit should have AI-Model trailer, got: %s", c2.Message)
+	}
 }
 // artifact the task declared can't be found at the given commit.
 func TestResolveMissingArtifact(t *testing.T) {
@@ -988,6 +1021,77 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 	}
 	if proj2.WorkDir() != workDir {
 		t.Errorf("expected same work dir after reclone, got %s vs %s", proj2.WorkDir(), workDir)
+	}
+}
+
+// TestSlugifyProjectDir verifies that ForProject with a project name
+// creates a "{slug}-{id}" directory, and that an existing numeric-only
+// directory is auto-migrated to the slug form.
+func TestSlugifyProjectDir(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	wsDir := t.TempDir()
+	ws, _ := NewWorkspace(wsDir, nullLogger())
+
+	// Case 1: passing a project name creates a slug-based dir.
+	proj, err := ws.ForProject(7, bare, "Battle Test Alpha")
+	if err != nil {
+		t.Fatalf("clone with name: %v", err)
+	}
+	expected := filepath.Join(wsDir, "battle-test-alpha-7")
+	if proj.WorkDir() != expected {
+		t.Errorf("expected workdir %s, got %s", expected, proj.WorkDir())
+	}
+	if !ws.HasLocalClone(7) {
+		t.Error("HasLocalClone should find slug-named dir")
+	}
+
+	// Case 2: legacy numeric dir gets auto-migrated.
+	// Create a numeric-only clone, then call ForProject with a name.
+	ws2, _ := NewWorkspace(t.TempDir(), nullLogger())
+	projOld, err := ws2.ForProject(8, bare) // no name → numeric dir
+	if err != nil {
+		t.Fatalf("clone without name: %v", err)
+	}
+	numericDir := projOld.WorkDir()
+	if filepath.Base(numericDir) != "8" {
+		t.Fatalf("expected numeric dir '8', got %s", filepath.Base(numericDir))
+	}
+	// Clear cached handle so ForProject re-resolves the directory.
+	ws2.mu.Lock()
+	delete(ws2.clients, 8)
+	ws2.mu.Unlock()
+	// Now call with a name — should rename the directory.
+	proj2, err := ws2.ForProject(8, bare, "My Project")
+	if err != nil {
+		t.Fatalf("reopen with name: %v", err)
+	}
+	if filepath.Base(proj2.WorkDir()) != "my-project-8" {
+		t.Errorf("expected migrated dir 'my-project-8', got %s", filepath.Base(proj2.WorkDir()))
+	}
+	// Old numeric dir should be gone.
+	if _, err := os.Stat(numericDir); !os.IsNotExist(err) {
+		t.Error("expected old numeric dir to be gone after migration")
+	}
+}
+
+// TestSlugify checks edge cases of the slugify helper.
+func TestSlugify(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Battle Test Alpha", "battle-test-alpha"},
+		{"  spaces  ", "spaces"},
+		{"UPPER-case_MIX", "upper-case-mix"},
+		{"---dashes---", "dashes"},
+		{"123numbers", "123numbers"},
+		{"", ""},
+		{"a", "a"},
+	}
+	for _, tc := range cases {
+		got := slugify(tc.in)
+		if got != tc.want {
+			t.Errorf("slugify(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
