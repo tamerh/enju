@@ -171,6 +171,7 @@ type SetTaskState struct {
 	ClearClaim bool   // invalidation: clear claimed_by/claimed_at/submitted_at/result_path/commit_sha
 	VoteChoice string // vote resolution: the winning option id
 	CommitSHA  string // resolution: the commit to record
+	FailReason string // fail: reason for failure
 }
 
 func (SetTaskState) mutationKind() MutationKind { return MutSetTaskState }

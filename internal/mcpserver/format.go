@@ -1306,11 +1306,18 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	// count as "done" for progress purposes so the bar agrees with
 	// the run state. Otherwise a completed run with skipped tasks
 	// shows 75% and confuses the user.
-	done := counts["accepted"] + counts["skipped"]
+	done := counts["accepted"] + counts["skipped"] + counts["failed"]
 
 	progressLine := fmt.Sprintf("Status: %s    Progress: %d/%d", state, done, total)
-	if counts["skipped"] > 0 {
-		progressLine += fmt.Sprintf(" (%d accepted, %d skipped)", counts["accepted"], counts["skipped"])
+	if counts["skipped"] > 0 || counts["failed"] > 0 {
+		parts := fmt.Sprintf("%d accepted", counts["accepted"])
+		if counts["skipped"] > 0 {
+			parts += fmt.Sprintf(", %d skipped", counts["skipped"])
+		}
+		if counts["failed"] > 0 {
+			parts += fmt.Sprintf(", %d failed", counts["failed"])
+		}
+		progressLine += fmt.Sprintf(" (%s)", parts)
 	}
 	b.WriteString(fmt.Sprintf("Project #%s → Run #%d: %s\n", projectID, int(seq), name))
 	if sourcePath, _ := run["source_path"].(string); sourcePath != "" {
@@ -1323,78 +1330,69 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	b.WriteString(progressLine + "\n")
 	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
 
-	// Build task list
-	b.WriteString("Tasks:\n\n")
-	for _, t := range tasks {
-		tid, _ := t["id"].(string)
-		tstate, _ := t["state"].(string)
-		claimedBy, _ := t["claimed_by"].(string)
-		deps, _ := t["depends_on"].(string)
-		prompt, _ := t["prompt"].(string)
-		citizensF, _ := t["citizens"].(float64)
-		citizens := int(citizensF)
-
-		seq, _ := t["seq"].(float64)
-		icon := stateIcon(tstate)
-
-		// For multi-citizen vote tasks, derive a phase-aware
-		// label instead of the generic "available" / "in
-		// progress" strings. The three phases are:
-		//   1. accepting claims    (0 < claimed < citizens, 0 submitted)
-		//   2. collecting votes    (some submitted, tally not resolved)
-		//   3. resolved            (state = accepted or skipped)
-		label := stateLabel(tstate)
-		if citizens > 1 && t["action"] == "vote" {
-			voteSubs, _ := t["vote_submissions"].([]interface{})
-			activeClaimants := stringSliceFromAny(t["active_claimants"])
-			submitted := len(voteSubs)
-			claimed := submitted + len(activeClaimants)
-			switch tstate {
-			case "accepted":
-				label = fmt.Sprintf("resolved (%d/%d votes)", submitted, citizens)
-			case "collecting":
-				label = fmt.Sprintf("collecting votes (%d/%d claimed, %d/%d submitted)", claimed, citizens, submitted, citizens)
-			case "ready":
-				if claimed == 0 {
-					label = fmt.Sprintf("accepting claims (0/%d claimed)", citizens)
-				} else {
-					label = fmt.Sprintf("accepting claims (%d/%d claimed, %d/%d submitted)", claimed, citizens, submitted, citizens)
+	// Compact summary: counts by state + active claimants.
+	// This is the default view for runs of any size.
+	b.WriteString("  Ready:     ")
+	b.WriteString(fmt.Sprintf("%d", counts["ready"]))
+	if counts["collecting"] > 0 {
+		b.WriteString(fmt.Sprintf("  Collecting: %d", counts["collecting"]))
+	}
+	b.WriteString("\n")
+	if counts["claimed"] > 0 || counts["running"] > 0 {
+		b.WriteString(fmt.Sprintf("  Claimed:   %d", counts["claimed"]+counts["running"]))
+		// Show who's working on what.
+		var workers []string
+		for _, t := range tasks {
+			ts, _ := t["state"].(string)
+			if ts == "claimed" || ts == "running" {
+				claimedBy, _ := t["claimed_by"].(string)
+				tid, _ := t["id"].(string)
+				if claimedBy != "" {
+					// Use short task ID (last segment).
+					parts := strings.Split(tid, ":")
+					short := parts[len(parts)-1]
+					if len(parts) >= 2 {
+						short = parts[len(parts)-2] + ":" + short
+					}
+					workers = append(workers, fmt.Sprintf("%s: %s", claimedBy, short))
 				}
 			}
 		}
-
-		// Task ID line with number for quick reference
-		b.WriteString(fmt.Sprintf("  %s #%d [%s] %s\n", icon, int(seq), tid, label))
-
-		if citizens <= 1 || t["action"] != "vote" {
-			switch tstate {
-			case "accepted":
-				if claimedBy != "" {
-					b.WriteString(fmt.Sprintf("    Completed by: %s\n", claimedBy))
-				}
-			case "claimed":
-				if claimedBy != "" {
-					b.WriteString(fmt.Sprintf("    Working: %s\n", claimedBy))
-				}
-			case "pending":
-				if deps != "" {
-					b.WriteString(fmt.Sprintf("    Blocked by: %s\n", deps))
-				}
-			}
-		} else if tstate == "pending" && deps != "" {
-			b.WriteString(fmt.Sprintf("    Blocked by: %s\n", deps))
+		if len(workers) > 0 {
+			b.WriteString(fmt.Sprintf(" (%s)", strings.Join(workers, ", ")))
 		}
-
-		// Prompt preview — hide template vars for blocked tasks
-		if prompt != "" {
-			preview := truncate(prompt, 100)
-			b.WriteString(fmt.Sprintf("    \"%s\"\n", preview))
-		}
-
 		b.WriteString("\n")
 	}
+	if counts["pending"] > 0 {
+		b.WriteString(fmt.Sprintf("  Blocked:   %d\n", counts["pending"]))
+	}
+	if counts["accepted"] > 0 {
+		b.WriteString(fmt.Sprintf("  Completed: %d\n", counts["accepted"]))
+	}
+	if counts["skipped"] > 0 {
+		b.WriteString(fmt.Sprintf("  Skipped:   %d\n", counts["skipped"]))
+	}
 
-	b.WriteString("Tip: Use enju_get_task(task_id=\"...\") to see full details of a task.")
+	// For small runs (≤10 tasks), show the full task list
+	// inline. For larger runs, just the summary + tip.
+	if total <= 10 {
+		b.WriteString("\nTasks:\n\n")
+		for _, t := range tasks {
+			tid, _ := t["id"].(string)
+			tstate, _ := t["state"].(string)
+			claimedBy, _ := t["claimed_by"].(string)
+			tseq, _ := t["seq"].(float64)
+			icon := stateIcon(tstate)
+			label := stateLabel(tstate)
+			line := fmt.Sprintf("  %s #%d [%s] %s", icon, int(tseq), tid, label)
+			if tstate == "claimed" && claimedBy != "" {
+				line += fmt.Sprintf(" (%s)", claimedBy)
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+
+	b.WriteString("\nTip: Use enju_get_task(task_id=\"...\") to see full details.")
 
 	return b.String()
 }
@@ -1604,6 +1602,29 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 				b.WriteString(formatResolvedArtifactsBlock(artMap, missingArts))
 			}
 		}
+	}
+
+	// Task history — show previous attempts when the task
+	// has been invalidated and re-run. Only present when the
+	// task response includes task_history (multiple claims).
+	if historyRaw, ok := task["task_history"].([]interface{}); ok && len(historyRaw) > 0 {
+		b.WriteString("\n── History ─────────────────────────────────\n")
+		for i, raw := range historyRaw {
+			h, _ := raw.(map[string]interface{})
+			citizen, _ := h["citizen"].(string)
+			claimedAt, _ := h["claimed_at"].(string)
+			submittedAt, _ := h["submitted_at"].(string)
+			outcome, _ := h["outcome"].(string)
+			line := fmt.Sprintf("  %d. @%s claimed %s", i+1, citizen, claimedAt)
+			if submittedAt != "" {
+				line += fmt.Sprintf(", submitted %s", submittedAt)
+			}
+			if outcome != "" {
+				line += fmt.Sprintf(" → %s", outcome)
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("────────────────────────────────────────────\n")
 	}
 
 	return b.String()
@@ -2258,6 +2279,8 @@ func stateIcon(state string) string {
 		// resolved against. Dim dot distinguishes from
 		// active/terminal-pass states.
 		return "•"
+	case "failed":
+		return "✗"
 	case "invalid", "invalidated", "rejected":
 		return "✗"
 	default:
@@ -2299,6 +2322,8 @@ func stateLabel(state string) string {
 		return "collecting — waiting for more submissions"
 	case "skipped":
 		return "skipped — losing branch of a vote"
+	case "failed":
+		return "failed"
 	default:
 		return state
 	}

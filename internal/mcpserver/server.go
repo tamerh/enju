@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -103,6 +104,9 @@ func New(cfg Config) *server.MCPServer {
 	s.AddTool(toolMyProfile(), client.handleMyProfile)
 	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
 	s.AddTool(toolTallyTask(), client.handleTallyTask)
+	s.AddTool(toolFailTask(), client.handleFailTask)
+	s.AddTool(toolExecuteTask(), client.handleExecuteTask)
+	s.AddTool(toolExportRun(), client.handleExportRun)
 	s.AddTool(toolListTemplates(), client.handleListTemplates)
 	s.AddTool(toolDescribeTemplate(), client.handleDescribeTemplate)
 
@@ -487,6 +491,61 @@ If you don't have a project yet, create one first with enju_create_project.`),
 // templates/ directory with its name, description, and
 // parameter summary so the LLM can pick a recipe that fits
 // the user's request without reading each file.
+func toolFailTask() mcp.Tool {
+	return mcp.NewTool("enju_fail_task",
+		mcp.WithDescription(`Mark a task as failed with a reason. Works for any action type (answer, contribute, compute, review, vote).
+
+Use this when you can't complete a task — missing data, broken upstream, environment issue, or any other blocker. The task moves to a terminal "failed" state, downstream descendants are blocked, and the reason is visible to all citizens in run_status.
+
+Recovery: the run author or any citizen can use enju_invalidate_task to bounce a failed task back to READY for re-assignment.`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The task to fail"),
+		),
+		mcp.WithString("reason",
+			mcp.Required(),
+			mcp.Description("Why the task failed (shown to all citizens in run_status)"),
+		),
+	)
+}
+
+func toolExecuteTask() mcp.Tool {
+	return mcp.NewTool("enju_execute_task",
+		mcp.WithDescription(`Execute a compute task's script, capture its output, and submit the result — all in one call.
+
+For action:compute tasks only. Claims the task if not already claimed, runs the declared script in the project's local clone, captures stdout as the result, and submits automatically.
+
+Environment variables available to the script:
+  ENJU_TASK_ID      — the full task ID
+  ENJU_PROJECT_DIR  — the project's local clone root
+  ENJU_RUN_DIR      — the result directory for this task
+
+Exit code semantics:
+  0     → submit as completed (stdout → result.md)
+  non-0 → task fails (stderr shown as the failure reason)
+
+The script runs in the project's workspace directory. It has full access to the local clone (upstream results, artifacts, etc.).`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The task to execute"),
+		),
+	)
+}
+
+func toolExportRun() mcp.Tool {
+	return mcp.NewTool("enju_export_run",
+		mcp.WithDescription(`Export a completed run as a single markdown document. Assembles all task results in DAG order — each task becomes a section with its prompt and result. Use this for the preprint appendix or to review the full output of a run in one place.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_seq",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+	)
+}
+
 func toolListTemplates() mcp.Tool {
 	return mcp.NewTool("enju_list_templates",
 		mcp.WithDescription(`List the reusable run recipes (templates) available in a project. Each entry shows the template's name, description, and its declared parameters. Use this first when a user asks to do something that matches a known recipe — the template saves them from hand-writing a run YAML.
@@ -1230,6 +1289,8 @@ type taskMeta struct {
 	// Parsed via mcpgit.ParseNamedOutputSchema by the fat-client
 	// submit helper.
 	OutputsSchemaJSON string
+	// Script is the script path for action:compute tasks.
+	Script string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -1280,6 +1341,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["citizens"].(float64); ok {
 		meta.Citizens = int(v)
+	}
+	if v, ok := raw["script"].(string); ok {
+		meta.Script = v
 	}
 	return meta, nil
 }
@@ -1683,16 +1747,28 @@ func (c *apiClient) submitResultFatClient(
 	// round-trip.
 	if meta != nil && meta.State != "" {
 		switch meta.State {
-		case "accepted", "skipped", "invalid", "invalidated", "rejected":
+		case "accepted", "skipped", "failed", "invalid", "invalidated", "rejected":
 			return mcp.NewToolResultError(fmt.Sprintf(
 				"task %s is already in terminal state %q — re-open it with enju_invalidate_task first if you need to resubmit",
 				taskID, meta.State,
 			)), nil
-		case "pending", "ready":
+		case "pending":
 			return mcp.NewToolResultError(fmt.Sprintf(
-				"task %s is in state %q — claim it with enju_claim_task before submitting",
-				taskID, meta.State,
+				"task %s is blocked (waiting on upstream dependencies) — it's not ready for submission yet",
+				taskID,
 			)), nil
+		case "ready":
+			// Multi-citizen tasks stay in READY while claims
+			// are being collected. Only reject for single-
+			// citizen tasks where READY means "not yet claimed."
+			if meta.Citizens <= 1 {
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"task %s is available but not claimed — use enju_claim_task first",
+					taskID,
+				)), nil
+			}
+			// Multi-citizen: READY is valid — the engine
+			// validates the citizen's active claim server-side.
 		}
 	}
 	if meta != nil && meta.Action == "review" {
@@ -2455,7 +2531,8 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	body := map[string]interface{}{
-		"yaml": yamlContent,
+		"yaml":     yamlContent,
+		"username": c.username,
 	}
 	if paramMap != nil {
 		body["params"] = paramMap
@@ -2479,6 +2556,301 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 // handleListTemplates — pure client-side tool. Walks the
 // project's templates/ directory in the local clone and
 // returns one entry per YAML file with its metadata.
+func (c *apiClient) handleFailTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	reason, err := req.RequireString("reason")
+	if err != nil {
+		return mcp.NewToolResultError("reason is required"), nil
+	}
+	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
+		"reason": reason,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(data, &resp)
+	if errMsg, ok := resp["error"].(string); ok {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✗ Task %s failed: %s", taskID, reason)), nil
+}
+
+func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_execute_task requires a local workspace"), nil
+	}
+
+	// Fetch task metadata.
+	meta, err := c.fetchTaskMeta(ctx, taskID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, err)), nil
+	}
+	if meta.Action != "compute" {
+		return mcp.NewToolResultError(fmt.Sprintf("enju_execute_task is only for action:compute tasks (got %q) — use enju_submit_result for %s tasks", meta.Action, meta.Action)), nil
+	}
+	if meta.Script == "" {
+		return mcp.NewToolResultError("task has no script field declared"), nil
+	}
+
+	// Claim if not already claimed.
+	if meta.State == "ready" || meta.State == "collecting" {
+		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
+			"username": c.username,
+		})
+		if err != nil {
+			return mcp.NewToolResultError("failed to claim: " + err.Error()), nil
+		}
+		var claimResp map[string]interface{}
+		if json.Unmarshal(claimData, &claimResp) == nil {
+			if errMsg, ok := claimResp["error"].(string); ok {
+				return mcp.NewToolResultError("claim failed: " + errMsg), nil
+			}
+		}
+	}
+
+	// Open the project workspace.
+	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	proj.Lock()
+	_ = proj.Pull()
+	proj.Unlock()
+
+	workDir := proj.WorkDir()
+	resultDir := mcpgit.ResultDir(meta.ProjectID, meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+
+	// Build environment variables.
+	env := os.Environ()
+	env = append(env,
+		"ENJU_TASK_ID="+taskID,
+		"ENJU_PROJECT_DIR="+workDir,
+		"ENJU_RUN_DIR="+filepath.Join(workDir, resultDir),
+	)
+
+	// Resolve the script path.
+	scriptPath := filepath.Join(workDir, meta.Script)
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("script %q not found in workspace", meta.Script)), nil
+	}
+
+	// Execute the script.
+	startTime := time.Now()
+	cmd := exec.CommandContext(ctx, scriptPath)
+	cmd.Dir = workDir
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	execErr := cmd.Run()
+	elapsed := time.Since(startTime).Round(time.Millisecond)
+	exitCode := 0
+	if execErr != nil {
+		if exitErr, ok := execErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to run script: %v", execErr)), nil
+		}
+	}
+
+	// Exit non-zero → auto-fail the task via the coordinator.
+	if exitCode != 0 {
+		stderrStr := stderr.String()
+		if len(stderrStr) > 1000 {
+			stderrStr = stderrStr[:1000] + "...(truncated)"
+		}
+		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, exitCode)
+		if stderrStr != "" {
+			reason += ": " + stderrStr
+		}
+		c.post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
+			"reason": reason,
+		})
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("✗ Script failed (exit %d, %s)\n", exitCode, elapsed))
+		if stderrStr != "" {
+			b.WriteString(fmt.Sprintf("  stderr: %s\n", stderrStr))
+		}
+		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", taskID))
+		return mcp.NewToolResultText(b.String()), nil
+	}
+
+	// Exit 0 → submit the result.
+	content := stdout.String()
+	if content == "" {
+		content = "(script produced no output)"
+	}
+
+	// Write result + metadata, commit, push.
+	files := []mcpgit.FileWrite{
+		{
+			RepoRelPath: filepath.Join(resultDir, "result.md"),
+			Content:     []byte(content),
+		},
+	}
+	metadata := map[string]interface{}{
+		"task_id":     taskID,
+		"model":       c.modelName,
+		"result_type": "text",
+		"action":      "compute",
+		"script":      meta.Script,
+		"exit_code":   0,
+		"elapsed_ms":  elapsed.Milliseconds(),
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
+	files = append(files, mcpgit.FileWrite{
+		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+		Content:     metaBytes,
+	})
+
+	proj.Lock()
+	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:      taskID,
+		Username:    c.username,
+		AuthorName:  c.citizenName,
+		AuthorEmail: c.citizenEmail,
+		Files:       files,
+	})
+	proj.Unlock()
+	if err != nil {
+		return mcp.NewToolResultError("git submit failed: " + err.Error()), nil
+	}
+
+	// Report to coordinator.
+	reportBody := map[string]interface{}{
+		"commit_sha":  submitRes.CommitSHA,
+		"result_path": resultDir,
+		"model":       c.modelName,
+		"username":    c.username,
+		"content":     content,
+	}
+	reportData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
+	if err != nil {
+		return mcp.NewToolResultError("coordinator report failed: " + err.Error()), nil
+	}
+
+	// Format response.
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("✓ Script completed (exit 0, %s)\n", elapsed))
+	b.WriteString(fmt.Sprintf("  Script:  %s\n", meta.Script))
+	b.WriteString(fmt.Sprintf("  Output:  %d bytes written to result.md\n", len(content)))
+	b.WriteString(fmt.Sprintf("  Commit:  %s\n", shortSHA(submitRes.CommitSHA)))
+
+	// Contribution counter from the report response.
+	var report map[string]interface{}
+	if json.Unmarshal(reportData, &report) == nil {
+		if n := jsonFloat(report["contribution_number"]); n > 0 {
+			b.WriteString(fmt.Sprintf("\nContribution #%d\n", int(n)))
+		}
+		if ready := jsonFloat(report["newly_ready"]); ready > 0 {
+			b.WriteString(fmt.Sprintf("Impact: %d new task(s) unlocked.\n", int(ready)))
+		}
+	}
+
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runSeq, err := req.RequireInt("run_seq")
+	if err != nil {
+		return mcp.NewToolResultError("run_seq is required"), nil
+	}
+
+	// Fetch run + tasks from coordinator.
+	runData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var run map[string]interface{}
+	json.Unmarshal(runData, &run)
+	if errMsg, _ := run["error"].(string); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	tasksData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runSeq))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var tasks []map[string]interface{}
+	json.Unmarshal(tasksData, &tasks)
+
+	// Read each accepted task's result from the local clone.
+	var remoteURL string
+	if c.workspace != nil {
+		if meta, err := c.fetchProjectMeta(ctx, int64(projectID)); err == nil {
+			remoteURL = meta
+		}
+	}
+
+	var b strings.Builder
+	runName, _ := run["name"].(string)
+	runState, _ := run["state"].(string)
+	b.WriteString(fmt.Sprintf("# Run: %s\n\n", runName))
+	b.WriteString(fmt.Sprintf("Project: #%d, Run: #%d, State: %s, Tasks: %d\n\n", projectID, runSeq, runState, len(tasks)))
+	b.WriteString("---\n\n")
+
+	for _, t := range tasks {
+		tid, _ := t["id"].(string)
+		tstate, _ := t["state"].(string)
+		action, _ := t["action"].(string)
+		prompt, _ := t["prompt"].(string)
+		commitSHA, _ := t["commit_sha"].(string)
+		resultPath, _ := t["result_path"].(string)
+		claimedBy, _ := t["claimed_by"].(string)
+		defID, _ := t["task_def_id"].(string)
+
+		b.WriteString(fmt.Sprintf("## %s\n\n", tid))
+		b.WriteString(fmt.Sprintf("Action: %s | State: %s", action, tstate))
+		if claimedBy != "" {
+			b.WriteString(fmt.Sprintf(" | By: @%s", claimedBy))
+		}
+		b.WriteString("\n\n")
+
+		// Read result from git first — for the preprint,
+		// the output is what matters. Show the prompt only
+		// as context below the result.
+		resultShown := false
+		if tstate == "accepted" && commitSHA != "" && c.workspace != nil && remoteURL != "" {
+			if proj, err := c.workspace.ForProject(int64(projectID), remoteURL); err == nil {
+				resultFile := resultPath + "/result.md"
+				if defID != "" && resultPath != "" {
+					content, found, err := proj.ReadFileAtCommit(commitSHA, resultFile)
+					if err == nil && found && len(content) > 0 {
+						b.WriteString(string(content) + "\n\n")
+						resultShown = true
+					}
+				}
+				_ = defID
+			}
+		}
+		if tstate == "skipped" {
+			b.WriteString("*(skipped — losing branch of a vote)*\n\n")
+		}
+		if !resultShown && prompt != "" {
+			// No result available — show the prompt template
+			// so the reader at least knows what was asked.
+			b.WriteString("**Prompt:** " + prompt + "\n\n")
+		}
+		b.WriteString("---\n\n")
+	}
+
+	return mcp.NewToolResultText(b.String()), nil
+}
+
 func (c *apiClient) handleListTemplates(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {

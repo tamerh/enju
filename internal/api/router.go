@@ -73,6 +73,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/projects/{projectID}/runs", s.handleCreateRun)
 		r.Get("/projects/{projectID}/runs/{runSeq}", s.handleGetRun)
 		r.Get("/projects/{projectID}/runs/{runSeq}/tasks", s.handleListRunTasks)
+		r.Get("/projects/{projectID}/runs/{runSeq}/cost", s.handleGetRunCostSummary)
 
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
@@ -94,6 +95,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
 		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
+		r.Post("/tasks/{taskID}/fail", s.handleFailTask)
 
 		// Citizens
 		r.Post("/citizens/register", s.handleRegisterCitizen)
@@ -410,9 +412,10 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 type createRunRequest struct {
 	YAML            string                 `json:"yaml"`
 	RepoURL         string                 `json:"repo_url,omitempty"`
-	Params          map[string]interface{} `json:"params,omitempty"`            // Phase H.1 — values for top-level params: block
-	SourcePath      string                 `json:"source_path,omitempty"`       // Phase H.1 — repo-relative template path for provenance
-	SourceCommitSHA string                 `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
+	Params          map[string]interface{} `json:"params,omitempty"`
+	SourcePath      string                 `json:"source_path,omitempty"`
+	SourceCommitSHA string                 `json:"source_commit_sha,omitempty"`
+	Username        string                 `json:"username,omitempty"` // citizen who created this run, for contribution tracking
 }
 
 type runResponse struct {
@@ -523,6 +526,20 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("run created", "id", runID, "project_id", projectID, "seq", runSeq, "name", parsed.Run.Name, "tasks", taskCount)
 
+	// Record run_created contribution event.
+	if req.Username != "" {
+		if citizen, _ := s.store.GetCitizenByUsername(req.Username); citizen != nil {
+			s.store.RecordContributionEvent(&store.ContributionEvent{
+				CitizenID:    citizen.ID,
+				EventType:    "run_created",
+				RunID:        runID,
+				ProjectID:    projectID,
+				Metadata:     fmt.Sprintf(`{"tasks":%d}`, taskCount),
+				CreatedAt:    now,
+			})
+		}
+	}
+
 	if len(parsed.Warnings) > 0 {
 		s.logger.Info("run created with warnings",
 			"id", runID, "warnings", parsed.Warnings)
@@ -565,6 +582,87 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleGetRunCostSummary(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	tasks, _ := s.store.ListTasksByRun(run.ID)
+
+	var citizenSet = map[int64]bool{}
+	var firstClaim, lastAccept time.Time
+	for _, t := range tasks {
+		if store.TaskState(t.State) == store.TaskAccepted {
+			if t.ClaimedBy > 0 {
+				citizenSet[t.ClaimedBy] = true
+			}
+			if t.ClaimedAt != nil && (firstClaim.IsZero() || t.ClaimedAt.Before(firstClaim)) {
+				firstClaim = *t.ClaimedAt
+			}
+			if t.SubmittedAt != nil && (lastAccept.IsZero() || t.SubmittedAt.After(lastAccept)) {
+				lastAccept = *t.SubmittedAt
+			}
+		}
+	}
+	// Pull char counts + estimated tokens from contribution
+	// events metadata (the task record doesn't store content
+	// length — content lives in git, but the events log has
+	// both prompt_chars and content_chars from submit time).
+	var totalPromptChars, totalContentChars, totalEstTokens int64
+	taskIDs := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		taskIDs = append(taskIDs, t.ID)
+	}
+	for _, tid := range taskIDs {
+		metadata, err := s.store.GetEventMetadataForTask(tid, "task_completed")
+		if err != nil {
+			continue
+		}
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(metadata), &m) == nil {
+			if v, ok := m["prompt_chars"].(float64); ok {
+				totalPromptChars += int64(v)
+			}
+			if v, ok := m["content_chars"].(float64); ok {
+				totalContentChars += int64(v)
+			}
+			if v, ok := m["estimated_tokens"].(float64); ok {
+				totalEstTokens += int64(v)
+			}
+		}
+	}
+
+	var wallClock string
+	if !firstClaim.IsZero() && !lastAccept.IsZero() {
+		wallClock = lastAccept.Sub(firstClaim).Round(time.Second).String()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"project_id":       projectID,
+		"run_seq":          runSeq,
+		"tasks_total":      len(tasks),
+		"tasks_accepted":   countByState(tasks, store.TaskAccepted),
+		"prompt_chars":     totalPromptChars,
+		"content_chars":    totalContentChars,
+		"estimated_tokens": totalEstTokens,
+		"citizen_count":    len(citizenSet),
+		"wall_clock":       wallClock,
+	})
+}
+
+func countByState(tasks []store.TaskRecord, state store.TaskState) int {
+	n := 0
+	for _, t := range tasks {
+		if store.TaskState(t.State) == state {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
@@ -660,6 +758,7 @@ type taskResponse struct {
 	VoteDeadlineAt  string   `json:"vote_deadline_at,omitempty"` // Phase E.2: absolute expiry (ISO), empty until first claim
 	Anonymize       bool     `json:"anonymize,omitempty"`        // Phase E.2: hide citizen usernames
 	Visibility      string   `json:"visibility,omitempty"`       // Phase E.2: open|blind during collection
+	FailReason      string   `json:"fail_reason,omitempty"`     // reason for FAILED state
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -671,6 +770,29 @@ type taskResponse struct {
 	// submitted). Empty for citizens=1 tasks — those use the
 	// ClaimedBy field.
 	ActiveClaimants []string `json:"active_claimants,omitempty"`
+	// ArtifactProvenance shows who last wrote each artifact
+	// this task reads.
+	ArtifactProvenance []artifactProvenance `json:"artifact_provenance,omitempty"`
+	// TaskHistory shows previous claim/submit/invalidation
+	// attempts on this task. Populated when the task has
+	// more than one claim record (indicates re-runs after
+	// invalidation).
+	TaskHistory []taskHistoryEntry `json:"task_history,omitempty"`
+}
+
+type taskHistoryEntry struct {
+	Citizen     string  `json:"citizen"`
+	ClaimedAt   string  `json:"claimed_at"`
+	SubmittedAt string  `json:"submitted_at,omitempty"`
+	Outcome     string  `json:"outcome"` // completed, invalidated, released, timed_out
+	Decision    string  `json:"decision,omitempty"`
+}
+
+type artifactProvenance struct {
+	Path       string `json:"path"`
+	LastWriter string `json:"last_writer,omitempty"` // username
+	LastTaskID string `json:"last_task_id,omitempty"`
+	CommitSHA  string `json:"commit_sha,omitempty"`
 }
 
 // voteSubmissionRef is one citizen's submitted vote on a
@@ -976,7 +1098,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if store.TaskState(task.State) != store.TaskCollecting {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q is not in collecting state (state: %s) — nothing to tally yet", taskID, task.State))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q is not collecting submissions yet (state: %s) — nothing to tally", taskID, engine.StateLabel(store.TaskState(task.State))))
 		return
 	}
 
@@ -1177,6 +1299,72 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 //	    {"path": "notes/intro.md", "commit_sha": "def..."}
 //	  ]
 //	}
+func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	// Can only fail tasks that are in an active state.
+	switch store.TaskState(task.State) {
+	case store.TaskClaimed, store.TaskReady, store.TaskCollecting:
+		// OK.
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("task %q cannot be failed (state: %s)", taskID, task.State))
+		return
+	}
+
+	// Set task to FAILED with reason via ApplyPlan.
+	plan := store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetTaskState{
+				TaskID:     taskID,
+				NewState:   store.TaskFailed,
+				FailReason: req.Reason,
+			},
+		},
+	}
+	if _, err := s.store.ApplyPlan(plan); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Record contribution event.
+	if task.ClaimedBy > 0 {
+		run, _ := s.store.GetRun(task.RunID)
+		projectID := int64(0)
+		if run != nil {
+			projectID = run.ProjectID
+		}
+		s.store.RecordContributionEvent(&store.ContributionEvent{
+			CitizenID:    task.ClaimedBy,
+			EventType:    "task_failed",
+			TaskID:       taskID,
+			RunID:        task.RunID,
+			ProjectID:    projectID,
+			Metadata:     fmt.Sprintf(`{"reason":%q}`, req.Reason),
+			CreatedAt:    time.Now(),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "failed",
+		"task_id": taskID,
+		"reason":  req.Reason,
+	})
+}
+
 func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, run *store.RunRecord) {
 	desc, err := s.engine().BuildInputsDescriptor(task, run)
 	if err != nil {
@@ -2163,6 +2351,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		VoteDeadline:    t.VoteDeadline,
 		Anonymize:       t.Anonymize,
 		Visibility:      t.Visibility,
+		FailReason:      t.FailReason,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks
@@ -2205,6 +2394,38 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 			}
 		}
 	}
+
+	// Task history: show previous attempts when the task has
+	// been invalidated and re-run. Only populated when there
+	// are multiple claim records (single-claim tasks skip
+	// this to avoid noise).
+	if history, err := s.store.ListTaskHistory(t.ID); err == nil && len(history) > 1 {
+		for _, h := range history {
+			entry := taskHistoryEntry{
+				Citizen:   s.citizenUsername(h.CitizenID),
+				ClaimedAt: h.ClaimedAt.Format(time.RFC3339),
+				Outcome:   h.Outcome,
+				Decision:  h.Option,
+			}
+			if h.SubmittedAt != nil {
+				entry.SubmittedAt = h.SubmittedAt.Format(time.RFC3339)
+			}
+			resp.TaskHistory = append(resp.TaskHistory, entry)
+		}
+	}
+
+	// Artifact provenance: for each artifact this task reads,
+	// show who last wrote it. Quick index lookup per path.
+	for _, path := range unmarshalStringSlice(t.ReadsArtifacts) {
+		prov := artifactProvenance{Path: path}
+		if art, err := s.store.GetArtifact(projectID, path); err == nil && art != nil {
+			prov.LastWriter = s.citizenUsername(art.LastWriter)
+			prov.LastTaskID = art.LastTaskID
+			prov.CommitSHA = art.CommitSHA
+		}
+		resp.ArtifactProvenance = append(resp.ArtifactProvenance, prov)
+	}
+
 	return resp
 }
 

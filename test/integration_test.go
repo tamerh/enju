@@ -4988,5 +4988,29 @@ tasks:
 	}
 }
 
+// TestContributionEventsRecorded — verifies that submitting
+// a task records a contribution event with correct metadata
+// (estimated tokens, prompt/content chars).
+func TestContributionEventsRecorded(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+	s.submit("task_a", "Hello world result")
+
+	// Query the contributions endpoint.
+	contribs := s.get(fmt.Sprintf("/api/v1/citizens/by-username/%s/contributions", alice))
+	completed, _ := contribs["tasks_completed"].(float64)
+	if completed < 1 {
+		t.Errorf("expected at least 1 task_completed event, got %.0f", completed)
+	}
+	tokens, _ := contribs["tokens_total"].(float64)
+	if tokens <= 0 {
+		t.Errorf("expected positive estimated tokens, got %.0f", tokens)
+	}
+}
+
 // Suppress unused import
 var _ = enjuYaml.Parse

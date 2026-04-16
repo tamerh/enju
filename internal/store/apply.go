@@ -135,8 +135,8 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		// - Target (→READY): must be in ACCEPTED.
 		// - Descendant (→PENDING): skip if already PENDING
 		//   (no-op, not an error).
-		if m.NewState == TaskReady && TaskState(currentState) != TaskAccepted {
-			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted)", m.TaskID, currentState)
+		if m.NewState == TaskReady && TaskState(currentState) != TaskAccepted && TaskState(currentState) != TaskFailed {
+			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted or failed)", m.TaskID, currentState)
 		}
 		if m.NewState == TaskPending && TaskState(currentState) == TaskPending {
 			// Already pending — skip silently, matching the
@@ -144,7 +144,7 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 			return nil
 		}
 		_, err := tx.Exec(
-			`UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '' WHERE id = ?`,
+			`UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = '' WHERE id = ?`,
 			m.NewState, m.TaskID,
 		)
 		if err != nil {
@@ -162,6 +162,10 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		if m.CommitSHA != "" {
 			q += `, commit_sha = ?`
 			args = append(args, m.CommitSHA)
+		}
+		if m.FailReason != "" {
+			q += `, fail_reason = ?`
+			args = append(args, m.FailReason)
 		}
 		q += ` WHERE id = ?`
 		args = append(args, m.TaskID)
@@ -388,7 +392,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
 	// Check if all tasks in the run are terminal.
 	var pending int
 	err := tx.QueryRow(
-		`SELECT COUNT(*) FROM tasks WHERE run_id = ? AND state NOT IN ('accepted', 'skipped')`,
+		`SELECT COUNT(*) FROM tasks WHERE run_id = ? AND state NOT IN ('accepted', 'skipped', 'failed')`,
 		m.RunID,
 	).Scan(&pending)
 	if err != nil {

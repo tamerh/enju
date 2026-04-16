@@ -277,6 +277,7 @@ func (s *Store) migrate() error {
 		// usernames).
 		`ALTER TABLE tasks ADD COLUMN anonymize INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN fail_reason TEXT NOT NULL DEFAULT ''`,
 		// Phase H.1 — template provenance. Records the
 		// repo-relative templates/*.yaml path this run was
 		// instantiated from. Empty string for inline-YAML
@@ -523,7 +524,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 	// "skipped by a gate vote" is one of those. This mirrors the
 	// invariant UpdateReadyTasks relies on for dep satisfaction.
 	err := s.db.QueryRow(
-		`SELECT COUNT(*), COUNT(CASE WHEN state IN ('accepted', 'skipped') THEN 1 END) FROM tasks WHERE run_id = ?`,
+		`SELECT COUNT(*), COUNT(CASE WHEN state IN ('accepted', 'skipped', 'failed') THEN 1 END) FROM tasks WHERE run_id = ?`,
 		runID,
 	).Scan(&total, &terminal)
 	if err != nil {
@@ -538,7 +539,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -582,7 +583,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility,
+		&anonymizeInt, &t.Visibility, &t.FailReason,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1370,7 +1371,7 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	// fail loudly at claim time; that's an author-error, not a
 	// scheduler concern.
 	acceptedRows, err := s.db.Query(
-		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
+		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped', 'failed')`, runID,
 	)
 	if err != nil {
 		return 0, err
@@ -1673,7 +1674,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility,
+			&anonymizeInt, &t.Visibility, &t.FailReason,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

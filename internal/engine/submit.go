@@ -68,7 +68,7 @@ func (e *Engine) ComputeSubmission(
 		// Single-citizen: must be CLAIMED or RUNNING.
 		if store.TaskState(task.State) != store.TaskClaimed &&
 			store.TaskState(task.State) != store.TaskRunning {
-			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, task.State)
+			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, StateLabel(store.TaskState(task.State)))
 		}
 		outcome.Resolved = true
 	} else {
@@ -77,9 +77,9 @@ func (e *Engine) ComputeSubmission(
 		case store.TaskReady, store.TaskCollecting:
 			// OK.
 		case store.TaskAccepted, store.TaskSkipped:
-			return nil, fmt.Errorf("task %q already resolved (state: %s) — your submission arrived after the tally closed", taskID, task.State)
+			return nil, fmt.Errorf("task %q already resolved (state: %s) — your submission arrived after the tally closed", taskID, StateLabel(store.TaskState(task.State)))
 		default:
-			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, task.State)
+			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, StateLabel(store.TaskState(task.State)))
 		}
 		// Check active claim — the correct semantic for
 		// multi-citizen tasks. Fixes the bug where the

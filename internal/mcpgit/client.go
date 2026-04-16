@@ -281,15 +281,32 @@ func (p *Project) Unlock() {
 // corrupted), it's removed and re-cloned.
 func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, error) {
 	if repo, err := gogit.PlainOpen(workDir); err == nil {
-		// Clone exists and is valid.
+		// Clone exists — verify the remote URL matches.
+		// After a DB wipe, the same workspace dir (keyed by
+		// project int ID) may hold a clone from a previous
+		// project that used the same numeric ID. If the
+		// origin URL doesn't match, wipe and re-clone so
+		// the citizen doesn't work against stale content.
+		if remoteURL != "" {
+			mismatch := true
+			if rem, err := repo.Remote("origin"); err == nil {
+				if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] == remoteURL {
+					mismatch = false
+				}
+			}
+			if mismatch {
+				logger.Warn("stale workspace — remote URL mismatch, re-cloning",
+					"path", workDir, "expected", remoteURL)
+				os.RemoveAll(workDir)
+				// Fall through to the clone path below.
+				goto clone
+			}
+		}
 		p := &Project{
 			workDir: workDir,
 			repo:    repo,
 			logger:  logger,
 		}
-		// Pick up the configured remote URL if the caller didn't
-		// specify one (e.g. when reopening an existing clone after
-		// a restart).
 		if remoteURL == "" {
 			if rem, err := repo.Remote("origin"); err == nil {
 				if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 {
@@ -300,6 +317,7 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, erro
 		p.remoteURL = remoteURL
 		return p, nil
 	}
+clone:
 
 	// Clone doesn't exist — either clone from remote or init empty.
 	if remoteURL == "" {

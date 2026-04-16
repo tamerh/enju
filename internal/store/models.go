@@ -33,6 +33,12 @@ const (
 	// counting and dependency satisfaction — a skipped task is
 	// "done, not taken," not "failed" or "pending."
 	TaskSkipped TaskState = "skipped"
+	// TaskFailed is a terminal state for tasks that a citizen
+	// explicitly failed (via enju_fail_task) or that a compute
+	// script exited non-zero on. Downstream descendants
+	// cascade to FAILED. Recovery: enju_invalidate_task
+	// bounces the task back to READY.
+	TaskFailed TaskState = "failed"
 )
 
 // RunState represents the state of a run.
@@ -171,6 +177,10 @@ type TaskRecord struct {
 	// still COLLECTING; once ACCEPTED everyone sees the full
 	// tally. Copied from the YAML `visibility:` field.
 	Visibility string
+	// FailReason records why a task was explicitly failed
+	// (via enju_fail_task or compute exit non-zero). Empty
+	// for non-failed tasks.
+	FailReason string
 
 	CreatedAt time.Time
 }

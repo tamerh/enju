@@ -74,12 +74,12 @@ func (e *Engine) ComputeClaim(taskID string, citizenID int64, deadline time.Time
 	if citizens == 1 {
 		// Single-citizen: must be READY.
 		if store.TaskState(task.State) != store.TaskReady {
-			return nil, fmt.Errorf("task %q is not ready (state: %s)", taskID, task.State)
+			return nil, fmt.Errorf("task %q is not available for claiming (state: %s)", taskID, StateLabel(store.TaskState(task.State)))
 		}
 	} else {
 		// Multi-citizen: READY or COLLECTING.
 		if store.TaskState(task.State) != store.TaskReady && store.TaskState(task.State) != store.TaskCollecting {
-			return nil, fmt.Errorf("task %q is not accepting claims (state: %s)", taskID, task.State)
+			return nil, fmt.Errorf("task %q is not accepting claims (state: %s)", taskID, StateLabel(store.TaskState(task.State)))
 		}
 		// Check own-slot BEFORE cap so citizen gets a specific
 		// "you already hold a slot" error, not "cap reached".
