@@ -51,6 +51,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -776,31 +777,32 @@ type SubmitResult struct {
 }
 
 // SubmitTaskResult is the main write path for the client. It handles
-// the full fetch → reset → overlay → commit → push cycle with retries
-// on non-fast-forward rejections. Returns the commit SHA that
-// actually landed so the caller can report it to the coordinator.
+// the overlay → commit → push cycle, with a `git pull --rebase`
+// retry on non-fast-forward rejections. Returns the commit SHA
+// that actually landed so the caller can report it to the
+// coordinator.
 //
 // The caller MUST hold the project lock for the duration of the call.
 //
 // Behavior details:
 //
-//   - Before writing any files, the function fetches origin and
-//     fast-forwards the local branch to origin/main. This ensures
-//     the commit is built on top of the latest remote state, not a
-//     stale local state.
-//
 //   - Files are written into the working tree at their declared
 //     paths (creating parent directories as needed). Any existing
-//     files at those paths are overwritten.
+//     files at those paths are overwritten. **Writes go on top of
+//     whatever is currently at HEAD** — user commits made in the
+//     workspace between submits are preserved, not rolled back.
 //
 //   - A single commit is created with the standard enju subject
 //     format. All files in the request land in that one commit.
 //
 //   - The commit is pushed. If the remote rejected the push as
 //     non-fast-forward (another client committed in the meantime),
-//     the cycle repeats: reset local state to the new origin/main,
-//     re-apply the files, commit, push. This is safer than
-//     rebasing because we can't know what the remote added.
+//     we run `git pull --rebase --autostash` to rebase our local
+//     chain (any user commits + our just-made task commit) onto
+//     the new remote tip, then push again. The rebase preserves
+//     all local work; only a real path-level conflict can fail
+//     it, and we surface that as a clear error rather than
+//     silently dropping commits.
 //
 //   - If we hit MaxRetries without succeeding, the most recent
 //     push error is returned. The caller should surface this so
@@ -819,97 +821,104 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 
 	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths, req.ModelName)
 
-	var (
-		lastErr  error
-		lastStep string
-	)
+	// Overlay the new files on top of current HEAD. Any local
+	// commits the user made (e.g. a manual edit to a script
+	// between submits) stay where they are — we do NOT reset
+	// HEAD to origin/main any more. That reset was the root
+	// cause of the "fat-client clobbers user commits" bug.
+	for _, f := range req.Files {
+		full := filepath.Join(p.workDir, f.RepoRelPath)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
+		}
+		if err := os.WriteFile(full, f.Content, 0644); err != nil {
+			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
+		}
+	}
+
+	// One commit per submit, on top of whatever was there.
+	sha, err := p.commit(commitMsg, req.AuthorName, req.AuthorEmail)
+	if err != nil {
+		return nil, fmt.Errorf("creating commit: %w", err)
+	}
+
+	// Push with retry. On non-FF rejection, rebase our chain
+	// onto the new remote tip and try again. Every attempt
+	// preserves local history — only a real path conflict can
+	// stop the rebase, and we surface that as an error rather
+	// than discard work.
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		// Sync to latest remote state before applying our changes.
-		if err := p.resetToRemote(); err != nil {
-			lastErr = err
-			lastStep = "sync"
-			continue
-		}
-
-		// Overlay the new files onto the working tree.
-		for _, f := range req.Files {
-			full := filepath.Join(p.workDir, f.RepoRelPath)
-			if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-				return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
+		pushErr := p.push()
+		if pushErr == nil {
+			// Rebase (if any) may have rewritten our commit
+			// SHA. Report the SHA that actually landed on
+			// the remote so the coordinator's state machine
+			// points at the right commit.
+			if head, herr := p.repo.Head(); herr == nil {
+				sha = head.Hash().String()
 			}
-			if err := os.WriteFile(full, f.Content, 0644); err != nil {
-				return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
-			}
+			return &SubmitResult{CommitSHA: sha, Attempts: attempt}, nil
 		}
-
-		// Stage, commit, push.
-		sha, err := p.commit(commitMsg, req.AuthorName, req.AuthorEmail)
-		if err != nil {
-			lastErr = err
-			lastStep = "commit"
-			continue
+		if !isNonFastForwardError(pushErr) {
+			return nil, fmt.Errorf("push failed: %w", pushErr)
 		}
-		if err := p.push(); err != nil {
-			lastErr = err
-			lastStep = "push"
-			// Push failed — could be non-ff. Loop and try again.
-			continue
+		// Non-FF: the remote moved while we were working.
+		// `git pull --rebase --autostash` fetches the new
+		// commits and replays our local commits (user's +
+		// ours) on top. Uses the system git CLI because
+		// go-git's rebase support doesn't cover the cases we
+		// need (especially divergent-history with
+		// user-authored commits).
+		if rebaseErr := p.rebaseOnRemote(); rebaseErr != nil {
+			return nil, fmt.Errorf(
+				"submit push rejected and rebase failed — your submit likely touches a file another client also changed. Local work is still in git reflog. Details: %w",
+				rebaseErr)
 		}
-		return &SubmitResult{CommitSHA: sha, Attempts: attempt}, nil
 	}
-	if lastErr == nil {
-		return nil, fmt.Errorf("submit failed after %d attempts (no error captured)", maxRetries)
-	}
-	return nil, fmt.Errorf("submit failed after %d attempts (last failure during %s step): %w", maxRetries, lastStep, lastErr)
+	return nil, fmt.Errorf("submit failed after %d push attempts", maxRetries)
 }
 
-// resetToRemote fetches origin and hard-resets the local branch to
-// origin/main so we have a clean base for new writes. Used before
-// each retry of SubmitTaskResult. For local-only projects (no
-// remote), this is a no-op. For bootstrapping empty remotes
-// (iteration A.5 fix), the fetch will return
-// transport.ErrEmptyRemoteRepository — treat that as "nothing to
-// catch up to" and proceed with the write.
-func (p *Project) resetToRemote() error {
+// rebaseOnRemote runs `git pull --rebase --autostash` via the
+// system git binary so divergent histories are merged without
+// discarding local commits. go-git's rebase support is too
+// limited for this case — it doesn't handle arbitrary
+// divergent-history replays, which is exactly what we need
+// when the user has committed between submits.
+//
+// --autostash protects against an edge case where the caller
+// left uncommitted changes in the working tree; they get
+// stashed + reapplied around the rebase so we never surprise
+// the user with a dirty-tree rejection.
+//
+// No-op for local-only projects (no remoteURL).
+func (p *Project) rebaseOnRemote() error {
 	if p.remoteURL == "" {
 		return nil
 	}
-	err := p.repo.Fetch(&gogit.FetchOptions{
-		RemoteName: "origin",
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
+	cmd := exec.Command("git", "-C", p.workDir, "pull", "--rebase", "--autostash", "origin", "main")
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		switch {
-		case errors.Is(err, gogit.NoErrAlreadyUpToDate):
-			// Up to date, carry on.
-		case errors.Is(err, transport.ErrEmptyRemoteRepository):
-			// Empty remote — we're bootstrapping it. Nothing
-			// to fetch, nothing to reset to. Proceed with
-			// the write; the first push will populate the
-			// remote's main branch.
-			return nil
-		default:
-			return friendlyGitError("fetch origin", p.remoteURL, err)
-		}
-	}
-	// Look up origin/main and reset HEAD to it.
-	ref, err := p.repo.Reference(plumbing.ReferenceName("refs/remotes/origin/main"), true)
-	if err != nil {
-		// No remote main yet (fresh repo or bootstrapped empty
-		// remote) — skip reset.
-		return nil
-	}
-	wt, err := p.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("getting worktree: %w", err)
-	}
-	if err := wt.Reset(&gogit.ResetOptions{
-		Mode:   gogit.HardReset,
-		Commit: ref.Hash(),
-	}); err != nil {
-		return fmt.Errorf("resetting to origin/main: %w", err)
+		return fmt.Errorf("git pull --rebase origin main: %s (%w)", strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// isNonFastForwardError tells whether a push error is the
+// "someone else pushed first" case (recoverable via rebase) vs
+// a real network / auth / config failure (not recoverable,
+// surface to the user). go-git surfaces non-FF via a few
+// different phrasings depending on the transport; check them
+// all.
+func isNonFastForwardError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "non-fast-forward") ||
+		strings.Contains(s, "fetch first") ||
+		strings.Contains(s, "rejected") ||
+		strings.Contains(s, "stale info")
 }
 
 // commit stages everything in the working tree and creates a

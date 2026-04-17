@@ -3861,6 +3861,126 @@ tasks:
 	}
 }
 
+// TestMCPSubmitPreservesManualUserCommits is the regression
+// guard for the "fat-client reset clobbers user work" bug.
+// Adopt-mode users (and anyone editing files in the workspace
+// clone between submits) need Enju to be a polite guest — a
+// task submission must commit on top of whatever's currently
+// there, not forcibly rewind HEAD to origin/main and discard
+// intermediate commits.
+//
+// Scenario:
+//  1. Submit task A (lands commit A on bare remote).
+//  2. User manually commits "user_notes.md" to their workspace
+//     clone on main. Commit exists locally, not yet pushed.
+//  3. Submit task B.
+//  4. Verify:
+//       a. The user's commit is still reachable from HEAD in
+//          the workspace clone.
+//       b. user_notes.md exists in the bare remote (push sent
+//          user's commit along with task B's).
+//       c. Task B's submit succeeded (SubmitResult carried a
+//          commit SHA, coordinator accepted).
+func TestMCPSubmitPreservesManualUserCommits(t *testing.T) {
+	h := newMCPHarness(t, "Polite Guest")
+	projectID := h.createTestProject()
+
+	yaml := `name: "submit preserves user commits"
+version: 1
+tasks:
+  - id: one
+    action: answer
+    prompt: "first"
+  - id: two
+    action: answer
+    prompt: "second"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Task A: submits normally. This populates the workspace
+	// clone and pushes a commit to the bare remote.
+	h.mcpClaimOK(t, "one")
+	h.mcpSubmitText(t, "one", "task one result")
+
+	// Locate the workspace clone directory so we can add a
+	// manual user commit there, simulating "user did work in
+	// the repo between submits."
+	workspaceDir := ""
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "test-*"))
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one project clone in workspace, got %d: %v", len(matches), matches)
+	}
+	workspaceDir = matches[0]
+
+	// User writes a file and commits it on main.
+	userFilePath := filepath.Join(workspaceDir, "user_notes.md")
+	userFileContent := "manual user edit — should survive submit 2"
+	if err := os.WriteFile(userFilePath, []byte(userFileContent), 0o644); err != nil {
+		t.Fatalf("write user file: %v", err)
+	}
+	runGit := func(args ...string) (string, error) {
+		cmd := execCommand("git", append([]string{"-C", workspaceDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	// Configure an author identity so the commit doesn't fail
+	// on CI machines without global git config.
+	if _, err := runGit("config", "user.email", "user@test.local"); err != nil {
+		t.Fatalf("git config email: %v", err)
+	}
+	if _, err := runGit("config", "user.name", "Test User"); err != nil {
+		t.Fatalf("git config name: %v", err)
+	}
+	if _, err := runGit("add", "user_notes.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if out, err := runGit("commit", "-m", "manual: add user notes"); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+	userCommitSHA, err := runGit("rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse: %v", err)
+	}
+
+	// Task B: submits through the fat-client path. Pre-fix,
+	// this resets HEAD to origin/main and loses the user's
+	// commit. Post-fix, it must commit on top of the user's
+	// commit and push both commits to the remote.
+	h.mcpClaimOK(t, "two")
+	h.mcpSubmitText(t, "two", "task two result")
+
+	// (a) The user's commit must still be reachable from HEAD
+	// in the workspace clone.
+	if out, err := runGit("cat-file", "-e", userCommitSHA); err != nil {
+		t.Errorf("user commit %s not reachable after task B submit:\n%s", userCommitSHA, out)
+	}
+	// Belt-and-suspenders: verify it's in the HEAD chain, not
+	// orphaned in the reflog.
+	hist, err := runGit("log", "--format=%H", "HEAD")
+	if err != nil {
+		t.Fatalf("git log HEAD: %v", err)
+	}
+	if !strings.Contains(hist, userCommitSHA) {
+		t.Errorf("user commit %s not in HEAD history (likely orphaned by hard reset):\nHEAD history:\n%s",
+			userCommitSHA, hist)
+	}
+
+	// (b) user_notes.md must exist in the BARE remote too —
+	// the submit's push should have carried the user's commit
+	// along with task B's commit.
+	if body, ok := h.readRepoFile(projectID, "user_notes.md"); !ok {
+		t.Errorf("user_notes.md missing from bare remote — user commit was clobbered before push")
+	} else if string(body) != userFileContent {
+		t.Errorf("user_notes.md content in bare remote mismatch: %q", string(body))
+	}
+
+	// (c) Task B's result file must also have landed (the
+	// submit itself succeeded, not just silently dropped).
+	if got := h.mcpBareResultMD(t, "two"); got != "task two result" {
+		t.Errorf("task two result missing from bare remote; got %q", got)
+	}
+}
+
 // TestMCPDynamicForEachInvalidateSingleInstance verifies that
 // invalidating one materialized instance (e.g. alpha:expand)
 // cascades only that instance's descendants — siblings (beta:*)

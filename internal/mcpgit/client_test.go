@@ -815,11 +815,17 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 	}
 }
 
-// TestSubmitRetryExhaustionNamesStep verifies that when retries are
-// exhausted, the final error names which step (sync/commit/push)
-// failed last — not just the raw underlying error. Covers the B1a
-// retry labeling improvement.
-func TestSubmitRetryExhaustionNamesStep(t *testing.T) {
+// TestSubmitFailsClearlyAgainstUnreachableRemote verifies that
+// a non-recoverable push failure (bogus remote) surfaces a
+// clean error naming the actual failure (push) and carrying
+// the underlying reason, without retrying uselessly. The old
+// design looped through a "sync → commit → push" retry and
+// labeled the error by step; the new design commits on top of
+// local HEAD once (preserving any user commits) and only
+// retries when the failure is a non-fast-forward rejection
+// that a rebase could fix. A missing-repository error is NOT
+// non-FF, so we return immediately with a clear message.
+func TestSubmitFailsClearlyAgainstUnreachableRemote(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
@@ -829,8 +835,9 @@ func TestSubmitRetryExhaustionNamesStep(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	// Point the project at a bogus remote so every fetch fails —
-	// exercises the "sync" failure path inside the retry loop.
+	// Point the project at a bogus remote so push fails with
+	// "repository not found" — a hard error the retry loop
+	// cannot recover from.
 	if err := proj.repo.DeleteRemote("origin"); err != nil {
 		t.Fatalf("delete origin: %v", err)
 	}
@@ -857,11 +864,13 @@ func TestSubmitRetryExhaustionNamesStep(t *testing.T) {
 		t.Fatal("expected submit to fail against bogus remote")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "submit failed after 2 attempts") {
-		t.Errorf("expected attempt count in error, got: %q", msg)
+	// The error must surface the push step and the underlying
+	// repository-not-found reason so users can diagnose.
+	if !strings.Contains(msg, "push failed") {
+		t.Errorf("expected 'push failed' prefix in error, got: %q", msg)
 	}
-	if !strings.Contains(msg, "sync step") {
-		t.Errorf("expected 'sync step' label in error, got: %q", msg)
+	if !strings.Contains(msg, "not found") {
+		t.Errorf("expected underlying 'not found' reason in error, got: %q", msg)
 	}
 }
 

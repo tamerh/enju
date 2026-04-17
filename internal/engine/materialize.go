@@ -84,8 +84,10 @@ func (e *Engine) ComputeMaterialization(
 	}
 
 	// Find directly-ready deferred task defs — those whose
-	// for_each refs ALL point at the accepting task and have
-	// values in outputLists.
+	// for_each refs ALL point at the accepting task AND have
+	// values in outputLists. `ref.TaskID` is matched against
+	// the short def id (both sides are written in YAML form),
+	// not the full task id.
 	type resolvedRef struct {
 		def     *enjuYaml.DeferredTaskDef
 		forEach map[string][]string
@@ -119,8 +121,14 @@ func (e *Engine) ComputeMaterialization(
 		return nil, nil
 	}
 
-	// Collect ALL deferred def IDs for cleanup (stale rows
-	// from a previous accept).
+	// Cleanup covers EVERY deferred def id — both the ones
+	// we're about to materialize AND the transitively-deferred
+	// singletons we'll handle in pass 3 below. This runs before
+	// allocation so a re-accept after invalidation wipes stale
+	// rows whose keys won't appear in the new list (e.g. round 1
+	// made alpha:analyze; round 2's list is [beta,gamma] — alpha
+	// must be deleted, not orphaned). Sorted output keeps the
+	// caller's store.DeleteTasksByDefInRun calls deterministic.
 	outcome := &MaterializationOutcome{}
 	deferredDefIDs := make(map[string]bool)
 	for _, rr := range directlyReady {
@@ -137,18 +145,30 @@ func (e *Engine) ComputeMaterialization(
 	}
 	sort.Strings(outcome.DefIDsToCleanUp)
 
-	// Two-pass allocation. Pass 1: pre-compute full IDs.
+	// Two-pass allocation. Pass 1: pre-compute every instance's
+	// IDs up front so pass 2 can cross-reference siblings (e.g.
+	// check:BRCA1's depends_on picks up analyze:BRCA1 before
+	// analyze:BRCA1's row has been built).
 	type plannedInstance struct {
 		def     *enjuYaml.TaskDef
 		inst    forEachInst
-		shortID string
-		fullID  string
+		shortID string // "alpha:expand" — instance key + def id
+		fullID  string // "1:1:alpha:expand" — runPrefix + shortID
+	}
+	// instanceIDs holds both forms of a materialized instance so
+	// each call site can pick the form it actually needs:
+	//   - ShortID ("alpha:expand") goes into ReviewsTarget so
+	//     consumers can uniformly prepend runPrefix themselves.
+	//   - FullID ("1:1:alpha:expand") goes into DependsOn, since
+	//     task records always store deps as fully-qualified IDs.
+	// Keep the names self-describing — bugs 3/4 came from a
+	// caller grabbing the wrong form from an anonymous struct.
+	type instanceIDs struct {
+		ShortID string
+		FullID  string
 	}
 	var plans []plannedInstance
-	instanceIndex := make(map[string]map[string]struct {
-		short string
-		full  string
-	})
+	instanceIndex := make(map[string]map[string]instanceIDs)
 	for _, rr := range directlyReady {
 		def, ok := taskDefByID[rr.def.TaskDefID]
 		if !ok {
@@ -156,25 +176,24 @@ func (e *Engine) ComputeMaterialization(
 		}
 		instances := ExpandForEach(rr.forEach)
 		if instanceIndex[def.ID] == nil {
-			instanceIndex[def.ID] = make(map[string]struct {
-				short string
-				full  string
-			}, len(instances))
+			instanceIndex[def.ID] = make(map[string]instanceIDs, len(instances))
 		}
 		for _, inst := range instances {
 			shortID := enjuYaml.MakeFullID(inst.Key, def.ID)
 			fullID := runPrefix + shortID
 			plans = append(plans, plannedInstance{def: def, inst: inst, shortID: shortID, fullID: fullID})
-			instanceIndex[def.ID][inst.Key] = struct {
-				short string
-				full  string
-			}{short: shortID, full: fullID}
+			instanceIndex[def.ID][inst.Key] = instanceIDs{ShortID: shortID, FullID: fullID}
 		}
 	}
+	// inBatch lets pass 2 detect "this dep is another instance
+	// being materialized right now" so the new task starts
+	// PENDING instead of READY — its dep row doesn't exist yet,
+	// and UpdateReadyTasks promotes it once all in-batch deps
+	// are created.
 	inBatch := make(map[string]bool)
-	for _, ids := range instanceIndex {
-		for _, ids2 := range ids {
-			inBatch[ids2.full] = true
+	for _, byKey := range instanceIndex {
+		for _, ids := range byKey {
+			inBatch[ids.FullID] = true
 		}
 	}
 
@@ -217,7 +236,15 @@ func (e *Engine) ComputeMaterialization(
 			seenDAGParent[short] = true
 			dagParents = append(dagParents, short)
 		}
-		// Seed with for_each sources.
+		// Seed the for_each source as a DAG parent. This edge is
+		// NOT returned by MergeDependencies (which only inspects
+		// `depends_on:` and prompt `{{task.field}}` refs — it
+		// doesn't know about `for_each: {x: "{{discover.items}}"}`
+		// refs). Without this seeding, the DAG's cascade walker
+		// can't find our materialized instances as descendants of
+		// the source task, and invalidating the source fails to
+		// dematerialize downstream — the bug that motivated J.1's
+		// eager dematerialization pass.
 		for _, dd := range parsed.DeferredTaskDefs {
 			if dd.TaskDefID != def.ID {
 				continue
@@ -227,37 +254,58 @@ func (e *Engine) ComputeMaterialization(
 			}
 			break
 		}
+		// Per-instance dep pairing: if the dep's def id appears
+		// in instanceIndex (another task materialized in this
+		// batch with matching keys), wire to the same-instance
+		// sibling. Otherwise fall through to the singleton path.
 		for _, dep := range allDeps {
+			// The accepting task IS the for_each source. Its
+			// task record already has an instance key (possibly
+			// empty for non-for_each sources), so we can't look
+			// it up in instanceIndex — we wire the edge directly.
 			if dep == task.TaskDefID {
 				addDAGParent(enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID))
 				continue
 			}
+			// Per-instance pair: check:alpha → analyze:alpha.
+			// Requires the two defs share a for_each variable, so
+			// ExpandForEach produced the same instance keys on
+			// both sides.
 			if ids, ok := instanceIndex[dep]; ok {
 				if matched, ok := ids[inst.Key]; ok {
-					resolvedDeps = append(resolvedDeps, matched.full)
-					addDAGParent(matched.short)
+					resolvedDeps = append(resolvedDeps, matched.FullID)
+					addDAGParent(matched.ShortID)
 					continue
 				}
 			}
+			// Singleton upstream (not materialized in this batch):
+			// the DB row already exists with the plain def id.
 			resolvedDeps = append(resolvedDeps, runPrefix+dep)
 			addDAGParent(dep)
 		}
 
-		// Review-target rewriting. Store the instance-matched
-		// SHORT form (e.g. "alpha:expand") so downstream consumers
-		// can uniformly prepend the run prefix without double-
-		// prefixing. matched.short is already `instanceKey:defID`
-		// (from MakeFullID on line 165 above).
+		// Per-instance review targets are stored in SHORT form
+		// ("alpha:expand"), NOT the full ID ("1:1:alpha:expand").
+		// Both submit_orchestrate.go (review cascade) and
+		// server.go fetchAndResolveLocally (inline review block)
+		// prepend runPrefix themselves; storing the full ID here
+		// produces the double-prefix bugs 3/4 were pinned on.
+		// server.go parseReviewsTarget splits this back into
+		// (defID, instanceKey) at the consumer side.
 		reviewsTarget := ti.Reviews
 		if reviewsTarget != "" {
 			if ids, ok := instanceIndex[reviewsTarget]; ok {
 				if matched, ok := ids[inst.Key]; ok {
-					reviewsTarget = matched.short
+					reviewsTarget = matched.ShortID
 				}
 			}
 		}
 
-		// State.
+		// If any dep is another instance being created in this
+		// same batch, start PENDING — the dep's row won't exist
+		// when this INSERT runs, and UpdateReadyTasks will
+		// promote us once it lands. A task whose every dep is
+		// pre-existing can start READY immediately.
 		state := store.TaskReady
 		for _, d := range resolvedDeps {
 			if inBatch[d] {
@@ -332,7 +380,21 @@ func (e *Engine) ComputeMaterialization(
 		}
 	}
 
-	// Transitively-deferred pass (singletons).
+	// Transitively-deferred pass. Singletons like `aggregate`
+	// that depend on a dynamic-for_each instance can't compute
+	// their depends_on until pass 2 has populated newInstances.
+	// This pass fans each dep in to EVERY matching instance —
+	// the singleton consumer ends up with N upstream edges and
+	// its claim-time resolver picks up the Option 4 fan-in
+	// block for {{expand.content}} aggregation.
+	//
+	// `len(def.ForEach) > 0` skips transitively-deferred tasks
+	// that have their OWN for_each — those are the J.2 "nested
+	// dynamic for_each" case and aren't handled by this pass.
+	// The parser's fixed-point walk that sets
+	// TransitivelyDeferred doesn't distinguish "deferred via an
+	// upstream dynamic for_each" from "deferred via its own
+	// dynamic for_each ref", so we filter out the latter here.
 	for i := range parsed.DeferredTaskDefs {
 		d := &parsed.DeferredTaskDefs[i]
 		if !d.TransitivelyDeferred {
@@ -346,6 +408,11 @@ func (e *Engine) ComputeMaterialization(
 		var resolved []string
 		var dagParents []string
 		for _, dep := range allDeps {
+			// Fan in: every materialized instance of this def
+			// becomes one dep edge. Gives the singleton's
+			// resolver N DependencyRef entries with the same
+			// TaskDefID → triggers the Option 4 fan-in block
+			// assembly in mcpgit.Project.Resolve.
 			if instances, ok := newInstances[dep]; ok {
 				for _, m := range instances {
 					resolved = append(resolved, m.FullID)
