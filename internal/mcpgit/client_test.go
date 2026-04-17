@@ -699,6 +699,9 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 	if !strings.Contains(c2.Message, "AI-Model: claude-sonnet-4-20250514") {
 		t.Errorf("AI commit should have AI-Model trailer, got: %s", c2.Message)
 	}
+	if !strings.Contains(c2.Message, "Co-Authored-By: Claude (claude-sonnet-4-20250514) <noreply@anthropic.com>") {
+		t.Errorf("AI commit should have Co-Authored-By trailer, got: %s", c2.Message)
+	}
 }
 // artifact the task declared can't be found at the given commit.
 func TestResolveMissingArtifact(t *testing.T) {

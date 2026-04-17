@@ -1163,9 +1163,34 @@ func buildCommitMessage(taskID, username string, artifactPaths []string, modelNa
 			taskID, username, len(artifactPaths), strings.Join(artifactPaths, ", "))
 	}
 	if modelName != "" {
-		subject += "\n\nAI-Model: " + modelName
+		coAuthor := aiCoAuthor(modelName)
+		subject += "\n\n" + coAuthor
+		subject += "\nAI-Model: " + modelName
 	}
 	return subject
+}
+
+// aiCoAuthor returns a Co-Authored-By trailer for the given model name.
+// Recognized prefixes get a branded identity (Claude, Gemini, GPT, etc.);
+// unknown models get a generic "AI" label.
+func aiCoAuthor(modelName string) string {
+	lower := strings.ToLower(modelName)
+	var name, email string
+	switch {
+	case strings.HasPrefix(lower, "claude"):
+		name = "Claude (" + modelName + ")"
+		email = "noreply@anthropic.com"
+	case strings.HasPrefix(lower, "gemini"):
+		name = "Gemini (" + modelName + ")"
+		email = "noreply@google.com"
+	case strings.HasPrefix(lower, "gpt"):
+		name = "GPT (" + modelName + ")"
+		email = "noreply@openai.com"
+	default:
+		name = "AI (" + modelName + ")"
+		email = "noreply@enju.ai"
+	}
+	return fmt.Sprintf("Co-Authored-By: %s <%s>", name, email)
 }
 
 // --- standard path helpers ---
