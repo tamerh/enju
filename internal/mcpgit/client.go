@@ -193,6 +193,20 @@ func (ws *Workspace) RegisterExternalDir(projectID int64, dir string) {
 	ws.externalDirs[projectID] = dir
 }
 
+// isLocalWorkingTree returns true if the path is a local directory
+// with a .git subdirectory (a git working tree, not a bare repo).
+// Used to detect enju_init'd projects whose path is stored as
+// remote_url on the coordinator.
+func isLocalWorkingTree(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	gitDir := filepath.Join(path, ".git")
+	gitInfo, err := os.Stat(gitDir)
+	return err == nil && gitInfo.IsDir()
+}
+
 // HasExternalDir returns true if the given project has been
 // registered as an external directory (from enju_init).
 func (ws *Workspace) HasExternalDir(projectID int64) bool {
@@ -260,9 +274,24 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 		return p, nil
 	}
 
-	// Check for external directory (from enju_init).
+	// Check for external directory (from enju_init, in-memory).
 	if extDir, ok := ws.externalDirs[projectID]; ok {
 		p, err := openOrClone(extDir, "", ws.logger)
+		if err != nil {
+			return nil, err
+		}
+		p.projectID = projectID
+		ws.clients[projectID] = p
+		return p, nil
+	}
+
+	// Detect local working tree: if remoteURL is a local path
+	// with a .git dir (not bare), open it directly instead of
+	// cloning. This handles enju_init'd projects that persist
+	// their path as remote_url across restarts.
+	if remoteURL != "" && isLocalWorkingTree(remoteURL) {
+		ws.externalDirs[projectID] = remoteURL
+		p, err := openOrClone(remoteURL, "", ws.logger)
 		if err != nil {
 			return nil, err
 		}

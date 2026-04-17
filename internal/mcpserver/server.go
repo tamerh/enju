@@ -1083,10 +1083,13 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		})
 	}
 
-	// Register project with coordinator (no remote_url — the folder
-	// IS the workspace, not a remote to clone from).
+	// Register project with coordinator. Store the local path as
+	// remote_url so it persists across MCP restarts. The fat-client
+	// path detects local working trees and opens them directly
+	// instead of cloning.
 	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
-		"name": name,
+		"name":       name,
+		"remote_url": dirPath,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
