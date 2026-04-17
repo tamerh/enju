@@ -1373,28 +1373,168 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		b.WriteString(fmt.Sprintf("  Skipped:   %d\n", counts["skipped"]))
 	}
 
-	// For small runs (≤10 tasks), show the full task list
-	// inline. For larger runs, just the summary + tip.
-	if total <= 10 {
-		b.WriteString("\nTasks:\n\n")
-		for _, t := range tasks {
-			tid, _ := t["id"].(string)
-			tstate, _ := t["state"].(string)
-			claimedBy, _ := t["claimed_by"].(string)
-			tseq, _ := t["seq"].(float64)
-			icon := stateIcon(tstate)
-			label := stateLabel(tstate)
-			line := fmt.Sprintf("  %s #%d [%s] %s", icon, int(tseq), tid, label)
-			if tstate == "claimed" && claimedBy != "" {
-				line += fmt.Sprintf(" (%s)", claimedBy)
-			}
-			b.WriteString(line + "\n")
-		}
+	// DAG tree view: show tasks as a dependency tree with
+	// unicode box-drawing connectors. For larger runs (>30),
+	// fall back to the compact summary only.
+	if total <= 30 {
+		b.WriteString("\n")
+		b.WriteString(renderDAGTree(tasks))
 	}
 
 	b.WriteString("\nTip: Use enju_get_task(task_id=\"...\") to see full details.")
 
 	return b.String()
+}
+
+// renderDAGTree builds a tree-shaped task list from dependency edges.
+// Root tasks (no dependencies) are top-level; children are indented
+// under their parent with box-drawing connectors.
+//
+// Output example:
+//
+//	discover ✓
+//	├── BRCA1:analyze ✓
+//	│   └── BRCA1:check ⏳
+//	├── TP53:analyze →
+//	│   └── TP53:check ○
+//	└── synthesize ○
+func renderDAGTree(tasks []map[string]interface{}) string {
+	// Build index: full task ID → task map.
+	byID := make(map[string]map[string]interface{}, len(tasks))
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		byID[id] = t
+	}
+
+	// Build parent map: task ID → list of parent IDs.
+	parents := map[string][]string{}
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		depsStr, _ := t["depends_on"].(string)
+		if depsStr == "" {
+			continue
+		}
+		for _, d := range strings.Split(depsStr, ",") {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				parents[id] = append(parents[id], d)
+			}
+		}
+	}
+
+	// Build children map + roots. Tasks with zero deps are roots.
+	// Tasks with multiple parents (fan-in aggregators like
+	// "synthesize") are also promoted to roots — they don't
+	// belong under any single parent.
+	children := map[string][]string{}
+	roots := []string{}
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		p := parents[id]
+		if len(p) == 0 || len(p) > 1 {
+			roots = append(roots, id)
+		} else {
+			children[p[0]] = append(children[p[0]], id)
+		}
+	}
+
+	// Deduplicate children: guard against a task appearing
+	// twice under the same parent.
+	placed := map[string]bool{}
+	for _, r := range roots {
+		placed[r] = true
+	}
+	dedup := func(parentID string) []string {
+		var result []string
+		for _, c := range children[parentID] {
+			if !placed[c] {
+				placed[c] = true
+				result = append(result, c)
+			}
+		}
+		return result
+	}
+
+	var b strings.Builder
+
+	// Recursive tree printer.
+	var walk func(id, prefix string, isLast bool)
+	walk = func(id, prefix string, isLast bool) {
+		t := byID[id]
+		if t == nil {
+			return
+		}
+		state, _ := t["state"].(string)
+		claimedBy, _ := t["claimed_by"].(string)
+		icon := stateIcon(state)
+
+		// Build the display name: "instance:taskdef" or just "taskdef".
+		displayName := taskShortName(t)
+
+		// Connector.
+		connector := "├── "
+		if isLast {
+			connector = "└── "
+		}
+
+		line := prefix + connector + displayName + " " + icon
+		if (state == "claimed" || state == "running") && claimedBy != "" {
+			line += fmt.Sprintf(" (%s)", claimedBy)
+		}
+		b.WriteString(line + "\n")
+
+		// Child prefix: if this node is the last sibling, don't
+		// draw a vertical line; otherwise continue the line.
+		childPrefix := prefix + "│   "
+		if isLast {
+			childPrefix = prefix + "    "
+		}
+
+		kids := dedup(id)
+		for i, kid := range kids {
+			walk(kid, childPrefix, i == len(kids)-1)
+		}
+	}
+
+	// Sort roots by task sequence for stable output.
+	sort.Slice(roots, func(i, j int) bool {
+		si, _ := byID[roots[i]]["seq"].(float64)
+		sj, _ := byID[roots[j]]["seq"].(float64)
+		return si < sj
+	})
+
+	// Print roots (no connector prefix for roots).
+	for _, r := range roots {
+		t := byID[r]
+		state, _ := t["state"].(string)
+		claimedBy, _ := t["claimed_by"].(string)
+		icon := stateIcon(state)
+		displayName := taskShortName(t)
+
+		line := displayName + " " + icon
+		if (state == "claimed" || state == "running") && claimedBy != "" {
+			line += fmt.Sprintf(" (%s)", claimedBy)
+		}
+		b.WriteString(line + "\n")
+
+		kids := dedup(r)
+		for i, kid := range kids {
+			walk(kid, "", i == len(kids)-1)
+		}
+	}
+
+	return b.String()
+}
+
+// taskShortName returns a compact display name for a task:
+// "instance:taskdef" for for_each instances, just "taskdef" otherwise.
+func taskShortName(t map[string]interface{}) string {
+	taskDefID, _ := t["task_def_id"].(string)
+	instanceKey, _ := t["instance_key"].(string)
+	if instanceKey != "" {
+		return instanceKey + ":" + taskDefID
+	}
+	return taskDefID
 }
 
 func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string {
@@ -2261,28 +2401,21 @@ func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
 func stateIcon(state string) string {
 	switch state {
 	case "accepted", "completed":
-		return "✓"
+		return "✅"
 	case "ready":
-		return "→"
+		return "🟡"
 	case "claimed", "running":
-		return "⏳"
+		return "🔵"
 	case "collecting":
-		// Phase E.2 session 2a — multi-citizen task in the
-		// middle of gathering submissions. Same hourglass as
-		// CLAIMED since it's conceptually "work in progress,"
-		// just with multiple people.
-		return "⏳"
+		return "🔵"
 	case "pending":
-		return "○"
+		return "⚪"
 	case "skipped":
-		// Phase E.2 — terminal state for branches a vote
-		// resolved against. Dim dot distinguishes from
-		// active/terminal-pass states.
-		return "•"
+		return "⊘"
 	case "failed":
-		return "✗"
+		return "🔴"
 	case "invalid", "invalidated", "rejected":
-		return "✗"
+		return "🔴"
 	default:
 		return "?"
 	}
