@@ -2088,7 +2088,6 @@ func formatDashboard(data []byte) string {
 	name, _ := citizen["name"].(string)
 	username, _ := citizen["username"].(string)
 	role, _ := citizen["role"].(string)
-	score, _ := citizen["score"].(float64)
 	completed, _ := citizen["tasks_completed"].(float64)
 	timedOut, _ := citizen["tasks_timed_out"].(float64)
 
@@ -2113,18 +2112,14 @@ func formatDashboard(data []byte) string {
 
 	var b strings.Builder
 
-	// Profile
-	const dashBorderTop = "┌─────────────────────────────────────────────┐\n"
-	const dashBorderBot = "└─────────────────────────────────────────────┘\n"
-	b.WriteString(dashBorderTop)
-	b.WriteString(fmt.Sprintf("│  %-32s  Score: %-4.0f │\n", truncateRunes(header, 32), score))
-	b.WriteString(fmt.Sprintf("│  Tasks: %.0f completed", completed))
+	// Profile — simple lines, no box drawing.
+	b.WriteString(header + "\n")
+	taskLine := fmt.Sprintf("Tasks: %.0f completed", completed)
 	if timedOut > 0 {
-		b.WriteString(fmt.Sprintf(", %.0f timed out", timedOut))
+		taskLine += fmt.Sprintf(", %.0f timed out", timedOut)
 	}
-	b.WriteString(fmt.Sprintf(", %d active", len(activeTasks)))
-	b.WriteString("          │\n")
-	b.WriteString(dashBorderBot)
+	taskLine += fmt.Sprintf(", %d active", len(activeTasks))
+	b.WriteString(taskLine + "\n")
 
 	// Active claims
 	if len(activeTasks) > 0 {
