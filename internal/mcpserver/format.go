@@ -1636,14 +1636,28 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	// Review-action metadata. Reviews target is set at run creation;
 	// decision only after submit.
 	if reviewsTarget, _ := task["reviews_target"].(string); reviewsTarget != "" {
-		b.WriteString(fmt.Sprintf("  Reviews:  %s\n", reviewsTarget))
+		reviewLine := fmt.Sprintf("  Reviews:  %s", reviewsTarget)
+		if by, _ := task["_review_target_claimed_by"].(string); by != "" {
+			reviewLine += fmt.Sprintf(" (by @%s)", by)
+		}
+		b.WriteString(reviewLine + "\n")
+		if p, _ := task["_review_target_path"].(string); p != "" {
+			b.WriteString(fmt.Sprintf("  Path:     %s/result.md\n", p))
+		}
+		if c, _ := task["_review_target_commit"].(string); c != "" {
+			b.WriteString(fmt.Sprintf("  Commit:   %s\n", shortSHA(c)))
+		}
 	}
 	if decision, _ := task["review_decision"].(string); decision != "" {
 		switch decision {
 		case "approve":
 			b.WriteString("  Decision: ✓ approved\n")
+		case "request_changes":
+			b.WriteString("  Decision: ↩ request changes (target back to ready)\n")
 		case "reject":
-			b.WriteString("  Decision: ✗ rejected (target invalidated)\n")
+			b.WriteString("  Decision: ✗ rejected (target failed)\n")
+		case "comment":
+			b.WriteString("  Decision: 💬 comment (non-blocking)\n")
 		default:
 			b.WriteString(fmt.Sprintf("  Decision: %s\n", decision))
 		}

@@ -2524,6 +2524,30 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 	// Also fetch inputs if task has dependencies
 	inputs, _ := c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
 
+	// For review tasks, enrich with the target's result_path and
+	// commit_sha so the reviewer can see what they'd be reviewing
+	// before claiming.
+	var taskMap map[string]interface{}
+	if json.Unmarshal(data, &taskMap) == nil {
+		if reviewsTarget, _ := taskMap["reviews_target"].(string); reviewsTarget != "" {
+			if projectID, _ := taskMap["project_id"].(float64); projectID > 0 {
+				if runSeq, _ := taskMap["run_seq"].(float64); runSeq > 0 {
+					targetFullID := fmt.Sprintf("%d:%d:%s", int(projectID), int(runSeq), reviewsTarget)
+					if targetData, terr := c.get(ctx, "/api/v1/tasks/"+targetFullID); terr == nil {
+						var target map[string]interface{}
+						if json.Unmarshal(targetData, &target) == nil {
+							taskMap["_review_target_path"] = target["result_path"]
+							taskMap["_review_target_commit"] = target["commit_sha"]
+							taskMap["_review_target_claimed_by"] = target["claimed_by"]
+							// Re-marshal with the enriched fields.
+							data, _ = json.Marshal(taskMap)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return mcp.NewToolResultText(formatTaskDetail(data, inputs, c.username)), nil
 }
 
