@@ -1366,12 +1366,10 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	// ACCEPTED (the normal terminal) AND SKIPPED (the Phase E.2
 	// vote skip-cascade terminal). A task whose parent was
 	// skipped-by-gate is still unblocked — the gate decided that
-	// branch is done, not pending. If the child references a
-	// skipped parent's content via a template, resolution will
-	// fail loudly at claim time; that's an author-error, not a
-	// scheduler concern.
+	// branch is done, not pending. FAILED is NOT satisfied — a
+	// failed upstream should block its downstream, not unblock it.
 	acceptedRows, err := s.db.Query(
-		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped', 'failed')`, runID,
+		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
 	)
 	if err != nil {
 		return 0, err
