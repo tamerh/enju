@@ -1892,9 +1892,21 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 	// parser auto-inserts the reviews: edge), and the fat-client
 	// has already pulled the commit to the local clone above, so
 	// this is a plain file read.
+	//
+	// ReviewsTarget is stored in one of two shapes:
+	//   - Non-for_each review: bare def id, e.g. "draft".
+	//   - Per-instance review (static or dynamic for_each): the
+	//     instance-matched short form "instanceKey:defID", e.g.
+	//     "alpha:expand". This lets us pair each review with its
+	//     matching target instance instead of collapsing to the
+	//     task_def_id and matching the first one we see.
 	if meta.Action == "review" && meta.ReviewsTarget != "" {
+		targetDefID, targetInstanceKey := parseReviewsTarget(meta.ReviewsTarget)
 		for _, d := range desc.Dependencies {
-			if d.TaskDefID != meta.ReviewsTarget {
+			if d.TaskDefID != targetDefID {
+				continue
+			}
+			if d.InstanceKey != targetInstanceKey {
 				continue
 			}
 			contentPath := filepath.Join(d.ResultPath, "result.md")
@@ -1913,10 +1925,13 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 				break
 			}
 			reviewingBlock := map[string]interface{}{
-				"target_def_id": meta.ReviewsTarget,
+				"target_def_id": targetDefID,
 				"commit_sha":    d.CommitSHA,
 				"result_path":   d.ResultPath,
 				"content":       string(data),
+			}
+			if targetInstanceKey != "" {
+				reviewingBlock["instance_key"] = targetInstanceKey
 			}
 			// Fetch the target task to pick up the claimer's
 			// username so the block can render "(by @alice)".
@@ -1937,6 +1952,23 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 		}
 	}
 	return json.Marshal(out)
+}
+
+// parseReviewsTarget splits a stored reviews_target into its
+// (task_def_id, instance_key) components. For non-for_each
+// reviews the target is just the def id ("draft" → "draft", "").
+// For per-instance reviews it's the instance-matched short form
+// "instanceKey:defID" ("alpha:expand" → "expand", "alpha").
+//
+// Keeps server.go's review-block resolver independent of which
+// shape materialize.go / create_run.go actually wrote — both
+// cases produce a valid (defID, instanceKey) pair the Dependency
+// list can be matched against.
+func parseReviewsTarget(target string) (defID, instanceKey string) {
+	if idx := strings.Index(target, ":"); idx >= 0 {
+		return target[idx+1:], target[:idx]
+	}
+	return target, ""
 }
 
 type descDependencyRef struct {

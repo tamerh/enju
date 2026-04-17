@@ -243,12 +243,16 @@ func (e *Engine) ComputeMaterialization(
 			addDAGParent(dep)
 		}
 
-		// Review-target rewriting.
+		// Review-target rewriting. Store the instance-matched
+		// SHORT form (e.g. "alpha:expand") so downstream consumers
+		// can uniformly prepend the run prefix without double-
+		// prefixing. matched.short is already `instanceKey:defID`
+		// (from MakeFullID on line 165 above).
 		reviewsTarget := ti.Reviews
 		if reviewsTarget != "" {
 			if ids, ok := instanceIndex[reviewsTarget]; ok {
 				if matched, ok := ids[inst.Key]; ok {
-					reviewsTarget = matched.full
+					reviewsTarget = matched.short
 				}
 			}
 		}

@@ -3383,8 +3383,14 @@ tasks:
 			t.Errorf("%s state: got %q, want pending (should wait on %s)",
 				checkID, state, analyzeID)
 		}
-		if rt, _ := check["reviews_target"].(string); rt != analyzeID {
-			t.Errorf("%s reviews_target: got %q, want %q", checkID, rt, analyzeID)
+		// reviews_target is stored in instance-short form
+		// ("BRCA1:analyze") so consumers uniformly prepend the
+		// run prefix. The previous full-id form ("1:1:BRCA1:
+		// analyze") caused double-prefixing bugs in
+		// submit_orchestrate.go + fetchAndResolveLocally.
+		wantShort := gene + ":analyze"
+		if rt, _ := check["reviews_target"].(string); rt != wantShort {
+			t.Errorf("%s reviews_target: got %q, want %q", checkID, rt, wantShort)
 		}
 		depsStr, _ := check["depends_on"].(string)
 		found := false
@@ -3474,6 +3480,405 @@ tasks:
 			t.Errorf("expected new instance %s, not found", wantID)
 		}
 	}
+}
+
+// ==========================================================================
+// Dynamic for_each runtime bugs (reported 2026-04-17)
+//
+// These tests lock in runtime behavior the earlier dynamic for_each
+// tests don't exercise: upstream submits complete, downstream
+// instances claim, and their resolved prompts must reflect the
+// per-instance pairing / fan-in aggregation / review cascade. The
+// earlier tests only verified materialization state (task rows,
+// deps, states) — which passes while runtime resolution is broken.
+// ==========================================================================
+
+// TestMCPDynamicForEachPerInstancePromptResolves verifies bug 1:
+// when a downstream task has the SAME dynamic for_each as its
+// upstream, each downstream instance's resolved prompt must carry
+// the matching upstream instance's content. tag:alpha reading
+// {{expand.content}} should resolve to expand:alpha's result —
+// not a raw placeholder, not expand:beta's content.
+func TestMCPDynamicForEachPerInstancePromptResolves(t *testing.T) {
+	h := newMCPHarness(t, "PerInstancePrompt")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-instance resolution"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List two values."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: tag
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Tag {{x}} based on: {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "EXPAND-CONTENT-FOR-ALPHA")
+	h.mcpClaimOK(t, "beta:expand")
+	h.mcpSubmitText(t, "beta:expand", "EXPAND-CONTENT-FOR-BETA")
+
+	inputs := h.mcpTaskInputs(t, "alpha:tag")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if strings.Contains(resolved, "{{expand.content}}") {
+		t.Errorf("bug 1: {{expand.content}} left unresolved in tag:alpha:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "EXPAND-CONTENT-FOR-ALPHA") {
+		t.Errorf("bug 1: tag:alpha should see expand:alpha content, got:\n%s", resolved)
+	}
+	if strings.Contains(resolved, "EXPAND-CONTENT-FOR-BETA") {
+		t.Errorf("bug 1: tag:alpha should NOT see expand:beta content (cross-instance leak):\n%s", resolved)
+	}
+
+	betaInputs := h.mcpTaskInputs(t, "beta:tag")
+	betaResolved, _ := betaInputs["resolved_prompt"].(string)
+	if !strings.Contains(betaResolved, "EXPAND-CONTENT-FOR-BETA") {
+		t.Errorf("bug 1: tag:beta should see expand:beta content, got:\n%s", betaResolved)
+	}
+	if strings.Contains(betaResolved, "EXPAND-CONTENT-FOR-ALPHA") {
+		t.Errorf("bug 1: tag:beta should NOT see expand:alpha content:\n%s", betaResolved)
+	}
+}
+
+// TestMCPDynamicForEachSingletonFanInAggregates verifies bug 2:
+// a singleton consumer of a dynamic-for_each upstream via
+// {{expand.content}} must receive every materialized instance's
+// content as an Option 4 markdown block.
+func TestMCPDynamicForEachSingletonFanInAggregates(t *testing.T) {
+	h := newMCPHarness(t, "SingletonFanIn")
+	projectID := h.createTestProject()
+
+	yaml := `name: "singleton fan-in over dynamic"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List two values."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: aggregate
+    action: answer
+    prompt: "Aggregate: {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "EXPAND-ALPHA-BODY")
+	h.mcpClaimOK(t, "beta:expand")
+	h.mcpSubmitText(t, "beta:expand", "EXPAND-BETA-BODY")
+
+	inputs := h.mcpTaskInputs(t, "aggregate")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if strings.Contains(resolved, "{{expand.content}}") {
+		t.Errorf("bug 2: {{expand.content}} left unresolved in singleton aggregate:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "EXPAND-ALPHA-BODY") {
+		t.Errorf("bug 2: aggregate should see expand:alpha content, got:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "EXPAND-BETA-BODY") {
+		t.Errorf("bug 2: aggregate should see expand:beta content, got:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "### iteration:") {
+		t.Errorf("bug 2: fan-in should render Option 4 header (### iteration:), got:\n%s", resolved)
+	}
+}
+
+// TestMCPDynamicForEachPerInstanceReviewCascades verifies bug 3:
+// request_changes on check:alpha (per-instance review of
+// expand:alpha) must cascade — expand:alpha bounces to READY,
+// check:alpha re-invalidates through the dep edge, expand:beta
+// stays accepted.
+func TestMCPDynamicForEachPerInstanceReviewCascades(t *testing.T) {
+	h := newMCPHarness(t, "CascadeDrafter")
+	reviewer := h.newMCPClientAs(t, "CascadeReviewer")
+
+	projectID := h.createTestProject()
+	yaml := `name: "per-instance review cascade"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List values."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: check
+    action: review
+    reviews: expand
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Review expansion of {{x}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "first draft alpha")
+	h.mcpClaimOK(t, "beta:expand")
+	h.mcpSubmitText(t, "beta:expand", "first draft beta")
+
+	h.mcpClaimAs(t, reviewer, "alpha:check")
+	h.mcpSubmitReviewAs(t, reviewer, "alpha:check", "needs revision", "request_changes")
+
+	if got := h.taskGet("alpha:expand")["state"]; got != "ready" {
+		t.Errorf("bug 3: expand:alpha should be READY after request_changes, got %v", got)
+	}
+	if got := h.taskGet("beta:expand")["state"]; got != "accepted" {
+		t.Errorf("bug 3: expand:beta should stay accepted (only alpha bounced), got %v", got)
+	}
+	if got := h.taskGet("alpha:check")["state"]; got == "accepted" {
+		t.Errorf("bug 3: check:alpha should NOT stay accepted after cascade, got %v", got)
+	}
+}
+
+// TestMCPDynamicForEachPerInstanceReviewShowsTargetContent
+// verifies bug 4: claiming a per-instance review task must render
+// the reviewed target's content inline in the ── Reviewing ──
+// block, matching the singleton-review behavior.
+func TestMCPDynamicForEachPerInstanceReviewShowsTargetContent(t *testing.T) {
+	h := newMCPHarness(t, "InlineDrafter")
+	reviewer := h.newMCPClientAs(t, "InlineReviewer")
+
+	projectID := h.createTestProject()
+	yaml := `name: "per-instance review inline"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: check
+    action: review
+    reviews: expand
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Review {{x}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha"})
+
+	h.mcpClaimOK(t, "alpha:expand")
+	const distinctive = "INLINE-REVIEW-MARKER-alpha-body"
+	h.mcpSubmitText(t, "alpha:expand", distinctive)
+
+	res := h.mcpCallOKVia(t, reviewer, "enju_claim_task",
+		map[string]any{"task_id": h.taskID("alpha:check")})
+	text := mcpText(res)
+	if !strings.Contains(text, "── Reviewing ──") {
+		t.Errorf("bug 4: claim response missing ── Reviewing ── block, got:\n%s", text)
+	}
+	if !strings.Contains(text, distinctive) {
+		t.Errorf("bug 4: Reviewing block missing target content %q, got:\n%s", distinctive, text)
+	}
+}
+
+// TestMCPDynamicForEachUserReportedStressScenario replays the
+// exact YAML the user filed the bug report against, following
+// the reported step-by-step sequence. Locks in that the full
+// pipeline (discover → 4 expand instances → 4 tag instances → 4
+// review instances → aggregate with writes_artifacts) survives
+// a per-instance request_changes without surfacing the
+// originally-reported symptoms:
+//   - alpha:expand must bounce to READY after review cascade.
+//   - beta:tag's resolved prompt must include beta:expand's
+//     paragraph (per-instance pairing), NOT raw {{expand.content}}.
+//   - aggregate's resolved prompt must aggregate every
+//     expand/tag instance via the Option 4 fan-in block, NOT
+//     raw {{expand.content}} / {{tag.content}}.
+func TestMCPDynamicForEachUserReportedStressScenario(t *testing.T) {
+	h := newMCPHarness(t, "tamer")
+	projectID := h.createTestProject()
+
+	yaml := `name: "For_each + review + fan-in stress test"
+description: "Toy stress test — dynamic for_each, per-instance review, multi-hop pairing, fan-in, artifact write."
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "Produce exactly 4 toy topic names, as a simple list. Use placeholder names like 'alpha', 'beta', 'gamma', 'delta'. Return them as a list<string> output."
+    outputs:
+      topics:
+        format: list<string>
+
+  - id: expand
+    action: answer
+    for_each:
+      topic: "{{discover.topics}}"
+    prompt: "Write a single short paragraph (~40 words) about the toy topic '{{topic}}'. Content can be nonsense — this is a mechanics test, not a content test."
+
+  - id: tag
+    action: answer
+    for_each:
+      topic: "{{discover.topics}}"
+    prompt: "Given this paragraph about '{{topic}}':\n\n{{expand.content}}\n\nReturn exactly 2 keywords, comma-separated."
+
+  - id: review
+    action: review
+    reviews: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    prompt: "Is the paragraph for '{{topic}}' acceptable?"
+
+  - id: aggregate
+    action: answer
+    prompt: "Produce a single consolidated summary document combining all expansions and their tags.\n\nExpansions:\n{{expand.content}}\n\nTags:\n{{tag.content}}"
+    writes_artifacts:
+      - stress/summary.md
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Step 2: discover → 4 topics.
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "topics", []string{"alpha", "beta", "gamma", "delta"})
+
+	// Step 3: claim + submit each *:expand with distinctive content.
+	for _, topic := range []string{"alpha", "beta", "gamma", "delta"} {
+		h.mcpClaimOK(t, topic+":expand")
+		h.mcpSubmitText(t, topic+":expand", "PARAGRAPH-FOR-"+topic)
+	}
+
+	// Step 4: alpha:review submits request_changes.
+	h.mcpClaimOK(t, "alpha:review")
+	h.mcpSubmitReview(t, "alpha:review", "needs more detail", "request_changes")
+
+	// Step 5 (bug 3): alpha:expand should have bounced to READY;
+	// the others stay accepted. alpha:tag should re-block on
+	// alpha:expand (move back from READY to PENDING).
+	if got := h.taskGet("alpha:expand")["state"]; got != "ready" {
+		t.Errorf("bug 3: alpha:expand should be READY after request_changes, got %v", got)
+	}
+	for _, topic := range []string{"beta", "gamma", "delta"} {
+		if got := h.taskGet(topic+":expand")["state"]; got != "accepted" {
+			t.Errorf("bug 3: %s:expand should remain accepted, got %v", topic, got)
+		}
+	}
+	// alpha:tag should no longer be ready (its upstream expand
+	// just bounced). beta/gamma/delta tags should still be ready.
+	if got := h.taskGet("alpha:tag")["state"]; got == "ready" || got == "accepted" {
+		t.Errorf("bug 3: alpha:tag should re-block after alpha:expand bounce, got %v", got)
+	}
+
+	// Step 6: beta/gamma/delta reviews approve.
+	for _, topic := range []string{"beta", "gamma", "delta"} {
+		h.mcpClaimOK(t, topic+":review")
+		h.mcpSubmitReview(t, topic+":review", "LGTM", "approve")
+	}
+
+	// Step 7 (bug 1): beta:tag's resolved prompt should include
+	// PARAGRAPH-FOR-beta (per-instance pairing), NOT raw
+	// {{expand.content}}.
+	inputs := h.mcpTaskInputs(t, "beta:tag")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if strings.Contains(resolved, "{{expand.content}}") {
+		t.Errorf("bug 1: beta:tag has unresolved {{expand.content}} — got:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "PARAGRAPH-FOR-beta") {
+		t.Errorf("bug 1: beta:tag should include PARAGRAPH-FOR-beta, got:\n%s", resolved)
+	}
+	if strings.Contains(resolved, "PARAGRAPH-FOR-alpha") ||
+		strings.Contains(resolved, "PARAGRAPH-FOR-gamma") {
+		t.Errorf("bug 1: beta:tag should not leak other topics' paragraphs, got:\n%s", resolved)
+	}
+
+	// Step 8 (bug 2): aggregate is singleton. Since alpha:expand
+	// is currently READY (rejected, awaiting revision), aggregate
+	// should still be PENDING. But first drive the loop to
+	// completion so we can claim aggregate: re-submit alpha:expand,
+	// re-approve alpha:review.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "PARAGRAPH-FOR-alpha-v2")
+	h.mcpClaimOK(t, "alpha:review")
+	h.mcpSubmitReview(t, "alpha:review", "fine now", "approve")
+
+	// Complete every tag so aggregate unblocks.
+	for _, topic := range []string{"alpha", "beta", "gamma", "delta"} {
+		h.mcpClaimOK(t, topic+":tag")
+		h.mcpSubmitText(t, topic+":tag", "TAGS-FOR-"+topic)
+	}
+
+	// Now aggregate — verify fan-in aggregation.
+	aggInputs := h.mcpTaskInputs(t, "aggregate")
+	aggResolved, _ := aggInputs["resolved_prompt"].(string)
+	if strings.Contains(aggResolved, "{{expand.content}}") {
+		t.Errorf("bug 2: aggregate has unresolved {{expand.content}}, got:\n%s", aggResolved)
+	}
+	if strings.Contains(aggResolved, "{{tag.content}}") {
+		t.Errorf("bug 2: aggregate has unresolved {{tag.content}}, got:\n%s", aggResolved)
+	}
+	for _, topic := range []string{"alpha", "beta", "gamma", "delta"} {
+		wantTag := "TAGS-FOR-" + topic
+		if !strings.Contains(aggResolved, wantTag) {
+			t.Errorf("bug 2: aggregate missing %q in fan-in, got:\n%s", wantTag, aggResolved)
+		}
+	}
+	for _, topic := range []string{"beta", "gamma", "delta"} {
+		wantPara := "PARAGRAPH-FOR-" + topic
+		if !strings.Contains(aggResolved, wantPara) {
+			t.Errorf("bug 2: aggregate missing %q in fan-in, got:\n%s", wantPara, aggResolved)
+		}
+	}
+	if !strings.Contains(aggResolved, "PARAGRAPH-FOR-alpha-v2") {
+		t.Errorf("bug 2: aggregate should include re-submitted alpha v2, got:\n%s", aggResolved)
+	}
+	if !strings.Contains(aggResolved, "### iteration:") {
+		t.Errorf("bug 2: aggregate should render Option 4 header, got:\n%s", aggResolved)
+	}
+}
+
+// mcpSubmitDiscoverListAs is a convenience for dynamic for_each
+// tests: submits a result with one list<string> output field so
+// the coordinator's output_lists materialization can fire.
+func (h *mcpHarness) mcpSubmitDiscoverListAs(t *testing.T, field string, items []string) {
+	t.Helper()
+	asAny := make([]any, len(items))
+	for i, v := range items {
+		asAny[i] = v
+	}
+	outputs := map[string]any{field: asAny}
+	outJSON, err := json.Marshal(outputs)
+	if err != nil {
+		t.Fatalf("marshal outputs: %v", err)
+	}
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"outputs_json": string(outJSON),
+	})
 }
 
 // TestMCPDynamicForEachEagerDematerialization is the MCP-layer
