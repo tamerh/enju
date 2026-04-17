@@ -2020,6 +2020,7 @@ func (c *apiClient) submitResultFatClient(
 	}
 	metadata := map[string]interface{}{
 		"task_id":     taskID,
+		"username":    c.username,
 		"model":       c.modelName,
 		"result_type": resultType,
 		"timestamp":   time.Now().Format(time.RFC3339),
