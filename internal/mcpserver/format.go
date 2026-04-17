@@ -721,7 +721,7 @@ func exampleValueForFormat(format string) string {
 	return `"content here"`
 }
 
-func formatClaimResult(claimData []byte, inputsData []byte, viewer string) string {
+func formatClaimResult(claimData []byte, inputsData []byte, viewer string, reviewFeedback ...[]byte) string {
 	var claim map[string]interface{}
 	if err := json.Unmarshal(claimData, &claim); err != nil {
 		return string(claimData)
@@ -868,6 +868,30 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string) strin
 			b.WriteString("── Prompt ──────────────────────────────────\n")
 			b.WriteString(prompt)
 			b.WriteString("\n────────────────────────────────────────────\n")
+		}
+	}
+
+	// Show reviewer feedback if this task was bounced back via
+	// request_changes — the author needs to know what to fix.
+	if len(reviewFeedback) > 0 && reviewFeedback[0] != nil {
+		var fb map[string]interface{}
+		if json.Unmarshal(reviewFeedback[0], &fb) == nil {
+			reviewer, _ := fb["reviewer"].(string)
+			decision, _ := fb["decision"].(string)
+			content, _ := fb["content"].(string)
+			if content != "" {
+				b.WriteString("\n── Reviewer feedback ───────────────────────\n")
+				header := "▸ "
+				if reviewer != "" {
+					header += "@" + reviewer
+				}
+				if decision != "" {
+					header += " — " + decision
+				}
+				b.WriteString(header + "\n\n")
+				b.WriteString("  " + strings.ReplaceAll(content, "\n", "\n  "))
+				b.WriteString("\n────────────────────────────────────────────\n")
+			}
 		}
 	}
 

@@ -1501,7 +1501,65 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 		inputs, _ = c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
 	}
 
-	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username)), nil
+	// If this task was bounced back via request_changes, find the
+	// reviewer's feedback so the author knows what to fix.
+	var reviewFeedback []byte
+	if meta != nil && meta.ProjectID > 0 {
+		reviewFeedback = c.fetchReviewFeedback(ctx, meta)
+	}
+
+	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username, reviewFeedback)), nil
+}
+
+// fetchReviewFeedback looks up the most recent review task that
+// targets this task and returned request_changes or reject. Returns
+// the reviewer's content as JSON, or nil if no review feedback exists.
+func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []byte {
+	// List all tasks in this run to find the reviewer.
+	tasksData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", meta.ProjectID, meta.RunSeq))
+	if err != nil {
+		return nil
+	}
+	var tasks []map[string]interface{}
+	if json.Unmarshal(tasksData, &tasks) != nil {
+		return nil
+	}
+	// Find review tasks targeting this task's def ID.
+	for _, t := range tasks {
+		reviewsTarget, _ := t["reviews_target"].(string)
+		if reviewsTarget != meta.TaskDefID {
+			continue
+		}
+		decision, _ := t["review_decision"].(string)
+		if decision != "request_changes" && decision != "reject" {
+			continue
+		}
+		// Found a reviewer with feedback. Fetch their submitted content.
+		reviewID, _ := t["id"].(string)
+		resultPath, _ := t["result_path"].(string)
+		claimedBy, _ := t["claimed_by"].(string)
+		if reviewID == "" || resultPath == "" {
+			continue
+		}
+		// Read the review content from the workspace.
+		if c.workspace != nil {
+			remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
+			if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
+				contentPath := filepath.Join(resultPath, "result.md")
+				if content, rerr := proj.ReadFile(contentPath); rerr == nil {
+					feedback := map[string]interface{}{
+						"reviewer":  claimedBy,
+						"decision":  decision,
+						"content":   string(content),
+						"review_id": reviewID,
+					}
+					data, _ := json.Marshal(feedback)
+					return data
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (c *apiClient) handleGetTaskInputs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
