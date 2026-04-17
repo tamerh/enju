@@ -72,7 +72,9 @@ Core model:
 - Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
 - Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.
 
-Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → next task unlocks.`),
+Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
+
+Conventions: After claiming, remind the human which task is active. After submitting, show the updated run tree so progress is visible. When working on a task, keep the human oriented — a brief context line (e.g. "Working on 1:1:draft") at the start of task-related responses helps.`),
 	)
 
 	logger := cfg.Logger
@@ -337,7 +339,7 @@ func toolListRuns() mcp.Tool {
 
 func toolListReadyTasks() mcp.Tool {
 	return mcp.NewTool("enju_list_ready_tasks",
-		mcp.WithDescription("List tasks that are ready to be claimed. Optionally filter by project and run."),
+		mcp.WithDescription("List tasks that are ready to be claimed. Display the result directly — it's already formatted. Optionally filter by project and run."),
 		mcp.WithNumber("project_id",
 			mcp.Description("Filter by project ID (optional)"),
 		),
@@ -349,7 +351,7 @@ func toolListReadyTasks() mcp.Tool {
 
 func toolClaimTask() mcp.Tool {
 	return mcp.NewTool("enju_claim_task",
-		mcp.WithDescription("Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and any upstream results."),
+		mcp.WithDescription("Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and upstream context. After claiming, tell the human which task you're now working on."),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task to claim"),
@@ -381,7 +383,8 @@ For action:review tasks: provide 'decision' — one of:
   - "comment" — non-blocking note, no state change on the target
 Your prose content is the reviewer's feedback in all cases.
 For action:vote tasks: provide 'option' as one of the declared option ids from the task's 'options:' list. Your prose content is free-form commentary. If the winning option has 'activates:' set, the DAG routes down that branch and tasks on losing branches flip to SKIPPED. Votes without 'activates:' are pure decisions — downstream tasks can still read the choice via {{task.winning_option}}.
-The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.`),
+The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.
+After submitting, call enju_run_status to show the human the updated DAG tree — they want to see progress.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task"),
@@ -467,7 +470,7 @@ func toolGetTask() mcp.Tool {
 
 func toolRunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
-		mcp.WithDescription("Get the status of a run including all its tasks. Run is addressed by project_id + run_id (per-project sequence)."),
+		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Display the result directly — it's already formatted with progress bar, state icons, and tree structure."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -699,7 +702,7 @@ func toolUpdateProfile() mcp.Tool {
 
 func toolMyDashboard() mcp.Tool {
 	return mcp.NewTool("enju_my_dashboard",
-		mcp.WithDescription("Show your citizen dashboard: stats, active tasks, and recent completions."),
+		mcp.WithDescription("Show your citizen dashboard: stats, active tasks, and recent completions. Display the result directly to the human without summarizing or interpreting — it's already formatted."),
 	)
 }
 
