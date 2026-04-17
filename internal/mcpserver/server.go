@@ -339,7 +339,7 @@ func toolListRuns() mcp.Tool {
 
 func toolListReadyTasks() mcp.Tool {
 	return mcp.NewTool("enju_list_ready_tasks",
-		mcp.WithDescription("List tasks that are ready to be claimed. Display the result directly — it's already formatted. Optionally filter by project and run."),
+		mcp.WithDescription("List tasks that are ready to be claimed. Paste the output verbatim in your reply — it's pre-formatted for the human. Optionally filter by project and run."),
 		mcp.WithNumber("project_id",
 			mcp.Description("Filter by project ID (optional)"),
 		),
@@ -460,7 +460,7 @@ func toolReleaseTask() mcp.Tool {
 
 func toolGetTask() mcp.Tool {
 	return mcp.NewTool("enju_get_task",
-		mcp.WithDescription("Get details of a specific task including its state, prompt, and dependencies."),
+		mcp.WithDescription("Get details of a specific task including its state, prompt, and dependencies. Paste the output verbatim in your reply — it's pre-formatted."),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task"),
@@ -470,7 +470,7 @@ func toolGetTask() mcp.Tool {
 
 func toolRunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
-		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Display the result directly — it's already formatted with progress bar, state icons, and tree structure."),
+		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -621,7 +621,7 @@ func toolDescribeTemplate() mcp.Tool {
 
 func toolListProjects() mcp.Tool {
 	return mcp.NewTool("enju_list_projects",
-		mcp.WithDescription("List all long-lived projects. A project is a workspace that holds many runs over time."),
+		mcp.WithDescription("List all long-lived projects. Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
@@ -702,13 +702,13 @@ func toolUpdateProfile() mcp.Tool {
 
 func toolMyDashboard() mcp.Tool {
 	return mcp.NewTool("enju_my_dashboard",
-		mcp.WithDescription("Show your citizen dashboard: stats, active tasks, and recent completions. Display the result directly to the human without summarizing or interpreting — it's already formatted."),
+		mcp.WithDescription("Show your citizen dashboard: stats, active tasks, and recent completions. Paste the output verbatim in your reply — it's pre-formatted for the human."),
 	)
 }
 
 func toolMyProfile() mcp.Tool {
 	return mcp.NewTool("enju_my_profile",
-		mcp.WithDescription("Show your own citizen profile — username (the stable handle used in assign_to and everywhere user-facing), display name, email, and role. Use this to confirm your handle before asking someone to put you in assign_to."),
+		mcp.WithDescription("Show your own citizen profile. Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
