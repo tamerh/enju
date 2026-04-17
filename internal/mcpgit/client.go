@@ -200,7 +200,7 @@ func (ws *Workspace) RegisterExternalDir(projectID int64, dir string) {
 // for non-SSH URLs (http/https/local paths) — go-git handles those
 // without explicit auth.
 func sshAuthMethod(remoteURL string) transport.AuthMethod {
-	if !isSSHURL(remoteURL) {
+	if !IsSSHURL(remoteURL) {
 		return nil
 	}
 	// Try SSH agent first.
@@ -234,7 +234,7 @@ func sshAuthMethod(remoteURL string) transport.AuthMethod {
 
 // isSSHURL returns true if the URL looks like an SSH remote
 // (git@host:..., ssh://...).
-func isSSHURL(url string) bool {
+func IsSSHURL(url string) bool {
 	if strings.HasPrefix(url, "ssh://") {
 		return true
 	}
@@ -249,7 +249,7 @@ func isSSHURL(url string) bool {
 // with a .git subdirectory (a git working tree, not a bare repo).
 // Used to detect enju_init'd projects whose path is stored as
 // remote_url on the coordinator.
-func isLocalWorkingTree(path string) bool {
+func IsLocalWorkingTree(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil || !info.IsDir() {
 		return false
@@ -341,7 +341,7 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 	// with a .git dir (not bare), open it directly instead of
 	// cloning. This handles enju_init'd projects that persist
 	// their path as remote_url across restarts.
-	if remoteURL != "" && isLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && IsLocalWorkingTree(remoteURL) {
 		ws.externalDirs[projectID] = remoteURL
 		p, err := openOrClone(remoteURL, "", ws.logger)
 		if err != nil {
@@ -423,6 +423,23 @@ func (p *Project) WorkDir() string { return p.workDir }
 // RemoteURL returns the configured origin URL, or an empty string
 // for local-only clones.
 func (p *Project) RemoteURL() string { return p.remoteURL }
+
+// GitOriginURL returns the URL of the "origin" remote from the git
+// config, or empty if no origin is configured. For init'd projects,
+// this is the actual push target (e.g. git@github.com:org/repo.git),
+// which may differ from RemoteURL() (the local folder path stored
+// on the coordinator).
+func (p *Project) GitOriginURL() string {
+	rem, err := p.repo.Remote("origin")
+	if err != nil {
+		return ""
+	}
+	cfg := rem.Config()
+	if cfg == nil || len(cfg.URLs) == 0 {
+		return ""
+	}
+	return cfg.URLs[0]
+}
 
 // Lock acquires the per-project write mutex AND the on-disk
 // flock. Callers performing a sequence of WriteFile + Commit +

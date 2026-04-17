@@ -1221,6 +1221,13 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 		return mcp.NewToolResultError("comparing to remote: " + err.Error()), nil
 	}
 
+	// For init'd projects, show both the workspace path and the
+	// actual git origin URL (if different).
+	if gitOrigin := proj.GitOriginURL(); gitOrigin != "" && gitOrigin != remoteURL {
+		resp["workspace"] = remoteURL
+		resp["remote_url"] = gitOrigin
+	}
+
 	resp["status"] = string(cmp.Status)
 	resp["local_head"] = cmp.LocalHead
 	resp["remote_head"] = cmp.RemoteHead

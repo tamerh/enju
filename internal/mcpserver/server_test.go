@@ -817,3 +817,80 @@ func TestFormatClaimResultNoFeedbackOnFirstClaim(t *testing.T) {
 		t.Errorf("should not show reviewer feedback on first claim, got:\n%s", result)
 	}
 }
+
+// TestIsLocalWorkingTree verifies detection of local working trees
+// vs bare repos vs non-git directories.
+func TestIsLocalWorkingTree(t *testing.T) {
+	// Case 1: folder with .git → true.
+	wtDir := t.TempDir()
+	gogit.PlainInitWithOptions(wtDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if !mcpgit.IsLocalWorkingTree(wtDir) {
+		t.Error("expected working tree detected")
+	}
+
+	// Case 2: plain folder → false.
+	plainDir := t.TempDir()
+	if mcpgit.IsLocalWorkingTree(plainDir) {
+		t.Error("plain dir should not be detected as working tree")
+	}
+
+	// Case 3: non-existent path → false.
+	if mcpgit.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
+		t.Error("non-existent path should not be detected")
+	}
+
+	// Case 4: SSH URL → false.
+	if mcpgit.IsLocalWorkingTree("git@github.com:org/repo.git") {
+		t.Error("SSH URL should not be detected as working tree")
+	}
+}
+
+// TestIsSSHURL verifies SSH URL detection.
+func TestIsSSHURL(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"git@github.com:org/repo.git", true},
+		{"ssh://git@github.com/org/repo.git", true},
+		{"/tmp/my-folder", false},
+		{"https://github.com/org/repo.git", false},
+		{"", false},
+		{"/home/tamer/.enju/repos/1.git", false},
+	}
+	for _, tc := range cases {
+		if got := mcpgit.IsSSHURL(tc.url); got != tc.want {
+			t.Errorf("IsSSHURL(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+// TestRenderDAGTree verifies the DAG tree rendering with fan-in.
+func TestRenderDAGTree(t *testing.T) {
+	tasks := []map[string]interface{}{
+		{"id": "1:1:draft", "task_def_id": "draft", "state": "accepted", "seq": float64(1), "depends_on": ""},
+		{"id": "1:1:check", "task_def_id": "check", "state": "ready", "seq": float64(2), "depends_on": "1:1:draft"},
+		{"id": "1:1:publish", "task_def_id": "publish", "state": "pending", "seq": float64(3), "depends_on": "1:1:draft,1:1:check"},
+	}
+	result := renderDAGTree(tasks)
+	// draft should be root.
+	if !strings.Contains(result, "draft") {
+		t.Error("expected draft in tree")
+	}
+	// publish has 2 parents → should nest under deepest (check).
+	if !strings.Contains(result, "publish") {
+		t.Error("expected publish in tree")
+	}
+	// check should be a child of draft.
+	if !strings.Contains(result, "├── check") && !strings.Contains(result, "└── check") {
+		t.Error("expected check nested under draft")
+	}
+	// publish should be nested under check (deepest parent), not at root.
+	if strings.HasPrefix(strings.TrimSpace(result), "publish") {
+		t.Error("publish should not be at root level — it has deps")
+	}
+}

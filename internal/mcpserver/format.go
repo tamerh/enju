@@ -82,11 +82,15 @@ func formatProjectRemoteStatus(data []byte) string {
 		b.WriteString("  (no remote configured)\n")
 		return b.String()
 	}
-	remoteLabel := remote
-	if strings.HasPrefix(remote, "/") && !strings.HasSuffix(remote, ".git") {
-		remoteLabel = remote + " (local workspace)"
+	// For init'd projects, show workspace path + actual git remote separately.
+	if workspace, ok := r["workspace"].(string); ok && workspace != "" {
+		b.WriteString("  workspace: " + workspace + " (adopted folder)\n")
+		b.WriteString("  git remote: " + remote + "\n")
+	} else if strings.HasPrefix(remote, "/") && !strings.HasSuffix(remote, ".git") {
+		b.WriteString("  workspace: " + remote + " (local, no git remote)\n")
+	} else {
+		b.WriteString("  remote:    " + remote + "\n")
 	}
-	b.WriteString("  remote:    " + remoteLabel + "\n")
 	b.WriteString("  status:    " + humanRemoteStatus(status, ahead, behind) + "\n")
 	if localHead, ok := r["local_head"].(string); ok && localHead != "" {
 		short := localHead
