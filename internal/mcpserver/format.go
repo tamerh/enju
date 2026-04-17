@@ -1407,7 +1407,7 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 	}
 
 	// Build parent map: task ID → list of parent IDs.
-	parents := map[string][]string{}
+	parentMap := map[string][]string{}
 	for _, t := range tasks {
 		id, _ := t["id"].(string)
 		depsStr, _ := t["depends_on"].(string)
@@ -1417,24 +1417,56 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		for _, d := range strings.Split(depsStr, ",") {
 			d = strings.TrimSpace(d)
 			if d != "" {
-				parents[id] = append(parents[id], d)
+				parentMap[id] = append(parentMap[id], d)
 			}
 		}
 	}
 
+	// Compute depth of each task in the DAG (longest path from root).
+	// Used to place multi-parent tasks under their deepest parent.
+	depth := map[string]int{}
+	var computeDepth func(id string) int
+	computeDepth = func(id string) int {
+		if d, ok := depth[id]; ok {
+			return d
+		}
+		maxParent := -1
+		for _, p := range parentMap[id] {
+			if pd := computeDepth(p); pd > maxParent {
+				maxParent = pd
+			}
+		}
+		depth[id] = maxParent + 1
+		return depth[id]
+	}
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		computeDepth(id)
+	}
+
 	// Build children map + roots. Tasks with zero deps are roots.
-	// Tasks with multiple parents (fan-in aggregators like
-	// "synthesize") are also promoted to roots — they don't
-	// belong under any single parent.
+	// Tasks with multiple parents (fan-in) go under their deepest
+	// parent so they nest naturally at the bottom of their branch.
 	children := map[string][]string{}
 	roots := []string{}
 	for _, t := range tasks {
 		id, _ := t["id"].(string)
-		p := parents[id]
-		if len(p) == 0 || len(p) > 1 {
+		parents := parentMap[id]
+		if len(parents) == 0 {
 			roots = append(roots, id)
+		} else if len(parents) == 1 {
+			children[parents[0]] = append(children[parents[0]], id)
 		} else {
-			children[p[0]] = append(children[p[0]], id)
+			// Pick the deepest parent.
+			best := parents[0]
+			bestDepth := depth[best]
+			for _, p := range parents[1:] {
+				if depth[p] > bestDepth {
+					best = p
+					bestDepth = depth[p]
+				}
+			}
+			children[best] = append(children[best], id)
 		}
 	}
 
@@ -1468,8 +1500,9 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		claimedBy, _ := t["claimed_by"].(string)
 		icon := stateIcon(state)
 
-		// Build the display name: "instance:taskdef" or just "taskdef".
+		// Build the display name with task ID.
 		displayName := taskShortName(t)
+		tid, _ := t["id"].(string)
 
 		// Connector.
 		connector := "├── "
@@ -1477,7 +1510,7 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 			connector = "└── "
 		}
 
-		line := prefix + connector + displayName + " " + icon
+		line := fmt.Sprintf("%s%s%s %s [%s]", prefix, connector, displayName, icon, tid)
 		if (state == "claimed" || state == "running") && claimedBy != "" {
 			line += fmt.Sprintf(" (%s)", claimedBy)
 		}
@@ -1510,8 +1543,9 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		claimedBy, _ := t["claimed_by"].(string)
 		icon := stateIcon(state)
 		displayName := taskShortName(t)
+		tid, _ := t["id"].(string)
 
-		line := displayName + " " + icon
+		line := fmt.Sprintf("%s %s [%s]", displayName, icon, tid)
 		if (state == "claimed" || state == "running") && claimedBy != "" {
 			line += fmt.Sprintf(" (%s)", claimedBy)
 		}
@@ -2400,6 +2434,11 @@ func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
 
 func stateIcon(state string) string {
 	switch state {
+	// Emoji icons — colorful, double-width but scannable at a glance.
+	// To switch to monochrome single-width, swap the return values:
+	//   accepted  → "✓"    ready     → "▶"
+	//   claimed   → "◐"    pending   → "○"
+	//   failed    → "✗"    skipped   → "⊘"
 	case "accepted", "completed":
 		return "✅"
 	case "ready":
@@ -2411,7 +2450,7 @@ func stateIcon(state string) string {
 	case "pending":
 		return "⚪"
 	case "skipped":
-		return "⊘"
+		return "⚫"
 	case "failed":
 		return "🔴"
 	case "invalid", "invalidated", "rejected":
