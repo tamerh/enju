@@ -68,7 +68,7 @@ func New(cfg Config) *server.MCPServer {
 
 Core model:
 - A claimed task is YOUR workspace. Iterate with the human freely — discuss, draft, refine. Only the final submission is committed to git. Internal back-and-forth doesn't need tracking.
-- Reviews are separate checkpoints where a different citizen evaluates submitted work. Decisions: approve (ship it), request_changes (revise and resubmit), reject (hard stop), or comment (non-blocking note).
+- Reviews are quality gates — you're deciding whether an upstream result is ready to feed into downstream tasks, not doing a line-by-line code review. Decisions: approve (ship it), request_changes (revise and resubmit), reject (hard stop), or comment (non-blocking note).
 - Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
 - Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.
 
@@ -1650,6 +1650,7 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 			reviewingBlock := map[string]interface{}{
 				"target_def_id": meta.ReviewsTarget,
 				"commit_sha":    d.CommitSHA,
+				"result_path":   d.ResultPath,
 				"content":       string(data),
 			}
 			// Fetch the target task to pick up the claimer's

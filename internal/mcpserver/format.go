@@ -515,6 +515,8 @@ func formatReviewingBlock(reviewing map[string]interface{}) string {
 	targetID, _ := reviewing["target_def_id"].(string)
 	claimedBy, _ := reviewing["claimed_by"].(string)
 	content, _ := reviewing["content"].(string)
+	commitSHA, _ := reviewing["commit_sha"].(string)
+	resultPath, _ := reviewing["result_path"].(string)
 
 	var b strings.Builder
 	b.WriteString("── Reviewing ───────────────────────────────\n")
@@ -522,6 +524,12 @@ func formatReviewingBlock(reviewing map[string]interface{}) string {
 	header := "▸ " + targetID
 	if claimedBy != "" {
 		header += " (by @" + claimedBy + ")"
+	}
+	if resultPath != "" {
+		b.WriteString(fmt.Sprintf("  Path:   %s/result.md\n", resultPath))
+	}
+	if commitSHA != "" {
+		b.WriteString(fmt.Sprintf("  Commit: %s\n", shortSHA(commitSHA)))
 	}
 	header += fmt.Sprintf(" — %d chars", len(content))
 
