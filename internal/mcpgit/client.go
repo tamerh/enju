@@ -61,6 +61,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
+	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/gofrs/flock"
 )
 
@@ -191,6 +192,57 @@ func (ws *Workspace) RegisterExternalDir(projectID int64, dir string) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	ws.externalDirs[projectID] = dir
+}
+
+// sshAuthMethod returns an SSH auth method for the given remote URL.
+// Tries SSH agent first (via SSH_AUTH_SOCK), then falls back to
+// common private key files (~/.ssh/id_ed25519, id_rsa). Returns nil
+// for non-SSH URLs (http/https/local paths) — go-git handles those
+// without explicit auth.
+func sshAuthMethod(remoteURL string) transport.AuthMethod {
+	if !isSSHURL(remoteURL) {
+		return nil
+	}
+	// Try SSH agent first.
+	if os.Getenv("SSH_AUTH_SOCK") != "" {
+		if auth, err := gitssh.NewSSHAgentAuth("git"); err == nil {
+			return auth
+		}
+	}
+	// Fall back to key files.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	keyFiles := []string{
+		filepath.Join(home, ".ssh", "id_ed25519"),
+		filepath.Join(home, ".ssh", "id_rsa"),
+		filepath.Join(home, ".ssh", "id_ecdsa"),
+	}
+	for _, kf := range keyFiles {
+		if _, err := os.Stat(kf); err != nil {
+			continue
+		}
+		auth, err := gitssh.NewPublicKeysFromFile("git", kf, "")
+		if err != nil {
+			continue // passphrase-protected, skip
+		}
+		return auth
+	}
+	return nil
+}
+
+// isSSHURL returns true if the URL looks like an SSH remote
+// (git@host:..., ssh://...).
+func isSSHURL(url string) bool {
+	if strings.HasPrefix(url, "ssh://") {
+		return true
+	}
+	// git@github.com:org/repo.git pattern
+	if strings.Contains(url, "@") && strings.Contains(url, ":") && !strings.Contains(url, "://") {
+		return true
+	}
+	return false
 }
 
 // isLocalWorkingTree returns true if the path is a local directory
@@ -493,6 +545,7 @@ clone:
 		URL:           remoteURL,
 		ReferenceName: plumbing.ReferenceName("refs/heads/main"),
 		SingleBranch:  true,
+		Auth:          sshAuthMethod(remoteURL),
 	})
 	if err != nil {
 		// Empty-remote bootstrap path (A.5 fix). Fresh repos on
@@ -804,6 +857,7 @@ func (p *Project) resetToRemote() error {
 	}
 	err := p.repo.Fetch(&gogit.FetchOptions{
 		RemoteName: "origin",
+		Auth:       sshAuthMethod(p.remoteURL),
 	})
 	if err != nil {
 		switch {
@@ -913,6 +967,7 @@ func (p *Project) pushInternal(force bool) error {
 	err := p.repo.Push(&gogit.PushOptions{
 		RemoteName: "origin",
 		Force:      force,
+		Auth:       sshAuthMethod(p.remoteURL),
 	})
 	// Record the outcome for the project_remote_status diagnostic,
 	// regardless of whether this was a success or a failure.
@@ -1057,6 +1112,7 @@ func (p *Project) CompareToRemote() (*RemoteComparison, error) {
 	if err != nil {
 		if fetchErr := p.repo.Fetch(&gogit.FetchOptions{
 			RemoteName: "origin",
+			Auth:       sshAuthMethod(p.remoteURL),
 		}); fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
 			// Can't fetch — report diverged conservatively so the
 			// user doesn't assume they're safe to fast-forward.
