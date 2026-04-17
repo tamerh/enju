@@ -1542,39 +1542,61 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 		return nil
 	}
 	// Find review tasks targeting this task's def ID.
+	// After request_changes, the cascade clears the review task's
+	// DB fields (review_decision, result_path, claimed_by). But
+	// the review content persists in git — both the result.md and
+	// metadata.json are still on disk. We read metadata.json to
+	// recover the decision and reviewer identity.
+	if c.workspace == nil {
+		return nil
+	}
+	remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
+	proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName)
+	if perr != nil {
+		return nil
+	}
+
 	for _, t := range tasks {
 		reviewsTarget, _ := t["reviews_target"].(string)
 		if reviewsTarget != meta.TaskDefID {
 			continue
 		}
-		decision, _ := t["review_decision"].(string)
+		reviewID, _ := t["id"].(string)
+		taskDefID, _ := t["task_def_id"].(string)
+		instanceKey, _ := t["instance_key"].(string)
+		if reviewID == "" {
+			continue
+		}
+		// Try to read the review's metadata.json from the workspace.
+		reviewResultDir := mcpgit.ResultDir(meta.RunSeq, instanceKey, taskDefID)
+		metaPath := filepath.Join(reviewResultDir, "metadata.json")
+		metaBytes, merr := proj.ReadFile(metaPath)
+		if merr != nil {
+			continue
+		}
+		var metaJSON map[string]interface{}
+		if json.Unmarshal(metaBytes, &metaJSON) != nil {
+			continue
+		}
+		decision, _ := metaJSON["decision"].(string)
 		if decision != "request_changes" && decision != "reject" {
 			continue
 		}
-		// Found a reviewer with feedback. Fetch their submitted content.
-		reviewID, _ := t["id"].(string)
-		resultPath, _ := t["result_path"].(string)
-		claimedBy, _ := t["claimed_by"].(string)
-		if reviewID == "" || resultPath == "" {
+		// Read the review content.
+		contentPath := filepath.Join(reviewResultDir, "result.md")
+		content, rerr := proj.ReadFile(contentPath)
+		if rerr != nil {
 			continue
 		}
-		// Read the review content from the workspace.
-		if c.workspace != nil {
-			remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
-			if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
-				contentPath := filepath.Join(resultPath, "result.md")
-				if content, rerr := proj.ReadFile(contentPath); rerr == nil {
-					feedback := map[string]interface{}{
-						"reviewer":  claimedBy,
-						"decision":  decision,
-						"content":   string(content),
-						"review_id": reviewID,
-					}
-					data, _ := json.Marshal(feedback)
-					return data
-				}
-			}
+		reviewer, _ := metaJSON["username"].(string)
+		feedback := map[string]interface{}{
+			"reviewer":  reviewer,
+			"decision":  decision,
+			"content":   string(content),
+			"review_id": reviewID,
 		}
+		data, _ := json.Marshal(feedback)
+		return data
 	}
 	return nil
 }
