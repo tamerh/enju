@@ -1726,7 +1726,18 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 
 	for _, t := range tasks {
 		reviewsTarget, _ := t["reviews_target"].(string)
-		if reviewsTarget != meta.TaskDefID {
+		// reviews_target carries one of two shapes:
+		//   - bare def id ("expand") for singleton reviews.
+		//   - "instanceKey:defID" ("alpha:expand") for per-
+		//     instance reviews (static or dynamic for_each).
+		// Split and match both components against this task's
+		// (TaskDefID, InstanceKey) — empty instance key on both
+		// sides for singleton paths means they still match.
+		targetDef, targetInstance := parseReviewsTarget(reviewsTarget)
+		if targetDef != meta.TaskDefID {
+			continue
+		}
+		if targetInstance != meta.InstanceKey {
 			continue
 		}
 		reviewID, _ := t["id"].(string)

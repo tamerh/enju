@@ -3861,6 +3861,570 @@ tasks:
 	}
 }
 
+// TestMCPDynamicForEachInvalidateSingleInstance verifies that
+// invalidating one materialized instance (e.g. alpha:expand)
+// cascades only that instance's descendants — siblings (beta:*)
+// stay accepted. Also verifies recovery: re-submitting the
+// invalidated instance re-unblocks its downstream, without
+// re-materializing from scratch.
+func TestMCPDynamicForEachInvalidateSingleInstance(t *testing.T) {
+	h := newMCPHarness(t, "InvalSingleInst")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-instance invalidation"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: tag
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Tag {{x}} from {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	// Complete everything.
+	for _, x := range []string{"alpha", "beta"} {
+		h.mcpClaimOK(t, x+":expand")
+		h.mcpSubmitText(t, x+":expand", "expand-"+x)
+		h.mcpClaimOK(t, x+":tag")
+		h.mcpSubmitText(t, x+":tag", "tag-"+x)
+	}
+
+	// Invalidate only alpha:expand. Only alpha:tag should cascade.
+	h.mcpInvalidate(t, "alpha:expand", "per-instance invalidation")
+
+	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "ready" {
+		t.Errorf("alpha:expand should be READY after invalidate, got %q", got)
+	}
+	// Cascade: alpha:tag should no longer be accepted.
+	if got, _ := h.taskGet("alpha:tag")["state"].(string); got == "accepted" {
+		t.Errorf("alpha:tag should NOT be accepted after upstream invalidate, got %q", got)
+	}
+	// Siblings untouched.
+	if got, _ := h.taskGet("beta:expand")["state"].(string); got != "accepted" {
+		t.Errorf("beta:expand should stay accepted (sibling), got %q", got)
+	}
+	if got, _ := h.taskGet("beta:tag")["state"].(string); got != "accepted" {
+		t.Errorf("beta:tag should stay accepted (sibling), got %q", got)
+	}
+
+	// Recovery: re-submit alpha:expand, re-do alpha:tag.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "expand-alpha-v2")
+	if got, _ := h.taskGet("alpha:tag")["state"].(string); got != "ready" {
+		t.Errorf("alpha:tag should be READY after upstream re-submit, got %q", got)
+	}
+	h.mcpClaimOK(t, "alpha:tag")
+	h.mcpSubmitText(t, "alpha:tag", "tag-alpha-v2")
+	if got, _ := h.taskGet("alpha:tag")["state"].(string); got != "accepted" {
+		t.Errorf("alpha:tag should be accepted after re-submit, got %q", got)
+	}
+}
+
+// TestMCPDynamicForEachCrossRunArtifactInvalidation verifies
+// cross-run cascade works when the artifact writer is a
+// for_each instance. A run-1 instance writes an artifact; a
+// separate run-2 task reads it. Invalidating the writer
+// instance must bounce the cross-run reader too.
+func TestMCPDynamicForEachCrossRunArtifactInvalidation(t *testing.T) {
+	h := newMCPHarness(t, "CrossRunForEach")
+	projectID := h.createTestProject()
+
+	// Run 1: for_each writer. writes_artifacts isn't template-
+	// resolved at materialization time, so we use a fixed path
+	// and limit the test to a single instance (last-write-wins
+	// would otherwise have instances race on the same file).
+	writerYAML := `name: "writer run"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    writes_artifacts:
+      - notes/alpha.md
+    prompt: "Write for {{x}}"
+`
+	h.mcpCreateRunInline(t, projectID, writerYAML)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha"})
+
+	// Each instance writes its own artifact.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitArtifacts(t, "alpha:expand", "",
+		map[string]string{"notes/alpha.md": "alpha note v1"})
+
+	// Artifact landed.
+	if content, ok := h.readArtifactFile(projectID, "notes/alpha.md"); !ok || content != "alpha note v1" {
+		t.Fatalf("artifact write failed: ok=%v content=%q", ok, content)
+	}
+
+	// Run 2: reader. Separate run reads the artifact.
+	readerYAML := `name: "reader run"
+version: 1
+tasks:
+  - id: summarize
+    action: answer
+    reads_artifacts: [notes/alpha.md]
+    prompt: "Summarize {{artifact:notes/alpha.md}}"
+`
+	h.mcpCreateRunInline(t, projectID, readerYAML)
+	h.mcpClaimOK(t, "summarize")
+	h.mcpSubmitText(t, "summarize", "summary v1")
+
+	// Point lastRunSeq back at run 1 before invalidating alpha.
+	h.lastRunSeq = 1
+	h.lastRunID = fmt.Sprintf("%d:1", projectID)
+	h.mcpInvalidate(t, "alpha:expand", "cross-run cascade test")
+
+	// Reader in run 2 must have cascaded to PENDING.
+	h.lastRunSeq = 2
+	h.lastRunID = fmt.Sprintf("%d:2", projectID)
+	if got, _ := h.taskGet("summarize")["state"].(string); got != "pending" {
+		t.Errorf("cross-run reader should be PENDING after per-instance writer invalidate, got %q", got)
+	}
+
+	// Recovery: re-submit alpha:expand with new artifact
+	// content → reader should unblock.
+	h.lastRunSeq = 1
+	h.lastRunID = fmt.Sprintf("%d:1", projectID)
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitArtifacts(t, "alpha:expand", "",
+		map[string]string{"notes/alpha.md": "alpha note v2"})
+
+	h.lastRunSeq = 2
+	h.lastRunID = fmt.Sprintf("%d:2", projectID)
+	if got, _ := h.taskGet("summarize")["state"].(string); got != "ready" {
+		t.Errorf("cross-run reader should be READY after writer re-submit, got %q", got)
+	}
+}
+
+// TestMCPDynamicForEachComputeAction verifies action:compute
+// works inside a dynamic for_each. Each materialized compute
+// instance runs the declared script via enju_execute_task, with
+// ENJU_TASK_ID in its env so the script can distinguish
+// iterations. The script is seeded into the project via a
+// preceding artifact-writing task.
+func TestMCPDynamicForEachComputeAction(t *testing.T) {
+	h := newMCPHarness(t, "ComputeForEach")
+	projectID := h.createTestProject()
+
+	yaml := `name: "compute inside for_each"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the script."
+    writes_artifacts:
+      - scripts/echo_iter.sh
+
+  - id: discover
+    action: answer
+    prompt: "List items."
+    depends_on: [setup]
+    outputs:
+      items:
+        format: list<string>
+
+  - id: run
+    action: compute
+    script: scripts/echo_iter.sh
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Run {{x}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// setup seeds an executable script that echoes the env var
+	// the handler injects. This is the iteration marker each
+	// compute instance receives at runtime.
+	h.mcpClaimOK(t, "setup")
+	script := "#!/bin/bash\necho \"ran ${ENJU_TASK_ID}\"\n"
+	h.mcpSubmitArtifacts(t, "setup", "seeded script",
+		map[string]string{"scripts/echo_iter.sh": script})
+	// The repository layer doesn't preserve the executable bit
+	// through commits, and handleExecuteTask's pull restores
+	// the committed mode. Apply chmod 755 right before each
+	// execute call, reaching every local clone under the
+	// workspace root.
+	chmodScript := func() {
+		matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "echo_iter.sh"))
+		for _, m := range matches {
+			_ = os.Chmod(m, 0o755)
+		}
+	}
+	chmodScript()
+
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	// Each compute instance runs via enju_execute_task. The
+	// handler claims + runs + submits all in one call.
+	for _, x := range []string{"alpha", "beta"} {
+		chmodScript()
+		res := h.call(t, "enju_execute_task", map[string]any{
+			"task_id": h.taskID(x + ":run"),
+		})
+		if res.IsError {
+			t.Fatalf("execute %s:run returned tool error: %s", x, mcpText(res))
+		}
+		text := mcpText(res)
+		if !strings.Contains(text, "Script completed") {
+			t.Errorf("%s:run should report script completed, got:\n%s", x, text)
+		}
+		if got, _ := h.taskGet(x + ":run")["state"].(string); got != "accepted" {
+			t.Errorf("%s:run should be accepted after execute, got %q", x, got)
+		}
+	}
+
+	// Each instance's result.md should carry the ENJU_TASK_ID
+	// the handler injected (containing the instance key).
+	for _, x := range []string{"alpha", "beta"} {
+		body := h.mcpBareResultMD(t, x+":run")
+		wantMarker := x + ":run"
+		if !strings.Contains(body, wantMarker) {
+			t.Errorf("%s:run result should contain %q (from ENJU_TASK_ID), got: %q",
+				x, wantMarker, body)
+		}
+	}
+}
+
+// TestMCPDynamicForEachPerInstanceMultiVoter verifies citizens:N
+// on a per-instance dynamic-for_each vote. Each materialized
+// vote task independently collects N ballots and tallies in
+// isolation.
+func TestMCPDynamicForEachPerInstanceMultiVoter(t *testing.T) {
+	h := newMCPHarness(t, "MultiVoteA")
+	bob := h.newMCPClientAs(t, "MultiVoteB")
+	carol := h.newMCPClientAs(t, "MultiVoteC")
+
+	projectID := h.createTestProject()
+	yaml := `name: "per-instance multi-voter"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: decide
+    action: vote
+    citizens: 3
+    threshold: majority
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Vote on {{x}}"
+    options:
+      - {id: yes, label: "Yes"}
+      - {id: no,  label: "No"}
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	// alpha cycle: all 3 vote "yes" → resolves as yes.
+	clients := []*mcpserver.TestClient{h.client, bob, carol}
+	for _, c := range clients {
+		h.mcpClaimAs(t, c, "alpha:decide")
+	}
+	for _, c := range clients {
+		h.mcpSubmitVoteAs(t, c, "alpha:decide", "rationale from "+c.Username(), "yes")
+	}
+	if got, _ := h.taskGet("alpha:decide")["state"].(string); got != "accepted" {
+		t.Errorf("alpha:decide should be accepted, got %q", got)
+	}
+	if got, _ := h.taskGet("alpha:decide")["vote_choice"].(string); got != "yes" {
+		t.Errorf("alpha:decide winning choice should be 'yes', got %q", got)
+	}
+
+	// beta cycle: 2 yes + 1 no → majority yes.
+	for _, c := range clients {
+		h.mcpClaimAs(t, c, "beta:decide")
+	}
+	h.mcpSubmitVoteAs(t, h.client, "beta:decide", "yes please", "yes")
+	h.mcpSubmitVoteAs(t, bob, "beta:decide", "yes too", "yes")
+	h.mcpSubmitVoteAs(t, carol, "beta:decide", "I say no", "no")
+	if got, _ := h.taskGet("beta:decide")["state"].(string); got != "accepted" {
+		t.Errorf("beta:decide should be accepted, got %q", got)
+	}
+	if got, _ := h.taskGet("beta:decide")["vote_choice"].(string); got != "yes" {
+		t.Errorf("beta:decide majority should be yes, got %q", got)
+	}
+
+	// Independent tallies: alpha's "all yes" should not have
+	// leaked into beta's tally (and vice versa). Already
+	// implicitly tested above — both resolved with their own
+	// correct winners.
+}
+
+// TestMCPDynamicForEachPerInstanceMultiReviewer verifies that
+// citizens:N on a per-instance dynamic-for_each review works —
+// each materialized instance independently collects N reviews
+// and tallies in isolation. alpha:check needs 3 reviewers,
+// beta:check needs 3 reviewers; approvals on alpha don't count
+// toward beta.
+func TestMCPDynamicForEachPerInstanceMultiReviewer(t *testing.T) {
+	h := newMCPHarness(t, "MultiRevA")
+	bob := h.newMCPClientAs(t, "MultiRevB")
+	carol := h.newMCPClientAs(t, "MultiRevC")
+
+	projectID := h.createTestProject()
+	yaml := `name: "per-instance multi-reviewer"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: check
+    action: review
+    reviews: expand
+    citizens: 3
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Review {{x}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
+
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "alpha body")
+	h.mcpClaimOK(t, "beta:expand")
+	h.mcpSubmitText(t, "beta:expand", "beta body")
+
+	// All three reviewers claim + approve alpha:check. Independent
+	// tally: alpha should resolve, beta should still be idle.
+	clients := []*mcpserver.TestClient{h.client, bob, carol}
+	for _, c := range clients {
+		h.mcpClaimAs(t, c, "alpha:check")
+	}
+	for _, c := range clients {
+		h.mcpSubmitReviewAs(t, c, "alpha:check", "LGTM from "+c.Username(), "approve")
+	}
+
+	if got, _ := h.taskGet("alpha:check")["state"].(string); got != "accepted" {
+		t.Errorf("alpha:check should be accepted after 3 approvals, got %q", got)
+	}
+	// beta:check — nobody reviewed it yet. Should be READY (open
+	// for claims) or COLLECTING (not possible w/o claims). The
+	// key invariant is: it is NOT accepted.
+	if got, _ := h.taskGet("beta:check")["state"].(string); got == "accepted" {
+		t.Errorf("beta:check must NOT be accepted (no reviews yet), got %q", got)
+	}
+
+	// Now run the beta cycle: only two reviewers approve, third
+	// request_changes. any-reject-kills should bounce beta:expand.
+	for _, c := range clients {
+		h.mcpClaimAs(t, c, "beta:check")
+	}
+	h.mcpSubmitReviewAs(t, h.client, "beta:check", "fine", "approve")
+	// carol's request_changes fires the any-reject rule
+	// immediately; bob's late approve must be rejected.
+	h.mcpSubmitReviewAs(t, carol, "beta:check", "needs revision", "request_changes")
+
+	if got, _ := h.taskGet("beta:expand")["state"].(string); got != "ready" {
+		t.Errorf("beta:expand should be READY after request_changes on beta:check, got %q", got)
+	}
+	// alpha side must be unaffected by beta's cascade.
+	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "accepted" {
+		t.Errorf("alpha:expand should remain accepted, got %q", got)
+	}
+	if got, _ := h.taskGet("alpha:check")["state"].(string); got != "accepted" {
+		t.Errorf("alpha:check should remain accepted, got %q", got)
+	}
+}
+
+// TestMCPDynamicForEachPerInstanceAllFourDecisions walks every
+// valid review decision (approve, reject, request_changes,
+// comment) against a per-instance dynamic-for_each review. The
+// singleton-equivalent test TestMCPSubmitResultAllFourReviewDecisionsLand
+// covers the non-for_each path. This test locks in the same
+// four-way contract for dynamic per-instance reviews:
+//
+//   - approve:         target stays accepted, downstream unblocks
+//   - reject (hard):   target goes FAILED, downstream blocked
+//   - request_changes: target bounces to READY, cascade fires
+//   - comment:         target stays accepted, non-blocking
+func TestMCPDynamicForEachPerInstanceAllFourDecisions(t *testing.T) {
+	cases := []struct {
+		decision            string
+		wantExpandStateAfter string
+		wantTagReachable     bool // can the per-instance tag become ready?
+	}{
+		{"approve", "accepted", true},
+		{"reject", "failed", false},
+		{"request_changes", "ready", false},
+		{"comment", "accepted", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.decision, func(t *testing.T) {
+			h := newMCPHarness(t, "PerInstance4Decisions-Drafter-"+tc.decision)
+			reviewer := h.newMCPClientAs(t, "PerInstance4Decisions-Reviewer-"+tc.decision)
+
+			projectID := h.createTestProject()
+			yaml := `name: "per-instance 4 decisions"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: check
+    action: review
+    reviews: expand
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Review {{x}}."
+  - id: tag
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Tag {{x}} based on {{expand.content}}"
+`
+			h.mcpCreateRunInline(t, projectID, yaml)
+			h.mcpClaimOK(t, "discover")
+			h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha"})
+
+			h.mcpClaimOK(t, "alpha:expand")
+			h.mcpSubmitText(t, "alpha:expand", "alpha body")
+
+			h.mcpClaimAs(t, reviewer, "alpha:check")
+			h.mcpSubmitReviewAs(t, reviewer, "alpha:check", "feedback prose", tc.decision)
+
+			if got, _ := h.taskGet("alpha:expand")["state"].(string); got != tc.wantExpandStateAfter {
+				t.Errorf("decision %q: alpha:expand state = %q, want %q",
+					tc.decision, got, tc.wantExpandStateAfter)
+			}
+
+			tagState, _ := h.taskGet("alpha:tag")["state"].(string)
+			if tc.wantTagReachable {
+				// approve / comment: tag should become ready
+				// (its upstream expand is still accepted).
+				if tagState != "ready" && tagState != "accepted" {
+					t.Errorf("decision %q: alpha:tag should be reachable, got state %q",
+						tc.decision, tagState)
+				}
+			} else {
+				// reject: tag must be blocked (upstream failed).
+				// request_changes: tag must be blocked (upstream ready).
+				if tagState == "ready" || tagState == "accepted" {
+					t.Errorf("decision %q: alpha:tag should NOT be reachable, got state %q",
+						tc.decision, tagState)
+				}
+			}
+		})
+	}
+}
+
+// TestMCPDynamicForEachPerInstanceRevisionContext verifies that
+// after request_changes on a per-instance review, re-claiming the
+// bounced expand instance surfaces the "Previous submission" and
+// "Reviewer feedback" blocks the singleton review path already
+// provides. Before the fix, fetchReviewFeedback compared
+// review.reviews_target (stored as "alpha:expand") against the
+// bounced task's bare TaskDefID ("expand") — the match failed and
+// neither block rendered.
+func TestMCPDynamicForEachPerInstanceRevisionContext(t *testing.T) {
+	h := newMCPHarness(t, "RevisionCtxDrafter")
+	reviewer := h.newMCPClientAs(t, "RevisionCtxReviewer")
+
+	projectID := h.createTestProject()
+	yaml := `name: "per-instance revision context"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List."
+    outputs:
+      items:
+        format: list<string>
+  - id: expand
+    action: answer
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Expand {{x}}"
+  - id: check
+    action: review
+    reviews: expand
+    for_each:
+      x: "{{discover.items}}"
+    prompt: "Review {{x}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha"})
+
+	// Drafter submits an initial expand, reviewer bounces it.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "First try on alpha")
+
+	h.mcpClaimAs(t, reviewer, "alpha:check")
+	h.mcpSubmitReviewAs(t, reviewer, "alpha:check", "please expand further", "request_changes")
+
+	// Re-claim alpha:expand — the claim response must carry both
+	// the "Previous submission" block (with the original content)
+	// and the "Reviewer feedback" block (with reviewer username +
+	// decision + feedback).
+	reclaim := h.callOK(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("alpha:expand"),
+	})
+	text := mcpText(reclaim)
+
+	if !strings.Contains(text, "Previous submission") {
+		t.Errorf("#1: expected 'Previous submission' block on per-instance re-claim, got:\n%s", text)
+	}
+	if !strings.Contains(text, "First try on alpha") {
+		t.Errorf("#1: previous-submission block should carry original content, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Reviewer feedback") {
+		t.Errorf("#1: expected 'Reviewer feedback' block, got:\n%s", text)
+	}
+	if !strings.Contains(text, "please expand further") {
+		t.Errorf("#1: feedback block should carry reviewer prose, got:\n%s", text)
+	}
+	if !strings.Contains(text, reviewer.Username()) {
+		t.Errorf("#1: feedback block should credit reviewer @%s, got:\n%s", reviewer.Username(), text)
+	}
+	if !strings.Contains(text, "request_changes") {
+		t.Errorf("#1: feedback block should label the decision, got:\n%s", text)
+	}
+}
+
 // mcpSubmitDiscoverListAs is a convenience for dynamic for_each
 // tests: submits a result with one list<string> output field so
 // the coordinator's output_lists materialization can fire.
