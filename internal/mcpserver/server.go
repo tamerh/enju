@@ -64,6 +64,15 @@ func New(cfg Config) *server.MCPServer {
 		"enju",
 		"0.1.0",
 		server.WithToolCapabilities(true),
+		server.WithInstructions(`Enju is a human-AI collaborative task orchestration system. Work is structured as DAGs of tasks within runs within projects.
+
+Core model:
+- A claimed task is YOUR workspace. Iterate with the human freely — discuss, draft, refine. Only the final submission is committed to git. Internal back-and-forth doesn't need tracking.
+- Reviews are separate checkpoints where a different citizen evaluates submitted work. Decisions: approve (ship it), request_changes (revise and resubmit), reject (hard stop), or comment (non-blocking note).
+- Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
+- Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.
+
+Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → next task unlocks.`),
 	)
 
 	logger := cfg.Logger
@@ -340,7 +349,7 @@ func toolListReadyTasks() mcp.Tool {
 
 func toolClaimTask() mcp.Tool {
 	return mcp.NewTool("enju_claim_task",
-		mcp.WithDescription("Claim a task to work on. Returns the task prompt and any upstream results needed."),
+		mcp.WithDescription("Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and any upstream results."),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task to claim"),
@@ -365,7 +374,12 @@ func toolSubmitResult() mcp.Tool {
 For simple tasks: provide 'content' as a string.
 For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
 For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
-For action:review tasks: provide 'decision' as "approve" or "reject". Your prose content is the reviewer's comment. A reject verdict automatically invalidates the target task (the one named in its 'reviews:' field) so the author can re-submit a fixed version.
+For action:review tasks: provide 'decision' — one of:
+  - "approve" — work is good, pass downstream
+  - "request_changes" — work needs revision, send back for another round (target bounces to READY)
+  - "reject" — work is fundamentally wrong, hard stop (target becomes FAILED, terminal)
+  - "comment" — non-blocking note, no state change on the target
+Your prose content is the reviewer's feedback in all cases.
 For action:vote tasks: provide 'option' as one of the declared option ids from the task's 'options:' list. Your prose content is free-form commentary. If the winning option has 'activates:' set, the DAG routes down that branch and tasks on losing branches flip to SKIPPED. Votes without 'activates:' are pure decisions — downstream tasks can still read the choice via {{task.winning_option}}.
 The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.`),
 		mcp.WithString("task_id",
@@ -382,7 +396,7 @@ The task detail shows the schema (outputs, writes_artifacts, reviews target, opt
 			mcp.Description(`For tasks with writes_artifacts: a JSON string mapping each artifact path to its new content. Example: '{"src/analyze.py": "def analyze():\n    pass\n"}'. Paths must be in the task's writes_artifacts list.`),
 		),
 		mcp.WithString("decision",
-			mcp.Description(`Required for action:review tasks: "approve" or "reject". Ignored on non-review tasks. A reject cascades an invalidation on the reviewed target task, bouncing it back to READY so the author can re-submit.`),
+			mcp.Description(`Required for action:review tasks: "approve", "request_changes", "reject", or "comment". approve = ship it; request_changes = send back for revision; reject = hard stop (FAILED); comment = non-blocking note.`),
 		),
 		mcp.WithString("option",
 			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
@@ -2097,10 +2111,10 @@ func (c *apiClient) submitResultFatClient(
 // different places.
 func validateReviewDecision(decision string) string {
 	switch decision {
-	case "approve", "reject":
+	case "approve", "reject", "request_changes", "comment":
 		return ""
 	case "":
-		return "decision is required on action:review tasks (must be \"approve\" or \"reject\")"
+		return "decision is required on action:review tasks (must be \"approve\", \"request_changes\", \"reject\", or \"comment\")"
 	default:
 		return invalidDecisionMessage(decision)
 	}

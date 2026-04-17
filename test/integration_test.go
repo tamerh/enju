@@ -381,6 +381,24 @@ func (s *testServer) submitYAMLToProject(path string, projectID int64) string {
 	return s.lastRunID
 }
 
+// submitInlineYAML creates a run from an inline YAML string (no file needed).
+func (s *testServer) submitInlineYAML(yamlContent string) string {
+	s.t.Helper()
+	projectID := s.createTestProject()
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]string{
+		"yaml": yamlContent,
+	})
+	seqFloat, _ := resp["seq"].(float64)
+	if seqFloat == 0 {
+		s.t.Fatalf("submit failed: %v", resp)
+		return ""
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seqFloat)
+	s.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seqFloat))
+	return s.lastRunID
+}
+
 // taskID returns the full task ID (project-run-prefixed) for the most recently submitted run.
 // Format: {projectID}:{runSeq}:{shortID} or {projectID}:{runSeq}:{instanceKey}:{taskDefID}
 func (s *testServer) taskID(shortID string) string {
@@ -3190,15 +3208,15 @@ func TestReviewRejectCascade(t *testing.T) {
 	bad := answer(t, "Write a one-sentence summary of enju.", "This is a bad draft.")
 	s.submit("draft", bad)
 
-	// Bob reviews and rejects.
+	// Bob reviews and requests changes (soft reject — bounces to READY).
 	s.claim("check", bob)
 	rejectComment := answer(t, "Does the draft hold up?", "Too vague — try again.")
-	rejectRes := s.submitReview("check", rejectComment, "reject")
+	rejectRes := s.submitReview("check", rejectComment, "request_changes")
 	if rejectRes["status"] != "accepted" {
-		t.Fatalf("reject submit not accepted: %v", rejectRes)
+		t.Fatalf("request_changes submit not accepted: %v", rejectRes)
 	}
-	if rejectRes["decision"] != "reject" {
-		t.Fatalf("expected decision=reject in response, got %v", rejectRes["decision"])
+	if rejectRes["decision"] != "request_changes" {
+		t.Fatalf("expected decision=request_changes in response, got %v", rejectRes["decision"])
 	}
 	cascade, ok := rejectRes["review_cascade"].(map[string]interface{})
 	if !ok {
@@ -3337,7 +3355,7 @@ func TestReviewRejectMetadataCarriesVerdict(t *testing.T) {
 	s.claim("draft", alice)
 	s.submit("draft", "A draft that will be rejected.")
 	s.claim("check", bob)
-	s.submitReview("check", "Needs more detail.", "reject")
+	s.submitReview("check", "Needs more detail.", "request_changes")
 
 	runSeq := 1
 	metaPath := filepath.Join(
@@ -3352,8 +3370,8 @@ func TestReviewRejectMetadataCarriesVerdict(t *testing.T) {
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		t.Fatalf("metadata.json malformed: %v", err)
 	}
-	if decision, _ := meta["decision"].(string); decision != "reject" {
-		t.Errorf("expected metadata.decision=reject, got %v", meta["decision"])
+	if decision, _ := meta["decision"].(string); decision != "request_changes" {
+		t.Errorf("expected metadata.decision=request_changes, got %v", meta["decision"])
 	}
 	if target, _ := meta["reviews_target"].(string); target != "draft" {
 		t.Errorf("expected metadata.reviews_target=draft, got %v", meta["reviews_target"])
@@ -3848,14 +3866,14 @@ func TestMultiReviewerAnyRejectKills(t *testing.T) {
 	if r1["status"] != "collecting" {
 		t.Fatalf("expected collecting after alice approve, got %v", r1["status"])
 	}
-	// Bob rejects — any-reject fires immediately.
-	r2 := s.submitReviewAs("check", bob, "This is wrong.", "reject")
+	// Bob requests changes — any-reject fires immediately.
+	r2 := s.submitReviewAs("check", bob, "This needs work.", "request_changes")
 	if r2["status"] != "accepted" {
-		t.Fatalf("expected accepted after bob reject (any-reject rule), got %v", r2)
+		t.Fatalf("expected accepted after bob request_changes (any-reject rule), got %v", r2)
 	}
 	tally, _ := r2["review_tally"].(map[string]interface{})
-	if tally == nil || tally["verdict"] != "reject" {
-		t.Errorf("expected verdict=reject in review_tally, got %v", tally)
+	if tally == nil || tally["verdict"] != "request_changes" {
+		t.Errorf("expected verdict=request_changes in review_tally, got %v", tally)
 	}
 	cascade, _ := r2["review_cascade"].(map[string]interface{})
 	if cascade == nil || cascade["target"] != "draft" {
@@ -3865,7 +3883,7 @@ func TestMultiReviewerAnyRejectKills(t *testing.T) {
 	// Draft should be back to READY; check task should be
 	// PENDING (invalidated via cascade).
 	if ds := s.taskGet("draft"); ds["state"] != "ready" {
-		t.Errorf("expected draft ready after reject, got %v", ds["state"])
+		t.Errorf("expected draft ready after request_changes, got %v", ds["state"])
 	}
 	if cs := s.taskGet("check"); cs["state"] != "pending" {
 		t.Errorf("expected check pending after cascade, got %v", cs["state"])
@@ -3873,6 +3891,137 @@ func TestMultiReviewerAnyRejectKills(t *testing.T) {
 
 	// Charlie can't submit anymore — the task was invalidated.
 	_ = charlie
+}
+
+// TestReviewHardRejectFailsTarget verifies that the "reject"
+// decision is a hard kill — the reviewed target goes to FAILED
+// (terminal), unlike "request_changes" which bounces to READY.
+func TestReviewHardRejectFailsTarget(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	yaml := `
+name: hard reject test
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Review the draft."
+`
+	s.submitInlineYAML(yaml)
+
+	s.claim("draft", alice)
+	s.submit("draft", "A terrible draft.")
+	s.claim("check", bob)
+	res := s.submitReview("check", "Fundamentally wrong direction.", "reject")
+	if res["status"] != "accepted" {
+		t.Fatalf("expected accepted, got %v", res)
+	}
+
+	// Target should be FAILED, not READY.
+	draft := s.taskGet("draft")
+	if draft["state"] != "failed" {
+		t.Errorf("expected draft FAILED after hard reject, got %v", draft["state"])
+	}
+}
+
+// TestReviewCommentIsNonBlocking verifies that the "comment"
+// decision records the review but doesn't change the target's
+// state — it's a non-blocking note.
+func TestReviewCommentIsNonBlocking(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	yaml := `
+name: comment test
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: check
+    action: review
+    reviews: draft
+    prompt: "Review the draft."
+  - id: publish
+    action: answer
+    prompt: "Publish based on {{draft.content}}"
+`
+	s.submitInlineYAML(yaml)
+
+	s.claim("draft", alice)
+	s.submit("draft", "A solid draft.")
+	s.claim("check", bob)
+	res := s.submitReview("check", "Minor typo on line 3, but fine overall.", "comment")
+	if res["status"] != "accepted" {
+		t.Fatalf("expected accepted, got %v", res)
+	}
+
+	// Draft should still be accepted (not bounced to READY).
+	draft := s.taskGet("draft")
+	if draft["state"] != "accepted" {
+		t.Errorf("expected draft still accepted after comment, got %v", draft["state"])
+	}
+
+	// Publish should now be ready (review task is done, draft is accepted).
+	publish := s.taskGet("publish")
+	if publish["state"] != "ready" {
+		t.Errorf("expected publish ready after comment review, got %v", publish["state"])
+	}
+}
+
+// TestMultiReviewerHardRejectOverridesSoft verifies that in a
+// multi-reviewer tally, a single hard "reject" overrides any
+// "request_changes" verdicts — the target goes FAILED, not READY.
+func TestMultiReviewerHardRejectOverridesSoft(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	charlie := s.register("charlie")
+
+	yaml := `
+name: hard vs soft reject
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: check
+    action: review
+    reviews: draft
+    citizens: 3
+    prompt: "Review the draft."
+`
+	s.submitInlineYAML(yaml)
+
+	s.claim("draft", alice)
+	s.submit("draft", "A draft.")
+	s.claim("check", alice)
+	s.claim("check", bob)
+	s.claim("check", charlie)
+
+	// Bob hard rejects first — any-reject-kills resolves immediately
+	// with verdict=reject (hard), since hasHardReject is true.
+	r1 := s.submitReviewAs("check", bob, "Completely wrong.", "reject")
+
+	tally, _ := r1["review_tally"].(map[string]interface{})
+	if tally != nil && tally["verdict"] != nil {
+		if tally["verdict"] != "reject" {
+			t.Errorf("expected hard reject verdict, got %v", tally["verdict"])
+		}
+	}
+
+	// Target should be FAILED (hard reject).
+	draft := s.taskGet("draft")
+	if draft["state"] != "failed" {
+		t.Errorf("expected draft FAILED after hard reject in tally, got %v", draft["state"])
+	}
 }
 
 // TestVoteResponsesTemplate — downstream task reads
@@ -4168,8 +4317,8 @@ tasks:
 	if r1["status"] != "collecting" {
 		t.Fatalf("expected collecting after alice approve, got %v", r1["status"])
 	}
-	// Bob rejects — any-reject-kills fires, task resolves.
-	r2 := s.submitReviewAs("check", bob, "Nope.", "reject")
+	// Bob requests changes — any-reject-kills fires, task resolves.
+	r2 := s.submitReviewAs("check", bob, "Nope.", "request_changes")
 	if r2["status"] != "accepted" {
 		t.Fatalf("expected accepted after bob reject, got %v", r2)
 	}
@@ -4205,7 +4354,7 @@ func TestReviewResponsesTemplate(t *testing.T) {
 	s.claim("peer_review", alice)
 	s.claim("peer_review", bob)
 	s.claim("peer_review", charlie)
-	s.submitReviewAs("peer_review", charlie, "I'd prefer Postgres.", "reject")
+	s.submitReviewAs("peer_review", charlie, "I'd prefer Postgres.", "request_changes")
 	s.submitReviewAs("peer_review", alice, "Works for me.", "approve")
 	s.submitReviewAs("peer_review", bob, "Concerns about tooling.", "approve")
 
@@ -4227,7 +4376,7 @@ func TestReviewResponsesTemplate(t *testing.T) {
 	for _, want := range []string{
 		"@alice", "@bob", "@charlie",
 		"approve",
-		"reject",
+		"request_changes",
 		"Works for me.",
 		"Concerns about tooling.",
 		"I'd prefer Postgres.",

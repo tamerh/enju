@@ -1539,9 +1539,17 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		if actions.ShouldRejectTarget && actions.RejectTargetID != "" {
 			res, err := s.performInvalidate(actions.RejectTargetID)
 			if err != nil {
-				s.logger.Error("review-reject cascade", "target", actions.RejectTargetID, "error", err)
+				s.logger.Error("review-request_changes cascade", "target", actions.RejectTargetID, "error", err)
 			} else {
 				rejectResult = res
+			}
+		}
+		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
+			plan, err := s.engine().ComputeFailTask(actions.RejectTargetID, "rejected by reviewer")
+			if err != nil {
+				s.logger.Error("review-reject fail: compute", "target", actions.RejectTargetID, "error", err)
+			} else if _, err := s.store.ApplyPlan(*plan); err != nil {
+				s.logger.Error("review-reject fail: apply", "target", actions.RejectTargetID, "error", err)
 			}
 		}
 		if actions.VoteResolvePlan != nil {

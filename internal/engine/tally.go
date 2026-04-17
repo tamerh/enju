@@ -65,12 +65,17 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 		return nil, fmt.Errorf("listing review submissions: %w", err)
 	}
 	out := &ReviewTallyOutcome{TotalReviews: len(submissions)}
+	hasHardReject := false
 	for _, sub := range submissions {
 		switch sub.Option {
 		case "approve":
 			out.Approves++
 		case "reject":
 			out.Rejects++
+			hasHardReject = true
+		case "request_changes":
+			out.Rejects++
+		// "comment" is non-blocking — doesn't count toward tally.
 		}
 	}
 
@@ -87,11 +92,19 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 		}
 	}
 
+	// negativeVerdict picks the strongest negative: any hard reject
+	// overrides request_changes. Multi-reviewer consensus: if even
+	// one reviewer said "reject" (hard kill), the verdict is reject.
+	negativeVerdict := "request_changes"
+	if hasHardReject {
+		negativeVerdict = "reject"
+	}
+
 	switch {
 	case policy == "any-reject-kills":
 		if out.Rejects > 0 {
 			out.Resolved = true
-			out.Verdict = "reject"
+			out.Verdict = negativeVerdict
 			return out, nil
 		}
 		if out.Approves < needed {
@@ -103,7 +116,7 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 	case policy == "unanimous-approve":
 		if out.Rejects > 0 {
 			out.Resolved = true
-			out.Verdict = "reject"
+			out.Verdict = negativeVerdict
 			return out, nil
 		}
 		if out.Approves < needed {
@@ -120,7 +133,7 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 		}
 		if out.Rejects*2 >= needed {
 			out.Resolved = true
-			out.Verdict = "reject"
+			out.Verdict = negativeVerdict
 			return out, nil
 		}
 		pending := needed - out.TotalReviews
@@ -148,7 +161,7 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 		}
 		if out.Approves+pending < requiredApproves {
 			out.Resolved = true
-			out.Verdict = "reject"
+			out.Verdict = negativeVerdict
 			return out, nil
 		}
 		out.Reason = fmt.Sprintf("percent:%d not yet met (%d of %d needed)",

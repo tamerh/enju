@@ -75,12 +75,12 @@ func (e *Engine) ValidateSubmitRequest(
 	// Decision validation for review tasks.
 	if task.Action == "review" {
 		switch req.Decision {
-		case "approve", "reject":
+		case "approve", "reject", "request_changes", "comment":
 			decision = req.Decision
 		case "":
-			return "", "", "", 0, fmt.Errorf(`decision is required on action:review tasks (must be "approve" or "reject")`)
+			return "", "", "", 0, fmt.Errorf(`decision is required on action:review tasks (must be "approve", "request_changes", "reject", or "comment")`)
 		default:
-			return "", "", "", 0, fmt.Errorf(`decision %q is invalid (must be "approve" or "reject")`, req.Decision)
+			return "", "", "", 0, fmt.Errorf(`decision %q is invalid (must be "approve", "request_changes", "reject", or "comment")`, req.Decision)
 		}
 	}
 
@@ -142,8 +142,9 @@ type PostSubmitActions struct {
 
 	// Review resolution.
 	ReviewTally        *ReviewTallyOutcome
-	ShouldRejectTarget bool
-	RejectTargetID     string // full ID of the review target to invalidate
+	ShouldRejectTarget bool   // request_changes: invalidate → READY for revision
+	ShouldFailTarget   bool   // reject: hard kill → FAILED, terminal
+	RejectTargetID     string // full ID of the review target
 	ReviewResolvePlan  *store.Plan // SetTaskState → ACCEPTED if review tally resolved
 
 	// Vote resolution.
@@ -207,9 +208,15 @@ func (e *Engine) ComputePostSubmitActions(
 	if task.Action == "review" && task.ReviewsTarget != "" {
 		if submitOutcome.Resolved {
 			// Single-reviewer — decision is final.
-			actions.ShouldRejectTarget = decision == "reject"
-			if actions.ShouldRejectTarget {
-				actions.RejectTargetID = fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+			// comment is non-blocking (no state change on target).
+			targetID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+			switch decision {
+			case "request_changes":
+				actions.ShouldRejectTarget = true
+				actions.RejectTargetID = targetID
+			case "reject":
+				actions.ShouldFailTarget = true
+				actions.RejectTargetID = targetID
 			}
 		} else if submitOutcome.Collecting {
 			// Multi-reviewer — run the tally.
@@ -217,9 +224,14 @@ func (e *Engine) ComputePostSubmitActions(
 			if err == nil && outcome != nil {
 				actions.ReviewTally = outcome
 				if outcome.Resolved {
-					if outcome.Verdict == "reject" {
+					targetID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+					switch outcome.Verdict {
+					case "reject":
+						actions.ShouldFailTarget = true
+						actions.RejectTargetID = targetID
+					case "request_changes":
 						actions.ShouldRejectTarget = true
-						actions.RejectTargetID = fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
+						actions.RejectTargetID = targetID
 					}
 					actions.ReviewResolvePlan = &store.Plan{
 						Version: EngineVersion,
