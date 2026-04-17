@@ -1741,8 +1741,8 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	// Any non-empty decision must be valid, regardless of action.
 	// The "required for review" check happens in the fat-client
 	// pre-validation and on the coordinator.
-	if decision != "" && decision != "approve" && decision != "reject" {
-		return mcp.NewToolResultError(invalidDecisionMessage(decision)), nil
+	if errMsg := validateReviewDecision(decision); decision != "" && errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Parse outputs_json into two buckets: plain string
@@ -2129,7 +2129,7 @@ func validateReviewDecision(decision string) string {
 // don't see three slightly-different wordings from three
 // different validation points.
 func invalidDecisionMessage(decision string) string {
-	return fmt.Sprintf("decision %q is invalid (must be \"approve\" or \"reject\")", decision)
+	return fmt.Sprintf("decision %q is invalid (must be \"approve\", \"request_changes\", \"reject\", or \"comment\")", decision)
 }
 
 // validateVoteOption is the client-side pre-validation guard for
