@@ -1641,11 +1641,17 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 			reviewLine += fmt.Sprintf(" (by @%s)", by)
 		}
 		b.WriteString(reviewLine + "\n")
-		if p, _ := task["_review_target_path"].(string); p != "" {
+		// Prefer absolute path; fall back to relative.
+		if absPath, _ := task["_review_target_abs_path"].(string); absPath != "" {
+			b.WriteString(fmt.Sprintf("  Path:     %s\n", absPath))
+		} else if p, _ := task["_review_target_path"].(string); p != "" {
 			b.WriteString(fmt.Sprintf("  Path:     %s/result.md\n", p))
 		}
 		if c, _ := task["_review_target_commit"].(string); c != "" {
 			b.WriteString(fmt.Sprintf("  Commit:   %s\n", shortSHA(c)))
+		}
+		if preview, _ := task["_review_target_preview"].(string); preview != "" {
+			b.WriteString(fmt.Sprintf("  Preview:  %s\n", preview))
 		}
 	}
 	if decision, _ := task["review_decision"].(string); decision != "" {

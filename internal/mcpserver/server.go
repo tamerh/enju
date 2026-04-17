@@ -2536,9 +2536,29 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 					if targetData, terr := c.get(ctx, "/api/v1/tasks/"+targetFullID); terr == nil {
 						var target map[string]interface{}
 						if json.Unmarshal(targetData, &target) == nil {
-							taskMap["_review_target_path"] = target["result_path"]
-							taskMap["_review_target_commit"] = target["commit_sha"]
+							resultPath, _ := target["result_path"].(string)
+							commitSHA, _ := target["commit_sha"].(string)
+							taskMap["_review_target_path"] = resultPath
+							taskMap["_review_target_commit"] = commitSHA
 							taskMap["_review_target_claimed_by"] = target["claimed_by"]
+
+							// Read preview from local workspace if available.
+							if c.workspace != nil && resultPath != "" {
+								remoteURL, _ := taskMap["project_remote_url"].(string)
+								projName, _ := taskMap["project_name"].(string)
+								if proj, perr := c.workspace.ForProject(int64(projectID), remoteURL, projName); perr == nil {
+									taskMap["_review_target_abs_path"] = filepath.Join(proj.WorkDir(), resultPath, "result.md")
+									contentPath := filepath.Join(resultPath, "result.md")
+									if content, rerr := proj.ReadFile(contentPath); rerr == nil {
+										preview := string(content)
+										if len(preview) > 200 {
+											preview = preview[:200] + "…"
+										}
+										taskMap["_review_target_preview"] = preview
+									}
+								}
+							}
+
 							// Re-marshal with the enriched fields.
 							data, _ = json.Marshal(taskMap)
 						}
