@@ -1,18 +1,20 @@
-.PHONY: build test test-llm clean run
+.PHONY: build test test-v test-llm clean run
 
 # Build
 build:
 	go build -o enju ./cmd/enju/
 
-# Unit + integration tests (fast, no LLM)
+# Unit + integration tests (fast, no LLM).
 test:
 	go test ./... -count=1
 
-# Unit + integration tests with verbose output
+# Same but verbose.
 test-v:
 	go test ./... -v -count=1
 
-# Full test suite including LLM tests (uses claude -p, costs tokens)
+# Full test suite with the LLM-mode variants enabled (uses
+# `claude -p`, costs tokens). Only a small number of tests
+# check ENJU_LLM_TEST and branch on it; the rest run as-is.
 test-llm:
 	ENJU_LLM_TEST=1 go test ./... -v -count=1 -timeout 300s
 

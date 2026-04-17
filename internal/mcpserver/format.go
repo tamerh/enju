@@ -1331,7 +1331,7 @@ func formatArtifactHistory(data []byte) string {
 	return b.String()
 }
 
-func formatRunStatus(runData []byte, tasksData []byte) string {
+func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return string(runData)
@@ -1349,6 +1349,12 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		return fmt.Sprintf("✗ Run not found: %s", errMsg)
 	}
 
+	viewerName := ""
+	if len(viewer) > 0 {
+		viewerName = viewer[0]
+	}
+	_ = viewerName // used below in renderYourQueue
+
 	var tasks []map[string]interface{}
 	if err := json.Unmarshal(tasksData, &tasks); err != nil {
 		return string(tasksData)
@@ -1359,6 +1365,7 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	name, _ := run["name"].(string)
 	state, _ := run["state"].(string)
 	projectID := jsonID(run["project_id"])
+	projectName, _ := run["_project_name"].(string)
 	seq, _ := run["seq"].(float64)
 
 	// Count by state
@@ -1385,7 +1392,12 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 		}
 		progressLine += fmt.Sprintf(" (%s)", parts)
 	}
-	b.WriteString(fmt.Sprintf("Project #%s → Run #%d: %s\n", projectID, int(seq), name))
+	header := fmt.Sprintf("Project #%s", projectID)
+	if projectName != "" {
+		header += " (" + projectName + ")"
+	}
+	header += fmt.Sprintf(" → Run #%d: %s", int(seq), name)
+	b.WriteString(header + "\n")
 	if sourcePath, _ := run["source_path"].(string); sourcePath != "" {
 		line := fmt.Sprintf("Source: %s", sourcePath)
 		if sourceSHA, _ := run["source_commit_sha"].(string); sourceSHA != "" {
@@ -1396,58 +1408,34 @@ func formatRunStatus(runData []byte, tasksData []byte) string {
 	b.WriteString(progressLine + "\n")
 	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
 
-	// Compact summary: counts by state + active claimants.
-	// This is the default view for runs of any size.
-	b.WriteString("  Ready:     ")
-	b.WriteString(fmt.Sprintf("%d", counts["ready"]))
-	if counts["collecting"] > 0 {
-		b.WriteString(fmt.Sprintf("  Collecting: %d", counts["collecting"]))
+	// Failed tasks at top — needs immediate attention.
+	var failedTasks []map[string]interface{}
+	for _, t := range tasks {
+		if s, _ := t["state"].(string); s == "failed" {
+			failedTasks = append(failedTasks, t)
+		}
 	}
-	b.WriteString("\n")
-	if counts["claimed"] > 0 || counts["running"] > 0 {
-		b.WriteString(fmt.Sprintf("  Claimed:   %d", counts["claimed"]+counts["running"]))
-		// Show who's working on what.
-		var workers []string
-		for _, t := range tasks {
-			ts, _ := t["state"].(string)
-			if ts == "claimed" || ts == "running" {
-				claimedBy, _ := t["claimed_by"].(string)
-				tid, _ := t["id"].(string)
-				if claimedBy != "" {
-					// Use short task ID (last segment).
-					parts := strings.Split(tid, ":")
-					short := parts[len(parts)-1]
-					if len(parts) >= 2 {
-						short = parts[len(parts)-2] + ":" + short
-					}
-					workers = append(workers, fmt.Sprintf("%s: %s", claimedBy, short))
-				}
+	if len(failedTasks) > 0 {
+		b.WriteString("  ❌ Failed:\n")
+		for _, t := range failedTasks {
+			tid, _ := t["id"].(string)
+			reason, _ := t["fail_reason"].(string)
+			line := fmt.Sprintf("    %s", tid)
+			if reason != "" {
+				line += " — " + reason
 			}
-		}
-		if len(workers) > 0 {
-			b.WriteString(fmt.Sprintf(" (%s)", strings.Join(workers, ", ")))
+			b.WriteString(line + "\n")
 		}
 		b.WriteString("\n")
 	}
-	if counts["pending"] > 0 {
-		b.WriteString(fmt.Sprintf("  Blocked:   %d\n", counts["pending"]))
-	}
-	if counts["accepted"] > 0 {
-		b.WriteString(fmt.Sprintf("  Completed: %d\n", counts["accepted"]))
-	}
-	if counts["skipped"] > 0 {
-		b.WriteString(fmt.Sprintf("  Skipped:   %d\n", counts["skipped"]))
-	}
 
-	// DAG tree view: show tasks as a dependency tree with
-	// unicode box-drawing connectors. For larger runs (>30),
-	// fall back to the compact summary only.
-	if total <= 30 {
-		b.WriteString("\n")
-		b.WriteString(renderDAGTree(tasks))
-	}
+	// Template-level summary: group by task_def_id, show
+	// counts per state. Readable regardless of DAG size.
+	b.WriteString(renderTemplateSummary(tasks))
 
-	b.WriteString("\nTip: Use enju_get_task(task_id=\"...\") to see full details.")
+	// Your queue: tasks the current viewer can act on
+	// (claimed by them or available to claim).
+	b.WriteString(renderYourQueue(tasks, viewerName))
 
 	return b.String()
 }
@@ -1635,6 +1623,106 @@ func taskShortName(t map[string]interface{}) string {
 		return instanceKey + ":" + taskDefID
 	}
 	return taskDefID
+}
+
+// renderTemplateSummary groups tasks by task_def_id and shows a
+// one-line summary per template: "discover  4/4 ✅" or
+// "review  1 in progress · 3 available".
+func renderTemplateSummary(tasks []map[string]interface{}) string {
+	type templateInfo struct {
+		defID string
+		total int
+		byState map[string]int
+		order int // preserve first-seen order
+	}
+	templates := map[string]*templateInfo{}
+	var order []string
+	for _, t := range tasks {
+		defID, _ := t["task_def_id"].(string)
+		if defID == "" {
+			continue
+		}
+		info, ok := templates[defID]
+		if !ok {
+			info = &templateInfo{defID: defID, byState: map[string]int{}, order: len(order)}
+			templates[defID] = info
+			order = append(order, defID)
+		}
+		s, _ := t["state"].(string)
+		info.total++
+		info.byState[s]++
+	}
+
+	var b strings.Builder
+	b.WriteString("By task:\n")
+	for _, defID := range order {
+		info := templates[defID]
+		done := info.byState["accepted"] + info.byState["skipped"]
+		allDone := done == info.total
+
+		// Build status description.
+		var statusParts []string
+		if allDone {
+			statusParts = append(statusParts, fmt.Sprintf("%d/%d ✅", done, info.total))
+		} else {
+			if n := info.byState["claimed"] + info.byState["running"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d in progress", n))
+			}
+			if n := info.byState["collecting"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d collecting", n))
+			}
+			if n := info.byState["ready"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d available", n))
+			}
+			if n := info.byState["pending"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d waiting", n))
+			}
+			if n := info.byState["accepted"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d done", n))
+			}
+			if n := info.byState["failed"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d failed", n))
+			}
+			if n := info.byState["skipped"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d skipped", n))
+			}
+		}
+		b.WriteString(fmt.Sprintf("  %-14s %s\n", defID, strings.Join(statusParts, " · ")))
+	}
+	return b.String()
+}
+
+// renderYourQueue shows tasks the viewer can act on: claimed by
+// them (finish first) and available to claim.
+func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
+	var claimed, available []map[string]interface{}
+	for _, t := range tasks {
+		s, _ := t["state"].(string)
+		claimedBy, _ := t["claimed_by"].(string)
+		if (s == "claimed" || s == "running") && claimedBy == viewer {
+			claimed = append(claimed, t)
+		} else if s == "ready" {
+			available = append(available, t)
+		}
+	}
+	if len(claimed) == 0 && len(available) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	total := len(claimed) + len(available)
+	b.WriteString(fmt.Sprintf("\nYour queue (%d):\n", total))
+	for _, t := range claimed {
+		name := taskShortName(t)
+		tid, _ := t["id"].(string)
+		b.WriteString(fmt.Sprintf("  🔵 %s [%s] — in progress\n", name, tid))
+	}
+	for _, t := range available {
+		name := taskShortName(t)
+		tid, _ := t["id"].(string)
+		b.WriteString(fmt.Sprintf("  🟡 %s [%s]\n", name, tid))
+	}
+	return b.String()
 }
 
 func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string {
@@ -2564,17 +2652,17 @@ func stateLabel(state string) string {
 	case "accepted":
 		return "completed"
 	case "ready":
-		return "available — claim this task"
+		return "available"
 	case "claimed", "running":
 		return "in progress"
 	case "pending":
-		return "blocked"
+		return "waiting"
 	case "invalid", "invalidated":
 		return "invalidated"
 	case "collecting":
-		return "collecting — waiting for more submissions"
+		return "collecting"
 	case "skipped":
-		return "skipped — losing branch of a vote"
+		return "skipped"
 	case "failed":
 		return "failed"
 	default:

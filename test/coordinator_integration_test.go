@@ -1,0 +1,1700 @@
+package test
+
+// Coordinator-layer integration tests.
+//
+// This file holds tests that verify coordinator invariants
+// independent of any client — state-machine rules (double-claim
+// rejection, submit-to-non-claimed, reaper timeouts), parser
+// contracts (YAML validation, atomic run creation), numbering
+// invariants (per-project run seq), auth middleware, and the
+// registration endpoint. These paths are called the same way by
+// every client (MCP today, future web UI / CLI worker), so
+// testing them at the REST layer gives honest coverage of the
+// coordinator contract without paying the MCP-handler +
+// workspace ceremony for every check.
+//
+// User-facing scenarios — claim/submit flows, review/vote
+// cycles, artifacts, access control, invalidation cascades,
+// templates, dynamic for_each — live in
+// mcp_integration_test.go and mcp_migrated_test.go. Those
+// exercise the MCP tool handlers end-to-end because that's the
+// layer where real users hit bugs (client-side pre-validation,
+// workspace interactions, format output).
+//
+// This file also hosts shared helpers (testServer, register,
+// submitYAML, taskID, readRepoFile, etc.) used by both test
+// layers. Moving them here keeps the split clear: one place for
+// engine-level setup, one set of files per user-scenario area.
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/enju-ai/enju/internal/api"
+	"github.com/enju-ai/enju/internal/mcpgit"
+	"github.com/enju-ai/enju/internal/store"
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+)
+
+// TestMain cleans the shared output directory before running tests.
+func TestMain(m *testing.M) {
+	os.RemoveAll(testOutputBase)
+	os.MkdirAll(testOutputBase, 0755)
+	os.Exit(m.Run())
+}
+
+// llmMode returns true when ENJU_LLM_TEST is set.
+func llmMode() bool {
+	return os.Getenv("ENJU_LLM_TEST") != ""
+}
+
+// answer returns an LLM-generated answer (via claude -p) or a canned answer.
+func answer(t *testing.T, prompt string, canned string) string {
+	t.Helper()
+	if !llmMode() {
+		return canned
+	}
+	t.Logf("LLM: asking claude -p: %.80s...", prompt)
+	out, err := exec.Command("claude", "-p", prompt).CombinedOutput()
+	if err != nil {
+		t.Fatalf("claude -p failed: %v\noutput: %s", err, out)
+	}
+	result := strings.TrimSpace(string(out))
+	t.Logf("LLM: got %d chars", len(result))
+	return result
+}
+
+// testServer wraps a running Enju coordinator for testing. Post the
+// iteration A orchestrator rewrite, the coordinator holds no git
+// state of its own — each project gets a bare repo under
+// `bareBaseDir` which acts as the project's "remote", and submits
+// are routed through a mcpgit.Workspace under `workspaceDir` so the
+// test client exercises the exact same fat-client code path the
+// real MCP server uses.
+type testServer struct {
+	t             *testing.T
+	server        *httptest.Server
+	url           string
+	bareBaseDir   string // base directory containing per-project bare remotes
+	workspaceDir  string // base directory for fat-client working clones
+	workspace     *mcpgit.Workspace
+	store         *store.Store // direct store access for testing reaper/internals
+	lastRunID     string       // "projectID:runSeq" of last submitted run
+	lastProjectID int64
+	lastRunSeq    int
+
+	// Per-project cached remote URLs so the submit helpers can pass
+	// them to the workspace without re-hitting the API.
+	muRemotes sync.Mutex
+	remotes   map[int64]string
+}
+
+// bareRemotePath returns the on-disk path of the bare repo acting
+// as a project's "remote". Used by test helpers that need to verify
+// what actually landed in the "remote".
+func (s *testServer) bareRemotePath(projectID int64) string {
+	return filepath.Join(s.bareBaseDir, fmt.Sprintf("%d", projectID))
+}
+
+// rememberRemote caches a project's remote URL so subsequent
+// submit/claim helpers can open the fat-client workspace without an
+// extra API round-trip.
+func (s *testServer) rememberRemote(projectID int64, url string) {
+	s.muRemotes.Lock()
+	defer s.muRemotes.Unlock()
+	s.remotes[projectID] = url
+}
+
+// remoteFor returns the cached remote URL for a project, fetching
+// it from the coordinator the first time if not yet cached.
+func (s *testServer) remoteFor(projectID int64) string {
+	s.muRemotes.Lock()
+	u, ok := s.remotes[projectID]
+	s.muRemotes.Unlock()
+	if ok {
+		return u
+	}
+	p := s.get(fmt.Sprintf("/api/v1/projects/%d", projectID))
+	if u, ok := p["remote_url"].(string); ok && u != "" {
+		s.rememberRemote(projectID, u)
+		return u
+	}
+	return ""
+}
+
+// testOutputDir is a fixed temp directory that gets symlinked into the run.
+const testOutputBase = "/tmp/enju-test-output"
+
+func newTestServer(t *testing.T) *testServer {
+	t.Helper()
+
+	// Create a test-specific subdirectory under the shared output base
+	testDir := filepath.Join(testOutputBase, t.Name())
+	os.RemoveAll(testDir)
+	os.MkdirAll(testDir, 0755)
+
+	dbPath := filepath.Join(testDir, "test.db")
+	bareBaseDir := filepath.Join(testDir, "bare-remotes")
+	workspaceDir := filepath.Join(testDir, "workspaces")
+	os.MkdirAll(bareBaseDir, 0755)
+	os.MkdirAll(workspaceDir, 0755)
+
+	// Ensure the symlink exists: test/output -> /tmp/enju-test-output
+	outputLink := filepath.Join(".", "output")
+	if target, err := os.Readlink(outputLink); err != nil || target != testOutputBase {
+		os.Remove(outputLink)
+		os.Symlink(testOutputBase, outputLink)
+	}
+
+	var logWriter io.Writer = io.Discard
+	if os.Getenv("ENJU_TEST_VERBOSE") != "" {
+		logWriter = os.Stderr
+	}
+	logger := slog.New(slog.NewTextHandler(logWriter, nil))
+
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	ws, err := mcpgit.NewWorkspace(workspaceDir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(st, logger)
+	ts := httptest.NewServer(srv.Router())
+	t.Cleanup(ts.Close)
+
+	return &testServer{
+		t:            t,
+		server:       ts,
+		url:          ts.URL,
+		bareBaseDir:  bareBaseDir,
+		workspaceDir: workspaceDir,
+		workspace:    ws,
+		store:        st,
+		remotes:      make(map[int64]string),
+	}
+}
+
+func (s *testServer) get(path string) map[string]interface{} {
+	s.t.Helper()
+	resp, err := http.Get(s.url + path)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+func (s *testServer) getList(path string) []interface{} {
+	s.t.Helper()
+	resp, err := http.Get(s.url + path)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result []interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+func (s *testServer) post(path string, body interface{}) map[string]interface{} {
+	s.t.Helper()
+	jsonBody, _ := json.Marshal(body)
+	resp, err := http.Post(s.url+path, "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+// register creates a citizen with the given display name. Returns the
+// username the server generated (same as the display name if it was a
+// clean slug, otherwise a slugified version or a suffixed variant on
+// collision). Tests use the returned username everywhere that used to
+// use the citizen id.
+func (s *testServer) register(name string) string {
+	s.t.Helper()
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": name})
+	username, ok := resp["username"].(string)
+	if !ok {
+		s.t.Fatalf("register failed: %v", resp)
+	}
+	return username
+}
+
+func (s *testServer) registerWithEmail(name, email string) string {
+	s.t.Helper()
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": name, "email": email})
+	username, ok := resp["username"].(string)
+	if !ok {
+		s.t.Fatalf("register failed: %v", resp)
+	}
+	return username
+}
+
+// citizenID resolves a username to the internal int64 primary key via
+// the store (skipping the API). Tests that need the PK for direct store
+// operations like SetCitizenRole call this.
+func (s *testServer) citizenID(username string) int64 {
+	s.t.Helper()
+	c, err := s.store.GetCitizenByUsername(username)
+	if err != nil || c == nil {
+		s.t.Fatalf("citizenID: username %q not found", username)
+	}
+	return c.ID
+}
+
+func (s *testServer) getCitizen(username string) map[string]interface{} {
+	s.t.Helper()
+	return s.get("/api/v1/citizens/by-username/" + username)
+}
+
+func (s *testServer) updateProfile(username, name, email string) map[string]interface{} {
+	s.t.Helper()
+	jsonBody, _ := json.Marshal(map[string]string{"name": name, "email": email})
+	req, _ := http.NewRequest("PUT", s.url+"/api/v1/citizens/by-username/"+username+"/profile", bytes.NewReader(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+// createTestProject creates a fresh test project per call (unique
+// name to avoid conflicts). In the iteration A model, every project
+// needs a remote — the test helper spins up a bare repo on disk and
+// passes its path as remote_url, so the fat-client submit path has
+// somewhere to push.
+func (s *testServer) createTestProject() int64 {
+	s.t.Helper()
+	// Unique name — timestamp + counter-ish from test server
+	name := fmt.Sprintf("test-%d", time.Now().UnixNano())
+
+	// Pick a bare-remote path unique to this project. We don't know
+	// the project ID yet so hash the timestamp suffix.
+	barePath := filepath.Join(s.bareBaseDir, name)
+	if _, err := gogit.PlainInitWithOptions(barePath, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+		Bare: true,
+	}); err != nil {
+		s.t.Fatalf("init bare remote: %v", err)
+	}
+	// Seed with an empty README commit on main so clones and pushes
+	// have a base to work from.
+	seedDir, err := os.MkdirTemp(s.bareBaseDir, "seed-")
+	if err != nil {
+		s.t.Fatalf("mkdir seed: %v", err)
+	}
+	defer os.RemoveAll(seedDir)
+	sRepo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		s.t.Fatalf("init seed: %v", err)
+	}
+	if _, err := sRepo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{barePath},
+	}); err != nil {
+		s.t.Fatalf("create seed remote: %v", err)
+	}
+	wt, _ := sRepo.Worktree()
+	readme := filepath.Join(seedDir, "README.md")
+	_ = os.WriteFile(readme, []byte("# "+name+"\n"), 0644)
+	_, _ = wt.Add("README.md")
+	sig := &object.Signature{Name: "Test", Email: "test@localhost", When: time.Unix(1700000000, 0)}
+	if _, err := wt.Commit("initial", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
+		s.t.Fatalf("seed commit: %v", err)
+	}
+	if err := sRepo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
+		s.t.Fatalf("seed push: %v", err)
+	}
+
+	resp := s.post("/api/v1/projects", map[string]string{
+		"name":       name,
+		"remote_url": barePath,
+	})
+	id, _ := resp["id"].(float64)
+	if id == 0 {
+		s.t.Fatalf("failed to create test project: %v", resp)
+	}
+	projectID := int64(id)
+	s.rememberRemote(projectID, barePath)
+	return projectID
+}
+
+// createTestProjectAt creates a project at a specific bare remote
+// path. Used by tests that need to share a remote across calls or
+// verify external remote behavior. For the normal per-test case
+// just call createTestProject().
+func (s *testServer) createTestProjectAt(name, barePath string) int64 {
+	s.t.Helper()
+	resp := s.post("/api/v1/projects", map[string]string{
+		"name":       name,
+		"remote_url": barePath,
+	})
+	id, _ := resp["id"].(float64)
+	if id == 0 {
+		s.t.Fatalf("failed to create test project: %v", resp)
+	}
+	projectID := int64(id)
+	s.rememberRemote(projectID, barePath)
+	return projectID
+}
+
+func (s *testServer) submitYAML(path string) string {
+	s.t.Helper()
+	// Auto-create a test project
+	projectID := s.createTestProject()
+	return s.submitYAMLToProject(path, projectID)
+}
+
+func (s *testServer) submitYAMLToProject(path string, projectID int64) string {
+	s.t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]string{
+		"yaml": string(data),
+	})
+
+	// The run's per-project sequence is what we use for task ID prefixing
+	seqFloat, _ := resp["seq"].(float64)
+	if seqFloat == 0 {
+		s.t.Fatalf("submit failed: %v", resp)
+		return ""
+	}
+
+	// Track project_id and run_seq for task auto-prefixing
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seqFloat)
+	s.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seqFloat))
+	return s.lastRunID
+}
+
+// submitInlineYAML creates a run from an inline YAML string (no file needed).
+func (s *testServer) submitInlineYAML(yamlContent string) string {
+	s.t.Helper()
+	projectID := s.createTestProject()
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]string{
+		"yaml": yamlContent,
+	})
+	seqFloat, _ := resp["seq"].(float64)
+	if seqFloat == 0 {
+		s.t.Fatalf("submit failed: %v", resp)
+		return ""
+	}
+	s.lastProjectID = projectID
+	s.lastRunSeq = int(seqFloat)
+	s.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seqFloat))
+	return s.lastRunID
+}
+
+// taskID returns the full task ID (project-run-prefixed) for the most recently submitted run.
+// Format: {projectID}:{runSeq}:{shortID} or {projectID}:{runSeq}:{instanceKey}:{taskDefID}
+func (s *testServer) taskID(shortID string) string {
+	// Already fully qualified if it starts with an integer that matches the last project
+	if strings.Contains(shortID, ":") {
+		parts := strings.SplitN(shortID, ":", 2)
+		if _, err := strconv.Atoi(parts[0]); err == nil {
+			// looks like it already starts with projectID
+			return shortID
+		}
+	}
+	if s.lastProjectID > 0 && s.lastRunSeq > 0 {
+		return fmt.Sprintf("%d:%d:%s", s.lastProjectID, s.lastRunSeq, shortID)
+	}
+	return shortID
+}
+
+func (s *testServer) readyTasks(runID string) []interface{} {
+	s.t.Helper()
+	path := "/api/v1/tasks/ready"
+	if runID != "" {
+		// runID is "projectID:runSeq" — split into separate query params
+		parts := strings.SplitN(runID, ":", 2)
+		if len(parts) == 2 {
+			path += "?project_id=" + parts[0] + "&run_id=" + parts[1]
+		} else {
+			path += "?run_id=" + runID
+		}
+	}
+	return s.getList(path)
+}
+
+// claim posts a claim request on behalf of the given username.
+// The parameter is named citizenID for historical reasons but tests
+// now pass the username (which is returned by register()).
+func (s *testServer) claim(taskID, username string) map[string]interface{} {
+	s.t.Helper()
+	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/claim", map[string]string{"username": username})
+}
+
+// submit writes a text result via the fat-client path: compute the
+// task's expected result layout, write result.md + metadata.json to
+// the project's local clone, commit+push via mcpgit, then POST the
+// report with commit_sha to the coordinator. This exercises the
+// exact code path the real MCP client uses.
+func (s *testServer) submit(taskID, content string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmit(taskID, content, nil, nil)
+}
+
+// submitWithArtifacts is submit + artifact writes in one atomic commit.
+func (s *testServer) submitWithArtifacts(taskID, content string, artifacts map[string]string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmit(taskID, content, nil, artifacts)
+}
+
+// submitOutputs submits a named-outputs result. Named outputs are
+// serialized as a single result.json for the A.3 first cut; the
+// follow-up iteration will support multi-file named output schemas.
+func (s *testServer) submitOutputs(taskID string, outputs map[string]string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmit(taskID, "", outputs, nil)
+}
+
+// submitReview is the review-action variant of submit: writes the
+// reviewer's comment as result.md, commits/pushes, and posts the
+// report with decision:approve or decision:reject. Mirrors what
+// the MCP client sends on a real review submission.
+func (s *testServer) submitReview(taskID, comment, decision string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecision(taskID, comment, nil, nil, decision, "")
+}
+
+// submitReviewAs is the multi-reviewer variant — names which
+// reviewer is casting this verdict so the coordinator credits
+// the right task_claims slot and writes the prose into the
+// correct citizen-{username}/ subdirectory.
+func (s *testServer) submitReviewAs(taskID, username, comment, decision string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecisionAs(taskID, username, comment, nil, nil, decision, "")
+}
+
+// submitVote is the vote-action variant of submit: writes the
+// voter's commentary as result.md, commits/pushes, and posts
+// the report with option:<option_id>. Mirrors what the MCP
+// client sends on a real vote submission. Defaults to the
+// single-voter "test" username for session-1-style submissions.
+func (s *testServer) submitVote(taskID, comment, option string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecisionAs(taskID, "", comment, nil, nil, "", option)
+}
+
+// submitVoteAs is the multi-voter variant: names which citizen is
+// casting this vote so the coordinator credits the right
+// task_claims slot and writes the result into the correct
+// citizen-{username}/ subdirectory.
+func (s *testServer) submitVoteAs(taskID, username, comment, option string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecisionAs(taskID, username, comment, nil, nil, "", option)
+}
+
+// fatClientSubmit is the shared helper that performs the full
+// iteration A write path: open the project's local clone, write
+// result files + artifacts, commit + push to the project's bare
+// remote, then POST the metadata report to the coordinator.
+func (s *testServer) fatClientSubmit(taskIDShort, content string, outputs, artifacts map[string]string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecision(taskIDShort, content, outputs, artifacts, "", "")
+}
+
+// fatClientSubmitWithDecision is fatClientSubmit with a review
+// decision and/or vote option attached. Review tasks pass
+// "approve" / "reject" in decision; vote tasks pass the chosen
+// option id in voteOption; other actions pass empty strings.
+func (s *testServer) fatClientSubmitWithDecision(taskIDShort, content string, outputs, artifacts map[string]string, decision, voteOption string) map[string]interface{} {
+	s.t.Helper()
+	return s.fatClientSubmitWithDecisionAs(taskIDShort, "", content, outputs, artifacts, decision, voteOption)
+}
+
+// fatClientSubmitWithDecisionAs is the multi-citizen variant: takes
+// an explicit username identifying which citizen is submitting.
+// For multi-citizen tasks the result lands under a
+// `citizen-<username>/` subdirectory so parallel submissions
+// don't race on the same result.md. When asUser is empty, the
+// helper uses the generic test identity (single-citizen shape).
+func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content string, outputs, artifacts map[string]string, decision, voteOption string) map[string]interface{} {
+	s.t.Helper()
+	fullTaskID := s.taskID(taskIDShort)
+
+	// Fetch task metadata so we know run_seq, task_def_id,
+	// instance_key, project_id (all needed to compute the result
+	// layout).
+	task := s.get("/api/v1/tasks/" + fullTaskID)
+	if errMsg, ok := task["error"].(string); ok {
+		s.t.Fatalf("fetchTask %q: %s", fullTaskID, errMsg)
+	}
+	projectID := int64(task["project_id"].(float64))
+	runSeq := int(task["run_seq"].(float64))
+	taskDefID, _ := task["task_def_id"].(string)
+	instanceKey, _ := task["instance_key"].(string)
+
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		s.t.Fatalf("project %d has no remote_url configured", projectID)
+	}
+
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		s.t.Fatalf("open project %d: %v", projectID, err)
+	}
+
+	// Phase E.2 session 2a — multi-citizen tasks route each
+	// submission into `citizen-<username>/` under the task's
+	// base result directory so parallel submitters don't race
+	// on the same result.md. Session-1 single-citizen tasks
+	// keep the flat layout.
+	baseResultDir := mcpgit.ResultDir(runSeq, instanceKey, taskDefID)
+	resultDir := baseResultDir
+	citizens := int64(1)
+	if v, ok := task["citizens"].(float64); ok {
+		citizens = int64(v)
+	}
+	if citizens > 1 {
+		voterUser := asUser
+		if voterUser == "" {
+			voterUser = "test"
+		}
+		resultDir = filepath.Join(baseResultDir, "citizen-"+voterUser)
+	}
+	files := []mcpgit.FileWrite{}
+	metadata := map[string]interface{}{
+		"task_id":     fullTaskID,
+		"model":       "test",
+		"result_type": "text",
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	// Phase E review-action audit trail. Mirror what
+	// submitResultFatClient does in production: when the task is
+	// action:review, embed action + decision + reviews_target in
+	// metadata.json so `git show` on the commit tells the full
+	// verdict story without touching the coordinator DB.
+	action, _ := task["action"].(string)
+	if action == "review" {
+		metadata["action"] = "review"
+		metadata["decision"] = decision
+		if rt, _ := task["reviews_target"].(string); rt != "" {
+			metadata["reviews_target"] = rt
+		}
+	}
+	if action == "vote" {
+		metadata["action"] = "vote"
+		metadata["option"] = voteOption
+		if voteOptsRaw, _ := task["vote_options"].(string); voteOptsRaw != "" {
+			var parsed interface{}
+			if json.Unmarshal([]byte(voteOptsRaw), &parsed) == nil {
+				metadata["options"] = parsed
+			}
+		}
+	}
+	if content != "" {
+		files = append(files, mcpgit.FileWrite{
+			RepoRelPath: filepath.Join(resultDir, "result.md"),
+			Content:     []byte(content),
+		})
+	}
+	if outputs != nil {
+		metadata["result_type"] = "json"
+		metadata["named_outputs"] = true
+		// If the task declares a schema with file: specs, write
+		// each output to its own file per the schema. Otherwise
+		// serialize the outputs map as a single result.json.
+		schemaJSON, _ := task["outputs"].(string)
+		schema := mcpgit.ParseNamedOutputSchema(schemaJSON)
+		hasFileSpec := false
+		for _, sp := range schema {
+			if sp.File != "" {
+				hasFileSpec = true
+				break
+			}
+		}
+		if hasFileSpec {
+			outFiles, fileIndex := mcpgit.BuildNamedOutputFiles(resultDir, schema, outputs)
+			files = append(files, outFiles...)
+			metadata["output_files"] = fileIndex
+		} else {
+			outBytes, _ := json.MarshalIndent(outputs, "", "  ")
+			files = append(files, mcpgit.FileWrite{
+				RepoRelPath: filepath.Join(resultDir, "result.json"),
+				Content:     outBytes,
+			})
+		}
+	}
+	if content == "" && outputs == nil && len(artifacts) == 0 {
+		s.t.Fatalf("submit with no content, outputs, or artifacts")
+	}
+	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
+	files = append(files, mcpgit.FileWrite{
+		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
+		Content:     metaBytes,
+	})
+	var artifactPaths []string
+	if len(artifacts) > 0 {
+		for p := range artifacts {
+			artifactPaths = append(artifactPaths, p)
+		}
+		// Deterministic ordering so commit message body matches.
+		for i := 1; i < len(artifactPaths); i++ {
+			for j := i; j > 0 && artifactPaths[j-1] > artifactPaths[j]; j-- {
+				artifactPaths[j-1], artifactPaths[j] = artifactPaths[j], artifactPaths[j-1]
+			}
+		}
+		for _, p := range artifactPaths {
+			files = append(files, mcpgit.FileWrite{
+				RepoRelPath: mcpgit.ArtifactPath(p),
+				Content:     []byte(artifacts[p]),
+			})
+		}
+	}
+
+	proj.Lock()
+	res, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+		TaskID:        fullTaskID,
+		Username:      "test",
+		AuthorName:    "Test Citizen",
+		AuthorEmail:   "test@enju.local",
+		Files:         files,
+		ArtifactPaths: artifactPaths,
+	})
+	proj.Unlock()
+	if err != nil {
+		s.t.Fatalf("fat-client submit for %q: %v", fullTaskID, err)
+	}
+
+	// Report the commit to the coordinator so state machine +
+	// artifact index get updated.
+	reportBody := map[string]interface{}{
+		"commit_sha":        res.CommitSHA,
+		"result_path":       resultDir,
+		"artifacts_written": artifactPaths,
+		"tokens_used":       100,
+		"model":             "test",
+	}
+	if asUser != "" {
+		reportBody["username"] = asUser
+	}
+	if decision != "" {
+		reportBody["decision"] = decision
+	}
+	if voteOption != "" {
+		reportBody["option"] = voteOption
+	}
+	if content != "" {
+		reportBody["content"] = content
+	}
+	return s.post("/api/v1/tasks/"+fullTaskID+"/result", reportBody)
+}
+
+// readArtifactFile reads an artifact's content from the project's
+// bare remote. Clones the bare into a throwaway dir to retrieve the
+// file. Path is the user-facing artifact path (no prefix); the
+// helper adds the `projects/{id}/artifacts/` namespace prefix that
+// iteration A.5 introduced.
+func (s *testServer) readArtifactFile(projectID int64, path string) (string, bool) {
+	s.t.Helper()
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		return "", false
+	}
+	cloneDir, err := os.MkdirTemp("", "read-artifact-")
+	if err != nil {
+		return "", false
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile(filepath.Join(cloneDir, mcpgit.ArtifactPath(path)))
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// readRepoFile reads any repo-relative file from a project's bare
+// remote. Thin wrapper around a throwaway clone. Used by tests that
+// need to peek at per-task result files like metadata.json or
+// result.md without knowing the artifact path-mapping convention.
+func (s *testServer) readRepoFile(projectID int64, repoRelPath string) ([]byte, bool) {
+	s.t.Helper()
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		return nil, false
+	}
+	cloneDir, err := os.MkdirTemp("", "read-repo-")
+	if err != nil {
+		return nil, false
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(cloneDir, repoRelPath))
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func (s *testServer) release(taskID, username string) map[string]interface{} {
+	s.t.Helper()
+	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/release", map[string]string{"username": username})
+}
+
+// invalidate posts an invalidation request for a task, optionally with
+// a reason. Returns the raw JSON response.
+func (s *testServer) invalidate(taskID, reason string) map[string]interface{} {
+	s.t.Helper()
+	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/invalidate", map[string]string{"reason": reason})
+}
+
+// taskGet returns details for a task, auto-prefixing with run_id if needed.
+func (s *testServer) taskGet(taskID string) map[string]interface{} {
+	s.t.Helper()
+	return s.get("/api/v1/tasks/" + s.taskID(taskID))
+}
+
+// taskInputs returns a resolved-prompt view of a task, matching the
+// legacy response shape: `resolved_prompt`, `artifacts`,
+// `missing_artifacts`. In the iteration A model the coordinator only
+// serves the dependency descriptor; the test helper does the
+// client-side resolution via mcpgit.Project.Resolve so existing
+// tests can keep asserting on `resolved_prompt`.
+func (s *testServer) taskInputs(taskID string) map[string]interface{} {
+	s.t.Helper()
+	fullTaskID := s.taskID(taskID)
+	desc := s.get("/api/v1/tasks/" + fullTaskID + "/inputs?client_mode=true")
+	if errMsg, ok := desc["error"].(string); ok {
+		s.t.Fatalf("taskInputs descriptor: %s", errMsg)
+	}
+
+	// Marshal the dependency descriptor back into the mcpgit types
+	// so we can use the shared resolver. JSON → struct is the
+	// simplest path that doesn't re-implement the resolver.
+	raw, _ := json.Marshal(desc)
+	var d struct {
+		PromptTemplate     string                   `json:"prompt_template"`
+		UserPromptTemplate string                   `json:"user_prompt_template"`
+		ForEachParams      map[string]string        `json:"for_each_params"`
+		Dependencies       []map[string]interface{} `json:"dependencies"`
+		ArtifactReads      []map[string]interface{} `json:"artifact_reads"`
+		ProjectRemoteURL   string                   `json:"project_remote_url"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		s.t.Fatalf("decode descriptor: %v", err)
+	}
+
+	// Fetch project metadata so we can open the local workspace
+	// clone.
+	task := s.get("/api/v1/tasks/" + fullTaskID)
+	projectID := int64(task["project_id"].(float64))
+
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		// No remote? Return the raw descriptor — tests that rely
+		// on this path will surface the issue loudly.
+		return desc
+	}
+	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	if err != nil {
+		s.t.Fatalf("open project: %v", err)
+	}
+	proj.Lock()
+	_ = proj.Pull()
+	proj.Unlock()
+
+	input := mcpgit.ResolveInput{
+		PromptTemplate:     d.PromptTemplate,
+		UserPromptTemplate: d.UserPromptTemplate,
+		ForEachParams:      d.ForEachParams,
+	}
+	for _, dep := range d.Dependencies {
+		paramsRaw, _ := dep["instance_params"].(map[string]interface{})
+		params := make(map[string]string, len(paramsRaw))
+		for k, v := range paramsRaw {
+			if sv, ok := v.(string); ok {
+				params[k] = sv
+			}
+		}
+		ref := mcpgit.DependencyRef{
+			TaskDefID:      asString(dep["task_def_id"]),
+			InstanceKey:    asString(dep["instance_key"]),
+			InstanceParams: params,
+			CommitSHA:      asString(dep["commit_sha"]),
+			ResultPath:     asString(dep["result_path"]),
+			VoteChoice:     asString(dep["vote_choice"]),
+		}
+		// Phase E.2 session 2b — multi-citizen upstream
+		// responses. The coordinator populates a per-citizen
+		// list on the descriptor; the resolver reads each
+		// citizen's result.md from the local clone.
+		if respsRaw, ok := dep["responses"].([]interface{}); ok {
+			for _, r := range respsRaw {
+				rm, _ := r.(map[string]interface{})
+				ref.Responses = append(ref.Responses, mcpgit.CitizenResponseRef{
+					Username: asString(rm["username"]),
+					Option:   asString(rm["option"]),
+					Content:  asString(rm["content"]),
+				})
+			}
+		}
+		input.Dependencies = append(input.Dependencies, ref)
+	}
+	for _, a := range d.ArtifactReads {
+		input.ArtifactReads = append(input.ArtifactReads, mcpgit.ArtifactRef{
+			Path:      asString(a["path"]),
+			CommitSHA: asString(a["commit_sha"]),
+		})
+	}
+
+	resolved, err := proj.Resolve(input)
+	if err != nil {
+		s.t.Fatalf("resolve: %v", err)
+	}
+
+	out := map[string]interface{}{
+		"task_id":         fullTaskID,
+		"resolved_prompt": resolved.Prompt,
+	}
+	if resolved.UserPrompt != "" {
+		out["resolved_user_prompt"] = resolved.UserPrompt
+	}
+	if len(resolved.ResolvedArtifacts) > 0 {
+		// Match legacy shape: map[string]string
+		as := make(map[string]interface{}, len(resolved.ResolvedArtifacts))
+		for k, v := range resolved.ResolvedArtifacts {
+			as[k] = v
+		}
+		out["artifacts"] = as
+	}
+	if len(resolved.MissingArtifacts) > 0 {
+		miss := make([]interface{}, 0, len(resolved.MissingArtifacts))
+		for _, p := range resolved.MissingArtifacts {
+			miss = append(miss, p)
+		}
+		out["missing_artifacts"] = miss
+	}
+	return out
+}
+
+// asString is a safe map-value-to-string coercion for the
+// descriptor decode path.
+func asString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// runPath converts a composite "projectID:runSeq" runID into the URL path segment
+// "projects/{projectID}/runs/{runSeq}".
+func runPath(runID string) string {
+	parts := strings.SplitN(runID, ":", 2)
+	if len(parts) != 2 {
+		return "projects/0/runs/" + runID
+	}
+	return "projects/" + parts[0] + "/runs/" + parts[1]
+}
+
+func (s *testServer) runStatus(runID string) map[string]interface{} {
+	s.t.Helper()
+	return s.get("/api/v1/" + runPath(runID))
+}
+
+func (s *testServer) runTasks(runID string) []interface{} {
+	s.t.Helper()
+	return s.getList("/api/v1/" + runPath(runID) + "/tasks")
+}
+
+// assertResultFile checks that a task's result file was written to
+// the project's bare remote with the expected content. Clones the
+// bare on demand into a throwaway directory — this is slow but
+// matches the reality of "content lives on the user's git host" in
+// the orchestrator model.
+func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedContent string) {
+	s.t.Helper()
+	parts := strings.SplitN(runID, ":", 2)
+	if len(parts) != 2 {
+		s.t.Fatalf("assertResultFile: bad runID %q (want projectID:runSeq)", runID)
+	}
+	projectIDInt, _ := strconv.ParseInt(parts[0], 10, 64)
+	runSeq := parts[1]
+
+	remoteURL := s.remoteFor(projectIDInt)
+	if remoteURL == "" {
+		s.t.Fatalf("assertResultFile: project %d has no remote_url", projectIDInt)
+	}
+	cloneDir, err := os.MkdirTemp("", "assert-result-")
+	if err != nil {
+		s.t.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(cloneDir)
+	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+		s.t.Fatalf("clone bare: %v", err)
+	}
+
+	dir := filepath.Join(cloneDir, ".enju", "runs", runSeq)
+	if instanceKey != "" {
+		dir = filepath.Join(dir, instanceKey, taskDefID)
+	} else {
+		dir = filepath.Join(dir, taskDefID)
+	}
+
+	resultPath := filepath.Join(dir, "result.md")
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		s.t.Fatalf("result file not found on remote: %s", resultPath)
+	}
+	content := string(data)
+	if expectedContent != "" && !strings.Contains(content, expectedContent) {
+		s.t.Fatalf("result file %s: expected to contain %q, got %q", resultPath, expectedContent, content)
+	}
+
+	metaPath := filepath.Join(dir, "metadata.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		s.t.Fatalf("metadata file not found on remote: %s", metaPath)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		s.t.Fatalf("invalid metadata JSON: %v", err)
+	}
+	if meta["task_id"] == nil {
+		s.t.Fatal("metadata missing task_id")
+	}
+}
+
+// assertGitCommits checks the number of commits in a project's
+// bare remote. Uses `git log` against the bare — fast because the
+// bare is on local disk.
+func (s *testServer) assertGitCommits(projectID int64, expected int) {
+	s.t.Helper()
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		s.t.Fatalf("assertGitCommits: project %d has no remote_url", projectID)
+	}
+	cmd := exec.Command("git", "--git-dir", remoteURL, "log", "--oneline")
+	out, err := cmd.Output()
+	if err != nil {
+		s.t.Fatalf("git log failed on bare %s: %v", remoteURL, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != expected {
+		s.t.Fatalf("project %d: expected %d git commits, got %d: %v", projectID, expected, len(lines), lines)
+	}
+}
+
+// ===================================================================
+// Tests
+// ===================================================================
+
+func TestHealth(t *testing.T) {
+	s := newTestServer(t)
+	resp := s.get("/health")
+	if resp["status"] != "ok" {
+		t.Fatalf("expected ok, got %v", resp)
+	}
+}
+
+
+
+
+
+// ===================================================================
+// Error Case Tests
+// ===================================================================
+
+func TestDoubleClaimRejected(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+
+	resp := s.claim("task_a", bob)
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for double claim")
+	}
+}
+
+func TestClaimReleaseReclaim(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	s.submitYAML("testdata/simple-no-deps.yaml")
+
+	s.claim("task_a", alice)
+	rel := s.release("task_a", alice)
+	if rel["status"] != "released" {
+		t.Fatalf("expected released, got %v", rel)
+	}
+
+	resp := s.claim("task_a", bob)
+	if _, hasErr := resp["error"]; hasErr {
+		t.Fatalf("bob should be able to claim after release: %v", resp)
+	}
+}
+
+func TestSubmitToNonClaimedFails(t *testing.T) {
+	s := newTestServer(t)
+	s.submitYAML("testdata/simple-no-deps.yaml")
+
+	resp := s.submit("task_a", "some content")
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error submitting to unclaimed task")
+	}
+}
+
+func TestNonexistentTaskFails(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+
+	resp := s.claim("nonexistent", alice)
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for nonexistent task")
+	}
+}
+
+func TestRegisterWithoutNameFails(t *testing.T) {
+	s := newTestServer(t)
+	resp := s.post("/api/v1/citizens/register", map[string]string{})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for empty name")
+	}
+}
+
+func TestInvalidYAMLRejected(t *testing.T) {
+	s := newTestServer(t)
+	pid := s.createTestProject()
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": "not: [valid"})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for invalid yaml")
+	}
+}
+
+func TestEmptyYAMLRejected(t *testing.T) {
+	s := newTestServer(t)
+	pid := s.createTestProject()
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": ""})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for empty yaml")
+	}
+}
+
+
+func TestTaskTimeout(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+
+	s.submitYAML("testdata/short-timeout.yaml")
+
+	// Alice claims the task (1s timeout)
+	s.claim("quick_task", alice)
+
+	// Wait for the deadline to pass
+	time.Sleep(2 * time.Second)
+
+	// Check for expired claims directly via store
+	expired, err := s.store.GetExpiredClaims()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired claim, got %d", len(expired))
+	}
+
+	// Expire it (simulating what the reaper does)
+	err = s.store.ExpireClaimedTask(expired[0].TaskID, expired[0].CitizenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Task should be back to READY
+	task := s.taskGet("quick_task")
+	if task["state"] != "ready" {
+		t.Fatalf("expected ready after timeout, got %v", task["state"])
+	}
+
+	// Bob can now claim it
+	resp := s.claim("quick_task", bob)
+	if _, hasErr := resp["error"]; hasErr {
+		t.Fatalf("bob should be able to claim after timeout: %v", resp)
+	}
+}
+
+
+func TestTaskSeqNumbers(t *testing.T) {
+	s := newTestServer(t)
+
+	s.submitYAML("testdata/branching.yaml")
+
+	// Check tasks have sequential numbers
+	tasks := s.getList("/api/v1/tasks/ready")
+	seqs := make(map[float64]bool)
+	for _, task := range tasks {
+		tm, _ := task.(map[string]interface{})
+		seq, _ := tm["seq"].(float64)
+		if seq == 0 {
+			t.Fatal("expected non-zero seq number")
+		}
+		seqs[seq] = true
+	}
+	if len(seqs) != 2 {
+		t.Fatalf("expected 2 unique seq numbers for ready tasks, got %d", len(seqs))
+	}
+}
+
+func TestRunAutoIncrementID(t *testing.T) {
+	s := newTestServer(t)
+
+	// Two runs in the same project → seq #1, #2
+	projectID := s.createTestProject()
+	pid1 := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	pid2 := s.submitYAMLToProject("testdata/branching.yaml", projectID)
+
+	expected1 := fmt.Sprintf("%d:1", projectID)
+	expected2 := fmt.Sprintf("%d:2", projectID)
+	if pid1 != expected1 {
+		t.Fatalf("expected first run id %q, got %q", expected1, pid1)
+	}
+	if pid2 != expected2 {
+		t.Fatalf("expected second run id %q, got %q", expected2, pid2)
+	}
+}
+
+
+
+func TestFreshDBHasNoProjects(t *testing.T) {
+	s := newTestServer(t)
+
+	projects := s.getList("/api/v1/projects")
+	if len(projects) != 0 {
+		t.Fatalf("expected 0 projects on fresh DB, got %d", len(projects))
+	}
+}
+
+
+func TestRunRequiresProject(t *testing.T) {
+	s := newTestServer(t)
+
+	// Submit with non-existent project_id — should fail
+	yamlData, _ := os.ReadFile("testdata/simple-no-deps.yaml")
+	bad := s.post("/api/v1/projects/999/runs", map[string]string{"yaml": string(yamlData)})
+	if _, hasErr := bad["error"]; !hasErr {
+		t.Fatal("expected error when submitting to non-existent project")
+	}
+}
+
+
+func TestPerProjectRunNumbering(t *testing.T) {
+	s := newTestServer(t)
+
+	// Create two projects
+	pj1 := s.post("/api/v1/projects", map[string]string{"name": "Project A"})
+	pid1 := int64(pj1["id"].(float64))
+	pj2 := s.post("/api/v1/projects", map[string]string{"name": "Project B"})
+	pid2 := int64(pj2["id"].(float64))
+
+	yamlData, _ := os.ReadFile("testdata/simple-no-deps.yaml")
+
+	// Project A gets runs #1, #2
+	r1 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData)})
+	seq1, _ := r1["seq"].(float64)
+	r2 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData)})
+	seq2, _ := r2["seq"].(float64)
+
+	if int(seq1) != 1 || int(seq2) != 2 {
+		t.Fatalf("expected seq 1,2 in project A, got %d,%d", int(seq1), int(seq2))
+	}
+
+	// Project B also starts from #1 (independent numbering)
+	r3 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid2), map[string]string{"yaml": string(yamlData)})
+	seq3, _ := r3["seq"].(float64)
+
+	if int(seq3) != 1 {
+		t.Fatalf("expected seq 1 in new project B, got %d", int(seq3))
+	}
+}
+
+
+
+func TestCitizenRegistrationWithEmail(t *testing.T) {
+	s := newTestServer(t)
+
+	// Register with email
+	alice := s.registerWithEmail("Alice", "alice@example.com")
+
+	// Check profile has email
+	profile := s.getCitizen(alice)
+	if profile["name"] != "Alice" {
+		t.Fatalf("expected Alice, got %v", profile["name"])
+	}
+	if profile["email"] != "alice@example.com" {
+		t.Fatalf("expected email, got %v", profile["email"])
+	}
+	if profile["role"] != "citizen" {
+		t.Fatalf("expected citizen role, got %v", profile["role"])
+	}
+}
+
+func TestDuplicateEmailRejected(t *testing.T) {
+	s := newTestServer(t)
+
+	s.registerWithEmail("Alice", "alice@example.com")
+
+	// Try registering with same email
+	resp := s.post("/api/v1/citizens/register", map[string]string{
+		"name":  "Fake Alice",
+		"email": "alice@example.com",
+	})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for duplicate email")
+	}
+}
+
+func TestRegisterWithoutEmailAllowed(t *testing.T) {
+	s := newTestServer(t)
+
+	// Multiple citizens without email — all should succeed
+	a := s.register("Alice")
+	b := s.register("Bob")
+
+	if a == b {
+		t.Fatal("expected different IDs")
+	}
+}
+
+
+func TestUpdateProfileDuplicateEmail(t *testing.T) {
+	s := newTestServer(t)
+
+	s.registerWithEmail("Alice", "alice@example.com")
+	bob := s.registerWithEmail("Bob", "bob@example.com")
+
+	// Bob tries to take Alice's email
+	resp := s.updateProfile(bob, "Bob", "alice@example.com")
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatal("expected error for duplicate email")
+	}
+}
+
+// --- Phase C: Artifacts ---
+
+
+
+// TestArtifactWriteRejectedForTraversal confirms path validation.
+func TestArtifactWriteRejectedForTraversal(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+
+	s.submitYAML("testdata/artifacts.yaml")
+	s.claim("bootstrap", alice)
+
+	resp := s.submitWithArtifacts("bootstrap", "path traversal attempt", map[string]string{
+		"../escape.txt": "no",
+	})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("expected error for path traversal, got %v", resp)
+	}
+}
+
+
+
+
+// --- Iteration 2: username model ---
+
+// TestRegisterGeneratesUsernameFromName verifies the server
+// auto-slugifies the display name into a unique username when no
+// explicit username is provided.
+func TestRegisterGeneratesUsernameFromName(t *testing.T) {
+	s := newTestServer(t)
+
+	// Simple name → slug is identical.
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": "alice"})
+	if u, _ := resp["username"].(string); u != "alice" {
+		t.Fatalf("expected username 'alice', got %v", resp["username"])
+	}
+
+	// Multi-word display name → slug with hyphens.
+	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "Tamer Gur"})
+	if u, _ := resp["username"].(string); u != "tamer-gur" {
+		t.Fatalf("expected username 'tamer-gur', got %v", resp["username"])
+	}
+
+	// Collision on the same slug → -2 suffix.
+	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "alice"})
+	if u, _ := resp["username"].(string); u != "alice-2" {
+		t.Fatalf("expected username 'alice-2' on collision, got %v", resp["username"])
+	}
+}
+
+// TestRegisterWithExplicitUsername verifies the caller can override the
+// auto-generated username.
+func TestRegisterWithExplicitUsername(t *testing.T) {
+	s := newTestServer(t)
+
+	resp := s.post("/api/v1/citizens/register", map[string]string{
+		"name":     "Tamer Gur",
+		"username": "tamerh",
+	})
+	if u, _ := resp["username"].(string); u != "tamerh" {
+		t.Fatalf("expected username 'tamerh', got %v", resp["username"])
+	}
+
+	// Invalid username (uppercase) is rejected.
+	resp = s.post("/api/v1/citizens/register", map[string]string{
+		"name":     "Bob",
+		"username": "BobTheBuilder",
+	})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("expected error for invalid username format, got %v", resp)
+	}
+
+	// Already-taken username is rejected.
+	resp = s.post("/api/v1/citizens/register", map[string]string{
+		"name":     "Impersonator",
+		"username": "tamerh",
+	})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("expected error for taken username, got %v", resp)
+	}
+}
+
+// TestAssignToRejectsUnknownUsername confirms run submission fails if
+// assign_to references a username that isn't registered.
+func TestAssignToRejectsUnknownUsername(t *testing.T) {
+	s := newTestServer(t)
+
+	yaml := `name: "Unknown assignee"
+version: 1
+tasks:
+  - id: t1
+    action: answer
+    assign_to: nonexistent-user
+    prompt: "Hi"
+`
+	pid := s.createTestProject()
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": yaml})
+	errMsg, hasErr := resp["error"].(string)
+	if !hasErr {
+		t.Fatalf("expected error for unknown assignee, got: %v", resp)
+	}
+	if !strings.Contains(errMsg, "nonexistent-user") {
+		t.Fatalf("expected error to mention unknown username, got: %s", errMsg)
+	}
+}
+
+// TestRunCreationAtomicOnValidationFailure is a regression test for
+// the ghost-run bug: if a task midway through a YAML fails validation
+// (here, an unknown assign_to username), the entire submission must be
+// rejected with zero side effects — no run inserted, no tasks created,
+// and the per-project seq counter must not advance.
+func TestRunCreationAtomicOnValidationFailure(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+
+	pid := s.createTestProject()
+
+	// First submit a valid run so we know what the next seq should be.
+	validYAML := `name: "Valid run"
+version: 1
+tasks:
+  - id: warmup
+    action: answer
+    prompt: "Warmup"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": validYAML})
+	firstSeq, _ := resp["seq"].(float64)
+	if firstSeq != 1 {
+		t.Fatalf("expected first run seq 1, got %v", resp["seq"])
+	}
+
+	// Now submit a run where the 3rd task has an unregistered
+	// assign_to, so validation fails after the first two are
+	// conceptually "processed."
+	badYAML := fmt.Sprintf(`name: "Mid-file failure"
+version: 1
+tasks:
+  - id: open_task
+    action: answer
+    prompt: "Anyone"
+  - id: assigned_to_me
+    action: answer
+    assign_to: %s
+    prompt: "Mine"
+  - id: assigned_to_stranger
+    action: answer
+    assign_to: nobody-here
+    prompt: "Rejected"
+  - id: open_task_4
+    action: answer
+    prompt: "Fourth"
+`, alice)
+
+	badResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": badYAML})
+	if _, hasErr := badResp["error"]; !hasErr {
+		t.Fatalf("expected error for mid-file validation failure, got: %v", badResp)
+	}
+
+	// Side effect checks:
+	// 1. The next successful run should be seq 2, not seq 3 — the failed
+	//    submission must NOT have consumed a seq number.
+	goodYAML := `name: "Follow-up"
+version: 1
+tasks:
+  - id: next
+    action: answer
+    prompt: "After the failure"
+`
+	goodResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": goodYAML})
+	nextSeq, _ := goodResp["seq"].(float64)
+	if nextSeq != 2 {
+		t.Fatalf("expected next run seq 2 (failed submission should not consume a seq), got %v", goodResp["seq"])
+	}
+
+	// 2. Listing runs under the project should show exactly 2 runs
+	//    (the warmup at seq 1 and the follow-up at seq 2), not 3.
+	runs := s.getList(fmt.Sprintf("/api/v1/projects/%d/runs", pid))
+	if len(runs) != 2 {
+		var seqs []int
+		for _, r := range runs {
+			m, _ := r.(map[string]interface{})
+			s, _ := m["seq"].(float64)
+			seqs = append(seqs, int(s))
+		}
+		t.Fatalf("expected 2 runs after atomic-failed submission, got %d (seqs: %v)", len(runs), seqs)
+	}
+
+	// 3. None of the ghost task IDs from the failed run should exist.
+	for _, ghostID := range []string{
+		fmt.Sprintf("%d:2:open_task", pid),
+		fmt.Sprintf("%d:2:assigned_to_me", pid),
+	} {
+		task := s.get("/api/v1/tasks/" + ghostID)
+		if _, found := task["id"].(string); found {
+			t.Fatalf("ghost task %q exists after atomic-failed submission: %v", ghostID, task)
+		}
+	}
+}
+
+// --- Iteration 1: assign_to + require_role ---
+
+
+
+
+
+// --- Iteration 3: cascade invalidation ---
+
+
+
+
+
+
+
+
+
+// --- Iteration 1: assign_to + require_role (historical section) ---
+
+
+
+
+
+
+// cleanYAML strips common LLM output issues: markdown fences, leading text, trailing text.
+func cleanYAML(raw string) string {
+	s := strings.TrimSpace(raw)
+
+	// Remove markdown code fences
+	if strings.HasPrefix(s, "```yaml") {
+		s = strings.TrimPrefix(s, "```yaml")
+	} else if strings.HasPrefix(s, "```yml") {
+		s = strings.TrimPrefix(s, "```yml")
+	} else if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```")
+	}
+	if strings.HasSuffix(s, "```") {
+		s = strings.TrimSuffix(s, "```")
+	}
+
+	s = strings.TrimSpace(s)
+
+	// If LLM added text before the YAML, find where "name:" starts
+	if idx := strings.Index(s, "name:"); idx > 0 {
+		s = s[idx:]
+	}
+
+	return strings.TrimSpace(s)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// TestReviewCommitShaOptional — a review submission with empty
+// commit_sha is accepted (P1 fix: commit_sha optional on
+// review/vote tasks because they don't ship content to git).
+func TestReviewCommitShaOptional(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	bob := s.register("bob")
+	s.submitYAML("testdata/review.yaml")
+
+	// Alice drafts normally.
+	s.claim("draft", alice)
+	s.submit("draft", "A draft.")
+
+	// Bob reviews. Post directly to the coordinator bypassing
+	// the fat client so we can send commit_sha:"" explicitly
+	// — the fat client would always populate one.
+	s.claim("check", bob)
+	fullID := s.taskID("check")
+	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
+		"result_path": ".enju/runs/1/check",
+		"commit_sha":  "",
+		"decision":    "approve",
+		"username":    "bob",
+		"tokens_used": 0,
+		"model":       "test",
+	})
+	if errMsg, _ := resp["error"].(string); errMsg != "" {
+		t.Fatalf("expected review submit with empty commit_sha to succeed, got error: %q", errMsg)
+	}
+	if resp["status"] != "accepted" {
+		t.Fatalf("expected accepted, got %v", resp["status"])
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// TestTokenAuthRejectsInvalidToken — a request with a
+// fake Bearer token should get 401.
+func TestTokenAuthRejectsInvalidToken(t *testing.T) {
+	s := newTestServer(t)
+
+	req, _ := http.NewRequest("GET", s.url+"/api/v1/projects", nil)
+	req.Header.Set("Authorization", "Bearer fake-token-12345")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for invalid token, got %d", resp.StatusCode)
+	}
+}
+
+// TestTokenAuthAllowsMissingToken — a request with no
+// Authorization header should be allowed (soft enforcement).
+func TestTokenAuthAllowsMissingToken(t *testing.T) {
+	s := newTestServer(t)
+
+	resp, err := http.Get(s.url + "/api/v1/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for missing token (soft enforcement), got %d", resp.StatusCode)
+	}
+}
+
+// TestTokenAuthAllowsValidToken — register a citizen, use
+// the returned token, verify the request succeeds.
+func TestTokenAuthAllowsValidToken(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	_ = alice
+
+	// Get the token from the citizens table via the DB.
+	citizen := s.get("/api/v1/citizens/by-username/alice")
+	// The token isn't in the public response (correct for
+	// security). So we test via: register returns a token,
+	// the client sends it, and the request works. Since our
+	// test harness doesn't save tokens, test that a POST
+	// with no token (soft enforcement) works for now.
+	// The real token test is: fake token → 401 (above).
+	projectResp := s.post("/api/v1/projects", map[string]string{
+		"name": "token-test",
+	})
+	if errMsg, ok := projectResp["error"].(string); ok {
+		t.Errorf("expected project creation to succeed, got: %s", errMsg)
+	}
+	_ = citizen
+}
+
+// TestAutoLocalRepoOnProjectCreate — when a project is
+// created without a remote_url, the system should still
+// allow full claim/submit workflow (the MCP client auto-
+// creates a local bare repo). This test simulates the
+// coordinator side: a project with a local bare repo as
+// remote should work for the full fat-client path.
+
+// Suppress unused import
+var _ = enjuYaml.Parse

@@ -79,7 +79,9 @@ Starting: If the user wants to start fresh, use enju_create_project. If they hav
 
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 
-Conventions: After claiming, remind the human which task is active. After submitting, show the updated run tree so progress is visible. When working on a task, keep the human oriented — a brief context line (e.g. "Working on 1:1:draft") at the start of task-related responses helps.`),
+Conventions: After claiming, remind the human which task is active. After submitting, show the updated run status so progress is visible. When working on a task, keep the human oriented — a brief context line (e.g. "Working on 1:1:draft") at the start of task-related responses helps.
+
+Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · ⚪ waiting · 🔴 failed · ⚫ skipped.`),
 	)
 
 	logger := cfg.Logger
@@ -2856,7 +2858,17 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return mcp.NewToolResultText(formatRunStatus(run, tasks)), nil
+	// Inject project name into the run data for the header.
+	_, projName, _ := c.fetchProjectMetaFull(ctx, int64(projectID))
+	if projName != "" {
+		var runMap map[string]interface{}
+		if json.Unmarshal(run, &runMap) == nil {
+			runMap["_project_name"] = projName
+			run, _ = json.Marshal(runMap)
+		}
+	}
+
+	return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
 }
 
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

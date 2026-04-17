@@ -1,0 +1,134 @@
+package mcpserver
+
+// TestClient exposes the MCP tool handlers to external test packages
+// so integration suites can drive the exact code path a real MCP
+// client takes, without spinning up a stdio subprocess. It wraps the
+// unexported apiClient so test code can construct one with a real
+// coordinator URL, real mcpgit.Workspace, real credentials — the
+// same wiring the production New() constructor uses — and call tool
+// handlers directly.
+//
+// Intended strictly for test harnesses. The production binary never
+// uses this type; real MCP hosts invoke handlers through the
+// mark3labs/mcp-go server via stdio.
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+
+	"github.com/mark3labs/mcp-go/mcp"
+)
+
+// TestClient is a thin wrapper around apiClient that exposes each
+// MCP tool handler as a public method. External tests call it by
+// tool name via Call(), or use one of the typed convenience methods
+// below.
+type TestClient struct {
+	c *apiClient
+}
+
+// NewTestClient builds a TestClient from a Config, mirroring the
+// wiring inside New(). The only omission vs. New() is that no
+// mark3labs/mcp-go server is constructed — tests talk to handler
+// methods in-process.
+func NewTestClient(cfg Config) *TestClient {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &TestClient{
+		c: &apiClient{
+			baseURL:      cfg.CoordinatorURL,
+			username:     cfg.Username,
+			citizenName:  cfg.CitizenName,
+			citizenEmail: cfg.CitizenEmail,
+			modelName:    cfg.ModelName,
+			authToken:    cfg.AuthToken,
+			saveCreds:    cfg.SaveCredentials,
+			workspace:    cfg.Workspace,
+			logger:       logger,
+			httpClient:   &http.Client{},
+		},
+	}
+}
+
+// Username returns the citizen username the TestClient was built
+// with. Handy for tests that claim + submit as a specific citizen
+// and want to spot-check who the submission credits.
+func (t *TestClient) Username() string { return t.c.username }
+
+// Call invokes an MCP tool handler by its registered tool name with
+// a map of arguments. Returns the tool-level *mcp.CallToolResult
+// exactly as the handler produced it (including IsError=true for
+// tool-level errors) and the Go error if the handler signaled one
+// — handlers normally return Go error = nil and encode tool errors
+// in the CallToolResult.
+func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: toolName, Arguments: args},
+	}
+	switch toolName {
+	case "enju_claim_task":
+		return t.c.handleClaimTask(ctx, req)
+	case "enju_submit_result":
+		return t.c.handleSubmitResult(ctx, req)
+	case "enju_get_task_inputs":
+		return t.c.handleGetTaskInputs(ctx, req)
+	case "enju_list_ready_tasks":
+		return t.c.handleListReadyTasks(ctx, req)
+	case "enju_get_task":
+		return t.c.handleGetTask(ctx, req)
+	case "enju_run_status":
+		return t.c.handleRunStatus(ctx, req)
+	case "enju_create_run":
+		return t.c.handleCreateRun(ctx, req)
+	case "enju_list_runs":
+		return t.c.handleListRuns(ctx, req)
+	case "enju_create_project":
+		return t.c.handleCreateProject(ctx, req)
+	case "enju_init":
+		return t.c.handleInit(ctx, req)
+	case "enju_release_task":
+		return t.c.handleReleaseTask(ctx, req)
+	case "enju_invalidate_task":
+		return t.c.handleInvalidateTask(ctx, req)
+	case "enju_tally_task":
+		return t.c.handleTallyTask(ctx, req)
+	case "enju_fail_task":
+		return t.c.handleFailTask(ctx, req)
+	case "enju_my_profile":
+		return t.c.handleMyProfile(ctx, req)
+	case "enju_my_dashboard":
+		return t.c.handleMyDashboard(ctx, req)
+	case "enju_list_projects":
+		return t.c.handleListProjects(ctx, req)
+	case "enju_update_profile":
+		return t.c.handleUpdateProfile(ctx, req)
+	case "enju_project_remote_status":
+		return t.c.handleProjectRemoteStatus(ctx, req)
+	case "enju_project_sync":
+		return t.c.handleProjectSync(ctx, req)
+	case "enju_set_project_remote":
+		return t.c.handleSetProjectRemote(ctx, req)
+	case "enju_leave_project":
+		return t.c.handleLeaveProject(ctx, req)
+	case "enju_list_artifacts":
+		return t.c.handleListArtifacts(ctx, req)
+	case "enju_get_artifact":
+		return t.c.handleGetArtifact(ctx, req)
+	case "enju_get_artifact_history":
+		return t.c.handleGetArtifactHistory(ctx, req)
+	case "enju_export_run":
+		return t.c.handleExportRun(ctx, req)
+	case "enju_list_templates":
+		return t.c.handleListTemplates(ctx, req)
+	case "enju_describe_template":
+		return t.c.handleDescribeTemplate(ctx, req)
+	case "enju_execute_task":
+		return t.c.handleExecuteTask(ctx, req)
+	default:
+		return nil, fmt.Errorf("mcpserver.TestClient: unknown tool %q", toolName)
+	}
+}
