@@ -82,7 +82,11 @@ func formatProjectRemoteStatus(data []byte) string {
 		b.WriteString("  (no remote configured)\n")
 		return b.String()
 	}
-	b.WriteString("  remote:    " + remote + "\n")
+	remoteLabel := remote
+	if strings.HasPrefix(remote, "/") && !strings.HasSuffix(remote, ".git") {
+		remoteLabel = remote + " (local workspace)"
+	}
+	b.WriteString("  remote:    " + remoteLabel + "\n")
 	b.WriteString("  status:    " + humanRemoteStatus(status, ahead, behind) + "\n")
 	if localHead, ok := r["local_head"].(string); ok && localHead != "" {
 		short := localHead

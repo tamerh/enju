@@ -643,7 +643,9 @@ func (p *Project) RemoteHeadHash() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("no origin remote: %w", err)
 	}
-	refs, err := rem.List(&gogit.ListOptions{})
+	refs, err := rem.List(&gogit.ListOptions{
+		Auth: sshAuthMethod(p.remoteURL),
+	})
 	if err != nil {
 		return "", friendlyGitError("check remote status", p.remoteURL, err)
 	}
