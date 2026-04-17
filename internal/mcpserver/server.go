@@ -19,6 +19,9 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -72,6 +75,8 @@ Core model:
 - Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
 - Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.
 
+Starting: If the user wants to start fresh, use enju_create_project. If they have an existing folder or repo, use enju_init. When unclear, ask.
+
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 
 Conventions: After claiming, remind the human which task is active. After submitting, show the updated run tree so progress is visible. When working on a task, keep the human oriented — a brief context line (e.g. "Working on 1:1:draft") at the start of task-related responses helps.`),
@@ -109,6 +114,7 @@ Conventions: After claiming, remind the human which task is active. After submit
 	s.AddTool(toolUpdateProfile(), client.handleUpdateProfile)
 	s.AddTool(toolListProjects(), client.handleListProjects)
 	s.AddTool(toolCreateProject(), client.handleCreateProject)
+	s.AddTool(toolInit(), client.handleInit)
 	s.AddTool(toolSetProjectRemote(), client.handleSetProjectRemote)
 	s.AddTool(toolProjectRemoteStatus(), client.handleProjectRemoteStatus)
 	s.AddTool(toolProjectSync(), client.handleProjectSync)
@@ -487,7 +493,7 @@ func toolCreateRun() mcp.Tool {
 		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
 1. WRITE IT DIRECTLY: pass "yaml" with the full run definition — use this for one-off runs the user is authoring from scratch.
-2. FROM A SAVED TEMPLATE: pass "path" pointing at a templates/*.yaml recipe in the project clone, plus "params" with the values that template asks for. Use this whenever a user's request matches a known recipe — see enju_list_templates.
+2. FROM A SAVED TEMPLATE: pass "path" pointing at a enju_templates/*.yaml recipe in the project clone, plus "params" with the values that template asks for. Use this whenever a user's request matches a known recipe — see enju_list_templates.
 3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a template file first.
 
 YAML format (same for inline and template files):
@@ -515,7 +521,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),
 		),
 		mcp.WithString("path",
-			mcp.Description("Repo-relative path to a template under templates/, e.g. 'templates/gwas.yaml'. The template is read from the local project clone. Mutually exclusive with 'yaml'."),
+			mcp.Description("Repo-relative path to a template under enju_templates/, e.g. 'enju_templates/gwas.yaml'. The template is read from the local project clone. Mutually exclusive with 'yaml'."),
 		),
 		mcp.WithObject("params",
 			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_template to see what a template expects."),
@@ -529,7 +535,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 
 // toolListTemplates is the LLM's template-discovery entry
 // point. Returns every YAML file under the project clone's
-// templates/ directory with its name, description, and
+// enju_templates/ directory with its name, description, and
 // parameter summary so the LLM can pick a recipe that fits
 // the user's request without reading each file.
 func toolFailTask() mcp.Tool {
@@ -591,12 +597,12 @@ func toolListTemplates() mcp.Tool {
 	return mcp.NewTool("enju_list_templates",
 		mcp.WithDescription(`List the reusable run recipes (templates) available in a project. Each entry shows the template's name, description, and its declared parameters. Use this first when a user asks to do something that matches a known recipe — the template saves them from hand-writing a run YAML.
 
-Templates are just regular run YAML files that live under templates/ in the project git repo. Any run can be promoted to a template by copying its YAML file into templates/; no conversion step.
+Templates are just regular run YAML files that live under enju_templates/ in the project git repo. Any run can be promoted to a template by copying its YAML file into enju_templates/; no conversion step.
 
 To see full parameter docs for one template (types, defaults, descriptions), call enju_describe_template <path>. To instantiate a template into a run, call enju_create_run with 'path' and 'params'.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The project whose templates/ directory to scan"),
+			mcp.Description("The project whose enju_templates/ directory to scan"),
 		),
 	)
 }
@@ -614,7 +620,7 @@ func toolDescribeTemplate() mcp.Tool {
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description("Repo-relative template path, e.g. 'templates/gwas.yaml'"),
+			mcp.Description("Repo-relative template path, e.g. 'enju_templates/gwas.yaml'"),
 		),
 	)
 }
@@ -627,7 +633,7 @@ func toolListProjects() mcp.Tool {
 
 func toolCreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription("Create a new long-lived project (workspace). Projects hold runs and artifacts over time."),
+		mcp.WithDescription("Create a brand-new Enju project from scratch. Use this when the user wants to start fresh with no existing folder or code. If the user mentions an existing directory, paper draft, or code repository they want to work with, use enju_init instead."),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Unique project name"),
@@ -637,6 +643,20 @@ func toolCreateProject() mcp.Tool {
 		),
 		mcp.WithString("remote_url",
 			mcp.Description("Optional external git remote URL (e.g., git@github.com:org/repo.git). When set, the coordinator pushes every task result commit to this remote. Auth follows the host's SSH/credential configuration."),
+		),
+	)
+}
+
+func toolInit() mcp.Tool {
+	return mcp.NewTool("enju_init",
+		mcp.WithDescription(`Adopt an existing folder as an Enju project. Use this when the user already has a directory (with or without git) and wants to add Enju orchestration on top. Enju writes its scaffold (.enju/, enju_templates/) into the folder and respects all existing files. If the user wants to start fresh with nothing, use enju_create_project instead.`),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Project name"),
+		),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Absolute path to the existing folder to adopt"),
 		),
 	)
 }
@@ -960,6 +980,134 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	}
 
 	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
+}
+
+// handleInit adopts an existing folder as an Enju project. It:
+// 1. Validates the path exists
+// 2. Initializes git if not present
+// 3. Writes .enju/ + enju_templates/ scaffold if missing
+// 4. Commits the scaffold
+// 5. Registers the project with the coordinator
+// 6. Sets the local path as the remote
+// 7. Eagerly clones into the workspace
+func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, err := req.RequireString("name")
+	if err != nil {
+		return mcp.NewToolResultError("name is required"), nil
+	}
+	dirPath, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required"), nil
+	}
+
+	// Validate path exists.
+	stat, err := os.Stat(dirPath)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("path %q does not exist: %v", dirPath, err)), nil
+	}
+	if !stat.IsDir() {
+		return mcp.NewToolResultError(fmt.Sprintf("path %q is not a directory", dirPath)), nil
+	}
+
+	// Detect git state.
+	repo, openErr := gogit.PlainOpen(dirPath)
+	if openErr != nil {
+		// No git — initialize.
+		var initErr error
+		repo, initErr = gogit.PlainInitWithOptions(dirPath, &gogit.PlainInitOptions{
+			InitOptions: gogit.InitOptions{
+				DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+			},
+		})
+		if initErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("git init failed: %v", initErr)), nil
+		}
+		c.logger.Info("initialized git in existing folder", "path", dirPath)
+	}
+
+	// Write scaffold if missing.
+	wt, err := repo.Worktree()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("getting worktree: %v", err)), nil
+	}
+	scaffoldWritten := false
+	enjuDir := filepath.Join(dirPath, ".enju")
+	if _, err := os.Stat(enjuDir); os.IsNotExist(err) {
+		os.MkdirAll(enjuDir, 0755)
+		scaffoldWritten = true
+	}
+	templatesDir := filepath.Join(dirPath, "enju_templates")
+	if _, err := os.Stat(templatesDir); os.IsNotExist(err) {
+		os.MkdirAll(templatesDir, 0755)
+		// Write a .gitkeep so the empty dir is tracked.
+		os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), []byte(""), 0644)
+		scaffoldWritten = true
+	}
+
+	// Commit scaffold (and any existing uncommitted files).
+	if scaffoldWritten {
+		if err := wt.AddGlob("."); err != nil {
+			c.logger.Warn("staging scaffold", "error", err)
+		}
+		status, _ := wt.Status()
+		if !status.IsClean() {
+			sig := &object.Signature{
+				Name:  "Enju",
+				Email: "enju@localhost",
+				When:  time.Now(),
+			}
+			_, commitErr := wt.Commit("Initialize Enju orchestration", &gogit.CommitOptions{
+				Author:    sig,
+				Committer: sig,
+			})
+			if commitErr != nil {
+				c.logger.Warn("scaffold commit", "error", commitErr)
+			} else {
+				c.logger.Info("committed Enju scaffold", "path", dirPath)
+			}
+		}
+	}
+
+	// Ensure the repo has at least one commit (needed for clone).
+	if _, err := repo.Head(); err != nil {
+		// No commits yet — commit everything.
+		wt.AddGlob(".")
+		sig := &object.Signature{
+			Name:  "Enju",
+			Email: "enju@localhost",
+			When:  time.Now(),
+		}
+		wt.Commit("initial commit", &gogit.CommitOptions{
+			Author:    sig,
+			Committer: sig,
+		})
+	}
+
+	// Register project with coordinator (no remote_url — the folder
+	// IS the workspace, not a remote to clone from).
+	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
+		"name": name,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Register the folder as an external workspace so ForProject
+	// opens it directly instead of cloning.
+	if c.workspace != nil {
+		var result map[string]interface{}
+		if json.Unmarshal(data, &result) == nil {
+			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+				c.workspace.RegisterExternalDir(projectID, dirPath)
+				// Open it immediately to verify it works.
+				if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
+					c.logger.Warn("opening init'd folder", "error", perr)
+				}
+			}
+		}
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Initialized Enju in %s\n  Project registered as: %s", dirPath, name)), nil
 }
 
 // commitAuthor returns the `name email` pair to use as git commit
@@ -1466,7 +1614,15 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 // iteration A.2 path for a given task: the client has a workspace
 // configured AND the project has an external remote URL.
 func (c *apiClient) useFatClient(meta *taskMeta) bool {
-	return c.workspace != nil && meta != nil && meta.ProjectRemoteURL != ""
+	if c.workspace == nil || meta == nil {
+		return false
+	}
+	if meta.ProjectRemoteURL != "" {
+		return true
+	}
+	// External-dir projects (from enju_init) have no remote URL
+	// but do have a workspace registered.
+	return c.workspace.HasExternalDir(meta.ProjectID)
 }
 
 func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2701,7 +2857,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	// Phase H.1: three input shapes —
 	//   1. yaml (inline definition, no params)
-	//   2. path (template file under templates/, optional params)
+	//   2. path (template file under enju_templates/, optional params)
 	//   3. yaml + params (inline definition with a declared params: block)
 	//
 	// Exactly one of (yaml, path) must be set. Params are optional in
@@ -2720,7 +2876,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	if yamlContent == "" && templatePath == "" {
-		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under templates/) is required"), nil
+		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under enju_templates/) is required"), nil
 	}
 	if yamlContent != "" && templatePath != "" {
 		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
@@ -2786,7 +2942,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 }
 
 // handleListTemplates — pure client-side tool. Walks the
-// project's templates/ directory in the local clone and
+// project's enju_templates/ directory in the local clone and
 // returns one entry per YAML file with its metadata.
 func (c *apiClient) handleFailTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
@@ -3133,7 +3289,7 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 	}
 	templatePath, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("path is required (e.g. 'templates/gwas.yaml')"), nil
+		return mcp.NewToolResultError("path is required (e.g. 'enju_templates/gwas.yaml')"), nil
 	}
 	if c.workspace == nil {
 		return mcp.NewToolResultError("enju_describe_template requires a local workspace (MCP client mode)"), nil

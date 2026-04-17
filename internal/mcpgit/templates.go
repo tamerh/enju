@@ -12,12 +12,12 @@ import (
 
 // Phase H.1 — Template discovery and instantiation on the fat
 // client side. Templates are just regular run YAML files that
-// happen to live under `templates/` at the root of a project's
+// happen to live under `enju_templates/` at the root of a project's
 // git clone. Any file in that directory is considered a
 // template; `.yaml` / `.yml` extensions only.
 //
 // There is no separate "template" file shape. A file is a
-// template when it's placed under `templates/` with a `params:`
+// template when it's placed under `enju_templates/` with a `params:`
 // block declaring what the caller must supply. The same file
 // can be submitted directly as a run (by passing param values
 // inline) or picked up by the LLM from the templates directory
@@ -28,7 +28,7 @@ import (
 // ListTemplates — enough for an LLM to pick a template from a
 // menu without having to parse the full YAML of each one.
 type TemplateSummary struct {
-	Path        string         `json:"path"`                  // repo-relative, e.g. "templates/gwas.yaml"
+	Path        string         `json:"path"`                  // repo-relative, e.g. "enju_templates/gwas.yaml"
 	Name        string         `json:"name,omitempty"`        // from `name:` field
 	Description string         `json:"description,omitempty"` // from `description:` field
 	Params      []ParamSummary `json:"params,omitempty"`      // short param summary
@@ -46,9 +46,9 @@ type ParamSummary struct {
 	Description string      `json:"description,omitempty"`
 }
 
-// ListTemplates scans the project's `templates/` directory and
+// ListTemplates scans the project's `enju_templates/` directory and
 // returns a summary for every *.yaml / *.yml file it finds. An
-// empty or missing templates/ directory returns an empty slice,
+// empty or missing enju_templates/ directory returns an empty slice,
 // not an error — "no templates yet" is a normal state.
 //
 // Files that fail to parse as run YAML are skipped silently in
@@ -56,7 +56,7 @@ type ParamSummary struct {
 // specific file to see the parse error). Rationale: one bad
 // template shouldn't crash the menu.
 func (p *Project) ListTemplates() ([]TemplateSummary, error) {
-	templatesDir := filepath.Join(p.workDir, "templates")
+	templatesDir := filepath.Join(p.workDir, "enju_templates")
 	entries, err := os.ReadDir(templatesDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -73,7 +73,7 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
 			continue
 		}
-		rel := filepath.ToSlash(filepath.Join("templates", name))
+		rel := filepath.ToSlash(filepath.Join("enju_templates", name))
 		summary, err := p.templateSummary(rel)
 		if err != nil {
 			// Skip unreadable / unparseable templates but keep
@@ -131,13 +131,13 @@ type LoadedTemplate struct {
 }
 
 // LoadTemplate reads a single template by its repo-relative
-// path (e.g. "templates/gwas.yaml"), parses it to extract the
+// path (e.g. "enju_templates/gwas.yaml"), parses it to extract the
 // summary, and returns both the raw bytes and the summary. The
 // raw bytes are what the caller hands to
 // yaml.ParseWithParams at instantiation time.
 func (p *Project) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
-	if !strings.HasPrefix(repoRelPath, "templates/") {
-		return nil, fmt.Errorf("template path %q must live under templates/", repoRelPath)
+	if !strings.HasPrefix(repoRelPath, "enju_templates/") {
+		return nil, fmt.Errorf("template path %q must live under enju_templates/", repoRelPath)
 	}
 	// Block path escapes — this is user-controlled input even
 	// though it's read from the local workspace, and a relative

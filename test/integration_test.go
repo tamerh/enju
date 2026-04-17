@@ -944,7 +944,7 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 		s.t.Fatalf("clone bare: %v", err)
 	}
 
-	dir := filepath.Join(cloneDir, "runs", runSeq)
+	dir := filepath.Join(cloneDir, ".enju", "runs", runSeq)
 	if instanceKey != "" {
 		dir = filepath.Join(dir, instanceKey, taskDefID)
 	} else {
@@ -1771,7 +1771,7 @@ func TestMultiFileOutputs(t *testing.T) {
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		t.Fatalf("clone bare: %v", err)
 	}
-	resultsDir := filepath.Join(cloneDir, "runs", fmt.Sprintf("%d", s.lastRunSeq), "analyze")
+	resultsDir := filepath.Join(cloneDir, ".enju", "runs", fmt.Sprintf("%d", s.lastRunSeq), "analyze")
 
 	// genes.csv should contain the CSV
 	csvData, err := os.ReadFile(filepath.Join(resultsDir, "genes.csv"))
@@ -3291,7 +3291,7 @@ func TestReviewMetadataAuditTrail(t *testing.T) {
 	// The review.yaml run is the project's run #1.
 	runSeq := 1
 	metaPath := filepath.Join(
-		fmt.Sprintf("runs/%d/check", runSeq),
+		fmt.Sprintf(".enju/runs/%d/check", runSeq),
 		"metadata.json",
 	)
 	raw, ok := s.readRepoFile(pid, metaPath)
@@ -3315,7 +3315,7 @@ func TestReviewMetadataAuditTrail(t *testing.T) {
 	// Non-review tasks should NOT carry decision/reviews_target
 	// keys. The draft's metadata.json is the control case.
 	draftPath := filepath.Join(
-		fmt.Sprintf("runs/%d/draft", runSeq),
+		fmt.Sprintf(".enju/runs/%d/draft", runSeq),
 		"metadata.json",
 	)
 	rawDraft, ok := s.readRepoFile(pid, draftPath)
@@ -3359,7 +3359,7 @@ func TestReviewRejectMetadataCarriesVerdict(t *testing.T) {
 
 	runSeq := 1
 	metaPath := filepath.Join(
-		fmt.Sprintf("runs/%d/check", runSeq),
+		fmt.Sprintf(".enju/runs/%d/check", runSeq),
 		"metadata.json",
 	)
 	raw, ok := s.readRepoFile(pid, metaPath)
@@ -4205,7 +4205,7 @@ func TestReviewCommitShaOptional(t *testing.T) {
 	s.claim("check", bob)
 	fullID := s.taskID("check")
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": "runs/1/check",
+		"result_path": ".enju/runs/1/check",
 		"commit_sha":  "",
 		"decision":    "approve",
 		"username":    "bob",

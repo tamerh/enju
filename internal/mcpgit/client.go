@@ -71,8 +71,9 @@ type Workspace struct {
 	rootDir string
 	logger  *slog.Logger
 
-	mu      sync.Mutex
-	clients map[int64]*Project // projectID → open project clone
+	mu           sync.Mutex
+	clients      map[int64]*Project // projectID → open project clone
+	externalDirs map[int64]string   // projectID → external folder path (from enju_init)
 }
 
 // NewWorkspace creates (or reuses) a workspace rooted at the given
@@ -90,9 +91,10 @@ func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 		return nil, fmt.Errorf("creating workspace root: %w", err)
 	}
 	return &Workspace{
-		rootDir: rootDir,
-		logger:  logger,
-		clients: make(map[int64]*Project),
+		rootDir:      rootDir,
+		logger:       logger,
+		clients:      make(map[int64]*Project),
+		externalDirs: make(map[int64]string),
 	}, nil
 }
 
@@ -181,6 +183,25 @@ func (ws *Workspace) findProjectDir(projectID int64) string {
 	return ""
 }
 
+// RegisterExternalDir tells the workspace that a given project's
+// working directory is an external folder (from enju_init), not a
+// clone under the workspace root. ForProject will open the external
+// folder directly instead of cloning from a remote.
+func (ws *Workspace) RegisterExternalDir(projectID int64, dir string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.externalDirs[projectID] = dir
+}
+
+// HasExternalDir returns true if the given project has been
+// registered as an external directory (from enju_init).
+func (ws *Workspace) HasExternalDir(projectID int64) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	_, ok := ws.externalDirs[projectID]
+	return ok
+}
+
 // LeaveProject forgets the cached Project handle (if any) and
 // removes the on-disk clone directory. The next ForProject call for
 // this project will re-clone from the remote. Safe to call even if
@@ -236,6 +257,17 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 	defer ws.mu.Unlock()
 
 	if p, ok := ws.clients[projectID]; ok {
+		return p, nil
+	}
+
+	// Check for external directory (from enju_init).
+	if extDir, ok := ws.externalDirs[projectID]; ok {
+		p, err := openOrClone(extDir, "", ws.logger)
+		if err != nil {
+			return nil, err
+		}
+		p.projectID = projectID
+		ws.clients[projectID] = p
 		return p, nil
 	}
 
@@ -1195,28 +1227,21 @@ func aiCoAuthor(modelName string) string {
 
 // --- standard path helpers ---
 //
-// A.5 note: all project-scoped content lives under the per-project
-// prefix `projects/{project_id}/...` so two projects sharing the
-// same git remote can coexist without stepping on each other's
-// result/artifact paths. Before A.5, runs were namespaced only by
-// run sequence, which collided whenever two projects pointed at
-// the same remote. The prefix is the project's coordinator-assigned
-// integer id — unique per coordinator instance, stable across the
-// lifetime of the project.
+// Enju state lives under `.enju/` in the workspace clone so it
+// coexists cleanly with existing repo content. Artifacts live
+// at their natural paths (no prefix). Templates live under
+// `enju_templates/`.
 
-// ProjectDir returns the repo-relative root directory for all of a
-// project's content. Used by callers that want to know where a
-// project's data lives in the shared remote.
 // ResultDir returns the repo-relative directory for a task's result
 // files. Layout:
 //
-//	runs/{runSeq}/{taskDefID}/                 (no for_each)
-//	runs/{runSeq}/{instanceKey}/{taskDefID}/   (with for_each)
+//	.enju/runs/{runSeq}/{taskDefID}/                 (no for_each)
+//	.enju/runs/{runSeq}/{instanceKey}/{taskDefID}/   (with for_each)
 //
-// Each workspace clone holds exactly one project, so there is no
-// per-project prefix in the repo tree.
+// Hidden under .enju/ so Enju can be added to existing repos
+// without polluting the root directory.
 func ResultDir(runSeq int, instanceKey, taskDefID string) string {
-	base := filepath.Join("runs", fmt.Sprintf("%d", runSeq))
+	base := filepath.Join(".enju", "runs", fmt.Sprintf("%d", runSeq))
 	if instanceKey != "" {
 		return filepath.Join(base, instanceKey, taskDefID)
 	}
@@ -1224,11 +1249,12 @@ func ResultDir(runSeq int, instanceKey, taskDefID string) string {
 }
 
 // ArtifactPath returns the repo-relative path for a user-facing
-// artifact. Validation (no ../, no .git, etc.) is the caller's
-// responsibility; this is just path concatenation with the
-// standard `artifacts/` prefix.
+// artifact. Artifacts live at their natural path in the repo root
+// (no prefix), so `writes_artifacts: [figures/fig1.png]` writes
+// directly to `figures/fig1.png`. Validation (no ../, no .git/,
+// no .enju/) is the caller's responsibility.
 func ArtifactPath(userPath string) string {
-	return filepath.Join("artifacts", userPath)
+	return userPath
 }
 
 // --- Named outputs with file specs ---

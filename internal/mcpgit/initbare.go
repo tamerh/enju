@@ -61,7 +61,7 @@ func InitBareWithSeed(bareDir string) error {
 
 	// Write a README and commit.
 	readme := filepath.Join(tmpDir, "README.md")
-	if err := os.WriteFile(readme, []byte("# Enju project\n"), 0644); err != nil {
+	if err := os.WriteFile(readme, []byte("# Enju project\n\nTask results live under `.enju/runs/`. Templates under `enju_templates/`.\n"), 0644); err != nil {
 		return fmt.Errorf("write readme: %w", err)
 	}
 	wt, err := repo.Worktree()

@@ -45,7 +45,7 @@ func TestListAndLoadTemplate(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	templatesDir := filepath.Join(proj.WorkDir(), "templates")
+	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
 	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
 		t.Fatalf("mkdir templates: %v", err)
 	}
@@ -86,7 +86,7 @@ tasks:
 	}
 
 	// LoadTemplate returns raw bytes + summary.
-	loaded, err := proj.LoadTemplate("templates/gwas.yaml")
+	loaded, err := proj.LoadTemplate("enju_templates/gwas.yaml")
 	if err != nil {
 		t.Fatalf("LoadTemplate: %v", err)
 	}
@@ -95,7 +95,7 @@ tasks:
 	}
 
 	// InstantiateTemplate substitutes supplied values.
-	parsed, _, err := proj.InstantiateTemplate("templates/gwas.yaml", map[string]interface{}{
+	parsed, _, err := proj.InstantiateTemplate("enju_templates/gwas.yaml", map[string]interface{}{
 		"disease": "PCOS",
 	})
 	if err != nil {
@@ -117,7 +117,7 @@ func TestInstantiateTemplateMissingRequired(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	templatesDir := filepath.Join(proj.WorkDir(), "templates")
+	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
 	_ = os.MkdirAll(templatesDir, 0o755)
 	_ = os.WriteFile(filepath.Join(templatesDir, "r.yaml"), []byte(`name: "R"
 version: 1
@@ -132,7 +132,7 @@ tasks:
     prompt: "x {{disease}}"
 `), 0o644)
 
-	err := proj.ValidateTemplateParams("templates/r.yaml", map[string]interface{}{})
+	err := proj.ValidateTemplateParams("enju_templates/r.yaml", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected missing-required error, got nil")
 	}
@@ -154,11 +154,11 @@ func TestLoadTemplateRejectsPathEscape(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	_, err := proj.LoadTemplate("templates/../.git/config")
+	_, err := proj.LoadTemplate("enju_templates/../.git/config")
 	if err == nil {
 		t.Fatal("expected path-escape rejection, got nil")
 	}
-	if !strings.Contains(err.Error(), "disallowed") {
+	if !strings.Contains(err.Error(), "disallowed") && !strings.Contains(err.Error(), "must live under") {
 		t.Errorf("expected disallowed-path error, got: %v", err)
 	}
 }

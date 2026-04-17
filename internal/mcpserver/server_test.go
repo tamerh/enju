@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -557,6 +558,206 @@ func TestEagerCloneOnCreateProject(t *testing.T) {
 			names[i] = e.Name()
 		}
 		t.Fatalf("expected slug-named dir containing 'my-cool-project', got: %v", names)
+	}
+}
+
+// TestInitFolderWithoutGit verifies that enju_init on a plain
+// folder (no .git) initializes git, writes the scaffold, and
+// registers the external dir so ForProject opens it directly.
+func TestInitFolderWithoutGit(t *testing.T) {
+	// Fake coordinator.
+	var createdProjectID int64 = 1
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"test-init"}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Create a plain folder with one file.
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# My Paper"), 0644)
+
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "enju_init",
+			Arguments: map[string]interface{}{"name": "test-init", "path": dir},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleInit: %v", err)
+	}
+	if result == nil || result.IsError {
+		t.Fatalf("expected success, got: %+v", result)
+	}
+
+	// Git should be initialized.
+	gitDir := filepath.Join(dir, ".git")
+	if _, err := os.Stat(gitDir); err != nil {
+		t.Error("expected .git dir after init")
+	}
+
+	// Scaffold should exist.
+	if _, err := os.Stat(filepath.Join(dir, "enju_templates", ".gitkeep")); err != nil {
+		t.Error("expected enju_templates/.gitkeep after init")
+	}
+
+	// Original file preserved.
+	data, _ := os.ReadFile(filepath.Join(dir, "paper.md"))
+	if string(data) != "# My Paper" {
+		t.Errorf("paper.md clobbered: %s", data)
+	}
+
+	// External dir registered — ForProject should open it.
+	if !ws.HasExternalDir(createdProjectID) {
+		t.Error("expected external dir registered")
+	}
+	proj, err := ws.ForProject(createdProjectID, "")
+	if err != nil {
+		t.Fatalf("ForProject on init'd dir: %v", err)
+	}
+	if proj.WorkDir() != dir {
+		t.Errorf("expected workdir=%s, got %s", dir, proj.WorkDir())
+	}
+}
+
+// TestInitFolderWithExistingGit verifies that enju_init on a
+// folder that already has git preserves existing history and
+// adds the scaffold on top.
+func TestInitFolderWithExistingGit(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":2,"name":"existing-git"}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Create a folder with git + one commit.
+	dir := t.TempDir()
+	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("pre-existing"), 0644)
+	wt, _ := repo.Worktree()
+	wt.Add("existing.txt")
+	wt.Commit("pre-existing commit", &gogit.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test", When: time.Now()},
+	})
+
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "enju_init",
+			Arguments: map[string]interface{}{"name": "existing-git", "path": dir},
+		},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+	}
+
+	// Should have 2 commits: the pre-existing one + scaffold.
+	iter, _ := repo.Log(&gogit.LogOptions{})
+	count := 0
+	iter.ForEach(func(c *object.Commit) error { count++; return nil })
+	if count != 2 {
+		t.Errorf("expected 2 commits (pre-existing + scaffold), got %d", count)
+	}
+
+	// Pre-existing file preserved.
+	data, _ := os.ReadFile(filepath.Join(dir, "existing.txt"))
+	if string(data) != "pre-existing" {
+		t.Errorf("existing.txt clobbered: %s", data)
+	}
+
+	// Scaffold added.
+	if _, err := os.Stat(filepath.Join(dir, "enju_templates", ".gitkeep")); err != nil {
+		t.Error("expected enju_templates after init on existing git repo")
+	}
+}
+
+// TestInitIdempotent verifies that running enju_init twice on the
+// same folder doesn't clobber anything or fail.
+func TestInitIdempotent(t *testing.T) {
+	mux := http.NewServeMux()
+	callCount := 0
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":%d,"name":"idempotent"}`, callCount)))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "data.csv"), []byte("a,b,c"), 0644)
+
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	makeReq := func() mcp.CallToolRequest {
+		return mcp.CallToolRequest{
+			Params: mcp.CallToolParams{
+				Name:      "enju_init",
+				Arguments: map[string]interface{}{"name": "idempotent", "path": dir},
+			},
+		}
+	}
+
+	// First init.
+	r1, err := c.handleInit(context.Background(), makeReq())
+	if err != nil || r1.IsError {
+		t.Fatalf("first init: err=%v result=%+v", err, r1)
+	}
+
+	// Second init — should not fail, scaffold already exists.
+	r2, err := c.handleInit(context.Background(), makeReq())
+	if err != nil || r2.IsError {
+		t.Fatalf("second init: err=%v result=%+v", err, r2)
+	}
+
+	// Data file still intact.
+	data, _ := os.ReadFile(filepath.Join(dir, "data.csv"))
+	if string(data) != "a,b,c" {
+		t.Errorf("data.csv clobbered: %s", data)
 	}
 }
 
