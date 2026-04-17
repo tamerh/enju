@@ -559,3 +559,60 @@ func TestEagerCloneOnCreateProject(t *testing.T) {
 		t.Fatalf("expected slug-named dir containing 'my-cool-project', got: %v", names)
 	}
 }
+
+// TestFormatClaimResultShowsRevisionContext verifies that when
+// reviewFeedback and previousSubmission are provided, the claim
+// response includes both sections so the author knows what they
+// wrote and what the reviewer said.
+func TestFormatClaimResultShowsRevisionContext(t *testing.T) {
+	claimData := []byte(`{
+		"task": {"id": "1:1:draft", "seq": 1, "prompt": "Write something."},
+		"deadline": "2026-04-17T10:00:00Z"
+	}`)
+
+	feedback := []byte(`{
+		"reviewer": "bob",
+		"decision": "request_changes",
+		"content": "Too vague. Be more specific."
+	}`)
+
+	prevSubmission := []byte(`{
+		"content": "This was my first attempt at writing."
+	}`)
+
+	result := formatClaimResult(claimData, nil, "alice", feedback, prevSubmission)
+
+	if !strings.Contains(result, "Previous submission") {
+		t.Errorf("expected 'Previous submission' section, got:\n%s", result)
+	}
+	if !strings.Contains(result, "first attempt") {
+		t.Errorf("expected previous content in output, got:\n%s", result)
+	}
+	if !strings.Contains(result, "Reviewer feedback") {
+		t.Errorf("expected 'Reviewer feedback' section, got:\n%s", result)
+	}
+	if !strings.Contains(result, "Too vague") {
+		t.Errorf("expected reviewer comment in output, got:\n%s", result)
+	}
+	if !strings.Contains(result, "@bob") {
+		t.Errorf("expected reviewer name in output, got:\n%s", result)
+	}
+}
+
+// TestFormatClaimResultNoFeedbackOnFirstClaim verifies that on a
+// fresh claim (no prior review), no feedback sections appear.
+func TestFormatClaimResultNoFeedbackOnFirstClaim(t *testing.T) {
+	claimData := []byte(`{
+		"task": {"id": "1:1:draft", "seq": 1, "prompt": "Write something."},
+		"deadline": "2026-04-17T10:00:00Z"
+	}`)
+
+	result := formatClaimResult(claimData, nil, "alice")
+
+	if strings.Contains(result, "Previous submission") {
+		t.Errorf("should not show previous submission on first claim, got:\n%s", result)
+	}
+	if strings.Contains(result, "Reviewer feedback") {
+		t.Errorf("should not show reviewer feedback on first claim, got:\n%s", result)
+	}
+}

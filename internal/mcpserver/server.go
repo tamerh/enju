@@ -1502,13 +1502,30 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// If this task was bounced back via request_changes, find the
-	// reviewer's feedback so the author knows what to fix.
+	// reviewer's feedback AND the author's previous submission
+	// so they know what to fix and what they wrote before.
 	var reviewFeedback []byte
 	if meta != nil && meta.ProjectID > 0 {
 		reviewFeedback = c.fetchReviewFeedback(ctx, meta)
 	}
 
-	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username, reviewFeedback)), nil
+	// Read the previous submission if it still exists on disk.
+	// After request_changes, the DB clears result_path/commit_sha
+	// but the file stays in the working tree.
+	var previousSubmission []byte
+	if reviewFeedback != nil && meta != nil && c.workspace != nil {
+		remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
+		if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
+			resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+			contentPath := filepath.Join(resultDir, "result.md")
+			if content, rerr := proj.ReadFile(contentPath); rerr == nil && len(content) > 0 {
+				prev := map[string]string{"content": string(content)}
+				previousSubmission, _ = json.Marshal(prev)
+			}
+		}
+	}
+
+	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username, reviewFeedback, previousSubmission)), nil
 }
 
 // fetchReviewFeedback looks up the most recent review task that

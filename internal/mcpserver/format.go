@@ -721,7 +721,10 @@ func exampleValueForFormat(format string) string {
 	return `"content here"`
 }
 
-func formatClaimResult(claimData []byte, inputsData []byte, viewer string, reviewFeedback ...[]byte) string {
+// formatClaimResult renders the response from claiming a task.
+// Optional trailing args: reviewFeedback (JSON from fetchReviewFeedback)
+// and previousSubmission (JSON with "content" key).
+func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra ...[]byte) string {
 	var claim map[string]interface{}
 	if err := json.Unmarshal(claimData, &claim); err != nil {
 		return string(claimData)
@@ -871,11 +874,34 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, revie
 		}
 	}
 
-	// Show reviewer feedback if this task was bounced back via
-	// request_changes — the author needs to know what to fix.
-	if len(reviewFeedback) > 0 && reviewFeedback[0] != nil {
+	// Show previous submission + reviewer feedback if this task
+	// was bounced back via request_changes.
+	var feedbackData, prevData []byte
+	if len(extra) > 0 {
+		feedbackData = extra[0]
+	}
+	if len(extra) > 1 {
+		prevData = extra[1]
+	}
+
+	if prevData != nil {
+		var prev map[string]string
+		if json.Unmarshal(prevData, &prev) == nil {
+			if content := prev["content"]; content != "" {
+				b.WriteString("\n── Previous submission ─────────────────────\n")
+				display := content
+				if len(display) > 500 {
+					display = display[:500] + "…"
+				}
+				b.WriteString("  " + strings.ReplaceAll(display, "\n", "\n  "))
+				b.WriteString("\n────────────────────────────────────────────\n")
+			}
+		}
+	}
+
+	if feedbackData != nil {
 		var fb map[string]interface{}
-		if json.Unmarshal(reviewFeedback[0], &fb) == nil {
+		if json.Unmarshal(feedbackData, &fb) == nil {
 			reviewer, _ := fb["reviewer"].(string)
 			decision, _ := fb["decision"].(string)
 			content, _ := fb["content"].(string)
