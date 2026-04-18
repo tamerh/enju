@@ -3698,6 +3698,111 @@ tasks:
 	}
 }
 
+// TestMCPComputeWritesArtifactsRegisters reproduces the
+// tester's compute-specific report: an action:compute task
+// that declares writes_artifacts on templated paths must
+// (1) substitute the path per-instance, (2) have the
+// executor pick up the on-disk file the script wrote, and
+// (3) register it in the artifact index so downstream
+// consumers can resolve it.
+//
+// Pre-fix: handleExecuteTask only committed result.md +
+// metadata.json and didn't report artifacts_written, so the
+// artifact index stayed empty even when the script wrote
+// the declared file. Per-instance dep inference via shared
+// artifact path ALSO relies on this chain: without the
+// writer ever registering, siblings could run anyway (their
+// depends_on landed correctly via the parse-time wiring,
+// but at claim time the artifact reader would find nothing).
+func TestMCPComputeWritesArtifactsRegisters(t *testing.T) {
+	h := newMCPHarness(t, "ComputeWrites")
+	projectID := h.createTestProject()
+
+	yaml := `name: "compute writes_artifacts"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the describe script."
+    writes_artifacts:
+      - "scripts/describe.sh"
+
+  - id: describe
+    for_each:
+      stem: [alpha, beta]
+    action: compute
+    script: scripts/describe.sh
+    writes_artifacts:
+      - "summaries/{{stem}}.md"
+    prompt: "Describe {{stem}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Seed a script that writes its per-instance artifact to
+	// the path enju tells it via ENJU_TASK_ID. The test YAML
+	// declares summaries/{{stem}}.md, which the parser has now
+	// substituted to summaries/alpha.md and summaries/beta.md
+	// on the two instances — we just have to make the script
+	// write to whichever stem belongs to this run.
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+# ENJU_TASK_ID is like "1:1:alpha:describe" — pull the stem out.
+# Artifacts live at their natural repo-relative path (no
+# "artifacts/" prefix); writes_artifacts declares the path
+# verbatim.
+stem=$(echo "$ENJU_TASK_ID" | awk -F: '{print $3}')
+mkdir -p "$ENJU_PROJECT_DIR/summaries"
+echo "summary of $stem" > "$ENJU_PROJECT_DIR/summaries/${stem}.md"
+echo "wrote $stem"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded script",
+		map[string]string{"scripts/describe.sh": script})
+
+	// The repository layer doesn't preserve +x; chmod after
+	// every pull by walking each local clone. Same pattern
+	// TestMCPDynamicForEachComputeAction uses.
+	chmodScript := func() {
+		matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "describe.sh"))
+		for _, m := range matches {
+			_ = os.Chmod(m, 0o755)
+		}
+	}
+	chmodScript()
+
+	// Each compute instance runs via enju_execute_task. After
+	// the run, the artifact index MUST have a per-instance
+	// entry — the substituted path, registered as a writer
+	// edge the coordinator knows about.
+	for _, stem := range []string{"alpha", "beta"} {
+		chmodScript()
+		res := h.call(t, "enju_execute_task", map[string]any{
+			"task_id": h.taskID(stem + ":describe"),
+		})
+		if res.IsError {
+			t.Fatalf("execute %s:describe: %s", stem, mcpText(res))
+		}
+		if !strings.Contains(mcpText(res), "Artifacts: summaries/"+stem+".md") {
+			t.Errorf("%s:describe reply should list the written artifact; got:\n%s", stem, mcpText(res))
+		}
+	}
+
+	// Artifact index now has both entries. Pre-fix this was
+	// empty — the bug's headline symptom.
+	arts := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	got := make(map[string]bool)
+	for _, a := range arts {
+		m, _ := a.(map[string]interface{})
+		if path, _ := m["path"].(string); path != "" {
+			got[path] = true
+		}
+	}
+	for _, want := range []string{"summaries/alpha.md", "summaries/beta.md"} {
+		if !got[want] {
+			t.Errorf("expected %q in artifact index after compute writes; have: %v", want, got)
+		}
+	}
+}
+
 // stringSliceFromTask pulls a []string field out of the
 // JSON map shape enju_get_task returns. Fields are either
 // []interface{} (JSON array) or absent.

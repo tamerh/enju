@@ -303,27 +303,67 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		Content:     metaBytes,
 	})
 
+	// Declared-artifact pickup. The script wrote its outputs
+	// to the declared writes_artifacts paths (or it didn't,
+	// and that's either a silent script bug or a truly
+	// optional output). Read each declared path from the
+	// workspace, include it in the commit, and report it to
+	// the coordinator so the artifact index gets the
+	// per-instance entry.
+	//
+	// Missing files are skipped with a soft warning accumulated
+	// into the response. They're not a hard failure — the
+	// script may legitimately skip writing conditionally —
+	// but the absence is surfaced so the author knows nothing
+	// registered.
+	var artifactsWritten []string
+	var missingArtifacts []string
+	for _, rel := range meta.WritesArtifacts {
+		if rel == "" {
+			continue
+		}
+		full := filepath.Join(workDir, mcpgit.ArtifactPath(rel))
+		body, rerr := os.ReadFile(full)
+		if rerr != nil {
+			missingArtifacts = append(missingArtifacts, rel)
+			continue
+		}
+		files = append(files, mcpgit.FileWrite{
+			RepoRelPath: mcpgit.ArtifactPath(rel),
+			Content:     body,
+		})
+		artifactsWritten = append(artifactsWritten, rel)
+	}
+
 	proj.Lock()
 	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
-		TaskID:      taskID,
-		Username:    c.username,
-		AuthorName:  c.citizenName,
-		AuthorEmail: c.citizenEmail,
-		ModelName:   c.modelName,
-		Files:       files,
+		TaskID:        taskID,
+		Username:      c.username,
+		AuthorName:    c.citizenName,
+		AuthorEmail:   c.citizenEmail,
+		ModelName:     c.modelName,
+		Files:         files,
+		ArtifactPaths: artifactsWritten,
 	})
 	proj.Unlock()
 	if err != nil {
 		return mcp.NewToolResultError("git submit failed: " + err.Error()), nil
 	}
 
-	// Report to coordinator.
+	// Report to coordinator. When the task declared
+	// writes_artifacts, include the list we actually picked
+	// up so the coordinator can upsert the artifact index
+	// (and validate against the declaration — unknown paths
+	// in artifacts_written are rejected at the engine layer).
 	reportBody := map[string]interface{}{
 		"commit_sha":  submitRes.CommitSHA,
 		"result_path": resultDir,
 		"model":       c.modelName,
 		"username":    c.username,
 		"content":     content,
+	}
+	if len(artifactsWritten) > 0 {
+		reportBody["artifacts_written"] = artifactsWritten
 	}
 	reportData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
 	if err != nil {
@@ -336,6 +376,15 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	b.WriteString(fmt.Sprintf("  Script:  %s\n", meta.Script))
 	b.WriteString(fmt.Sprintf("  Output:  %d bytes written to result.md\n", len(content)))
 	b.WriteString(fmt.Sprintf("  Commit:  %s\n", shortSHA(submitRes.CommitSHA)))
+	if len(artifactsWritten) > 0 {
+		b.WriteString(fmt.Sprintf("  Artifacts: %s\n", strings.Join(artifactsWritten, ", ")))
+	}
+	if len(missingArtifacts) > 0 {
+		// Warn loud — a declared path that the script didn't
+		// produce is usually a silent bug the author wants to
+		// know about.
+		b.WriteString(fmt.Sprintf("  ⚠ Missing (declared but not written by script): %s\n", strings.Join(missingArtifacts, ", ")))
+	}
 
 	// Contribution counter from the report response.
 	var report map[string]interface{}

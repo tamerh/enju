@@ -62,6 +62,15 @@ type taskMeta struct {
 	OutputsSchemaJSON string
 	// Script is the script path for action:compute tasks.
 	Script string
+	// WritesArtifacts is the resolved list of artifact paths
+	// this task declares it produces. For action:compute, the
+	// executor uses this to know which on-disk files the script
+	// wrote so it can include them in the commit and report
+	// them back to the coordinator for artifact-index upsert.
+	// Already per-instance substituted by the parser for
+	// for_each instances (e.g. "summaries/alpha.md" not
+	// "summaries/{{stem}}.md").
+	WritesArtifacts []string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -118,6 +127,17 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["script"].(string); ok {
 		meta.Script = v
+	}
+	// writes_artifacts lives on the task record as a []string
+	// (API response shape). Stored post-parse with any
+	// for_each {{var}} refs already substituted per-instance,
+	// so no further processing needed here.
+	if v, ok := raw["writes_artifacts"].([]interface{}); ok {
+		for _, p := range v {
+			if s, ok := p.(string); ok {
+				meta.WritesArtifacts = append(meta.WritesArtifacts, s)
+			}
+		}
 	}
 	return meta, nil
 }
