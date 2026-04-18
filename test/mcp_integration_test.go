@@ -3046,6 +3046,78 @@ tasks:
 	}
 }
 
+// TestMCPMermaidFanOutFromDynamicForEach is a regression test
+// for the "discover floats as a disconnected node" bug: when a
+// task uses `for_each: {x: "{{source.items}}"}`, the
+// materialized instances must record `source` in their
+// depends_on so downstream consumers (Mermaid renderer, DAG
+// walkers, any visualizer) see the fan-out edge. Before the
+// fix, materialization seeded the DAG edge for cascade
+// purposes but omitted it from depends_on, so
+// enju_export_diagram produced mermaid with dangling expand
+// nodes and no source edge.
+func TestMCPMermaidFanOutFromDynamicForEach(t *testing.T) {
+	h := newMCPHarness(t, "FanOutA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "dynamic for_each fan-out"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+  - id: aggregate
+    action: answer
+    depends_on: [expand]
+    prompt: "Summarize: {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Accept discover with a 3-item list → materializes
+	// alpha:expand, beta:expand, gamma:expand.
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitOutputLists(t, "discover", map[string]any{
+		"topics": []string{"alpha", "beta", "gamma"},
+	})
+
+	// The bug: each materialized expand:* instance must have
+	// discover in its depends_on. Without this, the Mermaid
+	// renderer has no edge to draw from discover to the
+	// instances.
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		shortID := key + ":expand"
+		task := h.taskGet(shortID)
+		deps, _ := task["depends_on"].(string)
+		if !strings.Contains(deps, ":discover") {
+			t.Errorf("expected %s depends_on to include discover (fan-out edge); got %q", shortID, deps)
+		}
+	}
+
+	// End-to-end verification: export the diagram and confirm
+	// the mermaid source actually contains the fan-out edges.
+	res := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "after_materialize",
+	})
+	out := mcpText(res)
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		// One edge per instance: t_1_1_discover --> t_1_1_<key>_expand
+		want := fmt.Sprintf("t_1_1_discover --> t_1_1_%s_expand", key)
+		if !strings.Contains(out, want) {
+			t.Errorf("missing fan-out edge %q in mermaid output; got:\n%s", want, out)
+		}
+	}
+}
+
 // TestMCPExportDiagram exercises enju_export_diagram end-to-end:
 // write an initial snapshot, overwrite with a re-exported
 // "initial" (idempotent, no accumulating final-1 / final-2),

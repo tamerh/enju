@@ -227,6 +227,14 @@ func (e *Engine) ComputeMaterialization(
 		// Resolve per-instance deps.
 		allDeps := template.MergeDependencies(def.DependsOn, def.Prompt)
 		var resolvedDeps []string
+		seenResolvedDep := make(map[string]bool)
+		addResolvedDep := func(full string) {
+			if full == "" || seenResolvedDep[full] {
+				return
+			}
+			seenResolvedDep[full] = true
+			resolvedDeps = append(resolvedDeps, full)
+		}
 		seenDAGParent := make(map[string]bool)
 		var dagParents []string
 		addDAGParent := func(short string) {
@@ -245,12 +253,34 @@ func (e *Engine) ComputeMaterialization(
 		// the source task, and invalidating the source fails to
 		// dematerialize downstream — the bug that motivated J.1's
 		// eager dematerialization pass.
+		//
+		// Also add the source to resolvedDeps (the persisted
+		// depends_on string). Without it, any downstream consumer
+		// of the task list — Mermaid export, DAG visualizers,
+		// `enju_run_status`'s per-instance tree — sees the
+		// materialized instances as dangling with no edge back to
+		// the task whose output list produced them. This was the
+		// "discover floats as a disconnected node" bug. Safe to
+		// add: the source is ACCEPTED at materialization time
+		// (that's what triggered this call), so scheduling doesn't
+		// regress — UpdateReadyTasks still finds the new row
+		// READY on the same tick.
 		for _, dd := range parsed.DeferredTaskDefs {
 			if dd.TaskDefID != def.ID {
 				continue
 			}
 			for _, ref := range dd.ForEachRefs {
 				addDAGParent(ref.TaskID)
+				// ref.TaskID is the def id; the source's full
+				// task id is `task.ID` when this batch was
+				// triggered by that task's own accept. For
+				// transitively-deferred defs (beta deferred on
+				// alpha, materialized when alpha accepts) the
+				// same relation holds — `task` is always the
+				// accepting task and is the direct source.
+				if ref.TaskID == task.TaskDefID {
+					addResolvedDep(task.ID)
+				}
 			}
 			break
 		}
@@ -263,8 +293,12 @@ func (e *Engine) ComputeMaterialization(
 			// task record already has an instance key (possibly
 			// empty for non-for_each sources), so we can't look
 			// it up in instanceIndex — we wire the edge directly.
+			// Explicit depends_on to the source goes into
+			// resolvedDeps too; the for_each-seeding block above
+			// already did it, but that's dedup-safe via addResolvedDep.
 			if dep == task.TaskDefID {
 				addDAGParent(enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID))
+				addResolvedDep(task.ID)
 				continue
 			}
 			// Per-instance pair: check:alpha → analyze:alpha.
@@ -273,14 +307,14 @@ func (e *Engine) ComputeMaterialization(
 			// both sides.
 			if ids, ok := instanceIndex[dep]; ok {
 				if matched, ok := ids[inst.Key]; ok {
-					resolvedDeps = append(resolvedDeps, matched.FullID)
+					addResolvedDep(matched.FullID)
 					addDAGParent(matched.ShortID)
 					continue
 				}
 			}
 			// Singleton upstream (not materialized in this batch):
 			// the DB row already exists with the plain def id.
-			resolvedDeps = append(resolvedDeps, runPrefix+dep)
+			addResolvedDep(runPrefix + dep)
 			addDAGParent(dep)
 		}
 
