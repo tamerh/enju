@@ -249,7 +249,7 @@ For action:compute tasks only. Claims if not already claimed, runs the declared 
 Environment variables exposed to the script:
   ENJU_TASK_ID       — full task ID
   ENJU_PROJECT_DIR   — project clone root (cwd)
-  ENJU_RUN_DIR       — this task's result directory
+  ENJU_RUN_DIR       — this task's result directory (also holds context.json)
   ENJU_TEMPLATE_DIR  — template snapshot dir, when instantiated from a bundle
   ENJU_PARAM_<name>  — every run param + for_each iteration var (lists comma-joined)
 
@@ -323,7 +323,9 @@ A template is a directory bundle under enju_templates/ with template.yaml at its
       template.yaml        # the manifest
       scripts/analyze.py   # bundled, picked up by the snapshot
 
-Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Call enju_describe_template for a template's parameters; enju_create_run with path=<bundle> to instantiate.`),
+Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Loose .yaml files directly under enju_templates/ are the legacy single-file shape — they surface with a migration hint in the listing, not a usable template.
+
+Call enju_describe_template for a template's parameters; enju_create_run with path=<bundle> to instantiate.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose enju_templates/ directory to scan"),
