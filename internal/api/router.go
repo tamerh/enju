@@ -1655,11 +1655,18 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		resp["decision"] = decision
 	}
 	if rejectResult != nil {
-		resp["review_cascade"] = map[string]interface{}{
-			"target":      task.ReviewsTarget,
-			"descendants": rejectResult.Descendants,
-			"changed":     rejectResult.Changed,
+		cascade := map[string]interface{}{
+			"target":            task.ReviewsTarget,
+			"descendants":       rejectResult.Descendants,
+			"changed":           rejectResult.Changed,
+			"rollbacks_count":   len(rejectResult.Rollbacks),
+			"cross_run_readers": rejectResult.CrossRunReaders,
 		}
+		// Verdict lets the formatter pick the right phrasing:
+		// request_changes = "bounced back to READY" (retry),
+		// reject = "rejected (terminal)" (fail cascade).
+		cascade["verdict"] = decision
+		resp["review_cascade"] = cascade
 	}
 	if reviewTally != nil {
 		resp["review_tally"] = map[string]interface{}{

@@ -2919,7 +2919,20 @@ tasks:
 
 	// 2. Reviewer hard-rejects. This fires performFailCascade.
 	h.mcpClaimOK(t, "check")
-	h.mcpSubmitReview(t, "check", "Not good enough.", "reject")
+	submitRes := h.mcpSubmitReview(t, "check", "Not good enough.", "reject")
+
+	// Submit message must describe terminal failure, not the
+	// stale request_changes "bounced back to READY" phrasing.
+	submitText := mcpText(submitRes)
+	if strings.Contains(submitText, "bounced back to READY") {
+		t.Errorf("reject submit message should not say 'bounced back to READY' (that's request_changes); got:\n%s", submitText)
+	}
+	if !strings.Contains(submitText, "rejected (terminal)") {
+		t.Errorf("expected reject submit message to say 'rejected (terminal)'; got:\n%s", submitText)
+	}
+	if !strings.Contains(submitText, "rolled back") {
+		t.Errorf("expected reject submit message to mention artifact rollback; got:\n%s", submitText)
+	}
 
 	// 3. Writer is terminally FAILED.
 	w := h.taskGet("write_data")

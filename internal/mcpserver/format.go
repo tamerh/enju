@@ -1135,6 +1135,36 @@ func formatSubmitResult(data []byte, taskID string) string {
 		b.WriteString(fmt.Sprintf("✗ Review rejected: %s\n", taskID))
 		if reviewCascade != nil {
 			target, _ := reviewCascade["target"].(string)
+			if target != "" {
+				// reject = terminal failure on the target with
+				// artifact rollback + descendant skip cascade.
+				// Phrasing must not reuse the old
+				// request_changes "bounced back to READY" line
+				// — see docs/rollback.md § Review verdicts.
+				descendants, _ := reviewCascade["descendants"].([]interface{})
+				rollbacks, _ := reviewCascade["rollbacks_count"].(float64)
+				crossRun, _ := reviewCascade["cross_run_readers"].([]interface{})
+				line := fmt.Sprintf("  → target %q rejected (terminal)", target)
+				var parts []string
+				if int(rollbacks) > 0 {
+					parts = append(parts, fmt.Sprintf("%d artifact(s) rolled back", int(rollbacks)))
+				}
+				if n := len(descendants); n > 0 {
+					parts = append(parts, fmt.Sprintf("%d descendant(s) skipped", n))
+				}
+				if n := len(crossRun); n > 0 {
+					parts = append(parts, fmt.Sprintf("%d cross-run reader(s) reset", n))
+				}
+				if len(parts) > 0 {
+					line += " — " + strings.Join(parts, ", ")
+				}
+				b.WriteString(line + "\n")
+			}
+		}
+	case decision == "request_changes":
+		b.WriteString(fmt.Sprintf("↺ Changes requested: %s\n", taskID))
+		if reviewCascade != nil {
+			target, _ := reviewCascade["target"].(string)
 			changed, _ := reviewCascade["changed"].(float64)
 			if target != "" {
 				b.WriteString(fmt.Sprintf("  → target %q invalidated and bounced back to READY (%d task(s) reset)\n", target, int(changed)))
