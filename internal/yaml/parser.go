@@ -22,7 +22,7 @@ type Run struct {
 	Version      int                    `yaml:"version"`
 	Ref          string                 `yaml:"ref,omitempty"`
 	Params       []ParamDef             `yaml:"params,omitempty"` // top-level run params, substituted into {{param}} refs at submission
-	ForEach      map[string][]string    `yaml:"for_each,omitempty"`
+	ForEach      ForEachMap             `yaml:"for_each,omitempty"`
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // project-level requirements, inherited by tasks
 	Tasks        []TaskDef              `yaml:"tasks"`
@@ -515,6 +515,13 @@ func applyParamValues(p *Run, supplied map[string]interface{}) error {
 	for k, v := range merged {
 		strMap[k] = stringifyParamValue(v)
 	}
+	// Substitute {{paramname}} refs in run-level for_each.
+	// Same pattern as task-level (below) but resolved once at
+	// the run scope so buildRunLevel sees a static map.
+	if err := substituteForEachParamRefs(p.ForEach, merged, "run"); err != nil {
+		return err
+	}
+
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
 		if t.Prompt != "" {
@@ -523,60 +530,60 @@ func applyParamValues(p *Run, supplied map[string]interface{}) error {
 		if t.UserPrompt != "" {
 			t.UserPrompt = template.ResolveParams(t.UserPrompt, strMap)
 		}
-		// Substitute {{paramname}} refs in for_each values.
-		// Param-refs get converted from ForEachSource.Ref
-		// (e.g. "{{genes}}") to ForEachSource.Values (the
-		// list<string> param's actual value), so downstream
-		// code sees a static for_each indistinguishable from
-		// one authored with a literal list.
-		if len(t.ForEach) == 0 {
+		// Task-level for_each param-ref substitution. Shared
+		// helper also handles the run-level scope above.
+		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// substituteForEachParamRefs walks a ForEachMap and replaces
+// every `{{paramname}}` reference with the param's list<string>
+// value from the merged param map. Task references are left
+// alone — dynamic materialization handles those at run time.
+// Errors are phrased for LLM forwarding (the scope label lands
+// in the prefix so "task \"foo\"" or "run" shows up first).
+func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, scope string) error {
+	if len(fe) == 0 {
+		return nil
+	}
+	for name, src := range fe {
+		if src.Ref == "" {
 			continue
 		}
-		for name, src := range t.ForEach {
-			if src.Ref == "" {
-				continue
-			}
-			paramName, ok := parseForEachParamRef(src.Ref)
-			if !ok {
-				continue // task ref, leave for dynamic materialization
-			}
-			v, haveValue := merged[paramName]
-			if !haveValue {
-				// validateDynamicForEach already checked the
-				// param is declared; this branch means the
-				// param is optional with no default and no
-				// value supplied. That's a real configuration
-				// error — a for_each can't operate on absence.
-				return fmt.Errorf("task %q: for_each variable %q: parameter %q is required to have a value (supply it when creating the run, or give the param a default list)", t.ID, name, paramName)
-			}
-			list, ok := v.([]string)
-			if !ok {
-				// Try to coerce []interface{} of strings —
-				// JSON decoders produce this shape for
-				// list<string> params supplied via the MCP
-				// tools.
-				if raw, ok := v.([]interface{}); ok {
-					coerced := make([]string, 0, len(raw))
-					for idx, item := range raw {
-						s, ok := item.(string)
-						if !ok {
-							return fmt.Errorf("task %q: for_each variable %q: parameter %q element %d is not a string", t.ID, name, paramName, idx)
-						}
-						coerced = append(coerced, s)
-					}
-					list = coerced
-				} else {
-					return fmt.Errorf("task %q: for_each variable %q: parameter %q must be a list of strings (got %T)", t.ID, name, paramName, v)
-				}
-			}
-			if err := validateForEachLiteralMap(
-				fmt.Sprintf("task %q", t.ID),
-				map[string][]string{name: list},
-			); err != nil {
-				return err
-			}
-			t.ForEach[name] = ForEachSource{Values: list}
+		paramName, ok := parseForEachParamRef(src.Ref)
+		if !ok {
+			continue // task ref — leave for dynamic materialization
 		}
+		v, haveValue := merged[paramName]
+		if !haveValue {
+			return fmt.Errorf("%s for_each variable %q: parameter %q is required to have a value (supply it when creating the run, or give the param a default list)", scope, name, paramName)
+		}
+		list, ok := v.([]string)
+		if !ok {
+			// JSON-decoded params arrive as []interface{};
+			// YAML-decoded arrive as []string. Coerce the
+			// former.
+			if raw, ok := v.([]interface{}); ok {
+				coerced := make([]string, 0, len(raw))
+				for idx, item := range raw {
+					s, ok := item.(string)
+					if !ok {
+						return fmt.Errorf("%s for_each variable %q: parameter %q element %d is not a string", scope, name, paramName, idx)
+					}
+					coerced = append(coerced, s)
+				}
+				list = coerced
+			} else {
+				return fmt.Errorf("%s for_each variable %q: parameter %q must be a list of strings (got %T)", scope, name, paramName, v)
+			}
+		}
+		if err := validateForEachLiteralMap(scope, map[string][]string{name: list}); err != nil {
+			return err
+		}
+		fe[name] = ForEachSource{Values: list}
 	}
 	return nil
 }
@@ -632,11 +639,30 @@ func validate(p *Run) ([]string, error) {
 		"review": true, "vote": true,
 	}
 
-	// Validate run-level for_each shape (strict: no empty lists).
-	// Run-level for_each stays static-only in Phase J.1 —
-	// dynamic references are a task-level feature.
-	if err := validateForEachLiteralMap("run", p.ForEach); err != nil {
-		return nil, err
+	// Validate run-level for_each shape. Run-level supports
+	// literal lists AND {{paramname}} refs (substituted at
+	// ParseWithParams time from a declared top-level
+	// list<string> param). Task-refs at run level are nonsense
+	// (no task context exists when the run's tasks are being
+	// built) and rejected here. Empty literal lists are
+	// rejected via the shared helper.
+	for name, src := range p.ForEach {
+		switch {
+		case src.Ref != "":
+			if _, ok := parseForEachParamRef(src.Ref); ok {
+				continue // substitution resolves it later
+			}
+			if _, _, ok := parseForEachRef(src.Ref); ok {
+				return nil, fmt.Errorf("run for_each: variable %q: task references like %q are not supported at run-level — use a static list or a {{paramname}} reference from a top-level param", name, src.Ref)
+			}
+			return nil, fmt.Errorf("run for_each: variable %q: %q is not a valid template reference (expected \"{{paramname}}\")", name, src.Ref)
+		case len(src.Values) == 0:
+			return nil, fmt.Errorf("run for_each: variable %q has an empty list — declare at least one value, a {{paramname}} reference, or remove the variable", name)
+		default:
+			if err := validateForEachLiteralMap("run", map[string][]string{name: src.Values}); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// Validate top-level params: names unique, types recognized,
@@ -1466,7 +1492,11 @@ func hasAnyTaskForEach(tasks []TaskDef) bool {
 // per run-level iteration. Preserved as-is so existing run-level
 // for_each users get identical behavior after this change.
 func buildRunLevel(p *Run) (*ParsedRun, error) {
-	instances := expandForEach(p.ForEach)
+	// By the time we reach build(), any {{paramname}} refs have
+	// been substituted to literal Values in applyParamValues.
+	// StaticValues drops any still-unresolved refs (which should
+	// not exist here — this is a last-line safety net).
+	instances := expandForEach(p.ForEach.StaticValues())
 
 	result := &ParsedRun{
 		Run:           p,

@@ -2546,23 +2546,49 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 // isValidCommitSHAShape checks whether s is shaped like a git
-// commit SHA (40 hex for SHA-1, 64 hex for SHA-256). This is a
-// shape sanity check, not a content verification — the
-// coordinator never fetches the commit to confirm it exists.
-// Under ARCHITECTURE principle 7 (trust-the-client), existence
-// verification is a client responsibility; we just refuse
-// obviously-malformed inputs so a buggy client can't pollute
-// the artifact index with garbage IDs that break downstream
-// template resolution.
+// commit SHA (40 hex for SHA-1, 64 hex for SHA-256) AND isn't
+// one of the obviously-phantom patterns (all zeros, all same
+// digit, etc.) that a buggy or test-harness client would
+// submit by accident.
+//
+// This is still a shape sanity check, not a content
+// verification — under ARCHITECTURE principle 7
+// (trust-the-client), existence verification is a client
+// responsibility. Full server-side verify-by-fetching the
+// commit is tracked as pre-launch work for hosted mode, where
+// the trust-the-client assumption no longer holds.
+//
+// Rejecting well-known phantoms (all-zero especially) closes
+// the "I sent '0000...000' manually and it was accepted"
+// class of reports without requiring the architectural shift
+// that would let the coordinator actually clone and verify
+// remotes.
 func isValidCommitSHAShape(s string) bool {
 	if len(s) != 40 && len(s) != 64 {
 		return false
 	}
+	// All hex?
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 			return false
 		}
+	}
+	// All-same-digit phantoms: "0000..." is the empty-SHA
+	// sentinel go-git uses as a nil-ref marker; "ffff..." and
+	// other repeats are common test-garbage values. A real
+	// commit SHA has entropy — accidental all-same-char is
+	// cryptographically impossible.
+	firstChar := s[0]
+	allSame := true
+	for i := 1; i < len(s); i++ {
+		if s[i] != firstChar {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		return false
 	}
 	return true
 }

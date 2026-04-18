@@ -27,11 +27,19 @@ import (
 // TemplateSummary is the lightweight shape returned by
 // ListTemplates — enough for an LLM to pick a template from a
 // menu without having to parse the full YAML of each one.
+// When a template file fails to parse, the summary still shows
+// up in the list with ParseError populated; the caller can see
+// the path + the reason without having to drill in via
+// describe_template to discover why it's missing. Hiding
+// unparseable templates (the old behavior) was a silent-skip
+// UX failure — users thought the tool didn't scan their
+// directory, when actually their file just failed to decode.
 type TemplateSummary struct {
-	Path        string         `json:"path"`                  // repo-relative, e.g. "enju_templates/gwas.yaml"
-	Name        string         `json:"name,omitempty"`        // from `name:` field
-	Description string         `json:"description,omitempty"` // from `description:` field
-	Params      []ParamSummary `json:"params,omitempty"`      // short param summary
+	Path        string         `json:"path"`                   // repo-relative, e.g. "enju_templates/gwas.yaml"
+	Name        string         `json:"name,omitempty"`         // from `name:` field
+	Description string         `json:"description,omitempty"`  // from `description:` field
+	Params      []ParamSummary `json:"params,omitempty"`       // short param summary
+	ParseError  string         `json:"parse_error,omitempty"` // set when the template YAML failed to decode/validate
 }
 
 // ParamSummary is the per-param shape embedded in a
@@ -76,8 +84,16 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 		rel := filepath.ToSlash(filepath.Join("enju_templates", name))
 		summary, err := p.templateSummary(rel)
 		if err != nil {
-			// Skip unreadable / unparseable templates but keep
-			// going so the menu still shows everything else.
+			// Surface unreadable / unparseable templates with
+			// an error marker instead of silently dropping.
+			// A user who created a template and runs
+			// list_templates deserves to see their file with
+			// the reason it's not usable, not an empty menu
+			// that makes them think the whole scan is broken.
+			out = append(out, TemplateSummary{
+				Path:       rel,
+				ParseError: err.Error(),
+			})
 			continue
 		}
 		out = append(out, *summary)

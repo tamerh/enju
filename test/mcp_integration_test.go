@@ -3861,6 +3861,77 @@ tasks:
 	}
 }
 
+// TestMCPTemplateParamInRunLevelForEach verifies the template
+// parameterization pattern where the run-level for_each list
+// comes from a top-level param. This is the most common shape
+// for reusable templates ("iterate over each item in my
+// gene/topic/file list"). Pre-fix, Run.ForEach was typed
+// map[string][]string so YAML decode failed before validation
+// or substitution could even run — the parser couldn't even
+// load the template, which cascaded into enju_list_templates
+// silently dropping it.
+func TestMCPTemplateParamInRunLevelForEach(t *testing.T) {
+	h := newMCPHarness(t, "RunLevelParamForEach")
+	projectID := h.createTestProject()
+
+	yaml := `name: "run-level param fan-out"
+description: "One task template, fanned out by a caller list."
+version: 1
+params:
+  - name: topics
+    type: list<string>
+    required: true
+    description: "Topics to cover"
+for_each:
+  topic: "{{topics}}"
+tasks:
+  - id: cover
+    action: answer
+    prompt: "Cover topic: {{topic}}"
+`
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"params":     map[string]any{"topics": []any{"red", "green", "blue"}},
+	})
+
+	runs := h.getList(fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if len(runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runs))
+	}
+	first, _ := runs[0].(map[string]interface{})
+	seq, _ := first["seq"].(float64)
+	h.lastProjectID = projectID
+	h.lastRunSeq = int(seq)
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seq))
+
+	// Run-level for_each expands every task per iteration — 3
+	// topics × 1 task = 3 cover instances.
+	tasks := h.runTasks(h.lastRunID)
+	if got := mcpCountTasksByDef(tasks, "cover"); got != 3 {
+		t.Errorf("expected 3 cover instances, got %d", got)
+	}
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, int(seq))
+	byID := map[string]map[string]interface{}{}
+	for _, raw := range tasks {
+		tk, _ := raw.(map[string]interface{})
+		id, _ := tk["id"].(string)
+		byID[id] = tk
+	}
+	for _, topic := range []string{"red", "green", "blue"} {
+		id := runPrefix + topic + ":cover"
+		tk, ok := byID[id]
+		if !ok {
+			t.Errorf("missing cover:%s instance", topic)
+			continue
+		}
+		want := "Cover topic: " + topic
+		if got, _ := tk["prompt"].(string); got != want {
+			t.Errorf("%s prompt: got %q, want %q", id, got, want)
+		}
+	}
+}
+
 // TestMCPTemplateParamInForEachList verifies a template can use
 // a top-level {{paramname}} as the source of a for_each list.
 // This is the canonical parameterized fan-out pattern:

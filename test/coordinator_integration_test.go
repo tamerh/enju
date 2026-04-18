@@ -1606,6 +1606,9 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 		"abc123",                // too short
 		strings.Repeat("z", 40), // correct length, wrong chars
 		"ABCDEF1234567890abcdef1234567890abcdef12", // uppercase rejected (git uses lowercase)
+		strings.Repeat("0", 40), // empty-SHA sentinel — go-git uses this as nil-ref
+		strings.Repeat("f", 40), // common test-garbage phantom
+		strings.Repeat("a", 64), // SHA-256 length but all-same-char
 	}
 	for _, bad := range malformed {
 		t.Run(bad, func(t *testing.T) {

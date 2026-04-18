@@ -2022,6 +2022,15 @@ func formatListTemplates(data []byte) string {
 		name, _ := m["name"].(string)
 		desc, _ := m["description"].(string)
 		params, _ := m["params"].([]interface{})
+		parseErr, _ := m["parse_error"].(string)
+
+		if parseErr != "" {
+			// Surface parse failures inline. Users deserve to
+			// see their template + the reason it's unusable,
+			// not a menu that silently skipped it.
+			b.WriteString(fmt.Sprintf("✗ %s  (unparseable — %s)\n", path, parseErr))
+			continue
+		}
 
 		b.WriteString(fmt.Sprintf("▸ %s\n", path))
 		if name != "" {
