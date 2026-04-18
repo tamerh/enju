@@ -3,9 +3,31 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
+// ApplyPlan is the load-bearing atomicity boundary for row
+// mutations on the tasks table. Every feature path that
+// changes task state — claim, submit, tally resolution,
+// invalidation, park / restore / delete reconciliation,
+// run creation, dynamic materialization, review verdict
+// cascade — constructs a Plan of typed mutations and applies
+// it here, inside a single SQLite transaction. If any
+// mutation fails validation, the entire plan rolls back —
+// no partial commits, no half-applied cascades.
+//
+// Invariant: this file is the only place that writes to the
+// tasks table (aside from a small set of legitimate
+// escape-hatch helpers for scheduler sweeps in sqlite.go —
+// UpdateReadyTasks, ExpireClaimedTask, ReleaseTask — which
+// don't participate in per-feature atomicity because they
+// run as separate follow-up passes). If you're about to add
+// a new `store.UpdateX` helper to mutate task rows
+// per-feature, stop — add a new mutation type (or extend an
+// existing one, e.g. SetTaskState) so it rides the plan's
+// transaction instead. See plan.go for the mutation shape.
+//
 // ApplyPlan validates and applies a Plan's mutations inside
 // a single transaction. If any mutation fails validation,
 // the entire plan is rolled back — no partial commits.
@@ -149,6 +171,16 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		// the ClearClaim path handles wipes all per-claim state.
 		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = '', skip_reason = ?`
 		args := []interface{}{m.NewState, m.SkipReason}
+		// depends_on rewrite (singleton-reopen case): the
+		// caller supplies a new edge set when a reconciled
+		// instance set changes which parents this task should
+		// wait on. Must ride the same UPDATE as the state
+		// flip — same atomicity argument as the non-clear
+		// branch below.
+		if m.NewDependsOn != nil {
+			q += `, depends_on = ?`
+			args = append(args, strings.Join(*m.NewDependsOn, ","))
+		}
 		q += ` WHERE id = ?`
 		args = append(args, m.TaskID)
 		if _, err := tx.Exec(q, args...); err != nil {
@@ -194,6 +226,16 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 			// Restoring from parked — clear the stash so a
 			// later park doesn't see stale residue.
 			q += `, parked_from_state = ''`
+		}
+		// depends_on rewrite, when the caller asked for one.
+		// Must ride the same UPDATE so the state flip and the
+		// edge-set change are atomic — otherwise a crash
+		// between them leaves a task in the new state with
+		// stale edges, which the scheduler reads as "ready
+		// when deps are satisfied" against the wrong deps.
+		if m.NewDependsOn != nil {
+			q += `, depends_on = ?`
+			args = append(args, strings.Join(*m.NewDependsOn, ","))
 		}
 		q += ` WHERE id = ?`
 		args = append(args, m.TaskID)

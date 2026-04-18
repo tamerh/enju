@@ -88,21 +88,6 @@ func New(dbPath string) (*Store, error) {
 }
 
 // Close closes the database connection.
-// UpdateTaskDependsOn rewrites a single task's depends_on
-// string. Used by the Phase 2 singleton-reopen path where
-// reconciliation may produce a different fan-in edge set from
-// a prior round. Not exposed as a generic mutation because
-// depends_on is structural metadata — it's only updated in
-// this one case, and keeping the call shape narrow makes the
-// intent obvious to a reader of the call graph.
-func (s *Store) UpdateTaskDependsOn(taskID, depsCSV string) error {
-	_, err := s.db.Exec(`UPDATE tasks SET depends_on = ? WHERE id = ?`, depsCSV, taskID)
-	if err != nil {
-		return fmt.Errorf("update depends_on for %q: %w", taskID, err)
-	}
-	return nil
-}
-
 func (s *Store) Close() error {
 	return s.db.Close()
 }

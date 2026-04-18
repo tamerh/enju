@@ -29,12 +29,7 @@ import (
 //   - SingletonReopens: transitively-deferred singletons
 //     (e.g. `aggregate`) whose deps set changed across
 //     reconciliation — reset to PENDING with new depends_on.
-//
-// DefIDsToCleanUp is retained as an empty slice so older
-// callers during transition don't break; Phase 2 never fills
-// it (precise per-task deletion replaces "wipe by def").
 type MaterializationOutcome struct {
-	DefIDsToCleanUp  []string
 	TasksToCreate    []store.TaskRecord
 	TasksToRestore   []RestoreOp
 	TasksToDelete    []string

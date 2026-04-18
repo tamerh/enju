@@ -1015,13 +1015,7 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	descendants, _ := result["descendants"].([]interface{})
 	readers, _ := result["artifact_readers"].([]interface{})
 	rollbacks, _ := result["artifacts_rolled_back"].([]interface{})
-	// parked is the new surface (J.2 partial re-mat);
-	// dematerialized is the legacy alias the coordinator
-	// still emits for older clients. Prefer parked.
 	parked, _ := result["parked"].([]interface{})
-	if len(parked) == 0 {
-		parked, _ = result["dematerialized"].([]interface{})
-	}
 
 	b.WriteString(fmt.Sprintf("✓ Invalidated: %s\n", taskID))
 	if reason != "" {

@@ -46,6 +46,7 @@
 package mcpgit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -948,7 +949,7 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 	for _, f := range req.Files {
 		full := filepath.Join(p.workDir, f.RepoRelPath)
 		existing, err := os.ReadFile(full)
-		if err != nil || !bytesEqual(existing, f.Content) {
+		if err != nil || !bytes.Equal(existing, f.Content) {
 			allMatch = false
 			break
 		}
@@ -1004,20 +1005,6 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 		}
 	}
 	return nil, fmt.Errorf("commit failed after %d push attempts", maxRetries)
-}
-
-// bytesEqual is a tiny helper so CommitFiles's no-op check
-// doesn't pull in bytes.Equal just for one call site.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // rebaseOnRemote runs `git pull --rebase --autostash` via the

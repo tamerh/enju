@@ -186,6 +186,19 @@ type SetTaskState struct {
 	// ClearClaim must be false when parking (otherwise ballots
 	// and result commits would be wiped).
 	ParkedFromState TaskState
+	// NewDependsOn, when non-nil, overwrites the task's
+	// depends_on column in the same transaction as the state
+	// flip. Nil = leave depends_on untouched. Used by the J.2
+	// partial re-materialization singleton-reopen path, where
+	// re-accepting with a different instance set requires
+	// rewriting a transitively-deferred singleton's fan-in
+	// edges at the same moment its state resets to PENDING.
+	//
+	// Empty-but-not-nil slice → depends_on is cleared (empty
+	// string). Non-nil pointer + non-empty slice →
+	// comma-joined into the column. The pointer shape makes
+	// "don't touch" vs "clear" unambiguous.
+	NewDependsOn *[]string
 }
 
 func (SetTaskState) mutationKind() MutationKind { return MutSetTaskState }

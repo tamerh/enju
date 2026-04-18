@@ -1656,18 +1656,17 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		resp["decision"] = decision
 	}
 	if rejectResult != nil {
-		cascade := map[string]interface{}{
+		// Formatter keys off `decision` on the outer response
+		// (request_changes vs reject → different phrasing),
+		// so the cascade block itself doesn't need to carry
+		// a verdict field.
+		resp["review_cascade"] = map[string]interface{}{
 			"target":            task.ReviewsTarget,
 			"descendants":       rejectResult.Descendants,
 			"changed":           rejectResult.Changed,
 			"rollbacks_count":   len(rejectResult.Rollbacks),
 			"cross_run_readers": rejectResult.CrossRunReaders,
 		}
-		// Verdict lets the formatter pick the right phrasing:
-		// request_changes = "bounced back to READY" (retry),
-		// reject = "rejected (terminal)" (fail cascade).
-		cascade["verdict"] = decision
-		resp["review_cascade"] = cascade
 	}
 	if reviewTally != nil {
 		resp["review_tally"] = map[string]interface{}{
@@ -2226,16 +2225,17 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 		})
 	}
 	for _, so := range outcome.SingletonReopens {
-		// Re-open carries an update to depends_on too — not
-		// part of SetTaskState's fields, so we fall through to
-		// a dedicated UPDATE after the plan applies. Keep the
-		// state-flip in the plan for atomicity of the state
-		// change; the deps update is structural metadata and
-		// safe to apply as a separate step.
+		// Re-open carries an update to depends_on too. Both
+		// ride the same SetTaskState mutation via the
+		// NewDependsOn field so state flip + edge-set rewrite
+		// land in one transaction — a mid-crash can't leave
+		// the singleton at PENDING with stale parents.
+		newDeps := strings.Split(so.NewDependsOn, ",")
 		muts = append(muts, store.SetTaskState{
-			TaskID:     so.TaskID,
-			NewState:   store.TaskPending,
-			ClearClaim: true,
+			TaskID:       so.TaskID,
+			NewState:     store.TaskPending,
+			ClearClaim:   true,
+			NewDependsOn: &newDeps,
 		})
 	}
 	for _, delID := range outcome.TasksToDelete {
@@ -2251,17 +2251,6 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 			Mutations: muts,
 		}); err != nil {
 			return fmt.Errorf("applying materialization plan: %w", err)
-		}
-	}
-
-	// Singleton depends_on updates post-plan. Separate store
-	// call because SetTaskState doesn't carry depends_on.
-	// Safe to run after the plan — the row already landed in
-	// PENDING with claim cleared; now we refresh its edge
-	// list so UpdateReadyTasks sees the correct parents.
-	for _, so := range outcome.SingletonReopens {
-		if err := s.store.UpdateTaskDependsOn(so.TaskID, so.NewDependsOn); err != nil {
-			return err
 		}
 	}
 
@@ -2422,15 +2411,11 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		resp["artifact_readers"] = result.CrossRunReaders
 	}
 	if len(result.Dematerialized) > 0 {
-		// Phase 1 renamed the semantic from "deleted" to
+		// J.2 renamed the semantic from "deleted" to
 		// "parked": the rows stay, waiting for a matching
 		// re-accept to restore or a non-matching one to
-		// delete. Emit the new key as the primary surface;
-		// keep the legacy `dematerialized` key for backward
-		// compatibility with older clients/formatters until
-		// we can cut it.
+		// delete. Single `parked` key on the wire.
 		resp["parked"] = result.Dematerialized
-		resp["dematerialized"] = result.Dematerialized
 	}
 	if len(result.Rollbacks) > 0 {
 		rbView := make([]map[string]interface{}, 0, len(result.Rollbacks))
