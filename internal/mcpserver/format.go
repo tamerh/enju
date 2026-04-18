@@ -1882,11 +1882,12 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	return b.String()
 }
 
-// formatRunStatusMermaid renders the run's DAG as Mermaid
-// `flowchart TD` syntax. The output is a code block ready to
-// paste into mermaid.live, a markdown file (GitHub renders
-// Mermaid natively in issues/PRs/READMEs), or the preprint
-// figures directory.
+// renderMermaidBody produces the **raw** Mermaid source for a
+// run's DAG — `flowchart TD` header, node declarations, edges,
+// classDef lines. No ``` fences, no ``%% run N`` comment header.
+// This is the bytes that go into a `.mmd` file: consumers
+// (mermaid.live, GitHub markdown, `mmdc` CLI, a preprint's
+// minted block) add their own rendering wrapper as needed.
 //
 // Node ids are derived from task ids with non-alphanumeric
 // characters replaced so Mermaid's parser accepts them. Labels
@@ -1899,26 +1900,25 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 // can color-code accepted / failed / skipped branches at a
 // glance (mermaid.live, GitHub, and most editors honor the
 // class definitions).
-func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
+//
+// Returns "" when the tasks JSON is malformed or the run
+// response carried an error — callers that want an error
+// surface should check for that and decide whether to write
+// the file anyway.
+func renderMermaidBody(runData []byte, tasksData []byte) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
-		return string(runData)
+		return ""
 	}
 	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
-		return fmt.Sprintf("✗ Run not found: %s", errMsg)
+		return ""
 	}
 	var tasks []map[string]interface{}
 	if err := json.Unmarshal(tasksData, &tasks); err != nil {
-		return string(tasksData)
+		return ""
 	}
 
-	runName, _ := run["name"].(string)
-	projectID := jsonID(run["project_id"])
-	seq, _ := run["seq"].(float64)
-
 	var b strings.Builder
-	b.WriteString("```mermaid\n")
-	b.WriteString(fmt.Sprintf("%%%% Run %s #%d — %s\n", projectID, int(seq), runName))
 	b.WriteString("flowchart TD\n")
 
 	// Index full-task-id → sanitized node id. We keep this
@@ -1983,6 +1983,41 @@ func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
 	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
 	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
 	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
+	return b.String()
+}
+
+// formatRunStatusMermaid is the tool-reply wrapper: renders the
+// raw body (see renderMermaidBody) and wraps it in a ```mermaid
+// code fence + a %% comment header naming the run, so the LLM
+// can paste the whole block into its reply and have it render
+// in any Markdown viewer. For **file** writes (enju_export_diagram)
+// use renderMermaidBody directly — the file should be pure
+// Mermaid source, no fence.
+func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
+	// Error paths: mirror the old behavior so existing callers
+	// still see a friendly "✗ Run not found" line instead of an
+	// empty fenced block. renderMermaidBody returns "" on those
+	// inputs, so we detect them here by re-peeking at the run.
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return string(runData)
+	}
+	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
+		return fmt.Sprintf("✗ Run not found: %s", errMsg)
+	}
+	body := renderMermaidBody(runData, tasksData)
+	if body == "" {
+		return string(tasksData)
+	}
+
+	runName, _ := run["name"].(string)
+	projectID := jsonID(run["project_id"])
+	seq, _ := run["seq"].(float64)
+
+	var b strings.Builder
+	b.WriteString("```mermaid\n")
+	b.WriteString(fmt.Sprintf("%%%% Run %s #%d — %s\n", projectID, int(seq), runName))
+	b.WriteString(body)
 	b.WriteString("```\n")
 	return b.String()
 }

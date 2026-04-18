@@ -260,6 +260,37 @@ The script runs in the project's workspace directory. It has full access to the 
 	)
 }
 
+// toolExportDiagram snapshots a run's DAG as raw Mermaid
+// source to a git-tracked file under .enju/runs/{seq}/graph/.
+// See handleExportDiagram for the semantics (idempotent same-
+// phase overwrite, no-op on unchanged content, response shape).
+func toolExportDiagram() mcp.Tool {
+	return mcp.NewTool("enju_export_diagram",
+		mcp.WithDescription(`Snapshot the run's DAG to a git-tracked Mermaid file for archival, preprint figures, or README embedding.
+
+Writes raw .mmd source (no markdown fences) to .enju/runs/{seq}/graph/{phase}.mmd and commits it. Common phase values:
+- "initial"  — capture right after enju_create_run; topology only, before any task runs
+- "final"    — capture once the run completes; fully resolved (winning branches, rejected tasks, expanded for_each)
+- <custom>   — any meaningful mid-run label (e.g. "post_vote_stack_choice", "after_reject_v2"); pick names that tell a story
+
+Idempotent: re-exporting the same phase overwrites the file (no accumulating final-1.mmd, final-2.mmd) and is a no-op if the content would be identical. Safe to call repeatedly without cluttering git history.
+
+Skip during routine enju_run_status checks — only call when the snapshot itself is the artifact (preprint, README, an archival checkpoint). The response also returns the rendered Mermaid inline so you can show the user the diagram immediately AND cite the file path in the same reply.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project (#1, #2, #3)"),
+		),
+		mcp.WithString("phase",
+			mcp.Required(),
+			mcp.Description("Snapshot label. Use 'initial' right after creation, 'final' on completion, or any safe-filename string for mid-run checkpoints. Must not contain '/', '\\', '..', or the null byte; must be ≤64 chars."),
+		),
+	)
+}
+
 func toolExportRun() mcp.Tool {
 	return mcp.NewTool("enju_export_run",
 		mcp.WithDescription(`Export a completed run as a single markdown document. Assembles all task results in DAG order — each task becomes a section with its prompt and result. Use this for the preprint appendix or to review the full output of a run in one place.`),

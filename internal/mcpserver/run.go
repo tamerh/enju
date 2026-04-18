@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -161,6 +162,128 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	return mcp.NewToolResultText(formatCreateRun(data)), nil
 }
+// handleExportDiagram snapshots the run's current DAG as raw
+// Mermaid and commits it to .enju/runs/{seq}/graph/{phase}.mmd.
+// See toolExportDiagram for the tool-facing contract; design
+// notes:
+//
+//   - File is pure .mmd source (no markdown fences). Consumers
+//     (GitHub, mermaid.live, `mmdc`, preprint minted blocks)
+//     wrap it themselves.
+//   - Same phase overwrites — "final.mmd" is always the current
+//     final state. If the user invalidates and re-runs, the new
+//     export replaces the previous final. History is in git.
+//   - No-op optimization: if the would-be content is byte-
+//     identical to what's on disk, we skip the write + commit
+//     so repeated calls don't produce empty "export again"
+//     commits.
+//   - Response includes both the file path and the fenced
+//     rendered Mermaid so the LLM can paste the image into
+//     its reply while also citing the archival location.
+func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	phase := strings.TrimSpace(req.GetString("phase", ""))
+	if err := validateDiagramPhase(phase); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_export_diagram requires a local workspace (MCP client mode)"), nil
+	}
+
+	// Fetch run + tasks from coordinator — same inputs as
+	// handleRunStatus so the diagram reflects the state the
+	// coordinator has committed, not anything the client
+	// might be holding locally.
+	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
+	runData, err := c.get(ctx, base)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	tasksData, err := c.get(ctx, base+"/tasks")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Render the raw body for the file. The body is "" when
+	// the run lookup failed (coordinator returned an error
+	// object) — surface that to the caller rather than
+	// committing an empty .mmd.
+	body := renderMermaidBody(runData, tasksData)
+	if body == "" {
+		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
+	}
+
+	// Acquire a workspace for the project so we can commit.
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	repoPath := fmt.Sprintf(".enju/runs/%d/graph/%s.mmd", runID, phase)
+	authorName, authorEmail := c.commitAuthor(ctx)
+	commitMsg := fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase)
+
+	proj.Lock()
+	res, err := proj.CommitFiles(mcpgit.CommitFilesRequest{
+		Files: []mcpgit.FileWrite{{
+			RepoRelPath: repoPath,
+			Content:     []byte(body),
+		}},
+		CommitMsg:   commitMsg,
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+		ModelName:   c.modelName,
+	})
+	proj.Unlock()
+	if err != nil {
+		return mcp.NewToolResultError("writing diagram to clone: " + err.Error()), nil
+	}
+
+	// Build the reply: path + embed hint + fenced inline render
+	// so the LLM has everything it needs to both show the user
+	// the diagram right now and cite where it lives.
+	var b strings.Builder
+	if res.NoOp {
+		b.WriteString(fmt.Sprintf("✓ Diagram unchanged — skipped commit. File: %s\n", repoPath))
+	} else {
+		b.WriteString(fmt.Sprintf("✓ Diagram written to %s (commit %s)\n", repoPath, shortSHA(res.CommitSHA)))
+	}
+	b.WriteString(fmt.Sprintf("  Embed in markdown: ![](%s)\n\n", repoPath))
+	b.WriteString("```mermaid\n")
+	b.WriteString(body)
+	b.WriteString("```\n")
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// validateDiagramPhase enforces the safe-filename contract on
+// the `phase` argument. We deliberately allow any other char so
+// the LLM can pick descriptive labels ("post_vote_stack_choice",
+// "after_reject_v2"), but we block path-traversal characters and
+// the null byte, cap length, and reject empty.
+func validateDiagramPhase(phase string) error {
+	if phase == "" {
+		return fmt.Errorf("phase is required (common values: 'initial', 'final', or a custom label)")
+	}
+	if len(phase) > 64 {
+		return fmt.Errorf("phase is too long (%d chars) — max 64", len(phase))
+	}
+	if strings.Contains(phase, "/") || strings.Contains(phase, "\\") || strings.Contains(phase, "..") || strings.ContainsRune(phase, 0) {
+		return fmt.Errorf("phase contains forbidden characters ('/', '\\\\', '..', or null byte)")
+	}
+	return nil
+}
+
 func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {

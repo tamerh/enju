@@ -878,6 +878,148 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	return nil, fmt.Errorf("submit failed after %d push attempts", maxRetries)
 }
 
+// CommitFilesRequest packages inputs for a generic file-commit
+// that isn't tied to a task submission (the existing
+// SubmitTaskResult is task-shaped — TaskID, ArtifactPaths,
+// task-specific commit subject). Use CommitFiles for client-side
+// artifacts that belong to a run or project but aren't a task
+// result: DAG snapshots, README updates, diagnostic bundles.
+type CommitFilesRequest struct {
+	Files       []FileWrite
+	CommitMsg   string // full commit message body (subject on first line, blank line, body)
+	AuthorName  string
+	AuthorEmail string
+	ModelName   string // when non-empty, appends an `AI-Model: <x>` trailer
+	MaxRetries  int    // defaults to 3
+}
+
+// CommitFilesResult is the outcome of a successful CommitFiles
+// call. Mirrors SubmitResult — commit SHA + attempt count for
+// logging/diagnostic purposes.
+type CommitFilesResult struct {
+	CommitSHA string
+	Attempts  int
+	// NoOp is true when none of the requested files would have
+	// changed the working tree (every target path already
+	// holds identical content). When NoOp is true, no commit
+	// is created and CommitSHA is the SHA of the current HEAD.
+	// Callers that want "skip no-op exports" can key off this.
+	NoOp bool
+}
+
+// CommitFiles is SubmitTaskResult's task-free sibling: overlay
+// files onto HEAD → commit → push → rebase-retry on non-FF.
+// Shares the push/rebase logic so a failing push on a diagram
+// export retries with the same "preserve user commits" behavior
+// as a task submit.
+//
+// Semantics:
+//
+//   - Caller must hold the project lock for the duration.
+//   - If every file in the request would be a no-op (same bytes
+//     already on disk), nothing is written, no commit is made,
+//     and the result carries NoOp=true. Useful for idempotent
+//     exports — calling enju_export_diagram twice with the same
+//     run state shouldn't clutter git history with empty
+//     commits.
+//   - Otherwise: one commit with the caller's message, then
+//     push with the standard rebase-on-non-FF retry loop.
+//
+// Returned CommitSHA is the SHA that actually landed on the
+// remote (rebase may rewrite it between the local commit and
+// the eventual push).
+func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) {
+	if len(req.Files) == 0 {
+		return nil, fmt.Errorf("no files to write")
+	}
+	if req.CommitMsg == "" {
+		return nil, fmt.Errorf("commit message is required")
+	}
+	maxRetries := req.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
+	// No-op check: read each target path's current content (if
+	// any) and bail if every requested write matches. Done
+	// before any on-disk mutation so a skipped export leaves
+	// the working tree byte-identical.
+	allMatch := true
+	for _, f := range req.Files {
+		full := filepath.Join(p.workDir, f.RepoRelPath)
+		existing, err := os.ReadFile(full)
+		if err != nil || !bytesEqual(existing, f.Content) {
+			allMatch = false
+			break
+		}
+	}
+	if allMatch {
+		sha := ""
+		if head, herr := p.repo.Head(); herr == nil {
+			sha = head.Hash().String()
+		}
+		return &CommitFilesResult{CommitSHA: sha, Attempts: 0, NoOp: true}, nil
+	}
+
+	// Commit message — optionally append the AI-Model trailer
+	// so `git log --format='%(trailers)'` can distinguish AI
+	// vs human contributions, same convention as SubmitTaskResult.
+	msg := req.CommitMsg
+	if req.ModelName != "" {
+		msg += fmt.Sprintf("\n\nAI-Model: %s\n", req.ModelName)
+	}
+
+	// Overlay files onto current HEAD (no reset — see
+	// SubmitTaskResult godoc for the rationale).
+	for _, f := range req.Files {
+		full := filepath.Join(p.workDir, f.RepoRelPath)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
+		}
+		if err := os.WriteFile(full, f.Content, 0644); err != nil {
+			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
+		}
+	}
+
+	sha, err := p.commit(msg, req.AuthorName, req.AuthorEmail)
+	if err != nil {
+		return nil, fmt.Errorf("creating commit: %w", err)
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		pushErr := p.push()
+		if pushErr == nil {
+			if head, herr := p.repo.Head(); herr == nil {
+				sha = head.Hash().String()
+			}
+			return &CommitFilesResult{CommitSHA: sha, Attempts: attempt}, nil
+		}
+		if !isNonFastForwardError(pushErr) {
+			return nil, fmt.Errorf("push failed: %w", pushErr)
+		}
+		if rebaseErr := p.rebaseOnRemote(); rebaseErr != nil {
+			return nil, fmt.Errorf(
+				"push rejected and rebase failed — local work is still in git reflog. Details: %w",
+				rebaseErr)
+		}
+	}
+	return nil, fmt.Errorf("commit failed after %d push attempts", maxRetries)
+}
+
+// bytesEqual is a tiny helper so CommitFiles's no-op check
+// doesn't pull in bytes.Equal just for one call site.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // rebaseOnRemote runs `git pull --rebase --autostash` via the
 // system git binary so divergent histories are merged without
 // discarding local commits. go-git's rebase support is too

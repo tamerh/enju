@@ -3046,6 +3046,130 @@ tasks:
 	}
 }
 
+// TestMCPExportDiagram exercises enju_export_diagram end-to-end:
+// write an initial snapshot, overwrite with a re-exported
+// "initial" (idempotent, no accumulating final-1 / final-2),
+// verify no-op when content hasn't changed, reject bad phases,
+// and confirm the response carries both the archive path and a
+// fenced inline render so the LLM can display the diagram in
+// the same turn it commits it.
+func TestMCPExportDiagram(t *testing.T) {
+	h := newMCPHarness(t, "ExportDiagramA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "export diagram run"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: review
+    action: answer
+    depends_on: [draft]
+    prompt: "Review: {{draft.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// --- initial snapshot ---
+	res := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "initial",
+	})
+	out := mcpText(res)
+	if !strings.Contains(out, ".enju/runs/1/graph/initial.mmd") {
+		t.Errorf("expected initial file path in response; got:\n%s", out)
+	}
+	if !strings.Contains(out, "flowchart TD") {
+		t.Errorf("expected fenced inline render; got:\n%s", out)
+	}
+	if !strings.Contains(out, "![](") {
+		t.Errorf("expected markdown embed hint; got:\n%s", out)
+	}
+	// File must land in the bare remote with raw .mmd content
+	// (no code fence, no %% comment header — those are for the
+	// response only).
+	body, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/initial.mmd")
+	if !ok {
+		t.Fatalf("expected .enju/runs/1/graph/initial.mmd in the bare remote")
+	}
+	if strings.Contains(string(body), "```mermaid") {
+		t.Errorf("file should not contain markdown fences — it's raw .mmd source")
+	}
+	if !strings.Contains(string(body), "flowchart TD") {
+		t.Errorf("file missing flowchart TD header; got:\n%s", body)
+	}
+
+	// --- no-op path: re-export the same phase with unchanged
+	// state. Must not create a new commit.
+	res2 := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "initial",
+	})
+	out2 := mcpText(res2)
+	if !strings.Contains(out2, "unchanged") && !strings.Contains(out2, "skipped commit") {
+		t.Errorf("expected no-op message on identical re-export; got:\n%s", out2)
+	}
+
+	// --- state-change path: claim + submit draft so the tasks
+	// move. Re-export as "final" — content should differ and
+	// a fresh commit should land.
+	h.mcpClaimOK(t, "draft")
+	h.mcpSubmitText(t, "draft", "done")
+	res3 := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "final",
+	})
+	out3 := mcpText(res3)
+	if !strings.Contains(out3, ".enju/runs/1/graph/final.mmd") {
+		t.Errorf("expected final file path in response; got:\n%s", out3)
+	}
+	if strings.Contains(out3, "unchanged") {
+		t.Errorf("expected a real write after state change, got no-op message:\n%s", out3)
+	}
+	// The previous initial snapshot must still exist — new phases
+	// land in new files, they don't clobber siblings.
+	if _, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/initial.mmd"); !ok {
+		t.Errorf("initial.mmd disappeared after final export — phases should be independent files")
+	}
+	finalBody, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/final.mmd")
+	if !ok {
+		t.Fatalf("expected .enju/runs/1/graph/final.mmd after export")
+	}
+	// Final diagram must reflect the state change — draft is
+	// now accepted. The initial.mmd still sees it as ready.
+	// This is the "planned vs actually ran" contract the tool
+	// exists to capture.
+	if !strings.Contains(string(finalBody), "✅") {
+		t.Errorf("expected final.mmd to contain the accepted glyph for draft; got:\n%s", finalBody)
+	}
+
+	// --- custom phase label: arbitrary descriptive name.
+	res4 := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "after_draft_accepted",
+	})
+	if !strings.Contains(mcpText(res4), "after_draft_accepted.mmd") {
+		t.Errorf("expected custom phase label in path; got:\n%s", mcpText(res4))
+	}
+
+	// --- phase validation: path-traversal attempts and empty
+	// must be rejected with clear errors, not silently coerced.
+	for _, bad := range []string{"", "../etc/passwd", "foo/bar", "with\\slash", strings.Repeat("x", 65)} {
+		text := h.callExpectError(t, "enju_export_diagram", map[string]any{
+			"project_id": float64(projectID),
+			"run_id":     float64(1),
+			"phase":      bad,
+		})
+		if !strings.Contains(strings.ToLower(text), "phase") {
+			t.Errorf("expected validation error mentioning 'phase' for %q, got: %s", bad, text)
+		}
+	}
+}
+
 // TestMCPVoteResponsesTemplate is the MCP-layer port. The
 // downstream task's resolved prompt embeds per-voter commentary
 // via {{upstream.responses}}.
