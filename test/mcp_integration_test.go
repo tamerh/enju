@@ -3698,6 +3698,114 @@ tasks:
 	}
 }
 
+// TestMCPDynamicForEachArtifactPairedDeps — the dynamic
+// analogue of TestMCPForEachArtifactPathSubstitution.
+//
+// Setup: discover produces stems at runtime; describe and
+// categorize both declare for_each on {{discover.items}},
+// describe writes summaries/{{stem}}.md, categorize reads the
+// same path. At materialization time (when discover accepts),
+// Enju must pair the instances: describe:alpha →
+// categorize:alpha, describe:beta → categorize:beta. Without
+// that pairing the categorize instances all go READY
+// simultaneously and a claimant hits "no artifact" mid-run.
+//
+// Pre-fix: artifact paths substituted correctly post-round-1,
+// parse-time wireArtifactDeps covers static for_each, but
+// dynamic materialization doesn't re-run the pairing pass —
+// so all categorizes materialize READY. This test was green
+// for static (TestMCPForEachArtifactPathSubstitution); now it
+// must also green for dynamic.
+func TestMCPDynamicForEachArtifactPairedDeps(t *testing.T) {
+	h := newMCPHarness(t, "DynArtPair")
+	projectID := h.createTestProject()
+
+	yaml := `name: "dynamic artifact pairing"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List stems."
+    outputs:
+      items:
+        format: list<string>
+  - id: describe
+    for_each:
+      stem: "{{discover.items}}"
+    action: answer
+    writes_artifacts:
+      - "summaries/{{stem}}.md"
+    prompt: "Describe {{stem}}"
+  - id: categorize
+    for_each:
+      stem: "{{discover.items}}"
+    action: answer
+    reads_artifacts:
+      - "summaries/{{stem}}.md"
+    prompt: "Categorize {{stem}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"items":["alpha","beta"]}`,
+	})
+
+	// Each describe instance should materialize READY (its
+	// only upstream — discover — is ACCEPTED).
+	for _, stem := range []string{"alpha", "beta"} {
+		task := h.taskGet(stem + ":describe")
+		if got := task["state"]; got != "ready" {
+			t.Errorf("describe:%s expected ready post-materialize, got %v", stem, got)
+		}
+	}
+
+	// Each categorize instance should materialize PENDING —
+	// paired with its describe sibling via the shared
+	// artifact path, waiting for THAT sibling to accept.
+	// Before this fix, they'd all materialize READY because
+	// the runtime didn't re-wire artifact-derived edges at
+	// materialization time.
+	for _, stem := range []string{"alpha", "beta"} {
+		task := h.taskGet(stem + ":categorize")
+		if task == nil {
+			t.Fatalf("categorize:%s did not materialize", stem)
+		}
+		if got := task["state"]; got != "pending" {
+			t.Errorf("categorize:%s expected pending (waiting on describe:%s via artifact), got %v",
+				stem, stem, got)
+		}
+		deps, _ := task["depends_on"].(string)
+		if !strings.Contains(deps, ":"+stem+":describe") {
+			t.Errorf("categorize:%s depends_on should include %s:describe; got %q", stem, stem, deps)
+		}
+	}
+
+	// Critically: categorize:alpha should NOT depend on
+	// describe:beta — the pairing is per-instance-key, not a
+	// full fan-in.
+	alphaCat := h.taskGet("alpha:categorize")
+	alphaDeps, _ := alphaCat["depends_on"].(string)
+	if strings.Contains(alphaDeps, ":beta:describe") {
+		t.Errorf("alpha:categorize must NOT depend on beta:describe (wrong pairing); got %q", alphaDeps)
+	}
+
+	// Accept describe:alpha → categorize:alpha flips to ready
+	// (only describe:alpha was its outstanding dep); beta
+	// stays pending.
+	h.mcpClaimOK(t, "alpha:describe")
+	h.mcpSubmitArtifacts(t, "alpha:describe", "alpha summary",
+		map[string]string{"summaries/alpha.md": "ALPHA"})
+	if got := h.taskGet("alpha:categorize")["state"]; got != "ready" {
+		t.Errorf("alpha:categorize should be ready after describe:alpha accepts, got %v", got)
+	}
+	if got := h.taskGet("beta:categorize")["state"]; got != "pending" {
+		t.Errorf("beta:categorize should stay pending (describe:beta still ready), got %v", got)
+	}
+}
+
 // TestMCPComputeWritesArtifactsRegisters reproduces the
 // tester's compute-specific report: an action:compute task
 // that declares writes_artifacts on templated paths must

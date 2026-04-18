@@ -627,6 +627,126 @@ func (e *Engine) ComputeMaterialization(
 		}{FullID: got.FullID, InstanceKey: t.InstanceKey})
 	}
 
+	// Artifact-derived per-instance dep wiring. The parser's
+	// wireArtifactDeps already handles the static-for_each
+	// case (writer and reader both materialize at parse time);
+	// for the dynamic case we have to wire it HERE because the
+	// instances don't exist until this materialization batch.
+	//
+	// The pairing we need: describe:alpha writes
+	// summaries/alpha.md, categorize:alpha reads the same —
+	// add describe:alpha → categorize:alpha. Without this
+	// edge, both rows materialize READY in parallel and a
+	// citizen claiming categorize:alpha before describe:alpha
+	// accepts hits a "no artifact" error at claim time.
+	//
+	// Writer lookup spans two populations: the just-built
+	// TasksToCreate (new this batch) AND non-deleted
+	// existing rows (restored from a prior accept, or
+	// unchanged singletons). A reader whose writer already
+	// exists and is ACCEPTED stays READY; any not-yet-
+	// accepted writer flips the reader to PENDING.
+	if len(outcome.TasksToCreate) > 0 {
+		deletedSet := make(map[string]bool, len(outcome.TasksToDelete))
+		for _, id := range outcome.TasksToDelete {
+			deletedSet[id] = true
+		}
+		// writersByPath: path → list of (fullID, state). We
+		// need the state to decide whether the reader can
+		// stay READY (writer already accepted) or must go
+		// PENDING (writer pending/ready/etc.).
+		type writerRef struct {
+			fullID string
+			state  store.TaskState
+			inBatch bool
+		}
+		writersByPath := map[string][]writerRef{}
+		for _, t := range allExisting {
+			if deletedSet[t.ID] {
+				continue
+			}
+			var paths []string
+			if t.WritesArtifacts != "" {
+				_ = json.Unmarshal([]byte(t.WritesArtifacts), &paths)
+			}
+			for _, p := range paths {
+				writersByPath[p] = append(writersByPath[p], writerRef{
+					fullID:  t.ID,
+					state:   store.TaskState(t.State),
+					inBatch: false,
+				})
+			}
+		}
+		for i := range outcome.TasksToCreate {
+			rec := &outcome.TasksToCreate[i]
+			var paths []string
+			if rec.WritesArtifacts != "" {
+				_ = json.Unmarshal([]byte(rec.WritesArtifacts), &paths)
+			}
+			for _, p := range paths {
+				writersByPath[p] = append(writersByPath[p], writerRef{
+					fullID:  rec.ID,
+					state:   rec.State,
+					inBatch: true,
+				})
+			}
+		}
+		// For each reader in TasksToCreate, add matching
+		// writer(s) to depends_on (dedup'd) and the DAG edge
+		// list. Flip state to PENDING when any added writer
+		// isn't ACCEPTED/SKIPPED yet.
+		for i := range outcome.TasksToCreate {
+			rec := &outcome.TasksToCreate[i]
+			var reads []string
+			if rec.ReadsArtifacts != "" {
+				_ = json.Unmarshal([]byte(rec.ReadsArtifacts), &reads)
+			}
+			if len(reads) == 0 {
+				continue
+			}
+			existing := map[string]bool{}
+			if rec.DependsOn != "" {
+				for _, d := range strings.Split(rec.DependsOn, ",") {
+					d = strings.TrimSpace(d)
+					if d != "" {
+						existing[d] = true
+					}
+				}
+			}
+			var added []string
+			anyPendingWriter := false
+			for _, p := range reads {
+				for _, w := range writersByPath[p] {
+					if w.fullID == rec.ID || existing[w.fullID] {
+						continue
+					}
+					existing[w.fullID] = true
+					added = append(added, w.fullID)
+					if w.inBatch || (w.state != store.TaskAccepted && w.state != store.TaskSkipped) {
+						anyPendingWriter = true
+					}
+					// DAG edge: writer-short → reader-short.
+					outcome.DAGEdges = append(outcome.DAGEdges, DAGEdge{
+						From: strings.TrimPrefix(w.fullID, runPrefix),
+						To:   strings.TrimPrefix(rec.ID, runPrefix),
+					})
+				}
+			}
+			if len(added) == 0 {
+				continue
+			}
+			// Append to the existing depends_on string.
+			if rec.DependsOn == "" {
+				rec.DependsOn = strings.Join(added, ",")
+			} else {
+				rec.DependsOn = rec.DependsOn + "," + strings.Join(added, ",")
+			}
+			if anyPendingWriter && rec.State == store.TaskReady {
+				rec.State = store.TaskPending
+			}
+		}
+	}
+
 	// Transitively-deferred pass. Singletons like `aggregate`
 	// that depend on a dynamic-for_each instance can't compute
 	// their depends_on until pass 2 has populated newInstances.
