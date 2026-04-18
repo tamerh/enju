@@ -894,3 +894,109 @@ func TestRenderDAGTree(t *testing.T) {
 		t.Error("publish should not be at root level — it has deps")
 	}
 }
+
+// TestRenderYourQueueClipsLargeGroups verifies that when a
+// for_each has fanned a template into many ready instances,
+// the queue output caps per-template rows and collapses the
+// rest behind a "...plus N more" line so status stays
+// scannable.
+func TestRenderYourQueueClipsLargeGroups(t *testing.T) {
+	var tasks []map[string]interface{}
+	// 30 ready instances of the same template — the pathological
+	// case the UX feedback flagged.
+	for i := 1; i <= 30; i++ {
+		tasks = append(tasks, map[string]interface{}{
+			"id":          fmt.Sprintf("1:1:t%02d:expand", i),
+			"task_def_id": "expand",
+			"state":       "ready",
+			"seq":         float64(i),
+			"instance_key": fmt.Sprintf("t%02d", i),
+		})
+	}
+	out := renderYourQueue(tasks, "alice")
+	if out == "" {
+		t.Fatalf("expected queue output for 30 ready tasks, got empty")
+	}
+	if !strings.Contains(out, "Your queue (30)") {
+		t.Errorf("expected header count 30; got:\n%s", out)
+	}
+	// Must clip — 30 rows is the UX problem we're fixing.
+	yellowCount := strings.Count(out, "🟡")
+	if yellowCount > maxQueueEntriesPerTemplate {
+		t.Errorf("expected at most %d 🟡 rows per template, got %d; output:\n%s", maxQueueEntriesPerTemplate, yellowCount, out)
+	}
+	// Must tell the reader about the clipped remainder.
+	want := fmt.Sprintf("...plus %d more of same template (expand)", 30-maxQueueEntriesPerTemplate)
+	if !strings.Contains(out, want) {
+		t.Errorf("expected %q in output; got:\n%s", want, out)
+	}
+	if !strings.Contains(out, "enju_list_ready_tasks") {
+		t.Errorf("expected pointer to enju_list_ready_tasks in clipped output; got:\n%s", out)
+	}
+}
+
+// TestFormatRunStatusMermaid snapshots the structural shape
+// of the Mermaid export — fenced code block, flowchart header,
+// one node per task with state-glyph labels, one edge per
+// depends_on, class definitions. The integration test covers
+// the HTTP wiring; this isolates the formatter.
+func TestFormatRunStatusMermaid(t *testing.T) {
+	runJSON := []byte(`{"project_id":1,"seq":1,"name":"demo","state":"active"}`)
+	tasksJSON := []byte(`[
+  {"id":"1:1:draft","task_def_id":"draft","state":"accepted","depends_on":""},
+  {"id":"1:1:check","task_def_id":"check","state":"claimed","depends_on":"1:1:draft"},
+  {"id":"1:1:publish","task_def_id":"publish","state":"pending","depends_on":"1:1:draft,1:1:check"}
+]`)
+	out := formatRunStatusMermaid(runJSON, tasksJSON)
+
+	// Fenced block + flowchart header.
+	if !strings.HasPrefix(out, "```mermaid") {
+		t.Errorf("expected ```mermaid prefix; got first line: %q", strings.SplitN(out, "\n", 2)[0])
+	}
+	if !strings.Contains(out, "flowchart TD") {
+		t.Errorf("missing flowchart TD header; got:\n%s", out)
+	}
+
+	// One node per task, labeled with state glyph + class suffix.
+	if !strings.Contains(out, "t_1_1_draft[\"draft ✅\"]:::accepted") {
+		t.Errorf("expected draft node with accepted class; got:\n%s", out)
+	}
+	if !strings.Contains(out, "t_1_1_check[\"check 🔵\"]:::active") {
+		t.Errorf("expected check node with active class; got:\n%s", out)
+	}
+	if !strings.Contains(out, "t_1_1_publish[\"publish ⚪\"]:::pending") {
+		t.Errorf("expected publish node with pending class; got:\n%s", out)
+	}
+
+	// Exactly 3 edges (draft→check, draft→publish, check→publish).
+	if got := strings.Count(out, "-->"); got != 3 {
+		t.Errorf("expected 3 edges for this DAG, got %d; output:\n%s", got, out)
+	}
+
+	// Class definitions present.
+	for _, cls := range []string{"classDef accepted", "classDef failed", "classDef skipped"} {
+		if !strings.Contains(out, cls) {
+			t.Errorf("expected %q in class defs; got:\n%s", cls, out)
+		}
+	}
+}
+
+// TestRenderYourQueueNoClipBelowThreshold checks the
+// below-cap path: a handful of distinct ready tasks should
+// still render one row each, with no clipping footer.
+func TestRenderYourQueueNoClipBelowThreshold(t *testing.T) {
+	tasks := []map[string]interface{}{
+		{"id": "1:1:draft", "task_def_id": "draft", "state": "ready"},
+		{"id": "1:1:check", "task_def_id": "check", "state": "ready"},
+	}
+	out := renderYourQueue(tasks, "alice")
+	if strings.Contains(out, "plus") {
+		t.Errorf("did not expect clipping at 2 tasks; got:\n%s", out)
+	}
+	if strings.Contains(out, "enju_list_ready_tasks") {
+		t.Errorf("did not expect list_ready_tasks pointer when all rows fit; got:\n%s", out)
+	}
+	if strings.Count(out, "🟡") != 2 {
+		t.Errorf("expected 2 🟡 rows; got:\n%s", out)
+	}
+}

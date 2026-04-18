@@ -153,7 +153,7 @@ func toolGetTask() mcp.Tool {
 
 func toolRunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
-		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure."),
+		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide)."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -161,6 +161,10 @@ func toolRunStatus() mcp.Tool {
 		mcp.WithNumber("run_id",
 			mcp.Required(),
 			mcp.Description("The run sequence number within the project (#1, #2, #3)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: \"default\" (action-oriented text summary with progress bar and queue, the usual reply) or \"mermaid\" (Mermaid flowchart TD syntax — paste into mermaid.live, a markdown file, or the preprint; GitHub renders it natively in issues/PRs). Defaults to \"default\"."),
+			mcp.Enum("default", "mermaid"),
 		),
 	)
 }

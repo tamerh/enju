@@ -2974,6 +2974,78 @@ tasks:
 	}
 }
 
+// TestMCPRunStatusMermaidFormat exercises the opt-in
+// format="mermaid" path on enju_run_status. For large or
+// complex DAGs the text tree gets unreadable; emitting
+// Mermaid `flowchart TD` lets the user paste the graph into
+// mermaid.live, a README, or the preprint directly.
+func TestMCPRunStatusMermaidFormat(t *testing.T) {
+	h := newMCPHarness(t, "MermaidA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "mermaid diagram run"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: check
+    action: answer
+    depends_on: [draft]
+    prompt: "Check: {{draft.content}}"
+  - id: publish
+    action: answer
+    depends_on: [check]
+    prompt: "Publish."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Fetch run_id from the default status first so we call
+	// the mermaid variant with the right seq.
+	res := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"format":     "mermaid",
+	})
+	out := mcpText(res)
+	if !strings.Contains(out, "```mermaid") {
+		t.Errorf("expected fenced mermaid block; got:\n%s", out)
+	}
+	if !strings.Contains(out, "flowchart TD") {
+		t.Errorf("expected 'flowchart TD' header; got:\n%s", out)
+	}
+	// Every task node should be present with its short name.
+	for _, name := range []string{"draft", "check", "publish"} {
+		if !strings.Contains(out, name) {
+			t.Errorf("expected node label %q in mermaid output; got:\n%s", name, out)
+		}
+	}
+	// Depends_on edges must appear as Mermaid arrows.
+	if !strings.Contains(out, "-->") {
+		t.Errorf("expected at least one --> edge; got:\n%s", out)
+	}
+	// Exactly two edges in a linear chain (draft→check, check→publish).
+	if got := strings.Count(out, "-->"); got != 2 {
+		t.Errorf("expected 2 edges in linear chain, got %d; output:\n%s", got, out)
+	}
+	// Class definitions are what make downstream renderers
+	// color nodes by state.
+	if !strings.Contains(out, "classDef accepted") {
+		t.Errorf("expected classDef declarations; got:\n%s", out)
+	}
+
+	// Default format should still render the textual summary
+	// (the opt-in nature of the knob).
+	res2 := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	defaultOut := mcpText(res2)
+	if strings.Contains(defaultOut, "flowchart TD") {
+		t.Errorf("default format should not include mermaid syntax; got:\n%s", defaultOut)
+	}
+}
+
 // TestMCPVoteResponsesTemplate is the MCP-layer port. The
 // downstream task's resolved prompt embeds per-voter commentary
 // via {{upstream.responses}}.

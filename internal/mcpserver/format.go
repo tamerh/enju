@@ -1790,8 +1790,23 @@ func joinSkipReasons(set map[string]bool) string {
 	return strings.Join(out, ", ")
 }
 
+// maxQueueEntriesPerTemplate caps how many "🟡 ready" rows we
+// spell out per task_def_id before collapsing the rest to a
+// single "...plus N more" line. Picked so a for_each producing
+// tens of instances stops drowning the status output while the
+// first few are still individually callable-out for a glance.
+// Claimed-by-viewer rows are always shown in full — those are
+// the tasks the user is actively holding.
+const maxQueueEntriesPerTemplate = 6
+
 // renderYourQueue shows tasks the viewer can act on: claimed by
 // them (finish first) and available to claim.
+//
+// Available tasks are grouped by task_def_id and clipped past
+// maxQueueEntriesPerTemplate per group. For a run where one
+// template has fanned out into dozens of instances, the output
+// stays scannable instead of listing 30+ near-identical rows.
+// Full list is always reachable via enju_list_ready_tasks.
 func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	var claimed, available []map[string]interface{}
 	for _, t := range tasks {
@@ -1810,17 +1825,224 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	var b strings.Builder
 	total := len(claimed) + len(available)
 	b.WriteString(fmt.Sprintf("\nYour queue (%d):\n", total))
+
+	// Claimed-by-viewer first — the reader's own work in flight.
 	for _, t := range claimed {
 		name := taskShortName(t)
 		tid, _ := t["id"].(string)
 		b.WriteString(fmt.Sprintf("  🔵 %s [%s] — in progress\n", name, tid))
 	}
+
+	// Bucket available tasks by task_def_id, preserving the
+	// order of first appearance so the output is stable and
+	// matches the "By task:" block above.
+	type group struct {
+		defID string
+		tasks []map[string]interface{}
+	}
+	groupIndex := map[string]int{}
+	var groups []*group
 	for _, t := range available {
-		name := taskShortName(t)
-		tid, _ := t["id"].(string)
-		b.WriteString(fmt.Sprintf("  🟡 %s [%s]\n", name, tid))
+		defID, _ := t["task_def_id"].(string)
+		if defID == "" {
+			// Shouldn't happen in practice, but guard so an
+			// ill-formed task row still renders somewhere.
+			defID = "(no template)"
+		}
+		idx, ok := groupIndex[defID]
+		if !ok {
+			idx = len(groups)
+			groupIndex[defID] = idx
+			groups = append(groups, &group{defID: defID})
+		}
+		groups[idx].tasks = append(groups[idx].tasks, t)
+	}
+
+	clipped := false
+	for _, g := range groups {
+		n := len(g.tasks)
+		head := n
+		if head > maxQueueEntriesPerTemplate {
+			head = maxQueueEntriesPerTemplate
+		}
+		for i := 0; i < head; i++ {
+			t := g.tasks[i]
+			name := taskShortName(t)
+			tid, _ := t["id"].(string)
+			b.WriteString(fmt.Sprintf("  🟡 %s [%s]\n", name, tid))
+		}
+		if n > head {
+			clipped = true
+			b.WriteString(fmt.Sprintf("     ...plus %d more of same template (%s)\n", n-head, g.defID))
+		}
+	}
+	if clipped {
+		b.WriteString("  → Use enju_list_ready_tasks for the full list.\n")
 	}
 	return b.String()
+}
+
+// formatRunStatusMermaid renders the run's DAG as Mermaid
+// `flowchart TD` syntax. The output is a code block ready to
+// paste into mermaid.live, a markdown file (GitHub renders
+// Mermaid natively in issues/PRs/READMEs), or the preprint
+// figures directory.
+//
+// Node ids are derived from task ids with non-alphanumeric
+// characters replaced so Mermaid's parser accepts them. Labels
+// use the human-readable short name + state glyph. Edges come
+// from `depends_on`; artifact-derived edges are intentionally
+// omitted to keep the graph readable — depends_on is the
+// authoring-layer relation the user actually wrote down.
+//
+// Terminal states get CSS classes so the downstream renderer
+// can color-code accepted / failed / skipped branches at a
+// glance (mermaid.live, GitHub, and most editors honor the
+// class definitions).
+func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return string(runData)
+	}
+	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
+		return fmt.Sprintf("✗ Run not found: %s", errMsg)
+	}
+	var tasks []map[string]interface{}
+	if err := json.Unmarshal(tasksData, &tasks); err != nil {
+		return string(tasksData)
+	}
+
+	runName, _ := run["name"].(string)
+	projectID := jsonID(run["project_id"])
+	seq, _ := run["seq"].(float64)
+
+	var b strings.Builder
+	b.WriteString("```mermaid\n")
+	b.WriteString(fmt.Sprintf("%%%% Run %s #%d — %s\n", projectID, int(seq), runName))
+	b.WriteString("flowchart TD\n")
+
+	// Index full-task-id → sanitized node id. We keep this
+	// map so edge declarations can look up the node id without
+	// re-sanitizing and risking drift.
+	nodeID := make(map[string]string, len(tasks))
+	// Track only task ids present in this run — edges pointing
+	// outside (shouldn't happen for depends_on, but guarded)
+	// get skipped rather than declaring mystery nodes.
+	present := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		if id == "" {
+			continue
+		}
+		present[id] = true
+		nodeID[id] = mermaidNodeID(id)
+	}
+
+	// Node declarations: one per task, with label + class.
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		if id == "" {
+			continue
+		}
+		state, _ := t["state"].(string)
+		skipReason, _ := t["skip_reason"].(string)
+		label := mermaidEscape(taskShortName(t)) + " " + stateIconFor(state, skipReason)
+		cls := mermaidStateClass(state)
+		b.WriteString(fmt.Sprintf("    %s[\"%s\"]", nodeID[id], label))
+		if cls != "" {
+			b.WriteString(":::" + cls)
+		}
+		b.WriteString("\n")
+	}
+
+	// Edges from depends_on. Parse the comma-separated string
+	// per task and emit one edge per parent.
+	b.WriteString("\n")
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		deps, _ := t["depends_on"].(string)
+		if id == "" || deps == "" {
+			continue
+		}
+		for _, parent := range strings.Split(deps, ",") {
+			parent = strings.TrimSpace(parent)
+			if parent == "" || !present[parent] {
+				continue
+			}
+			b.WriteString(fmt.Sprintf("    %s --> %s\n", nodeID[parent], nodeID[id]))
+		}
+	}
+
+	// Class definitions — one per terminal/active state. Colors
+	// are deliberately mild so the graph reads well on both
+	// white and dark backgrounds.
+	b.WriteString("\n")
+	b.WriteString("    classDef accepted fill:#d4edda,stroke:#28a745,color:#000\n")
+	b.WriteString("    classDef active fill:#cce5ff,stroke:#007bff,color:#000\n")
+	b.WriteString("    classDef ready fill:#fff3cd,stroke:#ffc107,color:#000\n")
+	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
+	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
+	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
+	b.WriteString("```\n")
+	return b.String()
+}
+
+// mermaidNodeID sanitizes a full task id like "1:2:alpha:expand"
+// into a valid Mermaid node identifier. Mermaid requires ids to
+// start with a letter and contain only [A-Za-z0-9_], so we
+// prefix with "t_" and replace any non-alphanumeric run with a
+// single underscore.
+func mermaidNodeID(taskID string) string {
+	var b strings.Builder
+	b.WriteString("t_")
+	prevUnderscore := false
+	for _, r := range taskID {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevUnderscore = false
+		default:
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	return b.String()
+}
+
+// mermaidEscape escapes the handful of characters that would
+// break a Mermaid node label quoted with ". `"` becomes `#quot;`
+// (Mermaid's own HTML-entity escape) and literal `]` is swapped
+// for `)` since it's the bracket we use to delimit the label.
+// No-op for most task names in practice.
+func mermaidEscape(s string) string {
+	s = strings.ReplaceAll(s, `"`, `#quot;`)
+	s = strings.ReplaceAll(s, `]`, `)`)
+	return s
+}
+
+// mermaidStateClass maps a task state to the Mermaid class
+// name declared at the bottom of the flowchart. Non-terminal
+// "claimed" / "running" / "collecting" all share the `active`
+// class — they're all "in flight" to the reader.
+func mermaidStateClass(state string) string {
+	switch state {
+	case "accepted", "completed":
+		return "accepted"
+	case "ready":
+		return "ready"
+	case "claimed", "running", "collecting":
+		return "active"
+	case "pending":
+		return "pending"
+	case "failed":
+		return "failed"
+	case "skipped":
+		return "skipped"
+	default:
+		return ""
+	}
 }
 
 func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string {

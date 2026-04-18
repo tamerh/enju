@@ -59,7 +59,16 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
-	return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
+	// Format switch: default = textual summary + tree; mermaid =
+	// flowchart TD syntax for pasting into mermaid.live / README
+	// / preprint. Invalid values fall back to default silently so
+	// older clients that don't know the param never error.
+	switch req.GetString("format", "default") {
+	case "mermaid":
+		return mcp.NewToolResultText(formatRunStatusMermaid(run, tasks)), nil
+	default:
+		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
+	}
 }
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
