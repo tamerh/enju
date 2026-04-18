@@ -242,6 +242,7 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 			InstanceParams: d.InstanceParams,
 			CommitSHA:      d.CommitSHA,
 			ResultPath:     d.ResultPath,
+			State:          d.State,
 			VoteChoice:     d.VoteChoice,
 		}
 		for _, r := range d.Responses {
@@ -359,6 +360,11 @@ type descDependencyRef struct {
 	InstanceParams map[string]string `json:"instance_params"`
 	CommitSHA      string            `json:"commit_sha"`
 	ResultPath     string            `json:"result_path"`
+	// State is the upstream's lifecycle state. Lets the
+	// client-side resolver render a visible marker for
+	// terminal-without-content states (skipped / failed)
+	// instead of trying to read nonexistent result files.
+	State string `json:"state,omitempty"`
 	// VoteChoice is the upstream vote task's winning option id
 	// (Phase E.2). Empty for non-vote upstreams.
 	VoteChoice string `json:"vote_choice,omitempty"`

@@ -84,6 +84,12 @@ func (e *Engine) BuildInputsDescriptor(
 				"commit_sha":      depTask.CommitSHA,
 				"result_path":     depTask.ResultPath,
 				"vote_choice":     depTask.VoteChoice,
+				// State lets the client-side resolver distinguish
+				// terminal-with-content (accepted) from
+				// terminal-without-content (skipped / failed) so
+				// it can render a visible marker instead of
+				// trying to read nonexistent result files.
+				"state": depTask.State,
 			}
 			// Multi-citizen upstreams: per-citizen responses
 			// for {{task.responses}} resolution.

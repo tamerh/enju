@@ -70,6 +70,13 @@ type DependencyRef struct {
 	// upstream's result files (e.g. "runs/2/gather" or
 	// "runs/2/BRCA1/gather").
 	ResultPath string
+	// State is the upstream's lifecycle state ("accepted",
+	// "skipped", "failed", etc.). Used to distinguish
+	// terminal-with-content (accepted) from terminal-without-
+	// content (skipped / failed). For skipped / failed, the
+	// resolver returns a visible marker instead of trying to
+	// read nonexistent result files.
+	State string
 	// VoteChoice is the upstream vote task's winning option id.
 	// Populated only when the upstream is an action:vote task
 	// that has resolved; empty otherwise. When non-empty, the
@@ -317,6 +324,24 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 func (p *Project) readResultForTemplate(dep DependencyRef) (map[string]interface{}, error) {
 	result := map[string]interface{}{
 		"task_id": dep.TaskDefID,
+	}
+
+	// Terminal-without-content states: skipped (losing vote
+	// branch) and failed (hard reject / compute script error).
+	// These have no result files on disk — reading would 404.
+	// Return a visible marker as content so downstream prompts
+	// that reference {{task.content}} see something explicit
+	// ("(skipped)") rather than an empty string (which could
+	// be mistaken for missing data) or a claim-time error
+	// (which would break workflows that legitimately aggregate
+	// across both taken and skipped branches).
+	switch dep.State {
+	case "skipped":
+		result["content"] = "(skipped)"
+		return result, nil
+	case "failed":
+		result["content"] = "(failed)"
+		return result, nil
 	}
 
 	// Phase E.2 — vote task upstreams expose their winning

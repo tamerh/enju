@@ -3861,6 +3861,206 @@ tasks:
 	}
 }
 
+// TestMCPTemplateParamInForEachList verifies a template can use
+// a top-level {{paramname}} as the source of a for_each list.
+// This is the canonical parameterized fan-out pattern:
+// user supplies genes=["BRCA1","TP53"] at create_run time and
+// the template's for_each: {gene: "{{genes}}"} expands into
+// per-gene instances. Pre-fix the strict parser rejected this
+// at describe_template and create_run time because the ref
+// didn't contain a dot (so parseForEachRef refused it as a
+// non-upstream-task reference) — even though it's a legitimate
+// param reference.
+func TestMCPTemplateParamInForEachList(t *testing.T) {
+	h := newMCPHarness(t, "ParamForEach")
+	projectID := h.createTestProject()
+
+	yaml := `name: "parameterized fan-out"
+description: "Fan out over a caller-supplied list."
+version: 1
+params:
+  - name: genes
+    type: list<string>
+    required: true
+    description: "Genes to analyze"
+tasks:
+  - id: analyze
+    action: answer
+    for_each:
+      gene: "{{genes}}"
+    prompt: "Analyze {{gene}}"
+`
+	// The describe_template path calls Parse() (no substitution)
+	// — this must NOT error out on the {{genes}} ref. The
+	// create_run path with a params map calls ParseWithParams
+	// — this must substitute and then materialize per-instance.
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"params":     map[string]any{"genes": []any{"BRCA1", "TP53"}},
+	})
+
+	// Locate the run.
+	runs := h.getList(fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if len(runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runs))
+	}
+	first, _ := runs[0].(map[string]interface{})
+	seq, _ := first["seq"].(float64)
+	h.lastProjectID = projectID
+	h.lastRunSeq = int(seq)
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seq))
+
+	// Two analyze instances must have been materialized —
+	// param expansion works the same way as a static literal
+	// list would.
+	tasks := h.runTasks(h.lastRunID)
+	if got := mcpCountTasksByDef(tasks, "analyze"); got != 2 {
+		t.Errorf("expected 2 analyze instances after param substitution, got %d", got)
+	}
+	// Per-instance prompts must have {{gene}} substituted.
+	runPrefix := fmt.Sprintf("%d:%d:", projectID, h.lastRunSeq)
+	byID := map[string]map[string]interface{}{}
+	for _, raw := range tasks {
+		tk, _ := raw.(map[string]interface{})
+		id, _ := tk["id"].(string)
+		byID[id] = tk
+	}
+	for _, gene := range []string{"BRCA1", "TP53"} {
+		id := runPrefix + gene + ":analyze"
+		tk, ok := byID[id]
+		if !ok {
+			t.Errorf("missing analyze:%s instance", gene)
+			continue
+		}
+		want := "Analyze " + gene
+		if got, _ := tk["prompt"].(string); got != want {
+			t.Errorf("%s prompt: got %q, want %q", id, got, want)
+		}
+	}
+}
+
+// TestMCPClaimResolvesSkippedUpstream verifies that a
+// downstream task whose depends_on reaches both an accepted and
+// a skipped upstream can still be claimed cleanly. Skipped is a
+// terminal state (losing vote branch, no result on disk). The
+// resolver must surface it as a visible marker instead of
+// failing on "no result file found" when the downstream
+// references {{skipped_task.content}}.
+func TestMCPClaimResolvesSkippedUpstream(t *testing.T) {
+	h := newMCPHarness(t, "SkippedResolve")
+	projectID := h.createTestProject()
+
+	// Vote task picks one of two branches. Each branch has a
+	// task. A finalize step references BOTH branches' content,
+	// so one of the refs will resolve to a skipped upstream.
+	yaml := `name: "skip-aware fan-in"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "Choose."
+    options:
+      - {id: a, label: "A", activates: [branch_a]}
+      - {id: b, label: "B", activates: [branch_b]}
+  - id: branch_a
+    action: answer
+    prompt: "Do A."
+  - id: branch_b
+    action: answer
+    prompt: "Do B."
+  - id: finalize
+    action: answer
+    depends_on: [branch_a, branch_b]
+    prompt: "A said: {{branch_a.content}}\nB said: {{branch_b.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "pick")
+	h.mcpSubmitVote(t, "pick", "going A", "a")
+
+	// Branch A runs; branch B goes skipped.
+	h.mcpClaimOK(t, "branch_a")
+	h.mcpSubmitText(t, "branch_a", "A-RESULT-MARKER")
+
+	if got, _ := h.taskGet("branch_b")["state"].(string); got != "skipped" {
+		t.Fatalf("expected branch_b skipped after vote resolution, got %q", got)
+	}
+
+	// Claim finalize — must NOT error out on the skipped
+	// upstream. Its resolved prompt should contain A's content
+	// and a skip marker for B (anything non-empty, non-literal).
+	inputs := h.mcpTaskInputs(t, "finalize")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if resolved == "" {
+		t.Fatal("finalize resolved prompt is empty — resolver likely failed on skipped upstream")
+	}
+	if strings.Contains(resolved, "{{branch_b.content}}") {
+		t.Errorf("{{branch_b.content}} left unresolved after skip, got:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "A-RESULT-MARKER") {
+		t.Errorf("expected branch_a content in finalize prompt, got:\n%s", resolved)
+	}
+	// Skip marker: accept either "(skipped)" or "skipped" token
+	// so the exact marker text can evolve without breaking this
+	// test. What matters is it's a visible marker, not empty.
+	if !strings.Contains(strings.ToLower(resolved), "skipped") {
+		t.Errorf("expected 'skipped' marker for branch_b, got:\n%s", resolved)
+	}
+}
+
+// TestMCPRunStatusShowsSkippedSeparately verifies the per-task
+// summary in enju_run_status doesn't collapse skipped branches
+// into the ✅ count. A vote that routes one branch and skips
+// another was previously displayed as "N/N ✅" — hiding the
+// lost branches from the reader. The summary must show ⚫
+// skipped separately so vote outcomes are visible at a glance.
+func TestMCPRunStatusShowsSkippedSeparately(t *testing.T) {
+	h := newMCPHarness(t, "SkippedCountFix")
+	projectID := h.createTestProject()
+	h.mcpCreateRunFromFixture(t, projectID, "vote-gate.yaml")
+
+	// Drive the vote: pick the python branch → rust branch
+	// (build_rust, ship_rust) goes SKIPPED.
+	h.mcpClaimOK(t, "analysis")
+	h.mcpSubmitText(t, "analysis", "analysis done")
+	h.mcpClaimOK(t, "pick")
+	h.mcpSubmitVote(t, "pick", "going python", "python")
+	h.mcpClaimOK(t, "build_python")
+	h.mcpSubmitText(t, "build_python", "built")
+	h.mcpClaimOK(t, "ship_python")
+	h.mcpSubmitText(t, "ship_python", "shipped")
+
+	// Run is now terminal: analysis + pick + build_python +
+	// ship_python accepted (4), build_rust + ship_rust skipped
+	// (2). Summary must surface the skipped count, not roll it
+	// under ✅.
+	text := h.mcpRunStatusText(t)
+
+	// build_rust and ship_rust should show up as skipped, not
+	// as ✅.
+	for _, defID := range []string{"build_rust", "ship_rust"} {
+		// Grab the line for this def.
+		var line string
+		for _, l := range strings.Split(text, "\n") {
+			if strings.Contains(l, defID) && !strings.Contains(l, "🟡") {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("no per-def summary line found for %q in:\n%s", defID, text)
+			continue
+		}
+		if !strings.Contains(line, "skipped") && !strings.Contains(line, "⚫") {
+			t.Errorf("%s line should indicate skipped status, got: %q", defID, line)
+		}
+		if strings.Contains(line, "✅") {
+			t.Errorf("%s was skipped but line shows ✅: %q", defID, line)
+		}
+	}
+}
+
 // TestMCPDynamicForEachVoteWinningOptionFanIn verifies that a
 // singleton downstream task referencing {{pick.winning_option}}
 // on a for_each vote upstream receives a markdown block

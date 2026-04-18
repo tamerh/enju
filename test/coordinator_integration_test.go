@@ -1586,6 +1586,57 @@ func cleanYAML(raw string) string {
 
 
 
+// TestCoordinatorRejectsMalformedCommitSHA verifies the REST
+// submit path rejects commit_sha values that aren't shaped like
+// git SHAs (40 or 64 hex chars). Trust-the-client doesn't mean
+// trust any string — a buggy client sending garbage would
+// pollute the artifact index and break downstream template
+// resolution. Shape check only, not a fetch-and-verify (that's
+// still a future opt-in mode per ARCHITECTURE principle 7 +
+// Open Question #4).
+func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+
+	fullID := s.taskID("task_a")
+	malformed := []string{
+		"not-a-sha",
+		"abc123",                // too short
+		strings.Repeat("z", 40), // correct length, wrong chars
+		"ABCDEF1234567890abcdef1234567890abcdef12", // uppercase rejected (git uses lowercase)
+	}
+	for _, bad := range malformed {
+		t.Run(bad, func(t *testing.T) {
+			resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
+				"result_path": ".enju/runs/1/task_a",
+				"commit_sha":  bad,
+				"content":     "data",
+				"username":    alice,
+			})
+			if errMsg, _ := resp["error"].(string); errMsg == "" {
+				t.Fatalf("expected rejection for malformed commit_sha %q, got success: %v", bad, resp)
+			} else if !strings.Contains(errMsg, "not a valid git SHA") {
+				t.Errorf("expected shape-check error, got: %q", errMsg)
+			}
+		})
+	}
+
+	// Valid shape is accepted (we don't fetch — trust model
+	// stays). Any 40-hex string passes the shape check.
+	valid := "0123456789abcdef0123456789abcdef01234567"
+	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
+		"result_path": ".enju/runs/1/task_a",
+		"commit_sha":  valid,
+		"content":     "data",
+		"username":    alice,
+	})
+	if errMsg, _ := resp["error"].(string); errMsg != "" {
+		t.Errorf("valid-shape commit_sha should be accepted, got error: %q", errMsg)
+	}
+}
+
 // TestReviewCommitShaOptional — a review submission with empty
 // commit_sha is accepted (P1 fix: commit_sha optional on
 // review/vote tasks because they don't ship content to git).

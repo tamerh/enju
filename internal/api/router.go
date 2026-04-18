@@ -1355,6 +1355,21 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "commit_sha is required — the coordinator no longer writes result files, clients must write + push + report")
 		return
 	}
+	// Shape-level validation on commit_sha. Trust-the-client
+	// architecture says we don't fetch the commit to verify it
+	// exists on the remote (that's an optional future mode —
+	// see ARCHITECTURE.md principle 7 + Open Question #4). But
+	// even under trust-the-client, a commit_sha of the wrong
+	// SHAPE is always a client bug — a buggy client sending
+	// "not-a-sha" corrupts the artifact index for its own
+	// project and makes downstream template resolution fail
+	// mysteriously. Shape-check catches that cheaply. Accept
+	// both SHA-1 (40 hex) and SHA-256 (64 hex) lengths so the
+	// check doesn't block git's future hash transition.
+	if req.CommitSHA != "" && !isValidCommitSHAShape(req.CommitSHA) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("commit_sha %q is not a valid git SHA (expected 40 or 64 hex characters)", req.CommitSHA))
+		return
+	}
 
 	if task.Action == "vote" || task.Action == "review" {
 		passed, derr := s.engine().DeadlinePassed(task)
@@ -2528,4 +2543,26 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// isValidCommitSHAShape checks whether s is shaped like a git
+// commit SHA (40 hex for SHA-1, 64 hex for SHA-256). This is a
+// shape sanity check, not a content verification — the
+// coordinator never fetches the commit to confirm it exists.
+// Under ARCHITECTURE principle 7 (trust-the-client), existence
+// verification is a client responsibility; we just refuse
+// obviously-malformed inputs so a buggy client can't pollute
+// the artifact index with garbage IDs that break downstream
+// template resolution.
+func isValidCommitSHAShape(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

@@ -523,6 +523,60 @@ func applyParamValues(p *Run, supplied map[string]interface{}) error {
 		if t.UserPrompt != "" {
 			t.UserPrompt = template.ResolveParams(t.UserPrompt, strMap)
 		}
+		// Substitute {{paramname}} refs in for_each values.
+		// Param-refs get converted from ForEachSource.Ref
+		// (e.g. "{{genes}}") to ForEachSource.Values (the
+		// list<string> param's actual value), so downstream
+		// code sees a static for_each indistinguishable from
+		// one authored with a literal list.
+		if len(t.ForEach) == 0 {
+			continue
+		}
+		for name, src := range t.ForEach {
+			if src.Ref == "" {
+				continue
+			}
+			paramName, ok := parseForEachParamRef(src.Ref)
+			if !ok {
+				continue // task ref, leave for dynamic materialization
+			}
+			v, haveValue := merged[paramName]
+			if !haveValue {
+				// validateDynamicForEach already checked the
+				// param is declared; this branch means the
+				// param is optional with no default and no
+				// value supplied. That's a real configuration
+				// error — a for_each can't operate on absence.
+				return fmt.Errorf("task %q: for_each variable %q: parameter %q is required to have a value (supply it when creating the run, or give the param a default list)", t.ID, name, paramName)
+			}
+			list, ok := v.([]string)
+			if !ok {
+				// Try to coerce []interface{} of strings —
+				// JSON decoders produce this shape for
+				// list<string> params supplied via the MCP
+				// tools.
+				if raw, ok := v.([]interface{}); ok {
+					coerced := make([]string, 0, len(raw))
+					for idx, item := range raw {
+						s, ok := item.(string)
+						if !ok {
+							return fmt.Errorf("task %q: for_each variable %q: parameter %q element %d is not a string", t.ID, name, paramName, idx)
+						}
+						coerced = append(coerced, s)
+					}
+					list = coerced
+				} else {
+					return fmt.Errorf("task %q: for_each variable %q: parameter %q must be a list of strings (got %T)", t.ID, name, paramName, v)
+				}
+			}
+			if err := validateForEachLiteralMap(
+				fmt.Sprintf("task %q", t.ID),
+				map[string][]string{name: list},
+			); err != nil {
+				return err
+			}
+			t.ForEach[name] = ForEachSource{Values: list}
+		}
 	}
 	return nil
 }
@@ -980,15 +1034,30 @@ func validate(p *Run) ([]string, error) {
 }
 
 // validateDynamicForEach checks every dynamic for_each
-// variable: the upstream task exists, the upstream declares
-// the referenced output field, and the output is typed as
-// list<string>. Errors are phrased so the LLM can forward
-// them as natural-language feedback.
+// variable's reference. Two valid shapes:
+//
+//   1. {{upstream_task.field_name}} — dynamic fan-out from
+//      another task's list<string> output. The upstream must
+//      exist and declare the field with format: list<string>.
+//   2. {{paramname}} — parameterized fan-out from a top-level
+//      param. The param must be declared and typed as
+//      list<string>. Substitution happens in applyParamValues
+//      when the run is actually instantiated; at parse-time
+//      we only check the reference shape and declaration.
+//
+// Errors are phrased so the LLM can forward them as
+// natural-language feedback.
 func validateDynamicForEach(p *Run, taskIDs map[string]bool) error {
 	// Build a quick lookup of outputs per task def.
 	taskByID := make(map[string]*TaskDef, len(p.Tasks))
 	for i := range p.Tasks {
 		taskByID[p.Tasks[i].ID] = &p.Tasks[i]
+	}
+	// Params declared at the top level. Used to resolve
+	// param-ref shapes in for_each (form 2 above).
+	paramByName := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		paramByName[p.Params[i].Name] = &p.Params[i]
 	}
 
 	for i := range p.Tasks {
@@ -1000,9 +1069,23 @@ func validateDynamicForEach(p *Run, taskIDs map[string]bool) error {
 			if src.Ref == "" {
 				continue
 			}
+			// Param-ref shape: {{paramname}}, no dot. Resolve
+			// against the top-level params block. The ref
+			// stays in place through parse; applyParamValues
+			// substitutes it when the run is instantiated.
+			if paramName, ok := parseForEachParamRef(src.Ref); ok {
+				pd, declared := paramByName[paramName]
+				if !declared {
+					return fmt.Errorf("task %q: for_each variable %q: references unknown parameter %q — declare it under top-level params: or use {{upstream_task.field_name}} for a dynamic task reference", t.ID, name, paramName)
+				}
+				if pd.Type != "list<string>" {
+					return fmt.Errorf("task %q: for_each variable %q: parameter %q must be declared with type: list<string> to serve as a for_each source (got %q)", t.ID, name, paramName, pd.Type)
+				}
+				continue
+			}
 			upstreamID, field, ok := parseForEachRef(src.Ref)
 			if !ok {
-				return fmt.Errorf("task %q: for_each variable %q: value %q is not a valid template reference (expected \"{{upstream_task.field_name}}\")", t.ID, name, src.Ref)
+				return fmt.Errorf("task %q: for_each variable %q: value %q is not a valid template reference (expected \"{{upstream_task.field_name}}\" or \"{{paramname}}\")", t.ID, name, src.Ref)
 			}
 			upstream, found := taskByID[upstreamID]
 			if !found {
@@ -1048,20 +1131,26 @@ func validateForEachLiteralMap(scope string, fe map[string][]string) error {
 
 // validateForEachMap validates a task-level ForEachMap. Each
 // variable's source is either a literal list (must be
-// non-empty) or a template reference scalar (must point at a
-// known upstream task's list<string> output — the upstream
-// check happens later in validateTemplateReferences once the
-// task ID table is built).
+// non-empty) or a template reference scalar. Accepted ref
+// shapes: `{{upstream_task.field}}` (dynamic fan-out from a
+// sibling task's list output) and `{{paramname}}` (fan-out
+// from a top-level param). The existence checks happen later
+// in validateTemplateReferences / validateDynamicForEach once
+// the task ID + param tables are built.
 func validateForEachMap(scope string, fe ForEachMap) error {
 	for name, src := range fe {
 		switch {
 		case src.Ref != "":
-			// Reference shape is checked by extractForEachRef
-			// below so we fail at parse time on
-			// non-template-reference scalars.
-			if _, _, ok := parseForEachRef(src.Ref); !ok {
-				return fmt.Errorf("%s for_each: variable %q: %q is not a template reference — expected \"{{task.field}}\" pointing at an upstream list output", scope, name, src.Ref)
+			// Accept either task-ref shape ({{x.y}}) or
+			// param-ref shape ({{paramname}}). Deeper
+			// validation (existence, type) happens later.
+			if _, _, ok := parseForEachRef(src.Ref); ok {
+				continue
 			}
+			if _, ok := parseForEachParamRef(src.Ref); ok {
+				continue
+			}
+			return fmt.Errorf("%s for_each: variable %q: %q is not a template reference — expected \"{{task.field}}\" (dynamic upstream) or \"{{paramname}}\" (top-level param)", scope, name, src.Ref)
 		case len(src.Values) == 0:
 			return fmt.Errorf("%s for_each: variable %q has an empty list — declare at least one value, a \"{{upstream.field}}\" reference, or remove the variable", scope, name)
 		default:
@@ -1115,7 +1204,8 @@ func collectDeferred(p *Run, deferred map[string]bool) []DeferredTaskDef {
 // parseForEachRef extracts (taskID, field) from a template
 // reference string like "{{discover.gene_symbols}}". Returns
 // the parts plus an ok flag. A non-reference scalar (or a
-// bare "{{param}}" with no dot) returns ok=false.
+// bare "{{param}}" with no dot) returns ok=false — param refs
+// are handled separately by parseForEachParamRef.
 func parseForEachRef(s string) (taskID, field string, ok bool) {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "{{") || !strings.HasSuffix(s, "}}") {
@@ -1127,6 +1217,34 @@ func parseForEachRef(s string) (taskID, field string, ok bool) {
 		return "", "", false
 	}
 	return inner[:dot], inner[dot+1:], true
+}
+
+// parseForEachParamRef extracts a top-level param name from a
+// reference string like "{{genes}}" (no dot). Returns the
+// param name + ok=true when the string is a bare-identifier
+// template ref; returns ok=false for anything else (including
+// task refs with dots, which parseForEachRef handles).
+func parseForEachParamRef(s string) (paramName string, ok bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{{") || !strings.HasSuffix(s, "}}") {
+		return "", false
+	}
+	inner := strings.TrimSpace(s[2 : len(s)-2])
+	if inner == "" || strings.ContainsAny(inner, ". :") {
+		return "", false
+	}
+	// Only plain identifiers are treated as param refs. Anything
+	// weirder (colons, spaces, etc.) falls through so the
+	// top-level task-ref validator surfaces a clearer error.
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_'
+		if !ok {
+			return "", false
+		}
+	}
+	return inner, true
 }
 
 // forEachEqual returns true if two ForEachMaps declare the

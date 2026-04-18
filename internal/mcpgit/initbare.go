@@ -59,17 +59,32 @@ func InitBareWithSeed(bareDir string) error {
 		return fmt.Errorf("create remote: %w", err)
 	}
 
-	// Write a README and commit.
+	// Write a README and seed the enju_templates/ dir with a
+	// .gitkeep so a fresh project clone has the same layout
+	// enju_init produces for adopted folders. Without this,
+	// enju_list_templates returns empty until the first
+	// manual commit under enju_templates/, which is a
+	// confusing "looks like the tool is broken" surprise.
 	readme := filepath.Join(tmpDir, "README.md")
 	if err := os.WriteFile(readme, []byte("# Enju project\n\nTask results live under `.enju/runs/`. Templates under `enju_templates/`.\n"), 0644); err != nil {
 		return fmt.Errorf("write readme: %w", err)
+	}
+	templatesDir := filepath.Join(tmpDir, "enju_templates")
+	if err := os.MkdirAll(templatesDir, 0755); err != nil {
+		return fmt.Errorf("create templates dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), []byte(""), 0644); err != nil {
+		return fmt.Errorf("write .gitkeep: %w", err)
 	}
 	wt, err := repo.Worktree()
 	if err != nil {
 		return fmt.Errorf("worktree: %w", err)
 	}
 	if _, err := wt.Add("README.md"); err != nil {
-		return fmt.Errorf("add: %w", err)
+		return fmt.Errorf("add README: %w", err)
+	}
+	if _, err := wt.Add("enju_templates/.gitkeep"); err != nil {
+		return fmt.Errorf("add .gitkeep: %w", err)
 	}
 	sig := &object.Signature{
 		Name:  "Enju",

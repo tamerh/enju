@@ -1657,14 +1657,33 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 	b.WriteString("By task:\n")
 	for _, defID := range order {
 		info := templates[defID]
-		done := info.byState["accepted"] + info.byState["skipped"]
-		allDone := done == info.total
+		accepted := info.byState["accepted"]
+		skipped := info.byState["skipped"]
+		failed := info.byState["failed"]
+		terminal := accepted + skipped + failed
+		allTerminal := terminal == info.total
 
 		// Build status description.
 		var statusParts []string
-		if allDone {
-			statusParts = append(statusParts, fmt.Sprintf("%d/%d ✅", done, info.total))
-		} else {
+		switch {
+		case allTerminal && skipped == 0 && failed == 0:
+			// All accepted — the clean "done" case.
+			statusParts = append(statusParts, fmt.Sprintf("%d/%d ✅", accepted, info.total))
+		case allTerminal:
+			// Terminal but mixed: separate the three outcomes so
+			// skipped/failed don't silently collapse into ✅.
+			// Previously "4/4 ✅" was shown even when some were
+			// skipped — hid vote-branch losses from the reader.
+			if accepted > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d ✅", accepted))
+			}
+			if skipped > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d ⚫ skipped", skipped))
+			}
+			if failed > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d 🔴 failed", failed))
+			}
+		default:
 			if n := info.byState["claimed"] + info.byState["running"]; n > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d in progress", n))
 			}
@@ -1677,14 +1696,14 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 			if n := info.byState["pending"]; n > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d waiting", n))
 			}
-			if n := info.byState["accepted"]; n > 0 {
-				statusParts = append(statusParts, fmt.Sprintf("%d done", n))
+			if accepted > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d done", accepted))
 			}
-			if n := info.byState["failed"]; n > 0 {
-				statusParts = append(statusParts, fmt.Sprintf("%d failed", n))
+			if failed > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d failed", failed))
 			}
-			if n := info.byState["skipped"]; n > 0 {
-				statusParts = append(statusParts, fmt.Sprintf("%d skipped", n))
+			if skipped > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d skipped", skipped))
 			}
 		}
 		b.WriteString(fmt.Sprintf("  %-14s %s\n", defID, strings.Join(statusParts, " · ")))
@@ -1993,7 +2012,7 @@ func formatListTemplates(data []byte) string {
 	}
 	templates, _ := resp["templates"].([]interface{})
 	if len(templates) == 0 {
-		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under templates/*.yaml in the project git repo. To add one, commit a YAML file to templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into templates/."
+		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under enju_templates/*.yaml in the project git repo. To add one, commit a YAML file to enju_templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into enju_templates/."
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("── Templates (%d) — enju_list_templates ──\n", len(templates)))
