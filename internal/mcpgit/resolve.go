@@ -181,25 +181,87 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 			inputs[taskDefID] = result
 			continue
 		}
-		// Fan-in.
-		var b strings.Builder
+		// Fan-in. Build per-iteration Option 4 blocks for each
+		// field downstreams can reference: content, winning_option
+		// (for_each vote upstreams), responses (for_each
+		// multi-citizen upstreams). Singleton handling above
+		// already exposes these fields via readResultForTemplate;
+		// the fan-in path needs to aggregate them in the same
+		// shape or {{pick.winning_option}} / {{pick.responses}}
+		// leak through as literal placeholders.
+		//
+		// Each field is its own independent block — a downstream
+		// may reference any subset. Only populated when at least
+		// one iteration had a non-empty value for that field, so
+		// {{task.responses}} on a non-multi-citizen for_each
+		// upstream stays literal-unresolved (same behavior as
+		// the singleton case).
+		var contentB, winningB, responsesB strings.Builder
+		hasWinning, hasResponses := false, false
 		for i, d := range deps {
-			if i > 0 {
-				b.WriteString("\n---\n")
-			}
 			label := formatIterationLabel(d.InstanceParams, d.InstanceKey)
-			fmt.Fprintf(&b, "### iteration: %s\n", label)
+			header := fmt.Sprintf("### iteration: %s\n", label)
+
 			result, err := p.readResultForTemplate(d)
 			if err != nil {
 				return nil, fmt.Errorf("reading upstream %q iteration %q%s: %w", taskDefID, d.InstanceKey, taskCtx, err)
 			}
-			b.WriteString(extractContentForAggregation(result))
-			b.WriteString("\n")
+
+			// Content (always present — even an empty-content
+			// iteration produces an empty block under its
+			// label for layout consistency).
+			if i > 0 {
+				contentB.WriteString("\n---\n")
+			}
+			contentB.WriteString(header)
+			contentB.WriteString(extractContentForAggregation(result))
+			contentB.WriteString("\n")
+
+			// Winning option (for_each vote).
+			if wo, ok := result["winning_option"].(string); ok && wo != "" {
+				if hasWinning {
+					winningB.WriteString("\n---\n")
+				}
+				winningB.WriteString(header)
+				winningB.WriteString(wo)
+				winningB.WriteString("\n")
+				hasWinning = true
+			}
+
+			// Responses (for_each multi-citizen). Each
+			// iteration's per-citizen list is pre-rendered by
+			// the shared template helper so downstream sees
+			// consistent markdown (### @username — option)
+			// whether the upstream was singleton or fan-in.
+			if rr, ok := result["responses"]; ok && rr != nil {
+				rendered := template.RenderResponsesMarkdown(rr)
+				if strings.TrimSpace(rendered) != "" {
+					if hasResponses {
+						responsesB.WriteString("\n---\n")
+					}
+					responsesB.WriteString(header)
+					responsesB.WriteString(rendered)
+					responsesB.WriteString("\n")
+					hasResponses = true
+				}
+			}
 		}
-		inputs[taskDefID] = map[string]interface{}{
+		aggregated := map[string]interface{}{
 			"task_id": taskDefID,
-			"content": b.String(),
+			"content": contentB.String(),
 		}
+		if hasWinning {
+			aggregated["winning_option"] = winningB.String()
+		}
+		if hasResponses {
+			// Stashed as a string — the template resolver's
+			// responses branch accepts strings (from fan-in)
+			// AND []{username,option,content} entries (from
+			// singleton readResultForTemplate) via the same
+			// extractField switch.
+			aggregated["responses"] = responsesB.String()
+		}
+		inputs[taskDefID] = aggregated
 	}
 
 	// 3. Resolve {{task.field}} references first, then for_each

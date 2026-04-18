@@ -3861,6 +3861,145 @@ tasks:
 	}
 }
 
+// TestMCPDynamicForEachVoteWinningOptionFanIn verifies that a
+// singleton downstream task referencing {{pick.winning_option}}
+// on a for_each vote upstream receives a markdown block
+// aggregating every iteration's winner — not a raw literal
+// placeholder. Parallel to the content fan-in behavior that
+// already works for {{task.content}}.
+func TestMCPDynamicForEachVoteWinningOptionFanIn(t *testing.T) {
+	h := newMCPHarness(t, "WinningOptFanIn")
+	projectID := h.createTestProject()
+
+	yaml := `name: "vote winner fan-in"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List flavors."
+    outputs:
+      flavors:
+        format: list<string>
+  - id: pick
+    action: vote
+    for_each:
+      f: "{{discover.flavors}}"
+    prompt: "Pick for {{f}}"
+    options:
+      - {id: yes, label: "Yes"}
+      - {id: no,  label: "No"}
+  - id: summarize
+    action: answer
+    prompt: "Winners: {{pick.winning_option}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "flavors", []string{"alpha", "beta"})
+
+	// Alpha votes yes, beta votes no.
+	h.mcpClaimOK(t, "alpha:pick")
+	h.mcpSubmitVote(t, "alpha:pick", "alpha rationale", "yes")
+	h.mcpClaimOK(t, "beta:pick")
+	h.mcpSubmitVote(t, "beta:pick", "beta rationale", "no")
+
+	inputs := h.mcpTaskInputs(t, "summarize")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if strings.Contains(resolved, "{{pick.winning_option}}") {
+		t.Errorf("winning_option fan-in bug: literal placeholder left unresolved:\n%s", resolved)
+	}
+	// Each iteration's winner must appear in the aggregated block,
+	// tagged by its iteration label.
+	if !strings.Contains(resolved, "yes") {
+		t.Errorf("expected alpha's winner 'yes' in fan-in, got:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "no") {
+		t.Errorf("expected beta's winner 'no' in fan-in, got:\n%s", resolved)
+	}
+	// The fan-in should use the same iteration-header format as
+	// {{task.content}} fan-in so authors have a consistent shape
+	// to parse.
+	if !strings.Contains(resolved, "### iteration:") {
+		t.Errorf("expected '### iteration:' header in winning_option fan-in, got:\n%s", resolved)
+	}
+}
+
+// TestMCPDynamicForEachVoteResponsesFanIn verifies the same
+// fan-in shape works for {{pick.responses}} on a multi-citizen
+// for_each vote: the downstream prompt should receive a
+// markdown block aggregating every iteration's per-citizen
+// response list, NOT a Go map literal.
+func TestMCPDynamicForEachVoteResponsesFanIn(t *testing.T) {
+	h := newMCPHarness(t, "RespFanInA")
+	bob := h.newMCPClientAs(t, "RespFanInB")
+
+	projectID := h.createTestProject()
+	yaml := `name: "vote responses fan-in"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: pick
+    action: vote
+    citizens: 2
+    min_quorum: 2
+    threshold: plurality
+    for_each:
+      t: "{{discover.topics}}"
+    prompt: "Vote on {{t}}"
+    options:
+      - {id: a, label: "A"}
+      - {id: b, label: "B"}
+  - id: synthesize
+    action: answer
+    prompt: "Per-iteration verdicts:\n{{pick.responses}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitDiscoverListAs(t, "topics", []string{"alpha", "beta"})
+
+	// Two citizens vote on each iteration.
+	for _, topic := range []string{"alpha", "beta"} {
+		h.mcpClaimOK(t, topic+":pick")
+		h.mcpClaimAs(t, bob, topic+":pick")
+		h.mcpSubmitVote(t, topic+":pick", h.username+" prose for "+topic, "a")
+		h.mcpSubmitVoteAs(t, bob, topic+":pick", bob.Username()+" prose for "+topic, "b")
+	}
+
+	inputs := h.mcpTaskInputs(t, "synthesize")
+	resolved, _ := inputs["resolved_prompt"].(string)
+	if strings.Contains(resolved, "{{pick.responses}}") {
+		t.Errorf("responses fan-in bug: literal placeholder left unresolved:\n%s", resolved)
+	}
+	// Must NOT render as a Go map literal — that was the
+	// symptom the bug report flagged.
+	if strings.Contains(resolved, "map[") {
+		t.Errorf("responses fan-in rendered as Go map literal (broken):\n%s", resolved)
+	}
+	// Each citizen's prose must appear.
+	for _, topic := range []string{"alpha", "beta"} {
+		wantAlice := h.username + " prose for " + topic
+		wantBob := bob.Username() + " prose for " + topic
+		if !strings.Contains(resolved, wantAlice) {
+			t.Errorf("expected %q in fan-in, got:\n%s", wantAlice, resolved)
+		}
+		if !strings.Contains(resolved, wantBob) {
+			t.Errorf("expected %q in fan-in, got:\n%s", wantBob, resolved)
+		}
+	}
+	// Per-voter markdown header format (### @username — option).
+	if !strings.Contains(resolved, "@"+h.username) || !strings.Contains(resolved, "@"+bob.Username()) {
+		t.Errorf("expected @username markdown headers in responses fan-in, got:\n%s", resolved)
+	}
+	// Iteration headers too — one per for_each instance.
+	if !strings.Contains(resolved, "### iteration:") {
+		t.Errorf("expected '### iteration:' header in responses fan-in, got:\n%s", resolved)
+	}
+}
+
 // TestMCPSubmitPreservesManualUserCommits is the regression
 // guard for the "fat-client reset clobbers user work" bug.
 // Adopt-mode users (and anyone editing files in the workspace

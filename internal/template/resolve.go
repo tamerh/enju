@@ -131,8 +131,17 @@ func extractField(result interface{}, field string) string {
 		// result.md files at the upstream's accepted commit.
 		// Render as markdown blocks so the downstream prompt
 		// gets human-readable output instead of raw JSON.
+		//
+		// For for_each upstreams the fan-in aggregator has
+		// already rendered a per-iteration block and stashes
+		// it here as a string — pass it through unchanged so
+		// {{task.responses}} works for both singleton and
+		// fan-in cases.
 		if responses, ok := resultMap["responses"]; ok {
-			return renderResponsesMarkdown(responses)
+			if s, ok := responses.(string); ok {
+				return s
+			}
+			return RenderResponsesMarkdown(responses)
 		}
 		return match(result, field)
 	}
@@ -164,12 +173,15 @@ func match(result interface{}, field string) string {
 	return fmt.Sprintf("%v", result)
 }
 
-// renderResponsesMarkdown renders a multi-citizen `responses`
+// RenderResponsesMarkdown renders a multi-citizen `responses`
 // array as a human-readable markdown block. Expected shape is
 // []interface{} of map[string]interface{} entries with keys
 // "username", "option", and "content". Missing fields render as
-// empty strings; unknown shapes fall back to JSON.
-func renderResponsesMarkdown(responses interface{}) string {
+// empty strings; unknown shapes fall back to JSON. Exported so
+// the mcpgit fan-in aggregator can pre-render per-iteration
+// response blocks when a for_each upstream is consumed via
+// {{task.responses}}.
+func RenderResponsesMarkdown(responses interface{}) string {
 	// Accept both []interface{} (what the JSON-decoded
 	// descriptor path produces) and []map[string]interface{}
 	// (what the in-Go resolver produces directly). The two
