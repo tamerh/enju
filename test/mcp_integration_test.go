@@ -3861,6 +3861,65 @@ tasks:
 	}
 }
 
+// TestMCPTemplateParamInAssignTo verifies that {{param}} refs
+// in assign_to (and other validated per-field slots) are
+// substituted BEFORE the fields reach their validators.
+// Pre-fix, substituteParamsInPlace only walked task prompts
+// and for_each values — AssignTo / RequireRole / Script /
+// WritesArtifacts / ReadsArtifacts were ignored, so the
+// engine's ValidateRunCreation saw the literal {{paramname}}
+// and rejected it as a malformed username/role/path.
+func TestMCPTemplateParamInAssignTo(t *testing.T) {
+	h := newMCPHarness(t, "signoff-person")
+	projectID := h.createTestProject()
+
+	// Template parameterizes the reviewer username — the
+	// canonical "who signs off on this batch" pattern.
+	yaml := `name: "parameterized assign_to"
+version: 1
+params:
+  - name: signoff_by
+    type: string
+    required: true
+    description: "Reviewer username"
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: check
+    action: review
+    reviews: draft
+    assign_to: "{{signoff_by}}"
+    prompt: "Review the draft."
+`
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"params":     map[string]any{"signoff_by": h.username},
+	})
+
+	runs := h.getList(fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if len(runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runs))
+	}
+	first, _ := runs[0].(map[string]interface{})
+	seq, _ := first["seq"].(float64)
+	h.lastProjectID = projectID
+	h.lastRunSeq = int(seq)
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, int(seq))
+
+	// The check task's AssignTo should be the substituted
+	// username, not the literal {{signoff_by}}.
+	check := h.taskGet("check")
+	assignees, _ := check["assign_to"].([]interface{})
+	if len(assignees) != 1 {
+		t.Fatalf("expected 1 assignee, got %v", assignees)
+	}
+	if got, _ := assignees[0].(string); got != h.username {
+		t.Errorf("assign_to: got %q, want %q", got, h.username)
+	}
+}
+
 // TestMCPTemplateParamInRunLevelForEach verifies the template
 // parameterization pattern where the run-level for_each list
 // comes from a top-level param. This is the most common shape
