@@ -3046,6 +3046,112 @@ tasks:
 	}
 }
 
+// TestMCPMermaidCrossRunArtifactEdges exercises the opt-in
+// include_external flag. A task in run #2 reads an artifact
+// written by run #1. Default Mermaid output omits the
+// cross-run dependency (intra-run graph only); with
+// include_external=true the artifact shows up as a dashed
+// "📎 <path> (from run #N)" external node with an edge into
+// the reader, making the full data-flow explicit. Needed for
+// preprint figures tracing upstream provenance, or audit
+// contexts where "where did this input come from?" matters.
+func TestMCPMermaidCrossRunArtifactEdges(t *testing.T) {
+	h := newMCPHarness(t, "CrossRunArtifactA")
+	projectID := h.createTestProject()
+
+	// Run #1: produce the artifact.
+	v1YAML := `name: "writer run"
+version: 1
+tasks:
+  - id: write_intro
+    action: answer
+    writes_artifacts: [data/intro.md]
+    prompt: "Write the intro."
+`
+	h.mcpCreateRunInline(t, projectID, v1YAML)
+	h.mcpClaimOK(t, "write_intro")
+	h.mcpSubmitArtifacts(t, "write_intro", "intro v1", map[string]string{
+		"data/intro.md": "THE INTRO",
+	})
+
+	// Run #2: read the artifact from run #1.
+	v2YAML := `name: "reader run"
+version: 1
+tasks:
+  - id: consume
+    action: answer
+    reads_artifacts: [data/intro.md]
+    prompt: "Using {{artifact:data/intro.md}}, do a thing."
+`
+	h.mcpCreateRunInline(t, projectID, v2YAML)
+
+	// Default mermaid output on run #2: no external node. The
+	// cross-run artifact is invisible by design — keeps the
+	// "show me this run" use case focused.
+	resDefault := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(2),
+		"format":     "mermaid",
+	})
+	defaultOut := mcpText(resDefault)
+	if strings.Contains(defaultOut, "ext_art_") {
+		t.Errorf("default mermaid should not include external artifact nodes; got:\n%s", defaultOut)
+	}
+	if strings.Contains(defaultOut, "from run #1") {
+		t.Errorf("default mermaid should not mention cross-run writer; got:\n%s", defaultOut)
+	}
+
+	// With include_external=true, run #1's writer shows up as
+	// an external 📎 node with the `external` class, and an
+	// edge flows from that node into the reader task.
+	resExt := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id":       float64(projectID),
+		"run_id":           float64(2),
+		"format":           "mermaid",
+		"include_external": true,
+	})
+	extOut := mcpText(resExt)
+	if !strings.Contains(extOut, "📎 data/intro.md") {
+		t.Errorf("expected 📎 external node labeling the artifact; got:\n%s", extOut)
+	}
+	if !strings.Contains(extOut, "from run #1") {
+		t.Errorf("expected writer run id surfaced in external node label; got:\n%s", extOut)
+	}
+	if !strings.Contains(extOut, ":::external") {
+		t.Errorf("expected external class on the artifact node; got:\n%s", extOut)
+	}
+	// Edge: external node → reader. Node id is prefixed
+	// ext_art_ and the reader's full task id gets the standard
+	// t_ sanitization.
+	if !strings.Contains(extOut, "ext_art_data_intro_md --> t_1_2_consume") {
+		t.Errorf("expected edge from external artifact node to consume task; got:\n%s", extOut)
+	}
+
+	// enju_export_diagram honors include_external too — same
+	// artifact node + edge appear in the committed .mmd.
+	expRes := h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id":       float64(projectID),
+		"run_id":           float64(2),
+		"phase":            "with_external",
+		"include_external": true,
+	})
+	expOut := mcpText(expRes)
+	if !strings.Contains(expOut, "📎 data/intro.md") {
+		t.Errorf("export_diagram with include_external=true missing external artifact node; got:\n%s", expOut)
+	}
+	// File content should also contain the external node (raw
+	// .mmd, no fences).
+	// Path is .enju/runs/{run_seq}/graph/..., where run_seq is
+	// the 2nd run in this project — so "2", not some global id.
+	fileBody, ok := h.readRepoFile(projectID, ".enju/runs/2/graph/with_external.mmd")
+	if !ok {
+		t.Fatalf("expected with_external.mmd in bare remote")
+	}
+	if !strings.Contains(string(fileBody), "ext_art_data_intro_md") {
+		t.Errorf("committed .mmd file missing external artifact node; got:\n%s", fileBody)
+	}
+}
+
 // TestMCPMermaidFanOutFromDynamicForEach is a regression test
 // for the "discover floats as a disconnected node" bug: when a
 // task uses `for_each: {x: "{{source.items}}"}`, the

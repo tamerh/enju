@@ -66,7 +66,11 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	// older clients that don't know the param never error.
 	switch req.GetString("format", "default") {
 	case "mermaid":
-		return mcp.NewToolResultText(formatRunStatusMermaid(run, tasks)), nil
+		var artifactsData []byte
+		if req.GetBool("include_external", false) {
+			artifactsData, _ = c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+		}
+		return mcp.NewToolResultText(formatRunStatusMermaidWith(run, tasks, artifactsData)), nil
 	default:
 		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
 	}
@@ -211,11 +215,23 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	// Optional: cross-run artifact edges. When include_external
+	// is true, fetch the project's artifact index and pass it
+	// through — the renderer adds 📎 external nodes for reads
+	// whose current writer lives in another run. Default off to
+	// keep the diagram focused on intra-run dataflow; opt in
+	// when the preprint or audit context wants the full data
+	// dependency graph.
+	var artifactsData []byte
+	if req.GetBool("include_external", false) {
+		artifactsData, _ = c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	}
+
 	// Render the raw body for the file. The body is "" when
 	// the run lookup failed (coordinator returned an error
 	// object) — surface that to the caller rather than
 	// committing an empty .mmd.
-	body := renderMermaidBody(runData, tasksData)
+	body := renderMermaidBody(runData, tasksData, artifactsData)
 	if body == "" {
 		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
 	}

@@ -153,7 +153,7 @@ func toolGetTask() mcp.Tool {
 
 func toolRunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
-		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide)."),
+		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide). Note: in mermaid mode, only intra-run edges are shown by default — artifact reads whose writer is in a DIFFERENT run are omitted. Set include_external=true to surface those as dashed external nodes."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -165,6 +165,9 @@ func toolRunStatus() mcp.Tool {
 		mcp.WithString("format",
 			mcp.Description("Output format: \"default\" (action-oriented text summary with progress bar and queue, the usual reply) or \"mermaid\" (Mermaid flowchart TD syntax — paste into mermaid.live, a markdown file, or the preprint; GitHub renders it natively in issues/PRs). Defaults to \"default\"."),
 			mcp.Enum("default", "mermaid"),
+		),
+		mcp.WithBoolean("include_external",
+			mcp.Description("Only meaningful with format=\"mermaid\". When true, cross-run artifact reads surface as dashed 📎 external nodes so the diagram reflects the full data-flow graph (not just this run's intra-DAG edges). Default false — cleaner diagrams for the common \"show me this run\" use case."),
 		),
 	)
 }
@@ -287,6 +290,9 @@ Skip during routine enju_run_status checks — only call when the snapshot itsel
 		mcp.WithString("phase",
 			mcp.Required(),
 			mcp.Description("Snapshot label. Use 'initial' right after creation, 'final' on completion, or any safe-filename string for mid-run checkpoints. Must not contain '/', '\\', '..', or the null byte; must be ≤64 chars."),
+		),
+		mcp.WithBoolean("include_external",
+			mcp.Description("When true, artifact reads whose writer is in a DIFFERENT run of the same project surface as dashed 📎 external nodes — capturing the full cross-run data-flow graph. Default false (intra-run edges only) keeps archival snapshots focused on the run they describe. Turn on when the diagram's job is to show *where inputs came from*, e.g. for a preprint figure tracing upstream provenance."),
 		),
 	)
 }

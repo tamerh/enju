@@ -968,9 +968,16 @@ func TestFormatRunStatusMermaid(t *testing.T) {
 		t.Errorf("expected publish node with pending class; got:\n%s", out)
 	}
 
-	// Exactly 3 edges (draft→check, draft→publish, check→publish).
-	if got := strings.Count(out, "-->"); got != 3 {
-		t.Errorf("expected 3 edges for this DAG, got %d; output:\n%s", got, out)
+	// After transitive reduction: 2 edges remain
+	// (draft→check, check→publish). The direct draft→publish
+	// is redundant because draft→check→publish already
+	// carries the dependency, so the renderer drops it per
+	// standard DAG visualization convention.
+	if got := strings.Count(out, "-->"); got != 2 {
+		t.Errorf("expected 2 edges after transitive reduction, got %d; output:\n%s", got, out)
+	}
+	if strings.Contains(out, "t_1_1_draft --> t_1_1_publish") {
+		t.Errorf("expected draft→publish to be reduced; got:\n%s", out)
 	}
 
 	// Class definitions present.
@@ -978,6 +985,83 @@ func TestFormatRunStatusMermaid(t *testing.T) {
 		if !strings.Contains(out, cls) {
 			t.Errorf("expected %q in class defs; got:\n%s", cls, out)
 		}
+	}
+}
+
+// TestTransitivelyReduce covers the core redundant-edge
+// cases we care about:
+//   - Diamond (discover → {expand, tag}, expand → tag): the
+//     direct discover → tag is redundant and must be dropped.
+//   - Two-hop chain (a → b → c) with a direct shortcut a → c:
+//     drop a → c.
+//   - No redundancy (a → b, a → c, neither b nor c reachable
+//     from the other): keep both.
+func TestTransitivelyReduce(t *testing.T) {
+	// Diamond: discover → expand → tag, discover → tag (redundant).
+	in := []edge{
+		{"discover", "expand"},
+		{"discover", "tag"},
+		{"expand", "tag"},
+	}
+	out := transitivelyReduce(in)
+	if len(out) != 2 {
+		t.Errorf("diamond reduce: expected 2 edges, got %d: %v", len(out), out)
+	}
+	for _, e := range out {
+		if e.from == "discover" && e.to == "tag" {
+			t.Errorf("expected direct discover→tag to be dropped; got %v", out)
+		}
+	}
+
+	// Chain: a → b → c, a → c (redundant).
+	in2 := []edge{{"a", "b"}, {"b", "c"}, {"a", "c"}}
+	out2 := transitivelyReduce(in2)
+	if len(out2) != 2 {
+		t.Errorf("chain reduce: expected 2 edges, got %d: %v", len(out2), out2)
+	}
+	for _, e := range out2 {
+		if e.from == "a" && e.to == "c" {
+			t.Errorf("expected direct a→c to be dropped; got %v", out2)
+		}
+	}
+
+	// No redundancy: fan-out only, each child disjoint.
+	in3 := []edge{{"a", "b"}, {"a", "c"}, {"a", "d"}}
+	out3 := transitivelyReduce(in3)
+	if len(out3) != 3 {
+		t.Errorf("no-redundancy case: expected all 3 edges kept, got %d: %v", len(out3), out3)
+	}
+}
+
+// TestRenderMermaidBodyTransitiveReduction verifies the full
+// pipeline applies reduction: a materialized dynamic for_each
+// where the source → instance edge already flows via the
+// intermediate (discover → expand → tag with discover → tag
+// also recorded) should collapse to two edges, not three.
+func TestRenderMermaidBodyTransitiveReduction(t *testing.T) {
+	runJSON := []byte(`{"project_id":1,"seq":1,"name":"demo","state":"active"}`)
+	// tag depends on BOTH discover (for_each source) and
+	// expand (explicit). Without reduction, the Mermaid output
+	// would show a redundant discover→tag edge.
+	tasksJSON := []byte(`[
+  {"id":"1:1:discover","task_def_id":"discover","state":"accepted","depends_on":""},
+  {"id":"1:1:expand","task_def_id":"expand","state":"accepted","depends_on":"1:1:discover"},
+  {"id":"1:1:tag","task_def_id":"tag","state":"ready","depends_on":"1:1:discover,1:1:expand"}
+]`)
+	out := renderMermaidBody(runJSON, tasksJSON, nil)
+	// Expect exactly 2 edges: discover→expand, expand→tag.
+	// The direct discover→tag should be pruned.
+	if got := strings.Count(out, "-->"); got != 2 {
+		t.Errorf("expected 2 edges after reduction, got %d; output:\n%s", got, out)
+	}
+	if !strings.Contains(out, "t_1_1_discover --> t_1_1_expand") {
+		t.Errorf("expected discover→expand edge; got:\n%s", out)
+	}
+	if !strings.Contains(out, "t_1_1_expand --> t_1_1_tag") {
+		t.Errorf("expected expand→tag edge; got:\n%s", out)
+	}
+	if strings.Contains(out, "t_1_1_discover --> t_1_1_tag") {
+		t.Errorf("direct discover→tag should be reduced; got:\n%s", out)
 	}
 }
 

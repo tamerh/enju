@@ -1882,6 +1882,16 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	return b.String()
 }
 
+// edge is a single directed connection in the Mermaid graph —
+// from source (either an in-run full task id, or a
+// pre-sanitized external-artifact node id) to a destination
+// full task id. Kept at package scope so transitivelyReduce
+// can operate on slices of it without an anonymous-struct
+// signature.
+type edge struct {
+	from, to string
+}
+
 // renderMermaidBody produces the **raw** Mermaid source for a
 // run's DAG — `flowchart TD` header, node declarations, edges,
 // classDef lines. No ``` fences, no ``%% run N`` comment header.
@@ -1905,7 +1915,7 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 // response carried an error — callers that want an error
 // surface should check for that and decide whether to write
 // the file anyway.
-func renderMermaidBody(runData []byte, tasksData []byte) string {
+func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return ""
@@ -1917,9 +1927,6 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	if err := json.Unmarshal(tasksData, &tasks); err != nil {
 		return ""
 	}
-
-	var b strings.Builder
-	b.WriteString("flowchart TD\n")
 
 	// Index full-task-id → sanitized node id. We keep this
 	// map so edge declarations can look up the node id without
@@ -1938,7 +1945,132 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 		nodeID[id] = mermaidNodeID(id)
 	}
 
-	// Node declarations: one per task, with label + class.
+	// Build the edge set from depends_on. Collect first, reduce,
+	// emit — so transitive reduction has the full picture before
+	// any output lands. Without collecting upfront, a naive
+	// emit-as-you-go would need a second pass anyway. The `edge`
+	// type is package-level so transitivelyReduce can take and
+	// return slices of it without an anonymous-struct dance.
+	var edges []edge
+	edgeSet := map[edge]bool{}
+	addEdge := func(from, to string) {
+		e := edge{from, to}
+		if edgeSet[e] {
+			return
+		}
+		edgeSet[e] = true
+		edges = append(edges, e)
+	}
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		deps, _ := t["depends_on"].(string)
+		if id == "" || deps == "" {
+			continue
+		}
+		for _, parent := range strings.Split(deps, ",") {
+			parent = strings.TrimSpace(parent)
+			if parent == "" || !present[parent] {
+				continue
+			}
+			addEdge(parent, id)
+		}
+	}
+
+	// Cross-run artifact edges (opt-in). The caller passes the
+	// project's artifact index; for each task in this run that
+	// reads an artifact path whose current writer is in a
+	// different run, emit an external "📎 path (from run #X)"
+	// node and an edge into the reader.
+	//
+	// External nodes get the `external` class so the viewer
+	// distinguishes them visually from in-run work. We add
+	// them to the edges list so transitive reduction can fold
+	// them into the regular DAG logic: if a task already reads
+	// path P via a sibling that also reads P, one edge is
+	// enough.
+	type externalNode struct {
+		nodeID    string
+		path      string
+		fromRunID int64
+	}
+	var externals []externalNode
+	externalByID := map[string]externalNode{} // dedup repeats
+	if len(artifactsData) > 0 {
+		var artifacts []map[string]interface{}
+		if json.Unmarshal(artifactsData, &artifacts) == nil {
+			// Build path → (last_task_id, last_run_id) lookup.
+			type writerRef struct {
+				taskID string
+				runID  int64
+			}
+			writers := map[string]writerRef{}
+			for _, a := range artifacts {
+				path, _ := a["path"].(string)
+				lt, _ := a["last_task_id"].(string)
+				lr, _ := a["last_run_id"].(float64)
+				if path == "" || lt == "" {
+					continue
+				}
+				writers[path] = writerRef{taskID: lt, runID: int64(lr)}
+			}
+			// This run's id: any in-run task's run_id will do.
+			// We derive it once from the run JSON so the
+			// external-detection check ("writer in different
+			// run?") doesn't depend on reading task rows.
+			thisRunID := int64(0)
+			if v, ok := run["id"].(float64); ok {
+				thisRunID = int64(v)
+			}
+			for _, t := range tasks {
+				readerID, _ := t["id"].(string)
+				if readerID == "" {
+					continue
+				}
+				reads, _ := t["reads_artifacts"].([]interface{})
+				for _, p := range reads {
+					path, _ := p.(string)
+					if path == "" {
+						continue
+					}
+					w, ok := writers[path]
+					if !ok {
+						continue // no writer tracked — skip silently
+					}
+					if w.runID == thisRunID {
+						continue // same-run writer — the intra-DAG edge already covers it
+					}
+					extID := mermaidExternalNodeID(path)
+					if _, seen := externalByID[extID]; !seen {
+						ext := externalNode{nodeID: extID, path: path, fromRunID: w.runID}
+						externalByID[extID] = ext
+						externals = append(externals, ext)
+					}
+					// Full-ID form for the edge so transitive
+					// reduction can see it. `present` is only used
+					// for guarding intra-run edges; externals are
+					// intentionally off the `present` map.
+					addEdge(extID, readerID)
+				}
+			}
+		}
+	}
+
+	// Transitive reduction on the combined edge set. For each
+	// edge u→v, drop it if v is reachable from any other
+	// out-neighbor of u through the remaining edges. Canonical
+	// DAG form for visualization: no edges whose endpoint is
+	// already reachable via a longer path. Applied uniformly to
+	// intra-run and external-artifact edges so a "discover →
+	// tag" redundancy disappears the same way a "📎 path → tag"
+	// redundancy would if `tag` transitively already depends on
+	// it through another task.
+	edges = transitivelyReduce(edges)
+
+	// Emit.
+	var b strings.Builder
+	b.WriteString("flowchart TD\n")
+
+	// Task nodes.
 	for _, t := range tasks {
 		id, _ := t["id"].(string)
 		if id == "" {
@@ -1955,27 +2087,37 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 		b.WriteString("\n")
 	}
 
-	// Edges from depends_on. Parse the comma-separated string
-	// per task and emit one edge per parent.
+	// External artifact nodes. Only emitted if we have any —
+	// no-op when the caller didn't opt in or no reads crossed
+	// a run boundary.
+	for _, ext := range externals {
+		label := fmt.Sprintf("📎 %s (from run #%d)", mermaidEscape(ext.path), ext.fromRunID)
+		b.WriteString(fmt.Sprintf("    %s[\"%s\"]:::external\n", ext.nodeID, label))
+	}
+
+	// Edges. For intra-run ones, `from` and `to` are full task
+	// ids and need nodeID lookup. External edges carry the
+	// pre-sanitized external node id as `from` — we detect it
+	// by the `ext_art_` prefix so a lookup-or-use-verbatim
+	// fallback works uniformly.
 	b.WriteString("\n")
-	for _, t := range tasks {
-		id, _ := t["id"].(string)
-		deps, _ := t["depends_on"].(string)
-		if id == "" || deps == "" {
-			continue
+	for _, e := range edges {
+		from := nodeID[e.from]
+		if from == "" {
+			from = e.from // external node — already sanitized
 		}
-		for _, parent := range strings.Split(deps, ",") {
-			parent = strings.TrimSpace(parent)
-			if parent == "" || !present[parent] {
-				continue
-			}
-			b.WriteString(fmt.Sprintf("    %s --> %s\n", nodeID[parent], nodeID[id]))
+		to := nodeID[e.to]
+		if to == "" {
+			to = e.to
 		}
+		b.WriteString(fmt.Sprintf("    %s --> %s\n", from, to))
 	}
 
 	// Class definitions — one per terminal/active state. Colors
 	// are deliberately mild so the graph reads well on both
-	// white and dark backgrounds.
+	// white and dark backgrounds. External-artifact nodes use a
+	// dashed stroke so the viewer can tell them apart from
+	// in-run work at a glance.
 	b.WriteString("\n")
 	b.WriteString("    classDef accepted fill:#d4edda,stroke:#28a745,color:#000\n")
 	b.WriteString("    classDef active fill:#cce5ff,stroke:#007bff,color:#000\n")
@@ -1983,6 +2125,106 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
 	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
 	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
+	b.WriteString("    classDef external fill:#fdf6e3,stroke:#8a6d3b,stroke-dasharray:3 3,color:#000\n")
+	return b.String()
+}
+
+// transitivelyReduce removes edges whose endpoint is already
+// reachable from the source through other edges. The canonical
+// DAG visualization convention: if u → v and u → w → ... → v
+// both exist, drop u → v so the diagram doesn't clutter with
+// a redundant direct edge.
+//
+// Algorithm: build the forward adjacency once, then for each
+// edge (u, v) BFS from every other out-neighbor of u looking
+// for v. If any reaches v through the remaining edges, u → v
+// is redundant. O(V·E) for the reachability checks — trivially
+// fast for the scale of runs we visualize.
+//
+// Input is a slice of edges; output preserves the input order
+// of retained edges so the emitted Mermaid output stays stable
+// across calls (useful for the no-op detection in
+// enju_export_diagram — re-export should produce byte-identical
+// content when the graph hasn't changed).
+func transitivelyReduce(edges []edge) []edge {
+	if len(edges) < 2 {
+		return edges
+	}
+	// Forward adjacency.
+	adj := map[string][]string{}
+	for _, e := range edges {
+		adj[e.from] = append(adj[e.from], e.to)
+	}
+	// Reachable(w, target) with a BFS that skips the direct
+	// edge u→v we're testing. We parameterize the skip so the
+	// caller can ask "is v reachable from w without using u→v
+	// directly?" — critical when u→v is a redundancy candidate
+	// that would also count itself as a "longer path."
+	reachableSkipping := func(start, target, skipFrom, skipTo string) bool {
+		if start == target {
+			return true
+		}
+		visited := map[string]bool{start: true}
+		queue := []string{start}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for _, next := range adj[cur] {
+				if cur == skipFrom && next == skipTo {
+					continue
+				}
+				if next == target {
+					return true
+				}
+				if visited[next] {
+					continue
+				}
+				visited[next] = true
+				queue = append(queue, next)
+			}
+		}
+		return false
+	}
+	kept := make([]edge, 0, len(edges))
+	for _, e := range edges {
+		redundant := false
+		for _, w := range adj[e.from] {
+			if w == e.to {
+				continue
+			}
+			if reachableSkipping(w, e.to, e.from, e.to) {
+				redundant = true
+				break
+			}
+		}
+		if !redundant {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// mermaidExternalNodeID derives a sanitized node id for an
+// external-artifact node keyed on the artifact path. Uses a
+// distinct `ext_art_` prefix so the emit loop can distinguish
+// pre-sanitized external ids from full-task-id lookup keys
+// without a separate set.
+func mermaidExternalNodeID(path string) string {
+	var b strings.Builder
+	b.WriteString("ext_art_")
+	prevUnderscore := false
+	for _, r := range path {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevUnderscore = false
+		default:
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
 	return b.String()
 }
 
@@ -1993,7 +2235,20 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 // in any Markdown viewer. For **file** writes (enju_export_diagram)
 // use renderMermaidBody directly — the file should be pure
 // Mermaid source, no fence.
+//
+// Kept as a no-artifacts shim around formatRunStatusMermaidWith
+// so existing tests/call sites that don't opt in to cross-run
+// edges don't have to pass nil.
 func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
+	return formatRunStatusMermaidWith(runData, tasksData, nil)
+}
+
+// formatRunStatusMermaidWith is the include_external-capable
+// variant. Same wrapping behavior as formatRunStatusMermaid;
+// the extra artifactsData argument threads through to
+// renderMermaidBody so readers of cross-run artifacts show up
+// as dashed external nodes in the diagram.
+func formatRunStatusMermaidWith(runData []byte, tasksData []byte, artifactsData []byte) string {
 	// Error paths: mirror the old behavior so existing callers
 	// still see a friendly "✗ Run not found" line instead of an
 	// empty fenced block. renderMermaidBody returns "" on those
@@ -2005,7 +2260,7 @@ func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
 	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
 		return fmt.Sprintf("✗ Run not found: %s", errMsg)
 	}
-	body := renderMermaidBody(runData, tasksData)
+	body := renderMermaidBody(runData, tasksData, artifactsData)
 	if body == "" {
 		return string(tasksData)
 	}
