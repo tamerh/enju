@@ -721,6 +721,20 @@ type FileWrite struct {
 	RepoRelPath string
 	// Content is the raw bytes to write.
 	Content []byte
+	// Mode is the file permission bits to write with. When
+	// zero, the caller doesn't care and we default to 0644.
+	// Callers that need executable scripts (template-bundle
+	// snapshots, in particular — see ReadBundleFiles) must
+	// set this to 0755 so go-git's Worktree.Add picks up the
+	// exec bit when building the tree entry, and downstream
+	// `git pull` on a fresh clone restores it.
+	//
+	// Without this, committing a shell script as a 0644 blob
+	// means the executor on the other side hits "permission
+	// denied" when trying to run it from the snapshot — the
+	// exact regression the 2026-04-18 template-bundle pass
+	// introduced.
+	Mode os.FileMode
 }
 
 // SubmitRequest packages everything needed for one submit: the files
@@ -832,8 +846,19 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
 			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
 		}
-		if err := os.WriteFile(full, f.Content, 0644); err != nil {
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0644
+		}
+		if err := os.WriteFile(full, f.Content, mode); err != nil {
 			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
+		}
+		// WriteFile respects umask on creation but existing
+		// files keep their prior mode. Explicit chmod so the
+		// requested mode actually sticks across overwrite-in-
+		// place cases (re-submit, re-snapshot).
+		if err := os.Chmod(full, mode); err != nil {
+			return nil, fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
 		}
 	}
 
@@ -977,8 +1002,15 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
 			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
 		}
-		if err := os.WriteFile(full, f.Content, 0644); err != nil {
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0644
+		}
+		if err := os.WriteFile(full, f.Content, mode); err != nil {
 			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
+		}
+		if err := os.Chmod(full, mode); err != nil {
+			return nil, fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
 		}
 	}
 

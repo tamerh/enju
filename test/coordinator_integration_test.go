@@ -773,13 +773,31 @@ func (s *testServer) readRepoFile(projectID int64, repoRelPath string) ([]byte, 
 	return data, true
 }
 
+// repoFileSpec is the per-file payload for writeRepoFilesWithMode.
+// Lets callers seed content at a specific permission mode so
+// tests covering exec-bit preservation (template bundles with
+// scripts, for instance) don't have to chmod after the fact.
+type repoFileSpec struct {
+	body string
+	mode os.FileMode
+}
+
 // writeRepoFiles commits + pushes a set of files directly to a
-// project's bare remote via a throwaway clone. Used by tests
-// that need to seed content which the normal MCP tools
-// wouldn't produce — template bundles, pre-existing artifacts,
-// manual project-side edits. `files` maps repo-relative paths
-// to file content bytes.
+// project's bare remote. Simple "all 0644" variant — thin
+// wrapper over writeRepoFilesWithMode.
 func (s *testServer) writeRepoFiles(projectID int64, files map[string]string, commitMsg string) {
+	specs := make(map[string]repoFileSpec, len(files))
+	for p, body := range files {
+		specs[p] = repoFileSpec{body: body, mode: 0o644}
+	}
+	s.writeRepoFilesWithMode(projectID, specs, commitMsg)
+}
+
+// writeRepoFilesWithMode commits + pushes files with
+// per-file permission modes via a throwaway clone. Use this
+// when exec-bit preservation matters (scripts that run under
+// the compute executor).
+func (s *testServer) writeRepoFilesWithMode(projectID int64, files map[string]repoFileSpec, commitMsg string) {
 	s.t.Helper()
 	remoteURL := s.remoteFor(projectID)
 	if remoteURL == "" {
@@ -798,13 +816,20 @@ func (s *testServer) writeRepoFiles(projectID int64, files map[string]string, co
 	if err != nil {
 		s.t.Fatalf("writeRepoFiles: worktree: %v", err)
 	}
-	for rel, body := range files {
+	for rel, spec := range files {
 		full := filepath.Join(cloneDir, rel)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			s.t.Fatalf("writeRepoFiles: mkdir %s: %v", full, err)
 		}
-		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+		mode := spec.mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		if err := os.WriteFile(full, []byte(spec.body), mode); err != nil {
 			s.t.Fatalf("writeRepoFiles: write %s: %v", full, err)
+		}
+		if err := os.Chmod(full, mode); err != nil {
+			s.t.Fatalf("writeRepoFiles: chmod %s: %v", full, err)
 		}
 		if _, err := wt.Add(rel); err != nil {
 			s.t.Fatalf("writeRepoFiles: add %s: %v", rel, err)

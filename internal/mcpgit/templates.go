@@ -241,9 +241,21 @@ func (p *Project) ReadBundleFiles(bundleDir, targetDir string) ([]FileWrite, err
 		if rerr != nil {
 			return fmt.Errorf("computing bundle-relative path for %s: %w", path, rerr)
 		}
+		// Preserve the source file's mode. Scripts with +x
+		// in the live bundle must stay executable in the
+		// snapshot — otherwise the executor resolves `script:`
+		// to a non-executable file and the task fails with
+		// "permission denied" on run. Use at-least-0644 as a
+		// floor so a weirdly-permissioned source (0600 from a
+		// restrictive umask) still becomes readable by git.
+		mode := info.Mode().Perm()
+		if mode&0o444 == 0 {
+			mode |= 0o644
+		}
 		files = append(files, FileWrite{
 			RepoRelPath: filepath.ToSlash(filepath.Join(targetDir, rel)),
 			Content:     body,
+			Mode:        mode,
 		})
 		return nil
 	})

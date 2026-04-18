@@ -3829,9 +3829,11 @@ func TestMCPTemplateBundleSnapshotAndExec(t *testing.T) {
 	// Seed a template bundle directly into the bare remote so
 	// the client's clone picks it up on the next pull. Bundle =
 	// a dir under enju_templates/ with template.yaml at its
-	// root + any sibling files (scripts, in this case).
-	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/sum/template.yaml": `name: "sum runner"
+	// root + any sibling files (scripts, in this case). Scripts
+	// seeded with +x so the snapshot copy has a live mode bit
+	// to preserve.
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/sum/template.yaml": {body: `name: "sum runner"
 version: 1
 tasks:
   - id: run
@@ -3840,12 +3842,12 @@ tasks:
     writes_artifacts:
       - "out/total.txt"
     prompt: "Run sum.sh"
-`,
-		"enju_templates/sum/scripts/sum.sh": `#!/bin/bash
+`, mode: 0o644},
+		"enju_templates/sum/scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "ORIGINAL BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran original"
-`,
+`, mode: 0o755},
 	}, "seed template bundle")
 
 	// Instantiate from the bundle dir. Post-creation, the
@@ -3875,26 +3877,37 @@ echo "ran original"
 		t.Errorf("snapshot script has wrong body: %s", snapScript)
 	}
 
+	// Assertion 1a: the snapshotted script is executable on
+	// disk in the client's local clone. Pre-fix, ReadBundleFiles
+	// wrote snapshot files at 0644 regardless of the source
+	// mode, so scripts silently became non-executable after
+	// snapshot — the exact regression the 2026-04-18 tester
+	// caught. Post-fix, source +x is preserved.
+	//
+	// Workspace dirs may be numeric ("1") or named ("slug-1")
+	// depending on project-name + slug rules, so glob for the
+	// snapshotted path rather than hardcoding the dir shape.
+	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju/runs/1/template/scripts/sum.sh"))
+	if len(snapMatches) == 0 {
+		t.Fatalf("snapshotted script not found under %s", h.workspaceDir)
+	}
+	if info, err := os.Stat(snapMatches[0]); err != nil {
+		t.Fatalf("stat snapshotted script: %v", err)
+	} else if info.Mode().Perm()&0o100 == 0 {
+		t.Errorf("snapshotted script at %s is not executable (mode %v) — +x not preserved through snapshot",
+			snapMatches[0], info.Mode().Perm())
+	}
+
 	// Mutate the live template to PROVE the run uses the
 	// snapshot, not the live tree. The executor below should
 	// still see the original behavior.
-	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/sum/scripts/sum.sh": `#!/bin/bash
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/sum/scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "MUTATED BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran mutated"
-`,
+`, mode: 0o755},
 	}, "edit live template after run created")
-
-	// Chmod +x the snapshotted script (the git roundtrip drops
-	// the exec bit, same as other compute tests).
-	chmodSnapshot := func() {
-		matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju/runs/1/template/scripts/sum.sh"))
-		for _, m := range matches {
-			_ = os.Chmod(m, 0o755)
-		}
-	}
-	chmodSnapshot()
 
 	// Execute the compute task. If the executor resolves script
 	// against the live tree (pre-fix), the result will say
