@@ -1552,7 +1552,8 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		}
 		state, _ := t["state"].(string)
 		claimedBy, _ := t["claimed_by"].(string)
-		icon := stateIcon(state)
+		skipReason, _ := t["skip_reason"].(string)
+		icon := stateIconFor(state, skipReason)
 
 		// Build the display name with task ID.
 		displayName := taskShortName(t)
@@ -1567,6 +1568,13 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		line := fmt.Sprintf("%s%s%s %s [%s]", prefix, connector, displayName, icon, tid)
 		if (state == "claimed" || state == "running") && claimedBy != "" {
 			line += fmt.Sprintf(" (%s)", claimedBy)
+		}
+		// Skipped-because-upstream-failed surfaces the upstream
+		// id inline so the reader can immediately see which
+		// failure blocked this task — distinct from vote-cascade
+		// skips (no reason), which are expected/intentional.
+		if state == "skipped" && skipReason != "" {
+			line += fmt.Sprintf(" (%s)", skipReason)
 		}
 		b.WriteString(line + "\n")
 
@@ -1628,12 +1636,23 @@ func taskShortName(t map[string]interface{}) string {
 // renderTemplateSummary groups tasks by task_def_id and shows a
 // one-line summary per template: "discover  4/4 ✅" or
 // "review  1 in progress · 3 available".
+//
+// Skipped tasks are rendered as ⚫ by default. When the skipped
+// task carries a non-empty skip_reason (only set on fail-cascade
+// skips today), it's rendered as ⊘ with the reason suffix so the
+// reader can tell "skipped because the gate picked the other
+// branch" apart from "skipped because an upstream task failed."
 func renderTemplateSummary(tasks []map[string]interface{}) string {
 	type templateInfo struct {
-		defID string
-		total int
+		defID   string
+		total   int
 		byState map[string]int
-		order int // preserve first-seen order
+		// skipReasons collects the unique skip_reason strings
+		// seen on this template's skipped tasks. Populated only
+		// when at least one skipped task has an upstream-failure
+		// reason; empty for vote-cascade skips.
+		skipReasons map[string]bool
+		order       int // preserve first-seen order
 	}
 	templates := map[string]*templateInfo{}
 	var order []string
@@ -1644,13 +1663,18 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 		}
 		info, ok := templates[defID]
 		if !ok {
-			info = &templateInfo{defID: defID, byState: map[string]int{}, order: len(order)}
+			info = &templateInfo{defID: defID, byState: map[string]int{}, skipReasons: map[string]bool{}, order: len(order)}
 			templates[defID] = info
 			order = append(order, defID)
 		}
 		s, _ := t["state"].(string)
 		info.total++
 		info.byState[s]++
+		if s == "skipped" {
+			if reason, _ := t["skip_reason"].(string); reason != "" {
+				info.skipReasons[reason] = true
+			}
+		}
 	}
 
 	var b strings.Builder
@@ -1678,7 +1702,15 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 				statusParts = append(statusParts, fmt.Sprintf("%d ✅", accepted))
 			}
 			if skipped > 0 {
-				statusParts = append(statusParts, fmt.Sprintf("%d ⚫ skipped", skipped))
+				// ⊘ signals "blocked by a failure"; ⚫ is the
+				// vote-cascade skip (intentional gating).
+				glyph := "⚫"
+				suffix := ""
+				if len(info.skipReasons) > 0 {
+					glyph = "⊘"
+					suffix = " (" + joinSkipReasons(info.skipReasons) + ")"
+				}
+				statusParts = append(statusParts, fmt.Sprintf("%d %s skipped%s", skipped, glyph, suffix))
 			}
 			if failed > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d 🔴 failed", failed))
@@ -1709,6 +1741,23 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 		b.WriteString(fmt.Sprintf("  %-14s %s\n", defID, strings.Join(statusParts, " · ")))
 	}
 	return b.String()
+}
+
+// joinSkipReasons renders the unique skip_reason set (from the
+// template's skipped tasks) as a compact suffix for the summary
+// line. One reason → verbatim; multiple distinct reasons →
+// deduped and comma-joined in sorted order so output is stable
+// across runs.
+func joinSkipReasons(set map[string]bool) string {
+	if len(set) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(set))
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }
 
 // renderYourQueue shows tasks the viewer can act on: claimed by
@@ -2630,6 +2679,15 @@ func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
 }
 
 func stateIcon(state string) string {
+	return stateIconFor(state, "")
+}
+
+// stateIconFor is stateIcon with skip-reason context so the
+// tree renderer can distinguish "skipped because upstream
+// failed" (blocked by a real failure — ⊘) from vote-cascade
+// skips (intentional gating — ⚫). Callers that don't have
+// the reason handy use the plain stateIcon wrapper.
+func stateIconFor(state, skipReason string) string {
 	switch state {
 	// Emoji icons — colorful, double-width but scannable at a glance.
 	// To switch to monochrome single-width, swap the return values:
@@ -2647,6 +2705,11 @@ func stateIcon(state string) string {
 	case "pending":
 		return "⚪"
 	case "skipped":
+		if skipReason != "" {
+			// "skipped because a dependency failed" — ⊘
+			// signals blocking, not intentional gating.
+			return "⊘"
+		}
 		return "⚫"
 	case "failed":
 		return "🔴"

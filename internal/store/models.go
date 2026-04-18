@@ -181,6 +181,13 @@ type TaskRecord struct {
 	// (via enju_fail_task or compute exit non-zero). Empty
 	// for non-failed tasks.
 	FailReason string
+	// SkipReason records why a task was skipped. Empty for
+	// vote-cascade skips (losing branch); populated with
+	// "upstream failed: <taskID>" when a descendant is
+	// skipped because its parent went FAILED via review
+	// reject or enju_fail_task. The run_status formatter
+	// keys the ⊘-vs-⚫ glyph off this field.
+	SkipReason string
 
 	CreatedAt time.Time
 }

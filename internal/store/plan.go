@@ -172,6 +172,7 @@ type SetTaskState struct {
 	VoteChoice string // vote resolution: the winning option id
 	CommitSHA  string // resolution: the commit to record
 	FailReason string // fail: reason for failure
+	SkipReason string // skip (upstream-failure cascade): e.g. "upstream failed: 1:4:write_data"
 }
 
 func (SetTaskState) mutationKind() MutationKind { return MutSetTaskState }

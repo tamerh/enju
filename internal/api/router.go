@@ -848,6 +848,7 @@ type taskResponse struct {
 	Anonymize       bool     `json:"anonymize,omitempty"`        // Phase E.2: hide citizen usernames
 	Visibility      string   `json:"visibility,omitempty"`       // Phase E.2: open|blind during collection
 	FailReason      string   `json:"fail_reason,omitempty"`     // reason for FAILED state
+	SkipReason      string   `json:"skip_reason,omitempty"`     // reason for SKIPPED via fail-cascade, e.g. "upstream failed: 1:4:write_data"
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -1414,13 +1415,18 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Engine validates + builds the Plan.
-	plan, err := s.engine().ComputeFailTask(taskID, req.Reason)
-	if err != nil {
+	// Validate the target is failable via the engine (preserves
+	// the state-precondition check) before running the cascade.
+	if _, err := s.engine().ComputeFailTask(taskID, req.Reason); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := s.store.ApplyPlan(*plan); err != nil {
+
+	// Full reject-cascade: target→FAILED + artifact rollback +
+	// descendants→SKIPPED + cross-run readers→PENDING. See
+	// performFailCascade godoc for the rationale.
+	res, err := s.performFailCascade(taskID, req.Reason)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1428,28 +1434,32 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	task, _ := s.store.GetTask(taskID)
 
 	// Record contribution event.
-	if task.ClaimedBy > 0 {
+	if task != nil && task.ClaimedBy > 0 {
 		run, _ := s.store.GetRun(task.RunID)
 		projectID := int64(0)
 		if run != nil {
 			projectID = run.ProjectID
 		}
 		s.store.RecordContributionEvent(&store.ContributionEvent{
-			CitizenID:    task.ClaimedBy,
-			EventType:    "task_failed",
-			TaskID:       taskID,
-			RunID:        task.RunID,
-			ProjectID:    projectID,
-			Metadata:     fmt.Sprintf(`{"reason":%q}`, req.Reason),
-			CreatedAt:    time.Now(),
+			CitizenID: task.ClaimedBy,
+			EventType: "task_failed",
+			TaskID:    taskID,
+			RunID:     task.RunID,
+			ProjectID: projectID,
+			Metadata:  fmt.Sprintf(`{"reason":%q}`, req.Reason),
+			CreatedAt: time.Now(),
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "failed",
-		"task_id": taskID,
-		"reason":  req.Reason,
-	})
+	resp := map[string]interface{}{
+		"status":              "failed",
+		"task_id":             taskID,
+		"reason":              req.Reason,
+		"skipped_descendants": res.SkippedDescendants,
+		"cross_run_readers":   res.CrossRunReaders,
+		"rollbacks":           res.Rollbacks,
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, run *store.RunRecord) {
@@ -1560,11 +1570,27 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			}
 		}
 		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
-			plan, err := s.engine().ComputeFailTask(actions.RejectTargetID, "rejected by reviewer")
-			if err != nil {
+			// Validate fail-ability (engine precondition check),
+			// then run the full cascade: target→FAILED + artifact
+			// rollback + descendants→SKIPPED + cross-run readers→
+			// PENDING. A raw ComputeFailTask here would leave the
+			// artifact index pointing at the rejected commit and
+			// leave DAG descendants stalled in PENDING forever —
+			// both were the bugs that motivated this path.
+			if _, err := s.engine().ComputeFailTask(actions.RejectTargetID, "rejected by reviewer"); err != nil {
 				s.logger.Error("review-reject fail: compute", "target", actions.RejectTargetID, "error", err)
-			} else if _, err := s.store.ApplyPlan(*plan); err != nil {
-				s.logger.Error("review-reject fail: apply", "target", actions.RejectTargetID, "error", err)
+			} else if res, err := s.performFailCascade(actions.RejectTargetID, "rejected by reviewer"); err != nil {
+				s.logger.Error("review-reject fail: cascade", "target", actions.RejectTargetID, "error", err)
+			} else {
+				rejectResult = &invalidationResult{
+					Task:            res.Task,
+					Descendants:     res.SkippedDescendants,
+					CrossRunReaders: res.CrossRunReaders,
+					Dematerialized:  res.Dematerialized,
+					Changed:         res.Changed,
+					Rollbacks:       res.Rollbacks,
+					AffectedRuns:    res.AffectedRuns,
+				}
 			}
 		}
 		if actions.VoteResolvePlan != nil {
@@ -1886,6 +1912,200 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		Rollbacks:       rollbacks,
 		AffectedRuns:    outcome.AffectedRunIDs,
 	}, nil
+}
+
+// failCascadeResult summarizes the outcome of performFailCascade
+// for logging and response rendering. Mirrors invalidationResult
+// but with terminal semantics — the target is FAILED (not back to
+// READY) and intra-run descendants are SKIPPED (not PENDING).
+type failCascadeResult struct {
+	Task               *store.TaskRecord
+	Reason             string
+	SkippedDescendants []string
+	CrossRunReaders    []string
+	Dematerialized     []string
+	Changed            int
+	Rollbacks          []rollbackOutcome
+	AffectedRuns       map[int64]bool
+}
+
+// performFailCascade is the reject/fail analogue of performInvalidate.
+// It's used when a writer task terminates unsuccessfully (review
+// `reject` verdict, enju_fail_task, compute script error) and any
+// downstream consumers or artifact readers must be told the data
+// they were going to consume is not coming.
+//
+// Semantic contract (see docs/rollback.md § Rejection vs invalidation):
+//
+//  1. Target → FAILED with the supplied reason. Terminal — unlike
+//     request_changes which bounces back to READY.
+//  2. Intra-run DAG descendants of the target → SKIPPED with
+//     skip_reason = "upstream failed: <targetID>". Terminal, and
+//     carries the reason so run_status can render ⊘ "(upstream
+//     failed: X)" distinctly from vote-cascade skips.
+//  3. Artifact rollback — identical to invalidation. The target's
+//     writes roll back to the prior accepted writer (or delete if
+//     none). Otherwise the artifact index would silently keep
+//     pointing at a rejected commit, which downstream readers would
+//     then consume.
+//  4. Cross-run artifact readers that were ACCEPTED against the
+//     rolled-back path → PENDING (not SKIPPED). They weren't DAG
+//     descendants of the rejected task; they're independent runs
+//     whose basis moved. Put them back on the queue to re-run with
+//     the restored content.
+//  5. Dynamic-for_each descendants of the target → DELETE (same as
+//     invalidation — their instance keys are tied to the rejected
+//     output list and can't survive).
+//
+// The computation (DAG walk + rollback decisions) reuses
+// engine.ComputeInvalidation; only the Plan that gets applied
+// differs (terminal states vs. reset-to-retry).
+func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, error) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	d, err := s.getOrLoadDAG(task.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("loading DAG for run %d: %w", task.RunID, err)
+	}
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, fmt.Errorf("run not found for task %q", taskID)
+	}
+	parsed, _ := s.getOrLoadParsedRun(task.RunID)
+
+	outcome, err := s.engine().ComputeInvalidation(task, run, d, parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	var mutations []store.Mutation
+
+	// 1. Artifact rollbacks (same as invalidation — the
+	//    artifact index shouldn't point at rejected content).
+	var rollbacks []rollbackOutcome
+	for _, rb := range outcome.ArtifactRollbacks {
+		if rb.Delete {
+			mutations = append(mutations, store.DeleteArtifact{
+				ProjectID: rb.ProjectID,
+				Path:      rb.Path,
+			})
+			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
+		} else if rb.RestoreTo != nil {
+			mutations = append(mutations, store.MoveArtifact{
+				Artifact: *rb.RestoreTo,
+			})
+			rollbacks = append(rollbacks, rollbackOutcome{
+				Path:              rb.Path,
+				RestoredFromTask:  rb.RestoreTo.LastTaskID,
+				RestoredCommitSHA: rb.RestoreTo.CommitSHA,
+			})
+		}
+	}
+
+	// 2. Target → FAILED (terminal). Preserve commit_sha and
+	//    claim info for audit; applySetTaskState without
+	//    ClearClaim writes the fail_reason as-is.
+	mutations = append(mutations, store.SetTaskState{
+		TaskID:     taskID,
+		NewState:   store.TaskFailed,
+		FailReason: reason,
+	})
+
+	// 3. Intra-run descendants → SKIPPED with reason. ClearClaim
+	//    so any in-flight claims are invalidated and per-claim
+	//    state wiped — a skipped task should not look half-claimed.
+	//
+	//    Filter to non-terminal descendants only. Terminal states
+	//    stay terminal:
+	//      - ACCEPTED review/vote that *caused* this failure
+	//        already did its job; overwriting it as "skipped
+	//        because upstream failed" is semantically backwards.
+	//      - Already-FAILED/SKIPPED descendants are no-ops; no
+	//        need to re-flip them and lose their original reason.
+	skipReason := fmt.Sprintf("upstream failed: %s", taskID)
+	var skippedDescendants []string
+	for _, descID := range outcome.RegularDescendants {
+		dt, err := s.store.GetTask(descID)
+		if err != nil || dt == nil {
+			continue
+		}
+		if isTerminalTaskState(dt.State) {
+			continue
+		}
+		mutations = append(mutations, store.SetTaskState{
+			TaskID:     descID,
+			NewState:   store.TaskSkipped,
+			ClearClaim: true,
+			SkipReason: skipReason,
+		})
+		skippedDescendants = append(skippedDescendants, descID)
+	}
+
+	// 4. Cross-run readers → PENDING. They're in other runs, not
+	//    descendants — they lost their basis but should re-run
+	//    with the rolled-back content, not be marked skipped.
+	for _, readerID := range outcome.CrossRunReaders {
+		mutations = append(mutations, store.SetTaskState{
+			TaskID:     readerID,
+			NewState:   store.TaskPending,
+			ClearClaim: true,
+		})
+	}
+
+	// 5. Dematerialized dynamic descendants → delete.
+	for _, descID := range outcome.DematerializedIDs {
+		mutations = append(mutations, store.DeleteTask{TaskID: descID})
+	}
+
+	plan := store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: mutations,
+	}
+	result, err := s.store.ApplyPlan(plan)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(outcome.DematerializedDefs) > 0 {
+		delete(s.dags, task.RunID)
+		delete(s.runs, task.RunID)
+	}
+
+	// Ready-task sweeps on affected runs — mainly for cross-run
+	// readers that went PENDING; their runs might have other
+	// tasks that became READY or blocked by the flip.
+	for runID := range outcome.AffectedRunIDs {
+		_, _ = s.store.UpdateReadyTasks(runID)
+		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
+			_ = s.store.UpdateRunState(runID, store.RunActive)
+		}
+	}
+
+	return &failCascadeResult{
+		Task:               task,
+		Reason:             reason,
+		SkippedDescendants: skippedDescendants,
+		CrossRunReaders:    outcome.CrossRunReaders,
+		Dematerialized:     outcome.DematerializedIDs,
+		Changed:            result.Changed + result.TasksDeleted,
+		Rollbacks:          rollbacks,
+		AffectedRuns:       outcome.AffectedRunIDs,
+	}, nil
+}
+
+// isTerminalTaskState reports whether a task state is terminal
+// (work is done, one way or another) and should not be rewritten
+// by a cascade. Used by performFailCascade to avoid overwriting
+// the ACCEPTED review that caused the failure, or descendants
+// that already landed in their own terminal state.
+func isTerminalTaskState(s store.TaskState) bool {
+	switch s {
+	case store.TaskAccepted, store.TaskFailed, store.TaskSkipped:
+		return true
+	}
+	return false
 }
 
 
@@ -2450,6 +2670,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		Anonymize:       t.Anonymize,
 		Visibility:      t.Visibility,
 		FailReason:      t.FailReason,
+		SkipReason:      t.SkipReason,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

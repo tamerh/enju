@@ -2856,6 +2856,111 @@ tasks:
 	}
 }
 
+// TestMCPRejectCascadesFailArtifactAndDownstream verifies the
+// full reject-cascade contract introduced to close a semantic
+// gap: before this, a writer rejected on review went FAILED,
+// but the artifact it wrote stayed in the project's artifact
+// index (pointing at a rejected commit) and downstream tasks
+// with depends_on on the writer stalled in PENDING forever.
+//
+// Expected behavior now (see docs/rollback.md § Rejection vs
+// invalidation):
+//   - writer → FAILED (terminal, not back to READY — that's
+//     request_changes)
+//   - writer's written artifact is removed from the index
+//     (no prior writer to roll back to)
+//   - intra-run depends_on descendants → SKIPPED with
+//     skip_reason = "upstream failed: <writerID>"
+//   - run_status renders ⊘ + "(upstream failed: X)" on those
+//     rows, distinct from the ⚫ used for vote-cascade skips
+func TestMCPRejectCascadesFailArtifactAndDownstream(t *testing.T) {
+	h := newMCPHarness(t, "RCReviewer")
+	projectID := h.createTestProject()
+
+	yaml := `name: "reject cascade"
+version: 1
+tasks:
+  - id: write_data
+    action: answer
+    writes_artifacts: [data/payload.md]
+    prompt: "Write the payload."
+  - id: check
+    action: review
+    reviews: write_data
+    prompt: "Review the payload."
+  - id: consume
+    action: answer
+    depends_on: [write_data]
+    prompt: "Use the payload: {{write_data.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// 1. Writer submits with artifact. This upserts the
+	//    artifact index ahead of review resolution.
+	h.mcpClaimOK(t, "write_data")
+	h.mcpSubmitArtifacts(t, "write_data", "the payload", map[string]string{
+		"data/payload.md": "THE DATA",
+	})
+
+	// Sanity: artifact is in the index pointing at write_data.
+	artifactsBefore := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	if len(artifactsBefore) != 1 {
+		t.Fatalf("expected 1 artifact before reject, got %d", len(artifactsBefore))
+	}
+	if last, _ := artifactsBefore[0].(map[string]interface{})["last_task_id"].(string); !strings.HasSuffix(last, ":write_data") {
+		t.Fatalf("expected index to point at write_data before reject, got %q", last)
+	}
+
+	// Downstream consume is PENDING — its upstream is not
+	// yet accepted (review gate open).
+	if got := h.taskGet("consume")["state"]; got != "pending" {
+		t.Fatalf("expected consume PENDING before review, got %v", got)
+	}
+
+	// 2. Reviewer hard-rejects. This fires performFailCascade.
+	h.mcpClaimOK(t, "check")
+	h.mcpSubmitReview(t, "check", "Not good enough.", "reject")
+
+	// 3. Writer is terminally FAILED.
+	w := h.taskGet("write_data")
+	if got := w["state"]; got != "failed" {
+		t.Fatalf("expected write_data FAILED after reject, got %v", got)
+	}
+	if fr, _ := w["fail_reason"].(string); fr == "" {
+		t.Errorf("expected write_data fail_reason set, got empty")
+	}
+
+	// 4. Artifact was removed from the index (no prior writer).
+	artifactsAfter := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	if len(artifactsAfter) != 0 {
+		t.Errorf("expected artifact removed after reject cascade, got %d entries: %v", len(artifactsAfter), artifactsAfter)
+	}
+
+	// 5. Downstream depends_on descendant is SKIPPED with a
+	//    reason that identifies the failing upstream.
+	c := h.taskGet("consume")
+	if got := c["state"]; got != "skipped" {
+		t.Fatalf("expected consume SKIPPED after reject, got %v", got)
+	}
+	reason, _ := c["skip_reason"].(string)
+	if !strings.Contains(reason, "upstream failed:") {
+		t.Errorf("expected skip_reason to mention upstream failure, got %q", reason)
+	}
+	if !strings.Contains(reason, "write_data") {
+		t.Errorf("expected skip_reason to name write_data, got %q", reason)
+	}
+
+	// 6. run_status tree renders the distinct ⊘ glyph + the
+	//    upstream-failed annotation on the skipped row.
+	status := h.mcpRunStatusText(t)
+	if !strings.Contains(status, "⊘") {
+		t.Errorf("expected run_status to contain ⊘ for upstream-failed skip, got:\n%s", status)
+	}
+	if !strings.Contains(status, "upstream failed:") {
+		t.Errorf("expected run_status to annotate with 'upstream failed:', got:\n%s", status)
+	}
+}
+
 // TestMCPVoteResponsesTemplate is the MCP-layer port. The
 // downstream task's resolved prompt embeds per-voter commentary
 // via {{upstream.responses}}.

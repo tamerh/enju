@@ -135,6 +135,8 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		// - Target (→READY): must be in ACCEPTED.
 		// - Descendant (→PENDING): skip if already PENDING
 		//   (no-op, not an error).
+		// - Descendant (→SKIPPED via fail-cascade): same clear
+		//   semantics as PENDING, but terminal.
 		if m.NewState == TaskReady && TaskState(currentState) != TaskAccepted && TaskState(currentState) != TaskFailed {
 			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted or failed)", m.TaskID, currentState)
 		}
@@ -143,11 +145,13 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 			// old InvalidateTask behavior.
 			return nil
 		}
-		_, err := tx.Exec(
-			`UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = '' WHERE id = ?`,
-			m.NewState, m.TaskID,
-		)
-		if err != nil {
+		// Fail-cascade skip carries a reason; everything else
+		// the ClearClaim path handles wipes all per-claim state.
+		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = '', skip_reason = ?`
+		args := []interface{}{m.NewState, m.SkipReason}
+		q += ` WHERE id = ?`
+		args = append(args, m.TaskID)
+		if _, err := tx.Exec(q, args...); err != nil {
 			return fmt.Errorf("set_task_state (clear): %w", err)
 		}
 		// Mark open claims as invalidated.
@@ -166,6 +170,10 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		if m.FailReason != "" {
 			q += `, fail_reason = ?`
 			args = append(args, m.FailReason)
+		}
+		if m.SkipReason != "" {
+			q += `, skip_reason = ?`
+			args = append(args, m.SkipReason)
 		}
 		q += ` WHERE id = ?`
 		args = append(args, m.TaskID)
