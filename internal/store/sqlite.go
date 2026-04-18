@@ -88,6 +88,21 @@ func New(dbPath string) (*Store, error) {
 }
 
 // Close closes the database connection.
+// UpdateTaskDependsOn rewrites a single task's depends_on
+// string. Used by the Phase 2 singleton-reopen path where
+// reconciliation may produce a different fan-in edge set from
+// a prior round. Not exposed as a generic mutation because
+// depends_on is structural metadata — it's only updated in
+// this one case, and keeping the call shape narrow makes the
+// intent obvious to a reader of the call graph.
+func (s *Store) UpdateTaskDependsOn(taskID, depsCSV string) error {
+	_, err := s.db.Exec(`UPDATE tasks SET depends_on = ? WHERE id = ?`, depsCSV, taskID)
+	if err != nil {
+		return fmt.Errorf("update depends_on for %q: %w", taskID, err)
+	}
+	return nil
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -284,6 +299,10 @@ func (s *Store) migrate() error {
 		// failed: X)" distinctly from vote-cascade skips (⚫).
 		// Empty for vote-cascade skips.
 		`ALTER TABLE tasks ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''`,
+		// J.2 partial re-materialization — stashes the state a
+		// parked task came from so a matched-key reconciliation
+		// can losslessly restore. Empty for non-parked rows.
+		`ALTER TABLE tasks ADD COLUMN parked_from_state TEXT NOT NULL DEFAULT ''`,
 		// Phase H.1 — template provenance. Records the
 		// repo-relative templates/*.yaml path this run was
 		// instantiated from. Empty string for inline-YAML
@@ -545,7 +564,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -589,7 +608,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason,
+		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1678,7 +1697,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason,
+			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

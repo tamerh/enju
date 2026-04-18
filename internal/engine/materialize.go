@@ -15,12 +15,54 @@ import (
 // MaterializationOutcome is the pure-computation result of
 // resolving a dynamic for_each expansion. The router
 // consumes it to insert task rows, add DAG nodes/edges, and
-// clean up stale instances.
+// reconcile against any parked rows from a prior accept.
+//
+// Post-Phase-2 buckets (partial re-materialization):
+//
+//   - TasksToCreate: brand-new instances (keys appearing in
+//     the output list that weren't already parked).
+//   - TasksToRestore: parked rows whose keys still match the
+//     new output list. Each carries the state to restore to
+//     (stashed in parked_from_state pre-Phase 2).
+//   - TasksToDelete: parked rows whose keys fell out of the
+//     new list. Deleted outright along with their subtrees.
+//   - SingletonReopens: transitively-deferred singletons
+//     (e.g. `aggregate`) whose deps set changed across
+//     reconciliation — reset to PENDING with new depends_on.
+//
+// DefIDsToCleanUp is retained as an empty slice so older
+// callers during transition don't break; Phase 2 never fills
+// it (precise per-task deletion replaces "wipe by def").
 type MaterializationOutcome struct {
-	DefIDsToCleanUp []string
-	TasksToCreate   []store.TaskRecord
-	DAGNodes        []DAGNode
-	DAGEdges        []DAGEdge
+	DefIDsToCleanUp  []string
+	TasksToCreate    []store.TaskRecord
+	TasksToRestore   []RestoreOp
+	TasksToDelete    []string
+	SingletonReopens []SingletonReopen
+	DAGNodes         []DAGNode
+	DAGEdges         []DAGEdge
+}
+
+// RestoreOp unparks a previously-parked row by reverting its
+// state to the value stashed in parked_from_state. The engine
+// does the read-and-capture up front so the apply layer only
+// needs a single SetTaskState mutation (NewState = ToState),
+// keeping the transaction small.
+type RestoreOp struct {
+	TaskID  string
+	ToState store.TaskState
+}
+
+// SingletonReopen records a transitively-deferred singleton
+// whose deps set changed across a reconciliation — i.e. the
+// reconciled instance set differs from what the singleton's
+// depends_on currently references. The row must reset to
+// PENDING (clearing claim/result state) and adopt the new
+// depends_on string so UpdateReadyTasks picks it up correctly
+// once the new instance set accepts.
+type SingletonReopen struct {
+	TaskID       string
+	NewDependsOn string
 }
 
 // DAGNode describes a node to add to the in-memory DAG.
@@ -121,15 +163,15 @@ func (e *Engine) ComputeMaterialization(
 		return nil, nil
 	}
 
-	// Cleanup covers EVERY deferred def id — both the ones
-	// we're about to materialize AND the transitively-deferred
-	// singletons we'll handle in pass 3 below. This runs before
-	// allocation so a re-accept after invalidation wipes stale
-	// rows whose keys won't appear in the new list (e.g. round 1
-	// made alpha:analyze; round 2's list is [beta,gamma] — alpha
-	// must be deleted, not orphaned). Sorted output keeps the
-	// caller's store.DeleteTasksByDefInRun calls deterministic.
 	outcome := &MaterializationOutcome{}
+
+	// Phase 2: reconciliation against parked rows from a prior
+	// accept. Before planning what to create, inventory
+	// existing rows in this run that belong to our deferred
+	// defs — these are either parked (from a post-J.2
+	// invalidation) or active (first-time accept). We use the
+	// DeferredTaskDef set to scope the inventory so unrelated
+	// tasks stay out of the reconciliation.
 	deferredDefIDs := make(map[string]bool)
 	for _, rr := range directlyReady {
 		deferredDefIDs[rr.def.TaskDefID] = true
@@ -140,10 +182,23 @@ func (e *Engine) ComputeMaterialization(
 			deferredDefIDs[d.TaskDefID] = true
 		}
 	}
-	for defID := range deferredDefIDs {
-		outcome.DefIDsToCleanUp = append(outcome.DefIDsToCleanUp, defID)
+
+	// existingByDef collects current rows per deferred def.
+	// existingByInstanceKey groups rows by instance_key for
+	// subtree reconciliation — a single parent key's subtree
+	// spans multiple defs but shares the instance_key.
+	existingByDef := make(map[string][]store.TaskRecord)
+	existingByInstanceKey := make(map[string][]store.TaskRecord)
+	allExisting, _ := e.store.ListTasksByRun(task.RunID)
+	for _, t := range allExisting {
+		if !deferredDefIDs[t.TaskDefID] {
+			continue
+		}
+		existingByDef[t.TaskDefID] = append(existingByDef[t.TaskDefID], t)
+		if t.InstanceKey != "" {
+			existingByInstanceKey[t.InstanceKey] = append(existingByInstanceKey[t.InstanceKey], t)
+		}
 	}
-	sort.Strings(outcome.DefIDsToCleanUp)
 
 	// Two-pass allocation. Pass 1: pre-compute every instance's
 	// IDs up front so pass 2 can cross-reference siblings (e.g.
@@ -169,6 +224,19 @@ func (e *Engine) ComputeMaterialization(
 	}
 	var plans []plannedInstance
 	instanceIndex := make(map[string]map[string]instanceIDs)
+	// matchedKeysByDef tracks which (def, key) pairs already
+	// have an existing row we're keeping (restore path) so the
+	// transitively-deferred fan-in pass can route deps to the
+	// preserved rows, not try to pair with a new-create entry
+	// that doesn't exist.
+	matchedKeysByDef := make(map[string]map[string]bool)
+	// survivingKeys is the union of keys we'll end up with
+	// after reconciliation (matched + new-created). Used by
+	// the singleton-deps comparator to detect "deps set
+	// changed" — a singleton's new depends_on is rebuilt from
+	// this set.
+	survivingKeysByDef := make(map[string]map[string]bool)
+
 	for _, rr := range directlyReady {
 		def, ok := taskDefByID[rr.def.TaskDefID]
 		if !ok {
@@ -178,13 +246,120 @@ func (e *Engine) ComputeMaterialization(
 		if instanceIndex[def.ID] == nil {
 			instanceIndex[def.ID] = make(map[string]instanceIDs, len(instances))
 		}
+		if matchedKeysByDef[def.ID] == nil {
+			matchedKeysByDef[def.ID] = make(map[string]bool)
+		}
+		if survivingKeysByDef[def.ID] == nil {
+			survivingKeysByDef[def.ID] = make(map[string]bool)
+		}
+
+		// Build a quick lookup of this def's existing rows by
+		// instance key so the per-instance reconciliation
+		// decision is O(1).
+		existingByKey := make(map[string]store.TaskRecord, len(existingByDef[def.ID]))
+		for _, e := range existingByDef[def.ID] {
+			existingByKey[e.InstanceKey] = e
+		}
+		// Keys from the new output list → the "target" set.
+		newKeySet := make(map[string]bool, len(instances))
+		for _, inst := range instances {
+			newKeySet[inst.Key] = true
+		}
+
+		// 1. Stale — keys that used to exist but aren't in
+		//    the new list. Delete their full subtrees
+		//    (instance row + every same-instance-key
+		//    descendant).
+		for _, existingRow := range existingByDef[def.ID] {
+			if newKeySet[existingRow.InstanceKey] {
+				continue
+			}
+			// The whole subtree is already captured by the
+			// instance-key grouping — fan-in descendants like
+			// alpha:tag, alpha:review share
+			// instance_key="alpha" with alpha:expand. Dedup
+			// via a map when assembling the delete list.
+		}
+
+		// 2. Plan the instances that will exist post-reconcile.
 		for _, inst := range instances {
 			shortID := enjuYaml.MakeFullID(inst.Key, def.ID)
 			fullID := runPrefix + shortID
-			plans = append(plans, plannedInstance{def: def, inst: inst, shortID: shortID, fullID: fullID})
 			instanceIndex[def.ID][inst.Key] = instanceIDs{ShortID: shortID, FullID: fullID}
+			survivingKeysByDef[def.ID][inst.Key] = true
+
+			if _, hasExisting := existingByKey[inst.Key]; hasExisting {
+				// Matched — this instance is being restored,
+				// not created. Skip plan (no TasksToCreate
+				// row) and skip DAG node (already there).
+				matchedKeysByDef[def.ID][inst.Key] = true
+				continue
+			}
+			// New key — falls through to pass 2's build.
+			plans = append(plans, plannedInstance{def: def, inst: inst, shortID: shortID, fullID: fullID})
 		}
 	}
+
+	// Emit restore ops for every row that belongs to a matched
+	// instance key. Scope: a row with instance_key="alpha"
+	// whose def is in the deferred set restores alongside
+	// alpha:expand. Singletons (instance_key="") are handled
+	// in the transitively-deferred pass below, not here.
+	matchedInstanceKeys := make(map[string]bool)
+	for _, keys := range matchedKeysByDef {
+		for k := range keys {
+			matchedInstanceKeys[k] = true
+		}
+	}
+	for _, t := range allExisting {
+		if t.InstanceKey == "" || !matchedInstanceKeys[t.InstanceKey] {
+			continue
+		}
+		if !deferredDefIDs[t.TaskDefID] {
+			continue
+		}
+		if store.TaskState(t.State) != store.TaskParked {
+			// Not parked (fresh first-accept, or somehow
+			// already restored). Nothing to do.
+			continue
+		}
+		outcome.TasksToRestore = append(outcome.TasksToRestore, RestoreOp{
+			TaskID:  t.ID,
+			ToState: store.TaskState(t.ParkedFromState),
+		})
+	}
+
+	// Emit delete ops for every row whose instance key is
+	// stale (exists in some def's parked rows but not in the
+	// new list). A key is stale if it appears in some
+	// existingByDef entry for a def we're directly
+	// materializing now, AND isn't in the new key set for any
+	// directly-ready def that produces it.
+	staleInstanceKeys := make(map[string]bool)
+	for _, rr := range directlyReady {
+		def := rr.def
+		existingForDef := existingByDef[def.TaskDefID]
+		surviving := survivingKeysByDef[def.TaskDefID]
+		for _, existingRow := range existingForDef {
+			if existingRow.InstanceKey == "" {
+				continue
+			}
+			if surviving[existingRow.InstanceKey] {
+				continue
+			}
+			staleInstanceKeys[existingRow.InstanceKey] = true
+		}
+	}
+	for _, t := range allExisting {
+		if t.InstanceKey == "" || !staleInstanceKeys[t.InstanceKey] {
+			continue
+		}
+		if !deferredDefIDs[t.TaskDefID] {
+			continue
+		}
+		outcome.TasksToDelete = append(outcome.TasksToDelete, t.ID)
+	}
+	sort.Strings(outcome.TasksToDelete)
 	// inBatch lets pass 2 detect "this dep is another instance
 	// being materialized right now" so the new task starts
 	// PENDING instead of READY — its dep row doesn't exist yet,
@@ -414,6 +589,44 @@ func (e *Engine) ComputeMaterialization(
 		}
 	}
 
+	// Phase 2 bridge: newInstances currently only contains
+	// the newly-created rows (pass 2 filters matched keys out
+	// of `plans`). The transitively-deferred singleton fan-in
+	// needs the full post-reconcile set — matched *and* new —
+	// otherwise an aggregate's depends_on would list only new
+	// keys and miss restored siblings. Fold matched rows in
+	// here so fan-in sees a complete picture.
+	for _, t := range allExisting {
+		if t.InstanceKey == "" {
+			continue
+		}
+		ids, hasDef := instanceIndex[t.TaskDefID]
+		if !hasDef {
+			continue
+		}
+		got, hasKey := ids[t.InstanceKey]
+		if !hasKey {
+			continue
+		}
+		// Skip entries we're about to insert via TasksToCreate
+		// (pass 2 already appended those). We just want to
+		// surface matched-existing rows.
+		alreadyAdded := false
+		for _, entry := range newInstances[t.TaskDefID] {
+			if entry.FullID == got.FullID {
+				alreadyAdded = true
+				break
+			}
+		}
+		if alreadyAdded {
+			continue
+		}
+		newInstances[t.TaskDefID] = append(newInstances[t.TaskDefID], struct {
+			FullID      string
+			InstanceKey string
+		}{FullID: got.FullID, InstanceKey: t.InstanceKey})
+	}
+
 	// Transitively-deferred pass. Singletons like `aggregate`
 	// that depend on a dynamic-for_each instance can't compute
 	// their depends_on until pass 2 has populated newInstances.
@@ -457,11 +670,58 @@ func (e *Engine) ComputeMaterialization(
 			resolved = append(resolved, runPrefix+dep)
 			dagParents = append(dagParents, dep)
 		}
+		// Keep the deps list stable across runs so the
+		// "same-set" comparator below isn't sensitive to
+		// iteration order.
+		sort.Strings(resolved)
 
-		nextSeq++
-		ti := BuildDeferredInstance(def, forEachInst{Key: "", Params: map[string]string{}}, parsed.Run)
 		shortID := def.ID
 		fullID := runPrefix + shortID
+
+		// Phase 2 reconciliation for singletons: if the row
+		// already exists (either parked by Phase 1 or
+		// accepted/pending from a prior round), we don't
+		// create a new one. Instead:
+		//   - deps set unchanged → restore if parked,
+		//     otherwise leave alone.
+		//   - deps set changed → re-open: state → PENDING,
+		//     clear claim, update depends_on. The row keeps
+		//     its seq/id/action/prompt so consumers that
+		//     cached the full id still find it.
+		if existingRow, err := e.store.GetTask(fullID); err == nil && existingRow != nil {
+			existingDeps := existingRow.DependsOn
+			// Normalize existing deps for comparison — the
+			// stored string is comma-joined; split + sort
+			// so "a,b" and "b,a" compare equal.
+			existingSorted := strings.Split(existingDeps, ",")
+			sort.Strings(existingSorted)
+			existingNorm := strings.Join(existingSorted, ",")
+			newNorm := strings.Join(resolved, ",")
+			if existingNorm == newNorm {
+				if store.TaskState(existingRow.State) == store.TaskParked {
+					outcome.TasksToRestore = append(outcome.TasksToRestore, RestoreOp{
+						TaskID:  fullID,
+						ToState: store.TaskState(existingRow.ParkedFromState),
+					})
+				}
+				// Not parked: leave alone. The aggregate
+				// is either still pending or already
+				// accepted with a result that's still
+				// valid under the preserved deps set.
+			} else {
+				outcome.SingletonReopens = append(outcome.SingletonReopens, SingletonReopen{
+					TaskID:       fullID,
+					NewDependsOn: strings.Join(resolved, ","),
+				})
+			}
+			// Skip the create path below — the row exists.
+			continue
+		}
+
+		// First-time materialization: proceed with the
+		// existing create flow.
+		nextSeq++
+		ti := BuildDeferredInstance(def, forEachInst{Key: "", Params: map[string]string{}}, parsed.Run)
 
 		resultType := ti.ResultType
 		if resultType == "" {

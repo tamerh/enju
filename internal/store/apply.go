@@ -175,6 +175,26 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 			q += `, skip_reason = ?`
 			args = append(args, m.SkipReason)
 		}
+		// Parking/restore semantics on parked_from_state:
+		//   - Transition TO parked: caller sets
+		//     ParkedFromState to the prior state; we stash
+		//     it so restore is a lossless revert.
+		//   - Transition FROM parked (restore): caller sets
+		//     NewState to the stashed value and leaves
+		//     ParkedFromState zero. We must explicitly clear
+		//     the column — otherwise the row would look
+		//     "previously parked" forever.
+		//   - Other transitions: column is left alone. (A row
+		//     that was never parked has empty parked_from_state;
+		//     nothing to change.)
+		if m.NewState == TaskParked {
+			q += `, parked_from_state = ?`
+			args = append(args, m.ParkedFromState)
+		} else if TaskState(currentState) == TaskParked {
+			// Restoring from parked — clear the stash so a
+			// later park doesn't see stale residue.
+			q += `, parked_from_state = ''`
+		}
 		q += ` WHERE id = ?`
 		args = append(args, m.TaskID)
 		if _, err := tx.Exec(q, args...); err != nil {

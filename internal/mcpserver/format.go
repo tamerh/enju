@@ -1015,7 +1015,13 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	descendants, _ := result["descendants"].([]interface{})
 	readers, _ := result["artifact_readers"].([]interface{})
 	rollbacks, _ := result["artifacts_rolled_back"].([]interface{})
-	dematerialized, _ := result["dematerialized"].([]interface{})
+	// parked is the new surface (J.2 partial re-mat);
+	// dematerialized is the legacy alias the coordinator
+	// still emits for older clients. Prefer parked.
+	parked, _ := result["parked"].([]interface{})
+	if len(parked) == 0 {
+		parked, _ = result["dematerialized"].([]interface{})
+	}
 
 	b.WriteString(fmt.Sprintf("✓ Invalidated: %s\n", taskID))
 	if reason != "" {
@@ -1025,15 +1031,16 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	// Compose a summary line that distinguishes the cascade
 	// categories so the user can see at a glance why each
 	// task was affected. Dynamic-for_each descendants are
-	// listed separately because they were DELETED, not just
-	// flipped to PENDING — the caller may want to know that
-	// those tasks ceased to exist.
+	// listed separately because they were PARKED (data kept,
+	// hidden from the scheduler), not deleted — matched keys
+	// restore on re-accept, stale keys get deleted at that
+	// point.
 	b.WriteString(fmt.Sprintf("\n%d task(s) changed state (target", int(changed)))
 	if len(descendants) > 0 {
 		b.WriteString(fmt.Sprintf(" + %d task descendant(s)", len(descendants)))
 	}
-	if len(dematerialized) > 0 {
-		b.WriteString(fmt.Sprintf(" + %d dynamic descendant(s) dematerialized", len(dematerialized)))
+	if len(parked) > 0 {
+		b.WriteString(fmt.Sprintf(" + %d dynamic descendant(s) parked", len(parked)))
 	}
 	if len(readers) > 0 {
 		b.WriteString(fmt.Sprintf(" + %d artifact-reader descendant(s)", len(readers)))
@@ -1048,14 +1055,15 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	}
 
 	// Dynamic descendants: they were materialized from the
-	// invalidated source's output list and have been deleted
-	// entirely. On re-accept the source will re-materialize
-	// fresh instances matching whatever the new list
-	// contains.
-	if len(dematerialized) > 0 {
-		b.WriteString("\nDematerialized (deleted — will be re-created on re-accept):\n")
-		for _, d := range dematerialized {
-			b.WriteString(fmt.Sprintf("  ✗ %v\n", d))
+	// invalidated source's output list and are now PARKED.
+	// On re-accept with a matching output list they restore
+	// in-place (no re-work, commits + ballots preserved); on
+	// a non-matching re-accept, the stale keys get deleted at
+	// that point.
+	if len(parked) > 0 {
+		b.WriteString("\nParked (will restore on matching re-accept, or delete on non-match):\n")
+		for _, d := range parked {
+			b.WriteString(fmt.Sprintf("  ⏸ %v\n", d))
 		}
 	}
 
@@ -1410,15 +1418,25 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 	// the run state. Otherwise a completed run with skipped tasks
 	// shows 75% and confuses the user.
 	done := counts["accepted"] + counts["skipped"] + counts["failed"]
+	// Parked tasks are NOT done — they're waiting for a
+	// reconciliation-driven restore or delete. Keep them out
+	// of the progress numerator so the bar accurately reflects
+	// "what's settled" and surface them separately below.
 
 	progressLine := fmt.Sprintf("Status: %s    Progress: %d/%d", state, done, total)
-	if counts["skipped"] > 0 || counts["failed"] > 0 {
+	if counts["skipped"] > 0 || counts["failed"] > 0 || counts["parked"] > 0 {
 		parts := fmt.Sprintf("%d accepted", counts["accepted"])
 		if counts["skipped"] > 0 {
 			parts += fmt.Sprintf(", %d skipped", counts["skipped"])
 		}
 		if counts["failed"] > 0 {
 			parts += fmt.Sprintf(", %d failed", counts["failed"])
+		}
+		if counts["parked"] > 0 {
+			// ⏸ mirrors the glyph in the per-task rows so the
+			// reader can connect the summary line to the
+			// paused entries below.
+			parts += fmt.Sprintf(", %d ⏸ parked", counts["parked"])
 		}
 		progressLine += fmt.Sprintf(" (%s)", parts)
 	}
@@ -1718,9 +1736,11 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 		allTerminal := terminal == info.total
 
 		// Build status description.
+		parked := info.byState["parked"]
+
 		var statusParts []string
 		switch {
-		case allTerminal && skipped == 0 && failed == 0:
+		case allTerminal && skipped == 0 && failed == 0 && parked == 0:
 			// All accepted — the clean "done" case.
 			statusParts = append(statusParts, fmt.Sprintf("%d/%d ✅", accepted, info.total))
 		case allTerminal:
@@ -1766,6 +1786,13 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 			}
 			if skipped > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d skipped", skipped))
+			}
+			if parked > 0 {
+				// Parked instances stay visible in the default
+				// (in-progress) rollup so the reader can see
+				// "this template has paused work" rather than
+				// just missing rows.
+				statusParts = append(statusParts, fmt.Sprintf("%d ⏸ parked", parked))
 			}
 		}
 		b.WriteString(fmt.Sprintf("  %-14s %s\n", defID, strings.Join(statusParts, " · ")))
@@ -2125,6 +2152,7 @@ func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) s
 	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
 	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
 	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
+	b.WriteString("    classDef parked fill:#e7e3f4,stroke:#6f42c1,stroke-dasharray:2 2,color:#000\n")
 	b.WriteString("    classDef external fill:#fdf6e3,stroke:#8a6d3b,stroke-dasharray:3 3,color:#000\n")
 	return b.String()
 }
@@ -2330,6 +2358,8 @@ func mermaidStateClass(state string) string {
 		return "failed"
 	case "skipped":
 		return "skipped"
+	case "parked":
+		return "parked"
 	default:
 		return ""
 	}
@@ -3257,6 +3287,14 @@ func stateIconFor(state, skipReason string) string {
 		return "🔴"
 	case "invalid", "invalidated", "rejected":
 		return "🔴"
+	case "parked":
+		// ⏸ (pause) signals "work preserved, awaiting
+		// reconciliation". Visually distinct from ⚫ (vote-
+		// cascade terminal skip) and ⊘ (blocked by failure)
+		// because the semantics are different: a parked task
+		// WILL come back — either restored to its prior state
+		// on matching re-accept, or deleted on non-match.
+		return "⏸"
 	default:
 		return "?"
 	}
@@ -3298,6 +3336,8 @@ func stateLabel(state string) string {
 		return "skipped"
 	case "failed":
 		return "failed"
+	case "parked":
+		return "parked (awaiting reconciliation)"
 	default:
 		return state
 	}

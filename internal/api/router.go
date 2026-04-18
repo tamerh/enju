@@ -849,6 +849,7 @@ type taskResponse struct {
 	Visibility      string   `json:"visibility,omitempty"`       // Phase E.2: open|blind during collection
 	FailReason      string   `json:"fail_reason,omitempty"`     // reason for FAILED state
 	SkipReason      string   `json:"skip_reason,omitempty"`     // reason for SKIPPED via fail-cascade, e.g. "upstream failed: 1:4:write_data"
+	ParkedFromState string   `json:"parked_from_state,omitempty"` // stashed prior state for a parked task; empty otherwise
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -1878,9 +1879,34 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		})
 	}
 
-	// 5. Dematerialized dynamic descendants → delete.
+	// 5. Dynamic descendants → PARK (J.2 partial re-mat
+	//    Phase 1). Previously these were deleted outright,
+	//    destroying any in-flight reviews / ballots / accepted
+	//    work on a re-accept with a near-identical list. Parking
+	//    preserves the row (state flips to 'parked', prior state
+	//    stashed in parked_from_state) so the Phase 2
+	//    reconciliation pass on re-accept can restore matched
+	//    keys losslessly. Stale keys still get deleted at that
+	//    point — but the judgment is deferred to when we have
+	//    the new output list in hand.
+	//
+	//    Fail-cascade keeps deleting (see performFailCascade
+	//    below, D5 in PARTIAL_REMAT_PLAN.md): a terminally
+	//    failed source will never re-accept, so its parked
+	//    descendants would orphan forever.
 	for _, descID := range outcome.DematerializedIDs {
-		mutations = append(mutations, store.DeleteTask{TaskID: descID})
+		dt, err := s.store.GetTask(descID)
+		if err != nil || dt == nil {
+			// Row vanished between the engine's read and this
+			// write — nothing to park. Unlikely under the
+			// project lock but handled defensively.
+			continue
+		}
+		mutations = append(mutations, store.SetTaskState{
+			TaskID:          descID,
+			NewState:        store.TaskParked,
+			ParkedFromState: store.TaskState(dt.State),
+		})
 	}
 
 	plan := store.Plan{
@@ -1892,11 +1918,11 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		return nil, err
 	}
 
-	// Wipe DAG cache if we dematerialized dynamic descendants.
-	if len(outcome.DematerializedDefs) > 0 {
-		delete(s.dags, task.RunID)
-		delete(s.runs, task.RunID)
-	}
+	// No DAG cache wipe: parked rows keep their nodes + edges
+	// intact so reconciliation can diff the current DAG
+	// against the incoming output list without rebuilding.
+	// (Previous deletion path wiped the cache because nodes
+	// disappeared.)
 
 	// Ready-task sweeps + run reactivation AFTER the plan
 	// transaction commits (SQLite doesn't support nested
@@ -2179,36 +2205,87 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 		return nil
 	}
 
-	// Apply: clean up stale rows + create new tasks via
-	// ApplyPlan so all mutations happen atomically.
-	// Stale cleanup still uses the existing helper (it
-	// deletes by def ID across the whole run, which is a
-	// broader sweep than individual DeleteTask mutations).
-	for _, defID := range outcome.DefIDsToCleanUp {
-		if err := s.store.DeleteTasksByDefInRun(task.RunID, defID); err != nil {
-			return fmt.Errorf("cleaning up stale instances for %q: %w", defID, err)
-		}
+	// Phase 2 reconciliation apply pass. All four buckets go
+	// through a single ApplyPlan transaction so a failure
+	// midway rolls back cleanly — we never want a run stuck
+	// with half-restored / half-deleted rows.
+	//
+	// Ordering within the plan:
+	//   1. Restore (unpark to stashed state) — safe to apply
+	//      before deletes because restored rows have matching
+	//      keys that won't collide with anything else.
+	//   2. Singleton re-opens (state → PENDING, new deps).
+	//   3. Delete stale subtrees.
+	//   4. Create new-only instances.
+	var muts []store.Mutation
+
+	for _, r := range outcome.TasksToRestore {
+		muts = append(muts, store.SetTaskState{
+			TaskID:   r.TaskID,
+			NewState: r.ToState,
+		})
 	}
-	if len(outcome.TasksToCreate) > 0 {
-		var createMuts []store.Mutation
-		for i := range outcome.TasksToCreate {
-			createMuts = append(createMuts, store.CreateTask{Task: outcome.TasksToCreate[i]})
-		}
+	for _, so := range outcome.SingletonReopens {
+		// Re-open carries an update to depends_on too — not
+		// part of SetTaskState's fields, so we fall through to
+		// a dedicated UPDATE after the plan applies. Keep the
+		// state-flip in the plan for atomicity of the state
+		// change; the deps update is structural metadata and
+		// safe to apply as a separate step.
+		muts = append(muts, store.SetTaskState{
+			TaskID:     so.TaskID,
+			NewState:   store.TaskPending,
+			ClearClaim: true,
+		})
+	}
+	for _, delID := range outcome.TasksToDelete {
+		muts = append(muts, store.DeleteTask{TaskID: delID})
+	}
+	for i := range outcome.TasksToCreate {
+		muts = append(muts, store.CreateTask{Task: outcome.TasksToCreate[i]})
+	}
+
+	if len(muts) > 0 {
 		if _, err := s.store.ApplyPlan(store.Plan{
 			Version:   engine.EngineVersion,
-			Mutations: createMuts,
+			Mutations: muts,
 		}); err != nil {
-			return fmt.Errorf("creating materialized tasks: %w", err)
+			return fmt.Errorf("applying materialization plan: %w", err)
 		}
 	}
-	for _, node := range outcome.DAGNodes {
-		if err := parsed.DAG.AddNode(node.ShortID, node.Action, node.Data); err != nil {
-			s.logger.Warn("DAG AddNode", "id", node.ShortID, "err", err)
+
+	// Singleton depends_on updates post-plan. Separate store
+	// call because SetTaskState doesn't carry depends_on.
+	// Safe to run after the plan — the row already landed in
+	// PENDING with claim cleared; now we refresh its edge
+	// list so UpdateReadyTasks sees the correct parents.
+	for _, so := range outcome.SingletonReopens {
+		if err := s.store.UpdateTaskDependsOn(so.TaskID, so.NewDependsOn); err != nil {
+			return err
 		}
 	}
-	for _, edge := range outcome.DAGEdges {
-		if err := parsed.DAG.AddEdge(edge.From, edge.To); err != nil {
-			s.logger.Warn("DAG AddEdge", "from", edge.From, "to", edge.To, "err", err)
+
+	// DAG cache management. Any deletion or singleton re-open
+	// invalidates edges the cache knows about; easier to wipe
+	// and let the next access rebuild than to surgically
+	// remove nodes/edges. Matches the performInvalidate
+	// pattern.
+	if len(outcome.TasksToDelete) > 0 || len(outcome.SingletonReopens) > 0 {
+		delete(s.dags, task.RunID)
+		delete(s.runs, task.RunID)
+	} else {
+		// No structural churn — safe to incrementally add the
+		// new nodes/edges to the cached DAG (the fast path
+		// for first-time materialization).
+		for _, node := range outcome.DAGNodes {
+			if err := parsed.DAG.AddNode(node.ShortID, node.Action, node.Data); err != nil {
+				s.logger.Warn("DAG AddNode", "id", node.ShortID, "err", err)
+			}
+		}
+		for _, edge := range outcome.DAGEdges {
+			if err := parsed.DAG.AddEdge(edge.From, edge.To); err != nil {
+				s.logger.Warn("DAG AddEdge", "from", edge.From, "to", edge.To, "err", err)
+			}
 		}
 	}
 	return nil
@@ -2345,6 +2422,14 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		resp["artifact_readers"] = result.CrossRunReaders
 	}
 	if len(result.Dematerialized) > 0 {
+		// Phase 1 renamed the semantic from "deleted" to
+		// "parked": the rows stay, waiting for a matching
+		// re-accept to restore or a non-matching one to
+		// delete. Emit the new key as the primary surface;
+		// keep the legacy `dematerialized` key for backward
+		// compatibility with older clients/formatters until
+		// we can cut it.
+		resp["parked"] = result.Dematerialized
 		resp["dematerialized"] = result.Dematerialized
 	}
 	if len(result.Rollbacks) > 0 {
@@ -2678,6 +2763,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		Visibility:      t.Visibility,
 		FailReason:      t.FailReason,
 		SkipReason:      t.SkipReason,
+		ParkedFromState: t.ParkedFromState,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

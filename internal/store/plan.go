@@ -173,6 +173,19 @@ type SetTaskState struct {
 	CommitSHA  string // resolution: the commit to record
 	FailReason string // fail: reason for failure
 	SkipReason string // skip (upstream-failure cascade): e.g. "upstream failed: 1:4:write_data"
+	// ParkedFromState carries the state to stash when
+	// transitioning to TaskParked (partial re-materialization
+	// Phase 1). The apply layer writes it to
+	// `parked_from_state` when NewState == TaskParked.
+	//
+	// Kept on SetTaskState rather than a dedicated mutation
+	// type so parking stays a single row UPDATE that also
+	// preserves claimed_by / commit_sha / review_decision /
+	// vote_choice / task_claims — everything that isn't the
+	// state column keeps its value so restore is lossless.
+	// ClearClaim must be false when parking (otherwise ballots
+	// and result commits would be wiped).
+	ParkedFromState TaskState
 }
 
 func (SetTaskState) mutationKind() MutationKind { return MutSetTaskState }

@@ -3046,6 +3046,802 @@ tasks:
 	}
 }
 
+// TestMCPPartialRematPhase1Parking is the Phase 1 gate for
+// partial re-materialization (PARTIAL_REMAT_PLAN.md). Today's
+// behavior: invalidate a dynamic for_each source → all
+// materialized descendants are DELETED outright, destroying any
+// in-flight reviews / ballots / accepted work.
+//
+// Phase 1 replaces the delete with a park: the row stays, state
+// flips to 'parked', the prior state is stashed in
+// parked_from_state. Scheduler queries filter parked rows out
+// (they're not in any claimable state set). Phase 2 will add
+// the reconciliation pass that restores matched keys on
+// re-accept; for now we just prove parking works in isolation.
+//
+// What this test DOES NOT assert yet (Phase 2):
+//   - restore on re-accept with identical list
+//   - three-way reconciliation diff (restore/delete/create)
+//   - singleton consumer re-open behavior
+//
+// Those come online in the next phase.
+func TestMCPPartialRematPhase1Parking(t *testing.T) {
+	h := newMCPHarness(t, "ParkA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "partial remat phase 1"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Materialize three expand instances.
+	h.mcpClaimOK(t, "discover")
+	h.mcpSubmitOutputLists(t, "discover", map[string]any{
+		"topics": []string{"alpha", "beta", "gamma"},
+	})
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		if h.taskGet(key+":expand") == nil {
+			t.Fatalf("expected %s:expand to materialize", key)
+		}
+	}
+
+	// Accept alpha:expand — simulates user work that MUST
+	// survive an invalidation of discover. Before Phase 1, this
+	// work would be destroyed on invalidate.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "alpha findings")
+	if got := h.taskGet("alpha:expand")["state"]; got != "accepted" {
+		t.Fatalf("expected alpha:expand accepted pre-invalidate, got %v", got)
+	}
+
+	// Invalidate discover. Under pre-Phase-1 behavior the three
+	// expand rows would vanish. Under Phase 1 they park.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "re-running with different topics",
+	})
+
+	// All three descendants must still exist in the store and
+	// be parked, with prior state stashed.
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		shortID := key + ":expand"
+		task := h.taskGet(shortID)
+		if task == nil {
+			t.Errorf("%s:expand was DELETED instead of parked — Phase 1 regression", shortID)
+			continue
+		}
+		state, _ := task["state"].(string)
+		if state != "parked" {
+			t.Errorf("expected %s state=parked after invalidate, got %q", shortID, state)
+		}
+	}
+
+	// alpha:expand specifically must keep its accepted-era
+	// metadata: the prior state stashed as 'accepted',
+	// commit_sha preserved, result_path preserved. That's
+	// what makes Phase 2 restore lossless.
+	alpha := h.taskGet("alpha:expand")
+	if pfs, _ := alpha["parked_from_state"].(string); pfs != "accepted" {
+		t.Errorf("expected alpha:expand parked_from_state=accepted, got %q", pfs)
+	}
+	if cs, _ := alpha["commit_sha"].(string); cs == "" {
+		t.Errorf("expected alpha:expand commit_sha preserved through park, got empty")
+	}
+
+	// beta and gamma were never claimed — they were ready.
+	// Their stashed state should be 'ready'.
+	for _, key := range []string{"beta", "gamma"} {
+		task := h.taskGet(key + ":expand")
+		if pfs, _ := task["parked_from_state"].(string); pfs != "ready" {
+			t.Errorf("expected %s:expand parked_from_state=ready, got %q", key, pfs)
+		}
+	}
+
+	// Parked rows must be invisible to the scheduler — not
+	// surfaced by enju_list_ready_tasks, not offered for claim.
+	readyRes := h.callOK(t, "enju_list_ready_tasks", map[string]any{
+		"project_id": float64(projectID),
+	})
+	readyText := mcpText(readyRes)
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		if strings.Contains(readyText, key+":expand") {
+			t.Errorf("parked task %s:expand appeared in enju_list_ready_tasks output:\n%s", key, readyText)
+		}
+	}
+}
+
+// TestMCPPartialRematPhase2IdenticalList is Phase 4 test #1
+// from PARTIAL_REMAT_PLAN.md — the headline guarantee of
+// partial re-materialization. Round-trip:
+//
+//  1. Accept the dynamic source with list [alpha, beta, gamma].
+//  2. A citizen does real work on alpha:expand — submits a
+//     result, the task becomes accepted.
+//  3. Invalidate the source (parking all descendants per
+//     Phase 1).
+//  4. Re-accept the source with the IDENTICAL list.
+//  5. All descendants should restore to their prior states —
+//     crucially, alpha:expand stays accepted, preserving the
+//     citizen's work. Zero re-work needed.
+//
+// Pre-Phase 2, step 4 destroys all descendants (they were
+// already parked as of Phase 1, but still get wiped when the
+// re-accept materializes fresh). Phase 2 adds the diff step
+// that restores matched keys.
+func TestMCPPartialRematPhase2IdenticalList(t *testing.T) {
+	h := newMCPHarness(t, "RematIdentical")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 identical list round-trip"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Round 1: accept discover with [alpha, beta, gamma].
+	// Content varies between rounds (via an explicit round
+	// marker) so the fat-client submit sees a diff and creates
+	// a commit — the underlying "identical-content submit fails"
+	// gap is a pre-existing issue tracked in TODO.md separately.
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta","gamma"]}`,
+	})
+
+	// Citizen submits alpha:expand — now accepted with a
+	// commit. This is the work partial re-mat must preserve.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "alpha findings")
+	alpha := h.taskGet("alpha:expand")
+	alphaCommit, _ := alpha["commit_sha"].(string)
+	if alphaCommit == "" {
+		t.Fatalf("expected alpha:expand commit_sha to be set after submit")
+	}
+	if got := alpha["state"]; got != "accepted" {
+		t.Fatalf("expected alpha:expand accepted after submit, got %v", got)
+	}
+
+	// Invalidate discover — everything below parks.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "round 2 with same list",
+	})
+
+	// Re-accept with IDENTICAL list. This is the key test —
+	// matched keys must restore, not delete + recreate.
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","beta","gamma"]}`,
+	})
+
+	// alpha:expand survived: still accepted, same commit.
+	alphaAfter := h.taskGet("alpha:expand")
+	if alphaAfter == nil {
+		t.Fatalf("alpha:expand deleted — Phase 2 reconciliation didn't restore it")
+	}
+	if got := alphaAfter["state"]; got != "accepted" {
+		t.Errorf("alpha:expand should have stayed accepted through round-trip, got %v", got)
+	}
+	if got, _ := alphaAfter["commit_sha"].(string); got != alphaCommit {
+		t.Errorf("alpha:expand commit_sha changed from %q to %q — work was re-done", alphaCommit, got)
+	}
+	if got, _ := alphaAfter["parked_from_state"].(string); got != "" {
+		t.Errorf("alpha:expand parked_from_state should have been cleared on restore, got %q", got)
+	}
+
+	// beta and gamma: never claimed in round 1 → were in 'ready'
+	// when parked → restored to 'ready' on re-accept.
+	for _, key := range []string{"beta", "gamma"} {
+		task := h.taskGet(key + ":expand")
+		if task == nil {
+			t.Fatalf("%s:expand deleted instead of restored", key)
+		}
+		if got := task["state"]; got != "ready" {
+			t.Errorf("%s:expand should restore to ready, got %v", key, got)
+		}
+	}
+}
+
+// TestMCPPartialRematPhase2KeyRemoved — test #2 from the plan.
+// Round 1: [alpha, beta, gamma]. Round 2: [alpha, beta]. The
+// gamma subtree must be deleted; alpha + beta preserved.
+func TestMCPPartialRematPhase2KeyRemoved(t *testing.T) {
+	h := newMCPHarness(t, "RematRemove")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 remove"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta","gamma"]}`,
+	})
+
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "drop gamma",
+	})
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	// alpha + beta survive (as ready), gamma is gone.
+	for _, key := range []string{"alpha", "beta"} {
+		task := h.taskGet(key + ":expand")
+		if task == nil {
+			t.Fatalf("%s:expand should survive, but row is gone", key)
+		}
+		if got := task["state"]; got != "ready" {
+			t.Errorf("%s:expand expected ready, got %v", key, got)
+		}
+	}
+	if task := h.taskGet("gamma:expand"); task["error"] == nil {
+		t.Errorf("gamma:expand should be deleted, but row still exists with state %v", task["state"])
+	}
+}
+
+// TestMCPPartialRematPhase2KeyAdded — test #3 from the plan.
+// Round 1: [alpha, beta]. Round 2: [alpha, beta, gamma]. New
+// gamma materializes ready; alpha + beta preserved.
+func TestMCPPartialRematPhase2KeyAdded(t *testing.T) {
+	h := newMCPHarness(t, "RematAdd")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 add"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "add gamma",
+	})
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","beta","gamma"]}`,
+	})
+
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		task := h.taskGet(key + ":expand")
+		if task == nil {
+			t.Fatalf("%s:expand should exist post-reconcile", key)
+		}
+		if got := task["state"]; got != "ready" {
+			t.Errorf("%s:expand expected ready, got %v", key, got)
+		}
+	}
+}
+
+// TestMCPPartialRematPhase2MixedDiff — test #4 from the plan.
+// Round 1: [alpha, beta, gamma] with alpha accepted. Round 2:
+// [alpha, beta, delta]. alpha stays accepted (restored), beta
+// stays ready (restored), gamma deleted, delta created new.
+func TestMCPPartialRematPhase2MixedDiff(t *testing.T) {
+	h := newMCPHarness(t, "RematMixed")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 mixed"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta","gamma"]}`,
+	})
+
+	// Do real work on alpha.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "alpha findings")
+	alphaCommit, _ := h.taskGet("alpha:expand")["commit_sha"].(string)
+
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "swap gamma for delta",
+	})
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","beta","delta"]}`,
+	})
+
+	alpha := h.taskGet("alpha:expand")
+	if alpha == nil || alpha["state"] != "accepted" {
+		t.Errorf("alpha:expand should stay accepted, got %v", alpha)
+	}
+	if sha, _ := alpha["commit_sha"].(string); sha != alphaCommit {
+		t.Errorf("alpha:expand commit changed — work lost; was %q now %q", alphaCommit, sha)
+	}
+	if b := h.taskGet("beta:expand"); b == nil || b["state"] != "ready" {
+		t.Errorf("beta:expand should be restored to ready, got %v", b)
+	}
+	if g := h.taskGet("gamma:expand"); g["error"] == nil {
+		t.Errorf("gamma:expand should be deleted, still exists: %v", g)
+	}
+	if d := h.taskGet("delta:expand"); d == nil || d["state"] != "ready" {
+		t.Errorf("delta:expand should be newly materialized ready, got %v", d)
+	}
+}
+
+// TestMCPPartialRematPhase2SingletonReopensOnDepChange —
+// test #5 from the plan. A transitively-deferred singleton
+// whose deps set changes (because one instance key was
+// swapped) must re-open to PENDING with updated depends_on.
+func TestMCPPartialRematPhase2SingletonReopensOnDepChange(t *testing.T) {
+	h := newMCPHarness(t, "RematSingleton")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 singleton reopen"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+  - id: aggregate
+    action: answer
+    prompt: "Combine: {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	// aggregate has a specific depends_on pointing at
+	// alpha:expand + beta:expand.
+	pre := h.taskGet("aggregate")
+	preDeps, _ := pre["depends_on"].(string)
+	if !strings.Contains(preDeps, "alpha:expand") || !strings.Contains(preDeps, "beta:expand") {
+		t.Fatalf("aggregate round-1 deps should include alpha+beta; got %q", preDeps)
+	}
+
+	// Swap beta for gamma — aggregate's deps set must change.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "swap beta for gamma",
+	})
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","gamma"]}`,
+	})
+
+	post := h.taskGet("aggregate")
+	postDeps, _ := post["depends_on"].(string)
+	if !strings.Contains(postDeps, "alpha:expand") {
+		t.Errorf("aggregate post-reconcile deps should still include alpha; got %q", postDeps)
+	}
+	if !strings.Contains(postDeps, "gamma:expand") {
+		t.Errorf("aggregate post-reconcile deps should now include gamma; got %q", postDeps)
+	}
+	if strings.Contains(postDeps, "beta:expand") {
+		t.Errorf("aggregate post-reconcile deps should NOT include beta (deleted); got %q", postDeps)
+	}
+	if got := post["state"]; got != "pending" {
+		t.Errorf("aggregate should re-open to pending on deps change, got %v", got)
+	}
+}
+
+// TestMCPPartialRematPhase2SingletonPreservedOnIdenticalDeps —
+// test #6 from the plan. If the deps set is unchanged after
+// reconciliation, an accepted singleton should stay accepted.
+func TestMCPPartialRematPhase2SingletonPreservedOnIdenticalDeps(t *testing.T) {
+	h := newMCPHarness(t, "RematSingletonKeep")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 singleton preserve"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+  - id: aggregate
+    action: answer
+    prompt: "Combine: {{expand.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	// Complete the whole chain so aggregate can accept.
+	h.mcpClaimOK(t, "alpha:expand")
+	h.mcpSubmitText(t, "alpha:expand", "alpha findings")
+	h.mcpClaimOK(t, "beta:expand")
+	h.mcpSubmitText(t, "beta:expand", "beta findings")
+	h.mcpClaimOK(t, "aggregate")
+	h.mcpSubmitText(t, "aggregate", "combined")
+	if got := h.taskGet("aggregate")["state"]; got != "accepted" {
+		t.Fatalf("aggregate should be accepted before round 2, got %v", got)
+	}
+	aggCommit, _ := h.taskGet("aggregate")["commit_sha"].(string)
+
+	// Round 2 with identical list — aggregate's deps set
+	// unchanged. Aggregate should stay accepted (its work is
+	// still valid).
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "identical list round-trip",
+	})
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	agg := h.taskGet("aggregate")
+	if got := agg["state"]; got != "accepted" {
+		t.Errorf("aggregate should stay accepted on unchanged-deps round-trip, got %v", got)
+	}
+	if got, _ := agg["commit_sha"].(string); got != aggCommit {
+		t.Errorf("aggregate commit_sha changed — work was re-done; was %q now %q", aggCommit, got)
+	}
+}
+
+// TestMCPPartialRematPhase5UX covers the Phase 5 UX polish:
+//   - run_status shows ⏸ next to parked rows (distinct from
+//     ⚫ vote-cascade skip and ⊘ upstream-failed skip).
+//   - run_status's progress counts surface "N ⏸ parked" so the
+//     reader knows work is pending reconciliation.
+//   - enju_invalidate_task's reply uses "parked" terminology
+//     and points at the restore-on-match contract; NOT the
+//     legacy "dematerialized / deleted" wording.
+func TestMCPPartialRematPhase5UX(t *testing.T) {
+	h := newMCPHarness(t, "RematUX")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 5 UX"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: expand
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Explore {{topic}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha","beta"]}`,
+	})
+
+	// Invalidate → parks alpha:expand, beta:expand.
+	invRes := h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "ux test",
+	})
+	invText := mcpText(invRes)
+	if strings.Contains(invText, "dematerialized") && !strings.Contains(invText, "parked") {
+		t.Errorf("invalidate reply should use 'parked' terminology, not 'dematerialized'; got:\n%s", invText)
+	}
+	if !strings.Contains(invText, "⏸") {
+		t.Errorf("invalidate reply should show ⏸ glyph next to parked rows; got:\n%s", invText)
+	}
+	if !strings.Contains(invText, "restore on matching re-accept") {
+		t.Errorf("invalidate reply should explain the restore-or-delete contract; got:\n%s", invText)
+	}
+
+	// run_status now shows the parked rows distinctly.
+	statusRes := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	statusText := mcpText(statusRes)
+	if !strings.Contains(statusText, "⏸") {
+		t.Errorf("run_status should show ⏸ for parked tasks; got:\n%s", statusText)
+	}
+	if !strings.Contains(statusText, "parked") {
+		t.Errorf("run_status should surface 'parked' count in progress line; got:\n%s", statusText)
+	}
+
+	// Mermaid format too: parked class should land on those nodes.
+	mermaidRes := h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"format":     "mermaid",
+	})
+	mermaidText := mcpText(mermaidRes)
+	if !strings.Contains(mermaidText, ":::parked") {
+		t.Errorf("mermaid output should tag parked nodes with :::parked; got:\n%s", mermaidText)
+	}
+	if !strings.Contains(mermaidText, "classDef parked") {
+		t.Errorf("mermaid output should include classDef parked; got:\n%s", mermaidText)
+	}
+}
+
+// TestMCPPartialRematPhase2MultiCitizenBallotsPreserved —
+// test #7 from the plan. A multi-citizen task mid-quorum
+// (2 of 3 ballots in, state=collecting) parks through an
+// invalidation of the dynamic source and resumes with
+// ballots intact on identical-list re-accept. If ballots were
+// destroyed, the two voters would have to submit again —
+// the exact work-loss this feature exists to prevent.
+func TestMCPPartialRematPhase2MultiCitizenBallotsPreserved(t *testing.T) {
+	alice := newMCPHarness(t, "RematVoteA")
+	bob := alice.newMCPClientAs(t, "RematVoteB")
+	// charlie is registered so the 3-citizen YAML passes
+	// assign-validation; we don't submit as charlie (point
+	// of the test is 2-of-3 → collecting).
+	_ = alice.newMCPClientAs(t, "RematVoteC")
+	projectID := alice.createTestProject()
+
+	yaml := `name: "phase 2 multi-citizen ballot preservation"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: vote_topic
+    for_each:
+      topic: "{{discover.topics}}"
+    action: vote
+    citizens: 3
+    prompt: "Vote on {{topic}}"
+    options:
+      - { id: "yes" }
+      - { id: "no" }
+`
+	alice.mcpCreateRunInline(t, projectID, yaml)
+
+	alice.mcpClaimOK(t, "discover")
+	alice.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      alice.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha"]}`,
+	})
+
+	// Two of the three citizens submit their ballots on
+	// alpha:vote_topic. Task transitions to COLLECTING,
+	// waiting on the third citizen.
+	alice.mcpClaimOK(t, "alpha:vote_topic")
+	alice.mcpSubmitVote(t, "alpha:vote_topic", "alice votes yes", "yes")
+	alice.mcpClaimAs(t, bob, "alpha:vote_topic")
+	alice.mcpSubmitVoteAs(t, bob, "alpha:vote_topic", "bob votes yes", "yes")
+
+	pre := alice.taskGet("alpha:vote_topic")
+	if got := pre["state"]; got != "collecting" {
+		t.Fatalf("expected alpha:vote_topic collecting after 2/3 ballots, got %v", got)
+	}
+	preSubs, _ := pre["vote_submissions"].([]interface{})
+	if len(preSubs) != 2 {
+		t.Fatalf("expected 2 vote submissions before invalidate, got %d", len(preSubs))
+	}
+
+	// Invalidate discover → parks alpha:vote_topic with
+	// parked_from_state=collecting. Ballots live in
+	// task_claims, not touched by the park mutation.
+	alice.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": alice.taskID("discover"),
+		"reason":  "re-run with same list",
+	})
+	parked := alice.taskGet("alpha:vote_topic")
+	if got := parked["state"]; got != "parked" {
+		t.Fatalf("expected alpha:vote_topic parked, got %v", got)
+	}
+	if got, _ := parked["parked_from_state"].(string); got != "collecting" {
+		t.Errorf("expected parked_from_state=collecting, got %q", got)
+	}
+
+	// Re-accept with IDENTICAL list. Task restores to
+	// collecting with both ballots intact. The third citizen
+	// can still submit and tally; the first two citizens don't
+	// re-vote.
+	alice.mcpClaimOK(t, "discover")
+	alice.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      alice.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha"]}`,
+	})
+	post := alice.taskGet("alpha:vote_topic")
+	if got := post["state"]; got != "collecting" {
+		t.Errorf("expected alpha:vote_topic restored to collecting, got %v", got)
+	}
+	postSubs, _ := post["vote_submissions"].([]interface{})
+	if len(postSubs) != 2 {
+		t.Errorf("expected 2 preserved vote submissions post-restore, got %d", len(postSubs))
+	}
+}
+
+// TestMCPPartialRematPhase2ReviewVerdictPreserved — test #8.
+// A per-instance review task whose verdict already landed
+// (target accepted or bounced by the review) survives an
+// identical-list round-trip with its decision intact.
+func TestMCPPartialRematPhase2ReviewVerdictPreserved(t *testing.T) {
+	h := newMCPHarness(t, "RematReview")
+	projectID := h.createTestProject()
+
+	yaml := `name: "phase 2 review verdict preservation"
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "List topics."
+    outputs:
+      topics:
+        format: list<string>
+  - id: draft
+    for_each:
+      topic: "{{discover.topics}}"
+    action: answer
+    prompt: "Draft on {{topic}}"
+  - id: check
+    for_each:
+      topic: "{{discover.topics}}"
+    action: review
+    reviews: draft
+    prompt: "Review {{topic}}'s draft"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 1",
+		"outputs_json": `{"topics":["alpha"]}`,
+	})
+
+	// Submit alpha:draft and approve it — alpha:check lands
+	// accepted with an approve verdict; alpha:draft becomes
+	// accepted via the review path.
+	h.mcpClaimOK(t, "alpha:draft")
+	h.mcpSubmitText(t, "alpha:draft", "the draft")
+	h.mcpClaimOK(t, "alpha:check")
+	h.mcpSubmitReview(t, "alpha:check", "looks good", "approve")
+
+	preCheck := h.taskGet("alpha:check")
+	if got := preCheck["state"]; got != "accepted" {
+		t.Fatalf("expected alpha:check accepted, got %v", got)
+	}
+	if got, _ := preCheck["review_decision"].(string); got != "approve" {
+		t.Fatalf("expected alpha:check decision=approve, got %q", got)
+	}
+
+	// Invalidate discover → parks everything below.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("discover"),
+		"reason":  "identical list round-trip",
+	})
+
+	// Re-accept with identical list.
+	h.mcpClaimOK(t, "discover")
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":      h.taskID("discover"),
+		"content":      "round 2",
+		"outputs_json": `{"topics":["alpha"]}`,
+	})
+
+	// alpha:check survives with its verdict; alpha:draft
+	// stays accepted too.
+	postCheck := h.taskGet("alpha:check")
+	if got := postCheck["state"]; got != "accepted" {
+		t.Errorf("expected alpha:check to stay accepted post-restore, got %v", got)
+	}
+	if got, _ := postCheck["review_decision"].(string); got != "approve" {
+		t.Errorf("expected alpha:check decision=approve preserved, got %q", got)
+	}
+	if got := h.taskGet("alpha:draft")["state"]; got != "accepted" {
+		t.Errorf("expected alpha:draft to stay accepted (target of preserved review), got %v", got)
+	}
+}
+
 // TestMCPMermaidCrossRunArtifactEdges exercises the opt-in
 // include_external flag. A task in run #2 reads an artifact
 // written by run #1. Default Mermaid output omits the
@@ -5526,15 +6322,30 @@ func (h *mcpHarness) mcpSubmitDiscoverListAs(t *testing.T, field string, items [
 	})
 }
 
-// TestMCPDynamicForEachEagerDematerialization is the MCP-layer
-// port. Invalidation deletes every descendant row; they're not
-// just flipped to PENDING. enju_get_task on a dematerialized id
-// returns a not-found error.
-func TestMCPDynamicForEachEagerDematerialization(t *testing.T) {
-	h := newMCPHarness(t, "DynDemat")
+// TestMCPDynamicForEachInvalidationParks is the Phase-1
+// successor to the old J.1 "eager dematerialization" test.
+//
+// Before: invalidation deleted every materialized descendant
+// outright. Anything in flight (mid-claim, mid-tally, already
+// accepted) was destroyed with no recovery path.
+//
+// After Phase 1 of partial re-materialization
+// (PARTIAL_REMAT_PLAN.md): descendants are PARKED instead —
+// rows preserved with `state = 'parked'` and their prior state
+// stashed in `parked_from_state`. Scheduler treats parked as
+// invisible (no claim, no ready-queue listing, no
+// run-completion counting), but the data survives for Phase 2's
+// reconciliation pass to restore matched keys.
+//
+// Phase 2 adds the "re-submit with different list → diff
+// against parked rows" logic. Until that ships, this test
+// asserts only the Phase 1 guarantees (parking, not deletion)
+// and does not follow the flow through a re-submission.
+func TestMCPDynamicForEachInvalidationParks(t *testing.T) {
+	h := newMCPHarness(t, "DynPark")
 	projectID := h.createTestProject()
 
-	yamlContent := `name: "Dematerialization test"
+	yamlContent := `name: "Parking test"
 version: 1
 tasks:
   - id: discover
@@ -5571,48 +6382,54 @@ tasks:
 		t.Fatalf("expected 6 tasks post-materialization, got %d", len(post))
 	}
 
-	// Invalidate discover — dematerialize every descendant.
-	h.mcpInvalidate(t, "discover", "test dematerialization")
+	// Invalidate discover — park every descendant.
+	h.mcpInvalidate(t, "discover", "test parking")
 
-	// Only discover survives.
+	// All 6 rows still present (nothing deleted).
 	postInval := h.runTasks(h.lastRunID)
-	if len(postInval) != 1 {
-		t.Errorf("expected 1 task (discover) after invalidate, got %d", len(postInval))
-	}
-	if len(postInval) > 0 {
-		tk, _ := postInval[0].(map[string]interface{})
-		if def, _ := tk["task_def_id"].(string); def != "discover" {
-			t.Errorf("expected surviving task to be discover, got %q", def)
-		}
-		if state, _ := tk["state"].(string); state != "ready" {
-			t.Errorf("expected discover ready after invalidate, got %q", state)
-		}
+	if len(postInval) != 6 {
+		t.Errorf("expected 6 tasks preserved after park, got %d", len(postInval))
 	}
 
-	// enju_get_task on a dematerialized id must fail.
+	// discover itself flipped back to ready; everything else
+	// should be parked. enju_get_task must still retrieve
+	// parked rows (not a not-found error) — that's the whole
+	// point of preserving them.
 	runPrefix := fmt.Sprintf("%d:%d:", h.lastProjectID, h.lastRunSeq)
-	for _, staleID := range []string{
+	for _, parkedID := range []string{
 		runPrefix + "BRCA1:analyze",
 		runPrefix + "TP53:analyze",
 		runPrefix + "BRCA1:check",
 		runPrefix + "TP53:check",
 		runPrefix + "synthesize",
 	} {
-		res := h.call(t, "enju_get_task", map[string]any{"task_id": staleID})
+		res := h.call(t, "enju_get_task", map[string]any{"task_id": parkedID})
+		if res.IsError {
+			t.Errorf("parked task %s should still be retrievable; got tool error: %s", parkedID, mcpText(res))
+			continue
+		}
 		text := mcpText(res)
-		if !strings.Contains(strings.ToLower(text), "not found") &&
-			!res.IsError {
-			t.Errorf("stale task %s still retrievable: %s", staleID, text)
+		if !strings.Contains(text, "parked") {
+			t.Errorf("expected parked state in task detail for %s; got:\n%s", parkedID, text)
 		}
 	}
 
-	// Re-submit with a different list — fresh instances.
-	h.mcpClaimOK(t, "discover")
-	h.mcpSubmitDiscoverWithList(t, []string{"EGFR"})
-	reMat := h.runTasks(h.lastRunID)
-	// discover + 1 analyze + 1 check + 1 synthesize.
-	if len(reMat) != 4 {
-		t.Errorf("expected 4 tasks after re-submit with 1 gene, got %d", len(reMat))
+	// discover itself is back to ready.
+	disc := h.taskGet("discover")
+	if state, _ := disc["state"].(string); state != "ready" {
+		t.Errorf("expected discover ready after invalidate, got %q", state)
+	}
+
+	// Parked rows must be invisible to the scheduler's ready
+	// queue, otherwise they'd be claimable — which would
+	// overwrite stashed state.
+	ready := h.readyTasks(h.lastRunID)
+	for _, r := range ready {
+		m, _ := r.(map[string]interface{})
+		id, _ := m["id"].(string)
+		if strings.Contains(id, "analyze") || strings.Contains(id, "check") || strings.Contains(id, "synthesize") {
+			t.Errorf("parked task %s surfaced in ready queue", id)
+		}
 	}
 }
 

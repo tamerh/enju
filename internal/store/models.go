@@ -39,6 +39,35 @@ const (
 	// cascade to FAILED. Recovery: enju_invalidate_task
 	// bounces the task back to READY.
 	TaskFailed TaskState = "failed"
+	// TaskParked is introduced by the J.2 "partial
+	// re-materialization" pass. When a dynamic for_each source
+	// is invalidated, its materialized descendants used to be
+	// deleted on the spot — destroying any in-flight reviews /
+	// ballots / accepted work. They now transition to PARKED
+	// instead: the row stays, claimed_by / commit_sha /
+	// task_claims are untouched, and the prior state is
+	// stashed in `parked_from_state` so a matched-key
+	// reconciliation on re-accept can losslessly restore
+	// (state = parked_from_state, parked_from_state = '').
+	//
+	// Semantics vs. other states:
+	//   - NOT terminal for run-completion purposes. A run with
+	//     parked tasks stays active — they're awaiting
+	//     reconciliation, not done.
+	//   - NOT in any scheduler state set (ready / claimed /
+	//     collecting). Parked tasks are invisible to
+	//     enju_list_ready_tasks, the Your Queue view, and the
+	//     UpdateReadyTasks sweep.
+	//   - NOT in terminal sets (accepted / skipped / failed).
+	//     Run completion checks naturally don't count parked
+	//     as done.
+	//
+	// Stale (non-matching-key) parked rows are removed by the
+	// reconciliation pass (Phase 2) via the regular
+	// subtree-delete machinery. Parked is always a
+	// "provisionally preserved" state, never long-lived in a
+	// completed run.
+	TaskParked TaskState = "parked"
 )
 
 // RunState represents the state of a run.
@@ -188,6 +217,18 @@ type TaskRecord struct {
 	// reject or enju_fail_task. The run_status formatter
 	// keys the ⊘-vs-⚫ glyph off this field.
 	SkipReason string
+	// ParkedFromState stashes the prior state when a task
+	// transitions to TaskParked during J.2 partial
+	// re-materialization. Restored lossless on reconciliation:
+	// `state = parked_from_state, parked_from_state = ''`.
+	// Empty string when state is not (and was never) parked.
+	//
+	// The stash is NOT the same as a transition log — we only
+	// carry the immediately-prior state, not a full history.
+	// Two consecutive park-then-reconcile cycles work by
+	// induction: the second park stashes whatever state the
+	// first restore produced.
+	ParkedFromState string
 
 	CreatedAt time.Time
 }
