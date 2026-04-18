@@ -1070,6 +1070,144 @@ tasks:
 	}
 }
 
+// TestParseComputeTaskNoDepsWarns — a compute task with no
+// visible upstream linkage (no task-field refs, no reads,
+// no depends_on) trips the structural lint. The warning tells
+// the author to declare explicitly; non-fatal.
+func TestParseComputeTaskNoDepsWarns(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute no deps"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Run the script"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\" has no declared dependencies") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected compute-no-deps warning for gen; got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseComputeWithDependsOnNoWarning — same compute task
+// with an explicit depends_on declaration silences the lint.
+func TestParseComputeWithDependsOnNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute with depends_on"
+version: 1
+tasks:
+  - id: source
+    action: answer
+    prompt: "Produce source data."
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    depends_on: [source]
+    prompt: "Run the script"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			t.Errorf("unexpected compute-no-deps warning with depends_on set: %s", w)
+		}
+	}
+}
+
+// TestParseComputeWithPromptRefNoWarning — {{task.field}} in
+// the prompt is an implicit dep declaration and also silences
+// the lint.
+func TestParseComputeWithPromptRefNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute with prompt ref"
+version: 1
+tasks:
+  - id: source
+    action: answer
+    prompt: "Produce source data."
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Process: {{source.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			t.Errorf("unexpected compute-no-deps warning with prompt ref: %s", w)
+		}
+	}
+}
+
+// TestParseComputeWithReadsArtifactNoWarning — reads_artifacts
+// is the third dep-declaration form and also silences the lint.
+func TestParseComputeWithReadsArtifactNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute with reads_artifacts"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    reads_artifacts: [data/input.csv]
+    prompt: "Run on input.csv"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			t.Errorf("unexpected compute-no-deps warning with reads_artifacts: %s", w)
+		}
+	}
+}
+
+// TestParseComputeParamRefDoesNotCount — `{{paramname}}` in
+// prompt is a param substitution, not a task reference. It
+// shouldn't silence the lint because it doesn't establish a
+// dependency edge. Separate test because the heuristic keys
+// on the presence of `.` inside the braces.
+func TestParseComputeParamRefDoesNotCount(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute with param only"
+version: 1
+params:
+  - name: target
+    type: string
+    required: true
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Run for {{target}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\" has no declared dependencies") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected compute-no-deps warning — param ref is not a task dep; got: %v", parsed.Warnings)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

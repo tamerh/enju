@@ -158,7 +158,21 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			if ti.Requirements == nil {
 				ti.Requirements = p.Requirements
 			}
-			ti.ReadsArtifacts = template.MergeArtifactReads(taskDef.ReadsArtifacts, taskDef.Prompt)
+			// Per-instance artifact paths: substitute
+			// for_each variables so `writes_artifacts:
+			// [summaries/{{stem}}.md]` resolves to
+			// `summaries/alpha.md` on the alpha instance
+			// etc. The def's backing slice is shared across
+			// instances so we allocate fresh via
+			// ResolveParamsSlice. Inferred reads from
+			// `{{artifact:...}}` prompt refs go through
+			// MergeArtifactReads against the RESOLVED prompt
+			// so inferred paths also pick up per-instance
+			// variable substitution.
+			ti.ReadsArtifacts = template.ResolveParamsSlice(
+				template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
+				inst.params)
+			ti.WritesArtifacts = template.ResolveParamsSlice(taskDef.WritesArtifacts, inst.params)
 
 			taskInstances = append(taskInstances, ti)
 
@@ -180,6 +194,10 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 		}
 
 		result.ExpandedTasks[inst.key] = taskInstances
+	}
+
+	if err := wireArtifactDeps(result); err != nil {
+		return nil, err
 	}
 
 	if err := result.DAG.Validate(); err != nil {
@@ -300,7 +318,12 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 		if ti.Requirements == nil {
 			ti.Requirements = p.Requirements
 		}
-		ti.ReadsArtifacts = template.MergeArtifactReads(taskDef.ReadsArtifacts, taskDef.Prompt)
+		// See the run-level variant above (step-1 comment on
+		// ReadsArtifacts / WritesArtifacts) for the why.
+		ti.ReadsArtifacts = template.ResolveParamsSlice(
+			template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
+			iter.params)
+		ti.WritesArtifacts = template.ResolveParamsSlice(taskDef.WritesArtifacts, iter.params)
 		return ti
 	}
 
@@ -414,6 +437,10 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 		result.ExpandedTasks[key] = list
 	}
 
+	if err := wireArtifactDeps(result); err != nil {
+		return nil, err
+	}
+
 	if err := result.DAG.Validate(); err != nil {
 		return nil, fmt.Errorf("DAG validation: %w", err)
 	}
@@ -426,4 +453,78 @@ func MakeFullID(instanceKey, taskID string) string {
 		return taskID
 	}
 	return instanceKey + ":" + taskID
+}
+
+// wireArtifactDeps augments depends_on + DAG edges with
+// artifact-derived dependencies — the Snakemake-style
+// "file dep graph" channel. For every pair of instances
+// where task A writes path P and task B reads the same
+// path P (after per-instance substitution), add an edge
+// A → B so the scheduler keeps them ordered.
+//
+// Without this pass, a compute script (or any task) that
+// declares reads_artifacts on a path another in-run task
+// declares writes_artifacts on would be silently scheduled
+// in parallel with its producer — the exact pitfall the
+// feedback-tester flagged. Prompt refs like
+// `{{task.content}}` already wire edges; artifact refs
+// should match that parity.
+//
+// Runs AFTER primary dep wiring so writers identified
+// here augment rather than replace the existing
+// DependsOn. Self-edges (a task that both reads and
+// writes the same path — append-style update within one
+// instance) are filtered. Cross-run artifact deps are
+// out of scope here; this is strictly same-run.
+func wireArtifactDeps(result *ParsedRun) error {
+	// Step 1 — build path → writers map across every
+	// materialized instance in the run.
+	writersByPath := make(map[string][]string) // path → []fullID
+	for _, instances := range result.ExpandedTasks {
+		for _, ti := range instances {
+			for _, path := range ti.WritesArtifacts {
+				if path == "" {
+					continue
+				}
+				writersByPath[path] = append(writersByPath[path], ti.FullID)
+			}
+		}
+	}
+	if len(writersByPath) == 0 {
+		return nil
+	}
+
+	// Step 2 — for each instance with reads, add every
+	// matching writer to depends_on (skipping self-edges
+	// and dedup'ing against edges the primary wiring
+	// already put there).
+	for key, instances := range result.ExpandedTasks {
+		for i := range instances {
+			ti := &instances[i]
+			if len(ti.ReadsArtifacts) == 0 {
+				continue
+			}
+			existing := make(map[string]bool, len(ti.DependsOn))
+			for _, d := range ti.DependsOn {
+				existing[d] = true
+			}
+			for _, path := range ti.ReadsArtifacts {
+				for _, writerID := range writersByPath[path] {
+					if writerID == ti.FullID {
+						continue // same-instance self-edge
+					}
+					if existing[writerID] {
+						continue
+					}
+					existing[writerID] = true
+					ti.DependsOn = append(ti.DependsOn, writerID)
+					if err := result.DAG.AddEdge(writerID, ti.FullID); err != nil {
+						return fmt.Errorf("adding artifact-derived edge %s -> %s: %w", writerID, ti.FullID, err)
+					}
+				}
+			}
+		}
+		result.ExpandedTasks[key] = instances
+	}
+	return nil
 }

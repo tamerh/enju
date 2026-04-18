@@ -3585,6 +3585,170 @@ tasks:
 	}
 }
 
+// TestMCPForEachArtifactPathSubstitution reproduces three
+// related bugs around templated artifact paths + for_each:
+//
+//  1. `{{var}}` in `writes_artifacts:` / `reads_artifacts:`
+//     isn't substituted per-instance — every materialized
+//     instance carries the LITERAL "summaries/{{stem}}.md"
+//     string instead of "summaries/alpha.md" etc.
+//  2. Because paths stay literal (and identical across
+//     instances), the parser can't infer per-instance deps
+//     from shared artifact paths either.
+//  3. On compute tasks that declare writes_artifacts, the
+//     artifact index doesn't register after the script runs —
+//     a downstream consequence of the same gap once the path
+//     substitution is fixed.
+//
+// All three tested via static for_each because it's
+// enough to expose the core substitution bug without needing
+// a dynamic source submission. Dynamic for_each has the same
+// BuildDeferredInstance code path that ignores artifact-field
+// substitution, so one fix covers both.
+//
+// Red-first: expected to fail on current main. Greens once
+// build.go (static) and materialize.go (dynamic) substitute
+// per-instance params into WritesArtifacts / ReadsArtifacts.
+func TestMCPForEachArtifactPathSubstitution(t *testing.T) {
+	h := newMCPHarness(t, "ArtifactSubst")
+	projectID := h.createTestProject()
+
+	yaml := `name: "artifact path substitution"
+version: 1
+tasks:
+  - id: describe
+    for_each:
+      stem: [alpha, beta]
+    action: answer
+    writes_artifacts:
+      - "summaries/{{stem}}.md"
+    prompt: "Describe {{stem}}."
+  - id: categorize
+    for_each:
+      stem: [alpha, beta]
+    action: answer
+    reads_artifacts:
+      - "summaries/{{stem}}.md"
+    prompt: "Categorize {{stem}} using the summary artifact."
+`
+	// Raw create_run so any parser surprises surface with
+	// their actual error text (mcpCreateRunInline swallows
+	// errors behind a generic "no ready tasks" assertion,
+	// which used to mask YAML flow-sequence issues).
+	res := h.call(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+	})
+	if res.IsError {
+		t.Fatalf("create_run failed: %s", mcpText(res))
+	}
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:alpha:describe", projectID))
+
+	// Bug #3: each instance's writes/reads_artifacts
+	// resolve to the concrete per-instance path, not the
+	// templated literal.
+	for _, stem := range []string{"alpha", "beta"} {
+		describeTask := h.taskGet(stem + ":describe")
+		writes := stringSliceFromTask(describeTask, "writes_artifacts")
+		wantWrite := "summaries/" + stem + ".md"
+		if len(writes) != 1 || writes[0] != wantWrite {
+			t.Errorf("describe:%s writes_artifacts want [%q], got %v", stem, wantWrite, writes)
+		}
+
+		categorizeTask := h.taskGet(stem + ":categorize")
+		reads := stringSliceFromTask(categorizeTask, "reads_artifacts")
+		wantRead := "summaries/" + stem + ".md"
+		if len(reads) != 1 || reads[0] != wantRead {
+			t.Errorf("categorize:%s reads_artifacts want [%q], got %v", stem, wantRead, reads)
+		}
+	}
+
+	// Bug #2: once per-instance paths substitute, the parser
+	// can infer that categorize:alpha depends on describe:alpha
+	// via the shared artifact path. categorize:alpha must NOT
+	// be ready before describe:alpha accepts.
+	for _, stem := range []string{"alpha", "beta"} {
+		if got := h.taskGet(stem + ":categorize")["state"]; got == "ready" {
+			t.Errorf("categorize:%s should NOT be ready before describe:%s runs — expected pending pending-on-artifact-writer; got %v",
+				stem, stem, got)
+		}
+	}
+
+	// Bug #1: after describe:alpha runs and writes the
+	// artifact, the artifact index must have an entry for the
+	// substituted per-instance path. We exercise this for
+	// action:answer here (artifacts submitted explicitly via
+	// artifacts_json). Compute-action coverage is a separate
+	// follow-up test once this baseline works.
+	h.mcpClaimOK(t, "alpha:describe")
+	h.mcpSubmitArtifacts(t, "alpha:describe", "alpha summary",
+		map[string]string{"summaries/alpha.md": "ALPHA DATA"})
+
+	arts := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	found := false
+	for _, a := range arts {
+		m, _ := a.(map[string]interface{})
+		if path, _ := m["path"].(string); path == "summaries/alpha.md" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected summaries/alpha.md in artifact index after describe:alpha submit; got %d artifacts", len(arts))
+	}
+}
+
+// stringSliceFromTask pulls a []string field out of the
+// JSON map shape enju_get_task returns. Fields are either
+// []interface{} (JSON array) or absent.
+func stringSliceFromTask(task map[string]interface{}, field string) []string {
+	raw, _ := task[field].([]interface{})
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// TestMCPComputeLintWarnsOnHiddenDeps verifies the structural
+// lint fires on a compute task with no declared upstream
+// linkage and that the warning reaches the caller through the
+// create_run MCP response. The concrete hazard: scripts that
+// read `.enju/runs/...` directly bypass the DAG, so two tasks
+// that should be ordered end up scheduled in parallel.
+func TestMCPComputeLintWarnsOnHiddenDeps(t *testing.T) {
+	h := newMCPHarness(t, "ComputeLintA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "compute lint test"
+version: 1
+tasks:
+  - id: source
+    action: answer
+    prompt: "Produce data."
+  - id: process
+    action: compute
+    script: scripts/process.py
+    prompt: "Run the script."
+`
+	res := h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, "⚠ Warnings") {
+		t.Errorf("expected warnings block in create_run reply; got:\n%s", text)
+	}
+	if !strings.Contains(text, `compute task "process" has no declared dependencies`) {
+		t.Errorf("expected compute lint warning mentioning process; got:\n%s", text)
+	}
+	if !strings.Contains(text, "docs/task-actions.md") {
+		t.Errorf("warning should point to the docs for context; got:\n%s", text)
+	}
+}
+
 // TestMCPPartialRematPhase5UX covers the Phase 5 UX polish:
 //   - run_status shows ⏸ next to parked rows (distinct from
 //     ⚫ vote-cascade skip and ⊘ upstream-failed skip).

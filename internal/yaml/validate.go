@@ -74,7 +74,93 @@ func validate(p *Run) ([]string, error) {
 	if err := validateDynamicForEach(p, ids); err != nil {
 		return nil, err
 	}
-	return append(paramWarnings, reviewWarnings...), nil
+	computeWarnings := validateComputeDependsDeclared(p)
+	warnings := append(paramWarnings, reviewWarnings...)
+	warnings = append(warnings, computeWarnings...)
+	return warnings, nil
+}
+
+// validateComputeDependsDeclared flags compute tasks that
+// declare no visible dependencies — no `{{task.*}}` refs in
+// prompt / user_prompt / script, no `reads_artifacts`, no
+// `depends_on`. Since compute scripts run opaquely (Enju can't
+// inspect what the script actually reads), a task with zero
+// declared deps whose script secretly reads another task's
+// private `.enju/runs/...` output produces a dep-less DAG.
+// The scheduler then marks producer and consumer ready in
+// parallel, and whichever claimant hits the consumer first
+// fails mid-script with a file-not-found that looks unrelated
+// to authoring.
+//
+// Warnings are non-fatal (false positives exist: a truly
+// independent compute task reading only config is valid).
+// The message is actionable — tell the author what the three
+// declaration forms are so they can pick one or dismiss the
+// warning knowingly.
+//
+// Not applied to non-compute actions because their dependency
+// surface is parseable (prompts for answer/review/vote,
+// template refs for any action). Only compute is opaque
+// enough to warrant the structural fallback check.
+func validateComputeDependsDeclared(p *Run) []string {
+	var warnings []string
+	for _, t := range p.Tasks {
+		if t.Action != "compute" {
+			continue
+		}
+		if hasTaskFieldReference(t.Prompt) ||
+			hasTaskFieldReference(t.UserPrompt) ||
+			hasTaskFieldReference(t.Script) ||
+			len(t.ReadsArtifacts) > 0 ||
+			len(t.DependsOn) > 0 {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"compute task %q has no declared dependencies "+
+				"(no {{task.*}} refs, no reads_artifacts, no depends_on). "+
+				"If its script reads output from another task, declare that "+
+				"dependency explicitly — otherwise the scheduler may run this "+
+				"task in parallel with its unknown upstream and a citizen "+
+				"will hit a file-not-found error mid-script. "+
+				"See docs/task-actions.md § compute — Dependency declaration.",
+			t.ID))
+	}
+	return warnings
+}
+
+// hasTaskFieldReference returns true when the string contains
+// a `{{task.field}}` / `{{task.content}}` / `{{task.responses}}`
+// / `{{task.winning_option}}` reference — i.e. anything Enju's
+// prompt resolver would translate into a DAG edge. Param-only
+// refs (`{{paramname}}`) don't count because those are
+// substituted at run creation and don't establish task
+// dependencies.
+//
+// Heuristic: the prompt resolver treats `{{word.anything}}` as
+// a task reference (the dot is the discriminator). Plain
+// `{{word}}` is a param. So we look for `.` inside `{{ ... }}`.
+func hasTaskFieldReference(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '{' || s[i+1] != '{' {
+			continue
+		}
+		// Walk to the matching `}}` or end-of-string. Track
+		// whether we saw a `.` inside — that's the task-ref
+		// marker.
+		sawDot := false
+		for j := i + 2; j+1 < len(s); j++ {
+			if s[j] == '}' && s[j+1] == '}' {
+				if sawDot {
+					return true
+				}
+				break
+			}
+			if s[j] == '.' {
+				sawDot = true
+			}
+		}
+	}
+	return false
 }
 
 // validateHeader checks the minimal "is this a run at all"

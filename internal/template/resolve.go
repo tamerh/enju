@@ -76,6 +76,27 @@ func ResolveParams(prompt string, params map[string]string) string {
 	})
 }
 
+// ResolveParamsSlice applies ResolveParams to every element of
+// a []string, returning a fresh slice. Used for per-instance
+// substitution of `writes_artifacts:` / `reads_artifacts:` /
+// `assign_to:` where the caller shares a task def across
+// multiple for_each instances and must not mutate the def's
+// backing slice.
+//
+// Nil input → nil output (preserves distinction between
+// "no paths" and "zero-length slice," useful for JSON
+// marshaling elsewhere in the pipeline).
+func ResolveParamsSlice(ss []string, params map[string]string) []string {
+	if ss == nil {
+		return nil
+	}
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = ResolveParams(s, params)
+	}
+	return out
+}
+
 // ResolveUpstream replaces {{task_id.field}} references with actual upstream results.
 // The inputs map is: task_def_id -> result content (raw JSON bytes or parsed map).
 func ResolveUpstream(prompt string, inputs map[string]interface{}) string {

@@ -2781,6 +2781,23 @@ func formatCreateRun(data []byte) string {
 		}
 		b.WriteString(line + "\n")
 	}
+
+	// Parse-time warnings are non-fatal advisories (missing
+	// review-consumer, compute task with no declared deps,
+	// etc). The run was created successfully, but the author
+	// should see these so they can fix the YAML before the
+	// warning becomes a silent runtime failure.
+	if warnings, ok := result["warnings"].([]interface{}); ok && len(warnings) > 0 {
+		b.WriteString("\n⚠ Warnings:\n")
+		for _, w := range warnings {
+			msg, _ := w.(string)
+			if msg == "" {
+				continue
+			}
+			b.WriteString("  - " + msg + "\n")
+		}
+	}
+
 	b.WriteString(fmt.Sprintf("\nUse enju_run_status(project_id=%s, run_id=%d) or enju_list_ready_tasks to see tasks.", projectID, int(seq)))
 	return b.String()
 }

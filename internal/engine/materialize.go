@@ -850,6 +850,19 @@ func BuildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInst, run *enjuYam
 	}
 	ti.Prompt = template.ResolveParams(def.Prompt, inst.Params)
 	ti.UserPrompt = template.ResolveParams(def.UserPrompt, inst.Params)
+	// Per-instance substitution for declared-artifact slots.
+	// Without this, `writes_artifacts: [summaries/{{stem}}.md]`
+	// would register literally on every instance row, the
+	// artifact-writer match at submit would fail, and the
+	// parser's per-instance dep inference (writer→reader via
+	// shared artifact path) would never trigger.
+	// ResolveParamsSlice allocates fresh slices so sibling
+	// instances don't share mutable backing storage with the
+	// def or each other.
+	ti.ReadsArtifacts = template.ResolveParamsSlice(
+		template.MergeArtifactReads(def.ReadsArtifacts, ti.Prompt),
+		inst.Params)
+	ti.WritesArtifacts = template.ResolveParamsSlice(def.WritesArtifacts, inst.Params)
 	if ti.Requirements == nil {
 		ti.Requirements = run.Requirements
 	}
