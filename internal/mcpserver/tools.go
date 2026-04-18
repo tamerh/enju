@@ -60,10 +60,10 @@ For simple tasks: provide 'content' as a string.
 For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
 For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
 For action:review tasks: provide 'decision' — one of:
-  - "approve" — work is good, pass downstream
-  - "request_changes" — work needs revision, send back for another round (target bounces to READY)
-  - "reject" — work is fundamentally wrong, hard stop (target becomes FAILED, terminal)
-  - "comment" — non-blocking note, no state change on the target
+  - "approve"          — target → ACCEPTED, downstream unblocks
+  - "request_changes"  — retry cascade: target → READY, artifact rolls back, descendants → PENDING (author revises + resubmits)
+  - "reject"           — fail cascade: target → FAILED (terminal), artifact rolls back, descendants → SKIPPED
+  - "comment"          — non-blocking; target state unchanged
 Your prose content is the reviewer's feedback in all cases.
 For action:vote tasks: provide 'option' as one of the declared option ids from the task's 'options:' list. Your prose content is free-form commentary. If the winning option has 'activates:' set, the DAG routes down that branch and tasks on losing branches flip to SKIPPED. Votes without 'activates:' are pure decisions — downstream tasks can still read the choice via {{task.winning_option}}.
 The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.
@@ -177,7 +177,7 @@ func toolCreateRun() mcp.Tool {
 		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
 1. WRITE IT DIRECTLY: pass "yaml" with the full run definition — use this for one-off runs the user is authoring from scratch.
-2. FROM A SAVED TEMPLATE: pass "path" pointing at a enju_templates/*.yaml recipe in the project clone, plus "params" with the values that template asks for. Use this whenever a user's request matches a known recipe — see enju_list_templates.
+2. FROM A SAVED TEMPLATE: pass "path" pointing at a bundle dir (enju_templates/<name>) or its template.yaml manifest. At create_run, the bundle is snapshotted into .enju/runs/{seq}/template/ and the run is pinned to that frozen copy — later edits to the live template don't affect this run. Script paths resolve from the snapshot. Supply "params" with the values the template declares; see enju_list_templates.
 3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a template file first.
 
 YAML format (same for inline and template files):
@@ -205,7 +205,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),
 		),
 		mcp.WithString("path",
-			mcp.Description("Repo-relative path to a template under enju_templates/, e.g. 'enju_templates/gwas.yaml'. The template is read from the local project clone. Mutually exclusive with 'yaml'."),
+			mcp.Description("Template bundle reference. Accepts either the bundle dir ('enju_templates/gwas-analysis') or its manifest ('enju_templates/gwas-analysis/template.yaml'). The bundle is snapshotted into the run's .enju/runs/{seq}/template/ for reproducibility. Mutually exclusive with 'yaml'."),
 		),
 		mcp.WithObject("params",
 			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_template to see what a template expects."),
@@ -244,18 +244,20 @@ func toolExecuteTask() mcp.Tool {
 	return mcp.NewTool("enju_execute_task",
 		mcp.WithDescription(`Execute a compute task's script, capture its output, and submit the result — all in one call.
 
-For action:compute tasks only. Claims the task if not already claimed, runs the declared script in the project's local clone, captures stdout as the result, and submits automatically.
+For action:compute tasks only. Claims if not already claimed, runs the declared script, captures stdout as result.md, submits automatically.
 
-Environment variables available to the script:
-  ENJU_TASK_ID      — the full task ID
-  ENJU_PROJECT_DIR  — the project's local clone root
-  ENJU_RUN_DIR      — the result directory for this task
+Environment variables exposed to the script:
+  ENJU_TASK_ID       — full task ID
+  ENJU_PROJECT_DIR   — project clone root (cwd)
+  ENJU_RUN_DIR       — this task's result directory
+  ENJU_TEMPLATE_DIR  — template snapshot dir, when instantiated from a bundle
+  ENJU_PARAM_<name>  — every run param + for_each iteration var (lists comma-joined)
 
-Exit code semantics:
-  0     → submit as completed (stdout → result.md)
-  non-0 → task fails (stderr shown as the failure reason)
+Also writes $ENJU_RUN_DIR/context.json with structured task context (task_id, iteration, params, reads_artifacts, writes_artifacts) for scripts that need typed access beyond env vars. Read via jq/json in any language.
 
-The script runs in the project's workspace directory. It has full access to the local clone (upstream results, artifacts, etc.).`),
+Declared writes_artifacts paths are picked up from disk post-exit-0 and registered in the artifact index.
+
+Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The task to execute"),
@@ -313,11 +315,15 @@ func toolExportRun() mcp.Tool {
 
 func toolListTemplates() mcp.Tool {
 	return mcp.NewTool("enju_list_templates",
-		mcp.WithDescription(`List the reusable run recipes (templates) available in a project. Each entry shows the template's name, description, and its declared parameters. Use this first when a user asks to do something that matches a known recipe — the template saves them from hand-writing a run YAML.
+		mcp.WithDescription(`List reusable run recipes (templates) in a project. Use before hand-writing YAML — a template usually matches a user's request.
 
-Templates are just regular run YAML files that live under enju_templates/ in the project git repo. Any run can be promoted to a template by copying its YAML file into enju_templates/; no conversion step.
+A template is a directory bundle under enju_templates/ with template.yaml at its root and any supporting scripts/data bundled alongside:
+  enju_templates/
+    gwas-analysis/
+      template.yaml        # the manifest
+      scripts/analyze.py   # bundled, picked up by the snapshot
 
-To see full parameter docs for one template (types, defaults, descriptions), call enju_describe_template <path>. To instantiate a template into a run, call enju_create_run with 'path' and 'params'.`),
+Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Call enju_describe_template for a template's parameters; enju_create_run with path=<bundle> to instantiate.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose enju_templates/ directory to scan"),
@@ -331,14 +337,14 @@ To see full parameter docs for one template (types, defaults, descriptions), cal
 // before filling in values and calling enju_create_run.
 func toolDescribeTemplate() mcp.Tool {
 	return mcp.NewTool("enju_describe_template",
-		mcp.WithDescription(`Show the full metadata for one template: name, description, and every declared parameter with its type, default, and prose description. Use this when a user picks a template from enju_list_templates and you need to gather the parameter values before calling enju_create_run.`),
+		mcp.WithDescription(`Show full metadata for one template bundle: name, description, declared params with types/defaults/descriptions. Use after picking a template from enju_list_templates to gather param values before enju_create_run.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose template to describe"),
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description("Repo-relative template path, e.g. 'enju_templates/gwas.yaml'"),
+			mcp.Description("Bundle reference — either the bundle dir ('enju_templates/gwas-analysis') or the full manifest path ('enju_templates/gwas-analysis/template.yaml'). Both resolve to the same bundle."),
 		),
 	)
 }
@@ -452,11 +458,11 @@ func toolMyProfile() mcp.Tool {
 
 func toolInvalidateTask() mcp.Tool {
 	return mcp.NewTool("enju_invalidate_task",
-		mcp.WithDescription(`Mark an accepted task as invalid because its result turned out to be wrong. Cascades to all downstream dependents — they transition back to PENDING and wait for the target to re-complete. The target itself goes back to READY so any citizen can re-claim and re-run it.
+		mcp.WithDescription(`Mark an accepted task as invalid (its result was wrong). Target → READY for re-claim; intra-run descendants → PENDING until the target re-completes. Artifact index rolls back to the prior writer. Git history preserves the previous result.
 
-Git history preserves the previous result; the new one overwrites it when submitted.
+When the target is a dynamic for_each source, materialized descendants are PARKED (not deleted) — on the next matching re-accept, matched instance keys restore their prior state (accepted work preserved), stale keys are deleted, new keys are materialized fresh.
 
-Only tasks in the 'accepted' state can be invalidated. Use this when you notice a task produced a bad result after the fact (hallucination, wrong data, missing piece).`),
+Only tasks in the 'accepted' state can be invalidated.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The fully-qualified ID of the task to invalidate"),
