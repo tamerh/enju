@@ -3806,6 +3806,138 @@ tasks:
 	}
 }
 
+// TestMCPTemplateBundleSnapshotAndExec covers the end-to-end
+// template-bundle feature introduced in the 2026-04-18 pass:
+//
+//  1. A template is a directory under enju_templates/ containing
+//     template.yaml + any bundled scripts / data.
+//  2. enju_create_run(path=<bundle-dir>) snapshots the bundle
+//     into .enju/runs/{seq}/template/ as part of run creation,
+//     committing a frozen copy.
+//  3. Compute tasks resolve `script:` from the snapshot path,
+//     not the live enju_templates/ tree. Editing the live
+//     template after the run was created CANNOT change the
+//     run's behavior — provenance + reproducibility guarantee.
+//
+// The three assertions below are the contract the tester
+// called out. If any of them regresses, a run that worked
+// yesterday could silently produce different output today.
+func TestMCPTemplateBundleSnapshotAndExec(t *testing.T) {
+	h := newMCPHarness(t, "TemplateBundle")
+	projectID := h.createTestProject()
+
+	// Seed a template bundle directly into the bare remote so
+	// the client's clone picks it up on the next pull. Bundle =
+	// a dir under enju_templates/ with template.yaml at its
+	// root + any sibling files (scripts, in this case).
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/sum/template.yaml": `name: "sum runner"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/sum.sh
+    writes_artifacts:
+      - "out/total.txt"
+    prompt: "Run sum.sh"
+`,
+		"enju_templates/sum/scripts/sum.sh": `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+echo "ORIGINAL BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
+echo "ran original"
+`,
+	}, "seed template bundle")
+
+	// Instantiate from the bundle dir. Post-creation, the
+	// client snapshots the bundle to .enju/runs/1/template/.
+	res := h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/sum",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+	if strings.Contains(mcpText(res), "⚠ Template") {
+		t.Fatalf("template snapshot warning on create_run: %s", mcpText(res))
+	}
+
+	// Assertion 1: the snapshot landed at .enju/runs/1/template/.
+	snapYAML, ok := h.readRepoFile(projectID, ".enju/runs/1/template/template.yaml")
+	if !ok {
+		t.Fatalf("expected .enju/runs/1/template/template.yaml to exist after snapshot")
+	}
+	if !strings.Contains(string(snapYAML), "sum runner") {
+		t.Errorf("snapshot template.yaml missing expected content: %s", snapYAML)
+	}
+	snapScript, ok := h.readRepoFile(projectID, ".enju/runs/1/template/scripts/sum.sh")
+	if !ok {
+		t.Fatalf("expected .enju/runs/1/template/scripts/sum.sh to exist after snapshot")
+	}
+	if !strings.Contains(string(snapScript), "ORIGINAL BEHAVIOR") {
+		t.Errorf("snapshot script has wrong body: %s", snapScript)
+	}
+
+	// Mutate the live template to PROVE the run uses the
+	// snapshot, not the live tree. The executor below should
+	// still see the original behavior.
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/sum/scripts/sum.sh": `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+echo "MUTATED BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
+echo "ran mutated"
+`,
+	}, "edit live template after run created")
+
+	// Chmod +x the snapshotted script (the git roundtrip drops
+	// the exec bit, same as other compute tests).
+	chmodSnapshot := func() {
+		matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju/runs/1/template/scripts/sum.sh"))
+		for _, m := range matches {
+			_ = os.Chmod(m, 0o755)
+		}
+	}
+	chmodSnapshot()
+
+	// Execute the compute task. If the executor resolves script
+	// against the live tree (pre-fix), the result will say
+	// "MUTATED BEHAVIOR" and the test fails. If it uses the
+	// snapshot (post-fix), the result is the original.
+	execRes := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	if execRes.IsError {
+		t.Fatalf("execute run: %s", mcpText(execRes))
+	}
+
+	// Assertion 2: script produced the ORIGINAL output, not
+	// the mutated one — proves the executor used the snapshot.
+	body, ok := h.readRepoFile(projectID, "out/total.txt")
+	if !ok {
+		t.Fatalf("expected out/total.txt to exist after script run")
+	}
+	if !strings.Contains(string(body), "ORIGINAL BEHAVIOR") {
+		t.Errorf("run used live template instead of snapshot — reproducibility broken.\nGot: %s", body)
+	}
+	if strings.Contains(string(body), "MUTATED BEHAVIOR") {
+		t.Errorf("run picked up post-create live edit — snapshot not honored.\nGot: %s", body)
+	}
+
+	// Assertion 3: the artifact registered in the index. This
+	// is a bonus that exercises the compute+artifact plumbing
+	// (tester's earlier report) end-to-end through the bundle
+	// feature.
+	arts := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	var foundTotal bool
+	for _, a := range arts {
+		m, _ := a.(map[string]interface{})
+		if path, _ := m["path"].(string); path == "out/total.txt" {
+			foundTotal = true
+			break
+		}
+	}
+	if !foundTotal {
+		t.Errorf("expected out/total.txt in artifact index; got %d artifacts: %v", len(arts), arts)
+	}
+}
+
 // TestMCPComputeWritesArtifactsRegisters reproduces the
 // tester's compute-specific report: an action:compute task
 // that declares writes_artifacts on templated paths must

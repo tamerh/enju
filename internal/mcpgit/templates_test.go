@@ -32,10 +32,12 @@ func TestListTemplatesEmpty(t *testing.T) {
 	}
 }
 
-// TestListAndLoadTemplate — drop a template file into the
-// clone's templates/ directory and verify ListTemplates
+// TestListAndLoadTemplate — drop a template bundle into the
+// clone's enju_templates/ directory and verify ListTemplates
 // surfaces its metadata, LoadTemplate returns the raw bytes,
-// and InstantiateTemplate substitutes supplied params.
+// and InstantiateTemplate substitutes supplied params. Also
+// covers the caller-supplied forms (dir path and full
+// manifest path).
 func TestListAndLoadTemplate(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
@@ -45,9 +47,9 @@ func TestListAndLoadTemplate(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
-	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
-		t.Fatalf("mkdir templates: %v", err)
+	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "gwas")
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatalf("mkdir bundle: %v", err)
 	}
 	template := []byte(`name: "GWAS analysis"
 description: "Analyze GWAS summary stats for a disease."
@@ -66,7 +68,7 @@ tasks:
     action: answer
     prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
 `)
-	if err := os.WriteFile(filepath.Join(templatesDir, "gwas.yaml"), template, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(bundleDir, "template.yaml"), template, 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
 
@@ -76,7 +78,7 @@ tasks:
 		t.Fatalf("ListTemplates: %v", err)
 	}
 	if len(templates) != 1 {
-		t.Fatalf("expected 1 template, got %d", len(templates))
+		t.Fatalf("expected 1 template, got %d: %+v", len(templates), templates)
 	}
 	if templates[0].Name != "GWAS analysis" {
 		t.Errorf("name: got %q", templates[0].Name)
@@ -84,18 +86,30 @@ tasks:
 	if len(templates[0].Params) != 2 {
 		t.Errorf("expected 2 params, got %d", len(templates[0].Params))
 	}
-
-	// LoadTemplate returns raw bytes + summary.
-	loaded, err := proj.LoadTemplate("enju_templates/gwas.yaml")
-	if err != nil {
-		t.Fatalf("LoadTemplate: %v", err)
+	if templates[0].Path != "enju_templates/gwas/template.yaml" {
+		t.Errorf("expected summary path to be the manifest, got %q", templates[0].Path)
 	}
-	if len(loaded.Raw) == 0 {
-		t.Error("expected raw bytes on LoadTemplate")
+
+	// LoadTemplate accepts both the dir form and the full
+	// manifest path — both resolve to the same bundle.
+	for _, ref := range []string{"enju_templates/gwas", "enju_templates/gwas/template.yaml"} {
+		loaded, err := proj.LoadTemplate(ref)
+		if err != nil {
+			t.Fatalf("LoadTemplate(%q): %v", ref, err)
+		}
+		if len(loaded.Raw) == 0 {
+			t.Errorf("LoadTemplate(%q): expected raw bytes", ref)
+		}
+		if loaded.BundleDir != "enju_templates/gwas" {
+			t.Errorf("LoadTemplate(%q): BundleDir = %q, want enju_templates/gwas", ref, loaded.BundleDir)
+		}
+		if loaded.Path != "enju_templates/gwas/template.yaml" {
+			t.Errorf("LoadTemplate(%q): Path = %q, want the manifest", ref, loaded.Path)
+		}
 	}
 
 	// InstantiateTemplate substitutes supplied values.
-	parsed, _, err := proj.InstantiateTemplate("enju_templates/gwas.yaml", map[string]interface{}{
+	parsed, _, err := proj.InstantiateTemplate("enju_templates/gwas", map[string]interface{}{
 		"disease": "PCOS",
 	})
 	if err != nil {
@@ -117,9 +131,9 @@ func TestInstantiateTemplateMissingRequired(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
-	_ = os.MkdirAll(templatesDir, 0o755)
-	_ = os.WriteFile(filepath.Join(templatesDir, "r.yaml"), []byte(`name: "R"
+	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "r")
+	_ = os.MkdirAll(bundleDir, 0o755)
+	_ = os.WriteFile(filepath.Join(bundleDir, "template.yaml"), []byte(`name: "R"
 version: 1
 params:
   - name: disease
@@ -132,7 +146,7 @@ tasks:
     prompt: "x {{disease}}"
 `), 0o644)
 
-	err := proj.ValidateTemplateParams("enju_templates/r.yaml", map[string]interface{}{})
+	err := proj.ValidateTemplateParams("enju_templates/r", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected missing-required error, got nil")
 	}
@@ -141,6 +155,38 @@ tasks:
 	}
 	if !strings.Contains(err.Error(), "The disease to analyze") {
 		t.Errorf("expected description in error, got: %v", err)
+	}
+}
+
+// TestListTemplatesLegacyFileShape — a loose .yaml directly
+// under enju_templates/ (the pre-bundle convention) shows up
+// with a migration-hint ParseError rather than being silently
+// skipped. Users who upgrade their enju install keep getting
+// a visible, actionable menu entry until they migrate.
+func TestListTemplatesLegacyFileShape(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	proj, _ := ws.ForProject(1, bare)
+
+	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
+	_ = os.MkdirAll(templatesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(templatesDir, "legacy.yaml"),
+		[]byte("name: legacy\nversion: 1\ntasks: [{id: t, action: answer, prompt: x}]\n"),
+		0o644)
+
+	templates, err := proj.ListTemplates()
+	if err != nil {
+		t.Fatalf("ListTemplates: %v", err)
+	}
+	if len(templates) != 1 {
+		t.Fatalf("expected 1 migration-hint entry, got %d: %+v", len(templates), templates)
+	}
+	if templates[0].ParseError == "" {
+		t.Error("expected ParseError with migration hint, got empty")
+	}
+	if !strings.Contains(templates[0].ParseError, "legacy single-file template") {
+		t.Errorf("expected migration hint in ParseError, got %q", templates[0].ParseError)
 	}
 }
 

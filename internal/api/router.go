@@ -850,6 +850,12 @@ type taskResponse struct {
 	FailReason      string   `json:"fail_reason,omitempty"`     // reason for FAILED state
 	SkipReason      string   `json:"skip_reason,omitempty"`     // reason for SKIPPED via fail-cascade, e.g. "upstream failed: 1:4:write_data"
 	ParkedFromState string   `json:"parked_from_state,omitempty"` // stashed prior state for a parked task; empty otherwise
+	// RunSourcePath mirrors run.source_path so the fat-client
+	// executor can resolve a compute task's `script:` field
+	// against the run's per-run template snapshot
+	// (.enju/runs/{seq}/template/) instead of the live
+	// enju_templates/ path. Empty for inline-YAML runs.
+	RunSourcePath   string   `json:"run_source_path,omitempty"`
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -2696,9 +2702,11 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	var runSeq int
 	var remoteURL string
 	var projectName string
+	var runSourcePath string
 	if run, _ := s.store.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
+		runSourcePath = run.SourcePath
 		if p, _ := s.store.GetProject(projectID); p != nil {
 			remoteURL = p.RemoteURL
 			projectName = p.Name
@@ -2749,6 +2757,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		FailReason:      t.FailReason,
 		SkipReason:      t.SkipReason,
 		ParkedFromState: t.ParkedFromState,
+		RunSourcePath:   runSourcePath,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

@@ -10,19 +10,32 @@ import (
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 )
 
-// Phase H.1 — Template discovery and instantiation on the fat
-// client side. Templates are just regular run YAML files that
-// happen to live under `enju_templates/` at the root of a project's
-// git clone. Any file in that directory is considered a
-// template; `.yaml` / `.yml` extensions only.
+// Phase H.1 + template-bundles pass — Template discovery and
+// instantiation on the fat client side. A template is a
+// DIRECTORY under `enju_templates/` with a `template.yaml` at
+// its root:
 //
-// There is no separate "template" file shape. A file is a
-// template when it's placed under `enju_templates/` with a `params:`
-// block declaring what the caller must supply. The same file
-// can be submitted directly as a run (by passing param values
-// inline) or picked up by the LLM from the templates directory
-// and instantiated on behalf of a user. Location signals intent,
-// not schema.
+//   enju_templates/
+//     gwas-analysis/
+//       template.yaml       ← the run definition (required)
+//       scripts/            ← bundled scripts referenced by compute tasks
+//       examples/           ← sample outputs, ignored by the loader
+//       README.md           ← author docs, ignored by the loader
+//
+// Everything else in the bundle — scripts, data files, docs,
+// examples — travels with the template when it's instantiated
+// into a run (see the snapshot-on-instantiate flow driven from
+// handleCreateRun). This makes templates self-contained and
+// makes runs reproducible: a live template edit after a run
+// was created can't retroactively change that run's behavior
+// because the run owns a frozen copy.
+//
+// Loose `.yaml` files directly under `enju_templates/` are not
+// recognized — they'd be ambiguous about whether they own the
+// surrounding directory. Templates must live in their own
+// folder; if an author wants to migrate an existing single-file
+// template, they move `enju_templates/foo.yaml` to
+// `enju_templates/foo/template.yaml`.
 
 // TemplateSummary is the lightweight shape returned by
 // ListTemplates — enough for an LLM to pick a template from a
@@ -54,15 +67,31 @@ type ParamSummary struct {
 	Description string      `json:"description,omitempty"`
 }
 
-// ListTemplates scans the project's `enju_templates/` directory and
-// returns a summary for every *.yaml / *.yml file it finds. An
-// empty or missing enju_templates/ directory returns an empty slice,
-// not an error — "no templates yet" is a normal state.
+// templateBundleYAML is the canonical entry-point filename
+// at the root of every template directory. Named by role
+// rather than by enclosing directory (like docker-compose.yaml
+// or pyproject.toml) so authors can rename the bundle folder
+// without also renaming the YAML.
+const templateBundleYAML = "template.yaml"
+
+// ListTemplates scans `enju_templates/` for directory-shaped
+// template bundles and returns a summary for each one. A
+// bundle is any subdirectory containing `template.yaml` at
+// its root. Empty or missing `enju_templates/` is a normal
+// state, not an error — returns (nil, nil).
 //
-// Files that fail to parse as run YAML are skipped silently in
-// the summary (callers can drill in via LoadTemplate for a
-// specific file to see the parse error). Rationale: one bad
-// template shouldn't crash the menu.
+// Directories without a `template.yaml` are skipped silently
+// (scratch folders, README-only dirs, etc). Bundles whose
+// template.yaml fails to parse are surfaced with ParseError
+// populated — a visible "unparseable" menu entry beats a
+// silent drop that makes the author think the scan missed
+// their template.
+//
+// Loose `.yaml` files directly under `enju_templates/` are
+// NOT discovered. If any are found, they're surfaced as a
+// single migration-hint entry in the result so the author
+// knows to move them; this keeps the "I had foo.yaml, where
+// did it go?" experience debuggable.
 func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 	templatesDir := filepath.Join(p.workDir, "enju_templates")
 	entries, err := os.ReadDir(templatesDir)
@@ -74,22 +103,34 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 	}
 	var out []TemplateSummary
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
 		name := e.Name()
-		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+		if !e.IsDir() {
+			// Catch the legacy single-file shape and emit
+			// exactly one actionable migration hint per
+			// offending file — silently skipping would leave
+			// the author with an empty menu and no clue why.
+			if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+				legacyRel := filepath.ToSlash(filepath.Join("enju_templates", name))
+				out = append(out, TemplateSummary{
+					Path: legacyRel,
+					ParseError: fmt.Sprintf(
+						"legacy single-file template layout — move %s to enju_templates/%s/template.yaml",
+						legacyRel, strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")),
+				})
+			}
 			continue
 		}
-		rel := filepath.ToSlash(filepath.Join("enju_templates", name))
+		// Directory entry → check for template.yaml at its root.
+		manifest := filepath.Join(templatesDir, name, templateBundleYAML)
+		if _, statErr := os.Stat(manifest); statErr != nil {
+			// Missing manifest → not a template bundle.
+			// Skip silently; directories might exist for
+			// other purposes (shared scratch, etc).
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Join("enju_templates", name, templateBundleYAML))
 		summary, err := p.templateSummary(rel)
 		if err != nil {
-			// Surface unreadable / unparseable templates with
-			// an error marker instead of silently dropping.
-			// A user who created a template and runs
-			// list_templates deserves to see their file with
-			// the reason it's not usable, not an empty menu
-			// that makes them think the whole scan is broken.
 			out = append(out, TemplateSummary{
 				Path:       rel,
 				ParseError: err.Error(),
@@ -136,54 +177,176 @@ func paramSummaries(ps []enjuYaml.ParamDef) []ParamSummary {
 	return out
 }
 
-// LoadedTemplate is the full parsed view of a template file,
-// returned by LoadTemplate. Carries the raw YAML bytes so the
-// caller can submit them unchanged (with a params map) to
-// ParseWithParams — i.e. the loader does not mutate the file.
+// LoadedTemplate is the full parsed view of a template
+// bundle, returned by LoadTemplate. Path is the
+// repo-relative path of the manifest YAML; BundleDir is the
+// enclosing directory, used by the snapshot-on-instantiate
+// flow to enumerate every file to copy.
 type LoadedTemplate struct {
-	Path    string
-	Raw     []byte
-	Summary TemplateSummary
+	Path      string // e.g. "enju_templates/gwas/template.yaml"
+	BundleDir string // e.g. "enju_templates/gwas"
+	Raw       []byte
+	Summary   TemplateSummary
 }
 
-// LoadTemplate reads a single template by its repo-relative
-// path (e.g. "enju_templates/gwas.yaml"), parses it to extract the
-// summary, and returns both the raw bytes and the summary. The
-// raw bytes are what the caller hands to
-// yaml.ParseWithParams at instantiation time.
+// ReadBundleFiles walks the bundle directory and returns
+// every regular file as a FileWrite, with repo-relative paths
+// rebased to a target directory (typically the per-run
+// snapshot location like `.enju/runs/3/template/`). Used by
+// handleCreateRun to commit the bundle into the run's
+// snapshot area at instantiation time, locking the recipe +
+// its scripts to the moment the run was created.
+//
+// Symlinks, special files, and hidden-dir entries (`.git/`)
+// are skipped. Size-guard: if the bundle exceeds 10 MB total,
+// return an error — templates aren't the place for large
+// data blobs, and a runaway snapshot would bloat every
+// subsequent run commit.
+func (p *Project) ReadBundleFiles(bundleDir, targetDir string) ([]FileWrite, error) {
+	root := filepath.Join(p.workDir, bundleDir)
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, fmt.Errorf("stat bundle %s: %w", bundleDir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("bundle path %q is not a directory", bundleDir)
+	}
+	const maxBundleBytes = 10 * 1024 * 1024
+	var totalBytes int64
+	var files []FileWrite
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			// Skip hidden dirs — .git (nested submodule checkouts)
+			// would pull a huge history into the snapshot.
+			if strings.HasPrefix(info.Name(), ".") && path != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil // symlinks, devices, etc.
+		}
+		totalBytes += info.Size()
+		if totalBytes > maxBundleBytes {
+			return fmt.Errorf("bundle %q exceeds %d-byte size limit; templates shouldn't carry large data blobs", bundleDir, maxBundleBytes)
+		}
+		body, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return fmt.Errorf("reading bundle file %s: %w", path, rerr)
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return fmt.Errorf("computing bundle-relative path for %s: %w", path, rerr)
+		}
+		files = append(files, FileWrite{
+			RepoRelPath: filepath.ToSlash(filepath.Join(targetDir, rel)),
+			Content:     body,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// LoadTemplate reads a template bundle by either:
+//   - its directory path (e.g. "enju_templates/gwas-analysis")
+//   - the full path to its manifest (e.g.
+//     "enju_templates/gwas-analysis/template.yaml")
+//
+// Both forms resolve to the same bundle; the loader picks up
+// the `template.yaml` at the directory root. The resolved
+// YAML path is what shows up in the returned
+// LoadedTemplate.Path; BundleDir carries the surrounding
+// directory so callers doing snapshot-on-instantiate can
+// enumerate all the files in the bundle.
 func (p *Project) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	if !strings.HasPrefix(repoRelPath, "enju_templates/") {
 		return nil, fmt.Errorf("template path %q must live under enju_templates/", repoRelPath)
 	}
-	// Block path escapes — this is user-controlled input even
-	// though it's read from the local workspace, and a relative
-	// `../` could let a caller pull in files from outside the
-	// templates directory.
+	// Block path escapes — user-controlled input even though
+	// it's read from the local workspace, and a `../` could
+	// let a caller pull files from outside the templates dir.
 	clean := filepath.ToSlash(filepath.Clean(repoRelPath))
 	if strings.Contains(clean, "../") || clean != repoRelPath {
 		return nil, fmt.Errorf("template path %q contains disallowed path components", repoRelPath)
 	}
-	data, err := os.ReadFile(filepath.Join(p.workDir, repoRelPath))
+
+	// Normalize: accept either the bundle dir or the full
+	// template.yaml path. Loose single-file paths like
+	// `enju_templates/foo.yaml` are the legacy shape we no
+	// longer support — reject with a migration hint.
+	bundleDir, manifestPath, err := resolveBundlePaths(p.workDir, repoRelPath)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(filepath.Join(p.workDir, manifestPath))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("template %q not found in workspace — check `enju_list_templates` for available recipes", repoRelPath)
 		}
-		return nil, fmt.Errorf("reading template %s: %w", repoRelPath, err)
+		return nil, fmt.Errorf("reading template %s: %w", manifestPath, err)
 	}
 	parsed, err := enjuYaml.Parse(data)
 	if err != nil {
-		return nil, fmt.Errorf("parsing template %s: %w", repoRelPath, err)
+		return nil, fmt.Errorf("parsing template %s: %w", manifestPath, err)
 	}
 	return &LoadedTemplate{
-		Path: repoRelPath,
-		Raw:  data,
+		Path:      manifestPath,
+		BundleDir: bundleDir,
+		Raw:       data,
 		Summary: TemplateSummary{
-			Path:        repoRelPath,
+			Path:        manifestPath,
 			Name:        parsed.Run.Name,
 			Description: parsed.Run.Description,
 			Params:      paramSummaries(parsed.Run.Params),
 		},
 	}, nil
+}
+
+// resolveBundlePaths maps a caller-supplied template reference
+// to the (bundleDir, manifestPath) pair the loader uses, both
+// as repo-relative slash-paths. Accepts:
+//
+//   - "enju_templates/NAME"                  → dir form
+//   - "enju_templates/NAME/template.yaml"    → manifest form
+//   - anything else ending in .yaml/.yml     → legacy single-file,
+//                                              rejected with migration hint
+func resolveBundlePaths(workDir, repoRelPath string) (bundleDir, manifestPath string, err error) {
+	p := strings.TrimSuffix(repoRelPath, "/")
+	// Manifest form: ends in /template.yaml under a bundle dir.
+	if strings.HasSuffix(p, "/"+templateBundleYAML) {
+		bundleDir = strings.TrimSuffix(p, "/"+templateBundleYAML)
+		if bundleDir == "enju_templates" {
+			return "", "", fmt.Errorf("template manifest must live inside a bundle subdirectory, e.g. enju_templates/NAME/%s", templateBundleYAML)
+		}
+		return bundleDir, p, nil
+	}
+	// Dir form: must be a directory with template.yaml inside.
+	if strings.HasSuffix(p, ".yaml") || strings.HasSuffix(p, ".yml") {
+		// Legacy single-file reference — emit a migration hint.
+		base := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(p), ".yaml"), ".yml")
+		return "", "", fmt.Errorf(
+			"legacy single-file template path %q — templates are now directory bundles. "+
+				"Move %s to enju_templates/%s/%s and reference it as enju_templates/%s (or the full manifest path)",
+			repoRelPath, repoRelPath, base, templateBundleYAML, base)
+	}
+	info, statErr := os.Stat(filepath.Join(workDir, p))
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return "", "", fmt.Errorf("template %q not found in workspace — check `enju_list_templates` for available recipes", repoRelPath)
+		}
+		return "", "", fmt.Errorf("stat template %s: %w", repoRelPath, statErr)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("template path %q is not a directory; templates are directory bundles with %s at their root", repoRelPath, templateBundleYAML)
+	}
+	return p, p + "/" + templateBundleYAML, nil
 }
 
 // InstantiateTemplate loads a template, substitutes the

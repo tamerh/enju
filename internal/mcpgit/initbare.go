@@ -66,7 +66,17 @@ func InitBareWithSeed(bareDir string) error {
 	// manual commit under enju_templates/, which is a
 	// confusing "looks like the tool is broken" surprise.
 	readme := filepath.Join(tmpDir, "README.md")
-	if err := os.WriteFile(readme, []byte("# Enju project\n\nTask results live under `.enju/runs/`. Templates under `enju_templates/`.\n"), 0644); err != nil {
+	readmeBody := "# Enju project\n\n" +
+		"Task results live under `.enju/runs/`.\n\n" +
+		"Templates live under `enju_templates/`, one directory per template:\n\n" +
+		"```\n" +
+		"enju_templates/\n" +
+		"  my-template/\n" +
+		"    template.yaml   # run definition (required)\n" +
+		"    scripts/        # bundled scripts referenced by compute tasks\n" +
+		"    README.md       # author-facing docs (optional)\n" +
+		"```\n"
+	if err := os.WriteFile(readme, []byte(readmeBody), 0644); err != nil {
 		return fmt.Errorf("write readme: %w", err)
 	}
 	templatesDir := filepath.Join(tmpDir, "enju_templates")

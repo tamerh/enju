@@ -773,6 +773,53 @@ func (s *testServer) readRepoFile(projectID int64, repoRelPath string) ([]byte, 
 	return data, true
 }
 
+// writeRepoFiles commits + pushes a set of files directly to a
+// project's bare remote via a throwaway clone. Used by tests
+// that need to seed content which the normal MCP tools
+// wouldn't produce — template bundles, pre-existing artifacts,
+// manual project-side edits. `files` maps repo-relative paths
+// to file content bytes.
+func (s *testServer) writeRepoFiles(projectID int64, files map[string]string, commitMsg string) {
+	s.t.Helper()
+	remoteURL := s.remoteFor(projectID)
+	if remoteURL == "" {
+		s.t.Fatalf("writeRepoFiles: no remote URL for project %d", projectID)
+	}
+	cloneDir, err := os.MkdirTemp("", "write-repo-")
+	if err != nil {
+		s.t.Fatalf("writeRepoFiles: mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(cloneDir)
+	repo, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL})
+	if err != nil {
+		s.t.Fatalf("writeRepoFiles: clone: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		s.t.Fatalf("writeRepoFiles: worktree: %v", err)
+	}
+	for rel, body := range files {
+		full := filepath.Join(cloneDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			s.t.Fatalf("writeRepoFiles: mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			s.t.Fatalf("writeRepoFiles: write %s: %v", full, err)
+		}
+		if _, err := wt.Add(rel); err != nil {
+			s.t.Fatalf("writeRepoFiles: add %s: %v", rel, err)
+		}
+	}
+	if _, err := wt.Commit(commitMsg, &gogit.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@localhost", When: time.Now()},
+	}); err != nil {
+		s.t.Fatalf("writeRepoFiles: commit: %v", err)
+	}
+	if err := repo.Push(&gogit.PushOptions{}); err != nil {
+		s.t.Fatalf("writeRepoFiles: push: %v", err)
+	}
+}
+
 func (s *testServer) release(taskID, username string) map[string]interface{} {
 	s.t.Helper()
 	return s.post("/api/v1/tasks/"+s.taskID(taskID)+"/release", map[string]string{"username": username})

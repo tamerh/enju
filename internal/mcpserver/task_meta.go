@@ -71,6 +71,14 @@ type taskMeta struct {
 	// for_each instances (e.g. "summaries/alpha.md" not
 	// "summaries/{{stem}}.md").
 	WritesArtifacts []string
+	// RunSourcePath mirrors the parent run's source_path —
+	// the template bundle directory that was snapshotted into
+	// `.enju/runs/{run_seq}/template/` at create_run time.
+	// Empty for inline-YAML runs. The compute executor uses
+	// this to resolve `script:` from the snapshot instead of
+	// the live enju_templates/ path, so a template edit after
+	// the run was created can't change its behavior.
+	RunSourcePath string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -138,6 +146,16 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 				meta.WritesArtifacts = append(meta.WritesArtifacts, s)
 			}
 		}
+	}
+	// run_source_path is populated when the parent run was
+	// instantiated from a template bundle (the template-bundle
+	// feature snapshots the bundle into .enju/runs/{seq}/template/
+	// at create_run time). The compute executor uses it to
+	// resolve the script from that snapshot instead of the
+	// live enju_templates/ path, which gives each run a frozen
+	// recipe that's immune to later edits.
+	if v, ok := raw["run_source_path"].(string); ok {
+		meta.RunSourcePath = v
 	}
 	return meta, nil
 }

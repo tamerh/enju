@@ -218,6 +218,31 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	workDir := proj.WorkDir()
 	resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
 
+	// Script resolution: runs instantiated from a template
+	// bundle resolve `script:` relative to the per-run
+	// snapshot at `.enju/runs/{seq}/template/`, not the live
+	// enju_templates/ path. Guarantees reproducibility —
+	// editing the template after the run was created can't
+	// retroactively change this run's behavior.
+	//
+	// Runs created from inline YAML (no source_path) keep the
+	// legacy resolution: script path is project-relative as
+	// declared.
+	//
+	// ENJU_TEMPLATE_DIR is exposed for scripts that want to
+	// read bundled data files (e.g. `$ENJU_TEMPLATE_DIR/data/ref.csv`)
+	// without hardcoding the snapshot path.
+	var scriptPath, templateDir string
+	if meta.RunSourcePath != "" {
+		templateDir = filepath.Join(workDir, fmt.Sprintf(".enju/runs/%d/template", meta.RunSeq))
+		scriptPath = filepath.Join(templateDir, meta.Script)
+	} else {
+		scriptPath = filepath.Join(workDir, meta.Script)
+	}
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("script %q not found at %s", meta.Script, scriptPath)), nil
+	}
+
 	// Build environment variables.
 	env := os.Environ()
 	env = append(env,
@@ -225,11 +250,8 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		"ENJU_PROJECT_DIR="+workDir,
 		"ENJU_RUN_DIR="+filepath.Join(workDir, resultDir),
 	)
-
-	// Resolve the script path.
-	scriptPath := filepath.Join(workDir, meta.Script)
-	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		return mcp.NewToolResultError(fmt.Sprintf("script %q not found in workspace", meta.Script)), nil
+	if templateDir != "" {
+		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
 	}
 
 	// Execute the script.

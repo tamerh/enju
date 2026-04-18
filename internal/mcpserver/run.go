@@ -108,11 +108,17 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
 	}
 
-	var sourceCommitSHA string
+	// Template-mode state kept through the flow so the
+	// post-create snapshot commit has everything it needs.
+	var (
+		sourceCommitSHA string
+		proj            *mcpgit.Project
+		loadedTemplate  *mcpgit.LoadedTemplate
+	)
 	if templatePath != "" {
 		// Template mode: pull the project's local clone so new
-		// templates pushed by other citizens show up, then read
-		// the file and capture the project HEAD for provenance.
+		// templates pushed by other citizens show up, then load
+		// the bundle and capture the project HEAD for provenance.
 		// Substitution + validation happen server-side in the
 		// coordinator's parser (consistent with the existing
 		// inline-YAML path).
@@ -123,7 +129,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+		proj, err = c.workspace.ForProject(int64(projectID), remoteURL, projName)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -134,11 +140,11 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		proj.Lock()
 		_ = proj.Pull()
 		proj.Unlock()
-		loaded, err := proj.LoadTemplate(templatePath)
+		loadedTemplate, err = proj.LoadTemplate(templatePath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		yamlContent = string(loaded.Raw)
+		yamlContent = string(loadedTemplate.Raw)
 		if head, herr := proj.HeadHash(); herr == nil {
 			sourceCommitSHA = head
 		}
@@ -164,7 +170,51 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return mcp.NewToolResultText(formatCreateRun(data)), nil
+	// Template mode: after the coordinator assigns a run seq,
+	// commit a frozen copy of the bundle into
+	// `.enju/runs/{seq}/template/` so the run owns its scripts,
+	// data, and docs. A live template edit after this point
+	// cannot retroactively change this run's behavior — the
+	// executor resolves `script:` paths from the snapshot (see
+	// handleExecuteTask).
+	//
+	// Errors here are non-fatal for the API response (the run
+	// exists on the coordinator side) but surface as a warning
+	// so the author knows the snapshot didn't land.
+	var snapshotWarning string
+	if loadedTemplate != nil && proj != nil {
+		var created map[string]interface{}
+		if err := json.Unmarshal(data, &created); err == nil {
+			if seqF, ok := created["seq"].(float64); ok {
+				seq := int(seqF)
+				snapshotTarget := fmt.Sprintf(".enju/runs/%d/template", seq)
+				files, ferr := proj.ReadBundleFiles(loadedTemplate.BundleDir, snapshotTarget)
+				if ferr != nil {
+					snapshotWarning = fmt.Sprintf("snapshot skipped: %v", ferr)
+				} else if len(files) > 0 {
+					authorName, authorEmail := c.commitAuthor(ctx)
+					proj.Lock()
+					_, cerr := proj.CommitFiles(mcpgit.CommitFilesRequest{
+						Files:       files,
+						CommitMsg:   fmt.Sprintf("Snapshot template %s into run %d", loadedTemplate.BundleDir, seq),
+						AuthorName:  authorName,
+						AuthorEmail: authorEmail,
+						ModelName:   c.modelName,
+					})
+					proj.Unlock()
+					if cerr != nil {
+						snapshotWarning = fmt.Sprintf("snapshot commit failed: %v", cerr)
+					}
+				}
+			}
+		}
+	}
+
+	text := formatCreateRun(data)
+	if snapshotWarning != "" {
+		text += fmt.Sprintf("\n⚠ Template %s\n", snapshotWarning)
+	}
+	return mcp.NewToolResultText(text), nil
 }
 // handleExportDiagram snapshots the run's current DAG as raw
 // Mermaid and commits it to .enju/runs/{seq}/graph/{phase}.mmd.
