@@ -117,8 +117,18 @@ type RunRecord struct {
 	// always reachable via `git show SHA:templates/gwas.yaml`.
 	// Empty for inline-YAML submissions.
 	SourceCommitSHA string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// Params is the JSON-encoded map of run-level params the
+	// caller supplied at create_run time, AFTER defaults were
+	// filled in for any omitted optional params. Persisted so
+	// the compute executor can expose them to scripts as
+	// ENJU_PARAM_<name> env vars — without this, submitted
+	// params were substituted into prompts at parse time and
+	// thrown away, unreachable from compute-task scripts.
+	//
+	// Empty for runs with no params: block.
+	Params    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // TaskRecord is a task instance stored in the database.

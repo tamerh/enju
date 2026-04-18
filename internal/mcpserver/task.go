@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -253,6 +254,71 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	if templateDir != "" {
 		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
 	}
+	// ENJU_PARAM_<name> — run-level params + per-iteration
+	// for_each vars, flattened. Gives shell scripts direct
+	// access to the values the user supplied at create_run
+	// and whatever stem/gene/etc. bound this instance of a
+	// for_each. Without these, scripts were trapped with
+	// just the 4 "infrastructure" vars (TASK_ID, PROJECT_DIR,
+	// RUN_DIR, TEMPLATE_DIR) and couldn't reach run context.
+	//
+	// Iteration vars take precedence on name collision —
+	// though the parser already rejects run params and
+	// for_each vars sharing a name, this is a belt-and-
+	// suspenders guard.
+	for k, v := range meta.RunParams {
+		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
+	}
+	for k, v := range meta.InstanceParams {
+		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
+	}
+
+	// context.json — structured companion to the env vars.
+	// Writes to $ENJU_RUN_DIR/context.json BEFORE the script
+	// runs so scripts in any language can read
+	//   jq -r '.params.source_repo' "$ENJU_RUN_DIR/context.json"
+	// Covers cases env vars can't: list values with commas,
+	// typed numbers/bools, structured artifact lists.
+	// Committed as part of the result (below, via the files
+	// slice) so each run's `.enju/runs/{seq}/{task}/` directory
+	// is self-documenting — "what was this task told?" is a
+	// git-log question with a concrete answer.
+	// Build the payload. ReadsArtifacts isn't on taskMeta
+	// today (only writes are — we pipe them through for the
+	// executor's "pick up declared outputs after script exits"
+	// logic). Fetch the task response inline for reads; the
+	// one extra GET is acceptable for the convenience of a
+	// structured context drop.
+	var readsArtifacts []string
+	if rawTask, rerr := c.get(ctx, "/api/v1/tasks/"+taskID); rerr == nil {
+		var tm map[string]interface{}
+		if json.Unmarshal(rawTask, &tm) == nil {
+			if r, ok := tm["reads_artifacts"].([]interface{}); ok {
+				for _, p := range r {
+					if s, ok := p.(string); ok {
+						readsArtifacts = append(readsArtifacts, s)
+					}
+				}
+			}
+		}
+	}
+	contextPayload := map[string]interface{}{
+		"task_id":          taskID,
+		"task_def_id":      meta.TaskDefID,
+		"instance_key":     meta.InstanceKey,
+		"iteration":        meta.InstanceParams,
+		"params":           meta.RunParams,
+		"reads_artifacts":  stringSliceNonNil(readsArtifacts),
+		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts),
+	}
+	contextBytes, _ := json.MarshalIndent(contextPayload, "", "  ")
+	contextFullPath := filepath.Join(workDir, resultDir, "context.json")
+	if err := os.MkdirAll(filepath.Dir(contextFullPath), 0755); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("creating run dir for context.json: %v", err)), nil
+	}
+	if err := os.WriteFile(contextFullPath, contextBytes, 0644); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("writing context.json: %v", err)), nil
+	}
 
 	// Execute the script.
 	startTime := time.Now()
@@ -307,6 +373,12 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
 			Content:     []byte(content),
+		},
+		// context.json was written to disk before exec;
+		// include it in the commit for auditability.
+		{
+			RepoRelPath: filepath.Join(resultDir, "context.json"),
+			Content:     contextBytes,
 		},
 	}
 	metadata := map[string]interface{}{
@@ -420,4 +492,62 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	}
 
 	return mcp.NewToolResultText(b.String()), nil
+}
+
+// stringSliceNonNil normalizes a possibly-nil []string to an
+// empty slice. context.json consumers expect `reads_artifacts`
+// / `writes_artifacts` to always be JSON arrays — `null` forces
+// every script to special-case absent keys. `[]` is equally
+// valid JSON and skips the null-check.
+func stringSliceNonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// encodeParamEnv renders a run param or for_each iteration
+// value as a shell-safe env var string. Scalars → fmt.Sprint;
+// []interface{} → comma-joined (list<string> round-trips
+// through JSON as []interface{} of strings). Nested structures
+// fall back to JSON — unlikely for param types Enju supports
+// today (string / int / bool / list<string>) but keeps the
+// encoder defensible if the type surface grows later.
+//
+// Comma-joining loses fidelity when list elements contain
+// commas; that's what the upcoming context.json Phase B
+// exists to cover (structured, language-agnostic JSON drop).
+// For the common case — identifiers, paths, gene symbols —
+// comma-joining is exactly what shell authors want.
+func encodeParamEnv(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case float64:
+		// JSON numbers decode as float64. Render integers
+		// without trailing ".000000" so scripts can use them
+		// directly (count math, seed args).
+		if x == float64(int64(x)) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case []interface{}:
+		parts := make([]string, 0, len(x))
+		for _, e := range x {
+			parts = append(parts, encodeParamEnv(e))
+		}
+		return strings.Join(parts, ",")
+	default:
+		if b, err := json.Marshal(x); err == nil {
+			return string(b)
+		}
+		return fmt.Sprint(x)
+	}
 }

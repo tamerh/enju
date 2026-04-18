@@ -571,6 +571,17 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 	// Create the run record.
 	now := time.Now()
+	// Persist the submitted params map (JSON-encoded) so the
+	// compute executor can rehydrate them into ENJU_PARAM_*
+	// env vars on task execution. Submitted params were
+	// previously substituted into prompts at parse time and
+	// not kept anywhere — unreachable from shell scripts.
+	var paramsJSON string
+	if req.Params != nil {
+		if b, merr := json.Marshal(req.Params); merr == nil {
+			paramsJSON = string(b)
+		}
+	}
 	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
 		ProjectID:       projectID,
 		Name:            parsed.Run.Name,
@@ -580,6 +591,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		State:           store.RunActive,
 		SourcePath:      req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
+		Params:          paramsJSON,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	})
@@ -856,6 +868,16 @@ type taskResponse struct {
 	// (.enju/runs/{seq}/template/) instead of the live
 	// enju_templates/ path. Empty for inline-YAML runs.
 	RunSourcePath   string   `json:"run_source_path,omitempty"`
+	// RunParams is the parsed map of run-level params the
+	// caller supplied at create_run, after defaults filled
+	// in. The executor exposes these to compute scripts as
+	// ENJU_PARAM_<name> env vars (lists comma-joined).
+	RunParams map[string]interface{} `json:"run_params,omitempty"`
+	// InstanceParams is the parsed per-iteration for_each
+	// variable map (e.g. {"stem": "alpha"} for alpha:describe).
+	// Surfaced alongside RunParams so the executor can expose
+	// both as ENJU_PARAM_<name>.
+	InstanceParamsMap map[string]interface{} `json:"instance_params_map,omitempty"`
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -2703,14 +2725,28 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	var remoteURL string
 	var projectName string
 	var runSourcePath string
+	var runParams map[string]interface{}
 	if run, _ := s.store.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
 		runSourcePath = run.SourcePath
+		if run.Params != "" {
+			// Best-effort decode; a malformed params JSON
+			// (shouldn't happen since we encoded it ourselves
+			// at create_run) shouldn't block the task response.
+			_ = json.Unmarshal([]byte(run.Params), &runParams)
+		}
 		if p, _ := s.store.GetProject(projectID); p != nil {
 			remoteURL = p.RemoteURL
 			projectName = p.Name
 		}
+	}
+	// Per-iteration for_each variables are stored as JSON on
+	// the task row itself. Decode so the fat-client can hand
+	// them to scripts alongside run-level params.
+	var instanceParams map[string]interface{}
+	if t.InstanceParams != "" {
+		_ = json.Unmarshal([]byte(t.InstanceParams), &instanceParams)
 	}
 	iterationLabel := ""
 	if t.InstanceKey != "" {
@@ -2754,10 +2790,12 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		VoteDeadline:    t.VoteDeadline,
 		Anonymize:       t.Anonymize,
 		Visibility:      t.Visibility,
-		FailReason:      t.FailReason,
-		SkipReason:      t.SkipReason,
-		ParkedFromState: t.ParkedFromState,
-		RunSourcePath:   runSourcePath,
+		FailReason:        t.FailReason,
+		SkipReason:        t.SkipReason,
+		ParkedFromState:   t.ParkedFromState,
+		RunSourcePath:     runSourcePath,
+		RunParams:         runParams,
+		InstanceParamsMap: instanceParams,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

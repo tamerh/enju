@@ -79,6 +79,16 @@ type taskMeta struct {
 	// the live enju_templates/ path, so a template edit after
 	// the run was created can't change its behavior.
 	RunSourcePath string
+	// RunParams is the submitted run-level params map (after
+	// defaults filled in). Exposed to compute-task scripts
+	// as ENJU_PARAM_<name> env vars. nil when the run has
+	// no params: block.
+	RunParams map[string]interface{}
+	// InstanceParams is the per-iteration for_each variable
+	// map for this task instance (e.g. {"stem": "alpha"} for
+	// alpha:describe). Merged with RunParams when emitting
+	// ENJU_PARAM_* env vars. nil for singleton tasks.
+	InstanceParams map[string]interface{}
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -156,6 +166,12 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	// recipe that's immune to later edits.
 	if v, ok := raw["run_source_path"].(string); ok {
 		meta.RunSourcePath = v
+	}
+	if v, ok := raw["run_params"].(map[string]interface{}); ok {
+		meta.RunParams = v
+	}
+	if v, ok := raw["instance_params_map"].(map[string]interface{}); ok {
+		meta.InstanceParams = v
 	}
 	return meta, nil
 }

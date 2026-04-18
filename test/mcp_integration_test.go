@@ -3806,6 +3806,207 @@ tasks:
 	}
 }
 
+// TestMCPComputeEnvVarsParams covers Phase A of the compute-
+// context enhancement: compute scripts see run-level params
+// AND per-iteration for_each variables exposed as
+// ENJU_PARAM_<name> env vars. Previously scripts could only
+// reach the 4 infrastructure vars (TASK_ID, PROJECT_DIR,
+// RUN_DIR, TEMPLATE_DIR) — run context was unreachable.
+//
+// The test seeds a template bundle that takes a required
+// `source_repo` string param and a `shas` list param, with
+// a per-iteration for_each over those SHAs. The script echoes
+// the env vars into result.md; we check they're correctly
+// populated after substitution.
+func TestMCPComputeEnvVarsParams(t *testing.T) {
+	h := newMCPHarness(t, "ComputeEnvA")
+	projectID := h.createTestProject()
+
+	// Bundle carries a script that prints env vars it cares
+	// about. Stamped 0755 so the executor can run it
+	// directly from the snapshot.
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/echo-params/template.yaml": {body: `name: "echo params"
+version: 1
+params:
+  - name: source_repo
+    type: string
+    required: true
+    description: "Where to analyze."
+  - name: shas
+    type: list<string>
+    required: true
+    description: "Commits to process."
+tasks:
+  - id: analyze
+    action: compute
+    script: scripts/echo.sh
+    for_each:
+      sha: "{{shas}}"
+    prompt: "Analyze {{sha}}"
+`, mode: 0o644},
+		"enju_templates/echo-params/scripts/echo.sh": {body: `#!/bin/bash
+printf 'source_repo=%s\n' "$ENJU_PARAM_source_repo"
+printf 'shas=%s\n' "$ENJU_PARAM_shas"
+printf 'sha=%s\n' "$ENJU_PARAM_sha"
+`, mode: 0o755},
+	}, "seed echo-params bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/echo-params",
+		"params": map[string]any{
+			"source_repo": "/data/enju",
+			"shas":        []string{"alpha", "beta"},
+		},
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:alpha:analyze", projectID))
+
+	// Run both instances. Each one's result.md should echo
+	// its OWN `sha` along with the shared `source_repo` and
+	// the full `shas` list.
+	for _, sha := range []string{"alpha", "beta"} {
+		res := h.call(t, "enju_execute_task", map[string]any{
+			"task_id": h.taskID(sha + ":analyze"),
+		})
+		if res.IsError {
+			t.Fatalf("execute %s:analyze: %s", sha, mcpText(res))
+		}
+		body := h.mcpBareResultMD(t, sha+":analyze")
+		// Run-level scalar param: identical for both instances.
+		if !strings.Contains(body, "source_repo=/data/enju") {
+			t.Errorf("%s: expected ENJU_PARAM_source_repo=/data/enju in result; got:\n%s", sha, body)
+		}
+		// Run-level list param: comma-joined.
+		if !strings.Contains(body, "shas=alpha,beta") {
+			t.Errorf("%s: expected ENJU_PARAM_shas=alpha,beta in result; got:\n%s", sha, body)
+		}
+		// Per-iteration for_each var: differs per instance.
+		wantSHA := "sha=" + sha
+		if !strings.Contains(body, wantSHA) {
+			t.Errorf("%s: expected %q in result (per-iteration ENJU_PARAM_sha); got:\n%s", sha, wantSHA, body)
+		}
+	}
+}
+
+// TestMCPComputeContextJSON covers Phase B of the compute-
+// context enhancement: $ENJU_RUN_DIR/context.json is written
+// before the script runs AND committed with the result. Lets
+// scripts in any language (Python, R, Node) read typed,
+// structured context — including list values, typed numbers,
+// and structured reads/writes declarations that env vars
+// can't faithfully represent.
+//
+// Script uses jq to extract the source_repo scalar and the
+// shas list, proving the JSON dropoff is accessible. Test
+// then reads the committed context.json from the bare remote
+// and asserts its shape for auditability.
+func TestMCPComputeContextJSON(t *testing.T) {
+	h := newMCPHarness(t, "ComputeCtxJSON")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/ctx-demo/template.yaml": {body: `name: "context.json demo"
+version: 1
+params:
+  - name: source_repo
+    type: string
+    required: true
+  - name: shas
+    type: list<string>
+    required: true
+tasks:
+  - id: process
+    action: compute
+    script: scripts/process.sh
+    for_each:
+      sha: "{{shas}}"
+    prompt: "Process {{sha}}"
+`, mode: 0o644},
+		"enju_templates/ctx-demo/scripts/process.sh": {body: `#!/bin/bash
+set -e
+CTX="$ENJU_RUN_DIR/context.json"
+# Prove we can read from the JSON dropoff — typed scalars
+# and list values both accessible via jq.
+printf 'source_repo=%s\n' "$(jq -r '.params.source_repo' "$CTX")"
+printf 'sha_count=%s\n' "$(jq -r '.params.shas | length' "$CTX")"
+printf 'iter_sha=%s\n' "$(jq -r '.iteration.sha' "$CTX")"
+printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
+`, mode: 0o755},
+	}, "seed ctx-demo bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/ctx-demo",
+		"params": map[string]any{
+			"source_repo": "/data/enju",
+			"shas":        []string{"abc123", "def456", "0f9a1b"},
+		},
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:abc123:process", projectID))
+
+	// Run one instance — enough to verify both the pre-script
+	// write (script reads it live) and the post-script commit
+	// (context.json lands in the bare remote).
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("abc123:process"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	// 1. Script successfully read the JSON dropoff.
+	body := h.mcpBareResultMD(t, "abc123:process")
+	for _, want := range []string{
+		"source_repo=/data/enju",
+		"sha_count=3",
+		"iter_sha=abc123",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in result.md; got:\n%s", want, body)
+		}
+	}
+
+	// 2. context.json committed alongside result.md.
+	ctxBytes, ok := h.readRepoFile(projectID, ".enju/runs/1/abc123/process/context.json")
+	if !ok {
+		t.Fatalf("expected context.json committed under .enju/runs/1/abc123/process/")
+	}
+	var ctx map[string]interface{}
+	if err := json.Unmarshal(ctxBytes, &ctx); err != nil {
+		t.Fatalf("unmarshal committed context.json: %v\nraw: %s", err, ctxBytes)
+	}
+	if got := ctx["task_id"]; got != fmt.Sprintf("%d:1:abc123:process", projectID) {
+		t.Errorf("context.task_id = %v, want run-prefixed :abc123:process", got)
+	}
+	params, _ := ctx["params"].(map[string]interface{})
+	if params == nil {
+		t.Fatalf("context.params missing; got %v", ctx)
+	}
+	if got := params["source_repo"]; got != "/data/enju" {
+		t.Errorf("context.params.source_repo = %v, want /data/enju", got)
+	}
+	shas, _ := params["shas"].([]interface{})
+	if len(shas) != 3 {
+		t.Errorf("context.params.shas = %v, want 3 entries", shas)
+	}
+	iter, _ := ctx["iteration"].(map[string]interface{})
+	if iter == nil || iter["sha"] != "abc123" {
+		t.Errorf("context.iteration.sha = %v, want abc123", iter)
+	}
+	// reads/writes_artifacts always arrays, never null —
+	// even when the task declares neither (makes script
+	// consumers' null-checks simpler).
+	if _, ok := ctx["reads_artifacts"].([]interface{}); !ok {
+		t.Errorf("context.reads_artifacts should be an array (empty OK), got %T: %v",
+			ctx["reads_artifacts"], ctx["reads_artifacts"])
+	}
+	if _, ok := ctx["writes_artifacts"].([]interface{}); !ok {
+		t.Errorf("context.writes_artifacts should be an array, got %T: %v",
+			ctx["writes_artifacts"], ctx["writes_artifacts"])
+	}
+}
+
 // TestMCPTemplateBundleSnapshotAndExec covers the end-to-end
 // template-bundle feature introduced in the 2026-04-18 pass:
 //
