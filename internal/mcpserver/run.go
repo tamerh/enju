@@ -72,6 +72,23 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
 	}
 }
+// runBranchFromData pulls the `branch` field out of a run JSON
+// payload as returned by GET /runs/{seq} or POST /runs. Empty
+// when the payload is malformed or missing — callers pass the
+// empty string through to CommitFiles, which falls back to the
+// project default. Central so every export-style tool threads
+// the value identically.
+func runBranchFromData(runData []byte) string {
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return ""
+	}
+	if b, ok := run["branch"].(string); ok {
+		return b
+	}
+	return ""
+}
+
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -184,6 +201,15 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if err := json.Unmarshal(data, &created); err == nil {
 			if seqF, ok := created["seq"].(float64); ok {
 				seq := int(seqF)
+				// The run's branch — pass to CommitFiles so the
+				// template snapshot lands on THIS run's branch
+				// (not whatever branch the worktree is currently
+				// on). Missing this caused template-mode create_run
+				// to commit snapshots to main regardless of the
+				// run's branch= value, leaving the branch ref
+				// uncreated and the run's first submit pushing to
+				// main.
+				runBranch, _ := created["branch"].(string)
 				snapshotTarget := fmt.Sprintf(".enju/runs/%d/template", seq)
 				files, ferr := proj.ReadBundleFiles(loadedTemplate.BundleDir, snapshotTarget)
 				if ferr != nil {
@@ -197,6 +223,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 						AuthorName:  authorName,
 						AuthorEmail: authorEmail,
 						ModelName:   c.modelName,
+						Branch:      runBranch,
 					})
 					proj.Unlock()
 					if cerr != nil {
@@ -274,6 +301,12 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
 	}
 
+	// Pull the run's branch out of the coordinator response so
+	// CommitFiles lands the export on the right branch — not
+	// the worktree's current HEAD (which could be any prior
+	// run's branch).
+	runBranch := runBranchFromData(runData)
+
 	// Acquire a workspace for the project so we can commit.
 	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
@@ -294,6 +327,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
 		ModelName:   c.modelName,
+		Branch:      runBranch,
 	})
 	proj.Unlock()
 	if err != nil {
@@ -367,6 +401,14 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 		return mcp.NewToolResultError("enju_export_run_events requires a local workspace (MCP client mode)"), nil
 	}
 
+	// Fetch the run record first so the events commit lands on
+	// the run's branch, not the worktree's current HEAD.
+	runData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	runBranch := runBranchFromData(runData)
+
 	// Pull events from the coordinator.
 	eventsData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/events", projectID, runID))
 	if err != nil {
@@ -411,6 +453,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
 		ModelName:   c.modelName,
+		Branch:      runBranch,
 	})
 	proj.Unlock()
 	if err != nil {

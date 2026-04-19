@@ -16,8 +16,13 @@ package test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 // TestMCPBranchSerialRunsRefused verifies the coordinator
@@ -245,6 +250,236 @@ tasks:
 	if got, _ := h.taskGet("greet")["state"].(string); got != "accepted" {
 		t.Errorf("expected greet=accepted after submit, got %q", got)
 	}
+
+	// Verify the chosen branch ref actually landed on the bare
+	// remote. Before the CheckoutBranch fix this assertion would
+	// fail — the coordinator tracked branch="run-N" but commits
+	// went to main because the worktree never switched.
+	chosenBranch := runs[0].Branch
+	remoteURL := h.remoteFor(projectID)
+	assertRemoteHasBranch(t, remoteURL, chosenBranch)
+	assertRemoteHasBranch(t, remoteURL, "main") // seed branch survives
+}
+
+// readRepoFileOnBranch reads a file from a specific branch on
+// the bare remote. Needed by branch tests because the default
+// readRepoFile clones the bare's HEAD (usually main), so
+// content committed to a non-default branch looks "missing" to
+// assertions that only check the default.
+func readRepoFileOnBranch(t *testing.T, remoteURL, branch, repoRelPath string) ([]byte, bool) {
+	t.Helper()
+	cloneDir := t.TempDir()
+	_, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{
+		URL:           remoteURL,
+		ReferenceName: plumbing.NewBranchReferenceName(branch),
+		SingleBranch:  true,
+	})
+	if err != nil {
+		return nil, false
+	}
+	b, err := os.ReadFile(filepath.Join(cloneDir, repoRelPath))
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// assertRemoteHasBranch opens a bare repo and fails the test if
+// `refs/heads/<branch>` isn't present. Used to pin the
+// branch-per-run behavior at the actual git layer, not just the
+// coordinator's bookkeeping.
+func assertRemoteHasBranch(t *testing.T, remoteURL, branch string) {
+	t.Helper()
+	repo, err := gogit.PlainOpen(remoteURL)
+	if err != nil {
+		t.Fatalf("open bare %q: %v", remoteURL, err)
+	}
+	iter, err := repo.Branches()
+	if err != nil {
+		t.Fatalf("list branches on %q: %v", remoteURL, err)
+	}
+	defer iter.Close()
+	found := false
+	var names []string
+	_ = iter.ForEach(func(ref *plumbing.Reference) error {
+		name := ref.Name().Short()
+		names = append(names, name)
+		if name == branch {
+			found = true
+		}
+		return nil
+	})
+	if !found {
+		t.Fatalf("bare remote %q missing branch %q (have: %v)", remoteURL, branch, names)
+	}
+}
+
+// TestMCPBranchTemplateModeCreatesRemoteRef is the tester's
+// exact repro: enju_create_run with path=<template bundle>
+// plus branch=<explicit>. The template-mode snapshot commit
+// used to drop the branch argument to CommitFiles, so the
+// snapshot landed on whatever branch the worktree was on
+// (usually main) rather than on the run's branch. That left
+// "run-N / experiment-X" as a coordinator label only — the
+// bare remote never saw the ref.
+func TestMCPBranchTemplateModeCreatesRemoteRef(t *testing.T) {
+	h := newMCPHarness(t, "TemplateBranchRef")
+	projectID := h.createTestProject()
+
+	// Seed a trivial template bundle in the project's clone.
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/hello/template.yaml": `name: "hello"
+version: 1
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi."
+`,
+	}, "seed hello template")
+
+	// create_run via template path + explicit branch.
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "experiment-1",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run template+branch: err=%v body=%s", err, mcpText(res))
+	}
+
+	// The snapshot commit ran inside create_run. The bare
+	// remote must show refs/heads/experiment-1 already —
+	// before any submit — since CommitFiles pushed.
+	remoteURL := h.remoteFor(projectID)
+	assertRemoteHasBranch(t, remoteURL, "experiment-1")
+	assertRemoteHasBranch(t, remoteURL, "main")
+}
+
+// TestMCPBranchTemplateModeComputeExecutes closes the last
+// square in the template-mode × branch test matrix: a compute
+// task's script lives inside the template bundle, snapshotted
+// into .enju/runs/{seq}/template/ at create_run time. If the
+// snapshot lands on the wrong branch (the bug the
+// CommitFilesRequest.Branch fix addressed), the executor
+// wouldn't find the script at all — the task would fail with
+// "script not found" instead of running.
+//
+// This test proves the executor + snapshot + branch routing
+// all line up end-to-end on a non-default branch.
+func TestMCPBranchTemplateModeComputeExecutes(t *testing.T) {
+	h := newMCPHarness(t, "TemplateBranchCompute")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/echo/template.yaml": {body: `name: "echo"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/echo.sh
+`, mode: 0o644},
+		"enju_templates/echo/scripts/echo.sh": {body: `#!/bin/bash
+echo "branch-test-ran"
+`, mode: 0o755},
+	}, "seed echo template")
+
+	// Template-mode create_run on a non-default branch.
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/echo",
+		"branch":     "compute-branch",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+	}
+
+	// Point the harness at this run.
+	runs, _ := h.store.ListRunsByProject(projectID)
+	h.lastProjectID = projectID
+	h.lastRunSeq = runs[0].Seq
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
+
+	// Execute — this both claims and submits via the compute
+	// executor path, which resolves `script:` from the per-
+	// run snapshot dir. A broken snapshot branch would leave
+	// the script missing.
+	execRes := h.callOK(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	if execRes.IsError {
+		t.Fatalf("execute_task failed — likely the template snapshot isn't on the run's branch: %s", mcpText(execRes))
+	}
+
+	// Remote should have both branches — main (from the seed)
+	// and compute-branch (from the snapshot + submit).
+	remoteURL := h.remoteFor(projectID)
+	assertRemoteHasBranch(t, remoteURL, "main")
+	assertRemoteHasBranch(t, remoteURL, "compute-branch")
+
+	// Result content lives on compute-branch, not main — the
+	// branch-aware read confirms the submit landed there.
+	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", fmt.Sprintf(".enju/runs/%d/run/result.md", runs[0].Seq))
+	if !ok {
+		t.Fatalf("result.md missing from compute-branch")
+	}
+	if !strings.Contains(string(body), "branch-test-ran") {
+		t.Errorf("expected script output in result; got:\n%s", string(body))
+	}
+}
+
+// TestMCPBranchExplicitNameCreatesRemoteRef reproduces the
+// tester-reported bug: coordinator accepts branch="experiment-1"
+// on enju_create_run, serial-per-branch enforcement works, but
+// commits land on main anyway because the git layer silently
+// skips the branch switch. Must end with the bare remote having
+// BOTH main (from the first run) and experiment-1 (from the
+// second).
+func TestMCPBranchExplicitNameCreatesRemoteRef(t *testing.T) {
+	h := newMCPHarness(t, "ExplicitBranchRef")
+	projectID := h.createTestProject()
+
+	yaml := `name: "r"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`
+	// Run #1: default branch (main). Submit to get a real
+	// commit on main so the bare has something.
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "on main")
+
+	// Run #2: explicit branch="experiment-1". Claim + submit.
+	// The coordinator is fine with this (different branch from
+	// run #1) and at the git level we expect the fat-client to
+	// check out experiment-1 before committing, then push it.
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"branch":     "experiment-1",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run branch=experiment-1: err=%v body=%s", err, mcpText(res))
+	}
+	runs, _ := h.store.ListRunsByProject(projectID)
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 runs, got %d", len(runs))
+	}
+	// Point harness state at run #2.
+	h.lastProjectID = projectID
+	h.lastRunSeq = runs[1].Seq
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
+
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "on experiment-1")
+
+	// The critical assertion: the bare remote has
+	// refs/heads/experiment-1, not just refs/heads/main.
+	remoteURL := h.remoteFor(projectID)
+	assertRemoteHasBranch(t, remoteURL, "main")
+	assertRemoteHasBranch(t, remoteURL, "experiment-1")
 }
 
 // TestMCPDefaultBranchOnCreateProject verifies default_branch
