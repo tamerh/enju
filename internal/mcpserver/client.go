@@ -83,6 +83,19 @@ func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]b
 	})
 }
 
+func (c *apiClient) delete(ctx context.Context, path string) ([]byte, error) {
+	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "DELETE", c.baseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		}
+		return c.httpClient.Do(req)
+	})
+}
+
 func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]byte, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {

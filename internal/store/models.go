@@ -243,6 +243,32 @@ type TaskRecord struct {
 	CreatedAt time.Time
 }
 
+// ProjectRole is a citizen's role within a specific project. Stored
+// as TEXT in project_members.role so new tiers (viewer, maintainer,
+// etc.) can slot in without a schema migration. The GitHub-style
+// starting model ships with two values: owner (admin) and member
+// (contributor). Orthogonal to CitizenRecord.Role, which is a
+// cross-project role slot reserved for future use.
+type ProjectRole string
+
+const (
+	ProjectRoleOwner  ProjectRole = "owner"
+	ProjectRoleMember ProjectRole = "member"
+)
+
+// ProjectMemberRecord is one row in the project_members join table:
+// a citizen's membership of a single project, with their role and
+// who added them. AddedBy is zero for rows created by the
+// creator-auto-add path (no one added the creator; they created
+// the project).
+type ProjectMemberRecord struct {
+	ProjectID int64
+	CitizenID int64
+	Role      ProjectRole
+	AddedAt   time.Time
+	AddedBy   int64 // citizens.id of the adder; 0 for the creator row
+}
+
 // ArtifactRecord is the index row for one mutable file inside a project's
 // repository. The file content itself lives only in git — this record
 // just tracks who wrote it last and when, for provenance and listings.

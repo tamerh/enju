@@ -10,6 +10,46 @@ import (
 
 // --- Rich formatting for MCP tool responses ---
 
+func formatProjectMemberList(data []byte, projectID int64) string {
+	var members []map[string]interface{}
+	if err := json.Unmarshal(data, &members); err != nil {
+		var errEnv map[string]interface{}
+		if json.Unmarshal(data, &errEnv) == nil {
+			if msg, ok := errEnv["error"].(string); ok && msg != "" {
+				return msg
+			}
+		}
+		return string(data)
+	}
+	if len(members) == 0 {
+		return fmt.Sprintf("Project #%d has no recorded members (legacy open project).", projectID)
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Members of project #%d\n\n", projectID))
+	for _, m := range members {
+		username, _ := m["username"].(string)
+		name, _ := m["name"].(string)
+		role, _ := m["role"].(string)
+		addedBy, _ := m["added_by"].(string)
+		addedAt, _ := m["added_at"].(string)
+		line := fmt.Sprintf("  @%-20s  %-7s", username, role)
+		if name != "" && name != username {
+			line += fmt.Sprintf("  (%s)", name)
+		}
+		if addedBy != "" {
+			line += fmt.Sprintf("  — added by @%s", addedBy)
+		} else {
+			line += "  — project creator"
+		}
+		if addedAt != "" {
+			line += fmt.Sprintf("  on %s", addedAt)
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func formatProjectList(data []byte) string {
 	var projects []map[string]interface{}
 	if err := json.Unmarshal(data, &projects); err != nil {

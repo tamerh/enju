@@ -18,6 +18,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,28 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 )
+
+// ctxKey is a private type for context keys so package-external
+// callers can't collide. Only the authenticated-citizen key is
+// stored this way today.
+type ctxKey int
+
+const (
+	ctxKeyCitizen ctxKey = iota
+)
+
+// citizenFromRequest returns the authenticated citizen that
+// authMiddleware stashed into the request context, or nil when
+// the request arrived without a valid Bearer token (soft-auth
+// backwards-compat path). Handlers that need to know who is
+// asking — read gating, ownership checks, creator auto-add —
+// call this; handlers that don't care skip it.
+func citizenFromRequest(r *http.Request) *store.CitizenRecord {
+	if v, ok := r.Context().Value(ctxKeyCitizen).(*store.CitizenRecord); ok {
+		return v
+	}
+	return nil
+}
 
 // Server holds the coordinator state and dependencies. Post the
 // iteration A orchestrator rewrite, the coordinator holds no git
@@ -123,8 +146,71 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid or expired token — delete ~/.enju/credentials.json and re-register")
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), ctxKeyCitizen, citizen)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// requireProjectMembershipForTask gates a task-scoped endpoint by
+// resolving the task's run → project, then deferring to
+// requireProjectMembership. Convenience wrapper so each task
+// handler doesn't re-implement the lookup.
+func (s *Server) requireProjectMembershipForTask(w http.ResponseWriter, r *http.Request, taskID string) (*store.ProjectMemberRecord, bool) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "task lookup failed: "+err.Error())
+		return nil, false
+	}
+	if task == nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return nil, false
+	}
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		writeError(w, http.StatusInternalServerError, "run lookup failed")
+		return nil, false
+	}
+	return s.requireProjectMembership(w, r, run.ProjectID)
+}
+
+// requireProjectMembership returns the caller's membership row for
+// a project, writing a 403 and returning nil if gating should
+// block. Three tiers of enforcement:
+//
+//   - No authenticated caller (soft-auth legacy path): allowed
+//     through with a nil record. Write endpoints log these already.
+//   - Project has zero members (pre-migration legacy project): open,
+//     returns nil. This is a transition-period courtesy — new
+//     projects always seed the creator as owner so they'll never
+//     land here.
+//   - Project has members: caller must appear. Non-members get a
+//     403 "not a member of project X".
+//
+// Callers that need owner-only enforcement check the returned
+// record's Role after this succeeds.
+func (s *Server) requireProjectMembership(w http.ResponseWriter, r *http.Request, projectID int64) (*store.ProjectMemberRecord, bool) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		return nil, true
+	}
+	total, err := s.store.CountProjectMembers(projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "membership lookup failed: "+err.Error())
+		return nil, false
+	}
+	if total == 0 {
+		return nil, true
+	}
+	m, err := s.store.GetProjectMember(projectID, caller.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "membership lookup failed: "+err.Error())
+		return nil, false
+	}
+	if m == nil {
+		writeError(w, http.StatusForbidden, fmt.Sprintf("not a member of project %d — ask an existing member to add you", projectID))
+		return nil, false
+	}
+	return m, true
 }
 
 // Router returns the chi router with all endpoints registered.
@@ -155,6 +241,16 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}/runs", s.handleListProjectRuns)
 		r.Get("/projects/{projectID}/artifacts", s.handleListArtifacts)
 		r.Get("/projects/{projectID}/artifacts/*", s.handleGetArtifact)
+
+		// Project membership. Flat owner/member tiers; enforcement
+		// lives in the handlers (add = any member, remove = owner
+		// or self, list = any member, role change = owner).
+		r.Get("/projects/{projectID}/members", s.handleListProjectMembers)
+		r.Post("/projects/{projectID}/members", s.handleAddProjectMember)
+		r.Delete("/projects/{projectID}/members/{citizenID}", s.handleRemoveProjectMember)
+		r.Delete("/projects/{projectID}/members/by-username/{username}", s.handleRemoveProjectMemberByUsername)
+		r.Put("/projects/{projectID}/members/{citizenID}/role", s.handleSetProjectMemberRole)
+		r.Put("/projects/{projectID}/members/by-username/{username}/role", s.handleSetProjectMemberRoleByUsername)
 
 		// Runs — hierarchical under projects
 		// Address runs by project_id + run_seq (per-project numbering)
@@ -279,9 +375,15 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	// empty, the project is a local-only project handled entirely
 	// by the MCP client's workspace.
 	now := time.Now()
+	creator := citizenFromRequest(r)
+	createdBy := ""
+	if creator != nil {
+		createdBy = creator.Username
+	}
 	id, err := s.store.CreateProject(&store.ProjectRecord{
 		Name:        req.Name,
 		Description: req.Description,
+		CreatedBy:   createdBy,
 		RemoteURL:   req.RemoteURL,
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -289,6 +391,18 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create project: "+err.Error())
 		return
+	}
+
+	// Creator auto-add: seed the project with the caller as
+	// owner. Skipped when the request arrived without a
+	// registered citizen (soft-auth legacy path) — the project
+	// exists, but membership is pre-migration "open" until
+	// someone claims ownership via a future adoption tool.
+	if creator != nil {
+		if err := s.store.AddProjectMember(id, creator.ID, store.ProjectRoleOwner, 0); err != nil {
+			s.logger.Warn("creator auto-add failed",
+				"project_id", id, "citizen_id", creator.ID, "error", err)
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, projectResponse{
@@ -307,6 +421,18 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if projectID == 0 {
 		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	// Owner-only: changing the remote URL moves the whole
+	// project's git home, which determines where task commits
+	// land. Members can push to the remote their owner set, but
+	// only owners can redirect it.
+	m, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	if m != nil && m.Role != store.ProjectRoleOwner {
+		writeError(w, http.StatusForbidden, "only project owners can change the remote URL")
 		return
 	}
 
@@ -334,7 +460,19 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
-	projects, err := s.store.ListProjects()
+	caller := citizenFromRequest(r)
+
+	// Authenticated callers see only projects they're a member
+	// of. Anonymous (soft-auth legacy) callers still see the
+	// full list — existing un-authenticated tooling keeps
+	// working during the transition.
+	var projects []store.ProjectRecord
+	var err error
+	if caller != nil {
+		projects, err = s.store.ListProjectsForCitizen(caller.ID)
+	} else {
+		projects, err = s.store.ListProjects()
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list projects")
 		return
@@ -368,6 +506,9 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
 
 	runs, _ := s.store.ListRunsByProject(p.ID)
 	writeJSON(w, http.StatusOK, toProjectResponse(*p, len(runs)))
@@ -382,6 +523,9 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
 	runs, err := s.store.ListRunsByProject(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list runs")
@@ -403,6 +547,286 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- Project members ---
+
+type addProjectMemberRequest struct {
+	Username string `json:"username"`
+	Role     string `json:"role,omitempty"` // optional; defaults to "member"
+}
+
+type projectMemberResponse struct {
+	Username string `json:"username"`
+	Name     string `json:"name,omitempty"`
+	Role     string `json:"role"`
+	AddedAt  string `json:"added_at"`
+	AddedBy  string `json:"added_by,omitempty"` // username of adder; empty for the creator row
+}
+
+type setProjectMemberRoleRequest struct {
+	Role string `json:"role"`
+}
+
+// handleListProjectMembers returns every member on the project,
+// gated on caller membership. Response rows expose usernames (not
+// citizen IDs) so all external identifiers match the rest of the
+// API surface.
+func (s *Server) handleListProjectMembers(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	rows, err := s.store.ListProjectMembers(projectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list members: "+err.Error())
+		return
+	}
+	resp := make([]projectMemberResponse, 0, len(rows))
+	for _, m := range rows {
+		cz, _ := s.store.GetCitizen(m.CitizenID)
+		username := ""
+		name := ""
+		if cz != nil {
+			username = cz.Username
+			name = cz.Name
+		}
+		resp = append(resp, projectMemberResponse{
+			Username: username,
+			Name:     name,
+			Role:     string(m.Role),
+			AddedAt:  m.AddedAt.Format(time.RFC3339),
+			AddedBy:  s.citizenUsername(m.AddedBy),
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleAddProjectMember grants membership to a citizen. Any
+// existing member can add — role-free delegation is the
+// GitHub-style trust the user asked for.
+func (s *Server) handleAddProjectMember(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	m, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	var req addProjectMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	target := s.resolveCitizen(w, req.Username)
+	if target == nil {
+		return
+	}
+	if existing, _ := s.store.GetProjectMember(projectID, target.ID); existing != nil {
+		writeError(w, http.StatusConflict, fmt.Sprintf("%q is already a member of this project", req.Username))
+		return
+	}
+	role := store.ProjectRole(req.Role)
+	switch role {
+	case "":
+		role = store.ProjectRoleMember
+	case store.ProjectRoleOwner:
+		// Promoting someone to owner on the add path is a
+		// shortcut for "add + promote" — gate it to owners so
+		// the shortcut doesn't quietly bypass the promote-
+		// only-by-owner rule. Members wanting to invite
+		// another owner have to ask an existing owner.
+		if m == nil || m.Role != store.ProjectRoleOwner {
+			writeError(w, http.StatusForbidden, "only project owners can add members as 'owner' — ask an owner, or add as 'member' and request promotion")
+			return
+		}
+	case store.ProjectRoleMember:
+		// default path
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown role %q (expected 'member' or 'owner')", req.Role))
+		return
+	}
+	var adder int64
+	if caller := citizenFromRequest(r); caller != nil {
+		adder = caller.ID
+	}
+	if err := s.store.AddProjectMember(projectID, target.ID, role, adder); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to add member: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, projectMemberResponse{
+		Username: target.Username,
+		Name:     target.Name,
+		Role:     string(role),
+		AddedAt:  time.Now().Format(time.RFC3339),
+		AddedBy:  s.citizenUsername(adder),
+	})
+}
+
+// handleRemoveProjectMember removes a citizen from the project.
+// The removed citizen must be the caller (self-leave) or the
+// caller must be an owner. Enforces the ≥1-owner invariant.
+func (s *Server) handleRemoveProjectMember(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	targetID, _ := strconv.ParseInt(chi.URLParam(r, "citizenID"), 10, 64)
+	if targetID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid citizen ID")
+		return
+	}
+	callerMember, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	caller := citizenFromRequest(r)
+	isSelf := caller != nil && caller.ID == targetID
+	// Only owners or the subject themselves can remove.
+	if !isSelf && (callerMember == nil || callerMember.Role != store.ProjectRoleOwner) {
+		writeError(w, http.StatusForbidden, "only project owners can remove other members — or remove yourself to leave")
+		return
+	}
+	target, err := s.store.GetProjectMember(projectID, targetID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "member lookup failed: "+err.Error())
+		return
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, "member not found on this project")
+		return
+	}
+	// Last-owner invariant: block a remove that would drop the
+	// owner count to zero. The subject (or owner doing the
+	// remove) must promote a successor first.
+	if target.Role == store.ProjectRoleOwner {
+		owners, _ := s.store.CountProjectOwners(projectID)
+		if owners <= 1 {
+			if isSelf {
+				writeError(w, http.StatusConflict, "you are the last owner — promote another member to owner first, then leave")
+			} else {
+				writeError(w, http.StatusConflict, "cannot remove the last owner — promote another member to owner first")
+			}
+			return
+		}
+	}
+	if err := s.store.RemoveProjectMember(projectID, targetID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to remove member: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"project_id": projectID,
+		"citizen":    s.citizenUsername(targetID),
+		"removed":    true,
+		"self_leave": isSelf,
+	})
+}
+
+// handleRemoveProjectMemberByUsername resolves the username to a
+// citizen ID and delegates to handleRemoveProjectMember. Thin
+// convenience alias so the MCP layer doesn't have to round-trip
+// through /citizens/by-username first.
+func (s *Server) handleRemoveProjectMemberByUsername(w http.ResponseWriter, r *http.Request) {
+	username := chi.URLParam(r, "username")
+	target := s.resolveCitizen(w, username)
+	if target == nil {
+		return
+	}
+	rctx := chi.RouteContext(r.Context())
+	rctx.URLParams.Add("citizenID", strconv.FormatInt(target.ID, 10))
+	s.handleRemoveProjectMember(w, r)
+}
+
+// handleSetProjectMemberRoleByUsername mirrors handleRemoveProjectMemberByUsername
+// for the role-change endpoint — resolves username to citizen ID
+// and hands off to the canonical handler.
+func (s *Server) handleSetProjectMemberRoleByUsername(w http.ResponseWriter, r *http.Request) {
+	username := chi.URLParam(r, "username")
+	target := s.resolveCitizen(w, username)
+	if target == nil {
+		return
+	}
+	rctx := chi.RouteContext(r.Context())
+	rctx.URLParams.Add("citizenID", strconv.FormatInt(target.ID, 10))
+	s.handleSetProjectMemberRole(w, r)
+}
+
+// handleSetProjectMemberRole promotes or demotes a member.
+// Owner-only. Enforces the ≥1-owner invariant when demoting the
+// last owner.
+func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	targetID, _ := strconv.ParseInt(chi.URLParam(r, "citizenID"), 10, 64)
+	if targetID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid citizen ID")
+		return
+	}
+	callerMember, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	if callerMember == nil || callerMember.Role != store.ProjectRoleOwner {
+		writeError(w, http.StatusForbidden, "only project owners can change member roles")
+		return
+	}
+	var req setProjectMemberRoleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	newRole := store.ProjectRole(req.Role)
+	if newRole != store.ProjectRoleOwner && newRole != store.ProjectRoleMember {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown role %q (expected 'owner' or 'member')", req.Role))
+		return
+	}
+	target, err := s.store.GetProjectMember(projectID, targetID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "member lookup failed: "+err.Error())
+		return
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, "member not found on this project")
+		return
+	}
+	if target.Role == newRole {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"project_id": projectID,
+			"citizen":    s.citizenUsername(targetID),
+			"role":       string(newRole),
+			"changed":    false,
+		})
+		return
+	}
+	// Demoting the last owner would leave the project
+	// ownerless. Refuse with guidance.
+	if target.Role == store.ProjectRoleOwner && newRole == store.ProjectRoleMember {
+		owners, _ := s.store.CountProjectOwners(projectID)
+		if owners <= 1 {
+			writeError(w, http.StatusConflict, "cannot demote the last owner — promote another member to owner first")
+			return
+		}
+	}
+	if err := s.store.SetProjectMemberRole(projectID, targetID, newRole); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to change role: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"project_id": projectID,
+		"citizen":    s.citizenUsername(targetID),
+		"role":       string(newRole),
+		"changed":    true,
+	})
 }
 
 // --- Artifacts ---
@@ -436,6 +860,9 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid project ID")
 		return
 	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
 
 	prefix := r.URL.Query().Get("prefix")
 	rows, err := s.store.ListArtifactsByProject(projectID, prefix)
@@ -466,6 +893,9 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if projectID == 0 {
 		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
 
@@ -531,6 +961,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	proj, err := s.store.GetProject(projectID)
 	if err != nil || proj == nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("project %d not found", projectID))
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
 
@@ -667,8 +1100,26 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Filter runs by project membership for authenticated
+	// callers. Anonymous soft-auth sees everything (existing
+	// behavior during the transition).
+	caller := citizenFromRequest(r)
+	allowed := map[int64]bool{}
+	if caller != nil {
+		memberProjects, _ := s.store.ListProjectsForCitizen(caller.ID)
+		for _, p := range memberProjects {
+			allowed[p.ID] = true
+		}
+	}
+
 	var resp []runResponse
 	for _, p := range runs {
+		if caller != nil {
+			total, _ := s.store.CountProjectMembers(p.ProjectID)
+			if total > 0 && !allowed[p.ProjectID] {
+				continue
+			}
+		}
 		tasks, _ := s.store.ListTasksByRun(p.ID)
 		resp = append(resp, runResponse{
 			ID:         p.ID,
@@ -691,6 +1142,9 @@ func (s *Server) handleGetRunCostSummary(w http.ResponseWriter, r *http.Request)
 	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil || run == nil {
 		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
 	tasks, _ := s.store.ListTasksByRun(run.ID)
@@ -771,6 +1225,9 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
 	events, err := s.store.ListRunEvents(run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
@@ -830,6 +1287,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "run not found")
 		return
 	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
 
 	tasks, _ := s.store.ListTasksByRun(p.ID)
 
@@ -859,6 +1319,9 @@ func (s *Server) handleListRunTasks(w http.ResponseWriter, r *http.Request) {
 	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil || run == nil {
 		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
 
@@ -979,6 +1442,16 @@ func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.ParseInt(r.URL.Query().Get("project_id"), 10, 64)
 	runSeq, _ := strconv.Atoi(r.URL.Query().Get("run_id"))
 
+	// When the caller scopes to a specific project, gate on
+	// membership here. When they don't (project_id=0), filter
+	// the returned task list down to runs whose project they're
+	// a member of — see below.
+	if projectID > 0 {
+		if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+			return
+		}
+	}
+
 	var runGlobalID int64
 	if projectID > 0 && runSeq > 0 {
 		run, _ := s.store.GetRunByProjectSeq(projectID, runSeq)
@@ -992,6 +1465,33 @@ func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list tasks")
 		return
 	}
+
+	// Cross-project listings: filter to tasks whose run's
+	// project the caller is a member of. Pre-membership legacy
+	// projects (zero members) stay visible. Anonymous soft-auth
+	// callers see everything.
+	if projectID == 0 {
+		caller := citizenFromRequest(r)
+		if caller != nil {
+			allowed := map[int64]bool{}
+			member, _ := s.store.ListProjectsForCitizen(caller.ID)
+			for _, p := range member {
+				allowed[p.ID] = true
+			}
+			filtered := tasks[:0]
+			for _, t := range tasks {
+				run, _ := s.store.GetRun(t.RunID)
+				if run == nil {
+					continue
+				}
+				total, _ := s.store.CountProjectMembers(run.ProjectID)
+				if total == 0 || allowed[run.ProjectID] {
+					filtered = append(filtered, t)
+				}
+			}
+			tasks = filtered
+		}
+	}
 	writeJSON(w, http.StatusOK, s.toTaskResponses(tasks))
 }
 
@@ -1004,6 +1504,9 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if task == nil {
 		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
 	// Lazy deadline check: if this is a collecting vote task
@@ -1111,6 +1614,9 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	if caller == nil {
 		return
 	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
+		return
+	}
 
 	// Get task to determine timeout and enforce access control
 	task, err := s.store.GetTask(taskID)
@@ -1171,6 +1677,9 @@ func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {
 	run, err := s.store.GetRun(task.RunID)
 	if err != nil || run == nil {
 		writeError(w, http.StatusInternalServerError, "run not found for task")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, run.ProjectID); !ok {
 		return
 	}
 	s.handleGetTaskInputsDescriptor(w, r, task, run)
@@ -1253,6 +1762,9 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 	task, err := s.store.GetTask(taskID)
 	if err != nil || task == nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("task %q not found", taskID))
+		return
+	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
 	if task.Action != "vote" && task.Action != "review" {
@@ -1396,6 +1908,9 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("task %q not found", taskID))
 		return
 	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
+		return
+	}
 
 	// Claim validity check comes next — a submit from someone
 	// who never claimed the task has no legitimate path, and
@@ -1493,6 +2008,9 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
 
@@ -1798,6 +2316,9 @@ func (s *Server) handleReleaseTask(w http.ResponseWriter, r *http.Request) {
 	}
 	caller := s.resolveCitizen(w, req.Username)
 	if caller == nil {
+		return
+	}
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
 
@@ -2460,6 +2981,10 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 
 	var req invalidateRequest
 	json.NewDecoder(r.Body).Decode(&req)
+
+	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
+		return
+	}
 
 	result, err := s.performInvalidate(taskID)
 	if err != nil {

@@ -455,10 +455,86 @@ func toolProjectSync() mcp.Tool {
 
 func toolLeaveProject() mcp.Tool {
 	return mcp.NewTool("enju_leave_project",
-		mcp.WithDescription("Forget a project's local clone and delete its workspace directory. Use this to reclaim disk space when you're done working on a project, or to recover from a corrupted local clone. The remote repo is untouched — this is a local cache wipe only. The next time you touch the project (claim a task, read an artifact, etc.) it will be re-cloned from the remote."),
+		mcp.WithDescription(`Leave a project. Two things happen: (1) your membership row is removed from the project, and (2) your local clone is wiped to reclaim disk space. The remote repo is untouched — other members keep their access.
+
+Refused when you are the sole remaining owner — promote another member to owner first (enju_promote_member), then leave. If you only want to wipe the local clone but keep your membership, use keep_membership=true.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The project whose local clone should be deleted"),
+			mcp.Description("The project to leave"),
+		),
+		mcp.WithBoolean("keep_membership",
+			mcp.Description("If true, only wipe the local clone without removing your project membership. Default false — leaving normally removes both."),
+		),
+	)
+}
+
+func toolAddProjectMember() mcp.Tool {
+	return mcp.NewTool("enju_add_project_member",
+		mcp.WithDescription(`Grant a registered citizen membership of a project. Any existing member can add others — this is the trust-based delegation that lets projects spread without owner-gated invitations.
+
+New members default to 'member' role. Only project owners may add someone as 'owner' directly (members wanting to invite another owner must ask an existing owner, or promote after the normal add).`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to add the member to"),
+		),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Username of the citizen to add"),
+		),
+		mcp.WithString("role",
+			mcp.Description("Role to assign. Defaults to 'member'. Pass 'owner' to add as an owner (owners only)."),
+		),
+	)
+}
+
+func toolRemoveProjectMember() mcp.Tool {
+	return mcp.NewTool("enju_remove_project_member",
+		mcp.WithDescription(`Remove a member from a project. Owner-only — use enju_leave_project to remove yourself. Refused when the target is the last owner (promote a successor first).`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to remove the member from"),
+		),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Username of the citizen to remove"),
+		),
+	)
+}
+
+func toolListProjectMembers() mcp.Tool {
+	return mcp.NewTool("enju_list_project_members",
+		mcp.WithDescription("List every member on a project, with role and when they were added. Members only. Paste the output verbatim in your reply — it's pre-formatted."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose members to list"),
+		),
+	)
+}
+
+func toolPromoteMember() mcp.Tool {
+	return mcp.NewTool("enju_promote_member",
+		mcp.WithDescription("Promote a member to owner. Owner-only — any owner can promote any member. Projects support multiple owners; this is the main way to grow the owner pool and avoid a single-point-of-failure."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project"),
+		),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Username of the member to promote"),
+		),
+	)
+}
+
+func toolDemoteOwner() mcp.Tool {
+	return mcp.NewTool("enju_demote_owner",
+		mcp.WithDescription("Demote an owner to regular member. Owner-only. Refused when the target is the last owner (promote a successor first to preserve the ≥1 owner invariant)."),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project"),
+		),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Username of the owner to demote"),
 		),
 	)
 }

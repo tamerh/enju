@@ -114,6 +114,16 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleSetProjectRemote(ctx, req)
 	case "enju_leave_project":
 		return t.c.handleLeaveProject(ctx, req)
+	case "enju_add_project_member":
+		return t.c.handleAddProjectMember(ctx, req)
+	case "enju_remove_project_member":
+		return t.c.handleRemoveProjectMember(ctx, req)
+	case "enju_list_project_members":
+		return t.c.handleListProjectMembers(ctx, req)
+	case "enju_promote_member":
+		return t.c.handlePromoteMember(ctx, req)
+	case "enju_demote_owner":
+		return t.c.handleDemoteOwner(ctx, req)
 	case "enju_list_artifacts":
 		return t.c.handleListArtifacts(ctx, req)
 	case "enju_get_artifact":

@@ -199,6 +199,26 @@ func (s *Store) migrate() error {
 		content TEXT NOT NULL DEFAULT ''
 	);
 
+	-- Project membership (Phase J — project_members). Flat two-tier
+	-- role model: 'owner' (can remove members, promote/demote,
+	-- transfer) and 'member' (can add members, read everything,
+	-- claim/submit tasks, leave). Creator is auto-added as owner
+	-- on CreateProject. Invariant: every project has ≥1 owner —
+	-- last-owner leave/demote/remove is refused.
+	--
+	-- Role is stored as TEXT so future tiers (viewer, maintainer,
+	-- etc.) can slot in without a schema migration. Permission
+	-- checks live in one helper per action, not scattered.
+	CREATE TABLE IF NOT EXISTS project_members (
+		project_id INTEGER NOT NULL REFERENCES projects(id),
+		citizen_id INTEGER NOT NULL REFERENCES citizens(id),
+		role TEXT NOT NULL DEFAULT 'member',
+		added_at TIMESTAMP NOT NULL,
+		added_by INTEGER REFERENCES citizens(id),
+		PRIMARY KEY (project_id, citizen_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_project_members_citizen ON project_members(citizen_id);
+
 	-- Phase G: contribution events log. Append-only — events
 	-- are never deleted, even when the underlying task is
 	-- invalidated (the invalidation is recorded as a separate
@@ -432,6 +452,150 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
+}
+
+// --- Project members ---
+
+// AddProjectMember inserts a (project, citizen, role) row. addedBy is
+// the citizens.id of the adder, or 0 for the creator self-add row.
+// Returns an error if the citizen is already a member (the caller
+// should check GetProjectMember first for a friendly path).
+func (s *Store) AddProjectMember(projectID, citizenID int64, role ProjectRole, addedBy int64) error {
+	if projectID == 0 || citizenID == 0 {
+		return fmt.Errorf("project_id and citizen_id are required")
+	}
+	if role == "" {
+		role = ProjectRoleMember
+	}
+	var addedByVal sql.NullInt64
+	if addedBy != 0 {
+		addedByVal = sql.NullInt64{Int64: addedBy, Valid: true}
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO project_members (project_id, citizen_id, role, added_at, added_by)
+		 VALUES (?, ?, ?, ?, ?)`,
+		projectID, citizenID, string(role), time.Now(), addedByVal,
+	)
+	return err
+}
+
+// RemoveProjectMember deletes the membership row. No-op if the
+// citizen is not a member. Caller is responsible for invariant
+// checks (last-owner refusal, active-claim release) — the store
+// layer will happily drop the row as asked.
+func (s *Store) RemoveProjectMember(projectID, citizenID int64) error {
+	_, err := s.db.Exec(
+		`DELETE FROM project_members WHERE project_id = ? AND citizen_id = ?`,
+		projectID, citizenID,
+	)
+	return err
+}
+
+// SetProjectMemberRole updates a citizen's role within a project.
+// No-op if the citizen is not a member (zero rows affected; no
+// error). Invariant enforcement (last-owner refusal) is the
+// caller's responsibility.
+func (s *Store) SetProjectMemberRole(projectID, citizenID int64, role ProjectRole) error {
+	_, err := s.db.Exec(
+		`UPDATE project_members SET role = ? WHERE project_id = ? AND citizen_id = ?`,
+		string(role), projectID, citizenID,
+	)
+	return err
+}
+
+// GetProjectMember returns the membership record for (project, citizen)
+// or nil if the citizen is not a member.
+func (s *Store) GetProjectMember(projectID, citizenID int64) (*ProjectMemberRecord, error) {
+	var m ProjectMemberRecord
+	var addedBy sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT project_id, citizen_id, role, added_at, added_by
+		 FROM project_members WHERE project_id = ? AND citizen_id = ?`,
+		projectID, citizenID,
+	).Scan(&m.ProjectID, &m.CitizenID, &m.Role, &m.AddedAt, &addedBy)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.AddedBy = addedBy.Int64
+	return &m, nil
+}
+
+// ListProjectMembers returns every membership row for a project,
+// ordered by (role DESC, added_at ASC) so owners surface first.
+func (s *Store) ListProjectMembers(projectID int64) ([]ProjectMemberRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT project_id, citizen_id, role, added_at, added_by
+		 FROM project_members WHERE project_id = ?
+		 ORDER BY role DESC, added_at ASC`,
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var members []ProjectMemberRecord
+	for rows.Next() {
+		var m ProjectMemberRecord
+		var addedBy sql.NullInt64
+		if err := rows.Scan(&m.ProjectID, &m.CitizenID, &m.Role, &m.AddedAt, &addedBy); err != nil {
+			return nil, err
+		}
+		m.AddedBy = addedBy.Int64
+		members = append(members, m)
+	}
+	return members, rows.Err()
+}
+
+// CountProjectOwners returns the number of owners on a project.
+// Used for the >=1 owner invariant check on leave/demote/remove.
+func (s *Store) CountProjectOwners(projectID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM project_members WHERE project_id = ? AND role = ?`,
+		projectID, string(ProjectRoleOwner),
+	).Scan(&n)
+	return n, err
+}
+
+// CountProjectMembers returns the total number of members on a
+// project regardless of role. A project with zero members is a
+// legacy project (pre-membership migration) — read/write gating
+// treats it as open for backwards compatibility.
+func (s *Store) CountProjectMembers(projectID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM project_members WHERE project_id = ?`,
+		projectID,
+	).Scan(&n)
+	return n, err
+}
+
+// ListProjectsForCitizen returns every project this citizen is a
+// member of, ordered by project id. Used by enju_list_projects to
+// scope the listing to projects the caller can see.
+func (s *Store) ListProjectsForCitizen(citizenID int64) ([]ProjectRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT `+projectSelectColumns+` FROM projects
+		 WHERE id IN (SELECT project_id FROM project_members WHERE citizen_id = ?)
+		 ORDER BY id ASC`,
+		citizenID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var projects []ProjectRecord
+	for rows.Next() {
+		var p ProjectRecord
+		if err := scanProject(rows, &p); err != nil {
+			return nil, err
+		}
+		projects = append(projects, p)
+	}
+	return projects, rows.Err()
 }
 
 // --- Runs ---

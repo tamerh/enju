@@ -454,19 +454,19 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 	data, _ := json.Marshal(resp)
 	return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
 }
-// handleLeaveProject deletes the local clone of a project from the
-// MCP client's workspace. Purely local — the coordinator and the
-// remote repo are untouched. Re-clones on next access.
+// handleLeaveProject removes the caller's membership on the
+// coordinator and wipes their local clone of a project. The
+// remote repo is untouched. Refused when the caller is the last
+// owner — promote another member first.
 //
-// Validates that the project actually exists on the coordinator
-// before removing anything, so a typo'd project_id returns a
-// crisp "not found" error instead of silently pretending the
-// no-op succeeded.
+// Pass keep_membership=true to wipe just the local clone while
+// staying a member (the original Phase A behavior).
 func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
+	keepMembership := req.GetBool("keep_membership", false)
 	if c.workspace == nil {
 		return mcp.NewToolResultError("leave project is only available in MCP client mode"), nil
 	}
@@ -476,17 +476,164 @@ func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequ
 	if _, err := c.fetchProjectMeta(ctx, int64(projectID)); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("✗ Project #%d not found", projectID)), nil
 	}
+	// Remove the coordinator-side membership row before wiping
+	// the clone — if the remove is refused (last-owner), we
+	// want to bail out with a clear error, not orphan the local
+	// clone on top. When keepMembership is set, skip this.
+	var membershipMsg string
+	if !keepMembership && c.username != "" {
+		path := fmt.Sprintf("/api/v1/projects/%d/members/by-username/%s", projectID, c.username)
+		data, err := c.delete(ctx, path)
+		if err != nil {
+			return mcp.NewToolResultError("leaving project: " + err.Error()), nil
+		}
+		if len(data) > 0 {
+			var resp map[string]interface{}
+			if json.Unmarshal(data, &resp) == nil {
+				if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+					return mcp.NewToolResultError(errMsg), nil
+				}
+			}
+		}
+		membershipMsg = fmt.Sprintf("✓ Project #%d: membership removed. ", projectID)
+	}
 	hadClone := c.workspace.HasLocalClone(int64(projectID))
 	if err := c.workspace.LeaveProject(int64(projectID)); err != nil {
 		return mcp.NewToolResultError("removing local clone: " + err.Error()), nil
 	}
-	var line string
+	var cloneMsg string
 	if hadClone {
-		line = fmt.Sprintf("✓ Project #%d: local clone removed — next access will re-clone from the remote", projectID)
+		cloneMsg = "local clone removed"
 	} else {
-		line = fmt.Sprintf("• Project #%d: no clone to remove (already absent)", projectID)
+		cloneMsg = "no clone to remove (already absent)"
 	}
-	return mcp.NewToolResultText(line), nil
+	if keepMembership {
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Project #%d: %s — membership kept (keep_membership=true)", projectID, cloneMsg)), nil
+	}
+	return mcp.NewToolResultText(membershipMsg + cloneMsg), nil
+}
+
+// handleAddProjectMember grants membership to another citizen.
+// Maps directly onto POST /projects/{id}/members.
+func (c *apiClient) handleAddProjectMember(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	username, err := req.RequireString("username")
+	if err != nil {
+		return mcp.NewToolResultError("username is required"), nil
+	}
+	role := req.GetString("role", "")
+	body := map[string]string{"username": username}
+	if role != "" {
+		body["role"] = role
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/members", projectID), body)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(data, &resp) == nil {
+		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		addedRole, _ := resp["role"].(string)
+		if addedRole == "" {
+			addedRole = "member"
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Added %s to project #%d as %s", username, projectID, addedRole)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Added %s to project #%d", username, projectID)), nil
+}
+
+// handleRemoveProjectMember removes another citizen from a project.
+// Owner-only on the coordinator side.
+func (c *apiClient) handleRemoveProjectMember(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	username, err := req.RequireString("username")
+	if err != nil {
+		return mcp.NewToolResultError("username is required"), nil
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/members/by-username/%s", projectID, username)
+	data, err := c.delete(ctx, path)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if len(data) > 0 {
+		var resp map[string]interface{}
+		if json.Unmarshal(data, &resp) == nil {
+			if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+				return mcp.NewToolResultError(errMsg), nil
+			}
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Removed %s from project #%d", username, projectID)), nil
+}
+
+// handleListProjectMembers lists the project's members. Members
+// only on the coordinator side.
+func (c *apiClient) handleListProjectMembers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/members", projectID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// GET endpoints return the coordinator body verbatim on
+	// 4xx — detect the error envelope and surface it as a
+	// tool-level error rather than rendering it as a listing.
+	var envelope map[string]interface{}
+	if json.Unmarshal(data, &envelope) == nil {
+		if msg, ok := envelope["error"].(string); ok && msg != "" {
+			return mcp.NewToolResultError(msg), nil
+		}
+	}
+	return mcp.NewToolResultText(formatProjectMemberList(data, int64(projectID))), nil
+}
+
+// handlePromoteMember sets a member's role to owner.
+func (c *apiClient) handlePromoteMember(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return c.setMemberRole(ctx, req, "owner", "promoted")
+}
+
+// handleDemoteOwner sets an owner's role back to member.
+func (c *apiClient) handleDemoteOwner(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return c.setMemberRole(ctx, req, "member", "demoted")
+}
+
+// setMemberRole is the shared body of promote + demote — both PUT
+// the target role to the same role-change endpoint; only the
+// role value and result verb differ.
+func (c *apiClient) setMemberRole(ctx context.Context, req mcp.CallToolRequest, newRole, verb string) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	username, err := req.RequireString("username")
+	if err != nil {
+		return mcp.NewToolResultError("username is required"), nil
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/members/by-username/%s/role", projectID, username)
+	data, err := c.put(ctx, path, map[string]string{"role": newRole})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(data, &resp) == nil {
+		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		if changed, _ := resp["changed"].(bool); !changed {
+			return mcp.NewToolResultText(fmt.Sprintf("• %s is already %s on project #%d (no change)", username, newRole, projectID)), nil
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ %s %s on project #%d (now: %s)", username, verb, projectID, newRole)), nil
 }
 // handleSetProjectRemote updates a project's remote URL in the
 // coordinator DB and, if a local clone exists, reconfigures its
