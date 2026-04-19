@@ -178,13 +178,14 @@ func (s *Store) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS artifacts (
 		project_id INTEGER NOT NULL REFERENCES projects(id),
+		branch TEXT NOT NULL DEFAULT 'main',
 		path TEXT NOT NULL,
 		last_writer INTEGER REFERENCES citizens(id),
 		last_task_id TEXT,
 		last_run_id INTEGER,
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL,
-		PRIMARY KEY (project_id, path)
+		PRIMARY KEY (project_id, branch, path)
 	);
 
 	CREATE TABLE IF NOT EXISTS task_claims (
@@ -324,13 +325,106 @@ func (s *Store) migrate() error {
 		// map[string]string. Populated on compute tasks that
 		// declare env:; empty string for every other task.
 		`ALTER TABLE tasks ADD COLUMN env TEXT NOT NULL DEFAULT ''`,
+		// Branch-per-run model. Every project has a default
+		// branch (new runs land there when the caller doesn't
+		// specify otherwise); every run carries the branch it
+		// commits to. Legacy rows default to 'main' so pre-
+		// migration projects and runs keep working unchanged.
+		// See docs/runs-and-branches.md.
+		`ALTER TABLE projects ADD COLUMN default_branch TEXT NOT NULL DEFAULT 'main'`,
+		`ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("schema alter %q: %w", q, err)
 		}
 	}
+
+	// Serial-runs-per-branch invariant enforced at the DB
+	// level. Partial unique index so only ACTIVE runs collide —
+	// completed / failed runs on the same branch are fine.
+	// Belt-and-suspenders alongside the application-level
+	// ActiveRunOnBranch check in handleCreateRun, which races
+	// under concurrent requests without this guard. Lives here
+	// (not in the schema block above) because it references the
+	// `branch` column which comes in via ALTER TABLE.
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state = 'active'`); err != nil {
+		return fmt.Errorf("schema: create idx_runs_active_branch: %w", err)
+	}
+
+	// Branch-per-run artifact index migration. SQLite can't
+	// alter a PRIMARY KEY in place, so: check if the artifacts
+	// table is missing the `branch` column (old schema keyed
+	// by (project_id, path)), and if so rebuild it keyed by
+	// (project_id, branch, path). All existing rows default
+	// to branch="main" since that's the only branch pre-
+	// migration runs targeted.
+	hasBranch, err := columnExists(s.db, "artifacts", "branch")
+	if err != nil {
+		return fmt.Errorf("checking artifacts.branch column: %w", err)
+	}
+	if !hasBranch {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin artifacts migration: %w", err)
+		}
+		stmts := []string{
+			`CREATE TABLE artifacts_v2 (
+				project_id INTEGER NOT NULL REFERENCES projects(id),
+				branch TEXT NOT NULL DEFAULT 'main',
+				path TEXT NOT NULL,
+				last_writer INTEGER REFERENCES citizens(id),
+				last_task_id TEXT,
+				last_run_id INTEGER,
+				commit_sha TEXT NOT NULL DEFAULT '',
+				created_at TIMESTAMP NOT NULL,
+				updated_at TIMESTAMP NOT NULL,
+				PRIMARY KEY (project_id, branch, path)
+			)`,
+			`INSERT INTO artifacts_v2 (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
+			 SELECT project_id, 'main', path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at FROM artifacts`,
+			`DROP TABLE artifacts`,
+			`ALTER TABLE artifacts_v2 RENAME TO artifacts`,
+			`CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id)`,
+		}
+		for _, q := range stmts {
+			if _, err := tx.Exec(q); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("artifacts migration %q: %w", q, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit artifacts migration: %w", err)
+		}
+	}
 	return nil
+}
+
+// columnExists reports whether a column is present in a SQLite
+// table. Used by one-off schema migrations that need to detect
+// "old shape vs new shape" because SQLite doesn't let you ALTER
+// a PRIMARY KEY in place. A missing table is treated as
+// "column absent" so fresh databases (which create the table
+// with the new shape) skip the migration entirely.
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // --- Projects (long-lived containers) ---
@@ -341,15 +435,38 @@ func (s *Store) CreateProject(p *ProjectRecord) (int64, error) {
 	if p.RemoteURL != "" {
 		remote = sql.NullString{String: p.RemoteURL, Valid: true}
 	}
+	// Default branch fallback: empty in → "main" on disk. The
+	// column default on the schema is also "main" but we set
+	// it explicitly here so the canonical INSERT shape always
+	// carries the value (simpler to reason about downstream).
+	branch := p.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
 	result, err := s.db.Exec(
-		`INSERT INTO projects (name, description, created_by, remote_url, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		p.Name, p.Description, p.CreatedBy, remote, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO projects (name, description, created_by, remote_url, default_branch, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.Name, p.Description, p.CreatedBy, remote, branch, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, err
 	}
 	return result.LastInsertId()
+}
+
+// SetProjectDefaultBranch updates a project's default branch.
+// Empty input defaults to "main" so the column is never left
+// blank. Validation (shape, length) is the caller's job — the
+// API handler calls validateBranchName before this point.
+func (s *Store) SetProjectDefaultBranch(projectID int64, branch string) error {
+	if branch == "" {
+		branch = "main"
+	}
+	_, err := s.db.Exec(
+		`UPDATE projects SET default_branch = ?, updated_at = ? WHERE id = ?`,
+		branch, time.Now(), projectID,
+	)
+	return err
 }
 
 // SetProjectRemoteURL updates a project's external git remote URL.
@@ -369,14 +486,14 @@ func (s *Store) SetProjectRemoteURL(projectID int64, remoteURL string) error {
 // projectSelectColumns is the canonical SELECT list for project rows,
 // kept in one place so every scanner pulls the same set in the same
 // order.
-const projectSelectColumns = `id, name, description, created_by, remote_url, created_at, updated_at`
+const projectSelectColumns = `id, name, description, created_by, remote_url, default_branch, created_at, updated_at`
 
 // scanProject reads one project row from a scanner into p.
 func scanProject(row interface {
 	Scan(dest ...interface{}) error
 }, p *ProjectRecord) error {
 	var desc, createdBy, remote sql.NullString
-	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.DefaultBranch, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return err
 	}
 	p.Description = desc.String
@@ -437,7 +554,7 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 // ListRunsByProject returns all runs in a project, ordered by seq.
 func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
 		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
 	)
 	if err != nil {
@@ -449,7 +566,7 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Ref = ref.String
@@ -625,10 +742,17 @@ func (s *Store) CreateRun(p *RunRecord) (int64, int, error) {
 	}
 	nextSeq := int(maxSeq.Int64) + 1
 
+	// Branch fallback: empty in → "main". Mirrors the schema
+	// default so the column is always populated with something
+	// meaningful (not the empty string).
+	branch := p.Branch
+	if branch == "" {
+		branch = "main"
+	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.Params, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.Params, branch, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err
@@ -649,8 +773,8 @@ func (s *Store) GetRun(id int64) (*RunRecord, error) {
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, created_at, updated_at FROM runs WHERE id = ?`, id,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -663,9 +787,9 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -674,7 +798,7 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 }
 
 func (s *Store) ListRuns() ([]RunRecord, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, created_at, updated_at FROM runs ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at FROM runs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -684,13 +808,61 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	for rows.Next() {
 		var p RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Ref = ref.String
 		runs = append(runs, p)
 	}
 	return runs, rows.Err()
+}
+
+// ActiveRunOnBranch returns the first ACTIVE run on the given
+// project+branch pair, or nil if none exists. Used by
+// handleCreateRun to enforce the serial-runs-per-branch
+// invariant: a second run on the same branch would step on the
+// first one's artifact writes, so we refuse it with a clear
+// error pointing at the existing run.
+func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, error) {
+	var r RunRecord
+	var ref sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
+		 FROM runs WHERE project_id = ? AND branch = ? AND state = 'active'
+		 ORDER BY seq ASC LIMIT 1`,
+		projectID, branch,
+	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.CreatedAt, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Ref = ref.String
+	return &r, nil
+}
+
+// ListRunBranches returns every distinct branch used by runs in
+// the given project. Used by the "auto" branch-name allocator
+// to pick an unused run-N.
+func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT DISTINCT branch FROM runs WHERE project_id = ? ORDER BY branch ASC`,
+		projectID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var b string
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) UpdateRunState(id int64, state RunState) error {
@@ -1513,11 +1685,12 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 }
 
 func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
-	// Pull project_id once for this run — every pending task in the run
-	// belongs to the same project, and we need it to check whether any
-	// reads_artifacts have been produced yet.
+	// Pull project_id + branch once for this run — every
+	// pending task shares both, and the artifact index lookups
+	// below need (project, branch) to find the right row.
 	var projectID int64
-	if err := s.db.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
+	var runBranch string
+	if err := s.db.QueryRow(`SELECT project_id, branch FROM runs WHERE id = ?`, runID).Scan(&projectID, &runBranch); err != nil {
 		return 0, fmt.Errorf("loading run project: %w", err)
 	}
 
@@ -1596,7 +1769,7 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 					if p == "" {
 						continue
 					}
-					a, err := s.GetArtifact(projectID, p)
+					a, err := s.GetArtifact(projectID, runBranch, p)
 					if err != nil {
 						return count, fmt.Errorf("checking artifact %s: %w", p, err)
 					}
@@ -1883,40 +2056,54 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 
 // --- Artifacts ---
 
-// UpsertArtifact records that a task wrote an artifact at the given path.
-// On first write the row is created; on subsequent writes the provenance
-// fields (last_writer, last_task_id, last_run_id, commit_sha,
-// updated_at) are refreshed and created_at is preserved.
+// UpsertArtifact records that a task wrote an artifact at the
+// given (branch, path) pair. On first write the row is created;
+// on subsequent writes the provenance fields (last_writer,
+// last_task_id, last_run_id, commit_sha, updated_at) are
+// refreshed and created_at is preserved.
+//
+// Branch defaults to "main" when empty — both for backwards-
+// compat with pre-branch-model callers and so the canonical
+// INSERT always carries a concrete value.
 func (s *Store) UpsertArtifact(a *ArtifactRecord) error {
 	if a.ProjectID == 0 || a.Path == "" {
 		return fmt.Errorf("UpsertArtifact: project_id and path are required")
 	}
+	branch := a.Branch
+	if branch == "" {
+		branch = "main"
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO artifacts (project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_id, path) DO UPDATE SET
+		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, branch, path) DO UPDATE SET
 		   last_writer  = excluded.last_writer,
 		   last_task_id = excluded.last_task_id,
 		   last_run_id  = excluded.last_run_id,
 		   commit_sha   = excluded.commit_sha,
 		   updated_at   = excluded.updated_at`,
-		a.ProjectID, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA,
+		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA,
 		a.CreatedAt, a.UpdatedAt,
 	)
 	return err
 }
 
-// GetArtifact looks up one artifact's index row by (project_id, path).
-// Returns nil if the artifact doesn't exist.
-func (s *Store) GetArtifact(projectID int64, path string) (*ArtifactRecord, error) {
+// GetArtifact looks up one artifact's index row by
+// (project_id, branch, path). Empty branch resolves to "main"
+// for back-compat with callers that don't know the branch yet.
+// Returns nil if no matching row exists.
+func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactRecord, error) {
+	if branch == "" {
+		branch = "main"
+	}
 	var a ArtifactRecord
 	var lastTaskID sql.NullString
 	var lastWriter, lastRunID sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
-		 FROM artifacts WHERE project_id = ? AND path = ?`,
-		projectID, path,
-	).Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt)
+		`SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
+		 FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`,
+		projectID, branch, path,
+	).Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1954,36 +2141,11 @@ func (s *Store) ListTasksWritingArtifact(projectID int64, path string, acceptedO
 	return scanTasks(rows)
 }
 
-// ListTasksReadingArtifact returns tasks in a project whose
-// reads_artifacts declaration contains the given path. If acceptedOnly
-// is true, only currently-accepted tasks are returned.
-//
-// Used by the invalidation cascade to find cross-run readers — tasks
-// that consumed an artifact version that's now being rolled back.
-//
-// Implementation: reads_artifacts is stored as a JSON array string
-// (e.g. `["notes/intro.md","src/main.py"]`). A LIKE pattern with the
-// quoted path anchors matches so `notes/intro` doesn't false-match on
-// `notes/intro.md`. Paths aren't allowed to contain `"` so this is
-// safe against embedded-quote false positives.
-func (s *Store) ListTasksReadingArtifact(projectID int64, path string, acceptedOnly bool) ([]TaskRecord, error) {
-	pattern := `%"` + path + `"%`
-	query := `SELECT ` + taskColumns + ` FROM tasks
-	          WHERE reads_artifacts LIKE ?
-	            AND run_id IN (SELECT id FROM runs WHERE project_id = ?)`
-	args := []interface{}{pattern, projectID}
-	if acceptedOnly {
-		query += ` AND state = 'accepted'`
-	}
-	query += ` ORDER BY id`
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanTasks(rows)
-}
+// ListTasksReadingArtifact was removed with the branch-per-run
+// model: cross-run reader cascade no longer exists, so no
+// caller needs to enumerate readers across runs. Within a
+// single run the reads_artifacts declaration plus UpdateReadyTasks
+// gating is enough to sequence things correctly.
 
 // DeleteTasksByDefInRun removes every task row in the given
 // run whose task_def_id matches. Used by the Phase J.1
@@ -2036,21 +2198,31 @@ func (s *Store) DeleteTasksByDefInRun(runID int64, defID string) error {
 // Used by the rollback path when an invalidated task was the file's
 // first writer — the artifact stops existing entirely. Git history
 // still has the previous state, so this is not destructive.
-func (s *Store) DeleteArtifact(projectID int64, path string) error {
+// DeleteArtifact removes an artifact index row keyed by
+// (project_id, branch, path). Empty branch resolves to "main".
+func (s *Store) DeleteArtifact(projectID int64, branch, path string) error {
+	if branch == "" {
+		branch = "main"
+	}
 	_, err := s.db.Exec(
-		`DELETE FROM artifacts WHERE project_id = ? AND path = ?`,
-		projectID, path,
+		`DELETE FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`,
+		projectID, branch, path,
 	)
 	return err
 }
 
-// ListArtifactsByProject returns all artifacts for a project, ordered by
-// path. If pathPrefix is non-empty, only artifacts whose path starts with
-// it are returned (useful for listing a directory subtree).
-func (s *Store) ListArtifactsByProject(projectID int64, pathPrefix string) ([]ArtifactRecord, error) {
-	query := `SELECT project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
-	          FROM artifacts WHERE project_id = ?`
-	args := []interface{}{projectID}
+// ListArtifactsByProject returns all artifacts for a project on
+// a specific branch, ordered by path. Empty branch resolves to
+// "main". If pathPrefix is non-empty, only artifacts whose path
+// starts with it are returned (useful for listing a directory
+// subtree).
+func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix string) ([]ArtifactRecord, error) {
+	if branch == "" {
+		branch = "main"
+	}
+	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
+	          FROM artifacts WHERE project_id = ? AND branch = ?`
+	args := []interface{}{projectID, branch}
 	if pathPrefix != "" {
 		query += ` AND path LIKE ?`
 		args = append(args, pathPrefix+"%")
@@ -2068,7 +2240,7 @@ func (s *Store) ListArtifactsByProject(projectID int64, pathPrefix string) ([]Ar
 		var a ArtifactRecord
 		var lastTaskID sql.NullString
 		var lastWriter, lastRunID sql.NullInt64
-		if err := rows.Scan(&a.ProjectID, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.LastWriter = lastWriter.Int64

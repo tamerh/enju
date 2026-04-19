@@ -60,8 +60,8 @@ type ReadStore interface {
 	GetCitizen(id int64) (*store.CitizenRecord, error)
 	GetCitizenByUsername(username string) (*store.CitizenRecord, error)
 
-	// Artifacts
-	GetArtifact(projectID int64, path string) (*store.ArtifactRecord, error)
+	// Artifacts — keyed by (project, branch, path) so runs on
+	// isolated branches see their own rows.
+	GetArtifact(projectID int64, branch, path string) (*store.ArtifactRecord, error)
 	ListTasksWritingArtifact(projectID int64, path string, acceptedOnly bool) ([]store.TaskRecord, error)
-	ListTasksReadingArtifact(projectID int64, path string, acceptedOnly bool) ([]store.TaskRecord, error)
 }

@@ -550,8 +550,16 @@ func (s *testServer) submitYAMLToProject(path string, projectID int64) string {
 	if err != nil {
 		s.t.Fatal(err)
 	}
+	// Serial-runs-per-branch invariant: every run lands on
+	// exactly one branch. For test code that creates multiple
+	// runs in a single project to exercise numbering /
+	// idempotency / error paths, auto-naming each one sidesteps
+	// the "main already has an active run" refusal. Membership-
+	// and branch-specific tests pass branch explicitly via the
+	// MCP tool path instead.
 	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", projectID), map[string]string{
-		"yaml": string(data),
+		"yaml":   string(data),
+		"branch": "auto",
 	})
 
 	// The run's per-project sequence is what we use for task ID prefixing
@@ -1470,10 +1478,12 @@ func TestPerProjectRunNumbering(t *testing.T) {
 
 	yamlData, _ := os.ReadFile("testdata/simple-no-deps.yaml")
 
-	// Project A gets runs #1, #2
-	r1 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData)})
+	// Project A gets runs #1, #2. Each lands on its own auto-
+	// allocated branch so the serial-per-branch invariant
+	// doesn't block the second submission.
+	r1 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData), "branch": "auto"})
 	seq1, _ := r1["seq"].(float64)
-	r2 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData)})
+	r2 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid1), map[string]string{"yaml": string(yamlData), "branch": "auto"})
 	seq2, _ := r2["seq"].(float64)
 
 	if int(seq1) != 1 || int(seq2) != 2 {
@@ -1481,7 +1491,7 @@ func TestPerProjectRunNumbering(t *testing.T) {
 	}
 
 	// Project B also starts from #1 (independent numbering)
-	r3 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid2), map[string]string{"yaml": string(yamlData)})
+	r3 := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid2), map[string]string{"yaml": string(yamlData), "branch": "auto"})
 	seq3, _ := r3["seq"].(float64)
 
 	if int(seq3) != 1 {
@@ -1676,7 +1686,10 @@ tasks:
     action: answer
     prompt: "Warmup"
 `
-	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": validYAML})
+	// Each successful run gets its own auto-allocated branch so
+	// the serial-per-branch invariant doesn't interfere with
+	// the seq-numbering assertions in this test.
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": validYAML, "branch": "auto"})
 	firstSeq, _ := resp["seq"].(float64)
 	if firstSeq != 1 {
 		t.Fatalf("expected first run seq 1, got %v", resp["seq"])
@@ -1704,7 +1717,7 @@ tasks:
     prompt: "Fourth"
 `, alice)
 
-	badResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": badYAML})
+	badResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": badYAML, "branch": "auto"})
 	if _, hasErr := badResp["error"]; !hasErr {
 		t.Fatalf("expected error for mid-file validation failure, got: %v", badResp)
 	}
@@ -1719,7 +1732,7 @@ tasks:
     action: answer
     prompt: "After the failure"
 `
-	goodResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": goodYAML})
+	goodResp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid), map[string]string{"yaml": goodYAML, "branch": "auto"})
 	nextSeq, _ := goodResp["seq"].(float64)
 	if nextSeq != 2 {
 		t.Fatalf("expected next run seq 2 (failed submission should not consume a seq), got %v", goodResp["seq"])

@@ -103,7 +103,7 @@ func (m *mockStore) GetCitizenByUsername(username string) (*store.CitizenRecord,
 	return m.citizensByUN[username], nil
 }
 
-func (m *mockStore) GetArtifact(projectID int64, path string) (*store.ArtifactRecord, error) {
+func (m *mockStore) GetArtifact(projectID int64, branch, path string) (*store.ArtifactRecord, error) {
 	if m.artifacts == nil {
 		return nil, nil
 	}
@@ -111,10 +111,6 @@ func (m *mockStore) GetArtifact(projectID int64, path string) (*store.ArtifactRe
 }
 
 func (m *mockStore) ListTasksWritingArtifact(projectID int64, path string, acceptedOnly bool) ([]store.TaskRecord, error) {
-	return nil, nil
-}
-
-func (m *mockStore) ListTasksReadingArtifact(projectID int64, path string, acceptedOnly bool) ([]store.TaskRecord, error) {
 	return nil, nil
 }
 

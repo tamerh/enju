@@ -67,11 +67,7 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	// older clients that don't know the param never error.
 	switch req.GetString("format", "default") {
 	case "mermaid":
-		var artifactsData []byte
-		if req.GetBool("include_external", false) {
-			artifactsData, _ = c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
-		}
-		return mcp.NewToolResultText(formatRunStatusMermaidWith(run, tasks, artifactsData)), nil
+		return mcp.NewToolResultText(formatRunStatusMermaid(run, tasks)), nil
 	default:
 		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
 	}
@@ -126,14 +122,11 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if c.workspace == nil {
 			return mcp.NewToolResultError("enju_create_run with 'path' requires a local workspace (MCP client mode)"), nil
 		}
-		remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
+		openedProj, _, _, _, err := c.openProject(ctx, int64(projectID))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		proj, err = c.workspace.ForProject(int64(projectID), remoteURL, projName)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
+		proj = openedProj
 		// Best-effort pull. If the remote is unreachable or has
 		// diverged, fall through and scan whatever's on disk —
 		// the loader will surface a clear "template not found"
@@ -163,6 +156,9 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if sourceCommitSHA != "" {
 			body["source_commit_sha"] = sourceCommitSHA
 		}
+	}
+	if branch := req.GetString("branch", ""); branch != "" {
+		body["branch"] = branch
 	}
 
 	apiPath := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
@@ -266,33 +262,20 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Optional: cross-run artifact edges. When include_external
-	// is true, fetch the project's artifact index and pass it
-	// through — the renderer adds 📎 external nodes for reads
-	// whose current writer lives in another run. Default off to
-	// keep the diagram focused on intra-run dataflow; opt in
-	// when the preprint or audit context wants the full data
-	// dependency graph.
-	var artifactsData []byte
-	if req.GetBool("include_external", false) {
-		artifactsData, _ = c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
-	}
-
 	// Render the raw body for the file. The body is "" when
 	// the run lookup failed (coordinator returned an error
 	// object) — surface that to the caller rather than
-	// committing an empty .mmd.
-	body := renderMermaidBody(runData, tasksData, artifactsData)
+	// committing an empty .mmd. The include_external flag that
+	// used to render cross-run artifact edges was removed with
+	// the branch-per-run model — branches isolate runs, so
+	// there's no "external" edge to visualize.
+	body := renderMermaidBody(runData, tasksData)
 	if body == "" {
 		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
 	}
 
 	// Acquire a workspace for the project so we can commit.
-	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -410,11 +393,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	// Commit the snapshot into git. Matches the
 	// handleExportDiagram pattern exactly — workspace lock,
 	// CommitFiles, embed path in response.
-	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

@@ -2360,67 +2360,13 @@ tasks:
 	}
 }
 
-// TestMCPInvalidateCascadesAcrossRunsViaArtifactReads is the
-// MCP-layer port. Invalidating an artifact writer must cascade
-// readers in OTHER runs too, flipping them from ACCEPTED to
-// PENDING via the artifact-aware scheduler.
-func TestMCPInvalidateCascadesAcrossRunsViaArtifactReads(t *testing.T) {
-	h := newMCPHarness(t, "CrossRun Alice")
-	projectID := h.createTestProject()
-
-	// Run 1: writer.
-	yaml1 := `name: "writer"
-version: 1
-tasks:
-  - id: write_v1
-    action: answer
-    writes_artifacts: [notes/intro.md]
-    prompt: "Write it."
-`
-	h.mcpCreateRunInline(t, projectID, yaml1)
-	h.mcpClaimOK(t, "write_v1")
-	h.mcpSubmitArtifacts(t, "write_v1", "made v1", map[string]string{"notes/intro.md": "version ONE"})
-
-	// Run 2: reader (separate run).
-	yaml2 := `name: "reader"
-version: 1
-tasks:
-  - id: summarize
-    action: answer
-    reads_artifacts: [notes/intro.md]
-    prompt: "Summarize {{artifact:notes/intro.md}}"
-`
-	h.mcpCreateRunInline(t, projectID, yaml2)
-	h.mcpClaimOK(t, "summarize")
-	h.mcpSubmitText(t, "summarize", "summary of version ONE")
-	if got := h.taskGet("summarize")["state"]; got != "accepted" {
-		t.Fatalf("summarize should be accepted pre-invalidate, got %v", got)
-	}
-
-	// Invalidate write_v1 — summarize must cascade across runs.
-	h.lastRunSeq = 1
-	invRes := h.callOK(t, "enju_invalidate_task", map[string]any{
-		"task_id": h.taskID("write_v1"),
-		"reason":  "testing cross-run cascade",
-	})
-	invText := mcpText(invRes)
-	if !strings.Contains(invText, "summarize") {
-		t.Errorf("expected invalidate output to mention cross-run reader 'summarize', got: %s", invText)
-	}
-
-	// summarize dropped to PENDING (artifact-aware scheduler
-	// blocks promotion until the artifact is re-written).
-	h.lastRunSeq = 2
-	if got := h.taskGet("summarize")["state"]; got != "pending" {
-		t.Fatalf("expected summarize PENDING after cross-run cascade, got %v", got)
-	}
-
-	// Run 2 should be back to active.
-	run2 := h.get(fmt.Sprintf("/api/v1/projects/%d/runs/2", projectID))
-	if run2["state"] != "active" {
-		t.Fatalf("expected run 2 active after cross-run cascade, got %v", run2["state"])
-	}
-}
+// TestMCPInvalidateCascadesAcrossRunsViaArtifactReads was
+// deleted with the branch-per-run redesign: cross-run artifact
+// cascades don't exist any more. Runs on distinct branches are
+// isolated workspaces; runs on the same branch are serial. The
+// "action at a distance" the old cascade existed to paper over
+// is handled at the git-branch level now. See
+// docs/runs-and-branches.md.
 
 // TestMCPInvalidateRejectsNonAcceptedTarget is the MCP-layer
 // port. Invalidating a task that isn't in the ACCEPTED state must
@@ -5050,111 +4996,10 @@ tasks:
 	}
 }
 
-// TestMCPMermaidCrossRunArtifactEdges exercises the opt-in
-// include_external flag. A task in run #2 reads an artifact
-// written by run #1. Default Mermaid output omits the
-// cross-run dependency (intra-run graph only); with
-// include_external=true the artifact shows up as a dashed
-// "📎 <path> (from run #N)" external node with an edge into
-// the reader, making the full data-flow explicit. Needed for
-// preprint figures tracing upstream provenance, or audit
-// contexts where "where did this input come from?" matters.
-func TestMCPMermaidCrossRunArtifactEdges(t *testing.T) {
-	h := newMCPHarness(t, "CrossRunArtifactA")
-	projectID := h.createTestProject()
-
-	// Run #1: produce the artifact.
-	v1YAML := `name: "writer run"
-version: 1
-tasks:
-  - id: write_intro
-    action: answer
-    writes_artifacts: [data/intro.md]
-    prompt: "Write the intro."
-`
-	h.mcpCreateRunInline(t, projectID, v1YAML)
-	h.mcpClaimOK(t, "write_intro")
-	h.mcpSubmitArtifacts(t, "write_intro", "intro v1", map[string]string{
-		"data/intro.md": "THE INTRO",
-	})
-
-	// Run #2: read the artifact from run #1.
-	v2YAML := `name: "reader run"
-version: 1
-tasks:
-  - id: consume
-    action: answer
-    reads_artifacts: [data/intro.md]
-    prompt: "Using {{artifact:data/intro.md}}, do a thing."
-`
-	h.mcpCreateRunInline(t, projectID, v2YAML)
-
-	// Default mermaid output on run #2: no external node. The
-	// cross-run artifact is invisible by design — keeps the
-	// "show me this run" use case focused.
-	resDefault := h.callOK(t, "enju_run_status", map[string]any{
-		"project_id": float64(projectID),
-		"run_id":     float64(2),
-		"format":     "mermaid",
-	})
-	defaultOut := mcpText(resDefault)
-	if strings.Contains(defaultOut, "ext_art_") {
-		t.Errorf("default mermaid should not include external artifact nodes; got:\n%s", defaultOut)
-	}
-	if strings.Contains(defaultOut, "from run #1") {
-		t.Errorf("default mermaid should not mention cross-run writer; got:\n%s", defaultOut)
-	}
-
-	// With include_external=true, run #1's writer shows up as
-	// an external 📎 node with the `external` class, and an
-	// edge flows from that node into the reader task.
-	resExt := h.callOK(t, "enju_run_status", map[string]any{
-		"project_id":       float64(projectID),
-		"run_id":           float64(2),
-		"format":           "mermaid",
-		"include_external": true,
-	})
-	extOut := mcpText(resExt)
-	if !strings.Contains(extOut, "📎 data/intro.md") {
-		t.Errorf("expected 📎 external node labeling the artifact; got:\n%s", extOut)
-	}
-	if !strings.Contains(extOut, "from run #1") {
-		t.Errorf("expected writer run id surfaced in external node label; got:\n%s", extOut)
-	}
-	if !strings.Contains(extOut, ":::external") {
-		t.Errorf("expected external class on the artifact node; got:\n%s", extOut)
-	}
-	// Edge: external node → reader. Node id is prefixed
-	// ext_art_ and the reader's full task id gets the standard
-	// t_ sanitization.
-	if !strings.Contains(extOut, "ext_art_data_intro_md --> t_1_2_consume") {
-		t.Errorf("expected edge from external artifact node to consume task; got:\n%s", extOut)
-	}
-
-	// enju_export_diagram honors include_external too — same
-	// artifact node + edge appear in the committed .mmd.
-	expRes := h.callOK(t, "enju_export_diagram", map[string]any{
-		"project_id":       float64(projectID),
-		"run_id":           float64(2),
-		"phase":            "with_external",
-		"include_external": true,
-	})
-	expOut := mcpText(expRes)
-	if !strings.Contains(expOut, "📎 data/intro.md") {
-		t.Errorf("export_diagram with include_external=true missing external artifact node; got:\n%s", expOut)
-	}
-	// File content should also contain the external node (raw
-	// .mmd, no fences).
-	// Path is .enju/runs/{run_seq}/graph/..., where run_seq is
-	// the 2nd run in this project — so "2", not some global id.
-	fileBody, ok := h.readRepoFile(projectID, ".enju/runs/2/graph/with_external.mmd")
-	if !ok {
-		t.Fatalf("expected with_external.mmd in bare remote")
-	}
-	if !strings.Contains(string(fileBody), "ext_art_data_intro_md") {
-		t.Errorf("committed .mmd file missing external artifact node; got:\n%s", fileBody)
-	}
-}
+// TestMCPMermaidCrossRunArtifactEdges was removed alongside the
+// cross-run artifact cascade — branches isolate a run's graph
+// from other runs' writes, so there's no "external" relationship
+// to render any more. See docs/runs-and-branches.md.
 
 // TestMCPMermaidFanOutFromDynamicForEach is a regression test
 // for the "discover floats as a disconnected node" bug: when a
@@ -7019,89 +6864,10 @@ tasks:
 	}
 }
 
-// TestMCPDynamicForEachCrossRunArtifactInvalidation verifies
-// cross-run cascade works when the artifact writer is a
-// for_each instance. A run-1 instance writes an artifact; a
-// separate run-2 task reads it. Invalidating the writer
-// instance must bounce the cross-run reader too.
-func TestMCPDynamicForEachCrossRunArtifactInvalidation(t *testing.T) {
-	h := newMCPHarness(t, "CrossRunForEach")
-	projectID := h.createTestProject()
-
-	// Run 1: for_each writer. writes_artifacts isn't template-
-	// resolved at materialization time, so we use a fixed path
-	// and limit the test to a single instance (last-write-wins
-	// would otherwise have instances race on the same file).
-	writerYAML := `name: "writer run"
-version: 1
-tasks:
-  - id: discover
-    action: answer
-    prompt: "List."
-    outputs:
-      items:
-        format: list<string>
-  - id: expand
-    action: answer
-    for_each:
-      x: "{{discover.items}}"
-    writes_artifacts:
-      - notes/alpha.md
-    prompt: "Write for {{x}}"
-`
-	h.mcpCreateRunInline(t, projectID, writerYAML)
-	h.mcpClaimOK(t, "discover")
-	h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha"})
-
-	// Each instance writes its own artifact.
-	h.mcpClaimOK(t, "alpha:expand")
-	h.mcpSubmitArtifacts(t, "alpha:expand", "",
-		map[string]string{"notes/alpha.md": "alpha note v1"})
-
-	// Artifact landed.
-	if content, ok := h.readArtifactFile(projectID, "notes/alpha.md"); !ok || content != "alpha note v1" {
-		t.Fatalf("artifact write failed: ok=%v content=%q", ok, content)
-	}
-
-	// Run 2: reader. Separate run reads the artifact.
-	readerYAML := `name: "reader run"
-version: 1
-tasks:
-  - id: summarize
-    action: answer
-    reads_artifacts: [notes/alpha.md]
-    prompt: "Summarize {{artifact:notes/alpha.md}}"
-`
-	h.mcpCreateRunInline(t, projectID, readerYAML)
-	h.mcpClaimOK(t, "summarize")
-	h.mcpSubmitText(t, "summarize", "summary v1")
-
-	// Point lastRunSeq back at run 1 before invalidating alpha.
-	h.lastRunSeq = 1
-	h.lastRunID = fmt.Sprintf("%d:1", projectID)
-	h.mcpInvalidate(t, "alpha:expand", "cross-run cascade test")
-
-	// Reader in run 2 must have cascaded to PENDING.
-	h.lastRunSeq = 2
-	h.lastRunID = fmt.Sprintf("%d:2", projectID)
-	if got, _ := h.taskGet("summarize")["state"].(string); got != "pending" {
-		t.Errorf("cross-run reader should be PENDING after per-instance writer invalidate, got %q", got)
-	}
-
-	// Recovery: re-submit alpha:expand with new artifact
-	// content → reader should unblock.
-	h.lastRunSeq = 1
-	h.lastRunID = fmt.Sprintf("%d:1", projectID)
-	h.mcpClaimOK(t, "alpha:expand")
-	h.mcpSubmitArtifacts(t, "alpha:expand", "",
-		map[string]string{"notes/alpha.md": "alpha note v2"})
-
-	h.lastRunSeq = 2
-	h.lastRunID = fmt.Sprintf("%d:2", projectID)
-	if got, _ := h.taskGet("summarize")["state"].(string); got != "ready" {
-		t.Errorf("cross-run reader should be READY after writer re-submit, got %q", got)
-	}
-}
+// TestMCPDynamicForEachCrossRunArtifactInvalidation was
+// removed with the branch-per-run model — cross-run artifact
+// cascade isn't a thing any more. A for_each writer's
+// invalidation stays inside its own run.
 
 // TestMCPDynamicForEachComputeAction verifies action:compute
 // works inside a dynamic for_each. Each materialized compute

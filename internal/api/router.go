@@ -245,6 +245,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects", s.handleListProjects)
 		r.Get("/projects/{projectID}", s.handleGetProject)
 		r.Put("/projects/{projectID}/remote", s.handleSetProjectRemote)
+		r.Put("/projects/{projectID}/default_branch", s.handleSetProjectDefaultBranch)
 		r.Get("/projects/{projectID}/runs", s.handleListProjectRuns)
 		r.Get("/projects/{projectID}/artifacts", s.handleListArtifacts)
 		r.Get("/projects/{projectID}/artifacts/*", s.handleGetArtifact)
@@ -342,6 +343,13 @@ type createProjectRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	RemoteURL   string `json:"remote_url,omitempty"`
+	// DefaultBranch is the git branch new runs land on by
+	// default. Optional — falls back to "main" when unset or
+	// empty. Orgs that want Enju activity to stay off their
+	// repo's main branch set this to e.g. "enju/work" at
+	// create-project time. Validated against the same loose
+	// git-ref grammar as branch= on create_run.
+	DefaultBranch string `json:"default_branch,omitempty"`
 }
 
 type setProjectRemoteRequest struct {
@@ -349,12 +357,13 @@ type setProjectRemoteRequest struct {
 }
 
 type projectResponse struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	RemoteURL   string `json:"remote_url,omitempty"`
-	RunCount    int    `json:"run_count"`
-	CreatedAt   string `json:"created_at"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	RemoteURL     string `json:"remote_url,omitempty"`
+	DefaultBranch string `json:"default_branch,omitempty"`
+	RunCount      int    `json:"run_count"`
+	CreatedAt     string `json:"created_at"`
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -389,13 +398,21 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authentication required to create a project")
 		return
 	}
+	defaultBranch := strings.TrimSpace(req.DefaultBranch)
+	if defaultBranch != "" {
+		if err := validateBranchName(defaultBranch); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	id, err := s.store.CreateProject(&store.ProjectRecord{
-		Name:        req.Name,
-		Description: req.Description,
-		CreatedBy:   creator.Username,
-		RemoteURL:   req.RemoteURL,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Name:          req.Name,
+		Description:   req.Description,
+		CreatedBy:     creator.Username,
+		RemoteURL:     req.RemoteURL,
+		DefaultBranch: defaultBranch,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create project: "+err.Error())
@@ -410,11 +427,16 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 			"project_id", id, "citizen_id", creator.ID, "error", err)
 	}
 
+	effectiveBranch := defaultBranch
+	if effectiveBranch == "" {
+		effectiveBranch = "main"
+	}
 	writeJSON(w, http.StatusCreated, projectResponse{
-		ID:        id,
-		Name:      req.Name,
-		RemoteURL: req.RemoteURL,
-		CreatedAt: now.Format(time.RFC3339),
+		ID:            id,
+		Name:          req.Name,
+		RemoteURL:     req.RemoteURL,
+		DefaultBranch: effectiveBranch,
+		CreatedAt:     now.Format(time.RFC3339),
 	})
 }
 
@@ -464,6 +486,51 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleSetProjectDefaultBranch updates a project's
+// default_branch column. Owner-only: the default branch is
+// where new runs land when no explicit branch is specified, so
+// flipping it is the sort of project-wide configuration change
+// that should sit with the admin tier.
+func (s *Server) handleSetProjectDefaultBranch(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if projectID == 0 {
+		writeError(w, http.StatusBadRequest, "invalid project ID")
+		return
+	}
+	m, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	if m != nil && m.Role != store.ProjectRoleOwner {
+		writeError(w, http.StatusForbidden, "only project owners can change the default branch")
+		return
+	}
+	var req struct {
+		Branch string `json:"branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	branch := strings.TrimSpace(req.Branch)
+	if branch == "" {
+		writeError(w, http.StatusBadRequest, "branch is required")
+		return
+	}
+	if err := validateBranchName(branch); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.store.SetProjectDefaultBranch(projectID, branch); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update default branch: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"project_id":     projectID,
+		"default_branch": branch,
+	})
+}
+
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	caller := citizenFromRequest(r)
 	if caller == nil {
@@ -489,12 +556,13 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 // record + a pre-computed run count.
 func toProjectResponse(p store.ProjectRecord, runCount int) projectResponse {
 	return projectResponse{
-		ID:          p.ID,
-		Name:        p.Name,
-		Description: p.Description,
-		RemoteURL:   p.RemoteURL,
-		RunCount:    runCount,
-		CreatedAt:   p.CreatedAt.Format(time.RFC3339),
+		ID:            p.ID,
+		Name:          p.Name,
+		Description:   p.Description,
+		RemoteURL:     p.RemoteURL,
+		DefaultBranch: p.DefaultBranch,
+		RunCount:      runCount,
+		CreatedAt:     p.CreatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -541,6 +609,7 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 			Name:       run.Name,
 			State:      string(run.State),
 			TaskCount:  len(tasks),
+			Branch:     run.Branch,
 			CreatedAt:  run.CreatedAt.Format(time.RFC3339),
 			SourcePath: run.SourcePath,
 		})
@@ -864,7 +933,17 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := r.URL.Query().Get("prefix")
-	rows, err := s.store.ListArtifactsByProject(projectID, prefix)
+	// Branch filter: callers can narrow to a specific branch
+	// via ?branch=<name>; empty defaults to the project's
+	// configured default branch so the common case ("show me
+	// artifacts on main") just works.
+	branch := r.URL.Query().Get("branch")
+	if branch == "" {
+		if p, _ := s.store.GetProject(projectID); p != nil {
+			branch = p.DefaultBranch
+		}
+	}
+	rows, err := s.store.ListArtifactsByProject(projectID, branch, prefix)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list artifacts")
 		return
@@ -906,7 +985,17 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta, err := s.store.GetArtifact(projectID, path)
+	// Branch filter defaults to the project's configured
+	// default — single-branch projects get the expected
+	// behavior, multi-branch projects can query with
+	// ?branch=<name>.
+	branch := r.URL.Query().Get("branch")
+	if branch == "" {
+		if p, _ := s.store.GetProject(projectID); p != nil {
+			branch = p.DefaultBranch
+		}
+	}
+	meta, err := s.store.GetArtifact(projectID, branch, path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to read artifact index")
 		return
@@ -927,6 +1016,77 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 
 // --- Runs ---
 
+// resolveRunBranch turns a caller's `branch:` request into a
+// concrete branch name, honoring the project's default and the
+// "auto" sugar form. Returns an error when the explicit name is
+// malformed (validator matches git's ref grammar loosely enough
+// to accept "experiment-2", "enju/work", etc. but rejects empty
+// segments, leading "-", and reserved forms).
+func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested string) (string, error) {
+	if requested == "" {
+		if defaultBranch == "" {
+			return "main", nil
+		}
+		return defaultBranch, nil
+	}
+	if requested == "auto" {
+		// Walk run-1, run-2, ... picking the first one that
+		// doesn't already appear on an existing run in this
+		// project. Bounded to 10_000 so a misbehaving caller
+		// can't stall the endpoint forever.
+		used := map[string]bool{}
+		branches, err := s.store.ListRunBranches(projectID)
+		if err != nil {
+			return "", fmt.Errorf("allocating auto branch name: %w", err)
+		}
+		for _, b := range branches {
+			used[b] = true
+		}
+		for n := 1; n <= 10000; n++ {
+			name := fmt.Sprintf("run-%d", n)
+			if !used[name] {
+				return name, nil
+			}
+		}
+		return "", fmt.Errorf("unable to allocate an auto branch name after 10000 tries — pass branch=\"<name>\" explicitly")
+	}
+	if err := validateBranchName(requested); err != nil {
+		return "", err
+	}
+	return requested, nil
+}
+
+// validateBranchName rejects shapes that git would refuse to
+// store as a ref. Deliberately loose — matches the subset of
+// git-check-ref-format rules that matter at create_run time.
+// The full rules are enforced by git itself when the fat client
+// pushes; this is a fast-fail upfront validation so a typo
+// doesn't leave us with a half-created run.
+func validateBranchName(s string) error {
+	if s == "" {
+		return fmt.Errorf("branch name cannot be empty")
+	}
+	if s == "HEAD" {
+		return fmt.Errorf("branch name %q is reserved", s)
+	}
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "/") || strings.HasSuffix(s, "/") {
+		return fmt.Errorf("branch name %q: must not start with '-' or '/' and must not end with '/'", s)
+	}
+	if strings.Contains(s, "..") || strings.Contains(s, "//") || strings.Contains(s, "@{") {
+		return fmt.Errorf("branch name %q contains a forbidden sequence (.., //, or @{)", s)
+	}
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '~', '^', ':', '?', '*', '[', '\\', '\x7f':
+			return fmt.Errorf("branch name %q contains a forbidden character %q", s, r)
+		}
+		if r < 0x20 {
+			return fmt.Errorf("branch name %q contains a control character", s)
+		}
+	}
+	return nil
+}
+
 type createRunRequest struct {
 	YAML            string                 `json:"yaml"`
 	RepoURL         string                 `json:"repo_url,omitempty"`
@@ -934,6 +1094,16 @@ type createRunRequest struct {
 	SourcePath      string                 `json:"source_path,omitempty"`
 	SourceCommitSHA string                 `json:"source_commit_sha,omitempty"`
 	Username        string                 `json:"username,omitempty"` // citizen who created this run, for contribution tracking
+	// Branch is the git branch this run should commit to.
+	// Three forms:
+	//   - empty → fall back to the project's DefaultBranch
+	//   - "auto" → the coordinator picks an unused branch name
+	//     of the shape "run-N" so parallel variants don't force
+	//     the caller to invent names
+	//   - explicit name → use it verbatim
+	// Refused when there's already an active run on the resolved
+	// branch (serial-per-branch invariant).
+	Branch string `json:"branch,omitempty"`
 }
 
 type runResponse struct {
@@ -943,6 +1113,7 @@ type runResponse struct {
 	Name            string   `json:"name"`
 	State           string   `json:"state"`
 	TaskCount       int      `json:"task_count"`
+	Branch          string   `json:"branch,omitempty"`            // git branch this run commits to
 	CreatedAt       string   `json:"created_at"`
 	SourcePath      string   `json:"source_path,omitempty"`       // Phase H.1 — template this run came from, if any
 	SourceCommitSHA string   `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
@@ -975,6 +1146,31 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if req.YAML == "" {
 		writeError(w, http.StatusBadRequest, "yaml is required")
 		return
+	}
+
+	// Branch resolution — three paths:
+	//   - empty → project default
+	//   - "auto" → pick an unused "run-N" name
+	//   - explicit → use verbatim, just validate shape
+	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Serial-runs-per-branch invariant: refuse a second active
+	// run on the same branch. Concurrent variants MUST use
+	// distinct branches. Error points at the existing run so
+	// the caller can wait, switch to branch="auto", or pick a
+	// specific name. "auto" skips this check because
+	// resolveRunBranch already guarantees the result is unused.
+	if req.Branch != "auto" {
+		if existing, _ := s.store.ActiveRunOnBranch(projectID, branch); existing != nil {
+			writeError(w, http.StatusConflict, fmt.Sprintf(
+				"branch %q already has an active run (#%d %q) — wait for it to finish, use branch=\"auto\" for an auto-named branch, or pass branch=\"<name>\" to isolate this run",
+				branch, existing.Seq, existing.Name,
+			))
+			return
+		}
 	}
 
 	// Always route through ParseWithParams so declared defaults
@@ -1026,10 +1222,26 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		SourcePath:      req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
 		Params:          paramsJSON,
+		Branch:          branch,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	})
 	if err != nil {
+		// SQLite's partial unique index on (project_id, branch)
+		// WHERE state = 'active' fires when a concurrent request
+		// wins the race past ActiveRunOnBranch but before our
+		// INSERT. Translate the raw constraint error into the
+		// same 409 + helpful message the application-level
+		// refusal produces, so both paths surface an identical
+		// user experience.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "idx_runs_active_branch") {
+			msg := fmt.Sprintf("branch %q already has an active run — wait for it to finish, use branch=\"auto\" for an auto-named branch, or pass branch=\"<name>\" to isolate this run", branch)
+			if existing, _ := s.store.ActiveRunOnBranch(projectID, branch); existing != nil {
+				msg = fmt.Sprintf("branch %q already has an active run (#%d %q) — wait for it to finish, use branch=\"auto\" for an auto-named branch, or pass branch=\"<name>\" to isolate this run", branch, existing.Seq, existing.Name)
+			}
+			writeError(w, http.StatusConflict, msg)
+			return
+		}
 		s.logger.Error("creating run", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to create run: "+err.Error())
 		return
@@ -1086,6 +1298,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		Name:            parsed.Run.Name,
 		State:           string(store.RunActive),
 		TaskCount:       taskCount,
+		Branch:          branch,
 		CreatedAt:       now.Format(time.RFC3339),
 		SourcePath:      req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
@@ -1128,6 +1341,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			Name:       p.Name,
 			State:      string(p.State),
 			TaskCount:  len(tasks),
+			Branch:     p.Branch,
 			CreatedAt:  p.CreatedAt.Format(time.RFC3339),
 			SourcePath: p.SourcePath,
 		})
@@ -1383,6 +1597,11 @@ type taskResponse struct {
 	// (.enju/runs/{seq}/template/) instead of the live
 	// enju_templates/ path. Empty for inline-YAML runs.
 	RunSourcePath   string   `json:"run_source_path,omitempty"`
+	// RunBranch is the git branch this task's run commits to.
+	// Fat-client submit/execute paths feed this into
+	// mcpgit.SubmitRequest so parallel runs on distinct
+	// branches don't stomp on each other's files.
+	RunBranch string `json:"run_branch,omitempty"`
 	// RunParams is the parsed map of run-level params the
 	// caller supplied at create_run, after defaults filled
 	// in. The executor exposes these to compute scripts as
@@ -2062,7 +2281,6 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		"task_id":             taskID,
 		"reason":              req.Reason,
 		"skipped_descendants": res.SkippedDescendants,
-		"cross_run_readers":   res.CrossRunReaders,
 		"rollbacks":           res.Rollbacks,
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -2189,13 +2407,11 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 				s.logger.Error("review-reject fail: cascade", "target", actions.RejectTargetID, "error", err)
 			} else {
 				rejectResult = &invalidationResult{
-					Task:            res.Task,
-					Descendants:     res.SkippedDescendants,
-					CrossRunReaders: res.CrossRunReaders,
-					Dematerialized:  res.Dematerialized,
-					Changed:         res.Changed,
-					Rollbacks:       res.Rollbacks,
-					AffectedRuns:    res.AffectedRuns,
+					Task:           res.Task,
+					Descendants:    res.SkippedDescendants,
+					Dematerialized: res.Dematerialized,
+					Changed:        res.Changed,
+					Rollbacks:      res.Rollbacks,
 				}
 			}
 		}
@@ -2222,15 +2438,10 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// 7. Ready-task sweep + run completion.
+	// 7. Ready-task sweep + run completion. No cross-run
+	// fan-out — branch isolation means other runs' readiness
+	// is unaffected by this submission.
 	readied, _ := s.store.UpdateReadyTasks(task.RunID)
-	if actions != nil {
-		for rid := range actions.CrossRunIDs {
-			if n, err := s.store.UpdateReadyTasks(rid); err == nil {
-				readied += n
-			}
-		}
-	}
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
 
 	// 8. Build response.
@@ -2266,11 +2477,10 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		// so the cascade block itself doesn't need to carry
 		// a verdict field.
 		resp["review_cascade"] = map[string]interface{}{
-			"target":            task.ReviewsTarget,
-			"descendants":       rejectResult.Descendants,
-			"changed":           rejectResult.Changed,
-			"rollbacks_count":   len(rejectResult.Rollbacks),
-			"cross_run_readers": rejectResult.CrossRunReaders,
+			"target":          task.ReviewsTarget,
+			"descendants":     rejectResult.Descendants,
+			"changed":         rejectResult.Changed,
+			"rollbacks_count": len(rejectResult.Rollbacks),
 		}
 	}
 	if reviewTally != nil {
@@ -2385,9 +2595,8 @@ func (s *Server) getOrLoadParsedRun(runID int64) (*enjuYaml.ParsedRun, error) {
 // render the response body and by the review-reject path in
 // handleSubmitResultReport to log what happened.
 type invalidationResult struct {
-	Task            *store.TaskRecord
-	Descendants     []string
-	CrossRunReaders []string
+	Task        *store.TaskRecord
+	Descendants []string
 	// Dematerialized lists task IDs that were deleted
 	// rather than flipped to PENDING. Populated for
 	// invalidations of dynamic-for_each sources — the
@@ -2398,7 +2607,6 @@ type invalidationResult struct {
 	Dematerialized []string
 	Changed        int
 	Rollbacks      []rollbackOutcome
-	AffectedRuns   map[int64]bool
 }
 
 type rollbackOutcome struct {
@@ -2446,6 +2654,7 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		if rb.Delete {
 			mutations = append(mutations, store.DeleteArtifact{
 				ProjectID: rb.ProjectID,
+				Branch:    rb.Branch,
 				Path:      rb.Path,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
@@ -2477,14 +2686,12 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		})
 	}
 
-	// 4. Cross-run readers → PENDING with claim clear.
-	for _, readerID := range outcome.CrossRunReaders {
-		mutations = append(mutations, store.SetTaskState{
-			TaskID:     readerID,
-			NewState:   store.TaskPending,
-			ClearClaim: true,
-		})
-	}
+	// 4. Cross-run reader cascade was removed with the branch-
+	// per-run model. Runs on distinct branches are isolated
+	// by design, so an invalidation on branch X can't affect
+	// readers on branch Y — the artifact index is keyed by
+	// (project, branch, path) and the serial-per-branch
+	// invariant means only one run is active on any branch.
 
 	// 5. Dynamic descendants → PARK (J.2 partial re-mat
 	//    Phase 1). Previously these were deleted outright,
@@ -2531,26 +2738,23 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	// (Previous deletion path wiped the cache because nodes
 	// disappeared.)
 
-	// Ready-task sweeps + run reactivation AFTER the plan
-	// transaction commits (SQLite doesn't support nested
-	// write transactions, so these run as separate calls).
-	for runID := range outcome.AffectedRunIDs {
-		_, _ = s.store.UpdateReadyTasks(runID)
-		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
-			_ = s.store.UpdateRunState(runID, store.RunActive)
-		}
+	// Ready-task sweep + run reactivation for the target's
+	// own run. No cross-run fan-out any more — branch
+	// isolation means other runs are unaffected by this
+	// invalidation.
+	_, _ = s.store.UpdateReadyTasks(task.RunID)
+	if r, _ := s.store.GetRun(task.RunID); r != nil && r.State == store.RunCompleted {
+		_ = s.store.UpdateRunState(task.RunID, store.RunActive)
 	}
 
 	changed := result.Changed + result.TasksDeleted
 
 	return &invalidationResult{
-		Task:            task,
-		Descendants:     outcome.RegularDescendants,
-		CrossRunReaders: outcome.CrossRunReaders,
-		Dematerialized:  outcome.DematerializedIDs,
-		Changed:         changed,
-		Rollbacks:       rollbacks,
-		AffectedRuns:    outcome.AffectedRunIDs,
+		Task:           task,
+		Descendants:    outcome.RegularDescendants,
+		Dematerialized: outcome.DematerializedIDs,
+		Changed:        changed,
+		Rollbacks:      rollbacks,
 	}, nil
 }
 
@@ -2562,11 +2766,9 @@ type failCascadeResult struct {
 	Task               *store.TaskRecord
 	Reason             string
 	SkippedDescendants []string
-	CrossRunReaders    []string
 	Dematerialized     []string
 	Changed            int
 	Rollbacks          []rollbackOutcome
-	AffectedRuns       map[int64]bool
 }
 
 // performFailCascade is the reject/fail analogue of performInvalidate.
@@ -2629,6 +2831,7 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 		if rb.Delete {
 			mutations = append(mutations, store.DeleteArtifact{
 				ProjectID: rb.ProjectID,
+				Branch:    rb.Branch,
 				Path:      rb.Path,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
@@ -2684,15 +2887,10 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	}
 
 	// 4. Cross-run readers → PENDING. They're in other runs, not
-	//    descendants — they lost their basis but should re-run
-	//    with the rolled-back content, not be marked skipped.
-	for _, readerID := range outcome.CrossRunReaders {
-		mutations = append(mutations, store.SetTaskState{
-			TaskID:     readerID,
-			NewState:   store.TaskPending,
-			ClearClaim: true,
-		})
-	}
+	//    Cross-run reader cascade was removed with the branch-
+	//    per-run model — see performInvalidate comment for the
+	//    rationale. A branch owns its artifact history; other
+	//    branches are unaffected.
 
 	// 5. Dematerialized dynamic descendants → delete.
 	for _, descID := range outcome.DematerializedIDs {
@@ -2713,25 +2911,21 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 		delete(s.runs, task.RunID)
 	}
 
-	// Ready-task sweeps on affected runs — mainly for cross-run
-	// readers that went PENDING; their runs might have other
-	// tasks that became READY or blocked by the flip.
-	for runID := range outcome.AffectedRunIDs {
-		_, _ = s.store.UpdateReadyTasks(runID)
-		if r, _ := s.store.GetRun(runID); r != nil && r.State == store.RunCompleted {
-			_ = s.store.UpdateRunState(runID, store.RunActive)
-		}
+	// Ready-task sweep for the target's own run — branch
+	// isolation means cross-run effects no longer need a
+	// fan-out.
+	_, _ = s.store.UpdateReadyTasks(task.RunID)
+	if r, _ := s.store.GetRun(task.RunID); r != nil && r.State == store.RunCompleted {
+		_ = s.store.UpdateRunState(task.RunID, store.RunActive)
 	}
 
 	return &failCascadeResult{
 		Task:               task,
 		Reason:             reason,
 		SkippedDescendants: skippedDescendants,
-		CrossRunReaders:    outcome.CrossRunReaders,
 		Dematerialized:     outcome.DematerializedIDs,
 		Changed:            result.Changed + result.TasksDeleted,
 		Rollbacks:          rollbacks,
-		AffectedRuns:       outcome.AffectedRunIDs,
 	}, nil
 }
 
@@ -3006,7 +3200,6 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("task invalidated",
 		"task_id", taskID,
 		"descendants", len(result.Descendants),
-		"cross_run_readers", len(result.CrossRunReaders),
 		"changed", result.Changed,
 		"artifacts_rolled_back", len(result.Rollbacks),
 		"reason", req.Reason,
@@ -3040,9 +3233,6 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		"descendants": result.Descendants,
 		"changed":     result.Changed,
 		"reason":      req.Reason,
-	}
-	if len(result.CrossRunReaders) > 0 {
-		resp["artifact_readers"] = result.CrossRunReaders
 	}
 	if len(result.Dematerialized) > 0 {
 		// J.2 renamed the semantic from "deleted" to
@@ -3331,11 +3521,13 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	var remoteURL string
 	var projectName string
 	var runSourcePath string
+	var runBranch string
 	var runParams map[string]interface{}
 	if run, _ := s.store.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
 		runSourcePath = run.SourcePath
+		runBranch = run.Branch
 		if run.Params != "" {
 			// Best-effort decode; a malformed params JSON
 			// (shouldn't happen since we encoded it ourselves
@@ -3400,6 +3592,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		SkipReason:        t.SkipReason,
 		ParkedFromState:   t.ParkedFromState,
 		RunSourcePath:     runSourcePath,
+		RunBranch:         runBranch,
 		RunParams:         runParams,
 		InstanceParamsMap: instanceParams,
 		Env:               unmarshalStringMapField(t.Env),
@@ -3466,10 +3659,13 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	}
 
 	// Artifact provenance: for each artifact this task reads,
-	// show who last wrote it. Quick index lookup per path.
+	// show who last wrote it on the task's own branch. Using
+	// runBranch (captured above) keeps provenance scoped to
+	// the branch this task actually consumes — parallel runs
+	// on other branches have their own index rows.
 	for _, path := range unmarshalStringSlice(t.ReadsArtifacts) {
 		prov := artifactProvenance{Path: path}
-		if art, err := s.store.GetArtifact(projectID, path); err == nil && art != nil {
+		if art, err := s.store.GetArtifact(projectID, runBranch, path); err == nil && art != nil {
 			prov.LastWriter = s.citizenUsername(art.LastWriter)
 			prov.LastTaskID = art.LastTaskID
 			prov.CommitSHA = art.CommitSHA

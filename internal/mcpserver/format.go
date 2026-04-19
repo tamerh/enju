@@ -1185,7 +1185,6 @@ func formatSubmitResult(data []byte, taskID string) string {
 				// — see docs/rollback.md § Review verdicts.
 				descendants, _ := reviewCascade["descendants"].([]interface{})
 				rollbacks, _ := reviewCascade["rollbacks_count"].(float64)
-				crossRun, _ := reviewCascade["cross_run_readers"].([]interface{})
 				line := fmt.Sprintf("  → target %q rejected (terminal)", target)
 				var parts []string
 				if int(rollbacks) > 0 {
@@ -1193,9 +1192,6 @@ func formatSubmitResult(data []byte, taskID string) string {
 				}
 				if n := len(descendants); n > 0 {
 					parts = append(parts, fmt.Sprintf("%d descendant(s) skipped", n))
-				}
-				if n := len(crossRun); n > 0 {
-					parts = append(parts, fmt.Sprintf("%d cross-run reader(s) reset", n))
 				}
 				if len(parts) > 0 {
 					line += " — " + strings.Join(parts, ", ")
@@ -1976,7 +1972,7 @@ type edge struct {
 // response carried an error — callers that want an error
 // surface should check for that and decide whether to write
 // the file anyway.
-func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) string {
+func renderMermaidBody(runData []byte, tasksData []byte) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return ""
@@ -2037,84 +2033,10 @@ func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) s
 		}
 	}
 
-	// Cross-run artifact edges (opt-in). The caller passes the
-	// project's artifact index; for each task in this run that
-	// reads an artifact path whose current writer is in a
-	// different run, emit an external "📎 path (from run #X)"
-	// node and an edge into the reader.
-	//
-	// External nodes get the `external` class so the viewer
-	// distinguishes them visually from in-run work. We add
-	// them to the edges list so transitive reduction can fold
-	// them into the regular DAG logic: if a task already reads
-	// path P via a sibling that also reads P, one edge is
-	// enough.
-	type externalNode struct {
-		nodeID    string
-		path      string
-		fromRunID int64
-	}
-	var externals []externalNode
-	externalByID := map[string]externalNode{} // dedup repeats
-	if len(artifactsData) > 0 {
-		var artifacts []map[string]interface{}
-		if json.Unmarshal(artifactsData, &artifacts) == nil {
-			// Build path → (last_task_id, last_run_id) lookup.
-			type writerRef struct {
-				taskID string
-				runID  int64
-			}
-			writers := map[string]writerRef{}
-			for _, a := range artifacts {
-				path, _ := a["path"].(string)
-				lt, _ := a["last_task_id"].(string)
-				lr, _ := a["last_run_id"].(float64)
-				if path == "" || lt == "" {
-					continue
-				}
-				writers[path] = writerRef{taskID: lt, runID: int64(lr)}
-			}
-			// This run's id: any in-run task's run_id will do.
-			// We derive it once from the run JSON so the
-			// external-detection check ("writer in different
-			// run?") doesn't depend on reading task rows.
-			thisRunID := int64(0)
-			if v, ok := run["id"].(float64); ok {
-				thisRunID = int64(v)
-			}
-			for _, t := range tasks {
-				readerID, _ := t["id"].(string)
-				if readerID == "" {
-					continue
-				}
-				reads, _ := t["reads_artifacts"].([]interface{})
-				for _, p := range reads {
-					path, _ := p.(string)
-					if path == "" {
-						continue
-					}
-					w, ok := writers[path]
-					if !ok {
-						continue // no writer tracked — skip silently
-					}
-					if w.runID == thisRunID {
-						continue // same-run writer — the intra-DAG edge already covers it
-					}
-					extID := mermaidExternalNodeID(path)
-					if _, seen := externalByID[extID]; !seen {
-						ext := externalNode{nodeID: extID, path: path, fromRunID: w.runID}
-						externalByID[extID] = ext
-						externals = append(externals, ext)
-					}
-					// Full-ID form for the edge so transitive
-					// reduction can see it. `present` is only used
-					// for guarding intra-run edges; externals are
-					// intentionally off the `present` map.
-					addEdge(extID, readerID)
-				}
-			}
-		}
-	}
+	// Cross-run "external artifact" node rendering was removed
+	// with the branch-per-run model — branches isolate a run's
+	// artifact state from other runs, so there's no cross-run
+	// writer to surface as a dashed external node.
 
 	// Transitive reduction on the combined edge set. For each
 	// edge u→v, drop it if v is reachable from any other
@@ -2148,24 +2070,13 @@ func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) s
 		b.WriteString("\n")
 	}
 
-	// External artifact nodes. Only emitted if we have any —
-	// no-op when the caller didn't opt in or no reads crossed
-	// a run boundary.
-	for _, ext := range externals {
-		label := fmt.Sprintf("📎 %s (from run #%d)", mermaidEscape(ext.path), ext.fromRunID)
-		b.WriteString(fmt.Sprintf("    %s[\"%s\"]:::external\n", ext.nodeID, label))
-	}
-
-	// Edges. For intra-run ones, `from` and `to` are full task
-	// ids and need nodeID lookup. External edges carry the
-	// pre-sanitized external node id as `from` — we detect it
-	// by the `ext_art_` prefix so a lookup-or-use-verbatim
-	// fallback works uniformly.
+	// Edges — intra-run depends_on only. Cross-run external
+	// nodes were removed with the branch-per-run model.
 	b.WriteString("\n")
 	for _, e := range edges {
 		from := nodeID[e.from]
 		if from == "" {
-			from = e.from // external node — already sanitized
+			from = e.from
 		}
 		to := nodeID[e.to]
 		if to == "" {
@@ -2187,7 +2098,6 @@ func renderMermaidBody(runData []byte, tasksData []byte, artifactsData []byte) s
 	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
 	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
 	b.WriteString("    classDef parked fill:#e7e3f4,stroke:#6f42c1,stroke-dasharray:2 2,color:#000\n")
-	b.WriteString("    classDef external fill:#fdf6e3,stroke:#8a6d3b,stroke-dasharray:3 3,color:#000\n")
 	return b.String()
 }
 
@@ -2266,30 +2176,6 @@ func transitivelyReduce(edges []edge) []edge {
 	return kept
 }
 
-// mermaidExternalNodeID derives a sanitized node id for an
-// external-artifact node keyed on the artifact path. Uses a
-// distinct `ext_art_` prefix so the emit loop can distinguish
-// pre-sanitized external ids from full-task-id lookup keys
-// without a separate set.
-func mermaidExternalNodeID(path string) string {
-	var b strings.Builder
-	b.WriteString("ext_art_")
-	prevUnderscore := false
-	for _, r := range path {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-			prevUnderscore = false
-		default:
-			if !prevUnderscore {
-				b.WriteByte('_')
-				prevUnderscore = true
-			}
-		}
-	}
-	return b.String()
-}
-
 // formatRunStatusMermaid is the tool-reply wrapper: renders the
 // raw body (see renderMermaidBody) and wraps it in a ```mermaid
 // code fence + a %% comment header naming the run, so the LLM
@@ -2298,19 +2184,7 @@ func mermaidExternalNodeID(path string) string {
 // use renderMermaidBody directly — the file should be pure
 // Mermaid source, no fence.
 //
-// Kept as a no-artifacts shim around formatRunStatusMermaidWith
-// so existing tests/call sites that don't opt in to cross-run
-// edges don't have to pass nil.
 func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
-	return formatRunStatusMermaidWith(runData, tasksData, nil)
-}
-
-// formatRunStatusMermaidWith is the include_external-capable
-// variant. Same wrapping behavior as formatRunStatusMermaid;
-// the extra artifactsData argument threads through to
-// renderMermaidBody so readers of cross-run artifacts show up
-// as dashed external nodes in the diagram.
-func formatRunStatusMermaidWith(runData []byte, tasksData []byte, artifactsData []byte) string {
 	// Error paths: mirror the old behavior so existing callers
 	// still see a friendly "✗ Run not found" line instead of an
 	// empty fenced block. renderMermaidBody returns "" on those
@@ -2322,7 +2196,7 @@ func formatRunStatusMermaidWith(runData []byte, tasksData []byte, artifactsData 
 	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
 		return fmt.Sprintf("✗ Run not found: %s", errMsg)
 	}
-	body := renderMermaidBody(runData, tasksData, artifactsData)
+	body := renderMermaidBody(runData, tasksData)
 	if body == "" {
 		return string(tasksData)
 	}

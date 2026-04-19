@@ -96,6 +96,13 @@ type taskMeta struct {
 	// time. nil or empty for non-compute tasks and for compute
 	// tasks that didn't declare env:.
 	Env map[string]string
+	// Branch is the git branch this task's run commits to —
+	// populated from the run's branch field (falling back to
+	// the project's default_branch when the run was created
+	// without a branch override). The fat-client submit path
+	// checks this out before writing + pushing so runs on
+	// parallel branches don't stomp on each other's files.
+	Branch string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -179,6 +186,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["instance_params_map"].(map[string]interface{}); ok {
 		meta.InstanceParams = v
+	}
+	if v, ok := raw["run_branch"].(string); ok {
+		meta.Branch = v
 	}
 	if v, ok := raw["env"].(map[string]interface{}); ok {
 		env := make(map[string]string, len(v))

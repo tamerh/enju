@@ -222,7 +222,7 @@ func (c *apiClient) submitResultFatClient(
 		}
 	}
 
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
+	proj, _, _, _, err := c.openProject(ctx, meta.ProjectID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -379,6 +379,7 @@ func (c *apiClient) submitResultFatClient(
 		ModelName:     c.modelName,
 		Files:         files,
 		ArtifactPaths: artifactPaths,
+		Branch:        meta.Branch,
 	})
 	proj.Unlock()
 	if err != nil {

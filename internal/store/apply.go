@@ -285,10 +285,14 @@ func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
 		return 0, 0, err
 	}
 	nextSeq := int(maxSeq.Int64) + 1
+	branch := r.Branch
+	if branch == "" {
+		branch = "main"
+	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, branch, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, branch, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err
@@ -423,18 +427,26 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 
 func applyMoveArtifact(tx *sql.Tx, m MoveArtifact) error {
 	a := &m.Artifact
+	branch := a.Branch
+	if branch == "" {
+		branch = "main"
+	}
 	_, err := tx.Exec(
-		`INSERT INTO artifacts (project_id, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_id, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, updated_at=?`,
-		a.ProjectID, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, a.CreatedAt, a.UpdatedAt,
+		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, branch, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, updated_at=?`,
+		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, a.CreatedAt, a.UpdatedAt,
 		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, a.UpdatedAt,
 	)
 	return err
 }
 
 func applyDeleteArtifact(tx *sql.Tx, m DeleteArtifact) error {
-	_, err := tx.Exec(`DELETE FROM artifacts WHERE project_id = ? AND path = ?`, m.ProjectID, m.Path)
+	branch := m.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	_, err := tx.Exec(`DELETE FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`, m.ProjectID, branch, m.Path)
 	return err
 }
 

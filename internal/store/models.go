@@ -87,8 +87,17 @@ type ProjectRecord struct {
 	Description string
 	CreatedBy   string // citizen ID
 	RemoteURL   string // optional external git remote (push target after each commit)
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// DefaultBranch is the git branch new runs land on when the
+	// caller doesn't override with `branch:` at create_run time.
+	// Always non-empty after migration — defaults to "main" for
+	// legacy rows and new projects unless the caller sets it on
+	// create_project / init. Orgs that want Enju activity to
+	// stay off their repo's main branch set this to e.g.
+	// "enju/work" at project creation time. See
+	// docs/runs-and-branches.md for the full rationale.
+	DefaultBranch string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // RunRecord is a run stored in the database.
@@ -126,7 +135,15 @@ type RunRecord struct {
 	// thrown away, unreachable from compute-task scripts.
 	//
 	// Empty for runs with no params: block.
-	Params    string
+	Params string
+	// Branch is the git branch this run commits to. Populated
+	// at create_run time from the caller's `branch:` param,
+	// falling back to the project's DefaultBranch when the
+	// caller doesn't specify one. The serial-runs-per-branch
+	// invariant means the coordinator refuses a second active
+	// run on the same branch — concurrent runs MUST use
+	// distinct branches. See docs/runs-and-branches.md.
+	Branch    string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -278,22 +295,30 @@ type ProjectMemberRecord struct {
 	AddedBy   int64 // citizens.id of the adder; 0 for the creator row
 }
 
-// ArtifactRecord is the index row for one mutable file inside a project's
-// repository. The file content itself lives only in git — this record
-// just tracks who wrote it last and when, for provenance and listings.
+// ArtifactRecord is the index row for one mutable file inside a
+// project's repository. The file content itself lives only in
+// git — this record just tracks who wrote it last and when, for
+// provenance and listings.
+//
+// Keyed by (project_id, branch, path) so runs on isolated
+// branches don't stomp on each other's artifact index. A run
+// writing artifacts on branch "experiment-2" and another run
+// writing the same path on branch "main" produce two rows, each
+// pointing at a commit on their own branch.
 type ArtifactRecord struct {
-	ProjectID    int64
-	Path         string // repo-relative path under artifacts/
-	LastWriter   int64  // citizens.id of the last writer, 0 if never written
-	LastTaskID   string // fully-qualified task ID that last wrote it
-	LastRunID    int64  // run that did the last write
+	ProjectID  int64
+	Branch     string // git branch this artifact write lives on
+	Path       string // repo-relative path
+	LastWriter int64  // citizens.id of the last writer, 0 if never written
+	LastTaskID string // fully-qualified task ID that last wrote it
+	LastRunID  int64  // run that did the last write
 	// CommitSHA is the git commit that currently holds this artifact's
 	// content. Used by the client-side template resolver (iteration
 	// A.2) to read the exact version the index points at rather than
 	// whatever happens to be in the working tree right now.
 	CommitSHA string
-	UpdatedAt    time.Time
-	CreatedAt    time.Time
+	UpdatedAt time.Time
+	CreatedAt time.Time
 }
 
 // CitizenRecord is a citizen stored in the database.

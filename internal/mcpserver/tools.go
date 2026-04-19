@@ -153,7 +153,7 @@ func toolGetTask() mcp.Tool {
 
 func toolRunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
-		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide). Note: in mermaid mode, only intra-run edges are shown by default — artifact reads whose writer is in a DIFFERENT run are omitted. Set include_external=true to surface those as dashed external nodes."),
+		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide)."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -165,9 +165,6 @@ func toolRunStatus() mcp.Tool {
 		mcp.WithString("format",
 			mcp.Description("Output format: \"default\" (action-oriented text summary with progress bar and queue, the usual reply) or \"mermaid\" (Mermaid flowchart TD syntax — paste into mermaid.live, a markdown file, or the preprint; GitHub renders it natively in issues/PRs). Defaults to \"default\"."),
 			mcp.Enum("default", "mermaid"),
-		),
-		mcp.WithBoolean("include_external",
-			mcp.Description("Only meaningful with format=\"mermaid\". When true, cross-run artifact reads surface as dashed 📎 external nodes so the diagram reflects the full data-flow graph (not just this run's intra-DAG edges). Default false — cleaner diagrams for the common \"show me this run\" use case."),
 		),
 	)
 }
@@ -213,6 +210,9 @@ If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID to create this run in (use enju_list_projects to see existing projects)"),
+		),
+		mcp.WithString("branch",
+			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name (run-1, run-2, ...) — useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
 		),
 	)
 }
@@ -322,9 +322,6 @@ Skip during routine enju_run_status checks — only call when the snapshot itsel
 			mcp.Required(),
 			mcp.Description("Snapshot label. Use 'initial' right after creation, 'final' on completion, or any safe-filename string for mid-run checkpoints. Must not contain '/', '\\', '..', or the null byte; must be ≤64 chars."),
 		),
-		mcp.WithBoolean("include_external",
-			mcp.Description("When true, artifact reads whose writer is in a DIFFERENT run of the same project surface as dashed 📎 external nodes — capturing the full cross-run data-flow graph. Default false (intra-run edges only) keeps archival snapshots focused on the run they describe. Turn on when the diagram's job is to show *where inputs came from*, e.g. for a preprint figure tracing upstream provenance."),
-		),
 	)
 }
 
@@ -399,6 +396,9 @@ func toolCreateProject() mcp.Tool {
 		mcp.WithString("remote_url",
 			mcp.Description("Optional external git remote URL (e.g., git@github.com:org/repo.git). When set, the coordinator pushes every task result commit to this remote. Auth follows the host's SSH/credential configuration."),
 		),
+		mcp.WithString("default_branch",
+			mcp.Description(`Optional git branch new runs land on by default. Defaults to "main". Orgs that want Enju activity to stay off their repo's main branch set this to e.g. "enju/work" — runs will commit to that branch unless an explicit branch= is passed at create_run time.`),
+		),
 	)
 }
 
@@ -412,6 +412,20 @@ func toolInit() mcp.Tool {
 		mcp.WithString("path",
 			mcp.Required(),
 			mcp.Description("Absolute path to the existing folder to adopt"),
+		),
+	)
+}
+
+func toolSetProjectDefaultBranch() mcp.Tool {
+	return mcp.NewTool("enju_set_project_default_branch",
+		mcp.WithDescription(`Change a project's default branch. Owner-only. The default is where new runs land when enju_create_run is called without an explicit branch=. Use this to move a project's Enju activity off "main" onto e.g. "enju/work" so repo main stays human-curated. Existing runs are unaffected — they stay on the branch they were created with.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose default branch to change"),
+		),
+		mcp.WithString("branch",
+			mcp.Required(),
+			mcp.Description(`Git branch name. Standard git ref rules apply (no spaces, no leading "-" or "/", no "..", etc.).`),
 		),
 	)
 }

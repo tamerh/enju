@@ -405,6 +405,15 @@ type Project struct {
 	mu       sync.Mutex   // in-process serialization
 	fileLock *flock.Flock // cross-process serialization (optional)
 
+	// defaultBranch is the branch Pull/Push operate on when the
+	// caller doesn't specify one, and the fallback target when
+	// CheckoutBranch needs to create a fresh branch from a
+	// starting point. Set via SetDefaultBranch when the
+	// workspace layer has the coordinator's record; defaults to
+	// "main" so bare-repo initialization and pre-branch-model
+	// tests keep working.
+	defaultBranch string
+
 	// Push status bookkeeping — in-memory only, per process
 	// lifetime. Updated by pushInternal on both success and
 	// failure so the project_remote_status tool can report
@@ -413,6 +422,47 @@ type Project struct {
 	// diagnostic.
 	lastPushAt    time.Time
 	lastPushError string
+}
+
+// defaultBranchOr returns p.defaultBranch when set, "main"
+// otherwise. Keeps the "no branch configured yet" case producing
+// the historical main-branch behavior so callers that pre-date
+// the branch model still work unchanged.
+func (p *Project) defaultBranchOr() string {
+	if p.defaultBranch == "" {
+		return "main"
+	}
+	return p.defaultBranch
+}
+
+// resolveBranch picks the branch a specific op should use: the
+// explicit override when non-empty, falling back to the
+// project's default. Central point so every call site stays
+// consistent.
+func (p *Project) resolveBranch(override string) string {
+	if override != "" {
+		return override
+	}
+	return p.defaultBranchOr()
+}
+
+// SetDefaultBranch configures the fallback branch for git ops
+// that don't take a branch override. Usually called by the
+// workspace layer right after ForProject, using the value from
+// the coordinator's project record. Idempotent; no-op on empty
+// input so callers that don't know the branch yet can leave it
+// untouched.
+func (p *Project) SetDefaultBranch(branch string) {
+	if branch == "" {
+		return
+	}
+	p.defaultBranch = branch
+}
+
+// DefaultBranch returns the currently configured default
+// branch, or "main" if none was set.
+func (p *Project) DefaultBranch() string {
+	return p.defaultBranchOr()
 }
 
 // ProjectID returns the coordinator-assigned project ID this clone
@@ -617,22 +667,53 @@ clone:
 	}, nil
 }
 
-// Pull fetches the latest state of origin/main and fast-forwards the
-// local branch to match. If the working tree has uncommitted local
-// changes (shouldn't happen in normal flow — clients should always
-// commit what they wrote before yielding), Pull returns an error.
-// The caller MUST hold the project lock.
+// Pull fetches the latest state of the project's configured
+// default branch and fast-forwards the local branch to match.
+// If the working tree has uncommitted local changes (shouldn't
+// happen in normal flow — clients should always commit what
+// they wrote before yielding), Pull returns an error. The
+// caller MUST hold the project lock.
+//
+// To pull a specific branch (typically the branch of a specific
+// run), use PullBranch(branch) — this shorthand uses the
+// project-level default.
 func (p *Project) Pull() error {
+	return p.PullBranch("")
+}
+
+// PullBranch is the branch-aware variant of Pull. Pass "" to
+// use the project's configured default branch.
+//
+// First-submit on a new branch: if origin has no
+// refs/heads/<branch> yet, we return nil. go-git's Pull raises
+// a "reference not found" error in that case, which would wedge
+// the very first claim on e.g. branch="run-2" before any
+// commits exist on the remote. The caller's next push creates
+// the remote ref naturally.
+func (p *Project) PullBranch(branch string) error {
 	if p.remoteURL == "" {
 		return nil // local-only, nothing to pull
+	}
+	b := p.resolveBranch(branch)
+	// Cheap ls-remote check so a brand-new branch doesn't
+	// propagate a reference-not-found error. Any network /
+	// auth failure here is passed through — we only swallow
+	// the specific "branch doesn't exist yet" case.
+	remoteSHA, err := p.RemoteBranchHash(b)
+	if err != nil {
+		return err
+	}
+	if remoteSHA == "" {
+		return nil
 	}
 	wt, err := p.repo.Worktree()
 	if err != nil {
 		return fmt.Errorf("getting worktree: %w", err)
 	}
+	refName := plumbing.NewBranchReferenceName(b)
 	err = wt.Pull(&gogit.PullOptions{
 		RemoteName:    "origin",
-		ReferenceName: plumbing.ReferenceName("refs/heads/main"),
+		ReferenceName: refName,
 		SingleBranch:  true,
 	})
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
@@ -650,11 +731,19 @@ func (p *Project) HeadHash() (string, error) {
 	return ref.Hash().String(), nil
 }
 
-// RemoteHeadHash contacts the remote via ls-remote and returns the
-// SHA of refs/heads/main there, or empty string if the remote has
-// no such ref. Used by CompareToRemote to compare local HEAD against
-// the authoritative remote state without a full fetch.
+// RemoteHeadHash contacts the remote via ls-remote and returns
+// the SHA of the project's configured default branch, or empty
+// string if the remote has no such ref. Used by CompareToRemote
+// to compare local HEAD against the authoritative remote state
+// without a full fetch.
 func (p *Project) RemoteHeadHash() (string, error) {
+	return p.RemoteBranchHash("")
+}
+
+// RemoteBranchHash is the branch-aware variant of
+// RemoteHeadHash. Pass "" to use the project's configured
+// default.
+func (p *Project) RemoteBranchHash(branch string) (string, error) {
 	if p.remoteURL == "" {
 		return "", fmt.Errorf("no remote configured")
 	}
@@ -668,8 +757,9 @@ func (p *Project) RemoteHeadHash() (string, error) {
 	if err != nil {
 		return "", friendlyGitError("check remote status", p.remoteURL, err)
 	}
+	target := plumbing.NewBranchReferenceName(p.resolveBranch(branch))
 	for _, r := range refs {
-		if r.Name() == plumbing.ReferenceName("refs/heads/main") {
+		if r.Name() == target {
 			return r.Hash().String(), nil
 		}
 	}
@@ -775,6 +865,11 @@ type SubmitRequest struct {
 	// MaxRetries caps the push retry loop on non-fast-forward
 	// rejections. Defaults to 3 if zero.
 	MaxRetries int
+	// Branch is the git branch this submit commits and pushes
+	// to. Empty → the project's configured default branch.
+	// Populated from the run's branch field when the MCP
+	// client's submit handler builds the request.
+	Branch string
 }
 
 // SubmitResult is the outcome of a successful SubmitTaskResult call.
@@ -836,11 +931,19 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 
 	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths, req.ModelName)
 
+	// Ensure we're on the target branch BEFORE writing files —
+	// commits otherwise land on the current HEAD's branch,
+	// which is fine only when the caller is already on the
+	// right branch.
+	if err := p.CheckoutBranch(req.Branch); err != nil {
+		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
+	}
+
 	// Overlay the new files on top of current HEAD. Any local
 	// commits the user made (e.g. a manual edit to a script
 	// between submits) stay where they are — we do NOT reset
-	// HEAD to origin/main any more. That reset was the root
-	// cause of the "fat-client clobbers user commits" bug.
+	// HEAD to origin/<default> any more. That reset was the
+	// root cause of the "fat-client clobbers user commits" bug.
 	for _, f := range req.Files {
 		full := filepath.Join(p.workDir, f.RepoRelPath)
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
@@ -874,7 +977,7 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	// stop the rebase, and we surface that as an error rather
 	// than discard work.
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		pushErr := p.push()
+		pushErr := p.pushBranchInternal(req.Branch, false)
 		if pushErr == nil {
 			// Rebase (if any) may have rewritten our commit
 			// SHA. Report the SHA that actually landed on
@@ -895,7 +998,7 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		// go-git's rebase support doesn't cover the cases we
 		// need (especially divergent-history with
 		// user-authored commits).
-		if rebaseErr := p.rebaseOnRemote(); rebaseErr != nil {
+		if rebaseErr := p.rebaseOnRemote(req.Branch); rebaseErr != nil {
 			return nil, fmt.Errorf(
 				"submit push rejected and rebase failed — your submit likely touches a file another client also changed. Local work is still in git reflog. Details: %w",
 				rebaseErr)
@@ -917,6 +1020,9 @@ type CommitFilesRequest struct {
 	AuthorEmail string
 	ModelName   string // when non-empty, appends an `AI-Model: <x>` trailer
 	MaxRetries  int    // defaults to 3
+	// Branch targets a specific branch for this commit. Empty
+	// → the project's configured default.
+	Branch string
 }
 
 // CommitFilesResult is the outcome of a successful CommitFiles
@@ -995,6 +1101,11 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 		msg += fmt.Sprintf("\n\nAI-Model: %s\n", req.ModelName)
 	}
 
+	// Ensure the commit lands on the right branch.
+	if err := p.CheckoutBranch(req.Branch); err != nil {
+		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
+	}
+
 	// Overlay files onto current HEAD (no reset — see
 	// SubmitTaskResult godoc for the rationale).
 	for _, f := range req.Files {
@@ -1020,7 +1131,7 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		pushErr := p.push()
+		pushErr := p.pushBranchInternal(req.Branch, false)
 		if pushErr == nil {
 			if head, herr := p.repo.Head(); herr == nil {
 				sha = head.Hash().String()
@@ -1030,13 +1141,73 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 		if !isNonFastForwardError(pushErr) {
 			return nil, fmt.Errorf("push failed: %w", pushErr)
 		}
-		if rebaseErr := p.rebaseOnRemote(); rebaseErr != nil {
+		if rebaseErr := p.rebaseOnRemote(req.Branch); rebaseErr != nil {
 			return nil, fmt.Errorf(
 				"push rejected and rebase failed — local work is still in git reflog. Details: %w",
 				rebaseErr)
 		}
 	}
 	return nil, fmt.Errorf("commit failed after %d push attempts", maxRetries)
+}
+
+// CheckoutBranch switches the working tree to `branch`, creating
+// it locally if it doesn't exist. The creation path bases the
+// new branch on whatever's currently checked out (typically the
+// project's default branch), so an unseen `run-2` branches off
+// from the tip of `main` — matching the "branches as isolated
+// run workspaces" mental model.
+//
+// Idempotent — a no-op when HEAD is already on `branch`. The
+// caller MUST hold the project lock.
+func (p *Project) CheckoutBranch(branch string) error {
+	target := p.resolveBranch(branch)
+	wt, err := p.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("getting worktree: %w", err)
+	}
+	refName := plumbing.NewBranchReferenceName(target)
+	// Already on this branch? No-op.
+	if head, err := p.repo.Head(); err == nil && head.Name() == refName {
+		return nil
+	}
+	// Does the branch exist locally? If so, simple checkout.
+	if _, err := p.repo.Reference(refName, true); err == nil {
+		return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+	}
+	// Branch doesn't exist yet. Create from current HEAD so
+	// the new branch starts with the project's seed commit
+	// (or whatever the user has worked on, for init'd repos).
+	// Create=true + Keep=true preserves working-tree state so
+	// we don't clobber uncommitted work on the way in.
+	return wt.Checkout(&gogit.CheckoutOptions{
+		Branch: refName,
+		Create: true,
+		Keep:   true,
+	})
+}
+
+// pushBranchInternal is the branch-aware equivalent of
+// pushInternal. It pushes only the named branch to origin.
+// Empty `branch` resolves to the project default.
+func (p *Project) pushBranchInternal(branch string, force bool) error {
+	if p.remoteURL == "" {
+		return nil
+	}
+	b := p.resolveBranch(branch)
+	refSpec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", b, b)
+	err := p.repo.Push(&gogit.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
+		Force:      force,
+		Auth:       sshAuthMethod(p.remoteURL),
+	})
+	p.lastPushAt = time.Now()
+	if err != nil && err != gogit.NoErrAlreadyUpToDate {
+		p.lastPushError = err.Error()
+		return friendlyGitError("push", p.remoteURL, err)
+	}
+	p.lastPushError = ""
+	return nil
 }
 
 // rebaseOnRemote runs `git pull --rebase --autostash` via the
@@ -1051,16 +1222,19 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 // stashed + reapplied around the rebase so we never surprise
 // the user with a dirty-tree rejection.
 //
-// No-op for local-only projects (no remoteURL).
-func (p *Project) rebaseOnRemote() error {
+// Pulls the specific branch the caller was pushing to — passing
+// "" resolves to the project's configured default. No-op for
+// local-only projects (no remoteURL).
+func (p *Project) rebaseOnRemote(branch string) error {
 	if p.remoteURL == "" {
 		return nil
 	}
-	cmd := exec.Command("git", "-C", p.workDir, "pull", "--rebase", "--autostash", "origin", "main")
+	b := p.resolveBranch(branch)
+	cmd := exec.Command("git", "-C", p.workDir, "pull", "--rebase", "--autostash", "origin", b)
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git pull --rebase origin main: %s (%w)", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("git pull --rebase origin %s: %s (%w)", b, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
@@ -1149,6 +1323,13 @@ func (p *Project) PushForce() error { return p.pushInternal(true) }
 // the private submit-time push. Returns nil for local-only projects
 // so callers can uniformly call it regardless of whether a remote is
 // configured.
+//
+// No RefSpecs — pushes every matching local branch to origin. In a
+// branch-per-run world a project can have many branches with local
+// commits that haven't shipped yet; a narrow default-branch-only
+// push would silently leave run-branch work behind on
+// enju_project_sync. Submit / CommitFiles paths that want to
+// target a single specific branch use pushBranchInternal instead.
 func (p *Project) pushInternal(force bool) error {
 	if p.remoteURL == "" {
 		return nil

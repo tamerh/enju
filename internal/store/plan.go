@@ -286,6 +286,7 @@ func (MoveArtifact) mutationKind() MutationKind { return MutMoveArtifact }
 // invalidation rollback when no prior writer exists.
 type DeleteArtifact struct {
 	ProjectID int64
+	Branch    string // branch this artifact row lives on; "" → "main"
 	Path      string
 }
 

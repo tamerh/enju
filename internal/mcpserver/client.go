@@ -283,16 +283,51 @@ func (c *apiClient) fetchProjectMeta(ctx context.Context, projectID int64) (remo
 // fetchProjectMetaFull is like fetchProjectMeta but also returns the
 // human-readable project name for workspace directory naming.
 func (c *apiClient) fetchProjectMetaFull(ctx context.Context, projectID int64) (remoteURL, name string, err error) {
+	remoteURL, name, _, err = c.fetchProjectMetaExpanded(ctx, projectID)
+	return
+}
+
+// openProject fetches project metadata, opens the workspace
+// clone, AND wires the project's default_branch into the
+// Project so Pull/Push fallback paths (enju_list_templates,
+// enju_get_artifact, enju_project_sync) target the right ref.
+// The tester-reported bug was exactly that: default_branch was
+// plumbed through the API but discarded at the workspace layer,
+// so every fallback silently used "main" regardless of what the
+// project was configured with. Every call site that pairs
+// fetchProjectMetaFull + workspace.ForProject should use this
+// helper instead to get the wiring for free.
+func (c *apiClient) openProject(ctx context.Context, projectID int64) (proj *mcpgit.Project, remoteURL, projName, defaultBranch string, err error) {
+	if c.workspace == nil {
+		return nil, "", "", "", fmt.Errorf("no workspace configured")
+	}
+	remoteURL, projName, defaultBranch, err = c.fetchProjectMetaExpanded(ctx, projectID)
+	if err != nil {
+		return nil, "", "", "", err
+	}
+	proj, err = c.workspace.ForProject(projectID, remoteURL, projName)
+	if err != nil {
+		return nil, remoteURL, projName, defaultBranch, err
+	}
+	proj.SetDefaultBranch(defaultBranch)
+	return proj, remoteURL, projName, defaultBranch, nil
+}
+
+// fetchProjectMetaExpanded returns remote_url + name +
+// default_branch. Called from paths that need the branch name
+// to configure the workspace (submit / claim / execute) so
+// Pull/Push target the right ref.
+func (c *apiClient) fetchProjectMetaExpanded(ctx context.Context, projectID int64) (remoteURL, name, defaultBranch string, err error) {
 	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d", projectID))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return "", "", fmt.Errorf("parsing project: %w", err)
+		return "", "", "", fmt.Errorf("parsing project: %w", err)
 	}
 	if errMsg, ok := raw["error"].(string); ok {
-		return "", "", fmt.Errorf("%s", errMsg)
+		return "", "", "", fmt.Errorf("%s", errMsg)
 	}
 	if v, ok := raw["remote_url"].(string); ok {
 		remoteURL = v
@@ -300,5 +335,8 @@ func (c *apiClient) fetchProjectMetaFull(ctx context.Context, projectID int64) (
 	if v, ok := raw["name"].(string); ok {
 		name = v
 	}
-	return remoteURL, name, nil
+	if v, ok := raw["default_branch"].(string); ok {
+		defaultBranch = v
+	}
+	return remoteURL, name, defaultBranch, nil
 }

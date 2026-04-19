@@ -208,13 +208,17 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		}
 	}
 
-	// Open the project workspace.
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
+	// Open the project workspace — openProject wires the
+	// project's default_branch into the Project, but this flow
+	// targets the RUN's branch explicitly via meta.Branch so
+	// the default is only used as a fallback for operations
+	// that don't take a branch override.
+	proj, _, _, _, err := c.openProject(ctx, meta.ProjectID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	proj.Lock()
-	_ = proj.Pull()
+	_ = proj.PullBranch(meta.Branch)
 	proj.Unlock()
 
 	workDir := proj.WorkDir()
@@ -485,6 +489,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		ModelName:     c.modelName,
 		Files:         files,
 		ArtifactPaths: artifactsWritten,
+		Branch:        meta.Branch,
 	})
 	proj.Unlock()
 	if err != nil {

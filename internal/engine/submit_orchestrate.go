@@ -136,9 +136,6 @@ func (e *Engine) ValidateSubmitRequest(
 type PostSubmitActions struct {
 	// ArtifactMutations to apply (MoveArtifact entries).
 	ArtifactMutations []store.Mutation
-	// CrossRunIDs lists run IDs that need a ready-task sweep
-	// because their artifact readers may have been affected.
-	CrossRunIDs map[int64]bool
 
 	// Review resolution.
 	ReviewTally        *ReviewTallyOutcome
@@ -169,9 +166,7 @@ func (e *Engine) ComputePostSubmitActions(
 	req *SubmitRequest,
 	decision, voteChoice string,
 ) (*PostSubmitActions, error) {
-	actions := &PostSubmitActions{
-		CrossRunIDs: map[int64]bool{},
-	}
+	actions := &PostSubmitActions{}
 
 	// Artifact index mutations.
 	if len(req.ArtifactsWritten) > 0 {
@@ -180,6 +175,7 @@ func (e *Engine) ComputePostSubmitActions(
 			actions.ArtifactMutations = append(actions.ArtifactMutations, store.MoveArtifact{
 				Artifact: store.ArtifactRecord{
 					ProjectID:  run.ProjectID,
+					Branch:     run.Branch,
 					Path:       path,
 					LastWriter: task.ClaimedBy,
 					LastTaskID: task.ID,
@@ -190,18 +186,12 @@ func (e *Engine) ComputePostSubmitActions(
 				},
 			})
 		}
-		// Cross-run propagation.
-		for _, path := range req.ArtifactsWritten {
-			readers, err := e.store.ListTasksReadingArtifact(run.ProjectID, path, false)
-			if err != nil {
-				continue
-			}
-			for _, rd := range readers {
-				if rd.RunID != task.RunID {
-					actions.CrossRunIDs[rd.RunID] = true
-				}
-			}
-		}
+		// Cross-run propagation used to sweep ready-tasks in
+		// other runs that read this artifact. Removed with the
+		// branch-per-run model: artifacts are keyed by
+		// (project, branch, path), so a write on branch A
+		// doesn't unblock readers on branch B — they read from
+		// their own branch's index, not this one.
 	}
 
 	// Review orchestration.

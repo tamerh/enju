@@ -11,19 +11,22 @@ import (
 )
 
 // InvalidationOutcome is the pure-computation result of
-// walking a task's DAG descendants, finding cross-run
-// artifact readers, computing artifact rollbacks, and
-// identifying dynamic-for_each descendants to
-// dematerialize. The router consumes this to decide what
-// store writes to perform.
+// walking a task's DAG descendants, computing artifact
+// rollbacks, and identifying dynamic-for_each descendants to
+// dematerialize. The router consumes this to decide what store
+// writes to perform.
+//
+// The cross-run-readers / affected-runs plumbing was removed
+// with the branch-per-run model — invalidation cascades stay
+// scoped to the target run, and branch isolation handles the
+// "what about other runs on the same data?" concern at a
+// lower level.
 type InvalidationOutcome struct {
 	TargetID           string
 	RegularDescendants []string
-	CrossRunReaders    []string
 	DematerializedIDs  []string
 	DematerializedDefs []string
 	ArtifactRollbacks  []ArtifactRollback
-	AffectedRunIDs     map[int64]bool
 }
 
 // ArtifactRollback describes what should happen to one
@@ -33,6 +36,7 @@ type InvalidationOutcome struct {
 type ArtifactRollback struct {
 	Path      string
 	ProjectID int64
+	Branch    string // branch this rollback targets; carried through to MoveArtifact/DeleteArtifact mutations
 	Delete    bool
 	RestoreTo *store.ArtifactRecord // nil when Delete is true
 }
@@ -115,36 +119,17 @@ func (e *Engine) ComputeInvalidation(
 		collectWrites(dt)
 	}
 
-	// Step 3: find cross-run artifact readers.
-	var crossRunReaders []string
-	affectedRunIDs := map[int64]bool{task.RunID: true}
-	for _, p := range writtenPaths {
-		art, _ := e.store.GetArtifact(run.ProjectID, p)
-		if art == nil {
-			continue
-		}
-		if !invalidatedSet[art.LastTaskID] {
-			continue
-		}
-		readers, err := e.store.ListTasksReadingArtifact(run.ProjectID, p, true)
-		if err != nil {
-			e.logger.Warn("listing artifact readers", "path", p, "error", err)
-			continue
-		}
-		for _, r := range readers {
-			if invalidatedSet[r.ID] {
-				continue
-			}
-			invalidatedSet[r.ID] = true
-			crossRunReaders = append(crossRunReaders, r.ID)
-			affectedRunIDs[r.RunID] = true
-		}
-	}
+	// Cross-run artifact reader cascade was removed with the
+	// branch-per-run model (Phase K): runs on distinct branches
+	// are isolated workspaces by design, and within a single
+	// branch the serial-runs-per-branch invariant means only
+	// one run is active at a time. Invalidations stay scoped to
+	// the target run's descendants.
 
 	// Step 4: compute artifact rollbacks.
 	var rollbacks []ArtifactRollback
 	for _, p := range writtenPaths {
-		art, _ := e.store.GetArtifact(run.ProjectID, p)
+		art, _ := e.store.GetArtifact(run.ProjectID, run.Branch, p)
 		if art == nil || !invalidatedSet[art.LastTaskID] {
 			continue
 		}
@@ -170,6 +155,7 @@ func (e *Engine) ComputeInvalidation(
 			rollbacks = append(rollbacks, ArtifactRollback{
 				Path:      p,
 				ProjectID: run.ProjectID,
+				Branch:    run.Branch,
 				Delete:    true,
 			})
 			continue
@@ -178,8 +164,10 @@ func (e *Engine) ComputeInvalidation(
 		rollbacks = append(rollbacks, ArtifactRollback{
 			Path:      p,
 			ProjectID: run.ProjectID,
+			Branch:    run.Branch,
 			RestoreTo: &store.ArtifactRecord{
 				ProjectID:  run.ProjectID,
+				Branch:     run.Branch,
 				Path:       p,
 				LastWriter: pick.ClaimedBy,
 				LastTaskID: pick.ID,
@@ -238,10 +226,8 @@ func (e *Engine) ComputeInvalidation(
 	return &InvalidationOutcome{
 		TargetID:           task.ID,
 		RegularDescendants: regularDescendants,
-		CrossRunReaders:    crossRunReaders,
 		DematerializedIDs:  dematerializedIDs,
 		DematerializedDefs: dematDefList,
 		ArtifactRollbacks:  rollbacks,
-		AffectedRunIDs:     affectedRunIDs,
 	}, nil
 }

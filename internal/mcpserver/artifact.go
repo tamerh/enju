@@ -66,8 +66,7 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, int64(projectID))
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -123,11 +122,7 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError("get_artifact_history requires a local workspace (MCP client mode)"), nil
 	}
 
-	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

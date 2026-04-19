@@ -402,6 +402,18 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 			"claimed_by": "alice"
 		}`))
 	})
+	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
+		// openProject fetches the project record to wire
+		// default_branch into the workspace. Minimal response
+		// matching the fields fetchProjectMetaExpanded reads.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": 7,
+			"name": "review-test",
+			"remote_url": "` + bareDir + `",
+			"default_branch": "main"
+		}`))
+	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1048,7 +1060,7 @@ func TestRenderMermaidBodyTransitiveReduction(t *testing.T) {
   {"id":"1:1:expand","task_def_id":"expand","state":"accepted","depends_on":"1:1:discover"},
   {"id":"1:1:tag","task_def_id":"tag","state":"ready","depends_on":"1:1:discover,1:1:expand"}
 ]`)
-	out := renderMermaidBody(runJSON, tasksJSON, nil)
+	out := renderMermaidBody(runJSON, tasksJSON)
 	// Expect exactly 2 edges: discover→expand, expand→tag.
 	// The direct discover→tag should be pruned.
 	if got := strings.Count(out, "-->"); got != 2 {

@@ -104,6 +104,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolCreateProject(), client.handleCreateProject)
 	s.AddTool(toolInit(), client.handleInit)
 	s.AddTool(toolSetProjectRemote(), client.handleSetProjectRemote)
+	s.AddTool(toolSetProjectDefaultBranch(), client.handleSetProjectDefaultBranch)
 	s.AddTool(toolProjectRemoteStatus(), client.handleProjectRemoteStatus)
 	s.AddTool(toolProjectSync(), client.handleProjectSync)
 	s.AddTool(toolLeaveProject(), client.handleLeaveProject)

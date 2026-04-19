@@ -219,13 +219,13 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	proj, err := c.workspace.ForProject(meta.ProjectID, meta.ProjectRemoteURL, meta.ProjectName)
+	proj, _, _, _, err := c.openProject(ctx, meta.ProjectID)
 	if err != nil {
 		return nil, err
 	}
 	proj.Lock()
 	defer proj.Unlock()
-	if err := proj.Pull(); err != nil {
+	if err := proj.PullBranch(meta.Branch); err != nil {
 		return nil, fmt.Errorf("refreshing local clone before resolving task %s: %w", meta.ID, err)
 	}
 

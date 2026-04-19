@@ -112,6 +112,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleProjectSync(ctx, req)
 	case "enju_set_project_remote":
 		return t.c.handleSetProjectRemote(ctx, req)
+	case "enju_set_project_default_branch":
+		return t.c.handleSetProjectDefaultBranch(ctx, req)
 	case "enju_leave_project":
 		return t.c.handleLeaveProject(ctx, req)
 	case "enju_add_project_member":

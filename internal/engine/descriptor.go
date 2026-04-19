@@ -120,7 +120,7 @@ func (e *Engine) BuildInputsDescriptor(
 		_ = json.Unmarshal([]byte(task.ReadsArtifacts), &artifactPaths)
 	}
 	for _, p := range artifactPaths {
-		art, err := e.store.GetArtifact(run.ProjectID, p)
+		art, err := e.store.GetArtifact(run.ProjectID, run.Branch, p)
 		if err != nil || art == nil {
 			desc.ArtifactReads = append(desc.ArtifactReads, map[string]interface{}{
 				"path":       p,

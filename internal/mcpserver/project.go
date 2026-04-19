@@ -99,6 +99,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	}
 	description := req.GetString("description", "")
 	remoteURL := req.GetString("remote_url", "")
+	defaultBranch := req.GetString("default_branch", "")
 
 	// Auto-create a local bare repo when no remote is
 	// specified. This ensures the fat-client path always
@@ -112,11 +113,15 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		autoLocal = true
 	}
 
-	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
+	body := map[string]string{
 		"name":        name,
 		"description": description,
 		"remote_url":  remoteURL,
-	})
+	}
+	if defaultBranch != "" {
+		body["default_branch"] = defaultBranch
+	}
+	data, err := c.post(ctx, "/api/v1/projects", body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -269,14 +274,30 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		})
 	}
 
+	// Pick up the folder's current HEAD branch as the
+	// project's default_branch. If HEAD can't be read (shouldn't
+	// happen after the scaffold commit above but we handle it
+	// just in case), fall back to "main" via omission. Adopted
+	// repos that already run on "trunk" / "develop" / "enju/work"
+	// get their existing branch honored instead of being forced
+	// onto "main".
+	adoptedBranch := ""
+	if head, herr := repo.Head(); herr == nil && head.Name().IsBranch() {
+		adoptedBranch = head.Name().Short()
+	}
+
 	// Register project with coordinator. Store the local path as
 	// remote_url so it persists across MCP restarts. The fat-client
 	// path detects local working trees and opens them directly
 	// instead of cloning.
-	data, err := c.post(ctx, "/api/v1/projects", map[string]string{
+	body := map[string]string{
 		"name":       name,
 		"remote_url": dirPath,
-	})
+	}
+	if adoptedBranch != "" {
+		body["default_branch"] = adoptedBranch
+	}
+	data, err := c.post(ctx, "/api/v1/projects", body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -312,7 +333,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 	if c.workspace == nil {
 		return mcp.NewToolResultError("remote status is only available in MCP client mode"), nil
 	}
-	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
+	proj, remoteURL, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -327,10 +348,6 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 		return mcp.NewToolResultText(formatProjectRemoteStatus(data)), nil
 	}
 
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
 	cmp, err := proj.CompareToRemote()
 	if err != nil {
 		return mcp.NewToolResultError("comparing to remote: " + err.Error()), nil
@@ -378,17 +395,12 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 	}
 	force := req.GetBool("force", false)
 
-	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
+	proj, remoteURL, _, _, err := c.openProject(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	if remoteURL == "" {
 		return mcp.NewToolResultError("project has no remote configured"), nil
-	}
-
-	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	proj.Lock()
@@ -635,6 +647,33 @@ func (c *apiClient) setMemberRole(ctx context.Context, req mcp.CallToolRequest, 
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("✓ %s %s on project #%d (now: %s)", username, verb, projectID, newRole)), nil
 }
+// handleSetProjectDefaultBranch changes a project's default
+// branch. Thin REST pass-through; the coordinator enforces
+// owner-only + branch shape validation.
+func (c *apiClient) handleSetProjectDefaultBranch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	branch, err := req.RequireString("branch")
+	if err != nil {
+		return mcp.NewToolResultError("branch is required"), nil
+	}
+	data, err := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/default_branch", projectID), map[string]string{
+		"branch": branch,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(data, &resp) == nil {
+		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Project #%d default branch set to %q", projectID, branch)), nil
+}
+
 // handleSetProjectRemote updates a project's remote URL in the
 // coordinator DB and, if a local clone exists, reconfigures its
 // origin remote to match. Kept as a single tool (not split between
