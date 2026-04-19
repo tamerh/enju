@@ -4213,6 +4213,101 @@ printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 	}
 }
 
+// TestMCPParamDefaultAppliesWhenUnsupplied verifies that a
+// declared default: on a run param fires when the caller
+// doesn't supply the param — both flows have to pick it up:
+// (1) {{placeholder}} substitution at parse time, and (2) the
+// persisted runs.params JSON that feeds ENJU_PARAM_<name>.
+// The coordinator used to skip substitution entirely when the
+// caller passed no params, so defaults silently did nothing.
+func TestMCPParamDefaultAppliesWhenUnsupplied(t *testing.T) {
+	h := newMCPHarness(t, "ParamDefault")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/defaulted/template.yaml": {body: `name: "default applies"
+version: 1
+params:
+  - name: effort_override
+    type: string
+    default: "medium"
+    description: "Effort level"
+tasks:
+  - id: run
+    action: compute
+    script: scripts/echo.sh
+    env:
+      CLAUDE_EFFORT: "{{effort_override}}"
+`, mode: 0o644},
+		"enju_templates/defaulted/scripts/echo.sh": {body: `#!/bin/bash
+printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
+printf 'param_effort=%s\n' "${ENJU_PARAM_effort_override:-unset}"
+`, mode: 0o755},
+	}, "seed defaulted bundle")
+
+	// Caller deliberately passes NO params. Old behavior:
+	// {{effort_override}} stays literal, ENJU_PARAM is empty.
+	// New behavior: default "medium" flows through both paths.
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/defaulted",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	body := h.mcpBareResultMD(t, "run")
+	if !strings.Contains(body, "effort=medium") {
+		t.Errorf("expected effort=medium from {{effort_override}} default; got:\n%s", body)
+	}
+	if !strings.Contains(body, "param_effort=medium") {
+		t.Errorf("expected ENJU_PARAM_effort_override=medium from persisted merged params; got:\n%s", body)
+	}
+}
+
+// TestMCPParamSuppliedOverridesDefault verifies caller-supplied
+// values still win when both default: and supplied are present.
+// Regression guard for the merge order.
+func TestMCPParamSuppliedOverridesDefault(t *testing.T) {
+	h := newMCPHarness(t, "ParamOverride")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/overridden/template.yaml": {body: `name: "supplied wins"
+version: 1
+params:
+  - name: effort_override
+    type: string
+    default: "medium"
+tasks:
+  - id: run
+    action: compute
+    script: scripts/echo.sh
+    env:
+      CLAUDE_EFFORT: "{{effort_override}}"
+`, mode: 0o644},
+		"enju_templates/overridden/scripts/echo.sh": {body: `#!/bin/bash
+printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
+`, mode: 0o755},
+	}, "seed overridden bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/overridden",
+		"params":     map[string]any{"effort_override": "high"},
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	body := h.mcpBareResultMD(t, "run")
+	if !strings.Contains(body, "effort=high") {
+		t.Errorf("expected caller-supplied 'high' to override default; got:\n%s", body)
+	}
+}
+
 // TestMCPComputeTaskEnvRejectsReservedPrefix verifies the
 // parser rejects env: keys that start with ENJU_ so authors
 // can't accidentally clobber system or run-param vars.

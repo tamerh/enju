@@ -87,8 +87,11 @@ func parseInternal(data []byte, paramValues map[string]interface{}, substitute b
 		return nil, fmt.Errorf("validation: %w", err)
 	}
 
+	var merged map[string]interface{}
 	if substitute {
-		if err := substituteParamsInPlace(&prob, paramValues); err != nil {
+		var err error
+		merged, err = substituteParamsInPlace(&prob, paramValues)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -98,6 +101,7 @@ func parseInternal(data []byte, paramValues map[string]interface{}, substitute b
 		return nil, fmt.Errorf("building DAG: %w", err)
 	}
 	parsed.Warnings = warnings
+	parsed.MergedParams = merged
 
 	return parsed, nil
 }
@@ -117,7 +121,7 @@ func resolveDefaults(p *Run) {
 // match, and substitutes `{{param}}` references in every task
 // prompt. Errors are phrased in natural language so the LLM can
 // forward them to the user as conversational follow-ups.
-func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
+func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[string]interface{}, error) {
 	// If the run declares no params, the caller should not be
 	// passing any either — that usually means a template path
 	// mixup.
@@ -128,9 +132,9 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			return fmt.Errorf("this run does not declare any parameters, but values were supplied for: %s", strings.Join(keys, ", "))
+			return nil, fmt.Errorf("this run does not declare any parameters, but values were supplied for: %s", strings.Join(keys, ", "))
 		}
-		return nil
+		return nil, nil
 	}
 
 	declared := make(map[string]*ParamDef, len(p.Params))
@@ -149,7 +153,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 				known = append(known, k)
 			}
 			sort.Strings(known)
-			return fmt.Errorf("unknown parameter %q — this run declares: %s", name, strings.Join(known, ", "))
+			return nil, fmt.Errorf("unknown parameter %q — this run declares: %s", name, strings.Join(known, ", "))
 		}
 	}
 
@@ -165,7 +169,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 	for name, v := range supplied {
 		pp := declared[name]
 		if err := checkParamValueType(name, pp.Type, v); err != nil {
-			return err
+			return nil, err
 		}
 		merged[name] = v
 	}
@@ -186,7 +190,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required parameter(s):\n  - %s", strings.Join(missing, "\n  - "))
+		return nil, fmt.Errorf("missing required parameter(s):\n  - %s", strings.Join(missing, "\n  - "))
 	}
 
 	// Substitute into task prompts. We stringify each value with
@@ -201,7 +205,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 	// Same pattern as task-level (below) but resolved once at
 	// the run scope so buildRunLevel sees a static map.
 	if err := substituteForEachParamRefs(p.ForEach, merged, "run"); err != nil {
-		return err
+		return nil, err
 	}
 
 	for i := range p.Tasks {
@@ -231,10 +235,10 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 		// Task-level for_each param-ref substitution. Shared
 		// helper also handles the run-level scope above.
 		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID)); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return merged, nil
 }
 
 // substituteStringSliceInPlace walks a []string (or the

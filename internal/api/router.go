@@ -977,18 +977,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse and validate the YAML. If the caller supplied
-	// top-level params (Phase H.1), use ParseWithParams to
-	// substitute them into task prompts before validation/DAG
-	// construction. Calls with no params take the plain Parse
-	// path so inline-YAML submissions keep their existing
-	// semantics.
-	var parsed *enjuYaml.ParsedRun
-	if req.Params != nil {
-		parsed, err = enjuYaml.ParseWithParams([]byte(req.YAML), req.Params)
-	} else {
-		parsed, err = enjuYaml.Parse([]byte(req.YAML))
-	}
+	// Always route through ParseWithParams so declared defaults
+	// fire even when the caller supplied no params. Passing nil
+	// is equivalent to "caller supplied nothing" — defaults
+	// still apply, and a required-no-default param raises the
+	// natural-language error. Previously the plain-Parse branch
+	// skipped substitution entirely and {{placeholder}} refs
+	// leaked through as literal text whenever callers leaned on
+	// defaults, which defeated the whole point of the default:
+	// field.
+	parsed, err := enjuYaml.ParseWithParams([]byte(req.YAML), req.Params)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid run definition: "+err.Error())
 		return
@@ -1004,14 +1002,17 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 	// Create the run record.
 	now := time.Now()
-	// Persist the submitted params map (JSON-encoded) so the
-	// compute executor can rehydrate them into ENJU_PARAM_*
-	// env vars on task execution. Submitted params were
-	// previously substituted into prompts at parse time and
-	// not kept anywhere — unreachable from shell scripts.
+	// Persist the MERGED params (declared defaults + caller-
+	// supplied values, supplied wins) so the compute executor
+	// rehydrates them into ENJU_PARAM_* env vars on task
+	// execution. Using the merged map here ensures defaults
+	// reach scripts too — persisting only req.Params would
+	// drop defaults, causing `{{param}}` refs to substitute
+	// correctly at parse time but ENJU_PARAM_<name> to come up
+	// empty for any param the caller didn't type.
 	var paramsJSON string
-	if req.Params != nil {
-		if b, merr := json.Marshal(req.Params); merr == nil {
+	if len(parsed.MergedParams) > 0 {
+		if b, merr := json.Marshal(parsed.MergedParams); merr == nil {
 			paramsJSON = string(b)
 		}
 	}

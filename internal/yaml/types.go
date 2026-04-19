@@ -358,6 +358,16 @@ type ParsedRun struct {
 	// nothing), a for_each variable with only one value
 	// (equivalent to a singleton), etc.
 	Warnings []string
+	// MergedParams is the fully-resolved parameter map used
+	// for this run: declared defaults merged with caller-
+	// supplied values (supplied wins on collision).
+	// Populated by ParseWithParams — nil when parsed via the
+	// plain Parse path (describe-only usage). This is the
+	// authoritative "what params was this run instantiated
+	// with" record and is what the coordinator persists to
+	// runs.params so compute scripts see defaults via
+	// ENJU_PARAM_<name>, not just what the caller typed.
+	MergedParams map[string]interface{}
 }
 
 // DeferredTaskDef records a task def whose expansion (or
