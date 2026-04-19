@@ -115,27 +115,32 @@ func (s *Server) authenticateCitizen(w http.ResponseWriter, r *http.Request) *st
 }
 
 // authMiddleware validates the Bearer token on every request.
-// Soft-enforced: missing token → allowed through (backwards
-// compat for clients that haven't re-registered yet).
-// Invalid token → 401. The validated citizen record is
-// stashed in the request context for handlers to use.
+// Hard-enforced: missing OR invalid token → 401. The only
+// un-authenticated endpoint is /citizens/register (bootstrap),
+// which is explicitly whitelisted below.
+//
+// Prior iterations let missing-token requests fall through for
+// backwards-compat. That was removed after Phase J: a coordinator
+// that silently ignores "no auth header" leaks project data to
+// anyone who just forgets to send one, and the coordinator
+// already rejects INVALID tokens — the asymmetry was a pure
+// footgun.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
-			// Soft enforcement: no token → allowed through.
-			// This is intentional for the transition period
-			// while clients upgrade. Monitor these in logs
-			// and tighten to hard-reject after battle tests.
-			if r.Method != "GET" {
-				s.logger.Debug("auth: no token on write request",
-					"method", r.Method, "path", r.URL.Path)
-			}
+		// Bootstrap exception: /citizens/register is the only
+		// endpoint that legitimately has no token — that's
+		// how a new citizen gets one.
+		if r.URL.Path == "/api/v1/citizens/register" {
 			next.ServeHTTP(w, r)
 			return
 		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			writeError(w, http.StatusUnauthorized, "Authorization header is required — send 'Bearer <token>' from your registered citizen")
+			return
+		}
 		if !strings.HasPrefix(auth, "Bearer ") {
-			writeError(w, http.StatusUnauthorized, "invalid Authorization header")
+			writeError(w, http.StatusUnauthorized, "invalid Authorization header — expected 'Bearer <token>'")
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
@@ -173,25 +178,24 @@ func (s *Server) requireProjectMembershipForTask(w http.ResponseWriter, r *http.
 	return s.requireProjectMembership(w, r, run.ProjectID)
 }
 
-// requireProjectMembership returns the caller's membership row for
-// a project, writing a 403 and returning nil if gating should
-// block. Three tiers of enforcement:
+// requireProjectMembership returns the caller's membership row
+// for a project, writing the appropriate error and returning
+// false when gating blocks the request.
 //
-//   - No authenticated caller (soft-auth legacy path): allowed
-//     through with a nil record. Write endpoints log these already.
-//   - Project has zero members (pre-migration legacy project): open,
-//     returns nil. This is a transition-period courtesy — new
-//     projects always seed the creator as owner so they'll never
-//     land here.
-//   - Project has members: caller must appear. Non-members get a
-//     403 "not a member of project X".
-//
-// Callers that need owner-only enforcement check the returned
-// record's Role after this succeeds.
+// Since authMiddleware hard-enforces Bearer tokens, the caller is
+// always non-nil by the time this runs. The only gray area is
+// pre-membership legacy projects with zero rows in
+// project_members — those remain open so databases migrated from
+// the pre-Phase-J schema don't lose access overnight. Every new
+// project seeds its creator as owner so it never lands there.
 func (s *Server) requireProjectMembership(w http.ResponseWriter, r *http.Request, projectID int64) (*store.ProjectMemberRecord, bool) {
 	caller := citizenFromRequest(r)
 	if caller == nil {
-		return nil, true
+		// Belt-and-suspenders: authMiddleware should have
+		// already rejected this. Treat as 401 if we ever
+		// somehow reach here.
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return nil, false
 	}
 	total, err := s.store.CountProjectMembers(projectID)
 	if err != nil {
@@ -199,6 +203,9 @@ func (s *Server) requireProjectMembership(w http.ResponseWriter, r *http.Request
 		return nil, false
 	}
 	if total == 0 {
+		// Pre-membership legacy project — no rows means "not
+		// migrated yet", not "empty." Keep open so reading
+		// the DB before any member is seeded still works.
 		return nil, true
 	}
 	m, err := s.store.GetProjectMember(projectID, caller.ID)
@@ -376,14 +383,16 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	// by the MCP client's workspace.
 	now := time.Now()
 	creator := citizenFromRequest(r)
-	createdBy := ""
-	if creator != nil {
-		createdBy = creator.Username
+	if creator == nil {
+		// authMiddleware requires a token; this is defense in
+		// depth for future refactors.
+		writeError(w, http.StatusUnauthorized, "authentication required to create a project")
+		return
 	}
 	id, err := s.store.CreateProject(&store.ProjectRecord{
 		Name:        req.Name,
 		Description: req.Description,
-		CreatedBy:   createdBy,
+		CreatedBy:   creator.Username,
 		RemoteURL:   req.RemoteURL,
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -393,16 +402,12 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Creator auto-add: seed the project with the caller as
-	// owner. Skipped when the request arrived without a
-	// registered citizen (soft-auth legacy path) — the project
-	// exists, but membership is pre-migration "open" until
-	// someone claims ownership via a future adoption tool.
-	if creator != nil {
-		if err := s.store.AddProjectMember(id, creator.ID, store.ProjectRoleOwner, 0); err != nil {
-			s.logger.Warn("creator auto-add failed",
-				"project_id", id, "citizen_id", creator.ID, "error", err)
-		}
+	// Seed the creator as owner. Every project has at least
+	// this one member from birth — no legacy zero-members
+	// branch on the new-project path.
+	if err := s.store.AddProjectMember(id, creator.ID, store.ProjectRoleOwner, 0); err != nil {
+		s.logger.Warn("creator auto-add failed",
+			"project_id", id, "citizen_id", creator.ID, "error", err)
 	}
 
 	writeJSON(w, http.StatusCreated, projectResponse{
@@ -461,18 +466,12 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	caller := citizenFromRequest(r)
-
-	// Authenticated callers see only projects they're a member
-	// of. Anonymous (soft-auth legacy) callers still see the
-	// full list — existing un-authenticated tooling keeps
-	// working during the transition.
-	var projects []store.ProjectRecord
-	var err error
-	if caller != nil {
-		projects, err = s.store.ListProjectsForCitizen(caller.ID)
-	} else {
-		projects, err = s.store.ListProjects()
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
 	}
+	// Callers see only projects they're a member of.
+	projects, err := s.store.ListProjectsForCitizen(caller.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list projects")
 		return
@@ -1100,25 +1099,25 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter runs by project membership for authenticated
-	// callers. Anonymous soft-auth sees everything (existing
-	// behavior during the transition).
+	// Filter runs to projects the caller is a member of.
+	// Legacy zero-members projects still flow through — they're
+	// the pre-Phase-J open set.
 	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 	allowed := map[int64]bool{}
-	if caller != nil {
-		memberProjects, _ := s.store.ListProjectsForCitizen(caller.ID)
-		for _, p := range memberProjects {
-			allowed[p.ID] = true
-		}
+	memberProjects, _ := s.store.ListProjectsForCitizen(caller.ID)
+	for _, p := range memberProjects {
+		allowed[p.ID] = true
 	}
 
 	var resp []runResponse
 	for _, p := range runs {
-		if caller != nil {
-			total, _ := s.store.CountProjectMembers(p.ProjectID)
-			if total > 0 && !allowed[p.ProjectID] {
-				continue
-			}
+		total, _ := s.store.CountProjectMembers(p.ProjectID)
+		if total > 0 && !allowed[p.ProjectID] {
+			continue
 		}
 		tasks, _ := s.store.ListTasksByRun(p.ID)
 		resp = append(resp, runResponse{
@@ -1468,29 +1467,30 @@ func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
 
 	// Cross-project listings: filter to tasks whose run's
 	// project the caller is a member of. Pre-membership legacy
-	// projects (zero members) stay visible. Anonymous soft-auth
-	// callers see everything.
+	// projects (zero members) stay visible.
 	if projectID == 0 {
 		caller := citizenFromRequest(r)
-		if caller != nil {
-			allowed := map[int64]bool{}
-			member, _ := s.store.ListProjectsForCitizen(caller.ID)
-			for _, p := range member {
-				allowed[p.ID] = true
-			}
-			filtered := tasks[:0]
-			for _, t := range tasks {
-				run, _ := s.store.GetRun(t.RunID)
-				if run == nil {
-					continue
-				}
-				total, _ := s.store.CountProjectMembers(run.ProjectID)
-				if total == 0 || allowed[run.ProjectID] {
-					filtered = append(filtered, t)
-				}
-			}
-			tasks = filtered
+		if caller == nil {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
 		}
+		allowed := map[int64]bool{}
+		member, _ := s.store.ListProjectsForCitizen(caller.ID)
+		for _, p := range member {
+			allowed[p.ID] = true
+		}
+		filtered := tasks[:0]
+		for _, t := range tasks {
+			run, _ := s.store.GetRun(t.RunID)
+			if run == nil {
+				continue
+			}
+			total, _ := s.store.CountProjectMembers(run.ProjectID)
+			if total == 0 || allowed[run.ProjectID] {
+				filtered = append(filtered, t)
+			}
+		}
+		tasks = filtered
 	}
 	writeJSON(w, http.StatusOK, s.toTaskResponses(tasks))
 }

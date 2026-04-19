@@ -104,6 +104,16 @@ type testServer struct {
 	// them to the workspace without re-hitting the API.
 	muRemotes sync.Mutex
 	remotes   map[int64]string
+
+	// Auth: the coordinator requires a Bearer token on every
+	// endpoint except /citizens/register. The test harness
+	// caches the token returned by register() per username and
+	// attaches the default citizen's token on every unqualified
+	// post/get. Tests that act as a specific citizen use the
+	// postAs/getAs variants.
+	muAuth         sync.Mutex
+	tokens         map[string]string // username → token
+	defaultUser    string            // first-registered citizen, used when no explicit actor specified
 }
 
 // bareRemotePath returns the on-disk path of the bare repo acting
@@ -193,43 +203,177 @@ func newTestServer(t *testing.T) *testServer {
 		workspace:    ws,
 		store:        st,
 		remotes:      make(map[int64]string),
+		tokens:       make(map[string]string),
 	}
 }
 
-func (s *testServer) get(path string) map[string]interface{} {
+// tokenFor returns the cached token for a username, or the
+// store-persisted token if we didn't cache it (e.g. the
+// username was created outside our helpers). Returns an empty
+// string if the citizen doesn't exist at all.
+func (s *testServer) tokenFor(username string) string {
+	s.muAuth.Lock()
+	tok, ok := s.tokens[username]
+	s.muAuth.Unlock()
+	if ok {
+		return tok
+	}
+	if cz, err := s.store.GetCitizenByUsername(username); err == nil && cz != nil {
+		s.muAuth.Lock()
+		s.tokens[username] = cz.Token
+		s.muAuth.Unlock()
+		return cz.Token
+	}
+	return ""
+}
+
+// defaultToken returns the token of the first-registered citizen
+// (the implicit "default actor" for unqualified post/get calls).
+// Returns "" when no citizen has been registered yet.
+func (s *testServer) defaultToken() string {
+	s.muAuth.Lock()
+	defer s.muAuth.Unlock()
+	if s.defaultUser == "" {
+		return ""
+	}
+	return s.tokens[s.defaultUser]
+}
+
+// wipeProjectMembers strips a project down to zero members so
+// it lands in the legacy open bucket that gating treats as
+// transparent. Test-harness convention: most existing tests
+// register multiple citizens and expect them all to work
+// against a freshly-created project without explicit membership
+// setup. Membership-specific tests create projects via
+// mcpCreateProjectAs which does NOT call this helper.
+func (s *testServer) wipeProjectMembers(projectID int64) {
 	s.t.Helper()
-	resp, err := http.Get(s.url + path)
+	members, _ := s.store.ListProjectMembers(projectID)
+	for _, m := range members {
+		_ = s.store.RemoveProjectMember(projectID, m.CitizenID)
+	}
+}
+
+// ensureDefaultCitizen auto-registers a throwaway "harness"
+// citizen so tests that don't care about identity still have an
+// implicit token to attach to unqualified post/get calls. No-op
+// if a default citizen is already set (either because the test
+// already registered someone, or because this helper fired on a
+// previous call).
+func (s *testServer) ensureDefaultCitizen() {
+	s.muAuth.Lock()
+	have := s.defaultUser != ""
+	s.muAuth.Unlock()
+	if have {
+		return
+	}
+	s.register("Test Harness")
+}
+
+// setAuth stashes a username/token pair and, if no default actor
+// is set yet, marks this username as the default. register()
+// calls this as soon as the coordinator hands back a fresh
+// token, so the very next call that uses the implicit default
+// picks up the right identity.
+func (s *testServer) setAuth(username, token string) {
+	s.muAuth.Lock()
+	defer s.muAuth.Unlock()
+	if s.tokens == nil {
+		s.tokens = make(map[string]string)
+	}
+	s.tokens[username] = token
+	if s.defaultUser == "" {
+		s.defaultUser = username
+	}
+}
+
+// doAuthed is the shared request path for every helper that
+// needs to authenticate. Builds the request, attaches the token
+// (if any), decodes the response into one of the shapes the
+// caller requested. A token of "" means "anonymous" — only
+// valid for /citizens/register, which the coordinator whitelists.
+func (s *testServer) doAuthed(method, path, token string, body interface{}) (*http.Response, []byte) {
+	s.t.Helper()
+	var reader *bytes.Reader
+	if body != nil {
+		jsonBody, _ := json.Marshal(body)
+		reader = bytes.NewReader(jsonBody)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequest(method, s.url+path, reader)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		s.t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp, data
+}
+
+func (s *testServer) get(path string) map[string]interface{} {
+	s.t.Helper()
+	s.ensureDefaultCitizen()
+	_, data := s.doAuthed("GET", path, s.defaultToken(), nil)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(data, &result)
 	return result
 }
 
 func (s *testServer) getList(path string) []interface{} {
 	s.t.Helper()
-	resp, err := http.Get(s.url + path)
-	if err != nil {
-		s.t.Fatal(err)
-	}
-	defer resp.Body.Close()
+	s.ensureDefaultCitizen()
+	_, data := s.doAuthed("GET", path, s.defaultToken(), nil)
 	var result []interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(data, &result)
+	return result
+}
+
+// getAs issues a GET with a specific citizen's token. Used by
+// membership tests that want to verify gating acts differently
+// per caller.
+func (s *testServer) getAs(username, path string) map[string]interface{} {
+	s.t.Helper()
+	_, data := s.doAuthed("GET", path, s.tokenFor(username), nil)
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
 	return result
 }
 
 func (s *testServer) post(path string, body interface{}) map[string]interface{} {
 	s.t.Helper()
-	jsonBody, _ := json.Marshal(body)
-	resp, err := http.Post(s.url+path, "application/json", bytes.NewReader(jsonBody))
-	if err != nil {
-		s.t.Fatal(err)
+	// /citizens/register is the bootstrap endpoint — no token
+	// required (and none available for the first citizen).
+	if path == "/api/v1/citizens/register" {
+		_, data := s.doAuthed("POST", path, "", body)
+		var result map[string]interface{}
+		json.Unmarshal(data, &result)
+		return result
 	}
-	defer resp.Body.Close()
+	// Every other endpoint requires auth; auto-register a
+	// throwaway harness citizen if the test hasn't already.
+	s.ensureDefaultCitizen()
+	_, data := s.doAuthed("POST", path, s.defaultToken(), body)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(data, &result)
+	return result
+}
+
+// postAs issues a POST with a specific citizen's token.
+func (s *testServer) postAs(username, path string, body interface{}) map[string]interface{} {
+	s.t.Helper()
+	_, data := s.doAuthed("POST", path, s.tokenFor(username), body)
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
 	return result
 }
 
@@ -245,6 +389,12 @@ func (s *testServer) register(name string) string {
 	if !ok {
 		s.t.Fatalf("register failed: %v", resp)
 	}
+	// Stash the server-issued token so subsequent unauth'd
+	// helpers (post, get) can attach the first-registered
+	// citizen's Bearer automatically.
+	if tok, _ := resp["token"].(string); tok != "" {
+		s.setAuth(username, tok)
+	}
 	return username
 }
 
@@ -254,6 +404,9 @@ func (s *testServer) registerWithEmail(name, email string) string {
 	username, ok := resp["username"].(string)
 	if !ok {
 		s.t.Fatalf("register failed: %v", resp)
+	}
+	if tok, _ := resp["token"].(string); tok != "" {
+		s.setAuth(username, tok)
 	}
 	return username
 }
@@ -297,6 +450,11 @@ func (s *testServer) updateProfile(username, name, email string) map[string]inte
 // somewhere to push.
 func (s *testServer) createTestProject() int64 {
 	s.t.Helper()
+	// Hard-auth requires SOME citizen at the wheel. Tests that
+	// don't care about identity (schema/parser tests) still
+	// need a token, so auto-register a "harness" citizen the
+	// first time we create a project without one.
+	s.ensureDefaultCitizen()
 	// Unique name — timestamp + counter-ish from test server
 	name := fmt.Sprintf("test-%d", time.Now().UnixNano())
 
@@ -354,6 +512,7 @@ func (s *testServer) createTestProject() int64 {
 	}
 	projectID := int64(id)
 	s.rememberRemote(projectID, barePath)
+	s.wipeProjectMembers(projectID)
 	return projectID
 }
 
@@ -363,6 +522,7 @@ func (s *testServer) createTestProject() int64 {
 // just call createTestProject().
 func (s *testServer) createTestProjectAt(name, barePath string) int64 {
 	s.t.Helper()
+	s.ensureDefaultCitizen()
 	resp := s.post("/api/v1/projects", map[string]string{
 		"name":       name,
 		"remote_url": barePath,
@@ -373,6 +533,7 @@ func (s *testServer) createTestProjectAt(name, barePath string) int64 {
 	}
 	projectID := int64(id)
 	s.rememberRemote(projectID, barePath)
+	s.wipeProjectMembers(projectID)
 	return projectID
 }
 
@@ -1776,9 +1937,12 @@ func TestTokenAuthRejectsInvalidToken(t *testing.T) {
 	}
 }
 
-// TestTokenAuthAllowsMissingToken — a request with no
-// Authorization header should be allowed (soft enforcement).
-func TestTokenAuthAllowsMissingToken(t *testing.T) {
+// TestTokenAuthRejectsMissingToken — the coordinator hard-
+// enforces the Bearer token on every endpoint except
+// /citizens/register. A request with no Authorization header
+// must get a 401 so public-facing deployments don't leak
+// project data to anonymous callers.
+func TestTokenAuthRejectsMissingToken(t *testing.T) {
 	s := newTestServer(t)
 
 	resp, err := http.Get(s.url + "/api/v1/projects")
@@ -1786,8 +1950,8 @@ func TestTokenAuthAllowsMissingToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 for missing token (soft enforcement), got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing token, got %d", resp.StatusCode)
 	}
 }
 
