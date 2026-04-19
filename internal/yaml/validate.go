@@ -108,6 +108,8 @@ func validateComputeDependsDeclared(p *Run) []string {
 		if t.Action != "compute" {
 			continue
 		}
+		// Task-field refs (`{{upstream.content}}`) imply a
+		// DAG edge — suppress as before.
 		if hasTaskFieldReference(t.Prompt) ||
 			hasTaskFieldReference(t.UserPrompt) ||
 			hasTaskFieldReference(t.Script) ||
@@ -115,9 +117,23 @@ func validateComputeDependsDeclared(p *Run) []string {
 			len(t.DependsOn) > 0 {
 			continue
 		}
+		// Bare `{{param}}` refs (no dot) indicate the task
+		// is parameterized by run-level context — `{{source_repo}}`,
+		// `{{file}}` for_each variable, etc. Scripts that
+		// reach run context explicitly aren't the class of
+		// compute task the lint was designed to catch
+		// (stealth-readers of peer task outputs). Suppress to
+		// clear the false-positive tester hit on templates
+		// that ingest external data via ENJU_PARAM_* /
+		// context.json.
+		if hasParamReference(t.Prompt) ||
+			hasParamReference(t.UserPrompt) ||
+			hasParamReference(t.Script) {
+			continue
+		}
 		warnings = append(warnings, fmt.Sprintf(
 			"compute task %q has no declared dependencies "+
-				"(no {{task.*}} refs, no reads_artifacts, no depends_on). "+
+				"(no {{task.*}} refs, no {{param}} refs, no reads_artifacts, no depends_on). "+
 				"If its script reads output from another task, declare that "+
 				"dependency explicitly — otherwise the scheduler may run this "+
 				"task in parallel with its unknown upstream and a citizen "+
@@ -126,6 +142,36 @@ func validateComputeDependsDeclared(p *Run) []string {
 			t.ID))
 	}
 	return warnings
+}
+
+// hasParamReference returns true when the string contains a
+// bare `{{name}}` reference — no dot inside the braces. Those
+// resolve to run-level params or for_each iteration variables
+// at creation / materialization time, never to a peer task's
+// output. Used by the compute-dep-lint to suppress warnings
+// on tasks that visibly reach run context rather than
+// stealth-read peer outputs.
+func hasParamReference(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '{' || s[i+1] != '{' {
+			continue
+		}
+		sawDot := false
+		sawContent := false
+		for j := i + 2; j+1 < len(s); j++ {
+			if s[j] == '}' && s[j+1] == '}' {
+				if sawContent && !sawDot {
+					return true
+				}
+				break
+			}
+			if s[j] == '.' {
+				sawDot = true
+			}
+			sawContent = true
+		}
+	}
+	return false
 }
 
 // hasTaskFieldReference returns true when the string contains

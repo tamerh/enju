@@ -914,7 +914,13 @@ func ExpandForEach(forEach map[string][]string) []forEachInst {
 			out := make([]forEachInst, 0, len(values))
 			for _, v := range values {
 				out = append(out, forEachInst{
-					Key:    v,
+					// Key becomes part of the full task ID
+					// (path segment in REST URLs) — slug it
+					// to keep IDs routable. Params keeps the
+					// raw value so prompts / env vars /
+					// context.json see the original string
+					// the user supplied.
+					Key:    enjuYaml.SlugInstanceKey(v),
 					Params: map[string]string{name: v},
 				})
 			}
@@ -938,7 +944,7 @@ func ExpandForEach(forEach map[string][]string) []forEachInst {
 			var parts []string
 			for _, k := range keys {
 				copyAcc[k] = acc[k]
-				parts = append(parts, acc[k])
+				parts = append(parts, enjuYaml.SlugInstanceKey(acc[k]))
 			}
 			result = append(result, forEachInst{
 				Key:    strings.Join(parts, "_"),
@@ -954,6 +960,7 @@ func ExpandForEach(forEach map[string][]string) []forEachInst {
 	walk(0, make(map[string]string, len(keys)))
 	return result
 }
+
 
 // BuildDeferredInstance creates a TaskInstance from a
 // task def + a resolved for_each iteration.

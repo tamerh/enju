@@ -286,6 +286,53 @@ type forEachInstance struct {
 	key    string
 	params map[string]string
 }
+
+// SlugInstanceKey transforms a raw for_each value into an
+// ID-safe slug. The key ends up embedded in the full task ID
+// (`{projectID}:{runSeq}:{slug}:{taskDefID}`), which is
+// carried in REST URL path segments, so characters like `/`
+// (path separator), `\`, `:` (our own ID separator), and
+// whitespace must not leak through.
+//
+// Rule: keep `[A-Za-z0-9._-]`; replace every other rune with
+// `_`; collapse runs of `_`; strip trailing `_`. The raw
+// value stays in Params (or InstanceParams on the task
+// record) so prompts and the script execution context
+// (context.json / ENJU_PARAM_*) see the original string. So
+// iterating over file paths like `internal/api/router.go`
+// yields task id `1:1:internal_api_router_go:analyze` while
+// `{{file}}` in the prompt still resolves to
+// `internal/api/router.go`.
+//
+// Collision caveat: two raw values that slug to the same
+// string (e.g. `a/b` and `a_b`) would produce identical task
+// ids and break materialization with a duplicate-key insert.
+// Real-world for_each values are almost always structurally
+// distinct; add numbered / hashed suffixes if a real
+// collision case surfaces (tracked in TODO.md J.2).
+func SlugInstanceKey(v string) string {
+	if v == "" {
+		return ""
+	}
+	var b strings.Builder
+	prevUnder := false
+	for _, r := range v {
+		safe := (r >= 'A' && r <= 'Z') ||
+			(r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_'
+		if safe {
+			b.WriteRune(r)
+			prevUnder = false
+			continue
+		}
+		if !prevUnder {
+			b.WriteByte('_')
+			prevUnder = true
+		}
+	}
+	return strings.TrimRight(b.String(), "_")
+}
 // expandForEach generates all combinations of for_each parameters.
 // For now, supports single for_each variable (most common case).
 // Multi-variable cartesian product can be added later.
@@ -301,7 +348,12 @@ func expandForEach(forEach map[string][]string) []forEachInstance {
 			instances := make([]forEachInstance, 0, len(values))
 			for _, val := range values {
 				instances = append(instances, forEachInstance{
-					key:    val,
+					// Slug the key so values containing `/`,
+					// `:`, whitespace etc. produce routable
+					// task IDs. params keeps the raw value so
+					// prompts / env vars / context.json see
+					// the original string.
+					key:    SlugInstanceKey(val),
 					params: map[string]string{varName: val},
 				})
 			}
@@ -336,10 +388,12 @@ func cartesianProduct(keys []string, vals [][]string) []forEachInstance {
 	var generate func(depth int, current map[string]string)
 	generate = func(depth int, current map[string]string) {
 		if depth == len(keys) {
-			// Build instance key from all param values
+			// Build instance key from all param values,
+			// slugging each component so the joined ID is
+			// URL-routable. params stays raw for prompts.
 			parts := make([]string, 0, len(keys))
 			for _, k := range keys {
-				parts = append(parts, current[k])
+				parts = append(parts, SlugInstanceKey(current[k]))
 			}
 			key := strings.Join(parts, "_")
 			params := make(map[string]string)

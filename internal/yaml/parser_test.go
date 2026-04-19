@@ -1174,12 +1174,18 @@ tasks:
 	}
 }
 
-// TestParseComputeParamRefDoesNotCount — `{{paramname}}` in
-// prompt is a param substitution, not a task reference. It
-// shouldn't silence the lint because it doesn't establish a
-// dependency edge. Separate test because the heuristic keys
-// on the presence of `.` inside the braces.
-func TestParseComputeParamRefDoesNotCount(t *testing.T) {
+// TestParseComputeParamRefSuppressesWarning — `{{paramname}}`
+// in the prompt signals the task is parameterized by run
+// context (via ENJU_PARAM_* / context.json). Scripts that
+// reach run context explicitly aren't the class of compute
+// task the lint was designed to catch (stealth-readers of
+// peer outputs), so the warning is suppressed.
+//
+// Tester report 2026-04-19: a review_claude compute task
+// read $SOURCE_REPO from run params but still tripped the
+// warning. Suppress on visible param refs clears the false
+// positive.
+func TestParseComputeParamRefSuppressesWarning(t *testing.T) {
 	parsed, err := Parse([]byte(`
 name: "Compute with param only"
 version: 1
@@ -1196,15 +1202,10 @@ tasks:
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	found := false
 	for _, w := range parsed.Warnings {
-		if contains(w, "compute task \"gen\" has no declared dependencies") {
-			found = true
-			break
+		if contains(w, "compute task \"gen\"") {
+			t.Errorf("unexpected compute-no-deps warning — visible {{param}} ref should suppress; got: %v", parsed.Warnings)
 		}
-	}
-	if !found {
-		t.Errorf("expected compute-no-deps warning — param ref is not a task dep; got: %v", parsed.Warnings)
 	}
 }
 

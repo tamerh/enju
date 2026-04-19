@@ -3873,6 +3873,64 @@ echo "DEBUG_STDERR_2" >&2                # → stderr → script.log only
 	}
 }
 
+// TestMCPForEachSlashKeyRoutable covers the regression the
+// tester hit while building a per-file PR-review template:
+// when a for_each value contains `/` (file path), enju_get_task
+// and enju_execute_task returned 404 because the slash broke
+// chi's URL-path routing. The fix slugs the instance key so
+// task IDs are always `[A-Za-z0-9._-_]*`, while the raw value
+// stays in instance_params (→ prompts, env vars, context.json)
+// so scripts still see the original string.
+func TestMCPForEachSlashKeyRoutable(t *testing.T) {
+	h := newMCPHarness(t, "SlashKey")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-file analyze"
+version: 1
+tasks:
+  - id: analyze
+    for_each:
+      file: ["internal/api/router.go", "docs/templates.md"]
+    action: answer
+    prompt: "Analyze {{file}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Both instances must be routable via the slug. Raw
+	// values (slashes intact) live in instance_params; task
+	// IDs use the slug form.
+	cases := []struct{ slug, raw string }{
+		{"internal_api_router.go", "internal/api/router.go"},
+		{"docs_templates.md", "docs/templates.md"},
+	}
+	for _, c := range cases {
+		task := h.taskGet(c.slug + ":analyze")
+		if task == nil || task["error"] != nil {
+			t.Fatalf("%s:analyze not routable — task ID must be slugged so chi URL routing finds it; got: %v", c.slug, task)
+		}
+		// Prompt substitution uses the raw value (from
+		// instance_params), not the slug.
+		prompt, _ := task["prompt"].(string)
+		if !strings.Contains(prompt, c.raw) {
+			t.Errorf("%s:analyze prompt should contain raw value %q (not slug); got %q", c.slug, c.raw, prompt)
+		}
+		// instance_key should be the slug (the routable
+		// segment), not the raw value.
+		key, _ := task["instance_key"].(string)
+		if key != c.slug {
+			t.Errorf("%s:analyze instance_key = %q, want %q (slugged)", c.slug, key, c.slug)
+		}
+	}
+
+	// End-to-end: claim + submit via the slugged ID — proves
+	// the whole REST surface (claim, submit, get) works.
+	h.mcpClaimOK(t, "internal_api_router.go:analyze")
+	h.mcpSubmitText(t, "internal_api_router.go:analyze", "done")
+	if got := h.taskGet("internal_api_router.go:analyze")["state"]; got != "accepted" {
+		t.Errorf("expected accepted after submit, got %v", got)
+	}
+}
+
 // TestMCPExportRunEvents covers the event-timeline export:
 // coordinator synthesizes a JSONL stream from
 // contribution_events + task_claims, client snapshots it to
