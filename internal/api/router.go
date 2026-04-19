@@ -1514,6 +1514,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		"name":       p.Name,
 		"state":      p.State,
 		"repo_url":   p.RepoURL,
+		"branch":     p.Branch,
 		"task_count": len(tasks),
 		"created_at": p.CreatedAt.Format(time.RFC3339),
 	}

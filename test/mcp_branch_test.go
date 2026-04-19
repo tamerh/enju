@@ -427,6 +427,116 @@ echo "branch-test-ran"
 	}
 }
 
+// TestMCPBranchExportDiagramRoutesToRunBranch pins the
+// tester-reported bug where enju_export_diagram committed the
+// .mmd file to workspace HEAD instead of the run's branch.
+// Root cause: handleGetRun's response was missing the `branch`
+// field, so runBranchFromData returned empty →
+// CheckoutBranch("") fell back to the project default.
+func TestMCPBranchExportDiagramRoutesToRunBranch(t *testing.T) {
+	h := newMCPHarness(t, "ExportDiagramBranch")
+	projectID := h.createTestProject()
+
+	h.mcpCreateRunInline(t, projectID, `name: "r"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`)
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "on main")
+
+	// Run #2 on explicit branch.
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml": `name: "r2"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`,
+		"branch": "experiment-1",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+	}
+	runs, _ := h.store.ListRunsByProject(projectID)
+	h.lastProjectID = projectID
+	h.lastRunSeq = runs[1].Seq
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
+
+	h.callOK(t, "enju_export_diagram", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(runs[1].Seq),
+		"phase":      "initial",
+	})
+
+	remoteURL := h.remoteFor(projectID)
+	expPath := fmt.Sprintf(".enju/runs/%d/graph/initial.mmd", runs[1].Seq)
+	if _, ok := readRepoFileOnBranch(t, remoteURL, "experiment-1", expPath); !ok {
+		t.Errorf("diagram missing from experiment-1 — wrong branch routing")
+	}
+	if _, onMain := readRepoFileOnBranch(t, remoteURL, "main", expPath); onMain {
+		t.Errorf("diagram leaked onto main — should live only on experiment-1")
+	}
+}
+
+// TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD pins the
+// tester-reported ancestry bug. Pre-fix, switching between
+// branches would compound history — `lane-b` created after
+// `lane-a` inherited lane-a's commits because CheckoutBranch
+// forked from current workspace HEAD. Post-fix, new branches
+// fork from `origin/main` (the project base), not from HEAD.
+func TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD(t *testing.T) {
+	h := newMCPHarness(t, "BranchAncestry")
+	projectID := h.createTestProject()
+
+	runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
+	h.lastProjectID = projectID
+	h.lastRunSeq = runA
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "on lane-a")
+
+	runB := mcpCreateRunOnBranch(t, h, projectID, "lane-b")
+	h.lastRunSeq = runB
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runB)
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "on lane-b")
+
+	remoteURL := h.remoteFor(projectID)
+	runAResultPath := fmt.Sprintf(".enju/runs/%d/t/result.md", runA)
+	if _, leaked := readRepoFileOnBranch(t, remoteURL, "lane-b", runAResultPath); leaked {
+		t.Errorf("lane-b unexpectedly contains run-A's result — branch forked from lane-a instead of main")
+	}
+	if _, ok := readRepoFileOnBranch(t, remoteURL, "lane-a", runAResultPath); !ok {
+		t.Errorf("lane-a missing its own result — something is off")
+	}
+}
+
+// mcpCreateRunOnBranch is a tiny helper for branch tests.
+func mcpCreateRunOnBranch(t *testing.T, h *mcpHarness, projectID int64, branch string) int {
+	t.Helper()
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml": `name: "r"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`,
+		"branch": branch,
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run %q: err=%v body=%s", branch, err, mcpText(res))
+	}
+	runs, _ := h.store.ListRunsByProject(projectID)
+	return runs[len(runs)-1].Seq
+}
+
 // TestMCPBranchTemplateUntrackedAutoCommitsToDefault is the
 // tester's exact repro: an UNTRACKED template file in the MCP
 // workspace, then create_run with a non-default branch. Pre-fix,

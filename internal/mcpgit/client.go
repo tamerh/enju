@@ -1170,20 +1170,92 @@ func (p *Project) CheckoutBranch(branch string) error {
 	if head, err := p.repo.Head(); err == nil && head.Name() == refName {
 		return nil
 	}
-	// Does the branch exist locally? If so, simple checkout.
+	// Does the branch exist locally (or track a known remote)?
+	// Simple checkout, no fork-from dance.
 	if _, err := p.repo.Reference(refName, true); err == nil {
 		return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
 	}
-	// Branch doesn't exist yet. Create from current HEAD so
-	// the new branch starts with the project's seed commit
-	// (or whatever the user has worked on, for init'd repos).
-	// Create=true + Keep=true preserves working-tree state so
-	// we don't clobber uncommitted work on the way in.
+	// Branch doesn't exist yet. Fork it from the project's
+	// BASE — not from workspace HEAD. Forking from HEAD silently
+	// inherits whatever branch was checked out last, which was
+	// the tester-reported "enju/work got created from run-1's
+	// tip instead of main" bug. "Project base" here = origin/main
+	// when available (the conventional seed), falling back to
+	// origin/<HEAD>, then the repo's root commit. This gives
+	// every new branch a clean, predictable ancestor.
+	baseHash, err := p.branchBaseHash()
+	if err != nil {
+		return fmt.Errorf("resolving base for new branch %q: %w", target, err)
+	}
+	// Create the branch ref at the base hash, then point HEAD
+	// at it. go-git's Worktree.Checkout with Create=true uses
+	// current HEAD as the starting point; doing the ref dance
+	// manually lets us fork from a different commit.
+	branchRef := plumbing.NewHashReference(refName, baseHash)
+	if err := p.repo.Storer.SetReference(branchRef); err != nil {
+		return fmt.Errorf("creating branch ref %s: %w", target, err)
+	}
+	// Checkout the new branch's tree with Force so files
+	// tracked on the PREVIOUS branch but not on the new one
+	// get removed from the worktree. Without Force, go-git
+	// would bail on "unstaged changes" (the prior branch's
+	// tracked files look like unstaged removals from the new
+	// branch's POV), OR pass Keep:true and silently carry
+	// those files into the next submit — which was the
+	// tester-reported "lane-b inherits lane-a's commits"
+	// leak. Untracked files that the user authored (e.g. a
+	// template.yaml pending auto-commit) are preserved by
+	// go-git's checkout regardless of Force.
 	return wt.Checkout(&gogit.CheckoutOptions{
 		Branch: refName,
-		Create: true,
-		Keep:   true,
+		Force:  true,
 	})
+}
+
+// branchBaseHash picks the commit a fresh branch should fork
+// from when the caller asks for a branch that doesn't exist
+// yet. Preference order:
+//
+//  1. origin/main — the conventional project seed.
+//  2. origin/<remote HEAD symbolic ref> — when a repo was
+//     init'd with a non-main default (e.g. git init
+//     --initial-branch=trunk).
+//  3. The repo's root commit — last-ditch fallback that
+//     always yields a valid hash.
+//
+// Deliberately does NOT fall back to the caller's current HEAD,
+// which would reintroduce the "silent inheritance" bug.
+func (p *Project) branchBaseHash() (plumbing.Hash, error) {
+	// Try origin/main first.
+	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", "main"), true); err == nil {
+		return ref.Hash(), nil
+	}
+	// Try the remote's HEAD symref — covers repos whose
+	// default isn't main (trunk, master, etc.).
+	if ref, err := p.repo.Reference(plumbing.NewRemoteHEADReferenceName("origin"), true); err == nil {
+		return ref.Hash(), nil
+	}
+	// Root commit fallback: walk to the very first commit
+	// reachable from any branch. The project always has a
+	// seed commit, so this succeeds except for the empty-repo
+	// edge case (tests that never commit anything).
+	iter, err := p.repo.Log(&gogit.LogOptions{})
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("log: %w", err)
+	}
+	defer iter.Close()
+	var root plumbing.Hash
+	for {
+		c, err := iter.Next()
+		if err != nil {
+			break
+		}
+		root = c.Hash
+	}
+	if root.IsZero() {
+		return plumbing.ZeroHash, fmt.Errorf("no commits in repo — cannot fork a new branch")
+	}
+	return root, nil
 }
 
 // pushBranchInternal is the branch-aware equivalent of
