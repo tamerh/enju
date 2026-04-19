@@ -108,6 +108,21 @@ func unmarshalStringSlice(s string) []string {
 	return xs
 }
 
+// unmarshalStringMapField decodes the JSON-encoded env: map
+// stored on tasks.env back into a map[string]string. Empty
+// string yields nil. Malformed JSON yields nil (defense in
+// depth — a corrupted row shouldn't crash the executor).
+func unmarshalStringMapField(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil
+	}
+	return m
+}
+
 // formatIterationLabel renders a task's iteration context as
 // "key1=val1, key2=val2" using the persisted instance_params JSON
 // when available, falling back to the raw instance key slug for

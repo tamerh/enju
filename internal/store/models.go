@@ -227,6 +227,15 @@ type TaskRecord struct {
 	// reject or enju_fail_task. The run_status formatter
 	// keys the ⊘-vs-⚫ glyph off this field.
 	SkipReason string
+	// Env is the JSON-encoded map[string]string of task-
+	// definition-level environment variables for compute
+	// tasks. Empty string for non-compute tasks or compute
+	// tasks that didn't declare an env: block. Injected into
+	// the compute script's process environment alongside the
+	// system ENJU_* vars and run-level ENJU_PARAM_<name>
+	// vars — three disjoint namespaces, no override logic.
+	Env string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

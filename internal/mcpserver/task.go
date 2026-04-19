@@ -273,6 +273,15 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	for k, v := range meta.InstanceParams {
 		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
 	}
+	// Task-definition-level env: block. Injected verbatim —
+	// values were already {{param}}-substituted at parse time,
+	// and the validator rejected any ENJU_-prefixed keys up
+	// front so these three namespaces (ENJU_* system,
+	// ENJU_PARAM_<name>, task env) stay disjoint. No
+	// precedence rule needed.
+	for k, v := range meta.Env {
+		env = append(env, k+"="+v)
+	}
 
 	// context.json — structured companion to the env vars.
 	// Writes to $ENJU_RUN_DIR/context.json BEFORE the script

@@ -559,6 +559,7 @@ func (e *Engine) ComputeMaterialization(
 			VoteDeadline:    ti.Deadline,
 			Anonymize:       ti.Anonymize,
 			Visibility:      ti.Visibility,
+			Env:             marshalStringMap(ti.Env),
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -872,6 +873,7 @@ func (e *Engine) ComputeMaterialization(
 			VoteDeadline:    ti.Deadline,
 			Anonymize:       ti.Anonymize,
 			Visibility:      ti.Visibility,
+			Env:             marshalStringMap(ti.Env),
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -1030,6 +1032,35 @@ func marshalStringSlice(s []string) string {
 		return ""
 	}
 	return string(data)
+}
+
+// marshalStringMap renders a map[string]string as JSON so it
+// can round-trip through a single TEXT column. Returns "" for
+// empty maps so the DB default stays clean.
+func marshalStringMap(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// unmarshalStringMap is the inverse of marshalStringMap. Empty
+// string returns nil; malformed JSON returns nil too so a
+// corrupted row doesn't crash the executor (caller sees "no
+// env" instead).
+func unmarshalStringMap(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 func marshalVoteOptions(opts []enjuYaml.VoteOption) string {

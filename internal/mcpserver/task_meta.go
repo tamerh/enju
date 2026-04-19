@@ -89,6 +89,13 @@ type taskMeta struct {
 	// alpha:describe). Merged with RunParams when emitting
 	// ENJU_PARAM_* env vars. nil for singleton tasks.
 	InstanceParams map[string]interface{}
+	// Env is the task-definition-level env: block for compute
+	// tasks — keys become env var names, values become env
+	// var values, injected into the compute script's process.
+	// Values have already been {{param}}-substituted at parse
+	// time. nil or empty for non-compute tasks and for compute
+	// tasks that didn't declare env:.
+	Env map[string]string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -172,6 +179,17 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["instance_params_map"].(map[string]interface{}); ok {
 		meta.InstanceParams = v
+	}
+	if v, ok := raw["env"].(map[string]interface{}); ok {
+		env := make(map[string]string, len(v))
+		for k, raw := range v {
+			if s, ok := raw.(string); ok {
+				env[k] = s
+			}
+		}
+		if len(env) > 0 {
+			meta.Env = env
+		}
 	}
 	return meta, nil
 }

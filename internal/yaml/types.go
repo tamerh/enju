@@ -199,6 +199,24 @@ type TaskDef struct {
 	UserPrompt string            `yaml:"user_prompt,omitempty"`
 	Script     string            `yaml:"script,omitempty"`
 	ScriptSource string          `yaml:"script_source,omitempty"`
+
+	// Env is the compute-task-level environment variable block.
+	// Keys become env var names, values become env var values,
+	// both injected into the process the compute script runs in.
+	// Values accept {{param}} / {{forEachVar}} substitution so
+	// templates stay runtime-configurable.
+	//
+	// Intentionally a separate namespace from the system's
+	// ENJU_* variables and from ENJU_PARAM_<name> (run-level
+	// params). Keys starting with ENJU_ are rejected by the
+	// validator so template authors can't accidentally (or
+	// intentionally) clobber either reservation. There's no
+	// "precedence" question — the three namespaces don't
+	// overlap by construction.
+	//
+	// Only valid on action:compute. Rejected on every other
+	// action to keep the field anchored to its purpose.
+	Env map[string]string `yaml:"env,omitempty"`
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
 	Gather     bool              `yaml:"gather,omitempty"`

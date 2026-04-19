@@ -1392,6 +1392,12 @@ type taskResponse struct {
 	// Surfaced alongside RunParams so the executor can expose
 	// both as ENJU_PARAM_<name>.
 	InstanceParamsMap map[string]interface{} `json:"instance_params_map,omitempty"`
+	// Env is the task-definition-level env: block for compute
+	// tasks — already {{param}}-substituted at parse time.
+	// Surfaced on the task record so the compute executor on
+	// the fat-client side can inject these into the script's
+	// process environment. Empty/absent for non-compute tasks.
+	Env map[string]string `json:"env,omitempty"`
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -3395,6 +3401,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		RunSourcePath:     runSourcePath,
 		RunParams:         runParams,
 		InstanceParamsMap: instanceParams,
+		Env:               unmarshalStringMapField(t.Env),
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

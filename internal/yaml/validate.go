@@ -25,6 +25,7 @@ package yaml
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/template"
@@ -332,6 +333,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateActionFields(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskEnv(t); err != nil {
+			return nil, false, err
+		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
@@ -345,6 +349,58 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		}
 	}
 	return ids, hasTaskLevelForEach, nil
+}
+
+// validateTaskEnv enforces the compute-only + reserved-prefix
+// rules for a task's env: block. The shape is dead simple on
+// purpose: keys become env var names, values become env var
+// values, and the three compute-context namespaces (system
+// ENJU_*, run params ENJU_PARAM_*, task env) are kept disjoint
+// by rejecting anything starting with ENJU_ here.
+func validateTaskEnv(t *TaskDef) error {
+	if len(t.Env) == 0 {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: env: is only valid on action: compute tasks", t.ID)
+	}
+	for k := range t.Env {
+		if k == "" {
+			return fmt.Errorf("task %q: env: has an empty key", t.ID)
+		}
+		if strings.HasPrefix(k, "ENJU_") {
+			return fmt.Errorf("task %q: env key %q: the ENJU_ prefix is reserved for system and run-param env vars — pick a different name", t.ID, k)
+		}
+		if !isValidEnvName(k) {
+			return fmt.Errorf("task %q: env key %q: must match [A-Za-z_][A-Za-z0-9_]* (standard env var name rules)", t.ID, k)
+		}
+	}
+	return nil
+}
+
+// isValidEnvName matches the POSIX-ish rule for environment
+// variable names: starts with a letter or underscore, followed
+// by letters, digits, or underscores. Anything else is rejected
+// so authors don't ship env: blocks that the shell can't
+// express.
+func isValidEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		isAlpha := (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if !isAlpha && r != '_' {
+				return false
+			}
+			continue
+		}
+		if !isAlpha && !isDigit && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // validateReviewTarget enforces the "reviews:" field contract:

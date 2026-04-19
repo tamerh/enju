@@ -4104,6 +4104,181 @@ printf 'sha=%s\n' "$ENJU_PARAM_sha"
 	}
 }
 
+// TestMCPComputeTaskEnvBlock verifies task-definition-level
+// env: lands in the compute script's process, independent of
+// run-level params. Two compute tasks share one script but
+// declare different env: values; the script echoes what it
+// sees so we can assert each ran with its own task-author-set
+// configuration.
+func TestMCPComputeTaskEnvBlock(t *testing.T) {
+	h := newMCPHarness(t, "ComputeTaskEnv")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/effort/template.yaml": {body: `name: "task-env demo"
+version: 1
+tasks:
+  - id: deep
+    action: compute
+    script: scripts/echo_env.sh
+    env:
+      CLAUDE_EFFORT: max
+      MODEL_HINT: opus
+  - id: quick
+    action: compute
+    script: scripts/echo_env.sh
+    env:
+      CLAUDE_EFFORT: low
+`, mode: 0o644},
+		"enju_templates/effort/scripts/echo_env.sh": {body: `#!/bin/bash
+printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
+printf 'model_hint=%s\n' "${MODEL_HINT:-unset}"
+`, mode: 0o755},
+	}, "seed effort bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/effort",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:deep", projectID))
+
+	// deep: both env vars set by the task
+	h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("deep"),
+	})
+	deep := h.mcpBareResultMD(t, "deep")
+	if !strings.Contains(deep, "effort=max") {
+		t.Errorf("deep: expected effort=max; got: %s", deep)
+	}
+	if !strings.Contains(deep, "model_hint=opus") {
+		t.Errorf("deep: expected model_hint=opus; got: %s", deep)
+	}
+
+	// quick: only CLAUDE_EFFORT set — MODEL_HINT should be
+	// "unset" (the script's default), proving task env:
+	// blocks don't leak between tasks.
+	h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("quick"),
+	})
+	quick := h.mcpBareResultMD(t, "quick")
+	if !strings.Contains(quick, "effort=low") {
+		t.Errorf("quick: expected effort=low; got: %s", quick)
+	}
+	if !strings.Contains(quick, "model_hint=unset") {
+		t.Errorf("quick: expected model_hint=unset (not set on this task); got: %s", quick)
+	}
+}
+
+// TestMCPComputeTaskEnvParamSubstitution verifies that
+// {{param}} references inside env: values are resolved at
+// parse time, so the env var injected into the script is the
+// post-substitution value.
+func TestMCPComputeTaskEnvParamSubstitution(t *testing.T) {
+	h := newMCPHarness(t, "ComputeTaskEnvParams")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/effort-param/template.yaml": {body: `name: "task-env + param subst"
+version: 1
+params:
+  - name: effort_override
+    type: string
+    required: true
+    description: "Effort level"
+tasks:
+  - id: run
+    action: compute
+    script: scripts/echo_env.sh
+    env:
+      CLAUDE_EFFORT: "{{effort_override}}"
+`, mode: 0o644},
+		"enju_templates/effort-param/scripts/echo_env.sh": {body: `#!/bin/bash
+printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
+`, mode: 0o755},
+	}, "seed effort-param bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/effort-param",
+		"params":     map[string]any{"effort_override": "medium"},
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	body := h.mcpBareResultMD(t, "run")
+	if !strings.Contains(body, "effort=medium") {
+		t.Errorf("expected effort=medium (from {{effort_override}} substitution); got: %s", body)
+	}
+}
+
+// TestMCPComputeTaskEnvRejectsReservedPrefix verifies the
+// parser rejects env: keys that start with ENJU_ so authors
+// can't accidentally clobber system or run-param vars.
+func TestMCPComputeTaskEnvRejectsReservedPrefix(t *testing.T) {
+	h := newMCPHarness(t, "ComputeTaskEnvReserved")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/bad/template.yaml": {body: `name: "reserved prefix"
+version: 1
+tasks:
+  - id: bad
+    action: compute
+    script: scripts/noop.sh
+    env:
+      ENJU_TASK_ID: hijacked
+`, mode: 0o644},
+		"enju_templates/bad/scripts/noop.sh": {body: `#!/bin/bash
+true
+`, mode: 0o755},
+	}, "seed reserved-prefix bundle")
+
+	res := h.call(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/bad",
+	})
+	if !res.IsError {
+		t.Fatalf("expected reserved-prefix rejection, got: %s", mcpText(res))
+	}
+	msg := mcpText(res)
+	if !strings.Contains(msg, "ENJU_") || !strings.Contains(msg, "reserved") {
+		t.Errorf("expected reserved-prefix error, got: %s", msg)
+	}
+}
+
+// TestMCPComputeTaskEnvRejectedOnNonCompute verifies the
+// parser rejects env: on actions that don't run scripts.
+func TestMCPComputeTaskEnvRejectedOnNonCompute(t *testing.T) {
+	h := newMCPHarness(t, "ComputeTaskEnvNonCompute")
+	projectID := h.createTestProject()
+
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/wrongaction/template.yaml": `name: "env on answer"
+version: 1
+tasks:
+  - id: q
+    action: answer
+    prompt: "Hi."
+    env:
+      FOO: bar
+`,
+	}, "seed wrong-action bundle")
+
+	res := h.call(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/wrongaction",
+	})
+	if !res.IsError {
+		t.Fatalf("expected env-on-non-compute rejection, got: %s", mcpText(res))
+	}
+	msg := mcpText(res)
+	if !strings.Contains(msg, "env:") || !strings.Contains(msg, "compute") {
+		t.Errorf("expected env-only-on-compute error, got: %s", msg)
+	}
+}
+
 // TestMCPComputeContextJSON covers Phase B of the compute-
 // context enhancement: $ENJU_RUN_DIR/context.json is written
 // before the script runs AND committed with the result. Lets

@@ -320,6 +320,10 @@ func (s *Store) migrate() error {
 		// rehydrate it into ENJU_PARAM_<name> env vars for
 		// scripts that need to reach run-level context.
 		`ALTER TABLE runs ADD COLUMN params TEXT NOT NULL DEFAULT ''`,
+		// Task-level env: block (Phase J+). JSON-encoded
+		// map[string]string. Populated on compute tasks that
+		// declare env:; empty string for every other task.
+		`ALTER TABLE tasks ADD COLUMN env TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -719,7 +723,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -736,14 +740,14 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 		anonymize = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
-		anonymize, t.Visibility,
+		anonymize, t.Visibility, t.Env,
 		t.CreatedAt,
 	)
 	return err
@@ -763,7 +767,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState,
+		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1852,7 +1856,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState,
+			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

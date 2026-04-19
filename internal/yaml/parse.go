@@ -224,6 +224,9 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) error {
 		substituteStringSliceInPlace(t.AssignTo, strMap)
 		substituteStringSliceInPlace(t.ReadsArtifacts, strMap)
 		substituteStringSliceInPlace(t.WritesArtifacts, strMap)
+		for k, v := range t.Env {
+			t.Env[k] = template.ResolveParams(v, strMap)
+		}
 
 		// Task-level for_each param-ref substitution. Shared
 		// helper also handles the run-level scope above.
