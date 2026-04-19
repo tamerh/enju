@@ -41,4 +41,4 @@ dev-restart: build
 	@echo "==> Starting coordinator on port $(PORT)..."
 	./enju serve -db ~/.enju/enju.db -port $(PORT) > /tmp/enju-serve.log 2>&1 &
 	@sleep 1
-	@curl -sf http://localhost:$(PORT)/api/v1/projects > /dev/null && echo "==> Coordinator running on port $(PORT)" || echo "==> ERROR: coordinator failed to start (check /tmp/enju-serve.log)"
+	@curl -sf http://localhost:$(PORT)/health > /dev/null && echo "==> Coordinator running on port $(PORT)" || echo "==> ERROR: coordinator failed to start (check /tmp/enju-serve.log)"
