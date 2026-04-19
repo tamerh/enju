@@ -162,6 +162,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}/runs/{runSeq}", s.handleGetRun)
 		r.Get("/projects/{projectID}/runs/{runSeq}/tasks", s.handleListRunTasks)
 		r.Get("/projects/{projectID}/runs/{runSeq}/cost", s.handleGetRunCostSummary)
+		r.Get("/projects/{projectID}/runs/{runSeq}/events", s.handleListRunEvents)
 
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
@@ -753,6 +754,57 @@ func (s *Server) handleGetRunCostSummary(w http.ResponseWriter, r *http.Request)
 		"citizen_count":    len(citizenSet),
 		"wall_clock":       wallClock,
 	})
+}
+
+// handleListRunEvents returns the synthesized event timeline
+// for one run — chronological JSON list built from
+// contribution_events + task_claims. Consumed by the fat-
+// client's enju_export_run_events tool which materializes
+// the list into `.enju/runs/{seq}/events/{phase}.jsonl`
+// on demand. Authoritative data stays in the coordinator DB;
+// git gets a snapshot only when the user asks for one.
+func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	events, err := s.store.ListRunEvents(run.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
+		return
+	}
+	// Flatten into JSON-friendly shape with ts as RFC3339
+	// (JSONL consumers parse this trivially) and metadata
+	// as raw JSON (not a quoted string) when parseable.
+	out := make([]map[string]interface{}, 0, len(events))
+	for _, e := range events {
+		row := map[string]interface{}{
+			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"type": e.Type,
+		}
+		if e.Subtype != "" {
+			row["subtype"] = e.Subtype
+		}
+		if e.TaskID != "" {
+			row["task_id"] = e.TaskID
+		}
+		if e.Citizen != "" {
+			row["citizen"] = e.Citizen
+		}
+		if e.Metadata != "" {
+			var md interface{}
+			if json.Unmarshal([]byte(e.Metadata), &md) == nil {
+				row["metadata"] = md
+			} else {
+				row["metadata"] = e.Metadata
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func countByState(tasks []store.TaskRecord, state store.TaskState) int {
@@ -2427,6 +2479,28 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		"artifacts_rolled_back", len(result.Rollbacks),
 		"reason", req.Reason,
 	)
+
+	// Record the invalidation in the contribution event log
+	// so the audit timeline (enju_export_run_events) shows
+	// the moment the cascade fired. Best-effort — failure to
+	// record shouldn't un-invalidate the task.
+	if result.Task != nil {
+		metaJSON := fmt.Sprintf(`{"reason":%q,"descendants":%d,"rollbacks":%d}`,
+			req.Reason, len(result.Descendants), len(result.Rollbacks))
+		s.store.RecordContributionEvent(&store.ContributionEvent{
+			EventType: "task_invalidated",
+			TaskID:    taskID,
+			RunID:     result.Task.RunID,
+			ProjectID: func() int64 {
+				if run, _ := s.store.GetRun(result.Task.RunID); run != nil {
+					return run.ProjectID
+				}
+				return 0
+			}(),
+			Metadata:  metaJSON,
+			CreatedAt: time.Now(),
+		})
+	}
 
 	resp := map[string]interface{}{
 		"status":      "invalidated",

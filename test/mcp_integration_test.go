@@ -3806,6 +3806,163 @@ tasks:
 	}
 }
 
+// TestMCPComputeScriptLog covers the script.log capture:
+// compute tasks have stdout+stderr teed into a combined
+// $ENJU_RUN_DIR/script.log, distinct from result.md (stdout
+// only, the contract-defined answer). On success the log is
+// committed alongside result.md; on failure it stays local.
+func TestMCPComputeScriptLog(t *testing.T) {
+	h := newMCPHarness(t, "ScriptLog")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/noisy/template.yaml": {body: `name: "noisy script"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/noisy.sh
+    prompt: "Run the noisy script"
+`, mode: 0o644},
+		"enju_templates/noisy/scripts/noisy.sh": {body: `#!/bin/bash
+# Emit to both streams; script.log should interleave them.
+echo "ANSWER_LINE"                       # → stdout → result.md AND script.log
+echo "DEBUG_STDERR_1" >&2                # → stderr → script.log only
+echo "ANSWER_CONTINUES"                  # → stdout → result.md AND script.log
+echo "DEBUG_STDERR_2" >&2                # → stderr → script.log only
+`, mode: 0o755},
+	}, "seed noisy bundle")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/noisy",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	// result.md: stdout ONLY (contract). Stderr lines must
+	// NOT leak in.
+	result := h.mcpBareResultMD(t, "run")
+	if !strings.Contains(result, "ANSWER_LINE") {
+		t.Errorf("result.md missing stdout line; got:\n%s", result)
+	}
+	if !strings.Contains(result, "ANSWER_CONTINUES") {
+		t.Errorf("result.md missing second stdout line; got:\n%s", result)
+	}
+	if strings.Contains(result, "DEBUG_STDERR") {
+		t.Errorf("result.md should not contain stderr content (contract says stdout only); got:\n%s", result)
+	}
+
+	// script.log: full combined transcript (stdout + stderr),
+	// committed alongside result.md.
+	logBytes, ok := h.readRepoFile(projectID, ".enju/runs/1/run/script.log")
+	if !ok {
+		t.Fatalf("expected .enju/runs/1/run/script.log committed on success")
+	}
+	logText := string(logBytes)
+	for _, want := range []string{"ANSWER_LINE", "ANSWER_CONTINUES", "DEBUG_STDERR_1", "DEBUG_STDERR_2"} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("script.log missing %q (should be the full transcript); got:\n%s", want, logText)
+		}
+	}
+}
+
+// TestMCPExportRunEvents covers the event-timeline export:
+// coordinator synthesizes a JSONL stream from
+// contribution_events + task_claims, client snapshots it to
+// .enju/runs/{seq}/events/{phase}.jsonl. Same pattern as
+// enju_export_diagram — authoritative data stays in the DB,
+// git gets a materialization on demand.
+func TestMCPExportRunEvents(t *testing.T) {
+	h := newMCPHarness(t, "EventsExportA")
+	projectID := h.createTestProject()
+
+	yaml := `name: "events export demo"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Draft."
+  - id: publish
+    action: answer
+    depends_on: [draft]
+    prompt: "Publish: {{draft.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Produce some history: claim + submit draft, then
+	// invalidate it, then re-claim + re-submit. Gives the
+	// timeline 6+ distinct events.
+	h.mcpClaimOK(t, "draft")
+	h.mcpSubmitText(t, "draft", "v1 content")
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": h.taskID("draft"),
+		"reason":  "redo",
+	})
+	h.mcpClaimOK(t, "draft")
+	h.mcpSubmitText(t, "draft", "v2 content")
+
+	// Export the timeline.
+	res := h.callOK(t, "enju_export_run_events", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+		"phase":      "after_redo",
+	})
+	out := mcpText(res)
+	if !strings.Contains(out, ".enju/runs/1/events/after_redo.jsonl") {
+		t.Errorf("expected file path in response; got:\n%s", out)
+	}
+	if !strings.Contains(out, "```jsonl") {
+		t.Errorf("expected inline jsonl preview; got:\n%s", out)
+	}
+
+	// Committed file is valid JSONL — each non-empty line
+	// parses as a JSON object.
+	body, ok := h.readRepoFile(projectID, ".enju/runs/1/events/after_redo.jsonl")
+	if !ok {
+		t.Fatalf("events jsonl missing in bare remote")
+	}
+	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	if len(lines) < 4 {
+		t.Errorf("expected at least 4 events (claim + submit + invalidate + claim + submit), got %d\nbody:\n%s", len(lines), body)
+	}
+	typesSeen := map[string]bool{}
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Errorf("non-JSON event line %q: %v", line, err)
+			continue
+		}
+		if event["ts"] == nil {
+			t.Errorf("event missing ts field: %v", event)
+		}
+		if event["type"] == nil {
+			t.Errorf("event missing type field: %v", event)
+			continue
+		}
+		typesSeen[event["type"].(string)] = true
+	}
+	// The key promises of the synthesizer: claim events come
+	// from task_claims (synthesized; contribution_events
+	// doesn't emit them), invalidation events were just added
+	// so the timeline has an entry at the cascade moment,
+	// completions land at submit time.
+	for _, want := range []string{"task_claimed", "task_completed", "task_invalidated"} {
+		if !typesSeen[want] {
+			t.Errorf("expected event type %q in timeline; got %v", want, typesSeen)
+		}
+	}
+}
+
 // TestMCPComputeEnvVarsParams covers Phase A of the compute-
 // context enhancement: compute scripts see run-level params
 // AND per-iteration for_each variables exposed as

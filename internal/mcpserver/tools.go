@@ -265,6 +265,35 @@ Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 	)
 }
 
+// toolExportRunEvents materializes a run's event timeline
+// (claims, submits, invalidations, tally resolutions) as a
+// JSONL file under .enju/runs/{seq}/events/. The authoritative
+// data lives in the coordinator's contribution_events +
+// task_claims; this tool just snapshots it into git so the
+// run's directory becomes self-documenting for audits /
+// postmortems / preprint figures.
+func toolExportRunEvents() mcp.Tool {
+	return mcp.NewTool("enju_export_run_events",
+		mcp.WithDescription(`Snapshot a run's event timeline (claims, submits, invalidations, tally resolutions) to a git-tracked JSONL file under .enju/runs/{seq}/events/{phase}.jsonl.
+
+Events live authoritatively in the coordinator DB. This tool is an on-demand materialization — call it when you want the timeline preserved in git (postmortem, preprint figure, shareable audit).
+
+Phase is a free-form label: 'final' on completion, 'checkpoint' mid-run, or any descriptive string. Same-phase re-export overwrites — no accumulating timeline-1 / timeline-2. Response includes the path + the first ~10 events inline so you can show progress without reading the file.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+		mcp.WithString("phase",
+			mcp.Required(),
+			mcp.Description("Snapshot label — e.g. 'final' on completion, 'checkpoint' mid-run. Must not contain '/', '\\', '..', or the null byte; ≤64 chars."),
+		),
+	)
+}
+
 // toolExportDiagram snapshots a run's DAG as raw Mermaid
 // source to a git-tracked file under .enju/runs/{seq}/graph/.
 // See handleExportDiagram for the semantics (idempotent same-

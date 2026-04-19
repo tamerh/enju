@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -325,9 +326,20 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	cmd := exec.CommandContext(ctx, scriptPath)
 	cmd.Dir = workDir
 	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Three buffers:
+	//   stdout     — stdout-only, becomes result.md (the
+	//                contract-defined task answer).
+	//   stderr    — stderr-only, becomes failure reason on
+	//                non-zero exit.
+	//   scriptLog — combined stdout+stderr, written to
+	//                $ENJU_RUN_DIR/script.log as the full
+	//                debug transcript. Preserves chronological
+	//                order via io.MultiWriter fan-out to both
+	//                the stream-specific buffer and the shared
+	//                log.
+	var stdout, stderr, scriptLog bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, &scriptLog)
+	cmd.Stderr = io.MultiWriter(&stderr, &scriptLog)
 
 	execErr := cmd.Run()
 	elapsed := time.Since(startTime).Round(time.Millisecond)
@@ -340,7 +352,21 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		}
 	}
 
+	// Write the combined script.log to disk before we branch
+	// on exit code, so the file is always present — audit
+	// trail works whether the script succeeded or failed, and
+	// a human debugging a failure can `cat .enju/runs/.../script.log`
+	// even before the coordinator has processed the fail.
+	scriptLogPath := filepath.Join(workDir, resultDir, "script.log")
+	if err := os.MkdirAll(filepath.Dir(scriptLogPath), 0755); err == nil {
+		_ = os.WriteFile(scriptLogPath, scriptLog.Bytes(), 0644)
+	}
+
 	// Exit non-zero → auto-fail the task via the coordinator.
+	// script.log stays on local disk as the debug transcript;
+	// it's not committed on failure paths because no result
+	// commit happens when a task fails. A human who wants it
+	// archived can commit manually.
 	if exitCode != 0 {
 		stderrStr := stderr.String()
 		if len(stderrStr) > 1000 {
@@ -358,6 +384,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		if stderrStr != "" {
 			b.WriteString(fmt.Sprintf("  stderr: %s\n", stderrStr))
 		}
+		b.WriteString(fmt.Sprintf("  Transcript: %s (local only, not committed on failure)\n", scriptLogPath))
 		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", taskID))
 		return mcp.NewToolResultText(b.String()), nil
 	}
@@ -379,6 +406,17 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		{
 			RepoRelPath: filepath.Join(resultDir, "context.json"),
 			Content:     contextBytes,
+		},
+		// script.log — full stdout+stderr transcript. Gets
+		// committed alongside result.md on the success path
+		// so a reader can reconstruct exactly what the script
+		// printed (including verbose tool output, warnings
+		// that didn't trip exit code, progress bars). Distinct
+		// from result.md which carries only the
+		// contract-defined stdout answer.
+		{
+			RepoRelPath: filepath.Join(resultDir, "script.log"),
+			Content:     scriptLog.Bytes(),
 		},
 	}
 	metadata := map[string]interface{}{

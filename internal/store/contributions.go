@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"sort"
 	"time"
 )
 
@@ -195,6 +196,109 @@ func (s *Store) GetEventMetadataForTask(taskID, eventType string) (string, error
 		return "", err
 	}
 	return metadata, nil
+}
+
+// RunEventRecord is one line of a run's synthesized timeline.
+// The fields are chosen to be JSONL-friendly — each becomes
+// a key in the exported `.enju/runs/{seq}/events/{phase}.jsonl`
+// file. Metadata is passed through as a raw JSON string so
+// the exporter can embed it without a double-decode round
+// trip.
+type RunEventRecord struct {
+	Timestamp time.Time
+	Type      string
+	Subtype   string
+	TaskID    string
+	Citizen   string
+	Metadata  string
+}
+
+// ListRunEvents synthesizes a chronological timeline for a
+// run by unioning two sources:
+//
+//  1. contribution_events scoped to this run — already a
+//     typed event log (task_completed, review_given,
+//     vote_cast, task_failed, task_invalidated, run_created).
+//  2. task_claims for this run's tasks — synthesized into
+//     task_claimed events since the claim path doesn't
+//     write contribution_events today.
+//
+// Result is sorted by timestamp. Caller (the export tool)
+// formats each record as a single JSONL line. Matches the
+// "git is the ledger" pattern: no ambient file writes,
+// authoritative data lives in the DB, snapshot materializes
+// to git on demand.
+func (s *Store) ListRunEvents(runID int64) ([]RunEventRecord, error) {
+	var events []RunEventRecord
+
+	// Source 1: typed events already in contribution_events.
+	ceRows, err := s.db.Query(
+		`SELECT ce.created_at, ce.event_type, ce.event_subtype, ce.task_id, ce.metadata,
+		        COALESCE(c.username, '') AS citizen
+		 FROM contribution_events ce
+		 LEFT JOIN citizens c ON ce.citizen_id = c.id
+		 WHERE ce.run_id = ?
+		 ORDER BY ce.created_at ASC`,
+		runID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for ceRows.Next() {
+		var r RunEventRecord
+		var metadata sql.NullString
+		if err := ceRows.Scan(&r.Timestamp, &r.Type, &r.Subtype, &r.TaskID, &metadata, &r.Citizen); err != nil {
+			continue
+		}
+		r.Metadata = metadata.String
+		events = append(events, r)
+	}
+	ceRows.Close()
+
+	// Source 2: claims synthesized as task_claimed events.
+	// JOIN to citizens for the username, and to tasks to
+	// scope by run_id. Outcome carries the follow-up event
+	// (completed / invalidated / released / timed_out) so
+	// we only emit the *claimed* moment — the resolution
+	// moment is already in contribution_events.
+	clRows, err := s.db.Query(
+		`SELECT tc.claimed_at, tc.task_id, COALESCE(c.username, '') AS citizen
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 LEFT JOIN citizens c ON tc.citizen_id = c.id
+		 WHERE t.run_id = ?
+		 ORDER BY tc.claimed_at ASC`,
+		runID,
+	)
+	if err != nil {
+		return events, nil // best-effort; degrade rather than fail the whole export
+	}
+	for clRows.Next() {
+		var r RunEventRecord
+		if err := clRows.Scan(&r.Timestamp, &r.TaskID, &r.Citizen); err != nil {
+			continue
+		}
+		r.Type = "task_claimed"
+		events = append(events, r)
+	}
+	clRows.Close()
+
+	// Merge-sort by timestamp. Small N (per-run scope), so
+	// a single sort.Slice is cheaper than maintaining two
+	// cursors during the scan.
+	sortRunEvents(events)
+	return events, nil
+}
+
+// sortRunEvents orders the merged timeline by timestamp,
+// stable so events with identical timestamps keep their
+// source-order (contribution events before synthesized
+// claim events, matching the intuitive "result recorded
+// moments before a new claim" reading when they collide).
+func sortRunEvents(events []RunEventRecord) {
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
 }
 
 // GetDownstreamImpact counts how many tasks transitively

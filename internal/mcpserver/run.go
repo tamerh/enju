@@ -7,6 +7,7 @@ package mcpserver
 // into one markdown document.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -348,6 +349,116 @@ func validateDiagramPhase(phase string) error {
 		return fmt.Errorf("phase contains forbidden characters ('/', '\\\\', '..', or null byte)")
 	}
 	return nil
+}
+
+// handleExportRunEvents pulls the coordinator's synthesized
+// event timeline for a run and commits it as JSONL under
+// .enju/runs/{seq}/events/{phase}.jsonl. Same snapshot-
+// on-demand pattern as handleExportDiagram: authoritative
+// data stays in the DB, git gets a frozen copy when the
+// caller explicitly asks.
+//
+// Design notes:
+//   - Lines are JSONL (one event per line, pretty-printed
+//     to match `jq -c` style) so shell tooling and Python's
+//     jsonl libraries consume it without extra parsing.
+//   - Same-phase re-export overwrites the existing file;
+//     CommitFiles treats byte-identical content as a no-op
+//     so calling repeatedly doesn't churn history.
+//   - Response inlines the first ~10 events for a quick
+//     glance — the full file is on disk + committed.
+func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	phase := strings.TrimSpace(req.GetString("phase", ""))
+	if err := validateDiagramPhase(phase); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_export_run_events requires a local workspace (MCP client mode)"), nil
+	}
+
+	// Pull events from the coordinator.
+	eventsData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/events", projectID, runID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var events []map[string]interface{}
+	if err := json.Unmarshal(eventsData, &events); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("parsing events response: %v", err)), nil
+	}
+
+	// JSONL = one compact JSON object per line. json.Marshal
+	// (not MarshalIndent) keeps each event on a single line,
+	// which is the contract downstream consumers expect.
+	var body bytes.Buffer
+	for _, e := range events {
+		line, merr := json.Marshal(e)
+		if merr != nil {
+			continue
+		}
+		body.Write(line)
+		body.WriteByte('\n')
+	}
+
+	// Commit the snapshot into git. Matches the
+	// handleExportDiagram pattern exactly — workspace lock,
+	// CommitFiles, embed path in response.
+	remoteURL, projName, err := c.fetchProjectMetaFull(ctx, int64(projectID))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	repoPath := fmt.Sprintf(".enju/runs/%d/events/%s.jsonl", runID, phase)
+	authorName, authorEmail := c.commitAuthor(ctx)
+	commitMsg := fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events))
+
+	proj.Lock()
+	res, err := proj.CommitFiles(mcpgit.CommitFilesRequest{
+		Files: []mcpgit.FileWrite{{
+			RepoRelPath: repoPath,
+			Content:     body.Bytes(),
+		}},
+		CommitMsg:   commitMsg,
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+		ModelName:   c.modelName,
+	})
+	proj.Unlock()
+	if err != nil {
+		return mcp.NewToolResultError("writing events to clone: " + err.Error()), nil
+	}
+
+	var b strings.Builder
+	if res.NoOp {
+		b.WriteString(fmt.Sprintf("✓ Events unchanged (%d total) — skipped commit. File: %s\n", len(events), repoPath))
+	} else {
+		b.WriteString(fmt.Sprintf("✓ %d events written to %s (commit %s)\n", len(events), repoPath, shortSHA(res.CommitSHA)))
+	}
+	// Inline preview — up to 10 lines so the LLM can show
+	// the tail of the timeline without opening the file.
+	preview := events
+	if len(preview) > 10 {
+		b.WriteString(fmt.Sprintf("  (showing first 10 of %d)\n", len(events)))
+		preview = preview[:10]
+	}
+	b.WriteString("\n```jsonl\n")
+	for _, e := range preview {
+		line, _ := json.Marshal(e)
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	b.WriteString("```\n")
+	return mcp.NewToolResultText(b.String()), nil
 }
 
 func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
