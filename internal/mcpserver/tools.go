@@ -212,7 +212,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The project ID to create this run in (use enju_list_projects to see existing projects)"),
 		),
 		mcp.WithString("branch",
-			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name (run-1, run-2, ...) — useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
+			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name — for template runs this is "<bundle>-1", "<bundle>-2", ... (e.g. path="enju_templates/gene-mapping" → "gene-mapping-1"); for inline YAML it falls back to "run-1", "run-2", .... Useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
 		),
 	)
 }

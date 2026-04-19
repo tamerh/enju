@@ -2678,9 +2678,14 @@ func formatCreateRun(data []byte) string {
 	taskCount, _ := result["task_count"].(float64)
 	sourcePath, _ := result["source_path"].(string)
 	sourceSHA, _ := result["source_commit_sha"].(string)
+	branch, _ := result["branch"].(string)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("✓ Run created in project #%s as run #%d: %s\n", projectID, int(seq), name))
+	if branch != "" {
+		b.WriteString(fmt.Sprintf("✓ Run created in project #%s as run #%d: %s on branch %q\n", projectID, int(seq), name, branch))
+	} else {
+		b.WriteString(fmt.Sprintf("✓ Run created in project #%s as run #%d: %s\n", projectID, int(seq), name))
+	}
 	b.WriteString(fmt.Sprintf("  Tasks: %d\n", int(taskCount)))
 	if sourcePath != "" {
 		line := fmt.Sprintf("  Source: %s", sourcePath)

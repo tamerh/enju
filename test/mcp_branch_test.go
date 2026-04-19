@@ -75,8 +75,10 @@ tasks:
 	}
 }
 
-// TestMCPBranchAutoAllocation verifies branch="auto" picks an
-// unused run-N and successive auto calls walk run-2, run-3, ...
+// TestMCPBranchAutoAllocation verifies branch="auto" picks
+// unused slots: inline-YAML runs walk run-1, run-2, ...;
+// template-mode runs would use the bundle dir name as slug
+// (covered separately by TestMCPBranchAutoTemplateSlug).
 func TestMCPBranchAutoAllocation(t *testing.T) {
 	h := newMCPHarness(t, "AutoBranch")
 	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-auto-%d", nowNano()))
@@ -132,6 +134,63 @@ tasks:
 	}
 	if autoCount != 2 {
 		t.Errorf("expected 2 run-N branches from auto allocation; got seen=%+v", seen)
+	}
+}
+
+// TestMCPBranchAutoTemplateSlug verifies branch="auto" derives
+// its slug from the template bundle dir name rather than the
+// generic "run-N" — so `path="enju_templates/hello"` + auto
+// yields "hello-1", "hello-2", .... Makes parallel parameter
+// sweeps instantly recognizable in `git branch`.
+func TestMCPBranchAutoTemplateSlug(t *testing.T) {
+	h := newMCPHarness(t, "AutoTemplateSlug")
+	projectID := h.createTestProject()
+
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/hello/template.yaml": `name: "hello"
+version: 1
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi."
+`,
+	}, "seed hello template")
+
+	// Two template-mode runs with branch="auto" should produce
+	// hello-1 and hello-2.
+	for i := 0; i < 2; i++ {
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju_templates/hello",
+			"branch":     "auto",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run auto #%d: err=%v body=%s", i, err, mcpText(res))
+		}
+	}
+
+	runs, err := h.store.ListRunsByProject(projectID)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range runs {
+		got[r.Branch] = true
+	}
+	if !got["hello-1"] || !got["hello-2"] {
+		t.Errorf("expected hello-1 and hello-2 auto branches; got=%+v", got)
+	}
+
+	// The create_run text should surface the resolved branch so
+	// callers see what got picked without shelling out to git.
+	res, _ := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "auto",
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, `branch "hello-3"`) {
+		t.Errorf("expected create_run text to cite branch \"hello-3\", got: %s", text)
 	}
 }
 
@@ -480,6 +539,123 @@ tasks:
 	}
 	if _, onMain := readRepoFileOnBranch(t, remoteURL, "main", expPath); onMain {
 		t.Errorf("diagram leaked onto main — should live only on experiment-1")
+	}
+}
+
+// TestMCPBranchUpstreamSubstitutionOnExplicitBranch is the
+// tester's regression repro: a two-task run (second reads
+// first.content) on an explicit non-default branch. Claim of
+// second must see the substituted prompt, not a literal
+// {{first.content}}. Root cause candidate: the workspace ends
+// up on a different branch than expected after submit, so the
+// fat-client resolver can't find first's commit in the local
+// clone.
+func TestMCPBranchUpstreamSubstitutionOnExplicitBranch(t *testing.T) {
+	h := newMCPHarness(t, "UpstreamOnBranch")
+	projectID := h.createTestProject()
+
+	yaml := `name: "two-step"
+version: 1
+tasks:
+  - id: first
+    action: answer
+    prompt: "Say a fruit."
+  - id: second
+    action: answer
+    prompt: "Echo upstream: {{first.content}}"
+`
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"branch":     "workbranch",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+	}
+
+	runs, _ := h.store.ListRunsByProject(projectID)
+	h.lastProjectID = projectID
+	h.lastRunSeq = runs[0].Seq
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
+
+	h.mcpClaimOK(t, "first")
+	h.mcpSubmitText(t, "first", "apple")
+
+	// Claim second — the MCP client resolves {{first.content}}
+	// locally by reading first's result.md at first's commit
+	// SHA. Pre-regression this worked; pre-fix the claim
+	// returned the literal {{first.content}} token and the
+	// get_task_inputs call errored with "no result file found".
+	claimRes := h.mcpClaimOK(t, "second")
+	text := mcpText(claimRes)
+	if strings.Contains(text, "{{first.content}}") {
+		t.Errorf("substitution regression — claim returned literal {{first.content}}; got:\n%s", text)
+	}
+	if !strings.Contains(text, "apple") {
+		t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
+	}
+}
+
+// TestMCPBranchUpstreamSubstitutionAfterBranchChurn tries to
+// reproduce the tester's regression with more realistic branch
+// churn: multiple runs on different branches, then a
+// substitution-dependent task pair. The hypothesis is that
+// CheckoutBranch's Force:true wipes the worktree tree enough
+// that the resolver can't find a prior commit's blob.
+func TestMCPBranchUpstreamSubstitutionAfterBranchChurn(t *testing.T) {
+	h := newMCPHarness(t, "UpstreamAfterChurn")
+	projectID := h.createTestProject()
+
+	// Run #1 on lane-a (some prior branch work).
+	runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
+	h.lastProjectID = projectID
+	h.lastRunSeq = runA
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
+	h.mcpClaimOK(t, "t")
+	h.mcpSubmitText(t, "t", "prior work on lane-a")
+
+	// Run #2 on a fresh branch with two dependent tasks.
+	yaml := `name: "chain"
+version: 1
+tasks:
+  - id: first
+    action: answer
+    prompt: "Say a fruit."
+  - id: second
+    action: answer
+    prompt: "Echo: {{first.content}}"
+`
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+		"branch":     "chain-branch",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run chain: err=%v body=%s", err, mcpText(res))
+	}
+	runs, _ := h.store.ListRunsByProject(projectID)
+	// The chain run is the most recent.
+	chainSeq := runs[len(runs)-1].Seq
+	h.lastRunSeq = chainSeq
+	h.lastRunID = fmt.Sprintf("%d:%d", projectID, chainSeq)
+
+	h.mcpClaimOK(t, "first")
+	h.mcpSubmitText(t, "first", "apple")
+
+	// Claim second. The resolver reads first's result.md at
+	// first's commit SHA — if CheckoutBranch's Force:true
+	// wiped the worktree such that first's commit isn't
+	// reachable from the current clone, this fails.
+	claimRes := h.mcpClaimOK(t, "second")
+	text := mcpText(claimRes)
+	if strings.Contains(text, "{{first.content}}") {
+		t.Errorf("regression — second's prompt has literal {{first.content}}; full:\n%s", text)
+	}
+	if strings.Contains(text, "no result file found") {
+		t.Errorf("regression — resolver couldn't find first's result file; full:\n%s", text)
+	}
+	if !strings.Contains(text, "apple") {
+		t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
 	}
 }
 

@@ -439,6 +439,17 @@ func (p *Project) readResultForTemplate(dep DependencyRef) (map[string]interface
 			return result, nil
 		}
 	}
+	// metadata.json present but neither result.md nor result.json nor
+	// named-output files — the upstream submit carried artifacts only
+	// (no content=, no outputs=). Downstream references to
+	// `{{<task>.content}}` can't resolve. Surface that directly
+	// rather than the low-level "no result file" error, which hides
+	// the real cause from authors.
+	if metaOK {
+		return nil, fmt.Errorf(
+			"upstream task %q submitted without content (artifacts-only submit); downstream references to {{%s.content}} have nothing to resolve. Pass content= (or outputs=) on submit, or drop the {{.content}} reference and use {{artifact:<path>}} instead",
+			dep.TaskDefID, dep.TaskDefID)
+	}
 	return nil, fmt.Errorf("no result file found under %s at commit %s", dep.ResultPath, dep.CommitSHA)
 }
 

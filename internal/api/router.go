@@ -1022,7 +1022,13 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 // malformed (validator matches git's ref grammar loosely enough
 // to accept "experiment-2", "enju/work", etc. but rejects empty
 // segments, leading "-", and reserved forms).
-func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested string) (string, error) {
+//
+// For branch="auto", the generated name uses `<slug>-N` where the
+// slug is derived from `sourcePath` (template bundle dir name —
+// recognizable to the caller, already git-safe since it's the
+// directory they authored under enju_templates/). Inline-YAML
+// runs with no source_path fall back to "run-N".
+func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sourcePath string) (string, error) {
 	if requested == "" {
 		if defaultBranch == "" {
 			return "main", nil
@@ -1030,10 +1036,10 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested stri
 		return defaultBranch, nil
 	}
 	if requested == "auto" {
-		// Walk run-1, run-2, ... picking the first one that
-		// doesn't already appear on an existing run in this
-		// project. Bounded to 10_000 so a misbehaving caller
-		// can't stall the endpoint forever.
+		// Walk <slug>-1, <slug>-2, ... picking the first one
+		// that doesn't already appear on an existing run in
+		// this project. Bounded to 10_000 so a misbehaving
+		// caller can't stall the endpoint forever.
 		used := map[string]bool{}
 		branches, err := s.store.ListRunBranches(projectID)
 		if err != nil {
@@ -1042,8 +1048,9 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested stri
 		for _, b := range branches {
 			used[b] = true
 		}
+		slug := autoBranchSlug(sourcePath)
 		for n := 1; n <= 10000; n++ {
-			name := fmt.Sprintf("run-%d", n)
+			name := fmt.Sprintf("%s-%d", slug, n)
 			if !used[name] {
 				return name, nil
 			}
@@ -1054,6 +1061,31 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested stri
 		return "", err
 	}
 	return requested, nil
+}
+
+// autoBranchSlug picks a human-recognizable prefix for auto-allocated
+// branch names. Template-mode runs yield the bundle directory name
+// (e.g. sourcePath="enju_templates/gene-mapping" → "gene-mapping");
+// inline-YAML runs with no source path fall back to "run".
+//
+// Bundle dir names are already git-safe (lowercase, hyphenated) by
+// virtue of being user-authored filesystem paths that git accepted
+// on commit — no slugging needed. If something slips through that
+// doesn't look ref-safe, we fall back to "run" rather than produce
+// a branch name git will refuse to store.
+func autoBranchSlug(sourcePath string) string {
+	base := strings.TrimSpace(sourcePath)
+	base = strings.TrimSuffix(base, "/")
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	if base == "" {
+		return "run"
+	}
+	if err := validateBranchName(base); err != nil {
+		return "run"
+	}
+	return base
 }
 
 // validateBranchName rejects shapes that git would refuse to
@@ -1152,7 +1184,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	//   - empty → project default
 	//   - "auto" → pick an unused "run-N" name
 	//   - explicit → use verbatim, just validate shape
-	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch)
+	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch, req.SourcePath)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
