@@ -427,6 +427,151 @@ echo "branch-test-ran"
 	}
 }
 
+// TestMCPBranchTemplateUntrackedAutoCommitsToDefault is the
+// tester's exact repro: an UNTRACKED template file in the MCP
+// workspace, then create_run with a non-default branch. Pre-fix,
+// the untracked file was silently swept onto the run's branch
+// only — subsequent runs on other branches saw "template not
+// found." Post-fix, EnsureBundleOnDefault auto-commits the
+// bundle to the default branch first, so it's reusable.
+func TestMCPBranchTemplateUntrackedAutoCommitsToDefault(t *testing.T) {
+	h := newMCPHarness(t, "TemplateUntracked")
+	projectID := h.createTestProject()
+
+	// Force the MCP workspace to clone the project so we have
+	// a real local worktree to write an untracked file into.
+	remoteURL := h.remoteFor(projectID)
+	proj, err := h.workspace.ForProject(projectID, remoteURL, "")
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+
+	// Write the template UNTRACKED directly into the worktree
+	// — bypassing git entirely, the way a user authoring a
+	// template with a plain text editor would.
+	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "hello")
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatalf("mkdir bundle: %v", err)
+	}
+	tmplPath := filepath.Join(bundleDir, "template.yaml")
+	tmplBody := `name: "hello"
+version: 1
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi."
+`
+	if err := os.WriteFile(tmplPath, []byte(tmplBody), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	// create_run on a non-default branch. The handler should
+	// auto-commit the untracked template to main BEFORE
+	// branching off to experiment-1.
+	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "experiment-1",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+	}
+
+	// Template must be committed on main in the bare remote
+	// — the auto-commit is the whole point.
+	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/hello/template.yaml")
+	if !ok {
+		t.Fatalf("template missing from main — auto-commit did not fire")
+	}
+	if !strings.Contains(string(mainBody), "Hi.") {
+		t.Errorf("main template content looks wrong: %s", string(mainBody))
+	}
+
+	// And experiment-1 exists (carries its per-run snapshot).
+	assertRemoteHasBranch(t, remoteURL, "experiment-1")
+
+	// The real test: a SECOND run on a different branch can
+	// still find the template (it's on main now). Pre-fix,
+	// this failed with "template not found."
+	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "experiment-2",
+	})
+	if err != nil || res2.IsError {
+		t.Fatalf("second create_run on experiment-2: err=%v body=%s", err, mcpText(res2))
+	}
+	assertRemoteHasBranch(t, remoteURL, "experiment-2")
+}
+
+// TestMCPBranchTemplateReusableAcrossBranches is the tester's
+// follow-up repro: a template authored in the worktree must be
+// reusable across multiple runs on different branches. Pre-fix,
+// the untracked template file got swept onto whichever branch
+// first used it (the snapshot's catch-all AddGlob), so run #2
+// on a different branch saw "template not found".
+//
+// The invariant: templates live on the project's default
+// branch. Run #1 on any branch auto-commits the template to
+// default before branching off; run #2 on another branch reads
+// it from default's already-committed history.
+func TestMCPBranchTemplateReusableAcrossBranches(t *testing.T) {
+	h := newMCPHarness(t, "TemplateReusable")
+	projectID := h.createTestProject()
+
+	// Seed the template in the project's clone (simulating the
+	// user writing the file into their workspace before first
+	// create_run). writeRepoFiles commits to main, which is the
+	// default branch for createTestProject — exactly the
+	// "templates live on default" end state, but reached via
+	// the normal authoring path.
+	h.writeRepoFiles(projectID, map[string]string{
+		"enju_templates/hello/template.yaml": `name: "hello"
+version: 1
+tasks:
+  - id: greet
+    action: answer
+    prompt: "Hi."
+`,
+	}, "seed hello template")
+
+	// Run #1 on an explicit non-default branch.
+	res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "experiment-1",
+	})
+	if err != nil || res1.IsError {
+		t.Fatalf("create_run #1 on experiment-1: err=%v body=%s", err, mcpText(res1))
+	}
+
+	// Run #2 on a DIFFERENT non-default branch. This is the
+	// critical second call — pre-fix it would have failed
+	// with "template not found" because the template only
+	// lived on experiment-1.
+	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/hello",
+		"branch":     "experiment-2",
+	})
+	if err != nil || res2.IsError {
+		t.Fatalf("create_run #2 on experiment-2: err=%v body=%s", err, mcpText(res2))
+	}
+
+	// Both branches exist, template is on main.
+	remoteURL := h.remoteFor(projectID)
+	assertRemoteHasBranch(t, remoteURL, "main")
+	assertRemoteHasBranch(t, remoteURL, "experiment-1")
+	assertRemoteHasBranch(t, remoteURL, "experiment-2")
+	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/hello/template.yaml")
+	if !ok {
+		t.Fatalf("template missing from main — expected auto-commit to default")
+	}
+	if !strings.Contains(string(mainBody), "Hi.") {
+		t.Errorf("main's template content looks wrong: %s", string(mainBody))
+	}
+}
+
 // TestMCPBranchExplicitNameCreatesRemoteRef reproduces the
 // tester-reported bug: coordinator accepts branch="experiment-1"
 // on enju_create_run, serial-per-branch enforcement works, but

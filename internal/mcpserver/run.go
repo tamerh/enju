@@ -156,7 +156,27 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		yamlContent = string(loadedTemplate.Raw)
-		if head, herr := proj.HeadHash(); herr == nil {
+		// Template-as-recipe invariant: templates live on the
+		// project's default branch. If the bundle files aren't
+		// tracked there yet (e.g. user authored them in the
+		// worktree and hasn't committed), auto-commit to
+		// default before the run branches off. Without this,
+		// the snapshot+branch-create flow below would sweep
+		// untracked template files onto the run's branch only,
+		// leaving the template unreachable on the default
+		// branch — so subsequent runs on other branches would
+		// see "template not found." See docs/runs-and-branches.md
+		// § Templates.
+		authorName, authorEmail := c.commitAuthor(ctx)
+		proj.Lock()
+		committedSHA, bundleErr := proj.EnsureBundleOnDefault(loadedTemplate.BundleDir, authorName, authorEmail, c.modelName)
+		proj.Unlock()
+		if bundleErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("pinning template to default branch: %v", bundleErr)), nil
+		}
+		if committedSHA != "" {
+			sourceCommitSHA = committedSHA
+		} else if head, herr := proj.HeadHash(); herr == nil {
 			sourceCommitSHA = head
 		}
 	}

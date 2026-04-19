@@ -1256,6 +1256,108 @@ func isNonFastForwardError(err error) bool {
 		strings.Contains(s, "stale info")
 }
 
+// EnsureBundleOnDefault pins a template bundle directory to the
+// project's default branch. This is the template-as-recipe
+// invariant: templates live on the default branch, runs on any
+// other branch read them from there.
+//
+// Flow: switch to default, pull so we commit onto the current
+// tip, stage every file under bundleDir (recursively — go-git's
+// AddGlob isn't always recursive so we walk), commit+push if
+// anything staged. No-op when the bundle is already clean.
+//
+// Returns the HEAD SHA on default after the operation so
+// callers can persist it as source_commit_sha — whether or not
+// an auto-commit actually fired.
+//
+// The caller MUST hold the project lock.
+func (p *Project) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, modelName string) (string, error) {
+	if err := p.CheckoutBranch(""); err != nil {
+		return "", fmt.Errorf("switching to default branch: %w", err)
+	}
+	if err := p.PullBranch(""); err != nil {
+		return "", fmt.Errorf("pulling default branch: %w", err)
+	}
+	wt, err := p.repo.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("getting worktree: %w", err)
+	}
+	// Walk the bundle dir and stage each file. Using per-file
+	// Add keeps staging scoped to the bundle — a wider
+	// AddGlob(".") would accidentally commit unrelated
+	// worktree changes the user might have in progress.
+	absBundle := filepath.Join(p.workDir, bundleDir)
+	if _, err := os.Stat(absBundle); err != nil {
+		return "", fmt.Errorf("bundle dir %q not found: %w", bundleDir, err)
+	}
+	walkErr := filepath.Walk(absBundle, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(p.workDir, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if _, err := wt.Add(rel); err != nil {
+			return fmt.Errorf("staging %s: %w", rel, err)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", walkErr
+	}
+	status, err := wt.Status()
+	if err != nil {
+		return "", fmt.Errorf("status: %w", err)
+	}
+	// Anything staged under the bundle path? If not, clean
+	// exit — return the current HEAD.
+	anyStaged := false
+	for path, s := range status {
+		if !strings.HasPrefix(filepath.ToSlash(path), bundleDir+"/") && filepath.ToSlash(path) != bundleDir {
+			continue
+		}
+		if s.Staging != gogit.Unmodified {
+			anyStaged = true
+			break
+		}
+	}
+	if !anyStaged {
+		if h, herr := p.repo.Head(); herr == nil {
+			return h.Hash().String(), nil
+		}
+		return "", nil
+	}
+	msg := fmt.Sprintf("Commit template bundle %s", bundleDir)
+	if modelName != "" {
+		msg += "\n\nAI-Model: " + modelName
+	}
+	if authorName == "" {
+		authorName = "Enju Client"
+	}
+	if authorEmail == "" {
+		authorEmail = "enju-client@localhost"
+	}
+	hash, err := wt.Commit(msg, &gogit.CommitOptions{
+		Author: &object.Signature{
+			Name:  authorName,
+			Email: authorEmail,
+			When:  time.Now(),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("committing bundle: %w", err)
+	}
+	if err := p.pushBranchInternal("", false); err != nil {
+		return "", fmt.Errorf("pushing default branch: %w", err)
+	}
+	return hash.String(), nil
+}
+
 // commit stages everything in the working tree and creates a
 // commit with the given message and author identity. If authorName
 // or authorEmail is empty, a generic `Enju Client` placeholder is
