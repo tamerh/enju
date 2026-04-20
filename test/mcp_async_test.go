@@ -94,6 +94,137 @@ echo "hello from async"
 	}
 }
 
+// TestMCPAsyncCursorAdvanceDoesNotStarveScanner is the direct
+// regression guard for the tester-reported "async cursor race"
+// bug. Claim: in async mode the wrapper's SubmitTaskResult
+// auto-advances the reconcile cursor past its own commit, so
+// when the submitter later calls enju_run_status the scanner
+// sees no new commits (cursor already past) and never posts
+// /tasks/reconcile — task stuck in claimed/running forever.
+//
+// Fix rule (already in compute.Run): wrapper MUST NOT pass
+// ProjectID/StateDir to SubmitTaskResult, because the scanner
+// needs to see that trailer on the submitter's next sweep.
+// Only sync-path callers (answer/review/vote submit, sync
+// compute report) advance the cursor — those already
+// reported to the coordinator directly.
+//
+// Scenario exercised:
+//  1. Seed a prior trailer-free state via create_run.
+//  2. Launch an async compute task.
+//  3. Wait for wrapper to finish and commit.
+//  4. Call run_status — scanner MUST find + reconcile the
+//     wrapper's commit.
+//  5. Task must reach "accepted".
+//
+// If the wrapper auto-advanced the cursor in step 3, step 4
+// would see no new commits and the task would be stuck.
+func TestMCPAsyncCursorAdvanceDoesNotStarveScanner(t *testing.T) {
+	h := newMCPHarness(t, "AsyncCursorStarve")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/async-starve/template.yaml": {body: `name: "async starve"
+version: 1
+tasks:
+  - id: job
+    action: compute
+    script: scripts/job.sh
+    mode: async
+`, mode: 0o644},
+		"enju_templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
+echo "async payload"
+`, mode: 0o755},
+	}, "seed async starve template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/async-starve",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
+
+	// Launch async. Handler's pullBranchWithReconcile fires
+	// at this point (cursor saves to pre-wrapper tip).
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("job"),
+	})
+	if res.IsError {
+		t.Fatalf("execute_task: %s", mcpText(res))
+	}
+
+	// Wait for wrapper to land its .wrap-result.json.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/job/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// run_status triggers reconcileRunBranch. If the wrapper
+	// had auto-advanced the cursor, scanner would find no
+	// new commits and never post — task state stays claimed.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach accepted — cursor likely advanced past wrapper commit: %v", err)
+	}
+}
+
+// TestMCPAsyncCursorRaceOnNamedBranch replicates the tester's
+// exact repro scenario: async task on a non-default named
+// branch (via branch:"auto" → slug-N). Their session showed
+// task state stuck in "claimed" even after run_status, with
+// the cursor advanced past the completion commit. The
+// baseline TestMCPAsyncComputeEndToEnd only exercised the
+// default branch, so any branch-specific regression would
+// slip through.
+func TestMCPAsyncCursorRaceOnNamedBranch(t *testing.T) {
+	h := newMCPHarness(t, "AsyncNamedBranch")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/simple-async/template.yaml": {body: `name: "simple-async"
+version: 1
+tasks:
+  - id: job
+    action: compute
+    script: scripts/job.sh
+    mode: async
+`, mode: 0o644},
+		"enju_templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
+echo "async payload on named branch"
+`, mode: 0o755},
+	}, "seed simple-async template")
+
+	// branch:"auto" → allocates slug-N (e.g. simple-async-1).
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/simple-async",
+		"branch":     "auto",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("job"),
+	})
+	if res.IsError {
+		t.Fatalf("execute_task: %s", mcpText(res))
+	}
+
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/job/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach accepted on named branch: %v", err)
+	}
+}
+
 // TestMCPAsyncComputeFailurePropagatesViaReaper verifies the
 // failure-on-return path: a detached wrapper whose script
 // exits non-zero drops a .wrap-result.json locally but does

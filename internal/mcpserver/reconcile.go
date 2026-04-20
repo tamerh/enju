@@ -106,6 +106,18 @@ func (c *apiClient) reconcileRunBranch(ctx context.Context, projectID int64, run
 		cursorMu.Lock()
 		cursors, _ := mcpgit.LoadCursors(c.stateDir(), projectID)
 		preCursor = cursors.Get(branch)
+		// See pullBranchWithReconcile's identical block for
+		// the full rationale: persist-on-first-touch so a
+		// brand-new run branch doesn't fall back to the
+		// first-scan baseline (or race with the wrapper's
+		// own local-ref advance) and orphan a task.
+		if preCursor == "" {
+			if h, herr := proj.LocalBranchHash(branch); herr == nil && h != "" {
+				preCursor = h
+				cursors.Set(branch, h)
+				_ = cursors.Save()
+			}
+		}
 		cursorMu.Unlock()
 		if tip, found, serr := proj.ScanBranchSince(branch, preCursor); serr == nil {
 			newTip = tip
@@ -207,6 +219,32 @@ func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *mcpgit.Pr
 		cursorMu.Lock()
 		cursors, _ := mcpgit.LoadCursors(c.stateDir(), projectID)
 		preCursor = cursors.Get(branch)
+		// Cursor baseline seeding: without this, a freshly-
+		// forked run branch (no origin/<branch> yet when the
+		// handler first touches it) gets an empty cursor;
+		// after the wrapper pushes, a subsequent scan finds
+		// preCursor="" and either hits ScanBranchSince's
+		// "first-time baseline" branch (tip+nil, silently
+		// skipping the wrapper's trailer) OR reads a local
+		// branch ref that the wrapper itself has already
+		// advanced to the completion commit (preCursor==tip,
+		// walks nothing). Either way the task orphans.
+		//
+		// Fix: on first touch, capture the current LOCAL
+		// branch ref hash AND persist it to the cursor file
+		// BEFORE anything else runs. That pins the scanner's
+		// starting point to the pre-wrapper state (baseHash
+		// for a fresh branch; current tip for an existing
+		// one). The cursor is now a real commit anchor, not
+		// a sentinel "first scan" value, so the next scan
+		// walks commits beyond it correctly.
+		if preCursor == "" {
+			if h, herr := proj.LocalBranchHash(branch); herr == nil && h != "" {
+				preCursor = h
+				cursors.Set(branch, h)
+				_ = cursors.Save()
+			}
+		}
 		cursorMu.Unlock()
 		tip, found, serr := proj.ScanBranchSince(branch, preCursor)
 		if serr != nil {

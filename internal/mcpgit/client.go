@@ -731,6 +731,29 @@ func (p *Project) HeadHash() (string, error) {
 	return ref.Hash().String(), nil
 }
 
+// LocalBranchHash returns the SHA of the named local branch ref,
+// falling back to refs/remotes/origin/<branch> when the local
+// ref doesn't exist, and finally to empty string when neither
+// exists. Used by the fetch-path reconcile hook to seed the
+// scanner cursor for a freshly-created run branch (local ref
+// exists at the base hash, no origin ref yet) without relying
+// on the worktree's current HEAD — HEAD can point at a
+// different branch after the user switches runs in the same
+// session. Empty `branch` resolves through the project's
+// configured default.
+func (p *Project) LocalBranchHash(branch string) (string, error) {
+	b := p.resolveBranch(branch)
+	localRef := plumbing.NewBranchReferenceName(b)
+	if ref, err := p.repo.Reference(localRef, true); err == nil {
+		return ref.Hash().String(), nil
+	}
+	remoteRef := plumbing.NewRemoteReferenceName("origin", b)
+	if ref, err := p.repo.Reference(remoteRef, true); err == nil {
+		return ref.Hash().String(), nil
+	}
+	return "", nil
+}
+
 // RemoteHeadHash contacts the remote via ls-remote and returns
 // the SHA of the project's configured default branch, or empty
 // string if the remote has no such ref. Used by CompareToRemote
@@ -1242,18 +1265,124 @@ func (p *Project) CheckoutBranch(branch string) error {
 	// Checkout the new branch's tree with Force so files
 	// tracked on the PREVIOUS branch but not on the new one
 	// get removed from the worktree. Without Force, go-git
-	// would bail on "unstaged changes" (the prior branch's
-	// tracked files look like unstaged removals from the new
-	// branch's POV), OR pass Keep:true and silently carry
-	// those files into the next submit — which was the
-	// tester-reported "lane-b inherits lane-a's commits"
-	// leak. Untracked files that the user authored (e.g. a
-	// template.yaml pending auto-commit) are preserved by
-	// go-git's checkout regardless of Force.
-	return wt.Checkout(&gogit.CheckoutOptions{
+	// bails on "unstaged changes" (the prior branch's tracked
+	// files look like unstaged removals from the new branch's
+	// POV), OR with Keep:true silently carries those files
+	// into the next submit — which was the tester-reported
+	// "lane-b inherits lane-a's commits" leak.
+	//
+	// Force:true in go-git ALSO wipes untracked files
+	// (different from `git checkout --force` CLI, which only
+	// overwrites conflicting paths) — an earlier version of
+	// this comment claimed untracked files were preserved;
+	// that was wrong, and cost a tester their in-progress
+	// template directory. To land the branch isolation Force
+	// gives us AND preserve user-authored scratch work, we
+	// snapshot untracked files into memory, force-checkout,
+	// then restore. The snapshot is cheap — on a fresh clone
+	// there are usually zero untracked files, and even a
+	// busy author's pending work is small relative to git
+	// object reads the checkout itself does.
+	preserved, err := snapshotUntrackedFiles(wt, p.workDir)
+	if err != nil {
+		return fmt.Errorf("snapshotting untracked files before checkout: %w", err)
+	}
+	if err := wt.Checkout(&gogit.CheckoutOptions{
 		Branch: refName,
 		Force:  true,
-	})
+	}); err != nil {
+		return err
+	}
+	if err := restoreUntrackedFiles(p.workDir, preserved); err != nil {
+		return fmt.Errorf("restoring untracked files after checkout: %w", err)
+	}
+	return nil
+}
+
+// untrackedFile captures one user-authored file that Force
+// checkout would otherwise wipe. Held in memory because the
+// alternative (temp-file relocation) would confuse a
+// concurrent reader and risk partial restore on crash.
+type untrackedFile struct {
+	relPath string
+	content []byte
+	mode    os.FileMode
+}
+
+// snapshotUntrackedFiles reads every untracked file from the
+// worktree into memory so a subsequent Force checkout can't
+// delete them. Uses go-git's Status() to identify untracked
+// paths — the same logic that would refuse a non-Force
+// checkout over unstaged changes, inverted to give us the
+// list instead of an error.
+//
+// Size bounded: template authoring involves small text files;
+// a pathological multi-GB untracked binary would balloon
+// memory, but that's an odd workflow and Force checkout
+// wouldn't survive it either.
+func snapshotUntrackedFiles(wt *gogit.Worktree, workDir string) ([]untrackedFile, error) {
+	status, err := wt.Status()
+	if err != nil {
+		return nil, fmt.Errorf("reading worktree status: %w", err)
+	}
+	var out []untrackedFile
+	for path, fs := range status {
+		if fs.Worktree != gogit.Untracked {
+			continue
+		}
+		full := filepath.Join(workDir, path)
+		info, err := os.Lstat(full)
+		if err != nil {
+			// File disappeared between Status and Lstat —
+			// nothing to preserve.
+			continue
+		}
+		// Skip directories and symlinks — only regular files
+		// are in scope for the "template pending auto-commit"
+		// case the fix targets. Directories get recreated
+		// implicitly when we restore files inside them.
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return nil, fmt.Errorf("reading untracked %s: %w", path, err)
+		}
+		out = append(out, untrackedFile{
+			relPath: path,
+			content: data,
+			mode:    info.Mode().Perm(),
+		})
+	}
+	return out, nil
+}
+
+// restoreUntrackedFiles writes each snapshotted file back to
+// its original path after a Force checkout, preserving the
+// mode bit. Creates parent dirs as needed. A file that
+// already exists post-checkout (because the new branch tracks
+// a path with the same name) is NOT overwritten — the
+// branch's tracked version wins, which is git's usual rule.
+// That case is rare for an untracked path but possible if a
+// user authored a file that conflicts with a branch-local
+// template.
+func restoreUntrackedFiles(workDir string, files []untrackedFile) error {
+	for _, f := range files {
+		full := filepath.Join(workDir, f.relPath)
+		if _, err := os.Stat(full); err == nil {
+			// Path now tracked on the new branch — skip to
+			// avoid overwriting branch content with user's
+			// pre-switch version.
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			return fmt.Errorf("creating parent of %s: %w", f.relPath, err)
+		}
+		if err := os.WriteFile(full, f.content, f.mode); err != nil {
+			return fmt.Errorf("restoring %s: %w", f.relPath, err)
+		}
+	}
+	return nil
 }
 
 // branchBaseHash picks the commit a fresh branch should fork
