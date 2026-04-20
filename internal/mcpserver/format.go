@@ -632,6 +632,43 @@ func stringSliceFromAny(v interface{}) []string {
 	return nil
 }
 
+// writeArtifactPathsFromAny extracts just the path strings from a
+// writes_artifacts payload — paths live at different shapes
+// depending on the source:
+//
+//   - Legacy / pre-Phase-A rows wrote bare strings: ["a","b"].
+//   - Current wire format is the object form:
+//     [{"path":"a","track":true}, {"path":"b","track":false}].
+//
+// Bug-fix helper: an earlier version of the display path used
+// stringSliceFromAny, which silently dropped every entry once
+// the wire shape became polymorphic — the entire "Writes" block
+// disappeared from claim + get_task output. This helper handles
+// both forms and mixed lists.
+func writeArtifactPathsFromAny(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	xs, ok := v.([]interface{})
+	if !ok {
+		// Fall back to the plain extractor for legacy typed
+		// inputs (e.g. []string directly from a test fixture).
+		return stringSliceFromAny(v)
+	}
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		switch e := x.(type) {
+		case string:
+			out = append(out, e)
+		case map[string]interface{}:
+			if p, _ := e["path"].(string); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
 // truncateRunes returns a rune-aware truncation of s to at most max
 // runes. Falls back to s unchanged if the string already fits. Used to
 // keep fixed-width dashboard boxes from overflowing when the user has
@@ -819,9 +856,11 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 		b.WriteString(s)
 	}
 
-	// Show artifact reads/writes schema if present
+	// Show artifact reads/writes schema if present.
+	// writes_artifacts is polymorphic on the wire post-Phase-A
+	// (object form {path,track}) — extractor handles both.
 	reads := stringSliceFromAny(task["reads_artifacts"])
-	writes := stringSliceFromAny(task["writes_artifacts"])
+	writes := writeArtifactPathsFromAny(task["writes_artifacts"])
 	if s := formatArtifactsSchema(reads, writes); s != "" {
 		b.WriteString(s)
 	}
@@ -2445,9 +2484,11 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 		b.WriteString(s)
 	}
 
-	// Show artifact reads/writes schema if present
+	// Show artifact reads/writes schema if present.
+	// writes_artifacts is polymorphic on the wire post-Phase-A
+	// (object form {path,track}) — extractor handles both.
 	reads := stringSliceFromAny(task["reads_artifacts"])
-	writes := stringSliceFromAny(task["writes_artifacts"])
+	writes := writeArtifactPathsFromAny(task["writes_artifacts"])
 	if s := formatArtifactsSchema(reads, writes); s != "" {
 		b.WriteString(s)
 	}

@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 )
 
 // taskMeta captures the fields the MCP client needs to drive the
@@ -62,15 +64,27 @@ type taskMeta struct {
 	OutputsSchemaJSON string
 	// Script is the script path for action:compute tasks.
 	Script string
-	// WritesArtifacts is the resolved list of artifact paths
-	// this task declares it produces. For action:compute, the
-	// executor uses this to know which on-disk files the script
-	// wrote so it can include them in the commit and report
-	// them back to the coordinator for artifact-index upsert.
-	// Already per-instance substituted by the parser for
-	// for_each instances (e.g. "summaries/alpha.md" not
-	// "summaries/{{stem}}.md").
-	WritesArtifacts []string
+	// WritesArtifacts is the resolved list of artifact entries
+	// this task declares it produces. Each entry carries both
+	// the path (per-instance substituted — "summaries/alpha.md"
+	// not "summaries/{{stem}}.md") and a Track flag that tells
+	// the fat-client whether to commit the file (Track=true) or
+	// record it as metadata-only (Track=false, written by the
+	// wrapper but excluded from git via a managed .gitignore
+	// block). The coordinator honors the same flag when writing
+	// the artifact-index entry — untracked entries land with
+	// commit_sha="".
+	WritesArtifacts enjuYaml.WriteArtifacts
+	// ReadsArtifacts is the resolved list of upstream artifact
+	// paths this task consumes. Populated per-instance (so
+	// "summaries/alpha.md", not "summaries/{{stem}}.md").
+	// Surfaced here for the claim-time presence check: if an
+	// upstream artifact is flagged untracked in the project's
+	// artifact index but its file is absent from this citizen's
+	// workspace, the claim is refused before coordinator state
+	// flips — the producer never pushed the content and this
+	// citizen has no way to read it.
+	ReadsArtifacts []string
 	// RunSourcePath mirrors the parent run's source_path —
 	// the template bundle directory that was snapshotted into
 	// `.enju/runs/{run_seq}/template/` at create_run time.
@@ -109,6 +123,11 @@ type taskMeta struct {
 	// the resolvedMode helper) at read sites to get the
 	// default-applied value.
 	Mode string
+	// Container is the Docker image reference the compute
+	// script should run inside (empty = run directly on the
+	// host). Threaded verbatim into the compute.Spec so the
+	// wrapper can pick the container vs direct-exec branch.
+	Container string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -166,14 +185,24 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	if v, ok := raw["script"].(string); ok {
 		meta.Script = v
 	}
-	// writes_artifacts lives on the task record as a []string
-	// (API response shape). Stored post-parse with any
-	// for_each {{var}} refs already substituted per-instance,
-	// so no further processing needed here.
-	if v, ok := raw["writes_artifacts"].([]interface{}); ok {
+	// writes_artifacts on the wire is the typed WriteArtifacts
+	// shape — [{"path":...,"track":...}]. For legacy DB rows
+	// written as a bare []string the yaml.WriteArtifacts
+	// UnmarshalJSON also accepts the old form. Re-marshal the
+	// raw element + decode through the typed parser so both
+	// flavors hit the same code path.
+	if v, ok := raw["writes_artifacts"]; ok && v != nil {
+		if b, err := json.Marshal(v); err == nil {
+			var w enjuYaml.WriteArtifacts
+			if err := json.Unmarshal(b, &w); err == nil {
+				meta.WritesArtifacts = w
+			}
+		}
+	}
+	if v, ok := raw["reads_artifacts"].([]interface{}); ok {
 		for _, p := range v {
 			if s, ok := p.(string); ok {
-				meta.WritesArtifacts = append(meta.WritesArtifacts, s)
+				meta.ReadsArtifacts = append(meta.ReadsArtifacts, s)
 			}
 		}
 	}
@@ -209,6 +238,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["mode"].(string); ok {
 		meta.Mode = v
+	}
+	if v, ok := raw["container"].(string); ok {
+		meta.Container = v
 	}
 	return meta, nil
 }

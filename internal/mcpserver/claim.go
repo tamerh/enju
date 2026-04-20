@@ -20,7 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -49,6 +52,19 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	if preMetaErr == nil && preMeta != nil && c.useFatClient(preMeta) {
 		if proj, _, _, _, perr := c.openProject(ctx, preMeta.ProjectID); perr == nil && proj != nil {
 			_ = c.pullBranchWithReconcile(ctx, proj, preMeta.ProjectID, preMeta.Branch)
+		}
+	}
+
+	// Pre-claim untracked-presence check. If this task reads any
+	// artifact that's flagged untracked in the coordinator's index
+	// but the file isn't on this citizen's workspace, the claim
+	// can't succeed (the downstream can't read the upstream's
+	// bytes from git — they were never committed). Refuse the
+	// claim BEFORE flipping coordinator state so the task stays
+	// available for a citizen who does have the file.
+	if preMetaErr == nil && preMeta != nil && c.useFatClient(preMeta) && len(preMeta.ReadsArtifacts) > 0 {
+		if err := c.checkUntrackedReadsPresence(ctx, preMeta); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 	}
 
@@ -187,6 +203,121 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 	}
 	return nil
 }
+// checkUntrackedReadsPresence verifies that every upstream
+// artifact this task reads is either tracked (in which case git
+// resolution handles it) or, if untracked, actually exists on
+// the local workspace. Returns a user-facing error when an
+// untracked upstream is missing — the caller surfaces it as a
+// tool-result-error so the task stays claimable by another
+// citizen who does have the file.
+//
+// Cheap path (no API calls) when the task doesn't read anything:
+// the caller guards on len(preMeta.ReadsArtifacts) > 0.
+func (c *apiClient) checkUntrackedReadsPresence(ctx context.Context, meta *taskMeta) error {
+	if len(meta.ReadsArtifacts) == 0 {
+		return nil
+	}
+	// Fetch the project's artifact index for this branch. One
+	// call lists every path the coordinator knows about —
+	// cheaper than N per-path fetches, and the list doesn't
+	// race against coordinator state because the pre-claim
+	// reconcile above already promoted any just-landed writes.
+	listPath := fmt.Sprintf("/api/v1/projects/%d/artifacts", meta.ProjectID)
+	if meta.Branch != "" {
+		listPath += "?branch=" + meta.Branch
+	}
+	data, err := c.get(ctx, listPath)
+	if err != nil {
+		// Best-effort: an index-listing failure shouldn't
+		// block a claim (the fat-client resolver below still
+		// reports a useful error if the file's truly
+		// unreadable). Only block on a confirmed untracked-
+		// and-missing signal.
+		c.logger.Warn("listing artifacts for presence check", "project_id", meta.ProjectID, "error", err)
+		return nil
+	}
+	var rows []map[string]interface{}
+	if json.Unmarshal(data, &rows) != nil {
+		return nil
+	}
+	// Build path → tracked map. Absent path = not in index
+	// yet (producer task hasn't accepted); treat as tracked
+	// here since the git resolver handles that failure mode
+	// with its own clear message.
+	trackedByPath := make(map[string]bool, len(rows))
+	writerByPath := make(map[string]string, len(rows))
+	for _, r := range rows {
+		p, _ := r["path"].(string)
+		if p == "" {
+			continue
+		}
+		// The tracked field is either absent (legacy row,
+		// implicit true), a *bool rendering, or a bare bool.
+		switch v := r["tracked"].(type) {
+		case bool:
+			trackedByPath[p] = v
+		case nil:
+			trackedByPath[p] = true
+		}
+		if t, _ := r["last_task_id"].(string); t != "" {
+			writerByPath[p] = t
+		}
+	}
+	// Open the project clone so we can stat files in the
+	// working tree. The pre-claim reconcile earlier already
+	// pulled the branch, so .gitignore + any tracked files
+	// are current.
+	remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
+	proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName)
+	if perr != nil {
+		c.logger.Warn("opening project for presence check", "project_id", meta.ProjectID, "error", perr)
+		return nil
+	}
+	workDir := proj.WorkDir()
+
+	var missing []string
+	for _, p := range meta.ReadsArtifacts {
+		tracked, known := trackedByPath[p]
+		if !known || tracked {
+			continue // tracked or not-yet-in-index; skip
+		}
+		// Best-effort shared-root hookup: if ENJU_SHARED_ROOT
+		// is configured AND the producer wrote through it, the
+		// downstream workspace won't have a file yet — the
+		// symlink needs to be materialized before the stat
+		// succeeds. EnsureSharedSymlink is a noop when the env
+		// var is unset, so this call is free in local-only
+		// setups.
+		if err := mcpgit.EnsureSharedSymlink(mcpgit.ArtifactPath(p), workDir,
+			meta.ProjectID, meta.ProjectName, meta.Branch, p); err != nil {
+			c.logger.Warn("shared-root symlink setup", "path", p, "error", err)
+		}
+		full := filepath.Join(workDir, mcpgit.ArtifactPath(p))
+		if _, err := os.Stat(full); err != nil {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	// Render a concrete, actionable error. Name the missing
+	// paths + their producer task so the citizen knows who
+	// to ask (or which task to re-run themselves).
+	var b strings.Builder
+	b.WriteString("cannot claim — this task reads untracked artifact(s) that aren't in your workspace:\n")
+	for _, p := range missing {
+		fmt.Fprintf(&b, "  - %s", p)
+		if writer := writerByPath[p]; writer != "" {
+			fmt.Fprintf(&b, " (produced by %s)", writer)
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString("\nUntracked artifacts live outside git — only the producer's workspace (or a shared mount via $ENJU_SHARED_ROOT) has the bytes. Options: ")
+	b.WriteString("re-run the producer task locally so it materializes the file here, or configure $ENJU_SHARED_ROOT to point at a mount the producer writes to.")
+	return fmt.Errorf("%s", b.String())
+}
+
 func (c *apiClient) handleGetTaskInputs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
 	if err != nil {

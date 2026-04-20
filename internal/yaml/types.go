@@ -16,6 +16,8 @@
 package yaml
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -189,6 +191,174 @@ func (o *OutputSpec) UnmarshalYAML(value *yamlv3.Node) error {
 	return nil
 }
 
+// WriteArtifact declares one artifact a compute task produces.
+// The `track` flag controls whether the artifact lands in git
+// history:
+//
+//   - track: true  (default) — artifact is committed by the
+//     fat-client on submit and recorded in the artifact index
+//     with its commit SHA. Downstream tasks read it through
+//     git like any other tracked file.
+//
+//   - track: false — artifact stays on disk but is NOT committed
+//     (a managed block in .gitignore keeps it out). The artifact
+//     index records its existence with an empty commit SHA so
+//     downstream readiness still works; the content itself only
+//     exists on whatever workspace produced it (or on shared
+//     storage if $ENJU_SHARED_ROOT is configured).
+//
+// The shorthand form — a bare path string — always expands to
+// `{Path: <string>, Track: true}`. Object form is only needed
+// when overriding Track.
+type WriteArtifact struct {
+	Path  string `yaml:"path" json:"path"`
+	Track bool   `yaml:"track" json:"track"`
+}
+
+// UnmarshalYAML accepts either a scalar (path string, track
+// defaults to true) or a mapping (path + optional track). Any
+// other shape is a schema error — caught by the generic yaml.v3
+// decoder when we fall through to struct decode.
+func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
+	if value.Kind == yamlv3.ScalarNode {
+		w.Path = value.Value
+		w.Track = true
+		return nil
+	}
+	if value.Kind != yamlv3.MappingNode {
+		return fmt.Errorf("writes_artifacts entry: expected string or mapping, got %s", nodeKindName(value.Kind))
+	}
+	// Decode via an alias to avoid recursing into our custom
+	// unmarshaller. Pre-set Track=true so an omitted `track:`
+	// key stays true — yaml.v3 doesn't overwrite fields
+	// absent from the YAML.
+	type alias WriteArtifact
+	a := alias{Track: true}
+	if err := value.Decode(&a); err != nil {
+		return err
+	}
+	*w = WriteArtifact(a)
+	return nil
+}
+
+// WriteArtifacts is a typed slice of WriteArtifact entries. The
+// named type carries behavior helpers (.Paths(), .TrackedPaths(),
+// .UntrackedPaths()) so call sites that only care about one slice
+// don't have to loop inline.
+type WriteArtifacts []WriteArtifact
+
+// Paths returns every declared path in declaration order,
+// regardless of track flag. Used by call sites that treat the
+// list as a pure output-set — artifact-dep wiring, LLM prompts,
+// error messages.
+func (w WriteArtifacts) Paths() []string {
+	if len(w) == 0 {
+		return nil
+	}
+	out := make([]string, len(w))
+	for i, e := range w {
+		out[i] = e.Path
+	}
+	return out
+}
+
+// TrackedPaths returns only the paths with Track=true. Used by
+// the fat-client commit step — these are the only files staged
+// into git.
+func (w WriteArtifacts) TrackedPaths() []string {
+	var out []string
+	for _, e := range w {
+		if e.Track {
+			out = append(out, e.Path)
+		}
+	}
+	return out
+}
+
+// UntrackedPaths returns only the paths with Track=false. Used
+// by the .gitignore management step and by the wrapper when
+// skipping files during the commit-staging phase.
+func (w WriteArtifacts) UntrackedPaths() []string {
+	var out []string
+	for _, e := range w {
+		if !e.Track {
+			out = append(out, e.Path)
+		}
+	}
+	return out
+}
+
+// UnmarshalJSON accepts two shapes for back-compat:
+//
+//   - Legacy:  ["path/a", "path/b"]        — every entry tracked.
+//   - Current: [{"path":"a","track":true},
+//              {"path":"b","track":false}]
+//
+// Pre-untracked-artifacts DB rows were written as the legacy
+// form; this parser lets them round-trip without a migration.
+// Writers always emit the object form.
+func (w *WriteArtifacts) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*w = nil
+		return nil
+	}
+	// Peek at the first non-whitespace byte inside the array to
+	// decide which shape we're looking at. This avoids a
+	// try-decode/fallback dance that would swallow real errors.
+	var raw []json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return fmt.Errorf("writes_artifacts: %w", err)
+	}
+	out := make(WriteArtifacts, 0, len(raw))
+	for i, elem := range raw {
+		e := bytes.TrimSpace(elem)
+		if len(e) == 0 {
+			continue
+		}
+		switch e[0] {
+		case '"':
+			// Legacy bare string → {Path, Track: true}.
+			var s string
+			if err := json.Unmarshal(e, &s); err != nil {
+				return fmt.Errorf("writes_artifacts[%d]: %w", i, err)
+			}
+			out = append(out, WriteArtifact{Path: s, Track: true})
+		case '{':
+			// Current object form. Pre-set Track=true so an
+			// omitted "track" key defaults correctly.
+			type alias WriteArtifact
+			a := alias{Track: true}
+			if err := json.Unmarshal(e, &a); err != nil {
+				return fmt.Errorf("writes_artifacts[%d]: %w", i, err)
+			}
+			out = append(out, WriteArtifact(a))
+		default:
+			return fmt.Errorf("writes_artifacts[%d]: expected string or object, got %s", i, string(e))
+		}
+	}
+	*w = out
+	return nil
+}
+
+// nodeKindName renders a yamlv3.Kind as a human label for error
+// messages. yaml.v3 doesn't ship one, so we keep a local mapping.
+func nodeKindName(k yamlv3.Kind) string {
+	switch k {
+	case yamlv3.DocumentNode:
+		return "document"
+	case yamlv3.SequenceNode:
+		return "sequence"
+	case yamlv3.MappingNode:
+		return "mapping"
+	case yamlv3.ScalarNode:
+		return "scalar"
+	case yamlv3.AliasNode:
+		return "alias"
+	}
+	return "unknown"
+}
+
 // TaskDef is a single task definition from the YAML.
 type TaskDef struct {
 	ID         string            `yaml:"id"`
@@ -235,6 +405,22 @@ type TaskDef struct {
 	// See docs/async-compute.md.
 	Mode string `yaml:"mode,omitempty"`
 
+	// Container declares a Docker image that the compute task's
+	// script runs inside. When set, the wrapper invokes
+	// `docker run <image> /bin/sh -c <script>` with the
+	// workspace bind-mounted at /workspace, ENJU_* env vars
+	// translated from host paths to container paths, and
+	// --user set to the host uid:gid so output files land
+	// owned by the host user (not root). Only valid on
+	// action: compute; rejected on every other action.
+	//
+	// Image reference is passed verbatim to docker — any
+	// registry/tag/digest form that docker accepts works
+	// (biocontainers/samtools:1.18, ghcr.io/org/tool@sha256:...).
+	// No pull-policy / network / resource-limit flags in v1.
+	// See docs/containers.md.
+	Container string `yaml:"container,omitempty"`
+
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
 	Gather     bool              `yaml:"gather,omitempty"`
@@ -260,8 +446,8 @@ type TaskDef struct {
 	// ReadsArtifacts can be inferred from {{artifact:path}} prompt
 	// references — the parser will merge inferred reads with any
 	// explicitly declared paths. WritesArtifacts is always explicit.
-	ReadsArtifacts  []string `yaml:"reads_artifacts,omitempty"`
-	WritesArtifacts []string `yaml:"writes_artifacts,omitempty"`
+	ReadsArtifacts  []string       `yaml:"reads_artifacts,omitempty"`
+	WritesArtifacts WriteArtifacts `yaml:"writes_artifacts,omitempty"`
 
 	// Reviews names the task this one reviews. Required on
 	// `action: review` tasks, ignored elsewhere. The reviewer reads

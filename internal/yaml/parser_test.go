@@ -1209,6 +1209,170 @@ tasks:
 	}
 }
 
+// TestParseWarnOnComputeContentRefWithArtifacts is the
+// regression guard for the "{{X.content}} on a compute task
+// that writes artifacts" footgun — .content is the script's
+// stdout, not the file bytes, but it's an easy mistake to make.
+// The lint fires on run creation so the author catches it
+// before any citizen claims a downstream.
+func TestParseWarnOnComputeContentRefWithArtifacts(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute content-ref lint"
+version: 1
+tasks:
+  - id: aggregate
+    action: compute
+    script: scripts/aggregate.sh
+    writes_artifacts:
+      - out/totals.tsv
+    prompt: "Aggregate the data"
+
+  - id: summarize
+    action: answer
+    prompt: "Summarize: {{aggregate.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var got string
+	for _, w := range parsed.Warnings {
+		if contains(w, "{{aggregate.content}}") {
+			got = w
+			break
+		}
+	}
+	if got == "" {
+		t.Fatalf("expected compute-content warning, got: %v", parsed.Warnings)
+	}
+	// Warning must name the artifact and the replacement syntax
+	// so the author can fix without cross-referencing docs.
+	for _, want := range []string{"out/totals.tsv", "{{artifact:"} {
+		if !contains(got, want) {
+			t.Errorf("warning missing %q: %s", want, got)
+		}
+	}
+}
+
+// TestParseComputeContentRefSuppressedByArtifactRef — if the
+// author ALREADY uses {{artifact:<path>}} for the same
+// producer's output, they clearly know the distinction.
+// Suppress the warning so a prompt that legitimately wants
+// both stdout (status line) + artifact (bytes) doesn't
+// nag the author.
+func TestParseComputeContentRefSuppressedByArtifactRef(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute content+artifact both"
+version: 1
+tasks:
+  - id: aggregate
+    action: compute
+    script: scripts/aggregate.sh
+    writes_artifacts:
+      - out/totals.tsv
+    prompt: "Aggregate the data"
+
+  - id: summarize
+    action: answer
+    prompt: |
+      Status line from aggregate: {{aggregate.content}}
+      Actual data: {{artifact:out/totals.tsv}}
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "{{aggregate.content}}") {
+			t.Errorf("warning should be suppressed when {{artifact:...}} is also present: %s", w)
+		}
+	}
+}
+
+// TestParseComputeContentRefNoArtifactsNoWarning — if the
+// producer compute task has no writes_artifacts, stdout IS the
+// canonical output. {{X.content}} is correct, no warning.
+func TestParseComputeContentRefNoArtifactsNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute no artifacts"
+version: 1
+tasks:
+  - id: compute_only
+    action: compute
+    script: scripts/run.sh
+    prompt: "Run it"
+
+  - id: consume
+    action: answer
+    prompt: "Read: {{compute_only.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "{{compute_only.content}}") {
+			t.Errorf("unexpected warning for stdout-only compute producer: %s", w)
+		}
+	}
+}
+
+// TestParseNonComputeContentRefNoWarning — {{X.content}} on
+// answer / contribute / review / vote producers is exactly the
+// right thing. Only compute tasks have the stdout-vs-artifact
+// split that creates the footgun.
+func TestParseNonComputeContentRefNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Answer content ref"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write a paragraph."
+
+  - id: review
+    action: answer
+    prompt: "Critique: {{draft.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "{{draft.content}}") {
+			t.Errorf("unexpected warning for answer-producer content ref: %s", w)
+		}
+	}
+}
+
+// TestParseComputeFieldRefNoWarning — {{X.field}} for a
+// declared named output is the correct pattern and should not
+// trip the stdout-vs-artifact lint.
+func TestParseComputeFieldRefNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Compute field ref"
+version: 1
+tasks:
+  - id: analyze
+    action: compute
+    script: scripts/analyze.sh
+    outputs:
+      gene_list:
+        description: "list of genes"
+    writes_artifacts:
+      - out/genes.tsv
+    prompt: "Analyze"
+
+  - id: consume
+    action: answer
+    prompt: "Genes: {{analyze.gene_list}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "{{analyze.") {
+			t.Errorf("unexpected warning for named-field ref: %s", w)
+		}
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

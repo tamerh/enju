@@ -108,6 +108,21 @@ func unmarshalStringSlice(s string) []string {
 	return xs
 }
 
+// unmarshalWriteArtifacts parses the storage form of the
+// writes_artifacts column (legacy []string OR current
+// [{path,track}] form — yaml.WriteArtifacts.UnmarshalJSON
+// handles both) into the typed slice used on the wire.
+func unmarshalWriteArtifacts(s string) enjuYaml.WriteArtifacts {
+	if s == "" {
+		return nil
+	}
+	var w enjuYaml.WriteArtifacts
+	if err := json.Unmarshal([]byte(s), &w); err != nil {
+		return nil
+	}
+	return w
+}
+
 // unmarshalStringMapField decodes the JSON-encoded env: map
 // stored on tasks.env back into a map[string]string. Empty
 // string yields nil. Malformed JSON yields nil (defense in

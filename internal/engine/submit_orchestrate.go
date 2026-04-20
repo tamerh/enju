@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/store"
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 )
 
 // SubmitRequest carries the fields from the HTTP submit
@@ -35,14 +36,16 @@ func (e *Engine) ValidateSubmitRequest(
 	run *store.RunRecord,
 	req *SubmitRequest,
 ) (resultPath, decision, voteChoice string, submitterID int64, err error) {
-	// Artifact path validation.
+	// Artifact path validation. WritesArtifacts column stores
+	// either legacy []string or current [{path,track}] JSON;
+	// yaml.WriteArtifacts.UnmarshalJSON handles both.
 	if len(req.ArtifactsWritten) > 0 {
-		var declared []string
+		var decl enjuYaml.WriteArtifacts
 		if task.WritesArtifacts != "" {
-			_ = json.Unmarshal([]byte(task.WritesArtifacts), &declared)
+			_ = json.Unmarshal([]byte(task.WritesArtifacts), &decl)
 		}
-		allowed := make(map[string]bool, len(declared))
-		for _, p := range declared {
+		allowed := make(map[string]bool, len(decl))
+		for _, p := range decl.Paths() {
 			allowed[p] = true
 		}
 		for _, path := range req.ArtifactsWritten {
@@ -168,10 +171,36 @@ func (e *Engine) ComputePostSubmitActions(
 ) (*PostSubmitActions, error) {
 	actions := &PostSubmitActions{}
 
-	// Artifact index mutations.
+	// Artifact index mutations. Each mutation carries the Tracked
+	// flag sourced from the task's declared writes_artifacts entry
+	// for that path — untracked entries land with commit_sha="" so
+	// consumers can recognize they're not in git. Paths missing
+	// from the declaration (shouldn't happen after
+	// ValidateSubmitRequest, but defense-in-depth) default to
+	// tracked so legacy behavior is preserved.
 	if len(req.ArtifactsWritten) > 0 {
+		var decl enjuYaml.WriteArtifacts
+		if task.WritesArtifacts != "" {
+			_ = json.Unmarshal([]byte(task.WritesArtifacts), &decl)
+		}
+		trackByPath := make(map[string]bool, len(decl))
+		for _, e := range decl {
+			trackByPath[e.Path] = e.Track
+		}
 		now := time.Now()
 		for _, path := range req.ArtifactsWritten {
+			tracked, known := trackByPath[path]
+			if !known {
+				tracked = true
+			}
+			commitSHA := req.CommitSHA
+			if !tracked {
+				// Untracked artifacts never have a commit SHA —
+				// the file is outside git entirely. Clear any
+				// accidental value the client sent so the column
+				// stays meaningful.
+				commitSHA = ""
+			}
 			actions.ArtifactMutations = append(actions.ArtifactMutations, store.MoveArtifact{
 				Artifact: store.ArtifactRecord{
 					ProjectID:  run.ProjectID,
@@ -180,7 +209,8 @@ func (e *Engine) ComputePostSubmitActions(
 					LastWriter: task.ClaimedBy,
 					LastTaskID: task.ID,
 					LastRunID:  task.RunID,
-					CommitSHA:  req.CommitSHA,
+					CommitSHA:  commitSHA,
+					Tracked:    tracked,
 					CreatedAt:  now,
 					UpdatedAt:  now,
 				},

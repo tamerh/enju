@@ -74,8 +74,14 @@ func TestFetchTaskMetaFullPayload(t *testing.T) {
 	if meta.Citizens != 2 || meta.Script != "scripts/run.sh" {
 		t.Fatalf("citizens/script wrong: %+v", meta)
 	}
-	if len(meta.WritesArtifacts) != 2 || meta.WritesArtifacts[0] != "out/a.md" {
+	if len(meta.WritesArtifacts) != 2 || meta.WritesArtifacts[0].Path != "out/a.md" {
 		t.Fatalf("writes_artifacts wrong: %v", meta.WritesArtifacts)
+	}
+	// Legacy []string form on the wire must decode with Track=true.
+	for i, e := range meta.WritesArtifacts {
+		if !e.Track {
+			t.Errorf("legacy []string entry %d should default Track=true, got %+v", i, e)
+		}
 	}
 	if meta.RunSourcePath != "enju_templates/demo" {
 		t.Fatalf("run_source_path wrong: %q", meta.RunSourcePath)
@@ -135,7 +141,7 @@ func TestFetchTaskMetaPartialPayload(t *testing.T) {
 	if meta.State != "ready" {
 		t.Fatalf("state not set: %q", meta.State)
 	}
-	if meta.ProjectID != 0 || meta.Citizens != 0 || meta.WritesArtifacts != nil {
+	if meta.ProjectID != 0 || meta.Citizens != 0 || len(meta.WritesArtifacts) != 0 {
 		t.Fatalf("expected zero defaults, got %+v", meta)
 	}
 	if meta.Env != nil {

@@ -227,7 +227,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		t.Reviews = template.ResolveParams(t.Reviews, strMap)
 		substituteStringSliceInPlace(t.AssignTo, strMap)
 		substituteStringSliceInPlace(t.ReadsArtifacts, strMap)
-		substituteStringSliceInPlace(t.WritesArtifacts, strMap)
+		substituteWriteArtifactsInPlace(t.WritesArtifacts, strMap)
 		for k, v := range t.Env {
 			t.Env[k] = template.ResolveParams(v, strMap)
 		}
@@ -245,11 +245,42 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 // yamlStringList alias) and replaces every {{paramname}} ref
 // with its resolved string value. No-op for empty slices.
 // Used by substituteParamsInPlace for list-shaped per-field
-// slots like AssignTo / WritesArtifacts / ReadsArtifacts.
+// slots like AssignTo / ReadsArtifacts.
 func substituteStringSliceInPlace[S ~[]string](s S, strMap map[string]string) {
 	for i := range s {
 		s[i] = template.ResolveParams(s[i], strMap)
 	}
+}
+
+// substituteWriteArtifactsInPlace runs {{param}} substitution
+// across every entry's Path. Track is unaffected — it's a
+// literal YAML bool, never a param ref. Mirrors
+// substituteStringSliceInPlace, split out because WriteArtifacts
+// is a []struct not a []string.
+func substituteWriteArtifactsInPlace(ws WriteArtifacts, strMap map[string]string) {
+	for i := range ws {
+		ws[i].Path = template.ResolveParams(ws[i].Path, strMap)
+	}
+}
+
+// ResolveWriteArtifacts returns a new WriteArtifacts slice with
+// every Path resolved through strMap. Used by build.go when
+// materializing per-instance task copies — the source slice is
+// shared across instances, so a fresh allocation is required.
+// Exported so `engine/materialize.go` can reuse the same rule
+// when dynamic for_each materializes deferred instances.
+func ResolveWriteArtifacts(ws WriteArtifacts, strMap map[string]string) WriteArtifacts {
+	if len(ws) == 0 {
+		return nil
+	}
+	out := make(WriteArtifacts, len(ws))
+	for i, e := range ws {
+		out[i] = WriteArtifact{
+			Path:  template.ResolveParams(e.Path, strMap),
+			Track: e.Track,
+		}
+	}
+	return out
 }
 // stringifyParamValue renders a YAML-decoded parameter value as
 // a string suitable for in-prompt substitution. The goal is a

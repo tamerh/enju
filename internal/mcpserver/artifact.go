@@ -11,6 +11,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
@@ -251,4 +255,168 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 		"history": entries,
 	})
 	return mcp.NewToolResultText(formatArtifactHistory(out)), nil
+}
+
+// handleListUntrackedArtifacts filters the coordinator's artifact
+// index down to entries with tracked=false and reports their
+// local-workspace visibility. Intended as a debugging aid for
+// "cannot claim — task reads untracked artifact(s) not in your
+// workspace" errors, and as a quick audit of which outputs this
+// project keeps out of git.
+//
+// For each untracked entry:
+//   - Runs EnsureSharedSymlink as a best-effort (materializes the
+//     link if $ENJU_SHARED_ROOT is configured and the workspace
+//     path isn't a live symlink yet). This means running this tool
+//     can fix the downstream claim error in-place when shared
+//     storage is available but the symlink wasn't yet created on
+//     this workspace.
+//   - os.Stat's the workspace path and records present/missing
+//     plus, when the path resolved to a symlink, the target so the
+//     user can see whether they're reading from local disk or
+//     shared storage.
+func (c *apiClient) handleListUntrackedArtifacts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	if c.workspace == nil {
+		return mcp.NewToolResultError("enju_list_untracked_artifacts requires a local workspace (MCP client mode)"), nil
+	}
+	branch := req.GetString("branch", "")
+
+	// Resolve project metadata once — the default_branch is
+	// load-bearing for the symlink materializer below (the
+	// producer's bytes live at
+	// $SHARED/<slug>/<project-default-branch>/<path>, not at
+	// a hard-coded "main"). For projects using default_branch
+	// like "enju/work" a hardcoded fallback would make the
+	// tool silently report "missing" even when bytes exist.
+	remoteURL, projName, defaultBranch, _ := c.fetchProjectMetaExpanded(ctx, int64(projectID))
+	if branch == "" {
+		branch = defaultBranch
+	}
+	listPath := fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID)
+	if branch != "" {
+		listPath += "?branch=" + branch
+	}
+	data, err := c.get(ctx, listPath)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var rows []map[string]interface{}
+	if json.Unmarshal(data, &rows) != nil {
+		return mcp.NewToolResultError("unable to parse artifact index"), nil
+	}
+
+	// Open project workspace so we can stat paths + run the
+	// symlink materializer. Non-fatal: if the open fails, we
+	// still report what the index says; the local visibility
+	// column just says "(workspace unavailable)".
+	var workDir string
+	if proj, perr := c.workspace.ForProject(int64(projectID), remoteURL, projName); perr == nil {
+		workDir = proj.WorkDir()
+	}
+
+	type untrackedRow struct {
+		Path       string
+		Producer   string
+		LocalState string // "present", "missing", "(unavailable)"
+		Target     string // symlink target if applicable
+	}
+	var out []untrackedRow
+	for _, r := range rows {
+		if _, ok := r["tracked"].(bool); !ok {
+			continue
+		}
+		if r["tracked"].(bool) {
+			continue
+		}
+		path, _ := r["path"].(string)
+		if path == "" {
+			continue
+		}
+		ur := untrackedRow{
+			Path:     path,
+			Producer: firstNonEmpty(r, "last_writer", "last_task_id"),
+		}
+		if workDir == "" {
+			ur.LocalState = "(workspace unavailable)"
+			out = append(out, ur)
+			continue
+		}
+		// Best-effort shared-root materialization — same logic
+		// the pre-claim check uses. A missing ENJU_SHARED_ROOT
+		// makes this a noop, so local-only users pay nothing.
+		// `branch` is guaranteed resolved (caller value or
+		// project's default_branch) so the symlink target
+		// matches what the producer actually wrote.
+		_ = mcpgit.EnsureSharedSymlink(mcpgit.ArtifactPath(path), workDir,
+			int64(projectID), projName, branch, path)
+		full := filepath.Join(workDir, mcpgit.ArtifactPath(path))
+		fi, serr := os.Lstat(full)
+		if os.IsNotExist(serr) {
+			ur.LocalState = "missing"
+		} else if serr != nil {
+			ur.LocalState = fmt.Sprintf("error: %v", serr)
+		} else {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				tgt, _ := os.Readlink(full)
+				ur.Target = tgt
+			}
+			ur.LocalState = "present"
+		}
+		out = append(out, ur)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Untracked artifacts in project %d", projectID)
+	if branch != "" {
+		fmt.Fprintf(&b, " (branch: %s)", branch)
+	}
+	b.WriteString("\n\n")
+	if len(out) == 0 {
+		b.WriteString("(none — no artifacts flagged track:false in this project)\n")
+		return mcp.NewToolResultText(b.String()), nil
+	}
+	shared := mcpgit.SharedRoot()
+	for _, u := range out {
+		marker := "?"
+		switch u.LocalState {
+		case "present":
+			marker = "✓"
+		case "missing":
+			marker = "✗"
+		}
+		fmt.Fprintf(&b, "%s %s\n", marker, u.Path)
+		if u.Producer != "" {
+			fmt.Fprintf(&b, "   Producer: %s\n", u.Producer)
+		}
+		fmt.Fprintf(&b, "   Local: %s", u.LocalState)
+		if u.Target != "" {
+			fmt.Fprintf(&b, " (symlink → %s)", u.Target)
+		}
+		b.WriteByte('\n')
+		b.WriteByte('\n')
+	}
+	if shared == "" {
+		b.WriteString("(ENJU_SHARED_ROOT not configured — missing entries can be fixed by re-running the producer task locally, or by pointing $ENJU_SHARED_ROOT at a mount the producer wrote to.)\n")
+	} else {
+		fmt.Fprintf(&b, "(ENJU_SHARED_ROOT=%s — missing entries mean the producer never wrote to this mount, or the mount is unavailable.)\n", shared)
+	}
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// firstNonEmpty returns the first string value among the given
+// keys, falling back through the list. Used for producer
+// provenance where the artifact-index row has both last_writer
+// (username) and last_task_id — either form is informative.
+func firstNonEmpty(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, _ := m[k].(string); v != "" {
+			return v
+		}
+	}
+	return ""
 }

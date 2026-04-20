@@ -958,8 +958,21 @@ type artifactResponse struct {
 	LastWriter string `json:"last_writer,omitempty"` // username of the last writer
 	LastTaskID string `json:"last_task_id,omitempty"`
 	LastRunID  int64  `json:"last_run_id,omitempty"`
-	UpdatedAt  string `json:"updated_at"`
+	CommitSHA  string `json:"commit_sha,omitempty"` // empty iff tracked=false
+	// Tracked reflects whether the artifact's bytes live in git.
+	// Defaults to true for every entry in pre-untracked DB rows;
+	// new untracked entries (writes_artifacts: track: false) land
+	// with Tracked=false and CommitSHA="". Serialized as a pointer
+	// so `false` is distinguishable from omitted on older clients.
+	Tracked   *bool  `json:"tracked,omitempty"`
+	UpdatedAt string `json:"updated_at"`
 }
+
+// trackedPtr renders the ArtifactRecord.Tracked bool for the
+// wire: returns a pointer so json.Marshal emits the field
+// unconditionally (including the false case). Keeps the same
+// omitempty behavior of Go's bool-pointer convention.
+func trackedPtr(b bool) *bool { return &b }
 
 // citizenUsername looks up the username for an internal citizen ID.
 // Returns the empty string if the citizen isn't found (e.g. id is 0).
@@ -1010,6 +1023,8 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 			LastWriter: s.citizenUsername(a.LastWriter),
 			LastTaskID: a.LastTaskID,
 			LastRunID:  a.LastRunID,
+			CommitSHA:  a.CommitSHA,
+			Tracked:    trackedPtr(a.Tracked),
 			UpdatedAt:  a.UpdatedAt.Format(time.RFC3339),
 		})
 	}
@@ -1064,6 +1079,7 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 		"last_task_id": meta.LastTaskID,
 		"last_run_id":  meta.LastRunID,
 		"commit_sha":   meta.CommitSHA,
+		"tracked":      meta.Tracked,
 		"updated_at":   meta.UpdatedAt.Format(time.RFC3339),
 	})
 }
@@ -1660,8 +1676,8 @@ type taskResponse struct {
 	ResultPath      string   `json:"result_path,omitempty"`
 	CommitSHA       string   `json:"commit_sha,omitempty"` // git SHA of the accepted result (iteration A+)
 	DependsOn       string   `json:"depends_on,omitempty"`
-	ReadsArtifacts  []string `json:"reads_artifacts,omitempty"`
-	WritesArtifacts []string `json:"writes_artifacts,omitempty"`
+	ReadsArtifacts  []string               `json:"reads_artifacts,omitempty"`
+	WritesArtifacts enjuYaml.WriteArtifacts `json:"writes_artifacts,omitempty"`
 	AssignTo        []string `json:"assign_to,omitempty"` // usernames
 	RequireRole     string   `json:"require_role,omitempty"`
 	ReviewsTarget   string   `json:"reviews_target,omitempty"`   // Phase E: target task id this review evaluates
@@ -1711,6 +1727,13 @@ type taskResponse struct {
 	// handler reads this to pick the sync vs detached-
 	// subprocess code path.
 	Mode string `json:"mode,omitempty"`
+	// Container is the Docker image reference this compute
+	// task runs inside (empty = run the script directly on the
+	// host as before). The fat-client's enju_execute_task
+	// handler feeds it into the compute wrapper, which builds
+	// a `docker run ...` invocation instead of exec'ing the
+	// script directly.
+	Container string `json:"container,omitempty"`
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -3946,7 +3969,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		CommitSHA:       t.CommitSHA,
 		DependsOn:       t.DependsOn,
 		ReadsArtifacts:  unmarshalStringSlice(t.ReadsArtifacts),
-		WritesArtifacts: unmarshalStringSlice(t.WritesArtifacts),
+		WritesArtifacts: unmarshalWriteArtifacts(t.WritesArtifacts),
 		AssignTo:        unmarshalStringSlice(t.AssignTo),
 		RequireRole:     t.RequireRole,
 		ReviewsTarget:   t.ReviewsTarget,
@@ -3968,6 +3991,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		InstanceParamsMap: instanceParams,
 		Env:               unmarshalStringMapField(t.Env),
 		Mode:              t.Mode,
+		Container:         t.Container,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

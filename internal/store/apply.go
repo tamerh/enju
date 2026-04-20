@@ -258,14 +258,14 @@ func applyCreateTask(tx *sql.Tx, m CreateTask) error {
 		anonymize = 1
 	}
 	_, err := tx.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
-		anonymize, t.Visibility, t.Env, t.Mode,
+		anonymize, t.Visibility, t.Env, t.Mode, t.Container,
 		t.CreatedAt,
 	)
 	return err
@@ -431,14 +431,29 @@ func applyMoveArtifact(tx *sql.Tx, m MoveArtifact) error {
 	if branch == "" {
 		branch = "main"
 	}
+	// Tracked flips between INSERT and ON-CONFLICT-UPDATE so
+	// re-running a compute task that flipped track:true → false
+	// (or vice versa) is reflected in-place rather than
+	// accumulating two rows. Same story for commit_sha, which
+	// is "" whenever tracked is false.
 	_, err := tx.Exec(
-		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_id, branch, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, updated_at=?`,
-		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, a.CreatedAt, a.UpdatedAt,
-		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, a.UpdatedAt,
+		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, branch, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, tracked=?, updated_at=?`,
+		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.CreatedAt, a.UpdatedAt,
+		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.UpdatedAt,
 	)
 	return err
+}
+
+// boolToInt maps Go bool -> SQLite INTEGER (0/1). SQLite doesn't
+// have a native BOOLEAN type; the application layer normalizes
+// both directions so the column stays clean.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func applyDeleteArtifact(tx *sql.Tx, m DeleteArtifact) error {

@@ -130,6 +130,82 @@ func TestFormatVotingBlockBlindOpenOnceAccepted(t *testing.T) {
 	)
 }
 
+// TestWriteArtifactsDisplayHandlesObjectForm pins the formatter's
+// ability to render writes_artifacts whether the wire carries the
+// legacy bare-string form or the current {path,track} object form.
+// Regression guard for a silent drop: the old extractor
+// type-asserted each element as string and returned empty when the
+// wire shape became polymorphic — the entire "Writes" block then
+// vanished from claim / get_task output.
+func TestWriteArtifactsDisplayHandlesObjectForm(t *testing.T) {
+	// Object form — the current wire shape after Phase A.
+	obj := []interface{}{
+		map[string]interface{}{"path": "out/summary.json", "track": true},
+		map[string]interface{}{"path": "out/big.bam", "track": false},
+	}
+	got := writeArtifactPathsFromAny(obj)
+	if len(got) != 2 || got[0] != "out/summary.json" || got[1] != "out/big.bam" {
+		t.Errorf("object form wrong: %v", got)
+	}
+
+	// Legacy bare-string form — what pre-Phase-A DB rows
+	// surface. Must still work for any consumer who hasn't
+	// re-saved.
+	legacy := []interface{}{"out/a.md", "out/b.md"}
+	got = writeArtifactPathsFromAny(legacy)
+	if len(got) != 2 || got[0] != "out/a.md" || got[1] != "out/b.md" {
+		t.Errorf("legacy form wrong: %v", got)
+	}
+
+	// Mixed form (legacy + object in the same list, shouldn't
+	// happen but must not panic).
+	mixed := []interface{}{
+		"bare/a.md",
+		map[string]interface{}{"path": "obj/b.md", "track": true},
+	}
+	got = writeArtifactPathsFromAny(mixed)
+	if len(got) != 2 || got[0] != "bare/a.md" || got[1] != "obj/b.md" {
+		t.Errorf("mixed form wrong: %v", got)
+	}
+
+	// Nil / empty / wrong-type inputs → nil, never panic.
+	if writeArtifactPathsFromAny(nil) != nil {
+		t.Error("nil should return nil")
+	}
+	if got := writeArtifactPathsFromAny([]interface{}{}); len(got) != 0 {
+		t.Errorf("empty should return empty, got %v", got)
+	}
+}
+
+// TestFormatGetTaskIncludesWritesArtifactsSection is the end-to-end
+// regression guard: a task payload carrying the object-form
+// writes_artifacts must render a visible "Writes" block in
+// formatGetTask's output. Before the fix, stringSliceFromAny's
+// string-only type assert silently dropped every entry and the
+// entire Artifacts block disappeared.
+func TestFormatGetTaskIncludesWritesArtifactsSection(t *testing.T) {
+	task := map[string]interface{}{
+		"id":          "1:1:compute",
+		"state":       "ready",
+		"action":      "compute",
+		"task_def_id": "analyze",
+		"writes_artifacts": []interface{}{
+			map[string]interface{}{"path": "out/report.md", "track": true},
+			map[string]interface{}{"path": "out/scratch.bam", "track": false},
+		},
+	}
+	out := formatArtifactsSchema(
+		writeArtifactPathsFromAny(task["reads_artifacts"]),
+		writeArtifactPathsFromAny(task["writes_artifacts"]),
+	)
+	mustContain(t, out,
+		"── Artifacts",
+		"Writes",
+		"out/report.md",
+		"out/scratch.bam",
+	)
+}
+
 func mustContain(t *testing.T, s string, wants ...string) {
 	t.Helper()
 	for _, w := range wants {

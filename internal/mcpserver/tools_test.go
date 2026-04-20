@@ -25,6 +25,7 @@ var allToolFactories = []struct {
 	{"enju_list_artifacts", toolListArtifacts},
 	{"enju_get_artifact", toolGetArtifact},
 	{"enju_get_artifact_history", toolGetArtifactHistory},
+	{"enju_list_untracked_artifacts", toolListUntrackedArtifacts},
 	{"enju_release_task", toolReleaseTask},
 	{"enju_get_task", toolGetTask},
 	{"enju_run_status", toolRunStatus},

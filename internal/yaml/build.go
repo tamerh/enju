@@ -172,7 +172,7 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			ti.ReadsArtifacts = template.ResolveParamsSlice(
 				template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
 				inst.params)
-			ti.WritesArtifacts = template.ResolveParamsSlice(taskDef.WritesArtifacts, inst.params)
+			ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, inst.params)
 
 			taskInstances = append(taskInstances, ti)
 
@@ -323,7 +323,7 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 		ti.ReadsArtifacts = template.ResolveParamsSlice(
 			template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
 			iter.params)
-		ti.WritesArtifacts = template.ResolveParamsSlice(taskDef.WritesArtifacts, iter.params)
+		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, iter.params)
 		return ti
 	}
 
@@ -482,11 +482,11 @@ func wireArtifactDeps(result *ParsedRun) error {
 	writersByPath := make(map[string][]string) // path → []fullID
 	for _, instances := range result.ExpandedTasks {
 		for _, ti := range instances {
-			for _, path := range ti.WritesArtifacts {
-				if path == "" {
+			for _, entry := range ti.WritesArtifacts {
+				if entry.Path == "" {
 					continue
 				}
-				writersByPath[path] = append(writersByPath[path], ti.FullID)
+				writersByPath[entry.Path] = append(writersByPath[entry.Path], ti.FullID)
 			}
 		}
 	}

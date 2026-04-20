@@ -99,11 +99,14 @@ func (e *Engine) ComputeInvalidation(
 	writtenPaths := make([]string, 0)
 	seenPath := make(map[string]bool)
 	collectWrites := func(t *store.TaskRecord) {
-		var paths []string
+		// WritesArtifacts JSON may be legacy []string or
+		// current [{path,track}] form — yaml.WriteArtifacts
+		// parses both.
+		var decl enjuYaml.WriteArtifacts
 		if t.WritesArtifacts != "" {
-			_ = json.Unmarshal([]byte(t.WritesArtifacts), &paths)
+			_ = json.Unmarshal([]byte(t.WritesArtifacts), &decl)
 		}
-		for _, p := range paths {
+		for _, p := range decl.Paths() {
 			if !seenPath[p] {
 				seenPath[p] = true
 				writtenPaths = append(writtenPaths, p)
@@ -147,6 +150,26 @@ func (e *Engine) ComputeInvalidation(
 			if t.CommitSHA == "" {
 				continue
 			}
+			// Skip prior writers that declared this path
+			// untracked — there's no committed content to
+			// point at, so rolling the pointer there would
+			// leave the index pointing at a non-existent
+			// blob. Fall through to the Delete branch below
+			// instead (same behavior as "no prior writer").
+			var decl enjuYaml.WriteArtifacts
+			if t.WritesArtifacts != "" {
+				_ = json.Unmarshal([]byte(t.WritesArtifacts), &decl)
+			}
+			isUntrackedHere := false
+			for _, e := range decl {
+				if e.Path == p && !e.Track {
+					isUntrackedHere = true
+					break
+				}
+			}
+			if isUntrackedHere {
+				continue
+			}
 			if pick == nil || (t.SubmittedAt != nil && pick.SubmittedAt != nil && t.SubmittedAt.After(*pick.SubmittedAt)) {
 				pick = t
 			}
@@ -173,6 +196,7 @@ func (e *Engine) ComputeInvalidation(
 				LastTaskID: pick.ID,
 				LastRunID:  pick.RunID,
 				CommitSHA:  pick.CommitSHA,
+				Tracked:    true, // prior tracked writer — by the isUntrackedHere skip above
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			},

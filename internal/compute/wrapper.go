@@ -63,16 +63,65 @@ type Spec struct {
 	ScriptLabel string `json:"script_label"`
 
 	// Paths the script is expected to write under the
-	// project's artifact namespace. Wrapper reads each after
-	// the script exits; missing ones land in
+	// project's artifact namespace AND commit into git. Wrapper
+	// reads each after the script exits; missing ones land in
 	// Result.MissingArtifacts as soft warnings.
+	//
+	// Historically this carried every declared artifact. Since
+	// the untracked-artifacts feature (track:false) this list
+	// narrows to the *tracked* subset; UntrackedArtifacts below
+	// carries the complement. Old wrapper specs (pre-untracked)
+	// set only this field — all declarations were tracked by
+	// definition, so they keep working without migration.
 	WritesArtifacts []string `json:"writes_artifacts,omitempty"`
+
+	// UntrackedArtifacts lists paths the script may produce but
+	// the wrapper must NOT commit. Rationale: large/scratch
+	// output files (BAMs, FASTQs, reference genomes) blow past
+	// git's practical size limit. Declaring track:false in YAML
+	// keeps these files on disk and in the coordinator's
+	// artifact index (as metadata-only entries with empty
+	// commit_sha) without inflating the repo.
+	//
+	// Like WritesArtifacts, missing entries here are soft warnings,
+	// not failures — a script may conditionally skip writing. Unlike
+	// WritesArtifacts, present entries do NOT appear in the commit
+	// (the managed .gitignore block added in a later phase also
+	// prevents accidental inclusion). They DO appear in
+	// Result.ArtifactsWritten so the coordinator's post-submit
+	// path can upsert an index row with tracked=false.
+	UntrackedArtifacts []string `json:"untracked_artifacts,omitempty"`
 
 	// Commit identity.
 	AuthorName  string `json:"author_name"`
 	AuthorEmail string `json:"author_email"`
 	Username    string `json:"username"`
 	Model       string `json:"model,omitempty"`
+
+	// Container, when set, routes script execution through a
+	// container runtime (Docker in v1) instead of exec'ing the
+	// script directly on the host. The image reference is
+	// passed verbatim to the runtime CLI at invocation time;
+	// the wrapper handles workspace bind-mounting, env-var
+	// translation from host to container paths, and user
+	// mapping so output files land owned by the invoking
+	// host user.
+	//
+	// Empty string = no container (run script on host, as
+	// before). Legacy spec files without this field decode
+	// cleanly to "", so in-flight async wrappers launched by
+	// older binaries keep working.
+	Container string `json:"container,omitempty"`
+
+	// Env is the task's declared env: block — keys + values
+	// the template author opted into as script inputs. Used
+	// only in container mode, as the allowlist alongside
+	// ENJU_* for which host-env entries are legitimate script
+	// inputs vs. accidental leaks (credentials, PATH, HOME,
+	// etc.). Direct-exec mode ignores this field — the flat
+	// env slice already carries the same values, and the host
+	// process inherits its own env naturally.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // Result is the wrapper→handler contract. Returned as JSON via the
@@ -140,6 +189,16 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		res.Error = fmt.Sprintf("script %q not found at %s", spec.ScriptLabel, spec.ScriptPath)
 		return res
 	}
+	// Container runtime presence check. When spec.Container is
+	// set this validates docker is on PATH up front so a missing
+	// runtime fails fast (before workspace open + shared-root
+	// symlink setup) with a user-actionable error rather than the
+	// cryptic `exec: "docker": executable file not found in $PATH`
+	// that exec.Command would surface a second later.
+	if err := checkContainerRuntime(spec); err != nil {
+		res.Error = err.Error()
+		return res
+	}
 
 	// Open the project clone via the fat-client workspace layer
 	// so the cross-process flock is honored — the MCP handler and
@@ -158,15 +217,50 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 
 	workDir := proj.WorkDir()
 
+	// Pre-exec: materialize shared-root symlinks for every
+	// declared untracked path. When ENJU_SHARED_ROOT is set,
+	// this swaps the workspace path for a symlink pointing at
+	// shared storage BEFORE the script runs — the script then
+	// writes THROUGH the symlink and the bytes land on the
+	// shared mount where downstream citizens with the same
+	// mount can see them. When ENJU_SHARED_ROOT is unset,
+	// the helper is a noop and untracked writes stay local.
+	for _, rel := range spec.UntrackedArtifacts {
+		if rel == "" {
+			continue
+		}
+		if err := mcpgit.EnsureSharedSymlink(mcpgit.ArtifactPath(rel), workDir,
+			spec.ProjectID, spec.ProjectName, spec.Branch, rel); err != nil {
+			logger.Warn("shared-root symlink setup failed",
+				"path", rel, "error", err)
+			// Don't fail the whole task — if the mount is
+			// unavailable, the script can still write the
+			// local path and downstream consumers on the
+			// same workspace will read it.
+		}
+	}
+
 	// Run the script. Three output streams:
 	//   - stdout buffer → result.md (contract-defined answer)
 	//   - stderr buffer → failure-reason body on non-zero exit
 	//   - scriptLog combined → committed with the result on success,
 	//                          kept on local disk on failure
+	//
+	// Two execution modes:
+	//   - Direct (spec.Container == ""): exec the script on the
+	//     host with the assembled `env`. Legacy path, unchanged.
+	//   - Containerized (spec.Container != ""): exec `docker run`
+	//     with the script inside. `env` is translated into `-e`
+	//     flags on the docker argv (path prefixes rewritten
+	//     host → /workspace); the docker CLI itself inherits
+	//     os.Environ() so it can find DOCKER_HOST, the user's
+	//     auth config, etc.
 	startTime := time.Now()
-	cmd := exec.CommandContext(ctx, spec.ScriptPath)
-	cmd.Dir = workDir
-	cmd.Env = env
+	cmd, cmdErr := buildExecCommand(ctx, spec, env, workDir)
+	if cmdErr != nil {
+		res.Error = cmdErr.Error()
+		return res
+	}
 	var stdout, stderr, scriptLog bytes.Buffer
 	cmd.Stdout = io.MultiWriter(&stdout, &scriptLog)
 	cmd.Stderr = io.MultiWriter(&stderr, &scriptLog)
@@ -241,6 +335,24 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// Pick up declared artifacts. Missing ones are soft warnings,
 	// not hard failures — scripts may legitimately skip writing
 	// conditionally.
+	//
+	// Two flavors of declaration, handled differently:
+	//   - Tracked (WritesArtifacts): read the file, include it in
+	//     the commit, report the path to the coordinator.
+	//   - Untracked (UntrackedArtifacts): stat the file so we know
+	//     it was produced; report the path; do NOT stage it. The
+	//     file stays on disk (and is kept out of the commit by the
+	//     managed .gitignore block written in Phase D). Coordinator
+	//     upserts an index row with tracked=false + empty
+	//     commit_sha, which downstream tasks use to verify
+	//     presence at claim time.
+	// committedPaths are the tracked artifacts that actually landed
+	// in the commit (exist on disk + readable). ArtifactPaths on the
+	// submit request carries this list so the commit message body
+	// and the Enju-Artifacts trailer accurately reflect "what's in
+	// this commit" — untracked paths are never mentioned at the
+	// git layer.
+	var committedPaths []string
 	for _, rel := range spec.WritesArtifacts {
 		if rel == "" {
 			continue
@@ -255,7 +367,41 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 			RepoRelPath: mcpgit.ArtifactPath(rel),
 			Content:     body,
 		})
+		committedPaths = append(committedPaths, rel)
 		res.ArtifactsWritten = append(res.ArtifactsWritten, rel)
+	}
+	for _, rel := range spec.UntrackedArtifacts {
+		if rel == "" {
+			continue
+		}
+		full := filepath.Join(workDir, mcpgit.ArtifactPath(rel))
+		if _, err := os.Stat(full); err != nil {
+			res.MissingArtifacts = append(res.MissingArtifacts, rel)
+			continue
+		}
+		// Intentionally NOT appending to `files` — untracked
+		// artifacts are kept out of git. The path still goes in
+		// res.ArtifactsWritten so /tasks/:id/result records a
+		// tracked=false row in the artifact index.
+		res.ArtifactsWritten = append(res.ArtifactsWritten, rel)
+	}
+
+	// Maintain the Enju-managed .gitignore block so untracked
+	// paths can never slip into a future commit via some
+	// unrelated `git add`/`stash` path. The helper is a no-op
+	// when the block already contains every declared path, so
+	// re-running the same task doesn't churn .gitignore with
+	// no-op commits.
+	if len(spec.UntrackedArtifacts) > 0 {
+		gitignorePath := filepath.Join(workDir, ".gitignore")
+		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
+		updated, changed := mcpgit.UpdateGitignoreManagedBlock(existing, spec.UntrackedArtifacts)
+		if changed {
+			files = append(files, mcpgit.FileWrite{
+				RepoRelPath: ".gitignore",
+				Content:     updated,
+			})
+		}
 	}
 
 	// Trailers carry the machine-parseable task-complete
@@ -280,8 +426,13 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		AuthorName:    spec.AuthorName,
 		AuthorEmail:   spec.AuthorEmail,
 		ModelName:     spec.Model,
-		Files:         files,
-		ArtifactPaths: res.ArtifactsWritten,
+		Files: files,
+		// ArtifactPaths feeds the commit message + Enju-Artifacts
+		// trailer — these describe what's *in* this commit, so only
+		// tracked artifacts belong. Untracked paths stay in
+		// Result.ArtifactsWritten (coordinator report) but out of
+		// git metadata.
+		ArtifactPaths: committedPaths,
 		Branch:        spec.Branch,
 		Trailers: mcpgit.EnjuTrailers{
 			TaskID:          spec.TaskID,

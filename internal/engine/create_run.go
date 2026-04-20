@@ -23,9 +23,9 @@ func (e *Engine) ValidateRunCreation(parsed *enjuYaml.ParsedRun) error {
 					return fmt.Errorf("task %q: invalid reads_artifacts path %q: %v", ti.ID, p, err)
 				}
 			}
-			for _, p := range ti.WritesArtifacts {
-				if err := ValidateArtifactPath(p); err != nil {
-					return fmt.Errorf("task %q: invalid writes_artifacts path %q: %v", ti.ID, p, err)
+			for _, entry := range ti.WritesArtifacts {
+				if err := ValidateArtifactPath(entry.Path); err != nil {
+					return fmt.Errorf("task %q: invalid writes_artifacts path %q: %v", ti.ID, entry.Path, err)
 				}
 			}
 			for _, uname := range ti.AssignTo {
@@ -138,7 +138,7 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				State:           state,
 				DependsOn:       strings.Join(deps, ","),
 				ReadsArtifacts:  marshalStringSlice(ti.ReadsArtifacts),
-				WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
+				WritesArtifacts: marshalWriteArtifacts(ti.WritesArtifacts),
 				AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
 				RequireRole:     ti.RequireRole,
 				ReviewsTarget:   ti.Reviews,
@@ -151,6 +151,7 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				Visibility:      ti.Visibility,
 				Env:             marshalStringMap(ti.Env),
 				Mode:            ti.Mode,
+				Container:       ti.Container,
 				CreatedAt:       now,
 			})
 		}

@@ -116,6 +116,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolListArtifacts(), client.handleListArtifacts)
 	s.AddTool(toolGetArtifact(), client.handleGetArtifact)
 	s.AddTool(toolGetArtifactHistory(), client.handleGetArtifactHistory)
+	s.AddTool(toolListUntrackedArtifacts(), client.handleListUntrackedArtifacts)
 	s.AddTool(toolMyProfile(), client.handleMyProfile)
 	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
 	s.AddTool(toolTallyTask(), client.handleTallyTask)

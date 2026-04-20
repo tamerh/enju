@@ -1906,8 +1906,18 @@ func TestMCPArtifactFieldsInTaskResponse(t *testing.T) {
 	reads, _ := task["reads_artifacts"].([]interface{})
 	writes, _ := task["writes_artifacts"].([]interface{})
 
-	if len(writes) != 1 || writes[0] != "src/hello.py" {
-		t.Fatalf("expected writes_artifacts = [src/hello.py], got %v", task["writes_artifacts"])
+	// Post-Phase-A, writes_artifacts is the object form
+	// [{"path":..., "track":...}]; legacy []string fixtures
+	// decode with Track=true by default.
+	if len(writes) != 1 {
+		t.Fatalf("expected 1 writes_artifacts entry, got %v", task["writes_artifacts"])
+	}
+	entry, _ := writes[0].(map[string]interface{})
+	if entry["path"] != "src/hello.py" {
+		t.Fatalf("expected writes_artifacts[0].path = src/hello.py, got %v", writes[0])
+	}
+	if entry["track"] != true {
+		t.Fatalf("expected writes_artifacts[0].track = true (default), got %v", entry["track"])
 	}
 	if len(reads) != 1 || reads[0] != "src/hello.py" {
 		t.Fatalf("expected reads_artifacts = [src/hello.py] (inferred), got %v", task["reads_artifacts"])
@@ -4688,15 +4698,862 @@ echo "wrote $stem"
 	}
 }
 
+// TestMCPComputeUntrackedArtifactStaysOutOfCommit covers the
+// end-to-end contract for track:false writes_artifacts entries:
+//
+//   - The compute wrapper runs the script and produces both a
+//     tracked and an untracked artifact on disk.
+//   - The tracked artifact lands in the result commit (readable via
+//     the artifact index's commit_sha).
+//   - The untracked artifact is NOT in the commit — its artifact
+//     index row has tracked=false and commit_sha="".
+//   - The untracked file still exists in the producer's workspace
+//     (the script wrote it; the wrapper didn't delete it; Phase D
+//     will also add it to .gitignore so re-commits don't pick it
+//     up accidentally).
+//
+// The two rows side-by-side are the test's headline signal: same
+// run, same script, divergent commit semantics keyed only off the
+// YAML declaration.
+func TestMCPComputeUntrackedArtifactStaysOutOfCommit(t *testing.T) {
+	h := newMCPHarness(t, "ComputeUntracked")
+	projectID := h.createTestProject()
+
+	yaml := `name: "compute with untracked"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the analyze script."
+    writes_artifacts:
+      - "scripts/analyze.sh"
+
+  - id: analyze
+    action: compute
+    script: scripts/analyze.sh
+    writes_artifacts:
+      - out/summary.json
+      - path: out/scratch.bam
+        track: false
+    prompt: "Run analyze"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+set -e
+mkdir -p "$ENJU_PROJECT_DIR/out"
+echo '{"rows":42}' > "$ENJU_PROJECT_DIR/out/summary.json"
+# Simulate a big-on-disk scratch file the lab wouldn't want in git.
+printf 'pretend-binary-bytes' > "$ENJU_PROJECT_DIR/out/scratch.bam"
+echo "analyze complete"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded analyze.sh",
+		map[string]string{"scripts/analyze.sh": script})
+
+	chmodScript := func() {
+		matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "analyze.sh"))
+		for _, m := range matches {
+			_ = os.Chmod(m, 0o755)
+		}
+	}
+	chmodScript()
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("analyze"),
+	})
+	if res.IsError {
+		t.Fatalf("execute analyze: %s", mcpText(res))
+	}
+
+	// Both paths must appear in the artifact index.
+	arts := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	byPath := map[string]map[string]interface{}{}
+	for _, a := range arts {
+		m, _ := a.(map[string]interface{})
+		if p, _ := m["path"].(string); p != "" {
+			byPath[p] = m
+		}
+	}
+
+	tracked, ok := byPath["out/summary.json"]
+	if !ok {
+		t.Fatalf("expected out/summary.json in artifact index; have: %v", byPath)
+	}
+	if tracked["tracked"] != true {
+		t.Errorf("summary.json should be tracked=true, got %v", tracked["tracked"])
+	}
+	if sha, _ := tracked["commit_sha"].(string); sha == "" {
+		t.Errorf("summary.json should carry a commit_sha, got empty")
+	}
+
+	untracked, ok := byPath["out/scratch.bam"]
+	if !ok {
+		t.Fatalf("expected out/scratch.bam in artifact index; have: %v", byPath)
+	}
+	if untracked["tracked"] != false {
+		t.Errorf("scratch.bam should be tracked=false, got %v", untracked["tracked"])
+	}
+	if sha, _ := untracked["commit_sha"].(string); sha != "" {
+		t.Errorf("untracked artifact must NOT have commit_sha, got %q", sha)
+	}
+
+	// The untracked file MUST still exist on disk — we only skipped
+	// committing it, we didn't erase it. Phase E's downstream
+	// consumers will stat() this exact path.
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "scratch.bam"))
+	if len(matches) == 0 {
+		t.Errorf("expected out/scratch.bam on disk after untracked write; workspace=%s", h.workspaceDir)
+	}
+
+	// Phase D: the managed .gitignore block must list the
+	// untracked path. Belt-and-suspenders against accidental
+	// `git add` / `stash -u` picking up the file on re-run.
+	gitignoreMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".gitignore"))
+	if len(gitignoreMatches) == 0 {
+		t.Fatalf(".gitignore not created after untracked submit; workspace=%s", h.workspaceDir)
+	}
+	gi, err := os.ReadFile(gitignoreMatches[0])
+	if err != nil {
+		t.Fatalf("reading .gitignore: %v", err)
+	}
+	gis := string(gi)
+	if !strings.Contains(gis, "out/scratch.bam") {
+		t.Errorf(".gitignore missing untracked path:\n%s", gis)
+	}
+	if !strings.Contains(gis, "BEGIN enju-untracked") || !strings.Contains(gis, "END enju-untracked") {
+		t.Errorf(".gitignore missing managed-block markers:\n%s", gis)
+	}
+
+	// The tracked file is committed, so `git log` on the workspace
+	// clone will show it under the analyze task's commit. A lighter
+	// check: its commit_sha on the index row is non-empty (asserted
+	// above) AND pointing at a different commit than an untracked
+	// sibling row (which has "" — guaranteed different).
+}
+
+// TestMCPClaimRefusesMissingUntrackedRead verifies Phase E's
+// presence guard: a downstream task that reads an artifact whose
+// producer marked it track:false cannot be claimed if the file
+// isn't in this citizen's workspace. The coordinator's task
+// state must stay unchanged — the task remains claimable by a
+// citizen who *does* have the file.
+//
+// Repro: compute task writes an untracked artifact; we then
+// delete the file from the workspace to simulate a second
+// citizen who never ran the producer. A downstream answer task
+// that reads the artifact should refuse to claim with a
+// user-facing error naming the missing path and its producer.
+func TestMCPClaimRefusesMissingUntrackedRead(t *testing.T) {
+	h := newMCPHarness(t, "ClaimUntrackedMissing")
+	projectID := h.createTestProject()
+
+	yaml := `name: "downstream reads untracked"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the producer script."
+    writes_artifacts:
+      - "scripts/produce.sh"
+
+  - id: produce
+    action: compute
+    script: scripts/produce.sh
+    writes_artifacts:
+      - path: out/big.bam
+        track: false
+    prompt: "Produce the untracked artifact"
+    depends_on: [setup]
+
+  - id: consume
+    action: answer
+    reads_artifacts:
+      - out/big.bam
+    prompt: "Analyze out/big.bam"
+    depends_on: [produce]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+printf 'pretend-bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+echo "produced"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
+		map[string]string{"scripts/produce.sh": script})
+
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "produce.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute produce: %s", mcpText(res))
+	}
+
+	// Simulate "some other citizen": nuke the untracked file
+	// from disk. Tracked artifacts (committed) would still
+	// live in git, but out/big.bam is a track:false output —
+	// once removed, this workspace has no copy.
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	if len(bamMatches) == 0 {
+		t.Fatalf("expected out/big.bam on disk before removal; workspace=%s", h.workspaceDir)
+	}
+	for _, m := range bamMatches {
+		if err := os.Remove(m); err != nil {
+			t.Fatalf("removing untracked artifact: %v", err)
+		}
+	}
+
+	// Attempt to claim consume. Must fail with a specific
+	// untracked-missing error — NOT a generic coordinator
+	// rejection, and NOT a silent state flip.
+	res = h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if !res.IsError {
+		t.Fatalf("expected claim to fail, got success:\n%s", mcpText(res))
+	}
+	msg := mcpText(res)
+	if !strings.Contains(msg, "untracked artifact") && !strings.Contains(msg, "out/big.bam") {
+		t.Errorf("error missing actionable content:\n%s", msg)
+	}
+	if !strings.Contains(msg, "out/big.bam") {
+		t.Errorf("error should name the missing path, got:\n%s", msg)
+	}
+
+	// Consume MUST still be claimable — its state stayed
+	// READY, no side effect happened server-side. Verify via
+	// task lookup.
+	taskDoc := h.taskGet("consume")
+	state, _ := taskDoc["state"].(string)
+	if state != "ready" {
+		t.Errorf("consume state should still be ready after failed claim, got %q", state)
+	}
+}
+
+// TestMCPClaimAllowsPresentUntrackedRead is the positive
+// counterpart: when the untracked artifact IS on disk, the
+// claim succeeds. Without this we wouldn't know the guard
+// can tell "present" from "missing" — a trivially-broken
+// implementation that always refuses would pass the negative
+// test above.
+func TestMCPClaimAllowsPresentUntrackedRead(t *testing.T) {
+	h := newMCPHarness(t, "ClaimUntrackedPresent")
+	projectID := h.createTestProject()
+
+	yaml := `name: "downstream reads untracked (present)"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the producer script."
+    writes_artifacts:
+      - "scripts/produce.sh"
+
+  - id: produce
+    action: compute
+    script: scripts/produce.sh
+    writes_artifacts:
+      - path: out/big.bam
+        track: false
+    prompt: "Produce the untracked artifact"
+    depends_on: [setup]
+
+  - id: consume
+    action: answer
+    reads_artifacts:
+      - out/big.bam
+    prompt: "Analyze out/big.bam"
+    depends_on: [produce]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+printf 'pretend-bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
+		map[string]string{"scripts/produce.sh": script})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "produce.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute produce: %s", mcpText(res))
+	}
+
+	// File is still on disk from the producer run — claim
+	// should succeed.
+	res = h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if res.IsError {
+		t.Fatalf("expected claim to succeed, got error:\n%s", mcpText(res))
+	}
+}
+
+// TestMCPSharedRootBridgesCitizens exercises Phase F: when
+// ENJU_SHARED_ROOT is configured, the producer's untracked
+// writes go through a symlink to shared storage. A downstream
+// citizen whose local workspace doesn't have the file can
+// still claim — the pre-claim check materializes the same
+// symlink on their side, pointing at the same shared bytes.
+//
+// The test harness uses one workspace per run; we simulate
+// the "second citizen" by deleting the producer's symlink,
+// leaving only the shared-side bytes. The Phase E claim
+// guard (now with Phase F's symlink step) re-creates the
+// symlink on stat, so the claim succeeds.
+//
+// Without Phase F, the same scenario fails like
+// TestMCPClaimRefusesMissingUntrackedRead — the second
+// citizen has no path to the bytes.
+func TestMCPSharedRootBridgesCitizens(t *testing.T) {
+	shared := t.TempDir()
+	t.Setenv("ENJU_SHARED_ROOT", shared)
+
+	h := newMCPHarness(t, "SharedRootBridge")
+	projectID := h.createTestProject()
+
+	yaml := `name: "shared root bridges citizens"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the producer script."
+    writes_artifacts:
+      - "scripts/produce.sh"
+
+  - id: produce
+    action: compute
+    script: scripts/produce.sh
+    writes_artifacts:
+      - path: out/shared.bam
+        track: false
+    prompt: "Produce via shared root"
+    depends_on: [setup]
+
+  - id: consume
+    action: answer
+    reads_artifacts:
+      - out/shared.bam
+    prompt: "Read shared.bam"
+    depends_on: [produce]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	// Script writes via the path the wrapper handed us — which
+	// is now a symlink to $ENJU_SHARED_ROOT/<slug>-<id>/main/out/shared.bam.
+	// The write flows through the symlink; bytes land on shared.
+	script := `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+printf 'shared-bam-bytes' > "$ENJU_PROJECT_DIR/out/shared.bam"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
+		map[string]string{"scripts/produce.sh": script})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "produce.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute produce: %s", mcpText(res))
+	}
+
+	// Bytes must have landed on the shared mount.
+	sharedFiles, _ := filepath.Glob(filepath.Join(shared, "*", "main", "out", "shared.bam"))
+	if len(sharedFiles) == 0 {
+		t.Fatalf("expected shared.bam on shared root %q after produce", shared)
+	}
+	data, err := os.ReadFile(sharedFiles[0])
+	if err != nil || string(data) != "shared-bam-bytes" {
+		t.Fatalf("shared bytes wrong: %q err=%v", data, err)
+	}
+
+	// Simulate "citizen B": remove the local symlink so the
+	// workspace appears to lack the file. The shared-side
+	// bytes remain untouched.
+	wsMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "shared.bam"))
+	for _, m := range wsMatches {
+		fi, err := os.Lstat(m)
+		if err != nil {
+			t.Fatalf("lstat workspace path: %v", err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("expected workspace path to be a symlink (shared root configured), got mode=%v", fi.Mode())
+		}
+		if err := os.Remove(m); err != nil {
+			t.Fatalf("removing workspace symlink: %v", err)
+		}
+	}
+
+	// Claim consume — Phase E's guard re-creates the symlink
+	// via the Phase F helper, then stats it, sees the shared
+	// bytes, and allows the claim.
+	res = h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if res.IsError {
+		t.Fatalf("expected claim to succeed via shared root, got error:\n%s", mcpText(res))
+	}
+
+	// The workspace symlink should have been re-created by the
+	// pre-claim check. Stat it through the symlink (os.Stat
+	// follows) and confirm bytes route to shared storage.
+	wsMatches2, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "shared.bam"))
+	if len(wsMatches2) == 0 {
+		t.Fatalf("expected workspace symlink re-materialized after claim")
+	}
+	got, err := os.ReadFile(wsMatches2[0])
+	if err != nil {
+		t.Fatalf("reading re-materialized artifact: %v", err)
+	}
+	if string(got) != "shared-bam-bytes" {
+		t.Errorf("re-materialized path serves wrong bytes: %q", got)
+	}
+}
+
+// TestMCPListUntrackedArtifactsReportsPresence covers the
+// Phase G debugging tool. After a producer writes one tracked
+// + one untracked artifact, the tool should list only the
+// untracked entry with a present/missing local state. Deleting
+// the untracked file from disk flips the report to "missing".
+func TestMCPListUntrackedArtifactsReportsPresence(t *testing.T) {
+	h := newMCPHarness(t, "ListUntracked")
+	projectID := h.createTestProject()
+
+	yaml := `name: "list untracked debug tool"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the producer script."
+    writes_artifacts:
+      - "scripts/produce.sh"
+
+  - id: produce
+    action: compute
+    script: scripts/produce.sh
+    writes_artifacts:
+      - out/summary.json
+      - path: out/big.bam
+        track: false
+    prompt: "Produce mix of tracked/untracked"
+    depends_on: [setup]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+echo '{"ok":1}' > "$ENJU_PROJECT_DIR/out/summary.json"
+printf 'bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded",
+		map[string]string{"scripts/produce.sh": script})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "produce.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute produce: %s", mcpText(res))
+	}
+
+	// List untracked — should include big.bam as present, and
+	// NOT mention summary.json (it's tracked).
+	res = h.call(t, "enju_list_untracked_artifacts", map[string]any{
+		"project_id": float64(projectID),
+	})
+	if res.IsError {
+		t.Fatalf("list_untracked: %s", mcpText(res))
+	}
+	report := mcpText(res)
+	if !strings.Contains(report, "out/big.bam") {
+		t.Errorf("expected untracked big.bam in report:\n%s", report)
+	}
+	if strings.Contains(report, "out/summary.json") {
+		t.Errorf("tracked summary.json must not appear in untracked listing:\n%s", report)
+	}
+	if !strings.Contains(report, "present") {
+		t.Errorf("expected present marker, got:\n%s", report)
+	}
+
+	// Now delete the untracked file — same "second citizen"
+	// simulation as the Phase E tests. Next listing should
+	// report missing.
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	for _, m := range bamMatches {
+		_ = os.Remove(m)
+	}
+	res = h.call(t, "enju_list_untracked_artifacts", map[string]any{
+		"project_id": float64(projectID),
+	})
+	if res.IsError {
+		t.Fatalf("list_untracked after delete: %s", mcpText(res))
+	}
+	report = mcpText(res)
+	if !strings.Contains(report, "missing") {
+		t.Errorf("expected missing marker after delete:\n%s", report)
+	}
+	if !strings.Contains(report, "ENJU_SHARED_ROOT") {
+		t.Errorf("expected hint about ENJU_SHARED_ROOT for unconfigured case:\n%s", report)
+	}
+}
+
+// TestMCPListUntrackedArtifactsResolvesDefaultBranch is a
+// regression guard for a debug-tool bug: when the caller omits
+// the `branch` argument, the tool used to hardcode "main" for
+// the symlink materializer's branch segment. Projects with
+// default_branch set to something else (e.g. "develop") would
+// then build a symlink target like $SHARED/<slug>/main/... even
+// though the producer wrote to $SHARED/<slug>/develop/..., so
+// the tool reported "missing" even when bytes existed on the
+// shared mount.
+//
+// Fix verification: flip default_branch away from "main", run
+// the producer, delete the workspace-side symlink, and confirm
+// the list tool materializes the symlink at the correct target
+// (and the file reads back correctly through it).
+func TestMCPListUntrackedArtifactsResolvesDefaultBranch(t *testing.T) {
+	shared := t.TempDir()
+	t.Setenv("ENJU_SHARED_ROOT", shared)
+
+	h := newMCPHarness(t, "ListUntrackedNonDefaultBranch")
+	projectID := h.createTestProject()
+
+	// Flip the default branch — any subsequent run defaults
+	// to it, and the list tool must resolve to it, not "main".
+	h.callOK(t, "enju_set_project_default_branch", map[string]any{
+		"project_id": float64(projectID),
+		"branch":     "develop",
+	})
+
+	yaml := `name: "list untracked with non-default branch"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed produce.sh"
+    writes_artifacts:
+      - "scripts/produce.sh"
+
+  - id: produce
+    action: compute
+    script: scripts/produce.sh
+    writes_artifacts:
+      - path: out/big.bam
+        track: false
+    prompt: "Produce big.bam on develop"
+    depends_on: [setup]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+printf 'develop-branch-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded",
+		map[string]string{"scripts/produce.sh": script})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "produce.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute produce: %s", mcpText(res))
+	}
+
+	// Producer wrote through the symlink to shared. Confirm
+	// the bytes are there under the non-default branch segment.
+	sharedFiles, _ := filepath.Glob(filepath.Join(shared, "*", "develop", "out", "big.bam"))
+	if len(sharedFiles) == 0 {
+		t.Fatalf("expected bytes under shared/<slug>/develop/... got none in %s", shared)
+	}
+
+	// Delete the workspace symlink to simulate a second citizen
+	// without a local copy.
+	wsMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	for _, m := range wsMatches {
+		if err := os.Remove(m); err != nil {
+			t.Fatalf("removing workspace symlink: %v", err)
+		}
+	}
+
+	// Call the tool without an explicit branch — bug 2 was
+	// that "main" was hardcoded here instead of the project's
+	// default_branch ("develop"). The fix resolves via
+	// fetchProjectMetaExpanded.
+	res = h.call(t, "enju_list_untracked_artifacts", map[string]any{
+		"project_id": float64(projectID),
+	})
+	if res.IsError {
+		t.Fatalf("list_untracked: %s", mcpText(res))
+	}
+	report := mcpText(res)
+	if !strings.Contains(report, "present") {
+		t.Errorf("expected present marker after symlink re-materialization, got:\n%s", report)
+	}
+
+	// And the workspace-side symlink must now resolve to the
+	// right shared target AND serve the producer's bytes.
+	wsMatches2, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	if len(wsMatches2) == 0 {
+		t.Fatalf("expected workspace symlink re-materialized after list_untracked")
+	}
+	target, err := os.Readlink(wsMatches2[0])
+	if err != nil {
+		t.Fatalf("reading symlink: %v", err)
+	}
+	if !strings.Contains(target, "/develop/") {
+		t.Errorf("symlink target should include /develop/ segment (default_branch), got %q", target)
+	}
+	got, err := os.ReadFile(wsMatches2[0])
+	if err != nil {
+		t.Fatalf("reading re-materialized artifact: %v", err)
+	}
+	if string(got) != "develop-branch-bytes" {
+		t.Errorf("re-materialized path serves wrong bytes: %q", got)
+	}
+}
+
+// requireDocker skips the test when Docker isn't available on
+// the host — both the CLI present AND the daemon responsive.
+// Uses `docker info` as the liveness probe: LookPath alone
+// would let a test proceed with Docker Desktop paused and fail
+// mid-run with an opaque error.
+//
+// CI runners without Docker (or with Docker Desktop stopped)
+// see a clean skip; developer machines with Docker see the
+// test run against a real container.
+func requireDocker(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker not on PATH — skipping container integration test: %v", err)
+	}
+	cmd := exec.Command("docker", "info")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		t.Skipf("docker daemon not responsive (`docker info` failed) — skipping: %v", err)
+	}
+}
+
+// TestMCPComputeContainerRunsInDocker exercises the full
+// Phase A–D pipeline end-to-end: YAML declares `container:`,
+// coordinator stores it, fat-client threads into compute.Spec,
+// wrapper invokes `docker run ...` with workspace bind-mounted
+// and user mapped, script writes propagate back to the host
+// workspace, result.md carries the script's stdout.
+//
+// Alpine (small, fast to pull) with a /bin/sh script avoids
+// any bash dependency. First invocation pulls the image; CI
+// runners without Docker skip via requireDocker.
+func TestMCPComputeContainerRunsInDocker(t *testing.T) {
+	requireDocker(t)
+
+	h := newMCPHarness(t, "ContainerDocker")
+	projectID := h.createTestProject()
+
+	yaml := `name: "container compute"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed the script."
+    writes_artifacts:
+      - "scripts/run.sh"
+
+  - id: run_in_container
+    action: compute
+    script: scripts/run.sh
+    container: alpine:3.19
+    writes_artifacts:
+      - out/summary.txt
+    prompt: "Run alpine container"
+    depends_on: [setup]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "setup")
+	script := `#!/bin/sh
+set -e
+# Alpine's /etc/os-release lets us prove we're running inside
+# the container, not on the host — no ambiguity about whether
+# the container branch actually fired.
+. /etc/os-release
+echo "ran inside $ID $VERSION_ID"
+mkdir -p "$ENJU_PROJECT_DIR/out"
+echo "container-produced content" > "$ENJU_PROJECT_DIR/out/summary.txt"
+`
+	h.mcpSubmitArtifacts(t, "setup", "seeded run.sh",
+		map[string]string{"scripts/run.sh": script})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "run.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run_in_container"),
+	})
+	if res.IsError {
+		t.Fatalf("execute run_in_container: %s", mcpText(res))
+	}
+	msg := mcpText(res)
+	// Proof that the container actually executed:
+	//   - script ran the /etc/os-release probe (alpine only)
+	//   - the file it wrote shows up on the host workspace
+	if !strings.Contains(msg, "ran inside alpine") {
+		t.Errorf("expected alpine os-release echo in result, got:\n%s", msg)
+	}
+
+	// The committed artifact must exist on the host side of
+	// the bind-mount with the expected bytes — which is also
+	// proof that --user mapped correctly (a root-owned file
+	// would still exist but host-side git operations would
+	// have failed earlier).
+	outMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "summary.txt"))
+	if len(outMatches) == 0 {
+		t.Fatalf("expected out/summary.txt on host after container run; workspace=%s", h.workspaceDir)
+	}
+	body, err := os.ReadFile(outMatches[0])
+	if err != nil {
+		t.Fatalf("reading out/summary.txt: %v", err)
+	}
+	if strings.TrimSpace(string(body)) != "container-produced content" {
+		t.Errorf("out/summary.txt has wrong content: %q", string(body))
+	}
+
+	// Coordinator's artifact index registered the write
+	// (tracked=true, the default).
+	arts := h.getList(fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID))
+	got := false
+	for _, a := range arts {
+		m, _ := a.(map[string]interface{})
+		if p, _ := m["path"].(string); p == "out/summary.txt" {
+			got = true
+			break
+		}
+	}
+	if !got {
+		t.Errorf("expected out/summary.txt in artifact index after container execute")
+	}
+}
+
+// TestMCPComputeContainerMissingDockerFriendlyError verifies
+// Phase D's presence check surfaces a user-actionable message
+// when docker isn't on PATH. Simulates "docker missing" by
+// pointing PATH at a temp dir with no docker binary — runs on
+// every host regardless of whether real Docker is installed.
+func TestMCPComputeContainerMissingDockerFriendlyError(t *testing.T) {
+	// Harness setup + seed push needs `git` on PATH. We only
+	// want to hide `docker` from the wrapper's LookPath, and
+	// only AFTER setup is done. Flip PATH just before the
+	// execute call; t.Setenv restores on test cleanup.
+	h := newMCPHarness(t, "ContainerNoDocker")
+	projectID := h.createTestProject()
+
+	yaml := `name: "container without docker"
+version: 1
+tasks:
+  - id: setup
+    action: answer
+    prompt: "Seed"
+    writes_artifacts:
+      - "scripts/run.sh"
+
+  - id: needs_docker
+    action: compute
+    script: scripts/run.sh
+    container: alpine:3.19
+    prompt: "Run in alpine"
+    depends_on: [setup]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "setup")
+	h.mcpSubmitArtifacts(t, "setup", "seeded",
+		map[string]string{"scripts/run.sh": "#!/bin/sh\necho hi\n"})
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "scripts", "run.sh"))
+	for _, m := range matches {
+		_ = os.Chmod(m, 0o755)
+	}
+
+	// Now isolate PATH. This shadows any real docker so
+	// exec.LookPath("docker") inside compute.Run fails,
+	// exercising Phase D's presence-check branch.
+	t.Setenv("PATH", t.TempDir())
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("needs_docker"),
+	})
+	if !res.IsError {
+		t.Fatalf("expected tool error when docker missing, got success:\n%s", mcpText(res))
+	}
+	msg := mcpText(res)
+	for _, want := range []string{"docker", "install", "container", "alpine:3.19"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should mention %q, got:\n%s", want, msg)
+		}
+	}
+}
+
+// TestMCPListUntrackedArtifactsEmpty covers the "no untracked
+// entries in this project" case — common for compute-free
+// projects. Tool must report cleanly instead of emitting an
+// empty response.
+func TestMCPListUntrackedArtifactsEmpty(t *testing.T) {
+	h := newMCPHarness(t, "ListUntrackedEmpty")
+	projectID := h.createTestProject()
+
+	res := h.call(t, "enju_list_untracked_artifacts", map[string]any{
+		"project_id": float64(projectID),
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", mcpText(res))
+	}
+	if !strings.Contains(mcpText(res), "none") {
+		t.Errorf("expected empty-list hint, got:\n%s", mcpText(res))
+	}
+}
+
 // stringSliceFromTask pulls a []string field out of the
 // JSON map shape enju_get_task returns. Fields are either
 // []interface{} (JSON array) or absent.
+//
+// writes_artifacts is polymorphic post-Phase-A (per-entry
+// {path, track} object). When an element is a map, this helper
+// extracts the `path` field so legacy assertions that checked
+// bare strings keep working.
 func stringSliceFromTask(task map[string]interface{}, field string) []string {
 	raw, _ := task[field].([]interface{})
 	out := make([]string, 0, len(raw))
 	for _, v := range raw {
-		if s, ok := v.(string); ok {
-			out = append(out, s)
+		switch x := v.(type) {
+		case string:
+			out = append(out, x)
+		case map[string]interface{}:
+			if s, ok := x["path"].(string); ok {
+				out = append(out, s)
+			}
 		}
 	}
 	return out

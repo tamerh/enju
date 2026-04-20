@@ -548,7 +548,7 @@ func (e *Engine) ComputeMaterialization(
 			State:           state,
 			DependsOn:       strings.Join(resolvedDeps, ","),
 			ReadsArtifacts:  marshalStringSlice(ti.ReadsArtifacts),
-			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
+			WritesArtifacts: marshalWriteArtifacts(ti.WritesArtifacts),
 			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
 			RequireRole:     ti.RequireRole,
 			ReviewsTarget:   reviewsTarget,
@@ -561,6 +561,7 @@ func (e *Engine) ComputeMaterialization(
 			Visibility:      ti.Visibility,
 			Env:             marshalStringMap(ti.Env),
 			Mode:            ti.Mode,
+			Container:       ti.Container,
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -662,11 +663,11 @@ func (e *Engine) ComputeMaterialization(
 			if deletedSet[t.ID] {
 				continue
 			}
-			var paths []string
+			var decl enjuYaml.WriteArtifacts
 			if t.WritesArtifacts != "" {
-				_ = json.Unmarshal([]byte(t.WritesArtifacts), &paths)
+				_ = json.Unmarshal([]byte(t.WritesArtifacts), &decl)
 			}
-			for _, p := range paths {
+			for _, p := range decl.Paths() {
 				writersByPath[p] = append(writersByPath[p], writerRef{
 					fullID:  t.ID,
 					state:   store.TaskState(t.State),
@@ -676,11 +677,11 @@ func (e *Engine) ComputeMaterialization(
 		}
 		for i := range outcome.TasksToCreate {
 			rec := &outcome.TasksToCreate[i]
-			var paths []string
+			var decl enjuYaml.WriteArtifacts
 			if rec.WritesArtifacts != "" {
-				_ = json.Unmarshal([]byte(rec.WritesArtifacts), &paths)
+				_ = json.Unmarshal([]byte(rec.WritesArtifacts), &decl)
 			}
-			for _, p := range paths {
+			for _, p := range decl.Paths() {
 				writersByPath[p] = append(writersByPath[p], writerRef{
 					fullID:  rec.ID,
 					state:   rec.State,
@@ -863,7 +864,7 @@ func (e *Engine) ComputeMaterialization(
 			State:           store.TaskPending,
 			DependsOn:       strings.Join(resolved, ","),
 			ReadsArtifacts:  marshalStringSlice(ti.ReadsArtifacts),
-			WritesArtifacts: marshalStringSlice(ti.WritesArtifacts),
+			WritesArtifacts: marshalWriteArtifacts(ti.WritesArtifacts),
 			AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
 			RequireRole:     ti.RequireRole,
 			ReviewsTarget:   ti.Reviews,
@@ -876,6 +877,7 @@ func (e *Engine) ComputeMaterialization(
 			Visibility:      ti.Visibility,
 			Env:             marshalStringMap(ti.Env),
 			Mode:            ti.Mode,
+			Container:       ti.Container,
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -988,7 +990,7 @@ func BuildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInst, run *enjuYam
 	ti.ReadsArtifacts = template.ResolveParamsSlice(
 		template.MergeArtifactReads(def.ReadsArtifacts, ti.Prompt),
 		inst.Params)
-	ti.WritesArtifacts = template.ResolveParamsSlice(def.WritesArtifacts, inst.Params)
+	ti.WritesArtifacts = enjuYaml.ResolveWriteArtifacts(def.WritesArtifacts, inst.Params)
 	if ti.Requirements == nil {
 		ti.Requirements = run.Requirements
 	}
@@ -1030,6 +1032,23 @@ func marshalStringSlice(s []string) string {
 		return ""
 	}
 	data, err := json.Marshal(s)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// marshalWriteArtifacts serializes a typed WriteArtifacts slice
+// as the current object JSON form — [{"path":..., "track":...}].
+// Empty/nil slices round-trip as "" so the DB column default
+// stays clean. The symmetric reader lives on yaml.WriteArtifacts
+// and accepts both this form and the legacy []string form for
+// back-compat with pre-untracked DB rows.
+func marshalWriteArtifacts(w enjuYaml.WriteArtifacts) string {
+	if len(w) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(w)
 	if err != nil {
 		return ""
 	}

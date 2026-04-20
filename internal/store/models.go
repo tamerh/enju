@@ -262,6 +262,16 @@ type TaskRecord struct {
 	// read sites so the default-to-sync rule lives in one place.
 	Mode string
 
+	// Container is the Docker image reference a compute task's
+	// script runs inside. When empty, the script runs directly
+	// on the host as before. When set, the wrapper invokes
+	// `docker run <image> /bin/sh -c <script>` with the
+	// workspace bind-mounted at /workspace. Only populated for
+	// action:compute tasks; copied verbatim from the YAML
+	// TaskDef.Container field. Image reference grammar isn't
+	// validated here — docker's CLI arbitrates at pull time.
+	Container string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:
@@ -325,7 +335,18 @@ type ArtifactRecord struct {
 	// content. Used by the client-side template resolver (iteration
 	// A.2) to read the exact version the index points at rather than
 	// whatever happens to be in the working tree right now.
+	//
+	// Empty when Tracked is false — untracked artifacts are not in
+	// git, so there is no SHA to point at. The resolver must handle
+	// the empty-SHA case explicitly (stat the working tree, not a
+	// historical ref).
 	CommitSHA string
+	// Tracked reports whether the artifact's bytes live in git
+	// (true) or only on disk / shared storage (false). Declared
+	// per-entry in YAML via `writes_artifacts: {path:..., track:...}`.
+	// Defaults to true — the legacy bare-string form always lands
+	// as tracked.
+	Tracked   bool
 	UpdatedAt time.Time
 	CreatedAt time.Time
 }

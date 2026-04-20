@@ -594,6 +594,26 @@ Only tasks in the 'accepted' state can be invalidated.`),
 	)
 }
 
+func toolListUntrackedArtifacts() mcp.Tool {
+	return mcp.NewTool("enju_list_untracked_artifacts",
+		mcp.WithDescription(`List artifacts produced by this project that are NOT tracked in git (declared with track:false in writes_artifacts). For each entry, reports whether the file is visible in this citizen's workspace so you can spot missing untracked dependencies before claiming a downstream task.
+
+Typical causes of "missing" locally:
+- The producer task was run by another citizen and this citizen never re-ran it.
+- $ENJU_SHARED_ROOT is configured but not pointing at the producer's mount, or the mount isn't up.
+- The producer's workspace was cleaned / ephemeral.
+
+Use this to debug a "cannot claim — task reads untracked artifact(s) that aren't in your workspace" error from enju_claim_task.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("Project to list untracked artifacts for"),
+		),
+		mcp.WithString("branch",
+			mcp.Description("Branch to list (defaults to project's default_branch)"),
+		),
+	)
+}
+
 func toolTallyTask() mcp.Tool {
 	return mcp.NewTool("enju_tally_task",
 		mcp.WithDescription(`Force a tally evaluation on a multi-citizen vote or review task that is currently in the 'collecting' state. Runs the same tally logic as a submission would: counts the per-citizen submissions, applies the task's threshold + quorum + deadline rules, and resolves the task to 'accepted' if a winner emerges. Reports the current tally state either way.

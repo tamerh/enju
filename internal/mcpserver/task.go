@@ -357,7 +357,12 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		"iteration":        meta.InstanceParams,
 		"params":           meta.RunParams,
 		"reads_artifacts":  stringSliceNonNil(readsArtifacts),
-		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts),
+		// context.json exposes paths-only for back-compat with
+		// compute scripts that expect a flat string list.
+		// Track-flag routing lives in the wrapper, not script
+		// userspace — the script always writes to disk the same
+		// way regardless.
+		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts.Paths()),
 	}
 	contextBytes, _ := json.MarshalIndent(contextPayload, "", "  ")
 	contextFullPath := filepath.Join(workDir, resultDir, "context.json")
@@ -375,20 +380,30 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	// long-running jobs survive MCP session close; sync keeps
 	// the in-process path for latency + simpler error surface.
 	spec := compute.Spec{
-		TaskID:          taskID,
-		ProjectID:       meta.ProjectID,
-		RemoteURL:       remoteURL,
-		WorkspaceRoot:   c.workspace.RootDir(),
-		ProjectName:     projName,
-		Branch:          meta.Branch,
-		ResultDir:       resultDir,
-		ScriptPath:      scriptPath,
-		ScriptLabel:     meta.Script,
-		WritesArtifacts: meta.WritesArtifacts,
-		AuthorName:      c.citizenName,
-		AuthorEmail:     c.citizenEmail,
-		Username:        c.username,
-		Model:           c.modelName,
+		TaskID:        taskID,
+		ProjectID:     meta.ProjectID,
+		RemoteURL:     remoteURL,
+		WorkspaceRoot: c.workspace.RootDir(),
+		ProjectName:   projName,
+		Branch:        meta.Branch,
+		ResultDir:     resultDir,
+		ScriptPath:    scriptPath,
+		ScriptLabel:   meta.Script,
+		// Tracked paths → committed in the task's result commit.
+		// Untracked paths → kept on disk, reported to the
+		// coordinator with tracked=false so downstream tasks can
+		// see they were produced (Phase C of untracked artifacts).
+		WritesArtifacts:    meta.WritesArtifacts.TrackedPaths(),
+		UntrackedArtifacts: meta.WritesArtifacts.UntrackedPaths(),
+		AuthorName:         c.citizenName,
+		AuthorEmail:        c.citizenEmail,
+		Username:           c.username,
+		Model:              c.modelName,
+		Container:          meta.Container,
+		// Container mode uses this as the host-env allowlist
+		// (alongside ENJU_*). Direct-exec mode ignores it —
+		// the flat env slice above already carries these.
+		Env: meta.Env,
 	}
 
 	// Async kickoff: long-running compute jobs (SLURM, multi-

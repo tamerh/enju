@@ -185,6 +185,12 @@ func (s *Store) migrate() error {
 		last_run_id INTEGER,
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL,
+		-- tracked=1: content lives in git at commit_sha.
+		-- tracked=0: artifact is produced but not committed (the
+		-- task declared track:false); commit_sha stays empty.
+		-- The index still records provenance so downstream
+		-- readiness + history tools work uniformly.
+		tracked INTEGER NOT NULL DEFAULT 1,
 		PRIMARY KEY (project_id, branch, path)
 	);
 
@@ -339,6 +345,17 @@ func (s *Store) migrate() error {
 		// raw so the execute handler can read yaml.ResolvedMode
 		// off the task record without re-parsing the YAML.
 		`ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT ''`,
+		// Untracked artifacts (Phase B). Existing rows predate
+		// the feature and are, by definition, committed to git —
+		// default them to tracked=1 so the column's semantics
+		// stay uniform across old and new data.
+		`ALTER TABLE artifacts ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1`,
+		// Docker containerization (Phase A of containers).
+		// Empty string = no container (run script on host).
+		// Otherwise carries an image reference (biocontainers/samtools:1.18,
+		// ghcr.io/org/tool@sha256:..., etc.) the wrapper hands to
+		// `docker run` at execute time.
+		`ALTER TABLE tasks ADD COLUMN container TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -901,7 +918,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -918,14 +935,14 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 		anonymize = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
-		anonymize, t.Visibility, t.Env, t.Mode,
+		anonymize, t.Visibility, t.Env, t.Mode, t.Container,
 		t.CreatedAt,
 	)
 	return err
@@ -945,7 +962,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode,
+		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2035,7 +2052,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode,
+			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -2062,37 +2079,12 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 
 // --- Artifacts ---
 
-// UpsertArtifact records that a task wrote an artifact at the
-// given (branch, path) pair. On first write the row is created;
-// on subsequent writes the provenance fields (last_writer,
-// last_task_id, last_run_id, commit_sha, updated_at) are
-// refreshed and created_at is preserved.
-//
-// Branch defaults to "main" when empty — both for backwards-
-// compat with pre-branch-model callers and so the canonical
-// INSERT always carries a concrete value.
-func (s *Store) UpsertArtifact(a *ArtifactRecord) error {
-	if a.ProjectID == 0 || a.Path == "" {
-		return fmt.Errorf("UpsertArtifact: project_id and path are required")
-	}
-	branch := a.Branch
-	if branch == "" {
-		branch = "main"
-	}
-	_, err := s.db.Exec(
-		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_id, branch, path) DO UPDATE SET
-		   last_writer  = excluded.last_writer,
-		   last_task_id = excluded.last_task_id,
-		   last_run_id  = excluded.last_run_id,
-		   commit_sha   = excluded.commit_sha,
-		   updated_at   = excluded.updated_at`,
-		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA,
-		a.CreatedAt, a.UpdatedAt,
-	)
-	return err
-}
+// The canonical write path for artifact-index rows is
+// applyMoveArtifact in apply.go (driven by MoveArtifact plan
+// mutations). Direct-write helpers lived here historically but
+// went unused once the plan-apply machinery took over, so
+// they've been removed to keep writes funneled through one
+// idempotent code path.
 
 // GetArtifact looks up one artifact's index row by
 // (project_id, branch, path). Empty branch resolves to "main"
@@ -2105,11 +2097,12 @@ func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactReco
 	var a ArtifactRecord
 	var lastTaskID sql.NullString
 	var lastWriter, lastRunID sql.NullInt64
+	var trackedInt int
 	err := s.db.QueryRow(
-		`SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
+		`SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
 		 FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`,
 		projectID, branch, path,
-	).Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2119,6 +2112,7 @@ func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactReco
 	a.LastWriter = lastWriter.Int64
 	a.LastTaskID = lastTaskID.String
 	a.LastRunID = lastRunID.Int64
+	a.Tracked = trackedInt != 0
 	return &a, nil
 }
 
@@ -2226,7 +2220,7 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 	if branch == "" {
 		branch = "main"
 	}
-	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, created_at, updated_at
+	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
 	          FROM artifacts WHERE project_id = ? AND branch = ?`
 	args := []interface{}{projectID, branch}
 	if pathPrefix != "" {
@@ -2246,12 +2240,14 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 		var a ArtifactRecord
 		var lastTaskID sql.NullString
 		var lastWriter, lastRunID sql.NullInt64
-		if err := rows.Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		var trackedInt int
+		if err := rows.Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.LastWriter = lastWriter.Int64
 		a.LastTaskID = lastTaskID.String
 		a.LastRunID = lastRunID.Int64
+		a.Tracked = trackedInt != 0
 		artifacts = append(artifacts, a)
 	}
 	return artifacts, rows.Err()

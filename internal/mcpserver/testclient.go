@@ -132,6 +132,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleGetArtifact(ctx, req)
 	case "enju_get_artifact_history":
 		return t.c.handleGetArtifactHistory(ctx, req)
+	case "enju_list_untracked_artifacts":
+		return t.c.handleListUntrackedArtifacts(ctx, req)
 	case "enju_export_run":
 		return t.c.handleExportRun(ctx, req)
 	case "enju_export_diagram":

@@ -25,6 +25,7 @@ package yaml
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -76,8 +77,10 @@ func validate(p *Run) ([]string, error) {
 		return nil, err
 	}
 	computeWarnings := validateComputeDependsDeclared(p)
+	contentRefWarnings := validateComputeContentRefs(p)
 	warnings := append(paramWarnings, reviewWarnings...)
 	warnings = append(warnings, computeWarnings...)
+	warnings = append(warnings, contentRefWarnings...)
 	return warnings, nil
 }
 
@@ -143,6 +146,103 @@ func validateComputeDependsDeclared(p *Run) []string {
 			t.ID))
 	}
 	return warnings
+}
+
+// contentRefPattern matches `{{taskID.content}}` — mirrors the
+// resolver's ref pattern (see internal/template/resolve.go)
+// except pinned specifically to the `.content` field. No
+// whitespace tolerance: the resolver itself doesn't accept
+// `{{ x.content }}`, so the lint's coverage matches reality.
+var contentRefPattern = regexp.MustCompile(`\{\{(\w+)\.content\}\}`)
+
+// validateComputeContentRefs flags `{{X.content}}` references
+// where X is a compute task that declared `writes_artifacts`.
+// The resolver will inline X's stdout (what the script printed,
+// captured in result.md) — NOT the artifact file's bytes. A
+// compute script that emits a status line like
+// "aggregated 12345 rows" and writes the real output to a TSV
+// will silently surface the status line downstream instead of
+// the data, and the author only discovers it when the
+// downstream task hallucinates or produces garbage summaries.
+//
+// Warning names the producer, the declared artifacts, and the
+// replacement syntax so the fix is a one-line swap:
+//
+//	{{aggregate.content}}          → ✗ stdout echo
+//	{{artifact:out/totals.tsv}}    → ✓ file bytes
+//
+// Suppressed when the prompt also contains `{{artifact:<one of
+// X's declared paths>}}` — the author clearly knows the
+// distinction and is pulling both on purpose (status + data).
+// Also suppressed for non-compute upstreams (stdout IS the
+// canonical output there) and for compute producers that
+// didn't declare any writes_artifacts (stdout really is all
+// they have).
+func validateComputeContentRefs(p *Run) []string {
+	// Build lookup: task ID → declared writes_artifacts paths
+	// (only compute tasks with at least one entry).
+	computeWrites := map[string][]string{}
+	for _, t := range p.Tasks {
+		if t.Action == "compute" && len(t.WritesArtifacts) > 0 {
+			computeWrites[t.ID] = t.WritesArtifacts.Paths()
+		}
+	}
+	if len(computeWrites) == 0 {
+		return nil
+	}
+
+	var warnings []string
+	for _, t := range p.Tasks {
+		// Scan every prompt-shaped string the resolver touches.
+		// Script strings aren't resolved, so they stay out of
+		// the scan.
+		for _, text := range []string{t.Prompt, t.UserPrompt} {
+			if text == "" {
+				continue
+			}
+			matches := contentRefPattern.FindAllStringSubmatch(text, -1)
+			for _, m := range matches {
+				producerID := m[1]
+				paths, ok := computeWrites[producerID]
+				if !ok {
+					continue
+				}
+				// Suppress if the author already references ANY
+				// of the producer's artifacts via
+				// {{artifact:path}} in the same prompt — they
+				// know the distinction.
+				if hasArtifactRefFor(text, paths) {
+					continue
+				}
+				warnings = append(warnings, fmt.Sprintf(
+					"task %q: {{%s.content}} references compute task %q's stdout (result.md), "+
+						"not its declared writes_artifacts (%s). "+
+						"Most compute scripts write data to artifacts and echo a status line to stdout — "+
+						"the downstream will see the status line, not the data. "+
+						"To pull the artifact bytes, use {{artifact:%s}} instead "+
+						"(resolves through the artifact index; no second depends_on needed). "+
+						"See docs/template-reference.md § {{artifact:path}}.",
+					t.ID, producerID, producerID,
+					strings.Join(paths, ", "),
+					paths[0]))
+			}
+		}
+	}
+	return warnings
+}
+
+// hasArtifactRefFor reports whether `text` contains a
+// `{{artifact:<path>}}` reference for any of the given paths.
+// Used to suppress the compute-content lint when the author is
+// visibly pulling both stdout (status line) and the artifact
+// (data) on purpose.
+func hasArtifactRefFor(text string, paths []string) bool {
+	for _, p := range paths {
+		if strings.Contains(text, "{{artifact:"+p+"}}") {
+			return true
+		}
+	}
+	return false
 }
 
 // hasParamReference returns true when the string contains a
@@ -339,6 +439,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskMode(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskContainer(t); err != nil {
+			return nil, false, err
+		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
@@ -373,6 +476,31 @@ func validateTaskMode(t *TaskDef) error {
 	default:
 		return fmt.Errorf("task %q: mode %q is invalid (must be \"sync\" or \"async\")", t.ID, t.Mode)
 	}
+}
+
+// validateTaskContainer enforces the shape of the `container:`
+// field: only valid on action: compute, and the image reference
+// must be non-empty when declared (`container: ""` is a typo
+// risk, not an intentional "no container" — leave the field out
+// entirely to run script-on-host).
+//
+// The image reference itself is NOT parsed — docker's own CLI
+// arbitrates registry/tag/digest validity at pull time, and
+// re-implementing that grammar here would drift. We only check
+// for empty and for trivially-bad characters (whitespace,
+// newlines) that almost always indicate a template-author
+// mistake.
+func validateTaskContainer(t *TaskDef) error {
+	if t.Container == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: container: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	if strings.ContainsAny(t.Container, " \t\n\r") {
+		return fmt.Errorf("task %q: container %q contains whitespace — image references should be a single token (e.g. biocontainers/samtools:1.18)", t.ID, t.Container)
+	}
+	return nil
 }
 
 // ResolvedMode returns the mode a compute task should run in,
