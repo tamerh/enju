@@ -32,6 +32,26 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
 
+	// Pre-claim reconcile: an async upstream may have landed a
+	// trailer commit since the caller's last tool invocation,
+	// leaving coordinator state one step behind the git state.
+	// If we POST the claim first, the coordinator sees the
+	// downstream as still blocked (upstream still "claimed"
+	// pre-reconcile) and rejects. Running pullBranchWithReconcile
+	// here flips the upstream to accepted via the normal
+	// reconcile path so the subsequent claim gate sees current
+	// truth. Best-effort: a reconcile failure (no workspace,
+	// network issue) just means we get the pre-fix behaviour
+	// for this call, not an error — the claim POST below
+	// still runs and returns its own error if the task isn't
+	// claimable for other reasons.
+	preMeta, preMetaErr := c.fetchTaskMeta(ctx, taskID)
+	if preMetaErr == nil && preMeta != nil && c.useFatClient(preMeta) {
+		if proj, _, _, _, perr := c.openProject(ctx, preMeta.ProjectID); perr == nil && proj != nil {
+			_ = c.pullBranchWithReconcile(ctx, proj, preMeta.ProjectID, preMeta.Branch)
+		}
+	}
+
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 		"username": c.username,
 	})

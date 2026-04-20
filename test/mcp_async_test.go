@@ -16,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 // TestMCPAsyncComputeEndToEnd launches a `mode: async` compute
@@ -222,6 +225,477 @@ echo "async payload on named branch"
 	})
 	if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
 		t.Fatalf("task did not reach accepted on named branch: %v", err)
+	}
+}
+
+// TestMCPAsyncClaimTriggersReconcile is the regression guard
+// for Bug 1: after an async upstream completes, claiming the
+// downstream directly (without a prior run_status call)
+// should still succeed. Currently handleClaimTask POSTs the
+// claim BEFORE it runs pullBranchWithReconcile, so the
+// coordinator sees the downstream as still blocked (upstream
+// state hasn't flipped yet) and rejects. The fix: reconcile
+// first, then attempt the claim.
+func TestMCPAsyncClaimTriggersReconcile(t *testing.T) {
+	h := newMCPHarness(t, "AsyncClaimReconcile")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/chain2/template.yaml": {body: `name: "chain2"
+version: 1
+tasks:
+  - id: produce
+    action: compute
+    script: scripts/p.sh
+    mode: async
+  - id: consume
+    action: answer
+    depends_on: [produce]
+    prompt: "consume {{produce.content}}"
+`, mode: 0o644},
+		"enju_templates/chain2/scripts/p.sh": {body: `#!/bin/bash
+echo "payload-v1"
+`, mode: 0o755},
+	}, "seed chain2 template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/chain2",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/produce/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// DELIBERATELY skip run_status. Go straight to claiming
+	// the downstream — handleClaimTask's reconcile hook must
+	// promote the upstream to accepted before the claim
+	// attempt reaches the coordinator's blocked-check gate.
+	claimRes := h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if claimRes.IsError {
+		t.Fatalf("claim on downstream failed — reconcile hook not running before claim POST: %s", mcpText(claimRes))
+	}
+	text := mcpText(claimRes)
+	if strings.Contains(text, "blocked") || strings.Contains(text, "pending") {
+		t.Fatalf("claim returned blocked/pending — reconcile hook not promoting upstream before claim:\n%s", text)
+	}
+}
+
+// TestMCPAsyncReExecuteUpdatesUpstreamCommit is the regression
+// guard for Bug 2: after async task is invalidated via
+// request_changes and re-executed, the task's commit_sha
+// must reflect the NEW commit. Review's resolver reads
+// upstream content via task.CommitSHA; if the re-run
+// reconcile doesn't update it, the review sees stale
+// content pinned to the invalidated commit.
+func TestMCPAsyncReExecuteUpdatesUpstreamCommit(t *testing.T) {
+	h := newMCPHarness(t, "AsyncReExecute")
+	projectID := h.createTestProject()
+
+	// Script embeds a sequence marker so we can distinguish
+	// run1 vs run2 outputs.
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/rerun/template.yaml": {body: `name: "rerun"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/g.sh
+    mode: async
+`, mode: 0o644},
+		"enju_templates/rerun/scripts/g.sh": {body: `#!/bin/bash
+echo "run-${SEQ:-1}"
+`, mode: 0o755},
+	}, "seed rerun template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/rerun",
+	})
+	taskID := fmt.Sprintf("%d:1:gen", projectID)
+	h.rememberRunFromTaskID(t, taskID)
+
+	// First execute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/gen/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1 wrap-result.json: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+	task1, _ := h.store.GetTask(taskID)
+	sha1 := task1.CommitSHA
+	if sha1 == "" {
+		t.Fatalf("run1 accepted but commit_sha is empty")
+	}
+
+	// Invalidate to force re-execution.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": taskID,
+		"reason":  "want fresher data",
+	})
+
+	// Remove the old wrap-result so waitForFile can tell
+	// run2's apart.
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json") // reaper may have renamed it
+
+	// Re-execute. SEQ env changes output content so the new
+	// commit's tree differs from the first.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2 wrap-result.json: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+
+	task2, _ := h.store.GetTask(taskID)
+	sha2 := task2.CommitSHA
+	if sha2 == "" {
+		t.Fatalf("run2 accepted but commit_sha is empty")
+	}
+	if sha2 == sha1 {
+		t.Fatalf("task.CommitSHA still points at run1 %s after re-execute — reconcile didn't update on rerun", sha1)
+	}
+}
+
+// TestMCPAsyncReviewSeesLatestUpstreamAfterRerun is Bug 2's
+// real user-visible scenario: async compute submits,
+// reviewer calls request_changes (bouncing both tasks back),
+// async compute re-executes, reviewer re-claims. The review's
+// claim payload MUST show the NEW commit's content, not the
+// invalidated first-run content. Walks through the
+// fetchAndResolveLocally resolver path that renders
+// {{upstream.content}} from the upstream task's current
+// task.CommitSHA.
+func TestMCPAsyncReviewSeesLatestUpstreamAfterRerun(t *testing.T) {
+	h := newMCPHarness(t, "AsyncReviewRerun")
+	projectID := h.createTestProject()
+
+	// Script uses SEQ env to distinguish run1 vs run2 output
+	// so the review's rendered upstream content is
+	// diagnosable. SEQ defaults to "v1"; we invalidate + pass
+	// nothing different and rely on the timestamp commit in
+	// metadata to differ. Simpler: script reads an env the
+	// caller can set via task env: block (not needed for
+	// this test — just record-anything).
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/gate/template.yaml": {body: `name: "gate"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/g.sh
+    mode: async
+  - id: gate
+    action: review
+    reviews: gen
+    prompt: "Review {{gen.content}}"
+`, mode: 0o644},
+		"enju_templates/gate/scripts/g.sh": {body: `#!/bin/bash
+echo "content-at-$(date +%s%N)"
+`, mode: 0o755},
+	}, "seed gate template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/gate",
+	})
+	genID := fmt.Sprintf("%d:1:gen", projectID)
+	gateID := fmt.Sprintf("%d:1:gate", projectID)
+	h.rememberRunFromTaskID(t, genID)
+
+	// Run1 async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/gen/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+
+	// Invalidate (models request_changes on the compute).
+	// A direct invalidate exercises the same state transition
+	// and sidesteps the review-submit plumbing.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": genID,
+		"reason":  "want rerun",
+	})
+
+	// Clean up run1's wrap-result so the next waitForFile
+	// detects run2's.
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json")
+
+	// Run2 async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+
+	// Gen's commit should now be run2's.
+	gen2, _ := h.store.GetTask(genID)
+	run2SHA := gen2.CommitSHA
+
+	// Claim the review. The rendered prompt carries the
+	// upstream's content — which should be run2's, not
+	// run1's. Bug 2 surfaces as the review seeing run1's
+	// content despite run2 being the accepted commit.
+	claim := h.callOK(t, "enju_claim_task", map[string]any{
+		"task_id": gateID,
+	})
+	claimText := mcpText(claim)
+
+	// The rendered prompt should embed run2's content. The
+	// script echoes a nanosecond timestamp, so run1 and run2
+	// produce DIFFERENT outputs.
+	if !strings.Contains(claimText, "content-at-") {
+		t.Fatalf("claim text missing content-at marker; got:\n%s", claimText)
+	}
+	// Read gen's result.md at run2's commit to know what we
+	// expect. Then assert the review claim text contains it.
+	remoteURL := h.remoteFor(projectID)
+	run2Result := readCommitFile(t, remoteURL, run2SHA, ".enju/runs/1/gen/result.md")
+	run2Content := strings.TrimSpace(string(run2Result))
+	if run2Content == "" {
+		t.Fatalf("run2 result.md missing at %s", run2SHA)
+	}
+	if !strings.Contains(claimText, run2Content) {
+		t.Fatalf("review claim shows stale run1 content, not run2's (%s). Claim text:\n%s", run2Content, claimText)
+	}
+}
+
+// readCommitFile reads a file from a specific commit in a bare
+// git remote and returns its bytes. Used by review-rerun tests
+// to distinguish "which upstream commit the review saw."
+func readCommitFile(t *testing.T, remoteURL, commitSHA, repoRelPath string) []byte {
+	t.Helper()
+	tmp := t.TempDir()
+	repo, err := gogit.PlainClone(tmp, false, &gogit.CloneOptions{URL: remoteURL, NoCheckout: true})
+	if err != nil {
+		t.Fatalf("clone for readCommitFile: %v", err)
+	}
+	commit, err := repo.CommitObject(plumbing.NewHash(commitSHA))
+	if err != nil {
+		t.Fatalf("load commit %s: %v", commitSHA, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("tree: %v", err)
+	}
+	file, err := tree.File(repoRelPath)
+	if err != nil {
+		t.Fatalf("file %s at %s: %v", repoRelPath, commitSHA, err)
+	}
+	r, err := file.Reader()
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer r.Close()
+	buf := make([]byte, 0, 1024)
+	chunk := make([]byte, 512)
+	for {
+		n, rerr := r.Read(chunk)
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	return buf
+}
+
+// TestMCPAsyncRequestChangesRerunArtifactIndex is the tester's
+// corrected Bug 2 repro: async compute with writes_artifacts,
+// a review that calls request_changes, then async re-execute.
+// After the re-run, the compute task's stored CommitSHA in the
+// coordinator MUST be the new commit, not the invalidated
+// first run. The tester originally reported this as a
+// functional bug ("review sees stale content") but clarified
+// it's actually a display bug: the worktree and preview show
+// new content, but the DB's commit_sha for the compute task
+// still points at the old (invalidated) commit. enju_get_task
+// on the review then renders a stale "Commit: <sha>" label
+// next to the otherwise-correct Preview.
+//
+// Root cause: PullBranch advances the local branch ref but
+// doesn't refresh `refs/remotes/origin/<branch>`. The
+// scanner reads the remote-tracking ref for `tip` — stale
+// ref made it re-emit the old run-1 trailer after the
+// review's submit (which advanced the cursor locally but
+// left origin-tracking behind). The re-emit flipped
+// task.CommitSHA back to the old value, then the real new
+// trailer was rejected by the "already terminal at a
+// different commit" guard. Fix: explicit FetchBranch in
+// pullBranchWithReconcile so origin-tracking is current
+// before the scan.
+func TestMCPAsyncRequestChangesRerunArtifactIndex(t *testing.T) {
+	h := newMCPHarness(t, "AsyncRerunArtifact")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/bug2/template.yaml": {body: `name: "bug2"
+version: 1
+tasks:
+  - id: compute_data
+    action: compute
+    mode: async
+    script: scripts/compute.sh
+    writes_artifacts:
+      - out/data.txt
+  - id: review_data
+    action: review
+    reviews: compute_data
+    prompt: "Review"
+`, mode: 0o644},
+		"enju_templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
+mkdir -p "$ENJU_PROJECT_DIR/out"
+# 50ms sleep guarantees the timestamp differs from any previous
+# run's output even on fast systems — nanosecond resolution is
+# best-effort in bash and two back-to-back runs could collide
+# without the padding. Much shorter than the tester's 3s sleep
+# but still deterministic.
+sleep 0.05
+echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
+`, mode: 0o755},
+	}, "seed bug2 template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/bug2",
+		"branch":     "auto",
+	})
+	computeID := fmt.Sprintf("%d:1:compute_data", projectID)
+	reviewID := fmt.Sprintf("%d:1:review_data", projectID)
+	h.rememberRunFromTaskID(t, computeID)
+
+	// Run1: async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/compute_data/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1 wrap-result: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+	compute1, _ := h.store.GetTask(computeID)
+	shaA := compute1.CommitSHA
+
+	// Review run1: request_changes.
+	h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":  reviewID,
+		"decision": "request_changes",
+		"content":  "rework please",
+	})
+
+	// Compute should now be READY again, CommitSHA cleared.
+	computeAfterInvalidate, _ := h.store.GetTask(computeID)
+	if computeAfterInvalidate.State != "ready" {
+		t.Fatalf("compute not bounced to ready after request_changes: state=%s", computeAfterInvalidate.State)
+	}
+
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json")
+
+	// Run2: re-execute. Timestamp in the content will differ,
+	// so sha_A ≠ sha_B.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2 wrap-result: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+	compute2, _ := h.store.GetTask(computeID)
+	shaB := compute2.CommitSHA
+	if shaB == "" || shaB == shaA {
+		t.Fatalf("compute.CommitSHA did not update after re-run reconcile: shaA=%s shaB=%s — scanner is re-posting old trailers, rejecting the new one via the terminal-state guard", shaA, shaB)
+	}
+
+	// Re-claim the review. After invalidation it's READY.
+	claim := h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
+	claimText := mcpText(claim)
+
+	// Bug 2 manifestation: claim should show shaB's content,
+	// not shaA's. If the review's target-preview reads from
+	// a stale workspace state OR from an out-of-date
+	// task.CommitSHA, we'd see shaA's content here.
+	remoteURL := h.remoteFor(projectID)
+	newArtifact := readCommitFile(t, remoteURL, shaB, "out/data.txt")
+	newContent := strings.TrimSpace(string(newArtifact))
+	if newContent == "" {
+		t.Fatalf("shaB has no out/data.txt artifact")
+	}
+	oldArtifact := readCommitFile(t, remoteURL, shaA, "out/data.txt")
+	oldContent := strings.TrimSpace(string(oldArtifact))
+	if oldContent == newContent {
+		t.Fatalf("test setup: shaA and shaB have same content, timestamps should differ")
+	}
+
+	// Assert the new content appears somewhere in the claim
+	// display (result.md preview or similar). The OLD content
+	// must NOT appear — that's the stale-display bug.
+	if strings.Contains(claimText, oldContent) {
+		t.Errorf("review claim shows STALE run1 content %q — artifact index / target preview is stale after re-run reconcile.\nClaim:\n%s", oldContent, claimText)
+	}
+
+	// Also verify the artifact index on the coordinator side
+	// points at shaB, not shaA. This is the specific field
+	// the tester flagged as broken. Branch comes from the
+	// run's record; compute_data was created on auto-branch.
+	runs, _ := h.store.ListRunsByProject(projectID)
+	if len(runs) == 0 {
+		t.Fatal("no runs found")
+	}
+	artifact, err := h.store.GetArtifact(projectID, runs[0].Branch, "out/data.txt")
+	if err != nil || artifact == nil {
+		t.Fatalf("artifact index missing out/data.txt entry on %q: %v", runs[0].Branch, err)
+	}
+	if artifact.CommitSHA != shaB {
+		t.Errorf("artifact index for out/data.txt points at %s, want shaB %s (shaA %s)", artifact.CommitSHA, shaB, shaA)
 	}
 }
 

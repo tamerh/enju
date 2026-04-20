@@ -176,33 +176,38 @@ func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *mcpgit.Pr
 	if proj == nil {
 		return nil
 	}
-	// Git phase: checkout + pull + scan, all under proj.Lock.
+	// Git phase: checkout + pull + fetch-for-scan + scan,
+	// all under proj.Lock.
 	//
 	// Checkout FIRST so the worktree reflects the target run's
 	// branch. Without this, running-multiple-runs-per-session
 	// breaks: the fat client stays on whatever branch the last
 	// tool call switched to, and template snapshots / script
-	// paths for other runs aren't on disk. Executing a task on
-	// Run A while the workspace is on Run B's branch would
-	// fail with "script not found" because `.enju/runs/N/
-	// template/scripts/...` only exists on Run A's branch.
+	// paths for other runs aren't on disk.
 	//
-	// PullBranch then fetches + merges into the now-correct
-	// HEAD. Its internal fetch step already updates
-	// origin/<branch>, so we don't need a second FetchBranch
-	// before scanning. Scan regardless of Pull's merge-step
-	// outcome: a conflict or transient error on merge doesn't
-	// invalidate the fetch that already landed, and gating on
-	// pullErr would starve reconcile whenever Pull had any
-	// non-fatal issue. ScanBranchSince tolerates a missing
-	// origin/<branch> ref (first-time / never-pushed branch)
-	// on its own.
+	// PullBranch then fetches + merges into HEAD, advancing
+	// the LOCAL branch ref. Important detail: it does NOT
+	// reliably update `refs/remotes/origin/<branch>` (the
+	// remote-tracking ref the scanner reads for `tip`). We
+	// observed this directly — after a prior sync submit
+	// pushed a commit on this branch, the local origin-
+	// tracking ref stayed at the pre-push commit, and the
+	// scanner then walked from an up-to-date cursor BACK
+	// through history (because the tracking ref pointed at an
+	// older ancestor), silently re-posting already-reconciled
+	// trailers. That cascaded into "task already accepted at
+	// commit X — cannot reconcile Y" errors that rejected the
+	// real new commit.
+	//
+	// Fix: explicit FetchBranch after PullBranch so origin/
+	// <branch> refs are refreshed before the scan reads them.
+	// Small cost (one ls-remote + short fetch) in exchange
+	// for correct scan semantics.
 	//
 	// Dirty-worktree case: go-git's non-Force Checkout refuses
 	// to switch when there are uncommitted changes — the error
 	// propagates to the user with a clear "you have local
-	// changes" message, which is the safest default. Stash /
-	// force semantics would silently discard work.
+	// changes" message, which is the safest default.
 	proj.Lock()
 	if branch != "" {
 		if err := proj.CheckoutBranch(branch); err != nil {
@@ -211,6 +216,13 @@ func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *mcpgit.Pr
 		}
 	}
 	pullErr := proj.PullBranch(branch)
+	if branch != "" {
+		// Best-effort — if fetch fails (network, missing
+		// remote ref) we still proceed with whatever the
+		// scanner can see. ScanBranchSince already tolerates
+		// a stale / missing origin ref.
+		_ = proj.FetchBranch(branch)
+	}
 	var trailers []mcpgit.CommitTrailer
 	var newTip string
 	var preCursor string
