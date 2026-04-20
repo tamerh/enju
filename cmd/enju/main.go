@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/api"
+	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
 	"github.com/enju-ai/enju/internal/scheduler"
@@ -31,6 +32,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
+	case "wrap-task":
+		cmdWrapTask(os.Args[2:])
 	case "version":
 		fmt.Println("enju v0.1.0-dev")
 	default:
@@ -46,6 +49,7 @@ func printUsage() {
 Usage:
   enju serve      Start the coordinator server
   enju mcp        Start the MCP server (for Claude Desktop/Code)
+  enju wrap-task  Run a compute task's script + commit (internal)
   enju version    Print version
 
 Run 'enju <command> -h' for command-specific help.`)
@@ -220,6 +224,23 @@ func cmdMCP(args []string) {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "MCP server exited cleanly\n")
+}
+
+// --- wrap-task ---
+
+// cmdWrapTask is the subprocess entry point used by the MCP
+// server's compute task handler. It reads a Spec from disk,
+// executes the script, commits the result, and writes a Result
+// back to disk. Designed to be trivially re-hostable on compute
+// nodes (SLURM, Kubernetes, …) later — the contract is env +
+// files, not in-process calls.
+//
+// Not a user-facing command. The MCP handler invokes it via
+// `os.Executable() wrap-task --spec … --output …`; a human
+// running it by hand is fine for debugging but the flags will
+// look opaque.
+func cmdWrapTask(args []string) {
+	os.Exit(compute.WrapMain(args, os.Stderr))
 }
 
 // --- helpers ---

@@ -217,6 +217,24 @@ type TaskDef struct {
 	// Only valid on action:compute. Rejected on every other
 	// action to keep the field anchored to its purpose.
 	Env map[string]string `yaml:"env,omitempty"`
+
+	// Mode controls whether a compute task blocks the
+	// enju_execute_task tool call until completion ("sync") or
+	// kicks off a detached wrapper process and returns
+	// immediately ("async"). Empty → "sync" (backward-compatible
+	// default). Only valid on action: compute; rejected on every
+	// other action by the validator.
+	//
+	// Async is the escape hatch for compute jobs that outlast
+	// the MCP session — SLURM submissions, multi-hour pipelines,
+	// anything where closing the laptop mid-run would lose
+	// progress. In async mode the task transitions to running
+	// at kickoff; the wrapper commits + pushes on its own
+	// schedule; the fetch-path scanner reconciles completion
+	// the next time any fat client touches the project.
+	// See docs/async-compute.md.
+	Mode string `yaml:"mode,omitempty"`
+
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
 	Gather     bool              `yaml:"gather,omitempty"`

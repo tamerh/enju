@@ -253,6 +253,15 @@ type TaskRecord struct {
 	// vars — three disjoint namespaces, no override logic.
 	Env string
 
+	// Mode controls whether a compute task's enju_execute_task
+	// call blocks until the script completes ("sync") or kicks
+	// off a detached wrapper and returns immediately ("async").
+	// Only populated for action:compute tasks; empty for every
+	// other action. Copied from the YAML TaskDef.Mode field at
+	// create_run time and resolved via yaml.ResolvedMode at
+	// read sites so the default-to-sync rule lives in one place.
+	Mode string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

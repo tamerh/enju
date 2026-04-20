@@ -103,6 +103,12 @@ type taskMeta struct {
 	// checks this out before writing + pushing so runs on
 	// parallel branches don't stomp on each other's files.
 	Branch string
+	// Mode is the compute-task execution mode ("sync" / "async")
+	// when the task was declared, as stored on the task record.
+	// Empty for non-compute tasks. Use yaml.ResolvedMode (or
+	// the resolvedMode helper) at read sites to get the
+	// default-applied value.
+	Mode string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -200,6 +206,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 		if len(env) > 0 {
 			meta.Env = env
 		}
+	}
+	if v, ok := raw["mode"].(string); ok {
+		meta.Mode = v
 	}
 	return meta, nil
 }

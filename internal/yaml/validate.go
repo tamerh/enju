@@ -336,6 +336,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskEnv(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskMode(t); err != nil {
+			return nil, false, err
+		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
@@ -349,6 +352,51 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		}
 	}
 	return ids, hasTaskLevelForEach, nil
+}
+
+// validateTaskMode enforces the shape of the `mode:` field on a
+// task definition: only "sync" or "async", only on action:
+// compute. Empty means "default" and is always accepted —
+// compute tasks default to sync, non-compute tasks ignore it
+// entirely (the field being set without a declared purpose
+// would be a template-author confusion, so reject that up front).
+func validateTaskMode(t *TaskDef) error {
+	if t.Mode == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: mode: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.Mode {
+	case "sync", "async":
+		return nil
+	default:
+		return fmt.Errorf("task %q: mode %q is invalid (must be \"sync\" or \"async\")", t.ID, t.Mode)
+	}
+}
+
+// ResolvedMode returns the mode a compute task should run in,
+// applying the default. Non-compute tasks return "" since the
+// concept doesn't apply; callers that branch on mode (the
+// scheduler, the MCP execute handler) should scope the check
+// to compute tasks first.
+func ResolvedMode(t *TaskDef) string {
+	return ResolvedModeFields(t.Action, t.Mode)
+}
+
+// ResolvedModeFields is the field-level variant of ResolvedMode.
+// Useful for sites like the MCP execute handler that have an
+// action + mode string pair from a task record (not a full
+// TaskDef struct) — avoids constructing a synthetic TaskDef
+// purely to call the defaulting logic.
+func ResolvedModeFields(action, mode string) string {
+	if action != "compute" {
+		return ""
+	}
+	if mode == "" {
+		return "sync"
+	}
+	return mode
 }
 
 // validateTaskEnv enforces the compute-only + reserved-prefix

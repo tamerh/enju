@@ -7,18 +7,16 @@ package mcpserver
 // multi-citizen resolution), execute (action:compute).
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -213,13 +211,15 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	// targets the RUN's branch explicitly via meta.Branch so
 	// the default is only used as a fallback for operations
 	// that don't take a branch override.
-	proj, _, _, _, err := c.openProject(ctx, meta.ProjectID)
+	proj, remoteURL, projName, _, err := c.openProject(ctx, meta.ProjectID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	proj.Lock()
-	_ = proj.PullBranch(meta.Branch)
-	proj.Unlock()
+	// Pull + implicit reconcile: refreshes the clone AND
+	// sweeps for any async-compute completions that landed
+	// since the last tool call. The caller's work flows on
+	// regardless of scanner/reaper errors.
+	_ = c.pullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch)
 
 	workDir := proj.WorkDir()
 	resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
@@ -334,58 +334,59 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(fmt.Sprintf("writing context.json: %v", err)), nil
 	}
 
-	// Execute the script.
-	startTime := time.Now()
-	cmd := exec.CommandContext(ctx, scriptPath)
-	cmd.Dir = workDir
-	cmd.Env = env
-	// Three buffers:
-	//   stdout     — stdout-only, becomes result.md (the
-	//                contract-defined task answer).
-	//   stderr    — stderr-only, becomes failure reason on
-	//                non-zero exit.
-	//   scriptLog — combined stdout+stderr, written to
-	//                $ENJU_RUN_DIR/script.log as the full
-	//                debug transcript. Preserves chronological
-	//                order via io.MultiWriter fan-out to both
-	//                the stream-specific buffer and the shared
-	//                log.
-	var stdout, stderr, scriptLog bytes.Buffer
-	cmd.Stdout = io.MultiWriter(&stdout, &scriptLog)
-	cmd.Stderr = io.MultiWriter(&stderr, &scriptLog)
+	// Execute the script via the compute wrapper. In phase 1
+	// sync mode this is an in-process call — the same logic the
+	// `enju wrap-task` subcommand runs, just without the fork.
+	// Phase 4 flips async tasks to a detached subprocess so
+	// long-running jobs survive MCP session close; sync keeps
+	// the in-process path for latency + simpler error surface.
+	spec := compute.Spec{
+		TaskID:          taskID,
+		ProjectID:       meta.ProjectID,
+		RemoteURL:       remoteURL,
+		WorkspaceRoot:   c.workspace.RootDir(),
+		ProjectName:     projName,
+		Branch:          meta.Branch,
+		ResultDir:       resultDir,
+		ScriptPath:      scriptPath,
+		ScriptLabel:     meta.Script,
+		WritesArtifacts: meta.WritesArtifacts,
+		AuthorName:      c.citizenName,
+		AuthorEmail:     c.citizenEmail,
+		Username:        c.username,
+		Model:           c.modelName,
+	}
 
-	execErr := cmd.Run()
-	elapsed := time.Since(startTime).Round(time.Millisecond)
-	exitCode := 0
-	if execErr != nil {
-		if exitErr, ok := execErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return mcp.NewToolResultError(fmt.Sprintf("failed to run script: %v", execErr)), nil
+	// Async kickoff: long-running compute jobs (SLURM, multi-
+	// hour pipelines) must outlive the MCP session. Spawn a
+	// detached wrapper subprocess, return immediately; the
+	// fetch-path scanner (phase 4c) reconciles the result when
+	// the wrapper's commit lands on origin.
+	if resolvedMode(meta) == "async" {
+		kick, err := c.kickoffAsyncWrapTask(spec, env, resultDir, workDir)
+		if err != nil {
+			return mcp.NewToolResultError("async kickoff: " + err.Error()), nil
 		}
+		return mcp.NewToolResultText(formatAsyncKickoff(taskID, meta.Script, kick)), nil
 	}
 
-	// Write the combined script.log to disk before we branch
-	// on exit code, so the file is always present — audit
-	// trail works whether the script succeeded or failed, and
-	// a human debugging a failure can `cat .enju/runs/.../script.log`
-	// even before the coordinator has processed the fail.
-	scriptLogPath := filepath.Join(workDir, resultDir, "script.log")
-	if err := os.MkdirAll(filepath.Dir(scriptLogPath), 0755); err == nil {
-		_ = os.WriteFile(scriptLogPath, scriptLog.Bytes(), 0644)
+	res := compute.Run(ctx, spec, env, c.logger)
+	if res.Error != "" {
+		return mcp.NewToolResultError(res.Error), nil
 	}
+	elapsed := time.Duration(res.ElapsedMS) * time.Millisecond
 
 	// Exit non-zero → auto-fail the task via the coordinator.
 	// script.log stays on local disk as the debug transcript;
 	// it's not committed on failure paths because no result
 	// commit happens when a task fails. A human who wants it
 	// archived can commit manually.
-	if exitCode != 0 {
-		stderrStr := stderr.String()
+	if res.ExitCode != 0 {
+		stderrStr := res.Stderr
 		if len(stderrStr) > 1000 {
 			stderrStr = stderrStr[:1000] + "...(truncated)"
 		}
-		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, exitCode)
+		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, res.ExitCode)
 		if stderrStr != "" {
 			reason += ": " + stderrStr
 		}
@@ -393,123 +394,34 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 			"reason": reason,
 		})
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("✗ Script failed (exit %d, %s)\n", exitCode, elapsed))
+		b.WriteString(fmt.Sprintf("✗ Script failed (exit %d, %s)\n", res.ExitCode, elapsed))
 		if stderrStr != "" {
 			b.WriteString(fmt.Sprintf("  stderr: %s\n", stderrStr))
 		}
-		b.WriteString(fmt.Sprintf("  Transcript: %s (local only, not committed on failure)\n", scriptLogPath))
+		if res.ScriptLogPath != "" {
+			b.WriteString(fmt.Sprintf("  Transcript: %s (local only, not committed on failure)\n", res.ScriptLogPath))
+		}
 		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", taskID))
 		return mcp.NewToolResultText(b.String()), nil
 	}
 
-	// Exit 0 → submit the result.
-	content := stdout.String()
-	if content == "" {
-		content = "(script produced no output)"
-	}
+	// Exit 0 → wrapper already committed + pushed. Cursor was
+	// advanced inside SubmitTaskResult (via spec.StateDir), so
+	// subsequent pullBranchWithReconcile calls won't re-post
+	// this commit as a "new" trailer event.
 
-	// Write result + metadata, commit, push.
-	files := []mcpgit.FileWrite{
-		{
-			RepoRelPath: filepath.Join(resultDir, "result.md"),
-			Content:     []byte(content),
-		},
-		// context.json was written to disk before exec;
-		// include it in the commit for auditability.
-		{
-			RepoRelPath: filepath.Join(resultDir, "context.json"),
-			Content:     contextBytes,
-		},
-		// script.log — full stdout+stderr transcript. Gets
-		// committed alongside result.md on the success path
-		// so a reader can reconstruct exactly what the script
-		// printed (including verbose tool output, warnings
-		// that didn't trip exit code, progress bars). Distinct
-		// from result.md which carries only the
-		// contract-defined stdout answer.
-		{
-			RepoRelPath: filepath.Join(resultDir, "script.log"),
-			Content:     scriptLog.Bytes(),
-		},
-	}
-	metadata := map[string]interface{}{
-		"task_id":     taskID,
-		"model":       c.modelName,
-		"result_type": "text",
-		"action":      "compute",
-		"script":      meta.Script,
-		"exit_code":   0,
-		"elapsed_ms":  elapsed.Milliseconds(),
-		"timestamp":   time.Now().Format(time.RFC3339),
-	}
-	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, mcpgit.FileWrite{
-		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
-		Content:     metaBytes,
-	})
-
-	// Declared-artifact pickup. The script wrote its outputs
-	// to the declared writes_artifacts paths (or it didn't,
-	// and that's either a silent script bug or a truly
-	// optional output). Read each declared path from the
-	// workspace, include it in the commit, and report it to
-	// the coordinator so the artifact index gets the
-	// per-instance entry.
-	//
-	// Missing files are skipped with a soft warning accumulated
-	// into the response. They're not a hard failure — the
-	// script may legitimately skip writing conditionally —
-	// but the absence is surfaced so the author knows nothing
-	// registered.
-	var artifactsWritten []string
-	var missingArtifacts []string
-	for _, rel := range meta.WritesArtifacts {
-		if rel == "" {
-			continue
-		}
-		full := filepath.Join(workDir, mcpgit.ArtifactPath(rel))
-		body, rerr := os.ReadFile(full)
-		if rerr != nil {
-			missingArtifacts = append(missingArtifacts, rel)
-			continue
-		}
-		files = append(files, mcpgit.FileWrite{
-			RepoRelPath: mcpgit.ArtifactPath(rel),
-			Content:     body,
-		})
-		artifactsWritten = append(artifactsWritten, rel)
-	}
-
-	proj.Lock()
-	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
-		TaskID:        taskID,
-		Username:      c.username,
-		AuthorName:    c.citizenName,
-		AuthorEmail:   c.citizenEmail,
-		ModelName:     c.modelName,
-		Files:         files,
-		ArtifactPaths: artifactsWritten,
-		Branch:        meta.Branch,
-	})
-	proj.Unlock()
-	if err != nil {
-		return mcp.NewToolResultError("git submit failed: " + err.Error()), nil
-	}
-
-	// Report to coordinator. When the task declared
-	// writes_artifacts, include the list we actually picked
-	// up so the coordinator can upsert the artifact index
-	// (and validate against the declaration — unknown paths
-	// in artifacts_written are rejected at the engine layer).
+	// Report the landed commit to the coordinator so the state
+	// machine, artifact index, and contribution counter advance.
+	content := res.Content
 	reportBody := map[string]interface{}{
-		"commit_sha":  submitRes.CommitSHA,
+		"commit_sha":  res.CommitSHA,
 		"result_path": resultDir,
 		"model":       c.modelName,
 		"username":    c.username,
 		"content":     content,
 	}
-	if len(artifactsWritten) > 0 {
-		reportBody["artifacts_written"] = artifactsWritten
+	if len(res.ArtifactsWritten) > 0 {
+		reportBody["artifacts_written"] = res.ArtifactsWritten
 	}
 	reportData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
 	if err != nil {
@@ -521,15 +433,15 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	b.WriteString(fmt.Sprintf("✓ Script completed (exit 0, %s)\n", elapsed))
 	b.WriteString(fmt.Sprintf("  Script:  %s\n", meta.Script))
 	b.WriteString(fmt.Sprintf("  Output:  %d bytes written to result.md\n", len(content)))
-	b.WriteString(fmt.Sprintf("  Commit:  %s\n", shortSHA(submitRes.CommitSHA)))
-	if len(artifactsWritten) > 0 {
-		b.WriteString(fmt.Sprintf("  Artifacts: %s\n", strings.Join(artifactsWritten, ", ")))
+	b.WriteString(fmt.Sprintf("  Commit:  %s\n", shortSHA(res.CommitSHA)))
+	if len(res.ArtifactsWritten) > 0 {
+		b.WriteString(fmt.Sprintf("  Artifacts: %s\n", strings.Join(res.ArtifactsWritten, ", ")))
 	}
-	if len(missingArtifacts) > 0 {
+	if len(res.MissingArtifacts) > 0 {
 		// Warn loud — a declared path that the script didn't
 		// produce is usually a silent bug the author wants to
 		// know about.
-		b.WriteString(fmt.Sprintf("  ⚠ Missing (declared but not written by script): %s\n", strings.Join(missingArtifacts, ", ")))
+		b.WriteString(fmt.Sprintf("  ⚠ Missing (declared but not written by script): %s\n", strings.Join(res.MissingArtifacts, ", ")))
 	}
 
 	// Contribution counter from the report response.

@@ -560,6 +560,7 @@ func (e *Engine) ComputeMaterialization(
 			Anonymize:       ti.Anonymize,
 			Visibility:      ti.Visibility,
 			Env:             marshalStringMap(ti.Env),
+			Mode:            ti.Mode,
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -874,6 +875,7 @@ func (e *Engine) ComputeMaterialization(
 			Anonymize:       ti.Anonymize,
 			Visibility:      ti.Visibility,
 			Env:             marshalStringMap(ti.Env),
+			Mode:            ti.Mode,
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)

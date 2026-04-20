@@ -870,6 +870,32 @@ type SubmitRequest struct {
 	// Populated from the run's branch field when the MCP
 	// client's submit handler builds the request.
 	Branch string
+
+	// Trailers carries Enju-* trailer values to emit in the
+	// commit message footer. TaskID defaults to req.TaskID at
+	// commit time (so callers don't have to set it twice).
+	// Compute tasks populate Trailers.ExitSet/ExitCode/
+	// DurationSeconds; answer/review/vote submits leave those
+	// zero and just get the task-complete trailer.
+	Trailers EnjuTrailers
+
+	// ProjectID, if nonzero, pairs with StateDir to auto-
+	// advance the fat-client's scan cursor past the commit
+	// this submit produces. Saves the submitter from posting
+	// their own self-generated trailer back through the
+	// reconcile endpoint on the next scan. Zero → skip
+	// (coordinator-side tests, store-level unit tests, any
+	// caller that doesn't maintain a cursor).
+	ProjectID int64
+
+	// StateDir is the fat-client state directory holding
+	// per-project cursor files (typically ~/.enju/state/).
+	// Set alongside ProjectID to enable auto-advance. Empty
+	// string means "no cursor to maintain" — the scanner will
+	// later re-see our commit and idempotently no-op at the
+	// coordinator; auto-advance is a bandwidth optimization,
+	// not a correctness requirement.
+	StateDir string
 }
 
 // SubmitResult is the outcome of a successful SubmitTaskResult call.
@@ -929,7 +955,17 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		maxRetries = 3
 	}
 
-	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths, req.ModelName)
+	// Default trailers carry at minimum the task id so the
+	// fetch-path scanner can pick any task-submit commit up
+	// without the caller having to opt in.
+	trailers := req.Trailers
+	if trailers.TaskID == "" {
+		trailers.TaskID = req.TaskID
+	}
+	if len(trailers.Artifacts) == 0 && len(req.ArtifactPaths) > 0 {
+		trailers.Artifacts = req.ArtifactPaths
+	}
+	commitMsg := buildCommitMessage(req.TaskID, req.Username, req.ArtifactPaths, req.ModelName, trailers)
 
 	// Ensure we're on the target branch BEFORE writing files —
 	// commits otherwise land on the current HEAD's branch,
@@ -986,6 +1022,14 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 			if head, herr := p.repo.Head(); herr == nil {
 				sha = head.Hash().String()
 			}
+			// Auto-advance the fat-client's scan cursor past
+			// this commit. Opt-in via (ProjectID, StateDir)
+			// so store-level tests and coordinator-side
+			// callers that don't maintain a cursor skip
+			// transparently. Runs under the process-wide
+			// per-project cursor mutex so it composes
+			// correctly with a concurrent scanner sweep.
+			advanceCursorIfConfigured(req.ProjectID, req.StateDir, p.resolveBranch(req.Branch), sha)
 			return &SubmitResult{CommitSHA: sha, Attempts: attempt}, nil
 		}
 		if !isNonFastForwardError(pushErr) {
@@ -1815,7 +1859,7 @@ func (p *Project) SetRemote(url string) error {
 //	Task {taskID} by @{username}: result + N artifact(s)
 //
 //	Artifacts: path1, path2, ...
-func buildCommitMessage(taskID, username string, artifactPaths []string, modelName string) string {
+func buildCommitMessage(taskID, username string, artifactPaths []string, modelName string, trailers EnjuTrailers) string {
 	var subject string
 	if len(artifactPaths) == 0 {
 		subject = fmt.Sprintf("Task %s by @%s: result", taskID, username)
@@ -1823,10 +1867,23 @@ func buildCommitMessage(taskID, username string, artifactPaths []string, modelNa
 		subject = fmt.Sprintf("Task %s by @%s: result + %d artifact(s)\n\nArtifacts: %s",
 			taskID, username, len(artifactPaths), strings.Join(artifactPaths, ", "))
 	}
+	// Trailer paragraph collects every `Key: value` line that
+	// should go at the very end of the message — git's trailer
+	// convention. Co-Authored-By and AI-Model live here
+	// alongside the Enju-* task-completion metadata so a single
+	// trailer-aware reader (scanners, `git interpret-trailers`,
+	// humans running `git log --format='%(trailers)'`) picks
+	// them all up with the same parse rules.
+	var trailerLines []string
 	if modelName != "" {
-		coAuthor := aiCoAuthor(modelName)
-		subject += "\n\n" + coAuthor
-		subject += "\nAI-Model: " + modelName
+		trailerLines = append(trailerLines, aiCoAuthor(modelName))
+		trailerLines = append(trailerLines, "AI-Model: "+modelName)
+	}
+	if rendered := RenderEnjuTrailers(trailers); rendered != "" {
+		trailerLines = append(trailerLines, rendered)
+	}
+	if len(trailerLines) > 0 {
+		subject += "\n\n" + strings.Join(trailerLines, "\n")
 	}
 	return subject
 }

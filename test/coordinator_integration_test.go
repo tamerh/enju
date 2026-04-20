@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/api"
+	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/store"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
@@ -53,8 +54,16 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
-// TestMain cleans the shared output directory before running tests.
+// TestMain cleans the shared output directory before running
+// tests. Also routes `test.binary wrap-task …` invocations to
+// the compute wrapper so async-compute tests (phase 4d) can
+// spawn the subprocess via os.Executable() without a pre-built
+// `enju` binary on PATH. Production dispatch lives in
+// cmd/enju/main.go.
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "wrap-task" {
+		os.Exit(compute.WrapMain(os.Args[2:], os.Stderr))
+	}
 	os.RemoveAll(testOutputBase)
 	os.MkdirAll(testOutputBase, 0755)
 	os.Exit(m.Run())

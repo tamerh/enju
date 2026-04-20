@@ -39,6 +39,14 @@ type apiClient struct {
 	// ensureCitizenFresh before firing the register POST.
 	reRegisterMu sync.Mutex
 
+	// Cursor serialization lives at the mcpgit package level
+	// via mcpgit.CursorMutexFor(stateDir, projectID) so
+	// SubmitTaskResult's in-package auto-advance and this
+	// apiClient's scanner sweeps share one mutex per project.
+	// Without that shared registry, the two paths could
+	// race-overwrite each other's cursor saves. Per-project
+	// keying keeps unrelated projects from serializing.
+
 	// Cached citizen profile (name + email) used to populate git
 	// commit author fields on the fat-client submit path. Fetched
 	// lazily on first use and held for the life of the MCP client

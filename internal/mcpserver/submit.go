@@ -370,6 +370,11 @@ func (c *apiClient) submitResultFatClient(
 	}
 
 	authorName, authorEmail := c.commitAuthor(ctx)
+	// ProjectID + StateDir on the request enable auto-advance
+	// of the fat-client's scan cursor past our own commit, so
+	// the next fetch-path reconcile doesn't replay this
+	// completion as a "new" trailer — logic lives inside
+	// SubmitTaskResult now, shared with every other caller.
 	proj.Lock()
 	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
 		TaskID:        taskID,
@@ -380,6 +385,8 @@ func (c *apiClient) submitResultFatClient(
 		Files:         files,
 		ArtifactPaths: artifactPaths,
 		Branch:        meta.Branch,
+		ProjectID:     meta.ProjectID,
+		StateDir:      c.stateDir(),
 	})
 	proj.Unlock()
 	if err != nil {

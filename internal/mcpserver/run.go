@@ -46,6 +46,14 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	// Opportunistic reconcile: any async compute tasks that
+	// committed + pushed since the last scan on this run's
+	// branch get picked up here, so the status we're about to
+	// render reflects the freshest coordinator state. Best-
+	// effort — a fetch or reconcile failure just means stale
+	// status this cycle, not a tool error.
+	c.reconcileRunBranch(ctx, int64(projectID), run)
+
 	tasks, err := c.get(ctx, base+"/tasks")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil

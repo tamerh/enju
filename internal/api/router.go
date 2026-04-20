@@ -178,6 +178,59 @@ func (s *Server) requireProjectMembershipForTask(w http.ResponseWriter, r *http.
 	return s.requireProjectMembership(w, r, run.ProjectID)
 }
 
+// checkProjectMembershipForTask is the write-free variant of
+// requireProjectMembershipForTask: returns the caller's
+// membership row or an error message without touching the
+// response writer. Used by batch endpoints (e.g.
+// /tasks/reconcile) that need to emit per-entry membership
+// errors as part of a larger JSON response envelope, not as
+// standalone HTTP errors. Mixing both forms in one request
+// would corrupt the response (headers already written, then a
+// second writeJSON) — see reconcileOne.
+func (s *Server) checkProjectMembershipForTask(r *http.Request, taskID string) (*store.ProjectMemberRecord, string) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		return nil, "task lookup failed: " + err.Error()
+	}
+	if task == nil {
+		return nil, "task not found"
+	}
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, "run lookup failed"
+	}
+	return s.checkProjectMembership(r, run.ProjectID)
+}
+
+// checkProjectMembership is the write-free variant of
+// requireProjectMembership. Same gating rules, but returns
+// (memb, errMsg) instead of writing to w. Empty errMsg with
+// nil memb means "legacy pre-membership project, caller is
+// accepted" — matches the membership-bypass branch in
+// requireProjectMembership.
+func (s *Server) checkProjectMembership(r *http.Request, projectID int64) (*store.ProjectMemberRecord, string) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		return nil, "authentication required"
+	}
+	total, err := s.store.CountProjectMembers(projectID)
+	if err != nil {
+		return nil, "membership lookup failed: " + err.Error()
+	}
+	if total == 0 {
+		// Legacy project — same bypass as requireProjectMembership.
+		return nil, ""
+	}
+	memb, err := s.store.GetProjectMember(projectID, caller.ID)
+	if err != nil {
+		return nil, "membership lookup failed: " + err.Error()
+	}
+	if memb == nil {
+		return nil, fmt.Sprintf("not a member of project %d", projectID)
+	}
+	return memb, ""
+}
+
 // requireProjectMembership returns the caller's membership row
 // for a project, writing the appropriate error and returning
 // false when gating blocks the request.
@@ -285,6 +338,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/tasks/{taskID}", s.handleGetTask)
 		r.Get("/tasks/{taskID}/inputs", s.handleGetTaskInputs)
 		r.Post("/tasks/{taskID}/result", s.handleSubmitResult)
+		r.Post("/tasks/reconcile", s.handleReconcileTasks)
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
 		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
@@ -1651,6 +1705,12 @@ type taskResponse struct {
 	// the fat-client side can inject these into the script's
 	// process environment. Empty/absent for non-compute tasks.
 	Env map[string]string `json:"env,omitempty"`
+	// Mode carries the compute-task execution mode — "sync"
+	// or "async" (phase 4 async compute). Empty for non-
+	// compute tasks. The fat-client's enju_execute_task
+	// handler reads this to pick the sync vs detached-
+	// subprocess code path.
+	Mode string `json:"mode,omitempty"`
 	// VoteSubmissions is the per-citizen voting history for
 	// multi-citizen vote tasks — one entry per submitted vote,
 	// in submission order. Populated lazily only for citizens>1
@@ -2236,6 +2296,267 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.handleSubmitResultReport(w, r, task, &req)
+}
+
+// reconcileEntry is one item in a POST /tasks/reconcile batch.
+// Same semantics as submitResultRequest fields but flattened for
+// batch transport. All fields are optional on the wire except
+// TaskID + CommitSHA + ExitCode — the fetch-path scanner extracts
+// them from commit trailers and forwards whatever it parsed.
+type reconcileEntry struct {
+	TaskID           string   `json:"task_id"`
+	CommitSHA        string   `json:"commit_sha"`
+	ExitCode         int      `json:"exit_code"`
+	ResultPath       string   `json:"result_path,omitempty"`
+	ArtifactsWritten []string `json:"artifacts_written,omitempty"`
+	Content          string   `json:"content,omitempty"`
+	FailReason       string   `json:"fail_reason,omitempty"` // optional override when ExitCode != 0
+	Username         string   `json:"username,omitempty"`
+	Model            string   `json:"model,omitempty"`
+}
+
+// reconcileBatchRequest is the top-level shape posted to
+// /tasks/reconcile. Accepts either a batch or a single entry
+// inline — scanners send batches, individual callers (wrapper's
+// future async path) send one entry at a time.
+type reconcileBatchRequest struct {
+	Tasks []reconcileEntry `json:"tasks"`
+}
+
+// reconcileResult is the per-entry outcome returned in the
+// response. Status is one of "accepted", "failed", "noop"
+// (already terminal at this commit), or "error" — the scanner
+// advances its cursor past entries regardless of status so a
+// persistent error doesn't wedge the queue, but surfaces the
+// error text so humans can diagnose.
+type reconcileResult struct {
+	TaskID    string `json:"task_id"`
+	CommitSHA string `json:"commit_sha,omitempty"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+// handleReconcileTasks processes a batch of task-completion
+// assertions from a fat-client fetch-path scanner. Each entry
+// says "commit X landed on task Y's branch; these are the
+// trailer-encoded results." The coordinator advances the task's
+// state (accepted on exit 0, failed otherwise) and runs the
+// downstream cascade — exactly as if the caller had POSTed to
+// /tasks/{taskID}/result, but idempotent and batchable.
+//
+// Phase 2 scope: endpoint + idempotency + single-task delegation
+// to the existing submit path. Phase 3 wires it into the fat
+// client's fetch-path scanner. Phase 4 uses it as the completion
+// signal for async compute tasks.
+//
+// Trust model: matches today's submit — the coordinator takes
+// the client's word for the commit contents. The shape-check
+// on commit_sha still fires (garbage-in-garbage-out gets
+// rejected), and the task/project membership gate stays in
+// place so a client can only reconcile tasks it's allowed to
+// see.
+func (s *Server) handleReconcileTasks(w http.ResponseWriter, r *http.Request) {
+	var req reconcileBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.Tasks) == 0 {
+		writeError(w, http.StatusBadRequest, "tasks is required and must be non-empty")
+		return
+	}
+
+	results := make([]reconcileResult, 0, len(req.Tasks))
+	for _, entry := range req.Tasks {
+		results = append(results, s.reconcileOne(r, entry))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"results": results})
+}
+
+// reconcileOne handles a single reconcile entry. Returns the
+// per-entry result; never writes to the ResponseWriter — every
+// gate/error path surfaces via res.Error so the batch handler
+// can aggregate and emit one writeJSON at the end. An earlier
+// revision used the write-to-w requireProjectMembership*
+// helper inside this loop, which would double-write the
+// response on any membership failure (headers already sent +
+// final writeJSON). Fixed by routing through
+// checkProjectMembershipForTask, which returns an errMsg
+// string instead. r is still needed to extract the
+// citizen-from-request principal.
+func (s *Server) reconcileOne(r *http.Request, entry reconcileEntry) reconcileResult {
+	res := reconcileResult{TaskID: entry.TaskID, CommitSHA: entry.CommitSHA}
+
+	if entry.TaskID == "" {
+		res.Status = "error"
+		res.Error = "task_id is required"
+		return res
+	}
+	if entry.CommitSHA == "" {
+		res.Status = "error"
+		res.Error = "commit_sha is required"
+		return res
+	}
+	if !isValidCommitSHAShape(entry.CommitSHA) {
+		res.Status = "error"
+		res.Error = fmt.Sprintf("commit_sha %q is not a valid git SHA (expected 40 or 64 hex characters)", entry.CommitSHA)
+		return res
+	}
+
+	task, err := s.store.GetTask(entry.TaskID)
+	if err != nil || task == nil {
+		res.Status = "error"
+		res.Error = fmt.Sprintf("task %q not found", entry.TaskID)
+		return res
+	}
+
+	// Idempotency: a task that already reached a terminal state
+	// at THIS commit is a no-op success. Different commit at
+	// terminal state means the caller is trying to rewrite
+	// history — return an error, not a silent overwrite.
+	if task.State == "accepted" || task.State == "failed" {
+		if task.CommitSHA == entry.CommitSHA {
+			res.Status = "noop"
+			return res
+		}
+		res.Status = "error"
+		res.Error = fmt.Sprintf("task already %s at commit %s — cannot reconcile a different commit %s",
+			task.State, shortCommit(task.CommitSHA), shortCommit(entry.CommitSHA))
+		return res
+	}
+	// Reconcile only advances tasks from in-flight states
+	// (claimed / running). Anything else — pending, ready,
+	// skipped, invalidated, parked — is a stale trailer: e.g.
+	// the scanner re-reads an old Enju-Task-Complete commit
+	// from a task that has since been invalidated and is
+	// waiting to be re-claimed. Advancing that would silently
+	// resurrect the old completion and clobber any in-progress
+	// re-run, so treat it as a no-op and move on.
+	if task.State != "claimed" && task.State != "running" {
+		res.Status = "noop"
+		return res
+	}
+
+	// Route exit != 0 to the fail cascade — same path the sync
+	// submit handler uses for compute-script failures. The fail
+	// reason defaults to a synthetic "script exited with code N"
+	// when the caller didn't supply one, matching the user-
+	// facing string from the inline path for consistency.
+	if entry.ExitCode != 0 {
+		reason := entry.FailReason
+		if reason == "" {
+			reason = fmt.Sprintf("script exited with code %d", entry.ExitCode)
+		}
+		if _, err := s.engine().ComputeFailTask(entry.TaskID, reason); err != nil {
+			res.Status = "error"
+			res.Error = "fail precondition: " + err.Error()
+			return res
+		}
+		if _, err := s.performFailCascade(entry.TaskID, reason); err != nil {
+			res.Status = "error"
+			res.Error = "fail cascade: " + err.Error()
+			return res
+		}
+		res.Status = "failed"
+		return res
+	}
+
+	// Exit 0 — delegate to the existing submit reporter.
+	// Membership check via the write-free variant: a batch
+	// handler must NOT let the per-entry gate touch the
+	// ResponseWriter, or the final writeJSON on the batch
+	// would be the second write to the same stream (headers
+	// already committed). checkProjectMembershipForTask
+	// returns (memb, errMsg) for us to surface inline on the
+	// result entry instead.
+	if _, errMsg := s.checkProjectMembershipForTask(r, entry.TaskID); errMsg != "" {
+		res.Status = "error"
+		res.Error = errMsg
+		return res
+	}
+	req := &submitResultRequest{
+		CommitSHA:        entry.CommitSHA,
+		ResultPath:       entry.ResultPath,
+		ArtifactsWritten: entry.ArtifactsWritten,
+		Content:          entry.Content,
+		Username:         entry.Username,
+		Model:            entry.Model,
+	}
+	if err := s.reconcileAcceptTask(task, req); err != nil {
+		res.Status = "error"
+		res.Error = err.Error()
+		return res
+	}
+	res.Status = "accepted"
+	return res
+}
+
+// shortCommit formats a commit SHA for display in error
+// messages (7 chars, git's standard abbreviation).
+func shortCommit(sha string) string {
+	if len(sha) <= 7 {
+		return sha
+	}
+	return sha[:7]
+}
+
+// reconcileAcceptTask runs the submit flow for a compute/answer
+// task that reconciled successfully. Reimplements the meaningful
+// slice of handleSubmitResultReport (engine validate → plan →
+// apply → cascade) without the HTTP plumbing, so the batch
+// handler can call it per-entry and get a plain `error` back.
+// The caller has already verified membership and task state.
+func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRequest) error {
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return fmt.Errorf("run not found for task %q", task.ID)
+	}
+
+	engineReq := &engine.SubmitRequest{
+		TaskID:           task.ID,
+		ResultPath:       req.ResultPath,
+		CommitSHA:        req.CommitSHA,
+		Username:         req.Username,
+		Content:          req.Content,
+		ArtifactsWritten: req.ArtifactsWritten,
+	}
+	resultPath, decision, voteChoice, submitterID, err := s.engine().ValidateSubmitRequest(task, run, engineReq)
+	if err != nil {
+		return err
+	}
+	submitOutcome, err := s.engine().ComputeSubmission(
+		task.ID, submitterID, resultPath, req.CommitSHA,
+		decision, voteChoice, req.Content, 0,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := s.store.ApplyPlan(submitOutcome.Plan); err != nil {
+		return fmt.Errorf("applying submit plan: %w", err)
+	}
+	for i := range submitOutcome.Events {
+		evt := &submitOutcome.Events[i]
+		if evt.ProjectID == 0 {
+			evt.ProjectID = run.ProjectID
+		}
+		if req.Model != "" && evt.Metadata != "" {
+			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, req.Model)
+		}
+		_ = s.store.RecordContributionEvent(evt)
+	}
+	actions, err := s.engine().ComputePostSubmitActions(task, run, submitOutcome, engineReq, decision, voteChoice)
+	if err != nil {
+		return err
+	}
+	if actions != nil && len(actions.ArtifactMutations) > 0 {
+		if _, err := s.store.ApplyPlan(store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: actions.ArtifactMutations,
+		}); err != nil {
+			return fmt.Errorf("upserting artifact index: %w", err)
+		}
+	}
+	return nil
 }
 
 // handleGetTaskInputsDescriptor is the client-writes claim-time
@@ -3629,6 +3950,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		RunParams:         runParams,
 		InstanceParamsMap: instanceParams,
 		Env:               unmarshalStringMapField(t.Env),
+		Mode:              t.Mode,
 	}
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks

@@ -223,11 +223,16 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 	if err != nil {
 		return nil, err
 	}
-	proj.Lock()
-	defer proj.Unlock()
-	if err := proj.PullBranch(meta.Branch); err != nil {
+	// Pull + opportunistic reconcile: picks up any async
+	// completions (scanner) + reaps failed detached wrappers
+	// (reaper) that may have finished since the last tool call.
+	// Lock-managed internally so we can re-acquire below for the
+	// resolver's git reads.
+	if err := c.pullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch); err != nil {
 		return nil, fmt.Errorf("refreshing local clone before resolving task %s: %w", meta.ID, err)
 	}
+	proj.Lock()
+	defer proj.Unlock()
 
 	input := mcpgit.ResolveInput{
 		TaskID:             meta.ID,
