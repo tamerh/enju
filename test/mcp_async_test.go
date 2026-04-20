@@ -228,6 +228,104 @@ echo "async payload on named branch"
 	}
 }
 
+// TestMCPAsyncChainStage2ClaimRaceOrphan reproduces the
+// tester-reported async→async chain orphan: when the user
+// calls enju_execute_task on stage2 immediately after stage1
+// completes, stage2 may still be PENDING on the coordinator
+// side (stage1's reconcile hasn't fired yet). handleExecuteTask
+// then skips the claim (gated on state == ready|collecting),
+// runs pullBranchWithReconcile which promotes stage2 → READY,
+// and launches the wrapper anyway. The wrapper commits with an
+// Enju-Task-Complete trailer, but the coordinator still sees
+// stage2 in READY, not CLAIMED. The scanner's stale-trailer
+// guard correctly noop's (state != claimed|running), the
+// cursor advances past the trailer, and stage2 orphans in
+// READY forever.
+//
+// Expected fix: move pullBranchWithReconcile BEFORE the claim
+// check so the state read reflects post-reconcile truth.
+// Alternatively, refuse to kickoff if the task wasn't
+// successfully claimed. Either way: after execute_task on
+// stage2, the task must reach ACCEPTED — not orphan.
+func TestMCPAsyncChainStage2ClaimRaceOrphan(t *testing.T) {
+	h := newMCPHarness(t, "AsyncChainRace")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/chain3/template.yaml": {body: `name: "chain3"
+version: 1
+tasks:
+  - id: stage1
+    action: compute
+    script: scripts/s.sh
+    mode: async
+  - id: stage2
+    action: compute
+    depends_on: [stage1]
+    script: scripts/s.sh
+    mode: async
+`, mode: 0o644},
+		"enju_templates/chain3/scripts/s.sh": {body: `#!/bin/bash
+sleep 0.05
+echo "out-$(date +%s%N)"
+`, mode: 0o755},
+	}, "seed chain3 template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/chain3",
+	})
+	stage1ID := fmt.Sprintf("%d:1:stage1", projectID)
+	stage2ID := fmt.Sprintf("%d:1:stage2", projectID)
+	h.rememberRunFromTaskID(t, stage1ID)
+
+	// Run stage1 async.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": stage1ID})
+	s1Result := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/stage1/.wrap-result.json")
+	if err := waitForFile(s1Result, 20*time.Second); err != nil {
+		t.Fatalf("stage1 wrap-result: %v", err)
+	}
+
+	// Call execute_task on stage2 DIRECTLY without an
+	// intervening run_status/claim/list_ready — the tester's
+	// exact repro. At this moment, stage1's completion
+	// commit exists on origin but the coordinator's state
+	// for stage1 is still "claimed" (no reconcile has
+	// fired), so stage2 is still "pending" (blocked on
+	// stage1). handleExecuteTask runs reconcile *inside*
+	// its pullBranchWithReconcile hook, which promotes
+	// stage2 → ready — but by then the claim check has
+	// already been skipped.
+	res := h.call(t, "enju_execute_task", map[string]any{"task_id": stage2ID})
+	if res.IsError {
+		// Acceptable per the tester's suggested fix: refuse
+		// to launch with a clear error instead of leaking a
+		// wrapper. Don't assert on a specific error wording.
+		t.Logf("execute_task(stage2) refused: %s (acceptable outcome)", mcpText(res))
+		return
+	}
+
+	// If execute_task returned success, the task MUST
+	// eventually reach accepted — otherwise we've leaked a
+	// wrapper whose commit will never advance state.
+	s2Result := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/stage2/.wrap-result.json")
+	if err := waitForFile(s2Result, 20*time.Second); err != nil {
+		t.Fatalf("stage2 wrap-result never appeared — wrapper may have failed: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, stage2ID, "accepted", 5*time.Second); err != nil {
+		got, _ := h.store.GetTask(stage2ID)
+		state := "<nil>"
+		if got != nil {
+			state = string(got.State)
+		}
+		t.Fatalf("stage2 stuck at state=%q after async chain — wrapper launched without successful claim, commit orphaned", state)
+	}
+}
+
 // TestMCPAsyncClaimTriggersReconcile is the regression guard
 // for Bug 1: after an async upstream completes, claiming the
 // downstream directly (without a prior run_status call)
@@ -315,7 +413,14 @@ tasks:
     mode: async
 `, mode: 0o644},
 		"enju_templates/rerun/scripts/g.sh": {body: `#!/bin/bash
-echo "run-${SEQ:-1}"
+# 50ms sleep + nanosecond timestamp guarantees run2's output
+# differs from run1's even on fast systems. Without this the
+# commit can return "nothing to commit" when content is
+# byte-identical → wrapper fails → task marked failed → test
+# flakes. Nanosecond resolution is best-effort in bash; the
+# sleep absorbs that jitter.
+sleep 0.05
+echo "run-$(date +%s%N)"
 `, mode: 0o755},
 	}, "seed rerun template")
 

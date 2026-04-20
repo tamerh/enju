@@ -178,7 +178,13 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("enju_execute_task requires a local workspace"), nil
 	}
 
-	// Fetch task metadata.
+	// Fetch task metadata up front — we need project + branch
+	// to open the workspace and run the reconcile hook. The
+	// state we read here is a PROBE, not the claim gate: an
+	// async chain scenario (stage2 depends on stage1) can have
+	// stage2 still PENDING at this moment even though stage1's
+	// commit is on origin, because no reconcile has run yet.
+	// Source-of-truth state comes after the reconcile below.
 	meta, err := c.fetchTaskMeta(ctx, taskID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, err)), nil
@@ -190,8 +196,43 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("task has no script field declared"), nil
 	}
 
-	// Claim if not already claimed.
-	if meta.State == "ready" || meta.State == "collecting" {
+	// Open the project workspace — openProject wires the
+	// project's default_branch into the Project, but this flow
+	// targets the RUN's branch explicitly via meta.Branch so
+	// the default is only used as a fallback for operations
+	// that don't take a branch override.
+	proj, remoteURL, projName, _, err := c.openProject(ctx, meta.ProjectID)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// Reconcile BEFORE the claim check. Without this, an
+	// async→async chain orphans stage2: stage1 completes, the
+	// coordinator still sees it as claimed (no one has run a
+	// tool yet), so stage2 is PENDING. If we probed state
+	// first and gated the claim on ready/collecting, we'd
+	// skip the claim and launch the wrapper anyway — stage2
+	// stays READY forever with an orphaned completion
+	// commit.
+	_ = c.pullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch)
+
+	// Re-fetch meta so the claim decision below sees the
+	// post-reconcile state. For the chain case, stage2
+	// should now be ready.
+	fresh, err := c.fetchTaskMeta(ctx, taskID)
+	if err == nil && fresh != nil {
+		meta = fresh
+	}
+
+	// Claim gate: the task must be in a state that permits
+	// claiming (ready / collecting) OR already be in a state
+	// where we can run the wrapper without a fresh claim
+	// (claimed / running — e.g. someone retried after a
+	// transient failure). Anything else — pending, accepted,
+	// failed, skipped, invalidated — means launching a wrapper
+	// would leak: the commit has no task to advance via the
+	// reconcile path.
+	switch meta.State {
+	case "ready", "collecting":
 		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 			"username": c.username,
 		})
@@ -204,22 +245,15 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 				return mcp.NewToolResultError("claim failed: " + errMsg), nil
 			}
 		}
+	case "claimed", "running":
+		// Already owned — proceed (typically the retry case
+		// after a transient wrapper failure).
+	default:
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"task %q is not claimable (state: %s) — run enju_run_status or wait for upstream to complete before retrying",
+			taskID, meta.State,
+		)), nil
 	}
-
-	// Open the project workspace — openProject wires the
-	// project's default_branch into the Project, but this flow
-	// targets the RUN's branch explicitly via meta.Branch so
-	// the default is only used as a fallback for operations
-	// that don't take a branch override.
-	proj, remoteURL, projName, _, err := c.openProject(ctx, meta.ProjectID)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	// Pull + implicit reconcile: refreshes the clone AND
-	// sweeps for any async-compute completions that landed
-	// since the last tool call. The caller's work flows on
-	// regardless of scanner/reaper errors.
-	_ = c.pullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch)
 
 	workDir := proj.WorkDir()
 	resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
