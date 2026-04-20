@@ -14,8 +14,10 @@ package mcpgit
 //     fallback.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -425,5 +427,170 @@ func TestCursorsAtomicSaveSurvivesPartialWrite(t *testing.T) {
 	reloaded, _ := LoadCursors(stateDir, 5)
 	if reloaded.Get("main") != "second" {
 		t.Errorf("expected second, got %q", reloaded.Get("main"))
+	}
+}
+
+// TestAdvanceCursorIfConfiguredSerializesConcurrentCallers
+// covers the last-writer-wins race the tester flagged. Before
+// CursorMutexFor, two callers could each do
+// LoadCursors → Set(branch, sha_i) → Save concurrently; the
+// later writer's save carried its own older snapshot and
+// silently overwrote the earlier writer's advance. The
+// atomic-rename inside Save keeps the file from corrupting,
+// but the cursor still goes BACKWARDS — next scan walks extra
+// history. Now both writers serialize through CursorMutexFor.
+//
+// Test: N goroutines each advance a unique commit SHA on the
+// same branch. After all finish, the saved cursor MUST be one
+// of the N SHAs (never empty, never a malformed mix). The
+// file must parse cleanly.
+func TestAdvanceCursorIfConfiguredSerializesConcurrentCallers(t *testing.T) {
+	stateDir := t.TempDir()
+	const projectID int64 = 42
+	const N = 20
+
+	// Pre-seed with an initial cursor so the file exists
+	// before the racers start.
+	seed := NewCursors(stateDir, projectID)
+	seed.Set("main", "seed")
+	if err := seed.Save(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	shas := make([]string, N)
+	for i := 0; i < N; i++ {
+		shas[i] = fmt.Sprintf("%040x", i+1)
+	}
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(sha string) {
+			defer wg.Done()
+			advanceCursorIfConfigured(projectID, stateDir, "main", sha)
+		}(shas[i])
+	}
+	wg.Wait()
+
+	loaded, err := LoadCursors(stateDir, projectID)
+	if err != nil {
+		t.Fatalf("load after race: %v", err)
+	}
+	final := loaded.Get("main")
+	if final == "" {
+		t.Fatalf("cursor vanished after concurrent advances")
+	}
+	// Must be one of the SHAs we wrote (not "seed", not a
+	// corrupt value).
+	found := false
+	for _, sha := range shas {
+		if sha == final {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("final cursor %q is not one of the advanced SHAs — concurrent save lost data", final)
+	}
+}
+
+// TestSubmitTaskResultAutoAdvancesCursor pins the auto-advance
+// hook added in SubmitTaskResult (cursor-advance ownership
+// moved from the MCP handler into mcpgit so every caller —
+// production, tests, future shell wrapper — benefits without
+// re-implementing the post-commit cursor update). Without
+// this, the scanner would replay self-generated commits as
+// fresh trailer events on the next sweep.
+func TestSubmitTaskResultAutoAdvancesCursor(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	if err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	const projectID int64 = 7
+	proj, err := ws.ForProject(projectID, bare)
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	stateDir := t.TempDir()
+	// Baseline: no cursor file yet.
+	pre, _ := LoadCursors(stateDir, projectID)
+	if pre.Get("main") != "" {
+		t.Fatalf("expected no pre-existing cursor, got %q", pre.Get("main"))
+	}
+
+	// Submit with ProjectID + StateDir set. Expect cursor
+	// to be advanced past the resulting commit.
+	proj.Lock()
+	res, err := proj.SubmitTaskResult(SubmitRequest{
+		TaskID:   "1:1:auto",
+		Username: "alice",
+		Branch:   "main",
+		Files: []FileWrite{
+			{RepoRelPath: ".enju/runs/1/auto/result.md", Content: []byte("ok")},
+		},
+		Trailers:  EnjuTrailers{TaskID: "1:1:auto", ExitCode: 0, ExitSet: true},
+		ProjectID: projectID,
+		StateDir:  stateDir,
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	// Cursor file should now exist and point at the commit
+	// SubmitTaskResult returned.
+	post, err := LoadCursors(stateDir, projectID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := post.Get("main"); got != res.CommitSHA {
+		t.Errorf("expected cursor=%s after submit, got %q", res.CommitSHA, got)
+	}
+}
+
+// TestSubmitTaskResultSkipsCursorAdvanceWithoutConfig verifies
+// the opt-in gate: callers that leave ProjectID / StateDir
+// zero (coordinator-side tests, store unit tests, raw mcpgit
+// callers) do NOT get a cursor file written. Otherwise any
+// test that exercised SubmitTaskResult would pollute the
+// user's home dir or fail in readonly environments.
+func TestSubmitTaskResultSkipsCursorAdvanceWithoutConfig(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	proj, _ := ws.ForProject(1, bare)
+
+	stateDir := t.TempDir()
+	proj.Lock()
+	_, err := proj.SubmitTaskResult(SubmitRequest{
+		TaskID:   "1:1:nocursor",
+		Username: "alice",
+		Branch:   "main",
+		Files: []FileWrite{
+			{RepoRelPath: ".enju/runs/1/nocursor/result.md", Content: []byte("x")},
+		},
+		Trailers: EnjuTrailers{TaskID: "1:1:nocursor"},
+		// Deliberately NOT setting ProjectID / StateDir.
+	})
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	// No cursor file should exist for any project in the
+	// supplied state dir — the auto-advance was gated off.
+	entries, rerr := os.ReadDir(stateDir)
+	if rerr != nil {
+		// Dir may not exist at all, which is also fine.
+		return
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			t.Errorf("unexpected cursor file %q written despite empty ProjectID/StateDir", e.Name())
+		}
 	}
 }

@@ -23,6 +23,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -163,17 +164,40 @@ func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *mcpgit.Pr
 	if proj == nil {
 		return nil
 	}
-	// Git phase: pull + scan, both under proj.Lock.
-	// PullBranch already fetched origin/<branch> internally
-	// (wt.Pull = fetch + merge), so we don't need a second
-	// FetchBranch here. Scan regardless of Pull's merge-step
+	// Git phase: checkout + pull + scan, all under proj.Lock.
+	//
+	// Checkout FIRST so the worktree reflects the target run's
+	// branch. Without this, running-multiple-runs-per-session
+	// breaks: the fat client stays on whatever branch the last
+	// tool call switched to, and template snapshots / script
+	// paths for other runs aren't on disk. Executing a task on
+	// Run A while the workspace is on Run B's branch would
+	// fail with "script not found" because `.enju/runs/N/
+	// template/scripts/...` only exists on Run A's branch.
+	//
+	// PullBranch then fetches + merges into the now-correct
+	// HEAD. Its internal fetch step already updates
+	// origin/<branch>, so we don't need a second FetchBranch
+	// before scanning. Scan regardless of Pull's merge-step
 	// outcome: a conflict or transient error on merge doesn't
 	// invalidate the fetch that already landed, and gating on
 	// pullErr would starve reconcile whenever Pull had any
 	// non-fatal issue. ScanBranchSince tolerates a missing
 	// origin/<branch> ref (first-time / never-pushed branch)
 	// on its own.
+	//
+	// Dirty-worktree case: go-git's non-Force Checkout refuses
+	// to switch when there are uncommitted changes — the error
+	// propagates to the user with a clear "you have local
+	// changes" message, which is the safest default. Stash /
+	// force semantics would silently discard work.
 	proj.Lock()
+	if branch != "" {
+		if err := proj.CheckoutBranch(branch); err != nil {
+			proj.Unlock()
+			return fmt.Errorf("switching workspace to branch %q: %w", branch, err)
+		}
+	}
 	pullErr := proj.PullBranch(branch)
 	var trailers []mcpgit.CommitTrailer
 	var newTip string

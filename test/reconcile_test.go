@@ -220,3 +220,70 @@ func TestReconcileRejectsEmptyBatch(t *testing.T) {
 		t.Fatalf("expected error for empty batch, got %+v", resp)
 	}
 }
+
+// TestReconcileBatchResponseShapeOnMixedErrors locks in the
+// write-free membership fix. Before the fix, per-entry errors
+// routed through requireProjectMembershipForTask wrote an
+// error payload directly to the response writer — then the
+// batch handler's final writeJSON was a SECOND write to the
+// same stream, corrupting the response envelope (either
+// truncated mid-JSON or with concatenated garbage). The
+// regression was inert in practice because scanners today
+// batch within one project, but a future batcher that mixes
+// projects would hit it.
+//
+// Contract: every entry — valid or invalid, whatever the
+// error — surfaces via results[].error. The response body
+// stays parseable JSON with the expected `results` array and
+// no duplicate / extra payloads.
+func TestReconcileBatchResponseShapeOnMixedErrors(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+	goodTaskID := s.taskID("task_a")
+
+	// Mixed batch: one valid (task_a, will accept), three
+	// invalid (missing task_id, missing sha, bad-shape sha,
+	// unknown task). Each invalid entry MUST become a
+	// results[i].error without corrupting the response body.
+	resp := reconcilePost(s, []map[string]interface{}{
+		{"commit_sha": fakeSHA("x"), "exit_code": 0},                         // missing task_id
+		{"task_id": goodTaskID, "exit_code": 0},                              // missing commit_sha
+		{"task_id": goodTaskID, "commit_sha": "not-40-hex", "exit_code": 0},  // bad shape
+		{"task_id": "99:99:ghost", "commit_sha": fakeSHA("g"), "exit_code": 0}, // unknown task
+		{"task_id": goodTaskID, "commit_sha": fakeSHA("ok"), "exit_code": 0,
+			"username": alice, "content": "done"}, // the valid one
+	})
+
+	// Envelope: single `results` key, no extras, array of 5
+	// entries. Pre-fix this would have been either short-
+	// circuited mid-stream or contaminated with standalone
+	// error payloads.
+	results, ok := resp["results"].([]interface{})
+	if !ok {
+		t.Fatalf("expected results[] envelope, got %+v", resp)
+	}
+	if _, hasError := resp["error"]; hasError {
+		t.Fatalf("expected no top-level error on mixed batch, got %+v", resp)
+	}
+	if len(results) != 5 {
+		t.Fatalf("expected 5 per-entry results, got %d: %+v", len(results), results)
+	}
+	// Spot-check statuses align with entry positions.
+	wantStatuses := []string{"error", "error", "error", "error", "accepted"}
+	for i, want := range wantStatuses {
+		got := results[i].(map[string]interface{})["status"]
+		if got != want {
+			t.Errorf("results[%d].status = %v, want %q", i, got, want)
+		}
+	}
+	// Error entries must carry an error message (otherwise
+	// the scanner has no handle for debugging).
+	for i := 0; i < 4; i++ {
+		errMsg, _ := results[i].(map[string]interface{})["error"].(string)
+		if errMsg == "" {
+			t.Errorf("results[%d]: expected non-empty error message, got %+v", i, results[i])
+		}
+	}
+}

@@ -137,6 +137,74 @@ tasks:
 	}
 }
 
+// TestMCPBranchExecuteTaskAutoCheckoutsRunBranch is the direct
+// regression guard for the multi-run-per-session branch bug:
+// enju_execute_task must auto-checkout the run's branch before
+// launching, because template snapshots only exist on the
+// branch they were committed to. Repro:
+//
+//  1. Create Run A on branch "branch-a" with a template — the
+//     snapshot lands on branch-a.
+//  2. Create Run B on branch "branch-b" — the workspace's HEAD
+//     switches to branch-b, and .enju/runs/1/template/* (Run A's
+//     snapshot) is NOT present on-disk because branch-b doesn't
+//     have it.
+//  3. Execute Run A's task.
+//
+// Pre-fix behaviour: `script scripts/… not found` because the
+// workspace is still on branch-b. Post-fix: the reconcile hook
+// checks out branch-a before running, snapshot materializes on
+// disk, script runs.
+func TestMCPBranchExecuteTaskAutoCheckoutsRunBranch(t *testing.T) {
+	h := newMCPHarness(t, "ExecAcrossBranches")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/greet/template.yaml": {body: `name: "greet"
+version: 1
+tasks:
+  - id: say
+    action: compute
+    script: scripts/say.sh
+`, mode: 0o644},
+		"enju_templates/greet/scripts/say.sh": {body: `#!/bin/bash
+echo "hi from $ENJU_TASK_ID"
+`, mode: 0o755},
+	}, "seed greet template")
+
+	// Run A on branch-a.
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/greet",
+		"branch":     "branch-a",
+	})
+	taskA := fmt.Sprintf("%d:1:say", projectID)
+
+	// Run B on branch-b — this pulls HEAD over to branch-b,
+	// and branch-b's .enju/runs/1/ doesn't contain Run A's
+	// snapshot. Before the fix, any subsequent tool call on
+	// Run A would find the workspace still on branch-b.
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/greet",
+		"branch":     "branch-b",
+	})
+
+	// Execute Run A's task. The handler's reconcile hook
+	// must auto-checkout branch-a so the template snapshot
+	// is on disk. If checkout is skipped, the script path
+	// resolves to a non-existent file and execute errors out.
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": taskA,
+	})
+	if res.IsError {
+		t.Fatalf("execute_task on Run A after Run B switched branches: %s", mcpText(res))
+	}
+	if !strings.Contains(mcpText(res), "Script completed") {
+		t.Errorf("expected successful execution, got:\n%s", mcpText(res))
+	}
+}
+
 // TestMCPBranchAutoTemplateSlug verifies branch="auto" derives
 // its slug from the template bundle dir name rather than the
 // generic "run-N" — so `path="enju_templates/hello"` + auto
