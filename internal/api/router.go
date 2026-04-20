@@ -2556,6 +2556,23 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 			return fmt.Errorf("upserting artifact index: %w", err)
 		}
 	}
+
+	// Ready-task sweep + run completion. Without this, any
+	// downstream whose only remaining blocker was this task
+	// stays in PENDING forever — the claim gate rejects it
+	// with "blocked". Mirrors step 7 of handleSubmitResultReport;
+	// an earlier revision of reconcileAcceptTask omitted the
+	// sweep, so async compute's downstream chain never unlocked.
+	// Errors are logged-and-swallowed (the same pattern the
+	// sync path uses) since a sweep failure mid-flight still
+	// leaves the submission applied correctly.
+	if _, err := s.store.UpdateReadyTasks(task.RunID); err != nil {
+		s.logger.Warn("reconcile ready-sweep", "task_id", task.ID, "run_id", task.RunID, "error", err)
+	}
+	if _, err := s.store.CheckAndCompleteRun(task.RunID); err != nil {
+		s.logger.Warn("reconcile run-complete check", "run_id", task.RunID, "error", err)
+	}
+
 	return nil
 }
 

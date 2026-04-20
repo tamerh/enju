@@ -225,6 +225,80 @@ echo "async payload on named branch"
 	}
 }
 
+// TestMCPAsyncReconcileUnblocksDownstream is the direct
+// regression guard for the tester's "downstream stays
+// blocked after async reconcile" report. When a normal sync
+// submit accepts a task, the handler runs
+// UpdateReadyTasks(runID) to promote any downstream whose
+// upstream-deps are now all satisfied. The reconcile path
+// (reconcileAcceptTask) forgot this sweep, so an async
+// upstream that reconciled to "accepted" left its
+// downstream tasks stuck in "pending" (shown as "blocked"
+// by the claim gate) forever.
+//
+// Minimum repro: one async compute task plus one answer
+// task depending on it. Execute the compute, wait for
+// reconcile, assert the downstream becomes claimable.
+func TestMCPAsyncReconcileUnblocksDownstream(t *testing.T) {
+	h := newMCPHarness(t, "AsyncDownstream")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju_templates/chain/template.yaml": {body: `name: "chain"
+version: 1
+tasks:
+  - id: produce
+    action: compute
+    script: scripts/p.sh
+    mode: async
+  - id: consume
+    action: answer
+    depends_on: [produce]
+    prompt: "consume {{produce.content}}"
+`, mode: 0o644},
+		"enju_templates/chain/scripts/p.sh": {body: `#!/bin/bash
+echo "payload"
+`, mode: 0o755},
+	}, "seed chain template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/chain",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
+
+	// Launch async upstream.
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	// Wait for wrapper to commit.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/produce/.wrap-result.json")
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// run_status triggers reconcile. Upstream flips to accepted.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("produce"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("produce did not reach accepted: %v", err)
+	}
+
+	// Downstream MUST now be ready — the reconcile path has to
+	// run the same ready-sweep the sync submit handler does.
+	// Before the fix, it stays in "pending" and the claim
+	// returns a blocked error.
+	if err := waitForTaskState(h, h.taskID("consume"), "ready", 5*time.Second); err != nil {
+		t.Fatalf("consume not promoted to ready after upstream reconcile — ready-sweep missing from reconcile path: %v", err)
+	}
+}
+
 // TestMCPAsyncComputeFailurePropagatesViaReaper verifies the
 // failure-on-return path: a detached wrapper whose script
 // exits non-zero drops a .wrap-result.json locally but does
