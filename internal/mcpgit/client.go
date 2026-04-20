@@ -1025,7 +1025,14 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	}
 
 	// One commit per submit, on top of whatever was there.
-	sha, err := p.commit(commitMsg, req.AuthorName, req.AuthorEmail)
+	// Stage ONLY the paths the caller explicitly wrote —
+	// AddGlob(".") would sweep any other pending untracked
+	// edits (e.g. a co-authored template) into the commit.
+	stagePaths := make([]string, 0, len(req.Files))
+	for _, f := range req.Files {
+		stagePaths = append(stagePaths, f.RepoRelPath)
+	}
+	sha, err := p.commit(commitMsg, stagePaths, req.AuthorName, req.AuthorEmail)
 	if err != nil {
 		return nil, fmt.Errorf("creating commit: %w", err)
 	}
@@ -1192,7 +1199,11 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 		}
 	}
 
-	sha, err := p.commit(msg, req.AuthorName, req.AuthorEmail)
+	stagePaths := make([]string, 0, len(req.Files))
+	for _, f := range req.Files {
+		stagePaths = append(stagePaths, f.RepoRelPath)
+	}
+	sha, err := p.commit(msg, stagePaths, req.AuthorName, req.AuthorEmail)
 	if err != nil {
 		return nil, fmt.Errorf("creating commit: %w", err)
 	}
@@ -1611,13 +1622,44 @@ func (p *Project) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mode
 // submit handler) always pass the citizen's real name and email so
 // pushes to the user's own git host attribute correctly on
 // contributor graphs, blame, and CODEOWNERS.
-func (p *Project) commit(message, authorName, authorEmail string) (string, error) {
+// commit builds a git commit with the given message + author
+// signature, staging ONLY the explicit paths the caller passes.
+// An earlier version used wt.AddGlob(".") which incidentally
+// swept every untracked file in the worktree into the commit —
+// that was the template-scatter bug, where co-authored
+// untracked templates (tmpl-b sitting next to tmpl-a being
+// instantiated) silently landed on the run's branch and
+// vanished from main. Scoped staging fixes both that bug and
+// the general principle that a commit helper should only
+// touch paths the caller asked for.
+//
+// An empty `paths` argument keeps the old "stage everything
+// under worktree root" semantics — we don't have any callers
+// relying on that anymore, but the fall-through exists so a
+// future caller that genuinely wants a sweep-everything
+// commit can opt in by passing nil.
+func (p *Project) commit(message string, paths []string, authorName, authorEmail string) (string, error) {
 	wt, err := p.repo.Worktree()
 	if err != nil {
 		return "", fmt.Errorf("getting worktree: %w", err)
 	}
-	if err := wt.AddGlob("."); err != nil {
-		return "", fmt.Errorf("staging: %w", err)
+	if paths == nil {
+		if err := wt.AddGlob("."); err != nil {
+			return "", fmt.Errorf("staging: %w", err)
+		}
+	} else {
+		for _, rel := range paths {
+			if rel == "" {
+				continue
+			}
+			// wt.Add handles New, Modified, and Deleted
+			// file states for the given path. Errors
+			// propagate (typically unknown-path, which
+			// means the caller's bookkeeping is off).
+			if _, err := wt.Add(rel); err != nil {
+				return "", fmt.Errorf("staging %s: %w", rel, err)
+			}
+		}
 	}
 	status, err := wt.Status()
 	if err != nil {

@@ -137,6 +137,96 @@ tasks:
 	}
 }
 
+// TestMCPBranchCoAuthoredTemplatesNotScattered replicates the
+// tester's "template scatter" scenario: a user authors two
+// templates side-by-side (both untracked), instantiates one,
+// and expects the OTHER to still be reachable on main for a
+// later create_run. With my earlier untracked-preserve fix,
+// the template directory survives the Force checkout — but
+// the snapshot commit on the run's branch then sweeps in
+// ALL untracked files via AddGlob("."), leaving tmpl-b
+// accidentally committed on the run branch and absent on
+// main. A subsequent create_run(tmpl-b) targeting main
+// can't find it, and switching back to main wipes it from
+// the worktree.
+func TestMCPBranchCoAuthoredTemplatesNotScattered(t *testing.T) {
+	h := newMCPHarness(t, "CoAuthoredTemplates")
+	projectID := h.createTestProject()
+
+	// Author both templates simultaneously, both untracked
+	// in the workspace. writeRepoFiles commits to the bare,
+	// which then mirrors to the fat-client via the usual
+	// pull paths — but that path tracks them. To simulate
+	// untracked authorship, write files directly via the
+	// harness's workDir helper.
+	workDir := h.workspaceDirForProject(projectID)
+	for _, spec := range []struct{ path, body string }{
+		{"enju_templates/tmpl-a/template.yaml", `name: "tmpl-a"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "hello"
+`},
+		{"enju_templates/tmpl-b/template.yaml", `name: "tmpl-b"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "world"
+`},
+	} {
+		full := filepath.Join(workDir, spec.path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(spec.body), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	// Instantiate tmpl-a on a run branch. EnsureBundleOnDefault
+	// commits tmpl-a to main; the snapshot commit lands on
+	// the run's branch.
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/tmpl-a",
+		"branch":     "run-a",
+	})
+
+	// Scatter-guard: tmpl-b MUST NOT have landed on run-a's
+	// branch. Before the fix, the snapshot commit on run-a
+	// swept it in via AddGlob(".") — that's the bug.
+	remoteURL := h.remoteFor(projectID)
+	if _, onA := readRepoFileOnBranch(t, remoteURL, "run-a", "enju_templates/tmpl-b/template.yaml"); onA {
+		t.Fatalf("tmpl-b scattered onto run-a's branch — snapshot commit accidentally swept up the co-authored untracked template")
+	}
+
+	// Workflow-continuity: the user MUST still be able to
+	// instantiate tmpl-b afterward. Post-fix, tmpl-b is
+	// simply untracked locally (never scattered, never
+	// clobbered); the next create_run's
+	// EnsureBundleOnDefault auto-commits it to main and
+	// proceeds. If this step errors with "template not
+	// found", the user's co-authored work has effectively
+	// been lost.
+	res := h.call(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju_templates/tmpl-b",
+	})
+	if res.IsError {
+		t.Fatalf("create_run(tmpl-b) after tmpl-a: %s", mcpText(res))
+	}
+	// After the second create_run, tmpl-b IS on main (auto-
+	// committed by EnsureBundleOnDefault). Verify so the
+	// test also guards against a regression where the
+	// second create_run succeeds but leaves main without
+	// the template.
+	if _, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/tmpl-b/template.yaml"); !ok {
+		t.Errorf("tmpl-b not published to main after create_run(tmpl-b) — EnsureBundleOnDefault skipped it")
+	}
+}
+
 // TestMCPBranchExecuteTaskAutoCheckoutsRunBranch is the direct
 // regression guard for the multi-run-per-session branch bug:
 // enju_execute_task must auto-checkout the run's branch before

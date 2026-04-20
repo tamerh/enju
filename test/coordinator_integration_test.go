@@ -873,7 +873,16 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 	})
 	proj.Unlock()
 	if err != nil {
-		s.t.Fatalf("fat-client submit for %q: %v", fullTaskID, err)
+		// Surface client-side submit failures (path
+		// traversal rejected by wt.Add, malformed files,
+		// etc.) as an error-shaped response so tests that
+		// EXPECT rejection can assert on it the same way
+		// they do for server-side rejections. Pre-scoped-
+		// staging, AddGlob(".") silently skipped paths
+		// outside the worktree and let server validation
+		// reject; now we reject earlier at the git layer.
+		// Both produce the same user-visible outcome.
+		return map[string]interface{}{"error": err.Error()}
 	}
 
 	// Report the commit to the coordinator so state machine +
