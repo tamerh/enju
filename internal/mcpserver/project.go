@@ -128,29 +128,56 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	}
 
 	// If auto-local, create the bare repo + set it as remote.
+	// Surface failures loudly — a silent failure here leaves the
+	// project with no remote_url, which later blows up opaquely
+	// in submit as "resolving base for new branch: reference not
+	// found". Any step's failure gets collected in `autoLocalErr`
+	// and returned to the caller so the user sees the root cause
+	// at create time, not one tool call later.
+	var autoLocalErr string
 	if autoLocal {
 		var result map[string]interface{}
 		if err := json.Unmarshal(data, &result); err != nil {
+			autoLocalErr = fmt.Sprintf("auto-local: parse project response: %v", err)
 			c.logger.Error("auto-local: failed to parse project response", "error", err)
 		} else if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
 			home, _ := os.UserHomeDir()
 			repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
 			if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
+				autoLocalErr = fmt.Sprintf("auto-local: create repos dir %s: %v", filepath.Dir(repoDir), err)
 				c.logger.Error("auto-local: failed to create repos dir", "error", err)
 			} else if err := mcpgit.InitBareWithSeed(repoDir); err != nil {
+				autoLocalErr = fmt.Sprintf("auto-local: init bare repo %s: %v", repoDir, err)
 				c.logger.Error("auto-local: failed to init bare repo", "path", repoDir, "error", err)
 			} else {
-				// Set the remote on the coordinator.
-				_, putErr := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
+				// Set the remote on the coordinator. c.put returns
+				// (body, nil) on 4xx/5xx — the error lives in the
+				// body's `error` field — so we have to decode the
+				// response explicitly rather than trusting the Go
+				// error alone. Without this, a 403 "only owners
+				// can change remote" silently claims success and
+				// the project ends up with no remote.
+				putData, putErr := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
 					map[string]string{"remote_url": repoDir})
 				if putErr != nil {
+					autoLocalErr = fmt.Sprintf("auto-local: set remote (transport): %v", putErr)
 					c.logger.Error("auto-local: failed to set remote", "error", putErr)
 				} else {
-					c.logger.Info("auto-created local repo",
-						"project_id", projectID, "path", repoDir)
+					var putResp map[string]interface{}
+					_ = json.Unmarshal(putData, &putResp)
+					if msg, _ := putResp["error"].(string); msg != "" {
+						autoLocalErr = fmt.Sprintf("auto-local: coordinator refused PUT /projects/%d/remote: %s", projectID, msg)
+						c.logger.Error("auto-local: coordinator rejected remote set", "error", msg)
+					} else {
+						c.logger.Info("auto-created local repo",
+							"project_id", projectID, "path", repoDir)
+					}
 				}
 			}
 		}
+	}
+	if autoLocalErr != "" {
+		return mcp.NewToolResultError(autoLocalErr), nil
 	}
 
 	// Eagerly clone into the workspace so the project directory

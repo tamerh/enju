@@ -70,6 +70,12 @@ type mcpHarness struct {
 // same local clones.
 func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 	t.Helper()
+	// Isolate $HOME so tests that hit the auto-local
+	// create_project path (bare repos seeded under
+	// $HOME/.enju/repos/) don't collide across runs or
+	// pollute the developer's real ~/.enju. Every harness
+	// gets a fresh, per-test home.
+	t.Setenv("HOME", t.TempDir())
 	ts := newTestServer(t)
 
 	// Register via the shared helper so the coordinator knows about

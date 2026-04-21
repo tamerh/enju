@@ -1422,10 +1422,17 @@ func (p *Project) branchBaseHash() (plumbing.Hash, error) {
 	// Root commit fallback: walk to the very first commit
 	// reachable from any branch. The project always has a
 	// seed commit, so this succeeds except for the empty-repo
-	// edge case (tests that never commit anything).
+	// edge case — which is exactly the "auto-local bare was
+	// not seeded" regression path. Surface the workspace +
+	// remote paths so the user can inspect what went wrong
+	// instead of chasing "log: reference not found" in isolation.
 	iter, err := p.repo.Log(&gogit.LogOptions{})
 	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf("log: %w", err)
+		return plumbing.ZeroHash, fmt.Errorf(
+			"local clone at %s has no refs to branch from (remote %q is empty or unseeded). "+
+				"This typically means enju_create_project's auto-local bare init failed silently. "+
+				"Check the coordinator's remote_url via enju_project_remote_status, or re-create the project",
+			p.workDir, p.remoteURL)
 	}
 	defer iter.Close()
 	var root plumbing.Hash
@@ -1437,7 +1444,12 @@ func (p *Project) branchBaseHash() (plumbing.Hash, error) {
 		root = c.Hash
 	}
 	if root.IsZero() {
-		return plumbing.ZeroHash, fmt.Errorf("no commits in repo — cannot fork a new branch")
+		return plumbing.ZeroHash, fmt.Errorf(
+			"local clone at %s has no commits to branch from (remote %q is empty). "+
+				"enju_create_project is supposed to seed the bare repo with an initial commit — "+
+				"this usually means that step failed silently. Re-create the project or set a "+
+				"valid remote via enju_set_project_remote",
+			p.workDir, p.remoteURL)
 	}
 	return root, nil
 }
