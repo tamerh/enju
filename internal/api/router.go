@@ -1095,11 +1095,13 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 // segments, leading "-", and reserved forms).
 //
 // For branch="auto", the generated name uses `<slug>-N` where the
-// slug is derived from `sourcePath` (template bundle dir name —
-// recognizable to the caller, already git-safe since it's the
-// directory they authored under enju/templates/). Inline-YAML
-// runs with no source_path fall back to "run-N".
-func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sourcePath string) (string, error) {
+// slug comes from engine.ComputeRunSlug(sourcePath, runName) — the
+// same rule that stamps the `enju/runs/{seq}-{slug}/` directory
+// name. Keeping both on the same slugger means the user never
+// sees `git checkout quick-inline-1` pointing at a run whose dir
+// is `2-Quick_Inline/` (style drift that surfaced on early
+// testing).
+func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sourcePath, runName string) (string, error) {
 	if requested == "" {
 		if defaultBranch == "" {
 			return "main", nil
@@ -1119,7 +1121,15 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sou
 		for _, b := range branches {
 			used[b] = true
 		}
-		slug := autoBranchSlug(sourcePath)
+		slug := engine.ComputeRunSlug(sourcePath, runName)
+		// Defense in depth: a slug that slips past the kebab
+		// slugger into something git would reject (shouldn't
+		// happen — all outputs are [a-z0-9-]+ — but the
+		// check is cheap) falls back to "run" so we still
+		// produce a usable branch name.
+		if validateBranchName(slug) != nil {
+			slug = "run"
+		}
 		for n := 1; n <= 10000; n++ {
 			name := fmt.Sprintf("%s-%d", slug, n)
 			if !used[name] {
@@ -1132,31 +1142,6 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sou
 		return "", err
 	}
 	return requested, nil
-}
-
-// autoBranchSlug picks a human-recognizable prefix for auto-allocated
-// branch names. Template-mode runs yield the bundle directory name
-// (e.g. sourcePath="enju/templates/gene-mapping" → "gene-mapping");
-// inline-YAML runs with no source path fall back to "run".
-//
-// Bundle dir names are already git-safe (lowercase, hyphenated) by
-// virtue of being user-authored filesystem paths that git accepted
-// on commit — no slugging needed. If something slips through that
-// doesn't look ref-safe, we fall back to "run" rather than produce
-// a branch name git will refuse to store.
-func autoBranchSlug(sourcePath string) string {
-	base := strings.TrimSpace(sourcePath)
-	base = strings.TrimSuffix(base, "/")
-	if idx := strings.LastIndex(base, "/"); idx >= 0 {
-		base = base[idx+1:]
-	}
-	if base == "" {
-		return "run"
-	}
-	if err := validateBranchName(base); err != nil {
-		return "run"
-	}
-	return base
 }
 
 // validateBranchName rejects shapes that git would refuse to
@@ -1252,11 +1237,32 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Always route through ParseWithParams so declared defaults
+	// fire even when the caller supplied no params. Passing nil
+	// is equivalent to "caller supplied nothing" — defaults
+	// still apply, and a required-no-default param raises the
+	// natural-language error. Previously the plain-Parse branch
+	// skipped substitution entirely and {{placeholder}} refs
+	// leaked through as literal text whenever callers leaned on
+	// defaults, which defeated the whole point of the default:
+	// field.
+	//
+	// Parsing runs BEFORE branch resolution so the auto-branch
+	// slug can source `parsed.Run.Name` (previously, branch:auto
+	// fell back to "run-N" for inline YAML even when the run
+	// carried a perfectly good name: field).
+	parsed, err := enjuYaml.ParseWithParams([]byte(req.YAML), req.Params)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run definition: "+err.Error())
+		return
+	}
+
 	// Branch resolution — three paths:
 	//   - empty → project default
-	//   - "auto" → pick an unused "run-N" name
+	//   - "auto" → pick an unused "<slug>-N" name sharing the
+	//     slug with the run directory
 	//   - explicit → use verbatim, just validate shape
-	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch, req.SourcePath)
+	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch, req.SourcePath, parsed.Run.Name)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1275,21 +1281,6 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			))
 			return
 		}
-	}
-
-	// Always route through ParseWithParams so declared defaults
-	// fire even when the caller supplied no params. Passing nil
-	// is equivalent to "caller supplied nothing" — defaults
-	// still apply, and a required-no-default param raises the
-	// natural-language error. Previously the plain-Parse branch
-	// skipped substitution entirely and {{placeholder}} refs
-	// leaked through as literal text whenever callers leaned on
-	// defaults, which defeated the whole point of the default:
-	// field.
-	parsed, err := enjuYaml.ParseWithParams([]byte(req.YAML), req.Params)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid run definition: "+err.Error())
-		return
 	}
 
 	// Pre-flight validation via engine (artifact paths +

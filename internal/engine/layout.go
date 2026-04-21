@@ -87,34 +87,73 @@ func RunDir(runSeq int, slug string) string {
 }
 
 // ComputeRunSlug derives the filesystem-safe slug that shows
-// up in enju/runs/{seq}-{slug}/. Canonical sources in order:
+// up in enju/runs/{seq}-{slug}/ AND in auto-branch names
+// (e.g. "variant-calling-2"). Canonical sources in order:
 //
 //  1. Template bundle dir's basename (e.g. "variant-calling"
-//     from enju/templates/variant-calling). Already lowercase
-//     + hyphen-friendly by bundle-loader convention, but we
-//     still run it through the slug rule for defense against
-//     hand-rolled paths.
-//  2. Run's `name:` field, slugged.
+//     from enju/templates/variant-calling).
+//  2. Run's `name:` field.
 //  3. Fallback "run" for inline-YAML runs with no name:.
 //
-// Kept in engine so the server-side run-create path and any
-// client-side helper that needs the slug (e.g. for the
-// template-snapshot commit target) stay in lock-step. A slug
-// mismatch between create-time and later reads would corrupt
-// the layout silently.
+// Every candidate is normalized through slugifyKebab so the
+// output is uniform regardless of the source (template author
+// conventions, human-typed run names, etc.). Without uniform
+// normalization, a template "hello" produced dir `1-hello/`
+// while inline `name: "Quick Inline"` produced `2-Quick_Inline/`
+// — same system, two styles, user-visible inconsistency.
+//
+// Branch-auto naming calls this with the same arguments so
+// `git checkout quick-inline-1` lines up with
+// `cd enju/runs/2-quick-inline/` instead of diverging into
+// `run-1` on the git side and `2-Quick_Inline/` on disk.
 func ComputeRunSlug(sourcePath, runName string) string {
 	if sourcePath != "" {
-		base := filepath.Base(sourcePath)
-		if slug := enjuYaml.SlugInstanceKey(base); slug != "" {
+		if slug := slugifyKebab(filepath.Base(sourcePath)); slug != "" {
 			return slug
 		}
 	}
 	if runName != "" {
-		if slug := enjuYaml.SlugInstanceKey(runName); slug != "" {
+		if slug := slugifyKebab(runName); slug != "" {
 			return slug
 		}
 	}
 	return "run"
+}
+
+// slugifyKebab is the kebab-case slug rule used for human-
+// readable run identifiers (directory suffixes + branch
+// names). Rules:
+//   - ASCII letters are lowercased.
+//   - ASCII digits pass through.
+//   - Everything else (spaces, punctuation, non-ASCII) collapses
+//     into a single `-`.
+//   - Leading / trailing `-` are trimmed.
+//
+// Deliberately different from yaml.SlugInstanceKey: for_each
+// values preserve case ("BRCA1" must not become "brca1" — that
+// would collide with a hypothetical gene "Brca1" and also make
+// logs harder to read), whereas run identifiers benefit from
+// uniform lowercasing because they're never compared to user
+// data, only to other run identifiers.
+func slugifyKebab(s string) string {
+	var b strings.Builder
+	prevDash := true // suppress a leading dash
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			prevDash = false
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.TrimRight(b.String(), "-")
 }
 
 // ComputeResultDir returns the repo-relative directory for a

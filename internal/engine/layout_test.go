@@ -170,9 +170,20 @@ func TestComputeRunSlug(t *testing.T) {
 	}{
 		{"template bundle wins", "enju/templates/variant-calling", "Ignored", "variant-calling"},
 		{"nested bundle path", "workflows/gwas-analysis", "", "gwas-analysis"},
-		{"inline with name", "", "My Smoke Test", "My_Smoke_Test"},
+		{"inline with name", "", "My Smoke Test", "my-smoke-test"},
 		{"slug fallback on empty", "", "", "run"},
-		{"name with unsafe chars", "", "Run: A/B", "Run_A_B"},
+		{"name with unsafe chars", "", "Run: A/B", "run-a-b"},
+		// Template bundle already lowercase-hyphenated — kebab
+		// slugger is idempotent, no drift.
+		{"bundle stays idempotent", "enju/templates/variant-calling", "", "variant-calling"},
+		// Case normalization: mixed-case bundle becomes lower.
+		// Previously the loader accepted any dir name; now we
+		// normalize so on-disk and git paths agree with the
+		// display form.
+		{"uppercase bundle normalized", "enju/templates/MyBundle", "", "mybundle"},
+		// Only whitespace/punctuation → "run" fallback (trim
+		// of dashes leaves nothing).
+		{"all-punctuation falls back", "", "!!!", "run"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

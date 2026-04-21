@@ -76,9 +76,14 @@ tasks:
 }
 
 // TestMCPBranchAutoAllocation verifies branch="auto" picks
-// unused slots: inline-YAML runs walk run-1, run-2, ...;
-// template-mode runs would use the bundle dir name as slug
-// (covered separately by TestMCPBranchAutoTemplateSlug).
+// unused slots using the same slug the runs-directory uses —
+// derived from the YAML's name: field for inline runs (or
+// bundle dir name for template-mode, covered separately by
+// TestMCPBranchAutoTemplateSlug). Previously inline runs fell
+// back to "run-N" regardless of name, which drifted from the
+// runs-dir slug; the unified slugger (engine.ComputeRunSlug)
+// now makes `git checkout auto-named-1` line up with
+// `cd enju/runs/2-auto-named/`.
 func TestMCPBranchAutoAllocation(t *testing.T) {
 	h := newMCPHarness(t, "AutoBranch")
 	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-auto-%d", nowNano()))
@@ -122,18 +127,18 @@ tasks:
 	if !seen["main"] {
 		t.Errorf("expected main among branches; got: %+v", seen)
 	}
-	// Auto runs pick run-1, run-2 (or run-2, run-3 depending
-	// on whether the first run occupied "run-1"). Just assert
-	// that the two auto calls produced distinct, run-N-shaped
-	// branches.
+	// Auto runs pick auto-named-1, auto-named-2 — the slug
+	// derives from the YAML's `name: "auto-named"` via the
+	// unified engine.ComputeRunSlug. Just assert the two auto
+	// calls produced distinct auto-named-N branches.
 	autoCount := 0
 	for b := range seen {
-		if strings.HasPrefix(b, "run-") {
+		if strings.HasPrefix(b, "auto-named-") {
 			autoCount++
 		}
 	}
 	if autoCount != 2 {
-		t.Errorf("expected 2 run-N branches from auto allocation; got seen=%+v", seen)
+		t.Errorf("expected 2 auto-named-N branches from auto allocation; got seen=%+v", seen)
 	}
 }
 
