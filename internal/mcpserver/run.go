@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/enju-ai/enju/internal/engine"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -105,7 +106,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	// Phase H.1: three input shapes —
 	//   1. yaml (inline definition, no params)
-	//   2. path (template file under enju_templates/, optional params)
+	//   2. path (template file under enju/templates/, optional params)
 	//   3. yaml + params (inline definition with a declared params: block)
 	//
 	// Exactly one of (yaml, path) must be set. Params are optional in
@@ -124,7 +125,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	if yamlContent == "" && templatePath == "" {
-		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under enju_templates/) is required"), nil
+		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under enju/templates/) is required"), nil
 	}
 	if yamlContent != "" && templatePath != "" {
 		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
@@ -214,7 +215,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	// Template mode: after the coordinator assigns a run seq,
 	// commit a frozen copy of the bundle into
-	// `.enju/runs/{seq}/template/` so the run owns its scripts,
+	// `enju/runs/{seq}/template-snapshot/` so the run owns its scripts,
 	// data, and docs. A live template edit after this point
 	// cannot retroactively change this run's behavior — the
 	// executor resolves `script:` paths from the snapshot (see
@@ -238,7 +239,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 				// uncreated and the run's first submit pushing to
 				// main.
 				runBranch, _ := created["branch"].(string)
-				snapshotTarget := fmt.Sprintf(".enju/runs/%d/template", seq)
+				snapshotTarget := engine.RunTemplateSnapshotDir(int(seq))
 				files, ferr := proj.ReadBundleFiles(loadedTemplate.BundleDir, snapshotTarget)
 				if ferr != nil {
 					snapshotWarning = fmt.Sprintf("snapshot skipped: %v", ferr)
@@ -269,7 +270,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	return mcp.NewToolResultText(text), nil
 }
 // handleExportDiagram snapshots the run's current DAG as raw
-// Mermaid and commits it to .enju/runs/{seq}/graph/{phase}.mmd.
+// Mermaid and commits it to enju/runs/{seq}/graph/{phase}.mmd.
 // See toolExportDiagram for the tool-facing contract; design
 // notes:
 //
@@ -341,7 +342,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	repoPath := fmt.Sprintf(".enju/runs/%d/graph/%s.mmd", runID, phase)
+	repoPath := fmt.Sprintf("enju/runs/%d/graph/%s.mmd", runID, phase)
 	authorName, authorEmail := c.commitAuthor(ctx)
 	commitMsg := fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase)
 
@@ -398,7 +399,7 @@ func validateDiagramPhase(phase string) error {
 
 // handleExportRunEvents pulls the coordinator's synthesized
 // event timeline for a run and commits it as JSONL under
-// .enju/runs/{seq}/events/{phase}.jsonl. Same snapshot-
+// enju/runs/{seq}/events/{phase}.jsonl. Same snapshot-
 // on-demand pattern as handleExportDiagram: authoritative
 // data stays in the DB, git gets a frozen copy when the
 // caller explicitly asks.
@@ -467,7 +468,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	repoPath := fmt.Sprintf(".enju/runs/%d/events/%s.jsonl", runID, phase)
+	repoPath := fmt.Sprintf("enju/runs/%d/events/%s.jsonl", runID, phase)
 	authorName, authorEmail := c.commitAuthor(ctx)
 	commitMsg := fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events))
 

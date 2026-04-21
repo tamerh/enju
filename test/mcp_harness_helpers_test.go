@@ -28,7 +28,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -298,7 +297,7 @@ func (h *mcpHarness) mcpCreateRunInline(t *testing.T, projectID int64, yamlBody 
 }
 
 // mcpCreateRunFromTemplate invokes enju_create_run in template
-// mode: `path` points at a enju_templates/*.yaml recipe in the
+// mode: `path` points at a enju/templates/*.yaml recipe in the
 // project clone, `params` populates the template's declared
 // parameters. Requires the template file to already be present
 // in the project's bare remote (seed it via createTestProject
@@ -406,12 +405,13 @@ func (h *mcpHarness) mcpGetArtifactHistory(t *testing.T, projectID int64, path s
 func (h *mcpHarness) mcpBareResultMD(t *testing.T, shortID string, citizen ...string) string {
 	t.Helper()
 	task := h.taskGet(shortID)
-	taskDefID, _ := task["task_def_id"].(string)
-	instanceKey, _ := task["instance_key"].(string)
-	runSeq := int(task["run_seq"].(float64))
 	projectID := int64(task["project_id"].(float64))
 
-	dir := mcpgit.ResultDir(runSeq, instanceKey, taskDefID)
+	// Use the server-computed result_dir from the task
+	// response — the layout schema lives coordinator-side
+	// (engine.ComputeResultDir), so test callers consume it
+	// directly rather than duplicating the build rule.
+	dir, _ := task["result_dir"].(string)
 	if len(citizen) > 0 && citizen[0] != "" {
 		dir = filepath.Join(dir, "citizen-"+citizen[0])
 	}
@@ -429,12 +429,9 @@ func (h *mcpHarness) mcpBareResultMD(t *testing.T, shortID string, citizen ...st
 func (h *mcpHarness) mcpBareMetadataJSON(t *testing.T, shortID string, citizen ...string) map[string]interface{} {
 	t.Helper()
 	task := h.taskGet(shortID)
-	taskDefID, _ := task["task_def_id"].(string)
-	instanceKey, _ := task["instance_key"].(string)
-	runSeq := int(task["run_seq"].(float64))
 	projectID := int64(task["project_id"].(float64))
 
-	dir := mcpgit.ResultDir(runSeq, instanceKey, taskDefID)
+	dir, _ := task["result_dir"].(string)
 	if len(citizen) > 0 && citizen[0] != "" {
 		dir = filepath.Join(dir, "citizen-"+citizen[0])
 	}

@@ -59,15 +59,14 @@ func ValidateArtifactPath(p string) error {
 	// Block reserved directories — artifacts live at natural repo
 	// paths so we must prevent writing into Enju's own state dirs
 	// or git internals.
-	if strings.HasPrefix(p, ".enju/") || strings.HasPrefix(p, ".enju\\") {
-		return fmt.Errorf("must not write into .enju/ (reserved for Enju state)")
+	if p == ResultDirRoot || strings.HasPrefix(p, ResultDirRoot+"/") || strings.HasPrefix(p, ResultDirRoot+`\`) {
+		return fmt.Errorf("must not write into %s/ (reserved for Enju state)", ResultDirRoot)
 	}
 	if strings.HasPrefix(p, ".git/") || strings.HasPrefix(p, ".git\\") || p == ".git" {
 		return fmt.Errorf("must not write into .git/")
 	}
-	if strings.HasPrefix(p, "enju_templates/") || strings.HasPrefix(p, "enju_templates\\") {
-		return fmt.Errorf("must not write into enju_templates/ (reserved for templates)")
-	}
+	// enju/templates/ is covered by the ResultDirRoot check above;
+	// no separate guard needed now that templates live under enju/.
 	return nil
 }
 

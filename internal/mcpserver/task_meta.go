@@ -87,10 +87,10 @@ type taskMeta struct {
 	ReadsArtifacts []string
 	// RunSourcePath mirrors the parent run's source_path —
 	// the template bundle directory that was snapshotted into
-	// `.enju/runs/{run_seq}/template/` at create_run time.
+	// `enju/runs/{run_seq}/template/` at create_run time.
 	// Empty for inline-YAML runs. The compute executor uses
 	// this to resolve `script:` from the snapshot instead of
-	// the live enju_templates/ path, so a template edit after
+	// the live enju/templates/ path, so a template edit after
 	// the run was created can't change its behavior.
 	RunSourcePath string
 	// RunParams is the submitted run-level params map (after
@@ -128,6 +128,14 @@ type taskMeta struct {
 	// host). Threaded verbatim into the compute.Spec so the
 	// wrapper can pick the container vs direct-exec branch.
 	Container string
+	// ResultDir is the pre-computed repo-relative path for
+	// this task's result files (e.g. enju/runs/3/align or
+	// enju/runs/3/align/sample=S1). The server computes it
+	// from the task's instance params via
+	// engine.ComputeResultDir; clients consume it as-is
+	// rather than rebuilding it from (runSeq, instanceKey,
+	// taskDefID).
+	ResultDir string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -208,10 +216,10 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	// run_source_path is populated when the parent run was
 	// instantiated from a template bundle (the template-bundle
-	// feature snapshots the bundle into .enju/runs/{seq}/template/
+	// feature snapshots the bundle into enju/runs/{seq}/template-snapshot/
 	// at create_run time). The compute executor uses it to
 	// resolve the script from that snapshot instead of the
-	// live enju_templates/ path, which gives each run a frozen
+	// live enju/templates/ path, which gives each run a frozen
 	// recipe that's immune to later edits.
 	if v, ok := raw["run_source_path"].(string); ok {
 		meta.RunSourcePath = v
@@ -241,6 +249,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["container"].(string); ok {
 		meta.Container = v
+	}
+	if v, ok := raw["result_dir"].(string); ok {
+		meta.ResultDir = v
 	}
 	return meta, nil
 }

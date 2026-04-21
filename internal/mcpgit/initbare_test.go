@@ -10,7 +10,7 @@ import (
 )
 
 // TestInitBareWithSeedScaffoldsTemplatesDir verifies that a
-// freshly-initialized bare repo carries enju_templates/.gitkeep in
+// freshly-initialized bare repo carries enju/templates/.gitkeep in
 // its initial commit. Without this scaffolding, a new project's
 // enju_list_templates call returns empty immediately after
 // create_project — a confusing "looks broken" experience for
@@ -37,11 +37,11 @@ func TestInitBareWithSeedScaffoldsTemplatesDir(t *testing.T) {
 		t.Errorf("README.md missing from initial commit: %v", err)
 	}
 
-	// enju_templates/.gitkeep — the new scaffolding this test
+	// enju/templates/.gitkeep — the new scaffolding this test
 	// locks in. Presence signals that enju_list_templates will
 	// find a directory to scan (empty is a valid result; the
 	// tool should never fail because the dir doesn't exist).
-	if _, err := os.Stat(filepath.Join(cloneDir, "enju_templates", ".gitkeep")); err != nil {
-		t.Errorf("enju_templates/.gitkeep missing from initial commit: %v", err)
+	if _, err := os.Stat(filepath.Join(cloneDir, "enju", "templates", ".gitkeep")); err != nil {
+		t.Errorf("enju/templates/.gitkeep missing from initial commit: %v", err)
 	}
 }

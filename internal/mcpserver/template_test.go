@@ -64,7 +64,7 @@ func TestHandleListTemplatesWithoutWorkspace(t *testing.T) {
 
 func TestHandleDescribeTemplateMissingProjectID(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleDescribeTemplate, map[string]any{"path": "enju_templates/x.yaml"})
+	res, err := callTool(c.handleDescribeTemplate, map[string]any{"path": "enju/templates/x.yaml"})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)
 	}
@@ -90,8 +90,8 @@ func TestHandleDescribeTemplateMissingPath(t *testing.T) {
 		t.Errorf("expected path-required error, got %q", msg)
 	}
 	// The hint that points the LLM at the right directory.
-	if !strings.Contains(msg, "enju_templates/") {
-		t.Errorf("expected path error to include enju_templates/ hint, got %q", msg)
+	if !strings.Contains(msg, "enju/templates/") {
+		t.Errorf("expected path error to include enju/templates/ hint, got %q", msg)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestHandleDescribeTemplateWithoutWorkspace(t *testing.T) {
 	c := newClientNoWorkspace()
 	res, err := callTool(c.handleDescribeTemplate, map[string]any{
 		"project_id": float64(1),
-		"path":       "enju_templates/x.yaml",
+		"path":       "enju/templates/x.yaml",
 	})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)

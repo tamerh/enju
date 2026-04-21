@@ -58,12 +58,14 @@ func (e *Engine) ValidateSubmitRequest(
 		}
 	}
 
-	// Result path verification.
-	expectedResultPath := fmt.Sprintf(".enju/runs/%d", run.Seq)
-	if task.InstanceKey != "" {
-		expectedResultPath += "/" + task.InstanceKey
-	}
-	expectedResultPath += "/" + task.TaskDefID
+	// Result path verification against the canonical layout
+	// (see engine.ComputeResultDir). The pre-launch layout
+	// change inverted from enju/runs/{seq}/{instanceKey}/{defID}/
+	// to enju/runs/{seq}/{defID}/{var}={value}/ so client
+	// submissions must now match the new shape. Multi-citizen
+	// tasks still nest per-citizen subdirs under the task's
+	// base result dir.
+	expectedResultPath := ComputeResultDir(task)
 	if req.ResultPath != "" && req.ResultPath != expectedResultPath {
 		allowedCitizenSubdir := false
 		if task.Citizens > 1 && strings.HasPrefix(req.ResultPath, expectedResultPath+"/citizen-") {

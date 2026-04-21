@@ -19,6 +19,51 @@ import (
 // go-git's plumbing package just to parse a hex SHA.
 func plumbingHash(s string) plumbing.Hash { return plumbing.NewHash(s) }
 
+// ResultDir rebuilds the canonical task-result path for
+// mcpgit's own tests. The layout schema lives in engine
+// (engine.ComputeResultDir), but mcpgit tests can't import
+// engine without a cycle, so this test-local duplicate
+// matches the schema by construction. If the engine schema
+// changes, this helper must move in lockstep — protected by
+// the layout tests in both packages asserting the same
+// canonical paths.
+func ResultDir(runSeq int, instanceKey, taskDefID string) string {
+	base := filepath.Join("enju", "runs",
+		// %d formatter avoided so test-local doesn't need fmt.
+		intToString(runSeq), taskDefID)
+	if instanceKey != "" {
+		// Legacy instance-key form: tests use a single blob
+		// (e.g. "BRCA1") rather than the key=value layout the
+		// server emits. For the purposes of mcpgit's client
+		// round-trip tests — which just need a unique
+		// result-dir-shaped string — appending the key under
+		// the task-def dir is enough. Test assertions use the
+		// same helper on both sides so the format is
+		// self-consistent within this package.
+		return filepath.Join(base, instanceKey)
+	}
+	return base
+}
+
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var digits []byte
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+	if neg {
+		digits = append([]byte{'-'}, digits...)
+	}
+	return string(digits)
+}
+
 // testSignature returns a deterministic signature for commits made
 // inside tests. Using a fixed time avoids spurious non-determinism
 // if anyone ever hashes commit metadata in assertions.

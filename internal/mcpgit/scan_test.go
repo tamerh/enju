@@ -529,7 +529,7 @@ func TestSubmitTaskResultAutoAdvancesCursor(t *testing.T) {
 		Username: "alice",
 		Branch:   "main",
 		Files: []FileWrite{
-			{RepoRelPath: ".enju/runs/1/auto/result.md", Content: []byte("ok")},
+			{RepoRelPath: "enju/runs/1/auto/result.md", Content: []byte("ok")},
 		},
 		Trailers:  EnjuTrailers{TaskID: "1:1:auto", ExitCode: 0, ExitSet: true},
 		ProjectID: projectID,
@@ -571,7 +571,7 @@ func TestSubmitTaskResultSkipsCursorAdvanceWithoutConfig(t *testing.T) {
 		Username: "alice",
 		Branch:   "main",
 		Files: []FileWrite{
-			{RepoRelPath: ".enju/runs/1/nocursor/result.md", Content: []byte("x")},
+			{RepoRelPath: "enju/runs/1/nocursor/result.md", Content: []byte("x")},
 		},
 		Trailers: EnjuTrailers{TaskID: "1:1:nocursor"},
 		// Deliberately NOT setting ProjectID / StateDir.

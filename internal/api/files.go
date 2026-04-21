@@ -43,11 +43,8 @@ func validateArtifactPath(p string) error {
 	if cleaned == ".git" || strings.HasPrefix(cleaned, ".git/") {
 		return fmt.Errorf(".git is reserved")
 	}
-	if cleaned == ".enju" || strings.HasPrefix(cleaned, ".enju/") {
-		return fmt.Errorf(".enju is reserved for Enju state")
-	}
-	if strings.HasPrefix(cleaned, "enju_templates/") {
-		return fmt.Errorf("enju_templates is reserved for templates")
+	if cleaned == "enju" || strings.HasPrefix(cleaned, "enju/") {
+		return fmt.Errorf("enju is reserved for Enju state")
 	}
 	return nil
 }

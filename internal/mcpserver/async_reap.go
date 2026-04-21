@@ -34,7 +34,7 @@ import (
 	"github.com/enju-ai/enju/internal/mcpgit"
 )
 
-// reapWrapperFailures walks the project's .enju/runs tree
+// reapWrapperFailures walks the project's enju/runs tree
 // looking for detached-wrapper result files whose recorded exit
 // is non-zero. For each, posts /tasks/:id/fail and moves the
 // result file aside so we don't re-notify. Silent on failures —
@@ -43,14 +43,14 @@ import (
 //
 // Called from reconcile hook points; cost is one directory
 // walk bounded by the number of runs × instances in the
-// project's .enju/runs tree. Empty or sync-only projects
+// project's enju/runs tree. Empty or sync-only projects
 // terminate quickly because most directories hold no
 // .wrap-result.json file.
 func (c *apiClient) reapWrapperFailures(ctx context.Context, proj *mcpgit.Project, projectID int64) {
 	if proj == nil {
 		return
 	}
-	root := filepath.Join(proj.WorkDir(), ".enju", "runs")
+	root := filepath.Join(proj.WorkDir(), "enju", "runs")
 	if _, err := os.Stat(root); os.IsNotExist(err) {
 		return
 	}

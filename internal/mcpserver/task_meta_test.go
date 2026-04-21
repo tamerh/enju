@@ -38,7 +38,7 @@ func TestFetchTaskMetaFullPayload(t *testing.T) {
 		"citizens": 2,
 		"script": "scripts/run.sh",
 		"writes_artifacts": ["out/a.md", "out/b.md"],
-		"run_source_path": "enju_templates/demo",
+		"run_source_path": "enju/templates/demo",
 		"run_params": {"k": "v"},
 		"instance_params_map": {"stem": "alpha"},
 		"run_branch": "feature-x",
@@ -83,7 +83,7 @@ func TestFetchTaskMetaFullPayload(t *testing.T) {
 			t.Errorf("legacy []string entry %d should default Track=true, got %+v", i, e)
 		}
 	}
-	if meta.RunSourcePath != "enju_templates/demo" {
+	if meta.RunSourcePath != "enju/templates/demo" {
 		t.Fatalf("run_source_path wrong: %q", meta.RunSourcePath)
 	}
 	if meta.Branch != "feature-x" {

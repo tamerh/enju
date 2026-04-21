@@ -759,7 +759,13 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 	// base result directory so parallel submitters don't race
 	// on the same result.md. Session-1 single-citizen tasks
 	// keep the flat layout.
-	baseResultDir := mcpgit.ResultDir(runSeq, instanceKey, taskDefID)
+	// Server-computed result_dir on the task response is the
+	// canonical layout — use it directly rather than
+	// duplicating the layout rule in test code.
+	baseResultDir, _ := task["result_dir"].(string)
+	_ = runSeq
+	_ = instanceKey
+	_ = taskDefID
 	resultDir := baseResultDir
 	citizens := int64(1)
 	if v, ok := task["citizens"].(float64); ok {
@@ -1214,7 +1220,6 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 		s.t.Fatalf("assertResultFile: bad runID %q (want projectID:runSeq)", runID)
 	}
 	projectIDInt, _ := strconv.ParseInt(parts[0], 10, 64)
-	runSeq := parts[1]
 
 	remoteURL := s.remoteFor(projectIDInt)
 	if remoteURL == "" {
@@ -1229,12 +1234,19 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 		s.t.Fatalf("clone bare: %v", err)
 	}
 
-	dir := filepath.Join(cloneDir, ".enju", "runs", runSeq)
+	// Ask the coordinator for the task's result_dir rather than
+	// rebuilding the layout rule here — the schema lives in
+	// engine.ComputeResultDir.
+	shortID := taskDefID
 	if instanceKey != "" {
-		dir = filepath.Join(dir, instanceKey, taskDefID)
-	} else {
-		dir = filepath.Join(dir, taskDefID)
+		shortID = instanceKey + ":" + taskDefID
 	}
+	task := s.taskGet(shortID)
+	relDir, _ := task["result_dir"].(string)
+	if relDir == "" {
+		s.t.Fatalf("assertResultFile: task %s has no result_dir", shortID)
+	}
+	dir := filepath.Join(cloneDir, relDir)
 
 	resultPath := filepath.Join(dir, "result.md")
 	data, err := os.ReadFile(resultPath)
@@ -1877,7 +1889,7 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 	for _, bad := range malformed {
 		t.Run(bad, func(t *testing.T) {
 			resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-				"result_path": ".enju/runs/1/task_a",
+				"result_path": "enju/runs/1/task_a",
 				"commit_sha":  bad,
 				"content":     "data",
 				"username":    alice,
@@ -1894,7 +1906,7 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 	// stays). Any 40-hex string passes the shape check.
 	valid := "0123456789abcdef0123456789abcdef01234567"
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": ".enju/runs/1/task_a",
+		"result_path": "enju/runs/1/task_a",
 		"commit_sha":  valid,
 		"content":     "data",
 		"username":    alice,
@@ -1923,7 +1935,7 @@ func TestReviewCommitShaOptional(t *testing.T) {
 	s.claim("check", bob)
 	fullID := s.taskID("check")
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": ".enju/runs/1/check",
+		"result_path": "enju/runs/1/check",
 		"commit_sha":  "",
 		"decision":    "approve",
 		"username":    "bob",

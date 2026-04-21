@@ -48,7 +48,7 @@ type Spec struct {
 	// Project.SubmitTaskResult, which handles checkout + push.
 	Branch string `json:"branch"`
 
-	// Repo-relative result directory (e.g. ".enju/runs/3/foo").
+	// Repo-relative result directory (e.g. "enju/runs/3/foo").
 	// The handler already wrote context.json here before spawn;
 	// the wrapper reads it back to include in the final commit.
 	ResultDir string `json:"result_dir"`

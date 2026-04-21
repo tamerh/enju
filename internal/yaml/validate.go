@@ -90,7 +90,7 @@ func validate(p *Run) ([]string, error) {
 // `depends_on`. Since compute scripts run opaquely (Enju can't
 // inspect what the script actually reads), a task with zero
 // declared deps whose script secretly reads another task's
-// private `.enju/runs/...` output produces a dep-less DAG.
+// private `enju/runs/...` output produces a dep-less DAG.
 // The scheduler then marks producer and consumer ready in
 // parallel, and whichever claimant hits the consumer first
 // fails mid-script with a file-not-found that looks unrelated

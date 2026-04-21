@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/enju-ai/enju/internal/engine"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -59,31 +60,36 @@ func InitBareWithSeed(bareDir string) error {
 		return fmt.Errorf("create remote: %w", err)
 	}
 
-	// Write a README and seed the enju_templates/ dir with a
+	// Write a README and seed the default templates/ dir with a
 	// .gitkeep so a fresh project clone has the same layout
 	// enju_init produces for adopted folders. Without this,
 	// enju_list_templates returns empty until the first
-	// manual commit under enju_templates/, which is a
+	// manual commit under enju/templates/, which is a
 	// confusing "looks like the tool is broken" surprise.
 	readme := filepath.Join(tmpDir, "README.md")
 	readmeBody := "# Enju project\n\n" +
-		"Task results live under `.enju/runs/`.\n\n" +
-		"Templates live under `enju_templates/`, one directory per template:\n\n" +
+		"Everything Enju-owned lives under `enju/`:\n\n" +
 		"```\n" +
-		"enju_templates/\n" +
-		"  my-template/\n" +
-		"    template.yaml   # run definition (required)\n" +
-		"    scripts/        # bundled scripts referenced by compute tasks\n" +
-		"    README.md       # author-facing docs (optional)\n" +
-		"```\n"
+		"enju/\n" +
+		"  templates/              # reusable run recipes (edit these)\n" +
+		"    my-template/\n" +
+		"      enju.yaml           # run definition (required)\n" +
+		"      scripts/            # bundled scripts for compute tasks\n" +
+		"      README.md           # author-facing docs (optional)\n" +
+		"  runs/                   # per-run results + audit trail (tool output)\n" +
+		"  conf.yaml               # optional project config\n" +
+		"```\n\n" +
+		"Override the templates location by creating `enju/conf.yaml` with a\n" +
+		"`templates:` list of repo-relative paths.\n"
 	if err := os.WriteFile(readme, []byte(readmeBody), 0644); err != nil {
 		return fmt.Errorf("write readme: %w", err)
 	}
-	templatesDir := filepath.Join(tmpDir, "enju_templates")
+	templatesDir := filepath.Join(tmpDir, engine.DefaultTemplatesDir)
 	if err := os.MkdirAll(templatesDir, 0755); err != nil {
 		return fmt.Errorf("create templates dir: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), []byte(""), 0644); err != nil {
+	gitkeepRel := filepath.ToSlash(filepath.Join(engine.DefaultTemplatesDir, ".gitkeep"))
+	if err := os.WriteFile(filepath.Join(tmpDir, gitkeepRel), []byte(""), 0644); err != nil {
 		return fmt.Errorf("write .gitkeep: %w", err)
 	}
 	wt, err := repo.Worktree()
@@ -93,7 +99,7 @@ func InitBareWithSeed(bareDir string) error {
 	if _, err := wt.Add("README.md"); err != nil {
 		return fmt.Errorf("add README: %w", err)
 	}
-	if _, err := wt.Add("enju_templates/.gitkeep"); err != nil {
+	if _, err := wt.Add(gitkeepRel); err != nil {
 		return fmt.Errorf("add .gitkeep: %w", err)
 	}
 	sig := &object.Signature{

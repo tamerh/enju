@@ -2,10 +2,10 @@ package mcpgit
 
 // CheckoutBranch's interaction with untracked worktree files.
 // The code comment on CheckoutBranch claims "Untracked files
-// that the user authored (e.g. a template.yaml pending
+// that the user authored (e.g. a enju.yaml pending
 // auto-commit) are preserved by go-git's checkout regardless
 // of Force." A tester reported an untracked
-// enju_templates/async-b/ directory vanished after
+// enju/templates/async-b/ directory vanished after
 // enju_create_run — if the claim is wrong, the fix is either
 // to drop Force:true on new-branch checkouts, or to stash /
 // restore untracked files around the checkout.
@@ -41,13 +41,13 @@ func TestCheckoutBranchPreservesUntrackedFiles(t *testing.T) {
 
 	// User authors an untracked template on main. This is
 	// the tester's exact scenario — a directory under
-	// enju_templates/ that hasn't been git-added yet.
+	// enju/templates/ that hasn't been git-added yet.
 	workDir := proj.WorkDir()
-	untrackedDir := filepath.Join(workDir, "enju_templates", "async-b")
+	untrackedDir := filepath.Join(workDir, "enju", "templates", "async-b")
 	if err := os.MkdirAll(untrackedDir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	untrackedFile := filepath.Join(untrackedDir, "template.yaml")
+	untrackedFile := filepath.Join(untrackedDir, "enju.yaml")
 	if err := os.WriteFile(untrackedFile, []byte("name: async-b\n"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestCheckoutBranchPreservesUntrackedFiles(t *testing.T) {
 
 	// The untracked file MUST still exist on disk.
 	if _, err := os.Stat(untrackedFile); err != nil {
-		t.Fatalf("untracked template.yaml was clobbered after CheckoutBranch: %v", err)
+		t.Fatalf("untracked enju.yaml was clobbered after CheckoutBranch: %v", err)
 	}
 }
 
@@ -242,17 +242,17 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 	// Simulate create_run(bundle-a, branch=run-a):
 	//   1. EnsureBundleOnDefault commits bundle-a to main.
 	//   2. CheckoutBranch(run-a) forks from main-with-bundle-a.
-	//   3. Snapshot commit on run-a with .enju/runs/1/template/
+	//   3. Snapshot commit on run-a with enju/runs/1/template-snapshot/
 	workDir := proj.WorkDir()
 	// Author bundle-a files untracked on main first.
-	if err := os.MkdirAll(filepath.Join(workDir, "enju_templates/bundle-a"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(workDir, "enju/templates/bundle-a"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workDir, "enju_templates/bundle-a/template.yaml"), []byte("name: a\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(workDir, "enju/templates/bundle-a/enju.yaml"), []byte("name: a\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	proj.Lock()
-	if _, err := proj.EnsureBundleOnDefault("enju_templates/bundle-a", "t", "t@x", ""); err != nil {
+	if _, err := proj.EnsureBundleOnDefault("enju/templates/bundle-a", "t", "t@x", ""); err != nil {
 		proj.Unlock()
 		t.Fatalf("ensure a: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 		t.Fatal(err)
 	}
 	// Snapshot commit on run-a.
-	snapFiles, err := proj.ReadBundleFiles("enju_templates/bundle-a", ".enju/runs/1/template")
+	snapFiles, err := proj.ReadBundleFiles("enju/templates/bundle-a", "enju/runs/1/template")
 	if err != nil {
 		proj.Unlock()
 		t.Fatalf("read bundle a: %v", err)
@@ -280,14 +280,14 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 	proj.Unlock()
 
 	// Second create_run on a different template.
-	if err := os.MkdirAll(filepath.Join(workDir, "enju_templates/bundle-b"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(workDir, "enju/templates/bundle-b"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workDir, "enju_templates/bundle-b/template.yaml"), []byte("name: b\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(workDir, "enju/templates/bundle-b/enju.yaml"), []byte("name: b\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	proj.Lock()
-	if _, err := proj.EnsureBundleOnDefault("enju_templates/bundle-b", "t", "t@x", ""); err != nil {
+	if _, err := proj.EnsureBundleOnDefault("enju/templates/bundle-b", "t", "t@x", ""); err != nil {
 		proj.Unlock()
 		t.Fatalf("ensure b: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 		proj.Unlock()
 		t.Fatal(err)
 	}
-	snapFilesB, err := proj.ReadBundleFiles("enju_templates/bundle-b", ".enju/runs/2/template")
+	snapFilesB, err := proj.ReadBundleFiles("enju/templates/bundle-b", "enju/runs/2/template")
 	if err != nil {
 		proj.Unlock()
 		t.Fatalf("read bundle b: %v", err)
@@ -322,8 +322,8 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 	}
 	proj.Unlock()
 
-	// Positive: bundle-a and bundle-b template.yaml are on main.
-	for _, path := range []string{"enju_templates/bundle-a/template.yaml", "enju_templates/bundle-b/template.yaml"} {
+	// Positive: bundle-a and bundle-b enju.yaml are on main.
+	for _, path := range []string{"enju/templates/bundle-a/enju.yaml", "enju/templates/bundle-b/enju.yaml"} {
 		if _, err := os.Stat(filepath.Join(workDir, path)); err != nil {
 			t.Errorf("main missing expected template %s: %v", path, err)
 		}
@@ -331,8 +331,8 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 	// Negative: run-a and run-b snapshots are NOT on main's worktree.
 	// These files are only committed on run-a / run-b branches.
 	for _, path := range []string{
-		".enju/runs/1/template/template.yaml",
-		".enju/runs/2/template/template.yaml",
+		"enju/runs/1/template-snapshot/enju.yaml",
+		"enju/runs/2/template-snapshot/enju.yaml",
 	} {
 		if _, err := os.Stat(filepath.Join(workDir, path)); err == nil {
 			t.Errorf("main worktree polluted with run-branch snapshot: %s", path)
@@ -342,7 +342,7 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 
 // TestCheckoutBranchPreservesUntrackedRoot exercises an
 // untracked file at the workspace root (not nested under
-// enju_templates/), in case gogit's Force behaviour differs
+// enju/templates/), in case gogit's Force behaviour differs
 // by path depth or match against tracked paths.
 func TestCheckoutBranchPreservesUntrackedRoot(t *testing.T) {
 	bare := initBareRemote(t)

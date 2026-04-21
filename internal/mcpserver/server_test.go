@@ -624,8 +624,8 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	}
 
 	// Scaffold should exist.
-	if _, err := os.Stat(filepath.Join(dir, "enju_templates", ".gitkeep")); err != nil {
-		t.Error("expected enju_templates/.gitkeep after init")
+	if _, err := os.Stat(filepath.Join(dir, "enju", "templates", ".gitkeep")); err != nil {
+		t.Error("expected enju/templates/.gitkeep after init")
 	}
 
 	// Original file preserved.
@@ -711,8 +711,8 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 	}
 
 	// Scaffold added.
-	if _, err := os.Stat(filepath.Join(dir, "enju_templates", ".gitkeep")); err != nil {
-		t.Error("expected enju_templates after init on existing git repo")
+	if _, err := os.Stat(filepath.Join(dir, "enju", "templates", ".gitkeep")); err != nil {
+		t.Error("expected enju/templates/.gitkeep after init on existing git repo")
 	}
 }
 

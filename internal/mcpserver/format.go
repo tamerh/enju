@@ -2582,7 +2582,7 @@ func formatListTemplates(data []byte) string {
 	}
 	templates, _ := resp["templates"].([]interface{})
 	if len(templates) == 0 {
-		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under enju_templates/*.yaml in the project git repo. To add one, commit a YAML file to enju_templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into enju_templates/."
+		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under enju/templates/*.yaml in the project git repo. To add one, commit a YAML file to enju/templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into enju/templates/."
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("── Templates (%d) — enju_list_templates ──\n", len(templates)))

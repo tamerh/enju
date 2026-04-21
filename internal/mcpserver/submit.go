@@ -233,7 +233,12 @@ func (c *apiClient) submitResultFatClient(
 	// citizen tasks keep the flat `runs/{seq}/{task}/` layout.
 	// The task's declared citizens count is stored on the DB
 	// row and surfaced via taskMeta.Citizens.
-	baseResultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	// ResultDir arrives pre-computed on taskMeta (server-side
+	// schema; see engine.ComputeResultDir). Multi-citizen tasks
+	// still nest per-citizen subdirs under it for submission
+	// isolation — that's a sync-layer concern, not a layout
+	// schema concern.
+	baseResultDir := meta.ResultDir
 	resultDir := baseResultDir
 	if meta.Citizens > 1 {
 		resultDir = filepath.Join(baseResultDir, "citizen-"+c.username)

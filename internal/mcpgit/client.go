@@ -2084,32 +2084,27 @@ func aiCoAuthor(modelName string) string {
 
 // --- standard path helpers ---
 //
-// Enju state lives under `.enju/` in the workspace clone so it
+// Enju state lives under `enju/` in the workspace clone so it
 // coexists cleanly with existing repo content. Artifacts live
 // at their natural paths (no prefix). Templates live under
-// `enju_templates/`.
+// `enju/templates/`.
 
-// ResultDir returns the repo-relative directory for a task's result
-// files. Layout:
-//
-//	.enju/runs/{runSeq}/{taskDefID}/                 (no for_each)
-//	.enju/runs/{runSeq}/{instanceKey}/{taskDefID}/   (with for_each)
-//
-// Hidden under .enju/ so Enju can be added to existing repos
-// without polluting the root directory.
-func ResultDir(runSeq int, instanceKey, taskDefID string) string {
-	base := filepath.Join(".enju", "runs", fmt.Sprintf("%d", runSeq))
-	if instanceKey != "" {
-		return filepath.Join(base, instanceKey, taskDefID)
-	}
-	return filepath.Join(base, taskDefID)
-}
+// ResultDir lived here historically and built the task's
+// repo-relative result path from (runSeq, instanceKey,
+// taskDefID). It's been deleted pre-launch because the layout
+// schema moved coordinator-side into engine.ComputeResultDir:
+// the server now stamps the full path onto every task
+// response's result_dir field, and clients consume it as-is.
+// Keeping the rule in one place was the whole point of the
+// layout overhaul (visible enju/ root + task-first +
+// key=value segments) — see docs/storage.md for the new
+// shape.
 
 // ArtifactPath returns the repo-relative path for a user-facing
 // artifact. Artifacts live at their natural path in the repo root
 // (no prefix), so `writes_artifacts: [figures/fig1.png]` writes
 // directly to `figures/fig1.png`. Validation (no ../, no .git/,
-// no .enju/) is the caller's responsibility.
+// no enju/) is the caller's responsibility.
 func ArtifactPath(userPath string) string {
 	return userPath
 }

@@ -174,7 +174,7 @@ func toolCreateRun() mcp.Tool {
 		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
 1. WRITE IT DIRECTLY: pass "yaml" with the full run definition — use this for one-off runs the user is authoring from scratch.
-2. FROM A SAVED TEMPLATE: pass "path" pointing at a bundle dir (enju_templates/<name>) or its template.yaml manifest. At create_run, the bundle is snapshotted into .enju/runs/{seq}/template/ and the run is pinned to that frozen copy — later edits to the live template don't affect this run. Script paths resolve from the snapshot. Supply "params" with the values the template declares; see enju_list_templates.
+2. FROM A SAVED TEMPLATE: pass "path" pointing at a bundle dir (enju/templates/<name>) or its enju.yaml manifest. At create_run, the bundle is snapshotted into enju/runs/{seq}/template-snapshot/ and the run is pinned to that frozen copy — later edits to the live template don't affect this run. Script paths resolve from the snapshot. Supply "params" with the values the template declares; see enju_list_templates.
 3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a template file first.
 
 YAML format (same for inline and template files):
@@ -202,7 +202,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),
 		),
 		mcp.WithString("path",
-			mcp.Description("Template bundle reference. Accepts either the bundle dir ('enju_templates/gwas-analysis') or its manifest ('enju_templates/gwas-analysis/template.yaml'). The bundle is snapshotted into the run's .enju/runs/{seq}/template/ for reproducibility. Mutually exclusive with 'yaml'."),
+			mcp.Description("Template bundle reference. Accepts either the bundle dir ('enju/templates/gwas-analysis') or its manifest ('enju/templates/gwas-analysis/enju.yaml'). The bundle is snapshotted into the run's enju/runs/{seq}/template-snapshot/ for reproducibility. Mutually exclusive with 'yaml'."),
 		),
 		mcp.WithObject("params",
 			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_template to see what a template expects."),
@@ -212,14 +212,14 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The project ID to create this run in (use enju_list_projects to see existing projects)"),
 		),
 		mcp.WithString("branch",
-			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name — for template runs this is "<bundle>-1", "<bundle>-2", ... (e.g. path="enju_templates/gene-mapping" → "gene-mapping-1"); for inline YAML it falls back to "run-1", "run-2", .... Useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
+			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name — for template runs this is "<bundle>-1", "<bundle>-2", ... (e.g. path="enju/templates/gene-mapping" → "gene-mapping-1"); for inline YAML it falls back to "run-1", "run-2", .... Useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
 		),
 	)
 }
 
 // toolListTemplates is the LLM's template-discovery entry
 // point. Returns every YAML file under the project clone's
-// enju_templates/ directory with its name, description, and
+// enju/templates/ directory with its name, description, and
 // parameter summary so the LLM can pick a recipe that fits
 // the user's request without reading each file.
 func toolFailTask() mcp.Tool {
@@ -267,14 +267,14 @@ Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 
 // toolExportRunEvents materializes a run's event timeline
 // (claims, submits, invalidations, tally resolutions) as a
-// JSONL file under .enju/runs/{seq}/events/. The authoritative
+// JSONL file under enju/runs/{seq}/events/. The authoritative
 // data lives in the coordinator's contribution_events +
 // task_claims; this tool just snapshots it into git so the
 // run's directory becomes self-documenting for audits /
 // postmortems / preprint figures.
 func toolExportRunEvents() mcp.Tool {
 	return mcp.NewTool("enju_export_run_events",
-		mcp.WithDescription(`Snapshot a run's event timeline (claims, submits, invalidations, tally resolutions) to a git-tracked JSONL file under .enju/runs/{seq}/events/{phase}.jsonl.
+		mcp.WithDescription(`Snapshot a run's event timeline (claims, submits, invalidations, tally resolutions) to a git-tracked JSONL file under enju/runs/{seq}/events/{phase}.jsonl.
 
 Events live authoritatively in the coordinator DB. This tool is an on-demand materialization — call it when you want the timeline preserved in git (postmortem, preprint figure, shareable audit).
 
@@ -295,14 +295,14 @@ Phase is a free-form label: 'final' on completion, 'checkpoint' mid-run, or any 
 }
 
 // toolExportDiagram snapshots a run's DAG as raw Mermaid
-// source to a git-tracked file under .enju/runs/{seq}/graph/.
+// source to a git-tracked file under enju/runs/{seq}/graph/.
 // See handleExportDiagram for the semantics (idempotent same-
 // phase overwrite, no-op on unchanged content, response shape).
 func toolExportDiagram() mcp.Tool {
 	return mcp.NewTool("enju_export_diagram",
 		mcp.WithDescription(`Snapshot the run's DAG to a git-tracked Mermaid file for archival, preprint figures, or README embedding.
 
-Writes raw .mmd source (no markdown fences) to .enju/runs/{seq}/graph/{phase}.mmd and commits it. Common phase values:
+Writes raw .mmd source (no markdown fences) to enju/runs/{seq}/graph/{phase}.mmd and commits it. Common phase values:
 - "initial"  — capture right after enju_create_run; topology only, before any task runs
 - "final"    — capture once the run completes; fully resolved (winning branches, rejected tasks, expanded for_each)
 - <custom>   — any meaningful mid-run label (e.g. "post_vote_stack_choice", "after_reject_v2"); pick names that tell a story
@@ -343,18 +343,18 @@ func toolListTemplates() mcp.Tool {
 	return mcp.NewTool("enju_list_templates",
 		mcp.WithDescription(`List reusable run recipes (templates) in a project. Use before hand-writing YAML — a template usually matches a user's request.
 
-A template is a directory bundle under enju_templates/ with template.yaml at its root and any supporting scripts/data bundled alongside:
-  enju_templates/
+A template is a directory bundle under enju/templates/ with enju.yaml at its root and any supporting scripts/data bundled alongside:
+  enju/templates/
     gwas-analysis/
-      template.yaml        # the manifest
+      enju.yaml        # the manifest
       scripts/analyze.py   # bundled, picked up by the snapshot
 
-Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Loose .yaml files directly under enju_templates/ are the legacy single-file shape — they surface with a migration hint in the listing, not a usable template.
+Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Loose .yaml files directly under enju/templates/ are the legacy single-file shape — they surface with a migration hint in the listing, not a usable template.
 
 Call enju_describe_template for a template's parameters; enju_create_run with path=<bundle> to instantiate.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The project whose enju_templates/ directory to scan"),
+			mcp.Description("The project whose enju/templates/ directory to scan"),
 		),
 	)
 }
@@ -372,7 +372,7 @@ func toolDescribeTemplate() mcp.Tool {
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description("Bundle reference — either the bundle dir ('enju_templates/gwas-analysis') or the full manifest path ('enju_templates/gwas-analysis/template.yaml'). Both resolve to the same bundle."),
+			mcp.Description("Bundle reference — either the bundle dir ('enju/templates/gwas-analysis') or the full manifest path ('enju/templates/gwas-analysis/enju.yaml'). Both resolve to the same bundle."),
 		),
 	)
 }
@@ -404,7 +404,7 @@ func toolCreateProject() mcp.Tool {
 
 func toolInit() mcp.Tool {
 	return mcp.NewTool("enju_init",
-		mcp.WithDescription(`Adopt an existing folder as an Enju project. Use this when the user already has a directory (with or without git) and wants to add Enju orchestration on top. Enju writes its scaffold (.enju/, enju_templates/) into the folder and respects all existing files. If the user wants to start fresh with nothing, use enju_create_project instead.`),
+		mcp.WithDescription(`Adopt an existing folder as an Enju project. Use this when the user already has a directory (with or without git) and wants to add Enju orchestration on top. Enju writes its scaffold (enju/, enju/templates/) into the folder and respects all existing files. If the user wants to start fresh with nothing, use enju_create_project instead.`),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Project name"),

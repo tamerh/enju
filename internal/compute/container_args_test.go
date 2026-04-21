@@ -46,12 +46,12 @@ func TestBuildContainerArgsHappyPath(t *testing.T) {
 
 	spec := Spec{
 		Container:  "biocontainers/samtools:1.18",
-		ScriptPath: "/host/workspaces/demo-1/.enju/runs/3/template/scripts/align.sh",
+		ScriptPath: "/host/workspaces/demo-1/enju/runs/3/template-snapshot/scripts/align.sh",
 	}
 	env := []string{
 		"ENJU_TASK_ID=1:3:align",
 		"ENJU_PROJECT_DIR=/host/workspaces/demo-1",
-		"ENJU_RUN_DIR=/host/workspaces/demo-1/.enju/runs/3/align",
+		"ENJU_RUN_DIR=/host/workspaces/demo-1/enju/runs/3/align",
 		"ENJU_PARAM_sample=alpha",
 	}
 	args, err := BuildContainerArgs(RuntimeDocker, spec, env, "/host/workspaces/demo-1", 1000, 1000)
@@ -84,7 +84,7 @@ func TestBuildContainerArgsHappyPath(t *testing.T) {
 	if !hasFlagValue(args, "-e", "ENJU_PROJECT_DIR=/workspace") {
 		t.Errorf("ENJU_PROJECT_DIR not translated: %v", args)
 	}
-	if !hasFlagValue(args, "-e", "ENJU_RUN_DIR=/workspace/.enju/runs/3/align") {
+	if !hasFlagValue(args, "-e", "ENJU_RUN_DIR=/workspace/enju/runs/3/align") {
 		t.Errorf("ENJU_RUN_DIR not translated: %v", args)
 	}
 
@@ -100,7 +100,7 @@ func TestBuildContainerArgsHappyPath(t *testing.T) {
 	// before the /bin/sh).
 	imgIdx := argIndex(args, "biocontainers/samtools:1.18")
 	shIdx := argIndex(args, "/bin/sh")
-	scriptIdx := argIndex(args, "/workspace/.enju/runs/3/template/scripts/align.sh")
+	scriptIdx := argIndex(args, "/workspace/enju/runs/3/template-snapshot/scripts/align.sh")
 	if imgIdx < 0 || shIdx < 0 || scriptIdx < 0 {
 		t.Fatalf("image/shell/script not all present: img=%d sh=%d script=%d\n%v", imgIdx, shIdx, scriptIdx, args)
 	}
@@ -215,7 +215,7 @@ func TestTranslatePathVariants(t *testing.T) {
 		{"exact match", "/host/ws", "/host/ws", "/workspace", true},
 		{"exact with trailing slash", "/host/ws/", "/host/ws", "/workspace", true},
 		{"subdir", "/host/ws/out/report.md", "/host/ws", "/workspace/out/report.md", true},
-		{"deep subdir", "/host/ws/.enju/runs/3/align", "/host/ws", "/workspace/.enju/runs/3/align", true},
+		{"deep subdir", "/host/ws/enju/runs/3/align", "/host/ws", "/workspace/enju/runs/3/align", true},
 		{"workdir with trailing slash", "/host/ws/out", "/host/ws/", "/workspace/out", true},
 		{"outside workspace", "/opt/tools/bwa", "/host/ws", "/opt/tools/bwa", false},
 		{"adjacent prefix not a match", "/host/ws-other/x", "/host/ws", "/host/ws-other/x", false},

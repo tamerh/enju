@@ -109,8 +109,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	if reviewFeedback != nil && meta != nil && c.workspace != nil {
 		remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
 		if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
-			resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
-			contentPath := filepath.Join(resultDir, "result.md")
+			contentPath := filepath.Join(meta.ResultDir, "result.md")
 			if content, rerr := proj.ReadFile(contentPath); rerr == nil && len(content) > 0 {
 				prev := map[string]string{"content": string(content)}
 				previousSubmission, _ = json.Marshal(prev)
@@ -165,13 +164,18 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 			continue
 		}
 		reviewID, _ := t["id"].(string)
-		taskDefID, _ := t["task_def_id"].(string)
-		instanceKey, _ := t["instance_key"].(string)
 		if reviewID == "" {
 			continue
 		}
-		// Try to read the review's metadata.json from the workspace.
-		reviewResultDir := mcpgit.ResultDir(meta.RunSeq, instanceKey, taskDefID)
+		// Read the review's result_dir directly from the
+		// peer task's response — the server pre-computes the
+		// path via engine.ComputeResultDir, so callers never
+		// need to reassemble it from (runSeq, instanceKey,
+		// taskDefID).
+		reviewResultDir, _ := t["result_dir"].(string)
+		if reviewResultDir == "" {
+			continue
+		}
 		metaPath := filepath.Join(reviewResultDir, "metadata.json")
 		metaBytes, merr := proj.ReadFile(metaPath)
 		if merr != nil {

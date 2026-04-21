@@ -200,7 +200,7 @@ func (s *Store) GetEventMetadataForTask(taskID, eventType string) (string, error
 
 // RunEventRecord is one line of a run's synthesized timeline.
 // The fields are chosen to be JSONL-friendly — each becomes
-// a key in the exported `.enju/runs/{seq}/events/{phase}.jsonl`
+// a key in the exported `enju/runs/{seq}/events/{phase}.jsonl`
 // file. Metadata is passed through as a raw JSON string so
 // the exporter can embed it without a double-decode round
 // trip.

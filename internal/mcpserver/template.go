@@ -1,7 +1,7 @@
 package mcpserver
 
 // Template-discovery handlers. enju_list_templates enumerates
-// enju_templates/*.yaml files in the project's local clone;
+// enju/templates/*.yaml files in the project's local clone;
 // enju_describe_template returns the full YAML + param schema
 // for a single template. Both are read-only client-side
 // operations — the coordinator doesn't know about templates
@@ -57,7 +57,7 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 	}
 	templatePath, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("path is required (e.g. 'enju_templates/gwas.yaml')"), nil
+		return mcp.NewToolResultError("path is required (e.g. 'enju/templates/gwas.yaml')"), nil
 	}
 	if c.workspace == nil {
 		return mcp.NewToolResultError("enju_describe_template requires a local workspace (MCP client mode)"), nil

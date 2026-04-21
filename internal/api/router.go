@@ -1096,7 +1096,7 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 // For branch="auto", the generated name uses `<slug>-N` where the
 // slug is derived from `sourcePath` (template bundle dir name —
 // recognizable to the caller, already git-safe since it's the
-// directory they authored under enju_templates/). Inline-YAML
+// directory they authored under enju/templates/). Inline-YAML
 // runs with no source_path fall back to "run-N".
 func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sourcePath string) (string, error) {
 	if requested == "" {
@@ -1135,7 +1135,7 @@ func (s *Server) resolveRunBranch(projectID int64, defaultBranch, requested, sou
 
 // autoBranchSlug picks a human-recognizable prefix for auto-allocated
 // branch names. Template-mode runs yield the bundle directory name
-// (e.g. sourcePath="enju_templates/gene-mapping" → "gene-mapping");
+// (e.g. sourcePath="enju/templates/gene-mapping" → "gene-mapping");
 // inline-YAML runs with no source path fall back to "run".
 //
 // Bundle dir names are already git-safe (lowercase, hyphenated) by
@@ -1530,7 +1530,7 @@ func (s *Server) handleGetRunCostSummary(w http.ResponseWriter, r *http.Request)
 // for one run — chronological JSON list built from
 // contribution_events + task_claims. Consumed by the fat-
 // client's enju_export_run_events tool which materializes
-// the list into `.enju/runs/{seq}/events/{phase}.jsonl`
+// the list into `enju/runs/{seq}/events/{phase}.jsonl`
 // on demand. Authoritative data stays in the coordinator DB;
 // git gets a snapshot only when the user asks for one.
 func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
@@ -1663,6 +1663,13 @@ type taskResponse struct {
 	TaskDefID       string   `json:"task_def_id"`
 	InstanceKey     string   `json:"instance_key,omitempty"`
 	IterationLabel  string   `json:"iteration_label,omitempty"` // "gene=BRCA1, tissue=breast" — human-readable for_each context
+	// ResultDir is the pre-computed repo-relative path for
+	// this task's result files. Layout is a coordinator-
+	// owned schema (see engine.ComputeResultDir); clients
+	// consume the string directly rather than rebuilding it
+	// from (runSeq, instanceKey, taskDefID). Keeps future
+	// layout changes to one function edit.
+	ResultDir       string   `json:"result_dir,omitempty"`
 	Ref             string   `json:"ref,omitempty"`
 	Action          string   `json:"action"`
 	Prompt          string   `json:"prompt,omitempty"`
@@ -1697,8 +1704,8 @@ type taskResponse struct {
 	// RunSourcePath mirrors run.source_path so the fat-client
 	// executor can resolve a compute task's `script:` field
 	// against the run's per-run template snapshot
-	// (.enju/runs/{seq}/template/) instead of the live
-	// enju_templates/ path. Empty for inline-YAML runs.
+	// (enju/runs/{seq}/template-snapshot/) instead of the live
+	// enju/templates/ path. Empty for inline-YAML runs.
 	RunSourcePath   string   `json:"run_source_path,omitempty"`
 	// RunBranch is the git branch this task's run commits to.
 	// Fat-client submit/execute paths feed this into
@@ -4021,6 +4028,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		Seq:              t.Seq,
 		TaskDefID:        t.TaskDefID,
 		InstanceKey:      t.InstanceKey,
+		ResultDir:        engine.ComputeResultDir(&t),
 		IterationLabel:   iterationLabel,
 		Ref:              t.Ref,
 		Action:          t.Action,

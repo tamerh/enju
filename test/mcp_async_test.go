@@ -30,7 +30,7 @@ func TestMCPAsyncComputeEndToEnd(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/async-ok/template.yaml": {body: `name: "async ok"
+		"enju/templates/async-ok/enju.yaml": {body: `name: "async ok"
 version: 1
 tasks:
   - id: run
@@ -38,14 +38,14 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/async-ok/scripts/run.sh": {body: `#!/bin/bash
+		"enju/templates/async-ok/scripts/run.sh": {body: `#!/bin/bash
 echo "hello from async"
 `, mode: 0o755},
 	}, "seed async template")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/async-ok",
+		"path":       "enju/templates/async-ok",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
 
@@ -76,7 +76,7 @@ echo "hello from async"
 	// committed + pushed. We poll the workspace the harness
 	// uses to issue MCP calls — the same clone the MCP server
 	// and wrapper share for this project.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/run/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/run/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrapper result file did not appear: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestMCPAsyncCursorAdvanceDoesNotStarveScanner(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/async-starve/template.yaml": {body: `name: "async starve"
+		"enju/templates/async-starve/enju.yaml": {body: `name: "async starve"
 version: 1
 tasks:
   - id: job
@@ -135,14 +135,14 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
+		"enju/templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
 echo "async payload"
 `, mode: 0o755},
 	}, "seed async starve template")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/async-starve",
+		"path":       "enju/templates/async-starve",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
 
@@ -156,7 +156,7 @@ echo "async payload"
 	}
 
 	// Wait for wrapper to land its .wrap-result.json.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/job/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/job/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestMCPAsyncCursorRaceOnNamedBranch(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/simple-async/template.yaml": {body: `name: "simple-async"
+		"enju/templates/simple-async/enju.yaml": {body: `name: "simple-async"
 version: 1
 tasks:
   - id: job
@@ -194,7 +194,7 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
+		"enju/templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
 echo "async payload on named branch"
 `, mode: 0o755},
 	}, "seed simple-async template")
@@ -202,7 +202,7 @@ echo "async payload on named branch"
 	// branch:"auto" → allocates slug-N (e.g. simple-async-1).
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/simple-async",
+		"path":       "enju/templates/simple-async",
 		"branch":     "auto",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
@@ -214,7 +214,7 @@ echo "async payload on named branch"
 		t.Fatalf("execute_task: %s", mcpText(res))
 	}
 
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/job/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/job/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestMCPAsyncChainStage2ClaimRaceOrphan(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/chain3/template.yaml": {body: `name: "chain3"
+		"enju/templates/chain3/enju.yaml": {body: `name: "chain3"
 version: 1
 tasks:
   - id: stage1
@@ -265,7 +265,7 @@ tasks:
     script: scripts/s.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/chain3/scripts/s.sh": {body: `#!/bin/bash
+		"enju/templates/chain3/scripts/s.sh": {body: `#!/bin/bash
 sleep 0.05
 echo "out-$(date +%s%N)"
 `, mode: 0o755},
@@ -273,7 +273,7 @@ echo "out-$(date +%s%N)"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/chain3",
+		"path":       "enju/templates/chain3",
 	})
 	stage1ID := fmt.Sprintf("%d:1:stage1", projectID)
 	stage2ID := fmt.Sprintf("%d:1:stage2", projectID)
@@ -281,7 +281,7 @@ echo "out-$(date +%s%N)"
 
 	// Run stage1 async.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": stage1ID})
-	s1Result := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/stage1/.wrap-result.json")
+	s1Result := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/stage1/.wrap-result.json")
 	if err := waitForFile(s1Result, 20*time.Second); err != nil {
 		t.Fatalf("stage1 wrap-result: %v", err)
 	}
@@ -308,7 +308,7 @@ echo "out-$(date +%s%N)"
 	// If execute_task returned success, the task MUST
 	// eventually reach accepted — otherwise we've leaked a
 	// wrapper whose commit will never advance state.
-	s2Result := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/stage2/.wrap-result.json")
+	s2Result := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/stage2/.wrap-result.json")
 	if err := waitForFile(s2Result, 20*time.Second); err != nil {
 		t.Fatalf("stage2 wrap-result never appeared — wrapper may have failed: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestMCPAsyncClaimTriggersReconcile(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/chain2/template.yaml": {body: `name: "chain2"
+		"enju/templates/chain2/enju.yaml": {body: `name: "chain2"
 version: 1
 tasks:
   - id: produce
@@ -351,14 +351,14 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-		"enju_templates/chain2/scripts/p.sh": {body: `#!/bin/bash
+		"enju/templates/chain2/scripts/p.sh": {body: `#!/bin/bash
 echo "payload-v1"
 `, mode: 0o755},
 	}, "seed chain2 template")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/chain2",
+		"path":       "enju/templates/chain2",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
 
@@ -369,7 +369,7 @@ echo "payload-v1"
 		t.Fatalf("execute: %s", mcpText(res))
 	}
 
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/produce/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/produce/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestMCPAsyncReExecuteUpdatesUpstreamCommit(t *testing.T) {
 	// Script embeds a sequence marker so we can distinguish
 	// run1 vs run2 outputs.
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/rerun/template.yaml": {body: `name: "rerun"
+		"enju/templates/rerun/enju.yaml": {body: `name: "rerun"
 version: 1
 tasks:
   - id: gen
@@ -412,7 +412,7 @@ tasks:
     script: scripts/g.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/rerun/scripts/g.sh": {body: `#!/bin/bash
+		"enju/templates/rerun/scripts/g.sh": {body: `#!/bin/bash
 # 50ms sleep + nanosecond timestamp guarantees run2's output
 # differs from run1's even on fast systems. Without this the
 # commit can return "nothing to commit" when content is
@@ -426,14 +426,14 @@ echo "run-$(date +%s%N)"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/rerun",
+		"path":       "enju/templates/rerun",
 	})
 	taskID := fmt.Sprintf("%d:1:gen", projectID)
 	h.rememberRunFromTaskID(t, taskID)
 
 	// First execute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/gen/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/gen/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1 wrap-result.json: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestMCPAsyncReviewSeesLatestUpstreamAfterRerun(t *testing.T) {
 	// caller can set via task env: block (not needed for
 	// this test — just record-anything).
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/gate/template.yaml": {body: `name: "gate"
+		"enju/templates/gate/enju.yaml": {body: `name: "gate"
 version: 1
 tasks:
   - id: gen
@@ -518,14 +518,14 @@ tasks:
     reviews: gen
     prompt: "Review {{gen.content}}"
 `, mode: 0o644},
-		"enju_templates/gate/scripts/g.sh": {body: `#!/bin/bash
+		"enju/templates/gate/scripts/g.sh": {body: `#!/bin/bash
 echo "content-at-$(date +%s%N)"
 `, mode: 0o755},
 	}, "seed gate template")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/gate",
+		"path":       "enju/templates/gate",
 	})
 	genID := fmt.Sprintf("%d:1:gen", projectID)
 	gateID := fmt.Sprintf("%d:1:gate", projectID)
@@ -533,7 +533,7 @@ echo "content-at-$(date +%s%N)"
 
 	// Run1 async compute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/gen/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/gen/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
@@ -593,7 +593,7 @@ echo "content-at-$(date +%s%N)"
 	// Read gen's result.md at run2's commit to know what we
 	// expect. Then assert the review claim text contains it.
 	remoteURL := h.remoteFor(projectID)
-	run2Result := readCommitFile(t, remoteURL, run2SHA, ".enju/runs/1/gen/result.md")
+	run2Result := readCommitFile(t, remoteURL, run2SHA, "enju/runs/1/gen/result.md")
 	run2Content := strings.TrimSpace(string(run2Result))
 	if run2Content == "" {
 		t.Fatalf("run2 result.md missing at %s", run2SHA)
@@ -673,7 +673,7 @@ func TestMCPAsyncRequestChangesRerunArtifactIndex(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/bug2/template.yaml": {body: `name: "bug2"
+		"enju/templates/bug2/enju.yaml": {body: `name: "bug2"
 version: 1
 tasks:
   - id: compute_data
@@ -687,7 +687,7 @@ tasks:
     reviews: compute_data
     prompt: "Review"
 `, mode: 0o644},
-		"enju_templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
+		"enju/templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 # 50ms sleep guarantees the timestamp differs from any previous
 # run's output even on fast systems — nanosecond resolution is
@@ -701,7 +701,7 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/bug2",
+		"path":       "enju/templates/bug2",
 		"branch":     "auto",
 	})
 	computeID := fmt.Sprintf("%d:1:compute_data", projectID)
@@ -710,7 +710,7 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 
 	// Run1: async compute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/compute_data/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/compute_data/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1 wrap-result: %v", err)
 	}
@@ -823,7 +823,7 @@ func TestMCPAsyncReconcileUnblocksDownstream(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/chain/template.yaml": {body: `name: "chain"
+		"enju/templates/chain/enju.yaml": {body: `name: "chain"
 version: 1
 tasks:
   - id: produce
@@ -835,14 +835,14 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-		"enju_templates/chain/scripts/p.sh": {body: `#!/bin/bash
+		"enju/templates/chain/scripts/p.sh": {body: `#!/bin/bash
 echo "payload"
 `, mode: 0o755},
 	}, "seed chain template")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/chain",
+		"path":       "enju/templates/chain",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
 
@@ -855,7 +855,7 @@ echo "payload"
 	}
 
 	// Wait for wrapper to commit.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/produce/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/produce/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -890,7 +890,7 @@ func TestMCPAsyncComputeFailurePropagatesViaReaper(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/async-fail/template.yaml": {body: `name: "async fail"
+		"enju/templates/async-fail/enju.yaml": {body: `name: "async fail"
 version: 1
 tasks:
   - id: run
@@ -898,7 +898,7 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-		"enju_templates/async-fail/scripts/run.sh": {body: `#!/bin/bash
+		"enju/templates/async-fail/scripts/run.sh": {body: `#!/bin/bash
 echo "something went wrong" >&2
 exit 7
 `, mode: 0o755},
@@ -906,7 +906,7 @@ exit 7
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/async-fail",
+		"path":       "enju/templates/async-fail",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
 
@@ -921,7 +921,7 @@ exit 7
 	// Wait for the wrapper to finish (.wrap-result.json written
 	// with exit_code=7). Before the reaper runs, coordinator
 	// still sees claimed.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), ".enju/runs/1/run/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/run/.wrap-result.json")
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}

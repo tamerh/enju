@@ -161,14 +161,14 @@ func TestMCPBranchCoAuthoredTemplatesNotScattered(t *testing.T) {
 	// harness's workDir helper.
 	workDir := h.workspaceDirForProject(projectID)
 	for _, spec := range []struct{ path, body string }{
-		{"enju_templates/tmpl-a/template.yaml", `name: "tmpl-a"
+		{"enju/templates/tmpl-a/enju.yaml", `name: "tmpl-a"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "hello"
 `},
-		{"enju_templates/tmpl-b/template.yaml", `name: "tmpl-b"
+		{"enju/templates/tmpl-b/enju.yaml", `name: "tmpl-b"
 version: 1
 tasks:
   - id: t
@@ -190,7 +190,7 @@ tasks:
 	// the run's branch.
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/tmpl-a",
+		"path":       "enju/templates/tmpl-a",
 		"branch":     "run-a",
 	})
 
@@ -198,7 +198,7 @@ tasks:
 	// branch. Before the fix, the snapshot commit on run-a
 	// swept it in via AddGlob(".") — that's the bug.
 	remoteURL := h.remoteFor(projectID)
-	if _, onA := readRepoFileOnBranch(t, remoteURL, "run-a", "enju_templates/tmpl-b/template.yaml"); onA {
+	if _, onA := readRepoFileOnBranch(t, remoteURL, "run-a", "enju/templates/tmpl-b/enju.yaml"); onA {
 		t.Fatalf("tmpl-b scattered onto run-a's branch — snapshot commit accidentally swept up the co-authored untracked template")
 	}
 
@@ -212,7 +212,7 @@ tasks:
 	// been lost.
 	res := h.call(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/tmpl-b",
+		"path":       "enju/templates/tmpl-b",
 	})
 	if res.IsError {
 		t.Fatalf("create_run(tmpl-b) after tmpl-a: %s", mcpText(res))
@@ -222,7 +222,7 @@ tasks:
 	// test also guards against a regression where the
 	// second create_run succeeds but leaves main without
 	// the template.
-	if _, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/tmpl-b/template.yaml"); !ok {
+	if _, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/tmpl-b/enju.yaml"); !ok {
 		t.Errorf("tmpl-b not published to main after create_run(tmpl-b) — EnsureBundleOnDefault skipped it")
 	}
 }
@@ -236,7 +236,7 @@ tasks:
 //  1. Create Run A on branch "branch-a" with a template — the
 //     snapshot lands on branch-a.
 //  2. Create Run B on branch "branch-b" — the workspace's HEAD
-//     switches to branch-b, and .enju/runs/1/template/* (Run A's
+//     switches to branch-b, and enju/runs/1/template-snapshot/* (Run A's
 //     snapshot) is NOT present on-disk because branch-b doesn't
 //     have it.
 //  3. Execute Run A's task.
@@ -250,14 +250,14 @@ func TestMCPBranchExecuteTaskAutoCheckoutsRunBranch(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/greet/template.yaml": {body: `name: "greet"
+		"enju/templates/greet/enju.yaml": {body: `name: "greet"
 version: 1
 tasks:
   - id: say
     action: compute
     script: scripts/say.sh
 `, mode: 0o644},
-		"enju_templates/greet/scripts/say.sh": {body: `#!/bin/bash
+		"enju/templates/greet/scripts/say.sh": {body: `#!/bin/bash
 echo "hi from $ENJU_TASK_ID"
 `, mode: 0o755},
 	}, "seed greet template")
@@ -265,18 +265,18 @@ echo "hi from $ENJU_TASK_ID"
 	// Run A on branch-a.
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/greet",
+		"path":       "enju/templates/greet",
 		"branch":     "branch-a",
 	})
 	taskA := fmt.Sprintf("%d:1:say", projectID)
 
 	// Run B on branch-b — this pulls HEAD over to branch-b,
-	// and branch-b's .enju/runs/1/ doesn't contain Run A's
+	// and branch-b's enju/runs/1/ doesn't contain Run A's
 	// snapshot. Before the fix, any subsequent tool call on
 	// Run A would find the workspace still on branch-b.
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/greet",
+		"path":       "enju/templates/greet",
 		"branch":     "branch-b",
 	})
 
@@ -297,7 +297,7 @@ echo "hi from $ENJU_TASK_ID"
 
 // TestMCPBranchAutoTemplateSlug verifies branch="auto" derives
 // its slug from the template bundle dir name rather than the
-// generic "run-N" — so `path="enju_templates/hello"` + auto
+// generic "run-N" — so `path="enju/templates/hello"` + auto
 // yields "hello-1", "hello-2", .... Makes parallel parameter
 // sweeps instantly recognizable in `git branch`.
 func TestMCPBranchAutoTemplateSlug(t *testing.T) {
@@ -305,7 +305,7 @@ func TestMCPBranchAutoTemplateSlug(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/hello/template.yaml": `name: "hello"
+		"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
@@ -319,7 +319,7 @@ tasks:
 	for i := 0; i < 2; i++ {
 		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 			"project_id": float64(projectID),
-			"path":       "enju_templates/hello",
+			"path":       "enju/templates/hello",
 			"branch":     "auto",
 		})
 		if err != nil || res.IsError {
@@ -343,7 +343,7 @@ tasks:
 	// callers see what got picked without shelling out to git.
 	res, _ := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "auto",
 	})
 	text := mcpText(res)
@@ -545,7 +545,7 @@ func TestMCPBranchTemplateModeCreatesRemoteRef(t *testing.T) {
 
 	// Seed a trivial template bundle in the project's clone.
 	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/hello/template.yaml": `name: "hello"
+		"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
@@ -557,7 +557,7 @@ tasks:
 	// create_run via template path + explicit branch.
 	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "experiment-1",
 	})
 	if err != nil || res.IsError {
@@ -575,7 +575,7 @@ tasks:
 // TestMCPBranchTemplateModeComputeExecutes closes the last
 // square in the template-mode × branch test matrix: a compute
 // task's script lives inside the template bundle, snapshotted
-// into .enju/runs/{seq}/template/ at create_run time. If the
+// into enju/runs/{seq}/template-snapshot/ at create_run time. If the
 // snapshot lands on the wrong branch (the bug the
 // CommitFilesRequest.Branch fix addressed), the executor
 // wouldn't find the script at all — the task would fail with
@@ -588,14 +588,14 @@ func TestMCPBranchTemplateModeComputeExecutes(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/echo/template.yaml": {body: `name: "echo"
+		"enju/templates/echo/enju.yaml": {body: `name: "echo"
 version: 1
 tasks:
   - id: run
     action: compute
     script: scripts/echo.sh
 `, mode: 0o644},
-		"enju_templates/echo/scripts/echo.sh": {body: `#!/bin/bash
+		"enju/templates/echo/scripts/echo.sh": {body: `#!/bin/bash
 echo "branch-test-ran"
 `, mode: 0o755},
 	}, "seed echo template")
@@ -603,7 +603,7 @@ echo "branch-test-ran"
 	// Template-mode create_run on a non-default branch.
 	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/echo",
+		"path":       "enju/templates/echo",
 		"branch":     "compute-branch",
 	})
 	if err != nil || res.IsError {
@@ -635,7 +635,7 @@ echo "branch-test-ran"
 
 	// Result content lives on compute-branch, not main — the
 	// branch-aware read confirms the submit landed there.
-	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", fmt.Sprintf(".enju/runs/%d/run/result.md", runs[0].Seq))
+	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", fmt.Sprintf("enju/runs/%d/run/result.md", runs[0].Seq))
 	if !ok {
 		t.Fatalf("result.md missing from compute-branch")
 	}
@@ -691,7 +691,7 @@ tasks:
 	})
 
 	remoteURL := h.remoteFor(projectID)
-	expPath := fmt.Sprintf(".enju/runs/%d/graph/initial.mmd", runs[1].Seq)
+	expPath := fmt.Sprintf("enju/runs/%d/graph/initial.mmd", runs[1].Seq)
 	if _, ok := readRepoFileOnBranch(t, remoteURL, "experiment-1", expPath); !ok {
 		t.Errorf("diagram missing from experiment-1 — wrong branch routing")
 	}
@@ -841,7 +841,7 @@ func TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD(t *testing.T) {
 	h.mcpSubmitText(t, "t", "on lane-b")
 
 	remoteURL := h.remoteFor(projectID)
-	runAResultPath := fmt.Sprintf(".enju/runs/%d/t/result.md", runA)
+	runAResultPath := fmt.Sprintf("enju/runs/%d/t/result.md", runA)
 	if _, leaked := readRepoFileOnBranch(t, remoteURL, "lane-b", runAResultPath); leaked {
 		t.Errorf("lane-b unexpectedly contains run-A's result — branch forked from lane-a instead of main")
 	}
@@ -893,11 +893,11 @@ func TestMCPBranchTemplateUntrackedAutoCommitsToDefault(t *testing.T) {
 	// Write the template UNTRACKED directly into the worktree
 	// — bypassing git entirely, the way a user authoring a
 	// template with a plain text editor would.
-	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "hello")
+	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "hello")
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
 		t.Fatalf("mkdir bundle: %v", err)
 	}
-	tmplPath := filepath.Join(bundleDir, "template.yaml")
+	tmplPath := filepath.Join(bundleDir, "enju.yaml")
 	tmplBody := `name: "hello"
 version: 1
 tasks:
@@ -914,7 +914,7 @@ tasks:
 	// branching off to experiment-1.
 	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "experiment-1",
 	})
 	if err != nil || res.IsError {
@@ -923,7 +923,7 @@ tasks:
 
 	// Template must be committed on main in the bare remote
 	// — the auto-commit is the whole point.
-	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/hello/template.yaml")
+	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
 	if !ok {
 		t.Fatalf("template missing from main — auto-commit did not fire")
 	}
@@ -939,7 +939,7 @@ tasks:
 	// this failed with "template not found."
 	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "experiment-2",
 	})
 	if err != nil || res2.IsError {
@@ -970,7 +970,7 @@ func TestMCPBranchTemplateReusableAcrossBranches(t *testing.T) {
 	// "templates live on default" end state, but reached via
 	// the normal authoring path.
 	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/hello/template.yaml": `name: "hello"
+		"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
@@ -982,7 +982,7 @@ tasks:
 	// Run #1 on an explicit non-default branch.
 	res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "experiment-1",
 	})
 	if err != nil || res1.IsError {
@@ -995,7 +995,7 @@ tasks:
 	// lived on experiment-1.
 	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/hello",
+		"path":       "enju/templates/hello",
 		"branch":     "experiment-2",
 	})
 	if err != nil || res2.IsError {
@@ -1007,7 +1007,7 @@ tasks:
 	assertRemoteHasBranch(t, remoteURL, "main")
 	assertRemoteHasBranch(t, remoteURL, "experiment-1")
 	assertRemoteHasBranch(t, remoteURL, "experiment-2")
-	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju_templates/hello/template.yaml")
+	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
 	if !ok {
 		t.Fatalf("template missing from main — expected auto-commit to default")
 	}

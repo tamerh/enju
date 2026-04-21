@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/enju-ai/enju/internal/engine"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -176,7 +177,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 // handleInit adopts an existing folder as an Enju project. It:
 // 1. Validates the path exists
 // 2. Initializes git if not present
-// 3. Writes .enju/ + enju_templates/ scaffold if missing
+// 3. Writes enju/ + enju/templates/ scaffold if missing
 // 4. Commits the scaffold
 // 5. Registers the project with the coordinator
 // 6. Sets the local path as the remote
@@ -222,12 +223,12 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(fmt.Sprintf("getting worktree: %v", err)), nil
 	}
 	scaffoldWritten := false
-	enjuDir := filepath.Join(dirPath, ".enju")
+	enjuDir := filepath.Join(dirPath, "enju")
 	if _, err := os.Stat(enjuDir); os.IsNotExist(err) {
 		os.MkdirAll(enjuDir, 0755)
 		scaffoldWritten = true
 	}
-	templatesDir := filepath.Join(dirPath, "enju_templates")
+	templatesDir := filepath.Join(dirPath, engine.DefaultTemplatesDir)
 	if _, err := os.Stat(templatesDir); os.IsNotExist(err) {
 		os.MkdirAll(templatesDir, 0755)
 		// Write a .gitkeep so the empty dir is tracked.

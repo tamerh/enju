@@ -42,7 +42,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -233,9 +232,6 @@ func TestMCPHarnessSmokesEnjuMyProfile(t *testing.T) {
 	if !strings.Contains(text, h.username) {
 		t.Errorf("expected profile to mention username %q, got: %s", h.username, text)
 	}
-	// Silence unused-import guard when mcpgit is only used by other
-	// tests in this file during early iterations.
-	_ = mcpgit.ResultDir
 }
 
 // mcpSubmitSimple runs a simple answer-task submission through
@@ -317,7 +313,7 @@ func TestMCPHappyPathFullCycle(t *testing.T) {
 	}
 
 	// Verify the commit landed in the bare remote.
-	resultDir := mcpgit.ResultDir(parseInt(t, parts[1]), "", "task_a")
+	resultDir := fmt.Sprintf("enju/runs/%d/task_a", parseInt(t, parts[1]))
 	body, ok := h.readRepoFile(projectID, resultDir+"/result.md")
 	if !ok {
 		t.Fatalf("result.md not found in bare remote at %s", resultDir)
@@ -726,9 +722,8 @@ func TestMCPMultiCitizenSubmitRoutesPerCitizen(t *testing.T) {
 	}
 
 	// Each reviewer's prose must be at
-	// .enju/runs/{seq}/check/citizen-{username}/result.md.
-	// ResultDir already prefixes with .enju/.
-	baseDir := mcpgit.ResultDir(h.lastRunSeq, "", "check")
+	// enju/runs/{seq}/check/citizen-{username}/result.md.
+	baseDir := fmt.Sprintf("enju/runs/%d/check", h.lastRunSeq)
 	for _, r := range reviewers {
 		path := baseDir + "/citizen-" + r.client.Username() + "/result.md"
 		body, ok := h.readRepoFile(projectID, path)
@@ -1618,7 +1613,7 @@ func TestMCPMultiFileOutputs(t *testing.T) {
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		t.Fatalf("clone bare: %v", err)
 	}
-	resultsDir := filepath.Join(cloneDir, ".enju", "runs", fmt.Sprintf("%d", h.lastRunSeq), "analyze")
+	resultsDir := filepath.Join(cloneDir, "enju", "runs", fmt.Sprintf("%d", h.lastRunSeq), "analyze")
 
 	fileChecks := []struct {
 		name     string
@@ -3772,7 +3767,7 @@ func TestMCPComputeScriptLog(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/noisy/template.yaml": {body: `name: "noisy script"
+		"enju/templates/noisy/enju.yaml": {body: `name: "noisy script"
 version: 1
 tasks:
   - id: run
@@ -3780,7 +3775,7 @@ tasks:
     script: scripts/noisy.sh
     prompt: "Run the noisy script"
 `, mode: 0o644},
-		"enju_templates/noisy/scripts/noisy.sh": {body: `#!/bin/bash
+		"enju/templates/noisy/scripts/noisy.sh": {body: `#!/bin/bash
 # Emit to both streams; script.log should interleave them.
 echo "ANSWER_LINE"                       # → stdout → result.md AND script.log
 echo "DEBUG_STDERR_1" >&2                # → stderr → script.log only
@@ -3791,7 +3786,7 @@ echo "DEBUG_STDERR_2" >&2                # → stderr → script.log only
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/noisy",
+		"path":       "enju/templates/noisy",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
 
@@ -3817,9 +3812,9 @@ echo "DEBUG_STDERR_2" >&2                # → stderr → script.log only
 
 	// script.log: full combined transcript (stdout + stderr),
 	// committed alongside result.md.
-	logBytes, ok := h.readRepoFile(projectID, ".enju/runs/1/run/script.log")
+	logBytes, ok := h.readRepoFile(projectID, "enju/runs/1/run/script.log")
 	if !ok {
-		t.Fatalf("expected .enju/runs/1/run/script.log committed on success")
+		t.Fatalf("expected enju/runs/1/run/script.log committed on success")
 	}
 	logText := string(logBytes)
 	for _, want := range []string{"ANSWER_LINE", "ANSWER_CONTINUES", "DEBUG_STDERR_1", "DEBUG_STDERR_2"} {
@@ -3890,7 +3885,7 @@ tasks:
 // TestMCPExportRunEvents covers the event-timeline export:
 // coordinator synthesizes a JSONL stream from
 // contribution_events + task_claims, client snapshots it to
-// .enju/runs/{seq}/events/{phase}.jsonl. Same pattern as
+// enju/runs/{seq}/events/{phase}.jsonl. Same pattern as
 // enju_export_diagram — authoritative data stays in the DB,
 // git gets a materialization on demand.
 func TestMCPExportRunEvents(t *testing.T) {
@@ -3929,7 +3924,7 @@ tasks:
 		"phase":      "after_redo",
 	})
 	out := mcpText(res)
-	if !strings.Contains(out, ".enju/runs/1/events/after_redo.jsonl") {
+	if !strings.Contains(out, "enju/runs/1/events/after_redo.jsonl") {
 		t.Errorf("expected file path in response; got:\n%s", out)
 	}
 	if !strings.Contains(out, "```jsonl") {
@@ -3938,7 +3933,7 @@ tasks:
 
 	// Committed file is valid JSONL — each non-empty line
 	// parses as a JSON object.
-	body, ok := h.readRepoFile(projectID, ".enju/runs/1/events/after_redo.jsonl")
+	body, ok := h.readRepoFile(projectID, "enju/runs/1/events/after_redo.jsonl")
 	if !ok {
 		t.Fatalf("events jsonl missing in bare remote")
 	}
@@ -3997,7 +3992,7 @@ func TestMCPComputeEnvVarsParams(t *testing.T) {
 	// about. Stamped 0755 so the executor can run it
 	// directly from the snapshot.
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/echo-params/template.yaml": {body: `name: "echo params"
+		"enju/templates/echo-params/enju.yaml": {body: `name: "echo params"
 version: 1
 params:
   - name: source_repo
@@ -4016,7 +4011,7 @@ tasks:
       sha: "{{shas}}"
     prompt: "Analyze {{sha}}"
 `, mode: 0o644},
-		"enju_templates/echo-params/scripts/echo.sh": {body: `#!/bin/bash
+		"enju/templates/echo-params/scripts/echo.sh": {body: `#!/bin/bash
 printf 'source_repo=%s\n' "$ENJU_PARAM_source_repo"
 printf 'shas=%s\n' "$ENJU_PARAM_shas"
 printf 'sha=%s\n' "$ENJU_PARAM_sha"
@@ -4025,7 +4020,7 @@ printf 'sha=%s\n' "$ENJU_PARAM_sha"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/echo-params",
+		"path":       "enju/templates/echo-params",
 		"params": map[string]any{
 			"source_repo": "/data/enju",
 			"shas":        []string{"alpha", "beta"},
@@ -4071,7 +4066,7 @@ func TestMCPComputeTaskEnvBlock(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/effort/template.yaml": {body: `name: "task-env demo"
+		"enju/templates/effort/enju.yaml": {body: `name: "task-env demo"
 version: 1
 tasks:
   - id: deep
@@ -4086,7 +4081,7 @@ tasks:
     env:
       CLAUDE_EFFORT: low
 `, mode: 0o644},
-		"enju_templates/effort/scripts/echo_env.sh": {body: `#!/bin/bash
+		"enju/templates/effort/scripts/echo_env.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 printf 'model_hint=%s\n' "${MODEL_HINT:-unset}"
 `, mode: 0o755},
@@ -4094,7 +4089,7 @@ printf 'model_hint=%s\n' "${MODEL_HINT:-unset}"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/effort",
+		"path":       "enju/templates/effort",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:deep", projectID))
 
@@ -4134,7 +4129,7 @@ func TestMCPComputeTaskEnvParamSubstitution(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/effort-param/template.yaml": {body: `name: "task-env + param subst"
+		"enju/templates/effort-param/enju.yaml": {body: `name: "task-env + param subst"
 version: 1
 params:
   - name: effort_override
@@ -4148,14 +4143,14 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju_templates/effort-param/scripts/echo_env.sh": {body: `#!/bin/bash
+		"enju/templates/effort-param/scripts/echo_env.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 `, mode: 0o755},
 	}, "seed effort-param bundle")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/effort-param",
+		"path":       "enju/templates/effort-param",
 		"params":     map[string]any{"effort_override": "medium"},
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
@@ -4181,7 +4176,7 @@ func TestMCPParamDefaultAppliesWhenUnsupplied(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/defaulted/template.yaml": {body: `name: "default applies"
+		"enju/templates/defaulted/enju.yaml": {body: `name: "default applies"
 version: 1
 params:
   - name: effort_override
@@ -4195,7 +4190,7 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju_templates/defaulted/scripts/echo.sh": {body: `#!/bin/bash
+		"enju/templates/defaulted/scripts/echo.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 printf 'param_effort=%s\n' "${ENJU_PARAM_effort_override:-unset}"
 `, mode: 0o755},
@@ -4206,7 +4201,7 @@ printf 'param_effort=%s\n' "${ENJU_PARAM_effort_override:-unset}"
 	// New behavior: default "medium" flows through both paths.
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/defaulted",
+		"path":       "enju/templates/defaulted",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
 
@@ -4230,7 +4225,7 @@ func TestMCPParamSuppliedOverridesDefault(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/overridden/template.yaml": {body: `name: "supplied wins"
+		"enju/templates/overridden/enju.yaml": {body: `name: "supplied wins"
 version: 1
 params:
   - name: effort_override
@@ -4243,14 +4238,14 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju_templates/overridden/scripts/echo.sh": {body: `#!/bin/bash
+		"enju/templates/overridden/scripts/echo.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 `, mode: 0o755},
 	}, "seed overridden bundle")
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/overridden",
+		"path":       "enju/templates/overridden",
 		"params":     map[string]any{"effort_override": "high"},
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
@@ -4272,7 +4267,7 @@ func TestMCPComputeTaskEnvRejectsReservedPrefix(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/bad/template.yaml": {body: `name: "reserved prefix"
+		"enju/templates/bad/enju.yaml": {body: `name: "reserved prefix"
 version: 1
 tasks:
   - id: bad
@@ -4281,14 +4276,14 @@ tasks:
     env:
       ENJU_TASK_ID: hijacked
 `, mode: 0o644},
-		"enju_templates/bad/scripts/noop.sh": {body: `#!/bin/bash
+		"enju/templates/bad/scripts/noop.sh": {body: `#!/bin/bash
 true
 `, mode: 0o755},
 	}, "seed reserved-prefix bundle")
 
 	res := h.call(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/bad",
+		"path":       "enju/templates/bad",
 	})
 	if !res.IsError {
 		t.Fatalf("expected reserved-prefix rejection, got: %s", mcpText(res))
@@ -4306,7 +4301,7 @@ func TestMCPComputeTaskEnvRejectedOnNonCompute(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFiles(projectID, map[string]string{
-		"enju_templates/wrongaction/template.yaml": `name: "env on answer"
+		"enju/templates/wrongaction/enju.yaml": `name: "env on answer"
 version: 1
 tasks:
   - id: q
@@ -4319,7 +4314,7 @@ tasks:
 
 	res := h.call(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/wrongaction",
+		"path":       "enju/templates/wrongaction",
 	})
 	if !res.IsError {
 		t.Fatalf("expected env-on-non-compute rejection, got: %s", mcpText(res))
@@ -4347,7 +4342,7 @@ func TestMCPComputeContextJSON(t *testing.T) {
 	projectID := h.createTestProject()
 
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/ctx-demo/template.yaml": {body: `name: "context.json demo"
+		"enju/templates/ctx-demo/enju.yaml": {body: `name: "context.json demo"
 version: 1
 params:
   - name: source_repo
@@ -4364,7 +4359,7 @@ tasks:
       sha: "{{shas}}"
     prompt: "Process {{sha}}"
 `, mode: 0o644},
-		"enju_templates/ctx-demo/scripts/process.sh": {body: `#!/bin/bash
+		"enju/templates/ctx-demo/scripts/process.sh": {body: `#!/bin/bash
 set -e
 CTX="$ENJU_RUN_DIR/context.json"
 # Prove we can read from the JSON dropoff — typed scalars
@@ -4378,7 +4373,7 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 
 	h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/ctx-demo",
+		"path":       "enju/templates/ctx-demo",
 		"params": map[string]any{
 			"source_repo": "/data/enju",
 			"shas":        []string{"abc123", "def456", "0f9a1b"},
@@ -4408,10 +4403,11 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 		}
 	}
 
-	// 2. context.json committed alongside result.md.
-	ctxBytes, ok := h.readRepoFile(projectID, ".enju/runs/1/abc123/process/context.json")
+	// 2. context.json committed alongside result.md. New
+	// layout: enju/runs/<seq>/<taskDefID>/<var>=<value>/.
+	ctxBytes, ok := h.readRepoFile(projectID, "enju/runs/1/process/sha=abc123/context.json")
 	if !ok {
-		t.Fatalf("expected context.json committed under .enju/runs/1/abc123/process/")
+		t.Fatalf("expected context.json committed under enju/runs/1/process/sha=abc123/")
 	}
 	var ctx map[string]interface{}
 	if err := json.Unmarshal(ctxBytes, &ctx); err != nil {
@@ -4451,13 +4447,13 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 // TestMCPTemplateBundleSnapshotAndExec covers the end-to-end
 // template-bundle feature introduced in the 2026-04-18 pass:
 //
-//  1. A template is a directory under enju_templates/ containing
-//     template.yaml + any bundled scripts / data.
+//  1. A template is a directory under enju/templates/ containing
+//     enju.yaml + any bundled scripts / data.
 //  2. enju_create_run(path=<bundle-dir>) snapshots the bundle
-//     into .enju/runs/{seq}/template/ as part of run creation,
+//     into enju/runs/{seq}/template-snapshot/ as part of run creation,
 //     committing a frozen copy.
 //  3. Compute tasks resolve `script:` from the snapshot path,
-//     not the live enju_templates/ tree. Editing the live
+//     not the live enju/templates/ tree. Editing the live
 //     template after the run was created CANNOT change the
 //     run's behavior — provenance + reproducibility guarantee.
 //
@@ -4470,12 +4466,12 @@ func TestMCPTemplateBundleSnapshotAndExec(t *testing.T) {
 
 	// Seed a template bundle directly into the bare remote so
 	// the client's clone picks it up on the next pull. Bundle =
-	// a dir under enju_templates/ with template.yaml at its
+	// a dir under enju/templates/ with enju.yaml at its
 	// root + any sibling files (scripts, in this case). Scripts
 	// seeded with +x so the snapshot copy has a live mode bit
 	// to preserve.
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/sum/template.yaml": {body: `name: "sum runner"
+		"enju/templates/sum/enju.yaml": {body: `name: "sum runner"
 version: 1
 tasks:
   - id: run
@@ -4485,7 +4481,7 @@ tasks:
       - "out/total.txt"
     prompt: "Run sum.sh"
 `, mode: 0o644},
-		"enju_templates/sum/scripts/sum.sh": {body: `#!/bin/bash
+		"enju/templates/sum/scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "ORIGINAL BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran original"
@@ -4493,27 +4489,27 @@ echo "ran original"
 	}, "seed template bundle")
 
 	// Instantiate from the bundle dir. Post-creation, the
-	// client snapshots the bundle to .enju/runs/1/template/.
+	// client snapshots the bundle to enju/runs/1/template-snapshot/.
 	res := h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
-		"path":       "enju_templates/sum",
+		"path":       "enju/templates/sum",
 	})
 	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
 	if strings.Contains(mcpText(res), "⚠ Template") {
 		t.Fatalf("template snapshot warning on create_run: %s", mcpText(res))
 	}
 
-	// Assertion 1: the snapshot landed at .enju/runs/1/template/.
-	snapYAML, ok := h.readRepoFile(projectID, ".enju/runs/1/template/template.yaml")
+	// Assertion 1: the snapshot landed at enju/runs/1/template-snapshot/.
+	snapYAML, ok := h.readRepoFile(projectID, "enju/runs/1/template-snapshot/enju.yaml")
 	if !ok {
-		t.Fatalf("expected .enju/runs/1/template/template.yaml to exist after snapshot")
+		t.Fatalf("expected enju/runs/1/template-snapshot/enju.yaml to exist after snapshot")
 	}
 	if !strings.Contains(string(snapYAML), "sum runner") {
-		t.Errorf("snapshot template.yaml missing expected content: %s", snapYAML)
+		t.Errorf("snapshot enju.yaml missing expected content: %s", snapYAML)
 	}
-	snapScript, ok := h.readRepoFile(projectID, ".enju/runs/1/template/scripts/sum.sh")
+	snapScript, ok := h.readRepoFile(projectID, "enju/runs/1/template-snapshot/scripts/sum.sh")
 	if !ok {
-		t.Fatalf("expected .enju/runs/1/template/scripts/sum.sh to exist after snapshot")
+		t.Fatalf("expected enju/runs/1/template-snapshot/scripts/sum.sh to exist after snapshot")
 	}
 	if !strings.Contains(string(snapScript), "ORIGINAL BEHAVIOR") {
 		t.Errorf("snapshot script has wrong body: %s", snapScript)
@@ -4529,7 +4525,7 @@ echo "ran original"
 	// Workspace dirs may be numeric ("1") or named ("slug-1")
 	// depending on project-name + slug rules, so glob for the
 	// snapshotted path rather than hardcoding the dir shape.
-	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju/runs/1/template/scripts/sum.sh"))
+	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju/runs/1/template-snapshot/scripts/sum.sh"))
 	if len(snapMatches) == 0 {
 		t.Fatalf("snapshotted script not found under %s", h.workspaceDir)
 	}
@@ -4544,7 +4540,7 @@ echo "ran original"
 	// snapshot, not the live tree. The executor below should
 	// still see the original behavior.
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju_templates/sum/scripts/sum.sh": {body: `#!/bin/bash
+		"enju/templates/sum/scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "MUTATED BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran mutated"
@@ -5563,7 +5559,7 @@ func stringSliceFromTask(task map[string]interface{}, field string) []string {
 // lint fires on a compute task with no declared upstream
 // linkage AND a downstream consumer — the case where
 // cascading failure is real. The concrete hazard: the compute
-// script reads `.enju/runs/...` directly (bypassing the DAG),
+// script reads `enju/runs/...` directly (bypassing the DAG),
 // scheduler runs it in parallel with its unknown upstream,
 // citizen hits a file-not-found mid-script, and the consumer
 // task sees no output.
@@ -5973,7 +5969,7 @@ tasks:
 		"phase":      "initial",
 	})
 	out := mcpText(res)
-	if !strings.Contains(out, ".enju/runs/1/graph/initial.mmd") {
+	if !strings.Contains(out, "enju/runs/1/graph/initial.mmd") {
 		t.Errorf("expected initial file path in response; got:\n%s", out)
 	}
 	if !strings.Contains(out, "flowchart TD") {
@@ -5985,9 +5981,9 @@ tasks:
 	// File must land in the bare remote with raw .mmd content
 	// (no code fence, no %% comment header — those are for the
 	// response only).
-	body, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/initial.mmd")
+	body, ok := h.readRepoFile(projectID, "enju/runs/1/graph/initial.mmd")
 	if !ok {
-		t.Fatalf("expected .enju/runs/1/graph/initial.mmd in the bare remote")
+		t.Fatalf("expected enju/runs/1/graph/initial.mmd in the bare remote")
 	}
 	if strings.Contains(string(body), "```mermaid") {
 		t.Errorf("file should not contain markdown fences — it's raw .mmd source")
@@ -6019,7 +6015,7 @@ tasks:
 		"phase":      "final",
 	})
 	out3 := mcpText(res3)
-	if !strings.Contains(out3, ".enju/runs/1/graph/final.mmd") {
+	if !strings.Contains(out3, "enju/runs/1/graph/final.mmd") {
 		t.Errorf("expected final file path in response; got:\n%s", out3)
 	}
 	if strings.Contains(out3, "unchanged") {
@@ -6027,12 +6023,12 @@ tasks:
 	}
 	// The previous initial snapshot must still exist — new phases
 	// land in new files, they don't clobber siblings.
-	if _, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/initial.mmd"); !ok {
+	if _, ok := h.readRepoFile(projectID, "enju/runs/1/graph/initial.mmd"); !ok {
 		t.Errorf("initial.mmd disappeared after final export — phases should be independent files")
 	}
-	finalBody, ok := h.readRepoFile(projectID, ".enju/runs/1/graph/final.mmd")
+	finalBody, ok := h.readRepoFile(projectID, "enju/runs/1/graph/final.mmd")
 	if !ok {
-		t.Fatalf("expected .enju/runs/1/graph/final.mmd after export")
+		t.Fatalf("expected enju/runs/1/graph/final.mmd after export")
 	}
 	// Final diagram must reflect the state change — draft is
 	// now accepted. The initial.mmd still sees it as ready.
@@ -6384,7 +6380,7 @@ tasks:
 	// The enju_create_run tool accepts yaml + params but has no
 	// source_path argument — source_path is populated only when
 	// the run is instantiated via `path` pointing at a
-	// enju_templates/*.yaml file in the project clone. That
+	// enju/templates/*.yaml file in the project clone. That
 	// path is exercised by a dedicated template-mode test; here
 	// we verify substitution via inline yaml + params.
 	res := h.callOK(t, "enju_create_run", map[string]any{

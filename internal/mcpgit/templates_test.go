@@ -33,7 +33,7 @@ func TestListTemplatesEmpty(t *testing.T) {
 }
 
 // TestListAndLoadTemplate — drop a template bundle into the
-// clone's enju_templates/ directory and verify ListTemplates
+// clone's enju/templates/ directory and verify ListTemplates
 // surfaces its metadata, LoadTemplate returns the raw bytes,
 // and InstantiateTemplate substitutes supplied params. Also
 // covers the caller-supplied forms (dir path and full
@@ -47,7 +47,7 @@ func TestListAndLoadTemplate(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "gwas")
+	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "gwas")
 	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
 		t.Fatalf("mkdir bundle: %v", err)
 	}
@@ -68,7 +68,7 @@ tasks:
     action: answer
     prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
 `)
-	if err := os.WriteFile(filepath.Join(bundleDir, "template.yaml"), template, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(bundleDir, "enju.yaml"), template, 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
 
@@ -86,13 +86,13 @@ tasks:
 	if len(templates[0].Params) != 2 {
 		t.Errorf("expected 2 params, got %d", len(templates[0].Params))
 	}
-	if templates[0].Path != "enju_templates/gwas/template.yaml" {
+	if templates[0].Path != "enju/templates/gwas/enju.yaml" {
 		t.Errorf("expected summary path to be the manifest, got %q", templates[0].Path)
 	}
 
 	// LoadTemplate accepts both the dir form and the full
 	// manifest path — both resolve to the same bundle.
-	for _, ref := range []string{"enju_templates/gwas", "enju_templates/gwas/template.yaml"} {
+	for _, ref := range []string{"enju/templates/gwas", "enju/templates/gwas/enju.yaml"} {
 		loaded, err := proj.LoadTemplate(ref)
 		if err != nil {
 			t.Fatalf("LoadTemplate(%q): %v", ref, err)
@@ -100,16 +100,16 @@ tasks:
 		if len(loaded.Raw) == 0 {
 			t.Errorf("LoadTemplate(%q): expected raw bytes", ref)
 		}
-		if loaded.BundleDir != "enju_templates/gwas" {
-			t.Errorf("LoadTemplate(%q): BundleDir = %q, want enju_templates/gwas", ref, loaded.BundleDir)
+		if loaded.BundleDir != "enju/templates/gwas" {
+			t.Errorf("LoadTemplate(%q): BundleDir = %q, want enju/templates/gwas", ref, loaded.BundleDir)
 		}
-		if loaded.Path != "enju_templates/gwas/template.yaml" {
+		if loaded.Path != "enju/templates/gwas/enju.yaml" {
 			t.Errorf("LoadTemplate(%q): Path = %q, want the manifest", ref, loaded.Path)
 		}
 	}
 
 	// InstantiateTemplate substitutes supplied values.
-	parsed, _, err := proj.InstantiateTemplate("enju_templates/gwas", map[string]interface{}{
+	parsed, _, err := proj.InstantiateTemplate("enju/templates/gwas", map[string]interface{}{
 		"disease": "PCOS",
 	})
 	if err != nil {
@@ -131,9 +131,9 @@ func TestInstantiateTemplateMissingRequired(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	bundleDir := filepath.Join(proj.WorkDir(), "enju_templates", "r")
+	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "r")
 	_ = os.MkdirAll(bundleDir, 0o755)
-	_ = os.WriteFile(filepath.Join(bundleDir, "template.yaml"), []byte(`name: "R"
+	_ = os.WriteFile(filepath.Join(bundleDir, "enju.yaml"), []byte(`name: "R"
 version: 1
 params:
   - name: disease
@@ -146,7 +146,7 @@ tasks:
     prompt: "x {{disease}}"
 `), 0o644)
 
-	err := proj.ValidateTemplateParams("enju_templates/r", map[string]interface{}{})
+	err := proj.ValidateTemplateParams("enju/templates/r", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected missing-required error, got nil")
 	}
@@ -159,7 +159,7 @@ tasks:
 }
 
 // TestListTemplatesLegacyFileShape — a loose .yaml directly
-// under enju_templates/ (the pre-bundle convention) shows up
+// under enju/templates/ (the pre-bundle convention) shows up
 // with a migration-hint ParseError rather than being silently
 // skipped. Users who upgrade their enju install keep getting
 // a visible, actionable menu entry until they migrate.
@@ -169,7 +169,7 @@ func TestListTemplatesLegacyFileShape(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	templatesDir := filepath.Join(proj.WorkDir(), "enju_templates")
+	templatesDir := filepath.Join(proj.WorkDir(), "enju", "templates")
 	_ = os.MkdirAll(templatesDir, 0o755)
 	_ = os.WriteFile(filepath.Join(templatesDir, "legacy.yaml"),
 		[]byte("name: legacy\nversion: 1\ntasks: [{id: t, action: answer, prompt: x}]\n"),
@@ -200,7 +200,7 @@ func TestLoadTemplateRejectsPathEscape(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	_, err := proj.LoadTemplate("enju_templates/../.git/config")
+	_, err := proj.LoadTemplate("enju/templates/../.git/config")
 	if err == nil {
 		t.Fatal("expected path-escape rejection, got nil")
 	}
@@ -223,7 +223,7 @@ func TestLoadTemplateRejectsOutsideTemplatesDir(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected outside-templates-dir rejection, got nil")
 	}
-	if !strings.Contains(err.Error(), "templates/") {
-		t.Errorf("expected templates/ prefix error, got: %v", err)
+	if !strings.Contains(err.Error(), "must live under") {
+		t.Errorf("expected 'must live under' error, got: %v", err)
 	}
 }

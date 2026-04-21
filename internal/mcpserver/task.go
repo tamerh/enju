@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/compute"
-	"github.com/enju-ai/enju/internal/mcpgit"
+	"github.com/enju-ai/enju/internal/engine"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -145,7 +145,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 	return mcp.NewToolResultText(formatTaskDetail(data, inputs, c.username)), nil
 }
 // handleListTemplates — pure client-side tool. Walks the
-// project's enju_templates/ directory in the local clone and
+// project's enju/templates/ directory in the local clone and
 // returns one entry per YAML file with its metadata.
 func (c *apiClient) handleFailTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
@@ -256,14 +256,16 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	}
 
 	workDir := proj.WorkDir()
-	resultDir := mcpgit.ResultDir(meta.RunSeq, meta.InstanceKey, meta.TaskDefID)
+	resultDir := meta.ResultDir
 
 	// Script resolution: runs instantiated from a template
 	// bundle resolve `script:` relative to the per-run
-	// snapshot at `.enju/runs/{seq}/template/`, not the live
-	// enju_templates/ path. Guarantees reproducibility —
+	// snapshot at enju/runs/{seq}/template-snapshot/, not the
+	// live templates directory. Guarantees reproducibility —
 	// editing the template after the run was created can't
-	// retroactively change this run's behavior.
+	// retroactively change this run's behavior. The dir name
+	// has a -snapshot suffix to disambiguate from the live
+	// templates dir in error messages.
 	//
 	// Runs created from inline YAML (no source_path) keep the
 	// legacy resolution: script path is project-relative as
@@ -274,7 +276,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	// without hardcoding the snapshot path.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
-		templateDir = filepath.Join(workDir, fmt.Sprintf(".enju/runs/%d/template", meta.RunSeq))
+		templateDir = filepath.Join(workDir, engine.RunTemplateSnapshotDir(meta.RunSeq))
 		scriptPath = filepath.Join(templateDir, meta.Script)
 	} else {
 		scriptPath = filepath.Join(workDir, meta.Script)
@@ -328,7 +330,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	// Covers cases env vars can't: list values with commas,
 	// typed numbers/bools, structured artifact lists.
 	// Committed as part of the result (below, via the files
-	// slice) so each run's `.enju/runs/{seq}/{task}/` directory
+	// slice) so each run's `enju/runs/{seq}/{task}/` directory
 	// is self-documenting — "what was this task told?" is a
 	// git-log question with a concrete answer.
 	// Build the payload. ReadsArtifacts isn't on taskMeta
