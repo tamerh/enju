@@ -3126,6 +3126,97 @@ tasks:
 	}
 }
 
+// TestMCPRejectCascadeSpareCrossIterationAggregator verifies
+// the for_each fail-isolation payoff: when one iteration's
+// chain is terminal-failed, cross-iteration aggregator tasks
+// (singletons depending on the fanned-out upstream) must
+// still run with partial data. Tester's battle-test repro
+// showed `campaign_report` getting SKIPPED transitively when
+// `api:deploy_vote` skipped — defeating the whole point of
+// for_each fail-isolation.
+//
+// Rule: fail cascade from iteration-level target scopes to
+// same-iteration descendants only. Cross-iteration
+// aggregators are preserved; they'll promote to READY once
+// all their deps resolve (ACCEPTED or SKIPPED) via the
+// normal ready-task sweep.
+func TestMCPRejectCascadeSparesCrossIterationAggregator(t *testing.T) {
+	h := newMCPHarness(t, "ForEachAgg")
+	projectID := h.createTestProject()
+
+	// Task-level for_each so campaign_report can be a true
+	// singleton (run-level for_each fans every task, leaving
+	// no singleton path for cohort aggregation).
+	yaml := `name: "partial cohort aggregation"
+version: 1
+tasks:
+  - id: scan
+    for_each:
+      module: [api, data]
+    action: answer
+    prompt: "Scan {{module}}."
+  - id: gate
+    for_each:
+      module: [api, data]
+    action: review
+    reviews: scan
+    prompt: "Approve {{module}} scan."
+  - id: deploy_vote
+    for_each:
+      module: [api, data]
+    action: answer
+    depends_on: [gate]
+    prompt: "Vote on {{module}}."
+  - id: campaign_report
+    action: answer
+    depends_on: [deploy_vote]
+    prompt: "Aggregate across modules."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Both modules scan. One rejects, one approves.
+	h.mcpClaimOK(t, "api:scan")
+	h.mcpSubmitText(t, "api:scan", "api scan output")
+	h.mcpClaimOK(t, "data:scan")
+	h.mcpSubmitText(t, "data:scan", "data scan output")
+
+	h.mcpClaimOK(t, "api:gate")
+	h.mcpSubmitReview(t, "api:gate", "Critical findings.", "reject")
+
+	// api subtree correctly skipped.
+	if got := h.taskGet("api:deploy_vote")["state"]; got != "skipped" {
+		t.Fatalf("api:deploy_vote should be SKIPPED in-iteration, got %v", got)
+	}
+	// campaign_report is a singleton — different iteration
+	// scope. Must NOT be dragged into the cascade.
+	if got := h.taskGet("campaign_report")["state"]; got == "skipped" {
+		t.Fatalf("regression: campaign_report SKIPPED transitively (for_each fail-isolation broken)")
+	}
+
+	// Data subtree proceeds.
+	h.mcpClaimOK(t, "data:gate")
+	h.mcpSubmitReview(t, "data:gate", "ok", "approve")
+	h.mcpClaimOK(t, "data:deploy_vote")
+	h.mcpSubmitText(t, "data:deploy_vote", "data deploys")
+
+	// Now campaign_report's deps are all terminal: api
+	// SKIPPED, data ACCEPTED. Aggregator should be READY.
+	// UpdateReadyTasks already treats SKIPPED as satisfied;
+	// the only thing blocking was the (wrong) pre-skip of
+	// the aggregator by the cascade, which we just removed.
+	if got := h.taskGet("campaign_report")["state"]; got != "ready" {
+		t.Fatalf("campaign_report should promote to READY once all deps terminal, got %v (deps api:deploy_vote=SKIPPED, data:deploy_vote=ACCEPTED)", got)
+	}
+
+	// Sanity: the aggregator can still be claimed + submitted
+	// — no silent block from leftover state.
+	h.mcpClaimOK(t, "campaign_report")
+	h.mcpSubmitText(t, "campaign_report", "2 of 2 modules ran; api was rejected, data shipped")
+	if got := h.taskGet("campaign_report")["state"]; got != "accepted" {
+		t.Errorf("campaign_report submit should land ACCEPTED, got %v", got)
+	}
+}
+
 // TestMCPRunStatusMermaidFormat exercises the opt-in
 // format="mermaid" path on enju_run_status. For large or
 // complex DAGs the text tree gets unreadable; emitting

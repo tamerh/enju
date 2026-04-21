@@ -41,6 +41,44 @@ type ArtifactRollback struct {
 	RestoreTo *store.ArtifactRecord // nil when Delete is true
 }
 
+// taskInIterationScope reports whether a descendant task
+// (identified by its short DAG node ID) shares the failing
+// target's iteration. Returns true when:
+//
+//   - Target is a singleton (targetKey == ""): all descendants
+//     fall under it (run-wide source fans to everything).
+//   - Target is iteration-level and descendant is in the same
+//     instance: same-iteration chain, strict cascade applies.
+//
+// Returns false for cross-iteration descendants:
+//
+//   - Singleton descendants below an iteration-level source:
+//     these are aggregators (e.g. `campaign_report` depending
+//     on a fanned-out `deploy_vote`). They aggregate across
+//     iterations and must survive partial-iteration failures.
+//   - Other-iteration descendants: a `data:deploy_vote` below
+//     an `api:scan` failure — different module, different fate.
+//
+// Node metadata is consulted through the DAG rather than
+// splitting the short ID string; matches how build.go stamps
+// the instance_key field and keeps this robust to future
+// changes in the short-ID format.
+func taskInIterationScope(d *dag.DAG, descShortID, targetKey string) bool {
+	if targetKey == "" {
+		return true
+	}
+	n, ok := d.GetNode(descShortID)
+	if !ok {
+		// Defense in depth — a descendant the walk returned
+		// that the DAG then can't resolve is an internal
+		// invariant violation. Don't widen the skip set on
+		// its behalf.
+		return false
+	}
+	descKey, _ := n.Data["instance_key"].(string)
+	return descKey == targetKey
+}
+
 // ComputeInvalidation walks the DAG from the target task,
 // finds all affected descendants (intra-run + cross-run
 // artifact readers), computes artifact pointer rollbacks,
@@ -81,11 +119,43 @@ func (e *Engine) ComputeInvalidation(
 	runPrefix := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq)
 	dagNodeID := enjuYaml.MakeFullID(task.InstanceKey, task.TaskDefID)
 
-	// Step 1: walk DAG descendants.
+	// Step 1: walk DAG descendants, filtered by iteration
+	// scope.
+	//
+	// for_each fail-isolation contract: when one iteration of
+	// a fanned-out upstream fails, the cascade must only skip
+	// same-iteration descendants — other iterations stay
+	// independent, and cross-iteration aggregators (singletons
+	// depending on the fanned-out upstream) still run on
+	// partial data. Without this filter, `campaign_report`
+	// depending on a fanned-out `deploy_vote` gets transitively
+	// skipped when one module's deploy_vote skips, defeating
+	// the whole point of per-iteration fail isolation — the
+	// battle-test reproduction that motivated this check.
+	//
+	// Rule: the target's iteration scope fans down to
+	// descendants sharing that key. A singleton target
+	// (InstanceKey == "") is run-wide — its scope includes
+	// everything, so the filter is a no-op for singleton
+	// failures.
+	//
+	// Dynamic for_each caveat: materialized instances carry
+	// a concrete InstanceKey like any static expansion, so
+	// the same predicate applies. Deferred (unmaterialized)
+	// descendants aren't in the DAG yet at cascade time, so
+	// they don't leak into the set either way.
 	shortDescendants := d.Descendants(dagNodeID)
 	descendants := make([]string, 0, len(shortDescendants))
 	for _, short := range shortDescendants {
-		descendants = append(descendants, runPrefix+short)
+		fullID := runPrefix + short
+		if !taskInIterationScope(d, short, task.InstanceKey) {
+			// Cross-iteration — aggregator or sibling
+			// iteration. Leave alone; ready-task sweep
+			// handles partial-data promotion when all
+			// deps resolve.
+			continue
+		}
+		descendants = append(descendants, fullID)
 	}
 
 	invalidatedSet := make(map[string]bool, 1+len(descendants))
