@@ -69,6 +69,56 @@ func TestParseEnjuTrailersRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEnjuTrailersUntrackedRoundTrip is the repro guard for a
+// reviewer-reported bug: async compute tasks' untracked
+// artifact writes never reached the coordinator's artifact
+// index because the commit trailer only carried tracked
+// (committed) paths. Scanner parsed `Enju-Artifacts:`,
+// reconcile POST carried only those, untracked paths went
+// missing, downstream tasks reading them stayed blocked.
+//
+// The fix ships a sibling trailer `Enju-Untracked-Artifacts:`
+// so the wrapper can record both kinds and the scanner can
+// forward the union through reconcile. The tracked trailer
+// stays semantically "what's in this commit"; the untracked
+// trailer records "what the task also produced outside git."
+func TestEnjuTrailersUntrackedRoundTrip(t *testing.T) {
+	input := EnjuTrailers{
+		TaskID:             "3:1:align",
+		ExitCode:           0,
+		ExitSet:            true,
+		DurationSeconds:    42,
+		Artifacts:          []string{"out/stats.json"},
+		UntrackedArtifacts: []string{"reads/S1_R1.fq", "reads/S1_R2.fq"},
+	}
+	msg := "Task 3:1:align by @alice: result + 3 artifact(s)\n\n" +
+		RenderEnjuTrailers(input)
+	got := ParseEnjuTrailers(msg)
+	if !reflect.DeepEqual(got, input) {
+		t.Errorf("round trip lost fidelity:\ngot:  %+v\nwant: %+v", got, input)
+	}
+}
+
+// TestEnjuTrailersLegacyWithoutUntrackedDecodes — in-flight
+// detached wrappers launched pre-fix produce commits with no
+// Enju-Untracked-Artifacts trailer. The parser must tolerate
+// the absence and leave UntrackedArtifacts nil rather than
+// erroring, so the async reaper can still reconcile those
+// commits after an upgrade.
+func TestEnjuTrailersLegacyWithoutUntrackedDecodes(t *testing.T) {
+	msg := "Task 3:1:t by @alice: result\n\n" +
+		"Enju-Task-Complete: 3:1:t\n" +
+		"Enju-Exit: 0\n" +
+		"Enju-Artifacts: out/stats.json"
+	got := ParseEnjuTrailers(msg)
+	if got.TaskID != "3:1:t" || len(got.Artifacts) != 1 {
+		t.Fatalf("legacy trailer decode failed: %+v", got)
+	}
+	if got.UntrackedArtifacts != nil {
+		t.Errorf("expected nil UntrackedArtifacts on legacy commit, got %+v", got.UntrackedArtifacts)
+	}
+}
+
 func TestParseEnjuTrailersIgnoresNonTrailerParagraphs(t *testing.T) {
 	// A commit message whose BODY contains text that looks
 	// trailer-shaped (`Key: val`) must not be picked up as a

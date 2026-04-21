@@ -33,6 +33,16 @@ import (
 // buildReconcileBody turns scanner results into the batch shape
 // the /tasks/reconcile endpoint consumes. Matches api.reconcileEntry
 // field names — keep in sync if one side changes.
+//
+// `artifacts_written` carries both tracked (from the commit's
+// Enju-Artifacts trailer) and untracked (from
+// Enju-Untracked-Artifacts) paths as a single union — the
+// coordinator's engine looks up each path's Track flag from
+// the task's writes_artifacts declaration and routes the
+// index mutation accordingly. Missing the untracked set was
+// the bug that blocked async downstream tasks reading
+// track:false outputs: sync path POSTs via /tasks/:id/result
+// with the full union; async path had to rely on the trailer.
 func buildReconcileBody(trailers []mcpgit.CommitTrailer) map[string]interface{} {
 	entries := make([]map[string]interface{}, 0, len(trailers))
 	for _, t := range trailers {
@@ -43,8 +53,10 @@ func buildReconcileBody(trailers []mcpgit.CommitTrailer) map[string]interface{} 
 		if t.Trailers.ExitSet {
 			entry["exit_code"] = t.Trailers.ExitCode
 		}
-		if len(t.Trailers.Artifacts) > 0 {
-			entry["artifacts_written"] = t.Trailers.Artifacts
+		combined := append([]string(nil), t.Trailers.Artifacts...)
+		combined = append(combined, t.Trailers.UntrackedArtifacts...)
+		if len(combined) > 0 {
+			entry["artifacts_written"] = combined
 		}
 		entries = append(entries, entry)
 	}

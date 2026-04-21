@@ -2535,6 +2535,11 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 		return fmt.Errorf("run not found for task %q", task.ID)
 	}
 
+	// Reconcile carries only the compute-submit subset — no
+	// decisions, options, tokens, or output lists (async flows
+	// are compute-only; reviews and votes go through the sync
+	// endpoint). The shared core accepts a full SubmitRequest
+	// so sync can pass its richer payload without branching.
 	engineReq := &engine.SubmitRequest{
 		TaskID:           task.ID,
 		ResultPath:       req.ResultPath,
@@ -2543,41 +2548,9 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 		Content:          req.Content,
 		ArtifactsWritten: req.ArtifactsWritten,
 	}
-	resultPath, decision, voteChoice, submitterID, err := s.engine().ValidateSubmitRequest(task, run, engineReq)
+	_, err = s.acceptComputeTaskCore(task, run, engineReq, req.Model)
 	if err != nil {
 		return err
-	}
-	submitOutcome, err := s.engine().ComputeSubmission(
-		task.ID, submitterID, resultPath, req.CommitSHA,
-		decision, voteChoice, req.Content, 0,
-	)
-	if err != nil {
-		return err
-	}
-	if _, err := s.store.ApplyPlan(submitOutcome.Plan); err != nil {
-		return fmt.Errorf("applying submit plan: %w", err)
-	}
-	for i := range submitOutcome.Events {
-		evt := &submitOutcome.Events[i]
-		if evt.ProjectID == 0 {
-			evt.ProjectID = run.ProjectID
-		}
-		if req.Model != "" && evt.Metadata != "" {
-			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, req.Model)
-		}
-		_ = s.store.RecordContributionEvent(evt)
-	}
-	actions, err := s.engine().ComputePostSubmitActions(task, run, submitOutcome, engineReq, decision, voteChoice)
-	if err != nil {
-		return err
-	}
-	if actions != nil && len(actions.ArtifactMutations) > 0 {
-		if _, err := s.store.ApplyPlan(store.Plan{
-			Version:   engine.EngineVersion,
-			Mutations: actions.ArtifactMutations,
-		}); err != nil {
-			return fmt.Errorf("upserting artifact index: %w", err)
-		}
 	}
 
 	// Ready-task sweep + run completion. Without this, any
@@ -2597,6 +2570,131 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 	}
 
 	return nil
+}
+
+// acceptComputeTaskCoreResult carries the engine products both
+// callers of acceptComputeTaskCore need to continue their work.
+// Sync-submit uses them to drive review/vote/reject cascades,
+// materialization, and its HTTP response shape; async-reconcile
+// ignores most of them and just does the ready sweep +
+// run-complete check.
+type acceptComputeTaskCoreResult struct {
+	Outcome     *engine.SubmissionOutcome
+	Actions     *engine.PostSubmitActions
+	ResultPath  string
+	Decision    string
+	VoteChoice  string
+	SubmitterID int64
+}
+
+// acceptComputeTaskCore runs the "task completed, apply the
+// consequences" dance that both sync submit-result and async
+// reconcile paths need:
+//
+//  1. ValidateSubmitRequest (artifacts, paths, citizen).
+//  2. ComputeSubmission → state-transition plan.
+//  3. ApplyPlan(submit plan).
+//  4. Record contribution events (best-effort, logged).
+//  5. ComputePostSubmitActions (artifacts + tally + resolution).
+//  6. ApplyPlan(artifact mutations).
+//
+// Each step mirrors one named phase in handleSubmitResultReport.
+// Factoring them here closes the "reconcile forgot step X" bug
+// class that already hit us once (ready-sweep omission, called
+// out in reconcileAcceptTask's surrounding comment). New
+// coordination steps added at this boundary affect both
+// entry points automatically.
+//
+// Deliberately does NOT include:
+//
+//   - The ready-task sweep + run-complete check (callers run
+//     those at different positions in their own flow — sync
+//     after cascades, reconcile right after core — so leaving
+//     them to the caller preserves current ordering byte-for-
+//     byte).
+//   - Review/vote/reject cascades, materialization, HTTP
+//     response — those only apply to the sync path.
+//
+// Returns (&result, nil) on success. On engine validation or
+// apply failure, returns an error with the submit state
+// partially applied (the submit plan may have landed even if
+// later steps fail — same semantics the old monolithic handler
+// had). Caller logs or surfaces the error as HTTP.
+func (s *Server) acceptComputeTaskCore(
+	task *store.TaskRecord,
+	run *store.RunRecord,
+	req *engine.SubmitRequest,
+	model string,
+) (*acceptComputeTaskCoreResult, error) {
+	eng := s.engine()
+
+	resultPath, decision, voteChoice, submitterID, err := eng.ValidateSubmitRequest(task, run, req)
+	if err != nil {
+		return nil, err
+	}
+	submitOutcome, err := eng.ComputeSubmission(
+		task.ID, submitterID, resultPath, req.CommitSHA,
+		decision, voteChoice, req.Content, req.TokensUsed,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.store.ApplyPlan(submitOutcome.Plan); err != nil {
+		return nil, fmt.Errorf("applying submit plan: %w", err)
+	}
+
+	// Contribution events are append-only and best-effort:
+	// a recording failure must not fail the submit (same
+	// contract the old sync path promised). Model injection
+	// is a per-submit client concern the engine doesn't know
+	// about, so we stamp it here before writing.
+	for i := range submitOutcome.Events {
+		evt := &submitOutcome.Events[i]
+		if evt.ProjectID == 0 {
+			evt.ProjectID = run.ProjectID
+		}
+		if model != "" && evt.Metadata != "" {
+			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, model)
+		}
+		if err := s.store.RecordContributionEvent(evt); err != nil {
+			s.logger.Warn("recording contribution event", "task_id", task.ID, "error", err)
+		}
+	}
+
+	actions, err := eng.ComputePostSubmitActions(task, run, submitOutcome, req, decision, voteChoice)
+	if err != nil {
+		// Log but don't error — partial state is still
+		// applied (events recorded, state transitioned), and
+		// a missing post-submit-actions computation shouldn't
+		// mask the accepted submission from the caller. Same
+		// soft-fail pattern the pre-refactor sync path used
+		// at this step.
+		s.logger.Error("post-submit actions failed", "task_id", task.ID, "error", err)
+	}
+
+	if actions != nil && len(actions.ArtifactMutations) > 0 {
+		if _, err := s.store.ApplyPlan(store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: actions.ArtifactMutations,
+		}); err != nil {
+			// Log-and-continue rather than hard-fail: the
+			// submission has already been accepted at the
+			// task level, and an artifact-index write
+			// failure is recoverable (the next submit or
+			// invalidation rebuilds the row). Matches the
+			// pre-refactor sync behavior.
+			s.logger.Error("upserting artifact index", "task_id", task.ID, "error", err)
+		}
+	}
+
+	return &acceptComputeTaskCoreResult{
+		Outcome:     submitOutcome,
+		Actions:     actions,
+		ResultPath:  resultPath,
+		Decision:    decision,
+		VoteChoice:  voteChoice,
+		SubmitterID: submitterID,
+	}, nil
 }
 
 // handleGetTaskInputsDescriptor is the client-writes claim-time
@@ -2696,7 +2794,6 @@ func (s *Server) handleGetTaskInputsDescriptor(w http.ResponseWriter, r *http.Re
 // scheduler re-evaluation, run completion. No git operations here.
 func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request, task *store.TaskRecord, req *submitResultRequest) {
 	taskID := task.ID
-	eng := s.engine()
 
 	run, err := s.store.GetRun(task.RunID)
 	if err != nil || run == nil {
@@ -2704,8 +2801,11 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 1. Engine validates request (artifacts, paths, decision,
-	//    option, citizen).
+	// Steps 1–6 (validate → submit plan → events → post-actions
+	// → artifact mutations) are shared with the async reconcile
+	// path; see acceptComputeTaskCore. This function owns the
+	// rest: review/vote/reject cascades, dynamic materialization,
+	// tail ready-sweep, and HTTP response shape.
 	engineReq := &engine.SubmitRequest{
 		TaskID:           taskID,
 		ResultPath:       req.ResultPath,
@@ -2718,59 +2818,26 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		ArtifactsWritten: req.ArtifactsWritten,
 		OutputLists:      req.OutputLists,
 	}
-	resultPath, decision, voteChoice, submitterID, err := eng.ValidateSubmitRequest(task, run, engineReq)
+	core, err := s.acceptComputeTaskCore(task, run, engineReq, req.Model)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		// Validation errors land as 400; anything else (apply
+		// plan failures) as 500. The core preserves the same
+		// split the old monolithic handler enforced —
+		// "applying submit plan" is the only error form that
+		// wraps its underlying cause.
+		status := http.StatusBadRequest
+		if strings.HasPrefix(err.Error(), "applying submit plan:") {
+			status = http.StatusInternalServerError
+		}
+		writeError(w, status, err.Error())
 		return
 	}
-
-	// 2. Engine computes submission → Plan.
-	submitOutcome, err := eng.ComputeSubmission(
-		taskID, submitterID, resultPath, req.CommitSHA,
-		decision, voteChoice, req.Content, req.TokensUsed,
-	)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if _, err := s.store.ApplyPlan(submitOutcome.Plan); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update task: "+err.Error())
-		return
-	}
-
-	// Record contribution events (append-only, never fails
-	// the submit — best-effort logging). Inject model name
-	// from the submit request — the engine doesn't have it
-	// because it's a client-side config.
-	for i := range submitOutcome.Events {
-		evt := &submitOutcome.Events[i]
-		if evt.ProjectID == 0 {
-			evt.ProjectID = run.ProjectID
-		}
-		if req.Model != "" && evt.Metadata != "" {
-			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, req.Model)
-		}
-		if err := s.store.RecordContributionEvent(evt); err != nil {
-			s.logger.Warn("recording contribution event", "error", err)
-		}
-	}
-
-	// 3. Engine computes post-submit actions (artifacts,
-	//    tally, resolution decisions).
-	actions, err := eng.ComputePostSubmitActions(task, run, submitOutcome, engineReq, decision, voteChoice)
-	if err != nil {
-		s.logger.Error("post-submit actions failed", "task_id", taskID, "error", err)
-	}
-
-	// 4. Apply artifact mutations.
-	if actions != nil && len(actions.ArtifactMutations) > 0 {
-		if _, err := s.store.ApplyPlan(store.Plan{
-			Version:   engine.EngineVersion,
-			Mutations: actions.ArtifactMutations,
-		}); err != nil {
-			s.logger.Error("upserting artifact index", "error", err)
-		}
-	}
+	submitOutcome := core.Outcome
+	actions := core.Actions
+	resultPath := core.ResultPath
+	decision := core.Decision
+	voteChoice := core.VoteChoice
+	submitterID := core.SubmitterID
 
 	// 5. Apply review/vote resolution + fire cascades.
 	var rejectResult *invalidationResult

@@ -419,6 +419,25 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// would starve the scanner on the async path. Scanner
 	// idempotency handles the sync case — it re-posts, the
 	// coordinator no-ops on the already-terminal task.
+	// Untracked artifacts that the script actually produced
+	// (exist on disk) land in res.ArtifactsWritten alongside
+	// tracked ones; the set-subtract gives us just the
+	// untracked subset for the trailer. Without the trailer,
+	// the async reconcile path would never surface these to
+	// the coordinator — sync mode POSTs the union directly
+	// via /tasks/:id/result, but async hosts rely entirely
+	// on the commit's trailer for the reconcile payload.
+	committedSet := make(map[string]struct{}, len(committedPaths))
+	for _, p := range committedPaths {
+		committedSet[p] = struct{}{}
+	}
+	var untrackedProduced []string
+	for _, p := range res.ArtifactsWritten {
+		if _, ok := committedSet[p]; !ok {
+			untrackedProduced = append(untrackedProduced, p)
+		}
+	}
+
 	proj.Lock()
 	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
 		TaskID:        spec.TaskID,
@@ -429,16 +448,17 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		Files: files,
 		// ArtifactPaths feeds the commit message + Enju-Artifacts
 		// trailer — these describe what's *in* this commit, so only
-		// tracked artifacts belong. Untracked paths stay in
-		// Result.ArtifactsWritten (coordinator report) but out of
-		// git metadata.
+		// tracked artifacts belong. Untracked paths go in the
+		// Enju-Untracked-Artifacts trailer (see below) so the
+		// async reconcile path can see them too.
 		ArtifactPaths: committedPaths,
 		Branch:        spec.Branch,
 		Trailers: mcpgit.EnjuTrailers{
-			TaskID:          spec.TaskID,
-			ExitCode:        0,
-			ExitSet:         true,
-			DurationSeconds: int(elapsed.Round(time.Second) / time.Second),
+			TaskID:             spec.TaskID,
+			ExitCode:           0,
+			ExitSet:            true,
+			DurationSeconds:    int(elapsed.Round(time.Second) / time.Second),
+			UntrackedArtifacts: untrackedProduced,
 		},
 	})
 	proj.Unlock()

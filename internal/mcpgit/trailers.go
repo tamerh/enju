@@ -23,10 +23,11 @@ import (
 // agree on the exact strings. Changing any of these is a
 // cross-component protocol bump.
 const (
-	TrailerTaskComplete    = "Enju-Task-Complete"
-	TrailerExit            = "Enju-Exit"
-	TrailerArtifacts       = "Enju-Artifacts"
-	TrailerDurationSeconds = "Enju-Duration-Seconds"
+	TrailerTaskComplete        = "Enju-Task-Complete"
+	TrailerExit                = "Enju-Exit"
+	TrailerArtifacts           = "Enju-Artifacts"
+	TrailerUntrackedArtifacts  = "Enju-Untracked-Artifacts"
+	TrailerDurationSeconds     = "Enju-Duration-Seconds"
 )
 
 // EnjuTrailers carries the parsed Enju-* trailer values from a
@@ -44,10 +45,32 @@ type EnjuTrailers struct {
 	ExitCode int
 	ExitSet  bool
 
-	// Artifacts — declared artifact paths actually written by
-	// the task. Comma-separated in the trailer, split here.
-	// Non-compute commits may omit or leave empty.
+	// Artifacts — tracked artifact paths actually written
+	// by the task AND included in this commit. Comma-
+	// separated in the trailer. Non-compute commits may
+	// omit or leave empty.
+	//
+	// The trailer's semantic contract is "what's in this
+	// commit" — untracked artifacts (track:false) never
+	// appear here. See UntrackedArtifacts below for the
+	// parallel trailer that records produced-but-not-
+	// committed files.
 	Artifacts []string
+
+	// UntrackedArtifacts — artifact paths declared track:false
+	// that the wrapper confirmed on disk but deliberately kept
+	// out of the commit. Recorded in a parallel trailer
+	// `Enju-Untracked-Artifacts:` so the fetch-path scanner
+	// can include them when reconciling async task completion
+	// — the coordinator's artifact index upserts both kinds,
+	// just with different commit_sha semantics (tracked → the
+	// actual SHA; untracked → empty).
+	//
+	// Without this, async tasks' untracked writes never reach
+	// the coordinator and downstream tasks reading them stay
+	// blocked. Sync tasks were unaffected because the handler
+	// POSTs /tasks/:id/result with the union directly.
+	UntrackedArtifacts []string
 
 	// DurationSeconds — wall-clock script runtime for compute
 	// tasks. Zero when absent. Useful for the fetch-path
@@ -90,6 +113,12 @@ func RenderEnjuTrailers(t EnjuTrailers) string {
 		b.WriteString(TrailerArtifacts)
 		b.WriteString(": ")
 		b.WriteString(strings.Join(t.Artifacts, ", "))
+	}
+	if len(t.UntrackedArtifacts) > 0 {
+		b.WriteString("\n")
+		b.WriteString(TrailerUntrackedArtifacts)
+		b.WriteString(": ")
+		b.WriteString(strings.Join(t.UntrackedArtifacts, ", "))
 	}
 	return b.String()
 }
@@ -143,6 +172,13 @@ func ParseEnjuTrailers(msg string) EnjuTrailers {
 				p = strings.TrimSpace(p)
 				if p != "" {
 					t.Artifacts = append(t.Artifacts, p)
+				}
+			}
+		case TrailerUntrackedArtifacts:
+			for _, p := range strings.Split(val, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					t.UntrackedArtifacts = append(t.UntrackedArtifacts, p)
 				}
 			}
 		}
