@@ -126,6 +126,181 @@ tasks:
 	}
 }
 
+// TestParseContainerRuntimeDockerAccepted — the reserved
+// forward-compat field accepts "docker" (and empty). Future
+// runtimes (apptainer, singularity) get a "not yet supported"
+// rejection so post-launch templates written ahead of
+// Apptainer shipping don't silently fall back to Docker.
+func TestParseContainerRuntimeDockerAccepted(t *testing.T) {
+	yaml := `
+name: "runtime docker accepted"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container: alpine:3.19
+    container_runtime: docker
+    prompt: "Run"
+`
+	parsed, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+	if got := parsed.Run.Tasks[0].ContainerRuntime; got != "docker" {
+		t.Errorf("container_runtime not preserved: got %q", got)
+	}
+}
+
+// TestParseContainerRuntimeEmptyAccepted — omitted field is
+// the common case; must parse cleanly.
+func TestParseContainerRuntimeEmptyAccepted(t *testing.T) {
+	yaml := `
+name: "runtime omitted"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container: alpine:3.19
+    prompt: "Run"
+`
+	if _, err := Parse([]byte(yaml)); err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+}
+
+// TestParseContainerRuntimeApptainerRejected — the whole
+// point of the reserved field: future values fail at parse
+// time with a concrete "not yet supported" message, not a
+// generic "unknown field" error. A template author writing
+// container_runtime: apptainer today knows exactly where
+// they stand instead of their job silently running under
+// Docker or their template getting rejected opaquely.
+func TestParseContainerRuntimeApptainerRejected(t *testing.T) {
+	for _, rt := range []string{"apptainer", "singularity", "podman", "nerdctl"} {
+		yaml := `
+name: "runtime unsupported"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container: alpine:3.19
+    container_runtime: ` + rt + `
+    prompt: "Run"
+`
+		_, err := Parse([]byte(yaml))
+		if err == nil {
+			t.Errorf("container_runtime=%q: expected parse error, got nil", rt)
+			continue
+		}
+		if !strings.Contains(err.Error(), "not yet supported") {
+			t.Errorf("container_runtime=%q: error should say 'not yet supported', got: %v", rt, err)
+		}
+		if !strings.Contains(err.Error(), rt) {
+			t.Errorf("container_runtime=%q: error should name the value, got: %v", rt, err)
+		}
+	}
+}
+
+// TestParseContainerRuntimeOnNonComputeRejected — field is
+// only meaningful on compute tasks; declaring it elsewhere
+// is a template-author mistake worth catching.
+func TestParseContainerRuntimeOnNonComputeRejected(t *testing.T) {
+	yaml := `
+name: "runtime on non-compute"
+version: 1
+tasks:
+  - id: run
+    action: answer
+    container_runtime: docker
+    prompt: "Run"
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected parse error for container_runtime on answer task")
+	}
+	if !strings.Contains(err.Error(), "compute") {
+		t.Errorf("error should mention action:compute, got: %v", err)
+	}
+}
+
+// TestParseExecutorLocalAccepted — reserved executor field
+// accepts "local" (current behavior) + empty.
+func TestParseExecutorLocalAccepted(t *testing.T) {
+	yaml := `
+name: "executor local"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    executor: local
+    prompt: "Run"
+`
+	parsed, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+	if got := parsed.Run.Tasks[0].Executor; got != "local" {
+		t.Errorf("executor not preserved: got %q", got)
+	}
+}
+
+// TestParseExecutorRemoteRejected — future executors
+// (slurm, k8s, aws-batch, gcp-batch) get a "not yet
+// supported" rejection that names the value and points at
+// the roadmap. Post-launch when the SLURM executor ships,
+// existing templates with executor: slurm just start
+// working — no migration needed.
+func TestParseExecutorRemoteRejected(t *testing.T) {
+	for _, exec := range []string{"slurm", "k8s", "kubernetes", "aws-batch", "gcp-batch"} {
+		yaml := `
+name: "executor unsupported"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    executor: ` + exec + `
+    prompt: "Run"
+`
+		_, err := Parse([]byte(yaml))
+		if err == nil {
+			t.Errorf("executor=%q: expected parse error, got nil", exec)
+			continue
+		}
+		if !strings.Contains(err.Error(), "not yet supported") {
+			t.Errorf("executor=%q: error should say 'not yet supported', got: %v", exec, err)
+		}
+		if !strings.Contains(err.Error(), exec) {
+			t.Errorf("executor=%q: error should name the value, got: %v", exec, err)
+		}
+	}
+}
+
+// TestParseExecutorOnNonComputeRejected — same shape as
+// the container_runtime guard.
+func TestParseExecutorOnNonComputeRejected(t *testing.T) {
+	yaml := `
+name: "executor on non-compute"
+version: 1
+tasks:
+  - id: run
+    action: answer
+    executor: local
+    prompt: "Run"
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected parse error for executor on answer task")
+	}
+	if !strings.Contains(err.Error(), "compute") {
+		t.Errorf("error should mention action:compute, got: %v", err)
+	}
+}
+
 // TestParseContainerSurvivesForEachInstanceExpansion — like
 // script: and env:, the container reference is literal (not
 // a template string). It copies unchanged onto every for_each

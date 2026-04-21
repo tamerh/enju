@@ -5561,10 +5561,18 @@ func stringSliceFromTask(task map[string]interface{}, field string) []string {
 
 // TestMCPComputeLintWarnsOnHiddenDeps verifies the structural
 // lint fires on a compute task with no declared upstream
-// linkage and that the warning reaches the caller through the
-// create_run MCP response. The concrete hazard: scripts that
-// read `.enju/runs/...` directly bypass the DAG, so two tasks
-// that should be ordered end up scheduled in parallel.
+// linkage AND a downstream consumer — the case where
+// cascading failure is real. The concrete hazard: the compute
+// script reads `.enju/runs/...` directly (bypassing the DAG),
+// scheduler runs it in parallel with its unknown upstream,
+// citizen hits a file-not-found mid-script, and the consumer
+// task sees no output.
+//
+// Leaf compute tasks with no consumers are deliberately
+// exempt from this lint (see
+// TestParseComputeLeafNoConsumersNoWarning in the yaml
+// package) — without a cascade there's nothing for the
+// warning to save.
 func TestMCPComputeLintWarnsOnHiddenDeps(t *testing.T) {
 	h := newMCPHarness(t, "ComputeLintA")
 	projectID := h.createTestProject()
@@ -5579,6 +5587,10 @@ tasks:
     action: compute
     script: scripts/process.py
     prompt: "Run the script."
+  - id: consume
+    action: answer
+    depends_on: [process]
+    prompt: "React to whatever process produced."
 `
 	res := h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),

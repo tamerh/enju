@@ -135,6 +135,19 @@ func validateComputeDependsDeclared(p *Run) []string {
 			hasParamReference(t.Script) {
 			continue
 		}
+		// Leaf-and-self-contained suppression: if no other
+		// task in the run consumes this one's output (no
+		// depends_on, no {{X.*}} ref, no review target, no
+		// reads_artifacts path match, no dynamic for_each
+		// source), the "stealth-reader" risk has no cascade.
+		// Even if the script does happen to read external
+		// state, only this task fails — there's nothing
+		// downstream to break. Prototype / test / one-shot
+		// compute tasks are exactly this shape and shouldn't
+		// nag the author.
+		if !hasDeclaredConsumer(p, t.ID, t.WritesArtifacts.Paths()) {
+			continue
+		}
 		warnings = append(warnings, fmt.Sprintf(
 			"compute task %q has no declared dependencies "+
 				"(no {{task.*}} refs, no {{param}} refs, no reads_artifacts, no depends_on). "+
@@ -146,6 +159,60 @@ func validateComputeDependsDeclared(p *Run) []string {
 			t.ID))
 	}
 	return warnings
+}
+
+// hasDeclaredConsumer reports whether any task in the run
+// consumes taskID's output via any declared mechanism:
+//
+//   - `depends_on: [taskID]` — explicit edge
+//   - `{{taskID.anything}}` in prompt or user_prompt — resolver
+//     injects the upstream result
+//   - `reviews: taskID` — review task gates on this one
+//   - `reads_artifacts` path that matches one of taskID's
+//     writes_artifacts paths — implicit artifact edge
+//   - `for_each: var: "{{taskID.field}}"` — dynamic fan-out
+//     source
+//
+// Pure inspection of the parsed Run; no side effects. Used by
+// the compute-dep lint to decide whether a "no declared
+// upstream" warning would be speculative (no cascade possible)
+// or load-bearing (something downstream depends on this).
+func hasDeclaredConsumer(p *Run, taskID string, writesArtifactPaths []string) bool {
+	writeSet := make(map[string]struct{}, len(writesArtifactPaths))
+	for _, w := range writesArtifactPaths {
+		if w != "" {
+			writeSet[w] = struct{}{}
+		}
+	}
+	refPrefix := "{{" + taskID + "."
+	for _, t := range p.Tasks {
+		if t.ID == taskID {
+			continue
+		}
+		for _, d := range t.DependsOn {
+			if d == taskID {
+				return true
+			}
+		}
+		if t.Reviews == taskID {
+			return true
+		}
+		if strings.Contains(t.Prompt, refPrefix) ||
+			strings.Contains(t.UserPrompt, refPrefix) {
+			return true
+		}
+		for _, r := range t.ReadsArtifacts {
+			if _, ok := writeSet[r]; ok {
+				return true
+			}
+		}
+		for _, src := range t.ForEach {
+			if src.Ref != "" && strings.Contains(src.Ref, refPrefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // contentRefPattern matches `{{taskID.content}}` — mirrors the
@@ -442,6 +509,12 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskContainer(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskContainerRuntime(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskExecutor(t); err != nil {
+			return nil, false, err
+		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
@@ -501,6 +574,59 @@ func validateTaskContainer(t *TaskDef) error {
 		return fmt.Errorf("task %q: container %q contains whitespace — image references should be a single token (e.g. biocontainers/samtools:1.18)", t.ID, t.Container)
 	}
 	return nil
+}
+
+// validateTaskContainerRuntime enforces the reserved-field
+// contract on `container_runtime:`. v1 accepts only "docker"
+// (or empty, which defaults to docker). Future runtimes
+// (apptainer, singularity, podman) are rejected with a
+// concrete "not yet supported" message rather than a generic
+// "unknown field" — template authors who write against the
+// planned roadmap get a clear signal today, and when those
+// runtimes eventually ship, the existing templates just
+// start working.
+//
+// Only valid on action: compute (the concept of a runtime
+// doesn't apply to answer/review/vote tasks).
+func validateTaskContainerRuntime(t *TaskDef) error {
+	if t.ContainerRuntime == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: container_runtime: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.ContainerRuntime {
+	case "docker":
+		return nil
+	default:
+		return fmt.Errorf("task %q: container_runtime %q is not yet supported in v1 (only \"docker\" is available). "+
+			"Apptainer/Singularity is planned alongside the SLURM executor post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
+			t.ID, t.ContainerRuntime)
+	}
+}
+
+// validateTaskExecutor enforces the reserved-field contract
+// on `executor:`. v1 accepts only "local" (or empty, which
+// defaults to local). Remote executors (SLURM, Kubernetes,
+// AWS Batch, GCP Batch) are rejected with a "not yet
+// supported" message pointing at the roadmap.
+//
+// Only valid on action: compute.
+func validateTaskExecutor(t *TaskDef) error {
+	if t.Executor == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: executor: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.Executor {
+	case "local":
+		return nil
+	default:
+		return fmt.Errorf("task %q: executor %q is not yet supported in v1 (only \"local\" is available). "+
+			"Remote executors (SLURM, Kubernetes, AWS Batch, GCP Batch) are planned post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
+			t.ID, t.Executor)
+	}
 }
 
 // ResolvedMode returns the mode a compute task should run in,

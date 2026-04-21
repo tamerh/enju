@@ -1072,8 +1072,13 @@ tasks:
 
 // TestParseComputeTaskNoDepsWarns — a compute task with no
 // visible upstream linkage (no task-field refs, no reads,
-// no depends_on) trips the structural lint. The warning tells
-// the author to declare explicitly; non-fatal.
+// no depends_on) AND a downstream consumer trips the
+// structural lint. The warning tells the author to declare
+// the upstream edge explicitly; non-fatal.
+//
+// Standalone (no consumer) compute tasks are exempt — see
+// TestParseComputeLeafNoConsumersNoWarning for the reviewer-
+// reported false-positive that suppression closes.
 func TestParseComputeTaskNoDepsWarns(t *testing.T) {
 	parsed, err := Parse([]byte(`
 name: "Compute no deps"
@@ -1083,6 +1088,11 @@ tasks:
     action: compute
     script: scripts/run.py
     prompt: "Run the script"
+
+  - id: downstream
+    action: answer
+    depends_on: [gen]
+    prompt: "Consumes whatever gen produced."
 `))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -1096,6 +1106,178 @@ tasks:
 	}
 	if !found {
 		t.Errorf("expected compute-no-deps warning for gen; got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseComputeLeafNoConsumersNoWarning — a standalone
+// compute task with no upstream deps AND no downstream
+// consumers (no task depends on it, no task references it,
+// no task reads its artifacts) is a safe "one-shot" use
+// case. The stealth-reader warning is speculative there:
+// nothing cascades if the task does happen to read
+// external state, and prototype / test templates commonly
+// look exactly like this.
+//
+// Regression guard for a reviewer-reported false positive
+// that fired on every standalone compute task in the test
+// templates.
+func TestParseComputeLeafNoConsumersNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "standalone compute"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.py
+    prompt: "Run the standalone script."
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"run\"") {
+			t.Errorf("leaf compute task with no consumers should not warn, got: %s", w)
+		}
+	}
+}
+
+// TestParseComputeWithDownstreamConsumerStillWarns — the
+// hidden-stealth-reader risk is real when another task
+// depends on this one (cascading failure). Keep the warning.
+func TestParseComputeWithDownstreamConsumerStillWarns(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "compute with downstream"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Run it"
+
+  - id: consume
+    action: answer
+    prompt: "Summarize: {{gen.content}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning (downstream exists), got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseComputeWithDependsOnConsumerStillWarns — consumer
+// declared via depends_on (not a prompt ref).
+func TestParseComputeWithDependsOnConsumerStillWarns(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "compute with depends_on consumer"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Run it"
+
+  - id: consume
+    action: answer
+    depends_on: [gen]
+    prompt: "After gen runs."
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning (depends_on consumer exists), got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseComputeWithArtifactConsumerStillWarns — consumer
+// declared via reads_artifacts matching the compute task's
+// writes_artifacts path.
+func TestParseComputeWithArtifactConsumerStillWarns(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "compute with artifact consumer"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    writes_artifacts:
+      - out/data.txt
+    prompt: "Produce data"
+
+  - id: consume
+    action: answer
+    reads_artifacts:
+      - out/data.txt
+    prompt: "Read: {{artifact:out/data.txt}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// The gen task has writes_artifacts → that counts as a
+	// declared output, but no upstream deps. The consume
+	// task reads via an artifact ref, so gen has a consumer.
+	// The stealth-reader warning should still fire — even
+	// though reads_artifacts is empty on `gen` (the checked
+	// condition), the path-match existence means consumers
+	// exist, so the conservative "might cascade" case holds.
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning (artifact-path consumer exists), got: %v", parsed.Warnings)
+	}
+}
+
+// TestParseComputeReviewTargetStillWarns — a review task
+// targeting the compute task counts as a consumer (cascade
+// via review approval/rejection).
+func TestParseComputeReviewTargetStillWarns(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "compute reviewed"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.py
+    prompt: "Run it"
+
+  - id: check
+    action: review
+    reviews: gen
+    prompt: "Is this OK?"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	found := false
+	for _, w := range parsed.Warnings {
+		if contains(w, "compute task \"gen\"") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning (review target is a consumer), got: %v", parsed.Warnings)
 	}
 }
 

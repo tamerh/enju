@@ -421,6 +421,31 @@ type TaskDef struct {
 	// See docs/containers.md.
 	Container string `yaml:"container,omitempty"`
 
+	// ContainerRuntime is the forward-compat seam for
+	// alternative container runtimes (apptainer/singularity
+	// for HPC). v1 accepts only "docker" (and empty, which
+	// defaults to docker). Future values are rejected at
+	// parse time with a "not yet supported" message — so
+	// templates pre-written against a planned runtime get
+	// a concrete signal today, and no migration is needed
+	// when that runtime actually ships.
+	//
+	// Only valid on action: compute. See WORKFLOW_GAPS.md §
+	// Executor abstraction for the roadmap.
+	ContainerRuntime string `yaml:"container_runtime,omitempty"`
+
+	// Executor is the forward-compat seam for remote
+	// execution (SLURM / K8s / AWS Batch / GCP Batch). v1
+	// accepts only "local" (and empty, which defaults to
+	// local). Future values are rejected at parse time; when
+	// the executor abstraction ships post-launch, existing
+	// templates with executor: slurm just start working
+	// without any migration.
+	//
+	// Only valid on action: compute. See WORKFLOW_GAPS.md §
+	// Executor abstraction for the roadmap.
+	Executor string `yaml:"executor,omitempty"`
+
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
 	Gather     bool              `yaml:"gather,omitempty"`
