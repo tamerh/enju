@@ -258,14 +258,14 @@ func applyCreateTask(tx *sql.Tx, m CreateTask) error {
 		anonymize = 1
 	}
 	_, err := tx.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
-		anonymize, t.Visibility, t.Env, t.Mode, t.Container,
+		anonymize, t.Visibility, t.Env, t.Mode, t.Container, t.RunSlug,
 		t.CreatedAt,
 	)
 	return err
@@ -289,10 +289,14 @@ func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
 	if branch == "" {
 		branch = "main"
 	}
+	slug := r.Slug
+	if slug == "" {
+		slug = "run"
+	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, branch, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, branch, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, branch, slug, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, branch, slug, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err

@@ -76,7 +76,7 @@ echo "hello from async"
 	// committed + pushed. We poll the workspace the harness
 	// uses to issue MCP calls — the same clone the MCP server
 	// and wrapper share for this project.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/run/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrapper result file did not appear: %v", err)
 	}
@@ -156,7 +156,7 @@ echo "async payload"
 	}
 
 	// Wait for wrapper to land its .wrap-result.json.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/job/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -214,7 +214,7 @@ echo "async payload on named branch"
 		t.Fatalf("execute_task: %s", mcpText(res))
 	}
 
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/job/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -281,7 +281,7 @@ echo "out-$(date +%s%N)"
 
 	// Run stage1 async.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": stage1ID})
-	s1Result := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/stage1/.wrap-result.json")
+	s1Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage1/.wrap-result.json"))
 	if err := waitForFile(s1Result, 20*time.Second); err != nil {
 		t.Fatalf("stage1 wrap-result: %v", err)
 	}
@@ -308,7 +308,7 @@ echo "out-$(date +%s%N)"
 	// If execute_task returned success, the task MUST
 	// eventually reach accepted — otherwise we've leaked a
 	// wrapper whose commit will never advance state.
-	s2Result := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/stage2/.wrap-result.json")
+	s2Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage2/.wrap-result.json"))
 	if err := waitForFile(s2Result, 20*time.Second); err != nil {
 		t.Fatalf("stage2 wrap-result never appeared — wrapper may have failed: %v", err)
 	}
@@ -369,7 +369,7 @@ echo "payload-v1"
 		t.Fatalf("execute: %s", mcpText(res))
 	}
 
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/produce/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -433,7 +433,7 @@ echo "run-$(date +%s%N)"
 
 	// First execute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/gen/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1 wrap-result.json: %v", err)
 	}
@@ -533,7 +533,7 @@ echo "content-at-$(date +%s%N)"
 
 	// Run1 async compute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/gen/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
@@ -593,7 +593,7 @@ echo "content-at-$(date +%s%N)"
 	// Read gen's result.md at run2's commit to know what we
 	// expect. Then assert the review claim text contains it.
 	remoteURL := h.remoteFor(projectID)
-	run2Result := readCommitFile(t, remoteURL, run2SHA, "enju/runs/1/gen/result.md")
+	run2Result := readCommitFile(t, remoteURL, run2SHA, filepath.Join(h.runDir(1), "gen/result.md"))
 	run2Content := strings.TrimSpace(string(run2Result))
 	if run2Content == "" {
 		t.Fatalf("run2 result.md missing at %s", run2SHA)
@@ -710,7 +710,7 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 
 	// Run1: async compute.
 	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/compute_data/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "compute_data/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("run1 wrap-result: %v", err)
 	}
@@ -855,7 +855,7 @@ echo "payload"
 	}
 
 	// Wait for wrapper to commit.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/produce/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}
@@ -921,7 +921,7 @@ exit 7
 	// Wait for the wrapper to finish (.wrap-result.json written
 	// with exit_code=7). Before the reaper runs, coordinator
 	// still sees claimed.
-	resultPath := filepath.Join(h.workspaceDirForProject(projectID), "enju/runs/1/run/.wrap-result.json")
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
 	if err := waitForFile(resultPath, 20*time.Second); err != nil {
 		t.Fatalf("wrap-result.json did not appear: %v", err)
 	}

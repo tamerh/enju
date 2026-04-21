@@ -276,7 +276,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	// without hardcoding the snapshot path.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
-		templateDir = filepath.Join(workDir, engine.RunTemplateSnapshotDir(meta.RunSeq))
+		templateDir = filepath.Join(workDir, engine.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
 		scriptPath = filepath.Join(templateDir, meta.Script)
 	} else {
 		scriptPath = filepath.Join(workDir, meta.Script)

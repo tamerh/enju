@@ -356,6 +356,17 @@ func (s *Store) migrate() error {
 		// ghcr.io/org/tool@sha256:..., etc.) the wrapper hands to
 		// `docker run` at execute time.
 		`ALTER TABLE tasks ADD COLUMN container TEXT NOT NULL DEFAULT ''`,
+		// Per-run slug for the self-documenting
+		// enju/runs/{seq}-{slug}/ directory layout. Stored on
+		// the run as the source of truth; denormalized onto
+		// each task so engine.ComputeResultDir stays a pure
+		// function of a single TaskRecord (no JOIN per
+		// serialization). Empty slug falls back to "run" in
+		// the layout helper, so old rows render as
+		// enju/runs/{seq}-run/ — still parseable, just
+		// doesn't advertise the template origin.
+		`ALTER TABLE runs ADD COLUMN slug TEXT NOT NULL DEFAULT 'run'`,
+		`ALTER TABLE tasks ADD COLUMN run_slug TEXT NOT NULL DEFAULT 'run'`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -577,7 +588,7 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 // ListRunsByProject returns all runs in a project, ordered by seq.
 func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
 		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
 	)
 	if err != nil {
@@ -589,7 +600,7 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Ref = ref.String
@@ -772,10 +783,14 @@ func (s *Store) CreateRun(p *RunRecord) (int64, int, error) {
 	if branch == "" {
 		branch = "main"
 	}
+	slug := p.Slug
+	if slug == "" {
+		slug = "run"
+	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.Params, branch, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.Params, branch, slug, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err
@@ -796,8 +811,8 @@ func (s *Store) GetRun(id int64) (*RunRecord, error) {
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at FROM runs WHERE id = ?`, id,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -810,9 +825,9 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 	var p RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -821,7 +836,7 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 }
 
 func (s *Store) ListRuns() ([]RunRecord, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at FROM runs ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at FROM runs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -831,7 +846,7 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	for rows.Next() {
 		var p RunRecord
 		var ref sql.NullString
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Ref = ref.String
@@ -850,11 +865,11 @@ func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, e
 	var r RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND branch = ? AND state = 'active'
 		 ORDER BY seq ASC LIMIT 1`,
 		projectID, branch,
-	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.CreatedAt, &r.UpdatedAt)
+	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -918,7 +933,7 @@ func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, run_slug, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -935,14 +950,14 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 		anonymize = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
-		anonymize, t.Visibility, t.Env, t.Mode, t.Container,
+		anonymize, t.Visibility, t.Env, t.Mode, t.Container, t.RunSlug,
 		t.CreatedAt,
 	)
 	return err
@@ -962,7 +977,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container,
+		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2052,7 +2067,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container,
+			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

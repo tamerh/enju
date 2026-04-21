@@ -397,6 +397,27 @@ func (h *mcpHarness) mcpGetArtifactHistory(t *testing.T, projectID int64, path s
 // Bare-remote helpers (post-assertion reads)
 // ===========================================================================
 
+// runDir returns the repo-relative directory the given run
+// owns — `enju/runs/{seq}-{slug}/`. Fetches the run over the
+// REST API to pull the server-computed slug rather than
+// recomputing it client-side, so tests stay in lock-step
+// with whatever engine.ComputeRunSlug produces now and later.
+//
+// Exists because 20+ integration tests hard-coded
+// `enju/runs/1/<taskdef>/...` back when the layout didn't
+// include the slug; those tests now go through this helper so
+// they don't have to know each YAML's name-derived slug.
+func (h *mcpHarness) runDir(runSeq int) string {
+	h.t.Helper()
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d", h.lastProjectID, runSeq)
+	data := h.get(path)
+	slug, _ := data["slug"].(string)
+	if slug == "" {
+		slug = "run"
+	}
+	return fmt.Sprintf("enju/runs/%d-%s", runSeq, slug)
+}
+
 // mcpBareResultMD returns the result.md content written by a task
 // to the project's bare remote. shortID uses the current run's
 // task IDs. For multi-citizen tasks the result lives under a

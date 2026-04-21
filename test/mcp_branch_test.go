@@ -635,7 +635,7 @@ echo "branch-test-ran"
 
 	// Result content lives on compute-branch, not main — the
 	// branch-aware read confirms the submit landed there.
-	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", fmt.Sprintf("enju/runs/%d/run/result.md", runs[0].Seq))
+	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", filepath.Join(h.runDir(int(runs[0].Seq)), "run/result.md"))
 	if !ok {
 		t.Fatalf("result.md missing from compute-branch")
 	}
@@ -691,7 +691,7 @@ tasks:
 	})
 
 	remoteURL := h.remoteFor(projectID)
-	expPath := fmt.Sprintf("enju/runs/%d/graph/initial.mmd", runs[1].Seq)
+	expPath := filepath.Join(h.runDir(int(runs[1].Seq)), "graph/initial.mmd")
 	if _, ok := readRepoFileOnBranch(t, remoteURL, "experiment-1", expPath); !ok {
 		t.Errorf("diagram missing from experiment-1 — wrong branch routing")
 	}
@@ -841,7 +841,7 @@ func TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD(t *testing.T) {
 	h.mcpSubmitText(t, "t", "on lane-b")
 
 	remoteURL := h.remoteFor(projectID)
-	runAResultPath := fmt.Sprintf("enju/runs/%d/t/result.md", runA)
+	runAResultPath := filepath.Join(h.runDir(int(runA)), "t/result.md")
 	if _, leaked := readRepoFileOnBranch(t, remoteURL, "lane-b", runAResultPath); leaked {
 		t.Errorf("lane-b unexpectedly contains run-A's result — branch forked from lane-a instead of main")
 	}

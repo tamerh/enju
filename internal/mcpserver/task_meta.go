@@ -129,13 +129,21 @@ type taskMeta struct {
 	// wrapper can pick the container vs direct-exec branch.
 	Container string
 	// ResultDir is the pre-computed repo-relative path for
-	// this task's result files (e.g. enju/runs/3/align or
-	// enju/runs/3/align/sample=S1). The server computes it
-	// from the task's instance params via
+	// this task's result files (e.g. enju/runs/3-gwas/align or
+	// enju/runs/3-gwas/align/sample=S1). The server computes
+	// it from the task's instance params via
 	// engine.ComputeResultDir; clients consume it as-is
 	// rather than rebuilding it from (runSeq, instanceKey,
 	// taskDefID).
 	ResultDir string
+	// RunSlug is the per-run slug ("variant-calling",
+	// "gwas", or "run" for nameless inline YAML) that shows
+	// up in enju/runs/{seq}-{slug}/. Threaded here so the
+	// fat-client executor can locate the template snapshot
+	// (enju/runs/{seq}-{slug}/template-snapshot/) — without
+	// this, the client would have to recompute the slug and
+	// risk drifting from the server's stored value.
+	RunSlug string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -252,6 +260,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["result_dir"].(string); ok {
 		meta.ResultDir = v
+	}
+	if v, ok := raw["run_slug"].(string); ok {
+		meta.RunSlug = v
 	}
 	return meta, nil
 }

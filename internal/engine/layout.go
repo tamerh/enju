@@ -60,11 +60,61 @@ const ProjectConfigPath = "enju/conf.yaml"
 const TemplateSnapshotDirName = "template-snapshot"
 
 // RunTemplateSnapshotDir returns the per-run bundle snapshot
-// location. Computed from the run seq so callers don't
-// string-format the `enju/runs/%d/template-snapshot/` layout
+// location. Computed from the run seq + slug so callers don't
+// string-format the `enju/runs/%d-%s/template-snapshot/` layout
 // themselves; keeps the snapshot naming rule in one place.
-func RunTemplateSnapshotDir(runSeq int) string {
-	return filepath.Join(ResultDirRoot, "runs", fmt.Sprintf("%d", runSeq), TemplateSnapshotDirName)
+// Empty slug falls back to "run" so the path is always
+// well-formed even for a run with no name or template.
+func RunTemplateSnapshotDir(runSeq int, slug string) string {
+	return filepath.Join(RunDir(runSeq, slug), TemplateSnapshotDirName)
+}
+
+// RunDir renders the per-run root segment
+// (enju/runs/{seq}-{slug}/) used by every path the run owns —
+// task result dirs, the template snapshot, and sibling
+// artifacts like graph/ and events/ exports.
+//
+// Centralizing this keeps ComputeResultDir,
+// ComputeResultDirForInstance, RunTemplateSnapshotDir, and the
+// mcpserver graph/events writers producing the same run-dir
+// prefix — no string-format drift.
+func RunDir(runSeq int, slug string) string {
+	s := slug
+	if s == "" {
+		s = "run"
+	}
+	return filepath.Join(ResultDirRoot, "runs", fmt.Sprintf("%d-%s", runSeq, s))
+}
+
+// ComputeRunSlug derives the filesystem-safe slug that shows
+// up in enju/runs/{seq}-{slug}/. Canonical sources in order:
+//
+//  1. Template bundle dir's basename (e.g. "variant-calling"
+//     from enju/templates/variant-calling). Already lowercase
+//     + hyphen-friendly by bundle-loader convention, but we
+//     still run it through the slug rule for defense against
+//     hand-rolled paths.
+//  2. Run's `name:` field, slugged.
+//  3. Fallback "run" for inline-YAML runs with no name:.
+//
+// Kept in engine so the server-side run-create path and any
+// client-side helper that needs the slug (e.g. for the
+// template-snapshot commit target) stay in lock-step. A slug
+// mismatch between create-time and later reads would corrupt
+// the layout silently.
+func ComputeRunSlug(sourcePath, runName string) string {
+	if sourcePath != "" {
+		base := filepath.Base(sourcePath)
+		if slug := enjuYaml.SlugInstanceKey(base); slug != "" {
+			return slug
+		}
+	}
+	if runName != "" {
+		if slug := enjuYaml.SlugInstanceKey(runName); slug != "" {
+			return slug
+		}
+	}
+	return "run"
 }
 
 // ComputeResultDir returns the repo-relative directory for a
@@ -101,7 +151,7 @@ func RunTemplateSnapshotDir(runSeq int) string {
 // the singleton path (which is still under the correct
 // run/task parent).
 func ComputeResultDir(t *store.TaskRecord) string {
-	base := filepath.Join(ResultDirRoot, "runs", fmt.Sprintf("%d", runSeqFromTask(t)), t.TaskDefID)
+	base := filepath.Join(RunDir(runSeqFromTask(t), t.RunSlug), t.TaskDefID)
 	if t.InstanceParams == "" {
 		return base
 	}
@@ -128,8 +178,8 @@ func ComputeResultDir(t *store.TaskRecord) string {
 // TaskRecord before it's persisted. Kept separate from
 // ComputeResultDir so the DB-row path doesn't need to
 // re-parse JSON at every call site.
-func ComputeResultDirForInstance(runSeq int, taskDefID string, rawParams map[string]string) string {
-	base := filepath.Join(ResultDirRoot, "runs", fmt.Sprintf("%d", runSeq), taskDefID)
+func ComputeResultDirForInstance(runSeq int, runSlug, taskDefID string, rawParams map[string]string) string {
+	base := filepath.Join(RunDir(runSeq, runSlug), taskDefID)
 	if len(rawParams) == 0 {
 		return base
 	}

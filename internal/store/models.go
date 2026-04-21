@@ -144,6 +144,15 @@ type RunRecord struct {
 	// run on the same branch — concurrent runs MUST use
 	// distinct branches. See docs/runs-and-branches.md.
 	Branch    string
+	// Slug is a filesystem-safe identifier derived at
+	// create_run time from the template bundle dir (template
+	// mode) or the parsed run name (inline YAML). Used to
+	// render the self-documenting directory layout
+	// enju/runs/{seq}-{slug}/. Empty-string defaults are
+	// treated as "run" by the layout helper so old rows still
+	// resolve to a valid path. Stamped once at creation and
+	// never updated — same stability contract as Branch.
+	Slug      string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -189,6 +198,13 @@ type TaskRecord struct {
 	// must be declared explicitly.
 	ReadsArtifacts  string
 	WritesArtifacts string
+
+	// RunSlug mirrors the enclosing run's Slug, denormalized
+	// onto every task row so engine.ComputeResultDir can
+	// render enju/runs/{seq}-{slug}/ without a JOIN on every
+	// task-response serialization. Stamped at creation time
+	// in BuildRunTasks from the caller-supplied slug.
+	RunSlug string
 
 	// Assignment and access control. Both optional — the default is
 	// open: any registered citizen can claim. When set they narrow who

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/enju-ai/enju/internal/engine"
@@ -94,6 +95,22 @@ func runBranchFromData(runData []byte) string {
 	}
 	if b, ok := run["branch"].(string); ok {
 		return b
+	}
+	return ""
+}
+
+// runSlugFromData extracts the run's filesystem slug (the
+// tail of enju/runs/{seq}-{slug}/) from a coordinator
+// run-detail payload. Empty means "fall back to the engine
+// default" — callers pass the empty string to
+// engine.RunDir, which treats it as "run".
+func runSlugFromData(runData []byte) string {
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return ""
+	}
+	if s, ok := run["slug"].(string); ok {
+		return s
 	}
 	return ""
 }
@@ -239,7 +256,16 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 				// uncreated and the run's first submit pushing to
 				// main.
 				runBranch, _ := created["branch"].(string)
-				snapshotTarget := engine.RunTemplateSnapshotDir(int(seq))
+				// Use the server-computed slug so the snapshot
+				// target matches the run's result-dir prefix.
+				// Falls back to client-side slug computation if
+				// the coordinator response predates the slug
+				// field (defense-in-depth for mid-rollout).
+				runSlug, _ := created["slug"].(string)
+				if runSlug == "" {
+					runSlug = engine.ComputeRunSlug(templatePath, "")
+				}
+				snapshotTarget := engine.RunTemplateSnapshotDir(int(seq), runSlug)
 				files, ferr := proj.ReadBundleFiles(loadedTemplate.BundleDir, snapshotTarget)
 				if ferr != nil {
 					snapshotWarning = fmt.Sprintf("snapshot skipped: %v", ferr)
@@ -342,7 +368,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	repoPath := fmt.Sprintf("enju/runs/%d/graph/%s.mmd", runID, phase)
+	repoPath := filepath.Join(engine.RunDir(int(runID), runSlugFromData(runData)), "graph", fmt.Sprintf("%s.mmd", phase))
 	authorName, authorEmail := c.commitAuthor(ctx)
 	commitMsg := fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase)
 
@@ -468,7 +494,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	repoPath := fmt.Sprintf("enju/runs/%d/events/%s.jsonl", runID, phase)
+	repoPath := filepath.Join(engine.RunDir(int(runID), runSlugFromData(runData)), "events", fmt.Sprintf("%s.jsonl", phase))
 	authorName, authorEmail := c.commitAuthor(ctx)
 	commitMsg := fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events))
 

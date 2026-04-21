@@ -7,16 +7,16 @@ import (
 )
 
 func TestComputeResultDirSingleton(t *testing.T) {
-	got := ComputeResultDirForInstance(3, "analyze", nil)
-	want := "enju/runs/3/analyze"
+	got := ComputeResultDirForInstance(3, "gwas", "analyze", nil)
+	want := "enju/runs/3-gwas/analyze"
 	if got != want {
 		t.Errorf("singleton: got %q want %q", got, want)
 	}
 }
 
 func TestComputeResultDirSingleForEach(t *testing.T) {
-	got := ComputeResultDirForInstance(3, "align", map[string]string{"sample": "S1"})
-	want := "enju/runs/3/align/sample=S1"
+	got := ComputeResultDirForInstance(3, "gwas", "align", map[string]string{"sample": "S1"})
+	want := "enju/runs/3-gwas/align/sample=S1"
 	if got != want {
 		t.Errorf("single for_each: got %q want %q", got, want)
 	}
@@ -24,11 +24,11 @@ func TestComputeResultDirSingleForEach(t *testing.T) {
 
 func TestComputeResultDirNestedForEachAlphaSorted(t *testing.T) {
 	// gene + tissue → alphabetical: gene first.
-	got := ComputeResultDirForInstance(5, "analyze", map[string]string{
+	got := ComputeResultDirForInstance(5, "gwas", "analyze", map[string]string{
 		"tissue": "breast",
 		"gene":   "BRCA1",
 	})
-	want := "enju/runs/5/analyze/gene=BRCA1/tissue=breast"
+	want := "enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast"
 	if got != want {
 		t.Errorf("nested alpha-sort: got %q want %q", got, want)
 	}
@@ -39,9 +39,9 @@ func TestComputeResultDirNestedForEachAlphaSorted(t *testing.T) {
 // instance-key already is, so `sample/A:B` becomes
 // `sample=sample_A_B` (no path-separator leaks, no `:` ambiguity).
 func TestComputeResultDirSlugsUnsafeValues(t *testing.T) {
-	got := ComputeResultDirForInstance(1, "t", map[string]string{"sample": "a/b c"})
+	got := ComputeResultDirForInstance(1, "gwas", "t", map[string]string{"sample": "a/b c"})
 	// "/" and " " both become "_"; adjacent runs collapse.
-	want := "enju/runs/1/t/sample=a_b_c"
+	want := "enju/runs/1-gwas/t/sample=a_b_c"
 	if got != want {
 		t.Errorf("slugging: got %q want %q", got, want)
 	}
@@ -52,10 +52,22 @@ func TestComputeResultDirSlugsUnsafeValues(t *testing.T) {
 // to the singleton layout. No trailing slash, no spurious
 // `=` segment.
 func TestComputeResultDirEmptyParamsMap(t *testing.T) {
-	got := ComputeResultDirForInstance(2, "answer", map[string]string{})
-	want := "enju/runs/2/answer"
+	got := ComputeResultDirForInstance(2, "gwas", "answer", map[string]string{})
+	want := "enju/runs/2-gwas/answer"
 	if got != want {
 		t.Errorf("empty map: got %q want %q", got, want)
+	}
+}
+
+// TestComputeResultDirEmptySlugFallback — an empty slug (e.g.
+// a legacy run row predating the slug column) renders as
+// "run" so the path is always well-formed. This is the
+// fallback every helper relies on.
+func TestComputeResultDirEmptySlugFallback(t *testing.T) {
+	got := ComputeResultDirForInstance(4, "", "t", nil)
+	want := "enju/runs/4-run/t"
+	if got != want {
+		t.Errorf("empty slug fallback: got %q want %q", got, want)
 	}
 }
 
@@ -68,8 +80,9 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		ID:             "7:3:align",
 		TaskDefID:      "align",
 		InstanceParams: "",
+		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t1); got != "enju/runs/3/align" {
+	if got := ComputeResultDir(t1); got != "enju/runs/3-gwas/align" {
 		t.Errorf("singleton via TaskRecord: got %q", got)
 	}
 
@@ -77,8 +90,9 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		ID:             "7:3:sample_S1:align",
 		TaskDefID:      "align",
 		InstanceParams: `{"sample":"S1"}`,
+		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t2); got != "enju/runs/3/align/sample=S1" {
+	if got := ComputeResultDir(t2); got != "enju/runs/3-gwas/align/sample=S1" {
 		t.Errorf("for_each via TaskRecord: got %q", got)
 	}
 
@@ -86,8 +100,9 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		ID:             "7:5:BRCA1_breast:analyze",
 		TaskDefID:      "analyze",
 		InstanceParams: `{"gene":"BRCA1","tissue":"breast"}`,
+		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t3); got != "enju/runs/5/analyze/gene=BRCA1/tissue=breast" {
+	if got := ComputeResultDir(t3); got != "enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast" {
 		t.Errorf("nested via TaskRecord: got %q", got)
 	}
 }
@@ -101,9 +116,10 @@ func TestComputeResultDirMalformedInstanceParams(t *testing.T) {
 		ID:             "1:2:weird",
 		TaskDefID:      "weird",
 		InstanceParams: `{not valid json`,
+		RunSlug:        "gwas",
 	}
 	got := ComputeResultDir(t1)
-	want := "enju/runs/2/weird"
+	want := "enju/runs/2-gwas/weird"
 	if got != want {
 		t.Errorf("malformed params fallback: got %q want %q", got, want)
 	}
@@ -113,11 +129,57 @@ func TestComputeResultDirMalformedInstanceParams(t *testing.T) {
 // pre-launch change: no dot prefix. Separate assertion so a
 // future accidental revert is loud.
 func TestComputeResultDirUsesVisibleRoot(t *testing.T) {
-	got := ComputeResultDirForInstance(1, "t", nil)
+	got := ComputeResultDirForInstance(1, "demo", "t", nil)
 	if len(got) < len("enju/") || got[:len("enju/")] != "enju/" {
 		t.Errorf("path should start with visible 'enju/', got %q", got)
 	}
 	if got[0] == '.' {
 		t.Errorf("path must not start with dot, got %q", got)
+	}
+}
+
+// TestRunTemplateSnapshotDir locks in the snapshot layout —
+// sibling of the result dirs, under the slugged run dir.
+// Drift here would silently break executor script resolution
+// because task.go looks up exactly this path.
+func TestRunTemplateSnapshotDir(t *testing.T) {
+	got := RunTemplateSnapshotDir(3, "variant-calling")
+	want := "enju/runs/3-variant-calling/template-snapshot"
+	if got != want {
+		t.Errorf("snapshot dir: got %q want %q", got, want)
+	}
+	// Empty slug → "run" fallback, same as the result-dir
+	// variant. Keeps the path well-formed for legacy rows.
+	if got := RunTemplateSnapshotDir(5, ""); got != "enju/runs/5-run/template-snapshot" {
+		t.Errorf("empty slug fallback: got %q", got)
+	}
+}
+
+// TestComputeRunSlug covers the slug-derivation rule used by
+// the server at create_run time. Precedence: bundle dir →
+// run name → "run" fallback. Every branch is asserted here
+// because a silent drift between client-side and server-side
+// slug computation would corrupt the layout (e.g. snapshot
+// dir lands at a different path than result dirs).
+func TestComputeRunSlug(t *testing.T) {
+	cases := []struct {
+		name     string
+		srcPath  string
+		runName  string
+		want     string
+	}{
+		{"template bundle wins", "enju/templates/variant-calling", "Ignored", "variant-calling"},
+		{"nested bundle path", "workflows/gwas-analysis", "", "gwas-analysis"},
+		{"inline with name", "", "My Smoke Test", "My_Smoke_Test"},
+		{"slug fallback on empty", "", "", "run"},
+		{"name with unsafe chars", "", "Run: A/B", "Run_A_B"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ComputeRunSlug(c.srcPath, c.runName)
+			if got != c.want {
+				t.Errorf("ComputeRunSlug(%q, %q) = %q, want %q", c.srcPath, c.runName, got, c.want)
+			}
+		})
 	}
 }

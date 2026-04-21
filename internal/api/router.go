@@ -664,6 +664,7 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 			State:      string(run.State),
 			TaskCount:  len(tasks),
 			Branch:     run.Branch,
+			Slug:       run.Slug,
 			CreatedAt:  run.CreatedAt.Format(time.RFC3339),
 			SourcePath: run.SourcePath,
 		})
@@ -1216,6 +1217,7 @@ type runResponse struct {
 	State           string   `json:"state"`
 	TaskCount       int      `json:"task_count"`
 	Branch          string   `json:"branch,omitempty"`            // git branch this run commits to
+	Slug            string   `json:"slug,omitempty"`              // per-run slug used in enju/runs/{seq}-{slug}/
 	CreatedAt       string   `json:"created_at"`
 	SourcePath      string   `json:"source_path,omitempty"`       // Phase H.1 — template this run came from, if any
 	SourceCommitSHA string   `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
@@ -1314,6 +1316,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			paramsJSON = string(b)
 		}
 	}
+	runSlug := engine.ComputeRunSlug(req.SourcePath, parsed.Run.Name)
 	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
 		ProjectID:       projectID,
 		Name:            parsed.Run.Name,
@@ -1325,6 +1328,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		SourceCommitSHA: req.SourceCommitSHA,
 		Params:          paramsJSON,
 		Branch:          branch,
+		Slug:            runSlug,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	})
@@ -1350,7 +1354,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build task records via engine and apply atomically.
-	taskRecords := engine.BuildRunTasks(parsed, runID, projectID, runSeq)
+	taskRecords := engine.BuildRunTasks(parsed, runID, projectID, runSeq, runSlug)
 	var mutations []store.Mutation
 	for i := range taskRecords {
 		mutations = append(mutations, store.CreateTask{Task: taskRecords[i]})
@@ -1401,6 +1405,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		State:           string(store.RunActive),
 		TaskCount:       taskCount,
 		Branch:          branch,
+		Slug:            runSlug,
 		CreatedAt:       now.Format(time.RFC3339),
 		SourcePath:      req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
@@ -1444,6 +1449,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			State:      string(p.State),
 			TaskCount:  len(tasks),
 			Branch:     p.Branch,
+			Slug:       p.Slug,
 			CreatedAt:  p.CreatedAt.Format(time.RFC3339),
 			SourcePath: p.SourcePath,
 		})
@@ -1617,6 +1623,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		"state":      p.State,
 		"repo_url":   p.RepoURL,
 		"branch":     p.Branch,
+		"slug":       p.Slug,
 		"task_count": len(tasks),
 		"created_at": p.CreatedAt.Format(time.RFC3339),
 	}
@@ -1670,6 +1677,11 @@ type taskResponse struct {
 	// from (runSeq, instanceKey, taskDefID). Keeps future
 	// layout changes to one function edit.
 	ResultDir       string   `json:"result_dir,omitempty"`
+	// RunSlug is the per-run slug that appears in ResultDir
+	// (enju/runs/{seq}-{slug}/). Surfaced on the wire so the
+	// fat-client executor can locate the template-snapshot
+	// dir without duplicating the slug rule client-side.
+	RunSlug         string   `json:"run_slug,omitempty"`
 	Ref             string   `json:"ref,omitempty"`
 	Action          string   `json:"action"`
 	Prompt          string   `json:"prompt,omitempty"`
@@ -4029,6 +4041,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		TaskDefID:        t.TaskDefID,
 		InstanceKey:      t.InstanceKey,
 		ResultDir:        engine.ComputeResultDir(&t),
+		RunSlug:          t.RunSlug,
 		IterationLabel:   iterationLabel,
 		Ref:              t.Ref,
 		Action:          t.Action,

@@ -76,7 +76,7 @@ func ValidateArtifactPath(p string) error {
 // by instance key so seq numbers are reproducible.
 //
 // Called AFTER CreateRun (when runID + runSeq are known).
-func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, runSeq int) []store.TaskRecord {
+func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, runSeq int, runSlug string) []store.TaskRecord {
 	runPrefix := fmt.Sprintf("%d:%d:", projectID, runSeq)
 	now := time.Now()
 
@@ -125,6 +125,7 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				TaskDefID:       ti.ID,
 				InstanceKey:     instanceKey,
 				InstanceParams:  paramsJSON,
+				RunSlug:         runSlug,
 				Ref:             ti.Ref,
 				Action:          ti.Action,
 				Prompt:          ti.Prompt,

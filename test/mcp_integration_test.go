@@ -319,7 +319,7 @@ func TestMCPHappyPathFullCycle(t *testing.T) {
 	}
 
 	// Verify the commit landed in the bare remote.
-	resultDir := fmt.Sprintf("enju/runs/%d/task_a", parseInt(t, parts[1]))
+	resultDir := filepath.Join(h.runDir(int(parseInt(t, parts[1]))), "task_a")
 	body, ok := h.readRepoFile(projectID, resultDir+"/result.md")
 	if !ok {
 		t.Fatalf("result.md not found in bare remote at %s", resultDir)
@@ -729,7 +729,7 @@ func TestMCPMultiCitizenSubmitRoutesPerCitizen(t *testing.T) {
 
 	// Each reviewer's prose must be at
 	// enju/runs/{seq}/check/citizen-{username}/result.md.
-	baseDir := fmt.Sprintf("enju/runs/%d/check", h.lastRunSeq)
+	baseDir := filepath.Join(h.runDir(int(h.lastRunSeq)), "check")
 	for _, r := range reviewers {
 		path := baseDir + "/citizen-" + r.client.Username() + "/result.md"
 		body, ok := h.readRepoFile(projectID, path)
@@ -1619,7 +1619,7 @@ func TestMCPMultiFileOutputs(t *testing.T) {
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		t.Fatalf("clone bare: %v", err)
 	}
-	resultsDir := filepath.Join(cloneDir, "enju", "runs", fmt.Sprintf("%d", h.lastRunSeq), "analyze")
+	resultsDir := filepath.Join(cloneDir, h.runDir(int(h.lastRunSeq)), "analyze")
 
 	fileChecks := []struct {
 		name     string
@@ -3818,7 +3818,7 @@ echo "DEBUG_STDERR_2" >&2                # → stderr → script.log only
 
 	// script.log: full combined transcript (stdout + stderr),
 	// committed alongside result.md.
-	logBytes, ok := h.readRepoFile(projectID, "enju/runs/1/run/script.log")
+	logBytes, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "run/script.log"))
 	if !ok {
 		t.Fatalf("expected enju/runs/1/run/script.log committed on success")
 	}
@@ -3930,7 +3930,7 @@ tasks:
 		"phase":      "after_redo",
 	})
 	out := mcpText(res)
-	if !strings.Contains(out, "enju/runs/1/events/after_redo.jsonl") {
+	if !strings.Contains(out, filepath.Join(h.runDir(1), "events/after_redo.jsonl")) {
 		t.Errorf("expected file path in response; got:\n%s", out)
 	}
 	if !strings.Contains(out, "```jsonl") {
@@ -3939,7 +3939,7 @@ tasks:
 
 	// Committed file is valid JSONL — each non-empty line
 	// parses as a JSON object.
-	body, ok := h.readRepoFile(projectID, "enju/runs/1/events/after_redo.jsonl")
+	body, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "events/after_redo.jsonl"))
 	if !ok {
 		t.Fatalf("events jsonl missing in bare remote")
 	}
@@ -4411,7 +4411,7 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 
 	// 2. context.json committed alongside result.md. New
 	// layout: enju/runs/<seq>/<taskDefID>/<var>=<value>/.
-	ctxBytes, ok := h.readRepoFile(projectID, "enju/runs/1/process/sha=abc123/context.json")
+	ctxBytes, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "process/sha=abc123/context.json"))
 	if !ok {
 		t.Fatalf("expected context.json committed under enju/runs/1/process/sha=abc123/")
 	}
@@ -4506,14 +4506,14 @@ echo "ran original"
 	}
 
 	// Assertion 1: the snapshot landed at enju/runs/1/template-snapshot/.
-	snapYAML, ok := h.readRepoFile(projectID, "enju/runs/1/template-snapshot/enju.yaml")
+	snapYAML, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "template-snapshot/enju.yaml"))
 	if !ok {
 		t.Fatalf("expected enju/runs/1/template-snapshot/enju.yaml to exist after snapshot")
 	}
 	if !strings.Contains(string(snapYAML), "sum runner") {
 		t.Errorf("snapshot enju.yaml missing expected content: %s", snapYAML)
 	}
-	snapScript, ok := h.readRepoFile(projectID, "enju/runs/1/template-snapshot/scripts/sum.sh")
+	snapScript, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh"))
 	if !ok {
 		t.Fatalf("expected enju/runs/1/template-snapshot/scripts/sum.sh to exist after snapshot")
 	}
@@ -4531,7 +4531,7 @@ echo "ran original"
 	// Workspace dirs may be numeric ("1") or named ("slug-1")
 	// depending on project-name + slug rules, so glob for the
 	// snapshotted path rather than hardcoding the dir shape.
-	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju/runs/1/template-snapshot/scripts/sum.sh"))
+	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh")))
 	if len(snapMatches) == 0 {
 		t.Fatalf("snapshotted script not found under %s", h.workspaceDir)
 	}
@@ -5975,7 +5975,7 @@ tasks:
 		"phase":      "initial",
 	})
 	out := mcpText(res)
-	if !strings.Contains(out, "enju/runs/1/graph/initial.mmd") {
+	if !strings.Contains(out, filepath.Join(h.runDir(1), "graph/initial.mmd")) {
 		t.Errorf("expected initial file path in response; got:\n%s", out)
 	}
 	if !strings.Contains(out, "flowchart TD") {
@@ -5987,7 +5987,7 @@ tasks:
 	// File must land in the bare remote with raw .mmd content
 	// (no code fence, no %% comment header — those are for the
 	// response only).
-	body, ok := h.readRepoFile(projectID, "enju/runs/1/graph/initial.mmd")
+	body, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "graph/initial.mmd"))
 	if !ok {
 		t.Fatalf("expected enju/runs/1/graph/initial.mmd in the bare remote")
 	}
@@ -6021,7 +6021,7 @@ tasks:
 		"phase":      "final",
 	})
 	out3 := mcpText(res3)
-	if !strings.Contains(out3, "enju/runs/1/graph/final.mmd") {
+	if !strings.Contains(out3, filepath.Join(h.runDir(1), "graph/final.mmd")) {
 		t.Errorf("expected final file path in response; got:\n%s", out3)
 	}
 	if strings.Contains(out3, "unchanged") {
@@ -6029,10 +6029,10 @@ tasks:
 	}
 	// The previous initial snapshot must still exist — new phases
 	// land in new files, they don't clobber siblings.
-	if _, ok := h.readRepoFile(projectID, "enju/runs/1/graph/initial.mmd"); !ok {
+	if _, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "graph/initial.mmd")); !ok {
 		t.Errorf("initial.mmd disappeared after final export — phases should be independent files")
 	}
-	finalBody, ok := h.readRepoFile(projectID, "enju/runs/1/graph/final.mmd")
+	finalBody, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "graph/final.mmd"))
 	if !ok {
 		t.Fatalf("expected enju/runs/1/graph/final.mmd after export")
 	}
