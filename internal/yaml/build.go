@@ -155,6 +155,19 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			ti.Prompt = resolvedPrompt
 			ti.UserPrompt = resolvedUserPrompt
 			ti.DependsOn = resolvedDeps
+			// Qualify the review target with this iteration's
+			// instance key. The YAML carries a bare short ID
+			// ("scan"), but at submit-reject time the
+			// cascade needs the full per-iteration ID
+			// ("api:scan") to resolve the right row — without
+			// this, rejecting `api:gate` tried to fail a
+			// nonexistent `scan` task and silently no-op'd,
+			// leaving gate-downstream tasks unlocked (the
+			// battle-test reproduction). Only overrides on
+			// review tasks; other tasks keep the YAML value.
+			if taskDef.Reviews != "" {
+				ti.Reviews = MakeFullID(inst.key, taskDef.Reviews)
+			}
 			if ti.Requirements == nil {
 				ti.Requirements = p.Requirements
 			}
@@ -324,6 +337,11 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 			template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
 			iter.params)
 		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, iter.params)
+		// Same per-iteration qualification as the run-level
+		// for_each path — see the comment there for why.
+		if taskDef.Reviews != "" {
+			ti.Reviews = MakeFullID(iter.key, taskDef.Reviews)
+		}
 		return ti
 	}
 

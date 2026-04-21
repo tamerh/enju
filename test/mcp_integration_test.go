@@ -2931,6 +2931,201 @@ tasks:
 	}
 }
 
+// TestMCPRejectCascadesDownstreamOfReviewGate catches the
+// bug where rejecting a review task failed to skip tasks
+// depending on the REVIEW TASK (the gate itself), only tasks
+// depending on its target. Battle-test reproduced this:
+// `risk_assessment` depended on `owner_review`, the review
+// gate rejected, and `risk_assessment` unlocked anyway —
+// collapsing approve/reject/request_changes from the DAG's
+// perspective.
+//
+// The gate semantics require: downstream of the gate should
+// not proceed when the gate says no. Target-only cascade
+// misses this because the review task sits ACCEPTED (the
+// submit succeeded; only the verdict rejected) and the
+// terminal-state filter in performFailCascade skips over it,
+// stranding anything behind it.
+func TestMCPRejectCascadesDownstreamOfReviewGate(t *testing.T) {
+	h := newMCPHarness(t, "RCGate")
+	projectID := h.createTestProject()
+
+	// This YAML shape deliberately has the review task's
+	// target (`scan`) with no other downstream consumers.
+	// Only the review task depends on the target. The
+	// downstream tasks (`risk_assessment`, `deploy_vote`)
+	// depend on the review task itself — the gate pattern.
+	// If the cascade only walks the target's subtree, it
+	// finds just the review task (which is ACCEPTED after
+	// submit, so the terminal filter drops it) and does
+	// nothing else.
+	yaml := `name: "reject gate cascade"
+version: 1
+tasks:
+  - id: scan
+    action: answer
+    prompt: "Run the scan."
+  - id: gate
+    action: review
+    reviews: scan
+    prompt: "Approve or reject."
+  - id: risk_assessment
+    action: answer
+    depends_on: [gate]
+    prompt: "Assess risk: {{scan.content}}"
+  - id: deploy_vote
+    action: answer
+    depends_on: [risk_assessment]
+    prompt: "Vote on deploy."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "scan")
+	h.mcpSubmitText(t, "scan", "scan output")
+	h.mcpClaimOK(t, "gate")
+	h.mcpSubmitReview(t, "gate", "Blocked: critical findings.", "reject")
+
+	// Target gets marked failed (existing path — works).
+	if got := h.taskGet("scan")["state"]; got != "failed" {
+		t.Fatalf("expected scan FAILED after gate reject, got %v", got)
+	}
+	// Gate task itself goes ACCEPTED — the review submission
+	// is valid, the verdict records what it records.
+	if got := h.taskGet("gate")["state"]; got != "accepted" {
+		t.Fatalf("expected gate ACCEPTED (verdict recorded), got %v", got)
+	}
+	// The real assertion: downstream of the gate must not
+	// proceed. risk_assessment depends on gate (ACCEPTED)
+	// but should still be SKIPPED because the verdict says
+	// no.
+	r := h.taskGet("risk_assessment")
+	if got := r["state"]; got != "skipped" {
+		t.Fatalf("regression: expected risk_assessment SKIPPED after gate reject, got %v (gate semantics collapsed)", got)
+	}
+	if reason, _ := r["skip_reason"].(string); !strings.Contains(reason, "upstream") {
+		t.Errorf("expected skip_reason to cite upstream, got %q", reason)
+	}
+	// Transitive: task behind the gate stays stopped.
+	if got := h.taskGet("deploy_vote")["state"]; got != "skipped" {
+		t.Errorf("expected deploy_vote SKIPPED transitively, got %v", got)
+	}
+}
+
+// TestMCPRequestChangesCascadesDownstreamOfReviewGate is the
+// request_changes analogue of the reject-gate test. Same
+// structural concern, different end state: resetting the
+// target to READY for revision must also reset the gate's
+// downstream consumers to PENDING, not leave them stranded
+// in a state where the first revision leaves them unlocked
+// on stale content.
+func TestMCPRequestChangesCascadesDownstreamOfReviewGate(t *testing.T) {
+	h := newMCPHarness(t, "RCGateRC")
+	projectID := h.createTestProject()
+
+	yaml := `name: "request_changes gate cascade"
+version: 1
+tasks:
+  - id: scan
+    action: answer
+    prompt: "Run the scan."
+  - id: gate
+    action: review
+    reviews: scan
+    prompt: "Approve or request_changes."
+  - id: followup
+    action: answer
+    depends_on: [gate]
+    prompt: "Use the scan: {{scan.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "scan")
+	h.mcpSubmitText(t, "scan", "first draft")
+	h.mcpClaimOK(t, "gate")
+	h.mcpSubmitReview(t, "gate", "Please revise.", "request_changes")
+
+	// Target bounces back to READY.
+	if got := h.taskGet("scan")["state"]; got != "ready" {
+		t.Fatalf("expected scan READY after request_changes, got %v", got)
+	}
+	// Gate downstream must be reset — otherwise the next scan
+	// revision won't re-trigger the gate for followup.
+	if got := h.taskGet("followup")["state"]; got != "pending" {
+		t.Fatalf("expected followup PENDING after gate request_changes, got %v (gate downstream stranded on stale input)", got)
+	}
+}
+
+// TestMCPRejectCascadesGateInForEachInstance reproduces the
+// battle-test repro exactly: `for_each` modules with a per-
+// iteration review gate. Rejecting one module's gate should
+// skip that iteration's downstream tasks, while sibling
+// iterations proceed unaffected.
+//
+// Shape mirrors the `migration` template: `api`, `data`,
+// `utils` expanded from `for_each: module`. For one module,
+// reject the gate and assert only that module's downstream
+// skips.
+func TestMCPRejectCascadesGateInForEachInstance(t *testing.T) {
+	h := newMCPHarness(t, "RCGateFE")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-module reject gate"
+version: 1
+for_each:
+  module: [api, data]
+tasks:
+  - id: scan
+    action: answer
+    prompt: "Scan {{module}}."
+  - id: gate
+    action: review
+    reviews: scan
+    prompt: "Approve {{module}} scan."
+  - id: risk_assessment
+    action: answer
+    depends_on: [gate]
+    prompt: "Assess {{module}}: {{scan.content}}"
+  - id: deploy_vote
+    action: answer
+    depends_on: [risk_assessment]
+    prompt: "Vote on {{module}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Complete scan for both modules, then reject api's gate.
+	h.mcpClaimOK(t, "api:scan")
+	h.mcpSubmitText(t, "api:scan", "api scan output")
+	h.mcpClaimOK(t, "data:scan")
+	h.mcpSubmitText(t, "data:scan", "data scan output")
+
+	h.mcpClaimOK(t, "api:gate")
+	h.mcpSubmitReview(t, "api:gate", "Critical findings.", "reject")
+
+	// api:scan → FAILED (target of the rejected review).
+	if got := h.taskGet("api:scan")["state"]; got != "failed" {
+		t.Fatalf("expected api:scan FAILED after gate reject, got %v", got)
+	}
+	// api's downstream of the gate must not proceed.
+	if got := h.taskGet("api:risk_assessment")["state"]; got != "skipped" {
+		t.Fatalf("regression (battle-test repro): expected api:risk_assessment SKIPPED, got %v", got)
+	}
+	if got := h.taskGet("api:deploy_vote")["state"]; got != "skipped" {
+		t.Errorf("expected api:deploy_vote SKIPPED transitively, got %v", got)
+	}
+	// Sibling iteration unaffected — data's gate is still
+	// waiting for review, and its downstream is still
+	// legitimately pending.
+	if got := h.taskGet("data:scan")["state"]; got != "accepted" {
+		t.Errorf("data:scan should stay accepted (sibling iteration unaffected), got %v", got)
+	}
+	if got := h.taskGet("data:gate")["state"]; got != "ready" {
+		t.Errorf("data:gate should stay ready for its own reviewer, got %v", got)
+	}
+	if got := h.taskGet("data:risk_assessment")["state"]; got != "pending" {
+		t.Errorf("data:risk_assessment should stay pending (its gate has not decided), got %v", got)
+	}
+}
+
 // TestMCPRunStatusMermaidFormat exercises the opt-in
 // format="mermaid" path on enju_run_status. For large or
 // complex DAGs the text tree gets unreadable; emitting
