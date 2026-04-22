@@ -1,8 +1,6 @@
 package mcpgit
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,15 +34,13 @@ func TestLoadProjectConfigWithTemplates(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	confDir := filepath.Join(proj.WorkDir(), "enju")
-	_ = os.MkdirAll(confDir, 0o755)
 	confBody := []byte(`templates:
   - config/enju/
   - workflows/enju
 `)
-	if err := os.WriteFile(filepath.Join(confDir, "conf.yaml"), confBody, 0o644); err != nil {
-		t.Fatalf("write conf: %v", err)
-	}
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/conf.yaml": confBody,
+	})
 	cfg, err := proj.LoadProjectConfig()
 	if err != nil {
 		t.Fatalf("LoadProjectConfig: %v", err)
@@ -79,9 +75,9 @@ func TestLoadProjectConfigRejectsAbsoluteOrEscape(t *testing.T) {
 			ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 			proj, _ := ws.ForProject(1, bare)
 
-			confDir := filepath.Join(proj.WorkDir(), "enju")
-			_ = os.MkdirAll(confDir, 0o755)
-			_ = os.WriteFile(filepath.Join(confDir, "conf.yaml"), []byte(body), 0o644)
+			commitToDefault(t, proj, map[string][]byte{
+				"enju/conf.yaml": []byte(body),
+			})
 
 			_, err := proj.LoadProjectConfig()
 			if err == nil {
@@ -100,9 +96,9 @@ func TestLoadProjectConfigMalformedYAML(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	confDir := filepath.Join(proj.WorkDir(), "enju")
-	_ = os.MkdirAll(confDir, 0o755)
-	_ = os.WriteFile(filepath.Join(confDir, "conf.yaml"), []byte("templates: [unclosed\n"), 0o644)
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/conf.yaml": []byte("templates: [unclosed\n"),
+	})
 
 	_, err := proj.LoadProjectConfig()
 	if err == nil {
@@ -124,15 +120,15 @@ func TestListTemplatesUsesConfiguredRoots(t *testing.T) {
 	proj, _ := ws.ForProject(1, bare)
 
 	// Drop a bundle under a custom path.
-	bundleDir := filepath.Join(proj.WorkDir(), "config", "enju", "hello")
-	_ = os.MkdirAll(bundleDir, 0o755)
-	_ = os.WriteFile(filepath.Join(bundleDir, "enju.yaml"), []byte(`name: "hello"
+	commitToDefault(t, proj, map[string][]byte{
+		"config/enju/hello/enju.yaml": []byte(`name: "hello"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "x"
-`), 0o644)
+`),
+	})
 
 	// Without the conf, discovery skips the custom dir.
 	templates, err := proj.ListTemplates()
@@ -145,9 +141,9 @@ tasks:
 
 	// Write a conf pointing at the custom dir. Discovery now
 	// surfaces the bundle.
-	confDir := filepath.Join(proj.WorkDir(), "enju")
-	_ = os.MkdirAll(confDir, 0o755)
-	_ = os.WriteFile(filepath.Join(confDir, "conf.yaml"), []byte("templates:\n  - config/enju\n"), 0o644)
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/conf.yaml": []byte("templates:\n  - config/enju\n"),
+	})
 
 	templates, err = proj.ListTemplates()
 	if err != nil {

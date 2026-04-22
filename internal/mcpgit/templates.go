@@ -9,6 +9,8 @@ import (
 
 	"github.com/enju-ai/enju/internal/engine"
 	enjuYaml "github.com/enju-ai/enju/internal/yaml"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // Template discovery and instantiation on the fat-client side.
@@ -38,6 +40,18 @@ import (
 // Discovery path: engine.DefaultTemplatesDir (enju/templates/)
 // by default, overridable via enju/conf.yaml's `templates:` list
 // for monorepos with existing config/ or workflows/ conventions.
+//
+// Source-of-truth invariant: all template reads go through the
+// default branch's git tree, NOT the worktree filesystem. This
+// means `enju_list_templates` returns the same set regardless of
+// which run branch the workspace happens to be checked out on —
+// a citizen claiming a task on run-42's branch can still discover
+// templates that were authored on main. The alternative
+// (filesystem reads against p.workDir) coupled discovery to
+// workspace state and broke as soon as create_run switched
+// branches. Pre-commit authoring UX is preserved because
+// EnsureBundleOnDefault commits the bundle to default before any
+// run branch is cut.
 
 // TemplateSummary is the lightweight shape returned by
 // ListTemplates — enough for an LLM to pick a template from a
@@ -47,10 +61,10 @@ import (
 // the path + the reason without having to drill in via
 // describe_template to discover why it's missing.
 type TemplateSummary struct {
-	Path        string         `json:"path"`                   // repo-relative, e.g. "enju/templates/gwas/enju.yaml"
-	Name        string         `json:"name,omitempty"`         // from `name:` field
-	Description string         `json:"description,omitempty"`  // from `description:` field
-	Params      []ParamSummary `json:"params,omitempty"`       // short param summary
+	Path        string         `json:"path"`                  // repo-relative, e.g. "enju/templates/gwas/enju.yaml"
+	Name        string         `json:"name,omitempty"`        // from `name:` field
+	Description string         `json:"description,omitempty"` // from `description:` field
+	Params      []ParamSummary `json:"params,omitempty"`      // short param summary
 	ParseError  string         `json:"parse_error,omitempty"` // set when the template YAML failed to decode/validate
 }
 
@@ -64,6 +78,75 @@ type ParamSummary struct {
 	Required    bool        `json:"required,omitempty"`
 	Default     interface{} `json:"default,omitempty"`
 	Description string      `json:"description,omitempty"`
+}
+
+// defaultBranchTree resolves the default branch tip commit and
+// returns its root tree. Returns (nil, nil) when the default
+// branch has no commits yet — callers treat that as "no
+// templates visible, not an error" so fresh repos don't spew
+// errors before the first commit lands. Prefers the local ref
+// (canonical after pull) and falls back to refs/remotes/origin
+// so a just-cloned workspace can discover templates before its
+// first explicit pull.
+func (p *Project) defaultBranchTree() (*object.Tree, error) {
+	b := p.defaultBranchOr()
+	var hash plumbing.Hash
+	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(b), true); err == nil {
+		hash = ref.Hash()
+	} else if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", b), true); err == nil {
+		hash = ref.Hash()
+	} else {
+		return nil, nil
+	}
+	commit, err := p.repo.CommitObject(hash)
+	if err != nil {
+		return nil, fmt.Errorf("loading default-branch commit %s: %w", hash, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("loading default-branch tree: %w", err)
+	}
+	return tree, nil
+}
+
+// treeSubTree descends `tree` along the slash-separated `path`
+// and returns the subtree. Returns (nil, false, nil) when any
+// segment is missing or resolves to a blob instead of a tree —
+// callers use the bool to distinguish "directory absent" from
+// real errors.
+func treeSubTree(tree *object.Tree, path string) (*object.Tree, bool, error) {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return tree, true, nil
+	}
+	sub, err := tree.Tree(path)
+	if err == object.ErrDirectoryNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		// ErrEntryNotFound (tree.Tree returns this when the
+		// entry exists but isn't a subtree) — treat as absent.
+		return nil, false, nil
+	}
+	return sub, true, nil
+}
+
+// treeReadBlob reads the blob at `path` within `tree`. Returns
+// (nil, false, nil) when the path is absent.
+func treeReadBlob(tree *object.Tree, path string) ([]byte, bool, error) {
+	path = strings.TrimLeft(path, "/")
+	file, err := tree.File(path)
+	if err == object.ErrFileNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("looking up %s: %w", path, err)
+	}
+	contents, err := file.Contents()
+	if err != nil {
+		return nil, false, fmt.Errorf("reading %s: %w", path, err)
+	}
+	return []byte(contents), true, nil
 }
 
 // ListTemplates scans every configured template root for
@@ -89,10 +172,17 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 	if err != nil {
 		return nil, err
 	}
+	tree, err := p.defaultBranchTree()
+	if err != nil {
+		return nil, err
+	}
+	if tree == nil {
+		return nil, nil
+	}
 	var out []TemplateSummary
 	seen := make(map[string]bool)
 	for _, root := range roots {
-		items, err := p.scanTemplateRoot(root)
+		items, err := p.scanTemplateRoot(tree, root)
 		if err != nil {
 			return nil, err
 		}
@@ -108,67 +198,68 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 	return out, nil
 }
 
-// scanTemplateRoot walks one template root and returns the
-// bundles it finds. Split out so ListTemplates can fan over
-// multiple configured roots.
-func (p *Project) scanTemplateRoot(root string) ([]TemplateSummary, error) {
-	absRoot := filepath.Join(p.workDir, root)
-	entries, err := os.ReadDir(absRoot)
+// scanTemplateRoot walks one template root in the default-branch
+// tree and returns the bundles it finds. Split out so
+// ListTemplates can fan over multiple configured roots.
+func (p *Project) scanTemplateRoot(tree *object.Tree, root string) ([]TemplateSummary, error) {
+	rootTree, ok, err := treeSubTree(tree, root)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("reading templates directory %s: %w", root, err)
 	}
+	if !ok {
+		return nil, nil
+	}
 	var out []TemplateSummary
-	for _, e := range entries {
-		name := e.Name()
-		if !e.IsDir() {
-			// Catch the legacy single-file shape and emit
-			// exactly one actionable migration hint per
-			// offending file — silently skipping would leave
-			// the author with an empty menu and no clue why.
-			if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
-				legacyRel := filepath.ToSlash(filepath.Join(root, name))
-				base := strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
-				out = append(out, TemplateSummary{
-					Path: legacyRel,
-					ParseError: fmt.Sprintf(
-						"legacy single-file template layout — move %s to %s/%s/%s",
-						legacyRel, root, base, engine.BundleManifestName),
-				})
+	for _, e := range rootTree.Entries {
+		name := e.Name
+		if !e.Mode.IsFile() && e.Mode != 0 {
+			// Directory (subtree) — check for the bundle manifest inside.
+			if subTree, err := rootTree.Tree(name); err == nil {
+				if _, ok, _ := treeReadBlob(subTree, engine.BundleManifestName); ok {
+					rel := filepath.ToSlash(filepath.Join(root, name, engine.BundleManifestName))
+					summary, err := p.templateSummaryFromTree(tree, rel)
+					if err != nil {
+						out = append(out, TemplateSummary{
+							Path:       rel,
+							ParseError: err.Error(),
+						})
+						continue
+					}
+					out = append(out, *summary)
+				}
+				// Missing manifest → not a template bundle. Skip silently.
+				continue
 			}
-			continue
+			// Tree lookup failed — fall through to file handling below.
 		}
-		// Directory entry → check for the bundle manifest at its root.
-		manifest := filepath.Join(absRoot, name, engine.BundleManifestName)
-		if _, statErr := os.Stat(manifest); statErr != nil {
-			// Missing manifest → not a template bundle.
-			// Skip silently; directories might exist for
-			// other purposes (shared scratch, etc).
-			continue
-		}
-		rel := filepath.ToSlash(filepath.Join(root, name, engine.BundleManifestName))
-		summary, err := p.templateSummary(rel)
-		if err != nil {
+		// File entry at the root. Catch the legacy single-file
+		// shape and emit exactly one actionable migration hint per
+		// offending file — silently skipping would leave the
+		// author with an empty menu and no clue why.
+		if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+			legacyRel := filepath.ToSlash(filepath.Join(root, name))
+			base := strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
 			out = append(out, TemplateSummary{
-				Path:       rel,
-				ParseError: err.Error(),
+				Path: legacyRel,
+				ParseError: fmt.Sprintf(
+					"legacy single-file template layout — move %s to %s/%s/%s",
+					legacyRel, root, base, engine.BundleManifestName),
 			})
-			continue
 		}
-		out = append(out, *summary)
 	}
 	return out, nil
 }
 
-// templateSummary reads one template file and returns its
-// compressed view. Used by ListTemplates and as a building
-// block for LoadTemplate.
-func (p *Project) templateSummary(repoRelPath string) (*TemplateSummary, error) {
-	data, err := os.ReadFile(filepath.Join(p.workDir, repoRelPath))
+// templateSummaryFromTree reads one template manifest from the
+// default-branch tree and returns its compressed view. Used by
+// ListTemplates and as a building block for LoadTemplate.
+func (p *Project) templateSummaryFromTree(tree *object.Tree, repoRelPath string) (*TemplateSummary, error) {
+	data, ok, err := treeReadBlob(tree, repoRelPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading template %s: %w", repoRelPath, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("template %s not found on default branch", repoRelPath)
 	}
 	parsed, err := enjuYaml.Parse(data)
 	if err != nil {
@@ -208,80 +299,118 @@ type LoadedTemplate struct {
 	Summary   TemplateSummary
 }
 
-// ReadBundleFiles walks the bundle directory and returns
-// every regular file as a FileWrite, with repo-relative paths
-// rebased to a target directory (typically the per-run
-// snapshot location produced by engine.RunTemplateSnapshotDir).
-// Used by handleCreateRun to commit the bundle into the run's
-// snapshot area at instantiation time, locking the recipe +
-// its scripts to the moment the run was created.
+// ReadBundleFiles walks the bundle directory in the default-branch
+// tree and returns every regular blob as a FileWrite, with
+// repo-relative paths rebased to a target directory (typically
+// the per-run snapshot location produced by
+// engine.RunTemplateSnapshotDir). Used by handleCreateRun to
+// commit the bundle into the run's snapshot area at
+// instantiation time, locking the recipe + its scripts to the
+// moment the run was created.
 //
-// Symlinks, special files, and hidden-dir entries (`.git/`)
-// are skipped. Size-guard: if the bundle exceeds 10 MB total,
-// return an error — templates aren't the place for large
-// data blobs, and a runaway snapshot would bloat every
-// subsequent run commit.
+// Reading from the tree — not the worktree filesystem — keeps
+// snapshots deterministic: whatever is committed to default is
+// what gets frozen into the run, independent of any uncommitted
+// edits that might be sitting in the worktree when create_run
+// fires. EnsureBundleOnDefault is responsible for landing the
+// bundle on default before this runs.
+//
+// Size guard: if the bundle exceeds 10 MB total, return an
+// error — templates aren't the place for large data blobs, and
+// a runaway snapshot would bloat every subsequent run commit.
 func (p *Project) ReadBundleFiles(bundleDir, targetDir string) ([]FileWrite, error) {
-	root := filepath.Join(p.workDir, bundleDir)
-	info, err := os.Stat(root)
+	tree, err := p.defaultBranchTree()
 	if err != nil {
-		return nil, fmt.Errorf("stat bundle %s: %w", bundleDir, err)
+		return nil, err
 	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("bundle path %q is not a directory", bundleDir)
+	if tree == nil {
+		return nil, fmt.Errorf("default branch has no commits; commit the template bundle before instantiating")
+	}
+	bundleTree, ok, err := treeSubTree(tree, bundleDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading bundle %s: %w", bundleDir, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("bundle %q not found on default branch", bundleDir)
 	}
 	const maxBundleBytes = 10 * 1024 * 1024
 	var totalBytes int64
 	var files []FileWrite
-	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	walker := object.NewTreeWalker(bundleTree, true, nil)
+	defer walker.Close()
+	for {
+		name, entry, err := walker.Next()
+		if err != nil {
+			break
 		}
-		if info.IsDir() {
-			// Skip hidden dirs — .git (nested submodule checkouts)
-			// would pull a huge history into the snapshot.
-			if strings.HasPrefix(info.Name(), ".") && path != root {
-				return filepath.SkipDir
+		if !entry.Mode.IsFile() {
+			continue
+		}
+		// Skip hidden dirs — .git (nested submodule checkouts)
+		// would pull a huge history into the snapshot. The tree
+		// walker is recursive, so filter on the full path.
+		skip := false
+		for _, seg := range strings.Split(name, "/") {
+			if strings.HasPrefix(seg, ".") {
+				skip = true
+				break
 			}
-			return nil
 		}
-		if !info.Mode().IsRegular() {
-			return nil // symlinks, devices, etc.
+		if skip {
+			continue
 		}
-		totalBytes += info.Size()
+		blob, err := p.repo.BlobObject(entry.Hash)
+		if err != nil {
+			return nil, fmt.Errorf("loading blob for %s: %w", name, err)
+		}
+		totalBytes += blob.Size
 		if totalBytes > maxBundleBytes {
-			return fmt.Errorf("bundle %q exceeds %d-byte size limit; templates shouldn't carry large data blobs", bundleDir, maxBundleBytes)
+			return nil, fmt.Errorf("bundle %q exceeds %d-byte size limit; templates shouldn't carry large data blobs", bundleDir, maxBundleBytes)
 		}
-		body, rerr := os.ReadFile(path)
-		if rerr != nil {
-			return fmt.Errorf("reading bundle file %s: %w", path, rerr)
+		reader, err := blob.Reader()
+		if err != nil {
+			return nil, fmt.Errorf("opening blob for %s: %w", name, err)
 		}
-		rel, rerr := filepath.Rel(root, path)
-		if rerr != nil {
-			return fmt.Errorf("computing bundle-relative path for %s: %w", path, rerr)
+		body := make([]byte, blob.Size)
+		if _, err := readFullFromBlob(reader, body); err != nil {
+			reader.Close()
+			return nil, fmt.Errorf("reading blob for %s: %w", name, err)
 		}
-		// Preserve the source file's mode. Scripts with +x
-		// in the live bundle must stay executable in the
+		reader.Close()
+		// Preserve executable bit from the tree entry mode.
+		// Scripts committed with +x must stay executable in the
 		// snapshot — otherwise the executor resolves `script:`
 		// to a non-executable file and the task fails with
-		// "permission denied" on run. Use at-least-0644 as a
-		// floor so a weirdly-permissioned source (0600 from a
-		// restrictive umask) still becomes readable by git.
-		mode := info.Mode().Perm()
-		if mode&0o444 == 0 {
-			mode |= 0o644
+		// "permission denied" on run.
+		mode := os.FileMode(0o644)
+		if entry.Mode == 0o100755 {
+			mode = 0o755
 		}
 		files = append(files, FileWrite{
-			RepoRelPath: filepath.ToSlash(filepath.Join(targetDir, rel)),
+			RepoRelPath: filepath.ToSlash(filepath.Join(targetDir, name)),
 			Content:     body,
 			Mode:        mode,
 		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	return files, nil
+}
+
+// readFullFromBlob reads exactly len(buf) bytes from r into buf.
+// go-git's blob Reader doesn't satisfy io.ReadFull semantics in
+// all versions, so we hand-roll the loop.
+func readFullFromBlob(r interface{ Read([]byte) (int, error) }, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		total += n
+		if err != nil {
+			if total == len(buf) {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // LoadTemplate reads a template bundle by either:
@@ -307,29 +436,36 @@ func (p *Project) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	if err := p.assertUnderTemplatesRoot(repoRelPath); err != nil {
 		return nil, err
 	}
-
-	bundleDir, manifestPath, err := p.resolveBundlePaths(repoRelPath)
+	tree, err := p.defaultBranchTree()
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(filepath.Join(p.workDir, manifestPath))
+	// Tree-first, worktree-fallback: the primary source of
+	// truth is the default-branch tree (so LoadTemplate works
+	// from any workspace branch). But create_run's
+	// author-on-disk UX — a user writes enju.yaml into the
+	// worktree without committing, then calls create_run which
+	// EnsureBundleOnDefault auto-commits — needs a read path
+	// for uncommitted files too. We check tree first, then fall
+	// back to the worktree. Discovery (ListTemplates) stays
+	// tree-only so list results don't vary with workspace
+	// state, but single-template load tolerates the
+	// pre-commit case.
+	rb, err := p.resolveAndReadBundle(tree, repoRelPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("template %q not found in workspace — check `enju_list_templates` for available recipes", repoRelPath)
-		}
-		return nil, fmt.Errorf("reading template %s: %w", manifestPath, err)
+		return nil, err
 	}
-	parsed, err := enjuYaml.Parse(data)
+	parsed, err := enjuYaml.Parse(rb.manifest)
 	if err != nil {
-		return nil, fmt.Errorf("parsing template %s: %w", manifestPath, err)
+		return nil, fmt.Errorf("parsing template %s: %w", rb.manifestPath, err)
 	}
 	return &LoadedTemplate{
-		Path:      manifestPath,
-		BundleDir: bundleDir,
-		Raw:       data,
+		Path:      rb.manifestPath,
+		BundleDir: rb.bundleDir,
+		Raw:       rb.manifest,
 		Summary: TemplateSummary{
-			Path:        manifestPath,
+			Path:        rb.manifestPath,
 			Name:        parsed.Run.Name,
 			Description: parsed.Run.Description,
 			Params:      paramSummaries(parsed.Run.Params),
@@ -356,15 +492,52 @@ func (p *Project) assertUnderTemplatesRoot(repoRelPath string) error {
 	return fmt.Errorf("template path %q must live under one of: %s", repoRelPath, strings.Join(roots, ", "))
 }
 
-// resolveBundlePaths maps a caller-supplied template reference
-// to the (bundleDir, manifestPath) pair the loader uses, both
-// as repo-relative slash-paths. Accepts:
-//
-//   - "<root>/NAME"                → dir form
-//   - "<root>/NAME/enju.yaml"      → manifest form
-//   - anything else ending in .yaml/.yml → legacy single-file,
-//                                          rejected with migration hint
-func (p *Project) resolveBundlePaths(repoRelPath string) (bundleDir, manifestPath string, err error) {
+// resolvedBundle is the output of resolveAndReadBundle: the
+// caller-supplied path, classified and paired with the manifest
+// bytes we just read.
+type resolvedBundle struct {
+	bundleDir    string
+	manifestPath string
+	manifest     []byte
+}
+
+// resolveAndReadBundle resolves a caller-supplied template
+// reference to a resolvedBundle in one pass: tree first, then
+// worktree filesystem as fallback. The filesystem fallback
+// supports the author-on-disk UX — a user writes enju.yaml
+// into their worktree and calls create_run;
+// EnsureBundleOnDefault commits the bundle before the run
+// actually branches off. Without the fallback, that flow would
+// break because the tree wouldn't have the template yet.
+func (p *Project) resolveAndReadBundle(tree *object.Tree, repoRelPath string) (*resolvedBundle, error) {
+	bundleDir, manifestPath, err := p.resolveBundlePathShape(repoRelPath)
+	if err != nil {
+		return nil, err
+	}
+	if tree != nil {
+		if data, ok, rerr := treeReadBlob(tree, manifestPath); rerr != nil {
+			return nil, fmt.Errorf("reading template %s: %w", manifestPath, rerr)
+		} else if ok {
+			return &resolvedBundle{bundleDir: bundleDir, manifestPath: manifestPath, manifest: data}, nil
+		}
+	}
+	// Worktree fallback — tolerate uncommitted authoring.
+	data, fsErr := os.ReadFile(filepath.Join(p.workDir, manifestPath))
+	if fsErr == nil {
+		return &resolvedBundle{bundleDir: bundleDir, manifestPath: manifestPath, manifest: data}, nil
+	}
+	if !os.IsNotExist(fsErr) {
+		return nil, fmt.Errorf("reading template %s: %w", manifestPath, fsErr)
+	}
+	return nil, fmt.Errorf("template %q not found on default branch or in worktree — check `enju_list_templates` for available recipes", repoRelPath)
+}
+
+// resolveBundlePathShape classifies the caller-supplied path
+// into (bundleDir, manifestPath) based on shape only — no tree
+// or filesystem check. Lets both tree-read and
+// filesystem-fallback loaders share the same classification
+// logic.
+func (p *Project) resolveBundlePathShape(repoRelPath string) (bundleDir, manifestPath string, err error) {
 	pth := strings.TrimSuffix(repoRelPath, "/")
 	// Manifest form: ends in /<BundleManifestName>.
 	if strings.HasSuffix(pth, "/"+engine.BundleManifestName) {
@@ -391,16 +564,6 @@ func (p *Project) resolveBundlePaths(repoRelPath string) (bundleDir, manifestPat
 			"legacy single-file template path %q — templates are now directory bundles. "+
 				"Move %s to %s/%s/%s and reference it as %s/%s (or the full manifest path)",
 			repoRelPath, repoRelPath, parentDir, base, engine.BundleManifestName, parentDir, base)
-	}
-	info, statErr := os.Stat(filepath.Join(p.workDir, pth))
-	if statErr != nil {
-		if os.IsNotExist(statErr) {
-			return "", "", fmt.Errorf("template %q not found in workspace — check `enju_list_templates` for available recipes", repoRelPath)
-		}
-		return "", "", fmt.Errorf("stat template %s: %w", repoRelPath, statErr)
-	}
-	if !info.IsDir() {
-		return "", "", fmt.Errorf("template path %q is not a directory; templates are directory bundles with %s at their root", repoRelPath, engine.BundleManifestName)
 	}
 	return pth, pth + "/" + engine.BundleManifestName, nil
 }

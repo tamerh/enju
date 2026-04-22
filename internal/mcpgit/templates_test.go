@@ -1,8 +1,6 @@
 package mcpgit
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,10 +45,6 @@ func TestListAndLoadTemplate(t *testing.T) {
 		t.Fatalf("clone: %v", err)
 	}
 
-	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "gwas")
-	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
-		t.Fatalf("mkdir bundle: %v", err)
-	}
 	template := []byte(`name: "GWAS analysis"
 description: "Analyze GWAS summary stats for a disease."
 version: 1
@@ -68,9 +62,9 @@ tasks:
     action: answer
     prompt: "Analyze GWAS data for {{disease}} in {{tissue}}"
 `)
-	if err := os.WriteFile(filepath.Join(bundleDir, "enju.yaml"), template, 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/templates/gwas/enju.yaml": template,
+	})
 
 	// ListTemplates surfaces the metadata.
 	templates, err := proj.ListTemplates()
@@ -131,9 +125,8 @@ func TestInstantiateTemplateMissingRequired(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "r")
-	_ = os.MkdirAll(bundleDir, 0o755)
-	_ = os.WriteFile(filepath.Join(bundleDir, "enju.yaml"), []byte(`name: "R"
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/templates/r/enju.yaml": []byte(`name: "R"
 version: 1
 params:
   - name: disease
@@ -144,7 +137,8 @@ tasks:
   - id: t
     action: answer
     prompt: "x {{disease}}"
-`), 0o644)
+`),
+	})
 
 	err := proj.ValidateTemplateParams("enju/templates/r", map[string]interface{}{})
 	if err == nil {
@@ -169,11 +163,9 @@ func TestListTemplatesLegacyFileShape(t *testing.T) {
 	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
-	templatesDir := filepath.Join(proj.WorkDir(), "enju", "templates")
-	_ = os.MkdirAll(templatesDir, 0o755)
-	_ = os.WriteFile(filepath.Join(templatesDir, "legacy.yaml"),
-		[]byte("name: legacy\nversion: 1\ntasks: [{id: t, action: answer, prompt: x}]\n"),
-		0o644)
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/templates/legacy.yaml": []byte("name: legacy\nversion: 1\ntasks: [{id: t, action: answer, prompt: x}]\n"),
+	})
 
 	templates, err := proj.ListTemplates()
 	if err != nil {
@@ -225,5 +217,59 @@ func TestLoadTemplateRejectsOutsideTemplatesDir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must live under") {
 		t.Errorf("expected 'must live under' error, got: %v", err)
+	}
+}
+
+// TestListTemplatesVisibleFromNonDefaultBranch is the regression
+// for the workspace-branch bug: after create_run switches the
+// worktree onto a run branch, enju_list_templates must still
+// surface templates that live on the default branch. Before the
+// fix, the scanner walked p.workDir (the current-branch
+// worktree), so templates authored on main disappeared from the
+// menu as soon as the workspace switched off main.
+func TestListTemplatesVisibleFromNonDefaultBranch(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	proj, err := ws.ForProject(1, bare)
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	// Commit a template bundle on main.
+	commitToDefault(t, proj, map[string][]byte{
+		"enju/templates/demo/enju.yaml": []byte(`name: "demo"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`),
+	})
+
+	// Simulate create_run switching the worktree off main.
+	if err := proj.CheckoutBranch("run-42"); err != nil {
+		t.Fatalf("checkout run-42: %v", err)
+	}
+
+	templates, err := proj.ListTemplates()
+	if err != nil {
+		t.Fatalf("ListTemplates on run branch: %v", err)
+	}
+	if len(templates) != 1 {
+		t.Fatalf("expected 1 template visible from run branch, got %d: %+v", len(templates), templates)
+	}
+	if templates[0].Name != "demo" {
+		t.Errorf("name: got %q, want demo", templates[0].Name)
+	}
+
+	// LoadTemplate must also succeed from the non-default
+	// branch — no workaround `git checkout main` needed.
+	loaded, err := proj.LoadTemplate("enju/templates/demo")
+	if err != nil {
+		t.Fatalf("LoadTemplate on run branch: %v", err)
+	}
+	if loaded.Summary.Name != "demo" {
+		t.Errorf("LoadTemplate: name = %q, want demo", loaded.Summary.Name)
 	}
 }

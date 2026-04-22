@@ -2,7 +2,6 @@ package mcpgit
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -31,23 +30,31 @@ type ProjectConfig struct {
 	Templates []string `yaml:"templates"`
 }
 
-// LoadProjectConfig reads enju/conf.yaml from the workspace. A
-// missing file is a normal state and returns (nil, nil) — the
-// conf is optional and the caller is expected to apply built-in
-// defaults. Returns an error only for real I/O / parse failures
-// so a malformed conf surfaces loudly instead of silently
-// reverting to defaults (which would make misconfiguration
-// invisible).
+// LoadProjectConfig reads enju/conf.yaml from the default branch's
+// git tree. A missing file is a normal state and returns
+// (nil, nil) — the conf is optional and the caller is expected
+// to apply built-in defaults. Returns an error only for real
+// parse failures so a malformed conf surfaces loudly instead of
+// silently reverting to defaults (which would make
+// misconfiguration invisible).
+//
+// Reading from the default-branch tree (not the worktree
+// filesystem) keeps template discovery consistent regardless of
+// which run branch the workspace happens to be checked out on.
+// See templates.go for the full rationale.
 func (p *Project) LoadProjectConfig() (*ProjectConfig, error) {
-	path := filepath.Join(p.workDir, engine.ProjectConfigPath)
-	data, err := os.ReadFile(path)
+	tree, err := p.defaultBranchTree()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
+		return nil, err
+	}
+	if tree == nil {
+		return nil, nil
+	}
+	data, ok, err := treeReadBlob(tree, engine.ProjectConfigPath)
+	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", engine.ProjectConfigPath, err)
 	}
-	if len(data) == 0 {
+	if !ok || len(data) == 0 {
 		return nil, nil
 	}
 	var cfg ProjectConfig

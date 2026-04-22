@@ -1159,3 +1159,31 @@ func errStr(s string) error { return &stringErr{s} }
 type stringErr struct{ msg string }
 
 func (e *stringErr) Error() string { return e.msg }
+
+// commitToDefault is a test helper that lands a set of files on
+// the project's default branch in one commit + push. Template
+// discovery reads through the default-branch tree, so tests that
+// exercise ListTemplates/LoadTemplate/LoadProjectConfig have to
+// commit their fixtures rather than leaving them as worktree
+// files.
+func commitToDefault(t *testing.T, proj *Project, files map[string][]byte) {
+	t.Helper()
+	writes := make([]FileWrite, 0, len(files))
+	for path, body := range files {
+		writes = append(writes, FileWrite{
+			RepoRelPath: path,
+			Content:     body,
+			Mode:        0o644,
+		})
+	}
+	proj.Lock()
+	defer proj.Unlock()
+	if _, err := proj.CommitFiles(CommitFilesRequest{
+		Files:       writes,
+		CommitMsg:   "seed test fixtures",
+		AuthorName:  "t",
+		AuthorEmail: "t@x",
+	}); err != nil {
+		t.Fatalf("commitToDefault: %v", err)
+	}
+}

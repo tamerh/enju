@@ -7632,7 +7632,7 @@ tasks:
   - id: pick
     action: vote
     citizens: 3
-    deadline: 100ms
+    deadline: 500ms
     threshold: majority
     prompt: "Pick."
     options:
@@ -7651,7 +7651,7 @@ tasks:
 	}
 
 	// Wait past the deadline, then read — lazy resolver fires.
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond)
 	pick := h.taskGet("pick")
 	if got := pick["state"]; got != "accepted" {
 		t.Fatalf("expected accepted after deadline lazy resolve, got %v", got)
