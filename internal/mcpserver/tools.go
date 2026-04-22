@@ -47,6 +47,44 @@ Set include_context=false for a lean response: task id, deadline, action schema 
 	)
 }
 
+func toolClaimReadyMatching() mcp.Tool {
+	return mcp.NewTool("enju_claim_ready_matching",
+		mcp.WithDescription(`Bulk-claim every ready task in a run that matches the filter. Symmetric to enju_submit_results_batch — one MCP call instead of N, designed for bulk-work flows: a reviewer approving all ready reviews, a rater handling every item in a labeling cohort, an agent running a paper-scale evaluation.
+
+Scope:
+- One project + one run (required). Cross-run selectors aren't supported — keep the claim cohort controllable.
+- Optional action filter (review, vote, answer, contribute, compute). Omit to match any ready action.
+- Pre-filters on access control (assign_to) before claiming, so the response isn't mostly failed claims on tasks this citizen can't touch.
+- Skips tasks already claimed by this citizen — re-running the selector is idempotent.
+
+Response shape:
+- Per-entry status: claimed | skipped (already_claimed) | error (with reason).
+- By default the response is minimal — task id, action, deadline, declared schema (options/reviews/outputs). Set include_context=true for the full single-claim response (inlined artifact content, resolved prompt) per entry.
+
+Safety:
+- Default limit is 50, hard cap 500. Bulk-claiming a 15K-task run in one call is almost always a mistake; the cap forces the caller to pass limit explicitly when they really mean it.
+- Ordering: task seq ASC within the run (deterministic, matches DAG construction order).
+- Atomicity: the coordinator's per-claim locking applies. A concurrent selector from another citizen won't double-claim the same task — the loser's entry reports "error" for that task.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+		mcp.WithString("action",
+			mcp.Description(`Filter by action type: "review", "vote", "answer", "contribute", "compute". Omit to match any action.`),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum number of tasks to claim (default 50, hard cap 500)."),
+		),
+		mcp.WithBoolean("include_context",
+			mcp.Description("Include the full resolved-prompt + inlined-artifact context per entry (default false — use the lean form for bulk-work flows)."),
+		),
+	)
+}
+
 func toolGetTaskInputs() mcp.Tool {
 	return mcp.NewTool("enju_get_task_inputs",
 		mcp.WithDescription("Get the upstream dependency results for a task. Use this to see what previous tasks produced."),

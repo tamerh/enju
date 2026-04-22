@@ -4041,6 +4041,199 @@ tasks:
 	}
 }
 
+// TestMCPClaimReadyMatchingHappyPath covers the core
+// selector-claim workflow: one call returns N claimed
+// tasks, filtered by action, in deterministic seq order.
+// Targets the bulk-review use case — reviewer has multiple
+// pending reviews and wants them all in one shot.
+func TestMCPClaimReadyMatchingHappyPath(t *testing.T) {
+	h := newMCPHarness(t, "ClaimSelect")
+	projectID := h.createTestProject()
+
+	yaml := `name: "bulk select"
+version: 1
+tasks:
+  - id: draft_a
+    action: answer
+    prompt: "a"
+  - id: draft_b
+    action: answer
+    prompt: "b"
+  - id: draft_c
+    action: answer
+    prompt: "c"
+  - id: review_a
+    action: review
+    reviews: draft_a
+    prompt: "r {{draft_a.content}}"
+  - id: review_b
+    action: review
+    reviews: draft_b
+    prompt: "r {{draft_b.content}}"
+  - id: review_c
+    action: review
+    reviews: draft_c
+    prompt: "r {{draft_c.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	for _, id := range []string{"draft_a", "draft_b", "draft_c"} {
+		h.mcpClaimOK(t, id)
+		h.mcpSubmitText(t, id, id+"-content")
+	}
+
+	// Selector claims all three reviews in one call.
+	res := h.call(t, "enju_claim_ready_matching", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"action":     "review",
+	})
+	if res.IsError {
+		t.Fatalf("selector claim failed: %s", mcpText(res))
+	}
+	out := mcpText(res)
+	if !strings.Contains(out, "Claimed 3 task(s)") {
+		t.Fatalf("expected '✓ Claimed 3 task(s)' summary, got:\n%s", out)
+	}
+	for _, id := range []string{"review_a", "review_b", "review_c"} {
+		tm := h.taskGet(id)
+		if got := tm["state"]; got != "claimed" {
+			t.Errorf("%s should be CLAIMED after selector, got %v", id, got)
+		}
+		if got := tm["claimed_by"]; got != h.username {
+			t.Errorf("%s claimed_by: got %v, want %s", id, got, h.username)
+		}
+	}
+}
+
+// TestMCPClaimReadyMatchingActionFilter verifies the action
+// filter excludes mismatching task types and leaves them
+// available for other callers. Also confirms "no matches"
+// emits a sensible empty-result response instead of an
+// error.
+func TestMCPClaimReadyMatchingActionFilter(t *testing.T) {
+	h := newMCPHarness(t, "ClaimFilter")
+	projectID := h.createTestProject()
+
+	yaml := `name: "filter test"
+version: 1
+tasks:
+  - id: answer_one
+    action: answer
+    prompt: "a"
+  - id: answer_two
+    action: answer
+    prompt: "b"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Filter action=review when none exist — empty result.
+	res := h.call(t, "enju_claim_ready_matching", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"action":     "review",
+	})
+	if res.IsError {
+		t.Fatalf("expected empty-result success, got error: %s", mcpText(res))
+	}
+	if !strings.Contains(mcpText(res), "No ready tasks match") {
+		t.Errorf("expected 'No ready tasks match' message, got:\n%s", mcpText(res))
+	}
+	// The answer tasks should still be ready — unclaimed.
+	for _, id := range []string{"answer_one", "answer_two"} {
+		if got := h.taskGet(id)["state"]; got != "ready" {
+			t.Errorf("%s should stay READY after action-filter mismatch, got %v", id, got)
+		}
+	}
+
+	// Now filter by the matching action — claims both.
+	res2 := h.call(t, "enju_claim_ready_matching", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"action":     "answer",
+	})
+	if res2.IsError {
+		t.Fatalf("answer filter failed: %s", mcpText(res2))
+	}
+	if !strings.Contains(mcpText(res2), "Claimed 2 task(s)") {
+		t.Errorf("expected 2 claims on action=answer, got:\n%s", mcpText(res2))
+	}
+}
+
+// TestMCPClaimReadyMatchingLimitCap rejects selector calls
+// with limit above the hard cap — an unintentional 15K-task
+// claim in one response is almost always a mistake. Explicit
+// higher caps require a code change, not a runtime tweak.
+func TestMCPClaimReadyMatchingLimitCap(t *testing.T) {
+	h := newMCPHarness(t, "ClaimCap")
+	projectID := h.createTestProject()
+
+	h.mcpCreateRunInline(t, projectID, `name: "cap"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "x"
+`)
+	res := h.call(t, "enju_claim_ready_matching", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"limit":      float64(9999),
+	})
+	if !res.IsError {
+		t.Fatalf("expected limit-cap rejection, got success: %s", mcpText(res))
+	}
+	if !strings.Contains(mcpText(res), "hard cap") {
+		t.Errorf("expected 'hard cap' message, got:\n%s", mcpText(res))
+	}
+}
+
+// TestMCPClaimReadyMatchingDedupAlreadyClaimed locks in the
+// idempotency contract: re-running the selector after a
+// partial claim doesn't re-claim tasks this citizen already
+// holds. Important for agent retry loops — "claim everything
+// I can work on" should be safe to call multiple times.
+func TestMCPClaimReadyMatchingDedupAlreadyClaimed(t *testing.T) {
+	h := newMCPHarness(t, "ClaimDedup")
+	projectID := h.createTestProject()
+
+	yaml := `name: "dedup"
+version: 1
+tasks:
+  - id: t1
+    action: answer
+    prompt: "one"
+  - id: t2
+    action: answer
+    prompt: "two"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	// Claim t1 individually first — simulates a partial
+	// pre-existing state.
+	h.mcpClaimOK(t, "t1")
+
+	res := h.call(t, "enju_claim_ready_matching", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"action":     "answer",
+	})
+	if res.IsError {
+		t.Fatalf("selector failed: %s", mcpText(res))
+	}
+	// Only t2 should have been claimed this round; t1 stays
+	// in CLAIMED state but is not re-acquired.
+	out := mcpText(res)
+	if !strings.Contains(out, "Claimed 1 task(s)") {
+		t.Errorf("expected selector to claim 1 new task (t2) after t1 already claimed, got:\n%s", out)
+	}
+	// t1 still claimed by us — selector is idempotent.
+	if got := h.taskGet("t1")["claimed_by"]; got != h.username {
+		t.Errorf("t1 claimed_by drifted: got %v", got)
+	}
+	if got := h.taskGet("t2")["state"]; got != "claimed" {
+		t.Errorf("t2 should be CLAIMED, got %v", got)
+	}
+}
+
 // TestMCPRunStatusMermaidFormat exercises the opt-in
 // format="mermaid" path on enju_run_status. For large or
 // complex DAGs the text tree gets unreadable; emitting
