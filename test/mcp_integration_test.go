@@ -3217,6 +3217,148 @@ tasks:
 	}
 }
 
+// TestMCPVoteActivatesSkipCascadeInForEach reproduces the
+// battle-test finding where a for_each-expanded vote with
+// activates: didn't fire the skip cascade. The vote's
+// activates list names a short task id ("human_adjudicate"),
+// but downstream is also fanned out per iteration
+// ("i03:human_adjudicate"). Without per-iteration
+// qualification, the cascade builds "run-prefix/
+// human_adjudicate" — a non-existent DAG node — and the
+// skip set comes back empty, leaving every downstream
+// available regardless of which option won.
+//
+// Correct behavior: a vote instance in iteration K resolves
+// to an option, and the activates list is interpreted
+// relative to K. Same-iteration downstream tasks
+// (K:human_adjudicate) are either activated (winning
+// option's list) or skipped (losing option's list minus
+// the winning set). Sibling iterations are unaffected.
+//
+// This is the load-bearing mechanism for "dissent routing"
+// — when it's broken, review tasks fire regardless of the
+// tally, collapsing approve vs escalate from the DAG's
+// perspective.
+func TestMCPVoteActivatesSkipCascadeInForEach(t *testing.T) {
+	h := newMCPHarness(t, "VoteAct")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-item dissent routing"
+version: 1
+tasks:
+  - id: synthesis
+    for_each:
+      item: [a, b]
+    action: vote
+    options:
+      - id: concur
+        activates: []
+      - id: escalate
+        activates: [human_adjudicate]
+    prompt: "Synthesize {{item}}."
+  - id: human_adjudicate
+    for_each:
+      item: [a, b]
+    action: answer
+    depends_on: [synthesis]
+    prompt: "Adjudicate {{item}}."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Item a concurs → human_adjudicate for a should skip.
+	// Item b escalates → human_adjudicate for b should run.
+	h.mcpClaimOK(t, "a:synthesis")
+	h.mcpSubmitVote(t, "a:synthesis", "agreement", "concur")
+
+	h.mcpClaimOK(t, "b:synthesis")
+	h.mcpSubmitVote(t, "b:synthesis", "needs human", "escalate")
+
+	if got := h.taskGet("a:human_adjudicate")["state"]; got != "skipped" {
+		t.Fatalf("regression: a:human_adjudicate should be SKIPPED after a:synthesis concur, got %v (dissent routing broken — the activates skip cascade did nothing)", got)
+	}
+	if got := h.taskGet("b:human_adjudicate")["state"]; got != "ready" {
+		t.Fatalf("b:human_adjudicate should be READY after b:synthesis escalate, got %v", got)
+	}
+}
+
+// TestMCPReadsArtifactsNoDuplicatesAcrossSubstitution locks
+// in the fix for a cosmetic bug where the claim response
+// listed the same reads_artifacts path twice when a template
+// declared it explicitly AND referenced it via {{artifact:...}}
+// with a for_each variable. Pre-substitution dedupe in
+// MergeArtifactReads saw the two strings
+// ("state/items/{{item}}.json" vs the resolved
+// "state/items/i01.json") as distinct, then ResolveParamsSlice
+// collapsed them into the same concrete path, producing a
+// duplicate entry on the wire.
+//
+// Fix: substitute the explicit list first, then merge with
+// inferred reads. Identity dedupe works on concrete paths.
+func TestMCPReadsArtifactsNoDuplicatesAcrossSubstitution(t *testing.T) {
+	h := newMCPHarness(t, "ReadsDedup")
+	projectID := h.createTestProject()
+
+	// Deliberate shape that pre-fix would produce a duplicate:
+	//   - explicit reads_artifacts contains a templated path
+	//     ({{item}}) — pre-substitution merge sees one string
+	//   - prompt's {{artifact:...}} reference is literal, so
+	//     InferArtifactReads returns the already-concrete path
+	// Old order (merge → substitute) left both entries
+	// because the strings differed; the subsequent
+	// ResolveParamsSlice collapsed them to the same path,
+	// producing a duplicate. New order (substitute → merge)
+	// dedupes correctly.
+	yaml := `name: "reads dedupe"
+version: 1
+tasks:
+  - id: seed
+    action: answer
+    writes_artifacts: [state/items/i01.json]
+    prompt: "Seed."
+  - id: consume
+    for_each:
+      item: [i01]
+    action: answer
+    depends_on: [seed]
+    reads_artifacts: ["state/items/{{item}}.json"]
+    prompt: "Use {{item}}: {{artifact:state/items/i01.json}}"
+`
+	// Call directly to surface any validation error rather
+	// than the generic "no ready tasks" the helper throws.
+	res := h.call(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml,
+	})
+	if res.IsError {
+		t.Fatalf("create_run rejected yaml: %s", mcpText(res))
+	}
+	ready := h.readyTasks("")
+	if len(ready) == 0 {
+		t.Fatalf("no ready tasks: response was %s", mcpText(res))
+	}
+	first, _ := ready[0].(map[string]interface{})
+	if id, _ := first["id"].(string); id != "" {
+		h.rememberRunFromTaskID(t, id)
+	}
+
+	h.mcpClaimOK(t, "seed")
+	h.mcpSubmitArtifacts(t, "seed", "ok", map[string]string{
+		"state/items/i01.json": `{"id":"i01"}`,
+	})
+
+	task := h.taskGet("i01:consume")
+	raw, _ := task["reads_artifacts"].([]interface{})
+	seen := map[string]int{}
+	for _, r := range raw {
+		if s, ok := r.(string); ok {
+			seen[s]++
+		}
+	}
+	if seen["state/items/i01.json"] != 1 {
+		t.Fatalf("expected state/items/i01.json to appear exactly once in reads_artifacts, got %d (raw: %+v)", seen["state/items/i01.json"], raw)
+	}
+}
+
 // TestMCPRunStatusMermaidFormat exercises the opt-in
 // format="mermaid" path on enju_run_status. For large or
 // complex DAGs the text tree gets unreadable; emitting

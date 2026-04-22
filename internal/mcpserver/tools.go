@@ -197,6 +197,8 @@ To browse available templates in a project, call enju_list_templates first. To s
 
 Dependencies between tasks are inferred automatically from {{task_id.content}} references. Tasks without references to other tasks run in parallel.
 
+List-valued params support a {{param[*]}} expansion in writes_artifacts / reads_artifacts / assign_to / depends_on — one declared element expands to N entries, one per value in the list<string> param. Useful for one-shot tasks that emit or read N files without enumerating every path.
+
 If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithString("yaml",
 			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),

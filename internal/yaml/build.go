@@ -177,14 +177,21 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			// `summaries/alpha.md` on the alpha instance
 			// etc. The def's backing slice is shared across
 			// instances so we allocate fresh via
-			// ResolveParamsSlice. Inferred reads from
-			// `{{artifact:...}}` prompt refs go through
-			// MergeArtifactReads against the RESOLVED prompt
-			// so inferred paths also pick up per-instance
-			// variable substitution.
-			ti.ReadsArtifacts = template.ResolveParamsSlice(
-				template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
-				inst.params)
+			// ResolveParamsSlice.
+			//
+			// Order matters: substitute the explicit list
+			// FIRST, then merge with inferred reads from
+			// `{{artifact:...}}` prompt refs. The resolvedPrompt
+			// is already substituted, so InferArtifactReads
+			// returns concrete paths — merging against an
+			// UNresolved explicit list would miss the dedupe
+			// (e.g. `[state/items/{{item}}.json]` vs inferred
+			// `state/items/i01.json` look distinct as strings,
+			// then both substitute to the same path and
+			// surface as a duplicate in the claim response).
+			ti.ReadsArtifacts = template.MergeArtifactReads(
+				template.ResolveParamsSlice(taskDef.ReadsArtifacts, inst.params),
+				resolvedPrompt)
 			ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, inst.params)
 
 			taskInstances = append(taskInstances, ti)
@@ -332,10 +339,12 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 			ti.Requirements = p.Requirements
 		}
 		// See the run-level variant above (step-1 comment on
-		// ReadsArtifacts / WritesArtifacts) for the why.
-		ti.ReadsArtifacts = template.ResolveParamsSlice(
-			template.MergeArtifactReads(taskDef.ReadsArtifacts, resolvedPrompt),
-			iter.params)
+		// ReadsArtifacts / WritesArtifacts) for the why, and
+		// for the substitute-before-merge ordering that
+		// avoids duplicate reads in the claim response.
+		ti.ReadsArtifacts = template.MergeArtifactReads(
+			template.ResolveParamsSlice(taskDef.ReadsArtifacts, iter.params),
+			resolvedPrompt)
 		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, iter.params)
 		// Same per-iteration qualification as the run-level
 		// for_each path — see the comment there for why.

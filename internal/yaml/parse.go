@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -210,6 +211,40 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
+		// List-expansion refs (`{{param[*]}}`) run BEFORE
+		// scalar substitution: expand each element into N
+		// entries based on a list<string> param, then let the
+		// scalar pass fill in any remaining `{{scalar}}` refs.
+		// Runs on every list-valued field that a template
+		// author would reasonably want to scale from one
+		// element to many without having to enumerate: the
+		// writer side of N per-item files, the reader side,
+		// a dynamic reviewer pool, and a list of prereq
+		// tasks. for_each: values deliberately aren't covered
+		// — they already accept a list-valued param directly.
+		// options[].activates stays structural.
+		scope := fmt.Sprintf("task %q", t.ID)
+		expandedWrites, err := expandStarRefsInWrites(t.WritesArtifacts, merged, scope+".writes_artifacts")
+		if err != nil {
+			return nil, err
+		}
+		t.WritesArtifacts = expandedWrites
+		expandedReads, err := expandStarRefsInSlice([]string(t.ReadsArtifacts), merged, scope+".reads_artifacts")
+		if err != nil {
+			return nil, err
+		}
+		t.ReadsArtifacts = expandedReads
+		expandedAssign, err := expandStarRefsInSlice([]string(t.AssignTo), merged, scope+".assign_to")
+		if err != nil {
+			return nil, err
+		}
+		t.AssignTo = expandedAssign
+		expandedDeps, err := expandStarRefsInSlice([]string(t.DependsOn), merged, scope+".depends_on")
+		if err != nil {
+			return nil, err
+		}
+		t.DependsOn = expandedDeps
+
 		// Substitute in every string / list-of-strings field
 		// that downstream validators compare against a strict
 		// pattern (username, role, artifact path, script path).
@@ -239,6 +274,126 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		}
 	}
 	return merged, nil
+}
+
+// starRefPattern matches `{{name[*]}}` — the list-expansion
+// syntax used in list-valued fields (writes_artifacts,
+// reads_artifacts, assign_to, depends_on). The referenced
+// param must be list<string>; each list element containing
+// a `[*]` ref expands into N entries, one per list value,
+// with the ref substituted for that value.
+//
+// Deliberately a separate pattern from the general `{{name}}`
+// ref — the bracket suffix makes the list-expansion intent
+// explicit (opt-in, not magical) and keeps the scalar path
+// untouched.
+var starRefPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\[\*\]\}\}`)
+
+// expandStarRefsInSlice duplicates list elements containing
+// `{{param[*]}}` into N entries, one per value in the
+// referenced list<string> param. Elements without a `[*]`
+// ref pass through unchanged.
+//
+// Multiple `[*]` refs in one element would imply a cartesian
+// product — rejected up front to keep the semantics
+// predictable and avoid accidental blowup (`[{{a[*]}}-{{b[*]}}]`
+// with two 10-element lists silently becomes a 100-element
+// list). If a real cartesian use case appears, add an
+// explicit `[*,*]` cross-product syntax then.
+//
+// Wrong-type or unknown param refs fail the parse rather
+// than passing the literal placeholder through to
+// validators — a typo on `items` surfaces as "unknown
+// parameter" instead of "artifact path {{items[*]}}
+// invalid."
+//
+// `scope` is free-form context for error messages
+// ("writes_artifacts on task X", "assign_to on task Y").
+func expandStarRefsInSlice(items []string, merged map[string]interface{}, scope string) ([]string, error) {
+	if len(items) == 0 {
+		return items, nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		expanded, err := expandOneStarElement(item, merged, scope)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, expanded...)
+	}
+	return out, nil
+}
+
+// expandOneStarElement returns the 1-or-N entries a single
+// list element produces after `{{param[*]}}` expansion.
+func expandOneStarElement(item string, merged map[string]interface{}, scope string) ([]string, error) {
+	matches := starRefPattern.FindAllStringSubmatch(item, -1)
+	if len(matches) == 0 {
+		return []string{item}, nil
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("%s: element %q contains multiple [*] refs; only one is supported per element", scope, item)
+	}
+	name := matches[0][1]
+	raw, ok := merged[name]
+	if !ok {
+		return nil, fmt.Errorf("%s: {{%s[*]}} references unknown parameter %q", scope, name, name)
+	}
+	values, ok := starListValues(raw)
+	if !ok {
+		return nil, fmt.Errorf("%s: {{%s[*]}} requires a list<string> parameter; got %T", scope, name, raw)
+	}
+	placeholder := fmt.Sprintf("{{%s[*]}}", name)
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, strings.ReplaceAll(item, placeholder, v))
+	}
+	return out, nil
+}
+
+// starListValues normalizes a YAML-decoded list param to
+// []string. Accepts []string directly and []interface{} with
+// string-compatible elements (the common YAML decode shape).
+// Returns false if the value isn't list-shaped or contains
+// non-stringable elements — the caller emits a typed error
+// with the param name.
+func starListValues(raw interface{}) ([]string, bool) {
+	switch v := raw.(type) {
+	case []string:
+		return v, true
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// expandStarRefsInWrites is the WriteArtifacts analogue of
+// expandStarRefsInSlice — one input entry with `{{param[*]}}`
+// in its Path becomes N entries, each carrying the same
+// Track flag. Track is a literal bool, never a param ref.
+func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, scope string) (WriteArtifacts, error) {
+	if len(ws) == 0 {
+		return ws, nil
+	}
+	out := make(WriteArtifacts, 0, len(ws))
+	for _, w := range ws {
+		paths, err := expandOneStarElement(w.Path, merged, scope)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range paths {
+			out = append(out, WriteArtifact{Path: p, Track: w.Track})
+		}
+	}
+	return out, nil
 }
 
 // substituteStringSliceInPlace walks a []string (or the

@@ -2,6 +2,7 @@ package yaml
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -1867,6 +1868,108 @@ tasks:
 	want := "Analyze:\nBRCA1\nTP53\nEGFR"
 	if got != want {
 		t.Errorf("list substitution wrong\n  got:  %q\n  want: %q", got, want)
+	}
+}
+
+// TestParseStarRefExpandsListFields verifies `{{param[*]}}`
+// duplicates a list element per value in a list<string> param.
+// Applies to writes_artifacts, reads_artifacts, assign_to,
+// depends_on — the four list-valued fields a template author
+// would want to scale from N=1 to N=many without enumerating
+// every path.
+func TestParseStarRefExpandsListFields(t *testing.T) {
+	yamlData := []byte(`
+name: "star expansion"
+version: 1
+params:
+  - name: items
+    type: list<string>
+    required: true
+tasks:
+  - id: seed
+    action: answer
+    writes_artifacts: ["state/items/{{items[*]}}.json"]
+    prompt: "Emit {{items}} items."
+  - id: consume
+    action: answer
+    depends_on: [seed]
+    reads_artifacts: ["state/items/{{items[*]}}.json"]
+    prompt: "Consume {{items}}."
+`)
+	parsed, err := ParseWithParams(yamlData, map[string]interface{}{
+		"items": []interface{}{"a", "b", "c"},
+	})
+	if err != nil {
+		t.Fatalf("ParseWithParams: %v", err)
+	}
+	seed := parsed.Run.Tasks[0]
+	if got := seed.WritesArtifacts.Paths(); len(got) != 3 || got[0] != "state/items/a.json" || got[2] != "state/items/c.json" {
+		t.Fatalf("writes_artifacts expansion wrong: %+v", got)
+	}
+	consume := parsed.Run.Tasks[1]
+	if got := []string(consume.ReadsArtifacts); len(got) != 3 || got[1] != "state/items/b.json" {
+		t.Fatalf("reads_artifacts expansion wrong: %+v", got)
+	}
+}
+
+// TestParseStarRefRejectsNonListParam — a typo that points
+// `[*]` at a scalar param fails the parse loudly rather than
+// leaving the literal placeholder in the artifact path (which
+// would blow up at validate time with a cryptic
+// "malformed path" error).
+func TestParseStarRefRejectsNonListParam(t *testing.T) {
+	yamlData := []byte(`
+name: "star on scalar"
+version: 1
+params:
+  - name: name
+    type: string
+    required: true
+tasks:
+  - id: t
+    action: answer
+    writes_artifacts: ["state/{{name[*]}}.json"]
+    prompt: "x"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{"name": "x"})
+	if err == nil {
+		t.Fatal("expected error on [*] against non-list param, got nil")
+	}
+	if !strings.Contains(err.Error(), "list<string>") {
+		t.Errorf("expected list<string> hint in error, got: %v", err)
+	}
+}
+
+// TestParseStarRefRejectsMultipleInOneElement — two `[*]`
+// refs in one element would imply a cartesian product and
+// silent blowup. Reject up front; if someone needs cross
+// products, add explicit syntax later.
+func TestParseStarRefRejectsMultipleInOneElement(t *testing.T) {
+	yamlData := []byte(`
+name: "two stars"
+version: 1
+params:
+  - name: a
+    type: list<string>
+    required: true
+  - name: b
+    type: list<string>
+    required: true
+tasks:
+  - id: t
+    action: answer
+    writes_artifacts: ["{{a[*]}}/{{b[*]}}.json"]
+    prompt: "x"
+`)
+	_, err := ParseWithParams(yamlData, map[string]interface{}{
+		"a": []interface{}{"1", "2"},
+		"b": []interface{}{"x", "y"},
+	})
+	if err == nil {
+		t.Fatal("expected error on multiple [*] refs, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple") {
+		t.Errorf("expected 'multiple' in error, got: %v", err)
 	}
 }
 

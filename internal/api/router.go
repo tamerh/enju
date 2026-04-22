@@ -3600,6 +3600,34 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 	// Build the winning set and the losing set. Both are
 	// expressed as full task ids ({projectID:runSeq:...}) since
 	// that's what the store uses.
+	//
+	// Iteration qualification: for a vote in iteration K
+	// (task.InstanceKey == "K"), each activates short id
+	// `"human_adjudicate"` refers to the same-iteration
+	// counterpart `"K:human_adjudicate"` — NOT the bare
+	// `"human_adjudicate"` DAG node (which doesn't exist in
+	// fanned-out templates, so the cascade used to silently
+	// no-op). Try the iteration-qualified form first; fall
+	// back to the bare form when the qualified node isn't in
+	// the DAG, which handles the rarer case of an iteration-
+	// level vote activating a singleton downstream.
+	resolveActivatesNode := func(shortID string) string {
+		if task.InstanceKey == "" {
+			return shortID
+		}
+		qualified := enjuYaml.MakeFullID(task.InstanceKey, shortID)
+		if _, ok := d.GetNode(qualified); ok {
+			return qualified
+		}
+		// Fall back to bare — singleton activated from an
+		// iteration vote. Still valid; the bare node is the
+		// same for every iteration so all activating instances
+		// contribute to the same winning/losing sets, which is
+		// the correct aggregation semantics for cross-scope
+		// activates.
+		return shortID
+	}
+
 	winningSet := make(map[string]bool)
 	losingSet := make(map[string]bool)
 	for _, o := range declared {
@@ -3608,9 +3636,9 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 			target = losingSet
 		}
 		for _, shortID := range o.Activates {
-			full := runPrefix + shortID
-			target[full] = true
-			for _, desc := range d.Descendants(shortID) {
+			nodeID := resolveActivatesNode(shortID)
+			target[runPrefix+nodeID] = true
+			for _, desc := range d.Descendants(nodeID) {
 				target[runPrefix+desc] = true
 			}
 		}
