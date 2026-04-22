@@ -124,6 +124,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolTallyTask(), client.handleTallyTask)
 	s.AddTool(toolFailTask(), client.handleFailTask)
 	s.AddTool(toolExecuteTask(), client.handleExecuteTask)
+	s.AddTool(toolExecuteRun(), client.handleExecuteRun)
 	s.AddTool(toolExportRun(), client.handleExportRun)
 	s.AddTool(toolExportDiagram(), client.handleExportDiagram)
 	s.AddTool(toolExportRunEvents(), client.handleExportRunEvents)

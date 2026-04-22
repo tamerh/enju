@@ -1,0 +1,300 @@
+package mcpserver
+
+// Extracted compute-task execution core. executeComputeTask
+// is the per-task worker for both enju_execute_task (single
+// task, renders free-text response) and enju_execute_run
+// (batch cascade, consumes the structured outcome). Keeping
+// the structured shape lets the batch caller stop/continue
+// per entry without re-parsing formatted text.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/enju-ai/enju/internal/compute"
+	"github.com/enju-ai/enju/internal/engine"
+)
+
+// executeOutcome is the structured result of one compute-task
+// execution. Exactly one of Status ∈ {completed, failed,
+// async_started} is set per call. All display/formatting happens
+// at the call site.
+type executeOutcome struct {
+	TaskID           string
+	Script           string
+	Status           string // "completed" | "failed" | "async_started"
+	ExitCode         int
+	ElapsedMS        int64
+	CommitSHA        string
+	ContentLen       int
+	ArtifactsWritten []string
+	MissingArtifacts []string
+	ScriptLogPath    string
+	ErrorMessage     string // populated when Status == "failed"
+	Stderr           string // captured stderr on failure (truncated at source)
+	ContribNum       int    // coordinator's contribution counter (0 if unknown)
+	NewlyReady       int    // count of tasks that transitioned to READY after this commit
+	Async            *asyncKickoffResult
+	// Branch is the run branch the task executed on — useful to
+	// callers that batch multiple tasks and want to pass it on.
+	Branch string
+}
+
+// executeComputeTask runs one action:compute task end-to-end:
+// reconcile → claim (if needed) → script execution → result
+// report. Mirrors the shape of handleExecuteTask but returns
+// structured data instead of an MCP text response.
+//
+// The error return is reserved for "cannot even attempt" conditions
+// (task not found, wrong action, no workspace, script missing,
+// claim gate closed). A script that runs and exits non-zero is
+// NOT an error — it returns (outcome{Status:"failed"}, nil) so
+// the batch caller can record it and stop the cascade
+// gracefully without unwinding as a generic failure.
+func (c *apiClient) executeComputeTask(ctx context.Context, taskID string) (*executeOutcome, error) {
+	if c.workspace == nil {
+		return nil, fmt.Errorf("enju_execute_task requires a local workspace")
+	}
+
+	meta, err := c.fetchTaskMeta(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %q not found: %w", taskID, err)
+	}
+	if meta.Action != "compute" {
+		return nil, fmt.Errorf("task %q is action=%q, not compute — use enju_submit_result", taskID, meta.Action)
+	}
+	if meta.Script == "" {
+		return nil, fmt.Errorf("task %q has no script field declared", taskID)
+	}
+
+	proj, remoteURL, projName, _, err := c.openProject(ctx, meta.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reconcile before the claim gate — an async→async chain
+	// otherwise orphans downstream tasks because the coordinator
+	// hasn't yet seen the upstream completion commit. Best-effort;
+	// a reconcile failure here just means slightly stale state.
+	_ = c.pullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch)
+
+	// Re-fetch so the claim decision sees the post-reconcile
+	// state (esp. for chained async tasks that just transitioned
+	// to ready as a side effect of the pull).
+	if fresh, ferr := c.fetchTaskMeta(ctx, taskID); ferr == nil && fresh != nil {
+		meta = fresh
+	}
+
+	switch meta.State {
+	case "ready", "collecting":
+		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
+			"username": c.username,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("claim %s: %w", taskID, err)
+		}
+		var claimResp map[string]interface{}
+		if json.Unmarshal(claimData, &claimResp) == nil {
+			if errMsg, _ := claimResp["error"].(string); errMsg != "" {
+				return nil, fmt.Errorf("claim %s: %s", taskID, errMsg)
+			}
+		}
+	case "claimed", "running":
+		// Already ours (e.g. retry after transient wrapper
+		// failure) — proceed without a fresh claim.
+	default:
+		return nil, fmt.Errorf(
+			"task %q is not claimable (state: %s) — run enju_run_status or wait for upstream to complete before retrying",
+			taskID, meta.State,
+		)
+	}
+
+	workDir := proj.WorkDir()
+	resultDir := meta.ResultDir
+
+	// Script resolution: template runs pin scripts to the per-run
+	// snapshot directory; inline-YAML runs use project-relative
+	// paths as declared. See handleExecuteTask for the full
+	// rationale — this block mirrors it exactly.
+	var scriptPath, templateDir string
+	if meta.RunSourcePath != "" {
+		templateDir = filepath.Join(workDir, engine.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		scriptPath = filepath.Join(templateDir, meta.Script)
+	} else {
+		scriptPath = filepath.Join(workDir, meta.Script)
+	}
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
+	}
+
+	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, meta)
+
+	// context.json — structured companion to the env vars.
+	// See handleExecuteTask for the motivation; this block
+	// stays identical so both entry points produce the same
+	// on-disk payload.
+	var readsArtifacts []string
+	if rawTask, rerr := c.get(ctx, "/api/v1/tasks/"+taskID); rerr == nil {
+		var tm map[string]interface{}
+		if json.Unmarshal(rawTask, &tm) == nil {
+			if r, ok := tm["reads_artifacts"].([]interface{}); ok {
+				for _, p := range r {
+					if s, ok := p.(string); ok {
+						readsArtifacts = append(readsArtifacts, s)
+					}
+				}
+			}
+		}
+	}
+	contextPayload := map[string]interface{}{
+		"task_id":          taskID,
+		"task_def_id":      meta.TaskDefID,
+		"instance_key":     meta.InstanceKey,
+		"iteration":        meta.InstanceParams,
+		"params":           meta.RunParams,
+		"reads_artifacts":  stringSliceNonNil(readsArtifacts),
+		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts.Paths()),
+	}
+	contextBytes, _ := json.MarshalIndent(contextPayload, "", "  ")
+	contextFullPath := filepath.Join(workDir, resultDir, "context.json")
+	if err := os.MkdirAll(filepath.Dir(contextFullPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating run dir for context.json: %w", err)
+	}
+	if err := os.WriteFile(contextFullPath, contextBytes, 0644); err != nil {
+		return nil, fmt.Errorf("writing context.json: %w", err)
+	}
+
+	spec := compute.Spec{
+		TaskID:             taskID,
+		ProjectID:          meta.ProjectID,
+		RemoteURL:          remoteURL,
+		WorkspaceRoot:      c.workspace.RootDir(),
+		ProjectName:        projName,
+		Branch:             meta.Branch,
+		ResultDir:          resultDir,
+		ScriptPath:         scriptPath,
+		ScriptLabel:        meta.Script,
+		WritesArtifacts:    meta.WritesArtifacts.TrackedPaths(),
+		UntrackedArtifacts: meta.WritesArtifacts.UntrackedPaths(),
+		AuthorName:         c.citizenName,
+		AuthorEmail:        c.citizenEmail,
+		Username:           c.username,
+		Model:              c.modelName,
+		Container:          meta.Container,
+		Env:                meta.Env,
+	}
+
+	if resolvedMode(meta) == "async" {
+		kick, err := c.kickoffAsyncWrapTask(spec, env, resultDir, workDir)
+		if err != nil {
+			return nil, fmt.Errorf("async kickoff: %w", err)
+		}
+		return &executeOutcome{
+			TaskID: taskID,
+			Script: meta.Script,
+			Status: "async_started",
+			Async:  kick,
+			Branch: meta.Branch,
+		}, nil
+	}
+
+	res := compute.Run(ctx, spec, env, c.logger)
+	if res.Error != "" {
+		return nil, fmt.Errorf("%s", res.Error)
+	}
+
+	if res.ExitCode != 0 {
+		stderr := res.Stderr
+		if len(stderr) > 1000 {
+			stderr = stderr[:1000] + "...(truncated)"
+		}
+		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, res.ExitCode)
+		if stderr != "" {
+			reason += ": " + stderr
+		}
+		c.post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
+			"reason": reason,
+		})
+		return &executeOutcome{
+			TaskID:        taskID,
+			Script:        meta.Script,
+			Status:        "failed",
+			ExitCode:      res.ExitCode,
+			ElapsedMS:     res.ElapsedMS,
+			ScriptLogPath: res.ScriptLogPath,
+			ErrorMessage:  reason,
+			Stderr:        stderr,
+			Branch:        meta.Branch,
+		}, nil
+	}
+
+	// Exit 0 → wrapper committed + pushed. Report the landed
+	// commit to the coordinator so the state machine advances.
+	reportBody := map[string]interface{}{
+		"commit_sha":  res.CommitSHA,
+		"result_path": resultDir,
+		"model":       c.modelName,
+		"username":    c.username,
+		"content":     res.Content,
+	}
+	if len(res.ArtifactsWritten) > 0 {
+		reportBody["artifacts_written"] = res.ArtifactsWritten
+	}
+	reportData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator report for %s: %w", taskID, err)
+	}
+
+	out := &executeOutcome{
+		TaskID:           taskID,
+		Script:           meta.Script,
+		Status:           "completed",
+		ExitCode:         0,
+		ElapsedMS:        res.ElapsedMS,
+		CommitSHA:        res.CommitSHA,
+		ContentLen:       len(res.Content),
+		ArtifactsWritten: res.ArtifactsWritten,
+		MissingArtifacts: res.MissingArtifacts,
+		Branch:           meta.Branch,
+	}
+	var report map[string]interface{}
+	if json.Unmarshal(reportData, &report) == nil {
+		if n := jsonFloat(report["contribution_number"]); n > 0 {
+			out.ContribNum = int(n)
+		}
+		if r := jsonFloat(report["newly_ready"]); r > 0 {
+			out.NewlyReady = int(r)
+		}
+	}
+	return out, nil
+}
+
+// buildComputeEnv assembles the env slice passed to the wrapper
+// process. Split out so both execute entry points (single-task
+// and batch) produce byte-identical environments for the same
+// task — any divergence would show up as reproducibility drift
+// between a manual execute and a batched one.
+func buildComputeEnv(taskID, workDir, resultDir, templateDir string, meta *taskMeta) []string {
+	env := os.Environ()
+	env = append(env,
+		"ENJU_TASK_ID="+taskID,
+		"ENJU_PROJECT_DIR="+workDir,
+		"ENJU_RUN_DIR="+filepath.Join(workDir, resultDir),
+	)
+	if templateDir != "" {
+		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
+	}
+	for k, v := range meta.RunParams {
+		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
+	}
+	for k, v := range meta.InstanceParams {
+		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
+	}
+	for k, v := range meta.Env {
+		env = append(env, k+"="+v)
+	}
+	return env
+}

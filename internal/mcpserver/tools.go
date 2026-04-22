@@ -304,6 +304,34 @@ Recovery: the run author or any citizen can use enju_invalidate_task to bounce a
 	)
 }
 
+func toolExecuteRun() mcp.Tool {
+	return mcp.NewTool("enju_execute_run",
+		mcp.WithDescription(`Drain all ready action:compute tasks in a run in one call. Stops at the next human decision point (any ready citizen task — vote, review, answer, contribute) and reports it as next_blocker.
+
+Use after any citizen submit to flush the deterministic work the submission unblocked. The cascade advances compute tasks by seq order, one at a time, until:
+  - a citizen task is ready (stop_reason="citizen_task_ready", next_blocker names the task)
+  - no more ready compute tasks (stop_reason="no_ready_compute" — run is idle/complete)
+  - a compute task fails (stop_reason="compute_failed" — downstream blocked)
+  - an async compute task is kicked off (stop_reason="async_task_started" — subprocess detached, re-run this tool after it lands)
+  - max_tasks reached (stop_reason="max_tasks" — call again to continue)
+
+Per-task attribution: the caller's identity authors each commit in the cascade. If a compute task has assign_to restricting it to specific citizens, it's treated as a blocker (skipped, not executed) — respects explicit scoping.
+
+Use this INSTEAD OF looping enju_execute_task yourself. Typical flow: after enju_submit_result on a citizen task, one enju_execute_run call drives the pipeline to the next gate.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+		mcp.WithNumber("max_tasks",
+			mcp.Description("Safety cap on how many tasks this call will execute (default 100, hard cap 1000). Call the tool again to continue past the cap."),
+		),
+	)
+}
+
 func toolExecuteTask() mcp.Tool {
 	return mcp.NewTool("enju_execute_task",
 		mcp.WithDescription(`Execute a compute task's script, capture its output, and submit the result — all in one call.

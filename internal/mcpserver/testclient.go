@@ -150,6 +150,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleDescribeTemplate(ctx, req)
 	case "enju_execute_task":
 		return t.c.handleExecuteTask(ctx, req)
+	case "enju_execute_run":
+		return t.c.handleExecuteRun(ctx, req)
 	default:
 		return nil, fmt.Errorf("mcpserver.TestClient: unknown tool %q", toolName)
 	}
