@@ -64,7 +64,10 @@ Response shape:
 Safety:
 - Default limit is 50, hard cap 500. Bulk-claiming a 15K-task run in one call is almost always a mistake; the cap forces the caller to pass limit explicitly when they really mean it.
 - Ordering: task seq ASC within the run (deterministic, matches DAG construction order).
-- Atomicity: the coordinator's per-claim locking applies. A concurrent selector from another citizen won't double-claim the same task — the loser's entry reports "error" for that task.`),
+- Atomicity: the coordinator's per-claim locking applies. A concurrent selector from another citizen won't double-claim the same task — the loser's entry reports "error" for that task.
+
+Pipelined runs:
+- The selector operates on tasks that are READY right now — PENDING tasks waiting on upstream are invisible to this call. Re-call it after each wave completes to pick up newly-unblocked work. This is exactly right for staged DAGs (e.g. a run with N judges that all need to accept before the syntheses can run): one selector call claims the ready judges; after they submit, a second call claims the newly-ready syntheses. The DAG gate happens at the edge of each call, not up front.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
