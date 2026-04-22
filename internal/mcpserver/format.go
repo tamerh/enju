@@ -827,7 +827,6 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 	taskID, _ := task["id"].(string)
 	prompt, _ := task["prompt"].(string)
 	mode, _ := task["mode"].(string)
-	deps, _ := task["depends_on"].(string)
 	seq, _ := task["seq"].(float64)
 
 	b.WriteString(fmt.Sprintf("✓ Claimed: #%d [%s]\n", int(seq), taskID))
@@ -954,11 +953,17 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 	}
 
 	if inputsData == nil {
-		if deps == "" {
-			b.WriteString("── Prompt ──────────────────────────────────\n")
-			b.WriteString(prompt)
-			b.WriteString("\n────────────────────────────────────────────\n")
-		}
+		// Always render the raw (unresolved) prompt when no
+		// inputs block is available. Pre-lean-claim this was
+		// gated on `deps == ""` because resolved-prompt
+		// rendering handled the with-deps case via inputsData;
+		// the lean claim path deliberately skips inputsData
+		// regardless of deps, and a scripted citizen still
+		// needs to see the prompt template to know what the
+		// task asks for.
+		b.WriteString("── Prompt ──────────────────────────────────\n")
+		b.WriteString(prompt)
+		b.WriteString("\n────────────────────────────────────────────\n")
 	}
 
 	// Show previous submission + reviewer feedback if this task

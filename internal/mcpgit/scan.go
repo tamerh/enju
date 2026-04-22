@@ -82,6 +82,15 @@ func CursorMutexFor(stateDir string, projectID int64) *sync.Mutex {
 // (coordinator-side code, store unit tests, the raw mcpgit
 // helpers in tests). Runs under CursorMutexFor so a
 // concurrent scanner save can't race-overwrite the advance.
+// AdvanceScanCursor is the exported variant of
+// advanceCursorIfConfigured. Same behavior (no-op on empty
+// stateDir / zero projectID / empty branch-or-sha), suitable
+// for batch submit's post-push cursor advance where the
+// SubmitTaskResult path isn't used.
+func AdvanceScanCursor(projectID int64, stateDir, branch, sha string) {
+	advanceCursorIfConfigured(projectID, stateDir, branch, sha)
+}
+
 func advanceCursorIfConfigured(projectID int64, stateDir, branch, sha string) {
 	if projectID == 0 || stateDir == "" || branch == "" || sha == "" {
 		return

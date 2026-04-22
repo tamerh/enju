@@ -34,6 +34,13 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
+	// include_context defaults to true — the existing
+	// context-rich response. The lean form skips the inputs
+	// fetch + review-feedback + previous-submission reads for
+	// scripted citizens that don't need the inlined data.
+	// Claim state still flips identically; only the response
+	// shape changes.
+	includeContext := req.GetBool("include_context", true)
 
 	// Pre-claim reconcile: an async upstream may have landed a
 	// trailer commit since the caller's last tool invocation,
@@ -79,40 +86,49 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	// project has a remote_url configured. Fat clients pull their
 	// own clone and resolve templates locally; legacy clients get
 	// a fully-resolved prompt from the coordinator.
+	//
+	// Lean mode (include_context=false) skips this entire
+	// block, plus the review-feedback + previous-submission
+	// reads below. The formatter already handles nil
+	// inputsData / nil extra by omitting those sections, so
+	// the minimal response is a natural subset — no new
+	// rendering path.
 	meta, metaErr := c.fetchTaskMeta(ctx, taskID)
 	if metaErr != nil {
 		c.logger.Warn("fetchTaskMeta after claim failed", "task_id", taskID, "error", metaErr)
 	}
 	var inputs []byte
-	if c.useFatClient(meta) {
-		inputs, err = c.fetchAndResolveLocally(ctx, meta)
-		if err != nil {
-			c.logger.Warn("fat-client resolve failed, falling back to legacy", "task_id", taskID, "error", err)
+	var reviewFeedback []byte
+	var previousSubmission []byte
+	if includeContext {
+		if c.useFatClient(meta) {
+			inputs, err = c.fetchAndResolveLocally(ctx, meta)
+			if err != nil {
+				c.logger.Warn("fat-client resolve failed, falling back to legacy", "task_id", taskID, "error", err)
+				inputs, _ = c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
+			}
+		} else {
 			inputs, _ = c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
 		}
-	} else {
-		inputs, _ = c.get(ctx, "/api/v1/tasks/"+taskID+"/inputs")
-	}
 
-	// If this task was bounced back via request_changes, find the
-	// reviewer's feedback AND the author's previous submission
-	// so they know what to fix and what they wrote before.
-	var reviewFeedback []byte
-	if meta != nil && meta.ProjectID > 0 {
-		reviewFeedback = c.fetchReviewFeedback(ctx, meta)
-	}
+		// If this task was bounced back via request_changes, find the
+		// reviewer's feedback AND the author's previous submission
+		// so they know what to fix and what they wrote before.
+		if meta != nil && meta.ProjectID > 0 {
+			reviewFeedback = c.fetchReviewFeedback(ctx, meta)
+		}
 
-	// Read the previous submission if it still exists on disk.
-	// After request_changes, the DB clears result_path/commit_sha
-	// but the file stays in the working tree.
-	var previousSubmission []byte
-	if reviewFeedback != nil && meta != nil && c.workspace != nil {
-		remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
-		if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
-			contentPath := filepath.Join(meta.ResultDir, "result.md")
-			if content, rerr := proj.ReadFile(contentPath); rerr == nil && len(content) > 0 {
-				prev := map[string]string{"content": string(content)}
-				previousSubmission, _ = json.Marshal(prev)
+		// Read the previous submission if it still exists on disk.
+		// After request_changes, the DB clears result_path/commit_sha
+		// but the file stays in the working tree.
+		if reviewFeedback != nil && meta != nil && c.workspace != nil {
+			remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
+			if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
+				contentPath := filepath.Join(meta.ResultDir, "result.md")
+				if content, rerr := proj.ReadFile(contentPath); rerr == nil && len(content) > 0 {
+					prev := map[string]string{"content": string(content)}
+					previousSubmission, _ = json.Marshal(prev)
+				}
 			}
 		}
 	}

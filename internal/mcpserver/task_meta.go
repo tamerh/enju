@@ -144,6 +144,13 @@ type taskMeta struct {
 	// this, the client would have to recompute the slug and
 	// risk drifting from the server's stored value.
 	RunSlug string
+	// DependsOn is the task's direct upstream dependency list,
+	// comma-separated full task ids (e.g.
+	// "1:2:foundation,1:2:review"). Used by the batch submit
+	// handler's intra-batch conflict check: if entry B's
+	// DependsOn contains entry A's task id, A's submission
+	// will cascade-modify B's state before B can submit.
+	DependsOn string
 }
 
 // fetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -263,6 +270,9 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["run_slug"].(string); ok {
 		meta.RunSlug = v
+	}
+	if v, ok := raw["depends_on"].(string); ok {
+		meta.DependsOn = v
 	}
 	return meta, nil
 }

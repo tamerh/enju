@@ -3359,6 +3359,688 @@ tasks:
 	}
 }
 
+// TestMCPVoteActivatesSkipCascadeSparesCrossIterationAggregator
+// catches the battle-test regression: a for_each-expanded
+// vote with activates: should skip only same-iteration
+// descendants of the losing option. A cross-iteration
+// aggregator that also transitively depends on the activated
+// tasks must survive, because other iterations' winning
+// branches keep it reachable.
+//
+// Prior behavior: d.Descendants(i01:human_adjudicate)
+// included the singleton aggregator (it fans in from every
+// iteration). The losing-set walker pulled it in, the
+// winning-set was empty (concur activates nothing), skip_set
+// = losing − winning dropped the aggregator. Subsequent
+// iterations couldn't recover it — terminal SKIPPED sticks.
+//
+// Fix (same pattern as fail-cascade iteration-scope filter):
+// the walker filters descendants by the vote's iteration
+// key, so cross-iteration merge points stay alive.
+func TestMCPVoteActivatesSkipCascadeSparesCrossIterationAggregator(t *testing.T) {
+	h := newMCPHarness(t, "VoteAggActivates")
+	projectID := h.createTestProject()
+
+	yaml := `name: "per-item dissent with aggregator"
+version: 1
+tasks:
+  - id: decide
+    for_each:
+      key: [a, b]
+    action: vote
+    options:
+      - id: skip_downstream
+        activates: []
+      - id: go_downstream
+        activates: [leaf]
+    prompt: "Decide {{key}}."
+  - id: leaf
+    for_each:
+      key: [a, b]
+    action: answer
+    depends_on: [decide]
+    prompt: "Leaf for {{key}}."
+  - id: cohort
+    action: answer
+    depends_on: [leaf]
+    prompt: "Cohort summary."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// a skips downstream, b goes downstream.
+	h.mcpClaimOK(t, "a:decide")
+	h.mcpSubmitVote(t, "a:decide", "skip a", "skip_downstream")
+
+	// After a's vote alone, cohort MUST stay alive. Prior
+	// behavior flipped cohort to SKIPPED here and subsequent
+	// iterations couldn't revive it.
+	if got := h.taskGet("cohort")["state"]; got == "skipped" {
+		t.Fatalf("regression: cohort SKIPPED after a:decide=skip_downstream (cross-iteration aggregator dropped by single-iteration skip-set computation)")
+	}
+	if got := h.taskGet("a:leaf")["state"]; got != "skipped" {
+		t.Fatalf("a:leaf should be SKIPPED by the activates skip, got %v", got)
+	}
+
+	h.mcpClaimOK(t, "b:decide")
+	h.mcpSubmitVote(t, "b:decide", "go b", "go_downstream")
+
+	// b's branch proceeds; cohort still alive.
+	if got := h.taskGet("b:leaf")["state"]; got != "ready" {
+		t.Fatalf("b:leaf should be READY after b:decide=go_downstream, got %v", got)
+	}
+	if got := h.taskGet("cohort")["state"]; got == "skipped" {
+		t.Fatalf("cohort still wrongly SKIPPED after b went downstream")
+	}
+
+	h.mcpClaimOK(t, "b:leaf")
+	h.mcpSubmitText(t, "b:leaf", "leaf b done")
+
+	// All deps terminal (a:leaf SKIPPED, b:leaf ACCEPTED) →
+	// cohort promotes via UpdateReadyTasks.
+	if got := h.taskGet("cohort")["state"]; got != "ready" {
+		t.Fatalf("cohort should promote to READY once all iteration leaves are terminal, got %v (mixed SKIPPED + ACCEPTED is the tolerance case)", got)
+	}
+}
+
+// TestMCPVoteActivatesSingletonActivateeSurvives locks in the
+// fanned-vote → singleton-activatee interaction between
+// resolveActivatesNode's bare-fallback path and the inScope
+// iteration-scope filter in performSkipCascade. The shape:
+// a fanned-out vote whose options' activates lists name a
+// SINGLETON (run-wide) task.
+//
+// Contract: a single iteration's decision must not skip the
+// singleton — other iterations might still activate it.
+// The singleton survives any single iteration's vote;
+// its actual run decision comes from the ready-task sweep
+// once every iteration is terminal (same partial-tolerance
+// we apply to cross-iteration aggregators). Without this
+// guarantee, a single "skip" vote in one iteration would
+// terminally kill a run-wide task.
+//
+// Mechanism: resolveActivatesNode qualifies the short id
+// first; when "a:global_cleanup" isn't in the DAG it falls
+// back to bare "global_cleanup". inScope then sees
+// instance_key="" vs task.InstanceKey="a", returns false,
+// and drops the singleton from BOTH winning and losing
+// sets — leaving its state untouched.
+func TestMCPVoteActivatesSingletonActivateeSurvives(t *testing.T) {
+	h := newMCPHarness(t, "VoteSingletonAct")
+	projectID := h.createTestProject()
+
+	yaml := `name: "fanned vote activates singleton"
+version: 1
+tasks:
+  - id: decide
+    for_each:
+      key: [a, b]
+    action: vote
+    options:
+      - id: skip
+        activates: []
+      - id: go
+        activates: [global_cleanup]
+    prompt: "Decide {{key}}."
+  - id: global_cleanup
+    action: answer
+    depends_on: [decide]
+    prompt: "Run cleanup if any iteration voted go."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// a votes skip. global_cleanup MUST NOT flip to SKIPPED —
+	// b hasn't voted yet, and even if both skip, the single
+	// iteration's decision shouldn't unilaterally kill the
+	// run-wide task.
+	h.mcpClaimOK(t, "a:decide")
+	h.mcpSubmitVote(t, "a:decide", "skip a", "skip")
+
+	if got := h.taskGet("global_cleanup")["state"]; got == "skipped" {
+		t.Fatalf("regression: singleton activatee SKIPPED by single-iteration 'skip' vote (fanned vote unilaterally killed run-wide task)")
+	}
+
+	// b votes go — explicitly activates the singleton. Still
+	// alive, now with fan-in deps both ACCEPTED.
+	h.mcpClaimOK(t, "b:decide")
+	h.mcpSubmitVote(t, "b:decide", "go b", "go")
+
+	if got := h.taskGet("global_cleanup")["state"]; got != "ready" {
+		t.Fatalf("global_cleanup should be READY after both votes resolve (a:skip, b:go), got %v", got)
+	}
+}
+
+// TestMCPClaimLeanMode locks in the opt-in minimal-response
+// contract for enju_claim_task. include_context=false skips:
+//   - inlined artifact contents (the big Resolved Artifacts
+//     block from formatResolvedArtifactsBlock)
+//   - resolved-prompt rendering (upstream context
+//     substitution)
+//   - upstream-sources enumeration
+//   - review feedback + previous submission reads
+//
+// It preserves: task id, deadline, iteration label, action
+// schema (options/reviews/outputs), access restrictions,
+// writes/reads declarations (paths only), and the raw prompt
+// template. The claim state transition is identical — only
+// the rendered response shape changes.
+func TestMCPClaimLeanMode(t *testing.T) {
+	h := newMCPHarness(t, "LeanClaim")
+	projectID := h.createTestProject()
+
+	yaml := `name: "lean claim"
+version: 1
+tasks:
+  - id: seed
+    action: answer
+    writes_artifacts: [data/payload.md]
+    prompt: "Write the payload."
+  - id: consume
+    action: answer
+    depends_on: [seed]
+    reads_artifacts: [data/payload.md]
+    prompt: "Use the payload: {{seed.content}} with artifact {{artifact:data/payload.md}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	h.mcpClaimOK(t, "seed")
+	h.mcpSubmitArtifacts(t, "seed", "SEED CONTENT UPSTREAM", map[string]string{
+		"data/payload.md": "PAYLOAD BYTES IN ARTIFACT",
+	})
+
+	// Default claim → full response with inlined content.
+	full := h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if full.IsError {
+		t.Fatalf("default claim failed: %s", mcpText(full))
+	}
+	fullText := mcpText(full)
+	if !strings.Contains(fullText, "PAYLOAD BYTES IN ARTIFACT") {
+		t.Errorf("default claim should inline artifact content, got:\n%s", fullText)
+	}
+	if !strings.Contains(fullText, "SEED CONTENT UPSTREAM") {
+		t.Errorf("default claim should inline upstream result, got:\n%s", fullText)
+	}
+	// Release so we can re-claim lean.
+	h.callOK(t, "enju_release_task", map[string]any{"task_id": h.taskID("consume")})
+
+	// Lean claim → schema + raw prompt only.
+	lean := h.call(t, "enju_claim_task", map[string]any{
+		"task_id":         h.taskID("consume"),
+		"include_context": false,
+	})
+	if lean.IsError {
+		t.Fatalf("lean claim failed: %s", mcpText(lean))
+	}
+	leanText := mcpText(lean)
+
+	// No inlined upstream content or artifact bytes — the
+	// whole point.
+	if strings.Contains(leanText, "PAYLOAD BYTES IN ARTIFACT") {
+		t.Errorf("lean claim should NOT inline artifact content, got:\n%s", leanText)
+	}
+	if strings.Contains(leanText, "SEED CONTENT UPSTREAM") {
+		t.Errorf("lean claim should NOT inline upstream result, got:\n%s", leanText)
+	}
+
+	// But the schema fingerprints that a scripted citizen
+	// needs MUST still be there: task id, the raw prompt
+	// template (with {{...}} refs unresolved), and the
+	// declared reads path in the Artifacts block.
+	if !strings.Contains(leanText, ":consume") {
+		t.Errorf("lean claim should carry the task id, got:\n%s", leanText)
+	}
+	if !strings.Contains(leanText, "{{seed.content}}") {
+		t.Errorf("lean claim should show the raw unresolved prompt, got:\n%s", leanText)
+	}
+	if !strings.Contains(leanText, "data/payload.md") {
+		t.Errorf("lean claim should show the declared reads path, got:\n%s", leanText)
+	}
+
+	// Lean response must be substantially smaller (sanity
+	// check — tight bound would flap with formatting tweaks).
+	if len(leanText) >= len(fullText) {
+		t.Errorf("lean response should be smaller than full; lean=%d full=%d", len(leanText), len(fullText))
+	}
+}
+
+// TestMCPSubmitResultsBatchHappyPath covers the bulk-approval
+// use case: one reviewer approving multiple independent
+// review tasks in a single MCP tool call. All entries pass
+// pre-validation, all commits land, coordinator state is
+// identical to having called enju_submit_result N times.
+func TestMCPSubmitResultsBatchHappyPath(t *testing.T) {
+	h := newMCPHarness(t, "BatchRev")
+	projectID := h.createTestProject()
+
+	yaml := `name: "batch bulk approve"
+version: 1
+tasks:
+  - id: draft_a
+    action: answer
+    prompt: "Draft a."
+  - id: draft_b
+    action: answer
+    prompt: "Draft b."
+  - id: review_a
+    action: review
+    reviews: draft_a
+    prompt: "Review {{draft_a.content}}"
+  - id: review_b
+    action: review
+    reviews: draft_b
+    prompt: "Review {{draft_b.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "draft_a")
+	h.mcpSubmitText(t, "draft_a", "a-content")
+	h.mcpClaimOK(t, "draft_b")
+	h.mcpSubmitText(t, "draft_b", "b-content")
+	h.mcpClaimOK(t, "review_a")
+	h.mcpClaimOK(t, "review_b")
+
+	submissions := fmt.Sprintf(`[
+  {"task_id":%q,"decision":"approve","content":"ok a"},
+  {"task_id":%q,"decision":"approve","content":"ok b"}
+]`, h.taskID("review_a"), h.taskID("review_b"))
+
+	res := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	if res.IsError {
+		t.Fatalf("batch submit failed: %s", mcpText(res))
+	}
+	out := mcpText(res)
+	if !strings.Contains(out, "2/2 accepted") {
+		t.Errorf("expected '2/2 accepted' header, got:\n%s", out)
+	}
+
+	// Both review tasks should be ACCEPTED with their
+	// approve decisions recorded.
+	for _, shortID := range []string{"review_a", "review_b"} {
+		tm := h.taskGet(shortID)
+		if got := tm["state"]; got != "accepted" {
+			t.Errorf("%s state: got %v, want accepted", shortID, got)
+		}
+		if got, _ := tm["review_decision"].(string); got != "approve" {
+			t.Errorf("%s review_decision: got %q, want approve", shortID, got)
+		}
+	}
+}
+
+// TestMCPSubmitResultsBatchRejectsIntraBatchDependency locks
+// in the pre-validation: a batch can't mix an upstream and
+// its direct downstream, because the upstream's cascade (or
+// even normal accept propagation) would mutate the
+// downstream's pre-submit state before it gets its turn.
+// Surfaces as an upfront error, no entries attempted.
+func TestMCPSubmitResultsBatchRejectsIntraBatchDependency(t *testing.T) {
+	h := newMCPHarness(t, "BatchDep")
+	projectID := h.createTestProject()
+
+	yaml := `name: "batch with conflicting deps"
+version: 1
+tasks:
+  - id: upstream
+    action: answer
+    prompt: "First."
+  - id: downstream
+    action: answer
+    depends_on: [upstream]
+    prompt: "Second: {{upstream.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "upstream")
+	// downstream can't be claimed yet — pending. But we can
+	// construct the batch payload regardless; validation
+	// kicks in upfront.
+
+	submissions := fmt.Sprintf(`[
+  {"task_id":%q,"content":"a"},
+  {"task_id":%q,"content":"b"}
+]`, h.taskID("upstream"), h.taskID("downstream"))
+
+	res := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	if !res.IsError {
+		t.Fatalf("expected IsError=true for intra-batch dependency, got success:\n%s", mcpText(res))
+	}
+	out := mcpText(res)
+	if !strings.Contains(out, "directly depends on") {
+		t.Errorf("expected 'directly depends on' message, got:\n%s", out)
+	}
+
+	// Critical: upstream must remain CLAIMED — the batch
+	// rejected BEFORE touching any entry. A regression where
+	// pre-validation happens after the first commit would
+	// leak a phantom commit.
+	if got := h.taskGet("upstream")["state"]; got != "claimed" {
+		t.Errorf("upstream should stay CLAIMED after rejected batch, got %v (atomic validation regression?)", got)
+	}
+}
+
+// TestMCPSubmitResultsBatchScopeChecks rejects cross-project
+// and cross-run batches upfront. The submit path's workspace
+// + branch handling assumes a single repo; routing a
+// cross-scope batch through would be a silent correctness
+// hazard, so it's rejected explicitly.
+func TestMCPSubmitResultsBatchScopeChecks(t *testing.T) {
+	h := newMCPHarness(t, "BatchScope")
+	projectID := h.createTestProject()
+
+	yaml := `name: "first run"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "One."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "t")
+	firstID := h.taskID("t")
+
+	// Second run in the same project.
+	yaml2 := `name: "second run"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "Two."
+`
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yaml2,
+		"branch":     "auto",
+	})
+	// Grab the second run's t.
+	runs, _ := h.store.ListRunsByProject(projectID)
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 runs, got %d", len(runs))
+	}
+	secondID := fmt.Sprintf("%d:%d:t", projectID, runs[1].Seq)
+	h.mcpClaimOK(t, secondID)
+
+	submissions := fmt.Sprintf(`[
+  {"task_id":%q,"content":"a"},
+  {"task_id":%q,"content":"b"}
+]`, firstID, secondID)
+
+	res := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	if !res.IsError {
+		t.Fatalf("expected cross-run rejection, got success:\n%s", mcpText(res))
+	}
+	if !strings.Contains(mcpText(res), "cross-run") {
+		t.Errorf("expected 'cross-run' message, got:\n%s", mcpText(res))
+	}
+}
+
+// TestMCPSubmitResultsBatchCoalescesPushes locks in the
+// phase-3 contract: batch submit produces N local commits
+// but only one git push round-trip. Each entry still gets
+// its own commit (preserving per-task audit trail + SHAs in
+// the artifact index), but the network step is coalesced so
+// wall-clock time scales with push latency once, not N times.
+//
+// Verification strategy:
+//   - 3 independent review tasks, all approved in one batch
+//     call.
+//   - After the batch: remote bare has exactly 3 submit
+//     commits on the branch (+ whatever came before), each
+//     with its own Enju-Task-Complete trailer. Confirms per-
+//     entry commits survive the single push.
+//   - Each task's coordinator row carries a distinct
+//     commit_sha matching one of the committed SHAs.
+func TestMCPSubmitResultsBatchCoalescesPushes(t *testing.T) {
+	h := newMCPHarness(t, "BatchPush")
+	projectID := h.createTestProject()
+
+	yaml := `name: "batch push coalescing"
+version: 1
+tasks:
+  - id: draft_a
+    action: answer
+    prompt: "a"
+  - id: draft_b
+    action: answer
+    prompt: "b"
+  - id: draft_c
+    action: answer
+    prompt: "c"
+  - id: review_a
+    action: review
+    reviews: draft_a
+    prompt: "review a: {{draft_a.content}}"
+  - id: review_b
+    action: review
+    reviews: draft_b
+    prompt: "review b: {{draft_b.content}}"
+  - id: review_c
+    action: review
+    reviews: draft_c
+    prompt: "review c: {{draft_c.content}}"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	for _, id := range []string{"draft_a", "draft_b", "draft_c"} {
+		h.mcpClaimOK(t, id)
+		h.mcpSubmitText(t, id, id+"-content")
+	}
+	for _, id := range []string{"review_a", "review_b", "review_c"} {
+		h.mcpClaimOK(t, id)
+	}
+
+	submissions := fmt.Sprintf(`[
+  {"task_id":%q,"decision":"approve","content":"ok a"},
+  {"task_id":%q,"decision":"approve","content":"ok b"},
+  {"task_id":%q,"decision":"approve","content":"ok c"}
+]`, h.taskID("review_a"), h.taskID("review_b"), h.taskID("review_c"))
+
+	res := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	if res.IsError {
+		t.Fatalf("batch submit failed: %s", mcpText(res))
+	}
+
+	// Each reviewer task reaches ACCEPTED with a unique
+	// commit_sha. If push coalescing had a bug that reused
+	// SHAs (e.g. reporting HEAD for every entry), the
+	// collision would show up here.
+	seen := make(map[string]string)
+	for _, shortID := range []string{"review_a", "review_b", "review_c"} {
+		tm := h.taskGet(shortID)
+		if got := tm["state"]; got != "accepted" {
+			t.Errorf("%s state: got %v, want accepted", shortID, got)
+		}
+		sha, _ := tm["commit_sha"].(string)
+		if sha == "" {
+			t.Errorf("%s: coordinator recorded empty commit_sha (phase-3 SHA remap regression?)", shortID)
+			continue
+		}
+		if prior, dup := seen[sha]; dup {
+			t.Errorf("%s shares commit_sha %s with %s — batch reported the same SHA for two entries (phase-3 CommitSHAsByTaskID regression?)", shortID, sha, prior)
+		}
+		seen[sha] = shortID
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 distinct commit SHAs across the batch, got %d", len(seen))
+	}
+
+	// Sanity: every recorded SHA resolves to a real commit
+	// on the bare remote with the matching
+	// Enju-Task-Complete trailer. Confirms N local commits
+	// survived the single push.
+	remoteURL := h.remoteFor(projectID)
+	if remoteURL == "" {
+		t.Fatal("no remote_url to verify commits against")
+	}
+	cmd := exec.Command("git", "--git-dir", remoteURL, "log", "--format=%H%n%B%x1e", "-n", "20")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git log bare: %v", err)
+	}
+	// Split on record separator.
+	commits := strings.Split(strings.TrimRight(string(out), "\x1e\n"), "\x1e\n")
+	trailerByTask := make(map[string]string)
+	for _, rec := range commits {
+		rec = strings.TrimSpace(rec)
+		if rec == "" {
+			continue
+		}
+		lines := strings.SplitN(rec, "\n", 2)
+		sha := strings.TrimSpace(lines[0])
+		body := ""
+		if len(lines) > 1 {
+			body = lines[1]
+		}
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, "Enju-Task-Complete:") {
+				id := strings.TrimSpace(strings.TrimPrefix(line, "Enju-Task-Complete:"))
+				trailerByTask[id] = sha
+			}
+		}
+	}
+	for _, shortID := range []string{"review_a", "review_b", "review_c"} {
+		tm := h.taskGet(shortID)
+		fullID := h.taskID(shortID)
+		coordinatorSHA, _ := tm["commit_sha"].(string)
+		remoteSHA, ok := trailerByTask[fullID]
+		if !ok {
+			t.Errorf("%s: no commit on bare remote carries its Enju-Task-Complete trailer", fullID)
+			continue
+		}
+		if coordinatorSHA != remoteSHA {
+			t.Errorf("%s: coordinator SHA %s != remote SHA %s — post-rebase remap drifted", fullID, coordinatorSHA, remoteSHA)
+		}
+	}
+}
+
+// TestMCPSubmitResultsBatchRollsBackOrphanCommits catches
+// regressions in the mid-batch-failure rollback path. When
+// PrepareCommit fails after one or more entries have already
+// committed locally (but before the coalesced push), the
+// handler hard-resets the branch to the pre-batch HEAD so a
+// subsequent retry doesn't layer duplicate
+// Enju-Task-Complete trailers on top of orphan commits.
+//
+// Forcing a PrepareCommit failure mid-loop is tricky —
+// prepareFatSubmit catches most validation errors upfront.
+// We use a filesystem-corruption trick: pre-create a regular
+// FILE at the path where the second entry's result dir
+// needs to be a directory. MkdirAll inside PrepareCommit
+// then fails on "not a directory," the batch rolls back,
+// and HEAD is back to the pre-batch snapshot.
+func TestMCPSubmitResultsBatchRollsBackOrphanCommits(t *testing.T) {
+	h := newMCPHarness(t, "BatchRollback")
+	projectID := h.createTestProject()
+
+	yaml := `name: "r"
+version: 1
+tasks:
+  - id: task_a
+    action: answer
+    prompt: "a"
+  - id: task_b
+    action: answer
+    prompt: "b"
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "task_a")
+	h.mcpClaimOK(t, "task_b")
+
+	// Open the workspace and snapshot pre-batch HEAD on the
+	// run's branch. Every assertion downstream compares
+	// against this hash — if rollback silently fails, one of
+	// the orphan commits would be HEAD instead.
+	proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+	if err != nil {
+		t.Fatalf("open project workspace: %v", err)
+	}
+	preBatchHead, err := proj.HeadHash()
+	if err != nil {
+		t.Fatalf("snapshot HEAD: %v", err)
+	}
+
+	// Corrupt task_b's result-dir path: write a regular
+	// FILE where PrepareCommit will need a directory. The
+	// run's slug is "r" (from name: "r" → kebab slug "r").
+	// task_b's result dir is enju/runs/1-r/task_b — pre-
+	// create a file at that exact path to make MkdirAll
+	// inside the eventual PrepareCommit fail.
+	bogusPath := filepath.Join(proj.WorkDir(), "enju", "runs", "1-r", "task_b")
+	if err := os.MkdirAll(filepath.Dir(bogusPath), 0755); err != nil {
+		t.Fatalf("prep bogus parent: %v", err)
+	}
+	if err := os.WriteFile(bogusPath, []byte("not a dir"), 0644); err != nil {
+		t.Fatalf("plant corruption: %v", err)
+	}
+
+	submissions := fmt.Sprintf(`[
+  {"task_id":%q,"content":"a ok"},
+  {"task_id":%q,"content":"b will fail prepare-commit"}
+]`, h.taskID("task_a"), h.taskID("task_b"))
+
+	res := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	// The batch returns a text result (not IsError) but its
+	// body reports 0/N accepted — every prepared entry
+	// surfaces the same write error, confirming the
+	// mid-loop failure path fired.
+	out := mcpText(res)
+	if !strings.Contains(out, "0/2 accepted") {
+		t.Fatalf("expected '0/2 accepted' summary on mid-batch failure, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not a directory") {
+		t.Errorf("expected filesystem error in batch output, got:\n%s", out)
+	}
+
+	// Load-bearing assertion: HEAD is back to the pre-batch
+	// snapshot. Orphan commits from task_a's successful
+	// PrepareCommit would have advanced HEAD; rollback put
+	// it back.
+	postBatchHead, err := proj.HeadHash()
+	if err != nil {
+		t.Fatalf("read HEAD after failed batch: %v", err)
+	}
+	if postBatchHead != preBatchHead {
+		t.Fatalf("HEAD advanced despite rollback: pre=%s post=%s (orphan commits persisted — ResetBranchToHash regression?)", preBatchHead, postBatchHead)
+	}
+
+	// Coordinator state: task_a stays CLAIMED (no commit
+	// landed upstream; coordinator never saw a report).
+	if got := h.taskGet("task_a")["state"]; got != "claimed" {
+		t.Errorf("task_a should stay CLAIMED after rollback, got %v", got)
+	}
+	if got := h.taskGet("task_b")["state"]; got != "claimed" {
+		t.Errorf("task_b should stay CLAIMED after rollback, got %v", got)
+	}
+
+	// Now fix the corruption and retry. ResetBranchToHash
+	// may have already cleaned up the bogus file (hard-
+	// resetting the worktree back to the pre-batch commit
+	// sweeps paths not present at that commit), so ignore
+	// "not found." The retry must compose from a clean
+	// state: no duplicate Enju-Task-Complete trailers from
+	// a prior failed attempt.
+	if err := os.Remove(bogusPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("clean corruption: %v", err)
+	}
+	res2 := h.call(t, "enju_submit_results_batch", map[string]any{
+		"submissions": submissions,
+	})
+	if res2.IsError {
+		t.Fatalf("retry after rollback should succeed, got:\n%s", mcpText(res2))
+	}
+	for _, id := range []string{"task_a", "task_b"} {
+		if got := h.taskGet(id)["state"]; got != "accepted" {
+			t.Errorf("%s should be ACCEPTED after successful retry, got %v", id, got)
+		}
+	}
+}
+
 // TestMCPRunStatusMermaidFormat exercises the opt-in
 // format="mermaid" path on enju_run_status. For large or
 // complex DAGs the text tree gets unreadable; emitting

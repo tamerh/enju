@@ -94,6 +94,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolClaimTask(), client.handleClaimTask)
 	s.AddTool(toolGetTaskInputs(), client.handleGetTaskInputs)
 	s.AddTool(toolSubmitResult(), client.handleSubmitResult)
+	s.AddTool(toolSubmitResultsBatch(), client.handleSubmitResultsBatch)
 	s.AddTool(toolReleaseTask(), client.handleReleaseTask)
 	s.AddTool(toolGetTask(), client.handleGetTask)
 	s.AddTool(toolRunStatus(), client.handleRunStatus)

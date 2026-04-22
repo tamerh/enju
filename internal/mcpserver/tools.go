@@ -34,10 +34,15 @@ func toolListReadyTasks() mcp.Tool {
 
 func toolClaimTask() mcp.Tool {
 	return mcp.NewTool("enju_claim_task",
-		mcp.WithDescription("Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and upstream context. After claiming, tell the human which task you're now working on."),
+		mcp.WithDescription(`Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and upstream context. After claiming, tell the human which task you're now working on.
+
+Set include_context=false for a lean response: task id, deadline, action schema (options/reviews/outputs), and the raw prompt template only — no inlined artifact contents, no resolved-prompt substitution, no upstream fan-in. Useful for scripted citizens that already have the context or can fetch with enju_get_artifact when needed.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
 			mcp.Description("The ID of the task to claim"),
+		),
+		mcp.WithBoolean("include_context",
+			mcp.Description("Include the full upstream context block (default: true). Set to false to get a minimal response without inlined artifact content or resolved prompt."),
 		),
 	)
 }
@@ -86,6 +91,22 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 		),
 		mcp.WithString("option",
 			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
+		),
+	)
+}
+
+func toolSubmitResultsBatch() mcp.Tool {
+	return mcp.NewTool("enju_submit_results_batch",
+		mcp.WithDescription(`Submit N results in one MCP call. Same citizen, same project + run, pre-validated upfront. Each entry mirrors enju_submit_result's body: {task_id, content?, decision?, option?, outputs_json?, artifacts_json?}.
+
+Mixed action types are fine — per-entry validation dispatches on the task's action (review needs decision, vote needs option, others need content/outputs/artifacts).
+
+Rejected upfront as a whole batch if any entry is missing required fields, names an unknown task, crosses project/run boundaries, or directly depends on another batch entry (submitting an upstream + its downstream in the same batch would let the upstream's cascade silently modify the downstream's pre-submit state). Per-entry runtime failures are reported individually — subsequent entries still attempt.
+
+Use for bulk-approval workflows (one reviewer approving N modules), multi-item labeling (one rater emitting N decisions), or composing multi-entry programmatic submissions.`),
+		mcp.WithString("submissions",
+			mcp.Required(),
+			mcp.Description(`JSON array of submission objects, one per task. Example: '[{"task_id":"1:1:a:review","decision":"approve"},{"task_id":"1:1:b:review","decision":"approve"}]'`),
 		),
 	)
 }

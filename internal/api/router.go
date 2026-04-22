@@ -3619,13 +3619,55 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 		if _, ok := d.GetNode(qualified); ok {
 			return qualified
 		}
-		// Fall back to bare — singleton activated from an
-		// iteration vote. Still valid; the bare node is the
-		// same for every iteration so all activating instances
-		// contribute to the same winning/losing sets, which is
-		// the correct aggregation semantics for cross-scope
-		// activates.
+		// Fall back to bare — the iteration-level vote is
+		// naming a singleton (run-wide) task. The inScope
+		// filter below treats the bare node's empty
+		// instance_key as out-of-scope for an iteration
+		// vote, so the singleton is excluded from BOTH the
+		// winning and losing sets: a single iteration's
+		// decision doesn't unilaterally skip a run-wide
+		// resource. Other iterations' votes reach the same
+		// singleton via the same fan-in edges, and the
+		// ready-task sweep promotes it once every iteration
+		// is terminal — exact same partial-tolerance
+		// semantics as cross-iteration aggregators.
+		//
+		// Kept live (not removed) because for a SINGLETON
+		// vote (the early-return above), this branch isn't
+		// reached and the bare form is still the correct
+		// lookup. The test
+		// TestMCPVoteActivatesSingletonActivateeSurvives
+		// locks in the fanned-vote → singleton shape.
 		return shortID
+	}
+
+	// inScope restricts the activates-reachability walk to
+	// same-iteration descendants of a fanned-out vote. A
+	// cross-iteration aggregator below the activated tasks
+	// (singleton consumer of the fanned-out leaf) is
+	// reachable from the current iteration's losing branch
+	// but ALSO from every other iteration's winning branch —
+	// pulling it into the single-iteration losing_set would
+	// skip the aggregator even when another iteration keeps
+	// it reachable. Same iteration-scope filter as the
+	// fail-cascade path: the walk stays inside the vote's
+	// iteration, cross-iteration merge points are left alone
+	// and promote via UpdateReadyTasks once all cohort
+	// instances are terminal.
+	//
+	// Singleton votes (InstanceKey == "") fan unrestricted —
+	// their scope is run-wide, and there's no other iteration
+	// to partition against.
+	inScope := func(descShortID string) bool {
+		if task.InstanceKey == "" {
+			return true
+		}
+		n, ok := d.GetNode(descShortID)
+		if !ok {
+			return false
+		}
+		descKey, _ := n.Data["instance_key"].(string)
+		return descKey == task.InstanceKey
 	}
 
 	winningSet := make(map[string]bool)
@@ -3637,8 +3679,14 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 		}
 		for _, shortID := range o.Activates {
 			nodeID := resolveActivatesNode(shortID)
+			if !inScope(nodeID) {
+				continue
+			}
 			target[runPrefix+nodeID] = true
 			for _, desc := range d.Descendants(nodeID) {
+				if !inScope(desc) {
+					continue
+				}
 				target[runPrefix+desc] = true
 			}
 		}

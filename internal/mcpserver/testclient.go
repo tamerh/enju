@@ -74,6 +74,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleClaimTask(ctx, req)
 	case "enju_submit_result":
 		return t.c.handleSubmitResult(ctx, req)
+	case "enju_submit_results_batch":
+		return t.c.handleSubmitResultsBatch(ctx, req)
 	case "enju_get_task_inputs":
 		return t.c.handleGetTaskInputs(ctx, req)
 	case "enju_list_ready_tasks":

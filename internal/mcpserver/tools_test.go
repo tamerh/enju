@@ -22,6 +22,7 @@ var allToolFactories = []struct {
 	{"enju_claim_task", toolClaimTask},
 	{"enju_get_task_inputs", toolGetTaskInputs},
 	{"enju_submit_result", toolSubmitResult},
+	{"enju_submit_results_batch", toolSubmitResultsBatch},
 	{"enju_list_artifacts", toolListArtifacts},
 	{"enju_get_artifact", toolGetArtifact},
 	{"enju_get_artifact_history", toolGetArtifactHistory},
@@ -124,6 +125,7 @@ func TestKeySchemasHaveRequiredArgs(t *testing.T) {
 	}{
 		{"enju_claim_task", toolClaimTask, []string{"task_id"}},
 		{"enju_submit_result", toolSubmitResult, []string{"task_id"}},
+		{"enju_submit_results_batch", toolSubmitResultsBatch, []string{"submissions"}},
 		{"enju_get_task", toolGetTask, []string{"task_id"}},
 		{"enju_get_task_inputs", toolGetTaskInputs, []string{"task_id"}},
 		{"enju_release_task", toolReleaseTask, []string{"task_id"}},
