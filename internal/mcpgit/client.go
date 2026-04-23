@@ -536,6 +536,17 @@ func (p *Project) Unlock() {
 // remoteURL. If workDir exists but isn't a repo (or the clone is
 // corrupted), it's removed and re-cloned.
 func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, error) {
+	// Recover from a previous crash that left non-tracked files
+	// staged in <workDir>.preserve-in-progress. Best-effort: a
+	// failure here logs but doesn't block workspace open — the
+	// preserve dir will stay on disk for manual inspection, and
+	// subsequent operations still work on whatever's already in
+	// workDir. See preserve.go for the recovery logic.
+	if err := recoverLeftoverPreserve(workDir, logger); err != nil && logger != nil {
+		logger.Warn("preserve-dir recovery failed; leaving for manual inspection",
+			"error", err, "path", workDir+preserveDirSuffix)
+	}
+
 	if repo, err := gogit.PlainOpen(workDir); err == nil {
 		// Clone exists — verify the remote URL matches.
 		// After a DB wipe, the same workspace dir (keyed by
@@ -1426,116 +1437,56 @@ func (p *Project) CheckoutBranch(branch string) error {
 	// into the next submit — which was the tester-reported
 	// "lane-b inherits lane-a's commits" leak.
 	//
-	// Force:true in go-git ALSO wipes untracked files
-	// (different from `git checkout --force` CLI, which only
-	// overwrites conflicting paths) — an earlier version of
-	// this comment claimed untracked files were preserved;
-	// that was wrong, and cost a tester their in-progress
-	// template directory. To land the branch isolation Force
-	// gives us AND preserve user-authored scratch work, we
-	// snapshot untracked files into memory, force-checkout,
-	// then restore. The snapshot is cheap — on a fresh clone
-	// there are usually zero untracked files, and even a
-	// busy author's pending work is small relative to git
-	// object reads the checkout itself does.
-	preserved, err := snapshotUntrackedFiles(wt, p.workDir)
+	// Force:true in go-git ALSO wipes untracked files (different
+	// from `git checkout --force` CLI, which only overwrites
+	// conflicting paths) — an earlier version of this code lost
+	// a tester's in-progress template directory to exactly that
+	// behavior. To get Force's branch-isolation AND preserve
+	// user-authored scratch / gitignored artifacts, we rename
+	// non-tracked paths out of workDir before the checkout and
+	// rename them back after. The move is a metadata-only
+	// inode-table update, so a 50 GB untracked BAM file (common
+	// in bio workflows) moves in microseconds — no memory blow-
+	// up, no data copy. See preserve.go for the full rationale.
+	//
+	// Concurrency: this operation runs under the caller's
+	// proj.Lock(), so the preserve dir can't collide with
+	// another CheckoutBranch on the same project.
+	preserveDir := p.workDir + preserveDirSuffix
+	manifest, err := movePreserveNonTracked(p.repo, p.workDir, preserveDir)
 	if err != nil {
-		return fmt.Errorf("snapshotting untracked files before checkout: %w", err)
+		// Refuse the checkout on partial-preserve failure.
+		// The preserve dir remains on disk for manual
+		// inspection / next-session crash recovery. This is
+		// the "don't touch git state if preservation is half-
+		// done" safety default — rollback has its own failure
+		// modes (rename-back might fail for the same reason
+		// the forward rename did).
+		return fmt.Errorf(
+			"preserving non-tracked files before checkout failed: %w — partial state at %q; next workspace open will attempt recovery",
+			err, preserveDir,
+		)
 	}
 	if err := wt.Checkout(&gogit.CheckoutOptions{
 		Branch: refName,
 		Force:  true,
 	}); err != nil {
+		// Checkout failed — restore what we moved so the
+		// workspace is usable again.
+		_, _ = restoreFromPreserve(p.workDir, preserveDir, manifest)
 		return err
 	}
-	if err := restoreUntrackedFiles(p.workDir, preserved); err != nil {
-		return fmt.Errorf("restoring untracked files after checkout: %w", err)
+	conflicts, restoreErr := restoreFromPreserve(p.workDir, preserveDir, manifest)
+	if restoreErr != nil {
+		return fmt.Errorf("restoring non-tracked files after checkout: %w", restoreErr)
 	}
-	return nil
-}
-
-// untrackedFile captures one user-authored file that Force
-// checkout would otherwise wipe. Held in memory because the
-// alternative (temp-file relocation) would confuse a
-// concurrent reader and risk partial restore on crash.
-type untrackedFile struct {
-	relPath string
-	content []byte
-	mode    os.FileMode
-}
-
-// snapshotUntrackedFiles reads every untracked file from the
-// worktree into memory so a subsequent Force checkout can't
-// delete them. Uses go-git's Status() to identify untracked
-// paths — the same logic that would refuse a non-Force
-// checkout over unstaged changes, inverted to give us the
-// list instead of an error.
-//
-// Size bounded: template authoring involves small text files;
-// a pathological multi-GB untracked binary would balloon
-// memory, but that's an odd workflow and Force checkout
-// wouldn't survive it either.
-func snapshotUntrackedFiles(wt *gogit.Worktree, workDir string) ([]untrackedFile, error) {
-	status, err := wt.Status()
-	if err != nil {
-		return nil, fmt.Errorf("reading worktree status: %w", err)
-	}
-	var out []untrackedFile
-	for path, fs := range status {
-		if fs.Worktree != gogit.Untracked {
-			continue
-		}
-		full := filepath.Join(workDir, path)
-		info, err := os.Lstat(full)
-		if err != nil {
-			// File disappeared between Status and Lstat —
-			// nothing to preserve.
-			continue
-		}
-		// Skip directories and symlinks — only regular files
-		// are in scope for the "template pending auto-commit"
-		// case the fix targets. Directories get recreated
-		// implicitly when we restore files inside them.
-		if !info.Mode().IsRegular() {
-			continue
-		}
-		data, err := os.ReadFile(full)
-		if err != nil {
-			return nil, fmt.Errorf("reading untracked %s: %w", path, err)
-		}
-		out = append(out, untrackedFile{
-			relPath: path,
-			content: data,
-			mode:    info.Mode().Perm(),
-		})
-	}
-	return out, nil
-}
-
-// restoreUntrackedFiles writes each snapshotted file back to
-// its original path after a Force checkout, preserving the
-// mode bit. Creates parent dirs as needed. A file that
-// already exists post-checkout (because the new branch tracks
-// a path with the same name) is NOT overwritten — the
-// branch's tracked version wins, which is git's usual rule.
-// That case is rare for an untracked path but possible if a
-// user authored a file that conflicts with a branch-local
-// template.
-func restoreUntrackedFiles(workDir string, files []untrackedFile) error {
-	for _, f := range files {
-		full := filepath.Join(workDir, f.relPath)
-		if _, err := os.Stat(full); err == nil {
-			// Path now tracked on the new branch — skip to
-			// avoid overwriting branch content with user's
-			// pre-switch version.
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			return fmt.Errorf("creating parent of %s: %w", f.relPath, err)
-		}
-		if err := os.WriteFile(full, f.content, f.mode); err != nil {
-			return fmt.Errorf("restoring %s: %w", f.relPath, err)
-		}
+	if len(conflicts) > 0 && p.logger != nil {
+		p.logger.Warn(
+			"branch switch preserved non-tracked paths, but some now conflict with tracked paths on the new branch; preserved copies remain in the preserve dir for manual review",
+			"preserve_dir", preserveDir,
+			"conflict_entries", len(conflicts),
+			"conflict_files", countConflictFiles(preserveDir, conflicts),
+		)
 	}
 	return nil
 }
