@@ -525,6 +525,34 @@ func (s *testServer) createTestProject() int64 {
 	return projectID
 }
 
+// createTestProjectNoRemote creates a project WITHOUT a remote URL
+// — the post-Option-B "I just want to start working, no GitHub yet"
+// shape that real users hit via enju_create_project without
+// remote_url=. Used by regression tests for code paths that must
+// work without a configured remote (e.g. fat-client commits should
+// still land in the local clone for vote/review/answer submits;
+// previously they silently went to the legacy POST path because
+// useFatClient gated on remote URL presence).
+//
+// Returns the project ID. No bare repo is created — the workspace
+// clone is created on demand by Workspace.ForProject(remoteURL="")
+// via Option B's local-only fallback.
+func (s *testServer) createTestProjectNoRemote() int64 {
+	s.t.Helper()
+	s.ensureDefaultCitizen()
+	name := fmt.Sprintf("test-noremote-%d", time.Now().UnixNano())
+	resp := s.post("/api/v1/projects", map[string]string{
+		"name": name,
+	})
+	id, _ := resp["id"].(float64)
+	if id == 0 {
+		s.t.Fatalf("failed to create no-remote test project: %v", resp)
+	}
+	projectID := int64(id)
+	s.wipeProjectMembers(projectID)
+	return projectID
+}
+
 // createTestProjectAt creates a project at a specific bare remote
 // path. Used by tests that need to share a remote across calls or
 // verify external remote behavior. For the normal per-test case

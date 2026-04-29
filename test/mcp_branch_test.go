@@ -29,50 +29,51 @@ import (
 // refuses a second active run on the same branch with a clear
 // error pointing at the existing run.
 func TestMCPBranchSerialRunsRefused(t *testing.T) {
-	h := newMCPHarness(t, "SerialBranch")
-	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-serial-%d", nowNano()))
+	eachRemoteMode(t, "SerialBranch", func(t *testing.T, h *mcpHarness) {
+		projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-serial-%d", nowNano()))
 
-	yaml := `name: "first run"
+		yaml := `name: "first run"
 version: 1
 tasks:
   - id: only
     action: answer
     prompt: "Hi."
 `
-	res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-	})
-	if err != nil {
-		t.Fatalf("create run 1: %v", err)
-	}
-	if res1.IsError {
-		t.Fatalf("create run 1 rejected: %s", mcpText(res1))
-	}
+		res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+		})
+		if err != nil {
+			t.Fatalf("create run 1: %v", err)
+		}
+		if res1.IsError {
+			t.Fatalf("create run 1 rejected: %s", mcpText(res1))
+		}
 
-	// Second run on the same (default) branch while #1 is active
-	// — must be refused. handleCreateRun wraps the coordinator's
-	// 409 in a ✗ success result (formatter pattern), so the
-	// IsError bit stays false; assertion is on the text.
-	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
+		// Second run on the same (default) branch while #1 is active
+		// — must be refused. handleCreateRun wraps the coordinator's
+		// 409 in a ✗ success result (formatter pattern), so the
+		// IsError bit stays false; assertion is on the text.
+		res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+		})
+		if err != nil {
+			t.Fatalf("create run 2: %v", err)
+		}
+		msg := mcpText(res2)
+		if !strings.Contains(msg, "already has an active run") {
+			t.Errorf("expected serial-run error, got: %s", msg)
+		}
+		if !strings.Contains(msg, `"auto"`) {
+			t.Errorf("expected error to suggest branch=\"auto\"; got: %s", msg)
+		}
+		// Second run must NOT have landed on the store side.
+		runs, _ := h.store.ListRunsByProject(projectID)
+		if len(runs) != 1 {
+			t.Fatalf("expected serial-runs refusal to prevent run creation, got %d runs", len(runs))
+		}
 	})
-	if err != nil {
-		t.Fatalf("create run 2: %v", err)
-	}
-	msg := mcpText(res2)
-	if !strings.Contains(msg, "already has an active run") {
-		t.Errorf("expected serial-run error, got: %s", msg)
-	}
-	if !strings.Contains(msg, `"auto"`) {
-		t.Errorf("expected error to suggest branch=\"auto\"; got: %s", msg)
-	}
-	// Second run must NOT have landed on the store side.
-	runs, _ := h.store.ListRunsByProject(projectID)
-	if len(runs) != 1 {
-		t.Fatalf("expected serial-runs refusal to prevent run creation, got %d runs", len(runs))
-	}
 }
 
 // TestMCPBranchAutoAllocation verifies branch="auto" picks
@@ -85,61 +86,62 @@ tasks:
 // now makes `git checkout auto-named-1` line up with
 // `cd enju/runs/2-auto-named/`.
 func TestMCPBranchAutoAllocation(t *testing.T) {
-	h := newMCPHarness(t, "AutoBranch")
-	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-auto-%d", nowNano()))
+	eachRemoteMode(t, "AutoBranch", func(t *testing.T, h *mcpHarness) {
+		projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-auto-%d", nowNano()))
 
-	yaml := `name: "auto-named"
+		yaml := `name: "auto-named"
 version: 1
 tasks:
   - id: only
     action: answer
     prompt: "Hi."
 `
-	// First run uses default branch (main).
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-	})
+		// First run uses default branch (main).
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+		})
 
-	// branch="auto" — picks the first unused run-N slot. Assert
-	// on the persisted run record since the tool text doesn't
-	// currently surface the chosen branch name.
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "auto",
-	})
-	// Second auto call → next unused slot.
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "auto",
-	})
+		// branch="auto" — picks the first unused run-N slot. Assert
+		// on the persisted run record since the tool text doesn't
+		// currently surface the chosen branch name.
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "auto",
+		})
+		// Second auto call → next unused slot.
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "auto",
+		})
 
-	runs, err := h.store.ListRunsByProject(projectID)
-	if err != nil || len(runs) != 3 {
-		t.Fatalf("expected 3 runs, got %d (err=%v)", len(runs), err)
-	}
-	seen := map[string]bool{}
-	for _, r := range runs {
-		seen[r.Branch] = true
-	}
-	if !seen["main"] {
-		t.Errorf("expected main among branches; got: %+v", seen)
-	}
-	// Auto runs pick auto-named-1, auto-named-2 — the slug
-	// derives from the YAML's `name: "auto-named"` via the
-	// unified engine.ComputeRunSlug. Just assert the two auto
-	// calls produced distinct auto-named-N branches.
-	autoCount := 0
-	for b := range seen {
-		if strings.HasPrefix(b, "auto-named-") {
-			autoCount++
+		runs, err := h.store.ListRunsByProject(projectID)
+		if err != nil || len(runs) != 3 {
+			t.Fatalf("expected 3 runs, got %d (err=%v)", len(runs), err)
 		}
-	}
-	if autoCount != 2 {
-		t.Errorf("expected 2 auto-named-N branches from auto allocation; got seen=%+v", seen)
-	}
+		seen := map[string]bool{}
+		for _, r := range runs {
+			seen[r.Branch] = true
+		}
+		if !seen["main"] {
+			t.Errorf("expected main among branches; got: %+v", seen)
+		}
+		// Auto runs pick auto-named-1, auto-named-2 — the slug
+		// derives from the YAML's `name: "auto-named"` via the
+		// unified engine.ComputeRunSlug. Just assert the two auto
+		// calls produced distinct auto-named-N branches.
+		autoCount := 0
+		for b := range seen {
+			if strings.HasPrefix(b, "auto-named-") {
+				autoCount++
+			}
+		}
+		if autoCount != 2 {
+			t.Errorf("expected 2 auto-named-N branches from auto allocation; got seen=%+v", seen)
+		}
+	})
 }
 
 // TestMCPBranchCoAuthoredTemplatesNotScattered replicates the
@@ -155,81 +157,83 @@ tasks:
 // can't find it, and switching back to main wipes it from
 // the worktree.
 func TestMCPBranchCoAuthoredTemplatesNotScattered(t *testing.T) {
-	h := newMCPHarness(t, "CoAuthoredTemplates")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "CoAuthoredTemplates", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	// Author both templates simultaneously, both untracked
-	// in the workspace. writeRepoFiles commits to the bare,
-	// which then mirrors to the fat-client via the usual
-	// pull paths — but that path tracks them. To simulate
-	// untracked authorship, write files directly via the
-	// harness's workDir helper.
-	workDir := h.workspaceDirForProject(projectID)
-	for _, spec := range []struct{ path, body string }{
-		{"enju/templates/tmpl-a/enju.yaml", `name: "tmpl-a"
+		// Author both templates simultaneously, both untracked
+		// in the workspace. writeRepoFiles commits to the bare,
+		// which then mirrors to the fat-client via the usual
+		// pull paths — but that path tracks them. To simulate
+		// untracked authorship, write files directly via the
+		// harness's workDir helper.
+		workDir := h.workspaceDirForProject(projectID)
+		for _, spec := range []struct{ path, body string }{
+			{"enju/templates/tmpl-a/enju.yaml", `name: "tmpl-a"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "hello"
 `},
-		{"enju/templates/tmpl-b/enju.yaml", `name: "tmpl-b"
+			{"enju/templates/tmpl-b/enju.yaml", `name: "tmpl-b"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "world"
 `},
-	} {
-		full := filepath.Join(workDir, spec.path)
-		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			t.Fatalf("mkdir: %v", err)
+		} {
+			full := filepath.Join(workDir, spec.path)
+			if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(full, []byte(spec.body), 0644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
 		}
-		if err := os.WriteFile(full, []byte(spec.body), 0644); err != nil {
-			t.Fatalf("write: %v", err)
+
+		// Instantiate tmpl-a on a run branch. EnsureBundleOnDefault
+		// commits tmpl-a to main; the snapshot commit lands on
+		// the run's branch.
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/tmpl-a",
+			"branch":     "run-a",
+		})
+
+		// Scatter-guard: tmpl-b MUST NOT have landed on run-a's
+		// branch. Before the fix, the snapshot commit on run-a
+		// swept it in via AddGlob(".") — that's the bug.
+		remoteURL := h.remoteFor(projectID)
+		if _, onA := readRepoFileOnBranch(t, remoteURL, "run-a", "enju/templates/tmpl-b/enju.yaml"); onA {
+			t.Fatalf("tmpl-b scattered onto run-a's branch — snapshot commit accidentally swept up the co-authored untracked template")
 		}
-	}
 
-	// Instantiate tmpl-a on a run branch. EnsureBundleOnDefault
-	// commits tmpl-a to main; the snapshot commit lands on
-	// the run's branch.
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/tmpl-a",
-		"branch":     "run-a",
+		// Workflow-continuity: the user MUST still be able to
+		// instantiate tmpl-b afterward. Post-fix, tmpl-b is
+		// simply untracked locally (never scattered, never
+		// clobbered); the next create_run's
+		// EnsureBundleOnDefault auto-commits it to main and
+		// proceeds. If this step errors with "template not
+		// found", the user's co-authored work has effectively
+		// been lost.
+		res := h.call(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/tmpl-b",
+		})
+		if res.IsError {
+			t.Fatalf("create_run(tmpl-b) after tmpl-a: %s", mcpText(res))
+		}
+		// After the second create_run, tmpl-b IS on main (auto-
+		// committed by EnsureBundleOnDefault). Verify so the
+		// test also guards against a regression where the
+		// second create_run succeeds but leaves main without
+		// the template.
+		if _, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/tmpl-b/enju.yaml"); !ok {
+			t.Errorf("tmpl-b not published to main after create_run(tmpl-b) — EnsureBundleOnDefault skipped it")
+		}
 	})
-
-	// Scatter-guard: tmpl-b MUST NOT have landed on run-a's
-	// branch. Before the fix, the snapshot commit on run-a
-	// swept it in via AddGlob(".") — that's the bug.
-	remoteURL := h.remoteFor(projectID)
-	if _, onA := readRepoFileOnBranch(t, remoteURL, "run-a", "enju/templates/tmpl-b/enju.yaml"); onA {
-		t.Fatalf("tmpl-b scattered onto run-a's branch — snapshot commit accidentally swept up the co-authored untracked template")
-	}
-
-	// Workflow-continuity: the user MUST still be able to
-	// instantiate tmpl-b afterward. Post-fix, tmpl-b is
-	// simply untracked locally (never scattered, never
-	// clobbered); the next create_run's
-	// EnsureBundleOnDefault auto-commits it to main and
-	// proceeds. If this step errors with "template not
-	// found", the user's co-authored work has effectively
-	// been lost.
-	res := h.call(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/tmpl-b",
-	})
-	if res.IsError {
-		t.Fatalf("create_run(tmpl-b) after tmpl-a: %s", mcpText(res))
-	}
-	// After the second create_run, tmpl-b IS on main (auto-
-	// committed by EnsureBundleOnDefault). Verify so the
-	// test also guards against a regression where the
-	// second create_run succeeds but leaves main without
-	// the template.
-	if _, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/tmpl-b/enju.yaml"); !ok {
-		t.Errorf("tmpl-b not published to main after create_run(tmpl-b) — EnsureBundleOnDefault skipped it")
-	}
 }
 
 // TestMCPBranchExecuteTaskAutoCheckoutsRunBranch is the direct
@@ -251,53 +255,55 @@ tasks:
 // checks out branch-a before running, snapshot materializes on
 // disk, script runs.
 func TestMCPBranchExecuteTaskAutoCheckoutsRunBranch(t *testing.T) {
-	h := newMCPHarness(t, "ExecAcrossBranches")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "ExecAcrossBranches", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju/templates/greet/enju.yaml": {body: `name: "greet"
+		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+			"enju/templates/greet/enju.yaml": {body: `name: "greet"
 version: 1
 tasks:
   - id: say
     action: compute
     script: scripts/say.sh
 `, mode: 0o644},
-		"enju/templates/greet/scripts/say.sh": {body: `#!/bin/bash
+			"enju/templates/greet/scripts/say.sh": {body: `#!/bin/bash
 echo "hi from $ENJU_TASK_ID"
 `, mode: 0o755},
-	}, "seed greet template")
+		}, "seed greet template")
 
-	// Run A on branch-a.
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/greet",
-		"branch":     "branch-a",
-	})
-	taskA := fmt.Sprintf("%d:1:say", projectID)
+		// Run A on branch-a.
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/greet",
+			"branch":     "branch-a",
+		})
+		taskA := fmt.Sprintf("%d:1:say", projectID)
 
-	// Run B on branch-b — this pulls HEAD over to branch-b,
-	// and branch-b's enju/runs/1/ doesn't contain Run A's
-	// snapshot. Before the fix, any subsequent tool call on
-	// Run A would find the workspace still on branch-b.
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/greet",
-		"branch":     "branch-b",
-	})
+		// Run B on branch-b — this pulls HEAD over to branch-b,
+		// and branch-b's enju/runs/1/ doesn't contain Run A's
+		// snapshot. Before the fix, any subsequent tool call on
+		// Run A would find the workspace still on branch-b.
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/greet",
+			"branch":     "branch-b",
+		})
 
-	// Execute Run A's task. The handler's reconcile hook
-	// must auto-checkout branch-a so the template snapshot
-	// is on disk. If checkout is skipped, the script path
-	// resolves to a non-existent file and execute errors out.
-	res := h.call(t, "enju_execute_task", map[string]any{
-		"task_id": taskA,
+		// Execute Run A's task. The handler's reconcile hook
+		// must auto-checkout branch-a so the template snapshot
+		// is on disk. If checkout is skipped, the script path
+		// resolves to a non-existent file and execute errors out.
+		res := h.call(t, "enju_execute_task", map[string]any{
+			"task_id": taskA,
+		})
+		if res.IsError {
+			t.Fatalf("execute_task on Run A after Run B switched branches: %s", mcpText(res))
+		}
+		if !strings.Contains(mcpText(res), "Script completed") {
+			t.Errorf("expected successful execution, got:\n%s", mcpText(res))
+		}
 	})
-	if res.IsError {
-		t.Fatalf("execute_task on Run A after Run B switched branches: %s", mcpText(res))
-	}
-	if !strings.Contains(mcpText(res), "Script completed") {
-		t.Errorf("expected successful execution, got:\n%s", mcpText(res))
-	}
 }
 
 // TestMCPBranchAutoTemplateSlug verifies branch="auto" derives
@@ -306,110 +312,114 @@ echo "hi from $ENJU_TASK_ID"
 // yields "hello-1", "hello-2", .... Makes parallel parameter
 // sweeps instantly recognizable in `git branch`.
 func TestMCPBranchAutoTemplateSlug(t *testing.T) {
-	h := newMCPHarness(t, "AutoTemplateSlug")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "AutoTemplateSlug", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	h.writeRepoFiles(projectID, map[string]string{
-		"enju/templates/hello/enju.yaml": `name: "hello"
+		h.writeRepoFiles(projectID, map[string]string{
+			"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
     action: answer
     prompt: "Hi."
 `,
-	}, "seed hello template")
+		}, "seed hello template")
 
-	// Two template-mode runs with branch="auto" should produce
-	// hello-1 and hello-2.
-	for i := 0; i < 2; i++ {
-		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+		// Two template-mode runs with branch="auto" should produce
+		// hello-1 and hello-2.
+		for i := 0; i < 2; i++ {
+			res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+				"project_id": float64(projectID),
+				"path":       "enju/templates/hello",
+				"branch":     "auto",
+			})
+			if err != nil || res.IsError {
+				t.Fatalf("create_run auto #%d: err=%v body=%s", i, err, mcpText(res))
+			}
+		}
+
+		runs, err := h.store.ListRunsByProject(projectID)
+		if err != nil {
+			t.Fatalf("list runs: %v", err)
+		}
+		got := map[string]bool{}
+		for _, r := range runs {
+			got[r.Branch] = true
+		}
+		if !got["hello-1"] || !got["hello-2"] {
+			t.Errorf("expected hello-1 and hello-2 auto branches; got=%+v", got)
+		}
+
+		// The create_run text should surface the resolved branch so
+		// callers see what got picked without shelling out to git.
+		res, _ := h.client.Call(context.Background(), "enju_create_run", map[string]any{
 			"project_id": float64(projectID),
 			"path":       "enju/templates/hello",
 			"branch":     "auto",
 		})
-		if err != nil || res.IsError {
-			t.Fatalf("create_run auto #%d: err=%v body=%s", i, err, mcpText(res))
+		text := mcpText(res)
+		if !strings.Contains(text, `branch "hello-3"`) {
+			t.Errorf("expected create_run text to cite branch \"hello-3\", got: %s", text)
 		}
-	}
-
-	runs, err := h.store.ListRunsByProject(projectID)
-	if err != nil {
-		t.Fatalf("list runs: %v", err)
-	}
-	got := map[string]bool{}
-	for _, r := range runs {
-		got[r.Branch] = true
-	}
-	if !got["hello-1"] || !got["hello-2"] {
-		t.Errorf("expected hello-1 and hello-2 auto branches; got=%+v", got)
-	}
-
-	// The create_run text should surface the resolved branch so
-	// callers see what got picked without shelling out to git.
-	res, _ := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "auto",
 	})
-	text := mcpText(res)
-	if !strings.Contains(text, `branch "hello-3"`) {
-		t.Errorf("expected create_run text to cite branch \"hello-3\", got: %s", text)
-	}
 }
 
 // TestMCPBranchExplicitName verifies an explicit branch= name
 // is accepted, persisted on the run, and shows up in the
 // response.
 func TestMCPBranchExplicitName(t *testing.T) {
-	h := newMCPHarness(t, "ExplicitBranch")
-	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-explicit-%d", nowNano()))
+	eachRemoteMode(t, "ExplicitBranch", func(t *testing.T, h *mcpHarness) {
+		projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-explicit-%d", nowNano()))
 
-	yaml := `name: "experiment"
+		yaml := `name: "experiment"
 version: 1
 tasks:
   - id: only
     action: answer
     prompt: "Hi."
 `
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "ablation-no-dropout",
-	})
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "ablation-no-dropout",
+		})
 
-	// Look up the run on the store side to confirm persistence.
-	runs, err := h.store.ListRunsByProject(projectID)
-	if err != nil || len(runs) != 1 {
-		t.Fatalf("expected 1 run, got %d (err=%v)", len(runs), err)
-	}
-	if runs[0].Branch != "ablation-no-dropout" {
-		t.Errorf("expected branch=\"ablation-no-dropout\" persisted on run, got %q", runs[0].Branch)
-	}
+		// Look up the run on the store side to confirm persistence.
+		runs, err := h.store.ListRunsByProject(projectID)
+		if err != nil || len(runs) != 1 {
+			t.Fatalf("expected 1 run, got %d (err=%v)", len(runs), err)
+		}
+		if runs[0].Branch != "ablation-no-dropout" {
+			t.Errorf("expected branch=\"ablation-no-dropout\" persisted on run, got %q", runs[0].Branch)
+		}
+	})
 }
 
 // TestMCPBranchRejectsMalformed verifies branch shape validation
 // catches clearly-invalid names before they reach git.
 func TestMCPBranchRejectsMalformed(t *testing.T) {
-	h := newMCPHarness(t, "BadBranch")
-	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-bad-%d", nowNano()))
+	eachRemoteMode(t, "BadBranch", func(t *testing.T, h *mcpHarness) {
+		projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-bad-%d", nowNano()))
 
-	for _, bad := range []string{"-leading-dash", "has space", "HEAD", "dots..in..name", "trailing/"} {
-		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"yaml":       "name: \"x\"\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: \"x\"\n",
-			"branch":     bad,
-		})
-		if err != nil {
-			t.Fatalf("call %q: %v", bad, err)
+		for _, bad := range []string{"-leading-dash", "has space", "HEAD", "dots..in..name", "trailing/"} {
+			res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+				"project_id": float64(projectID),
+				"yaml":       "name: \"x\"\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: \"x\"\n",
+				"branch":     bad,
+			})
+			if err != nil {
+				t.Fatalf("call %q: %v", bad, err)
+			}
+			// The formatter pattern wraps coordinator errors as
+			// ✗-prefixed text rather than tool-level errors; assert
+			// on the text so either shape counts as "rejected."
+			text := mcpText(res)
+			if !strings.Contains(text, "Failed to create run") {
+				t.Errorf("expected branch %q to be rejected, got: %s", bad, text)
+			}
 		}
-		// The formatter pattern wraps coordinator errors as
-		// ✗-prefixed text rather than tool-level errors; assert
-		// on the text so either shape counts as "rejected."
-		text := mcpText(res)
-		if !strings.Contains(text, "Failed to create run") {
-			t.Errorf("expected branch %q to be rejected, got: %s", bad, text)
-		}
-	}
+	})
 }
 
 // TestMCPBranchClaimAndSubmitOnAutoBranch verifies a full
@@ -421,66 +431,70 @@ func TestMCPBranchRejectsMalformed(t *testing.T) {
 // ls-remotes first and treats "remote ref doesn't exist" as a
 // soft no-op, letting first-submit create the ref naturally.
 func TestMCPBranchClaimAndSubmitOnAutoBranch(t *testing.T) {
-	h := newMCPHarness(t, "AutoBranchCycle")
+	eachRemoteMode(t, "AutoBranchCycle", func
 	// Use the legacy zero-members test project path so we get
 	// a real bare remote wired up via the test harness — the
 	// membership-creator route goes through ~/.enju/repos which
 	// isn't test-isolated.
-	projectID := h.createTestProject()
+	(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
 
-	yaml := `name: "run on auto branch"
+		projectID := h.createTestProject()
+
+		yaml := `name: "run on auto branch"
 version: 1
 tasks:
   - id: greet
     action: answer
     prompt: "Hi."
 `
-	// Create a run on an auto-allocated branch — nothing pushed
-	// to origin/<branch> yet.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "auto",
-	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run branch=auto: %v / %s", err, mcpText(res))
-	}
+		// Create a run on an auto-allocated branch — nothing pushed
+		// to origin/<branch> yet.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "auto",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run branch=auto: %v / %s", err, mcpText(res))
+		}
 
-	// Point lastRunSeq at the freshly-created run. Single-run
-	// project, so we grab it from the store.
-	runs, _ := h.store.ListRunsByProject(projectID)
-	if len(runs) != 1 {
-		t.Fatalf("expected 1 run, got %d", len(runs))
-	}
-	h.lastProjectID = projectID
-	h.lastRunSeq = runs[0].Seq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
+		// Point lastRunSeq at the freshly-created run. Single-run
+		// project, so we grab it from the store.
+		runs, _ := h.store.ListRunsByProject(projectID)
+		if len(runs) != 1 {
+			t.Fatalf("expected 1 run, got %d", len(runs))
+		}
+		h.lastProjectID = projectID
+		h.lastRunSeq = runs[0].Seq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
 
-	// Claim — the path that used to fail at PullBranch for a
-	// fresh branch with no remote ref.
-	claimRes := h.mcpClaimOK(t, "greet")
-	if claimRes.IsError {
-		t.Fatalf("claim on auto-branch run: %s", mcpText(claimRes))
-	}
+		// Claim — the path that used to fail at PullBranch for a
+		// fresh branch with no remote ref.
+		claimRes := h.mcpClaimOK(t, "greet")
+		if claimRes.IsError {
+			t.Fatalf("claim on auto-branch run: %s", mcpText(claimRes))
+		}
 
-	// Submit — this push creates origin/<branch> for the first
-	// time.
-	h.mcpSubmitText(t, "greet", "Hi back.")
+		// Submit — this push creates origin/<branch> for the first
+		// time.
+		h.mcpSubmitText(t, "greet", "Hi back.")
 
-	// Task should now be accepted, and the branch ref should
-	// exist on the remote.
-	if got, _ := h.taskGet("greet")["state"].(string); got != "accepted" {
-		t.Errorf("expected greet=accepted after submit, got %q", got)
-	}
+		// Task should now be accepted, and the branch ref should
+		// exist on the remote.
+		if got, _ := h.taskGet("greet")["state"].(string); got != "accepted" {
+			t.Errorf("expected greet=accepted after submit, got %q", got)
+		}
 
-	// Verify the chosen branch ref actually landed on the bare
-	// remote. Before the CheckoutBranch fix this assertion would
-	// fail — the coordinator tracked branch="run-N" but commits
-	// went to main because the worktree never switched.
-	chosenBranch := runs[0].Branch
-	remoteURL := h.remoteFor(projectID)
-	assertRemoteHasBranch(t, remoteURL, chosenBranch)
-	assertRemoteHasBranch(t, remoteURL, "main") // seed branch survives
+		// Verify the chosen branch ref actually landed on the bare
+		// remote. Before the CheckoutBranch fix this assertion would
+		// fail — the coordinator tracked branch="run-N" but commits
+		// went to main because the worktree never switched.
+		chosenBranch := runs[0].Branch
+		remoteURL := h.remoteFor(projectID)
+		assertRemoteHasBranch(t, remoteURL, chosenBranch)
+		assertRemoteHasBranch(t, remoteURL, "main")
+	}) // seed branch survives
 }
 
 // readRepoFileOnBranch reads a file from a specific branch on
@@ -545,36 +559,38 @@ func assertRemoteHasBranch(t *testing.T, remoteURL, branch string) {
 // "run-N / experiment-X" as a coordinator label only — the
 // bare remote never saw the ref.
 func TestMCPBranchTemplateModeCreatesRemoteRef(t *testing.T) {
-	h := newMCPHarness(t, "TemplateBranchRef")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "TemplateBranchRef", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	// Seed a trivial template bundle in the project's clone.
-	h.writeRepoFiles(projectID, map[string]string{
-		"enju/templates/hello/enju.yaml": `name: "hello"
+		// Seed a trivial template bundle in the project's clone.
+		h.writeRepoFiles(projectID, map[string]string{
+			"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
     action: answer
     prompt: "Hi."
 `,
-	}, "seed hello template")
+		}, "seed hello template")
 
-	// create_run via template path + explicit branch.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "experiment-1",
+		// create_run via template path + explicit branch.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/hello",
+			"branch":     "experiment-1",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run template+branch: err=%v body=%s", err, mcpText(res))
+		}
+
+		// The snapshot commit ran inside create_run. The bare
+		// remote must show refs/heads/experiment-1 already —
+		// before any submit — since CommitFiles pushed.
+		remoteURL := h.remoteFor(projectID)
+		assertRemoteHasBranch(t, remoteURL, "experiment-1")
+		assertRemoteHasBranch(t, remoteURL, "main")
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run template+branch: err=%v body=%s", err, mcpText(res))
-	}
-
-	// The snapshot commit ran inside create_run. The bare
-	// remote must show refs/heads/experiment-1 already —
-	// before any submit — since CommitFiles pushed.
-	remoteURL := h.remoteFor(projectID)
-	assertRemoteHasBranch(t, remoteURL, "experiment-1")
-	assertRemoteHasBranch(t, remoteURL, "main")
 }
 
 // TestMCPBranchTemplateModeComputeExecutes closes the last
@@ -589,64 +605,66 @@ tasks:
 // This test proves the executor + snapshot + branch routing
 // all line up end-to-end on a non-default branch.
 func TestMCPBranchTemplateModeComputeExecutes(t *testing.T) {
-	h := newMCPHarness(t, "TemplateBranchCompute")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "TemplateBranchCompute", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju/templates/echo/enju.yaml": {body: `name: "echo"
+		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+			"enju/templates/echo/enju.yaml": {body: `name: "echo"
 version: 1
 tasks:
   - id: run
     action: compute
     script: scripts/echo.sh
 `, mode: 0o644},
-		"enju/templates/echo/scripts/echo.sh": {body: `#!/bin/bash
+			"enju/templates/echo/scripts/echo.sh": {body: `#!/bin/bash
 echo "branch-test-ran"
 `, mode: 0o755},
-	}, "seed echo template")
+		}, "seed echo template")
 
-	// Template-mode create_run on a non-default branch.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/echo",
-		"branch":     "compute-branch",
+		// Template-mode create_run on a non-default branch.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/echo",
+			"branch":     "compute-branch",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+		}
+
+		// Point the harness at this run.
+		runs, _ := h.store.ListRunsByProject(projectID)
+		h.lastProjectID = projectID
+		h.lastRunSeq = runs[0].Seq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
+
+		// Execute — this both claims and submits via the compute
+		// executor path, which resolves `script:` from the per-
+		// run snapshot dir. A broken snapshot branch would leave
+		// the script missing.
+		execRes := h.callOK(t, "enju_execute_task", map[string]any{
+			"task_id": h.taskID("run"),
+		})
+		if execRes.IsError {
+			t.Fatalf("execute_task failed — likely the template snapshot isn't on the run's branch: %s", mcpText(execRes))
+		}
+
+		// Remote should have both branches — main (from the seed)
+		// and compute-branch (from the snapshot + submit).
+		remoteURL := h.remoteFor(projectID)
+		assertRemoteHasBranch(t, remoteURL, "main")
+		assertRemoteHasBranch(t, remoteURL, "compute-branch")
+
+		// Result content lives on compute-branch, not main — the
+		// branch-aware read confirms the submit landed there.
+		body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", filepath.Join(h.runDir(int(runs[0].Seq)), "run/result.md"))
+		if !ok {
+			t.Fatalf("result.md missing from compute-branch")
+		}
+		if !strings.Contains(string(body), "branch-test-ran") {
+			t.Errorf("expected script output in result; got:\n%s", string(body))
+		}
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
-	}
-
-	// Point the harness at this run.
-	runs, _ := h.store.ListRunsByProject(projectID)
-	h.lastProjectID = projectID
-	h.lastRunSeq = runs[0].Seq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
-
-	// Execute — this both claims and submits via the compute
-	// executor path, which resolves `script:` from the per-
-	// run snapshot dir. A broken snapshot branch would leave
-	// the script missing.
-	execRes := h.callOK(t, "enju_execute_task", map[string]any{
-		"task_id": h.taskID("run"),
-	})
-	if execRes.IsError {
-		t.Fatalf("execute_task failed — likely the template snapshot isn't on the run's branch: %s", mcpText(execRes))
-	}
-
-	// Remote should have both branches — main (from the seed)
-	// and compute-branch (from the snapshot + submit).
-	remoteURL := h.remoteFor(projectID)
-	assertRemoteHasBranch(t, remoteURL, "main")
-	assertRemoteHasBranch(t, remoteURL, "compute-branch")
-
-	// Result content lives on compute-branch, not main — the
-	// branch-aware read confirms the submit landed there.
-	body, ok := readRepoFileOnBranch(t, remoteURL, "compute-branch", filepath.Join(h.runDir(int(runs[0].Seq)), "run/result.md"))
-	if !ok {
-		t.Fatalf("result.md missing from compute-branch")
-	}
-	if !strings.Contains(string(body), "branch-test-ran") {
-		t.Errorf("expected script output in result; got:\n%s", string(body))
-	}
 }
 
 // TestMCPBranchExportDiagramRoutesToRunBranch pins the
@@ -656,53 +674,55 @@ echo "branch-test-ran"
 // field, so runBranchFromData returned empty →
 // CheckoutBranch("") fell back to the project default.
 func TestMCPBranchExportDiagramRoutesToRunBranch(t *testing.T) {
-	h := newMCPHarness(t, "ExportDiagramBranch")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "ExportDiagramBranch", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	h.mcpCreateRunInline(t, projectID, `name: "r"
+		h.mcpCreateRunInline(t, projectID, `name: "r"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "x"
 `)
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "on main")
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "on main")
 
-	// Run #2 on explicit branch.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml": `name: "r2"
+		// Run #2 on explicit branch.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml": `name: "r2"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "x"
 `,
-		"branch": "experiment-1",
-	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
-	}
-	runs, _ := h.store.ListRunsByProject(projectID)
-	h.lastProjectID = projectID
-	h.lastRunSeq = runs[1].Seq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
+			"branch": "experiment-1",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+		}
+		runs, _ := h.store.ListRunsByProject(projectID)
+		h.lastProjectID = projectID
+		h.lastRunSeq = runs[1].Seq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
 
-	h.callOK(t, "enju_export_diagram", map[string]any{
-		"project_id": float64(projectID),
-		"run_id":     float64(runs[1].Seq),
-		"phase":      "initial",
-	})
+		h.callOK(t, "enju_export_diagram", map[string]any{
+			"project_id": float64(projectID),
+			"run_id":     float64(runs[1].Seq),
+			"phase":      "initial",
+		})
 
-	remoteURL := h.remoteFor(projectID)
-	expPath := filepath.Join(h.runDir(int(runs[1].Seq)), "graph/initial.mmd")
-	if _, ok := readRepoFileOnBranch(t, remoteURL, "experiment-1", expPath); !ok {
-		t.Errorf("diagram missing from experiment-1 — wrong branch routing")
-	}
-	if _, onMain := readRepoFileOnBranch(t, remoteURL, "main", expPath); onMain {
-		t.Errorf("diagram leaked onto main — should live only on experiment-1")
-	}
+		remoteURL := h.remoteFor(projectID)
+		expPath := filepath.Join(h.runDir(int(runs[1].Seq)), "graph/initial.mmd")
+		if _, ok := readRepoFileOnBranch(t, remoteURL, "experiment-1", expPath); !ok {
+			t.Errorf("diagram missing from experiment-1 — wrong branch routing")
+		}
+		if _, onMain := readRepoFileOnBranch(t, remoteURL, "main", expPath); onMain {
+			t.Errorf("diagram leaked onto main — should live only on experiment-1")
+		}
+	})
 }
 
 // TestMCPBranchUpstreamSubstitutionOnExplicitBranch is the
@@ -714,10 +734,10 @@ tasks:
 // fat-client resolver can't find first's commit in the local
 // clone.
 func TestMCPBranchUpstreamSubstitutionOnExplicitBranch(t *testing.T) {
-	h := newMCPHarness(t, "UpstreamOnBranch")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "UpstreamOnBranch", func(t *testing.T, h *mcpHarness) {
+		projectID := h.createTestProject()
 
-	yaml := `name: "two-step"
+		yaml := `name: "two-step"
 version: 1
 tasks:
   - id: first
@@ -727,36 +747,37 @@ tasks:
     action: answer
     prompt: "Echo upstream: {{first.content}}"
 `
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "workbranch",
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "workbranch",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+		}
+
+		runs, _ := h.store.ListRunsByProject(projectID)
+		h.lastProjectID = projectID
+		h.lastRunSeq = runs[0].Seq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
+
+		h.mcpClaimOK(t, "first")
+		h.mcpSubmitText(t, "first", "apple")
+
+		// Claim second — the MCP client resolves {{first.content}}
+		// locally by reading first's result.md at first's commit
+		// SHA. Pre-regression this worked; pre-fix the claim
+		// returned the literal {{first.content}} token and the
+		// get_task_inputs call errored with "no result file found".
+		claimRes := h.mcpClaimOK(t, "second")
+		text := mcpText(claimRes)
+		if strings.Contains(text, "{{first.content}}") {
+			t.Errorf("substitution regression — claim returned literal {{first.content}}; got:\n%s", text)
+		}
+		if !strings.Contains(text, "apple") {
+			t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
+		}
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
-	}
-
-	runs, _ := h.store.ListRunsByProject(projectID)
-	h.lastProjectID = projectID
-	h.lastRunSeq = runs[0].Seq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[0].Seq)
-
-	h.mcpClaimOK(t, "first")
-	h.mcpSubmitText(t, "first", "apple")
-
-	// Claim second — the MCP client resolves {{first.content}}
-	// locally by reading first's result.md at first's commit
-	// SHA. Pre-regression this worked; pre-fix the claim
-	// returned the literal {{first.content}} token and the
-	// get_task_inputs call errored with "no result file found".
-	claimRes := h.mcpClaimOK(t, "second")
-	text := mcpText(claimRes)
-	if strings.Contains(text, "{{first.content}}") {
-		t.Errorf("substitution regression — claim returned literal {{first.content}}; got:\n%s", text)
-	}
-	if !strings.Contains(text, "apple") {
-		t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
-	}
 }
 
 // TestMCPBranchUpstreamSubstitutionAfterBranchChurn tries to
@@ -766,19 +787,19 @@ tasks:
 // CheckoutBranch's Force:true wipes the worktree tree enough
 // that the resolver can't find a prior commit's blob.
 func TestMCPBranchUpstreamSubstitutionAfterBranchChurn(t *testing.T) {
-	h := newMCPHarness(t, "UpstreamAfterChurn")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "UpstreamAfterChurn", func(t *testing.T, h *mcpHarness) {
+		projectID := h.createTestProject()
 
-	// Run #1 on lane-a (some prior branch work).
-	runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
-	h.lastProjectID = projectID
-	h.lastRunSeq = runA
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "prior work on lane-a")
+		// Run #1 on lane-a (some prior branch work).
+		runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
+		h.lastProjectID = projectID
+		h.lastRunSeq = runA
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "prior work on lane-a")
 
-	// Run #2 on a fresh branch with two dependent tasks.
-	yaml := `name: "chain"
+		// Run #2 on a fresh branch with two dependent tasks.
+		yaml := `name: "chain"
 version: 1
 tasks:
   - id: first
@@ -788,38 +809,39 @@ tasks:
     action: answer
     prompt: "Echo: {{first.content}}"
 `
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "chain-branch",
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "chain-branch",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run chain: err=%v body=%s", err, mcpText(res))
+		}
+		runs, _ := h.store.ListRunsByProject(projectID)
+		// The chain run is the most recent.
+		chainSeq := runs[len(runs)-1].Seq
+		h.lastRunSeq = chainSeq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, chainSeq)
+
+		h.mcpClaimOK(t, "first")
+		h.mcpSubmitText(t, "first", "apple")
+
+		// Claim second. The resolver reads first's result.md at
+		// first's commit SHA — if CheckoutBranch's Force:true
+		// wiped the worktree such that first's commit isn't
+		// reachable from the current clone, this fails.
+		claimRes := h.mcpClaimOK(t, "second")
+		text := mcpText(claimRes)
+		if strings.Contains(text, "{{first.content}}") {
+			t.Errorf("regression — second's prompt has literal {{first.content}}; full:\n%s", text)
+		}
+		if strings.Contains(text, "no result file found") {
+			t.Errorf("regression — resolver couldn't find first's result file; full:\n%s", text)
+		}
+		if !strings.Contains(text, "apple") {
+			t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
+		}
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run chain: err=%v body=%s", err, mcpText(res))
-	}
-	runs, _ := h.store.ListRunsByProject(projectID)
-	// The chain run is the most recent.
-	chainSeq := runs[len(runs)-1].Seq
-	h.lastRunSeq = chainSeq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, chainSeq)
-
-	h.mcpClaimOK(t, "first")
-	h.mcpSubmitText(t, "first", "apple")
-
-	// Claim second. The resolver reads first's result.md at
-	// first's commit SHA — if CheckoutBranch's Force:true
-	// wiped the worktree such that first's commit isn't
-	// reachable from the current clone, this fails.
-	claimRes := h.mcpClaimOK(t, "second")
-	text := mcpText(claimRes)
-	if strings.Contains(text, "{{first.content}}") {
-		t.Errorf("regression — second's prompt has literal {{first.content}}; full:\n%s", text)
-	}
-	if strings.Contains(text, "no result file found") {
-		t.Errorf("regression — resolver couldn't find first's result file; full:\n%s", text)
-	}
-	if !strings.Contains(text, "apple") {
-		t.Errorf("expected substituted prompt with 'apple'; got:\n%s", text)
-	}
 }
 
 // TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD pins the
@@ -829,30 +851,32 @@ tasks:
 // forked from current workspace HEAD. Post-fix, new branches
 // fork from `origin/main` (the project base), not from HEAD.
 func TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD(t *testing.T) {
-	h := newMCPHarness(t, "BranchAncestry")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "BranchAncestry", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
-	h.lastProjectID = projectID
-	h.lastRunSeq = runA
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "on lane-a")
+		runA := mcpCreateRunOnBranch(t, h, projectID, "lane-a")
+		h.lastProjectID = projectID
+		h.lastRunSeq = runA
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runA)
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "on lane-a")
 
-	runB := mcpCreateRunOnBranch(t, h, projectID, "lane-b")
-	h.lastRunSeq = runB
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runB)
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "on lane-b")
+		runB := mcpCreateRunOnBranch(t, h, projectID, "lane-b")
+		h.lastRunSeq = runB
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runB)
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "on lane-b")
 
-	remoteURL := h.remoteFor(projectID)
-	runAResultPath := filepath.Join(h.runDir(int(runA)), "t/result.md")
-	if _, leaked := readRepoFileOnBranch(t, remoteURL, "lane-b", runAResultPath); leaked {
-		t.Errorf("lane-b unexpectedly contains run-A's result — branch forked from lane-a instead of main")
-	}
-	if _, ok := readRepoFileOnBranch(t, remoteURL, "lane-a", runAResultPath); !ok {
-		t.Errorf("lane-a missing its own result — something is off")
-	}
+		remoteURL := h.remoteFor(projectID)
+		runAResultPath := filepath.Join(h.runDir(int(runA)), "t/result.md")
+		if _, leaked := readRepoFileOnBranch(t, remoteURL, "lane-b", runAResultPath); leaked {
+			t.Errorf("lane-b unexpectedly contains run-A's result — branch forked from lane-a instead of main")
+		}
+		if _, ok := readRepoFileOnBranch(t, remoteURL, "lane-a", runAResultPath); !ok {
+			t.Errorf("lane-a missing its own result — something is off")
+		}
+	})
 }
 
 // mcpCreateRunOnBranch is a tiny helper for branch tests.
@@ -884,73 +908,75 @@ tasks:
 // found." Post-fix, EnsureBundleOnDefault auto-commits the
 // bundle to the default branch first, so it's reusable.
 func TestMCPBranchTemplateUntrackedAutoCommitsToDefault(t *testing.T) {
-	h := newMCPHarness(t, "TemplateUntracked")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "TemplateUntracked", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	// Force the MCP workspace to clone the project so we have
-	// a real local worktree to write an untracked file into.
-	remoteURL := h.remoteFor(projectID)
-	proj, err := h.workspace.ForProject(projectID, remoteURL, "")
-	if err != nil {
-		t.Fatalf("open workspace: %v", err)
-	}
+		// Force the MCP workspace to clone the project so we have
+		// a real local worktree to write an untracked file into.
+		remoteURL := h.remoteFor(projectID)
+		proj, err := h.workspace.ForProject(projectID, remoteURL, "")
+		if err != nil {
+			t.Fatalf("open workspace: %v", err)
+		}
 
-	// Write the template UNTRACKED directly into the worktree
-	// — bypassing git entirely, the way a user authoring a
-	// template with a plain text editor would.
-	bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "hello")
-	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
-		t.Fatalf("mkdir bundle: %v", err)
-	}
-	tmplPath := filepath.Join(bundleDir, "enju.yaml")
-	tmplBody := `name: "hello"
+		// Write the template UNTRACKED directly into the worktree
+		// — bypassing git entirely, the way a user authoring a
+		// template with a plain text editor would.
+		bundleDir := filepath.Join(proj.WorkDir(), "enju", "templates", "hello")
+		if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+			t.Fatalf("mkdir bundle: %v", err)
+		}
+		tmplPath := filepath.Join(bundleDir, "enju.yaml")
+		tmplBody := `name: "hello"
 version: 1
 tasks:
   - id: greet
     action: answer
     prompt: "Hi."
 `
-	if err := os.WriteFile(tmplPath, []byte(tmplBody), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
+		if err := os.WriteFile(tmplPath, []byte(tmplBody), 0o644); err != nil {
+			t.Fatalf("write template: %v", err)
+		}
 
-	// create_run on a non-default branch. The handler should
-	// auto-commit the untracked template to main BEFORE
-	// branching off to experiment-1.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "experiment-1",
+		// create_run on a non-default branch. The handler should
+		// auto-commit the untracked template to main BEFORE
+		// branching off to experiment-1.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/hello",
+			"branch":     "experiment-1",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
+		}
+
+		// Template must be committed on main in the bare remote
+		// — the auto-commit is the whole point.
+		mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
+		if !ok {
+			t.Fatalf("template missing from main — auto-commit did not fire")
+		}
+		if !strings.Contains(string(mainBody), "Hi.") {
+			t.Errorf("main template content looks wrong: %s", string(mainBody))
+		}
+
+		// And experiment-1 exists (carries its per-run snapshot).
+		assertRemoteHasBranch(t, remoteURL, "experiment-1")
+
+		// The real test: a SECOND run on a different branch can
+		// still find the template (it's on main now). Pre-fix,
+		// this failed with "template not found."
+		res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/hello",
+			"branch":     "experiment-2",
+		})
+		if err != nil || res2.IsError {
+			t.Fatalf("second create_run on experiment-2: err=%v body=%s", err, mcpText(res2))
+		}
+		assertRemoteHasBranch(t, remoteURL, "experiment-2")
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run: err=%v body=%s", err, mcpText(res))
-	}
-
-	// Template must be committed on main in the bare remote
-	// — the auto-commit is the whole point.
-	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
-	if !ok {
-		t.Fatalf("template missing from main — auto-commit did not fire")
-	}
-	if !strings.Contains(string(mainBody), "Hi.") {
-		t.Errorf("main template content looks wrong: %s", string(mainBody))
-	}
-
-	// And experiment-1 exists (carries its per-run snapshot).
-	assertRemoteHasBranch(t, remoteURL, "experiment-1")
-
-	// The real test: a SECOND run on a different branch can
-	// still find the template (it's on main now). Pre-fix,
-	// this failed with "template not found."
-	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "experiment-2",
-	})
-	if err != nil || res2.IsError {
-		t.Fatalf("second create_run on experiment-2: err=%v body=%s", err, mcpText(res2))
-	}
-	assertRemoteHasBranch(t, remoteURL, "experiment-2")
 }
 
 // TestMCPBranchTemplateReusableAcrossBranches is the tester's
@@ -965,60 +991,62 @@ tasks:
 // default before branching off; run #2 on another branch reads
 // it from default's already-committed history.
 func TestMCPBranchTemplateReusableAcrossBranches(t *testing.T) {
-	h := newMCPHarness(t, "TemplateReusable")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "TemplateReusable", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	// Seed the template in the project's clone (simulating the
-	// user writing the file into their workspace before first
-	// create_run). writeRepoFiles commits to main, which is the
-	// default branch for createTestProject — exactly the
-	// "templates live on default" end state, but reached via
-	// the normal authoring path.
-	h.writeRepoFiles(projectID, map[string]string{
-		"enju/templates/hello/enju.yaml": `name: "hello"
+		// Seed the template in the project's clone (simulating the
+		// user writing the file into their workspace before first
+		// create_run). writeRepoFiles commits to main, which is the
+		// default branch for createTestProject — exactly the
+		// "templates live on default" end state, but reached via
+		// the normal authoring path.
+		h.writeRepoFiles(projectID, map[string]string{
+			"enju/templates/hello/enju.yaml": `name: "hello"
 version: 1
 tasks:
   - id: greet
     action: answer
     prompt: "Hi."
 `,
-	}, "seed hello template")
+		}, "seed hello template")
 
-	// Run #1 on an explicit non-default branch.
-	res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "experiment-1",
+		// Run #1 on an explicit non-default branch.
+		res1, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/hello",
+			"branch":     "experiment-1",
+		})
+		if err != nil || res1.IsError {
+			t.Fatalf("create_run #1 on experiment-1: err=%v body=%s", err, mcpText(res1))
+		}
+
+		// Run #2 on a DIFFERENT non-default branch. This is the
+		// critical second call — pre-fix it would have failed
+		// with "template not found" because the template only
+		// lived on experiment-1.
+		res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"path":       "enju/templates/hello",
+			"branch":     "experiment-2",
+		})
+		if err != nil || res2.IsError {
+			t.Fatalf("create_run #2 on experiment-2: err=%v body=%s", err, mcpText(res2))
+		}
+
+		// Both branches exist, template is on main.
+		remoteURL := h.remoteFor(projectID)
+		assertRemoteHasBranch(t, remoteURL, "main")
+		assertRemoteHasBranch(t, remoteURL, "experiment-1")
+		assertRemoteHasBranch(t, remoteURL, "experiment-2")
+		mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
+		if !ok {
+			t.Fatalf("template missing from main — expected auto-commit to default")
+		}
+		if !strings.Contains(string(mainBody), "Hi.") {
+			t.Errorf("main's template content looks wrong: %s", string(mainBody))
+		}
 	})
-	if err != nil || res1.IsError {
-		t.Fatalf("create_run #1 on experiment-1: err=%v body=%s", err, mcpText(res1))
-	}
-
-	// Run #2 on a DIFFERENT non-default branch. This is the
-	// critical second call — pre-fix it would have failed
-	// with "template not found" because the template only
-	// lived on experiment-1.
-	res2, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"path":       "enju/templates/hello",
-		"branch":     "experiment-2",
-	})
-	if err != nil || res2.IsError {
-		t.Fatalf("create_run #2 on experiment-2: err=%v body=%s", err, mcpText(res2))
-	}
-
-	// Both branches exist, template is on main.
-	remoteURL := h.remoteFor(projectID)
-	assertRemoteHasBranch(t, remoteURL, "main")
-	assertRemoteHasBranch(t, remoteURL, "experiment-1")
-	assertRemoteHasBranch(t, remoteURL, "experiment-2")
-	mainBody, ok := readRepoFileOnBranch(t, remoteURL, "main", "enju/templates/hello/enju.yaml")
-	if !ok {
-		t.Fatalf("template missing from main — expected auto-commit to default")
-	}
-	if !strings.Contains(string(mainBody), "Hi.") {
-		t.Errorf("main's template content looks wrong: %s", string(mainBody))
-	}
 }
 
 // TestMCPBranchExplicitNameCreatesRemoteRef reproduces the
@@ -1029,126 +1057,130 @@ tasks:
 // BOTH main (from the first run) and experiment-1 (from the
 // second).
 func TestMCPBranchExplicitNameCreatesRemoteRef(t *testing.T) {
-	h := newMCPHarness(t, "ExplicitBranchRef")
-	projectID := h.createTestProject()
+	eachRemoteMode(t, "ExplicitBranchRef", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
 
-	yaml := `name: "r"
+		yaml := `name: "r"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "x"
 `
-	// Run #1: default branch (main). Submit to get a real
-	// commit on main so the bare has something.
-	h.mcpCreateRunInline(t, projectID, yaml)
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "on main")
+		// Run #1: default branch (main). Submit to get a real
+		// commit on main so the bare has something.
+		h.mcpCreateRunInline(t, projectID, yaml)
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "on main")
 
-	// Run #2: explicit branch="experiment-1". Claim + submit.
-	// The coordinator is fine with this (different branch from
-	// run #1) and at the git level we expect the fat-client to
-	// check out experiment-1 before committing, then push it.
-	res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
-		"project_id": float64(projectID),
-		"yaml":       yaml,
-		"branch":     "experiment-1",
+		// Run #2: explicit branch="experiment-1". Claim + submit.
+		// The coordinator is fine with this (different branch from
+		// run #1) and at the git level we expect the fat-client to
+		// check out experiment-1 before committing, then push it.
+		res, err := h.client.Call(context.Background(), "enju_create_run", map[string]any{
+			"project_id": float64(projectID),
+			"yaml":       yaml,
+			"branch":     "experiment-1",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_run branch=experiment-1: err=%v body=%s", err, mcpText(res))
+		}
+		runs, _ := h.store.ListRunsByProject(projectID)
+		if len(runs) != 2 {
+			t.Fatalf("expected 2 runs, got %d", len(runs))
+		}
+		// Point harness state at run #2.
+		h.lastProjectID = projectID
+		h.lastRunSeq = runs[1].Seq
+		h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
+
+		h.mcpClaimOK(t, "t")
+		h.mcpSubmitText(t, "t", "on experiment-1")
+
+		// The critical assertion: the bare remote has
+		// refs/heads/experiment-1, not just refs/heads/main.
+		remoteURL := h.remoteFor(projectID)
+		assertRemoteHasBranch(t, remoteURL, "main")
+		assertRemoteHasBranch(t, remoteURL, "experiment-1")
 	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_run branch=experiment-1: err=%v body=%s", err, mcpText(res))
-	}
-	runs, _ := h.store.ListRunsByProject(projectID)
-	if len(runs) != 2 {
-		t.Fatalf("expected 2 runs, got %d", len(runs))
-	}
-	// Point harness state at run #2.
-	h.lastProjectID = projectID
-	h.lastRunSeq = runs[1].Seq
-	h.lastRunID = fmt.Sprintf("%d:%d", projectID, runs[1].Seq)
-
-	h.mcpClaimOK(t, "t")
-	h.mcpSubmitText(t, "t", "on experiment-1")
-
-	// The critical assertion: the bare remote has
-	// refs/heads/experiment-1, not just refs/heads/main.
-	remoteURL := h.remoteFor(projectID)
-	assertRemoteHasBranch(t, remoteURL, "main")
-	assertRemoteHasBranch(t, remoteURL, "experiment-1")
 }
 
 // TestMCPDefaultBranchOnCreateProject verifies default_branch
 // passed at create_project time sticks + runs without an
 // explicit branch land on it.
 func TestMCPDefaultBranchOnCreateProject(t *testing.T) {
-	h := newMCPHarness(t, "DefaultBranch")
-	projectName := fmt.Sprintf("branch-default-%d", nowNano())
-	res, err := h.client.Call(context.Background(), "enju_create_project", map[string]any{
-		"name":           projectName,
-		"default_branch": "enju/work",
-	})
-	if err != nil || res.IsError {
-		t.Fatalf("create_project: err=%v isError=%v body=%s", err, res.IsError, mcpText(res))
-	}
-	proj, err := h.store.GetProjectByName(projectName)
-	if err != nil || proj == nil {
-		t.Fatalf("project lookup: %v", err)
-	}
-	if proj.DefaultBranch != "enju/work" {
-		t.Fatalf("expected default_branch=\"enju/work\", got %q", proj.DefaultBranch)
-	}
+	eachRemoteMode(t, "DefaultBranch", func(t *testing.T, h *mcpHarness) {
+		projectName := fmt.Sprintf("branch-default-%d", nowNano())
+		res, err := h.client.Call(context.Background(), "enju_create_project", map[string]any{
+			"name":           projectName,
+			"default_branch": "enju/work",
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("create_project: err=%v isError=%v body=%s", err, res.IsError, mcpText(res))
+		}
+		proj, err := h.store.GetProjectByName(projectName)
+		if err != nil || proj == nil {
+			t.Fatalf("project lookup: %v", err)
+		}
+		if proj.DefaultBranch != "enju/work" {
+			t.Fatalf("expected default_branch=\"enju/work\", got %q", proj.DefaultBranch)
+		}
 
-	// Run without explicit branch lands on enju/work.
-	yaml := `name: "r"
+		// Run without explicit branch lands on enju/work.
+		yaml := `name: "r"
 version: 1
 tasks:
   - id: t
     action: answer
     prompt: "x"
 `
-	h.callOK(t, "enju_create_run", map[string]any{
-		"project_id": float64(proj.ID),
-		"yaml":       yaml,
+		h.callOK(t, "enju_create_run", map[string]any{
+			"project_id": float64(proj.ID),
+			"yaml":       yaml,
+		})
+		runs, _ := h.store.ListRunsByProject(proj.ID)
+		if len(runs) != 1 || runs[0].Branch != "enju/work" {
+			t.Fatalf("expected run on enju/work; got %+v", runs)
+		}
 	})
-	runs, _ := h.store.ListRunsByProject(proj.ID)
-	if len(runs) != 1 || runs[0].Branch != "enju/work" {
-		t.Fatalf("expected run on enju/work; got %+v", runs)
-	}
 }
 
 // TestMCPSetProjectDefaultBranch verifies the tool flips the
 // default for NEW runs (existing runs keep their branch) and
 // is owner-only.
 func TestMCPSetProjectDefaultBranch(t *testing.T) {
-	h := newMCPHarness(t, "FlipDefault")
-	projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-flip-%d", nowNano()))
+	eachRemoteMode(t, "FlipDefault", func(t *testing.T, h *mcpHarness) {
+		projectID := mcpCreateProjectAs(t, h, h.client, fmt.Sprintf("branch-flip-%d", nowNano()))
 
-	// Owner flips default → "develop".
-	h.callOK(t, "enju_set_project_default_branch", map[string]any{
-		"project_id": float64(projectID),
-		"branch":     "develop",
-	})
-	if p, _ := h.store.GetProject(projectID); p == nil || p.DefaultBranch != "develop" {
-		t.Fatalf("expected default_branch=\"develop\", got %+v", p)
-	}
+		// Owner flips default → "develop".
+		h.callOK(t, "enju_set_project_default_branch", map[string]any{
+			"project_id": float64(projectID),
+			"branch":     "develop",
+		})
+		if p, _ := h.store.GetProject(projectID); p == nil || p.DefaultBranch != "develop" {
+			t.Fatalf("expected default_branch=\"develop\", got %+v", p)
+		}
 
-	// Non-owner (fresh member) is refused.
-	bobUsername := h.register("Bob " + fmt.Sprintf("%d", nowNano()))
-	h.callOK(t, "enju_add_project_member", map[string]any{
-		"project_id": float64(projectID),
-		"username":   bobUsername,
+		// Non-owner (fresh member) is refused.
+		bobUsername := h.register("Bob " + fmt.Sprintf("%d", nowNano()))
+		h.callOK(t, "enju_add_project_member", map[string]any{
+			"project_id": float64(projectID),
+			"username":   bobUsername,
+		})
+		bob := newTestClientFor(t, h, bobUsername, "Bob")
+		res, err := bob.Call(context.Background(), "enju_set_project_default_branch", map[string]any{
+			"project_id": float64(projectID),
+			"branch":     "other",
+		})
+		if err != nil {
+			t.Fatalf("bob call: %v", err)
+		}
+		if !res.IsError {
+			t.Fatalf("expected non-owner to be refused, got: %s", mcpText(res))
+		}
+		if !strings.Contains(mcpText(res), "owner") {
+			t.Errorf("expected owner-only error, got: %s", mcpText(res))
+		}
 	})
-	bob := newTestClientFor(t, h, bobUsername, "Bob")
-	res, err := bob.Call(context.Background(), "enju_set_project_default_branch", map[string]any{
-		"project_id": float64(projectID),
-		"branch":     "other",
-	})
-	if err != nil {
-		t.Fatalf("bob call: %v", err)
-	}
-	if !res.IsError {
-		t.Fatalf("expected non-owner to be refused, got: %s", mcpText(res))
-	}
-	if !strings.Contains(mcpText(res), "owner") {
-		t.Errorf("expected owner-only error, got: %s", mcpText(res))
-	}
 }

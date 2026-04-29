@@ -194,9 +194,9 @@ func TestReconcileRejectsBadShape(t *testing.T) {
 	taskID := s.taskID("task_a")
 
 	resp := reconcilePost(s, []map[string]interface{}{
-		{"commit_sha": fakeSHA("a"), "exit_code": 0},                       // missing task_id
-		{"task_id": taskID, "exit_code": 0},                                // missing commit_sha
-		{"task_id": taskID, "commit_sha": "not-a-sha", "exit_code": 0},     // bad shape
+		{"commit_sha": fakeSHA("a"), "exit_code": 0},                                                        // missing task_id
+		{"task_id": taskID, "exit_code": 0},                                                                 // missing commit_sha
+		{"task_id": taskID, "commit_sha": "not-a-sha", "exit_code": 0},                                      // bad shape
 		{"task_id": taskID, "commit_sha": fakeSHA("g"), "exit_code": 0, "username": alice, "content": "ok"}, // good, should still process
 	})
 	results := resp["results"].([]interface{})
@@ -248,9 +248,9 @@ func TestReconcileBatchResponseShapeOnMixedErrors(t *testing.T) {
 	// unknown task). Each invalid entry MUST become a
 	// results[i].error without corrupting the response body.
 	resp := reconcilePost(s, []map[string]interface{}{
-		{"commit_sha": fakeSHA("x"), "exit_code": 0},                         // missing task_id
-		{"task_id": goodTaskID, "exit_code": 0},                              // missing commit_sha
-		{"task_id": goodTaskID, "commit_sha": "not-40-hex", "exit_code": 0},  // bad shape
+		{"commit_sha": fakeSHA("x"), "exit_code": 0},                           // missing task_id
+		{"task_id": goodTaskID, "exit_code": 0},                                // missing commit_sha
+		{"task_id": goodTaskID, "commit_sha": "not-40-hex", "exit_code": 0},    // bad shape
 		{"task_id": "99:99:ghost", "commit_sha": fakeSHA("g"), "exit_code": 0}, // unknown task
 		{"task_id": goodTaskID, "commit_sha": fakeSHA("ok"), "exit_code": 0,
 			"username": alice, "content": "done"}, // the valid one

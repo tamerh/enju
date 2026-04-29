@@ -278,16 +278,32 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 }
 
 // useFatClient reports whether the MCP client should take the
-// iteration A.2 path for a given task: the client has a workspace
-// configured AND the project has an external remote URL.
+// fat-client write path for a given task: any workspace-configured
+// session uses local commits as the source of truth.
+//
+// Pre-Option-B this was gated on "has remote URL OR registered as
+// external dir" because the legacy coordinator-writes path was the
+// fallback for projects without a place to push to. That fallback
+// is broken in the current architecture — the coordinator no longer
+// writes files (it's metadata-only) so the legacy POST path silently
+// records state without committing or materializing on disk. Vote /
+// review / answer submits in projects without remotes hit this gap:
+// state=accepted, result_path set, but commit_sha empty and the
+// expected directory missing on disk. Compute tasks happen to work
+// because they go through their own commit path
+// (compute.Run → Project.SubmitTaskResult) that bypasses
+// useFatClient entirely.
+//
+// New behavior: workspace configured = always use the fat-client
+// path. Workspace.ForProject creates a local clone on demand
+// (Option B's local-only fallback) regardless of remote URL.
+// Local commits land in that clone; push happens only when there's
+// a remote. Projects with no remote keep their commit history in
+// the local workspace, recoverable and intact, just not synced
+// anywhere.
 func (c *apiClient) useFatClient(meta *taskMeta) bool {
 	if c.workspace == nil || meta == nil {
 		return false
 	}
-	if meta.ProjectRemoteURL != "" {
-		return true
-	}
-	// External-dir projects (from enju_init) have no remote URL
-	// but do have a workspace registered.
-	return c.workspace.HasExternalDir(meta.ProjectID)
+	return true
 }

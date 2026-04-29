@@ -231,6 +231,15 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 	}
 }
 
+// TestUseFatClientWithoutRemoteOrExternal pins the post-Option-B
+// behavior: a project with neither a remote URL nor an init-
+// registered external dir STILL uses the fat-client path. The
+// workspace creates a local clone on demand and commits land there.
+//
+// Pre-fix this returned false → submits silently went to the
+// (broken) legacy POST path → vote/review/answer tasks recorded
+// state=accepted with empty commit_sha and no on-disk directory.
+// Only compute tasks worked because they bypass useFatClient.
 func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
 	ws, err := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -238,7 +247,7 @@ func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
 	}
 	c := &apiClient{workspace: ws}
 	meta := &taskMeta{ProjectID: 99} // no remote, not registered
-	if c.useFatClient(meta) {
-		t.Fatal("expected false for self-hosted project without external dir")
+	if !c.useFatClient(meta) {
+		t.Fatal("expected true: workspace exists, fat-client path commits to local clone even without a remote")
 	}
 }
