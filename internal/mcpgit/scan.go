@@ -128,6 +128,16 @@ func (p *Project) FetchBranch(branch string) error {
 	if p.remoteURL == "" {
 		return nil // local-only, nothing to fetch
 	}
+	// Mirror PullBranch's solo-init guard: a project whose
+	// coordinator-stored remote_url is the working-tree path
+	// (enju_init solo mode) has no `origin` configured in the
+	// local repo, so a fetch attempt would error on the
+	// missing remote. Treating "no git origin" the same as
+	// "no remote_url" keeps the scanner's local-heads
+	// fallback path clean.
+	if p.GitOriginURL() == "" {
+		return nil
+	}
 	b := p.resolveBranch(branch)
 	// ls-remote first so a non-existent remote branch is a
 	// no-op rather than a fetch error. Matches the PullBranch
@@ -195,9 +205,30 @@ func (p *Project) ScanBranchSince(branch, since string) (newTip string, found []
 	remoteRef := plumbing.NewRemoteReferenceName("origin", b)
 	ref, err := p.repo.Reference(remoteRef, true)
 	if err != nil {
-		// Local-only project (no origin) or branch not yet
-		// fetched. Not an error — scanner moves on.
-		return since, nil, nil
+		// Origin tracking ref absent. Two scenarios resolve to
+		// the same fallback:
+		//
+		//   - Local-only project (no remote configured at all).
+		//     Wrappers commit directly to refs/heads/<branch>;
+		//     there's no push step. Without a fallback the
+		//     scanner finds nothing forever and async tasks
+		//     silently stall (TP53 Bug 1's failure mode).
+		//
+		//   - Branch present locally but origin not yet fetched
+		//     (transient state right after creating a fresh
+		//     run branch). The local head is the authoritative
+		//     state; treating it as the scan target is correct.
+		//
+		// Walk refs/heads/<branch> in both cases. When a remote
+		// IS configured and reachable, this fallback is bypassed
+		// — origin's tracking ref exists post-fetch, and the
+		// fast path above takes over.
+		localRef := plumbing.NewBranchReferenceName(b)
+		ref, err = p.repo.Reference(localRef, true)
+		if err != nil {
+			// Neither ref exists — branch genuinely unknown.
+			return since, nil, nil
+		}
 	}
 	tip := ref.Hash().String()
 	if since == "" {

@@ -580,53 +580,33 @@ func TestEagerCloneOnCreateProject(t *testing.T) {
 	}
 }
 
-// TestAutoLocalBareRepoOnCreateProject verifies the auto-local
-// code path: when enju_create_project is called with no
-// remote_url, the client (a) creates a seeded bare repo under
-// $HOME/.enju/repos/{id}.git, (b) PUTs that path as the
-// coordinator's remote_url for the project, and (c) eagerly
-// clones the workspace so a subsequent submit has a working
-// tree with at least the initial commit to branch from.
+// TestCreateProjectLocalOnlyWorkingTree verifies that
+// enju_create_project with no remote_url produces a single
+// local working tree — no shadow bare under
+// $HOME/.enju/repos/{id}.git, no PUT /remote dance. The
+// scanner's refs/heads fallback (ScanBranchSince) is what makes
+// this work without async tasks stalling. Project ends up with
+// remote_url="" on the coordinator; user can later upgrade to
+// a real remote via enju_set_project_remote.
 //
-// Tester reported: "create_project succeeded but ~/.enju/
-// workspaces is empty and submit fails with 'log: reference
-// not found'". The failure mode is exactly the one this test
-// guards — a regression anywhere in (a), (b), or (c) leaves
-// the submit path without a ref to branch from.
-func TestAutoLocalBareRepoOnCreateProject(t *testing.T) {
-	// Redirect $HOME so the test doesn't pollute the real
-	// ~/.enju/. The autoLocal branch hardcodes the path via
-	// os.UserHomeDir(), so overriding $HOME is how we
-	// sandbox it.
+// Replaces the legacy TestAutoLocalBareRepoOnCreateProject —
+// the auto-bare workaround was needed when the scanner only
+// walked refs/remotes/origin; with the fallback shipped, the
+// shadow becomes vestigial.
+func TestCreateProjectLocalOnlyWorkingTree(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
-	// Fake coordinator:
-	//   POST /projects        → returns {id:1, name:"demo"},
-	//                            initially no remote_url.
-	//   PUT  /projects/1/remote → stores the remote_url in
-	//                            `storedRemote` so the
-	//                            subsequent GET reflects it.
-	//   GET  /projects/1      → returns remote_url the PUT set.
-	var storedRemote atomic.Value
-	storedRemote.Store("")
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects/1/remote", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			http.Error(w, "method", http.StatusMethodNotAllowed)
-			return
-		}
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		storedRemote.Store(body["remote_url"])
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// Should NEVER be called for local-only create. If
+		// this fires, the autoLocal regression came back.
+		t.Errorf("unexpected PUT /projects/1/remote — local-only create should not call it (autoLocal regression)")
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		remote, _ := storedRemote.Load().(string)
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":1,"name":"demo","remote_url":%q}`, remote)))
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo","remote_url":""}`))
 	})
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -649,101 +629,48 @@ func TestAutoLocalBareRepoOnCreateProject(t *testing.T) {
 		httpClient: &http.Client{},
 	}
 
-	// Call create_project with NO remote_url — triggers autoLocal.
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name:      "enju_create_project",
 			Arguments: map[string]interface{}{"name": "demo"},
 		},
 	})
-	if err != nil || result == nil {
-		t.Fatalf("handleCreateProject: err=%v result=%v", err, result)
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
 	}
 
-	// (a) Bare repo exists at the expected auto-local path.
-	bareDir := filepath.Join(tmpHome, ".enju", "repos", "1.git")
-	if _, err := os.Stat(bareDir); err != nil {
-		t.Fatalf("auto-local bare not created at %s: %v", bareDir, err)
+	// No shadow bare must exist at the legacy autoLocal path.
+	legacyBare := filepath.Join(tmpHome, ".enju", "repos", "1.git")
+	if _, err := os.Stat(legacyBare); err == nil {
+		t.Errorf("unexpected shadow bare at %s — local-only mode should not create one", legacyBare)
 	}
 
-	// (b) Coordinator's remote_url was set via PUT.
-	if got, _ := storedRemote.Load().(string); got != bareDir {
-		t.Errorf("coordinator remote_url: got %q, want %q", got, bareDir)
-	}
-
-	// (c) Eager clone produced a working tree. This is the
-	// load-bearing assertion — without this, submit can't
-	// branch because there's no ref in the clone.
+	// The eager-init produced a working tree. Without this,
+	// the user would later hit "reference not found" on first
+	// submit because branchBaseHash needs at least one commit
+	// to fork from.
 	if !ws.HasLocalClone(1) {
-		t.Fatal("expected local clone after create_project (regression: tester hit 'log: reference not found' on submit)")
+		t.Fatal("expected local clone after create_project")
 	}
 
-	// Sanity: the clone must carry the seeded initial commit,
-	// otherwise a branch-off-of-HEAD in submit still fails
-	// with the same "reference not found" message.
-	proj, err := ws.ForProject(1, bareDir, "demo")
+	// The clone must carry the seeded initial commit so
+	// branch-off-of-HEAD works on first submit.
+	proj, err := ws.ForProject(1, "", "demo")
 	if err != nil {
 		t.Fatalf("ForProject post-create: %v", err)
 	}
 	if _, err := proj.HeadHash(); err != nil {
-		t.Fatalf("clone has no HEAD ref (the exact tester-reported failure): %v", err)
-	}
-}
-
-// TestAutoLocalSurfacesCoordinatorPUTFailure — when the
-// coordinator rejects the PUT /projects/{id}/remote (auth, role
-// check, etc.), handleCreateProject must surface the error to
-// the caller instead of returning "success" while leaving the
-// project with no remote. Silent success here is exactly what
-// left the tester staring at "log: reference not found" one
-// tool call later.
-func TestAutoLocalSurfacesCoordinatorPUTFailure(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/projects/1/remote", func(w http.ResponseWriter, r *http.Request) {
-		// Simulate the coordinator rejecting the PUT. c.put
-		// returns (body, nil) on 4xx — so the handler has to
-		// decode the error from the body, not trust the Go err.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"error":"only project owners can change the remote URL"}`))
-	})
-	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"name":"demo"}`))
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
+		t.Fatalf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
 	}
 
-	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name:      "enju_create_project",
-			Arguments: map[string]interface{}{"name": "demo"},
-		},
-	})
-	if err != nil || result == nil {
-		t.Fatalf("handleCreateProject: err=%v result=%v", err, result)
-	}
-	if !result.IsError {
-		t.Fatal("expected IsError=true when PUT /remote is rejected; got a success result (silent-failure regression)")
-	}
-	// The error text should cite the coordinator's refusal
-	// message so the user knows the root cause instead of
-	// chasing "reference not found" downstream.
-	got := toolResultText(result)
-	if !strings.Contains(got, "only project owners") {
-		t.Errorf("error should include coordinator's refusal message, got: %q", got)
+	// The seed should have produced README + the templates
+	// scaffold, so the user-visible layout matches what
+	// remote-backed projects ship with.
+	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
+		full := filepath.Join(proj.WorkDir(), rel)
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("expected seeded file %s after local-only create, got: %v", rel, err)
+		}
 	}
 }
 
@@ -974,36 +901,28 @@ func TestInitIdempotent(t *testing.T) {
 	}
 }
 
-// TestInitAutoCreatesBareForOriginlessFolder is the regression
-// for TP53 Bug 1: enju_init on a folder with no `origin` must
-// create ~/.enju/repos/{id}.git, configure it as origin in the
-// working tree, and push initial state. Without this, async
-// wrappers commit to local refs/heads/<branch> with nowhere to
-// push and ScanBranchSince's walk of refs/remotes/origin/<branch>
-// finds nothing — the pipeline silently stalls.
-//
-// We verify all four post-conditions:
-//
-//  1. The bare exists at ~/.enju/repos/{id}.git.
-//  2. The working tree has origin pointing at the bare.
-//  3. The bare has the working tree's HEAD commit (push happened).
-//  4. The coordinator's stored remote_url is the bare path.
-func TestInitAutoCreatesBareForOriginlessFolder(t *testing.T) {
+// TestInitOriginlessFolderStaysOriginless verifies the new
+// solo-mode behavior: enju_init on a folder with no `origin`
+// must NOT create a shadow bare at ~/.enju/repos/{id}.git
+// or configure origin in the working tree. Async tasks still
+// work because ScanBranchSince falls back to refs/heads when
+// no origin tracking ref exists. Replaces the legacy
+// TestInitAutoCreatesBareForOriginlessFolder — the auto-bare
+// workaround was a complement to an origin-only scanner;
+// with the scanner fallback the shadow becomes vestigial.
+func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	mux := http.NewServeMux()
-	var capturedRemoteURL string
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":42,"name":"tp53"}`))
 	})
 	mux.HandleFunc("/api/v1/projects/42/remote", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var parsed map[string]string
-		_ = json.Unmarshal(body, &parsed)
-		capturedRemoteURL = parsed["remote_url"]
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// Should NEVER fire for solo-mode init. If this hits,
+		// the auto-bare regression came back.
+		t.Error("unexpected PUT /projects/42/remote — solo-mode enju_init should not call it")
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1012,8 +931,10 @@ func TestInitAutoCreatesBareForOriginlessFolder(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	// Folder with `git init` + one commit, no origin — exact
-	// reproduction of the user's TP53 setup.
+	// Folder with `git init` + one commit, no origin — the
+	// minimal repro of the TP53 setup that used to silently
+	// stall. With Phase 1's scanner fallback shipped, this
+	// case Just Works without any bare.
 	dir := t.TempDir()
 	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
 		InitOptions: gogit.InitOptions{
@@ -1026,6 +947,7 @@ func TestInitAutoCreatesBareForOriginlessFolder(t *testing.T) {
 	_, _ = wt.Commit("seed", &gogit.CommitOptions{
 		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
 	})
+
 	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c := &apiClient{
 		baseURL:    ts.URL,
@@ -1045,53 +967,31 @@ func TestInitAutoCreatesBareForOriginlessFolder(t *testing.T) {
 		t.Fatalf("handleInit: err=%v result=%+v", err, result)
 	}
 
-	// 1. Bare exists at ~/.enju/repos/42.git.
-	expectedBare := filepath.Join(os.Getenv("HOME"), ".enju", "repos", "42.git")
-	if _, err := os.Stat(expectedBare); err != nil {
-		t.Fatalf("expected managed bare at %s: %v", expectedBare, err)
+	// No shadow bare must exist.
+	legacyBare := filepath.Join(os.Getenv("HOME"), ".enju", "repos", "42.git")
+	if _, err := os.Stat(legacyBare); err == nil {
+		t.Errorf("unexpected shadow bare at %s — solo-mode init should leave the folder alone", legacyBare)
 	}
 
-	// 2. Working tree's origin points at the bare.
-	rem, err := repo.Remote("origin")
-	if err != nil {
-		t.Fatalf("origin not configured on adopted folder: %v", err)
-	}
-	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != expectedBare {
-		t.Errorf("origin URL: got %v, want %s", cfg.URLs, expectedBare)
-	}
-
-	// 3. The bare contains the working tree's post-init HEAD on
-	//    refs/heads/main — proves the push landed. This is the
-	//    exact precondition ScanBranchSince needs to walk
-	//    refs/remotes/origin/main and find result trailers later.
-	//    handleInit may have added a scaffold commit on top of
-	//    our seed, so we re-read working-tree HEAD after the call.
-	headAfter, err := repo.Head()
-	if err != nil {
-		t.Fatalf("reading working-tree HEAD post-init: %v", err)
-	}
-	expectedHEAD := headAfter.Hash().String()
-	bareRepo, err := gogit.PlainOpen(expectedBare)
-	if err != nil {
-		t.Fatalf("opening bare: %v", err)
-	}
-	bareMain, err := bareRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
-	if err != nil {
-		t.Fatalf("bare missing refs/heads/main: %v", err)
-	}
-	if got := bareMain.Hash().String(); got != expectedHEAD {
-		t.Errorf("bare main: got %s, want %s (working tree HEAD post-init)", got, expectedHEAD)
+	// Working tree must NOT have origin configured (the input
+	// state was originless; we don't auto-add one anymore).
+	if rem, err := repo.Remote("origin"); err == nil {
+		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] != "" {
+			t.Errorf("origin was unexpectedly configured: %v", cfg.URLs)
+		}
 	}
 
-	// 4. Coordinator stored the bare path as remote_url.
-	if capturedRemoteURL != expectedBare {
-		t.Errorf("PUT /remote captured: got %q, want %q", capturedRemoteURL, expectedBare)
+	// Workspace's external dir registration succeeded — user
+	// can immediately operate on the project.
+	if !ws.HasExternalDir(42) {
+		t.Error("expected external dir registered for init'd folder")
 	}
-
-	// Response text should mention the managed bare so the
-	// user knows where their state landed.
-	if got := toolResultText(result); !strings.Contains(got, expectedBare) {
-		t.Errorf("response should cite managed bare path; got:\n%s", got)
+	proj, err := ws.ForProject(42, "")
+	if err != nil {
+		t.Fatalf("ForProject post-init: %v", err)
+	}
+	if proj.WorkDir() != dir {
+		t.Errorf("workspace points at %s, want %s", proj.WorkDir(), dir)
 	}
 }
 
@@ -1636,6 +1536,62 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	for _, b := range []string{"main", "run-1"} {
 		if got := cursors.Get(b); got != mcpgit.RescanSentinelSHA {
 			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, mcpgit.RescanSentinelSHA)
+		}
+	}
+}
+
+// TestSetProjectRemoteRejectsEmptyURL is the validation guard
+// for the no-origin broken state (TP53 Bug 1's failure mode).
+// The handler must reject remote_url="" loudly with a recovery
+// hint pointing at the real alternatives — clearing the
+// remote silently stalls async reconciliation, and there's no
+// legitimate use case for it.
+func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/9/remote", func(w http.ResponseWriter, r *http.Request) {
+		// Should never reach the coordinator — handler must
+		// reject before the HTTP call.
+		t.Error("unexpected PUT /projects/9/remote — handler should reject empty remote_url before calling the coordinator")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	for _, badURL := range []string{"", "   ", "\t\n"} {
+		result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
+			Params: mcp.CallToolParams{
+				Name: "enju_set_project_remote",
+				Arguments: map[string]interface{}{
+					"project_id": float64(9),
+					"remote_url": badURL,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("transport error for %q: %v", badURL, err)
+		}
+		if result == nil || !result.IsError {
+			t.Errorf("expected error for remote_url=%q, got success: %+v", badURL, result)
+			continue
+		}
+		got := toolResultText(result)
+		if !strings.Contains(got, "cannot be empty") {
+			t.Errorf("expected 'cannot be empty' in error for %q, got: %s", badURL, got)
+		}
+		// Should point at the real alternatives.
+		if !strings.Contains(got, "enju_leave_project") {
+			t.Errorf("expected error to suggest enju_leave_project as the deletion path, got: %s", got)
 		}
 	}
 }

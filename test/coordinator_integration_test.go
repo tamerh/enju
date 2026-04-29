@@ -2029,5 +2029,41 @@ func TestTokenAuthAllowsValidToken(t *testing.T) {
 // coordinator side: a project with a local bare repo as
 // remote should work for the full fat-client path.
 
+// TestSetProjectRemoteRejectsEmptyURLAtAPI is the
+// defense-in-depth complement to the MCP-handler-level
+// validation: the coordinator's PUT /projects/{id}/remote
+// must also reject an empty remote_url. A direct HTTP call
+// (curl, alternative client) bypasses the MCP handler, so
+// without this check an attacker / scripted caller could
+// silently fork a multi-machine project by clearing its
+// remote.
+func TestSetProjectRemoteRejectsEmptyURLAtAPI(t *testing.T) {
+	s := newTestServer(t)
+	pid := s.createTestProject()
+
+	for _, badURL := range []string{"", "   ", "\t\n"} {
+		body := map[string]string{"remote_url": badURL}
+		jsonBody, _ := json.Marshal(body)
+		req, _ := http.NewRequest("PUT",
+			s.url+fmt.Sprintf("/api/v1/projects/%d/remote", pid),
+			bytes.NewReader(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.defaultToken())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("transport error for %q: %v", badURL, err)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("remote_url=%q: expected 400, got %d (body: %s)", badURL, resp.StatusCode, bodyBytes)
+			continue
+		}
+		if !strings.Contains(string(bodyBytes), "cannot be empty") {
+			t.Errorf("remote_url=%q: expected 'cannot be empty' in body, got: %s", badURL, bodyBytes)
+		}
+	}
+}
+
 // Suppress unused import
 var _ = enjuYaml.Parse

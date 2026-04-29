@@ -19,8 +19,11 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // submitOnBranch is a test helper that lands one task-result
@@ -592,5 +595,108 @@ func TestSubmitTaskResultSkipsCursorAdvanceWithoutConfig(t *testing.T) {
 		if filepath.Ext(e.Name()) == ".json" {
 			t.Errorf("unexpected cursor file %q written despite empty ProjectID/StateDir", e.Name())
 		}
+	}
+}
+
+// TestScanBranchSinceFallsBackToLocalHeads is the foundation
+// test for solo / local-only mode: when no origin tracking ref
+// exists, the scanner walks refs/heads/<branch> directly. This
+// is what lets a project without a shadow bare still surface
+// async-task trailer commits to the coordinator.
+//
+// Without this fallback, async tasks would silently stall
+// (TP53 Bug 1's failure mode). The auto-bare we shipped earlier
+// was a workaround; this fallback is the real fix.
+func TestScanBranchSinceFallsBackToLocalHeads(t *testing.T) {
+	// Build a working tree via git init — no remote, no bare,
+	// no `RegisterExternalDir` dance. This matches what a
+	// solo user would have after `git init` + `enju_init` in
+	// the eventual local-only mode.
+	workDir := t.TempDir()
+	repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+	wt, _ := repo.Worktree()
+
+	// Commit 1: baseline (so since cursor has somewhere to
+	// start). Trailer-less so it doesn't pollute the count.
+	_ = os.WriteFile(filepath.Join(workDir, "seed.md"), []byte("seed"), 0o644)
+	_, _ = wt.Add("seed.md")
+	baseHash, _ := wt.Commit("seed", &gogit.CommitOptions{
+		Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()},
+	})
+
+	// Commit 2: trailer-bearing — this is what the scanner
+	// must find via the local-heads fallback.
+	_ = os.WriteFile(filepath.Join(workDir, "result.md"), []byte("ran"), 0o644)
+	_, _ = wt.Add("result.md")
+	trailerCommitHash, _ := wt.Commit(
+		"Task 1:1:work by @t: result\n\nEnju-Task-Complete: 1:1:work\n",
+		&gogit.CommitOptions{Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()}},
+	)
+
+	// Wrap the bare PlainOpen in a Project so ScanBranchSince
+	// uses the same code path as the rest of the system. No
+	// origin is configured, so the scanner's fast path
+	// (refs/remotes/origin/main) misses and the fallback
+	// kicks in.
+	proj := &Project{
+		workDir: workDir,
+		repo:    repo,
+		logger:  nullLogger(),
+	}
+
+	tip, found, err := proj.ScanBranchSince("main", baseHash.String())
+	if err != nil {
+		t.Fatalf("ScanBranchSince: %v", err)
+	}
+	if tip != trailerCommitHash.String() {
+		t.Errorf("tip: got %s, want %s", tip, trailerCommitHash.String())
+	}
+	if len(found) != 1 {
+		t.Fatalf("expected 1 trailer commit, got %d: %+v", len(found), found)
+	}
+	if found[0].Trailers.TaskID != "1:1:work" {
+		t.Errorf("trailer task_id: got %q, want %q", found[0].Trailers.TaskID, "1:1:work")
+	}
+	if found[0].CommitSHA != trailerCommitHash.String() {
+		t.Errorf("trailer commit SHA: got %s, want %s", found[0].CommitSHA, trailerCommitHash.String())
+	}
+}
+
+// TestScanBranchSinceUnknownBranchReturnsEmpty: when neither
+// refs/remotes/origin/<branch> nor refs/heads/<branch> exists,
+// the scanner returns the unchanged cursor + empty results
+// (legitimate "branch unknown" state, not an error).
+func TestScanBranchSinceUnknownBranchReturnsEmpty(t *testing.T) {
+	workDir := t.TempDir()
+	repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+
+	proj := &Project{
+		workDir: workDir,
+		repo:    repo,
+		logger:  nullLogger(),
+	}
+	tip, found, err := proj.ScanBranchSince("does-not-exist", "abc123")
+	if err != nil {
+		t.Fatalf("ScanBranchSince on unknown branch: %v", err)
+	}
+	if tip != "abc123" {
+		t.Errorf("tip should be unchanged when branch unknown; got %s", tip)
+	}
+	if len(found) != 0 {
+		t.Errorf("expected no trailers for unknown branch, got %d", len(found))
 	}
 }

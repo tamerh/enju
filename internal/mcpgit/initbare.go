@@ -13,16 +13,82 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+// seedLocalWorkspace writes a README + enju/templates/.gitkeep
+// into a freshly-init'd working tree and creates the first
+// commit on the default branch. Used by openOrClone's local-
+// only path so a fresh project without a remote still has the
+// baseline state every other code path expects: at least one
+// commit on refs/heads/main, the standard enju/templates/
+// directory ready to receive templates, a recognizable README.
+//
+// Mirrors what InitBareWithSeed produces inside a bare repo,
+// so the user-facing layout doesn't depend on whether a remote
+// was configured at create time. Idempotent in the only sense
+// that matters here (caller only invokes on fresh init); does
+// not check for existing commits.
+func seedLocalWorkspace(repo *gogit.Repository, workDir string) error {
+	readme := filepath.Join(workDir, "README.md")
+	readmeBody := "# Enju project\n\n" +
+		"Everything Enju-owned lives under `enju/`:\n\n" +
+		"```\n" +
+		"enju/\n" +
+		"  templates/              # reusable run recipes (edit these)\n" +
+		"    my-template/\n" +
+		"      enju.yaml           # run definition (required)\n" +
+		"      scripts/            # bundled scripts for compute tasks\n" +
+		"      README.md           # author-facing docs (optional)\n" +
+		"  runs/                   # per-run results + audit trail (tool output)\n" +
+		"  conf.yaml               # optional project config\n" +
+		"```\n\n" +
+		"Override the templates location by creating `enju/conf.yaml` with a\n" +
+		"`templates:` list of repo-relative paths.\n"
+	if err := os.WriteFile(readme, []byte(readmeBody), 0644); err != nil {
+		return fmt.Errorf("write README: %w", err)
+	}
+	templatesDir := filepath.Join(workDir, engine.DefaultTemplatesDir)
+	if err := os.MkdirAll(templatesDir, 0755); err != nil {
+		return fmt.Errorf("create templates dir: %w", err)
+	}
+	gitkeepRel := filepath.ToSlash(filepath.Join(engine.DefaultTemplatesDir, ".gitkeep"))
+	if err := os.WriteFile(filepath.Join(workDir, gitkeepRel), []byte(""), 0644); err != nil {
+		return fmt.Errorf("write .gitkeep: %w", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("worktree: %w", err)
+	}
+	if _, err := wt.Add("README.md"); err != nil {
+		return fmt.Errorf("add README: %w", err)
+	}
+	if _, err := wt.Add(gitkeepRel); err != nil {
+		return fmt.Errorf("add .gitkeep: %w", err)
+	}
+	sig := &object.Signature{
+		Name:  "Enju",
+		Email: "enju@localhost",
+		When:  time.Now(),
+	}
+	if _, err := wt.Commit("initial commit", &gogit.CommitOptions{
+		Author:    sig,
+		Committer: sig,
+	}); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // InitBareEmpty creates an empty bare git repo at the given
 // path with no refs and no commits. Useful when you have an
 // existing working tree whose commits will be pushed in as
 // the initial state — a separate seed would just create a
 // divergent root that can't merge with what's already there.
 //
-// Used by enju_init's auto-local-remote feature: an adopted
-// folder typically already has its own initial commit (and
-// possibly a full history); we want a bare to push to without
-// fighting an artificial seed commit.
+// Production callers used to be enju_init's auto-bare path;
+// after Option B (solo-mode default), no production code path
+// creates bares anymore — the scanner falls back to local
+// refs/heads. This helper is retained for test fixtures that
+// need to construct fake remotes (set_project_remote tests,
+// integration scenarios that exercise the upgrade path).
 func InitBareEmpty(bareDir string) error {
 	if err := os.MkdirAll(bareDir, 0755); err != nil {
 		return fmt.Errorf("creating bare dir: %w", err)
@@ -40,13 +106,19 @@ func InitBareEmpty(bareDir string) error {
 }
 
 // InitBareWithSeed creates a bare git repo at the given path
-// with one initial commit (a README.md). This is needed so
-// PlainClone can clone from it — an empty bare repo with no
-// refs/HEAD fails to clone.
+// with one initial commit (a README + enju/templates/.gitkeep).
+// Needed so PlainClone can clone from it — an empty bare repo
+// with no refs/HEAD fails to clone.
 //
-// Used by the MCP client's auto-local-repo feature: when a
-// project is created without a remote_url, we auto-create
-// ~/.enju/repos/{id}.git as the backing store.
+// Production callers used to be the autoLocal path of
+// enju_create_project; after Option B (solo-mode default),
+// no production code path creates bares anymore. This helper
+// is retained for test fixtures that need to construct fake
+// remotes (eager-clone tests, integration scenarios that
+// exercise multi-machine sharing). The seed contents mirror
+// what seedLocalWorkspace writes into a working tree, so
+// remote-backed and solo projects share the same starting
+// layout.
 func InitBareWithSeed(bareDir string) error {
 	// Init a temp working tree, commit, push to bare.
 	if err := os.MkdirAll(bareDir, 0755); err != nil {

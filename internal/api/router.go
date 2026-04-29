@@ -523,6 +523,23 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Reject empty remote_url. Defense-in-depth complement to the
+	// MCP-handler validation: a direct API call would otherwise
+	// store an empty remote and silently fork the team on a
+	// multi-machine project (Alice's commits stop pushing
+	// anywhere; Bob's machine can't see them). The legitimate
+	// way to clear a remote from coordinator state is to leave
+	// the project entirely (DELETE membership); migration to a
+	// new remote uses this endpoint with the new URL directly.
+	// Note: POST /projects still accepts empty remote_url for
+	// local-only project creation — that's the create-time entry
+	// point for solo work, deliberate, not in scope here.
+	if strings.TrimSpace(req.RemoteURL) == "" {
+		writeError(w, http.StatusBadRequest,
+			"remote_url cannot be empty — clearing a remote silently forks multi-machine projects. Pass the new URL directly to migrate, or leave the project to stop using it.")
+		return
+	}
+
 	p, err := s.store.GetProject(projectID)
 	if err != nil || p == nil {
 		writeError(w, http.StatusNotFound, "project not found")

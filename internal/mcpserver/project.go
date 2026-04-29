@@ -14,12 +14,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/engine"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	gogit "github.com/go-git/go-git/v5"
-	gogitConfig "github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -103,18 +103,6 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	remoteURL := req.GetString("remote_url", "")
 	defaultBranch := req.GetString("default_branch", "")
 
-	// Auto-create a local bare repo when no remote is
-	// specified. This ensures the fat-client path always
-	// activates (every project has a remote, at minimum a
-	// local one). The citizen can later upgrade to a real
-	// remote via enju_set_project_remote.
-	autoLocal := false
-	if remoteURL == "" && c.workspace != nil {
-		// Create the project first to get the ID, then
-		// create the bare repo and set the remote.
-		autoLocal = true
-	}
-
 	body := map[string]string{
 		"name":        name,
 		"description": description,
@@ -128,73 +116,32 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// If auto-local, create the bare repo + set it as remote.
-	// Surface failures loudly — a silent failure here leaves the
-	// project with no remote_url, which later blows up opaquely
-	// in submit as "resolving base for new branch: reference not
-	// found". Any step's failure gets collected in `autoLocalErr`
-	// and returned to the caller so the user sees the root cause
-	// at create time, not one tool call later.
-	var autoLocalErr string
-	if autoLocal {
-		var result map[string]interface{}
-		if err := json.Unmarshal(data, &result); err != nil {
-			autoLocalErr = fmt.Sprintf("auto-local: parse project response: %v", err)
-			c.logger.Error("auto-local: failed to parse project response", "error", err)
-		} else if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
-			home, _ := os.UserHomeDir()
-			repoDir := filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
-			if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
-				autoLocalErr = fmt.Sprintf("auto-local: create repos dir %s: %v", filepath.Dir(repoDir), err)
-				c.logger.Error("auto-local: failed to create repos dir", "error", err)
-			} else if err := mcpgit.InitBareWithSeed(repoDir); err != nil {
-				autoLocalErr = fmt.Sprintf("auto-local: init bare repo %s: %v", repoDir, err)
-				c.logger.Error("auto-local: failed to init bare repo", "path", repoDir, "error", err)
-			} else {
-				// Set the remote on the coordinator. c.put returns
-				// (body, nil) on 4xx/5xx — the error lives in the
-				// body's `error` field — so we have to decode the
-				// response explicitly rather than trusting the Go
-				// error alone. Without this, a 403 "only owners
-				// can change remote" silently claims success and
-				// the project ends up with no remote.
-				putData, putErr := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
-					map[string]string{"remote_url": repoDir})
-				if putErr != nil {
-					autoLocalErr = fmt.Sprintf("auto-local: set remote (transport): %v", putErr)
-					c.logger.Error("auto-local: failed to set remote", "error", putErr)
-				} else {
-					var putResp map[string]interface{}
-					_ = json.Unmarshal(putData, &putResp)
-					if msg, _ := putResp["error"].(string); msg != "" {
-						autoLocalErr = fmt.Sprintf("auto-local: coordinator refused PUT /projects/%d/remote: %s", projectID, msg)
-						c.logger.Error("auto-local: coordinator rejected remote set", "error", msg)
-					} else {
-						c.logger.Info("auto-created local repo",
-							"project_id", projectID, "path", repoDir)
-					}
-				}
-			}
-		}
-	}
-	if autoLocalErr != "" {
-		return mcp.NewToolResultError(autoLocalErr), nil
-	}
-
-	// Eagerly clone into the workspace so the project directory
+	// Eagerly initialize the workspace so the project directory
 	// exists immediately after creation — not lazily on first
-	// claim. This gives the citizen a visible workspace to browse
-	// and confirms the git remote is reachable.
+	// claim. Two paths:
+	//
+	//   - remote_url set: ForProject clones from the remote.
+	//     Confirms the git remote is reachable at creation time
+	//     instead of failing at first task.
+	//
+	//   - remote_url empty: ForProject's local-only path
+	//     init's the working tree and seeds it with one commit
+	//     (README + enju/templates/.gitkeep). No shadow bare —
+	//     async reconciliation works via the scanner's
+	//     refs/heads/<branch> fallback. The user sees a single
+	//     git folder, behaves like `git init` would.
+	//
+	// Failures are non-fatal at this point: the project record
+	// is registered, and the next tool call will retry the
+	// init/clone. Logged as a warning so the user knows.
 	if c.workspace != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
 				remote, projName, _ := c.fetchProjectMetaFull(ctx, projectID)
-				if remote != "" {
-					if _, err := c.workspace.ForProject(projectID, remote, projName); err != nil {
-						c.logger.Warn("eager clone failed (will retry on first task)",
-							"project_id", projectID, "error", err)
-					}
+				if _, err := c.workspace.ForProject(projectID, remote, projName); err != nil {
+					c.logger.Warn("eager workspace init failed (will retry on first task)",
+						"project_id", projectID, "remote", remote, "error", err)
 				}
 			}
 		}
@@ -315,45 +262,19 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		adoptedBranch = head.Name().Short()
 	}
 
-	// Detect existing origin. Two paths from here:
-	//
-	//   - Working tree HAS an origin (e.g. a github clone). Use it
-	//     as-is — pushes already work, scanner walks
-	//     refs/remotes/origin/<branch> populated by go-git's push,
-	//     async reconciliation flows. Coordinator-stored remote_url
-	//     stays as the working-tree path because team members on
-	//     this machine open the tree directly via
-	//     RegisterExternalDir; cross-machine sharing happens via
-	//     the existing origin (whatever URL it points to).
-	//
-	//   - Working tree has NO origin. Without one, async wrappers
-	//     commit to local refs/heads/<branch> with nowhere to push,
-	//     ScanBranchSince's walk of refs/remotes/origin/<branch>
-	//     finds nothing, and the pipeline silently stalls (TP53
-	//     validation Bug 1). Auto-create a managed bare at
-	//     ~/.enju/repos/{id}.git, point origin at it, push every
-	//     local branch in. Mirrors handleCreateProject's autoLocal
-	//     path so init'd and freshly-created projects converge to
-	//     the same working layout.
-	hasExistingOrigin := false
-	if rem, err := repo.Remote("origin"); err == nil {
-		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] != "" {
-			hasExistingOrigin = true
-		}
-	}
-
-	// Register project with coordinator. For folders with an
-	// existing origin, the working-tree path goes in remote_url
-	// so the local fat-client opens it directly. For folders
-	// where we'll auto-create a bare, post empty and PUT the
-	// bare path after creation.
+	// Register project with coordinator. The working-tree path
+	// goes in remote_url so the local fat-client opens it
+	// directly via RegisterExternalDir below. If the folder
+	// already has an origin (github clone case), pushes still
+	// route to that origin via the working tree's git config —
+	// nothing to coordinate at the Enju layer. If the folder
+	// has NO origin, async tasks still work via the scanner's
+	// refs/heads fallback (no shadow bare needed). The user
+	// can later upgrade to a shared remote with
+	// enju_set_project_remote.
 	body := map[string]string{
-		"name": name,
-	}
-	if hasExistingOrigin {
-		body["remote_url"] = dirPath
-	} else {
-		body["remote_url"] = ""
+		"name":       name,
+		"remote_url": dirPath,
 	}
 	if adoptedBranch != "" {
 		body["default_branch"] = adoptedBranch
@@ -363,128 +284,22 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Pull out the assigned project ID — needed by both branches
-	// below (bare auto-create + external-dir registration).
-	var projectID int64
-	{
+	// Register the folder as an external workspace so ForProject
+	// opens it directly instead of cloning into ~/.enju/workspaces.
+	if c.workspace != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
-			projectID = int64(jsonFloat(result["id"]))
-		}
-	}
-
-	// Auto-create the managed bare for the no-origin case.
-	// Surfaces failures loudly: a silent failure here would leave
-	// the project with no origin and revive the silent-stall
-	// behavior we're fixing.
-	//
-	// Recovery on partial failure: by the time we get here, the
-	// coordinator has already accepted the project (POST above).
-	// If any step below errors out, the project is registered
-	// with an empty remote_url and the user must run
-	// enju_set_project_remote to recover. That tool now does the
-	// right thing — push existing branches + reset cursors — so
-	// the recovery is one tool call, not a manual git dance.
-	// Error messages below cite that escape hatch explicitly so
-	// the user doesn't have to discover it.
-	const recoveryHint = " — project is registered with no remote; run enju_set_project_remote to recover"
-	autoBarePath := ""
-	if !hasExistingOrigin && projectID > 0 {
-		home, _ := os.UserHomeDir()
-		autoBarePath = filepath.Join(home, ".enju", "repos", fmt.Sprintf("%d.git", projectID))
-		if err := os.MkdirAll(filepath.Dir(autoBarePath), 0755); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: create repos dir: %v"+recoveryHint, err)), nil
-		}
-		if err := mcpgit.InitBareEmpty(autoBarePath); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: init bare repo %s: %v"+recoveryHint, autoBarePath, err)), nil
-		}
-		// Wire origin into the working tree and push every local
-		// branch. RefSpecs covers main + any other branches the
-		// adopted folder already had committed.
-		//
-		// DRY note: this duplicates Project.PushAllLocalBranches'
-		// payload because at this point we don't have a Project
-		// handle yet — workspace.RegisterExternalDir runs after
-		// the bare setup so the eager-open call below sees the
-		// configured origin. A future restructure that builds
-		// the Project handle first could call PushAllLocalBranches
-		// directly.
-		if _, err := repo.CreateRemote(&gogitConfig.RemoteConfig{
-			Name: "origin",
-			URLs: []string{autoBarePath},
-		}); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: add origin: %v"+recoveryHint, err)), nil
-		}
-		if err := repo.Push(&gogit.PushOptions{
-			RemoteName: "origin",
-			RefSpecs:   []gogitConfig.RefSpec{"refs/heads/*:refs/heads/*"},
-		}); err != nil && err != gogit.NoErrAlreadyUpToDate {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: pushing initial state to %s: %v"+recoveryHint, autoBarePath, err)), nil
-		}
-		// Update coordinator with the bare path so it shows up
-		// correctly in enju_list_projects and stays consistent
-		// across MCP restarts.
-		putData, putErr := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID),
-			map[string]string{"remote_url": autoBarePath})
-		if putErr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: set remote (transport): %v"+recoveryHint, putErr)), nil
-		}
-		var putResp map[string]interface{}
-		_ = json.Unmarshal(putData, &putResp)
-		if msg, _ := putResp["error"].(string); msg != "" {
-			return mcp.NewToolResultError(fmt.Sprintf("auto-bare: coordinator refused PUT remote: %s"+recoveryHint, msg)), nil
-		}
-		// Defensive cursor reset for the auto-bare path. The
-		// typical case (fresh init, no prior async runs) has no
-		// cursor file yet, so this is a no-op write of sentinels
-		// for whatever local branches exist. The edge case it
-		// guards: a user who manually committed Enju trailer
-		// commits to refs/heads/* before calling enju_init —
-		// rare, since Enju trailers come from the wrapper, but
-		// possible if the user copied result.md commits over
-		// from another project. Without the reset, the next scan
-		// would baseline tip and skip the inherited trailers.
-		// Mirrors the late-add recovery in handleSetProjectRemote
-		// so behavior is symmetric.
-		if c.workspace != nil {
-			branches := []string{}
-			iter, ierr := repo.Branches()
-			if ierr == nil {
-				_ = iter.ForEach(func(ref *plumbing.Reference) error {
-					branches = append(branches, ref.Name().Short())
-					return nil
-				})
-				iter.Close()
+			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+				c.workspace.RegisterExternalDir(projectID, dirPath)
+				// Open it immediately to verify it works.
+				if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
+					c.logger.Warn("opening init'd folder", "error", perr)
+				}
 			}
-			cursorMu := mcpgit.CursorMutexFor(c.stateDir(), projectID)
-			cursorMu.Lock()
-			cursors, _ := mcpgit.LoadCursors(c.stateDir(), projectID)
-			for _, b := range branches {
-				cursors.Set(b, mcpgit.RescanSentinelSHA)
-			}
-			_ = cursors.Save()
-			cursorMu.Unlock()
-		}
-		c.logger.Info("auto-created managed bare for adopted folder",
-			"project_id", projectID, "bare", autoBarePath, "work_dir", dirPath)
-	}
-
-	// Register the folder as an external workspace so ForProject
-	// opens it directly instead of cloning. Done AFTER the bare
-	// setup so the registered handle reflects the new origin.
-	if c.workspace != nil && projectID > 0 {
-		c.workspace.RegisterExternalDir(projectID, dirPath)
-		// Open it immediately to verify it works.
-		if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
-			c.logger.Warn("opening init'd folder", "error", perr)
 		}
 	}
 
-	msg := fmt.Sprintf("✓ Initialized Enju in %s\n  Project registered as: %s", dirPath, name)
-	if autoBarePath != "" {
-		msg += fmt.Sprintf("\n  Managed bare repo: %s", autoBarePath)
-	}
-	return mcp.NewToolResultText(msg), nil
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Initialized Enju in %s\n  Project registered as: %s", dirPath, name)), nil
 }
 // handleProjectRemoteStatus runs the remote-status diagnostic
 // entirely on the client side. Phase 1 ran this in the coordinator
@@ -855,6 +670,26 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 	if err != nil {
 		return mcp.NewToolResultError("remote_url is required"), nil
 	}
+	// Reject empty remote_url. With the scanner's refs/heads
+	// fallback (Option B), clearing the remote no longer breaks
+	// async reconciliation locally — the caller's own machine
+	// keeps working. But on a multi-machine project, clearing
+	// silently forks the team: Alice's local commits stop
+	// pushing anywhere, Bob's machine has no way to see them,
+	// and the project quietly bifurcates. The original "clear
+	// remote" semantics had no legitimate use case in either
+	// solo or shared mode: migrating to a different remote uses
+	// the URL-replace path (just call this tool with the new
+	// URL); deleting a project uses enju_leave_project. Closing
+	// the door here removes a footgun whose blast radius scales
+	// with how many citizens depend on the project.
+	if strings.TrimSpace(remoteURL) == "" {
+		return mcp.NewToolResultError(
+			"remote_url cannot be empty — clearing a project's remote breaks async reconciliation. " +
+				"To migrate to a different remote, pass the new URL directly. " +
+				"To stop using this project on this machine, call enju_leave_project.",
+		), nil
+	}
 	data, err := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/remote", projectID), map[string]string{
 		"remote_url": remoteURL,
 	})
@@ -871,13 +706,13 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 	// Mirror the remote change into the existing local clone:
 	//   1. Update the on-disk origin URL so future pushes/fetches
 	//      hit the right place.
-	//   2. If we just SET (not cleared) a remote, push every local
-	//      branch to it so the new bare contains all the work
-	//      that accumulated while the project was originless. The
-	//      typical late-add scenario is "project ran async compute
-	//      with no remote, commits stranded on local refs/heads/*"
-	//      — without seeding, refs/remotes/origin/<branch> stays
-	//      empty and the scanner can't see those commits.
+	//   2. Push every local branch to it so the new bare contains
+	//      all the work that accumulated while the project was
+	//      originless. The typical late-add scenario is "project
+	//      ran async compute with no remote, commits stranded on
+	//      local refs/heads/*" — without seeding,
+	//      refs/remotes/origin/<branch> stays empty and the
+	//      scanner can't see those commits.
 	//   3. Reset scan cursors for every local branch to the
 	//      sentinel that forces full-history rescans on next
 	//      reconcile. This is what surfaces the historical
@@ -886,48 +721,46 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 	//      ScanBranchSince re-emits every trailer commit, the
 	//      coordinator processes them (idempotent), and the
 	//      artifact index catches up.
+	//
+	// remoteURL is guaranteed non-empty here — the validation at
+	// the top of this handler rejects empty input.
 	pushWarning := ""
 	if c.workspace != nil {
 		if proj, err := c.workspace.ForProject(int64(projectID), remoteURL); err == nil {
 			proj.Lock()
 			_ = proj.SetRemote(remoteURL)
-			if remoteURL != "" {
-				if pushErr := proj.PushAllLocalBranches(); pushErr != nil {
-					// Non-fatal: the remote is set, but seeding
-					// failed. Surface so the user knows manual
-					// pushes may be needed before the cursor reset
-					// can find anything to walk.
-					pushWarning = fmt.Sprintf("\n⚠ Pushing local branches to new remote failed: %v", pushErr)
-					c.logger.Warn("set_project_remote: push to new remote failed",
-						"project_id", projectID, "remote", remoteURL, "error", pushErr)
+			if pushErr := proj.PushAllLocalBranches(); pushErr != nil {
+				// Non-fatal: the remote is set, but seeding
+				// failed. Surface so the user knows manual
+				// pushes may be needed before the cursor reset
+				// can find anything to walk.
+				pushWarning = fmt.Sprintf("\n⚠ Pushing local branches to new remote failed: %v", pushErr)
+				c.logger.Warn("set_project_remote: push to new remote failed",
+					"project_id", projectID, "remote", remoteURL, "error", pushErr)
+			}
+			// Cursor reset runs even on push failure: a partial
+			// push (some branches landed) still wants
+			// retroactive scans on those branches, and
+			// resetting branches whose remote refs don't yet
+			// exist is harmless (the scanner returns empty
+			// when the remote ref is missing, leaving the
+			// sentinel in place for the next attempt).
+			if branches, lerr := proj.LocalBranches(); lerr == nil {
+				cursorMu := mcpgit.CursorMutexFor(c.stateDir(), int64(projectID))
+				cursorMu.Lock()
+				cursors, _ := mcpgit.LoadCursors(c.stateDir(), int64(projectID))
+				for _, b := range branches {
+					cursors.Set(b, mcpgit.RescanSentinelSHA)
 				}
-				// Cursor reset runs even on push failure: a partial
-				// push (some branches landed) still wants
-				// retroactive scans on those branches, and
-				// resetting branches whose remote refs don't yet
-				// exist is harmless (the scanner returns empty
-				// when the remote ref is missing, leaving the
-				// sentinel in place for the next attempt).
-				if branches, lerr := proj.LocalBranches(); lerr == nil {
-					cursorMu := mcpgit.CursorMutexFor(c.stateDir(), int64(projectID))
-					cursorMu.Lock()
-					cursors, _ := mcpgit.LoadCursors(c.stateDir(), int64(projectID))
-					for _, b := range branches {
-						cursors.Set(b, mcpgit.RescanSentinelSHA)
-					}
-					if serr := cursors.Save(); serr != nil {
-						c.logger.Warn("set_project_remote: cursor reset save failed",
-							"project_id", projectID, "error", serr)
-					}
-					cursorMu.Unlock()
+				if serr := cursors.Save(); serr != nil {
+					c.logger.Warn("set_project_remote: cursor reset save failed",
+						"project_id", projectID, "error", serr)
 				}
+				cursorMu.Unlock()
 			}
 			proj.Unlock()
 		}
 	}
 
-	if remoteURL == "" {
-		return mcp.NewToolResultText(fmt.Sprintf("✓ Cleared remote for project %d", projectID)), nil
-	}
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s", projectID, remoteURL, pushWarning)), nil
 }

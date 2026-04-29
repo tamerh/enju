@@ -524,14 +524,14 @@ func toolSetProjectDefaultBranch() mcp.Tool {
 
 func toolSetProjectRemote() mcp.Tool {
 	return mcp.NewTool("enju_set_project_remote",
-		mcp.WithDescription("Set or clear the external git remote URL for a project. Subsequent task result commits will be pushed to this remote. Pass an empty string to clear the remote."),
+		mcp.WithDescription("Set the external git remote URL for a project, or migrate from one remote to another. Subsequent task result commits push to this remote. Pass the new URL directly to migrate; use enju_leave_project to stop using the project on this machine. Empty strings are rejected — clearing a remote on a multi-machine project would silently fork the team."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose remote to update"),
 		),
 		mcp.WithString("remote_url",
 			mcp.Required(),
-			mcp.Description("Git remote URL, or empty string to clear"),
+			mcp.Description("Git remote URL (must be non-empty)."),
 		),
 	)
 }

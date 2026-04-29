@@ -588,8 +588,14 @@ clone:
 
 	// Clone doesn't exist — either clone from remote or init empty.
 	if remoteURL == "" {
-		// Degenerate local-only mode: init an empty repo with one
-		// commit so future writes have a base.
+		// Local-only mode: init the working tree and seed it
+		// with one commit so subsequent operations
+		// (branchBaseHash, template scans, submit's first
+		// parent lookup) have something to work against.
+		// Mirrors what InitBareWithSeed produces inside a bare;
+		// the contents (README + enju/templates/.gitkeep) match
+		// so the layout users see is the same regardless of
+		// whether a remote was configured at create time.
 		if err := os.MkdirAll(workDir, 0755); err != nil {
 			return nil, fmt.Errorf("creating work dir: %w", err)
 		}
@@ -600,6 +606,9 @@ clone:
 		})
 		if err != nil {
 			return nil, fmt.Errorf("initializing local-only repo: %w", err)
+		}
+		if err := seedLocalWorkspace(repo, workDir); err != nil {
+			return nil, fmt.Errorf("seeding local-only repo: %w", err)
 		}
 		logger.Info("initialized local-only repo", "path", workDir)
 		return &Project{
@@ -704,6 +713,16 @@ func (p *Project) Pull() error {
 func (p *Project) PullBranch(branch string) error {
 	if p.remoteURL == "" {
 		return nil // local-only, nothing to pull
+	}
+	// Solo enju_init projects store the working-tree path as
+	// remote_url on the coordinator (not an external bare),
+	// so p.remoteURL is non-empty even though the local repo
+	// has no `origin` configured. Treat that as local-only too
+	// — without this guard, RemoteBranchHash below errors
+	// with "no origin remote" and the failure cascades up to
+	// the caller as a spurious remote-error message.
+	if p.GitOriginURL() == "" {
+		return nil
 	}
 	b := p.resolveBranch(branch)
 	// Cheap ls-remote check so a brand-new branch doesn't
@@ -1979,6 +1998,19 @@ func (p *Project) CompareToRemote() (*RemoteComparison, error) {
 	r := &RemoteComparison{}
 
 	if p.remoteURL == "" {
+		r.Status = RemoteNoRemote
+		return r, nil
+	}
+	// Solo enju_init projects store the working-tree path as
+	// the coordinator's remote_url even though the local repo
+	// has no `origin` configured. Without this second check,
+	// the comparison would attempt `git ls-remote` against the
+	// working tree's missing origin, fail with "no origin
+	// remote", and mark the status as RemoteUnreachable —
+	// confusing UX for a healthy local-only project. Report
+	// RemoteNoRemote instead so the user-facing answer matches
+	// the actual git state.
+	if p.GitOriginURL() == "" {
 		r.Status = RemoteNoRemote
 		return r, nil
 	}
