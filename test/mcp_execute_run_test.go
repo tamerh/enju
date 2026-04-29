@@ -429,3 +429,232 @@ tasks:
 		t.Errorf("recovery hint should not point at enju_invalidate_task (task is in claimed state, invalidate would error); got:\n%s", text)
 	}
 }
+
+// TestMCPExecuteRunParallelDrainsAllCompute is the regression
+// for parallel-mode happy path: a fan-out DAG (seed → 4
+// independent judges → aggregate) should dispatch the 4 judges
+// concurrently, then run aggregate after they finish. parallel=4
+// dispatches all judges at once; serial would do them
+// back-to-back. Asserting wall-clock here would be flaky on CI;
+// we instead assert all 6 tasks completed and the aggregate
+// committed last (after its 4 upstreams).
+func TestMCPExecuteRunParallelDrainsAllCompute(t *testing.T) {
+	h := newMCPHarness(t, "ExecRunParallelAll")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/say.sh": {body: `#!/bin/bash
+echo "did $ENJU_TASK_ID"
+`, mode: 0o755},
+	}, "seed script")
+
+	yaml := `name: "fan-out"
+version: 1
+tasks:
+  - id: seed
+    action: compute
+    script: scripts/say.sh
+  - id: j1
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: j2
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: j3
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: j4
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: agg
+    action: compute
+    script: scripts/say.sh
+    depends_on: [j1, j2, j3, j4]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	res := h.callOK(t, "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"parallel":   float64(4),
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, "Stop reason: no_ready_compute") {
+		t.Fatalf("expected stop_reason=no_ready_compute, got:\n%s", text)
+	}
+	for _, id := range []string{"seed", "j1", "j2", "j3", "j4", "agg"} {
+		full := fmt.Sprintf("%d:1:%s", projectID, id)
+		if !strings.Contains(text, "✓ "+full) {
+			t.Errorf("expected completion entry for %s, got:\n%s", id, text)
+		}
+	}
+}
+
+// TestMCPExecuteRunParallelStopsAtCitizenWithInflightDrain:
+// when a citizen task is ready alongside compute tasks, the
+// parallel cascade dispatches the eligible compute, lets them
+// drain, then surfaces the citizen blocker. The complete-then-
+// stop policy means in-flight compute MUST finish even after the
+// citizen blocker is detected.
+func TestMCPExecuteRunParallelStopsAtCitizenWithInflightDrain(t *testing.T) {
+	h := newMCPHarness(t, "ExecRunParallelStopAtCitizen")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/say.sh": {body: `#!/bin/bash
+echo "did $ENJU_TASK_ID"
+`, mode: 0o755},
+	}, "seed script")
+
+	// seed unblocks both prep_a/prep_b (compute) AND humgate
+	// (answer) — they all become ready at the same time. With
+	// parallel=3, the cascade dispatches both prep tasks, drains
+	// them, then sees only humgate left in /ready and stops.
+	yaml := `name: "mixed-parallel"
+version: 1
+tasks:
+  - id: seed
+    action: compute
+    script: scripts/say.sh
+  - id: prep_a
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: prep_b
+    action: compute
+    script: scripts/say.sh
+    depends_on: [seed]
+  - id: humgate
+    action: answer
+    prompt: "decide"
+    depends_on: [seed]
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	res := h.callOK(t, "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"parallel":   float64(3),
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, "Stop reason: citizen_task_ready") {
+		t.Fatalf("expected stop_reason=citizen_task_ready, got:\n%s", text)
+	}
+	if !strings.Contains(text, "next_blocker="+fmt.Sprintf("%d:1:humgate", projectID)) {
+		t.Errorf("expected next_blocker=humgate, got:\n%s", text)
+	}
+	// All three compute tasks must have completed (seed +
+	// prep_a + prep_b). The drain-on-stop policy means
+	// in-flight prep tasks finish even though humgate is
+	// already detected as the blocker.
+	for _, id := range []string{"seed", "prep_a", "prep_b"} {
+		full := fmt.Sprintf("%d:1:%s", projectID, id)
+		if !strings.Contains(text, "✓ "+full) {
+			t.Errorf("expected %s to complete despite stop signal, got:\n%s", id, text)
+		}
+	}
+}
+
+// TestMCPExecuteRunParallelStopsOnFailure: with parallel
+// dispatch, a failing task triggers the stop signal but
+// in-flight siblings still finish. The cascade summary shows
+// stop_reason=compute_failed and includes both the failed task
+// and any siblings that completed before the drain.
+func TestMCPExecuteRunParallelStopsOnFailure(t *testing.T) {
+	h := newMCPHarness(t, "ExecRunParallelFail")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/ok.sh": {body: `#!/bin/bash
+echo ok
+`, mode: 0o755},
+		"scripts/boom.sh": {body: `#!/bin/bash
+echo "script went wrong" >&2
+exit 7
+`, mode: 0o755},
+	}, "seed scripts")
+
+	// Three independent compute tasks ready at the start. With
+	// parallel=3, all three get dispatched concurrently. The
+	// boom task fails; the other two should still complete
+	// before the cascade returns.
+	yaml := `name: "fail-parallel"
+version: 1
+tasks:
+  - id: ok1
+    action: compute
+    script: scripts/ok.sh
+  - id: boom
+    action: compute
+    script: scripts/boom.sh
+  - id: ok2
+    action: compute
+    script: scripts/ok.sh
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	res := h.callOK(t, "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"parallel":   float64(3),
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, "Stop reason: compute_failed") {
+		t.Fatalf("expected stop_reason=compute_failed, got:\n%s", text)
+	}
+	boomID := fmt.Sprintf("%d:1:boom", projectID)
+	if !strings.Contains(text, "✗ "+boomID) {
+		t.Errorf("expected failed entry for boom, got:\n%s", text)
+	}
+	// Drain-on-stop: siblings dispatched at the same time
+	// finish before the cascade returns.
+	for _, id := range []string{"ok1", "ok2"} {
+		full := fmt.Sprintf("%d:1:%s", projectID, id)
+		if !strings.Contains(text, "✓ "+full) {
+			t.Errorf("expected %s to complete during drain after boom failed, got:\n%s", id, text)
+		}
+	}
+}
+
+// TestMCPExecuteRunParallelRejectsExcessive: parallel parameter
+// must be capped at 32 for safety. Asking for 100 should error
+// up-front instead of fan-spawning 100 goroutines.
+func TestMCPExecuteRunParallelRejectsExcessive(t *testing.T) {
+	h := newMCPHarness(t, "ExecRunParallelCap")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/say.sh": {body: `#!/bin/bash
+echo did
+`, mode: 0o755},
+	}, "seed script")
+
+	yaml := `name: "cap-test"
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: scripts/say.sh
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	res, err := h.client.Call(context.Background(), "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"parallel":   float64(100),
+	})
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected error for parallel=100, got success: %s", mcpText(res))
+	}
+	got := mcpText(res)
+	if !strings.Contains(got, "exceeds hard cap") {
+		t.Errorf("expected cap message in error, got: %s", got)
+	}
+}

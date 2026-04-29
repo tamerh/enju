@@ -317,7 +317,9 @@ Use after any citizen submit to flush the deterministic work the submission unbl
 
 Per-task attribution: the caller's identity authors each commit in the cascade. If a compute task has assign_to restricting it to specific citizens, it's treated as a blocker (skipped, not executed) — respects explicit scoping.
 
-Use this INSTEAD OF looping enju_execute_task yourself. Typical flow: after enju_submit_result on a citizen task, one enju_execute_run call drives the pipeline to the next gate.`),
+Use this INSTEAD OF looping enju_execute_task yourself. Typical flow: after enju_submit_result on a citizen task, one enju_execute_run call drives the pipeline to the next gate.
+
+Parallel execution: parallel=N (default 4, max 32) dispatches up to N compute tasks concurrently. Scripts run truly in parallel; the git commit/push layer serializes naturally. Best for script-bound workloads (bio pipelines, ML inference, long-running compute) where wall-clock is dominated by script execution. Pass parallel=1 to force serial when debugging or when scripts are RAM-hungry.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project ID"),
@@ -328,6 +330,9 @@ Use this INSTEAD OF looping enju_execute_task yourself. Typical flow: after enju
 		),
 		mcp.WithNumber("max_tasks",
 			mcp.Description("Safety cap on how many tasks this call will execute (default 100, hard cap 1000). Call the tool again to continue past the cap."),
+		),
+		mcp.WithNumber("parallel",
+			mcp.Description("Maximum compute tasks dispatched concurrently within this cascade (default 4, max 32). Scripts run in parallel; git commit/push serializes through the per-project lock. Pass 1 to force serial."),
 		),
 	)
 }

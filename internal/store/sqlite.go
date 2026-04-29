@@ -71,13 +71,32 @@ type Store struct {
 
 // New creates a new Store and initializes the schema.
 func New(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// busy_timeout has to ride on the DSN, not a one-shot
+	// PRAGMA: SQLite scopes busy_timeout per-connection, and
+	// database/sql opens new pool connections lazily under
+	// load. A startup PRAGMA only applies to whichever
+	// connection happened to run it; the next pool-grow under
+	// parallel execute_run would create a connection with the
+	// default 0 timeout and surface SQLITE_BUSY again. The
+	// modernc.org/sqlite driver applies _pragma=name(value)
+	// DSN params on every new connection it opens, so the
+	// timeout is effectively pool-wide.
+	dsn := dbPath + "?_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		return nil, fmt.Errorf("setting WAL mode: %w", err)
+	}
+	// Belt-and-suspenders busy_timeout PRAGMA. The DSN form
+	// above is what makes the timeout pool-safe; this
+	// startup exec ensures the FIRST connection (the one
+	// the migration runs on) also has the timeout, in case
+	// a future driver swap doesn't honor the DSN form.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		return nil, fmt.Errorf("setting busy_timeout: %w", err)
 	}
 
 	s := &Store{db: db}
