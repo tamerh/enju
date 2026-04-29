@@ -39,6 +39,13 @@ type batchSubmission struct {
 	Option        string                 `json:"option,omitempty"`
 	OutputsJSON   string                 `json:"outputs_json,omitempty"`
 	ArtifactsJSON string                 `json:"artifacts_json,omitempty"`
+	// Model is an optional per-entry override. Empty falls back
+	// to the session default (the -model flag). Per-entry rather
+	// than batch-level because cross-model workflows want each
+	// entry attributed to whatever model actually produced its
+	// content — e.g. Opus produced one result and Sonnet produced
+	// another, both submitted in the same batch.
+	Model string `json:"model,omitempty"`
 	// Raw retained for the coordinator's error reports — the
 	// LLM sees "entry N: <error>" pointed at the entry that
 	// failed validation, not a positional index it has to
@@ -127,6 +134,9 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 		}
 		if v, ok := raw["artifacts_json"].(string); ok {
 			entry.ArtifactsJSON = v
+		}
+		if v, ok := raw["model"].(string); ok {
+			entry.Model = v
 		}
 		entries = append(entries, entry)
 	}
@@ -257,7 +267,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 			results[i] = batchEntryResult{TaskID: e.TaskID, Status: "error", Message: parseErr}
 			continue
 		}
-		prep, errRes := c.prepareFatSubmit(ctx, e.TaskID, bc.meta, e.Content, outputs, outputLists, artifacts, e.Decision, e.Option)
+		prep, errRes := c.prepareFatSubmit(ctx, e.TaskID, bc.meta, e.Content, outputs, outputLists, artifacts, e.Decision, e.Option, e.Model)
 		if errRes != nil {
 			results[i] = batchEntryResult{TaskID: e.TaskID, Status: "error", Message: toolResultPlainText(errRes)}
 			continue
@@ -307,7 +317,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 				Username:      c.username,
 				AuthorName:    prep.AuthorName,
 				AuthorEmail:   prep.AuthorEmail,
-				ModelName:     c.modelName,
+				ModelName:     prep.EffectiveModel,
 				Files:         prep.Files,
 				ArtifactPaths: prep.ArtifactPaths,
 				Branch:        branch,
@@ -486,11 +496,11 @@ func (c *apiClient) submitOneForBatch(ctx context.Context, e batchSubmission, me
 
 	var res *mcp.CallToolResult
 	if c.useFatClient(meta) {
-		res, _ = c.submitResultFatClient(ctx, e.TaskID, meta, e.Content, outputs, outputLists, artifacts, e.Decision, e.Option)
+		res, _ = c.submitResultFatClient(ctx, e.TaskID, meta, e.Content, outputs, outputLists, artifacts, e.Decision, e.Option, e.Model)
 	} else {
 		// Legacy coordinator-writes path — same shape the
 		// single-submit handler builds.
-		body := map[string]interface{}{"model": c.modelName}
+		body := map[string]interface{}{"model": c.effectiveModel(e.Model)}
 		if outputs != nil {
 			body["outputs"] = outputs
 		}
@@ -624,6 +634,7 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	artifactsJSON := req.GetString("artifacts_json", "")
 	decision := req.GetString("decision", "")
 	option := req.GetString("option", "")
+	modelOverride := req.GetString("model", "")
 
 	// Primary-field presence check. A vote task can submit with
 	// just `option`, a review task with just `decision` — those
@@ -699,12 +710,12 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, metaErr)), nil
 	}
 	if c.useFatClient(meta) {
-		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, outputLists, artifacts, decision, option)
+		return c.submitResultFatClient(ctx, taskID, meta, content, outputs, outputLists, artifacts, decision, option, modelOverride)
 	}
 
 	// Legacy coordinator-writes path.
 	body := map[string]interface{}{
-		"model": c.modelName,
+		"model": c.effectiveModel(modelOverride),
 	}
 	if outputs != nil {
 		body["outputs"] = outputs
@@ -755,6 +766,15 @@ type preparedFatSubmit struct {
 	// the final SHA yet — a rebase during push may rewrite
 	// it).
 	ReportBody map[string]interface{}
+	// EffectiveModel is the resolved model identifier for this
+	// submission (per-call override if the caller passed one,
+	// else the session default). Stashed here so the caller can
+	// pass it consistently into both the report body (already
+	// done, ReportBody["model"]) AND the git commit's
+	// AI-Model trailer (SubmitRequest.ModelName) — without this
+	// field the trailer would silently use c.modelName even when
+	// the caller overrode for attribution.
+	EffectiveModel string
 }
 
 // prepareFatSubmit runs every pre-commit step the fat-client
@@ -785,7 +805,17 @@ func (c *apiClient) prepareFatSubmit(
 	artifacts map[string]string,
 	decision string,
 	option string,
+	modelOverride string,
 ) (*preparedFatSubmit, *mcp.CallToolResult) {
+	// Resolve the effective model once and reuse across the
+	// three sites that need it: metadata.json, the report body,
+	// and the EffectiveModel field on the returned prep struct
+	// (so SubmitTaskResult/PrepareCommit get the same value via
+	// prep.EffectiveModel). One call, one source of truth — a
+	// future override-precedence change touches one line, not
+	// three.
+	effectiveModel := c.effectiveModel(modelOverride)
+
 	// Task-state gate: a submission against an already-terminal
 	// task (accepted / skipped / invalidated / rejected) has no
 	// legitimate landing state. Reject it client-side with a
@@ -861,7 +891,7 @@ func (c *apiClient) prepareFatSubmit(
 	metadata := map[string]interface{}{
 		"task_id":     taskID,
 		"username":    c.username,
-		"model":       c.modelName,
+		"model":       effectiveModel,
 		"result_type": resultType,
 		"timestamp":   time.Now().Format(time.RFC3339),
 	}
@@ -993,7 +1023,7 @@ func (c *apiClient) prepareFatSubmit(
 		"result_path":       resultDir,
 		"artifacts_written": artifactPaths,
 		"tokens_used":       0,
-		"model":             c.modelName,
+		"model":             effectiveModel,
 		// Username identifies the submitting citizen for
 		// multi-citizen task bookkeeping (so the coordinator
 		// credits the right task_claims row). Single-citizen
@@ -1022,15 +1052,16 @@ func (c *apiClient) prepareFatSubmit(
 		reportBody["option"] = option
 	}
 	return &preparedFatSubmit{
-		TaskID:        taskID,
-		Meta:          meta,
-		Project:       proj,
-		Files:         files,
-		ArtifactPaths: artifactPaths,
-		ResultDir:     resultDir,
-		AuthorName:    authorName,
-		AuthorEmail:   authorEmail,
-		ReportBody:    reportBody,
+		TaskID:         taskID,
+		Meta:           meta,
+		Project:        proj,
+		Files:          files,
+		ArtifactPaths:  artifactPaths,
+		ResultDir:      resultDir,
+		AuthorName:     authorName,
+		AuthorEmail:    authorEmail,
+		ReportBody:     reportBody,
+		EffectiveModel: effectiveModel,
 	}, nil
 }
 
@@ -1055,8 +1086,9 @@ func (c *apiClient) submitResultFatClient(
 	artifacts map[string]string,
 	decision string,
 	option string,
+	modelOverride string,
 ) (*mcp.CallToolResult, error) {
-	prep, errRes := c.prepareFatSubmit(ctx, taskID, meta, content, outputs, outputLists, artifacts, decision, option)
+	prep, errRes := c.prepareFatSubmit(ctx, taskID, meta, content, outputs, outputLists, artifacts, decision, option, modelOverride)
 	if errRes != nil {
 		return errRes, nil
 	}
@@ -1067,7 +1099,7 @@ func (c *apiClient) submitResultFatClient(
 		Username:      c.username,
 		AuthorName:    prep.AuthorName,
 		AuthorEmail:   prep.AuthorEmail,
-		ModelName:     c.modelName,
+		ModelName:     prep.EffectiveModel,
 		Files:         prep.Files,
 		ArtifactPaths: prep.ArtifactPaths,
 		Branch:        prep.Meta.Branch,

@@ -133,21 +133,26 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 		mcp.WithString("option",
 			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
 		),
+		mcp.WithString("model",
+			mcp.Description(`Optional per-call override for which model produced this result. Defaults to the model name from the session's -model flag. Use this when you switch models mid-session (e.g. opened MCP with claude-opus-4-7 but produced this specific result with claude-sonnet-4-6) so attribution lines up with reality. Unknown model names are auto-registered into the catalog on first use; pre-register via enju_register_model if you want a prettier display name. Ignored when empty — the session default applies.`),
+		),
 	)
 }
 
 func toolSubmitResultsBatch() mcp.Tool {
 	return mcp.NewTool("enju_submit_results_batch",
-		mcp.WithDescription(`Submit N results in one MCP call. Same citizen, same project + run, pre-validated upfront. Each entry mirrors enju_submit_result's body: {task_id, content?, decision?, option?, outputs_json?, artifacts_json?}.
+		mcp.WithDescription(`Submit N results in one MCP call. Same citizen, same project + run, pre-validated upfront. Each entry mirrors enju_submit_result's body: {task_id, content?, decision?, option?, outputs_json?, artifacts_json?, model?}.
 
 Mixed action types are fine — per-entry validation dispatches on the task's action (review needs decision, vote needs option, others need content/outputs/artifacts).
+
+Per-entry 'model' override is supported and honored independently for each entry — useful for cross-model batches where one entry was produced by Opus and another by Sonnet. Omit 'model' in an entry to fall back to the session default (the -model flag).
 
 Rejected upfront as a whole batch if any entry is missing required fields, names an unknown task, crosses project/run boundaries, or directly depends on another batch entry (submitting an upstream + its downstream in the same batch would let the upstream's cascade silently modify the downstream's pre-submit state). Per-entry runtime failures are reported individually — subsequent entries still attempt.
 
 Use for bulk-approval workflows (one reviewer approving N modules), multi-item labeling (one rater emitting N decisions), or composing multi-entry programmatic submissions.`),
 		mcp.WithString("submissions",
 			mcp.Required(),
-			mcp.Description(`JSON array of submission objects, one per task. Example: '[{"task_id":"1:1:a:review","decision":"approve"},{"task_id":"1:1:b:review","decision":"approve"}]'`),
+			mcp.Description(`JSON array of submission objects, one per task. Example: '[{"task_id":"1:1:a:review","decision":"approve"},{"task_id":"1:1:b:review","decision":"approve","model":"claude-sonnet-4-6"}]'`),
 		),
 	)
 }

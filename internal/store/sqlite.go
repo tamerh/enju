@@ -2326,6 +2326,15 @@ func (s *Store) ListTokensByCitizen(citizenID int64) ([]TokenRecord, error) {
 // Provider routing is in the deferred section of the design doc;
 // when it ships, the prefix becomes a separate column on the
 // submission row, not part of the model's identity.
+//
+// Same principle for snapshot/version drift: providers silently
+// update weights under the same nominal name (today's
+// claude-opus-4-7 ≠ next year's claude-opus-4-7). The catalog
+// stays one bucket per logical model; when the model_resolved
+// column ships (also deferred), each submit records the literal
+// identifier the API echoed back ("anthropic/claude-opus-4-7-
+// 20260415"). Both deferred items in docs/operator-model-design.md
+// — "Provider routing" and "Model drift / snapshot pinning".
 var modelCatalogSeed = []struct {
 	Username string
 	Name     string

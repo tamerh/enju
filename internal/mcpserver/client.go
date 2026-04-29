@@ -348,3 +348,22 @@ func (c *apiClient) fetchProjectMetaExpanded(ctx context.Context, projectID int6
 	}
 	return remoteURL, name, defaultBranch, nil
 }
+
+// effectiveModel returns the model identifier to attribute a single
+// action to. If the caller passed an explicit override (the per-call
+// `model` argument on submit / submit_results_batch), use it.
+// Otherwise fall back to the session default — the `-model` flag
+// the MCP client was launched with, stashed in c.modelName.
+//
+// The override path is what makes mixed-model workflows work without
+// restarting MCP: a session opened with -model claude-opus-4-7 can
+// submit one task with claude-opus-4-7 and the next with
+// claude-sonnet-4-6 by passing model="claude-sonnet-4-6" on the
+// individual submit call. Empty string in the override means "no
+// override" — same as if the field weren't present at all.
+func (c *apiClient) effectiveModel(override string) string {
+	if override != "" {
+		return override
+	}
+	return c.modelName
+}

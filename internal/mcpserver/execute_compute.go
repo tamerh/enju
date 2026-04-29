@@ -183,6 +183,16 @@ func (c *apiClient) executeComputeTask(ctx context.Context, taskID string) (*exe
 		AuthorName:         c.citizenName,
 		AuthorEmail:        c.citizenEmail,
 		Username:           c.username,
+		// Compute attribution uses the session model unconditionally,
+		// no per-call override path. Rationale: an answer/review/vote
+		// submit attributes the LLM that produced the words, which
+		// genuinely varies per turn (caller might draft with Opus
+		// then ratify with Sonnet). A compute submit attributes the
+		// citizen who LAUNCHED THE SCRIPT — the script itself
+		// produces deterministic bytes from code + inputs, not LLM
+		// output. The "who initiated" answer doesn't change mid-run.
+		// If an operator wants attribution for a different model,
+		// they restart MCP with -model X and re-execute.
 		Model:              c.modelName,
 		Container:          meta.Container,
 		Env:                meta.Env,

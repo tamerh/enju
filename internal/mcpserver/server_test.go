@@ -232,6 +232,7 @@ func TestSubmitReviewPreValidationBlocksGit(t *testing.T) {
 				nil,
 				tc.decision,
 				"", // option (non-vote task)
+				"", // model override (use session default)
 			)
 			if err != nil {
 				t.Fatalf("handler should return tool error, not Go error: %v", err)

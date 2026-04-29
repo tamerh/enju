@@ -201,6 +201,34 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 	}
 }
 
+// TestEffectiveModelPrecedence pins the override-vs-default rule
+// the per-call model param relies on. Without this test, a refactor
+// that flips the precedence (e.g. session always wins) would
+// silently break attribution for mixed-model workflows: every submit
+// would end up credited to the -model session value, regardless of
+// what the caller passed.
+func TestEffectiveModelPrecedence(t *testing.T) {
+	c := &apiClient{modelName: "session-default"}
+
+	// Override empty → fall back to session default.
+	if got := c.effectiveModel(""); got != "session-default" {
+		t.Errorf("empty override: got %q, want session-default", got)
+	}
+	// Override non-empty → win over session default.
+	if got := c.effectiveModel("call-override"); got != "call-override" {
+		t.Errorf("non-empty override: got %q, want call-override", got)
+	}
+	// Override non-empty even when session default is empty.
+	c2 := &apiClient{modelName: ""}
+	if got := c2.effectiveModel("call-override"); got != "call-override" {
+		t.Errorf("override with empty session: got %q, want call-override", got)
+	}
+	// Both empty → empty (the unaided-human case).
+	if got := c2.effectiveModel(""); got != "" {
+		t.Errorf("both empty: got %q, want empty (unaided human)", got)
+	}
+}
+
 // TestModelRegisterAndListE2E covers the catalog extension path:
 // list shows the seed; register adds; list shows the new entry.
 func TestModelRegisterAndListE2E(t *testing.T) {
