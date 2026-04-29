@@ -70,11 +70,18 @@ const (
 	stopNoReadyCompute           = "no_ready_compute"
 	stopCitizenTaskReady         = "citizen_task_ready"
 	stopComputeAssignedElsewhere = "compute_assigned_elsewhere"
-	stopComputeFailed    = "compute_failed"
-	stopComputeErrored   = "compute_errored"
-	stopAsyncTaskStarted = "async_task_started"
-	stopMaxTasks         = "max_tasks"
-	stopContextCancelled = "context_cancelled"
+	stopComputeFailed            = "compute_failed"
+	stopComputeErrored           = "compute_errored"
+	// stopGitOperationFailed fires when the script ran fine
+	// (exit 0, produced output) but the post-script git
+	// commit/push failed. Distinct from compute_failed (script
+	// non-zero) and compute_errored (wrapper-level / pre-exec
+	// failure) so callers know the work product is on disk and
+	// the recovery is fix-the-git-state, not re-run-the-script.
+	stopGitOperationFailed = "git_operation_failed"
+	stopAsyncTaskStarted   = "async_task_started"
+	stopMaxTasks           = "max_tasks"
+	stopContextCancelled   = "context_cancelled"
 )
 
 func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -195,6 +202,15 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 		switch outcome.Status {
 		case "failed":
 			stopReason = stopComputeFailed
+		case "git_failed":
+			// Script ran fine; the post-exec commit/push
+			// failed. Recovery is fix-the-git-state (e.g.
+			// re-add a remote, rebase), not re-run the script —
+			// the work product is still on disk under
+			// spec.ResultDir. Surfaced as a distinct stop_reason
+			// so callers can route to a different recovery path
+			// than for compute_failed.
+			stopReason = stopGitOperationFailed
 		case "async_started":
 			// Async compute spawns a detached subprocess; the
 			// task isn't done yet, so continuing would drive
@@ -387,6 +403,11 @@ func entryFromOutcome(out *executeOutcome) executeRunEntry {
 			reason = out.ErrorMessage
 		}
 		e.Reason = reason
+	case "git_failed":
+		// ErrorMessage carries the chained git error
+		// ("git submit failed: push failed: ...") so users see
+		// the actual git stderr, not just "compute errored."
+		e.Reason = out.ErrorMessage
 	case "completed":
 		if len(out.ArtifactsWritten) > 0 {
 			e.Artifacts = out.ArtifactsWritten
@@ -401,13 +422,15 @@ func entryFromOutcome(out *executeOutcome) executeRunEntry {
 // formatClaimMatchingSummary + formatBatchSubmit so a caller
 // that parses batch responses can key off the same structure.
 func formatExecuteRunSummary(entries []executeRunEntry, stopReason string, blocker *executeRunBlocker, maxTasks int) string {
-	var completed, failed, errored, async int
+	var completed, failed, errored, async, gitFailed int
 	for _, e := range entries {
 		switch e.Status {
 		case "completed":
 			completed++
 		case "failed":
 			failed++
+		case "git_failed":
+			gitFailed++
 		case "async_started":
 			async++
 		case "error":
@@ -417,13 +440,16 @@ func formatExecuteRunSummary(entries []executeRunEntry, stopReason string, block
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Cascade: %d executed", len(entries)))
-	if completed > 0 || failed > 0 || async > 0 || errored > 0 {
+	if completed > 0 || failed > 0 || gitFailed > 0 || async > 0 || errored > 0 {
 		parts := []string{}
 		if completed > 0 {
 			parts = append(parts, fmt.Sprintf("%d completed", completed))
 		}
 		if failed > 0 {
 			parts = append(parts, fmt.Sprintf("%d failed", failed))
+		}
+		if gitFailed > 0 {
+			parts = append(parts, fmt.Sprintf("%d git-op-failed", gitFailed))
 		}
 		if async > 0 {
 			parts = append(parts, fmt.Sprintf("%d async started", async))
@@ -453,6 +479,15 @@ func formatExecuteRunSummary(entries []executeRunEntry, stopReason string, block
 		b.WriteString("\n  → run is idle or complete; check enju_run_status.\n")
 	case stopComputeFailed:
 		b.WriteString("\n  → downstream tasks blocked. Fix the script + enju_invalidate_task, or accept the failure.\n")
+	case stopGitOperationFailed:
+		// Note: do NOT suggest enju_invalidate_task here. The
+		// task is still in `claimed` state (no /result, no /fail
+		// reported to the coordinator), so invalidate would
+		// reject. executeComputeTask's claim gate already
+		// handles the "claimed by us" retry path —
+		// re-running enju_execute_run after fixing the remote
+		// is sufficient.
+		b.WriteString("\n  → script ran fine — work product is still on disk. Failure was at the git layer (commit/push). Inspect enju_project_remote_status, fix the remote state, then call enju_execute_run again to retry.\n")
 	case stopAsyncTaskStarted:
 		b.WriteString("\n  → an async compute task is running detached. Call enju_execute_run again once it lands.\n")
 	case stopMaxTasks:
@@ -479,6 +514,11 @@ func writeExecuteRunEntryLine(b *strings.Builder, e executeRunEntry) {
 		prefix = "✓"
 	case "failed":
 		prefix = "✗"
+	case "git_failed":
+		// Distinct icon so a human reader doesn't confuse it
+		// with a script failure — the work product is on disk,
+		// just not pushed.
+		prefix = "✗git"
 	case "async_started":
 		prefix = "…"
 	default:

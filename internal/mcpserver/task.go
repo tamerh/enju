@@ -196,6 +196,26 @@ func formatExecuteOutcome(out *executeOutcome) string {
 			b.WriteString(fmt.Sprintf("  Transcript: %s (local only, not committed on failure)\n", out.ScriptLogPath))
 		}
 		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", out.TaskID))
+	case "git_failed":
+		// Distinct from "failed" so the user knows the script
+		// itself ran fine — the failure is at the git layer
+		// (commit/push). Work product is still on disk; recovery
+		// is fix-the-git-state, not re-run-the-script.
+		b.WriteString(fmt.Sprintf("✗ Git operation failed after script ran (%s)\n", elapsed))
+		b.WriteString(fmt.Sprintf("  Script:  %s — completed successfully\n", out.Script))
+		b.WriteString(fmt.Sprintf("  Output:  %d bytes on disk in run dir (NOT committed)\n", out.ContentLen))
+		if out.ErrorMessage != "" {
+			b.WriteString(fmt.Sprintf("  Git error: %s\n", out.ErrorMessage))
+		}
+		if out.ScriptLogPath != "" {
+			b.WriteString(fmt.Sprintf("  Transcript: %s\n", out.ScriptLogPath))
+		}
+		// Recovery note: don't suggest enju_invalidate_task —
+		// the task is still in `claimed` state, and invalidate
+		// only operates on accepted tasks. The execute path's
+		// claim gate handles "claimed by us" as a retry, so a
+		// plain re-call after fixing the remote is enough.
+		b.WriteString(fmt.Sprintf("  Task %s — fix the remote/branch state (enju_project_remote_status), then call enju_execute_task again to retry.\n", out.TaskID))
 	case "completed":
 		b.WriteString(fmt.Sprintf("✓ Script completed (exit 0, %s)\n", elapsed))
 		b.WriteString(fmt.Sprintf("  Script:  %s\n", out.Script))

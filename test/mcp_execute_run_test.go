@@ -7,6 +7,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -346,5 +347,85 @@ tasks:
 	}
 	if !strings.Contains(text, "Stop reason: no_ready_compute") {
 		t.Errorf("expected stop_reason=no_ready_compute on idle run, got:\n%s", text)
+	}
+}
+
+// TestMCPExecuteRunStopsOnGitFailure is the regression for TP53
+// Bug 3a: when the script runs successfully but the post-script
+// git push fails (e.g. "object not found" on a freshly-added
+// remote), the cascade must surface stop_reason=
+// git_operation_failed — distinct from compute_failed (script
+// non-zero) and compute_errored (wrapper-level failure) — so the
+// user knows the work product is on disk and the recovery is
+// fix-the-git-state, not re-run-the-script.
+//
+// We provoke the failure by removing the project's bare remote
+// directory between create_run and execute_run, so the push
+// inside the wrapper hits a non-existent remote.
+func TestMCPExecuteRunStopsOnGitFailure(t *testing.T) {
+	h := newMCPHarness(t, "ExecRunGitFail")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/say.sh": {body: `#!/bin/bash
+echo "ok"
+`, mode: 0o755},
+	}, "seed script")
+
+	yaml := `name: "git-fail"
+version: 1
+tasks:
+  - id: only
+    action: compute
+    script: scripts/say.sh
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	// Touch the workspace via run_status so the project is
+	// cloned into c.workspace before we sabotage the bare. If
+	// we delete the bare too early, the first ForProject call
+	// inside execute_run hits "clone failed" — that's a
+	// legitimate failure mode but a different one than the
+	// post-script push failure we're reproducing here.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+	})
+
+	// Sabotage the remote: nuke the bare repo directory so the
+	// post-script push fails. Script will still run fine — it
+	// only writes to the local workspace clone — but the push
+	// to origin won't find the remote.
+	bareURL := h.remoteFor(projectID)
+	if bareURL == "" {
+		t.Fatalf("no remote URL for project %d", projectID)
+	}
+	if err := os.RemoveAll(bareURL); err != nil {
+		t.Fatalf("removing bare to force git failure: %v", err)
+	}
+
+	res := h.callOK(t, "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+	})
+	text := mcpText(res)
+	if !strings.Contains(text, "Stop reason: git_operation_failed") {
+		t.Fatalf("expected stop_reason=git_operation_failed, got:\n%s", text)
+	}
+	// The git_failed icon distinguishes this from script failure.
+	onlyID := fmt.Sprintf("%d:1:only", projectID)
+	if !strings.Contains(text, "✗git "+onlyID) {
+		t.Errorf("expected ✗git entry for %s, got:\n%s", onlyID, text)
+	}
+	// Recovery hint should mention the git layer + project_remote_status.
+	if !strings.Contains(text, "git layer") {
+		t.Errorf("expected recovery hint to cite the git layer, got:\n%s", text)
+	}
+	// Hint must NOT suggest enju_invalidate_task — the task is
+	// still in `claimed`, and invalidate only operates on
+	// accepted tasks. Following that suggestion would dead-end
+	// the user.
+	if strings.Contains(text, "enju_invalidate_task") {
+		t.Errorf("recovery hint should not point at enju_invalidate_task (task is in claimed state, invalidate would error); got:\n%s", text)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/engine"
@@ -25,7 +26,7 @@ import (
 type executeOutcome struct {
 	TaskID           string
 	Script           string
-	Status           string // "completed" | "failed" | "async_started"
+	Status           string // "completed" | "failed" | "async_started" | "git_failed"
 	ExitCode         int
 	ElapsedMS        int64
 	CommitSHA        string
@@ -33,7 +34,7 @@ type executeOutcome struct {
 	ArtifactsWritten []string
 	MissingArtifacts []string
 	ScriptLogPath    string
-	ErrorMessage     string // populated when Status == "failed"
+	ErrorMessage     string // populated when Status == "failed" or "git_failed"
 	Stderr           string // captured stderr on failure (truncated at source)
 	ContribNum       int    // coordinator's contribution counter (0 if unknown)
 	NewlyReady       int    // count of tasks that transitioned to READY after this commit
@@ -204,6 +205,35 @@ func (c *apiClient) executeComputeTask(ctx context.Context, taskID string) (*exe
 	res := compute.Run(ctx, spec, env, c.logger)
 	if res.Error != "" {
 		return nil, fmt.Errorf("%s", res.Error)
+	}
+
+	// Script ran fine but the post-script git operation failed
+	// (commit/push retry exhausted, "object not found" on a
+	// freshly-added remote, etc.). Surface as Status="git_failed"
+	// so batch callers (enju_execute_run) can route to a distinct
+	// stop_reason instead of conflating with script-failed —
+	// the work product is still on disk in spec.ResultDir; the
+	// recovery is fix-the-git-state, not re-run-the-script.
+	//
+	// Backwards-compat fallback: old wrappers that didn't set
+	// GitError put the same message in Error with a "git submit
+	// failed:" prefix, so we treat that path identically. New
+	// wrappers populate GitError directly.
+	gitErrMsg := res.GitError
+	if gitErrMsg == "" && res.Error != "" && strings.HasPrefix(res.Error, compute.GitSubmitFailedPrefix) {
+		gitErrMsg = res.Error
+	}
+	if gitErrMsg != "" {
+		return &executeOutcome{
+			TaskID:        taskID,
+			Script:        meta.Script,
+			Status:        "git_failed",
+			ElapsedMS:     res.ElapsedMS,
+			ContentLen:    len(res.Content),
+			ScriptLogPath: res.ScriptLogPath,
+			ErrorMessage:  gitErrMsg,
+			Branch:        meta.Branch,
+		}, nil
 	}
 
 	if res.ExitCode != 0 {

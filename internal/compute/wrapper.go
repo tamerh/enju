@@ -31,6 +31,18 @@ import (
 	"github.com/enju-ai/enju/internal/mcpgit"
 )
 
+// GitSubmitFailedPrefix is the leading text of the wrapper's
+// legacy Result.Error string when the script ran fine but the
+// post-script commit/push failed. New wrappers populate
+// Result.GitError directly; old ones (in-flight async wrappers
+// launched by an older binary) still write the prefixed
+// message into Result.Error. The handler's classification path
+// in mcpserver/execute_compute.go uses this prefix to detect
+// the legacy shape and route it identically to GitError. Shared
+// here so a wording change in wrapper.go can't silently demote
+// the classification to compute_errored on the handler side.
+const GitSubmitFailedPrefix = "git submit failed:"
+
 // Spec is the handler→wrapper contract. Populated by the MCP
 // handler, serialized as JSON into a temp file, and read by the
 // wrapper subprocess. Every field the wrapper needs to produce a
@@ -162,11 +174,24 @@ type Result struct {
 	// even before the coordinator catches up.
 	ScriptLogPath string `json:"script_log_path,omitempty"`
 
-	// Wrapper-level failure (spec parse, project open, commit
-	// error). Distinct from ExitCode — a non-empty Error means
-	// nothing committed and the handler should bubble up the
-	// message to the user as a tool error.
+	// Wrapper-level failure (spec parse, project open, script
+	// not found, container runtime missing). Distinct from
+	// ExitCode — a non-empty Error means the wrapper couldn't
+	// even attempt the script. The handler bubbles this up as
+	// a tool error.
 	Error string `json:"error,omitempty"`
+
+	// GitError is set when the script ran successfully (exit 0,
+	// produced output) but the post-script commit/push failed —
+	// e.g. "object not found" on a freshly-added remote, push
+	// rejected and rebase failed, etc. Distinct from Error so
+	// callers can route a script-passed-but-git-failed task to
+	// a clear "fix the git state, the work product is still on
+	// disk" recovery path. Old wrappers didn't have this field;
+	// when GitError is empty and Error contains "git submit
+	// failed:" the new handler still classifies correctly via
+	// fallback heuristic in execute_compute.go.
+	GitError string `json:"git_error,omitempty"`
 }
 
 // Run executes a compute task's script per the given Spec and, on
@@ -463,7 +488,15 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	})
 	proj.Unlock()
 	if err != nil {
-		res.Error = fmt.Sprintf("git submit failed: %v", err)
+		// Script ran fine; the failure is at the git layer
+		// (commit retry exhausted, push rejected, rebase
+		// failed, "object not found" on a freshly-added
+		// remote). Route via GitError so the caller can
+		// distinguish this from a wrapper-level failure
+		// (script not found, project open failed) and surface
+		// "git op failed, work product is on disk" to the
+		// user instead of "compute task errored."
+		res.GitError = fmt.Sprintf("%s %v", GitSubmitFailedPrefix, err)
 		return res
 	}
 	res.CommitSHA = submitRes.CommitSHA
