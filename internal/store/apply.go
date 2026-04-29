@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 )
@@ -36,7 +37,91 @@ import (
 // (claim, submit, invalidate, tally, run creation, dynamic
 // materialization) goes through the same function. The
 // engine produces the plan; ApplyPlan is the executor.
+//
+// Retries on SQLITE_BUSY-class errors with exponential
+// backoff. The DSN config (busy_timeout=5000, _txlock=
+// immediate) handles the common case — busy_timeout retries
+// writer-vs-writer contention and IMMEDIATE prevents
+// snapshot conflicts. This wrapper is defense-in-depth: if
+// either of those breaks (driver upgrade, DSN regression,
+// future code path that opens a separate sql.DB) or if
+// busy_timeout overflows under genuinely heavy load, the
+// caller sees a successful retry instead of a failed plan.
 func (s *Store) ApplyPlan(plan Plan) (ApplyResult, error) {
+	return applyWithRetry(applyPlanMaxAttempts, func() (ApplyResult, error) {
+		return s.applyPlanOnce(plan)
+	})
+}
+
+// applyPlanMaxAttempts is the retry budget for ApplyPlan. Exposed as
+// a constant so retry tests can reference it without hardcoding.
+const applyPlanMaxAttempts = 5
+
+// applyWithRetry invokes fn up to maxAttempts times, retrying only on
+// SQLITE_BUSY-class errors with exponential backoff (5ms, 10ms, 20ms,
+// 40ms, 80ms — max ~155ms total wait across all retries, with up to
+// 50% jitter). Backoff is short because busy_timeout=5s is already
+// the long-tail handler — this loop is for the rare case where 5s of
+// busy waiting wasn't enough.
+//
+// On success returns the ApplyResult immediately. On a non-busy error
+// returns the result fn produced (which may be a partial; preserving
+// it matches pre-refactor semantics for callers that inspect it). On
+// retry exhaustion returns a zero ApplyResult and a wrapped error.
+//
+// Extracted from ApplyPlan as a standalone func so the retry contract
+// (count, backoff, busy-vs-non-busy distinction) is unit-testable
+// without standing up a real database. See sqlite_concurrency_test.go.
+func applyWithRetry(maxAttempts int, fn func() (ApplyResult, error)) (ApplyResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, err := fn()
+		if err == nil {
+			return result, nil
+		}
+		// Only retry SQLITE_BUSY / "database is locked" —
+		// every other error is either a validation failure
+		// (no point retrying) or a structural problem the
+		// caller needs to see.
+		if !isSQLiteBusy(err) {
+			return result, err
+		}
+		lastErr = err
+		sleepBusyBackoff(attempt)
+	}
+	return ApplyResult{}, fmt.Errorf("ApplyPlan failed after %d retries on SQLITE_BUSY: %w", maxAttempts, lastErr)
+}
+
+// sleepBusyBackoff is the per-attempt sleep between retries. Package
+// var (not const) so tests can swap in a no-op to keep the retry tests
+// fast without adding fake-clock plumbing.
+var sleepBusyBackoff = func(attempt int) {
+	backoff := time.Duration(5<<attempt) * time.Millisecond
+	jitter := time.Duration(rand.Intn(int(backoff / 2)))
+	time.Sleep(backoff + jitter)
+}
+
+// isSQLiteBusy reports whether err is a SQLITE_BUSY-class
+// error worth retrying. String-match because the modernc
+// driver wraps the underlying error and the typed sqlite.Error
+// surface isn't part of database/sql. The two patterns it
+// produces are "database is locked" (default text) and
+// "SQLITE_BUSY" (when the error code is rendered) — covering
+// both keeps us robust to driver-version wording shifts.
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY")
+}
+
+// applyPlanOnce is the body of ApplyPlan, extracted so the
+// retry wrapper can call it multiple times. Same single-
+// transaction semantics: any mutation failure rolls back the
+// whole plan.
+func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("begin tx: %w", err)

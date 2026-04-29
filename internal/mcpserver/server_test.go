@@ -1595,3 +1595,94 @@ func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
 		}
 	}
 }
+
+// TestClaimTransientRetryRecovers is the regression for the
+// claim-with-retry path added after the SQLITE_BUSY parallel-
+// claims bug. The store layer's _txlock=immediate normally
+// prevents this, but the claim-time retry is defense-in-depth
+// for any other transient HTTP/network blip the coordinator
+// might surface (5xx during restart, reconcile race, etc.).
+//
+// The stub coordinator returns a transient SQLITE_BUSY error
+// on the first claim attempt, then succeeds on the second.
+// claimWithTransientRetry must mask the first attempt and
+// surface only the success.
+func TestClaimTransientRetryRecovers(t *testing.T) {
+	var attempts int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/tasks/1:1:t/claim", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			// First call: transient SQLITE_BUSY-style error in
+			// the response body. Don't return non-200 — c.post
+			// returns the body either way; the retry path keys
+			// off the body's "error" field.
+			_, _ = w.Write([]byte(`{"error":"set_claim: database is locked (5) (SQLITE_BUSY)"}`))
+			return
+		}
+		// Second call: success.
+		_, _ = w.Write([]byte(`{"task":{"id":"1:1:t","action":"compute"},"deadline":"2026-04-30T00:00:00Z"}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	if err := c.claimWithTransientRetry(context.Background(), "1:1:t"); err != nil {
+		t.Fatalf("claimWithTransientRetry: %v (expected success after one transient retry)", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Errorf("expected 2 coordinator calls (1 transient + 1 success), got %d", got)
+	}
+}
+
+// TestClaimTransientRetrySkipsSubstantiveErrors verifies the
+// retry logic does NOT swallow real claim refusals. A "task
+// not in claimable state" or role-mismatch error is the
+// coordinator's deterministic verdict; retrying would just
+// burn time and produce the same refusal. The retry path must
+// surface immediately on substantive errors.
+func TestClaimTransientRetrySkipsSubstantiveErrors(t *testing.T) {
+	var attempts int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/tasks/1:1:t/claim", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error":"task is not in claimable state"}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	err := c.claimWithTransientRetry(context.Background(), "1:1:t")
+	if err == nil {
+		t.Fatalf("claimWithTransientRetry: expected error for non-claimable task, got nil")
+	}
+	if !strings.Contains(err.Error(), "not in claimable state") {
+		t.Errorf("expected substantive error to surface, got: %v", err)
+	}
+	// Substantive errors must NOT trigger retry.
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("expected 1 coordinator call (substantive error, no retry), got %d", got)
+	}
+}

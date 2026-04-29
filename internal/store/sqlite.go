@@ -71,17 +71,35 @@ type Store struct {
 
 // New creates a new Store and initializes the schema.
 func New(dbPath string) (*Store, error) {
-	// busy_timeout has to ride on the DSN, not a one-shot
-	// PRAGMA: SQLite scopes busy_timeout per-connection, and
-	// database/sql opens new pool connections lazily under
-	// load. A startup PRAGMA only applies to whichever
-	// connection happened to run it; the next pool-grow under
-	// parallel execute_run would create a connection with the
-	// default 0 timeout and surface SQLITE_BUSY again. The
-	// modernc.org/sqlite driver applies _pragma=name(value)
-	// DSN params on every new connection it opens, so the
-	// timeout is effectively pool-wide.
-	dsn := dbPath + "?_pragma=busy_timeout(5000)"
+	// Two DSN parameters carry the concurrent-write story:
+	//
+	//   _pragma=busy_timeout(5000)
+	//     Per-connection wait-for-lock budget. Pool-wide
+	//     because modernc applies _pragma DSN params on every
+	//     new connection it opens. Without this, a writer
+	//     contending with another writer fails fast with
+	//     SQLITE_BUSY instead of waiting.
+	//
+	//   _txlock=immediate
+	//     Makes db.Begin() issue `BEGIN IMMEDIATE` instead of
+	//     the default `BEGIN DEFERRED`. This is the LOAD-
+	//     BEARING bit for parallel execute_run.
+	//
+	//     Why: ApplyPlan runs mutations like applySetClaim
+	//     that SELECT then INSERT in the same transaction.
+	//     Under DEFERRED, the SELECT acquires a read snapshot
+	//     and the INSERT later upgrades to a write — but if
+	//     another transaction committed between the SELECT
+	//     and the INSERT, SQLite returns SQLITE_BUSY_SNAPSHOT
+	//     and busy_timeout does NOT retry it. Application
+	//     would have to roll back and retry the whole
+	//     transaction. IMMEDIATE acquires the writer lock
+	//     upfront, before any reads, so snapshot drift can't
+	//     happen — busy_timeout fully covers the remaining
+	//     writer-vs-writer contention. See
+	//     TestReadThenWriteInDeferredTxHitsSnapshotBusy for
+	//     the failing repro that motivated this.
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/engine"
@@ -91,17 +92,16 @@ func (c *apiClient) executeComputeTask(ctx context.Context, taskID string) (*exe
 
 	switch meta.State {
 	case "ready", "collecting":
-		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
-			"username": c.username,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("claim %s: %w", taskID, err)
-		}
-		var claimResp map[string]interface{}
-		if json.Unmarshal(claimData, &claimResp) == nil {
-			if errMsg, _ := claimResp["error"].(string); errMsg != "" {
-				return nil, fmt.Errorf("claim %s: %s", taskID, errMsg)
-			}
+		// Claim with transient-error retry. Parallel cascades can
+		// stack short-lived BUSY / 5xx / network blips on the
+		// coordinator side; without a retry, the cascade aborts
+		// with stop_reason=compute_errored on what should be a
+		// recoverable hiccup. The store layer's _txlock=immediate
+		// + ApplyPlan retry already cover SQLITE_BUSY end-to-end,
+		// so this loop's main job is mopping up coordinator-side
+		// transient HTTP/network errors.
+		if err := c.claimWithTransientRetry(ctx, taskID); err != nil {
+			return nil, err
 		}
 	case "claimed", "running":
 		// Already ours (e.g. retry after transient wrapper
@@ -327,4 +327,111 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir string, meta *taskM
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+// claimWithTransientRetry posts the claim with a small retry
+// loop on transient errors only. Substantive errors (state
+// reasons, role mismatch, validation) bypass the retry and
+// return immediately so the caller doesn't waste attempts on
+// genuinely-failed claims.
+//
+// Transient classes covered:
+//
+//   - Coordinator unreachable / network blip (transport-level
+//     error from c.post).
+//   - SQLITE_BUSY / "database is locked" surfacing in the
+//     response body's error field. The store-layer retry in
+//     ApplyPlan should normally catch this before it reaches
+//     here, but a particularly nasty contention pile-up could
+//     exhaust those 5 attempts; this is the second tier.
+//
+// 3 attempts with 50/100/200ms backoff. Total max wait ~350ms,
+// short enough that callers don't notice the retries unless
+// the network is really down.
+func (c *apiClient) claimWithTransientRetry(ctx context.Context, taskID string) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
+			"username": c.username,
+		})
+		if err != nil {
+			// Transport-level error. Check if it's transient
+			// — connection refused, EOF, timeout, etc. — and
+			// retry; otherwise give up.
+			if !isTransientTransportError(err) {
+				return fmt.Errorf("claim %s: %w", taskID, err)
+			}
+			lastErr = fmt.Errorf("claim %s: %w", taskID, err)
+			sleepBackoff(attempt)
+			continue
+		}
+		// HTTP-level success — but the coordinator may still
+		// have surfaced an error in the body.
+		var claimResp map[string]interface{}
+		if json.Unmarshal(claimData, &claimResp) == nil {
+			if errMsg, _ := claimResp["error"].(string); errMsg != "" {
+				if !isTransientCoordinatorError(errMsg) {
+					return fmt.Errorf("claim %s: %s", taskID, errMsg)
+				}
+				lastErr = fmt.Errorf("claim %s: %s", taskID, errMsg)
+				sleepBackoff(attempt)
+				continue
+			}
+		}
+		// Success.
+		return nil
+	}
+	return fmt.Errorf("after %d retries: %w", maxAttempts, lastErr)
+}
+
+// isTransientTransportError reports whether a transport-level
+// error from c.post is the sort that's worth retrying.
+// Pattern-matches against the friendly wrappers c.post emits
+// ("coordinator unreachable: ...") plus net-package error text
+// for connection refused / EOF / timeout.
+func isTransientTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, pat := range []string{
+		"coordinator unreachable",
+		"connection refused",
+		"connection reset",
+		"EOF",
+		"i/o timeout",
+		"broken pipe",
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransientCoordinatorError reports whether a coordinator-
+// returned error string (from response body's `error` field)
+// indicates a transient condition worth retrying. The current
+// patterns are SQLITE_BUSY-family — the store layer retries
+// these first, so seeing one here means contention exhausted
+// those retries too. One more shot with backoff.
+func isTransientCoordinatorError(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY")
+}
+
+// sleepBackoff is the exponential backoff between retry
+// attempts. Caps at 200ms so the worst case is ~350ms total
+// across 3 attempts — invisible to humans, generous to the
+// coordinator.
+func sleepBackoff(attempt int) {
+	d := time.Duration(50<<attempt) * time.Millisecond
+	if d > 200*time.Millisecond {
+		d = 200 * time.Millisecond
+	}
+	time.Sleep(d)
 }
