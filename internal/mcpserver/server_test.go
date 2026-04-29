@@ -751,12 +751,20 @@ func TestAutoLocalSurfacesCoordinatorPUTFailure(t *testing.T) {
 // folder (no .git) initializes git, writes the scaffold, and
 // registers the external dir so ForProject opens it directly.
 func TestInitFolderWithoutGit(t *testing.T) {
+	// Isolate $HOME — handleInit's auto-bare path writes under
+	// ~/.enju/repos/, which would collide with the developer's
+	// real project state if we let tests share $HOME.
+	t.Setenv("HOME", t.TempDir())
 	// Fake coordinator.
 	var createdProjectID int64 = 1
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":1,"name":"test-init"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/1/remote", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -825,10 +833,15 @@ func TestInitFolderWithoutGit(t *testing.T) {
 // folder that already has git preserves existing history and
 // adds the scaffold on top.
 func TestInitFolderWithExistingGit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":2,"name":"existing-git"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/2/remote", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -893,12 +906,26 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 // TestInitIdempotent verifies that running enju_init twice on the
 // same folder doesn't clobber anything or fail.
 func TestInitIdempotent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	mux := http.NewServeMux()
 	callCount := 0
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":%d,"name":"idempotent"}`, callCount)))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Catch-all for PUT /projects/{id}/remote — both calls
+		// (first and second init) hit a different ID so we
+		// can't pre-register handlers per ID without growing
+		// the test scaffolding. The second init is a no-op
+		// idempotency check; replying 200 is fine.
+		if strings.HasPrefix(r.URL.Path, "/api/v1/projects/") && strings.HasSuffix(r.URL.Path, "/remote") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	})
 	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -944,6 +971,216 @@ func TestInitIdempotent(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(dir, "data.csv"))
 	if string(data) != "a,b,c" {
 		t.Errorf("data.csv clobbered: %s", data)
+	}
+}
+
+// TestInitAutoCreatesBareForOriginlessFolder is the regression
+// for TP53 Bug 1: enju_init on a folder with no `origin` must
+// create ~/.enju/repos/{id}.git, configure it as origin in the
+// working tree, and push initial state. Without this, async
+// wrappers commit to local refs/heads/<branch> with nowhere to
+// push and ScanBranchSince's walk of refs/remotes/origin/<branch>
+// finds nothing — the pipeline silently stalls.
+//
+// We verify all four post-conditions:
+//
+//  1. The bare exists at ~/.enju/repos/{id}.git.
+//  2. The working tree has origin pointing at the bare.
+//  3. The bare has the working tree's HEAD commit (push happened).
+//  4. The coordinator's stored remote_url is the bare path.
+func TestInitAutoCreatesBareForOriginlessFolder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	var capturedRemoteURL string
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":42,"name":"tp53"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/42/remote", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]string
+		_ = json.Unmarshal(body, &parsed)
+		capturedRemoteURL = parsed["remote_url"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Folder with `git init` + one commit, no origin — exact
+	// reproduction of the user's TP53 setup.
+	dir := t.TempDir()
+	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	_ = os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# tp53\n"), 0644)
+	wt, _ := repo.Worktree()
+	_, _ = wt.Add("paper.md")
+	_, _ = wt.Commit("seed", &gogit.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
+	})
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "enju_init",
+			Arguments: map[string]interface{}{"name": "tp53", "path": dir},
+		},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+	}
+
+	// 1. Bare exists at ~/.enju/repos/42.git.
+	expectedBare := filepath.Join(os.Getenv("HOME"), ".enju", "repos", "42.git")
+	if _, err := os.Stat(expectedBare); err != nil {
+		t.Fatalf("expected managed bare at %s: %v", expectedBare, err)
+	}
+
+	// 2. Working tree's origin points at the bare.
+	rem, err := repo.Remote("origin")
+	if err != nil {
+		t.Fatalf("origin not configured on adopted folder: %v", err)
+	}
+	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != expectedBare {
+		t.Errorf("origin URL: got %v, want %s", cfg.URLs, expectedBare)
+	}
+
+	// 3. The bare contains the working tree's post-init HEAD on
+	//    refs/heads/main — proves the push landed. This is the
+	//    exact precondition ScanBranchSince needs to walk
+	//    refs/remotes/origin/main and find result trailers later.
+	//    handleInit may have added a scaffold commit on top of
+	//    our seed, so we re-read working-tree HEAD after the call.
+	headAfter, err := repo.Head()
+	if err != nil {
+		t.Fatalf("reading working-tree HEAD post-init: %v", err)
+	}
+	expectedHEAD := headAfter.Hash().String()
+	bareRepo, err := gogit.PlainOpen(expectedBare)
+	if err != nil {
+		t.Fatalf("opening bare: %v", err)
+	}
+	bareMain, err := bareRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
+	if err != nil {
+		t.Fatalf("bare missing refs/heads/main: %v", err)
+	}
+	if got := bareMain.Hash().String(); got != expectedHEAD {
+		t.Errorf("bare main: got %s, want %s (working tree HEAD post-init)", got, expectedHEAD)
+	}
+
+	// 4. Coordinator stored the bare path as remote_url.
+	if capturedRemoteURL != expectedBare {
+		t.Errorf("PUT /remote captured: got %q, want %q", capturedRemoteURL, expectedBare)
+	}
+
+	// Response text should mention the managed bare so the
+	// user knows where their state landed.
+	if got := toolResultText(result); !strings.Contains(got, expectedBare) {
+		t.Errorf("response should cite managed bare path; got:\n%s", got)
+	}
+}
+
+// TestInitPreservesExistingOrigin verifies the github-clone
+// case: when the adopted folder already has an origin (e.g.
+// from a prior `git clone`), enju_init must NOT overwrite it
+// with a managed bare. The user's existing push target stays
+// intact.
+func TestInitPreservesExistingOrigin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	var setRemoteCalled bool
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":7,"name":"with-origin"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/7/remote", func(w http.ResponseWriter, r *http.Request) {
+		setRemoteCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Pre-existing origin URL (a fake github-style remote).
+	const preExistingOrigin = "git@github.com:org/repo.git"
+
+	// Folder with git init + commit + a pre-configured origin.
+	dir := t.TempDir()
+	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	_ = os.WriteFile(filepath.Join(dir, "x.md"), []byte("hi"), 0644)
+	wt, _ := repo.Worktree()
+	_, _ = wt.Add("x.md")
+	_, _ = wt.Commit("seed", &gogit.CommitOptions{
+		Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()},
+	})
+	_, _ = repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{preExistingOrigin},
+	})
+
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "enju_init",
+			Arguments: map[string]interface{}{"name": "with-origin", "path": dir},
+		},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+	}
+
+	// Origin must be untouched.
+	rem, err := repo.Remote("origin")
+	if err != nil {
+		t.Fatalf("origin removed by init: %v", err)
+	}
+	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != preExistingOrigin {
+		t.Errorf("origin URL changed: got %v, want %s", cfg.URLs, preExistingOrigin)
+	}
+
+	// No managed bare should have been created.
+	managedBare := filepath.Join(os.Getenv("HOME"), ".enju", "repos", "7.git")
+	if _, err := os.Stat(managedBare); err == nil {
+		t.Errorf("unexpectedly created managed bare at %s — github-clone case should be untouched", managedBare)
+	}
+
+	// PUT /remote must NOT have been called — coordinator's
+	// remote_url stays at whatever was set during POST
+	// (the working-tree path, per the with-existing-origin path).
+	if setRemoteCalled {
+		t.Error("PUT /projects/7/remote should not be called when origin already exists")
 	}
 }
 
@@ -1268,5 +1505,137 @@ func TestRenderYourQueueNoClipBelowThreshold(t *testing.T) {
 	}
 	if strings.Count(out, "🟡") != 2 {
 		t.Errorf("expected 2 🟡 rows; got:\n%s", out)
+	}
+}
+
+// TestSetProjectRemoteResetsCursorsForRescan is the regression
+// for TP53 Bug 2: when a remote is configured (or changed) on
+// a project that already has commits on local refs/heads/*,
+// enju_set_project_remote must (a) push existing local
+// branches into the new bare so refs/remotes/origin/* gets
+// populated, and (b) reset every local branch's cursor to the
+// rescan sentinel so the next reconcile walks the full history
+// and re-emits historical trailers.
+//
+// Without this, a project that ran async compute pre-remote
+// has commits stranded on local refs/heads/* with no way for
+// the scanner to find them: ScanBranchSince would either return
+// nothing (no remote ref) or baseline-tip on first scan after
+// the push (cursor empty) and skip the historical trailers.
+func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// Coordinator stub: PUT /projects/2/remote returns OK.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/2/remote", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Build the buggy state: a working tree with commits on
+	// main + a run branch, NO origin configured. This is what
+	// a pre-Bug-1-fix init'd project looks like in practice.
+	workDir := t.TempDir()
+	repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+	wt, _ := repo.Worktree()
+	_ = os.WriteFile(filepath.Join(workDir, "seed.md"), []byte("seed"), 0644)
+	_, _ = wt.Add("seed.md")
+	_, _ = wt.Commit("seed", &gogit.CommitOptions{
+		Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()},
+	})
+	// Branch off and add a "trailer-bearing" run-branch commit
+	// so we can verify the bare receives it after set_remote.
+	branchName := "run-1"
+	if err := wt.Checkout(&gogit.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+		Create: true,
+	}); err != nil {
+		t.Fatalf("checkout run-1: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(workDir, "result.md"), []byte("ran"), 0644)
+	_, _ = wt.Add("result.md")
+	runCommitHash, _ := wt.Commit("Task 2:1:work by @t: result\n\nEnju-Task-Complete: 2:1:work\n",
+		&gogit.CommitOptions{Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()}})
+
+	// Wire the workspace + project.
+	wsRoot := t.TempDir()
+	ws, _ := mcpgit.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws.RegisterExternalDir(2, workDir)
+	if _, err := ws.ForProject(2, ""); err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+
+	// Fresh empty bare for the new remote.
+	bareDir := filepath.Join(t.TempDir(), "bare.git")
+	if err := mcpgit.InitBareEmpty(bareDir); err != nil {
+		t.Fatalf("init bare: %v", err)
+	}
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_set_project_remote",
+			Arguments: map[string]interface{}{
+				"project_id": float64(2),
+				"remote_url": bareDir,
+			},
+		},
+	})
+	if err != nil || (result != nil && result.IsError) {
+		t.Fatalf("handleSetProjectRemote: err=%v result=%+v", err, result)
+	}
+
+	// Bare must contain run-1's commit on refs/heads/run-1 —
+	// proves the all-branches push happened. Without this,
+	// the scanner would have nothing to walk even after the
+	// cursor reset.
+	bareRepo, err := gogit.PlainOpen(bareDir)
+	if err != nil {
+		t.Fatalf("opening bare: %v", err)
+	}
+	bareRun, err := bareRepo.Reference(plumbing.NewBranchReferenceName("run-1"), true)
+	if err != nil {
+		t.Fatalf("bare missing refs/heads/run-1 — push did not seed the new remote: %v", err)
+	}
+	if got := bareRun.Hash().String(); got != runCommitHash.String() {
+		t.Errorf("bare run-1 head: got %s, want %s", got, runCommitHash.String())
+	}
+
+	// Cursors must be set to the rescan sentinel for every
+	// local branch — main and run-1. Without this, the next
+	// scan would baseline tip and miss the historical trailer
+	// commit on run-1.
+	cursors, err := mcpgit.LoadCursors(c.stateDir(), 2)
+	if err != nil {
+		t.Fatalf("loading cursors: %v", err)
+	}
+	for _, b := range []string{"main", "run-1"} {
+		if got := cursors.Get(b); got != mcpgit.RescanSentinelSHA {
+			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, mcpgit.RescanSentinelSHA)
+		}
 	}
 }

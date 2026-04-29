@@ -1802,6 +1802,55 @@ func (p *Project) push() error {
 	return p.pushInternal(false)
 }
 
+// LocalBranches returns the short names of every refs/heads/*
+// in the local repository. Used when we need to enumerate
+// branches without a coordinator round-trip — e.g. resetting
+// scan cursors after a project's remote URL changes.
+func (p *Project) LocalBranches() ([]string, error) {
+	iter, err := p.repo.Branches()
+	if err != nil {
+		return nil, fmt.Errorf("listing branches: %w", err)
+	}
+	defer iter.Close()
+	var names []string
+	err = iter.ForEach(func(ref *plumbing.Reference) error {
+		names = append(names, ref.Name().Short())
+		return nil
+	})
+	if err != nil {
+		return names, fmt.Errorf("iterating branches: %w", err)
+	}
+	return names, nil
+}
+
+// PushAllLocalBranches pushes every refs/heads/* to origin in a
+// single push, with explicit refspec so it doesn't depend on
+// per-branch upstream tracking config. Used when a freshly
+// configured (or freshly changed) origin needs to be seeded
+// with the workspace's existing branch state — e.g. a late-add
+// of an origin to a project that already has run-branch
+// commits, where the regular Push() default refspec might miss
+// branches without configured upstream.
+//
+// Caller MUST hold the project lock.
+func (p *Project) PushAllLocalBranches() error {
+	if p.remoteURL == "" {
+		return fmt.Errorf("no remote configured")
+	}
+	err := p.repo.Push(&gogit.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{"refs/heads/*:refs/heads/*"},
+		Auth:       sshAuthMethod(p.remoteURL),
+	})
+	p.lastPushAt = time.Now()
+	if err != nil && err != gogit.NoErrAlreadyUpToDate {
+		p.lastPushError = err.Error()
+		return friendlyGitError("push", p.remoteURL, err)
+	}
+	p.lastPushError = ""
+	return nil
+}
+
 // Push is the public safe-push entry point for the MCP tool handler
 // that performs on-demand sync (enju_project_sync). It pushes the
 // local HEAD to origin with go-git's default (non-force) semantics,

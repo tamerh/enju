@@ -13,6 +13,32 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+// InitBareEmpty creates an empty bare git repo at the given
+// path with no refs and no commits. Useful when you have an
+// existing working tree whose commits will be pushed in as
+// the initial state — a separate seed would just create a
+// divergent root that can't merge with what's already there.
+//
+// Used by enju_init's auto-local-remote feature: an adopted
+// folder typically already has its own initial commit (and
+// possibly a full history); we want a bare to push to without
+// fighting an artificial seed commit.
+func InitBareEmpty(bareDir string) error {
+	if err := os.MkdirAll(bareDir, 0755); err != nil {
+		return fmt.Errorf("creating bare dir: %w", err)
+	}
+	_, err := gogit.PlainInitWithOptions(bareDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+		Bare: true,
+	})
+	if err != nil {
+		return fmt.Errorf("init bare: %w", err)
+	}
+	return nil
+}
+
 // InitBareWithSeed creates a bare git repo at the given path
 // with one initial commit (a README.md). This is needed so
 // PlainClone can clone from it — an empty bare repo with no
