@@ -14,7 +14,7 @@ func TestComputeClaimSingleCitizen(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	plan, err := e.ComputeClaim("t1", 1, time.Now().Add(30*time.Minute))
+	plan, err := e.ComputeClaim("t1", 1, time.Now().Add(30*time.Minute), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestComputeClaimRejectsNonReady(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeClaim("t1", 1, time.Now())
+	_, err := e.ComputeClaim("t1", 1, time.Now(), nil)
 	if err == nil {
 		t.Fatal("expected error for non-ready task")
 	}
@@ -47,7 +47,7 @@ func TestComputeClaimMultiCitizenAcceptsReady(t *testing.T) {
 		claimCounts: map[string]int{"t1": 1},
 	}
 	e := New(ms, nil)
-	plan, err := e.ComputeClaim("t1", 2, time.Now())
+	plan, err := e.ComputeClaim("t1", 2, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestComputeClaimMultiCitizenAcceptsCollecting(t *testing.T) {
 		claimCounts: map[string]int{"t1": 1},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeClaim("t1", 2, time.Now())
+	_, err := e.ComputeClaim("t1", 2, time.Now(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestComputeClaimRejectsDuplicateSlot(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeClaim("t1", 1, time.Now())
+	_, err := e.ComputeClaim("t1", 1, time.Now(), nil)
 	if err == nil {
 		t.Fatal("expected duplicate-slot error")
 	}
@@ -97,7 +97,7 @@ func TestComputeClaimRejectsCapReached(t *testing.T) {
 		claimCounts: map[string]int{"t1": 2},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeClaim("t1", 3, time.Now())
+	_, err := e.ComputeClaim("t1", 3, time.Now(), nil)
 	if err == nil {
 		t.Fatal("expected cap-reached error")
 	}

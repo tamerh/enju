@@ -191,6 +191,7 @@ func (c *apiClient) handleClaimReadyMatching(ctx context.Context, req mcp.CallTo
 func (c *apiClient) claimOneForSelector(ctx context.Context, taskID string, includeContext bool) batchClaimEntry {
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 		"username": c.username,
+		"model":    c.modelName, // operator/model design — empty for unaided humans
 	})
 	if err != nil {
 		return batchClaimEntry{TaskID: taskID, Status: "error", Reason: err.Error()}

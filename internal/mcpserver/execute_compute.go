@@ -354,6 +354,7 @@ func (c *apiClient) claimWithTransientRetry(ctx context.Context, taskID string) 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		claimData, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 			"username": c.username,
+			"model":    c.modelName, // operator/model design — empty for unaided humans
 		})
 		if err != nil {
 			// Transport-level error. Check if it's transient

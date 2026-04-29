@@ -350,6 +350,18 @@ func (s *Server) Router() http.Handler {
 		r.Get("/citizens/by-username/{username}/contributions", s.handleCitizenContributions)
 		r.Put("/citizens/by-username/{username}/profile", s.handleUpdateProfile)
 		r.Get("/citizens/by-username/{username}", s.handleGetCitizenByUsername)
+
+		// operator/model design — bot + model
+		// registration tools. Bots are kind='bot' citizens
+		// owned by a parent (the registering human). Models
+		// are kind='model' catalog entries with no token,
+		// referenced for per-submit attribution. See
+		// docs/operator-model-design.md.
+		r.Post("/citizens/me/bots", s.handleRegisterBot)
+		r.Get("/citizens/me/bots", s.handleListMyBots)
+		r.Post("/tokens/revoke", s.handleRevokeToken)
+		r.Get("/models", s.handleListModels)
+		r.Post("/models", s.handleRegisterModel)
 	})
 
 	return r
@@ -1953,6 +1965,63 @@ func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
 // server resolves it to an int64 citizen ID.
 type claimRequest struct {
 	Username string `json:"username"`
+	// Model is the LLM citizen username producing the
+	// words for this claim (operator/model design, layer B). Empty
+	// when the operator is a human submitting unaided. Bots MUST
+	// supply a non-empty value or the apply path rejects the claim.
+	// Server resolves the username to a model citizen ID via
+	// resolveModelByUsername.
+	Model string `json:"model,omitempty"`
+}
+
+// resolveModelByUsername looks up a model citizen by username and
+// returns its ID. Empty input → (nil, nil), the unaided-human case
+// (apply-layer enforces "bots must have model" so empty for a bot
+// fails downstream with a clear message).
+//
+// Per the operator/model design doc's "free-form + soft validation"
+// stance, unknown-but-valid model names are AUTO-REGISTERED as new
+// kind='model' catalog entries on first use. This matches local-mode
+// philosophy: someone running Ollama with a custom finetune
+// shouldn't have to ceremonially pre-register before they can submit.
+// Hosted-mode policy gating (require pre-registration / admin
+// approval) is deferred — see the design doc.
+//
+// The one defense kept: reject if the username resolves to a
+// non-model citizen (kind ∈ {human, bot}). Without this, a caller
+// could attribute their submit to a teammate's account, blurring
+// who-did-what.
+func (s *Server) resolveModelByUsername(modelName string) (*int64, error) {
+	if modelName == "" {
+		return nil, nil
+	}
+	c, err := s.store.GetCitizenByUsername(modelName)
+	if err != nil {
+		return nil, fmt.Errorf("look up model %q: %w", modelName, err)
+	}
+	if c != nil {
+		if c.Kind != "model" {
+			return nil, fmt.Errorf("citizen %q has kind %q, not %q — operators cannot be self-attributed as their own model", modelName, c.Kind, "model")
+		}
+		return &c.ID, nil
+	}
+	// Unknown model — auto-register. Display name defaults to the
+	// username; explicit registration via enju_register_model gives
+	// callers a chance to set a prettier display name.
+	//
+	// Known limitation: typos pollute the catalog. A submit with
+	// model=clude-opus-4-7 (typo) creates a permanent ghost entry.
+	// No cleanup tool ships today. Acceptable for now since
+	// (a) the catalog is small, (b) typos surface in
+	// enju_list_models so the user can spot them, (c) ghost models
+	// don't authenticate or grant access. A "delete unused model"
+	// admin tool can land later if catalog hygiene becomes a real
+	// problem in hosted mode.
+	id, err := s.store.CreateModelCitizen(modelName, modelName)
+	if err != nil {
+		return nil, fmt.Errorf("auto-register model %q: %w", modelName, err)
+	}
+	return &id, nil
 }
 
 // resolveCitizen looks up a caller by username and returns the
@@ -2009,8 +2078,17 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 	deadline := time.Now().Add(timeout)
 
+	// Resolve optional model attribution. Empty model
+	// is fine for human operators (unaided submit); bots that
+	// arrive here without a model are rejected by the apply layer.
+	modelID, err := s.resolveModelByUsername(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Engine validates (state, slots, cap) → returns Plan.
-	plan, err := s.engine().ComputeClaim(taskID, caller.ID, deadline)
+	plan, err := s.engine().ComputeClaim(taskID, caller.ID, deadline, modelID)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -2659,9 +2737,19 @@ func (s *Server) acceptComputeTaskCore(
 	if err != nil {
 		return nil, err
 	}
+	// Resolve optional model attribution. The model
+	// string already arrives via SubmitRequest.Model from the
+	// fat-client submit path; here we resolve it to a model
+	// citizen ID so it can ride the RecordSubmission mutation.
+	// Empty model is fine for human operators (unaided); bots
+	// without a model are rejected at apply time.
+	modelID, err := s.resolveModelByUsername(model)
+	if err != nil {
+		return nil, err
+	}
 	submitOutcome, err := eng.ComputeSubmission(
 		task.ID, submitterID, resultPath, req.CommitSHA,
-		decision, voteChoice, req.Content, req.TokensUsed,
+		decision, voteChoice, req.Content, req.TokensUsed, modelID,
 	)
 	if err != nil {
 		return nil, err
@@ -3921,6 +4009,265 @@ func (s *Server) handleGetCitizenByUsername(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, citizenToMap(citizen))
+}
+
+// --- operator/model design: bot + model registration ---
+//
+// Five handlers covering bot lifecycle (register, list, revoke
+// token) and model catalog (list, register). All require Bearer
+// auth — bots inherit the same auth surface as humans, models
+// require an authenticated caller in local mode (hosted-mode
+// gating deferred per the design doc).
+
+type registerBotRequest struct {
+	Name     string `json:"name"`               // display name, required
+	Username string `json:"username,omitempty"` // optional — auto-slugified
+	Role     string `json:"role,omitempty"`     // optional — defaults to 'citizen'
+	Label    string `json:"label,omitempty"`    // optional initial-token label
+}
+
+// handleRegisterBot creates a new kind='bot' citizen owned by the
+// authenticated caller, plus an initial token returned ONCE in the
+// response. The caller is responsible for stashing the token where
+// the bot will run from (CI env var, daemon config, etc.) — there
+// is no recovery path. To rotate, issue a new token via
+// (future) tools and revoke the old one.
+func (s *Server) handleRegisterBot(w http.ResponseWriter, r *http.Request) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req registerBotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	username := req.Username
+	if username != "" {
+		if err := store.ValidateUsername(username); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		username = s.generateUniqueUsername(req.Name)
+	}
+	role := req.Role
+	if role == "" {
+		role = "citizen"
+	}
+	token := uuid.New().String()
+	now := time.Now()
+
+	id, err := s.store.CreateCitizen(&store.CitizenRecord{
+		Username:     username,
+		Name:         req.Name,
+		Role:         role,
+		Token:        token,
+		RegisteredAt: now,
+		LastSeen:     now,
+		Kind:         "bot",
+		ParentID:     &caller.ID,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "already taken") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "register bot: "+err.Error())
+		return
+	}
+	// CreateCitizen already inserted the initial token under
+	// label=''. If the caller named a label, retag it via a
+	// fresh issue + revoke of the auto-issued one. Cheaper than
+	// adding a label parameter to CreateCitizen for the one
+	// caller that needs it.
+	if req.Label != "" {
+		// Look up the auto-issued token and update its label
+		// in place — no re-issue, just metadata.
+		_, _ = s.store.DB().Exec(`UPDATE tokens SET label = ? WHERE citizen_id = ? AND token = ?`, req.Label, id, token)
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":          id,
+		"username":    username,
+		"name":        req.Name,
+		"kind":        "bot",
+		"parent_id":   caller.ID,
+		"parent_name": caller.Username,
+		"token":       token,
+		"label":       req.Label,
+		"warning":     "Stash this token now — it cannot be retrieved later. Revoke + re-issue if lost.",
+	})
+}
+
+// handleListMyBots returns every bot the authenticated caller owns
+// (parent_id = caller.id), with each bot's active token labels but
+// NOT the token values (those were shown once at registration).
+func (s *Server) handleListMyBots(w http.ResponseWriter, r *http.Request) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	bots, err := s.store.ListBotsByParent(caller.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list bots: "+err.Error())
+		return
+	}
+	out := make([]map[string]interface{}, 0, len(bots))
+	for _, b := range bots {
+		tokens, _ := s.store.ListTokensByCitizen(b.ID)
+		tokenInfo := make([]map[string]interface{}, 0, len(tokens))
+		for _, t := range tokens {
+			info := map[string]interface{}{
+				"id":        t.ID,
+				"label":     t.Label,
+				"issued_at": t.IssuedAt.Format(time.RFC3339),
+			}
+			if t.RevokedAt != nil {
+				info["revoked_at"] = t.RevokedAt.Format(time.RFC3339)
+			}
+			tokenInfo = append(tokenInfo, info)
+		}
+		out = append(out, map[string]interface{}{
+			"id":         b.ID,
+			"username":   b.Username,
+			"name":       b.Name,
+			"role":       b.Role,
+			"registered": b.RegisteredAt.Format(time.RFC3339),
+			"tokens":     tokenInfo,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"bots": out})
+}
+
+type revokeTokenRequest struct {
+	Token   string `json:"token,omitempty"`    // revoke by value (caller already holds it)
+	TokenID int64  `json:"token_id,omitempty"` // revoke by row id (from list endpoint)
+}
+
+// handleRevokeToken marks a token as revoked. The caller must own
+// the token: either it's their own (humans rotating their session
+// token) or it belongs to a bot they parent. Without that check, a
+// member could revoke another member's session — auth bypass via
+// denial.
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req revokeTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Token == "" && req.TokenID == 0 {
+		writeError(w, http.StatusBadRequest, "either token or token_id is required")
+		return
+	}
+	// Resolve the citizen this token belongs to so we can verify
+	// ownership before revoking.
+	ownerID, err := s.store.LookupTokenOwner(req.Token, req.TokenID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ownerID == 0 {
+		writeError(w, http.StatusNotFound, "token not found")
+		return
+	}
+	// Ownership check: caller must own the token directly OR
+	// parent the bot that owns it.
+	if ownerID != caller.ID {
+		owner, _ := s.store.GetCitizen(ownerID)
+		if owner == nil || owner.Kind != "bot" || owner.ParentID == nil || *owner.ParentID != caller.ID {
+			writeError(w, http.StatusForbidden, "you don't own this token")
+			return
+		}
+	}
+	if req.TokenID != 0 {
+		err = s.store.RevokeToken(req.TokenID)
+	} else {
+		err = s.store.RevokeTokenByValue(req.Token)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "revoke: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"revoked": true})
+}
+
+// handleListModels returns the model catalog. Open to any
+// authenticated citizen — the catalog is public information; you
+// need to know which models exist before you can attribute work to
+// them.
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	models, err := s.store.ListModelCitizens()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list models: "+err.Error())
+		return
+	}
+	out := make([]map[string]interface{}, 0, len(models))
+	for _, m := range models {
+		out = append(out, map[string]interface{}{
+			"id":       m.ID,
+			"username": m.Username,
+			"name":     m.Name,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"models": out})
+}
+
+type registerModelRequest struct {
+	Username    string `json:"username"`               // required, slug-form
+	DisplayName string `json:"display_name,omitempty"` // optional, defaults to username
+}
+
+// handleRegisterModel creates a new kind='model' citizen in the
+// catalog. Per the design doc's "free-form + soft validation"
+// stance, any authenticated citizen can register in local mode;
+// hosted-mode policy gating is deferred. Idempotent on duplicate
+// (returns 409 with a helpful error).
+func (s *Server) handleRegisterModel(w http.ResponseWriter, r *http.Request) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req registerModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Username == "" {
+		writeError(w, http.StatusBadRequest, "username is required (e.g. 'ollama-llama-3-1-70b')")
+		return
+	}
+	displayName := req.DisplayName
+	if displayName == "" {
+		displayName = req.Username
+	}
+	id, err := s.store.CreateModelCitizen(req.Username, displayName)
+	if err != nil {
+		if strings.Contains(err.Error(), "already taken") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":           id,
+		"username":     req.Username,
+		"display_name": displayName,
+		"kind":         "model",
+	})
 }
 
 func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {

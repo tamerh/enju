@@ -727,3 +727,66 @@ The tally response includes the current counts, whether the task resolved, and i
 		),
 	)
 }
+
+
+// --- operator/model design: bot + model registration ---
+
+func toolRegisterBot() mcp.Tool {
+	return mcp.NewTool("enju_register_bot",
+		mcp.WithDescription(`Register a bot citizen owned by you. Returns the bot's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the bot's launcher (CI env var, daemon config, ~/.enju/bot-credentials.json) so the bot can authenticate as itself.
+
+Use cases: autonomous overnight agents, CI runners, role-bots (developer-bot / reviewer-bot / tester-bot for the living-workflow pattern). The bot acts under its own identity in audit logs but ownership chains back to you for accountability. Multiple bots per parent are allowed — clone freely for parallel workloads or A/B testing. See docs/operator-model-design.md.`),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Display name (e.g. \"Tamer's Reviewer Bot\")"),
+		),
+		mcp.WithString("username",
+			mcp.Description("Optional explicit username (slug-form, GitHub-username regex). Auto-slugified from name if omitted."),
+		),
+		mcp.WithString("role",
+			mcp.Description("Optional role tag (defaults to 'citizen'). Future work may surface role-based routing."),
+		),
+		mcp.WithString("label",
+			mcp.Description("Optional label for the initial token (e.g. \"laptop\", \"ci-server\") — useful when you'll rotate tokens later and need to tell deployments apart."),
+		),
+	)
+}
+
+func toolListMyBots() mcp.Tool {
+	return mcp.NewTool("enju_list_my_bots",
+		mcp.WithDescription("List every bot you own, with each bot's active and revoked tokens (token VALUES are not returned — only labels and timestamps; token strings are shown once at registration). Paste the output verbatim in your reply — it's pre-formatted."),
+	)
+}
+
+func toolRevokeToken() mcp.Tool {
+	return mcp.NewTool("enju_revoke_token",
+		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of a bot whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_bots)."),
+		mcp.WithString("token",
+			mcp.Description("Raw token string. Use this when the token leaked into logs / a CI env / your shell history."),
+		),
+		mcp.WithNumber("token_id",
+			mcp.Description("Token row id from enju_list_my_bots. Use this when revoking a labeled deployment (e.g. \"the ci-server token\")."),
+		),
+	)
+}
+
+func toolListModels() mcp.Tool {
+	return mcp.NewTool("enju_list_models",
+		mcp.WithDescription("Browse the model catalog. Returns every kind='model' citizen — the seeded popular models (Claude Opus / Sonnet / Haiku, GPT-4o, Gemini, Llama, etc.) plus any custom models registered locally. Use before submitting if you're unsure what -model name to pass."),
+	)
+}
+
+func toolRegisterModel() mcp.Tool {
+	return mcp.NewTool("enju_register_model",
+		mcp.WithDescription(`Register a custom model in the catalog so submits can attribute work to it. Local-mode use case: you're running Ollama / llama.cpp / a lab-internal finetune that the seed catalog doesn't cover. Any authenticated citizen can register in local mode; hosted-mode policy gating is deferred.
+
+Note: unknown model names passed to -model auto-register on first use, so explicit registration is mostly for picking nice display names.`),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Slug-form identifier (e.g. \"ollama-llama-3-1-70b\"). Must match the GitHub-username regex (lowercase alphanumerics + hyphen)."),
+		),
+		mcp.WithString("display_name",
+			mcp.Description("Human-readable name (e.g. \"Llama 3.1 70B (local)\"). Defaults to the username."),
+		),
+	)
+}

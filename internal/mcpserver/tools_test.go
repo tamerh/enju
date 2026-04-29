@@ -58,6 +58,12 @@ var allToolFactories = []struct {
 	{"enju_my_profile", toolMyProfile},
 	{"enju_invalidate_task", toolInvalidateTask},
 	{"enju_tally_task", toolTallyTask},
+	// operator/model design — bot + model registration tools.
+	{"enju_register_bot", toolRegisterBot},
+	{"enju_list_my_bots", toolListMyBots},
+	{"enju_revoke_token", toolRevokeToken},
+	{"enju_list_models", toolListModels},
+	{"enju_register_model", toolRegisterModel},
 }
 
 // TestAllToolsValidShape invokes every tool-schema factory and

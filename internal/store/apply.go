@@ -400,11 +400,18 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 		citizens = 1
 	}
 
+	// operator/model design — enforce "bots must have a
+	// model" at apply time (SQLite CHECK can't cross-table-reference
+	// to look up citizens.kind). Human operators may submit unaided.
+	if err := requireModelForBot(tx, m.CitizenID, m.ModelID, "set_claim"); err != nil {
+		return err
+	}
+
 	now := time.Now()
 	// Insert the claim row.
 	_, err := tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline) VALUES (?, ?, ?, ?)`,
-		m.TaskID, m.CitizenID, now, m.Deadline,
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id) VALUES (?, ?, ?, ?, ?)`,
+		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID),
 	)
 	if err != nil {
 		return fmt.Errorf("set_claim: %w", err)
@@ -456,6 +463,13 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		citizens = 1
 	}
 
+	// operator/model design — same constraint as the
+	// claim path. Bots can't submit without naming a model; humans
+	// can.
+	if err := requireModelForBot(tx, m.CitizenID, m.ModelID, "submit"); err != nil {
+		return err
+	}
+
 	if citizens == 1 {
 		// Single-citizen: one submit → ACCEPTED.
 		_, err := tx.Exec(
@@ -466,8 +480,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 			return err
 		}
 		_, err = tx.Exec(
-			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ? WHERE task_id = ? AND outcome IS NULL`,
-			now, m.VoteChoice, m.TaskID,
+			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, model_id = COALESCE(?, model_id) WHERE task_id = ? AND outcome IS NULL`,
+			now, m.VoteChoice, nullableInt64(m.ModelID), m.TaskID,
 		)
 		if err != nil {
 			return err
@@ -501,8 +515,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		}
 		if claimRowID.Valid {
 			tx.Exec(
-				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ? WHERE id = ?`,
-				now, choice, m.Content, claimRowID.Int64,
+				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
+				now, choice, m.Content, nullableInt64(m.ModelID), claimRowID.Int64,
 			)
 		}
 		// Token contribution only (score waits for tally).
@@ -589,4 +603,41 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
 	}
 	_, err = tx.Exec(`UPDATE runs SET state = 'completed', updated_at = ? WHERE id = ? AND state = 'active'`, time.Now(), m.RunID)
 	return err == nil, err
+}
+
+// requireModelForBot enforces the operator/model rule from
+// docs/operator-model-design.md: a bot operator must always name
+// the model that produced the words for its action; a human
+// operator may submit unaided. Used by both applySetClaim and
+// applyRecordSubmission so the constraint kicks in whether the
+// bot lies about its model at claim time or at submit time.
+//
+// Implemented in Go (not SQL CHECK) because SQLite CHECK can't
+// reference another table, and we need to read citizens.kind to
+// decide. The query is small (one row by primary key) and runs
+// inside the apply transaction, so consistency is preserved.
+func requireModelForBot(tx *sql.Tx, operatorID int64, modelID *int64, op string) error {
+	if modelID != nil {
+		return nil // model named — fine for any operator kind
+	}
+	var kind string
+	if err := tx.QueryRow(`SELECT kind FROM citizens WHERE id = ?`, operatorID).Scan(&kind); err != nil {
+		return fmt.Errorf("%s: read operator kind: %w", op, err)
+	}
+	if kind == "bot" {
+		return fmt.Errorf("%s: operator citizen %d is a bot — model_id is required (bots cannot act without naming a model)", op, operatorID)
+	}
+	return nil
+}
+
+// nullableInt64 converts a *int64 to a value suitable for SQL
+// nullable INTEGER columns. Passing a typed nil through database/
+// sql works for some drivers but is brittle; sql.NullInt64 with
+// Valid=false is the portable form. Callers use this for
+// task_claims.model_id and other nullable FKs.
+func nullableInt64(p *int64) interface{} {
+	if p == nil {
+		return nil
+	}
+	return *p
 }

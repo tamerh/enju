@@ -131,6 +131,14 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolListTemplates(), client.handleListTemplates)
 	s.AddTool(toolDescribeTemplate(), client.handleDescribeTemplate)
 
+	// operator/model design — bot + model
+	// registration tools. See docs/operator-model-design.md.
+	s.AddTool(toolRegisterBot(), client.handleRegisterBot)
+	s.AddTool(toolListMyBots(), client.handleListMyBots)
+	s.AddTool(toolRevokeToken(), client.handleRevokeToken)
+	s.AddTool(toolListModels(), client.handleListModels)
+	s.AddTool(toolRegisterModel(), client.handleRegisterModel)
+
 	return s
 }
 

@@ -280,11 +280,29 @@ func (s *Store) migrate() error {
 		created_at TIMESTAMP NOT NULL
 	);
 
+	-- operator/model design — tokens move out of the
+	-- citizens row into their own table. Multiple tokens per
+	-- citizen (rotation, per-deployment labels), revocable
+	-- (revoked_at IS NULL = active), audit-preserved (revoke =
+	-- mark, never delete). The citizens.token column is left
+	-- intact as a legacy mirror until a future cleanup phase can
+	-- safely drop it. See docs/operator-model-design.md.
+	CREATE TABLE IF NOT EXISTS tokens (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		citizen_id      INTEGER NOT NULL REFERENCES citizens(id),
+		token           TEXT NOT NULL UNIQUE,
+		label           TEXT NOT NULL DEFAULT '',
+		issued_at       TIMESTAMP NOT NULL,
+		revoked_at      TIMESTAMP,
+		last_used_at    TIMESTAMP
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
 	CREATE INDEX IF NOT EXISTS idx_citizens_token ON citizens(token);
+	CREATE INDEX IF NOT EXISTS idx_tokens_citizen ON tokens(citizen_id);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE email IS NOT NULL AND email != '';
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_username ON citizens(username);
 	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
@@ -404,11 +422,53 @@ func (s *Store) migrate() error {
 		// doesn't advertise the template origin.
 		`ALTER TABLE runs ADD COLUMN slug TEXT NOT NULL DEFAULT 'run'`,
 		`ALTER TABLE tasks ADD COLUMN run_slug TEXT NOT NULL DEFAULT 'run'`,
+		// operator/model design — citizen kind discriminator
+		// + bot-ownership chain. Existing rows default to kind='human'
+		// (the only kind that existed pre-migration) and parent_id=NULL.
+		// Bots set parent_id to the owner citizen's id; models stay NULL
+		// (they belong to the catalog, not to any owner). See
+		// docs/operator-model-design.md.
+		`ALTER TABLE citizens ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'`,
+		`ALTER TABLE citizens ADD COLUMN parent_id INTEGER REFERENCES citizens(id)`,
+		// operator/model design — submission attribution.
+		// task_claims.citizen_id is the operator (existing); model_id
+		// is the LLM that produced the words for this submit (new).
+		// Nullable: humans may submit without an LLM (hand-review);
+		// bots must always have a model — that constraint is enforced
+		// in applySetClaim / applyRecordSubmission since SQLite CHECK
+		// constraints can't reference another table's columns.
+		`ALTER TABLE task_claims ADD COLUMN model_id INTEGER REFERENCES citizens(id)`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("schema alter %q: %w", q, err)
 		}
+	}
+
+	// operator/model design — backfill the tokens table
+	// from existing citizens.token values. Idempotent: only inserts
+	// rows that don't already exist (keyed on citizen_id, since each
+	// pre-migration citizen had exactly one token). After this
+	// runs, existing humans authenticate via the tokens table the
+	// same way they authenticate today via citizens.token.
+	if _, err := s.db.Exec(`
+		INSERT INTO tokens (citizen_id, token, label, issued_at)
+		SELECT id, token, 'legacy', registered_at
+		FROM citizens
+		WHERE token != ''
+		  AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.citizen_id = citizens.id)
+	`); err != nil {
+		return fmt.Errorf("schema: backfill tokens: %w", err)
+	}
+
+	// operator/model design — seed a hand-curated model
+	// catalog so submit-attribution has real model
+	// citizens to reference. OpenRouter auto-fetch is deferred —
+	// see docs/operator-model-design.md "OpenRouter catalog fetch"
+	// in the deferred section. Local-mode users add their own
+	// (Ollama, internal finetunes) via enju_register_model.
+	if err := s.seedModelCitizens(); err != nil {
+		return fmt.Errorf("schema: seed model citizens: %w", err)
 	}
 
 	// Serial-runs-per-branch invariant enforced at the DB
@@ -1447,7 +1507,7 @@ func (s *Store) ResolveMultiCitizenReview(taskID, verdict, commitSHA string) err
 // formatters that render collection progress.
 func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content
+		`SELECT `+taskClaimColumns+`
 		 FROM task_claims
 		 WHERE task_id = ? AND outcome = 'completed'
 		 ORDER BY submitted_at`,
@@ -1457,23 +1517,7 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []TaskClaimRecord
-	for rows.Next() {
-		var r TaskClaimRecord
-		var outcome sql.NullString
-		var submittedAt sql.NullTime
-		if err := rows.Scan(&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content); err != nil {
-			return nil, err
-		}
-		if outcome.Valid {
-			r.Outcome = outcome.String
-		}
-		if submittedAt.Valid {
-			r.SubmittedAt = &submittedAt.Time
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return scanTaskClaims(rows)
 }
 
 // ListActiveClaims returns every open (outcome = NULL) claim row
@@ -1482,7 +1526,7 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 // that haven't resolved yet.
 func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content
+		`SELECT `+taskClaimColumns+`
 		 FROM task_claims
 		 WHERE task_id = ? AND outcome IS NULL
 		 ORDER BY claimed_at`,
@@ -1492,12 +1536,29 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanTaskClaims(rows)
+}
+
+// taskClaimColumns is the canonical column list for task_claims
+// reads. model_id is the current attribution column; future
+// operator/model-design columns (route, model_resolved, paid_by)
+// extend this list when they ship.
+const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, model_id`
+
+// scanTaskClaims is the shared scanner used by ListVoteSubmissions
+// and ListActiveClaims. Centralizing the scan keeps the two paths
+// in sync — adding a column means one edit, not two.
+func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 	var out []TaskClaimRecord
 	for rows.Next() {
 		var r TaskClaimRecord
 		var outcome sql.NullString
 		var submittedAt sql.NullTime
-		if err := rows.Scan(&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content); err != nil {
+		var modelID sql.NullInt64
+		if err := rows.Scan(
+			&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
+			&outcome, &submittedAt, &r.Option, &r.Content, &modelID,
+		); err != nil {
 			return nil, err
 		}
 		if outcome.Valid {
@@ -1505,6 +1566,10 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 		}
 		if submittedAt.Valid {
 			r.SubmittedAt = &submittedAt.Time
+		}
+		if modelID.Valid {
+			v := modelID.Int64
+			r.ModelID = &v
 		}
 		out = append(out, r)
 	}
@@ -1932,18 +1997,24 @@ func (s *Store) ExpireClaimedTask(taskID string, citizenID int64) error {
 // --- Citizens ---
 
 // citizenColumns lists every citizen column we read in the same order
-// scan functions expect. Keep this in sync with CitizenRecord.
-const citizenColumns = `id, username, name, email, role, token, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen`
+// scan functions expect. Keep this in sync with CitizenRecord. Each
+// column is qualified with `citizens.` so the same list works both
+// for plain `FROM citizens` queries and for joins where another
+// table has overlapping column names (notably tokens.id and
+// tokens.token, which would collide otherwise).
+const citizenColumns = `citizens.id, citizens.username, citizens.name, citizens.email, citizens.role, citizens.token, citizens.score, citizens.tasks_completed, citizens.tasks_rejected, citizens.tasks_timed_out, citizens.tasks_released, citizens.tokens_contributed, citizens.registered_at, citizens.last_seen, citizens.kind, citizens.parent_id`
 
 // scanCitizen reads one citizen row into a CitizenRecord. Used by
 // GetCitizen, GetCitizenByUsername, GetCitizenByToken.
 func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	var p CitizenRecord
 	var email, role sql.NullString
+	var parentID sql.NullInt64
 	err := row.Scan(
 		&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
 		&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
 		&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
+		&p.Kind, &parentID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1953,6 +2024,10 @@ func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	}
 	p.Email = email.String
 	p.Role = role.String
+	if parentID.Valid {
+		v := parentID.Int64
+		p.ParentID = &v
+	}
 	return &p, nil
 }
 
@@ -1984,14 +2059,52 @@ func (s *Store) CreateCitizen(p *CitizenRecord) (int64, error) {
 		role = "citizen"
 	}
 
-	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
-		p.Username, p.Name, p.Email, role, p.Token, p.RegisteredAt, p.LastSeen,
+	// Insert citizen + matching tokens row in one transaction so we
+	// can't leave a citizen authenticatable through citizens.token
+	// (legacy mirror) but invisible to the tokens-table auth path.
+	// Model citizens won't have a token; the conditional insert
+	// below skips the tokens row when p.Token is empty.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// operator/model design — kind and parent_id MUST be in the INSERT
+	// or the schema's column defaults silently override the
+	// caller's intent (kind=>'human', parent_id=>NULL). That's
+	// the exact bug a previous iteration shipped: enju_register_bot
+	// produced kind='human' rows that ListBotsByParent never
+	// returned, and requireModelForBot became dead code. The Phase
+	// 1.1 test already pinned that scanCitizen reads these
+	// columns; this insert path is the matching write side.
+	kind := p.Kind
+	if kind == "" {
+		kind = "human"
+	}
+	res, err := tx.Exec(
+		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+		p.Username, p.Name, p.Email, role, p.Token, p.RegisteredAt, p.LastSeen, kind, nullableInt64(p.ParentID),
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if p.Token != "" {
+		if _, err := tx.Exec(
+			`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, '', ?)`,
+			id, p.Token, p.RegisteredAt,
+		); err != nil {
+			return 0, fmt.Errorf("issue initial token: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit citizen+token: %w", err)
+	}
+	return id, nil
 }
 
 // SetCitizenRole updates a citizen's global role (citizen / author /
@@ -2037,9 +2150,24 @@ func (s *Store) UpdateCitizenProfile(id int64, name, email *string) error {
 	return err
 }
 
+// GetCitizenByToken resolves a token to its owning citizen for
+// authentication. Reads from the tokens table and
+// rejects revoked tokens — `revoked_at IS NULL` is the active
+// filter. Returns (nil, nil) when the token doesn't exist OR has
+// been revoked; the auth middleware treats both the same way.
+//
+// The citizens.token column is no longer consulted on this path.
+// It remains populated as a legacy mirror until a future cleanup
+// phase drops it; new revocations / rotations only show up on the
+// tokens table.
 func (s *Store) GetCitizenByToken(token string) (*CitizenRecord, error) {
 	return scanCitizen(s.db.QueryRow(
-		`SELECT `+citizenColumns+` FROM citizens WHERE token = ?`, token,
+		`SELECT `+citizenColumns+`
+		   FROM citizens
+		   JOIN tokens ON tokens.citizen_id = citizens.id
+		  WHERE tokens.token = ?
+		    AND tokens.revoked_at IS NULL`,
+		token,
 	))
 }
 
@@ -2086,6 +2214,324 @@ func (s *Store) ListCitizenCompletedTasks(citizenID int64, limit int) ([]TaskRec
 	}
 	defer rows.Close()
 	return scanTasks(rows)
+}
+
+// --- Tokens ---
+//
+// operator/model design — tokens table CRUD. The auth
+// path (GetCitizenByToken) joins through this table; the helpers
+// below are the management surface (issue, revoke, list) that
+// the bot-registration tools lean on.
+
+// IssueToken creates a new token row for the given citizen. Returns
+// the new token's primary key. Multiple active tokens per citizen
+// are allowed — used for rotation (issue new, distribute, revoke
+// old) and per-deployment labels (e.g. "ci-server", "laptop").
+// Token uniqueness is enforced by the schema; callers must supply
+// an unguessable random value.
+func (s *Store) IssueToken(citizenID int64, token, label string) (int64, error) {
+	if token == "" {
+		return 0, fmt.Errorf("token must be non-empty")
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
+		citizenID, token, label, time.Now(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// RevokeToken marks a token as revoked. Subsequent
+// GetCitizenByToken calls return nil for the same token string.
+// The row is preserved for audit (never deleted). Idempotent: a
+// double-revoke is a no-op (the WHERE clause filters already-
+// revoked rows so revoked_at doesn't get overwritten with a later
+// timestamp).
+func (s *Store) RevokeToken(tokenID int64) error {
+	_, err := s.db.Exec(
+		`UPDATE tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
+		time.Now(), tokenID,
+	)
+	return err
+}
+
+// RevokeTokenByValue is the same as RevokeToken but keyed by the
+// token string instead of the row id. Convenience for callers (CLI,
+// API) that hold the token but not its row id.
+func (s *Store) RevokeTokenByValue(token string) error {
+	_, err := s.db.Exec(
+		`UPDATE tokens SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL`,
+		time.Now(), token,
+	)
+	return err
+}
+
+// ListTokensByCitizen returns all tokens for the given citizen,
+// active and revoked, most recently issued first. Callers that
+// only want active tokens filter on RevokedAt == nil.
+func (s *Store) ListTokensByCitizen(citizenID int64) ([]TokenRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, citizen_id, token, label, issued_at, revoked_at, last_used_at
+		   FROM tokens WHERE citizen_id = ? ORDER BY issued_at DESC`,
+		citizenID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TokenRecord
+	for rows.Next() {
+		var t TokenRecord
+		var label sql.NullString
+		var revokedAt, lastUsedAt sql.NullTime
+		if err := rows.Scan(&t.ID, &t.CitizenID, &t.Token, &label, &t.IssuedAt, &revokedAt, &lastUsedAt); err != nil {
+			return nil, err
+		}
+		t.Label = label.String
+		if revokedAt.Valid {
+			v := revokedAt.Time
+			t.RevokedAt = &v
+		}
+		if lastUsedAt.Valid {
+			v := lastUsedAt.Time
+			t.LastUsedAt = &v
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// --- Model catalog ---
+//
+// operator/model design — model citizens are LLM catalog
+// entries (kind='model'), passive: no token, can't claim, can't
+// submit. They exist to be REFERENCED on submission rows for
+// per-submit attribution. Seeded with a hand-curated list at
+// first migration; users extend the catalog via the
+// enju_register_model MCP tool for local models the seed
+// doesn't cover (Ollama, lab finetunes, etc.).
+
+// modelCatalogSeed is the hand-curated set of popular models inserted
+// at first migration. Versions match the model identifiers users
+// would type at the -model flag today; "Display Name" is the
+// human-readable form for run_status / dashboards. Adding to this
+// list is non-breaking — seedModelCitizens is idempotent (skips
+// usernames already in the table), so a coordinator restart picks
+// up new entries without touching existing ones.
+//
+// Models with provider-prefixed identifiers (e.g. OpenRouter's
+// "anthropic/claude-opus-4-7") are stored without the prefix here.
+// Provider routing is in the deferred section of the design doc;
+// when it ships, the prefix becomes a separate column on the
+// submission row, not part of the model's identity.
+var modelCatalogSeed = []struct {
+	Username string
+	Name     string
+}{
+	{"claude-opus-4-7", "Claude Opus 4.7"},
+	{"claude-sonnet-4-6", "Claude Sonnet 4.6"},
+	{"claude-haiku-4-5", "Claude Haiku 4.5"},
+	{"gpt-4o", "GPT-4o"},
+	{"gpt-4-turbo", "GPT-4 Turbo"},
+	{"gemini-2-5-pro", "Gemini 2.5 Pro"},
+	{"llama-3-1-70b", "Llama 3.1 70B"},
+	{"deepseek-v3", "DeepSeek V3"},
+	{"mistral-large", "Mistral Large"},
+	{"qwen-2-5-72b", "Qwen 2.5 72B"},
+}
+
+// seedModelCitizens inserts the hand-curated catalog entries that
+// don't already exist. Idempotent on username collision. Called from
+// migrate() after schema is in place.
+func (s *Store) seedModelCitizens() error {
+	for _, m := range modelCatalogSeed {
+		if err := s.upsertModelCitizen(m.Username, m.Name); err != nil {
+			return fmt.Errorf("seed %s: %w", m.Username, err)
+		}
+	}
+	return nil
+}
+
+// upsertModelCitizen inserts a model-kind citizen if no row with the
+// given username exists. The token column gets a non-functional
+// placeholder ("model:<username>") to satisfy the legacy NOT NULL
+// UNIQUE constraint on citizens.token; the placeholder NEVER
+// authenticates because the auth path queries the tokens table
+// and we deliberately don't insert a tokens row for
+// model citizens.
+//
+// SECURITY GOTCHA-OF-FUTURE: the placeholder string is PREDICTABLE
+// ("model:gpt-4o", "model:claude-opus-4-7", etc. — derivable from
+// the public catalog). If a future maintainer "fixes" the auth path
+// to fall back to citizens.token (e.g., for backward compatibility
+// during a migration), every model citizen's token becomes
+// guessable instantly. Anyone who could enumerate model usernames
+// could authenticate as them and submit on their behalf.
+//
+// Mitigation: never restore citizens.token as an auth source. The
+// tokens table is the only authority. The legacy column is on a
+// path to be dropped entirely in a future cleanup phase. If you're
+// touching auth and considering "fall back to citizens.token" — DO
+// NOT. Read this comment first; the placeholder rule depends on it.
+func (s *Store) upsertModelCitizen(username, displayName string) error {
+	if err := ValidateUsername(username); err != nil {
+		return err
+	}
+	var existingID int64
+	err := s.db.QueryRow(`SELECT id FROM citizens WHERE username = ?`, username).Scan(&existingID)
+	if err == nil {
+		return nil // already in the catalog
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	now := time.Now()
+	_, err = s.db.Exec(
+		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind)
+		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'model')`,
+		username, displayName, "model:"+username, now, now,
+	)
+	return err
+}
+
+// CreateModelCitizen registers a new model in the catalog. Called by
+// the API handler behind enju_register_model (any authenticated
+// citizen in local mode; hosted-mode policy gating deferred — see
+// docs/operator-model-design.md). Returns the new citizen ID and
+// the standard "username taken" error on conflict.
+func (s *Store) CreateModelCitizen(username, displayName string) (int64, error) {
+	if err := ValidateUsername(username); err != nil {
+		return 0, err
+	}
+	var existingID int64
+	err := s.db.QueryRow(`SELECT id FROM citizens WHERE username = ?`, username).Scan(&existingID)
+	if err == nil {
+		return 0, fmt.Errorf("username %q is already taken", username)
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+	now := time.Now()
+	res, err := s.db.Exec(
+		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind)
+		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'model')`,
+		username, displayName, "model:"+username, now, now,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ListBotsByParent returns every kind='bot' citizen whose parent_id
+// matches the given citizen, ordered by registration time (newest
+// first). Used by enju_my_bots and revocation cascades. Empty slice
+// if the parent has no bots — not an error.
+func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT `+citizenColumns+` FROM citizens WHERE kind = 'bot' AND parent_id = ? ORDER BY registered_at DESC`,
+		parentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CitizenRecord
+	for rows.Next() {
+		var p CitizenRecord
+		var email, role sql.NullString
+		var pid sql.NullInt64
+		if err := rows.Scan(
+			&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
+			&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
+			&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
+			&p.Kind, &pid,
+		); err != nil {
+			return nil, err
+		}
+		p.Email = email.String
+		p.Role = role.String
+		if pid.Valid {
+			v := pid.Int64
+			p.ParentID = &v
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// LookupTokenOwner resolves a token to its owning citizen ID,
+// regardless of revoked state. Used by revoke endpoint authorization
+// (caller must own the token they're revoking). Returns 0 (not 0,
+// nil — distinct from a real error) when the token doesn't exist.
+//
+// Either token (string value) or tokenID (row id) must be non-zero;
+// the other is ignored. The endpoint accepts both forms because
+// callers may have either: list_tokens returns rows with ids; the
+// CLI/agent that holds the token at compromise time has only the
+// string.
+func (s *Store) LookupTokenOwner(token string, tokenID int64) (int64, error) {
+	var ownerID int64
+	var err error
+	if tokenID != 0 {
+		err = s.db.QueryRow(`SELECT citizen_id FROM tokens WHERE id = ?`, tokenID).Scan(&ownerID)
+	} else if token != "" {
+		err = s.db.QueryRow(`SELECT citizen_id FROM tokens WHERE token = ?`, token).Scan(&ownerID)
+	} else {
+		return 0, fmt.Errorf("either token or tokenID required")
+	}
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return ownerID, nil
+}
+
+// DB exposes the underlying *sql.DB for ad-hoc queries. Reserved
+// for narrow cases (router needs to update a tokens row's label
+// in place during bot registration). New callers should prefer
+// adding a typed helper.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// ListModelCitizens returns all kind='model' citizens in
+// alphabetical-by-username order. Used by run_status / dashboard /
+// `enju_list_models` to render the catalog. Filters out
+// soft-deleted models when that's a concept (not yet — flagged for
+// future).
+func (s *Store) ListModelCitizens() ([]CitizenRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT ` + citizenColumns + ` FROM citizens WHERE kind = 'model' ORDER BY username`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CitizenRecord
+	for rows.Next() {
+		var p CitizenRecord
+		var email, role sql.NullString
+		var parentID sql.NullInt64
+		if err := rows.Scan(
+			&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
+			&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
+			&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
+			&p.Kind, &parentID,
+		); err != nil {
+			return nil, err
+		}
+		p.Email = email.String
+		p.Role = role.String
+		if parentID.Valid {
+			v := parentID.Int64
+			p.ParentID = &v
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // --- Helpers ---

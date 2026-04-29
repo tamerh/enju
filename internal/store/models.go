@@ -380,6 +380,15 @@ type CitizenRecord struct {
 	Name            string
 	Email           string
 	Role            string // "citizen", "author", "reviewer"
+	// Token is the LEGACY MIRROR of the originally-issued token —
+	// authentication lives in the tokens table now. It
+	// stays populated for backward compatibility with old reads
+	// but is NOT updated on revocation: a revoked token's value
+	// remains in this field even though it no longer
+	// authenticates. New code should use ListTokensByCitizen and
+	// the tokens table for any "is this token still valid" check.
+	// This field is kept for one migration cycle and will be
+	// dropped once no callers read it.
 	Token           string
 	Score           float64
 	TasksCompleted  int
@@ -389,6 +398,31 @@ type CitizenRecord struct {
 	TokensContrib   int64
 	RegisteredAt    time.Time
 	LastSeen        time.Time
+	// operator/model design — citizen kind discriminator.
+	// "human" (default for everyone pre-migration), "bot" (owned by a
+	// human or project, has its own token), "model" (LLM catalog
+	// entry, no token, attribution-only). See
+	// docs/operator-model-design.md.
+	Kind            string
+	// ParentID is the owner chain for bots. Non-nil for kind='bot'
+	// (points at the citizen that owns this bot); nil for humans
+	// and models. Used by enju_my_bots and revocation cascades.
+	ParentID        *int64
+}
+
+// TokenRecord is one row from the tokens table — an issued bearer
+// token with optional label and revocation timestamp. Multiple
+// tokens per citizen are allowed (rotation, per-deployment labels).
+// Part of the operator/model design — see
+// docs/operator-model-design.md.
+type TokenRecord struct {
+	ID         int64
+	CitizenID  int64
+	Token      string
+	Label      string     // "ci-server", "laptop", "" for legacy-migrated tokens have label='legacy'
+	IssuedAt   time.Time
+	RevokedAt  *time.Time // nil = active
+	LastUsedAt *time.Time // nil = never used (or last_used_at not yet wired up)
 }
 
 // TaskClaimRecord tracks the history of task claims. In multi-
@@ -413,6 +447,11 @@ type TaskClaimRecord struct {
 	// Kept short — formatters that need the full prose still read
 	// from the per-citizen result.md in the project's git repo.
 	Content string
+	// ModelID is the
+	// model citizen credited for this submission's text. nil for
+	// pre-1.4 rows and for human submits with no LLM ("hand-
+	// reviewed contested item" case in the design doc).
+	ModelID *int64
 }
 
 

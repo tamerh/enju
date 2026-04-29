@@ -46,11 +46,16 @@ type SubmissionOutcome struct {
 //     waits for tally resolution).
 //
 // The router calls this instead of store.SubmitTaskResult.
+// ComputeSubmission's modelID parameter is
+// the model citizen credited for the words in this submit. Pass
+// nil for human-without-LLM (hand-review). Apply-time enforcement
+// rejects bot operators that pass nil.
 func (e *Engine) ComputeSubmission(
 	taskID string,
 	citizenID int64,
 	resultPath, commitSHA, decision, voteChoice, content string,
 	tokensUsed int64,
+	modelID *int64,
 ) (*SubmissionOutcome, error) {
 	task, err := e.store.GetTask(taskID)
 	if err != nil || task == nil {
@@ -106,6 +111,7 @@ func (e *Engine) ComputeSubmission(
 				VoteChoice: voteChoice,
 				Content:    content,
 				TokensUsed: tokensUsed,
+				ModelID:    modelID,
 			},
 		},
 	}

@@ -235,10 +235,18 @@ func (CreateRun) mutationKind() MutationKind { return MutCreateRun }
 // claimed_at fields. For multi-citizen tasks, each citizen
 // gets one slot; the coordinator validates slot availability
 // at apply time.
+//
+// ModelID attributes the claim to a model citizen
+// when known at claim time. Optional for humans (a hand-review
+// has no model); REQUIRED for bot operators — applySetClaim
+// rejects bot claims with model_id=NULL because bots can't
+// think on their own. The constraint is enforced at apply
+// time, not in SQLite, since CHECK can't cross-table-reference.
 type SetClaim struct {
 	TaskID    string
 	CitizenID int64
 	Deadline  time.Time
+	ModelID   *int64
 }
 
 func (SetClaim) mutationKind() MutationKind { return MutSetClaim }
@@ -269,6 +277,12 @@ type RecordSubmission struct {
 	VoteChoice string // vote: chosen option id
 	Content    string // prose commentary
 	TokensUsed int64
+	// ModelID attributes the submission to a model
+	// citizen. Optional for human operators (a hand-review has
+	// no model); REQUIRED for bot operators — applyRecordSubmission
+	// rejects bot submissions with model_id=NULL. The constraint
+	// is enforced at apply time (SQLite CHECK can't cross-table).
+	ModelID *int64
 }
 
 func (RecordSubmission) mutationKind() MutationKind { return MutRecordSubmission }

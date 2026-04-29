@@ -77,6 +77,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 		"username": c.username,
+		"model":    c.modelName, // operator/model design — empty for unaided humans
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
