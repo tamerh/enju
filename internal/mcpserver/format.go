@@ -2366,6 +2366,14 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	}
 	if claimedBy != "" && !multiCitizen {
 		b.WriteString(fmt.Sprintf("  Claimed:  %s\n", claimedBy))
+		// Model attribution (operator/model design): when the
+		// task has a completed submission, show which LLM was
+		// credited. Empty for pre-1.4 rows and unaided humans —
+		// in both cases the line is suppressed entirely so it
+		// doesn't show up as "Model: " with nothing after.
+		if model, _ := task["model"].(string); model != "" {
+			b.WriteString(fmt.Sprintf("  Model:    %s\n", model))
+		}
 	}
 	if deps != "" {
 		b.WriteString(fmt.Sprintf("  Depends:  %s\n", deps))
@@ -3056,7 +3064,7 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 	submitted := totalSubmitted
 	// Tally counts per option and per-voter list.
 	counts := map[string]int{}
-	type ballot struct{ user, option string }
+	type ballot struct{ user, option, model string }
 	ballots := make([]ballot, 0, submitted)
 	for _, v := range voteSubs {
 		m, ok := v.(map[string]interface{})
@@ -3065,8 +3073,9 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 		}
 		user, _ := m["username"].(string)
 		option, _ := m["option"].(string)
+		model, _ := m["model"].(string)
 		counts[option]++
-		ballots = append(ballots, ballot{user: user, option: option})
+		ballots = append(ballots, ballot{user: user, option: option, model: model})
 	}
 
 	// Status line varies by state. For review tasks, use the
@@ -3106,11 +3115,21 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 		b.WriteString("  Tally:    " + strings.Join(tally, ", ") + "\n")
 	}
 
-	// Per-voter ballots.
+	// Per-voter ballots. The optional " (model)" suffix surfaces
+	// per-voter model attribution from the operator/model design
+	// — useful for cross-model quorum runs where seeing which
+	// model produced each verdict is the whole point. Suppressed
+	// per-entry when the field is empty (pre-1.4 rows or unaided
+	// humans) so the line stays compact when nobody declared a
+	// model.
 	if len(ballots) > 0 {
 		parts := make([]string, 0, len(ballots))
 		for _, b := range ballots {
-			parts = append(parts, fmt.Sprintf("%s→%s", b.user, b.option))
+			entry := fmt.Sprintf("%s→%s", b.user, b.option)
+			if b.model != "" {
+				entry += fmt.Sprintf(" (%s)", b.model)
+			}
+			parts = append(parts, entry)
 		}
 		if isReview {
 			b.WriteString("  Reviewers: " + strings.Join(parts, ", ") + "\n")

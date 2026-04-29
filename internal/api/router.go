@@ -1712,6 +1712,14 @@ type taskResponse struct {
 	ResultType      string   `json:"result_type"`
 	State           string   `json:"state"`
 	ClaimedBy       string   `json:"claimed_by,omitempty"` // username of the claimer
+	// Model is the model citizen username credited for the most
+	// recent completed submission on this task. Populated for
+	// single-citizen tasks once they reach a terminal/submitted
+	// state; multi-citizen tasks expose per-voter models via
+	// VoteSubmissions[].Model instead. Empty when no submission
+	// has happened yet, when the operator was a human submitting
+	// unaided, or for pre-1.4 rows that never recorded a model.
+	Model string `json:"model,omitempty"`
 	ResultPath      string   `json:"result_path,omitempty"`
 	CommitSHA       string   `json:"commit_sha,omitempty"` // git SHA of the accepted result (iteration A+)
 	DependsOn       string   `json:"depends_on,omitempty"`
@@ -1816,6 +1824,13 @@ type voteSubmissionRef struct {
 	Username    string `json:"username"`
 	Option      string `json:"option"`
 	SubmittedAt string `json:"submitted_at,omitempty"`
+	// Model is the model citizen username credited for this
+	// submission's words (operator/model design — the operator
+	// is Username, the model is who PRODUCED the prose). Empty
+	// when the operator is a human submitting unaided. Pre-1.4
+	// rows have empty model; new submits populate it from the
+	// per-call -model flag or the per-call override.
+	Model string `json:"model,omitempty"`
 }
 
 func (s *Server) handleListReadyTasks(w http.ResponseWriter, r *http.Request) {
@@ -4512,6 +4527,36 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		Mode:              t.Mode,
 		Container:         t.Container,
 	}
+	// Single-citizen task model attribution. For multi-citizen
+	// tasks we expose per-voter models on VoteSubmissions[].Model
+	// (below); for single-citizen tasks there's one (or after
+	// invalidate+resubmit, multiple) task_claims row, so a single
+	// top-level resp.Model field is the natural surface for the
+	// formatter to render alongside "Claimed by".
+	//
+	// Gate on state == accepted: no completed claim row exists
+	// before a task lands in a terminal-success state, so for a
+	// 100-task run-listing query most tasks skip this round-trip
+	// entirely. Without the gate, every toTaskResponse call pays
+	// an extra task_claims query plus a citizens lookup — N+1 on
+	// every run-listing endpoint.
+	//
+	// Take the LAST element, not the first: ListVoteSubmissions
+	// orders by submitted_at ASC. After invalidate → re-claim →
+	// re-submit, the original (stale) claim row stays at
+	// subs[0] because invalidation only flips outcome=NULL rows
+	// to 'invalidated', leaving 'completed' rows untouched. The
+	// freshly-submitted model lives at subs[len-1] — that's what
+	// the formatter and any caller cares about.
+	if t.Citizens <= 1 && store.TaskState(t.State) == store.TaskAccepted {
+		if subs, err := s.store.ListVoteSubmissions(t.ID); err == nil && len(subs) > 0 {
+			latest := subs[len(subs)-1]
+			if latest.ModelID != nil {
+				resp.Model = s.citizenUsername(*latest.ModelID)
+			}
+		}
+	}
+
 	// Phase E.2 session 2a/2b — surface per-citizen claim and
 	// submission state for multi-citizen vote AND review tasks
 	// so MCP formatters can render the Voting / Review block
@@ -4536,6 +4581,14 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 				}
 				if sub.SubmittedAt != nil {
 					ref.SubmittedAt = sub.SubmittedAt.Format(time.RFC3339)
+				}
+				// Resolve the model citizen username if this
+				// submit recorded one. citizenUsername returns
+				// "" for nil id or unknown citizen — both render
+				// as no model field, which is correct for
+				// pre-1.4 rows and unaided humans.
+				if sub.ModelID != nil {
+					ref.Model = s.citizenUsername(*sub.ModelID)
 				}
 				resp.VoteSubmissions = append(resp.VoteSubmissions, ref)
 			}

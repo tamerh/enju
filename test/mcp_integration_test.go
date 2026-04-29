@@ -2512,6 +2512,169 @@ func mcpCountTasksByDef(tasks []interface{}, defID string) int {
 	return n
 }
 
+// TestMCPVoteSubmitMaterializesMetadata is the repro for the
+// tester-reported gap: vote submits resolve cleanly (DB has the
+// winning option, run completes) but produce NO git commit and
+// NO filesystem state. Compute tasks in the same project DO
+// materialize. Aggregator scripts in stages 4-7 historically
+// read winning options from enju/runs/{seq}-{slug}/{task}/
+// metadata.json — that file goes missing for vote submits.
+//
+// What this test pins:
+//   - Vote submit produces a commit on the run's branch.
+//   - metadata.json lands at the expected per-task path with
+//     action="vote", option="<winning>", model=<attribution>.
+//
+// If this fails (vote submit doesn't materialize), the path
+// inside prepareFatSubmit / submitResultFatClient is bypassing
+// the commit step for vote actions somehow — that's the bug.
+func TestMCPVoteSubmitMaterializesMetadata(t *testing.T) {
+	h := newMCPHarness(t, "VoteMaterialize")
+	projectID := h.createTestProject()
+
+	yaml := `name: "vote-materialize"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "Pick one."
+    options:
+      - {id: a, label: "Option A"}
+      - {id: b, label: "Option B"}
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "pick")
+
+	// Pre-submit HEAD on the run's branch.
+	proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+	preHead, err := proj.HeadHash()
+	if err != nil {
+		t.Fatalf("pre-submit HEAD: %v", err)
+	}
+
+	// Submit the vote with content + option (typical case).
+	h.mcpSubmitVote(t, "pick", "A is the right choice", "a")
+
+	if got := h.taskGet("pick")["state"]; got != "accepted" {
+		t.Fatalf("vote did not resolve: state=%v", got)
+	}
+
+	// Post-submit HEAD must be different — the submit must have
+	// committed.
+	postHead, err := proj.HeadHash()
+	if err != nil {
+		t.Fatalf("post-submit HEAD: %v", err)
+	}
+	if postHead == preHead {
+		t.Fatalf("HEAD unchanged after vote submit (%s) — no commit landed; aggregator scripts can't read this vote's metadata.json", preHead)
+	}
+
+	// metadata.json must exist on disk at the expected path.
+	metadataPath := filepath.Join(proj.WorkDir(), h.runDir(1), "pick", "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatalf("metadata.json missing at %s: %v", metadataPath, err)
+	}
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("metadata.json invalid JSON: %v", err)
+	}
+	if action, _ := metadata["action"].(string); action != "vote" {
+		t.Errorf("metadata.action=%q, want vote", action)
+	}
+	if opt, _ := metadata["option"].(string); opt != "a" {
+		t.Errorf("metadata.option=%q, want a", opt)
+	}
+}
+
+// TestMCPVoteForEachSubmitMaterializesMetadata is the focused
+// repro of the tester-reported gap: vote tasks WITHIN a for_each
+// loop (instance keys like "i01", "i02") submit, the run resolves,
+// but no commit lands and no per-instance metadata.json appears.
+// Aggregator scripts can't recover the per-instance vote choice.
+//
+// The plain (non-iteration) vote case passes —
+// TestMCPVoteSubmitMaterializesMetadata covers that. This test
+// exercises the iteration-key code path which routes the result
+// dir through engine.ComputeResultDir + the InstanceKey.
+func TestMCPVoteForEachSubmitMaterializesMetadata(t *testing.T) {
+	h := newMCPHarness(t, "VoteForEach")
+	projectID := h.createTestProject()
+
+	yaml := `name: "vote-foreach"
+version: 1
+for_each:
+  item: [i01, i02]
+tasks:
+  - id: pick
+    action: vote
+    prompt: "Pick one for {{item}}."
+    options:
+      - {id: approve, label: "Approve"}
+      - {id: reject, label: "Reject"}
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "i01:pick")
+	proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+	preHead, _ := proj.HeadHash()
+
+	h.mcpSubmitVote(t, "i01:pick", "approve for i01", "approve")
+
+	postHead, _ := proj.HeadHash()
+	if postHead == preHead {
+		t.Fatalf("HEAD unchanged after for_each vote submit on i01 — no commit landed; this is the tester-reported gap")
+	}
+
+	// Task-first layout: enju/runs/{seq}-{slug}/{task}/<key>=<value>/.
+	// (Not <key>=<value>/{task}/ — the layout overhaul made the
+	// task ID the directory pivot.) Aggregator scripts that walk
+	// the run dir need to know this shape.
+	metadataPath := filepath.Join(proj.WorkDir(), h.runDir(1), "pick", "item=i01", "metadata.json")
+	if _, err := os.Stat(metadataPath); err != nil {
+		t.Fatalf("metadata.json missing at %s: %v", metadataPath, err)
+	}
+}
+
+// TestMCPVoteSubmitOptionOnlyNoContent — the no-content variant.
+// Aggregator workflows where the vote choice is the only signal
+// pass option= without content=; ensure metadata.json still lands.
+func TestMCPVoteSubmitOptionOnlyNoContent(t *testing.T) {
+	h := newMCPHarness(t, "VoteOptionOnly")
+	projectID := h.createTestProject()
+
+	yaml := `name: "vote-option-only"
+version: 1
+tasks:
+  - id: pick
+    action: vote
+    prompt: "Pick one."
+    options:
+      - {id: a}
+      - {id: b}
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	h.mcpClaimOK(t, "pick")
+	proj, _ := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+	preHead, _ := proj.HeadHash()
+
+	// Submit option only — no content prose.
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id": h.taskID("pick"),
+		"option":  "a",
+	})
+
+	postHead, _ := proj.HeadHash()
+	if postHead == preHead {
+		t.Fatalf("HEAD unchanged after option-only vote submit — content gates the commit but the metadata.json should land regardless")
+	}
+}
+
 // TestMCPVotePureDecisionNoSkipCascade is the MCP-layer port. A
 // vote with no activates: on any option is a pure decision — no
 // branches are skipped; downstream tasks just need `pick` to
