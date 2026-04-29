@@ -2212,6 +2212,31 @@ type submitResultRequest struct {
 // has already done the git work; the coordinator just validates the
 // report, updates the state machine, updates the artifact index,
 // runs the scheduler, and checks run completion.
+//
+// This is coordinator protocol, not a bot SDK — the wire format
+// fat clients use to report a completed submission. There is no
+// coordinator-side git worker (trust-the-client); bots calling
+// this directly take on the fat client's git responsibilities.
+//
+// Per-action contract:
+//
+//   - compute / answer / contribute → commit_sha REQUIRED. The
+//     400 fires below if missing. Submission lives in git
+//     (metadata.json + result.md + writes_artifacts paths) and
+//     the DB stores commit_sha + result_path as the pointer.
+//
+//   - vote / review → commit_sha OPTIONAL. The DB row
+//     (task_claims.content + tasks.vote_choice / review_decision)
+//     is the load-bearing record; the state machine, scheduler,
+//     and tally engine all read from it. A direct-HTTP submit
+//     without commit_sha is state-machine-correct but loses the
+//     immutable git audit artifact (metadata.json with action +
+//     option/decision + model + timestamp) that the MCP fat
+//     client produces.
+//
+// See docs/coordinator.md § REST API § Tasks for the full
+// per-action table and the two-tier (DB-mutable, git-immutable)
+// rationale.
 // handleTallyTask forces a tally evaluation on a collecting
 // vote or review task. Any user can trigger it; it runs the
 // same tally logic as a submission would, resolves if the

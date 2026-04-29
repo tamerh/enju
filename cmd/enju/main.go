@@ -103,7 +103,10 @@ func cmdMCP(args []string) {
 	email := fs.String("email", "", "Citizen email (optional)")
 	model := fs.String("model", "", "LLM model name for contribution tracking (e.g. claude-opus-4, gpt-4o)")
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
+	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running multiple MCP processes for different citizens on one host — see docs/multi-citizen.md § Running multiple citizens on one host.")
 	fs.Parse(args)
+
+	resolvedCredsPath := resolveCredentialsPath(*credsPath)
 
 	// Local-only mode: start an embedded coordinator in the
 	// same process on a random port. The MCP client talks to
@@ -154,7 +157,7 @@ func cmdMCP(args []string) {
 	// ~/.enju/credentials.json is the source of truth for a user's
 	// identity, and the CLI args exist mostly as bootstrap metadata
 	// for the very first registration.
-	creds := loadCredentials(credsKey)
+	creds := loadCredentialsAt(credsKey, resolvedCredsPath)
 	if creds != nil {
 		if creds.Username != "" {
 			*username = creds.Username
@@ -185,7 +188,7 @@ func cmdMCP(args []string) {
 		}
 		*username = gotUsername
 		token = gotToken
-		saveCredentials(credsKey, *username, *name, *email, token)
+		saveCredentialsAt(credsKey, *username, *name, *email, token, resolvedCredsPath)
 		fmt.Fprintf(os.Stderr, "Registered as @%s (%s)\n", *username, *name)
 	} else {
 		token = creds.Token
@@ -214,7 +217,7 @@ func cmdMCP(args []string) {
 		Workspace:      ws,
 		Logger:         logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
-			saveCredentials(credsKey, gotUsername, gotName, gotEmail, gotToken)
+			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)
 		},
 	})
 
@@ -262,8 +265,24 @@ func credentialsPath() string {
 	return filepath.Join(home, ".enju", "credentials.json")
 }
 
+// resolveCredentialsPath returns override when non-empty, else the
+// default ~/.enju/credentials.json. Used by `enju mcp --credentials`
+// so multiple bot/citizen MCP processes on one host can each carry
+// their own identity without HOME isolation gymnastics. See
+// docs/multi-citizen.md § Running multiple citizens on one host.
+func resolveCredentialsPath(override string) string {
+	if override != "" {
+		return override
+	}
+	return credentialsPath()
+}
+
 func loadCredentials(coordinator string) *credentials {
-	data, err := os.ReadFile(credentialsPath())
+	return loadCredentialsAt(coordinator, credentialsPath())
+}
+
+func loadCredentialsAt(coordinator, path string) *credentials {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -285,7 +304,10 @@ func loadCredentials(coordinator string) *credentials {
 // because auto re-register fires a save with a typed struct that
 // doesn't know about those fields.
 func saveCredentials(coordinator, username, name, email, token string) {
-	path := credentialsPath()
+	saveCredentialsAt(coordinator, username, name, email, token, credentialsPath())
+}
+
+func saveCredentialsAt(coordinator, username, name, email, token, path string) {
 	creds := map[string]interface{}{}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &creds) // tolerate missing/malformed
