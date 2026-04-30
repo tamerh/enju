@@ -590,6 +590,23 @@ type TaskClaimRecord struct {
 	// pre-1.4 rows and for human submits with no LLM ("hand-
 	// reviewed contested item" case in the design doc).
 	ModelID *int64
+	// Branch is the per-iteration topic branch this claim writes
+	// to (e.g. "myrun/expand/iter-1"). Generated at claim time
+	// from (run-slug, task-def-id, prior-claim-count). Empty for
+	// vote/review actions and for legacy-migrated rows.
+	Branch string
+	// CommitSHA is the git SHA of the submission commit that
+	// resolved this claim — captured at submit time so future
+	// re-iterations don't overwrite this row's history. Empty
+	// when the submission produced no commit (untracked-only
+	// outputs, vote/review without a content commit) or when
+	// the claim hasn't been submitted yet.
+	CommitSHA string
+	// Decision is the reviewer verdict captured at submit time
+	// for action:review claims ("accept" / "request_changes" /
+	// "reject"). Empty for non-review claims and for unresolved
+	// claims.
+	Decision string
 }
 
 

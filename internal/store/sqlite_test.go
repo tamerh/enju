@@ -1362,7 +1362,7 @@ func TestClaimTask_StampsIterationBranch(t *testing.T) {
 	if len(iters) != 1 {
 		t.Fatalf("expected 1 iteration, got %d", len(iters))
 	}
-	if iters[0].Branch != "build/dev/iter-1" {
+	if iters[0].Branch != "1-build/dev/iter-1" {
 		t.Fatalf("iter-1 branch: %q", iters[0].Branch)
 	}
 
@@ -1386,36 +1386,40 @@ func TestClaimTask_StampsIterationBranch(t *testing.T) {
 	if len(iters) != 2 {
 		t.Fatalf("expected 2 iterations, got %d", len(iters))
 	}
-	if iters[1].Branch != "build/dev/iter-2" {
+	if iters[1].Branch != "1-build/dev/iter-2" {
 		t.Fatalf("iter-2 branch: %q", iters[1].Branch)
 	}
 }
 
-func TestClaimTask_VoteReviewSkipBranchGeneration(t *testing.T) {
+func TestClaimTask_VoteSkipsBranchGeneration(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
 	now := time.Now()
 	if err := s.CreateTask(&TaskRecord{
-		ID: "1:1:gate", RunID: runID, Seq: 1, TaskDefID: "gate",
-		Action: "review", ResultType: "text",
+		ID: "1:1:tally", RunID: runID, Seq: 1, TaskDefID: "tally",
+		Action: "vote", ResultType: "text",
 		State: TaskReady, RunSlug: "build",
 		CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	alice := createTestCitizen(t, s, "alice", "tok-vrb")
-	if err := s.ClaimTask("1:1:gate", alice, now.Add(30*time.Minute)); err != nil {
+	if err := s.ClaimTask("1:1:tally", alice, now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	iters, _ := s.ListTaskIterations("1:1:gate")
+	iters, _ := s.ListTaskIterations("1:1:tally")
 	if len(iters) != 1 {
 		t.Fatalf("expected 1 iteration, got %d", len(iters))
 	}
-	// Review tasks have no git artifact, so branching is
-	// meaningless — we leave the field empty rather than
-	// stamp a misleading topic-branch name.
+	// Vote tasks aggregate per-citizen submits into a single
+	// tally rather than producing one canonical commit, so the
+	// topic-branch flow doesn't model them — empty branch is
+	// the correct stamp. Review tasks DO get a topic in the
+	// foundational v1 design (so an approve carries the verdict
+	// commit through the same merge gate as content); see
+	// TestClaimTask_StampsIterationBranch for that path.
 	if iters[0].Branch != "" {
-		t.Fatalf("review iter should have empty branch, got %q", iters[0].Branch)
+		t.Fatalf("vote iter should have empty branch, got %q", iters[0].Branch)
 	}
 }
 

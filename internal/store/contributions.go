@@ -133,7 +133,7 @@ func (s *Store) CountProjectsThisMonth(citizenID int64) (int, error) {
 // released, and active claims — the full audit trail.
 func (s *Store) ListTaskHistory(taskID string) ([]TaskClaimRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content
+		`SELECT task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, branch, commit_sha, decision
 		 FROM task_claims WHERE task_id = ? ORDER BY claimed_at ASC`,
 		taskID,
 	)
@@ -146,7 +146,7 @@ func (s *Store) ListTaskHistory(taskID string) ([]TaskClaimRecord, error) {
 		var r TaskClaimRecord
 		var outcome sql.NullString
 		var submittedAt sql.NullTime
-		if err := rows.Scan(&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content); err != nil {
+		if err := rows.Scan(&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Content, &r.Branch, &r.CommitSHA, &r.Decision); err != nil {
 			continue
 		}
 		r.Outcome = outcome.String

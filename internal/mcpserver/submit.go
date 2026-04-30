@@ -613,12 +613,20 @@ func formatBatchResults(results []batchEntryResult, anySuccess bool) string {
 // For per-instance reviews it's the instance-matched short form
 // "instanceKey:defID" ("alpha:expand" → "expand", "alpha").
 //
+// `idx > 0` (not `>= 0`) skips pathological ":foo" shapes that
+// would otherwise parse as (defID="foo", instanceKey=""). The
+// materializer never writes such values, but matching the
+// engine-side parseReviewsTargetForMerge boundary keeps the
+// two implementations in lockstep — they MUST agree byte-for-
+// byte or the merge-target collector and the review-feedback
+// resolver will diverge on edge inputs.
+//
 // Keeps server.go's review-block resolver independent of which
 // shape materialize.go / create_run.go actually wrote — both
 // cases produce a valid (defID, instanceKey) pair the Dependency
 // list can be matched against.
 func parseReviewsTarget(target string) (defID, instanceKey string) {
-	if idx := strings.Index(target, ":"); idx >= 0 {
+	if idx := strings.Index(target, ":"); idx > 0 {
 		return target[idx+1:], target[:idx]
 	}
 	return target, ""
@@ -1093,6 +1101,40 @@ func (c *apiClient) submitResultFatClient(
 		return errRes, nil
 	}
 
+	// Living-workflow phase 6b foundational v1: topic-branch
+	// flow. Commits land on the per-iteration topic branch the
+	// coordinator handed back at claim time, forked from the
+	// run branch tip. After the coordinator transitions the
+	// task to ACCEPTED (immediately for unreviewed answer/
+	// compute, on review-approve for reviewed paths), it
+	// returns `accepted_merges` in the submit response; this
+	// handler then FF-pushes each topic SHA onto the run
+	// branch, refusing loudly on non-FF (linear progression
+	// guarantees this never fires in normal operation).
+	//
+	// Empty IterationBranch — vote/review actions, or pre-
+	// phase-5 rows — keeps the legacy "commit directly to the
+	// run branch" behavior so tasks without a topic continue
+	// to advance the run branch directly.
+	commitBranch := prep.Meta.Branch
+	baseBranch := ""
+	if prep.Meta.IterationBranch != "" {
+		commitBranch = prep.Meta.IterationBranch
+		baseBranch = prep.Meta.Branch
+		// Action:review forks its topic from the upstream's
+		// topic (when present) so the review's commit lands
+		// on top of the upstream's content. On approve the
+		// resulting topic is a fast-forward of the run branch
+		// AND carries the upstream's commit too — one FF push
+		// advances main with both the upstream content and
+		// the reviewer's verdict, no concurrent-merge
+		// gymnastics. When the upstream has no topic (legacy
+		// run-branch submission) we fall back to forking from
+		// the run branch.
+		if prep.Meta.Action == "review" && prep.Meta.UpstreamIterationBranch != "" {
+			baseBranch = prep.Meta.UpstreamIterationBranch
+		}
+	}
 	prep.Project.Lock()
 	submitRes, err := prep.Project.SubmitTaskResult(mcpgit.SubmitRequest{
 		TaskID:        prep.TaskID,
@@ -1102,7 +1144,8 @@ func (c *apiClient) submitResultFatClient(
 		ModelName:     prep.EffectiveModel,
 		Files:         prep.Files,
 		ArtifactPaths: prep.ArtifactPaths,
-		Branch:        prep.Meta.Branch,
+		Branch:        commitBranch,
+		BaseBranch:    baseBranch,
 		ProjectID:     prep.Meta.ProjectID,
 		StateDir:      c.stateDir(),
 	})
@@ -1119,7 +1162,73 @@ func (c *apiClient) submitResultFatClient(
 	if errMsg := extractErrorString(data); errMsg != "" {
 		return mcp.NewToolResultError(decorateCoordinatorRejection(errMsg)), nil
 	}
+	if err := c.applyAcceptedMerges(prep.Project, data); err != nil {
+		return mcp.NewToolResultError("auto-merging accepted topic branch: " + err.Error()), nil
+	}
 	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
+}
+
+// applyAcceptedMerges drives the post-submit FF-merge of any
+// topic branches the coordinator marked ACCEPTED. The submit
+// response carries an `accepted_merges` array; each entry is
+// (task_id, topic_branch, run_branch, commit_sha) and the fat-
+// client FF-pushes the topic SHA onto the run branch's ref
+// (locally + on origin). Hard-fail on non-FF — under linear
+// progression that should never fire in normal use.
+//
+// Empty / missing array is a no-op (older coordinators, vote/
+// review submits without an accepted target). The merge step
+// is idempotent: a re-submit that resurfaces the same merge
+// targets just performs a same-SHA push, which mcpgit treats
+// as already-up-to-date.
+func (c *apiClient) applyAcceptedMerges(proj *mcpgit.Project, responseBody []byte) error {
+	if proj == nil || len(responseBody) == 0 {
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
+		return nil
+	}
+	merges, ok := raw["accepted_merges"].([]interface{})
+	if !ok || len(merges) == 0 {
+		return nil
+	}
+	proj.Lock()
+	defer proj.Unlock()
+	var lastRunBranch string
+	for _, m := range merges {
+		entry, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		runBranch, _ := entry["run_branch"].(string)
+		commitSHA, _ := entry["commit_sha"].(string)
+		if runBranch == "" || commitSHA == "" {
+			continue
+		}
+		if err := proj.FastForwardBranchToCommit(runBranch, commitSHA); err != nil {
+			topicBranch, _ := entry["topic_branch"].(string)
+			taskID, _ := entry["task_id"].(string)
+			return fmt.Errorf(
+				"task %s: ff-merging topic %q onto run branch %q at %s: %w",
+				taskID, topicBranch, runBranch, commitSHA, err)
+		}
+		lastRunBranch = runBranch
+	}
+	// Switch the workspace HEAD back to the run branch after a
+	// successful merge so the next operation in this session
+	// (a manual git commit, a sibling submit, the user
+	// inspecting the workspace) sees the authoritative merged
+	// state rather than the now-stale topic branch we were
+	// on coming out of SubmitTaskResult. Without this the
+	// workspace stays on the topic and any later manual commit
+	// lands on a branch the next claim won't fork from.
+	if lastRunBranch != "" {
+		if err := proj.CheckoutBranch(lastRunBranch); err != nil {
+			return fmt.Errorf("returning workspace to run branch %q after merge: %w", lastRunBranch, err)
+		}
+	}
+	return nil
 }
 
 // validateReviewDecision returns an empty string when the decision

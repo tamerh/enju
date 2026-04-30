@@ -397,12 +397,13 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 	// pull task_def_id + run_slug for the iteration branch
 	// name (living-workflow phase 6a).
 	var citizens int
-	var taskDefID, runSlug, taskAction string
+	var runSeq int
+	var taskDefID, runSlug, taskAction, instanceKey string
 	if err := tx.QueryRow(
-		`SELECT t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action
-		 FROM tasks t WHERE t.id = ?`,
+		`SELECT t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action, COALESCE(t.instance_key, ''), r.seq
+		 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
 		m.TaskID,
-	).Scan(&citizens, &taskDefID, &runSlug, &taskAction); err != nil {
+	).Scan(&citizens, &taskDefID, &runSlug, &taskAction, &instanceKey, &runSeq); err != nil {
 		return fmt.Errorf("set_claim: task %q not found", m.TaskID)
 	}
 	if citizens <= 0 {
@@ -421,7 +422,21 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 	// ClaimTask path.
 	var priorClaims int
 	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, m.TaskID).Scan(&priorClaims)
-	branch := generateIterationBranch(taskAction, taskDefID, runSlug, priorClaims)
+	// Living-workflow phase 6b foundational v1: gate the
+	// topic-branch flow at the run level. If ANY task in the
+	// same run is multi-citizen (vote, multi-reviewer),
+	// disable topics for the entire run — the multi-citizen
+	// path commits directly to the run branch and would
+	// silently advance main between this task's claim and
+	// its accept, breaking the FF-merge invariant the topic
+	// flow relies on. Conservative for v1; rebase support
+	// (v2) lifts this restriction.
+	var runHasMulti int
+	_ = tx.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE run_id = (SELECT run_id FROM tasks WHERE id = ?) AND citizens > 1`,
+		m.TaskID,
+	).Scan(&runHasMulti)
+	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, priorClaims, citizens, runHasMulti > 0)
 
 	now := time.Now()
 	// Insert the claim row with the branch identifier.

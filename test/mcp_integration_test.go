@@ -496,16 +496,25 @@ func parseInt64(t *testing.T, s string) int64 {
 	return n
 }
 
-// bareCommitCount counts commits in a project's bare remote. Used
-// by the pre-validation tests to prove that rejected submissions
-// don't leave phantom commits.
+// bareCommitCount counts commits in a project's bare remote.
+// Used by the pre-validation tests to prove that rejected
+// submissions don't leave phantom commits, and by the topic-
+// branch flow tests to assert that approved submits land.
+//
+// Walks ALL refs (--all), not just HEAD, so commits that live
+// only on per-iteration topic branches (request_changes /
+// reject reviews, in-flight iterations) are counted too. Pre-
+// 6b a single git-log was sufficient because every commit
+// landed on the run branch; the foundational v1 wedge moves
+// commits onto topic refs first and only merges accepted ones
+// to main, so HEAD-only counting misses the topic commits.
 func (h *mcpHarness) bareCommitCount(t *testing.T, projectID int64) int {
 	t.Helper()
 	remoteURL := h.remoteFor(projectID)
 	if remoteURL == "" {
 		t.Fatalf("bareCommitCount: project %d has no remote_url", projectID)
 	}
-	cmd := execCommand("git", "--git-dir", remoteURL, "log", "--oneline")
+	cmd := execCommand("git", "--git-dir", remoteURL, "log", "--all", "--oneline")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git log failed: %v", err)

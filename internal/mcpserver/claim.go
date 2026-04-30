@@ -122,11 +122,31 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 		// Read the previous submission if it still exists on disk.
 		// After request_changes, the DB clears result_path/commit_sha
 		// but the file stays in the working tree.
+		//
+		// Phase 6b.1: the prior content may live on a topic
+		// branch the workspace isn't currently on (the pre-claim
+		// reconcile checks out the run branch, dropping iter-1's
+		// topic-branch-only content from the worktree). When the
+		// coordinator surfaces a PreviousIterationCommit, read
+		// from THAT commit's tree directly via ReadFileAtCommit;
+		// fall back to the worktree ReadFile for legacy paths
+		// (no iteration branch involved, prior commit unknown).
 		if reviewFeedback != nil && meta != nil && c.workspace != nil {
 			remoteURL, projName, _ := c.fetchProjectMetaFull(ctx, meta.ProjectID)
 			if proj, perr := c.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
 				contentPath := filepath.Join(meta.ResultDir, "result.md")
-				if content, rerr := proj.ReadFile(contentPath); rerr == nil && len(content) > 0 {
+				var content []byte
+				if meta.PreviousIterationCommit != "" {
+					if b, ok, _ := proj.ReadFileAtCommit(meta.PreviousIterationCommit, contentPath); ok && len(b) > 0 {
+						content = b
+					}
+				}
+				if len(content) == 0 {
+					if b, rerr := proj.ReadFile(contentPath); rerr == nil && len(b) > 0 {
+						content = b
+					}
+				}
+				if len(content) > 0 {
 					prev := map[string]string{"content": string(content)}
 					previousSubmission, _ = json.Marshal(prev)
 				}
@@ -194,8 +214,28 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 			continue
 		}
 		metaPath := filepath.Join(reviewResultDir, "metadata.json")
-		metaBytes, merr := proj.ReadFile(metaPath)
-		if merr != nil {
+		// Phase 6b foundational v1: a request_changes /
+		// reject review's commit lives on the review's topic
+		// branch (which DOES NOT merge to the run branch on
+		// negative decisions). The workspace is on the run
+		// branch after the pre-claim reconcile, so ReadFile
+		// of the workspace path returns nothing. Prefer
+		// reading the metadata.json + result.md from the
+		// peer task's latest_completed_commit_sha, falling
+		// back to the worktree only when the API didn't
+		// surface a commit (legacy / pre-foundational rows).
+		latestCommit, _ := t["latest_completed_commit_sha"].(string)
+		var metaBytes []byte
+		var merr error
+		if latestCommit != "" {
+			if b, ok, _ := proj.ReadFileAtCommit(latestCommit, metaPath); ok && len(b) > 0 {
+				metaBytes = b
+			}
+		}
+		if len(metaBytes) == 0 {
+			metaBytes, merr = proj.ReadFile(metaPath)
+		}
+		if merr != nil || len(metaBytes) == 0 {
 			continue
 		}
 		var metaJSON map[string]interface{}
@@ -206,11 +246,22 @@ func (c *apiClient) fetchReviewFeedback(ctx context.Context, meta *taskMeta) []b
 		if decision != "request_changes" && decision != "reject" {
 			continue
 		}
-		// Read the review content.
+		// Read the review content via the same commit-aware
+		// path — same rationale: negative-verdict reviews
+		// don't merge to the run branch.
 		contentPath := filepath.Join(reviewResultDir, "result.md")
-		content, rerr := proj.ReadFile(contentPath)
-		if rerr != nil {
-			continue
+		var content []byte
+		if latestCommit != "" {
+			if b, ok, _ := proj.ReadFileAtCommit(latestCommit, contentPath); ok && len(b) > 0 {
+				content = b
+			}
+		}
+		if len(content) == 0 {
+			b, rerr := proj.ReadFile(contentPath)
+			if rerr != nil {
+				continue
+			}
+			content = b
 		}
 		reviewer, _ := metaJSON["username"].(string)
 		feedback := map[string]interface{}{

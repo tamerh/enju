@@ -117,6 +117,34 @@ type taskMeta struct {
 	// checks this out before writing + pushing so runs on
 	// parallel branches don't stomp on each other's files.
 	Branch string
+	// IterationBranch is the per-iteration topic branch this
+	// citizen's claim writes to (e.g. "myrun/expand/iter-1").
+	// Forked from Branch (the run branch) at checkout time.
+	// When empty (vote/review actions, or pre-phase-5 rows)
+	// the fat-client falls back to committing directly on the
+	// run branch — phase 6b.1 design: same syntax, deeper
+	// semantics, no breakage when the topic-branch flow isn't
+	// applicable.
+	IterationBranch string
+	// UpstreamIterationBranch is the topic branch of the task
+	// this review is judging — populated only for action:review
+	// tasks. Used as the BaseBranch when forking the review's
+	// own topic so review_topic carries the upstream's content
+	// forward; on approve, a single FF merge then advances the
+	// run branch to a tip that contains both the upstream's
+	// commit and the reviewer's verdict prose. Empty when
+	// upstream has no topic (legacy run-branch submission) or
+	// when the task isn't a review.
+	UpstreamIterationBranch string
+	// PreviousIterationCommit is the commit SHA of the prior
+	// completed claim on this task — used by the fat-client's
+	// re-claim flow to surface "Previous submission" content
+	// after request_changes. With phase 6b.1 the prior content
+	// lives on a (now-stale) topic branch, not on the run
+	// branch the workspace is currently on, so the fat-client
+	// reads via ReadFileAtCommit rather than ReadFile. Empty
+	// when there's no prior completed claim.
+	PreviousIterationCommit string
 	// Mode is the compute-task execution mode ("sync" / "async")
 	// when the task was declared, as stored on the task record.
 	// Empty for non-compute tasks. Use yaml.ResolvedMode (or
@@ -247,6 +275,23 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["run_branch"].(string); ok {
 		meta.Branch = v
+	}
+	// iteration_branches is a username → topic-branch map
+	// from /tasks/{id}; pick out the branch for this citizen
+	// if one is registered. Falls back to "" silently — the
+	// submit path treats empty IterationBranch as "use run
+	// branch", which preserves pre-phase-6b behavior for
+	// vote/review actions and legacy claim rows.
+	if v, ok := raw["iteration_branches"].(map[string]interface{}); ok {
+		if b, ok := v[c.username].(string); ok {
+			meta.IterationBranch = b
+		}
+	}
+	if v, ok := raw["previous_iteration_commit"].(string); ok {
+		meta.PreviousIterationCommit = v
+	}
+	if v, ok := raw["upstream_iteration_branch"].(string); ok {
+		meta.UpstreamIterationBranch = v
 	}
 	if v, ok := raw["env"].(map[string]interface{}); ok {
 		env := make(map[string]string, len(v))

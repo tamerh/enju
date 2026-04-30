@@ -921,8 +921,20 @@ type SubmitRequest struct {
 	// Branch is the git branch this submit commits and pushes
 	// to. Empty → the project's configured default branch.
 	// Populated from the run's branch field when the MCP
-	// client's submit handler builds the request.
+	// client's submit handler builds the request — or, in the
+	// living-workflow phase 6b.1 topic-branch flow, from the
+	// per-iteration topic branch that the coordinator handed
+	// back at claim time.
 	Branch string
+
+	// BaseBranch, when non-empty, is the fork point for `Branch`
+	// when the latter doesn't yet exist locally or as a remote-
+	// tracking ref. Used by the topic-branch flow: pass the run
+	// branch as BaseBranch so the per-iteration topic branch
+	// inherits the run branch's current state. Ignored when
+	// Branch already exists. Empty → fall back to the project's
+	// default base (origin/main, then origin/<HEAD>, then root).
+	BaseBranch string
 
 	// Trailers carries Enju-* trailer values to emit in the
 	// commit message footer. TaskID defaults to req.TaskID at
@@ -1059,8 +1071,10 @@ func (p *Project) PrepareCommit(req SubmitRequest) (string, error) {
 	// Ensure we're on the target branch BEFORE writing files —
 	// commits otherwise land on the current HEAD's branch,
 	// which is fine only when the caller is already on the
-	// right branch.
-	if err := p.CheckoutBranch(req.Branch); err != nil {
+	// right branch. When the caller passed BaseBranch (topic-
+	// branch flow), use it as the fork point so a per-iteration
+	// topic branch lands on top of the run branch's tip.
+	if err := p.CheckoutBranchFrom(req.Branch, req.BaseBranch); err != nil {
 		return "", fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
@@ -1412,6 +1426,25 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 // Idempotent — a no-op when HEAD is already on `branch`. The
 // caller MUST hold the project lock.
 func (p *Project) CheckoutBranch(branch string) error {
+	return p.CheckoutBranchFrom(branch, "")
+}
+
+// CheckoutBranchFrom is the base-branch-aware variant of
+// CheckoutBranch. When `baseBranch` is non-empty AND `branch`
+// doesn't yet exist locally or as a remote-tracking ref, the new
+// branch is forked from the tip of `baseBranch` (resolved via
+// origin/<baseBranch>, then the local refs/heads/<baseBranch>).
+// Used by the living-workflow phase 6b.1 topic-branch flow:
+// per-iteration topic branches fork from the run branch tip,
+// not from origin/main, so iter-1's commits land on top of the
+// run branch's current state.
+//
+// When `baseBranch` is empty, behavior is identical to
+// CheckoutBranch — the project's default base (origin/main, then
+// origin/<remote HEAD>, then root) is used as the fork point.
+//
+// Caller MUST hold the project lock.
+func (p *Project) CheckoutBranchFrom(branch, baseBranch string) error {
 	target := p.resolveBranch(branch)
 	wt, err := p.repo.Worktree()
 	if err != nil {
@@ -1435,9 +1468,24 @@ func (p *Project) CheckoutBranch(branch string) error {
 	// when available (the conventional seed), falling back to
 	// origin/<HEAD>, then the repo's root commit. This gives
 	// every new branch a clean, predictable ancestor.
-	baseHash, err := p.branchBaseHash()
-	if err != nil {
-		return fmt.Errorf("resolving base for new branch %q: %w", target, err)
+	//
+	// When the caller passed an explicit baseBranch (phase 6b.1
+	// topic-branch flow), prefer that as the fork point so a
+	// per-iteration branch lands on top of the run branch's
+	// current tip. Falls back to the default base resolution
+	// when baseBranch is empty or its tip can't be resolved.
+	var baseHash plumbing.Hash
+	if baseBranch != "" {
+		if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
+			baseHash = h
+		}
+	}
+	if baseHash.IsZero() {
+		h, err := p.branchBaseHash()
+		if err != nil {
+			return fmt.Errorf("resolving base for new branch %q: %w", target, err)
+		}
+		baseHash = h
 	}
 	// Create the branch ref at the base hash, then point HEAD
 	// at it. go-git's Worktree.Checkout with Create=true uses
@@ -1508,6 +1556,138 @@ func (p *Project) CheckoutBranch(branch string) error {
 		)
 	}
 	return nil
+}
+
+// resolveBaseBranchHash looks up the tip commit of a named base
+// branch for the topic-branch flow. Prefers the LOCAL ref
+// refs/heads/<baseBranch> over the origin-tracking ref because
+// recent local commits (template auto-commits on first
+// create_run, batch submits not yet pushed) live on the local
+// branch BEFORE origin learns about them — and forking the
+// topic from a stale origin/<baseBranch> would produce a
+// branch whose history misses those commits, breaking the FF
+// invariant when we later merge topic back onto the local run
+// branch. Returns (hash, true) on success; (zero, false) when
+// neither ref exists, letting the caller fall back to the
+// default base resolution.
+func (p *Project) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
+	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true); err == nil {
+		return ref.Hash(), true
+	}
+	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", baseBranch), true); err == nil {
+		return ref.Hash(), true
+	}
+	return plumbing.ZeroHash, false
+}
+
+// FastForwardBranchToCommit advances `branch` to `commitSHA`
+// locally and on origin, refusing if the move isn't a fast-
+// forward. Used by the living-workflow phase 6b foundational
+// auto-merge: after a topic-branch commit lands and the
+// coordinator marks the task ACCEPTED, the fat-client FF-pushes
+// the topic SHA onto the run branch so all downstream readers
+// see the canonical state on the run branch.
+//
+// FF-only is the v1 contract — under linear progression
+// (depends_on must be merged before downstream starts) a
+// non-FF here means a parallel iteration ran without proper
+// gating, which is a workflow bug we want to surface loudly
+// rather than silently rewrite history. v2 will introduce
+// rebase / spawn-resolve_conflict on this path.
+//
+// Caller MUST hold the project lock.
+func (p *Project) FastForwardBranchToCommit(branch, commitSHA string) error {
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	if commitSHA == "" {
+		return fmt.Errorf("commit SHA is required")
+	}
+	hash := plumbing.NewHash(commitSHA)
+	if hash.IsZero() {
+		return fmt.Errorf("invalid commit SHA %q", commitSHA)
+	}
+
+	// Verify FF locally first: the current branch ref (or its
+	// origin-tracking ref, if the local ref doesn't exist yet)
+	// must be an ancestor of the target commit. Refuses with a
+	// clear message rather than letting the remote reject in a
+	// less-readable form.
+	refName := plumbing.NewBranchReferenceName(branch)
+	var currentHash plumbing.Hash
+	if ref, err := p.repo.Reference(refName, true); err == nil {
+		currentHash = ref.Hash()
+	} else if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true); err == nil {
+		currentHash = ref.Hash()
+	}
+	if !currentHash.IsZero() && currentHash != hash {
+		isAncestor, ancErr := p.commitIsAncestor(currentHash, hash)
+		if ancErr != nil {
+			return fmt.Errorf("verifying fast-forward of %q: %w", branch, ancErr)
+		}
+		if !isAncestor {
+			return fmt.Errorf(
+				"refusing non-fast-forward update of %q from %s to %s — "+
+					"the run branch has diverged from the topic branch, which under "+
+					"linear progression should never happen. Investigate parallel "+
+					"iterations or manual ref edits before retrying",
+				branch, currentHash.String()[:8], hash.String()[:8])
+			}
+	}
+
+	// Update the local ref so subsequent reads see the merged
+	// state. Idempotent when already at target.
+	if currentHash != hash {
+		if err := p.repo.Storer.SetReference(plumbing.NewHashReference(refName, hash)); err != nil {
+			return fmt.Errorf("updating local %q to %s: %w", branch, hash, err)
+		}
+	}
+
+	// Push the same SHA to the remote branch ref. Using the
+	// non-force form means the remote will reject any non-FF
+	// update — a defense-in-depth check on top of the local
+	// ancestry verify. The remote rejection message is less
+	// readable than ours, so we treat the remote-side reject as
+	// a separate hard error class.
+	if p.remoteURL == "" {
+		return nil
+	}
+	refSpec := fmt.Sprintf("%s:refs/heads/%s", hash.String(), branch)
+	pushErr := p.repo.Push(&gogit.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
+		Auth:       sshAuthMethod(p.remoteURL),
+	})
+	p.lastPushAt = time.Now()
+	if pushErr != nil && pushErr != gogit.NoErrAlreadyUpToDate {
+		p.lastPushError = pushErr.Error()
+		return friendlyGitError("ff-push", p.remoteURL, pushErr)
+	}
+	p.lastPushError = ""
+	return nil
+}
+
+// commitIsAncestor reports whether `ancestor` is reachable
+// from `descendant` via parent links — the standard "is X a
+// fast-forward of Y" check. Used by FastForwardBranchToCommit
+// before any ref update.
+func (p *Project) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, error) {
+	if ancestor == descendant {
+		return true, nil
+	}
+	descCommit, err := p.repo.CommitObject(descendant)
+	if err != nil {
+		return false, fmt.Errorf("loading descendant commit %s: %w", descendant, err)
+	}
+	ancCommit, err := p.repo.CommitObject(ancestor)
+	if err != nil {
+		return false, fmt.Errorf("loading ancestor commit %s: %w", ancestor, err)
+	}
+	// go-git semantics: X.IsAncestor(Y) reports whether X is
+	// reachable from Y by walking parent links — i.e. "is X an
+	// ancestor of Y." So to ask "is ancestor an ancestor of
+	// descendant" we call ancCommit.IsAncestor(descCommit).
+	return ancCommit.IsAncestor(descCommit)
 }
 
 // branchBaseHash picks the commit a fresh branch should fork

@@ -2756,6 +2756,13 @@ type taskResponse struct {
 	// submitted). Empty for citizens=1 tasks — those use the
 	// ClaimedBy field.
 	ActiveClaimants []string `json:"active_claimants,omitempty"`
+	// IterationBranches maps each active claimant's username to
+	// the per-iteration topic branch they should commit on
+	// (e.g. "myrun/expand/iter-1"). The fat client picks its
+	// own entry — coordinator stays branch-agnostic. Empty when
+	// no active claim has a branch (vote/review actions, or
+	// pre-phase-5 rows).
+	IterationBranches map[string]string `json:"iteration_branches,omitempty"`
 	// ArtifactProvenance shows who last wrote each artifact
 	// this task reads.
 	ArtifactProvenance []artifactProvenance `json:"artifact_provenance,omitempty"`
@@ -2764,6 +2771,43 @@ type taskResponse struct {
 	// more than one claim record (indicates re-runs after
 	// invalidation).
 	TaskHistory []taskHistoryEntry `json:"task_history,omitempty"`
+	// PreviousIterationCommit is the commit SHA of the most
+	// recent COMPLETED claim that's no longer the active one.
+	// Surfaced for the phase 6b.1 topic-branch flow: when the
+	// fat-client re-claims after request_changes, the prior
+	// iteration's content lives on its (now stale) topic
+	// branch; the previous-submission UI uses this SHA to
+	// read the content via ReadFileAtCommit instead of from
+	// the current workspace (which was switched to the run
+	// branch by the pre-claim reconcile). Empty when there's
+	// no prior completed claim, or when the prior claim
+	// wrote no commit (vote/review without content).
+	PreviousIterationCommit string `json:"previous_iteration_commit,omitempty"`
+	// UpstreamIterationBranch is the topic branch of the task
+	// this one is reviewing — populated only for action:review
+	// tasks whose reviews_target has a completed claim with a
+	// topic branch. The fat-client uses it as the fork point
+	// for the review's own topic branch so that, when the
+	// review approves, the merged review topic carries the
+	// upstream's content forward to the run branch in one FF
+	// step. Empty for non-review tasks and for reviews whose
+	// targets predate the topic-branch flow (legacy claim
+	// rows on the run branch).
+	UpstreamIterationBranch string `json:"upstream_iteration_branch,omitempty"`
+	// LatestCompletedCommitSHA is the most recent submission
+	// commit on this task, regardless of whether the task is
+	// currently in a terminal state. Useful to readers that
+	// need to recover content after a state-clearing transition
+	// (request_changes, invalidate) where t.CommitSHA gets
+	// blanked but the underlying git commit still exists. Empty
+	// when no claim ever completed.
+	LatestCompletedCommitSHA string `json:"latest_completed_commit_sha,omitempty"`
+	// LatestCompletedBranch is the topic branch of the same
+	// claim referenced by LatestCompletedCommitSHA. Pair with
+	// LatestCompletedCommitSHA for ReadFileAtCommit lookups
+	// against historic content that's no longer on the
+	// workspace's current branch.
+	LatestCompletedBranch string `json:"latest_completed_branch,omitempty"`
 }
 
 type taskHistoryEntry struct {
@@ -3079,7 +3123,11 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 
 	s.store.TouchCitizen(caller.ID)
 
-	// Return task with full details
+	// Return task with full details. The per-citizen
+	// iteration_branch is surfaced via toTaskResponse's
+	// IterationBranches map (read by the fat-client through
+	// fetchTaskMeta), so no separate top-level field is
+	// needed here.
 	updatedTask, _ := s.store.GetTask(taskID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"task":     s.toTaskResponse(*updatedTask),
@@ -4211,7 +4259,170 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	if completed {
 		resp["run_completed"] = true
 	}
+
+	// Living-workflow phase 6b foundational v1: surface
+	// "tasks that just transitioned to ACCEPTED and need their
+	// topic branch fast-forwarded onto the run branch." The
+	// fat-client iterates these and pushes <topic-sha> :
+	// refs/heads/<run-branch> for each one. Two cases:
+	//
+	//   - The submitter's own task auto-accepted (single-citizen
+	//     answer/compute, no review).
+	//   - A review's target transitioned to accepted because the
+	//     reviewer approved.
+	//
+	// Vote tasks have no topic branch (generateIterationBranch
+	// returns "" for vote/review actions), so they don't appear
+	// here even when the vote resolves on this submit. Same for
+	// reviews themselves — only the targets they approved are
+	// candidates.
+	if merges := s.collectAcceptedMerges(taskID, task, actions, run.Branch); len(merges) > 0 {
+		resp["accepted_merges"] = merges
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// acceptedMergeTarget identifies one (topic-branch, run-branch,
+// commit-sha) tuple that the fat-client must FF-push to advance
+// the run branch onto the accepted iteration's tip. Phase 6b.1
+// + auto-merge wedge.
+type acceptedMergeTarget struct {
+	TaskID      string `json:"task_id"`
+	TopicBranch string `json:"topic_branch"`
+	RunBranch   string `json:"run_branch"`
+	CommitSHA   string `json:"commit_sha"`
+}
+
+// collectAcceptedMerges builds the post-submit list of tasks
+// whose accepted topic branch needs FF-merging onto the run
+// branch. Caller surfaces these in the submit response so the
+// fat-client can drive the merges (trust-the-client — the
+// coordinator never touches git).
+func (s *Server) collectAcceptedMerges(
+	submittedTaskID string,
+	submittedTask *store.TaskRecord,
+	actions *engine.PostSubmitActions,
+	runBranch string,
+) []acceptedMergeTarget {
+	if runBranch == "" {
+		return nil
+	}
+	var out []acceptedMergeTarget
+
+	// Case 1: the submitter's own task accepted on this submit
+	// (single-citizen answer/compute, no review gate, or a
+	// multi-citizen vote that resolved on this submit). Re-read
+	// state — the submit plan we applied above may have
+	// transitioned the task without us looking again.
+	//
+	// Suppress for reviews that did NOT approve. Per the
+	// design: "Reject → branch stays where it is, main
+	// untouched." A request_changes / reject review's topic
+	// must not merge to main; the topic stays as audit. Only
+	// approving reviews advance main (and they bring the
+	// upstream's content along since review_topic was forked
+	// from upstream_topic).
+	skipMergeOfSelf := false
+	if submittedTask != nil && submittedTask.Action == "review" &&
+		actions != nil && (actions.ShouldRejectTarget || actions.ShouldFailTarget) {
+		skipMergeOfSelf = true
+	}
+	if !skipMergeOfSelf {
+		if cur, err := s.store.GetTask(submittedTaskID); err == nil && cur != nil &&
+			store.TaskState(cur.State) == store.TaskAccepted {
+			if t := s.acceptedMergeForTask(cur.ID, runBranch); t != nil {
+				out = append(out, *t)
+			}
+		}
+	}
+
+	// Case 2: review approved the upstream. The review's own
+	// topic branch was forked from the upstream's topic at
+	// claim time (see UpstreamIterationBranch in the claim
+	// response), so the review_topic SHA already carries the
+	// upstream's commits. The case-1 merge above (which emits
+	// the review's own topic) is sufficient — emitting the
+	// upstream's topic separately would just attempt a second
+	// FF whose target isn't a descendant of the now-advanced
+	// run branch tip and would fail the FF check.
+	//
+	// The only situation where we DO need to emit an upstream
+	// merge is if the review HAS no topic branch of its own
+	// (legacy claim row, multi-citizen review where the
+	// reviewer that pushed it over the threshold also has an
+	// empty IterationBranch). In that case the review's
+	// commit landed directly on the run branch and the
+	// upstream's topic still needs to advance separately.
+	if submittedTask != nil && submittedTask.Action == "review" && submittedTask.ReviewsTarget != "" &&
+		actions != nil && !actions.ShouldRejectTarget && !actions.ShouldFailTarget {
+		reviewHadTopic := false
+		for _, m := range out {
+			if m.TaskID == submittedTaskID {
+				reviewHadTopic = true
+				break
+			}
+		}
+		if !reviewHadTopic {
+			targetDef, targetInstance := parseReviewsTargetForMerge(submittedTask.ReviewsTarget)
+			runTasks, _ := s.store.ListTasksByRun(submittedTask.RunID)
+			for _, rt := range runTasks {
+				if rt.TaskDefID != targetDef {
+					continue
+				}
+				if rt.InstanceKey != targetInstance {
+					continue
+				}
+				if store.TaskState(rt.State) != store.TaskAccepted {
+					continue
+				}
+				if t := s.acceptedMergeForTask(rt.ID, runBranch); t != nil {
+					out = append(out, *t)
+				}
+				break
+			}
+		}
+	}
+
+	return out
+}
+
+// acceptedMergeForTask renders one merge target for a task that
+// is currently in state=accepted. Returns nil when the task
+// has no topic branch (vote/review action) or no commit_sha
+// on its latest completed claim (untracked-only outputs).
+func (s *Server) acceptedMergeForTask(taskID, runBranch string) *acceptedMergeTarget {
+	hist, err := s.store.ListTaskHistory(taskID)
+	if err != nil {
+		return nil
+	}
+	for i := len(hist) - 1; i >= 0; i-- {
+		c := hist[i]
+		if c.Outcome != "completed" {
+			continue
+		}
+		if c.Branch == "" || c.CommitSHA == "" {
+			return nil
+		}
+		return &acceptedMergeTarget{
+			TaskID:      taskID,
+			TopicBranch: c.Branch,
+			RunBranch:   runBranch,
+			CommitSHA:   c.CommitSHA,
+		}
+	}
+	return nil
+}
+
+// parseReviewsTargetForMerge mirrors mcpserver.parseReviewsTarget
+// for the merge-targets path: split a reviews_target value
+// (either "defID" or "instanceKey:defID") into (defID,
+// instanceKey). Kept local to avoid a server→mcpserver import
+// cycle; the two implementations must stay in sync.
+func parseReviewsTargetForMerge(target string) (string, string) {
+	if idx := strings.Index(target, ":"); idx > 0 {
+		return target[idx+1:], target[:idx]
+	}
+	return target, ""
 }
 
 func (s *Server) handleReleaseTask(w http.ResponseWriter, r *http.Request) {
@@ -5704,6 +5915,116 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 					uname = fmt.Sprintf("active-citizen-%d", idx+1)
 				}
 				resp.ActiveClaimants = append(resp.ActiveClaimants, uname)
+				if c.Branch != "" {
+					if resp.IterationBranches == nil {
+						resp.IterationBranches = map[string]string{}
+					}
+					resp.IterationBranches[uname] = c.Branch
+				}
+			}
+		}
+	}
+
+	// Phase 6b foundational v1: upstream_iteration_branch for
+	// action:review tasks. When the upstream (this task's
+	// reviews_target) has a completed claim with a topic
+	// branch, surface it so the fat-client can fork the
+	// review's own topic from the upstream's topic — the
+	// review's merge on approve then advances main to a tip
+	// that contains BOTH the upstream's content and the
+	// review's prose, in one FF step.
+	if t.Action == "review" && t.ReviewsTarget != "" {
+		// reviews_target is either a bare def id or
+		// "instanceKey:defID"; find the upstream task within
+		// the same run and read its latest completed claim's
+		// branch.
+		//
+		// Only set UpstreamIterationBranch when the upstream
+		// has NOT yet merged to the run branch — i.e. when its
+		// state is something other than ACCEPTED. An accepted
+		// upstream's commit is already on main (the topic
+		// merged at its submit time), so the review's topic
+		// should fork from current main, not from the now-
+		// stale upstream topic. Forking from a stale topic
+		// produces a base behind main and the eventual FF
+		// merge of the review topic would refuse as non-FF.
+		targetDef, targetInstance := parseReviewsTargetForMerge(t.ReviewsTarget)
+		runTasks, _ := s.store.ListTasksByRun(t.RunID)
+		for _, ut := range runTasks {
+			if ut.TaskDefID != targetDef || ut.InstanceKey != targetInstance {
+				continue
+			}
+			if store.TaskState(ut.State) == store.TaskAccepted {
+				break
+			}
+			hist, _ := s.store.ListTaskHistory(ut.ID)
+			for i := len(hist) - 1; i >= 0; i-- {
+				if hist[i].Outcome == "completed" && hist[i].Branch != "" {
+					resp.UpstreamIterationBranch = hist[i].Branch
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// Phase 6b.1: previous_iteration_commit. The most recent
+	// claim that submitted (outcome=completed) AND isn't the
+	// current active one. After a request_changes re-claim,
+	// the active claim has no commit yet but the prior closed
+	// claim's commit SHA lets the fat-client surface the prior
+	// content via ReadFileAtCommit — the workspace is on the
+	// run branch by then, so a plain ReadFile of the workspace
+	// path can't see the prior topic-branch-only content.
+	//
+	// Also populate latest_completed_commit_sha + branch from
+	// the same scan (foundational v1 fan-out): readers that
+	// need a task's last submission content even after the
+	// task's DB state was cleared (request_changes cascade
+	// blanks t.CommitSHA on the task row but the commit
+	// itself persists on the topic branch) use these for a
+	// branch-safe ReadFileAtCommit.
+	if hist, err := s.store.ListTaskHistory(t.ID); err == nil {
+		for i := len(hist) - 1; i >= 0; i-- {
+			c := hist[i]
+			if c.Outcome != "completed" || c.CommitSHA == "" {
+				continue
+			}
+			if resp.LatestCompletedCommitSHA == "" {
+				resp.LatestCompletedCommitSHA = c.CommitSHA
+				resp.LatestCompletedBranch = c.Branch
+			}
+			if resp.PreviousIterationCommit == "" {
+				resp.PreviousIterationCommit = c.CommitSHA
+			}
+			if resp.LatestCompletedCommitSHA != "" && resp.PreviousIterationCommit != "" {
+				break
+			}
+		}
+	}
+
+	// Phase 6b.1: surface per-citizen iteration_branches for
+	// EVERY task that has an active claim, not just multi-
+	// citizen vote/review. Single-citizen action:answer tasks
+	// also need their topic branch on the wire so the fat-
+	// client submit handler can pick it up via fetchTaskMeta
+	// after the claim. Anonymized tasks remain anonymized —
+	// fall through to the multi-citizen block above which
+	// already handles that case.
+	if resp.IterationBranches == nil && !t.Anonymize {
+		if claims, err := s.store.ListActiveClaims(t.ID); err == nil {
+			for _, c := range claims {
+				if c.Branch == "" {
+					continue
+				}
+				uname := s.citizenUsername(c.CitizenID)
+				if uname == "" {
+					continue
+				}
+				if resp.IterationBranches == nil {
+					resp.IterationBranches = map[string]string{}
+				}
+				resp.IterationBranches[uname] = c.Branch
 			}
 		}
 	}

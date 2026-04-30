@@ -437,7 +437,20 @@ func (h *mcpHarness) mcpBareResultMD(t *testing.T, shortID string, citizen ...st
 		dir = filepath.Join(dir, "citizen-"+citizen[0])
 	}
 	path := filepath.Join(dir, "result.md")
-	body, ok := h.readRepoFile(projectID, path)
+	// Foundational v1: tasks whose topic hasn't merged to
+	// main (rejected reviews, in-flight iterations) only
+	// have their result.md on the topic branch. Prefer the
+	// topic ref when the task response surfaces it, falling
+	// back to the bare's default branch.
+	var body []byte
+	var ok bool
+	if topic, _ := task["latest_completed_branch"].(string); topic != "" {
+		remoteURL := h.remoteFor(projectID)
+		body, ok = readRepoFileOnBranch(t, remoteURL, topic, path)
+	}
+	if !ok {
+		body, ok = h.readRepoFile(projectID, path)
+	}
 	if !ok {
 		t.Fatalf("mcpBareResultMD: %s not found in bare remote", path)
 	}
@@ -447,6 +460,14 @@ func (h *mcpHarness) mcpBareResultMD(t *testing.T, shortID string, citizen ...st
 // mcpBareMetadataJSON parses a task's metadata.json from the
 // bare remote into a generic map. Used by audit-trail tests that
 // verify embedded decision / option / username fields.
+//
+// Foundational v1: rejected / request_changes reviews don't
+// merge their topic branch onto main, so their metadata.json
+// only lives on the topic ref. When the task response surfaces
+// a `latest_completed_branch`, prefer that branch for the
+// read; otherwise fall back to the bare's default branch
+// (the legacy run-branch path for tasks that did merge to
+// main, plus pre-foundational tests).
 func (h *mcpHarness) mcpBareMetadataJSON(t *testing.T, shortID string, citizen ...string) map[string]interface{} {
 	t.Helper()
 	task := h.taskGet(shortID)
@@ -457,7 +478,15 @@ func (h *mcpHarness) mcpBareMetadataJSON(t *testing.T, shortID string, citizen .
 		dir = filepath.Join(dir, "citizen-"+citizen[0])
 	}
 	path := filepath.Join(dir, "metadata.json")
-	body, ok := h.readRepoFile(projectID, path)
+	var body []byte
+	var ok bool
+	if topic, _ := task["latest_completed_branch"].(string); topic != "" {
+		remoteURL := h.remoteFor(projectID)
+		body, ok = readRepoFileOnBranch(t, remoteURL, topic, path)
+	}
+	if !ok {
+		body, ok = h.readRepoFile(projectID, path)
+	}
 	if !ok {
 		t.Fatalf("mcpBareMetadataJSON: %s not found in bare remote", path)
 	}

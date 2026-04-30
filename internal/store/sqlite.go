@@ -1427,10 +1427,13 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 	var state string
 	var citizens int
 	var taskDefID, runSlug, taskAction string
+	var instanceKey string
+	var runSeq int
 	err = tx.QueryRow(
-		`SELECT state, citizens, task_def_id, COALESCE(run_slug, ''), action FROM tasks WHERE id = ?`,
+		`SELECT t.state, t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action, COALESCE(t.instance_key, ''), r.seq
+		 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
 		taskID,
-	).Scan(&state, &citizens, &taskDefID, &runSlug, &taskAction)
+	).Scan(&state, &citizens, &taskDefID, &runSlug, &taskAction, &instanceKey, &runSeq)
 	if err != nil {
 		return fmt.Errorf("task %q not found: %w", taskID, err)
 	}
@@ -1507,7 +1510,12 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 	// count prior claims for iter-N.
 	var priorClaims int
 	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, taskID).Scan(&priorClaims)
-	branch := generateIterationBranch(taskAction, taskDefID, runSlug, priorClaims)
+	var runHasMulti int
+	_ = tx.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE run_id = (SELECT run_id FROM tasks WHERE id = ?) AND citizens > 1`,
+		taskID,
+	).Scan(&runHasMulti)
+	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, priorClaims, citizens, runHasMulti > 0)
 
 	_, err = tx.Exec(
 		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, branch) VALUES (?, ?, ?, ?, ?)`,
@@ -1829,7 +1837,7 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 // reads. model_id is the current attribution column; future
 // operator/model-design columns (route, model_resolved, paid_by)
 // extend this list when they ship.
-const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, model_id`
+const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, model_id, branch, commit_sha, decision`
 
 // scanTaskClaims is the shared scanner used by ListVoteSubmissions
 // and ListActiveClaims. Centralizing the scan keeps the two paths
@@ -1844,6 +1852,7 @@ func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 		if err := rows.Scan(
 			&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
 			&outcome, &submittedAt, &r.Option, &r.Content, &modelID,
+			&r.Branch, &r.CommitSHA, &r.Decision,
 		); err != nil {
 			return nil, err
 		}

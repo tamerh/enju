@@ -18,6 +18,14 @@ func TestParseReviewsTarget(t *testing.T) {
 		{"iter-3:summarize", "summarize", "iter-3"},
 		// Empty passes through.
 		{"", "", ""},
+		// Pathological leading-colon shape: NOT split. The
+		// materializer never writes ":foo" (instance keys
+		// aren't empty when a colon is present), so we treat
+		// the whole string as the def id rather than producing
+		// (defID="foo", instanceKey="") — matches the engine
+		// side's parseReviewsTargetForMerge behavior so the
+		// merge collector and feedback resolver agree.
+		{":foo", ":foo", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {

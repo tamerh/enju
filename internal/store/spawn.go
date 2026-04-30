@@ -18,7 +18,24 @@ type SpawnSpec struct {
 	Action         string   // "answer" | "compute" | "contribute" | "review" | "vote"
 	Prompt         string   // optional
 	UserPrompt     string   // optional
-	Citizens       int      // default 1
+	// Citizens is the multi-citizen count for the spawned
+	// task. Defaults to 1.
+	//
+	// Caveat (foundational v1 / phase 6b): if the run already
+	// has any topic-stamped claims and a spawn lands a task
+	// with Citizens > 1, the run-level multi-citizen gate in
+	// generateIterationBranch only takes effect for FUTURE
+	// claims — earlier topics keep their refs and FF-merge as
+	// expected, but the new multi-citizen task commits
+	// directly to the run branch and can advance main between
+	// an earlier topic's fork and its own FF-merge, producing
+	// a non-FF refusal at merge time. In practice, today's
+	// spawn paths (manual, on_review_reject remediation, auto-
+	// triage) all default to Citizens=1 so the failure mode
+	// is vacuous; v2 (rebase-on-non-FF + multi-citizen topic
+	// flow) lifts this. See docs/living-workflow.md § v2
+	// follow-ups.
+	Citizens       int
 	DependsOn      []string // optional — fully-qualified task ids the spawned task must wait on
 	AssignTo       []string // optional — restrict claim to specific usernames
 	RequireRole    string   // optional
@@ -274,26 +291,83 @@ func (s *Store) ListRunsWithAutoTriage(projectID int64) ([]int64, error) {
 // the two write paths. Format:
 // "<run-slug>/<task_def_id>/iter-<N>".
 //
-// Vote/review tasks have no git artifact and so no meaningful
-// topic branch — the helper returns "" for those, and callers
-// store the empty string rather than a misleading branch name.
+// Vote tasks aggregate per-citizen submits into a single tally
+// rather than producing one canonical commit, so the topic-
+// branch flow doesn't model them well — the helper returns ""
+// for vote action and the fat-client falls back to committing
+// directly on the run branch (existing behavior).
+//
+// Review action DOES get a topic branch in the foundational v1
+// design: a review's commit (metadata.json + result.md) holds
+// the verdict prose and must travel through the same accept-
+// then-merge gate as the upstream content it judges. Without a
+// review topic branch, an approved review's commit lands on
+// the run branch BEFORE the upstream's topic-→-run merge,
+// producing a divergence that the FF gate refuses (the run
+// branch and the upstream's topic branch then have unrelated
+// tips).
 //
 // taskAction is the task's action ("answer" / "compute" / etc.),
-// taskDefID is the YAML id, runSlug is the per-run slug for the
+// taskDefID is the YAML id, instanceKey is the per-instance
+// for_each segment ("alpha" for alpha:expand, empty for
+// singleton tasks), runSlug is the per-run slug for the
 // enju/runs/{seq}-{slug}/ layout (defaults to "run" when empty).
 // priorClaims should be the result of
 // `SELECT COUNT(*) FROM task_claims WHERE task_id = ?` evaluated
 // inside the same transaction so iter-N is monotonic under
 // concurrent claims.
-func generateIterationBranch(taskAction, taskDefID, runSlug string, priorClaims int) string {
-	if taskAction == "vote" || taskAction == "review" {
+//
+// The instance key is required: without it, for_each siblings
+// (e.g. Python:pros and Go:pros) would share the same topic-
+// branch name and the second submit would silently land on top
+// of the first, producing a topic that diverges from main when
+// the first sibling has already merged. Encoding the instance
+// key gives each iteration its own unique ref.
+func generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug string, runSeq, priorClaims, citizens int, runHasMultiCitizen bool) string {
+	if taskAction == "vote" {
+		return ""
+	}
+	// Multi-citizen tasks (parallel reviewers, parallel
+	// answerers) keep the legacy "commit directly to the run
+	// branch" behavior. Each citizen writes their own per-
+	// citizen subdir, so per-claim topic branches would
+	// produce N divergent topics that can't FF-merge cleanly
+	// onto the run branch — exactly the parallel-iteration
+	// case the v1 wedge defers. Single-citizen tasks (the
+	// vast majority) get the topic-branch flow.
+	if citizens > 1 {
+		return ""
+	}
+	// Run-level gate: if ANY task in the run is multi-
+	// citizen, disable topics for every task in that run.
+	// Otherwise a single-citizen draft's topic could be
+	// forked from main_old, then a multi-citizen reviewer
+	// commits directly to main, then the draft's topic ↔
+	// main FF would fail. Conservative v1 behavior; the
+	// rebase-on-non-FF work (v2) lets us re-enable per-task
+	// topics independently.
+	if runHasMultiCitizen {
 		return ""
 	}
 	slug := runSlug
 	if slug == "" {
 		slug = "run"
 	}
-	return fmt.Sprintf("%s/%s/iter-%d", slug, taskDefID, priorClaims+1)
+	// Encode run seq alongside the slug so two runs with the
+	// same name (or two runs created from the same template)
+	// don't collide on a single topic-branch ref. The runs
+	// dir on disk uses the same `<seq>-<slug>` segment.
+	runSegment := fmt.Sprintf("%d-%s", runSeq, slug)
+	// Branch names can't contain ":" — use "/" as the
+	// separator so the instance key sits as its own path
+	// segment in the ref namespace (refs/heads/<run-segment>/
+	// <instance-key>/<task-def>/iter-N). For singleton tasks
+	// (no instance key) the segment collapses naturally.
+	defSegment := taskDefID
+	if instanceKey != "" {
+		defSegment = instanceKey + "/" + taskDefID
+	}
+	return fmt.Sprintf("%s/%s/iter-%d", runSegment, defSegment, priorClaims+1)
 }
 
 // SetAutoTriageTemplate persists the run-level auto-triage rule
