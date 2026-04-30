@@ -301,6 +301,106 @@ func sortRunEvents(events []RunEventRecord) {
 	})
 }
 
+// EventQuery is a filter for ListEvents — the projection layer
+// over contribution_events. All fields are optional; Limit caps
+// at 1000 to keep responses bounded. At least one of ProjectID
+// or RunID should be set in practice, otherwise the query is
+// "every event ever recorded" which is rarely what callers want.
+type EventQuery struct {
+	ProjectID  int64
+	RunID      int64
+	CitizenID  int64
+	EventTypes []string  // OR-matched if non-empty
+	Since      time.Time // zero value = no lower bound
+	Limit      int       // default 100, max 1000
+}
+
+// ListEvents returns the projection layer over the
+// contribution_events table — the read-only counterpart to the
+// `enju_export_run_events` git-tracked snapshot. Ordered newest-
+// first so log-tailing UX is natural; reverse on the client when
+// you want chronological order.
+//
+// Living-workflow phase 2: the contribution_events table is the
+// canonical event log (per design notes). This method exposes
+// it with filters; the MCP tool `enju_show_events` formats the
+// result as JSONL.
+func (s *Store) ListEvents(q EventQuery) ([]RunEventRecord, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	conds := []string{}
+	args := []interface{}{}
+	if q.ProjectID > 0 {
+		conds = append(conds, "ce.project_id = ?")
+		args = append(args, q.ProjectID)
+	}
+	if q.RunID > 0 {
+		conds = append(conds, "ce.run_id = ?")
+		args = append(args, q.RunID)
+	}
+	if q.CitizenID > 0 {
+		conds = append(conds, "ce.citizen_id = ?")
+		args = append(args, q.CitizenID)
+	}
+	if len(q.EventTypes) > 0 {
+		placeholders := ""
+		for i := range q.EventTypes {
+			if i > 0 {
+				placeholders += ", "
+			}
+			placeholders += "?"
+			args = append(args, q.EventTypes[i])
+		}
+		conds = append(conds, "ce.event_type IN ("+placeholders+")")
+	}
+	if !q.Since.IsZero() {
+		conds = append(conds, "ce.created_at >= ?")
+		args = append(args, q.Since)
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + conds[0]
+		for i := 1; i < len(conds); i++ {
+			where += " AND " + conds[i]
+		}
+	}
+
+	args = append(args, limit)
+	rows, err := s.db.Query(
+		`SELECT ce.created_at, ce.event_type, ce.event_subtype, ce.task_id, ce.metadata,
+		        COALESCE(c.username, '') AS citizen
+		 FROM contribution_events ce
+		 LEFT JOIN citizens c ON ce.citizen_id = c.id
+		 `+where+`
+		 ORDER BY ce.created_at DESC, ce.id DESC
+		 LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []RunEventRecord
+	for rows.Next() {
+		var r RunEventRecord
+		var metadata sql.NullString
+		if err := rows.Scan(&r.Timestamp, &r.Type, &r.Subtype, &r.TaskID, &metadata, &r.Citizen); err != nil {
+			continue
+		}
+		r.Metadata = metadata.String
+		events = append(events, r)
+	}
+	return events, nil
+}
+
 // GetDownstreamImpact counts how many tasks transitively
 // depended on tasks this citizen completed. This is the
 // "Your outputs were used by N downstream tasks" metric.

@@ -563,6 +563,9 @@ func (e *Engine) ComputeMaterialization(
 			Env:             marshalStringMap(ti.Env),
 			Mode:            ti.Mode,
 			Container:       ti.Container,
+			OnReviewReject:         ti.OnReviewReject,
+			OnReviewRequestChanges: ti.OnReviewRequestChanges,
+			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -880,6 +883,9 @@ func (e *Engine) ComputeMaterialization(
 			Env:             marshalStringMap(ti.Env),
 			Mode:            ti.Mode,
 			Container:       ti.Container,
+			OnReviewReject:         ti.OnReviewReject,
+			OnReviewRequestChanges: ti.OnReviewRequestChanges,
+			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
 			CreatedAt:       now,
 		}
 		outcome.TasksToCreate = append(outcome.TasksToCreate, rec)
@@ -1051,6 +1057,21 @@ func marshalWriteArtifacts(w enjuYaml.WriteArtifacts) string {
 		return ""
 	}
 	data, err := json.Marshal(w)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// marshalRemediationTemplate JSON-encodes the inline remediation
+// spec so it round-trips through tasks.remediation_template as
+// a single TEXT column. nil pointer or zero value → "" so the DB
+// default stays clean and "no rule" is unambiguous.
+func marshalRemediationTemplate(t *enjuYaml.RemediationTemplate) string {
+	if t == nil || (t.Action == "" && t.Prompt == "" && len(t.AssignTo) == 0 && t.RequireRole == "") {
+		return ""
+	}
+	data, err := json.Marshal(t)
 	if err != nil {
 		return ""
 	}

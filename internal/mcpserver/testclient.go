@@ -88,6 +88,26 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleRunStatus(ctx, req)
 	case "enju_create_run":
 		return t.c.handleCreateRun(ctx, req)
+	case "enju_pause_run":
+		return t.c.handlePauseRun(ctx, req)
+	case "enju_resume_run":
+		return t.c.handleResumeRun(ctx, req)
+	case "enju_spawn_task":
+		return t.c.handleSpawnTask(ctx, req)
+	case "enju_set_cycle_budget":
+		return t.c.handleSetCycleBudget(ctx, req)
+	case "enju_show_events":
+		return t.c.handleShowEvents(ctx, req)
+	case "enju_file_issue":
+		return t.c.handleFileIssue(ctx, req)
+	case "enju_list_issues":
+		return t.c.handleListIssues(ctx, req)
+	case "enju_get_issue":
+		return t.c.handleGetIssue(ctx, req)
+	case "enju_triage_issue":
+		return t.c.handleTriageIssue(ctx, req)
+	case "enju_close_issue":
+		return t.c.handleCloseIssue(ctx, req)
 	case "enju_list_runs":
 		return t.c.handleListRuns(ctx, req)
 	case "enju_create_project":

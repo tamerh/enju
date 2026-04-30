@@ -297,6 +297,36 @@ func (s *Store) migrate() error {
 		last_used_at    TIMESTAMP
 	);
 
+	-- Issues are project-level structured artifacts (living-
+	-- workflow phase 3). Outlive individual runs — filed in run
+	-- #2, triaged in run #4, fixed in run #7 is normal. Status
+	-- transitions: open → triaged → closed (or wontfix). Atomic
+	-- per-project counter via MAX(seq)+1 inside CreateIssue's
+	-- transaction; the UNIQUE (project_id, seq) constraint
+	-- doubles as the racing-create guard. See
+	-- docs/living-workflow-design-notes.md § 6.
+	CREATE TABLE IF NOT EXISTS issues (
+		id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id          INTEGER NOT NULL,
+		seq                 INTEGER NOT NULL,
+		title               TEXT NOT NULL,
+		body                TEXT NOT NULL DEFAULT '',
+		status              TEXT NOT NULL DEFAULT 'open',
+		severity            TEXT NOT NULL DEFAULT 'medium',
+		found_in_run_id     INTEGER NOT NULL DEFAULT 0,
+		found_in_task_id    TEXT NOT NULL DEFAULT '',
+		filed_by            INTEGER NOT NULL,
+		filed_at            TIMESTAMP NOT NULL,
+		triaged_by          INTEGER NOT NULL DEFAULT 0,
+		triaged_at          TIMESTAMP,
+		closed_by_task_id   TEXT NOT NULL DEFAULT '',
+		closed_at           TIMESTAMP,
+		updated_at          TIMESTAMP NOT NULL,
+		UNIQUE (project_id, seq)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_issues_project_status ON issues(project_id, status);
+
 	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
@@ -438,6 +468,48 @@ func (s *Store) migrate() error {
 		// in applySetClaim / applyRecordSubmission since SQLite CHECK
 		// constraints can't reference another table's columns.
 		`ALTER TABLE task_claims ADD COLUMN model_id INTEGER REFERENCES citizens(id)`,
+		// Living-workflow phase 4 — per-run cycle budget. Caps how
+		// many tasks can be spawned into a run at runtime to prevent
+		// runaway loops where bot A spawns bot B spawns bot A.
+		// Counter increments on every successful spawn; when used
+		// reaches max, further spawns are refused and the run is
+		// auto-paused until an operator extends the budget. Default
+		// 200 per the design notes — generous enough that legitimate
+		// remediation chains don't trip it, tight enough that a
+		// runaway is caught within a few minutes. Existing rows
+		// default to 0/200; pre-spawn runs are unaffected.
+		`ALTER TABLE runs ADD COLUMN cycle_budget_used INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN cycle_budget_max INTEGER NOT NULL DEFAULT 200`,
+		// Living-workflow phase 4 — task spawn provenance. Records
+		// the parent task that triggered a spawn (or 0 for tasks
+		// authored at run-create time) and the spawn trigger source
+		// (human / bot / template_rule / auto_triage). The audit
+		// log lives in contribution_events as task_spawned; these
+		// columns make the lineage queryable without a join.
+		`ALTER TABLE tasks ADD COLUMN spawned_from TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN spawn_trigger TEXT NOT NULL DEFAULT ''`,
+		// Living-workflow phase 4b — declarative review-failure
+		// spawn rules. Declared on the task that gets reviewed
+		// (the dev task), not the review task itself. Empty
+		// string preserves the historical cascade-invalidate
+		// behavior so existing templates parse and run
+		// unchanged. RemediationTemplate is JSON-encoded;
+		// empty when the rule is "continue_iteration" or the
+		// default invalidate path.
+		`ALTER TABLE tasks ADD COLUMN on_review_reject TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN on_review_request_changes TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN remediation_template TEXT NOT NULL DEFAULT ''`,
+		// Living-workflow phase 4c — run-level auto-triage rule
+		// + per-task issue linkage. auto_triage_template is the
+		// JSON-encoded RemediationTemplate the engine uses to
+		// spawn a fix task when a run lands on idle and has open
+		// issues. closes_issue_seq on the spawned task records
+		// which issue (per-project seq) the task is fixing — when
+		// it accepts, the auto-close hook transitions the issue
+		// to "closed". 0 on every other task. See
+		// docs/living-workflow-design-notes.md § 7.
+		`ALTER TABLE runs ADD COLUMN auto_triage_template TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN closes_issue_seq INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -472,14 +544,26 @@ func (s *Store) migrate() error {
 	}
 
 	// Serial-runs-per-branch invariant enforced at the DB
-	// level. Partial unique index so only ACTIVE runs collide —
+	// level. Partial unique index so only ALIVE runs collide —
 	// completed / failed runs on the same branch are fine.
-	// Belt-and-suspenders alongside the application-level
-	// ActiveRunOnBranch check in handleCreateRun, which races
-	// under concurrent requests without this guard. Lives here
-	// (not in the schema block above) because it references the
-	// `branch` column which comes in via ALTER TABLE.
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state = 'active'`); err != nil {
+	// "Alive" expanded in living-workflow phase 1 to include
+	// idle and paused: an idle run is still the run for its
+	// branch and should block a new run from being created on
+	// the same branch. Belt-and-suspenders alongside the
+	// application-level ActiveRunOnBranch check in
+	// handleCreateRun, which races under concurrent requests
+	// without this guard. Lives here (not in the schema block
+	// above) because it references the `branch` column which
+	// comes in via ALTER TABLE.
+	//
+	// The phase-1 migration drops the old active-only index and
+	// recreates it covering active|idle|paused. The DROP is a
+	// no-op for fresh DBs (CREATE IF NOT EXISTS earlier was
+	// skipped) and silently rebuilds the index for upgrades.
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS idx_runs_active_branch`); err != nil {
+		return fmt.Errorf("schema: drop idx_runs_active_branch: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state IN ('active', 'idle', 'paused')`); err != nil {
 		return fmt.Errorf("schema: create idx_runs_active_branch: %w", err)
 	}
 
@@ -952,18 +1036,27 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	return runs, rows.Err()
 }
 
-// ActiveRunOnBranch returns the first ACTIVE run on the given
+// ActiveRunOnBranch returns the first ALIVE run on the given
 // project+branch pair, or nil if none exists. Used by
 // handleCreateRun to enforce the serial-runs-per-branch
 // invariant: a second run on the same branch would step on the
 // first one's artifact writes, so we refuse it with a clear
 // error pointing at the existing run.
+//
+// Living-workflow phase 1 widened the alive predicate from
+// active-only to active|idle|paused — an idle run is still
+// alive and still owns its branch slot. The predicate must
+// match idx_runs_active_branch's WHERE clause; if it drifts,
+// app-level pre-flight returns nil and the user sees a raw SQL
+// constraint error from the DB instead of the friendly "run X
+// already alive on this branch" message. Name kept as
+// ActiveRunOnBranch for callsite stability.
 func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, error) {
 	var r RunRecord
 	var ref sql.NullString
 	err := s.db.QueryRow(
 		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
-		 FROM runs WHERE project_id = ? AND branch = ? AND state = 'active'
+		 FROM runs WHERE project_id = ? AND branch = ? AND state IN ('active', 'idle', 'paused')
 		 ORDER BY seq ASC LIMIT 1`,
 		projectID, branch,
 	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt)
@@ -1008,29 +1101,179 @@ func (s *Store) UpdateRunState(id int64, state RunState) error {
 	return err
 }
 
+// CheckAndCompleteRun re-evaluates a run's state and returns
+// true if the run transitioned to `completed`. Historical name
+// kept for caller compatibility; the implementation is now the
+// full active/idle/completed evaluator (see applyCompleteRun for
+// the rule). Wraps EvaluateRunState; returns the boolean
+// "completed" signal that legacy callers branch on.
 func (s *Store) CheckAndCompleteRun(runID int64) (bool, error) {
-	var total, terminal int
-	// SKIPPED tasks count as terminal alongside ACCEPTED — a run
-	// completes when every task has reached a "done" state, and
-	// "skipped by a gate vote" is one of those. This mirrors the
-	// invariant UpdateReadyTasks relies on for dep satisfaction.
-	err := s.db.QueryRow(
-		`SELECT COUNT(*), COUNT(CASE WHEN state IN ('accepted', 'skipped', 'failed') THEN 1 END) FROM tasks WHERE run_id = ?`,
-		runID,
-	).Scan(&total, &terminal)
+	next, err := s.EvaluateRunState(runID)
 	if err != nil {
 		return false, err
 	}
-	if total > 0 && total == terminal {
-		err = s.UpdateRunState(runID, RunCompleted)
-		return err == nil, err
+	return next == RunCompleted, nil
+}
+
+// EvaluateRunState recomputes a run's state from current task
+// counts and writes the new state if it differs. Returns the
+// resulting state. Paused / failed runs are not touched — those
+// states are operator/explicit-only and EvaluateRunState skips
+// them so a passing submit can't accidentally un-pause a run.
+//
+// Living-workflow phase 4c — open-ended runs. When all tasks
+// are terminal AND the run has an auto_triage_template AND the
+// project has at least one open issue, the run lands on idle
+// instead of completed: the auto-triage hook still has work
+// it could spawn, so the run is genuinely "waiting" rather
+// than "done." Without auto-triage configured, the historical
+// "all terminal → completed" rule applies unchanged.
+//
+// Used by every site that previously force-flipped state to
+// active (invalidate, fail-cascade, skip-cascade) so those
+// transitions land on the right state.
+func (s *Store) EvaluateRunState(runID int64) (RunState, error) {
+	var current string
+	var projectID int64
+	var autoTriage string
+	if err := s.db.QueryRow(
+		`SELECT state, project_id, auto_triage_template FROM runs WHERE id = ?`, runID,
+	).Scan(&current, &projectID, &autoTriage); err != nil {
+		return "", err
 	}
-	return false, nil
+	if current == string(RunPaused) || current == string(RunFailed) {
+		return RunState(current), nil
+	}
+
+	var active, holding, total int
+	err := s.db.QueryRow(
+		`SELECT
+		   COUNT(*),
+		   COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
+		   COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
+		 FROM tasks WHERE run_id = ?`,
+		runID,
+	).Scan(&total, &active, &holding)
+	if err != nil {
+		return "", err
+	}
+
+	var next RunState
+	switch {
+	case total == 0:
+		return RunState(current), nil
+	case active > 0:
+		next = RunActive
+	case holding > 0:
+		next = RunIdle
+	default:
+		next = RunCompleted
+	}
+
+	// Auto-triage open-ended override: would-be `completed`
+	// gets demoted to `idle` when there's still latent work
+	// the auto-triage hook could spawn (rule + ≥1 open issue).
+	if next == RunCompleted && autoTriage != "" {
+		var openCount int
+		_ = s.db.QueryRow(
+			`SELECT COUNT(*) FROM issues WHERE project_id = ? AND status = 'open'`, projectID,
+		).Scan(&openCount)
+		if openCount > 0 {
+			next = RunIdle
+		}
+	}
+
+	if string(next) == current {
+		return next, nil
+	}
+	now := time.Now()
+	if _, err := s.db.Exec(`UPDATE runs SET state = ?, updated_at = ? WHERE id = ?`, next, now, runID); err != nil {
+		return "", err
+	}
+	s.recordRunLifecycleEvent(runID, "run_"+string(next), current, string(next), 0, now)
+	return next, nil
+}
+
+// recordRunLifecycleEvent inserts a contribution event for a
+// run-state transition. Used by the standalone (non-tx) state
+// transition paths — EvaluateRunState, PauseRun, ResumeRun. The
+// tx-bound applyCompleteRun emits its own event inside the
+// transaction. Best-effort: a logging failure here must not
+// surface to the caller (state is already authoritative).
+//
+// citizenID = 0 marks system-initiated transitions (idle,
+// completed). PauseRun / ResumeRun pass the calling citizen so
+// human/bot interventions get attributed.
+func (s *Store) recordRunLifecycleEvent(runID int64, eventType, fromState, toState string, citizenID int64, ts time.Time) {
+	var projectID int64
+	_ = s.db.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID)
+	_, _ = s.db.Exec(
+		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
+		 VALUES (?, ?, ?, '', ?, ?, ?, ?)`,
+		citizenID, eventType, fromState, runID, projectID,
+		fmt.Sprintf(`{"from":%q,"to":%q}`, fromState, toState), ts,
+	)
+}
+
+// PauseRun moves a run into the `paused` state. Refuses if the
+// run is already terminal (completed / failed) — pause is for
+// alive runs only. Idempotent on already-paused runs (no event
+// emitted on the second call).
+func (s *Store) PauseRun(runID int64, citizenID int64) error {
+	var current string
+	if err := s.db.QueryRow(`SELECT state FROM runs WHERE id = ?`, runID).Scan(&current); err != nil {
+		return err
+	}
+	if RunState(current) == RunPaused {
+		return nil
+	}
+	now := time.Now()
+	res, err := s.db.Exec(
+		`UPDATE runs SET state = 'paused', updated_at = ?
+		 WHERE id = ? AND state IN ('active', 'idle')`,
+		now, runID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("run %d cannot be paused (already terminal or not found)", runID)
+	}
+	s.recordRunLifecycleEvent(runID, "run_paused", current, "paused", citizenID, now)
+	return nil
+}
+
+// ResumeRun moves a paused run back to active or idle, depending
+// on whether ready work exists. No-op if the run is already
+// active / idle. Refuses if the run is terminal.
+func (s *Store) ResumeRun(runID int64, citizenID int64) (RunState, error) {
+	var current string
+	if err := s.db.QueryRow(`SELECT state FROM runs WHERE id = ?`, runID).Scan(&current); err != nil {
+		return "", err
+	}
+	switch RunState(current) {
+	case RunCompleted, RunFailed:
+		return "", fmt.Errorf("run %d is %s — cannot resume a terminal run", runID, current)
+	case RunActive, RunIdle:
+		return RunState(current), nil
+	}
+	// Lift to active first so EvaluateRunState (which preserves
+	// paused/failed) actually re-evaluates. If there's no ready
+	// work, the next call lands it on idle.
+	now := time.Now()
+	if _, err := s.db.Exec(`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'paused'`, now, runID); err != nil {
+		return "", err
+	}
+	s.recordRunLifecycleEvent(runID, "run_resumed", "paused", "active", citizenID, now)
+	// EvaluateRunState below may further transition active →
+	// idle; that emits its own event with citizen_id=0.
+	return s.EvaluateRunState(runID)
 }
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, run_slug, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at`
 
 func (s *Store) CreateTask(t *TaskRecord) error {
 	// commit_sha / review_decision / vote_choice are never set at
@@ -1047,14 +1290,16 @@ func (s *Store) CreateTask(t *TaskRecord) error {
 		anonymize = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
 		anonymize, t.Visibility, t.Env, t.Mode, t.Container, t.RunSlug,
+		t.OnReviewReject, t.OnReviewRequestChanges, t.RemediationTemplate,
+		t.ClosesIssueSeq,
 		t.CreatedAt,
 	)
 	return err
@@ -1075,6 +1320,8 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
+		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
+		&t.ClosesIssueSeq,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2560,6 +2807,8 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
+			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
+			&t.ClosesIssueSeq,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

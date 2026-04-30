@@ -3458,6 +3458,282 @@ tasks:
 	})
 }
 
+// TestMCPReviewRejectSpawnsRemediation exercises the
+// living-workflow phase 4b auto-spawn path end-to-end:
+// declare on_review_reject: spawn_remediation + a
+// remediation_template, submit a review with reject, assert
+// that a new task is spawned with the reviewer's feedback
+// substituted into the prompt and the cascade is suppressed.
+//
+// This is the load-bearing payoff of phase 4b — without this
+// test, a future refactor of handleSubmitResultReport could
+// silently break the entire feature and CI would still pass.
+func TestMCPReviewRejectSpawnsRemediation(t *testing.T) {
+	eachRemoteMode(t, "RemediationSpawn", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
+
+		yaml := `name: "remediation auto-spawn"
+version: 1
+tasks:
+  - id: develop_x
+    action: answer
+    prompt: "Build X."
+    on_review_reject: spawn_remediation
+    remediation_template:
+      action: answer
+      prompt: "The reviewer rejected this with feedback: {{review.feedback}} (decision: {{review.decision}}). Propose a revision."
+  - id: review_x
+    action: review
+    reviews: develop_x
+    prompt: "Review the build."
+  - id: downstream_x
+    action: answer
+    depends_on: [develop_x]
+    prompt: "Continue from {{develop_x.content}}"
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		h.mcpClaimOK(t, "develop_x")
+		h.mcpSubmitText(t, "develop_x", "first attempt")
+		h.mcpClaimOK(t, "review_x")
+		h.mcpSubmitReview(t, "review_x", "missing edge-case handling around empty input", "reject")
+
+		// 1. Dev task NOT failed — cascade was suppressed.
+		if got := h.taskGet("develop_x")["state"]; got == "failed" {
+			t.Fatalf("develop_x should NOT be failed when on_review_reject=spawn_remediation; got %v", got)
+		}
+
+		// 2. Downstream NOT skipped — cascade suppression
+		//    means downstream stays in whatever state it was
+		//    before (still pending if dev not accepted, ready
+		//    or accepted if it was already running).
+		if got := h.taskGet("downstream_x")["state"]; got == "skipped" {
+			t.Fatalf("downstream_x should NOT be skipped when remediation spawned; got %v (cascade leaked)", got)
+		}
+
+		// 3. A remediation task exists. The naming pattern is
+		//    <target_def_id>_remediation_<N>.
+		tasks := h.runTasks(h.lastRunID)
+		var rem map[string]interface{}
+		for _, raw := range tasks {
+			ti, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			defID, _ := ti["task_def_id"].(string)
+			if defID == "develop_x_remediation_1" {
+				rem = ti
+				break
+			}
+		}
+		if rem == nil {
+			t.Fatalf("expected develop_x_remediation_1 to exist; tasks=%v", taskDefIDs(tasks))
+		}
+
+		// 4. Prompt has reviewer feedback substituted.
+		fullID, _ := rem["id"].(string)
+		full := h.taskGet(fullID)
+		prompt, _ := full["prompt"].(string)
+		if !strings.Contains(prompt, "missing edge-case handling around empty input") {
+			t.Fatalf("remediation prompt missing {{review.feedback}} substitution: %q", prompt)
+		}
+		if !strings.Contains(prompt, "decision: reject") {
+			t.Fatalf("remediation prompt missing {{review.decision}} substitution: %q", prompt)
+		}
+
+		// 5. depends_on chains to the original target (so any
+		//    re-claim chain naturally waits for the remediation).
+		deps, _ := full["depends_on"].(string)
+		if !strings.Contains(deps, "develop_x") {
+			t.Errorf("expected remediation depends_on to include develop_x, got %q", deps)
+		}
+	})
+}
+
+// taskDefIDs flattens a list of task records into their def
+// ids for diagnostic messages.
+func taskDefIDs(tasks []interface{}) []string {
+	ids := make([]string, 0, len(tasks))
+	for _, raw := range tasks {
+		t, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if id, _ := t["task_def_id"].(string); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// TestMCPAutoTriageSpawnsFixOnIdle exercises the
+// living-workflow phase 4c idle-trigger end-to-end:
+// declare auto_triage on a run, file an issue, submit the
+// only DAG task to send the run to idle, assert that the
+// engine spawns a fix task with the issue context substituted
+// into the prompt and the issue transitions to in_progress.
+// Then submit the fix task and assert auto-close.
+func TestMCPAutoTriageSpawnsFixOnIdle(t *testing.T) {
+	eachRemoteMode(t, "AutoTriage", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
+
+		yaml := `name: "auto-triage on idle"
+version: 1
+auto_triage:
+  action: answer
+  prompt: "Fix issue {{issue.id}}: {{issue.title}}\n\nDetails: {{issue.body}}"
+tasks:
+  - id: develop_x
+    action: answer
+    prompt: "Build X."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// File an issue first — this represents a tester bot
+		// filing a finding before the dev task lands.
+		filed := h.callOK(t, "enju_file_issue", map[string]any{
+			"project_id": float64(projectID),
+			"title":      "off-by-one in iterator",
+			"body":       "Loop overflows on empty input.",
+			"severity":   "high",
+		})
+		if !strings.Contains(mcpText(filed), "ISSUE-001") {
+			t.Fatalf("expected ISSUE-001 to be filed, got %s", mcpText(filed))
+		}
+
+		// Submit develop_x — run goes idle.
+		h.mcpClaimOK(t, "develop_x")
+		h.mcpSubmitText(t, "develop_x", "first build")
+
+		// Auto-triage should have spawned a fix task.
+		tasks := h.runTasks(h.lastRunID)
+		var fix map[string]interface{}
+		for _, raw := range tasks {
+			ti, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			defID, _ := ti["task_def_id"].(string)
+			if strings.HasPrefix(defID, "fix_ISSUE_001_") {
+				fix = ti
+				break
+			}
+		}
+		if fix == nil {
+			t.Fatalf("expected auto-triage to spawn fix_ISSUE_001_*; tasks=%v", taskDefIDs(tasks))
+		}
+
+		// Prompt has issue context substituted.
+		fullID, _ := fix["id"].(string)
+		full := h.taskGet(fullID)
+		prompt, _ := full["prompt"].(string)
+		if !strings.Contains(prompt, "off-by-one in iterator") {
+			t.Errorf("expected {{issue.title}} substitution, got prompt=%q", prompt)
+		}
+		if !strings.Contains(prompt, "Loop overflows on empty input") {
+			t.Errorf("expected {{issue.body}} substitution, got prompt=%q", prompt)
+		}
+		if !strings.Contains(prompt, "ISSUE-001") {
+			t.Errorf("expected {{issue.id}} substitution, got prompt=%q", prompt)
+		}
+
+		// Issue is now in_progress.
+		issueResp := h.callOK(t, "enju_get_issue", map[string]any{
+			"project_id": float64(projectID),
+			"issue_seq":  float64(1),
+		})
+		if !strings.Contains(mcpText(issueResp), "in_progress") {
+			t.Fatalf("expected issue to be in_progress; got: %s", mcpText(issueResp))
+		}
+
+		// Submit the fix task — auto-close should fire.
+		h.mcpClaimOK(t, fullID[len(fmt.Sprintf("%s:", h.lastRunID)):])
+		h.mcpSubmitText(t, fullID[len(fmt.Sprintf("%s:", h.lastRunID)):], "fixed")
+
+		// Issue is now closed.
+		issueResp = h.callOK(t, "enju_get_issue", map[string]any{
+			"project_id": float64(projectID),
+			"issue_seq":  float64(1),
+		})
+		closedText := mcpText(issueResp)
+		if !strings.Contains(closedText, "status: closed") {
+			t.Fatalf("expected issue to be auto-closed after fix submit; got: %s", closedText)
+		}
+		if !strings.Contains(closedText, fullID) {
+			t.Errorf("expected closed_by_task_id to point at fix task %q; got: %s", fullID, closedText)
+		}
+	})
+}
+
+// TestMCPAutoTriageFileAfterCompletedRun exercises the
+// reviewer-flagged gap: an issue filed AFTER a run with
+// auto_triage_template has already reached "completed" must
+// still trigger the auto-triage hook. Without the file-issue →
+// re-evaluate path, the issue would sit open while the run sat
+// completed and no fix would ever spawn.
+func TestMCPAutoTriageFileAfterCompletedRun(t *testing.T) {
+	eachRemoteMode(t, "AutoTriagePostComplete", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
+
+		yaml := `name: "post-complete file-issue"
+version: 1
+auto_triage:
+  action: answer
+  prompt: "Fix {{issue.id}}: {{issue.title}}"
+tasks:
+  - id: develop
+    action: answer
+    prompt: "Build."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// Submit develop with NO open issue at the time. The
+		// run reaches "completed" because the open-ended
+		// override only fires when there's an open issue to
+		// keep it alive.
+		h.mcpClaimOK(t, "develop")
+		h.mcpSubmitText(t, "develop", "first build")
+
+		if got := h.taskGet("develop")["state"]; got != "accepted" {
+			t.Fatalf("setup: expected develop accepted, got %v", got)
+		}
+
+		// File the issue AFTER completion — the fix path must
+		// re-evaluate the run.
+		filed := h.callOK(t, "enju_file_issue", map[string]any{
+			"project_id": float64(projectID),
+			"title":      "post-complete bug",
+			"body":       "shows up only after the dev task lands",
+			"severity":   "medium",
+		})
+		if !strings.Contains(mcpText(filed), "ISSUE-001") {
+			t.Fatalf("issue not filed: %s", mcpText(filed))
+		}
+
+		// Fix task should be spawned even though the run had
+		// already completed.
+		tasks := h.runTasks(h.lastRunID)
+		var fix map[string]interface{}
+		for _, raw := range tasks {
+			ti, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			defID, _ := ti["task_def_id"].(string)
+			if strings.HasPrefix(defID, "fix_ISSUE_001_") {
+				fix = ti
+				break
+			}
+		}
+		if fix == nil {
+			t.Fatalf("expected fix task after post-complete file-issue; tasks=%v", taskDefIDs(tasks))
+		}
+	})
+}
+
 // TestMCPRequestChangesCascadesDownstreamOfReviewGate is the
 // request_changes analogue of the reject-gate test. Same
 // structural concern, different end state: resetting the

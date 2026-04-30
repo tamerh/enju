@@ -2289,3 +2289,104 @@ tasks:
 		t.Errorf("expected 'no description' warning, got: %v", parsed.Warnings)
 	}
 }
+
+func TestParseRemediationRule(t *testing.T) {
+	yamlData := []byte(`
+name: "remediation rule test"
+version: 1
+tasks:
+  - id: develop_x
+    action: answer
+    prompt: "build it"
+    on_review_reject: spawn_remediation
+    remediation_template:
+      action: answer
+      prompt: "Address: {{review.feedback}}"
+  - id: review_x
+    action: review
+    reviews: develop_x
+    depends_on: [develop_x]
+    prompt: "check it"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dev *TaskDef
+	for i := range parsed.Run.Tasks {
+		if parsed.Run.Tasks[i].ID == "develop_x" {
+			dev = &parsed.Run.Tasks[i]
+			break
+		}
+	}
+	if dev == nil {
+		t.Fatal("develop_x task not found in parsed tasks")
+	}
+	if dev.OnReviewReject != "spawn_remediation" {
+		t.Fatalf("on_review_reject mismatch: %q", dev.OnReviewReject)
+	}
+	if dev.RemediationTemplate == nil {
+		t.Fatal("expected RemediationTemplate to be parsed")
+	}
+	if dev.RemediationTemplate.Action != "answer" {
+		t.Fatalf("remediation action: %q", dev.RemediationTemplate.Action)
+	}
+	if dev.RemediationTemplate.Prompt != "Address: {{review.feedback}}" {
+		t.Fatalf("remediation prompt: %q", dev.RemediationTemplate.Prompt)
+	}
+}
+
+func TestParseAutoTriage(t *testing.T) {
+	yamlData := []byte(`
+name: "auto-triage parse test"
+version: 1
+auto_triage:
+  action: answer
+  prompt: "Fix issue {{issue.id}}: {{issue.title}}"
+  assign_to: [bot-fixer]
+  require_role: "developer"
+tasks:
+  - id: develop
+    action: answer
+    prompt: "Build it"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := parsed.Run.AutoTriage
+	if at == nil {
+		t.Fatal("expected Run.AutoTriage to be parsed, got nil")
+	}
+	if at.Action != "answer" {
+		t.Fatalf("action: %q", at.Action)
+	}
+	if at.Prompt != "Fix issue {{issue.id}}: {{issue.title}}" {
+		t.Fatalf("prompt: %q", at.Prompt)
+	}
+	if len(at.AssignTo) != 1 || at.AssignTo[0] != "bot-fixer" {
+		t.Fatalf("assign_to: %v", at.AssignTo)
+	}
+	if at.RequireRole != "developer" {
+		t.Fatalf("require_role: %q", at.RequireRole)
+	}
+}
+
+func TestParseAutoTriageOmitted(t *testing.T) {
+	// Static workflow without auto_triage — Run.AutoTriage is nil.
+	yamlData := []byte(`
+name: "no auto_triage"
+version: 1
+tasks:
+  - id: x
+    action: answer
+    prompt: "y"
+`)
+	parsed, err := Parse(yamlData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Run.AutoTriage != nil {
+		t.Fatalf("expected nil AutoTriage, got %+v", parsed.Run.AutoTriage)
+	}
+}

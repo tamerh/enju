@@ -343,14 +343,16 @@ func applyCreateTask(tx *sql.Tx, m CreateTask) error {
 		anonymize = 1
 	}
 	_, err := tx.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, container, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
 		t.AssignTo, t.RequireRole, t.ReviewsTarget,
 		t.VoteOptions, citizens, t.MinQuorum, t.VoteThreshold, t.VoteDeadline,
 		anonymize, t.Visibility, t.Env, t.Mode, t.Container, t.RunSlug,
+		t.OnReviewReject, t.OnReviewRequestChanges, t.RemediationTemplate,
+		t.ClosesIssueSeq,
 		t.CreatedAt,
 	)
 	return err
@@ -588,21 +590,101 @@ func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks) (int, error
 	return s.UpdateReadyTasks(m.RunID)
 }
 
+// applyCompleteRun re-evaluates the run's state from the current
+// task counts. The mutation name is historical — phase 1 of the
+// living-workflow design expanded it from "flip to completed if
+// all terminal" to "compute the right alive-or-completed state."
+//
+// State rule:
+//
+//   - Any task in {ready, claimed, running, collecting} → active
+//   - Else any task in {pending, parked} → idle
+//   - Else (all in {accepted, skipped, failed}) → completed
+//
+// Paused is preserved — pause is a deliberate operator action and
+// must only be left via explicit resume. The function returns
+// true when the run transitioned to `completed` so callers that
+// surface "run completed" UX (the existing behavior) keep working
+// unchanged.
 func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
-	// Check if all tasks in the run are terminal.
-	var pending int
+	var current string
+	var projectID int64
+	var autoTriage string
 	err := tx.QueryRow(
-		`SELECT COUNT(*) FROM tasks WHERE run_id = ? AND state NOT IN ('accepted', 'skipped', 'failed')`,
-		m.RunID,
-	).Scan(&pending)
+		`SELECT state, project_id, auto_triage_template FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID, &autoTriage)
 	if err != nil {
 		return false, err
 	}
-	if pending > 0 {
+	// Paused / failed runs don't auto-transition.
+	if current == string(RunPaused) || current == string(RunFailed) {
 		return false, nil
 	}
-	_, err = tx.Exec(`UPDATE runs SET state = 'completed', updated_at = ? WHERE id = ? AND state = 'active'`, time.Now(), m.RunID)
-	return err == nil, err
+
+	var active, holding, total int
+	err = tx.QueryRow(
+		`SELECT
+		   COUNT(*),
+		   COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
+		   COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
+		 FROM tasks WHERE run_id = ?`,
+		m.RunID,
+	).Scan(&total, &active, &holding)
+	if err != nil {
+		return false, err
+	}
+
+	var next RunState
+	switch {
+	case total == 0:
+		// Empty run — keep current. Run is freshly created and
+		// tasks haven't been inserted yet; CompleteRun fired
+		// from a stale plan should not flip an empty run.
+		return false, nil
+	case active > 0:
+		next = RunActive
+	case holding > 0:
+		next = RunIdle
+	default:
+		next = RunCompleted
+	}
+
+	// Phase 4c open-ended override: a run with an
+	// auto_triage_template + open issues stays alive (idle)
+	// instead of completing — the hook may still spawn work.
+	// See EvaluateRunState for the matching standalone rule.
+	if next == RunCompleted && autoTriage != "" {
+		var openCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM issues WHERE project_id = ? AND status = 'open'`, projectID,
+		).Scan(&openCount)
+		if openCount > 0 {
+			next = RunIdle
+		}
+	}
+
+	if string(next) == current {
+		return next == RunCompleted, nil
+	}
+	now := time.Now()
+	if _, err := tx.Exec(`UPDATE runs SET state = ?, updated_at = ? WHERE id = ?`, next, now, m.RunID); err != nil {
+		return false, err
+	}
+	// Emit a lifecycle event in the same transaction so the
+	// event log is consistent with the run-state UPDATE.
+	// citizen 0 = system (not initiated by a specific actor —
+	// these transitions fall out of task-graph state).
+	// projectID was already loaded above for the auto-triage
+	// override; reuse it.
+	if _, err := tx.Exec(
+		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
+		 VALUES (0, ?, ?, '', ?, ?, ?, ?)`,
+		"run_"+string(next), current, m.RunID, projectID,
+		fmt.Sprintf(`{"from":%q,"to":%q}`, current, next), now,
+	); err != nil {
+		return false, err
+	}
+	return next == RunCompleted, nil
 }
 
 // requireModelForBot enforces the operator/model rule from

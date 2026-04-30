@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -82,6 +83,208 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
 	}
 }
+// handlePauseRun moves a run into the `paused` state. Living-
+// workflow phase 1: the state value is observable now; spawn-time
+// gating (refusing claims/submits while paused) arrives with
+// phase 4. Use to inspect a run mid-flight without auto-state
+// transitions racing against you.
+func (c *apiClient) handlePauseRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/pause", projectID, runID), map[string]string{})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(data, &resp) == nil {
+		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		state, _ := resp["state"].(string)
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d paused (state: %s)", projectID, runID, state)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d paused", projectID, runID)), nil
+}
+
+// handleResumeRun lifts a paused run back to active or idle.
+// Lands on idle when no ready work exists, active when ready
+// tasks are present; the response carries the resolved state.
+func (c *apiClient) handleResumeRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/resume", projectID, runID), map[string]string{})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(data, &resp) == nil {
+		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+		state, _ := resp["state"].(string)
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d resumed (state: %s)", projectID, runID, state)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d resumed", projectID, runID)), nil
+}
+
+// handleShowEvents queries the project event log and returns
+// JSONL — one event per line, newest-first. Filters: run_id,
+// citizen, event_types (comma-separated), since (RFC3339),
+// limit (default 100, max 1000). Living-workflow phase 2: this
+// is the read-only projection over contribution_events. For
+// git-tracked snapshots use enju_export_run_events instead.
+func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	q := url.Values{}
+	if rs := req.GetInt("run_id", 0); rs != 0 {
+		q.Set("run_seq", fmt.Sprintf("%d", rs))
+	}
+	if u := req.GetString("citizen", ""); u != "" {
+		q.Set("citizen", u)
+	}
+	if et := req.GetString("event_types", ""); et != "" {
+		q.Set("event_types", et)
+	}
+	if since := req.GetString("since", ""); since != "" {
+		q.Set("since", since)
+	}
+	if limit := req.GetInt("limit", 0); limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+
+	endpoint := fmt.Sprintf("/api/v1/projects/%d/events", projectID)
+	if encoded := q.Encode(); encoded != "" {
+		endpoint += "?" + encoded
+	}
+	data, err := c.get(ctx, endpoint)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var events []map[string]interface{}
+	if err := json.Unmarshal(data, &events); err != nil {
+		return mcp.NewToolResultError("decoding events: " + err.Error()), nil
+	}
+	if len(events) == 0 {
+		return mcp.NewToolResultText("(no events match the given filters)"), nil
+	}
+	var b bytes.Buffer
+	for _, e := range events {
+		line, err := json.Marshal(e)
+		if err != nil {
+			continue
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// handleSpawnTask creates a new task in an in-flight run.
+// Living-workflow phase 4a — manual spawn primitive. The
+// spawning citizen is the authenticated caller; trigger
+// defaults to "human". Subject to the per-run cycle budget;
+// budget exhaustion auto-pauses the run.
+func (c *apiClient) handleSpawnTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	taskDefID, err := req.RequireString("task_def_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_def_id is required"), nil
+	}
+	action, err := req.RequireString("action")
+	if err != nil {
+		return mcp.NewToolResultError("action is required"), nil
+	}
+
+	body := map[string]interface{}{
+		"task_def_id":    taskDefID,
+		"action":         action,
+		"prompt":         req.GetString("prompt", ""),
+		"user_prompt":    req.GetString("user_prompt", ""),
+		"parent_task_id": req.GetString("parent_task_id", ""),
+		"trigger":        req.GetString("trigger", "human"),
+		"require_role":   req.GetString("require_role", ""),
+		"result_type":    req.GetString("result_type", ""),
+		"citizens":       req.GetInt("citizens", 1),
+	}
+	if dep := req.GetString("depends_on", ""); dep != "" {
+		body["depends_on"] = strings.Split(dep, ",")
+	}
+	if as := req.GetString("assign_to", ""); as != "" {
+		body["assign_to"] = strings.Split(as, ",")
+	}
+
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/spawn", projectID, runID), body)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return mcp.NewToolResultError("decoding: " + err.Error()), nil
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	taskID, _ := resp["task_id"].(string)
+	out := fmt.Sprintf("✓ Spawned %s", taskID)
+	if budget, ok := resp["cycle_budget"].(map[string]interface{}); ok {
+		used, _ := budget["used"].(float64)
+		max, _ := budget["max"].(float64)
+		out += fmt.Sprintf(" (cycle_budget: %d/%d)", int(used), int(max))
+	}
+	return mcp.NewToolResultText(out), nil
+}
+
+// handleSetCycleBudget bumps the per-run spawn cap. Use to
+// extend room after a runaway has been triaged.
+func (c *apiClient) handleSetCycleBudget(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	max, err := req.RequireInt("max")
+	if err != nil {
+		return mcp.NewToolResultError("max is required"), nil
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/cycle_budget", projectID, runID), map[string]int{"max": max})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return mcp.NewToolResultError("decoding: " + err.Error()), nil
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Cycle budget set to %d for run %d:%d", max, projectID, runID)), nil
+}
+
 // runBranchFromData pulls the `branch` field out of a run JSON
 // payload as returned by GET /runs/{seq} or POST /runs. Empty
 // when the payload is malformed or missing — callers pass the

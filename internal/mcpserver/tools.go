@@ -518,6 +518,206 @@ func toolInit() mcp.Tool {
 	)
 }
 
+func toolFileIssue() mcp.Tool {
+	return mcp.NewTool("enju_file_issue",
+		mcp.WithDescription(`File a project-level issue (living-workflow phase 3). Issues outlive runs — file in run #2, fix in run #7 is normal. Tester bots use this to record structured findings (one issue per failure mode); humans use it for ad-hoc bug reports. Filing ≠ fixing — triage and fix-task linkage are separate steps. Emits an issue_filed event.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project to file the issue against"),
+		),
+		mcp.WithString("title", mcp.Required(),
+			mcp.Description("Short summary line (one sentence). Required."),
+		),
+		mcp.WithString("body",
+			mcp.Description("Optional prose body — reproducer, context, suspected cause"),
+		),
+		mcp.WithString("severity",
+			mcp.Description(`"low" | "medium" (default) | "high" | "critical"`),
+		),
+		mcp.WithNumber("found_in_run_seq",
+			mcp.Description("Optional run sequence number where the issue was discovered"),
+		),
+		mcp.WithString("found_in_task_id",
+			mcp.Description("Optional fully-qualified task id (project:run:taskdef[:instance]) the issue surfaced in"),
+		),
+	)
+}
+
+func toolListIssues() mcp.Tool {
+	return mcp.NewTool("enju_list_issues",
+		mcp.WithDescription(`List issues in a project, newest-first. Filters compose: leave them empty to see everything, narrow by status/severity. Returns a one-line summary per issue. For full body + frontmatter, use enju_get_issue.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project to query"),
+		),
+		mcp.WithString("status",
+			mcp.Description(`Comma-separated statuses: "open", "triaged", "closed", "wontfix". Empty = all.`),
+		),
+		mcp.WithString("severity",
+			mcp.Description(`Comma-separated severities: "low", "medium", "high", "critical". Empty = all.`),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum issues to return (default 100, max 1000)"),
+		),
+	)
+}
+
+func toolGetIssue() mcp.Tool {
+	return mcp.NewTool("enju_get_issue",
+		mcp.WithDescription(`Get full detail for one issue, formatted as YAML frontmatter + body — the same shape the future enju/issues/ISSUE-<NNN>.md filesystem mirror will write to disk.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project the issue belongs to"),
+		),
+		mcp.WithNumber("issue_seq", mcp.Required(),
+			mcp.Description("Per-project issue sequence number (the NNN in ISSUE-NNN)"),
+		),
+	)
+}
+
+func toolTriageIssue() mcp.Tool {
+	return mcp.NewTool("enju_triage_issue",
+		mcp.WithDescription(`Move an open issue to "triaged" state, optionally adjusting severity. Triage is the "we've looked at this and decided what to do" signal — it's distinct from filing (recording the finding) and from closing (the issue's resolved). Phase 4 will let triage spawn fix-tasks; in phase 3 it's just a status update.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project the issue belongs to"),
+		),
+		mcp.WithNumber("issue_seq", mcp.Required(),
+			mcp.Description("Per-project issue sequence number"),
+		),
+		mcp.WithString("severity",
+			mcp.Description("Optional severity override during triage"),
+		),
+	)
+}
+
+func toolCloseIssue() mcp.Tool {
+	return mcp.NewTool("enju_close_issue",
+		mcp.WithDescription(`Move an issue into terminal status. Use status="closed" when fixed (optionally pass closed_by_task_id pointing at the fix-task that resolved it); use status="wontfix" when the issue is a duplicate, won't-do, or a misclassification. Refuses on already-terminal issues.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project the issue belongs to"),
+		),
+		mcp.WithNumber("issue_seq", mcp.Required(),
+			mcp.Description("Per-project issue sequence number"),
+		),
+		mcp.WithString("status",
+			mcp.Description(`"closed" (default) or "wontfix"`),
+		),
+		mcp.WithString("closed_by_task_id",
+			mcp.Description("Optional fully-qualified task id whose acceptance resolved this issue"),
+		),
+	)
+}
+
+func toolShowEvents() mcp.Tool {
+	return mcp.NewTool("enju_show_events",
+		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over contribution_events — the canonical event log. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events, which writes git-tracked snapshots; this tool is for ad-hoc queries.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to query"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Description("Optional run sequence number (#1, #2, ...) to scope to a single run"),
+		),
+		mcp.WithString("citizen",
+			mcp.Description("Optional citizen username to filter to events emitted by that citizen"),
+		),
+		mcp.WithString("event_types",
+			mcp.Description(`Comma-separated event types to include (e.g. "task_completed,review_given,run_paused"). Empty = all types.`),
+		),
+		mcp.WithString("since",
+			mcp.Description("Optional RFC3339 timestamp lower bound (e.g. 2026-04-30T00:00:00Z)"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum events to return (default 100, max 1000)"),
+		),
+	)
+}
+
+func toolSpawnTask() mcp.Tool {
+	return mcp.NewTool("enju_spawn_task",
+		mcp.WithDescription(`Spawn a new task into an in-flight run at runtime (living-workflow phase 4a). This is the tasks-spawn-tasks primitive — used to add remediation tasks after a review reject, or fix-tasks after a tester files an issue, or any other "we discovered we need this work" pattern. Subject to the per-run cycle budget (default 200); exhaustion auto-pauses the run. Spawned task starts ready unless depends_on names existing tasks. Emits task_spawned event with parent + trigger attribution.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project containing the run"),
+		),
+		mcp.WithNumber("run_id", mcp.Required(),
+			mcp.Description("Run sequence number within the project"),
+		),
+		mcp.WithString("task_def_id", mcp.Required(),
+			mcp.Description("Unique task id within the run (e.g. 'remediation_1', 'fix_BUG_001'). Becomes the YAML-style identifier; the full id is project:run:task_def_id."),
+		),
+		mcp.WithString("action", mcp.Required(),
+			mcp.Description(`"answer" | "compute" | "contribute" | "review" | "vote"`),
+		),
+		mcp.WithString("prompt",
+			mcp.Description("Optional task prompt (instructions for the claimant). Most spawned tasks set this."),
+		),
+		mcp.WithString("user_prompt",
+			mcp.Description("Optional user-prompt addendum (rare)"),
+		),
+		mcp.WithString("parent_task_id",
+			mcp.Description("Optional parent task id whose output triggered this spawn — recorded as lineage in the task_spawned event"),
+		),
+		mcp.WithString("trigger",
+			mcp.Description(`"human" (default) | "bot" | "template_rule" | "auto_triage"`),
+		),
+		mcp.WithString("depends_on",
+			mcp.Description("Optional comma-separated list of fully-qualified task ids the spawned task waits on. Empty = task starts ready."),
+		),
+		mcp.WithString("assign_to",
+			mcp.Description("Optional comma-separated list of usernames eligible to claim. Empty = open to any project member."),
+		),
+		mcp.WithString("require_role",
+			mcp.Description("Optional citizen role required to claim"),
+		),
+		mcp.WithString("result_type",
+			mcp.Description(`"text" (default) or "json"`),
+		),
+		mcp.WithNumber("citizens",
+			mcp.Description("Number of citizens needed (default 1; >1 = multi-citizen task)"),
+		),
+	)
+}
+
+func toolSetCycleBudget() mcp.Tool {
+	return mcp.NewTool("enju_set_cycle_budget",
+		mcp.WithDescription(`Bump the per-run cycle budget (max number of spawned tasks). Use to extend room after a runaway has been triaged and the underlying loop fixed; the run remains paused until enju_resume_run is called. Default budget is 200 per run.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project containing the run"),
+		),
+		mcp.WithNumber("run_id", mcp.Required(),
+			mcp.Description("Run sequence number"),
+		),
+		mcp.WithNumber("max", mcp.Required(),
+			mcp.Description("New maximum (must be ≥ current used)"),
+		),
+	)
+}
+
+func toolPauseRun() mcp.Tool {
+	return mcp.NewTool("enju_pause_run",
+		mcp.WithDescription(`Pause a run. The run's state moves to "paused" and stays there until enju_resume_run is called. Refused on terminal (completed/failed) runs. SpawnTask refuses while paused (a runaway can't keep growing the task graph); claim and submit currently pass through, full claim/submit gating lands later. Use this to inspect a run mid-flight without state transitions racing against you, or as a circuit-breaker when something looks wrong.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project containing the run"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project (#1, #2, ...)"),
+		),
+	)
+}
+
+func toolResumeRun() mcp.Tool {
+	return mcp.NewTool("enju_resume_run",
+		mcp.WithDescription(`Resume a paused run. The run's state is re-evaluated based on current task counts: lands on "active" if there's ready or in-flight work, "idle" if only pending tasks remain, "completed" if everything is terminal. No-op on already-alive runs; refused on terminal runs.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project containing the run"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+	)
+}
+
 func toolSetProjectDefaultBranch() mcp.Tool {
 	return mcp.NewTool("enju_set_project_default_branch",
 		mcp.WithDescription(`Change a project's default branch. Owner-only. The default is where new runs land when enju_create_run is called without an explicit branch=. Use this to move a project's Enju activity off "main" onto e.g. "enju/work" so repo main stays human-curated. Existing runs are unaffected — they stay on the branch they were created with.`),

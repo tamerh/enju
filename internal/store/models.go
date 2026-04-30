@@ -71,13 +71,44 @@ const (
 )
 
 // RunState represents the state of a run.
+//
+// State transitions (living-workflow phase 1):
+//
+//	create → active
+//	active → idle      (no ready/in-flight work, but non-terminal tasks remain)
+//	idle → active      (a task transitions to ready, e.g. after invalidate or future task-spawn)
+//	active|idle → paused        (explicit enju_pause_run)
+//	paused → active|idle        (explicit enju_resume_run, then re-evaluate)
+//	active|idle → completed     (every task is in {accepted, skipped, failed})
+//
+// Idle is the "no ready work but the run isn't sealed" signal.
+// Today (phase 1) it's observable but rarely entered, since static
+// workflows go straight from active → completed in one transaction.
+// Phase 4 (spawn primitive) will make idle the wake-trigger surface
+// for auto-triage. Paused freezes the state machine until an
+// operator resumes; phase 1 ships the state, claim/submit gating
+// arrives with phase 4.
 type RunState string
 
 const (
 	RunActive    RunState = "active"
+	RunIdle      RunState = "idle"
+	RunPaused    RunState = "paused"
 	RunCompleted RunState = "completed"
 	RunFailed    RunState = "failed"
 )
+
+// IsAlive reports whether a run still owns its (project, branch)
+// slot — i.e. is not in a terminal state. The unique-branch index
+// keys off the same predicate so two alive runs can't collide on
+// one branch even if one of them is idle or paused.
+func (s RunState) IsAlive() bool {
+	switch s {
+	case RunActive, RunIdle, RunPaused:
+		return true
+	}
+	return false
+}
 
 // ProjectRecord is a long-lived project container stored in the database.
 // A project holds many runs over time, plus shared artifacts.
@@ -301,6 +332,35 @@ type TaskRecord struct {
 	// first restore produced.
 	ParkedFromState string
 
+	// SpawnedFrom and SpawnTrigger record runtime spawn provenance
+	// (living-workflow phase 4). SpawnedFrom is the parent task's
+	// full id (empty for tasks authored at run-create time);
+	// SpawnTrigger is one of "human", "bot", "template_rule",
+	// "auto_triage" describing which mechanism fired the spawn.
+	// The detailed audit lives in contribution_events as
+	// task_spawned; these columns make lineage queryable in a
+	// single row.
+	SpawnedFrom  string
+	SpawnTrigger string
+
+	// Review-failure spawn rules (living-workflow phase 4b).
+	// Declared in YAML on the dev task; consulted by the engine
+	// when a reviewing task rejects this one.
+	//
+	//   OnReviewReject:         "" (default cascade) | "spawn_remediation"
+	//   OnReviewRequestChanges: "" / "continue_iteration" (default) | "spawn_remediation"
+	//   RemediationTemplate:    JSON-encoded yaml.RemediationTemplate; empty when no rule applies
+	OnReviewReject         string
+	OnReviewRequestChanges string
+	RemediationTemplate    string
+
+	// Living-workflow phase 4c — auto-triage linkage. When > 0,
+	// this task was spawned by the auto-triage hook to fix the
+	// project-scoped issue with the given seq. On task accept,
+	// the close-on-accept hook transitions that issue to
+	// `closed`. 0 on every other task.
+	ClosesIssueSeq int
+
 	CreatedAt time.Time
 }
 
@@ -328,6 +388,40 @@ type ProjectMemberRecord struct {
 	Role      ProjectRole
 	AddedAt   time.Time
 	AddedBy   int64 // citizens.id of the adder; 0 for the creator row
+}
+
+// IssueRecord is one row in the issues table — a project-level
+// structured artifact. Issues outlive runs: filed in one run,
+// possibly triaged in a later run, possibly closed by a fix-task
+// in a yet-later run. See docs/living-workflow-design-notes.md § 6.
+type IssueRecord struct {
+	ID             int64
+	ProjectID      int64
+	Seq            int    // per-project counter — ISSUE-001, ISSUE-002, ...
+	Title          string
+	Body           string
+	Status         string // "open" | "triaged" | "closed" | "wontfix"
+	Severity       string // "low" | "medium" | "high" | "critical"
+	FoundInRunID   int64  // 0 if not run-scoped (rare)
+	FoundInTaskID  string // empty if not task-scoped (e.g. filed against the project as a whole)
+	FiledBy        int64  // citizen ID
+	FiledAt        time.Time
+	TriagedBy      int64      // 0 until triaged
+	TriagedAt      *time.Time // nil until triaged
+	// ClosedByTaskID has dual semantics depending on Status:
+	//   - status=in_progress: the fix task currently working
+	//     on this issue (set by MarkIssueInProgress).
+	//   - status=closed:      the fix task whose acceptance
+	//     resolved this issue (set by CloseIssue, often the
+	//     same value MarkIssueInProgress wrote).
+	//   - status=open / triaged / wontfix: empty.
+	// Column name is historical — "closed by" was accurate
+	// pre-phase-4c when issues went open → triaged → closed
+	// directly. The phase-4c in_progress status overloaded
+	// the field as a "linked fix-task" pointer.
+	ClosedByTaskID string
+	ClosedAt       *time.Time // nil while open/triaged/in_progress
+	UpdatedAt      time.Time
 }
 
 // ArtifactRecord is the index row for one mutable file inside a

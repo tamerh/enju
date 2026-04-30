@@ -21,10 +21,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enju-ai/enju/internal/dag"
@@ -67,6 +69,14 @@ type Server struct {
 	dags   map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
 	runs   map[int64]*enjuYaml.ParsedRun
 	logger *slog.Logger
+
+	// triageMu serializes maybeAutoTriage per project to close
+	// the bounded race where two concurrent submits both pass
+	// the open-issue check, both spawn a fix task, and one
+	// becomes an orphan. Loads-or-stores per project — the
+	// map is small (one entry per active project), keyed by
+	// projectID. See the maybeAutoTriage doc comment.
+	triageMu sync.Map // projectID(int64) -> *sync.Mutex
 }
 
 // NewServer creates a new API server.
@@ -77,6 +87,18 @@ func NewServer(st *store.Store, logger *slog.Logger) *Server {
 		runs:   make(map[int64]*enjuYaml.ParsedRun),
 		logger: logger,
 	}
+}
+
+// projectTriageMutex returns the per-project mutex used by
+// maybeAutoTriage. Idempotent: first caller for a projectID
+// allocates, subsequent callers find the same mutex.
+func (s *Server) projectTriageMutex(projectID int64) *sync.Mutex {
+	if m, ok := s.triageMu.Load(projectID); ok {
+		return m.(*sync.Mutex)
+	}
+	m := &sync.Mutex{}
+	actual, _ := s.triageMu.LoadOrStore(projectID, m)
+	return actual.(*sync.Mutex)
 }
 
 // engine creates a lightweight Engine instance for
@@ -320,6 +342,21 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}/runs/{runSeq}/tasks", s.handleListRunTasks)
 		r.Get("/projects/{projectID}/runs/{runSeq}/cost", s.handleGetRunCostSummary)
 		r.Get("/projects/{projectID}/runs/{runSeq}/events", s.handleListRunEvents)
+		r.Post("/projects/{projectID}/runs/{runSeq}/pause", s.handlePauseRun)
+		r.Post("/projects/{projectID}/runs/{runSeq}/resume", s.handleResumeRun)
+		r.Post("/projects/{projectID}/runs/{runSeq}/spawn", s.handleSpawnTask)
+		r.Post("/projects/{projectID}/runs/{runSeq}/cycle_budget", s.handleSetCycleBudget)
+		r.Get("/projects/{projectID}/events", s.handleShowEvents)
+
+		// Issues — project-level structured artifacts
+		// (living-workflow phase 3). Outlive runs; filed by
+		// any project member, triaged or closed by any member,
+		// linked to fix-tasks once spawn arrives.
+		r.Post("/projects/{projectID}/issues", s.handleFileIssue)
+		r.Get("/projects/{projectID}/issues", s.handleListIssues)
+		r.Get("/projects/{projectID}/issues/{issueSeq}", s.handleGetIssue)
+		r.Post("/projects/{projectID}/issues/{issueSeq}/triage", s.handleTriageIssue)
+		r.Post("/projects/{projectID}/issues/{issueSeq}/close", s.handleCloseIssue)
 
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
@@ -1373,6 +1410,24 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Living-workflow phase 4c — persist the run-level
+	// auto_triage rule (if any) before tasks are inserted, so
+	// the auto-triage hook can read it the moment the run lands
+	// on idle. Marshalled to JSON; empty when not declared OR
+	// when declared empty (`auto_triage: {}`) so static
+	// workflows and "rule present but empty" are both treated
+	// uniformly. Without the empty check, an empty block would
+	// land as `{}` in the column and the maybeAutoTriage hook
+	// would log "missing action" warnings every idle tick.
+	if t := parsed.Run.AutoTriage; t != nil &&
+		(t.Action != "" || t.Prompt != "" || len(t.AssignTo) > 0 || t.RequireRole != "") {
+		if data, err := json.Marshal(t); err == nil {
+			if err := s.store.SetAutoTriageTemplate(runID, string(data)); err != nil {
+				s.logger.Error("setting auto_triage_template", "run_id", runID, "error", err)
+			}
+		}
+	}
+
 	// Build task records via engine and apply atomically.
 	taskRecords := engine.BuildRunTasks(parsed, runID, projectID, runSeq, runSlug)
 	var mutations []store.Mutation
@@ -1604,6 +1659,884 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handlePauseRun moves a run to the `paused` state. Idempotent on
+// already-paused runs; refuses on terminal (completed / failed)
+// runs. Member-gated. Living-workflow phase 1 — see
+// docs/living-workflow.md § 5 (out-of-band human interrupt).
+func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	member, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	if err := s.store.PauseRun(run.ID, member.CitizenID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, _ := s.store.GetRun(run.ID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "paused",
+		"run_id":  fmt.Sprintf("%d:%d", projectID, runSeq),
+		"state":   string(updated.State),
+		"message": "run paused — SpawnTask now refuses on paused runs, but claims and submits still pass through. Full spawn-aware gating (claim/submit refusal) arrives with phase 4c.",
+	})
+}
+
+// handleResumeRun moves a paused run back to active or idle,
+// depending on whether ready work exists. No-op on already-alive
+// runs; refuses on terminal runs.
+func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	member, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+	next, err := s.store.ResumeRun(run.ID, member.CitizenID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "resumed",
+		"run_id": fmt.Sprintf("%d:%d", projectID, runSeq),
+		"state":  string(next),
+	})
+}
+
+// handleShowEvents is the read-only projection over
+// contribution_events — the JSONL-shaped event log view.
+// Distinct from /events (run-scoped) and from
+// enju_export_run_events (which writes git-tracked snapshots).
+// This endpoint is for ad-hoc queries: "what happened in this
+// project / run / by this citizen, of these types, since when."
+//
+// Query params: run_seq (optional, narrows to one run),
+// citizen (username, optional), event_types (comma-separated),
+// since (RFC3339), limit (default 100, max 1000).
+//
+// Living-workflow phase 2 — see docs/living-workflow-design-notes.md
+// § "The event log is the central data primitive."
+func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+
+	q := store.EventQuery{ProjectID: projectID}
+
+	if rs := r.URL.Query().Get("run_seq"); rs != "" {
+		seq, err := strconv.Atoi(rs)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid run_seq")
+			return
+		}
+		run, err := s.store.GetRunByProjectSeq(projectID, seq)
+		if err != nil || run == nil {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		q.RunID = run.ID
+	}
+	if u := r.URL.Query().Get("citizen"); u != "" {
+		c, err := s.store.GetCitizenByUsername(u)
+		if err == nil && c != nil {
+			q.CitizenID = c.ID
+		} else {
+			// Unknown username → empty result, not an error.
+			writeJSON(w, http.StatusOK, []map[string]interface{}{})
+			return
+		}
+	}
+	if et := r.URL.Query().Get("event_types"); et != "" {
+		q.EventTypes = strings.Split(et, ",")
+	}
+	if since := r.URL.Query().Get("since"); since != "" {
+		ts, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid since (expected RFC3339): "+err.Error())
+			return
+		}
+		q.Since = ts
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		q.Limit = n
+	}
+
+	events, err := s.store.ListEvents(q)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, len(events))
+	for _, e := range events {
+		row := map[string]interface{}{
+			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"type": e.Type,
+		}
+		if e.Subtype != "" {
+			row["subtype"] = e.Subtype
+		}
+		if e.TaskID != "" {
+			row["task_id"] = e.TaskID
+		}
+		if e.Citizen != "" {
+			row["citizen"] = e.Citizen
+		}
+		if e.Metadata != "" {
+			var md interface{}
+			if json.Unmarshal([]byte(e.Metadata), &md) == nil {
+				row["metadata"] = md
+			} else {
+				row["metadata"] = e.Metadata
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// maybeAutoTriage handles the living-workflow phase 4c idle
+// trigger: when a run lands on `idle` AND the run carries an
+// auto_triage_template AND the project has at least one open
+// issue, the engine spawns a fix task for the oldest open
+// issue (by per-project seq). The spawned task lifts the run
+// back to active; when it accepts, the close-on-accept hook
+// transitions the issue to "closed".
+//
+// Best-effort: failures are logged and don't surface to
+// callers — the run is still genuinely idle even if triage
+// can't pick it up. Idempotent per (run, issue): the issue is
+// transitioned to in_progress on spawn, so a second call finds
+// no `open` issue and is a no-op.
+//
+// Concurrency: serialized per project via projectTriageMutex.
+// Without the mutex, two concurrent submits in the same
+// project could each pass FindOldestOpenIssue before either
+// got to MarkIssueInProgress, both spawn a fix task, and one
+// would become an orphan (correct issue link but no
+// corresponding in_progress claim). The mutex closes that
+// window — only one auto-triage per project can be mid-flight
+// at any moment. Across projects there's no contention.
+//
+// Caller invokes after every state evaluation that can land on
+// idle (submit, invalidate, fail-cascade).
+func (s *Server) maybeAutoTriage(runID int64) {
+	tmpl, err := s.store.GetAutoTriageTemplate(runID)
+	if err != nil || tmpl == "" {
+		return
+	}
+	run, err := s.store.GetRun(runID)
+	if err != nil || run == nil {
+		return
+	}
+	mu := s.projectTriageMutex(run.ProjectID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-check under the mutex: another goroutine may have
+	// just spawned for this issue and transitioned it. If so,
+	// FindOldestOpenIssue returns nil and we no-op.
+	issue, err := s.store.FindOldestOpenIssue(run.ProjectID)
+	if err != nil || issue == nil {
+		return
+	}
+
+	var spec enjuYaml.RemediationTemplate
+	if err := json.Unmarshal([]byte(tmpl), &spec); err != nil {
+		s.logger.Error("auto_triage_template malformed", "run", runID, "error", err)
+		return
+	}
+	if spec.Action == "" {
+		s.logger.Error("auto_triage_template missing action", "run", runID)
+		return
+	}
+
+	// Substitute issue context at spawn time. Mirrors the
+	// {{review.feedback}} pattern from maybeSpawnRemediation
+	// so the prompt captures the issue snapshot — even if the
+	// underlying issue is later updated, the spawned task's
+	// prompt remembers what triggered it.
+	prompt := spec.Prompt
+	prompt = strings.ReplaceAll(prompt, "{{issue.title}}", issue.Title)
+	prompt = strings.ReplaceAll(prompt, "{{issue.body}}", issue.Body)
+	prompt = strings.ReplaceAll(prompt, "{{issue.severity}}", issue.Severity)
+	prompt = strings.ReplaceAll(prompt, "{{issue.id}}", fmt.Sprintf("ISSUE-%03d", issue.Seq))
+
+	// Per-issue task_def_id pattern: fix_ISSUE_<seq>_<n> where
+	// n is the next-available index. Mirrors the remediation
+	// naming so multiple fix attempts on the same issue (e.g.
+	// after a previous fix-task failed and the issue was
+	// re-opened) don't collide.
+	base := fmt.Sprintf("fix_ISSUE_%03d", issue.Seq)
+	count, _ := s.store.CountTasksWithDefIDPrefix(runID, base+"_")
+	defID := fmt.Sprintf("%s_%d", base, count+1)
+
+	var assignTo []string
+	if len(spec.AssignTo) > 0 {
+		assignTo = []string(spec.AssignTo)
+	}
+
+	taskID, err := s.store.SpawnTask(store.SpawnSpec{
+		RunID:          runID,
+		TaskDefID:      defID,
+		Action:         spec.Action,
+		Prompt:         prompt,
+		AssignTo:       assignTo,
+		RequireRole:    spec.RequireRole,
+		Trigger:        "auto_triage",
+		ClosesIssueSeq: issue.Seq,
+		// SpawnedBy = 0 — system-initiated, not a specific
+		// citizen. The audit trail records this as
+		// trigger=auto_triage which is the better attribution
+		// signal anyway.
+	})
+	if err != nil {
+		s.logger.Error("auto-triage spawn failed", "run", runID, "issue", issue.Seq, "error", err)
+		return
+	}
+
+	// Move the issue to in_progress + link to the fix task.
+	// MarkIssueInProgress emits issue_in_progress event for
+	// the audit log.
+	if err := s.store.MarkIssueInProgress(issue.ID, 0, taskID); err != nil {
+		s.logger.Warn("auto-triage in_progress transition failed", "issue", issue.ID, "task", taskID, "error", err)
+	}
+}
+
+// evaluateRunStateAndMaybeTriage wraps EvaluateRunState with
+// the post-evaluation auto-triage hook. Used at every site
+// that re-evaluates a run's state after a task transition.
+func (s *Server) evaluateRunStateAndMaybeTriage(runID int64) {
+	next, err := s.store.EvaluateRunState(runID)
+	if err != nil {
+		return
+	}
+	if next == store.RunIdle {
+		s.maybeAutoTriage(runID)
+	}
+}
+
+// maybeAutoTriageIfIdle is the submit-path variant: the state
+// was already re-evaluated by CheckAndCompleteRun (which
+// applyCompleteRun runs inside the submit Plan tx). We just
+// need to read the current state and fire the trigger if
+// idle. Cheap.
+func (s *Server) maybeAutoTriageIfIdle(runID int64) {
+	r, err := s.store.GetRun(runID)
+	if err != nil || r == nil {
+		return
+	}
+	if r.State == store.RunIdle {
+		s.maybeAutoTriage(runID)
+	}
+}
+
+// maybeAutoCloseIssue closes the issue linked to a submitted
+// fix task. Triggered when a task with closes_issue_seq > 0
+// reaches accepted. Best-effort — a CloseIssue refusal (issue
+// already terminal somehow, e.g. closed manually mid-flight)
+// is logged and absorbed.
+func (s *Server) maybeAutoCloseIssue(task *store.TaskRecord) {
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return
+	}
+	issue, err := s.store.GetIssueBySeq(run.ProjectID, task.ClosesIssueSeq)
+	if err != nil || issue == nil {
+		return
+	}
+	// Pass citizen_id = 0 (system close on auto-triage). The
+	// audit event records closed_by_task_id pointing at the
+	// fix task, which is the more useful attribution.
+	if err := s.store.CloseIssue(issue.ID, 0, store.IssueStatusClosed, task.ID); err != nil {
+		s.logger.Warn("auto-close issue failed", "issue", issue.ID, "task", task.ID, "error", err)
+	}
+}
+
+// maybeSpawnRemediation handles the living-workflow phase 4b
+// auto-spawn rule. Returns (result, true) when the target
+// declared spawn_remediation for the given decision and a
+// remediation task was successfully spawned; (nil, false)
+// otherwise so the caller falls through to default cascade
+// behavior.
+//
+// The spawned remediation:
+//   - Carries the reviewer's feedback in metadata so an audit
+//     reader can reconstruct the why
+//   - Has the reviewer's content substituted into prompt via
+//     {{review.feedback}} and {{review.decision}}
+//   - depends_on names the original target so any future
+//     re-claim chain naturally waits for the remediation
+//   - Trigger = "template_rule" — distinguishes auto-spawned
+//     remediations from human/bot-initiated spawns in the audit log
+//
+// Failure modes: rule unset, target not found, malformed
+// remediation_template JSON, or SpawnTask error (cycle budget
+// exhausted etc.) all return (nil, false). The caller falls
+// back to the default cascade. We log but don't surface — a
+// remediation-spawn failure must not stop a review submission
+// from being recorded.
+func (s *Server) maybeSpawnRemediation(reviewTaskID, targetTaskID, eventKind, decision, feedback string, submitterID int64) (*invalidationResult, bool) {
+	target, err := s.store.GetTask(targetTaskID)
+	if err != nil || target == nil {
+		return nil, false
+	}
+	var rule string
+	switch eventKind {
+	case "reject":
+		rule = target.OnReviewReject
+	case "request_changes":
+		rule = target.OnReviewRequestChanges
+	}
+	if rule != "spawn_remediation" || target.RemediationTemplate == "" {
+		return nil, false
+	}
+
+	var tmpl enjuYaml.RemediationTemplate
+	if err := json.Unmarshal([]byte(target.RemediationTemplate), &tmpl); err != nil {
+		s.logger.Error("remediation_template malformed", "target", targetTaskID, "error", err)
+		return nil, false
+	}
+	if tmpl.Action == "" {
+		s.logger.Error("remediation_template missing action", "target", targetTaskID)
+		return nil, false
+	}
+
+	// Substitute reviewer feedback into the prompt. Done at
+	// spawn time (not claim time) so the remediation task
+	// captures the feedback text immutably even if the review
+	// task is later edited or invalidated.
+	prompt := tmpl.Prompt
+	prompt = strings.ReplaceAll(prompt, "{{review.feedback}}", feedback)
+	prompt = strings.ReplaceAll(prompt, "{{review.decision}}", decision)
+
+	// Pick a unique task_def_id for the remediation. The
+	// pattern <target>_remediation_<n> keeps lineage readable;
+	// the counter handles the case where the same target gets
+	// rejected multiple times. Empty target_def_id falls back
+	// to a generic seq via task_spawned events.
+	remediationDefID := s.nextRemediationDefID(target)
+
+	var assignTo []string
+	if len(tmpl.AssignTo) > 0 {
+		assignTo = []string(tmpl.AssignTo)
+	}
+
+	taskID, err := s.store.SpawnTask(store.SpawnSpec{
+		RunID:        target.RunID,
+		ParentTaskID: targetTaskID,
+		TaskDefID:    remediationDefID,
+		Action:       tmpl.Action,
+		Prompt:       prompt,
+		DependsOn:    []string{targetTaskID},
+		AssignTo:     assignTo,
+		RequireRole:  tmpl.RequireRole,
+		Trigger:      "template_rule",
+		SpawnedBy:    submitterID,
+	})
+	if err != nil {
+		s.logger.Error("auto-spawn remediation failed", "target", targetTaskID, "error", err)
+		return nil, false
+	}
+
+	updated, _ := s.store.GetTask(taskID)
+	return &invalidationResult{
+		Task: updated,
+	}, true
+}
+
+// nextRemediationDefID picks a fresh task_def_id for an
+// auto-spawned remediation by counting existing remediation
+// tasks for the target. Pattern: <target_def_id>_remediation_<N>
+// where N is the next-available index.
+//
+// Counts directly from the tasks table via a LIKE prefix
+// match — bounded query (one COUNT, indexed by run_id) and
+// precise (no false-positive substring traps that an
+// event-metadata scan would have).
+func (s *Server) nextRemediationDefID(target *store.TaskRecord) string {
+	base := target.TaskDefID + "_remediation"
+	count, err := s.store.CountTasksWithDefIDPrefix(target.RunID, base+"_")
+	if err != nil {
+		return fmt.Sprintf("%s_1", base)
+	}
+	return fmt.Sprintf("%s_%d", base, count+1)
+}
+
+// --- Spawn primitive (living-workflow phase 4a) ---
+
+type spawnTaskRequest struct {
+	ParentTaskID string   `json:"parent_task_id,omitempty"`
+	TaskDefID    string   `json:"task_def_id"`
+	Action       string   `json:"action"`
+	Prompt       string   `json:"prompt,omitempty"`
+	UserPrompt   string   `json:"user_prompt,omitempty"`
+	Citizens     int      `json:"citizens,omitempty"`
+	DependsOn    []string `json:"depends_on,omitempty"`
+	AssignTo     []string `json:"assign_to,omitempty"`
+	RequireRole  string   `json:"require_role,omitempty"`
+	ResultType   string   `json:"result_type,omitempty"`
+	Trigger      string   `json:"trigger,omitempty"`
+}
+
+// handleSpawnTask creates a new task in an existing run at
+// runtime. Member-gated; the spawning citizen is the
+// authenticated caller. Subject to the per-run cycle budget —
+// budget exhaustion auto-pauses the run and returns 409 Conflict
+// so callers can distinguish "you tried to spawn into a stopped
+// run" from generic 400 validation errors.
+//
+// Living-workflow phase 4a. The YAML-rule sugar
+// (on_review_reject, on_idle) lands in 4b/4c on top of this
+// primitive.
+func (s *Server) handleSpawnTask(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	runSeq, err := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run_seq")
+		return
+	}
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	member, ok := s.requireProjectMembership(w, r, projectID)
+	if !ok {
+		return
+	}
+
+	var req spawnTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.TaskDefID == "" {
+		writeError(w, http.StatusBadRequest, "task_def_id is required")
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "action is required")
+		return
+	}
+
+	taskID, err := s.store.SpawnTask(store.SpawnSpec{
+		RunID:        run.ID,
+		ParentTaskID: req.ParentTaskID,
+		TaskDefID:    req.TaskDefID,
+		Action:       req.Action,
+		Prompt:       req.Prompt,
+		UserPrompt:   req.UserPrompt,
+		Citizens:     req.Citizens,
+		DependsOn:    req.DependsOn,
+		AssignTo:     req.AssignTo,
+		RequireRole:  req.RequireRole,
+		ResultType:   req.ResultType,
+		Trigger:      req.Trigger,
+		SpawnedBy:    member.CitizenID,
+	})
+	if err != nil {
+		// Cycle-budget exhaustion is a distinct condition —
+		// the run is now paused, the caller should know to
+		// resume after extending budget. 409 Conflict matches
+		// the "request can't be fulfilled in current state"
+		// REST convention.
+		if strings.Contains(err.Error(), "cycle budget exhausted") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	used, max, _ := s.store.GetCycleBudget(run.ID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":           "spawned",
+		"task_id":          taskID,
+		"task_def_id":      req.TaskDefID,
+		"parent_task_id":   req.ParentTaskID,
+		"trigger":          req.Trigger,
+		"cycle_budget":     map[string]int{"used": used, "max": max},
+	})
+}
+
+type setCycleBudgetRequest struct {
+	Max int `json:"max"`
+}
+
+// handleSetCycleBudget bumps the cycle-budget cap on a run.
+// Used by operators to extend room after a runaway has been
+// triaged and the underlying loop fixed. Member-gated.
+func (s *Server) handleSetCycleBudget(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	runSeq, err := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run_seq")
+		return
+	}
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	var req setCycleBudgetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Max <= 0 {
+		writeError(w, http.StatusBadRequest, "max must be positive")
+		return
+	}
+	if err := s.store.SetCycleBudgetMax(run.ID, req.Max); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	used, max, _ := s.store.GetCycleBudget(run.ID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "updated",
+		"cycle_budget": map[string]int{"used": used, "max": max},
+	})
+}
+
+// --- Issues (living-workflow phase 3) ---
+
+type fileIssueRequest struct {
+	Title         string `json:"title"`
+	Body          string `json:"body"`
+	Severity      string `json:"severity"`
+	FoundInRunSeq int    `json:"found_in_run_seq,omitempty"`
+	FoundInTaskID string `json:"found_in_task_id,omitempty"`
+}
+
+// handleFileIssue creates a new issue under a project. Member-
+// gated; the filer is the authenticated citizen. Emits an
+// `issue_filed` contribution event so the issue appears in the
+// project's event log. Body and severity are optional; status
+// defaults to "open."
+//
+// Living-workflow phase 3 — see
+// docs/living-workflow-design-notes.md § 6.
+func (s *Server) handleFileIssue(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+
+	var req fileIssueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Title == "" {
+		writeError(w, http.StatusBadRequest, "title is required")
+		return
+	}
+	// Filer attribution comes from the auth context — works
+	// uniformly for both regular projects (where the caller is
+	// also a member) and legacy zero-member projects (where
+	// requireProjectMembership returns nil-member-ok-true under
+	// the open-access fallback). Falling back to caller via
+	// citizenFromRequest keeps the audit trail meaningful in
+	// both cases.
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	rec := &store.IssueRecord{
+		ProjectID:     projectID,
+		Title:         req.Title,
+		Body:          req.Body,
+		Severity:      req.Severity,
+		FoundInTaskID: req.FoundInTaskID,
+		FiledBy:       caller.ID,
+	}
+	// found_in_run_seq is project-scoped; resolve to the run's
+	// global ID before storing. Soft-fails on lookup miss — the
+	// issue is still useful without it.
+	if req.FoundInRunSeq > 0 {
+		if run, err := s.store.GetRunByProjectSeq(projectID, req.FoundInRunSeq); err == nil && run != nil {
+			rec.FoundInRunID = run.ID
+		}
+	}
+
+	// CreateIssue emits issue_filed in the same tx as the
+	// INSERT, so no follow-up event recording here.
+	id, seq, err := s.store.CreateIssue(rec)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "creating issue: "+err.Error())
+		return
+	}
+
+	// Living-workflow phase 4c — file-against-completed-run
+	// gap. A run that opted into auto_triage and reached
+	// "completed" because no issue existed at the time should
+	// re-evaluate now that one does: completed → idle, then
+	// the auto-triage hook spawns a fix. Without this, the
+	// natural pattern "dev task finishes, THEN tester files
+	// issue" silently drops the trigger and the issue sits
+	// open against a dead run.
+	if runIDs, err := s.store.ListRunsWithAutoTriage(projectID); err == nil {
+		for _, rid := range runIDs {
+			s.evaluateRunStateAndMaybeTriage(rid)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":        id,
+		"seq":       seq,
+		"slug":      fmt.Sprintf("ISSUE-%03d", seq),
+		"status":    rec.Status,
+		"severity":  rec.Severity,
+		"title":     rec.Title,
+	})
+}
+
+// handleListIssues returns all issues in a project, newest-first.
+// Optional query params: status (comma-separated, OR-matched),
+// severity (comma-separated), limit (default 100, max 1000).
+func (s *Server) handleListIssues(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+
+	f := store.IssueFilter{ProjectID: projectID}
+	if st := r.URL.Query().Get("status"); st != "" {
+		f.Status = strings.Split(st, ",")
+	}
+	if sv := r.URL.Query().Get("severity"); sv != "" {
+		f.Severity = strings.Split(sv, ",")
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		f.Limit = n
+	}
+
+	issues, err := s.store.ListIssues(f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing issues: "+err.Error())
+		return
+	}
+	out := make([]map[string]interface{}, 0, len(issues))
+	for _, it := range issues {
+		out = append(out, s.issueToMap(&it))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleGetIssue returns one issue by its (project, seq) pair.
+func (s *Server) handleGetIssue(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	seq, err := strconv.Atoi(chi.URLParam(r, "issueSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid issue_seq")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	it, err := s.store.GetIssueBySeq(projectID, seq)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if it == nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.issueToMap(it))
+}
+
+type triageIssueRequest struct {
+	Severity string `json:"severity,omitempty"` // optional severity update
+}
+
+func (s *Server) handleTriageIssue(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	seq, err := strconv.Atoi(chi.URLParam(r, "issueSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid issue_seq")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req triageIssueRequest
+	// Body is optional (severity-only update). Decode and
+	// tolerate io.EOF — that covers Content-Length: 0,
+	// Transfer-Encoding: chunked with empty body, and a nil
+	// body equally. Any other decode error means the caller
+	// sent malformed JSON and should hear about it.
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	it, err := s.store.GetIssueBySeq(projectID, seq)
+	if err != nil || it == nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	}
+	// TriageIssue emits issue_triaged in the same tx as the
+	// UPDATE.
+	if err := s.store.TriageIssue(it.ID, caller.ID, req.Severity); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, _ := s.store.GetIssue(it.ID)
+	writeJSON(w, http.StatusOK, s.issueToMap(updated))
+}
+
+type closeIssueRequest struct {
+	Status         string `json:"status"`            // "closed" | "wontfix"
+	ClosedByTaskID string `json:"closed_by_task_id"` // optional
+}
+
+func (s *Server) handleCloseIssue(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	seq, err := strconv.Atoi(chi.URLParam(r, "issueSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid issue_seq")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req closeIssueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Status == "" {
+		req.Status = store.IssueStatusClosed
+	}
+
+	it, err := s.store.GetIssueBySeq(projectID, seq)
+	if err != nil || it == nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	}
+	// CloseIssue emits issue_closed in the same tx as the UPDATE.
+	if err := s.store.CloseIssue(it.ID, caller.ID, req.Status, req.ClosedByTaskID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, _ := s.store.GetIssue(it.ID)
+	writeJSON(w, http.StatusOK, s.issueToMap(updated))
+}
+
+// issueToMap is the shared JSON shape for every issue endpoint.
+// Keys mirror the YAML frontmatter from the design notes (id,
+// title, status, severity, ...) so a future fat-client mirror
+// can dump the map straight into ISSUE-<NNN>.md.
+//
+// Citizen ids are resolved to usernames so humans (and the
+// markdown frontmatter) read names, not numbers — matches the
+// vote/review submission rendering.
+func (s *Server) issueToMap(it *store.IssueRecord) map[string]interface{} {
+	m := map[string]interface{}{
+		"id":         fmt.Sprintf("ISSUE-%03d", it.Seq),
+		"db_id":      it.ID,
+		"seq":        it.Seq,
+		"project_id": it.ProjectID,
+		"title":      it.Title,
+		"body":       it.Body,
+		"status":     it.Status,
+		"severity":   it.Severity,
+		"filed_by":   s.citizenUsername(it.FiledBy),
+		"filed_at":   it.FiledAt.UTC().Format(time.RFC3339),
+		"updated_at": it.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if it.FoundInRunID > 0 {
+		m["found_in_run_id"] = it.FoundInRunID
+	}
+	if it.FoundInTaskID != "" {
+		m["found_in_task_id"] = it.FoundInTaskID
+	}
+	if it.TriagedBy > 0 {
+		m["triaged_by"] = s.citizenUsername(it.TriagedBy)
+	}
+	if it.TriagedAt != nil {
+		m["triaged_at"] = it.TriagedAt.UTC().Format(time.RFC3339)
+	}
+	if it.ClosedByTaskID != "" {
+		m["closed_by_task_id"] = it.ClosedByTaskID
+	}
+	if it.ClosedAt != nil {
+		m["closed_at"] = it.ClosedAt.UTC().Format(time.RFC3339)
+	}
+	return m
 }
 
 func countByState(tasks []store.TaskRecord, state store.TaskState) int {
@@ -3002,32 +3935,52 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			s.store.ApplyPlan(*actions.ReviewResolvePlan)
 		}
 		if actions.ShouldRejectTarget && actions.RejectTargetID != "" {
-			res, err := s.performInvalidate(actions.RejectTargetID)
-			if err != nil {
-				s.logger.Error("review-request_changes cascade", "target", actions.RejectTargetID, "error", err)
+			// Living-workflow phase 4b — if the target opted into
+			// spawn_remediation on request_changes, skip the
+			// invalidate cascade and spawn the remediation
+			// instead. Default behavior (continue_iteration via
+			// invalidate cascade) is preserved when the rule is
+			// unset.
+			if spawned, ok := s.maybeSpawnRemediation(taskID, actions.RejectTargetID, "request_changes", req.Decision, req.Content, submitterID); ok {
+				rejectResult = spawned
 			} else {
-				rejectResult = res
+				res, err := s.performInvalidate(actions.RejectTargetID)
+				if err != nil {
+					s.logger.Error("review-request_changes cascade", "target", actions.RejectTargetID, "error", err)
+				} else {
+					rejectResult = res
+				}
 			}
 		}
 		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
-			// Validate fail-ability (engine precondition check),
-			// then run the full cascade: target→FAILED + artifact
-			// rollback + descendants→SKIPPED + cross-run readers→
-			// PENDING. A raw ComputeFailTask here would leave the
-			// artifact index pointing at the rejected commit and
-			// leave DAG descendants stalled in PENDING forever —
-			// both were the bugs that motivated this path.
-			if _, err := s.engine().ComputeFailTask(actions.RejectTargetID, "rejected by reviewer"); err != nil {
-				s.logger.Error("review-reject fail: compute", "target", actions.RejectTargetID, "error", err)
-			} else if res, err := s.performFailCascade(actions.RejectTargetID, "rejected by reviewer"); err != nil {
-				s.logger.Error("review-reject fail: cascade", "target", actions.RejectTargetID, "error", err)
+			// Living-workflow phase 4b — if the target opted into
+			// spawn_remediation on reject, skip the fail-cascade
+			// and spawn the remediation instead. The author of
+			// the YAML opted in to "reject = soft fork, not hard
+			// kill." Default behavior (cascade-fail) preserved
+			// when the rule is unset.
+			if spawned, ok := s.maybeSpawnRemediation(taskID, actions.RejectTargetID, "reject", req.Decision, req.Content, submitterID); ok {
+				rejectResult = spawned
 			} else {
-				rejectResult = &invalidationResult{
-					Task:           res.Task,
-					Descendants:    res.SkippedDescendants,
-					Dematerialized: res.Dematerialized,
-					Changed:        res.Changed,
-					Rollbacks:      res.Rollbacks,
+				// Validate fail-ability (engine precondition check),
+				// then run the full cascade: target→FAILED + artifact
+				// rollback + descendants→SKIPPED + cross-run readers→
+				// PENDING. A raw ComputeFailTask here would leave the
+				// artifact index pointing at the rejected commit and
+				// leave DAG descendants stalled in PENDING forever —
+				// both were the bugs that motivated this path.
+				if _, err := s.engine().ComputeFailTask(actions.RejectTargetID, "rejected by reviewer"); err != nil {
+					s.logger.Error("review-reject fail: compute", "target", actions.RejectTargetID, "error", err)
+				} else if res, err := s.performFailCascade(actions.RejectTargetID, "rejected by reviewer"); err != nil {
+					s.logger.Error("review-reject fail: cascade", "target", actions.RejectTargetID, "error", err)
+				} else {
+					rejectResult = &invalidationResult{
+						Task:           res.Task,
+						Descendants:    res.SkippedDescendants,
+						Dematerialized: res.Dematerialized,
+						Changed:        res.Changed,
+						Rollbacks:      res.Rollbacks,
+					}
 				}
 			}
 		}
@@ -3059,6 +4012,27 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	// is unaffected by this submission.
 	readied, _ := s.store.UpdateReadyTasks(task.RunID)
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
+
+	// 7b. Living-workflow phase 4c — auto-triage hook.
+	// CheckAndCompleteRun returns true only on the
+	// active|idle → completed edge; we still need to fire the
+	// idle hook on every transition that lands on idle. Cheap
+	// post-evaluation: load the current state and fire if
+	// idle. No-op when no auto_triage_template / no open
+	// issues.
+	if !completed {
+		s.maybeAutoTriageIfIdle(task.RunID)
+	}
+
+	// 7c. Auto-close on accept (living-workflow phase 4c).
+	// If this submitted task was spawned by auto-triage to fix
+	// an issue, transition that issue to "closed" now that the
+	// fix landed. CountTasks-by-prefix already protects against
+	// duplicate auto-closes; CloseIssue refuses on already-
+	// terminal issues.
+	if task.ClosesIssueSeq > 0 && submitOutcome.Resolved {
+		s.maybeAutoCloseIssue(task)
+	}
 
 	// 8. Build response.
 	s.logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", req.CommitSHA, "newly_ready", readied)
@@ -3354,14 +4328,16 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	// (Previous deletion path wiped the cache because nodes
 	// disappeared.)
 
-	// Ready-task sweep + run reactivation for the target's
-	// own run. No cross-run fan-out any more — branch
+	// Ready-task sweep + run state re-evaluation for the
+	// target's own run. No cross-run fan-out any more — branch
 	// isolation means other runs are unaffected by this
-	// invalidation.
+	// invalidation. EvaluateRunState lands on active / idle /
+	// completed based on the current task counts; previously we
+	// just force-flipped to active, which is wrong now that idle
+	// is observable (a run with only pending work after
+	// invalidation is genuinely idle, not active).
 	_, _ = s.store.UpdateReadyTasks(task.RunID)
-	if r, _ := s.store.GetRun(task.RunID); r != nil && r.State == store.RunCompleted {
-		_ = s.store.UpdateRunState(task.RunID, store.RunActive)
-	}
+	s.evaluateRunStateAndMaybeTriage(task.RunID)
 
 	changed := result.Changed + result.TasksDeleted
 
@@ -3527,13 +4503,10 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 		delete(s.runs, task.RunID)
 	}
 
-	// Ready-task sweep for the target's own run — branch
-	// isolation means cross-run effects no longer need a
-	// fan-out.
+	// Ready-task sweep + state re-evaluation. See the matching
+	// comment in performInvalidate for the rationale.
 	_, _ = s.store.UpdateReadyTasks(task.RunID)
-	if r, _ := s.store.GetRun(task.RunID); r != nil && r.State == store.RunCompleted {
-		_ = s.store.UpdateRunState(task.RunID, store.RunActive)
-	}
+	s.evaluateRunStateAndMaybeTriage(task.RunID)
 
 	return &failCascadeResult{
 		Task:               task,

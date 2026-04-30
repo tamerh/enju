@@ -36,6 +36,16 @@ type Run struct {
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // project-level requirements, inherited by tasks
 	Tasks        []TaskDef              `yaml:"tasks"`
+
+	// Living-workflow phase 4c — auto-triage rule. When set, the
+	// engine watches for the run to land on `idle` while open
+	// issues exist, and spawns a fix task using this template
+	// for the oldest open issue. Single-trigger v1: there's only
+	// one strategy ("oldest open issue"), so the field carries
+	// just the fix-task template, not a trigger discriminator.
+	// {{issue.title}}, {{issue.body}}, {{issue.severity}},
+	// {{issue.id}} are substituted at spawn time.
+	AutoTriage *RemediationTemplate `yaml:"auto_triage,omitempty"`
 }
 
 // ParamDef declares a single top-level run parameter. A run with
@@ -543,6 +553,65 @@ type TaskDef struct {
 	// Phase 2 feature that depends on project membership.
 	AssignTo    yamlStringList `yaml:"assign_to,omitempty"`
 	RequireRole string         `yaml:"require_role,omitempty"`
+
+	// Living-workflow phase 4b — review-failure spawn rule.
+	// Declared on the task that gets reviewed (the dev task,
+	// not the review task). When the reviewing task rejects,
+	// the engine looks at this field on the target.
+	//
+	// Recognized values (anything else is treated as empty
+	// today; phase 4b.2 will add a parser-level enum check):
+	//
+	//   - ""               default behavior, no rule.
+	//                      OnReviewReject empty = cascade-fail
+	//                      target → FAILED, descendants → SKIPPED.
+	//                      OnReviewRequestChanges empty = invalidate
+	//                      cascade target → PENDING, re-claim same task.
+	//   - "spawn_remediation"
+	//                      Engine spawns a remediation task using
+	//                      RemediationTemplate with the reviewer's
+	//                      feedback substituted into the prompt
+	//                      ({{review.feedback}}, {{review.decision}}).
+	//                      The default cascade is suppressed — the
+	//                      author opted in to "review failure forks
+	//                      a remediation, doesn't kill the target."
+	//
+	// "continue_iteration" is the design's prose name for the
+	// empty-string default behavior on OnReviewRequestChanges;
+	// it is NOT recognized as an explicit value today. Authors
+	// who write `on_review_request_changes: continue_iteration`
+	// get the default cascade (which IS continue-iteration
+	// semantics), so the result is correct, but the field
+	// content is treated as empty.
+	OnReviewReject         string                  `yaml:"on_review_reject,omitempty"`
+	OnReviewRequestChanges string                  `yaml:"on_review_request_changes,omitempty"`
+	RemediationTemplate    *RemediationTemplate    `yaml:"remediation_template,omitempty"`
+}
+
+// RemediationTemplate is the inline task spec spawned when a
+// review fails and the reviewed task declares
+// `on_review_reject: spawn_remediation` (or the same for
+// request_changes). Fields mirror the task vocabulary; the
+// engine fills in id, depends_on, and reviewer-feedback
+// substitution at spawn time.
+//
+// Stored as JSON in tasks.remediation_template — kept inline
+// (not as a reference to a separate template file) so the rule
+// is self-contained and the run YAML stays readable.
+type RemediationTemplate struct {
+	// Action is the new task's action — typically "answer" or
+	// "compute". Required.
+	Action string `yaml:"action,omitempty" json:"action,omitempty"`
+	// Prompt is the new task's prompt. Two template variables
+	// are substituted at spawn time:
+	//   - {{review.feedback}} = the reviewer's content (rejection rationale)
+	//   - {{review.decision}} = "request_changes" or "reject"
+	// Other template references (e.g. {{original.content}})
+	// resolve at claim time as usual.
+	Prompt string `yaml:"prompt,omitempty" json:"prompt,omitempty"`
+	// AssignTo / RequireRole optionally restrict who can claim.
+	AssignTo    yamlStringList `yaml:"assign_to,omitempty" json:"assign_to,omitempty"`
+	RequireRole string         `yaml:"require_role,omitempty" json:"require_role,omitempty"`
 }
 
 // VoteOption is one choice on an action:vote task.
