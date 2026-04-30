@@ -284,6 +284,27 @@ func (s *Store) ListRunsWithAutoTriage(projectID int64) ([]int64, error) {
 	return ids, nil
 }
 
+// BuildReviewsTargetKey is the single source of truth for the
+// canonical `reviews_target` string shape. Singleton reviews
+// store the bare def id; per-instance for_each reviews store
+// "instanceKey:defID". Used by every site that constructs a
+// reviews_target value to query (the merge gate's
+// taskHasDownstreamReview, the submit-path stayOpen check,
+// the upstream-iteration-branch resolver) — keeping the
+// encoding in one place means the lookups can't drift.
+//
+// The matching parser is parseReviewsTargetForMerge in
+// internal/api/router.go (and parseReviewsTarget in
+// internal/mcpserver/submit.go); both use `idx > 0` to skip
+// the pathological ":foo" shape, which this builder never
+// emits because instanceKey is empty when there's no colon.
+func BuildReviewsTargetKey(taskDefID, instanceKey string) string {
+	if instanceKey != "" {
+		return instanceKey + ":" + taskDefID
+	}
+	return taskDefID
+}
+
 // generateIterationBranch is the single source of truth for the
 // per-iteration branch identifier (living-workflow phase 6a).
 // Both the plan-driven applySetClaim and the standalone

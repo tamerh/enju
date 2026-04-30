@@ -311,20 +311,26 @@ tasks:
 	})
 }
 
-// TestMCPRequestChangesRelabelsClaimOutcome pins ISSUE-003 from
-// the v1 sanity report: when a review request_changes / reject
-// fires, the rejected iteration's claim row outcome must be
-// relabeled from "completed" (its row-level state when the
-// citizen submitted) to "rejected" (the verdict it actually
-// received). Without this relabel, every iteration in
-// list_iterations reads "completed" regardless of what really
-// happened, destroying the audit trail.
-func TestMCPRequestChangesRelabelsClaimOutcome(t *testing.T) {
-	eachRemoteMode(t, "OutcomeRelabel", func(t *testing.T, h *mcpHarness) {
-		reviewer := h.newMCPClientAs(t, "OutcomeReviewer")
+// TestMCPRequestChangesKeepsClaimOpenForRevision is the 6c
+// successor to the prior TestMCPRequestChangesRelabelsClaimOutcome.
+// The 6b.2 behavior (relabel claim outcome to "rejected" on
+// request_changes) was an interim fix; 6c supersedes it with
+// the proper iteration semantics: a request_changes round is
+// a revision within the SAME iteration, not a new one. The
+// claim row stays OPEN (outcome=NULL) so the next claim by
+// the same citizen reuses it, the topic-branch name is stable
+// across revisions, and iter-N bumps only on a hard reset
+// (invalidate, reject, abandon).
+//
+// Pre-6c: iter-1 [rejected] → re-claim → iter-2 [completed].
+// Post-6c: iter-1 stays open → re-submit → iter-1 [completed]
+// (after final approve).
+func TestMCPRequestChangesKeepsClaimOpenForRevision(t *testing.T) {
+	eachRemoteMode(t, "OpenForRevision", func(t *testing.T, h *mcpHarness) {
+		reviewer := h.newMCPClientAs(t, "RevisionReviewer")
 		projectID := h.createTestProject()
 
-		yaml := `name: "outcome relabel"
+		yaml := `name: "open for revision"
 version: 1
 tasks:
   - id: draft
@@ -337,67 +343,202 @@ tasks:
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 
-		// Iter-1: submit draft → request_changes.
+		// First attempt: submit + reviewer asks for changes.
 		h.mcpClaimOK(t, "draft")
 		h.mcpSubmitText(t, "draft", "first attempt")
 		h.mcpClaimAs(t, reviewer, "gate")
 		h.mcpSubmitReviewAs(t, reviewer, "gate", "needs work", "request_changes")
 
-		// list_iterations should now show iter-1 with
-		// outcome=rejected, NOT outcome=completed. Read the
-		// rendered output (the table format is
-		// "iter-N  @user  [<outcome>]").
+		// Phase 6c contract: still ONE iteration, claim open.
+		// list_iterations should show iter-1 with NEITHER a
+		// "[rejected]" relabel NOR a fresh iter-2 — the row
+		// stays open through the revision round.
 		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
 			"task_id": h.taskID("draft"),
 		}))
-		if !strings.Contains(out, "[rejected]") {
-			t.Errorf("iter-1 outcome should be relabeled to 'rejected' after request_changes, got:\n%s", out)
+		if strings.Contains(out, "iter-2") {
+			t.Errorf("request_changes must NOT bump iter-N; expected only iter-1, got:\n%s", out)
+		}
+		if strings.Contains(out, "[rejected]") {
+			t.Errorf("request_changes must NOT close the claim with outcome=rejected (the claim stays open for revision), got:\n%s", out)
+		}
+
+		// Re-claim + re-submit on the same iteration. The
+		// reuse-on-reopen logic lets the same citizen claim
+		// the same row again; submit lands as a new attempt
+		// in task_submissions but the claim row's iter_seq
+		// stays 1.
+		h.mcpClaimOK(t, "draft")
+		h.mcpSubmitText(t, "draft", "second attempt")
+
+		// Reviewer approves on the revised attempt.
+		h.mcpClaimAs(t, reviewer, "gate")
+		h.mcpSubmitReviewAs(t, reviewer, "gate", "looks good now", "approve")
+
+		// Final state: still iter-1, now [completed]. ONE
+		// iteration row, two submission attempts on it.
+		out = mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": h.taskID("draft"),
+		}))
+		if strings.Contains(out, "iter-2") {
+			t.Errorf("approve after revision must keep iter-N stable; expected only iter-1, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[completed]") {
+			t.Errorf("iter-1 should be [completed] after final approve, got:\n%s", out)
+		}
+	})
+}
+
+// TestMCPManualInvalidateRelabelsClaimOutcome pairs with
+// TestMCPRequestChangesRelabelsClaimOutcome — both pin the
+// rule "the iteration's outcome reflects what happened, not
+// just whether bytes were submitted." Round-3 review caught
+// that 6b.2 covered the request_changes / reject paths but
+// missed the manual `enju_invalidate_task` path; the relabel
+// is the same shape, just with outcome=invalidated instead of
+// rejected (no verdict — operator scrapped the iteration).
+func TestMCPManualInvalidateRelabelsClaimOutcome(t *testing.T) {
+	eachRemoteMode(t, "InvalidateRelabel", func(t *testing.T, h *mcpHarness) {
+		projectID := h.createTestProject()
+
+		yaml := `name: "invalidate relabel"
+version: 1
+tasks:
+  - id: solo
+    action: answer
+    prompt: "Write."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// Iter-1: submit, then operator manually invalidates.
+		h.mcpClaimOK(t, "solo")
+		h.mcpSubmitText(t, "solo", "first attempt")
+		h.mcpInvalidate(t, "solo", "operator scrapped this")
+
+		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": h.taskID("solo"),
+		}))
+		if !strings.Contains(out, "[invalidated]") {
+			t.Errorf("iter-1 outcome should be relabeled to 'invalidated' after manual invalidate, got:\n%s", out)
 		}
 		if strings.Contains(out, "[completed]") {
-			t.Errorf("iter-1 outcome should NOT read 'completed' after request_changes (audit drift), got:\n%s", out)
+			t.Errorf("iter-1 outcome should NOT read 'completed' after manual invalidate (audit drift), got:\n%s", out)
+		}
+	})
+}
+
+// TestMCPFailCascadeInvalidatesClaimedDescendant pins the
+// 6c follow-up bug fix: when an upstream task is failed
+// (manually via enju_fail_task, or via review reject) and
+// a downstream consumer was ALREADY claimed, the
+// descendant's open claim row must be marked 'invalidated'
+// by the fail cascade.
+//
+// Pre-fix the descendant's task row went to skipped
+// (correct) but its task_claims row stayed open with
+// outcome=NULL — list_iterations then reported an active
+// iteration on a skipped task. Pre-6c this worked
+// implicitly via applySetTaskState{ClearClaim:true};
+// 6c moved that decision to the cascade caller, and
+// performFailCascade missed the loop while
+// performInvalidate had it. This test pins the parity.
+//
+// Uses enju_fail_task on a no-review chain (rather than
+// review reject) so we can claim the consumer while it's
+// READY — under review-gating, a reviewed-upstream's
+// consumer waits for the gate's verdict before becoming
+// ready, so the "claimed-before-cascade" window only opens
+// for the explicit fail path.
+func TestMCPFailCascadeInvalidatesClaimedDescendant(t *testing.T) {
+	eachRemoteMode(t, "FailCascadeClaim", func(t *testing.T, h *mcpHarness) {
+		consumer := h.newMCPClientAs(t, "Consumer")
+		projectID := h.createTestProject()
+
+		yaml := `name: "fail cascade claimed descendant"
+version: 1
+tasks:
+  - id: producer
+    action: answer
+    prompt: "Write."
+  - id: consume
+    action: answer
+    depends_on: [producer]
+    prompt: "Use {{producer.content}}"
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// Producer submits — no downstream review, so it
+		// auto-accepts and merges. Consumer becomes ready,
+		// gets claimed (claim row open).
+		h.mcpClaimOK(t, "producer")
+		h.mcpSubmitText(t, "producer", "producer content")
+		if got := h.taskGet("consume")["state"]; got != "ready" {
+			t.Fatalf("consume should be ready after producer accept; got %v", got)
+		}
+		h.mcpClaimAs(t, consumer, "consume")
+		if got := h.taskGet("consume")["state"]; got != "claimed" {
+			t.Fatalf("consume should be claimed after mcpClaimAs; got %v", got)
+		}
+
+		// Operator manually fails the upstream. handleFailTask
+		// → performFailCascade fires: producer → failed,
+		// consume → skipped, AND consume's open claim row
+		// must be marked invalidated.
+		h.mcpFail(t, "producer", "operator scrapped this")
+
+		if got := h.taskGet("consume")["state"]; got != "skipped" {
+			t.Errorf("consume should be skipped after producer fail; got %v", got)
+		}
+
+		// The bug pin: consume's iteration row must read
+		// [invalidated], not show as an open claim. Pre-fix
+		// performFailCascade left descendants' claim rows
+		// with outcome=NULL.
+		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": h.taskID("consume"),
+		}))
+		if !strings.Contains(out, "[invalidated]") {
+			t.Errorf("consume's claim outcome should be 'invalidated' after upstream fail-cascade (claimed-descendant case), got:\n%s", out)
 		}
 	})
 }
 
 // TestMCPSingleCitizenReclaimGetsNewTopic pins the iteration-
-// rotation contract: after request_changes invalidates iter-1,
-// re-claiming the same task produces iter-2 on a DISTINCT
-// topic ref. The iter-1 ref is retained (audit); iter-2 is
-// brand new. This guards against a regression where the
-// branch-name generator forgets to bump iter-N or where the
-// re-claim quietly reuses iter-1's ref (which would silently
-// destroy the iter-1 audit).
+// rotation contract: after a HARD reset (manual invalidate
+// via enju_invalidate_task), re-claiming the same task
+// produces iter-2 on a DISTINCT topic ref. The iter-1 ref is
+// retained (audit); iter-2 is brand new.
+//
+// 6c semantics: only terminal-outcome events bump iter-N
+// (invalidate, reject, abandon). request_changes — which
+// previously triggered the bump in this test — now leaves
+// the claim open for revision and keeps iter-N stable; a
+// separate test (TestMCPRequestChangesKeepsClaimOpenForRevision)
+// pins that behavior. This test uses invalidate to force the
+// terminal outcome and exercise the iter rotation.
 func TestMCPSingleCitizenReclaimGetsNewTopic(t *testing.T) {
 	eachRemoteMode(t, "TopicReclaimRotates", func(t *testing.T, h *mcpHarness) {
 		requireRemote(t, h)
-		reviewer := h.newMCPClientAs(t, "RotateReviewer")
 		projectID := h.createTestProject()
 
 		yaml := `name: "iter rotates on reclaim"
 version: 1
 tasks:
-  - id: draft
+  - id: solo
     action: answer
     prompt: "Write."
-  - id: gate
-    action: review
-    reviews: draft
-    prompt: "Approve."
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 
-		// iter-1: submit draft + reject it. After the cascade,
-		// draft bounces back to READY for revision.
-		h.mcpClaimOK(t, "draft")
-		h.mcpSubmitText(t, "draft", "ITER-1-content")
-		h.mcpClaimAs(t, reviewer, "gate")
-		h.mcpSubmitReviewAs(t, reviewer, "gate", "needs work", "request_changes")
+		// iter-1: submit + manual invalidate.
+		h.mcpClaimOK(t, "solo")
+		h.mcpSubmitText(t, "solo", "ITER-1-content")
+		h.mcpInvalidate(t, "solo", "operator scrapped this")
 
 		// Capture iter-1's topic ref + SHA from the bare BEFORE
-		// the re-claim (so iter-2's stamp doesn't overwrite it
-		// in our snapshot).
+		// the re-claim.
 		remoteURL := h.remoteFor(projectID)
-		iters := h.draftIterationBranches(t, "draft")
+		iters := h.draftIterationBranches(t, "solo")
 		if len(iters) != 1 {
 			t.Fatalf("expected 1 iteration before reclaim, got %d: %v", len(iters), iters)
 		}
@@ -407,11 +548,13 @@ tasks:
 			t.Fatalf("iter-1 topic %q missing on bare before reclaim", iter1Topic)
 		}
 
-		// iter-2: re-claim draft and submit a new revision.
-		h.mcpClaimOK(t, "draft")
-		h.mcpSubmitText(t, "draft", "ITER-2-content")
+		// iter-2: re-claim and submit. Invalidate was
+		// terminal, so iter_seq bumps and a fresh topic is
+		// generated.
+		h.mcpClaimOK(t, "solo")
+		h.mcpSubmitText(t, "solo", "ITER-2-content")
 
-		iters = h.draftIterationBranches(t, "draft")
+		iters = h.draftIterationBranches(t, "solo")
 		if len(iters) != 2 {
 			t.Fatalf("expected 2 iterations after reclaim, got %d: %v", len(iters), iters)
 		}

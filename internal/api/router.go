@@ -4101,16 +4101,15 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 				} else {
 					rejectResult = res
 				}
-				// Phase 6b.2 / ISSUE-003: relabel the rejected
-				// iteration's claim row from "completed" to
-				// "rejected" so the audit trail reflects the
-				// verdict, not just the bare fact that bytes
-				// were submitted. Best-effort — a labeling
-				// failure shouldn't undo the cascade.
-				if _, err := s.store.MarkLatestCompletedClaimOutcome(actions.RejectTargetID, "rejected"); err != nil {
-					s.logger.Warn("relabel claim outcome on request_changes",
-						"target", actions.RejectTargetID, "error", err)
-				}
+				// Phase 6c — request_changes intentionally does
+				// NOT close the claim. The claim row stays open
+				// (outcome=NULL) so the next claim by the same
+				// citizen reuses it (revision-within-iteration
+				// semantics). The task_submissions audit is
+				// already in place from the reviewer's submit;
+				// future revisions add additional submission
+				// rows under the same claim_id. Pre-6c this
+				// path relabeled to "rejected" — undone here.
 			}
 		}
 		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
@@ -4143,18 +4142,44 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 						Rollbacks:      res.Rollbacks,
 					}
 				}
-				// Phase 6b.2 / ISSUE-003: same relabel for the
-				// terminal-reject path — the rejected iteration
-				// should read "rejected" in the audit log, not
-				// "completed."
-				if _, err := s.store.MarkLatestCompletedClaimOutcome(actions.RejectTargetID, "rejected"); err != nil {
-					s.logger.Warn("relabel claim outcome on review reject",
+				// Phase 6c — reject is terminal; close the
+				// claim with outcome=rejected. Uses the
+				// "set on latest claim regardless of current
+				// outcome" helper because under 6c the claim
+				// outcome was NULL (open through the review
+				// round) before this point.
+				if _, err := s.store.MarkLatestClaimOutcome(actions.RejectTargetID, "rejected"); err != nil {
+					s.logger.Warn("close claim on review reject",
 						"target", actions.RejectTargetID, "error", err)
 				}
 			}
 		}
 		if actions.VoteResolvePlan != nil {
 			s.store.ApplyPlan(*actions.VoteResolvePlan)
+		}
+		// Phase 6c — review approve closes the upstream's
+		// claim with outcome=completed. Detected as "this is
+		// a review submit AND neither rejection flag is set."
+		// Pre-6c the upstream's claim was already 'completed'
+		// (engine state-level auto-accept on submit); 6c moved
+		// that to be conditional on review verdict, so this is
+		// where the close happens for reviewed-task workflows.
+		// Same shape as the reject close above, just a
+		// different terminal outcome.
+		if task.Action == "review" && task.ReviewsTarget != "" &&
+			!actions.ShouldRejectTarget && !actions.ShouldFailTarget {
+			targetDef, targetInstance := parseReviewsTargetForMerge(task.ReviewsTarget)
+			runTasks, _ := s.store.ListTasksByRun(task.RunID)
+			for _, rt := range runTasks {
+				if rt.TaskDefID != targetDef || rt.InstanceKey != targetInstance {
+					continue
+				}
+				if _, err := s.store.MarkLatestClaimOutcome(rt.ID, "completed"); err != nil {
+					s.logger.Warn("close upstream claim on review approve",
+						"target", rt.ID, "error", err)
+				}
+				break
+			}
 		}
 		if actions.ShouldSkipCascade {
 			updated, _ := s.store.GetTask(taskID)
@@ -4458,7 +4483,15 @@ func (s *Server) taskHasDownstreamReview(t *store.TaskRecord) bool {
 // acceptedMergeForTask renders one merge target for a task that
 // is currently in state=accepted. Returns nil when the task
 // has no topic branch (vote/review action) or no commit_sha
-// on its latest completed claim (untracked-only outputs).
+// on its latest claim (untracked-only outputs).
+//
+// Phase 6c — match on the latest claim with a non-empty
+// CommitSHA regardless of outcome. The merge collector fires
+// AFTER the cascade has updated outcome to its terminal value
+// (completed for approve, rejected for reject — handled by
+// the suppression path in collectAcceptedMerges); this lookup
+// just needs the commit + branch from the iteration that's
+// currently in scope, which is always the latest claim row.
 func (s *Server) acceptedMergeForTask(taskID, runBranch string) *acceptedMergeTarget {
 	hist, err := s.store.ListTaskHistory(taskID)
 	if err != nil {
@@ -4466,10 +4499,10 @@ func (s *Server) acceptedMergeForTask(taskID, runBranch string) *acceptedMergeTa
 	}
 	for i := len(hist) - 1; i >= 0; i-- {
 		c := hist[i]
-		if c.Outcome != "completed" {
+		if c.CommitSHA == "" {
 			continue
 		}
-		if c.Branch == "" || c.CommitSHA == "" {
+		if c.Branch == "" {
 			return nil
 		}
 		return &acceptedMergeTarget{
@@ -4705,6 +4738,26 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		return nil, err
 	}
 
+	// Phase 6c — mark descendants' open claims as
+	// 'invalidated'. Pre-6c, applySetTaskState's ClearClaim
+	// path did this implicitly for any task it cleared
+	// (target + descendants). With the request_changes /
+	// revision-within-iteration semantics, the target's
+	// claim must stay open — so the implicit blanket-
+	// invalidation moved out of apply.go, and each cascade
+	// caller decides its own claim-outcome policy. For
+	// performInvalidate, descendants' claims are collateral
+	// damage (their work was thrown away because their
+	// upstream went back to ready) — invalidate them. The
+	// target's claim policy is set by the CALLER of
+	// performInvalidate (request_changes leaves it open;
+	// manual invalidate marks it invalidated).
+	for _, descID := range outcome.RegularDescendants {
+		if _, err := s.store.MarkOpenClaimsInvalidated(descID); err != nil {
+			s.logger.Debug("invalidate descendant open claims", "task_id", descID, "error", err)
+		}
+	}
+
 	// No DAG cache wipe: parked rows keep their nodes + edges
 	// intact so reconciliation can diff the current DAG
 	// against the incoming output list without rebuilding.
@@ -4879,6 +4932,26 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	result, err := s.store.ApplyPlan(plan)
 	if err != nil {
 		return nil, err
+	}
+
+	// Phase 6c — invalidate descendants' open claim rows.
+	// Same shape as performInvalidate's matching loop: a
+	// descendant that was already claimed-but-not-terminal
+	// when the upstream got rejected has an open claim row;
+	// pre-6c the implicit ClearClaim path in apply.go marked
+	// it 'invalidated' as a side effect, but 6c moved that
+	// decision to the cascade caller. fail-cascade omitted
+	// the loop, leaving descendant rows with outcome=NULL on
+	// a state=skipped task — which list_iterations then
+	// rendered as an active iteration on a skipped task.
+	// Reachable via: claimed-descendant + reviewed-upstream
+	// reject. Idempotent — descendants without an open claim
+	// no-op.
+	for _, descID := range skippedDescendants {
+		if _, err := s.store.MarkOpenClaimsInvalidated(descID); err != nil {
+			s.logger.Debug("invalidate descendant open claims (fail-cascade)",
+				"task_id", descID, "error", err)
+		}
 	}
 
 	if len(outcome.DematerializedDefs) > 0 {
@@ -5243,6 +5316,15 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		// the specific reason.
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	// Phase 6c — invalidate is terminal. Close the latest
+	// claim with outcome=invalidated regardless of its prior
+	// outcome (the operator might invalidate an open
+	// reviewed-task claim, or an already-completed one).
+	if _, err := s.store.MarkLatestClaimOutcome(taskID, "invalidated"); err != nil {
+		s.logger.Warn("close claim on manual invalidate",
+			"task_id", taskID, "error", err)
 	}
 
 	s.logger.Info("task invalidated",
@@ -6023,7 +6105,13 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 			}
 			hist, _ := s.store.ListTaskHistory(ut.ID)
 			for i := len(hist) - 1; i >= 0; i-- {
-				if hist[i].Outcome == "completed" && hist[i].Branch != "" {
+				// Phase 6c — accept any non-empty branch
+				// regardless of outcome. The reviewed
+				// upstream's claim is open (outcome=NULL)
+				// while the review is in progress; the
+				// branch column is set at claim time and is
+				// the right fork base.
+				if hist[i].Branch != "" {
 					resp.UpstreamIterationBranch = hist[i].Branch
 					break
 				}
@@ -6049,20 +6137,25 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	// itself persists on the topic branch) use these for a
 	// branch-safe ReadFileAtCommit.
 	// Match any claim that produced a commit, regardless of
-	// final verdict. Phase 6b.2's outcome relabel (ISSUE-003)
-	// flips the row from "completed" to "rejected" when a
-	// review request_changes / reject fires, but the commit
-	// itself still exists on the topic branch and the
-	// previous-submission UI / merge collector still need to
-	// reach it. Match on `CommitSHA != ""` rather than the
-	// outcome string so the lookup survives the relabel.
+	// outcome state. Phase 6b.2 + 6c semantics:
+	//
+	//  - "completed": single-citizen unreviewed task that
+	//    auto-accepted, or reviewed task whose review approved.
+	//  - "rejected" / "invalidated" / "abandoned" / "released":
+	//    terminal outcomes from cascades.
+	//  - NULL with a non-empty CommitSHA: 6c reviewed-task
+	//    claim that submitted but the review verdict is
+	//    still pending (the claim stays open through
+	//    request_changes rounds for revision).
+	//
+	// All five shapes have valid commits the UI may need
+	// (previous-submission, merge collector); match on
+	// CommitSHA != "" rather than outcome string so any
+	// future outcome additions don't silently break readers.
 	if hist, err := s.store.ListTaskHistory(t.ID); err == nil {
 		for i := len(hist) - 1; i >= 0; i-- {
 			c := hist[i]
 			if c.CommitSHA == "" {
-				continue
-			}
-			if c.Outcome != "completed" && c.Outcome != "rejected" {
 				continue
 			}
 			if resp.LatestCompletedCommitSHA == "" {

@@ -271,8 +271,20 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		if _, err := tx.Exec(q, args...); err != nil {
 			return fmt.Errorf("set_task_state (clear): %w", err)
 		}
-		// Mark open claims as invalidated.
-		tx.Exec(`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`, m.TaskID)
+		// Phase 6c — open claims are NOT implicitly marked
+		// here. The cascade caller decides:
+		//   - Request_changes target: claim stays open
+		//     (revision-within-iteration semantics).
+		//   - Manual invalidate / reject target: caller
+		//     explicitly calls MarkLatestClaimOutcome with
+		//     the right terminal outcome.
+		//   - Cascade descendants: caller marks their open
+		//     claims as 'invalidated' (their work is
+		//     collateral — wasn't a verdict against them, but
+		//     their iteration is gone).
+		// Pre-6c this code unconditionally wrote 'invalidated'
+		// here, which broke request_changes by closing the
+		// target's claim and forcing iter-N to bump.
 	} else {
 		q := `UPDATE tasks SET state = ?`
 		args := []interface{}{m.NewState}
@@ -417,11 +429,98 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 		return err
 	}
 
-	// Generate the iteration branch name via the shared
-	// helper so the format stays in sync with the standalone
-	// ClaimTask path.
-	var priorClaims int
-	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, m.TaskID).Scan(&priorClaims)
+	// Phase 6c — iter_seq computation + reuse-on-reopen.
+	// Single-citizen reuse: if there's an open claim row for
+	// this task by THIS citizen, reuse it (don't INSERT a new
+	// one). This is the "request_changes leaves the claim
+	// open for revision" semantics — the same iteration row
+	// stays around through multiple submission attempts. The
+	// task state still flips to 'claimed' below.
+	//
+	// Different-citizen takeover: if there's an open claim by
+	// a DIFFERENT citizen, mark it 'abandoned' (terminal,
+	// distinct from 'released' which means timeout/voluntary).
+	// iter_seq then bumps for this fresh claim. Only fires
+	// for single-citizen tasks; multi-citizen tasks have N
+	// open claims by design and citizens don't take each
+	// other over.
+	now := time.Now()
+	if citizens == 1 {
+		var openID int64
+		var openCitizen int64
+		err := tx.QueryRow(
+			`SELECT id, citizen_id FROM task_claims WHERE task_id = ? AND outcome IS NULL ORDER BY claimed_at DESC LIMIT 1`,
+			m.TaskID,
+		).Scan(&openID, &openCitizen)
+		if err == nil {
+			if openCitizen == m.CitizenID {
+				// Same citizen reclaiming after a
+				// request_changes round. Reuse — don't
+				// INSERT a new claim row, just refresh the
+				// deadline and mark the task claimed.
+				if _, err := tx.Exec(
+					`UPDATE task_claims SET claimed_at = ?, deadline = ? WHERE id = ?`,
+					now, m.Deadline, openID,
+				); err != nil {
+					return fmt.Errorf("set_claim reuse: %w", err)
+				}
+				if _, err := tx.Exec(
+					`UPDATE tasks SET state = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ?`,
+					m.CitizenID, now, m.TaskID,
+				); err != nil {
+					return err
+				}
+				return nil
+			}
+			// Different citizen taking over: mark old
+			// 'abandoned' so iter_seq counts it as terminal
+			// when we INSERT below.
+			if _, err := tx.Exec(
+				`UPDATE task_claims SET outcome = 'abandoned' WHERE id = ?`,
+				openID,
+			); err != nil {
+				return fmt.Errorf("set_claim abandon: %w", err)
+			}
+		}
+	}
+
+	// iter_seq for the new claim = (highest iter_seq among
+	// terminal-outcome rows) + 1. Open rows are part of the
+	// current iteration; we just abandoned the only single-
+	// citizen one above (if any), so terminal rows reflect
+	// completed prior iterations. Multi-citizen tasks have
+	// concurrent open rows that all share the same iter_seq —
+	// we read it from any open peer.
+	iterSeq := 1
+	if citizens > 1 {
+		var peerIter sql.NullInt64
+		_ = tx.QueryRow(
+			`SELECT iter_seq FROM task_claims WHERE task_id = ? AND outcome IS NULL ORDER BY claimed_at DESC LIMIT 1`,
+			m.TaskID,
+		).Scan(&peerIter)
+		if peerIter.Valid && peerIter.Int64 > 0 {
+			iterSeq = int(peerIter.Int64)
+		} else {
+			var maxTerm sql.NullInt64
+			_ = tx.QueryRow(
+				`SELECT MAX(iter_seq) FROM task_claims WHERE task_id = ? AND outcome IS NOT NULL`,
+				m.TaskID,
+			).Scan(&maxTerm)
+			if maxTerm.Valid {
+				iterSeq = int(maxTerm.Int64) + 1
+			}
+		}
+	} else {
+		var maxTerm sql.NullInt64
+		_ = tx.QueryRow(
+			`SELECT MAX(iter_seq) FROM task_claims WHERE task_id = ? AND outcome IS NOT NULL`,
+			m.TaskID,
+		).Scan(&maxTerm)
+		if maxTerm.Valid {
+			iterSeq = int(maxTerm.Int64) + 1
+		}
+	}
+
 	// Living-workflow phase 6b foundational v1: gate the
 	// topic-branch flow at the run level. If ANY task in the
 	// same run is multi-citizen (vote, multi-reviewer),
@@ -436,13 +535,14 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 		`SELECT COUNT(*) FROM tasks WHERE run_id = (SELECT run_id FROM tasks WHERE id = ?) AND citizens > 1`,
 		m.TaskID,
 	).Scan(&runHasMulti)
-	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, priorClaims, citizens, runHasMulti > 0)
+	// Topic-branch name encodes iter_seq, so the branch is
+	// stable across revisions within an iteration (phase 6c).
+	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, iterSeq-1, citizens, runHasMulti > 0)
 
-	now := time.Now()
 	// Insert the claim row with the branch identifier.
 	_, err := tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id, branch) VALUES (?, ?, ?, ?, ?, ?)`,
-		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID), branch,
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id, branch, iter_seq) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID), branch, iterSeq,
 	)
 	if err != nil {
 		return fmt.Errorf("set_claim: %w", err)
@@ -484,10 +584,15 @@ func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim) error {
 func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 	now := time.Now()
 
-	// Read task to determine single vs multi citizen.
+	// Read task to determine single vs multi citizen + action.
 	var citizens int
+	var taskAction, taskDefID, instanceKey string
+	var runID int64
 	var claimedBy sql.NullInt64
-	if err := tx.QueryRow(`SELECT citizens, claimed_by FROM tasks WHERE id = ?`, m.TaskID).Scan(&citizens, &claimedBy); err != nil {
+	if err := tx.QueryRow(
+		`SELECT citizens, action, task_def_id, COALESCE(instance_key, ''), run_id, claimed_by FROM tasks WHERE id = ?`,
+		m.TaskID,
+	).Scan(&citizens, &taskAction, &taskDefID, &instanceKey, &runID, &claimedBy); err != nil {
 		return fmt.Errorf("submit: task %q not found", m.TaskID)
 	}
 	if citizens <= 0 {
@@ -501,8 +606,49 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		return err
 	}
 
+	// Phase 6c — find the open claim row for THIS citizen (or
+	// the latest one for single-citizen tasks where the
+	// claim_by is implicit). The submission attempt is
+	// recorded in task_submissions; the claim row's outcome
+	// flips to 'completed' ONLY when the submission terminates
+	// the iteration. A submitter whose task has a downstream
+	// review leaves the claim open (outcome=NULL) — the
+	// review's verdict will close it.
+	var claimRowID sql.NullInt64
 	if citizens == 1 {
-		// Single-citizen: one submit → ACCEPTED.
+		_ = tx.QueryRow(
+			`SELECT id FROM task_claims WHERE task_id = ? AND outcome IS NULL ORDER BY id DESC LIMIT 1`,
+			m.TaskID,
+		).Scan(&claimRowID)
+	} else {
+		_ = tx.QueryRow(
+			`SELECT id FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+			m.TaskID, m.CitizenID,
+		).Scan(&claimRowID)
+	}
+
+	choice := m.VoteChoice
+	if choice == "" {
+		choice = m.Decision
+	}
+
+	// Always record the submission attempt. Even if the claim
+	// stays open (reviewed task awaiting verdict), the
+	// submission row is the audit trail of THIS attempt.
+	if claimRowID.Valid {
+		if _, err := tx.Exec(
+			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, content, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			claimRowID.Int64, now, m.CommitSHA, m.Decision, choice, m.Content, nullableInt64(m.ModelID),
+		); err != nil {
+			return fmt.Errorf("submit: record submission: %w", err)
+		}
+	}
+
+	if citizens == 1 {
+		// Single-citizen: one submit → ACCEPTED at the task
+		// level (engine state machine, unchanged). The claim's
+		// outcome is conditional on whether a downstream
+		// review will weigh in.
 		_, err := tx.Exec(
 			`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
 			now, m.ResultPath, m.CommitSHA, m.Decision, m.VoteChoice, m.TaskID,
@@ -510,12 +656,54 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(
-			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE task_id = ? AND outcome IS NULL`,
-			now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), m.TaskID,
-		)
-		if err != nil {
-			return err
+
+		// Phase 6c — claim outcome is "completed" UNLESS this
+		// task has a downstream review still expecting a
+		// verdict. A reviewed answer/compute task leaves its
+		// claim open through the review round; the review's
+		// approve/reject path (in handleSubmitResultReport)
+		// closes it. A review task itself, or any task with no
+		// downstream reviewer, terminates on submit.
+		stayOpen := false
+		if taskAction != "review" {
+			var reviewerID sql.NullString
+			// Use the shared canonical builder so this
+			// stayOpen lookup matches the router's merge-
+			// gate query (api.taskHasDownstreamReview →
+			// store.HasReviewerOfTarget) byte-for-byte.
+			// Diverging on the encoding would gate a task
+			// here but not there (or vice versa), causing
+			// silent merge-on-submit when a review is
+			// pending.
+			target := BuildReviewsTargetKey(taskDefID, instanceKey)
+			_ = tx.QueryRow(
+				`SELECT id FROM tasks WHERE run_id = ? AND action = 'review' AND reviews_target = ? LIMIT 1`,
+				runID, target,
+			).Scan(&reviewerID)
+			if reviewerID.Valid {
+				stayOpen = true
+			}
+		}
+
+		if claimRowID.Valid && !stayOpen {
+			if _, err := tx.Exec(
+				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
+				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
+			); err != nil {
+				return err
+			}
+		} else if claimRowID.Valid {
+			// Stay open — but still update the
+			// denormalized fields on the claim row so legacy
+			// readers (which haven't been migrated to
+			// task_submissions yet) see the latest attempt.
+			// outcome stays NULL.
+			if _, err := tx.Exec(
+				`UPDATE task_claims SET submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
+				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
+			); err != nil {
+				return err
+			}
 		}
 		// Score accounting.
 		if claimedBy.Valid {
@@ -526,23 +714,15 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		}
 	} else {
 		// Multi-citizen: record submission, state → COLLECTING.
+		// Each citizen's claim closes on their own submit
+		// (their part is done); the task-level tally
+		// transition is handled separately.
 		_, err := tx.Exec(
 			`UPDATE tasks SET state = 'collecting', result_path = ? WHERE id = ?`,
 			m.ResultPath, m.TaskID,
 		)
 		if err != nil {
 			return err
-		}
-		// Find the citizen's open claim row.
-		var claimRowID sql.NullInt64
-		tx.QueryRow(
-			`SELECT id FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
-			m.TaskID, m.CitizenID,
-		).Scan(&claimRowID)
-
-		choice := m.VoteChoice
-		if choice == "" {
-			choice = m.Decision
 		}
 		if claimRowID.Valid {
 			tx.Exec(

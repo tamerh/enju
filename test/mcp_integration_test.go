@@ -3794,15 +3794,17 @@ tasks:
 		if !strings.Contains(out, "iter-2") {
 			t.Errorf("expected iter-2 in output, got:\n%s", out)
 		}
-		// Both iterations show outcome=completed: the iteration
-		// outcome is "from claim to terminal state of THAT
-		// iteration." Iter-1 submitted successfully → completed;
-		// the later cascade-invalidate doesn't rewrite the
-		// prior iteration's outcome (it only catches still-open
-		// claims). Iter-2 also completed when bob's submit
-		// landed.
-		if strings.Count(out, "[completed]") != 2 {
-			t.Errorf("expected both iterations completed, got:\n%s", out)
+		// Iter-1 shows outcome=invalidated: phase 6b.2 round-3
+		// added the manual-invalidate relabel so the audit log
+		// reflects the operator's wipe instead of the row's
+		// pre-cascade "completed" state. Iter-2 stays
+		// completed since it submitted successfully and wasn't
+		// invalidated.
+		if !strings.Contains(out, "[invalidated]") {
+			t.Errorf("expected iter-1 outcome=invalidated after manual invalidate, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[completed]") {
+			t.Errorf("expected iter-2 outcome=completed, got:\n%s", out)
 		}
 		// Branch identifiers from phase 6a (both action:answer
 		// so both get topic-branch names).

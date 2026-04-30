@@ -243,6 +243,39 @@ func (s *Store) migrate() error {
 		content TEXT NOT NULL DEFAULT ''
 	);
 
+	-- Phase 6c — task_submissions captures per-attempt
+	-- submission state. Living-workflow design intent: an
+	-- iteration is one accept-cycle (claim → maybe-revise →
+	-- terminal); within an iteration there can be multiple
+	-- submission attempts (e.g. submit → request_changes →
+	-- revise → re-submit → approve). Each attempt is a row
+	-- here, hung off the claim row by claim_id.
+	--
+	-- Coexistence with the denormalized fields on task_claims
+	-- (submitted_at, commit_sha, content, option, decision,
+	-- model_id): applyRecordSubmission writes BOTH for now.
+	-- The task_submissions row is the audit-of-record (each
+	-- attempt is preserved); the task_claims fields hold the
+	-- "latest attempt" denormalization for legacy readers
+	-- that haven't been migrated to JOIN with
+	-- task_submissions yet (notably ListVoteSubmissions and
+	-- ListActiveClaims via taskClaimColumns). Pre-launch the
+	-- DB resets on each rollout, so no data migration is
+	-- needed; a post-launch cleanup pass can drop the
+	-- duplicated columns once every reader pulls from
+	-- task_submissions.
+	CREATE TABLE IF NOT EXISTS task_submissions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		claim_id INTEGER NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+		submitted_at TIMESTAMP NOT NULL,
+		commit_sha TEXT NOT NULL DEFAULT '',
+		decision TEXT NOT NULL DEFAULT '',
+		option TEXT NOT NULL DEFAULT '',
+		content TEXT NOT NULL DEFAULT '',
+		model_id INTEGER REFERENCES citizens(id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_submissions_claim ON task_submissions(claim_id);
+
 	-- Project membership (Phase J — project_members). Flat two-tier
 	-- role model: 'owner' (can remove members, promote/demote,
 	-- transfer) and 'member' (can add members, read everything,
@@ -535,6 +568,30 @@ func (s *Store) migrate() error {
 		// Captured at the four submit-path UPDATE sites.
 		`ALTER TABLE task_claims ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE task_claims ADD COLUMN decision TEXT NOT NULL DEFAULT ''`,
+		// Phase 6c — iter_seq turns task_claims into the
+		// iteration envelope. iter_seq counts accept-cycles,
+		// not raw claim rows: bumps only when the prior claim
+		// reaches a terminal outcome (completed reviewed-and-
+		// reject, invalidated, abandoned, released). A
+		// request_changes round leaves the claim open and
+		// re-submission lands as another row in
+		// task_submissions, sharing the same claim_id and
+		// therefore the same iter_seq.
+		//
+		// Default 0 is a sentinel for any pre-6c row that
+		// somehow survives a pre-launch DB reset. The expected
+		// state is that no such rows exist on production
+		// stores: rollouts wipe the DB, and ClaimTask /
+		// applySetClaim stamp a real iter_seq (≥1) on every
+		// new claim. The MAX(iter_seq) WHERE outcome IS NOT
+		// NULL lookup correctly ignores 0-stamped legacy rows
+		// because they have NULL outcome (they were never
+		// closed); a partial-migration scenario where a
+		// terminal-outcome legacy row sneaks through with
+		// iter_seq=0 would silently produce iter_seq=1 on
+		// the next claim — acceptable under the "no upgrade
+		// path for existing data" pre-launch contract.
+		`ALTER TABLE task_claims ADD COLUMN iter_seq INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1484,6 +1541,42 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 
 	now := time.Now()
 
+	// Phase 6c — same reuse-on-reopen + iter_seq logic as
+	// applySetClaim. Single-citizen reclaim by the same
+	// citizen reuses the existing open claim row; takeover
+	// by a different citizen marks the old as 'abandoned'
+	// and bumps iter_seq for the fresh row.
+	if citizens == 1 {
+		var openID int64
+		var openCitizen int64
+		if scanErr := tx.QueryRow(
+			`SELECT id, citizen_id FROM task_claims WHERE task_id = ? AND outcome IS NULL ORDER BY claimed_at DESC LIMIT 1`,
+			taskID,
+		).Scan(&openID, &openCitizen); scanErr == nil {
+			if openCitizen == citizenID {
+				if _, uerr := tx.Exec(
+					`UPDATE task_claims SET claimed_at = ?, deadline = ? WHERE id = ?`,
+					now, deadline, openID,
+				); uerr != nil {
+					return fmt.Errorf("claim reuse: %w", uerr)
+				}
+				if _, uerr := tx.Exec(
+					`UPDATE tasks SET state = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ?`,
+					citizenID, now, taskID,
+				); uerr != nil {
+					return uerr
+				}
+				return tx.Commit()
+			}
+			if _, uerr := tx.Exec(
+				`UPDATE task_claims SET outcome = 'abandoned' WHERE id = ?`,
+				openID,
+			); uerr != nil {
+				return fmt.Errorf("claim abandon prior: %w", uerr)
+			}
+		}
+	}
+
 	// tasks.claimed_by is only meaningful for citizens=1 tasks.
 	// For multi-citizen tasks we leave it as whatever the most
 	// recent claimer is — the task_claims table is the source of
@@ -1507,22 +1600,47 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 		return err
 	}
 
-	// Phase 6a — generate the per-iteration branch name via
-	// the shared helper. Same rule as applySetClaim's plan-
-	// driven path: skip for vote/review (no git artifact);
-	// count prior claims for iter-N.
-	var priorClaims int
-	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, taskID).Scan(&priorClaims)
+	// Phase 6c — iter_seq from prior terminals, see
+	// applySetClaim for the matching computation.
+	iterSeq := 1
+	if citizens > 1 {
+		var peerIter sql.NullInt64
+		_ = tx.QueryRow(
+			`SELECT iter_seq FROM task_claims WHERE task_id = ? AND outcome IS NULL ORDER BY claimed_at DESC LIMIT 1`,
+			taskID,
+		).Scan(&peerIter)
+		if peerIter.Valid && peerIter.Int64 > 0 {
+			iterSeq = int(peerIter.Int64)
+		} else {
+			var maxTerm sql.NullInt64
+			_ = tx.QueryRow(
+				`SELECT MAX(iter_seq) FROM task_claims WHERE task_id = ? AND outcome IS NOT NULL`,
+				taskID,
+			).Scan(&maxTerm)
+			if maxTerm.Valid {
+				iterSeq = int(maxTerm.Int64) + 1
+			}
+		}
+	} else {
+		var maxTerm sql.NullInt64
+		_ = tx.QueryRow(
+			`SELECT MAX(iter_seq) FROM task_claims WHERE task_id = ? AND outcome IS NOT NULL`,
+			taskID,
+		).Scan(&maxTerm)
+		if maxTerm.Valid {
+			iterSeq = int(maxTerm.Int64) + 1
+		}
+	}
 	var runHasMulti int
 	_ = tx.QueryRow(
 		`SELECT COUNT(*) FROM tasks WHERE run_id = (SELECT run_id FROM tasks WHERE id = ?) AND citizens > 1`,
 		taskID,
 	).Scan(&runHasMulti)
-	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, priorClaims, citizens, runHasMulti > 0)
+	branch := generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug, runSeq, iterSeq-1, citizens, runHasMulti > 0)
 
 	_, err = tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, branch) VALUES (?, ?, ?, ?, ?)`,
-		taskID, citizenID, now, deadline, branch,
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, branch, iter_seq) VALUES (?, ?, ?, ?, ?, ?)`,
+		taskID, citizenID, now, deadline, branch, iterSeq,
 	)
 	if err != nil {
 		return err
@@ -1824,8 +1942,11 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 // (or worse, would case-fall-through and look "completed"
 // to a string-equality check).
 var validRelabelOutcomes = map[string]bool{
-	"rejected":  true, // request_changes / reject cascade
-	"abandoned": true, // future: caller declines without verdict
+	"completed":   true, // review approve transitions an open reviewed-task claim to terminal-success
+	"rejected":    true, // request_changes / reject cascade (review verdict)
+	"invalidated": true, // manual enju_invalidate_task — operator wiped the task without a verdict
+	"abandoned":   true, // citizen-takeover: a different citizen claimed an open row, prior is closed without verdict
+	"released":    true, // timeout / voluntary release
 }
 
 // HasReviewerOfTarget reports whether any task in `runID` is
@@ -1847,10 +1968,7 @@ var validRelabelOutcomes = map[string]bool{
 // gate doesn't need to know whether the run is for_each-
 // expanded or not.
 func (s *Store) HasReviewerOfTarget(runID int64, taskDefID, instanceKey string) (bool, error) {
-	target := taskDefID
-	if instanceKey != "" {
-		target = instanceKey + ":" + taskDefID
-	}
+	target := BuildReviewsTargetKey(taskDefID, instanceKey)
 	var present int
 	err := s.db.QueryRow(
 		`SELECT 1 FROM tasks
@@ -1865,6 +1983,67 @@ func (s *Store) HasReviewerOfTarget(runID int64, taskDefID, instanceKey string) 
 		return false, err
 	}
 	return true, nil
+}
+
+// MarkOpenClaimsInvalidated closes any open (outcome IS NULL)
+// claim rows for `taskID` with outcome='invalidated'. Used by
+// cascade callers (performInvalidate, performFailCascade)
+// when a downstream descendant was claimed-but-not-yet-
+// terminal and its iteration is being thrown away as
+// collateral damage. Idempotent — claims already in a
+// terminal outcome stay where they are.
+//
+// Phase 6c moved this logic out of applySetTaskState (where
+// it ran on every ClearClaim call, which broke the
+// request_changes target case). Now each cascade caller
+// decides whether to invoke this for its descendants — and
+// the target gets its own explicit MarkLatestClaimOutcome
+// call with the appropriate terminal outcome.
+func (s *Store) MarkOpenClaimsInvalidated(taskID string) (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`,
+		taskID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// MarkLatestClaimOutcome sets the outcome of the most recent
+// claim row for `taskID` to `outcome`, regardless of its
+// current value (NULL or any prior terminal). Used by the 6c
+// cascade paths where the claim might be either open
+// (reviewed task awaiting verdict) or already terminal
+// (operator invalidating an accepted task long after the
+// fact). Validates against validRelabelOutcomes — a typo here
+// would produce a bogus state the projection layer can't
+// render.
+//
+// "Latest" is determined by claim id (autoincrement) — a
+// reviewed-task workflow only has one open claim per single-
+// citizen task, and the relabel paths fire serially, so id-
+// ordering is sufficient. Returns affected row count.
+func (s *Store) MarkLatestClaimOutcome(taskID, outcome string) (int64, error) {
+	if outcome == "" {
+		return 0, fmt.Errorf("outcome is required")
+	}
+	if !validRelabelOutcomes[outcome] {
+		return 0, fmt.Errorf("invalid claim outcome %q (must be one of: completed, rejected, invalidated, abandoned, released)", outcome)
+	}
+	res, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = ?
+		 WHERE id = (
+		   SELECT id FROM task_claims
+		   WHERE task_id = ?
+		   ORDER BY id DESC LIMIT 1
+		 )`,
+		outcome, taskID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // MarkLatestCompletedClaimOutcome rewrites the outcome of the
