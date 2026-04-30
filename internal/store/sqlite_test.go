@@ -1182,6 +1182,257 @@ func TestAutoTriageTemplate_GetSetRoundtrip(t *testing.T) {
 	}
 }
 
+// --- Iteration projection (living-workflow phase 5) ---
+
+func TestListTaskIterations_OrdersByClaimAndComputesSeq(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+
+	// Single-citizen task gets claimed, submitted, invalidated,
+	// re-claimed. The two task_claims rows should surface as
+	// iter-1 (invalidated) and iter-2 (active).
+	if err := s.CreateTask(&TaskRecord{
+		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
+		Action: "answer", ResultType: "text",
+		State:     TaskReady,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alice := createTestCitizen(t, s, "alice", "tok-iter-1")
+	bob := createTestCitizen(t, s, "bob", "tok-iter-2")
+
+	// Iteration 1: alice claims, submits, gets invalidated.
+	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult("1:1:dev", alice, "out/dev", "abc123", "", "", "", 100); err != nil {
+		t.Fatal(err)
+	}
+	// Force invalidate of iter-1 by closing it manually via
+	// task_claims update — emulates the cascade-invalidate path.
+	if _, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Reset task so it can be re-claimed.
+	if _, err := s.db.Exec(
+		`UPDATE tasks SET state = 'ready', claimed_by = 0, claimed_at = NULL, submitted_at = NULL, commit_sha = '' WHERE id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Iteration 2: bob claims, still active.
+	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	iters, err := s.ListTaskIterations("1:1:dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iters) != 2 {
+		t.Fatalf("expected 2 iterations, got %d", len(iters))
+	}
+	if iters[0].Seq != 1 || iters[1].Seq != 2 {
+		t.Fatalf("seqs not 1,2: %+v", iters)
+	}
+	if iters[0].Username != "alice" || iters[1].Username != "bob" {
+		t.Fatalf("usernames wrong: %q, %q", iters[0].Username, iters[1].Username)
+	}
+	if iters[0].Outcome != "invalidated" {
+		t.Fatalf("iter-1 outcome: %q", iters[0].Outcome)
+	}
+	if iters[1].Outcome != "" {
+		t.Fatalf("iter-2 should still be active, got %q", iters[1].Outcome)
+	}
+	// iter-1 had the submission; the task's commit was overwritten
+	// when we reset state. Ensure iter-2 starts blank.
+	if iters[1].SubmittedAt != nil {
+		t.Fatal("iter-2 submitted_at should be nil")
+	}
+}
+
+// TestListTaskIterations_PreservesHistoricalCommitAndDecision
+// guards the fidelity fix from reviewer feedback: when iter-2
+// starts and the task-level commit_sha / review_decision get
+// cleared by invalidation, iter-1's row in task_claims still
+// carries the historical values. The projection reads from
+// task_claims, not from a JOIN to tasks, so the reconstruction
+// "what happened with this task" stays accurate across
+// re-iterations.
+func TestListTaskIterations_PreservesHistoricalCommitAndDecision(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, RunSlug: "build",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alice := createTestCitizen(t, s, "alice", "tok-fid-1")
+	bob := createTestCitizen(t, s, "bob", "tok-fid-2")
+
+	// Iter-1: alice claims and submits with commit "abc123".
+	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult("1:1:dev", alice, "out/dev", "abc123def456abc123def456abc123def456abcd", "", "", "", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate cascade-invalidate: clears tasks.commit_sha,
+	// flips task_claims outcome, resets task to ready.
+	if _, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE tasks SET state = 'ready', claimed_by = 0, claimed_at = NULL, submitted_at = NULL, commit_sha = '', review_decision = '' WHERE id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Iter-2: bob claims and submits with a different commit.
+	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult("1:1:dev", bob, "out/dev", "fedcbafedcbafedcbafedcbafedcbafedcbafedc", "", "", "", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	iters, err := s.ListTaskIterations("1:1:dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iters) != 2 {
+		t.Fatalf("expected 2 iterations, got %d", len(iters))
+	}
+	// The load-bearing assertion: iter-1's commit must be
+	// the one alice submitted, NOT the one bob just submitted
+	// (which is what the JOIN-to-tasks version would have
+	// returned for both rows).
+	if iters[0].CommitSHA != "abc123def456abc123def456abc123def456abcd" {
+		t.Fatalf("iter-1 commit lost in re-iteration: got %q (should be alice's submit)", iters[0].CommitSHA)
+	}
+	if iters[1].CommitSHA != "fedcbafedcbafedcbafedcbafedcbafedcbafedc" {
+		t.Fatalf("iter-2 commit wrong: %q", iters[1].CommitSHA)
+	}
+	// Outcomes preserved per row.
+	if iters[0].Outcome != "invalidated" {
+		t.Fatalf("iter-1 outcome: %q", iters[0].Outcome)
+	}
+	if iters[1].Outcome != "completed" {
+		t.Fatalf("iter-2 outcome: %q", iters[1].Outcome)
+	}
+}
+
+// --- Phase 6a: branch identifier per iteration ---
+
+func TestClaimTask_StampsIterationBranch(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, RunSlug: "build",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alice := createTestCitizen(t, s, "alice", "tok-b1")
+	bob := createTestCitizen(t, s, "bob", "tok-b2")
+
+	// Iteration 1.
+	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	iters, _ := s.ListTaskIterations("1:1:dev")
+	if len(iters) != 1 {
+		t.Fatalf("expected 1 iteration, got %d", len(iters))
+	}
+	if iters[0].Branch != "build/dev/iter-1" {
+		t.Fatalf("iter-1 branch: %q", iters[0].Branch)
+	}
+
+	// Invalidate iter-1 + reset task, then bob claims iter-2.
+	if _, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE tasks SET state = 'ready', claimed_by = 0, claimed_at = NULL WHERE id = ?`,
+		"1:1:dev",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	iters, _ = s.ListTaskIterations("1:1:dev")
+	if len(iters) != 2 {
+		t.Fatalf("expected 2 iterations, got %d", len(iters))
+	}
+	if iters[1].Branch != "build/dev/iter-2" {
+		t.Fatalf("iter-2 branch: %q", iters[1].Branch)
+	}
+}
+
+func TestClaimTask_VoteReviewSkipBranchGeneration(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "1:1:gate", RunID: runID, Seq: 1, TaskDefID: "gate",
+		Action: "review", ResultType: "text",
+		State: TaskReady, RunSlug: "build",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alice := createTestCitizen(t, s, "alice", "tok-vrb")
+	if err := s.ClaimTask("1:1:gate", alice, now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	iters, _ := s.ListTaskIterations("1:1:gate")
+	if len(iters) != 1 {
+		t.Fatalf("expected 1 iteration, got %d", len(iters))
+	}
+	// Review tasks have no git artifact, so branching is
+	// meaningless — we leave the field empty rather than
+	// stamp a misleading topic-branch name.
+	if iters[0].Branch != "" {
+		t.Fatalf("review iter should have empty branch, got %q", iters[0].Branch)
+	}
+}
+
+func TestListTaskIterations_NoClaimsReturnsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	makeTask(t, s, runID, "1:1:fresh", TaskReady)
+
+	iters, err := s.ListTaskIterations("1:1:fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iters) != 0 {
+		t.Fatalf("expected 0, got %d", len(iters))
+	}
+}
+
 func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 	// Living-workflow phase 1 expanded the unique branch index
 	// to cover idle and paused. A second run on the same

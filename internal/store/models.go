@@ -390,6 +390,50 @@ type ProjectMemberRecord struct {
 	AddedBy   int64 // citizens.id of the adder; 0 for the creator row
 }
 
+// IterationRecord is the projection of one attempt at a task —
+// living-workflow phase 5. Each row is a task_claims row enriched
+// with the per-task seq counter, the claimant's username, and the
+// review decision (when applicable). The DB still stores claims
+// row-by-row; this struct is what enju_get_task and
+// enju_list_iterations surface.
+//
+// "Iteration" maps to "task_claims row" in v1 — one row per
+// fresh claim. Within a claim, request_changes today invalidates
+// and re-claims (creating a new iteration); a future
+// request_changes-stays-on-same-claim refactor would let one
+// iteration carry multiple submissions, at which point the
+// CommitSHA field becomes a list.
+//
+// Outcome values (verbatim from task_claims):
+//   - "" (active)
+//   - "completed"  — submitted and accepted
+//   - "invalidated" — cascade-invalidated by an upstream rejection
+//   - "released"    — claimant released voluntarily
+//   - "timed_out"   — reaper claimed the deadline pass
+type IterationRecord struct {
+	TaskID         string
+	Seq            int    // 1-based, ordered by claimed_at
+	CitizenID      int64  // claimant
+	Username       string // resolved at projection time
+	ClaimedAt      time.Time
+	Deadline       time.Time
+	SubmittedAt    *time.Time
+	Outcome        string
+	CommitSHA      string // the task's commit at submit time; "" until submitted
+	ReviewDecision string // approve | request_changes | reject | "" (no decision yet)
+	Option         string // vote choice (vote tasks)
+	Content        string // commentary (vote/review tasks)
+	ModelID        *int64 // attribution (per-claim model)
+	// Branch is the iteration-scoped topic branch identifier
+	// (living-workflow phase 6a). Format:
+	// "<run-slug>/<task_def_id>/iter-<N>". Empty for
+	// vote/review tasks (no git artifact) and for pre-phase-6a
+	// rows. Phase 6b will use this as the actual git ref the
+	// fat client checks out / commits to; phase 6a just records
+	// it for audit and forward compat.
+	Branch string
+}
+
 // IssueRecord is one row in the issues table — a project-level
 // structured artifact. Issues outlive runs: filed in one run,
 // possibly triaged in a later run, possibly closed by a fix-task

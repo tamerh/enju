@@ -98,6 +98,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleSetCycleBudget(ctx, req)
 	case "enju_show_events":
 		return t.c.handleShowEvents(ctx, req)
+	case "enju_list_iterations":
+		return t.c.handleListIterations(ctx, req)
 	case "enju_file_issue":
 		return t.c.handleFileIssue(ctx, req)
 	case "enju_list_issues":

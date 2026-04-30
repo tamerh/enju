@@ -374,6 +374,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/claim", s.handleClaimTask)
 		r.Get("/tasks/{taskID}", s.handleGetTask)
 		r.Get("/tasks/{taskID}/inputs", s.handleGetTaskInputs)
+		r.Get("/tasks/{taskID}/iterations", s.handleListIterations)
 		r.Post("/tasks/{taskID}/result", s.handleSubmitResult)
 		r.Post("/tasks/reconcile", s.handleReconcileTasks)
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
@@ -3090,6 +3091,78 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 // that client-side template resolvers (mcpgit.Project.Resolve)
 // consume. The coordinator never reads files — it just reads DB rows
 // and emits commit SHAs + paths. This replaces the legacy path that
+// handleListIterations is the living-workflow phase 5 surface
+// for the iteration projection. One row per task_claims row,
+// in claim-order, with the seq counter computed and the
+// claimant + commit_sha + review_decision joined in.
+//
+// Member-gated through the task's project. Citizens render as
+// usernames; ModelID resolves to model citizen username when
+// present.
+func (s *Server) handleListIterations(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	run, err := s.store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		writeError(w, http.StatusInternalServerError, "run not found for task")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, run.ProjectID); !ok {
+		return
+	}
+	iters, err := s.store.ListTaskIterations(taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing iterations: "+err.Error())
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, len(iters))
+	for _, it := range iters {
+		row := map[string]interface{}{
+			"seq":        it.Seq,
+			"citizen":    it.Username,
+			"claimed_at": it.ClaimedAt.UTC().Format(time.RFC3339),
+		}
+		// Outcome — render the active iteration explicitly so
+		// the consumer doesn't have to interpret "" as "still
+		// running."
+		if it.Outcome == "" {
+			row["outcome"] = "active"
+		} else {
+			row["outcome"] = it.Outcome
+		}
+		if it.SubmittedAt != nil {
+			row["submitted_at"] = it.SubmittedAt.UTC().Format(time.RFC3339)
+		}
+		if it.CommitSHA != "" {
+			row["commit_sha"] = it.CommitSHA
+		}
+		if it.Branch != "" {
+			row["branch"] = it.Branch
+		}
+		if it.ReviewDecision != "" {
+			row["review_decision"] = it.ReviewDecision
+		}
+		if it.Option != "" {
+			row["option"] = it.Option
+		}
+		if it.Content != "" {
+			row["content"] = it.Content
+		}
+		if it.ModelID != nil {
+			if model := s.citizenUsername(*it.ModelID); model != "" {
+				row["model"] = model
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // resolved templates server-side by reading upstream result files
 // from a coordinator-owned working tree.
 func (s *Server) handleGetTaskInputs(w http.ResponseWriter, r *http.Request) {

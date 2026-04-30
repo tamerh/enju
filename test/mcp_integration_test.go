@@ -3734,6 +3734,78 @@ tasks:
 	})
 }
 
+// TestMCPListIterationsAfterReclaim exercises the full
+// "MCP tool → HTTP handler → member auth → store query →
+// JSONL output" wiring for enju_list_iterations. The store
+// projection is unit-tested elsewhere; this guards against
+// regressions in the wire path (wrong endpoint URL, broken
+// member-auth gating, JSON serialization).
+//
+// Living-workflow phase 5 + 6a: alice claims iter-1 and
+// submits, the iteration gets invalidated, bob claims iter-2.
+// The tool output should show two rows with the right seqs,
+// outcomes, claimants, and branch identifiers.
+func TestMCPListIterationsAfterReclaim(t *testing.T) {
+	eachRemoteMode(t, "ListIterReclaim", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
+
+		yaml := `name: "iteration history"
+version: 1
+tasks:
+  - id: develop
+    action: answer
+    prompt: "Build."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+		fullID := h.taskID("develop")
+
+		// Iter-1: default citizen claims + submits.
+		h.mcpClaimOK(t, "develop")
+		h.mcpSubmitText(t, "develop", "first attempt")
+
+		// Invalidate the iteration to force a re-claim.
+		h.callOK(t, "enju_invalidate_task", map[string]any{
+			"task_id": fullID,
+		})
+
+		// Iter-2: re-claim and resubmit (still default citizen
+		// — the harness only registers one — but the iteration
+		// counter advances per claim, not per citizen).
+		h.mcpClaimOK(t, "develop")
+		h.mcpSubmitText(t, "develop", "second attempt")
+
+		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": fullID,
+		}))
+		// Both iterations should appear in the rendered table.
+		if !strings.Contains(out, "iter-1") {
+			t.Errorf("expected iter-1 in output, got:\n%s", out)
+		}
+		if !strings.Contains(out, "iter-2") {
+			t.Errorf("expected iter-2 in output, got:\n%s", out)
+		}
+		// Both iterations show outcome=completed: the iteration
+		// outcome is "from claim to terminal state of THAT
+		// iteration." Iter-1 submitted successfully → completed;
+		// the later cascade-invalidate doesn't rewrite the
+		// prior iteration's outcome (it only catches still-open
+		// claims). Iter-2 also completed when bob's submit
+		// landed.
+		if strings.Count(out, "[completed]") != 2 {
+			t.Errorf("expected both iterations completed, got:\n%s", out)
+		}
+		// Branch identifiers from phase 6a (both action:answer
+		// so both get topic-branch names).
+		if !strings.Contains(out, "/develop/iter-1") {
+			t.Errorf("expected iter-1 branch in output, got:\n%s", out)
+		}
+		if !strings.Contains(out, "/develop/iter-2") {
+			t.Errorf("expected iter-2 branch in output, got:\n%s", out)
+		}
+	})
+}
+
 // TestMCPRequestChangesCascadesDownstreamOfReviewGate is the
 // request_changes analogue of the reject-gate test. Same
 // structural concern, different end state: resetting the

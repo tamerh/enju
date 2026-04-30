@@ -605,6 +605,15 @@ func toolCloseIssue() mcp.Tool {
 	)
 }
 
+func toolListIterations() mcp.Tool {
+	return mcp.NewTool("enju_list_iterations",
+		mcp.WithDescription(`List the iteration history of a task — one row per claim attempt, with per-task seq counter, claimant, claim/submit timestamps, commit SHA, review decision, and outcome (active | completed | invalidated | released | timed_out). Living-workflow phase 5: this is how you reconstruct "what happened with this task" without grepping the event log. For aggregate timelines across the whole run, use enju_show_events instead.`),
+		mcp.WithString("task_id", mcp.Required(),
+			mcp.Description("Fully-qualified task id (project:run:task_def_id [:instance])"),
+		),
+	)
+}
+
 func toolShowEvents() mcp.Tool {
 	return mcp.NewTool("enju_show_events",
 		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over contribution_events — the canonical event log. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events, which writes git-tracked snapshots; this tool is for ad-hoc queries.`),

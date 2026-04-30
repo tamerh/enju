@@ -47,6 +47,73 @@ func (c *apiClient) handleTallyTask(ctx context.Context, req mcp.CallToolRequest
 	}
 	return mcp.NewToolResultText(formatTallyResult(data, taskID)), nil
 }
+// handleListIterations is the living-workflow phase 5 surface
+// for the iteration history of a task. Returns one row per
+// task_claims row, with the per-task seq computed and the
+// claimant + commit_sha + review decision joined in. Renders
+// as a plain text table; raw JSON form is one HTTP hop away
+// for callers that need to parse.
+func (c *apiClient) handleListIterations(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	data, err := c.get(ctx, "/api/v1/tasks/"+taskID+"/iterations")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if errMsg := errorFromResponse(data); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	var iters []map[string]interface{}
+	if err := json.Unmarshal(data, &iters); err != nil {
+		return mcp.NewToolResultError("decoding iterations: " + err.Error()), nil
+	}
+	if len(iters) == 0 {
+		return mcp.NewToolResultText(fmt.Sprintf("(no iterations for %s — task hasn't been claimed yet)", taskID)), nil
+	}
+	out := fmt.Sprintf("Iteration history for %s:\n\n", taskID)
+	for _, it := range iters {
+		seq, _ := it["seq"].(float64)
+		citizen, _ := it["citizen"].(string)
+		outcome, _ := it["outcome"].(string)
+		out += fmt.Sprintf("  iter-%d  @%s  [%s]\n", int(seq), citizen, outcome)
+		if claimed, ok := it["claimed_at"].(string); ok {
+			out += "    claimed_at:  " + claimed + "\n"
+		}
+		if submitted, ok := it["submitted_at"].(string); ok {
+			out += "    submitted_at: " + submitted + "\n"
+		}
+		if commit, ok := it["commit_sha"].(string); ok && commit != "" {
+			short := commit
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			out += "    commit:       " + short + "\n"
+		}
+		if branch, ok := it["branch"].(string); ok && branch != "" {
+			out += "    branch:       " + branch + "\n"
+		}
+		if dec, ok := it["review_decision"].(string); ok && dec != "" {
+			out += "    review:       " + dec + "\n"
+		}
+		if opt, ok := it["option"].(string); ok && opt != "" {
+			out += "    option:       " + opt + "\n"
+		}
+		if model, ok := it["model"].(string); ok && model != "" {
+			out += "    model:        " + model + "\n"
+		}
+		if content, ok := it["content"].(string); ok && content != "" {
+			snippet := content
+			if len(snippet) > 80 {
+				snippet = snippet[:77] + "..."
+			}
+			out += "    content:      " + snippet + "\n"
+		}
+	}
+	return mcp.NewToolResultText(out), nil
+}
+
 func (c *apiClient) handleListReadyTasks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	path := "/api/v1/tasks/ready"
 	pid := req.GetInt("project_id", 0)

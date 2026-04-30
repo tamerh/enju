@@ -267,6 +267,35 @@ func (s *Store) ListRunsWithAutoTriage(projectID int64) ([]int64, error) {
 	return ids, nil
 }
 
+// generateIterationBranch is the single source of truth for the
+// per-iteration branch identifier (living-workflow phase 6a).
+// Both the plan-driven applySetClaim and the standalone
+// Store.ClaimTask call this so the format never drifts between
+// the two write paths. Format:
+// "<run-slug>/<task_def_id>/iter-<N>".
+//
+// Vote/review tasks have no git artifact and so no meaningful
+// topic branch — the helper returns "" for those, and callers
+// store the empty string rather than a misleading branch name.
+//
+// taskAction is the task's action ("answer" / "compute" / etc.),
+// taskDefID is the YAML id, runSlug is the per-run slug for the
+// enju/runs/{seq}-{slug}/ layout (defaults to "run" when empty).
+// priorClaims should be the result of
+// `SELECT COUNT(*) FROM task_claims WHERE task_id = ?` evaluated
+// inside the same transaction so iter-N is monotonic under
+// concurrent claims.
+func generateIterationBranch(taskAction, taskDefID, runSlug string, priorClaims int) string {
+	if taskAction == "vote" || taskAction == "review" {
+		return ""
+	}
+	slug := runSlug
+	if slug == "" {
+		slug = "run"
+	}
+	return fmt.Sprintf("%s/%s/iter-%d", slug, taskDefID, priorClaims+1)
+}
+
 // SetAutoTriageTemplate persists the run-level auto-triage rule
 // (JSON-encoded RemediationTemplate). Called by the create-run
 // path after the RunRecord is inserted; runs without a rule

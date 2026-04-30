@@ -393,9 +393,16 @@ func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
 }
 
 func applySetClaim(tx *sql.Tx, m SetClaim) error {
-	// Read citizens count to decide single vs multi behavior.
+	// Read citizens count to decide single vs multi behavior;
+	// pull task_def_id + run_slug for the iteration branch
+	// name (living-workflow phase 6a).
 	var citizens int
-	if err := tx.QueryRow(`SELECT citizens FROM tasks WHERE id = ?`, m.TaskID).Scan(&citizens); err != nil {
+	var taskDefID, runSlug, taskAction string
+	if err := tx.QueryRow(
+		`SELECT t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action
+		 FROM tasks t WHERE t.id = ?`,
+		m.TaskID,
+	).Scan(&citizens, &taskDefID, &runSlug, &taskAction); err != nil {
 		return fmt.Errorf("set_claim: task %q not found", m.TaskID)
 	}
 	if citizens <= 0 {
@@ -409,11 +416,18 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 		return err
 	}
 
+	// Generate the iteration branch name via the shared
+	// helper so the format stays in sync with the standalone
+	// ClaimTask path.
+	var priorClaims int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, m.TaskID).Scan(&priorClaims)
+	branch := generateIterationBranch(taskAction, taskDefID, runSlug, priorClaims)
+
 	now := time.Now()
-	// Insert the claim row.
+	// Insert the claim row with the branch identifier.
 	_, err := tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id) VALUES (?, ?, ?, ?, ?)`,
-		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID),
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id, branch) VALUES (?, ?, ?, ?, ?, ?)`,
+		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID), branch,
 	)
 	if err != nil {
 		return fmt.Errorf("set_claim: %w", err)
@@ -482,8 +496,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 			return err
 		}
 		_, err = tx.Exec(
-			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, model_id = COALESCE(?, model_id) WHERE task_id = ? AND outcome IS NULL`,
-			now, m.VoteChoice, nullableInt64(m.ModelID), m.TaskID,
+			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE task_id = ? AND outcome IS NULL`,
+			now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), m.TaskID,
 		)
 		if err != nil {
 			return err
@@ -517,8 +531,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		}
 		if claimRowID.Valid {
 			tx.Exec(
-				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
-				now, choice, m.Content, nullableInt64(m.ModelID), claimRowID.Int64,
+				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
+				now, choice, m.Content, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
 			)
 		}
 		// Token contribution only (score waits for tally).

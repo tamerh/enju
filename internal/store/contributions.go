@@ -159,6 +159,78 @@ func (s *Store) ListTaskHistory(taskID string) ([]TaskClaimRecord, error) {
 	return records, nil
 }
 
+// ListTaskIterations returns the iteration history of a task —
+// the living-workflow phase 5 projection over task_claims +
+// tasks + citizens. Ordered by claimed_at ascending; Seq is
+// 1-based.
+//
+// One row per task_claims row. A future iteration model that
+// keeps multiple submissions inside one claim (request_changes
+// staying on the same claim) would change Submissions from
+// scalar to list; the wire shape leaves the door open by
+// surfacing CommitSHA as a single field today.
+//
+// CommitSHA is the task-level CommitSHA at the moment this
+// iteration's outcome landed. For active iterations (no
+// outcome yet) it's the task's current CommitSHA, which may
+// be empty. ReviewDecision is similarly the task-level
+// decision; in single-citizen review tasks every iteration's
+// decision overwrites; in multi-citizen tasks the per-claim
+// option/content fields carry the per-citizen contribution.
+func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
+	// commit_sha / decision / branch are read from task_claims
+	// directly, not joined from tasks — the per-claim columns
+	// preserve historical fidelity (iter-1's commit doesn't
+	// vanish when iter-2 starts and clears the task-level
+	// fields). The tasks join is dropped entirely.
+	rows, err := s.db.Query(
+		`SELECT
+		   tc.task_id, tc.citizen_id, tc.claimed_at, tc.deadline,
+		   COALESCE(tc.outcome, '') AS outcome,
+		   tc.submitted_at, tc.option, tc.content, tc.model_id,
+		   COALESCE(c.username, '') AS username,
+		   COALESCE(tc.commit_sha, '') AS commit_sha,
+		   COALESCE(tc.decision, '') AS decision,
+		   COALESCE(tc.branch, '') AS branch
+		 FROM task_claims tc
+		 LEFT JOIN citizens c ON tc.citizen_id = c.id
+		 WHERE tc.task_id = ?
+		 ORDER BY tc.claimed_at ASC, tc.id ASC`,
+		taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []IterationRecord
+	seq := 0
+	for rows.Next() {
+		seq++
+		var r IterationRecord
+		var submittedAt sql.NullTime
+		var modelID sql.NullInt64
+		if err := rows.Scan(
+			&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
+			&r.Outcome, &submittedAt, &r.Option, &r.Content, &modelID,
+			&r.Username, &r.CommitSHA, &r.ReviewDecision, &r.Branch,
+		); err != nil {
+			continue
+		}
+		r.Seq = seq
+		if submittedAt.Valid {
+			t := submittedAt.Time
+			r.SubmittedAt = &t
+		}
+		if modelID.Valid {
+			id := modelID.Int64
+			r.ModelID = &id
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // GetTemplateReuseCount returns how many runs were
 // instantiated from templates committed by this citizen.
 // Uses runs.source_path + contribution_events to correlate:

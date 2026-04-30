@@ -510,6 +510,28 @@ func (s *Store) migrate() error {
 		// docs/living-workflow-design-notes.md § 7.
 		`ALTER TABLE runs ADD COLUMN auto_triage_template TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN closes_issue_seq INTEGER NOT NULL DEFAULT 0`,
+		// Living-workflow phase 6a — iteration branch as a
+		// first-class identifier on task_claims. Generated at
+		// claim time as "<run-slug>/<task_def_id>/iter-<N>".
+		// Phase 6a stores the value and surfaces it in the
+		// audit projection; the actual fat-client git workflow
+		// (checkout/commit on topic branch, automerge on
+		// approve, cleanup on reject) is phase 6b. Empty for
+		// rows that predate the column or for vote/review
+		// tasks where branching is meaningless (no git
+		// artifact). See docs/living-workflow-design-notes.md § 4.
+		`ALTER TABLE task_claims ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
+		// Phase 5 fidelity columns — capture commit_sha and
+		// review decision per-claim at submit time, so the
+		// iteration projection returns the historical value
+		// even after the task-level fields are cleared by
+		// invalidation. Without these, ListTaskIterations
+		// joined to t.commit_sha / t.review_decision and
+		// iter-1's value vanished the moment iter-2 started
+		// (because invalidate clears the task-level fields).
+		// Captured at the four submit-path UPDATE sites.
+		`ALTER TABLE task_claims ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE task_claims ADD COLUMN decision TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1404,7 +1426,11 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 
 	var state string
 	var citizens int
-	err = tx.QueryRow(`SELECT state, citizens FROM tasks WHERE id = ?`, taskID).Scan(&state, &citizens)
+	var taskDefID, runSlug, taskAction string
+	err = tx.QueryRow(
+		`SELECT state, citizens, task_def_id, COALESCE(run_slug, ''), action FROM tasks WHERE id = ?`,
+		taskID,
+	).Scan(&state, &citizens, &taskDefID, &runSlug, &taskAction)
 	if err != nil {
 		return fmt.Errorf("task %q not found: %w", taskID, err)
 	}
@@ -1475,9 +1501,17 @@ func (s *Store) ClaimTask(taskID string, citizenID int64, deadline time.Time) er
 		return err
 	}
 
+	// Phase 6a — generate the per-iteration branch name via
+	// the shared helper. Same rule as applySetClaim's plan-
+	// driven path: skip for vote/review (no git artifact);
+	// count prior claims for iter-N.
+	var priorClaims int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM task_claims WHERE task_id = ?`, taskID).Scan(&priorClaims)
+	branch := generateIterationBranch(taskAction, taskDefID, runSlug, priorClaims)
+
 	_, err = tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline) VALUES (?, ?, ?, ?)`,
-		taskID, citizenID, now, deadline,
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, branch) VALUES (?, ?, ?, ?, ?)`,
+		taskID, citizenID, now, deadline, branch,
 	)
 	if err != nil {
 		return err
@@ -1566,8 +1600,8 @@ func (s *Store) SubmitTaskResult(taskID string, citizenID int64, resultPath, com
 			return nil, err
 		}
 		_, err = tx.Exec(
-			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ? WHERE task_id = ? AND outcome IS NULL`,
-			now, voteChoice, taskID,
+			`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ? WHERE task_id = ? AND outcome IS NULL`,
+			now, voteChoice, commitSHA, decision, taskID,
 		)
 		if err != nil {
 			return nil, err
@@ -1645,8 +1679,8 @@ func (s *Store) SubmitTaskResult(taskID string, citizenID int64, resultPath, com
 		choice = decision
 	}
 	_, err = tx.Exec(
-		`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ? WHERE id = ?`,
-		now, choice, content, claimRow.Int64,
+		`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ?, commit_sha = ?, decision = ? WHERE id = ?`,
+		now, choice, content, commitSHA, decision, claimRow.Int64,
 	)
 	if err != nil {
 		return nil, err
