@@ -4101,6 +4101,16 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 				} else {
 					rejectResult = res
 				}
+				// Phase 6b.2 / ISSUE-003: relabel the rejected
+				// iteration's claim row from "completed" to
+				// "rejected" so the audit trail reflects the
+				// verdict, not just the bare fact that bytes
+				// were submitted. Best-effort — a labeling
+				// failure shouldn't undo the cascade.
+				if _, err := s.store.MarkLatestCompletedClaimOutcome(actions.RejectTargetID, "rejected"); err != nil {
+					s.logger.Warn("relabel claim outcome on request_changes",
+						"target", actions.RejectTargetID, "error", err)
+				}
 			}
 		}
 		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
@@ -4132,6 +4142,14 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 						Changed:        res.Changed,
 						Rollbacks:      res.Rollbacks,
 					}
+				}
+				// Phase 6b.2 / ISSUE-003: same relabel for the
+				// terminal-reject path — the rejected iteration
+				// should read "rejected" in the audit log, not
+				// "completed."
+				if _, err := s.store.MarkLatestCompletedClaimOutcome(actions.RejectTargetID, "rejected"); err != nil {
+					s.logger.Warn("relabel claim outcome on review reject",
+						"target", actions.RejectTargetID, "error", err)
 				}
 			}
 		}
@@ -4315,16 +4333,36 @@ func (s *Server) collectAcceptedMerges(
 	// state — the submit plan we applied above may have
 	// transitioned the task without us looking again.
 	//
-	// Suppress for reviews that did NOT approve. Per the
-	// design: "Reject → branch stays where it is, main
-	// untouched." A request_changes / reject review's topic
-	// must not merge to main; the topic stays as audit. Only
-	// approving reviews advance main (and they bring the
-	// upstream's content along since review_topic was forked
-	// from upstream_topic).
+	// Three suppression rules, all variants of "this commit
+	// doesn't yet belong on main":
+	//
+	//  (a) Review that did NOT approve. Per the design:
+	//      "Reject → branch stays where it is, main untouched."
+	//      A request_changes / reject review's topic stays as
+	//      audit, never merged.
+	//
+	//  (b) Task with a downstream review (phase 6b.2 fix for
+	//      ISSUE-001). The existing engine auto-accepts answer/
+	//      compute tasks on submit even when a reviewer is
+	//      pending; without this guard those topics merged to
+	//      main BEFORE the reviewer ever saw them, polluting
+	//      main with rejected work. The merge moment must be
+	//      "the review approves," not "the task transitions to
+	//      accepted." The review's own topic was forked from
+	//      this task's topic and carries its content forward —
+	//      so on approve, Case 1 fires for the review, and the
+	//      single FF push lands both upstream content and
+	//      verdict prose on main.
+	//
+	//  (c) Whatever future state-machine cases land here —
+	//      keep this gate the only place merge eligibility is
+	//      decided so nothing slips around it.
 	skipMergeOfSelf := false
 	if submittedTask != nil && submittedTask.Action == "review" &&
 		actions != nil && (actions.ShouldRejectTarget || actions.ShouldFailTarget) {
+		skipMergeOfSelf = true
+	}
+	if !skipMergeOfSelf && submittedTask != nil && s.taskHasDownstreamReview(submittedTask) {
 		skipMergeOfSelf = true
 	}
 	if !skipMergeOfSelf {
@@ -4384,6 +4422,37 @@ func (s *Server) collectAcceptedMerges(
 	}
 
 	return out
+}
+
+// taskHasDownstreamReview reports whether any task in the same
+// run is an action:review that targets `t` (matched on
+// (TaskDefID, InstanceKey)). Used by the merge gate to suppress
+// auto-merge of a task whose verdict is still pending.
+//
+// Phase 6b.2 design contract: "merge fires on the review's
+// approve, not on the upstream's submit." Without this gate,
+// the engine's state-level auto-accept (answer/compute tasks
+// transition to ACCEPTED on submit even when a reviewer is
+// pending) would pollute main with content the reviewer hasn't
+// seen — exactly the launch-blocking ISSUE-001 from the v1
+// sanity report.
+//
+// O(log N) via the idx_tasks_reviews_target partial index —
+// previously this was O(tasks-in-run) because we walked
+// ListTasksByRun and string-matched per row, which gets
+// expensive on for_each-heavy runs that fan out to dozens of
+// instances. Multi-distinct-reviewer-per-target is rejected at
+// parse time (yaml.validateNoDuplicateReviewTargets), so even
+// the index lookup returns at most one row.
+func (s *Server) taskHasDownstreamReview(t *store.TaskRecord) bool {
+	if t == nil {
+		return false
+	}
+	has, err := s.store.HasReviewerOfTarget(t.RunID, t.TaskDefID, t.InstanceKey)
+	if err != nil {
+		return false
+	}
+	return has
 }
 
 // acceptedMergeForTask renders one merge target for a task that
@@ -5925,37 +5994,32 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		}
 	}
 
-	// Phase 6b foundational v1: upstream_iteration_branch for
-	// action:review tasks. When the upstream (this task's
-	// reviews_target) has a completed claim with a topic
-	// branch, surface it so the fat-client can fork the
-	// review's own topic from the upstream's topic — the
-	// review's merge on approve then advances main to a tip
-	// that contains BOTH the upstream's content and the
-	// review's prose, in one FF step.
+	// Phase 6b foundational v1 + 6b.2: upstream_iteration_branch
+	// for action:review tasks. The fat-client uses this as the
+	// fork base for the review's own topic — review_topic is
+	// then a descendant of upstream_topic, so the eventual
+	// approve merge advances main to a tip that contains BOTH
+	// the upstream's commit and the review's verdict prose in
+	// one FF step.
+	//
+	// Always set when the upstream has a completed claim with
+	// a topic. Phase 6b.1 used to clear this when the upstream
+	// was state=accepted on the assumption that "accepted means
+	// merged" — false after 6b.2's merge gate, where reviewed
+	// tasks stay accepted but unmerged until the review approves.
+	// The previous gate would have produced fork-from-main
+	// here, which under linear progression equals fork-from-
+	// upstream-topic SHA (main hasn't moved past upstream's
+	// base) — but under any concurrent-task scenario the SHAs
+	// diverge and the FF refuses. Always forking from the
+	// upstream topic keeps the merge invariant correct in both
+	// linear and divergent layouts.
 	if t.Action == "review" && t.ReviewsTarget != "" {
-		// reviews_target is either a bare def id or
-		// "instanceKey:defID"; find the upstream task within
-		// the same run and read its latest completed claim's
-		// branch.
-		//
-		// Only set UpstreamIterationBranch when the upstream
-		// has NOT yet merged to the run branch — i.e. when its
-		// state is something other than ACCEPTED. An accepted
-		// upstream's commit is already on main (the topic
-		// merged at its submit time), so the review's topic
-		// should fork from current main, not from the now-
-		// stale upstream topic. Forking from a stale topic
-		// produces a base behind main and the eventual FF
-		// merge of the review topic would refuse as non-FF.
 		targetDef, targetInstance := parseReviewsTargetForMerge(t.ReviewsTarget)
 		runTasks, _ := s.store.ListTasksByRun(t.RunID)
 		for _, ut := range runTasks {
 			if ut.TaskDefID != targetDef || ut.InstanceKey != targetInstance {
 				continue
-			}
-			if store.TaskState(ut.State) == store.TaskAccepted {
-				break
 			}
 			hist, _ := s.store.ListTaskHistory(ut.ID)
 			for i := len(hist) - 1; i >= 0; i-- {
@@ -5984,10 +6048,21 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	// blanks t.CommitSHA on the task row but the commit
 	// itself persists on the topic branch) use these for a
 	// branch-safe ReadFileAtCommit.
+	// Match any claim that produced a commit, regardless of
+	// final verdict. Phase 6b.2's outcome relabel (ISSUE-003)
+	// flips the row from "completed" to "rejected" when a
+	// review request_changes / reject fires, but the commit
+	// itself still exists on the topic branch and the
+	// previous-submission UI / merge collector still need to
+	// reach it. Match on `CommitSHA != ""` rather than the
+	// outcome string so the lookup survives the relabel.
 	if hist, err := s.store.ListTaskHistory(t.ID); err == nil {
 		for i := len(hist) - 1; i >= 0; i-- {
 			c := hist[i]
-			if c.Outcome != "completed" || c.CommitSHA == "" {
+			if c.CommitSHA == "" {
+				continue
+			}
+			if c.Outcome != "completed" && c.Outcome != "rejected" {
 				continue
 			}
 			if resp.LatestCompletedCommitSHA == "" {

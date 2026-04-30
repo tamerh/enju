@@ -15,12 +15,19 @@ import (
 )
 
 // TestMCPApprovedReviewMergesUpstreamAndVerdict pins the happy
-// path: a reviewer approves a single-citizen draft. The run
-// branch must advance to a tip that contains BOTH the upstream's
-// commit AND the reviewer's verdict prose, in one fast-forward
-// step. Pre-fix, the FF push would refuse because the review
-// topic was forked from main (missing upstream content) or
-// from a stale upstream topic (missing other accepted work).
+// path: a reviewer approves a single-citizen draft. Phase 6b.2
+// changed the merge gate so a reviewed task does NOT merge on
+// submit — it stays on its topic, waiting for the reviewer's
+// verdict. The approve is the merge moment: main advances to a
+// tip that contains BOTH the upstream's commit AND the reviewer's
+// verdict prose, in one fast-forward step.
+//
+// Pre-6b.2, draft auto-merged on submit; ISSUE-001 in the v1
+// sanity report flagged that as launch-blocking because rejected
+// work would have already polluted main by the time the reviewer
+// said no. The assertions below pin the gate's two halves: main
+// is unchanged after the draft submit, and main IS advanced
+// after the review approve.
 func TestMCPApprovedReviewMergesUpstreamAndVerdict(t *testing.T) {
 	eachRemoteMode(t, "TopicApprove", func(t *testing.T, h *mcpHarness) {
 		requireRemote(t, h)
@@ -40,50 +47,54 @@ tasks:
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 
+		remoteURL := h.remoteFor(projectID)
+		mainBeforeDraft := bareRefSHA(t, remoteURL, "main")
+		if mainBeforeDraft == "" {
+			t.Fatalf("main missing on bare before draft submit")
+		}
+
 		h.mcpClaimOK(t, "draft")
 		h.mcpSubmitText(t, "draft", "DRAFT-CONTENT-marker")
 
-		// Draft is single-citizen with a downstream review, so
-		// it transitions to ACCEPTED on submit and its topic
-		// FF-merges to main immediately. Snapshot main's tip
-		// after the draft merge so we can assert the review
-		// merge advances it further.
-		remoteURL := h.remoteFor(projectID)
+		// Phase 6b.2 gate: draft has a downstream review, so
+		// its topic must NOT merge to main on submit. Main
+		// stays exactly where it was. The draft commit lives
+		// only on its topic ref until the reviewer approves.
 		mainAfterDraft := bareRefSHA(t, remoteURL, "main")
-		if mainAfterDraft == "" {
-			t.Fatalf("main missing on bare after draft submit")
+		if mainAfterDraft != mainBeforeDraft {
+			t.Errorf("draft submit must not advance main while a downstream review is pending:\n  before=%s\n  after=%s",
+				mainBeforeDraft, mainAfterDraft)
 		}
-		// Sanity: draft's content must be on main (the FF
-		// merge happened).
+		// Draft's content must NOT be on main yet — that's the
+		// inverse of the old assertion. The content lives on
+		// the topic ref only.
 		draftPath := filepath.Join(h.runDir(1), "draft/result.md")
-		if body, ok := readRepoFileOnBranch(t, remoteURL, "main", draftPath); !ok || !strings.Contains(string(body), "DRAFT-CONTENT-marker") {
-			t.Fatalf("draft content missing on main after auto-accept; ok=%v body=%q", ok, body)
+		if _, ok := readRepoFileOnBranch(t, remoteURL, "main", draftPath); ok {
+			t.Errorf("draft content unexpectedly on main before review approval — merge gate failed")
 		}
 
-		// Reviewer approves. The review's topic should fork
-		// from upstream's topic (since draft is now accepted
-		// and on main, fork-from-current-main is fine too —
-		// either way the review topic includes the draft
-		// commit). Approve triggers FF merge of review topic
-		// to main.
+		// Reviewer approves. The review's topic was forked
+		// from upstream's topic, so review_topic carries
+		// draft's commit. The approve triggers one FF push
+		// that advances main with both the upstream and the
+		// verdict.
 		h.mcpClaimAs(t, reviewer, "gate")
 		h.mcpSubmitReviewAs(t, reviewer, "gate", "VERDICT-PROSE-marker", "approve")
 
 		mainAfterApprove := bareRefSHA(t, remoteURL, "main")
 		if mainAfterApprove == mainAfterDraft {
-			t.Errorf("approve should have advanced main beyond draft tip; main stayed at %s", mainAfterDraft)
+			t.Errorf("approve should have advanced main; stayed at %s", mainAfterDraft)
 		}
 
-		// The reviewer's verdict prose lives in the review
-		// task's result.md and must now be visible on main —
-		// that's the whole point of the merge.
-		reviewPath := filepath.Join(h.runDir(1), "gate/result.md")
-		body, ok := readRepoFileOnBranch(t, remoteURL, "main", reviewPath)
-		if !ok {
-			t.Errorf("review result.md missing from main after approve")
+		// Both files must now be visible on main: draft's
+		// content (carried forward via fork chain) and the
+		// reviewer's verdict prose.
+		if body, ok := readRepoFileOnBranch(t, remoteURL, "main", draftPath); !ok || !strings.Contains(string(body), "DRAFT-CONTENT-marker") {
+			t.Errorf("draft content missing on main after approve; ok=%v body=%q", ok, body)
 		}
-		if !strings.Contains(string(body), "VERDICT-PROSE-marker") {
-			t.Errorf("review content on main missing VERDICT-PROSE-marker, got: %q", body)
+		reviewPath := filepath.Join(h.runDir(1), "gate/result.md")
+		if body, ok := readRepoFileOnBranch(t, remoteURL, "main", reviewPath); !ok || !strings.Contains(string(body), "VERDICT-PROSE-marker") {
+			t.Errorf("review verdict missing on main after approve; ok=%v body=%q", ok, body)
 		}
 	})
 }
@@ -152,24 +163,16 @@ tasks:
 // upstream's commit too — no separate upstream merge step,
 // no missing draft content on main after approve.
 //
-// In v1 the path that delivers this is "review forks from
-// current main" because every action:answer auto-accepts on
-// submit, which FF-merges its topic onto main BEFORE the
-// review claims (a review only becomes ready when its target
-// is in state=accepted, per Store.UpdateReadyTasks). So at
-// gate's claim time, draft.State == accepted and main
-// already carries draft's commit. The router's
-// upstream_iteration_branch field is gated on `state !=
-// accepted` and is therefore empty in this scenario — the
-// conditional is asserted explicitly below.
-//
-// The "upstream still review_pending → fork from
-// upstream_topic" branch in router.go's toTaskResponse is
-// future-proofing for v2 (chained reviews, races between
-// invalidate and claim) and is unreachable under v1's
-// normal flow. Tested implicitly by the integration suite,
-// which would surface a non-FF refusal if the wrong fork
-// base were ever chosen.
+// Phase 6b.2 fixes the path that delivers this. Reviewed
+// tasks no longer auto-merge on submit; their commit lives
+// only on the topic ref. The review's response surfaces the
+// upstream's topic via upstream_iteration_branch, the fat
+// client uses it as the fork base, and the resulting review
+// topic descends from upstream_topic and carries its commit
+// forward. This test pins the conditional API contract
+// (upstream_iteration_branch is non-empty for the reviewed
+// case) AND the user-facing observable (review topic has
+// upstream's content).
 func TestMCPReviewTopicCarriesUpstreamForward(t *testing.T) {
 	eachRemoteMode(t, "TopicForkBase", func(t *testing.T, h *mcpHarness) {
 		requireRemote(t, h)
@@ -192,17 +195,21 @@ tasks:
 		h.mcpClaimOK(t, "draft")
 		h.mcpSubmitText(t, "draft", "UPSTREAM-CONTENT-DRAFT")
 
-		// Draft auto-accepted on submit (single-citizen
-		// answer). Pin the conditional contract: because
-		// draft.State == accepted, gate's response must NOT
-		// surface upstream_iteration_branch — fork is from
-		// current main, not from upstream's topic.
+		// Phase 6b.2 contract: gate becomes ready (engine
+		// state machine still auto-accepts answer on submit
+		// even when reviewed) and gate.upstream_iteration_branch
+		// is non-empty — pointing at draft's topic, which
+		// hasn't merged to main because of the new gate.
 		gate := h.taskGet("gate")
 		if got := gate["state"]; got != "ready" {
-			t.Fatalf("expected gate ready after draft accept, got %v", got)
+			t.Fatalf("expected gate ready after draft submit, got %v", got)
 		}
-		if up, _ := gate["upstream_iteration_branch"].(string); up != "" {
-			t.Errorf("gate.upstream_iteration_branch should be empty when upstream accepted (router gates on state); got %q", up)
+		upstreamTopic, _ := gate["upstream_iteration_branch"].(string)
+		if upstreamTopic == "" {
+			t.Fatalf("gate.upstream_iteration_branch should be non-empty (draft has unmerged topic); got %q", upstreamTopic)
+		}
+		if !strings.Contains(upstreamTopic, "/draft/iter-1") {
+			t.Errorf("upstream_iteration_branch %q doesn't look like draft's topic ref", upstreamTopic)
 		}
 
 		h.mcpClaimAs(t, reviewer, "gate")
@@ -234,6 +241,120 @@ tasks:
 		gatePath := filepath.Join(h.runDir(1), "gate/result.md")
 		if body, ok := readRepoFileOnBranch(t, remoteURL, reviewTopic, gatePath); !ok || !strings.Contains(string(body), "REVIEW-VERDICT") {
 			t.Errorf("review topic missing its own result.md: ok=%v body=%q", ok, body)
+		}
+	})
+}
+
+// TestMCPReviewedTaskSubmitDoesNotMergeUntilApprove is the
+// dedicated pin for the phase 6b.2 ISSUE-001 fix: a task with a
+// downstream review must NOT merge to main on submit. The merge
+// moment is the review's approve. Without this gate, rejected
+// work pollutes main forever — exactly the launch-blocking
+// regression the v1 sanity report flagged.
+//
+// Where TestMCPApprovedReviewMergesUpstreamAndVerdict tests
+// the full happy path (draft → review approve → main advances),
+// this test isolates the gate itself: it asserts that the
+// draft's topic ref is pushed to the bare (audit trail) but
+// the run branch tip is unchanged after the draft submit. Any
+// future regression in `taskHasDownstreamReview` or in the
+// merge-gate suppression logic would surface as a moved main
+// SHA here.
+func TestMCPReviewedTaskSubmitDoesNotMergeUntilApprove(t *testing.T) {
+	eachRemoteMode(t, "MergeGate", func(t *testing.T, h *mcpHarness) {
+		requireRemote(t, h)
+		projectID := h.createTestProject()
+
+		yaml := `name: "merge gate pin"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: gate
+    action: review
+    reviews: draft
+    prompt: "Approve."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		remoteURL := h.remoteFor(projectID)
+		mainBefore := bareRefSHA(t, remoteURL, "main")
+		if mainBefore == "" {
+			t.Fatalf("main missing on bare before any submit")
+		}
+
+		h.mcpClaimOK(t, "draft")
+		h.mcpSubmitText(t, "draft", "WORK-IN-PROGRESS")
+
+		// Half 1 of the gate: main MUST NOT have moved. The
+		// draft's auto-accept (engine state machine) doesn't
+		// trigger a merge because of the downstream-review
+		// suppression in collectAcceptedMerges.
+		mainAfter := bareRefSHA(t, remoteURL, "main")
+		if mainAfter != mainBefore {
+			t.Errorf("merge gate broken: main advanced after submit of reviewed task:\n  before=%s\n  after=%s\nrejected/pending work would now be on main forever",
+				mainBefore, mainAfter)
+		}
+
+		// Half 2 of the gate: the topic ref MUST exist on the
+		// bare. The commit was pushed (audit trail) — only the
+		// merge to main was suppressed.
+		draftTask := h.taskGet("draft")
+		topic, _ := draftTask["latest_completed_branch"].(string)
+		if topic == "" {
+			t.Fatalf("draft.latest_completed_branch empty; cannot verify topic was pushed")
+		}
+		if sha := bareRefSHA(t, remoteURL, topic); sha == "" {
+			t.Errorf("draft topic %q missing from bare — submit didn't push, gate is over-suppressing", topic)
+		}
+	})
+}
+
+// TestMCPRequestChangesRelabelsClaimOutcome pins ISSUE-003 from
+// the v1 sanity report: when a review request_changes / reject
+// fires, the rejected iteration's claim row outcome must be
+// relabeled from "completed" (its row-level state when the
+// citizen submitted) to "rejected" (the verdict it actually
+// received). Without this relabel, every iteration in
+// list_iterations reads "completed" regardless of what really
+// happened, destroying the audit trail.
+func TestMCPRequestChangesRelabelsClaimOutcome(t *testing.T) {
+	eachRemoteMode(t, "OutcomeRelabel", func(t *testing.T, h *mcpHarness) {
+		reviewer := h.newMCPClientAs(t, "OutcomeReviewer")
+		projectID := h.createTestProject()
+
+		yaml := `name: "outcome relabel"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: gate
+    action: review
+    reviews: draft
+    prompt: "Approve."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// Iter-1: submit draft → request_changes.
+		h.mcpClaimOK(t, "draft")
+		h.mcpSubmitText(t, "draft", "first attempt")
+		h.mcpClaimAs(t, reviewer, "gate")
+		h.mcpSubmitReviewAs(t, reviewer, "gate", "needs work", "request_changes")
+
+		// list_iterations should now show iter-1 with
+		// outcome=rejected, NOT outcome=completed. Read the
+		// rendered output (the table format is
+		// "iter-N  @user  [<outcome>]").
+		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": h.taskID("draft"),
+		}))
+		if !strings.Contains(out, "[rejected]") {
+			t.Errorf("iter-1 outcome should be relabeled to 'rejected' after request_changes, got:\n%s", out)
+		}
+		if strings.Contains(out, "[completed]") {
+			t.Errorf("iter-1 outcome should NOT read 'completed' after request_changes (audit drift), got:\n%s", out)
 		}
 	})
 }

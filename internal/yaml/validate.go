@@ -62,6 +62,9 @@ func validate(p *Run) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateNoDuplicateReviewTargets(p); err != nil {
+		return nil, err
+	}
 	if err := validateForEachScopes(p, hasTaskLevelForEach); err != nil {
 		return nil, err
 	}
@@ -703,6 +706,59 @@ func isValidEnvName(s string) bool {
 		}
 	}
 	return true
+}
+
+// validateNoDuplicateReviewTargets refuses YAML where two
+// distinct review tasks both target the same task. Living-
+// workflow phase 6b.2 / multi-reviewer-per-task gate.
+//
+// The topic-branch + auto-merge model can't coherently merge
+// two review topics that fork from the same upstream: the
+// first approve advances main to review_a's tip, then the
+// second approve attempts to FF main → review_b's tip — which
+// isn't a descendant (review_b shares only the upstream's
+// commit with review_a, not review_a's verdict commit). The
+// FF refuses, surfacing the failure mode the reviewer can't
+// recover from.
+//
+// v1 stance is "refuse at parse time with a clear path
+// forward." Two recovery shapes for the YAML author:
+//
+//   - Use citizens: N on a single review task for quorum-
+//     style multi-citizen review (handled by the run-level
+//     multi-citizen gate).
+//   - Split the reviewers into sequential review stages
+//     (review_a depends_on draft, review_b depends_on
+//     review_a). Each stage merges in turn.
+//
+// v2 will lift the restriction once rebase-on-non-FF and
+// parallel-merge handling land; until then, parse-time
+// rejection beats silent breakage on the second approve.
+func validateNoDuplicateReviewTargets(p *Run) error {
+	// targetID → first reviewer task that claimed it. Compared
+	// pre-instance-expansion (against the bare `reviews:` field
+	// from the YAML) since for_each-scoped reviews of the same
+	// per-instance target are fine — each instance is a
+	// different upstream task.
+	firstReviewer := make(map[string]string)
+	for _, t := range p.Tasks {
+		if t.Action != "review" || t.Reviews == "" {
+			continue
+		}
+		if prior, dup := firstReviewer[t.Reviews]; dup {
+			return fmt.Errorf(
+				"task %q reviews %q but task %q already does; "+
+					"multi-reviewer-per-task is not supported in v1 "+
+					"(would produce non-FF merge on the second approve). "+
+					"Use citizens: N on a single review task for quorum-style "+
+					"multi-citizen review, or split the reviewers into "+
+					"sequential review stages (e.g. add depends_on so they "+
+					"approve in turn).",
+				t.ID, t.Reviews, prior)
+		}
+		firstReviewer[t.Reviews] = t.ID
+	}
+	return nil
 }
 
 // validateReviewTarget enforces the "reviews:" field contract:

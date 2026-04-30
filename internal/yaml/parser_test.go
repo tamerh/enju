@@ -562,6 +562,69 @@ tasks:
 	}
 }
 
+// TestParseRejectsMultiReviewerPerTask pins the phase 6b.2
+// parse-time gate that two distinct review tasks targeting the
+// same upstream are rejected. The auto-merge model can't FF-merge
+// two divergent review topics that share an upstream — the
+// second approve would refuse, after the YAML author has already
+// committed to the topology. Surfacing the error at parse time
+// gives them a clear path forward (citizens: N for quorum, or
+// sequential review stages).
+func TestParseRejectsMultiReviewerPerTask(t *testing.T) {
+	yamlData := []byte(`
+name: "Two reviewers"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "write"
+  - id: gate_a
+    action: review
+    reviews: draft
+    prompt: "review a"
+  - id: gate_b
+    action: review
+    reviews: draft
+    prompt: "review b"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting two reviewers of the same target")
+	}
+	for _, want := range []string{"gate_b", "gate_a", "draft", "multi-reviewer-per-task"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message missing %q: %s", want, err.Error())
+		}
+	}
+}
+
+// TestParseAcceptsReviewOfReviewSequentialChain confirms that
+// the multi-reviewer-per-task gate doesn't reject sequential
+// review stages where review_b reviews review_a (different
+// targets). That's the workaround the gate's error message
+// suggests, so it must remain valid YAML.
+func TestParseAcceptsReviewOfReviewSequentialChain(t *testing.T) {
+	yamlData := []byte(`
+name: "Sequential reviews"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "write"
+  - id: gate_a
+    action: review
+    reviews: draft
+    prompt: "first review"
+  - id: gate_b
+    action: review
+    reviews: gate_a
+    prompt: "review the review"
+`)
+	if _, err := Parse(yamlData); err != nil {
+		t.Fatalf("sequential review chain should parse: %v", err)
+	}
+}
+
 // --- Strict for_each validation (iteration 5 bugs 2/3/4) ---
 
 func TestParseRejectsEmptyForEachList(t *testing.T) {

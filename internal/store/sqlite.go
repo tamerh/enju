@@ -330,6 +330,9 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
+	CREATE INDEX IF NOT EXISTS idx_tasks_reviews_target
+	  ON tasks(run_id, reviews_target)
+	  WHERE reviews_target != '' AND action = 'review';
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
 	CREATE INDEX IF NOT EXISTS idx_citizens_token ON citizens(token);
 	CREATE INDEX IF NOT EXISTS idx_tokens_citizen ON tokens(citizen_id);
@@ -1812,6 +1815,98 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 	}
 	defer rows.Close()
 	return scanTaskClaims(rows)
+}
+
+// validRelabelOutcomes is the closed set of outcome values
+// MarkLatestCompletedClaimOutcome will write. Defends against
+// caller typos that would otherwise silently land a bogus
+// outcome the projection layer doesn't know how to render
+// (or worse, would case-fall-through and look "completed"
+// to a string-equality check).
+var validRelabelOutcomes = map[string]bool{
+	"rejected":  true, // request_changes / reject cascade
+	"abandoned": true, // future: caller declines without verdict
+}
+
+// HasReviewerOfTarget reports whether any task in `runID` is
+// an action:review whose `reviews_target` matches the given
+// (taskDefID, instanceKey) pair. Backed by the partial index
+// idx_tasks_reviews_target so the lookup is O(log N) regardless
+// of run size.
+//
+// Used by the merge gate (router.taskHasDownstreamReview) to
+// decide whether a just-submitted task's auto-accept should
+// also trigger a merge to main, or whether it's waiting for a
+// downstream reviewer's verdict.
+//
+// Caller passes (defID, instanceKey) and we reconstruct the
+// canonical reviews_target shape — bare def id for singleton
+// reviews, "instanceKey:defID" for per-instance ones (the
+// shape build.go's MakeFullID writes). Keeping the shape
+// reconstruction here, not at the call site, means the merge
+// gate doesn't need to know whether the run is for_each-
+// expanded or not.
+func (s *Store) HasReviewerOfTarget(runID int64, taskDefID, instanceKey string) (bool, error) {
+	target := taskDefID
+	if instanceKey != "" {
+		target = instanceKey + ":" + taskDefID
+	}
+	var present int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM tasks
+		 WHERE run_id = ? AND action = 'review' AND reviews_target = ?
+		 LIMIT 1`,
+		runID, target,
+	).Scan(&present)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkLatestCompletedClaimOutcome rewrites the outcome of the
+// most recent claim row for `taskID` whose outcome is currently
+// 'completed', setting it to `outcome`. Used by the cascade
+// path (request_changes / reject) to retroactively label a
+// submitted iteration with the verdict it actually received —
+// "completed" is true at the row level (the citizen DID submit)
+// but loses the audit info about whether the work was accepted
+// or thrown away. Living-workflow phase 6b.2 / ISSUE-003.
+//
+// Outcome MUST be a member of validRelabelOutcomes. The
+// allow-list is intentionally narrow — every valid relabel
+// corresponds to a specific cascade path and the projection
+// layer renders each one differently. Adding a new value is
+// a deliberate design choice, not a typo a caller can make
+// by accident.
+//
+// Returns the affected row count (0 if no completed claim
+// exists, e.g. because the task was invalidated before any
+// submission landed). Idempotent — calling it twice with the
+// same outcome is a no-op on the second call.
+func (s *Store) MarkLatestCompletedClaimOutcome(taskID, outcome string) (int64, error) {
+	if outcome == "" {
+		return 0, fmt.Errorf("outcome is required")
+	}
+	if !validRelabelOutcomes[outcome] {
+		return 0, fmt.Errorf("invalid relabel outcome %q (must be one of: rejected, abandoned)", outcome)
+	}
+	res, err := s.db.Exec(
+		`UPDATE task_claims SET outcome = ?
+		 WHERE id = (
+		   SELECT id FROM task_claims
+		   WHERE task_id = ? AND outcome = 'completed'
+		   ORDER BY submitted_at DESC, id DESC LIMIT 1
+		 )`,
+		outcome, taskID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ListActiveClaims returns every open (outcome = NULL) claim row
