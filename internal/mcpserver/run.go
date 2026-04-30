@@ -107,6 +107,13 @@ func (c *apiClient) handlePauseRun(ctx context.Context, req mcp.CallToolRequest)
 			return mcp.NewToolResultError(errMsg), nil
 		}
 		state, _ := resp["state"].(string)
+		// Distinguish "we just paused it" from "it was already
+		// paused, no-op" so the caller can tell whether the
+		// pause was actually effective. Behaviour is identical
+		// either way; the message just doesn't lie.
+		if changed, _ := resp["changed"].(bool); !changed {
+			return mcp.NewToolResultText(fmt.Sprintf("• Run %d:%d already paused (state: %s) [no-op]", projectID, runID, state)), nil
+		}
 		return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d paused (state: %s)", projectID, runID, state)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Run %d:%d paused", projectID, runID)), nil
@@ -174,6 +181,16 @@ func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolReques
 	data, err := c.get(ctx, endpoint)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	// The events endpoint normally returns a JSON array. When
+	// the server hits an error path (e.g. run_seq names a run
+	// that doesn't exist) it returns a single error object
+	// like {"error": "run not found"} with a 4xx status. Try
+	// to decode that shape first so the caller gets a usable
+	// message instead of the raw "cannot unmarshal object
+	// into []map" decoder error.
+	if errMsg := errorFromResponse(data); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
 	}
 	var events []map[string]interface{}
 	if err := json.Unmarshal(data, &events); err != nil {

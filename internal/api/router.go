@@ -1677,16 +1677,22 @@ func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.PauseRun(run.ID, member.CitizenID); err != nil {
+	changed, err := s.store.PauseRun(run.ID, member.CitizenID)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	updated, _ := s.store.GetRun(run.ID)
+	status := "paused"
+	if !changed {
+		status = "already_paused"
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "paused",
+		"status":  status,
 		"run_id":  fmt.Sprintf("%d:%d", projectID, runSeq),
 		"state":   string(updated.State),
-		"message": "run paused — SpawnTask now refuses on paused runs, but claims and submits still pass through. Full spawn-aware gating (claim/submit refusal) arrives with phase 4c.",
+		"changed": changed,
+		"message": "run paused — SpawnTask now refuses on paused runs, but claims and submits still pass through.",
 	})
 }
 
@@ -2214,6 +2220,11 @@ func (s *Server) handleSetCycleBudget(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 	var req setCycleBudgetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -2223,7 +2234,7 @@ func (s *Server) handleSetCycleBudget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "max must be positive")
 		return
 	}
-	if err := s.store.SetCycleBudgetMax(run.ID, req.Max); err != nil {
+	if err := s.store.SetCycleBudgetMax(run.ID, caller.ID, req.Max); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -2292,12 +2303,22 @@ func (s *Server) handleFileIssue(w http.ResponseWriter, r *http.Request) {
 		FiledBy:       caller.ID,
 	}
 	// found_in_run_seq is project-scoped; resolve to the run's
-	// global ID before storing. Soft-fails on lookup miss — the
-	// issue is still useful without it.
+	// global ID before storing. Hard-fail on lookup miss so the
+	// audit trail can't accumulate issues that point at runs
+	// that never existed — silent drops were the bug ISSUE-007
+	// flagged.
 	if req.FoundInRunSeq > 0 {
-		if run, err := s.store.GetRunByProjectSeq(projectID, req.FoundInRunSeq); err == nil && run != nil {
-			rec.FoundInRunID = run.ID
+		run, err := s.store.GetRunByProjectSeq(projectID, req.FoundInRunSeq)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "looking up found_in_run_seq: "+err.Error())
+			return
 		}
+		if run == nil {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("found_in_run_seq %d does not exist in project %d", req.FoundInRunSeq, projectID))
+			return
+		}
+		rec.FoundInRunID = run.ID
 	}
 
 	// CreateIssue emits issue_filed in the same tx as the
@@ -2518,8 +2539,17 @@ func (s *Server) issueToMap(it *store.IssueRecord) map[string]interface{} {
 		"filed_at":   it.FiledAt.UTC().Format(time.RFC3339),
 		"updated_at": it.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+	// Surface the per-project run seq (#1, #2, ...) — the
+	// citizen-facing identity. The internal DB id stays out
+	// of the response shape so a future filesystem mirror
+	// writes the human-meaningful number into ISSUE-NNN.md
+	// frontmatter. Lookup is best-effort: if the run was
+	// hard-deleted the field falls off silently rather than
+	// blocking the issue render.
 	if it.FoundInRunID > 0 {
-		m["found_in_run_id"] = it.FoundInRunID
+		if run, err := s.store.GetRun(it.FoundInRunID); err == nil && run != nil {
+			m["found_in_run_seq"] = run.Seq
+		}
 	}
 	if it.FoundInTaskID != "" {
 		m["found_in_task_id"] = it.FoundInTaskID

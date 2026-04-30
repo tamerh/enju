@@ -110,17 +110,29 @@ func (c *apiClient) handleGetIssue(ctx context.Context, req mcp.CallToolRequest)
 	}
 	out := fmt.Sprintf("---\nid: %v\ntitle: %v\nstatus: %v\nseverity: %v\nfiled_by: %v\nfiled_at: %v\n",
 		it["id"], it["title"], it["status"], it["severity"], it["filed_by"], it["filed_at"])
-	if it["found_in_run_id"] != nil {
-		out += fmt.Sprintf("found_in_run_id: %v\n", it["found_in_run_id"])
+	// Optional fields are emitted only when issueToMap actually
+	// included them. The previous version forced closed_by_task_id
+	// onto the line whenever closed_at was present, which printed
+	// the literal string "<nil>" when the issue closed without a
+	// linked task (e.g. status=wontfix). Treat each key
+	// independently so the YAML frontmatter stays parseable.
+	if v, ok := it["found_in_run_seq"]; ok && v != nil {
+		out += fmt.Sprintf("found_in_run_seq: %v\n", v)
 	}
-	if it["found_in_task_id"] != nil {
-		out += fmt.Sprintf("found_in_task_id: %v\n", it["found_in_task_id"])
+	if v, ok := it["found_in_task_id"]; ok && v != nil {
+		out += fmt.Sprintf("found_in_task_id: %v\n", v)
 	}
-	if it["triaged_at"] != nil {
-		out += fmt.Sprintf("triaged_at: %v\ntriaged_by: %v\n", it["triaged_at"], it["triaged_by"])
+	if v, ok := it["triaged_at"]; ok && v != nil {
+		out += fmt.Sprintf("triaged_at: %v\n", v)
 	}
-	if it["closed_at"] != nil {
-		out += fmt.Sprintf("closed_at: %v\nclosed_by_task_id: %v\n", it["closed_at"], it["closed_by_task_id"])
+	if v, ok := it["triaged_by"]; ok && v != nil {
+		out += fmt.Sprintf("triaged_by: %v\n", v)
+	}
+	if v, ok := it["closed_at"]; ok && v != nil {
+		out += fmt.Sprintf("closed_at: %v\n", v)
+	}
+	if v, ok := it["closed_by_task_id"]; ok && v != nil {
+		out += fmt.Sprintf("closed_by_task_id: %v\n", v)
 	}
 	out += "---\n"
 	if body, _ := it["body"].(string); body != "" {

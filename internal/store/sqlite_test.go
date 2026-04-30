@@ -465,7 +465,7 @@ func TestEvaluateRunState_PausedRunIsPreserved(t *testing.T) {
 	runID := createTestRun(t, s)
 	makeTask(t, s, runID, "t1", TaskReady)
 
-	if err := s.PauseRun(runID, 0); err != nil {
+	if _, err := s.PauseRun(runID, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Even though there's a ready task, EvaluateRunState
@@ -480,6 +480,36 @@ func TestEvaluateRunState_PausedRunIsPreserved(t *testing.T) {
 	}
 }
 
+func TestPauseRun_IdempotentReturnsChangedFalse(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	makeTask(t, s, runID, "t1", TaskReady)
+
+	changed, err := s.PauseRun(runID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("first pause: expected changed=true")
+	}
+
+	// Second pause is a no-op — same final state, but the
+	// store reports changed=false so callers can render
+	// "[no-op]" instead of pretending the action took effect.
+	changed, err = s.PauseRun(runID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("second pause: expected changed=false (already paused)")
+	}
+
+	// And no duplicate run_paused events were emitted.
+	if got := countEvents(t, s, runID, "run_paused"); got != 1 {
+		t.Fatalf("expected 1 run_paused event after re-pause, got %d", got)
+	}
+}
+
 func TestPauseRun_RefusedOnTerminalRun(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
@@ -491,7 +521,7 @@ func TestPauseRun_RefusedOnTerminalRun(t *testing.T) {
 	if r.State != RunCompleted {
 		t.Fatalf("setup: expected completed, got %s", r.State)
 	}
-	if err := s.PauseRun(runID, 0); err == nil {
+	if _, err := s.PauseRun(runID, 0); err == nil {
 		t.Fatal("expected error pausing completed run")
 	}
 }
@@ -502,7 +532,7 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskReady)
 	makeTask(t, s, runID, "t2", TaskPending)
 
-	if err := s.PauseRun(runID, 0); err != nil {
+	if _, err := s.PauseRun(runID, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -516,7 +546,7 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 
 	// Now pause again, downgrade the only ready task to pending,
 	// resume — should land on idle.
-	if err := s.PauseRun(runID, 0); err != nil {
+	if _, err := s.PauseRun(runID, 0); err != nil {
 		t.Fatal(err)
 	}
 	setTaskState(t, s, "t1", TaskPending)
@@ -585,14 +615,14 @@ func TestPauseResume_EmitEventsAttributedToCitizen(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskReady)
 	alice := createTestCitizen(t, s, "alice", "tok-pause")
 
-	if err := s.PauseRun(runID, alice); err != nil {
+	if _, err := s.PauseRun(runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_paused"); got != 1 {
 		t.Fatalf("expected one run_paused event, got %d", got)
 	}
 	// Idempotent second pause should NOT emit.
-	if err := s.PauseRun(runID, alice); err != nil {
+	if _, err := s.PauseRun(runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_paused"); got != 1 {
@@ -878,7 +908,7 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-3")
 
 	// Tighten the budget so we can exhaust it cheaply.
-	if err := s.SetCycleBudgetMax(runID, 2); err != nil {
+	if err := s.SetCycleBudgetMax(runID, 0, 2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -926,7 +956,7 @@ func TestSpawnTask_RefusedOnPausedRun(t *testing.T) {
 	makeTask(t, s, runID, "1:1:root", TaskReady)
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-4")
 
-	if err := s.PauseRun(runID, alice); err != nil {
+	if _, err := s.PauseRun(runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	_, err := s.SpawnTask(SpawnSpec{
@@ -987,10 +1017,10 @@ func TestSetCycleBudgetMax_RefusesBelowUsed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.SetCycleBudgetMax(runID, 3); err == nil {
+	if err := s.SetCycleBudgetMax(runID, 0, 3); err == nil {
 		t.Fatal("expected refusal: new max below current used")
 	}
-	if err := s.SetCycleBudgetMax(runID, 10); err != nil {
+	if err := s.SetCycleBudgetMax(runID, 0, 10); err != nil {
 		t.Fatalf("legitimate bump rejected: %v", err)
 	}
 }

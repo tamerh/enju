@@ -175,6 +175,16 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 		assignTo, spec.RequireRole, spec.Citizens, runSlug,
 		spec.ParentTaskID, spec.Trigger, spec.ClosesIssueSeq, now,
 	); err != nil {
+		// Translate the SQLite UNIQUE constraint into a
+		// domain message — the raw error leaks table/column
+		// names and an SQLite errno that's actionable to no
+		// caller. The most likely cause is a colliding
+		// task_def_id (template rule + same-issue retry
+		// without bumping the suffix), so name the field the
+		// caller can fix.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: tasks.id") {
+			return "", fmt.Errorf("task_def_id %q already exists in run %d — pick a different id (or bump the suffix on a re-spawn)", spec.TaskDefID, spec.RunID)
+		}
 		return "", fmt.Errorf("inserting spawned task: %w", err)
 	}
 
@@ -312,15 +322,48 @@ func likeEscape(s string) string {
 
 // SetCycleBudgetMax bumps the budget cap on a run. Use to give
 // a paused-by-exhaustion run room to keep going. Refuses if the
-// new max is below current used (would be immediately exhausted).
-func (s *Store) SetCycleBudgetMax(runID int64, newMax int) error {
-	used, _, err := s.GetCycleBudget(runID)
+// new max is below current used (would be immediately
+// exhausted). Emits `cycle_budget_changed` in the same tx as
+// the UPDATE so the audit log captures who raised the safety
+// cap and when — set_cycle_budget is a privileged operator
+// action and the event log is its only after-the-fact record.
+func (s *Store) SetCycleBudgetMax(runID int64, citizenID int64, newMax int) error {
+	tx, err := s.db.Begin()
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var used, oldMax int
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT cycle_budget_used, cycle_budget_max, project_id FROM runs WHERE id = ?`, runID,
+	).Scan(&used, &oldMax, &projectID); err != nil {
 		return err
 	}
 	if newMax < used {
 		return fmt.Errorf("new max %d is below current used %d — would be immediately exhausted", newMax, used)
 	}
-	_, err = s.db.Exec(`UPDATE runs SET cycle_budget_max = ?, updated_at = ? WHERE id = ?`, newMax, time.Now(), runID)
-	return err
+	if newMax == oldMax {
+		// No-op set; don't emit a noise event.
+		return tx.Commit()
+	}
+
+	now := time.Now()
+	if _, err := tx.Exec(
+		`UPDATE runs SET cycle_budget_max = ?, updated_at = ? WHERE id = ?`,
+		newMax, now, runID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
+		 VALUES (?, 'cycle_budget_changed', '', '', ?, ?, ?, ?)`,
+		citizenID, runID, projectID,
+		fmt.Sprintf(`{"old_max":%d,"new_max":%d,"used":%d}`, oldMax, newMax, used),
+		now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

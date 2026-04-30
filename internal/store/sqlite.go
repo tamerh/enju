@@ -1219,13 +1219,18 @@ func (s *Store) recordRunLifecycleEvent(runID int64, eventType, fromState, toSta
 // run is already terminal (completed / failed) — pause is for
 // alive runs only. Idempotent on already-paused runs (no event
 // emitted on the second call).
-func (s *Store) PauseRun(runID int64, citizenID int64) error {
+//
+// Returns (changed, error): changed=true when an active|idle
+// run was actually transitioned to paused; false when the run
+// was already paused (caller can render a "[no-op]" hint
+// instead of pretending the action took effect).
+func (s *Store) PauseRun(runID int64, citizenID int64) (bool, error) {
 	var current string
 	if err := s.db.QueryRow(`SELECT state FROM runs WHERE id = ?`, runID).Scan(&current); err != nil {
-		return err
+		return false, err
 	}
 	if RunState(current) == RunPaused {
-		return nil
+		return false, nil
 	}
 	now := time.Now()
 	res, err := s.db.Exec(
@@ -1234,14 +1239,14 @@ func (s *Store) PauseRun(runID int64, citizenID int64) error {
 		now, runID,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("run %d cannot be paused (already terminal or not found)", runID)
+		return false, fmt.Errorf("run %d cannot be paused (already terminal or not found)", runID)
 	}
 	s.recordRunLifecycleEvent(runID, "run_paused", current, "paused", citizenID, now)
-	return nil
+	return true, nil
 }
 
 // ResumeRun moves a paused run back to active or idle, depending
