@@ -1678,7 +1678,7 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	if !s.store.Events().Enabled() {
 		w.Header().Set("X-Enju-Audit-Disabled", "true")
 	}
-	events, err := s.store.ListRunEvents(run.ID)
+	events, err := s.store.ListRunEvents(run.ProjectID, run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
 		return

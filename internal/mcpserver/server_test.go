@@ -1126,6 +1126,40 @@ func TestInitAcceptsAlreadyAdoptedRepo(t *testing.T) {
 	}
 }
 
+// TestInitDetectsEnjuBinaryNotMistakenForScaffold pins the
+// IsDir discrimination on the safety check. The enju repo
+// itself is a populated git repo whose root contains the
+// compiled `enju` binary as a regular file. Without the IsDir
+// check, an os.Stat-only marker test would treat the binary
+// as an "enju/" scaffold marker and skip refusal — defeating
+// the safety gate exactly in the scenario it's there to catch
+// (calling LLM adopting the enju source repo).
+func TestInitDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create a regular file named "enju" — mimics the compiled
+	// binary in the enju source repo.
+	if err := os.WriteFile(filepath.Join(dir, "enju"), []byte("#!/bin/sh\nexec real-enju\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wt, _ := repo.Worktree()
+	wt.Add(".")
+	sig := &object.Signature{Name: "User", Email: "u@e.com", When: time.Now()}
+	wt.Commit("source repo with enju binary", &gogit.CommitOptions{Author: sig, Committer: sig})
+
+	if reason := detectPopulatedUnrelatedRepo(dir); reason == "" {
+		t.Error("expected refusal for populated repo with regular-file 'enju' (compiled binary), got empty (mistaken for scaffold)")
+	}
+}
+
 // TestInitFolderWithoutGit verifies that enju_init on a plain
 // folder (no .git) initializes git, writes the scaffold, and
 // registers the external dir so ForProject opens it directly.

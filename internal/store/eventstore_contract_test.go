@@ -78,7 +78,7 @@ type brokenEventStore struct{}
 
 func (brokenEventStore) Record(Event) {} // silent drop, mimics post-Close behavior
 
-func (brokenEventStore) QueryByRun(context.Context, int64, time.Time, int) ([]Event, error) {
+func (brokenEventStore) QueryByRun(context.Context, int64, int64, time.Time, int) ([]Event, error) {
 	return nil, errors.New("simulated event store failure")
 }
 func (brokenEventStore) QueryByCitizen(context.Context, int64, int) ([]Event, error) {

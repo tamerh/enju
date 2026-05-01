@@ -70,7 +70,7 @@ func TestEventStoreOpenCloseRoundTrip(t *testing.T) {
 	// Async writer: wait for the event to land before reading.
 	waitForPersisted(t, es, 1, time.Second)
 
-	got, err := es.QueryByRun(context.Background(), 1, time.Time{}, 10)
+	got, err := es.QueryByRun(context.Background(), 1, 1, time.Time{}, 10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestEventStoreKillSwitch(t *testing.T) {
 	}
 
 	// Reads return the sentinel error.
-	_, err = es.QueryByRun(context.Background(), 1, time.Time{}, 10)
+	_, err = es.QueryByRun(context.Background(), 1, 1, time.Time{}, 10)
 	if !errors.Is(err, ErrEventStoreDisabled) {
 		t.Errorf("expected ErrEventStoreDisabled, got %v", err)
 	}
@@ -123,7 +123,7 @@ func TestEventStoreKillSwitch(t *testing.T) {
 
 	waitForPersisted(t, es, 1, time.Second)
 
-	got, err := es.QueryByRun(context.Background(), 1, time.Time{}, 10)
+	got, err := es.QueryByRun(context.Background(), 1, 1, time.Time{}, 10)
 	if err != nil {
 		t.Fatalf("query after re-enable: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestStoreEventsReturnsNoopBeforeAttach(t *testing.T) {
 
 	// Reads return ErrEventStoreDisabled — same shape as
 	// the operator-killed real store.
-	_, err = es.QueryByRun(context.Background(), 1, time.Time{}, 10)
+	_, err = es.QueryByRun(context.Background(), 1, 1, time.Time{}, 10)
 	if !errors.Is(err, ErrEventStoreDisabled) {
 		t.Errorf("expected ErrEventStoreDisabled from noop store, got %v", err)
 	}
@@ -323,7 +323,7 @@ func TestEventStoreGracefulShutdownDrainsQueue(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer es2.Close()
-	got, err := es2.QueryByRun(context.Background(), 1, time.Time{}, 1000)
+	got, err := es2.QueryByRun(context.Background(), 1, 1, time.Time{}, 1000)
 	if err != nil {
 		t.Fatalf("query after reopen: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestEventStoreOrderingFIFO(t *testing.T) {
 	}
 	waitForPersisted(t, es, N, time.Second)
 
-	got, err := es.QueryByRun(context.Background(), 1, time.Time{}, N+10)
+	got, err := es.QueryByRun(context.Background(), 1, 1, time.Time{}, N+10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestEventStoreSeqMonotonePerProject(t *testing.T) {
 	}
 	waitForPersisted(t, es, 6, time.Second)
 
-	got1, _ := es.QueryByRun(context.Background(), 0, time.Time{}, 100)
+	got1, _ := es.QueryByRun(context.Background(), 0, 0, time.Time{}, 100)
 	_ = got1 // run-scoped query returns []; we want project queries
 
 	// Use Query (generic) to filter by project.
@@ -474,6 +474,85 @@ func TestEventStoreSeqMonotonePerProject(t *testing.T) {
 				t.Errorf("%s seq[%d]=%d, want %d (each project should have its own 1..N)", projectName, i, s, want[i])
 			}
 		}
+	}
+}
+
+// TestEventStoreQueryByRunDoesNotLeakAcrossProjects pins the
+// scoping invariant that ListRunEvents (and via it,
+// enju_export_run_events) relies on: filtering events by run_id
+// alone must not leak events from a different project that
+// happens to share a run_seq with the queried project.
+//
+// Concretely, the run_id stored on events is the global runs.id
+// (auto-increment, project-independent) — so two projects each
+// having a run with seq=1 still get unique global ids, and a
+// QueryByRun for one's id never sees the other's events. A
+// regression where anything emits events with RunID set to the
+// per-project seq (instead of the global id) would silently
+// pollute exports across projects.
+func TestEventStoreQueryByRunDoesNotLeakAcrossProjects(t *testing.T) {
+	dir := t.TempDir()
+	es, err := NewSQLiteEventStore(filepath.Join(dir, "events.db"), nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer es.Close()
+
+	// Project 2's first run has global runs.id = 100.
+	// Project 3's first run has global runs.id = 101.
+	// Both share per-project seq = 1, but different global IDs.
+	const (
+		projA, runIDA = int64(2), int64(100)
+		projB, runIDB = int64(3), int64(101)
+	)
+
+	for i := 0; i < 5; i++ {
+		es.Record(Event{
+			ProjectID: projA, RunID: runIDA,
+			EventType: "task_completed", CreatedAt: time.Now(),
+		})
+		es.Record(Event{
+			ProjectID: projB, RunID: runIDB,
+			EventType: "task_completed", CreatedAt: time.Now(),
+		})
+	}
+	waitForPersisted(t, es, 10, time.Second)
+
+	// Query project B's run with the (project, run) pair. Must
+	// return only B's 5 events.
+	got, err := es.QueryByRun(context.Background(), projB, runIDB, time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("QueryByRun: %v", err)
+	}
+	if len(got) != 5 {
+		t.Errorf("expected 5 events for project B's run, got %d", len(got))
+	}
+	for _, e := range got {
+		if e.RunID != runIDB || e.ProjectID != projB {
+			t.Errorf("leak: got event with run_id=%d project_id=%d, want run_id=%d project_id=%d",
+				e.RunID, e.ProjectID, runIDB, projB)
+		}
+	}
+
+	// Defense-in-depth: simulate the dev-environment scenario
+	// where state.db gets reset and runs.id is reissued. Inject
+	// an event for project B's run_id but with project A's
+	// project_id (representing leftover events from a previous
+	// project that owned this run_id). QueryByRun(projB, runIDB)
+	// must still return only 5 events — the project_id filter
+	// keeps the leftover out.
+	es.Record(Event{
+		ProjectID: projA, RunID: runIDB,
+		EventType: "task_completed", CreatedAt: time.Now(),
+	})
+	waitForPersisted(t, es, 11, time.Second)
+
+	got, err = es.QueryByRun(context.Background(), projB, runIDB, time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("QueryByRun after pollution: %v", err)
+	}
+	if len(got) != 5 {
+		t.Errorf("expected 5 events after cross-project pollution, got %d (project_id filter not applied?)", len(got))
 	}
 }
 
@@ -614,11 +693,11 @@ func TestEventStoreAttachWiresThrough(t *testing.T) {
 		t.Error("after Attach, Events() should return the enabled real store")
 	}
 	es.Record(Event{
-		CitizenID: 99, EventType: "test", RunID: 1,
+		CitizenID: 99, EventType: "test", RunID: 1, ProjectID: 1,
 		CreatedAt: time.Now(),
 	})
 	waitForPersisted(t, real, 1, time.Second)
-	got, err := es.QueryByRun(context.Background(), 1, time.Time{}, 10)
+	got, err := es.QueryByRun(context.Background(), 1, 1, time.Time{}, 10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

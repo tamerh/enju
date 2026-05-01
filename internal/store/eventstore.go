@@ -143,7 +143,16 @@ type EventStore interface {
 	// Used by enju_show_events and enju_export_run_events.
 	// Returns ErrEventStoreDisabled when the kill-switch is
 	// engaged.
-	QueryByRun(ctx context.Context, runID int64, since time.Time, limit int) ([]Event, error)
+	//
+	// Scoped by (project_id, run_id) — both required. The
+	// project_id filter is defense-in-depth: even though
+	// runs.id is a globally-unique autoincrement in steady
+	// state, state-DB resets, migrations, and dev environments
+	// where state.db is wiped while events.db is preserved
+	// can reissue the same runs.id to a different project.
+	// Filtering by project_id ensures the run's events stay
+	// scoped to its owning project across those scenarios.
+	QueryByRun(ctx context.Context, projectID, runID int64, since time.Time, limit int) ([]Event, error)
 
 	// QueryByCitizen returns events for a citizen across all
 	// projects, ordered by seq. Used by profile/contribution

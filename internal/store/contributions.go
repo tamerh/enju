@@ -396,11 +396,11 @@ type RunEventRecord struct {
 // Disabled EventStore → returns an empty slice + nil error.
 // Matches the rest of the read API: audit emission off means
 // the run timeline shows nothing, not a 5xx.
-func (s *Store) ListRunEvents(runID int64) ([]RunEventRecord, error) {
+func (s *Store) ListRunEvents(projectID, runID int64) ([]RunEventRecord, error) {
 	var events []RunEventRecord
 
 	ctx := context.Background()
-	rawEvents, err := s.Events().QueryByRun(ctx, runID, time.Time{}, 0)
+	rawEvents, err := s.Events().QueryByRun(ctx, projectID, runID, time.Time{}, 0)
 	if err != nil {
 		if errors.Is(err, ErrEventStoreDisabled) {
 			return nil, nil

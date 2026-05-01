@@ -25,7 +25,7 @@ type noopEventStore struct{}
 
 func (noopEventStore) Record(Event) {}
 
-func (noopEventStore) QueryByRun(context.Context, int64, time.Time, int) ([]Event, error) {
+func (noopEventStore) QueryByRun(context.Context, int64, int64, time.Time, int) ([]Event, error) {
 	return nil, ErrEventStoreDisabled
 }
 

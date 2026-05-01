@@ -245,11 +245,29 @@ func detectPopulatedUnrelatedRepo(dirPath string) string {
 		return ""
 	}
 	// Has commits. Check for Enju markers — either the scaffold
-	// directory or the project conf file. Either signals "this
+	// directory or a project conf file. Either signals "this
 	// directory is already an Enju project, adoption is a re-
 	// adoption (idempotent)."
-	for _, marker := range []string{"enju", "enju/conf.yaml", "enju.yaml"} {
-		if _, err := os.Stat(filepath.Join(dirPath, marker)); err == nil {
+	//
+	// Type discrimination matters: in the enju repo itself, the
+	// compiled binary is named `enju` (a regular file at repo
+	// root), which would false-positive-match an "enju path
+	// exists" check. Require the directory marker to be a
+	// directory, and the YAML markers to be regular files.
+	markers := []struct {
+		rel  string
+		isDir bool
+	}{
+		{"enju", true},        // scaffold directory
+		{"enju/conf.yaml", false}, // project conf file
+		{"enju.yaml", false},     // legacy / alt-location project conf
+	}
+	for _, m := range markers {
+		info, err := os.Stat(filepath.Join(dirPath, m.rel))
+		if err != nil {
+			continue
+		}
+		if info.IsDir() == m.isDir {
 			return ""
 		}
 	}

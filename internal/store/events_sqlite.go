@@ -577,7 +577,7 @@ func (s *SQLiteEventStore) persistOne(event Event) error {
 // timeline placement will look surprising. Either populate
 // project_id at emit time, or change the sort to
 // `id ASC` when project_id=0 events become a real case.
-func (s *SQLiteEventStore) QueryByRun(ctx context.Context, runID int64, since time.Time, limit int) ([]Event, error) {
+func (s *SQLiteEventStore) QueryByRun(ctx context.Context, projectID, runID int64, since time.Time, limit int) ([]Event, error) {
 	if !s.enabled.Load() {
 		return nil, ErrEventStoreDisabled
 	}
@@ -587,10 +587,10 @@ func (s *SQLiteEventStore) QueryByRun(ctx context.Context, runID int64, since ti
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, seq, citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at
 		 FROM events
-		 WHERE run_id = ? AND created_at >= ?
+		 WHERE project_id = ? AND run_id = ? AND created_at >= ?
 		 ORDER BY seq ASC, id ASC
 		 LIMIT ?`,
-		runID, since, limit,
+		projectID, runID, since, limit,
 	)
 	if err != nil {
 		return nil, err
