@@ -1,0 +1,18 @@
+# enju.conf — server config for `enju serve`.
+# Copy to ~/.enju/enju.conf or pass via -config. All keys optional;
+# missing keys use the defaults shown. CLI flags override config.
+
+coordinator:
+  bind: ""              # empty = all interfaces
+  port: 8000
+
+data:
+  state_db: "enju.db"
+  events_db: ""         # empty = sibling of state_db (e.g. enju-events.db)
+
+events:
+  emission_enabled: true   # kill-switch; flip live by editing this file + SIGHUP
+
+logging:
+  level: "info"          # debug | info | warn | error
+  output: "stdout"        # stdout | stderr | file path

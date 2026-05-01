@@ -61,7 +61,7 @@ Core model:
 - Templates are reproducible bundles. enju_create_run(path=enju/templates/foo) snapshots the full bundle (enju.yaml + scripts + data) into enju/runs/{seq}/template-snapshot/ at creation. The run is pinned to that frozen copy — later live-template edits don't affect in-flight runs. Compute scripts resolve from the snapshot.
 - Compute scripts get both env vars (ENJU_TASK_ID, ENJU_PROJECT_DIR, ENJU_RUN_DIR, ENJU_TEMPLATE_DIR, ENJU_PARAM_<name> for each param + iteration var) and a structured $ENJU_RUN_DIR/context.json with typed params/iteration/artifact declarations. Use env vars for shell, context.json for anything richer.
 
-Starting: If the user wants to start fresh, use enju_create_project. If they have an existing folder or repo, use enju_init. When unclear, ask.
+Starting: If the user wants to start fresh, use enju_create_project — workspace lands at ~/.enju/workspaces/<slug>-<id>/, no risk of adopting your cwd. If they have an existing folder or repo, use enju_init and pass path= explicitly (your cwd may be a different project than the one being adopted — very common when running inside one repo while creating an Enju project for another). When unclear, ask.
 
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 
