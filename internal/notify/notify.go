@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -81,10 +82,22 @@ type Config struct {
 	// fall back to the table in ratelimit.go.
 	RateLimits map[string]rateLimit
 
-	// StateFile is the path where Run persists last_seq across
-	// restarts. Writes are atomic (tmp + rename). Empty path
-	// means "don't persist" — the daemon resumes from the
-	// current head on every restart.
+	// ProjectDir is the project's local clone directory (e.g.
+	// ~/.enju/workspaces/tp53-paper-5/). All project-scoped state
+	// — the cursor file, the live.jsonl event log, the user
+	// rules file — lives under {ProjectDir}/enju/. Empty means
+	// "don't persist anything to disk"; tests that supply
+	// in-memory configs leave it blank.
+	//
+	// Invariant: when ProjectDir is set, StateFile is ignored —
+	// the cursor lives at {ProjectDir}/enju/events/cursor.json.
+	// StateFile remains for explicit-path tests.
+	ProjectDir string
+
+	// StateFile is the legacy explicit-path cursor used by tests
+	// that set up cursor state without a full project workspace.
+	// In production callers, leave empty; ProjectDir derives the
+	// path automatically.
 	StateFile string
 
 	// PollWait is the per-request long-poll duration ("?wait=").
@@ -157,7 +170,7 @@ func Run(ctx context.Context, cfg Config) error {
 		pollWait = 30 * time.Second
 	}
 
-	state, _ := loadState(cfg.StateFile) // missing file = empty state, fine
+	state, _ := loadState(cursorPath(cfg)) // missing file = empty state, fine
 
 	// Compose user rules with Layer 1 defaults. Defaults come
 	// first so they're evaluated first; ordering doesn't affect
@@ -172,7 +185,7 @@ func Run(ctx context.Context, cfg Config) error {
 	logger.Info("notify loop started",
 		"project_id", cfg.ProjectID,
 		"citizen", cfg.Username,
-		"since", state.LastSeen,
+		"since_seq", state.LastSeq,
 		"defaults", len(defaults),
 		"user_rules", len(cfg.Rules),
 	)
@@ -185,7 +198,7 @@ func Run(ctx context.Context, cfg Config) error {
 		default:
 		}
 
-		events, err := pollEvents(ctx, httpClient, cfg, pollWait, state.LastSeen)
+		events, err := pollEvents(ctx, httpClient, cfg, pollWait, state.LastSeq)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -199,11 +212,31 @@ func Run(ctx context.Context, cfg Config) error {
 			continue
 		}
 
+		// Server returns newest-first; iterate oldest-first so
+		// cursor advances monotonically and dispatch order matches
+		// causal order.
+		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+			events[i], events[j] = events[j], events[i]
+		}
+
 		dispatcher := cfg.Dispatcher
 		if dispatcher == nil {
 			dispatcher = dispatch
 		}
+		jsonlPath := liveJSONLPath(cfg)
 		for _, ev := range events {
+			// Append to local audit log BEFORE dispatch. If we
+			// crash between log-write and dispatch, the next run
+			// catches up via cursor — events aren't lost. If we
+			// crash between dispatch and log-write, the user got
+			// notified but the local log lacks the entry — also
+			// recoverable on next poll because the cursor hasn't
+			// advanced yet.
+			if jsonlPath != "" {
+				if err := appendEventToLog(jsonlPath, ev); err != nil {
+					logger.Warn("notify log append failed", "path", jsonlPath, "error", err)
+				}
+			}
 			matched := matchRulesAgainst(allRules, ev, cfg)
 			for _, rule := range matched {
 				if !limiter.allow(rule, cfg) {
@@ -216,41 +249,31 @@ func Run(ctx context.Context, cfg Config) error {
 						"rule", rule.Name, "event_type", ev.Type, "error", err)
 				}
 			}
-			// Cursor advance: bump 1ns past the event timestamp.
-			// The coordinator's /events?since= filter is inclusive
-			// (`created_at >= since`), so storing the raw timestamp
-			// would re-fetch the same event on the next poll and
-			// dispatch it forever. +1ns shifts the cursor strictly
-			// past this event without skipping any (timestamps are
-			// nanosecond-resolution wall-clock, near-zero collision
-			// risk in real workloads).
-			if next := ev.Timestamp.Add(time.Nanosecond); next.After(state.LastSeen) {
-				state.LastSeen = next
+			// Cursor advance: server's since_seq filter is strict
+			// `>`, so saving the event's seq is exact. Next poll
+			// returns "everything strictly after this." No +1
+			// dance, no edge cases.
+			if ev.Seq > state.LastSeq {
+				state.LastSeq = ev.Seq
 			}
 		}
 
 		// Persist after each batch — bounded staleness on crash.
 		// Atomic write so a half-finished file isn't readable.
-		if err := saveState(cfg.StateFile, state); err != nil {
+		if err := saveState(cursorPath(cfg), state); err != nil {
 			logger.Warn("notify state save failed", "error", err)
 		}
 	}
 }
 
 // pollEvents issues one long-poll request and returns the
-// decoded events. since is the last-seen timestamp; the
-// coordinator returns events strictly after it.
-func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.Duration, since time.Time) ([]Event, error) {
+// decoded events. sinceSeq is the strict-`>` cursor; the
+// coordinator returns events with seq > sinceSeq.
+func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.Duration, sinceSeq int64) ([]Event, error) {
 	q := url.Values{}
 	q.Set("wait", wait.String())
-	if !since.IsZero() {
-		// Fixed-width nanos. time.RFC3339Nano (".999999999") strips
-		// trailing zeros, so a cursor of e.g. .387655150 serializes
-		// as .38765515 — which the server then re-parses as the
-		// smaller fractional 387,651,500ns and re-matches the same
-		// event. The .000000000 layout pins all 9 digits and avoids
-		// the round-trip precision loss.
-		q.Set("since", since.UTC().Format("2006-01-02T15:04:05.000000000Z07:00"))
+	if sinceSeq > 0 {
+		q.Set("since_seq", strconv.FormatInt(sinceSeq, 10))
 	}
 	endpoint := fmt.Sprintf("%s/api/v1/projects/%d/events?%s",
 		strings.TrimRight(cfg.CoordinatorURL, "/"), cfg.ProjectID, q.Encode())
@@ -287,10 +310,45 @@ func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.
 // in dependency closure (matters for the future Tier 2
 // standalone binary).
 type Event struct {
+	Seq       int64     `json:"seq"`
 	Timestamp time.Time `json:"ts"`
 	Type      string    `json:"type"`
 	Subtype   string    `json:"subtype,omitempty"`
 	TaskID    string    `json:"task_id,omitempty"`
 	Citizen   string    `json:"citizen,omitempty"`
 	Metadata  any       `json:"metadata,omitempty"`
+}
+
+
+// cursorPath resolves the cursor file location for this loop.
+// Project-scoped path takes precedence over the legacy explicit
+// StateFile (which test fixtures still rely on).
+func cursorPath(cfg Config) string {
+	if cfg.StateFile != "" {
+		return cfg.StateFile
+	}
+	if cfg.ProjectDir == "" {
+		return ""
+	}
+	return cfg.ProjectDir + "/enju/events/cursor.json"
+}
+
+// UserConfigPath returns the canonical project-scoped notify.yaml
+// location for a given project clone dir. Exported so callers
+// outside the package (notifySession) can compute it from a path
+// they have but resolve the layout convention from one place.
+func UserConfigPath(projectDir string) string {
+	if projectDir == "" {
+		return ""
+	}
+	return projectDir + "/enju/notify.yaml"
+}
+
+// liveJSONLPath resolves the append-only event log path. Empty
+// when ProjectDir is unset (writes skip cleanly).
+func liveJSONLPath(cfg Config) string {
+	if cfg.ProjectDir == "" {
+		return ""
+	}
+	return cfg.ProjectDir + "/enju/events/live.jsonl"
 }

@@ -60,11 +60,11 @@ type apiClient struct {
 	profileEmail string
 	profileKind  string // "human" | "bot" | "model" — see citizenKind()
 
-	// notifySup is the auto-subscribe notification supervisor.
+	// notifySess is the auto-subscribe notification session.
 	// Nil when Config.Notify wasn't supplied; handlers that call
-	// notifySup.Switch tolerate nil receivers as a no-op so the
+	// notifySess.Switch tolerate nil receivers as a no-op so the
 	// "notify disabled" path costs nothing at the call site.
-	notifySup *notifySupervisor
+	notifySess *notifySession
 }
 
 func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {

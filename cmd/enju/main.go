@@ -285,13 +285,6 @@ func cmdMCP(args []string) {
 	// true: local mode is normally a single-user dev path
 	// where the kill-switch isn't load-bearing.
 	localEventsEnabled := fs.Bool("events-enabled", true, "Local-mode only: enable the embedded coordinator's event store at boot")
-	// Notify-bot opt-in. When set, this MCP process also runs an
-	// embedded notification poller for the named project (Tier 1
-	// of docs/notifications.md). Layer 1 defaults plus any rules
-	// from ~/.enju/notify.yaml apply. Unset (default) → no
-	// background polling, zero added cost.
-	notifyProject := fs.Int64("notify-project", 0, "If non-zero, run the bundled notification poller for this project ID. Honors ~/.enju/notify.yaml.")
-	notifyConfigPath := fs.String("notify-config", "", "Path to notify.yaml (default ~/.enju/notify.yaml)")
 	fs.Parse(args)
 
 	resolvedCredsPath := resolveCredentialsPath(*credsPath)
@@ -408,15 +401,15 @@ func cmdMCP(args []string) {
 		os.Exit(1)
 	}
 
-	// Tier 1 notification poller — auto-subscribes to the project
-	// the user is working with. The supervisor inside mcpserver
-	// resumes from ~/.enju/notify-active.json on startup; tool
-	// handlers (create_project, init) call Switch when the user
-	// touches a project, so the active record stays current.
-	// -notify-project, when non-zero, overrides the saved record.
+	// Tier 1 notification session — stays dormant at boot. When
+	// the user calls enju_create_project or enju_init, mcpserver
+	// fires notifySession.Switch and the polling loop activates
+	// for that project. All notify state (cursor, event log,
+	// rules) lives under the project's enju/ directory; nothing
+	// in ~/.enju/.
 	notifyCtx, cancelNotify := context.WithCancel(context.Background())
 	defer cancelNotify()
-	notifyOpts := buildNotifyOptions(notifyCtx, logger, credsKey, *notifyConfigPath, *notifyProject)
+	notifyOpts := &mcpserver.NotifyOptions{ParentCtx: notifyCtx}
 
 	s := mcpserver.New(mcpserver.Config{
 		CoordinatorURL: *coordinator,
@@ -441,39 +434,6 @@ func cmdMCP(args []string) {
 	fmt.Fprintf(os.Stderr, "MCP server exited cleanly\n")
 }
 
-// buildNotifyOptions assembles the boot-time wiring the
-// mcpserver supervisor needs to manage notify lifecycles. The
-// supervisor itself takes over from here: it auto-resumes from
-// ~/.enju/notify-active.json on startup, switches projects when
-// tool handlers (create_project, init) fire, and dies cleanly
-// when ctx is cancelled. Returns nil when home-dir discovery
-// fails (Layer 3 config can't be located), which mcpserver
-// treats as "notify disabled" and the cost is zero.
-//
-// initialProjectID, when non-zero, is the explicit -notify-project
-// flag override; mcpserver kicks off polling for that project
-// regardless of any saved active record.
-func buildNotifyOptions(ctx context.Context, logger *slog.Logger, coordinatorKey, configPath string, initialProjectID int64) *mcpserver.NotifyOptions {
-	home, homeErr := os.UserHomeDir()
-	if homeErr != nil {
-		logger.Warn("notify: cannot resolve user home dir — disabling notification subsystem for this session",
-			"err", homeErr)
-		return nil
-	}
-	if configPath == "" {
-		configPath = filepath.Join(home, ".enju", "notify.yaml")
-	}
-	return &mcpserver.NotifyOptions{
-		UserConfigPath:    configPath,
-		StateFileFunc:     func(pid int64) string {
-			return filepath.Join(home, ".enju", fmt.Sprintf("notify-state-%d.json", pid))
-		},
-		ActiveProjectPath: filepath.Join(home, ".enju", "notify-active.json"),
-		CoordinatorKey:    coordinatorKey,
-		ParentCtx:         ctx,
-		InitialProjectID:  initialProjectID,
-	}
-}
 
 // --- wrap-task ---
 

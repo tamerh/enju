@@ -6,28 +6,37 @@ package notify
 // without configuring anything. Toggleable per-name via
 // Config.DisableDefaults.
 //
-// Today's set is deliberately small. Most of the design doc's
-// proposed defaults (assigned_task_ready, my_review_resolved,
-// issue_in_owned_project) need server-side enrichment of the
-// events response — fields like assign_to and run.creator
-// aren't currently included. Phase 4d (server enrichment +
-// Tier 1 wiring) unlocks the rest. For now we ship two
-// defaults that work with the current Event shape so the
-// framework is exercised end-to-end:
+// Project scope is implicit: notifySession polls one project's
+// /events feed, so every event reaching this matcher is already
+// the active project's event. Predicate filters narrow further
+// (Citizen=={{me}} for "my-X" rules; type-only for project-pulse
+// rules that fire on any project member's action).
 //
-//   my_task_completed — fires when a task you acted on resolves
-//   my_task_failed   — fires when a task you acted on fails
+// Three categories shipped:
 //
-// Both filter by Citizen=={{me}} which matches today's event
-// emission semantics (the citizen who submitted the work).
-// Adding richer defaults later is purely additive — append to
-// compiledDefaults and define rate limits in ratelimit.go.
+//   "my-X" defaults — fire only on events I caused/own
+//     my_task_completed
+//     my_task_failed
+//
+//   project-pulse defaults — fire on any project member's events
+//     branch_merged
+//     issue_filed
+//     cycle_budget_exhausted
+//     task_request_changes
+//     run_completed
+//     run_paused
+//     run_resumed
+//
+// Adding richer "for me specifically" rules (assigned_task_ready,
+// my_review_resolved, my_run_failed) needs server-side
+// enrichment of /events — see notifications.md.
 
 // compiledDefaults returns the built-in Layer 1 rules.
 // Returned fresh each call so callers can safely mutate the
 // slice without affecting future calls.
 func compiledDefaults() []Rule {
 	return []Rule{
+		// --- "my-X" defaults — citizen-scoped ---
 		{
 			Name: "my_task_completed",
 			When: Predicate{
@@ -45,6 +54,68 @@ func compiledDefaults() []Rule {
 			},
 			Kind:    "desktop",
 			Message: "✗ Task {{task_id}} failed",
+		},
+
+		// --- project-pulse defaults — fire on any actor ---
+		{
+			Name: "branch_merged",
+			When: Predicate{
+				EventType: "branch_merged",
+			},
+			Kind:    "desktop",
+			Message: "↳ Topic merged ({{task_id}})",
+		},
+		{
+			Name: "issue_filed",
+			When: Predicate{
+				EventType: "issue_filed",
+			},
+			Kind:    "desktop",
+			Message: "🚩 Issue filed by @{{citizen}}",
+		},
+		{
+			Name: "cycle_budget_exhausted",
+			When: Predicate{
+				EventType: "cycle_budget_exhausted",
+			},
+			Kind:    "desktop",
+			Message: "⏸ Cycle budget exhausted — run auto-paused (runaway loop suspected)",
+		},
+		{
+			Name: "task_request_changes",
+			When: Predicate{
+				EventType: "task_request_changes",
+			},
+			Kind:    "desktop",
+			// Without assign_to enrichment we can't say "your work
+			// needs revision." The active-project scope already
+			// narrows this to events the user cares about; the
+			// message points at the task so the user can check.
+			Message: "↩ Review came back on {{task_id}} — changes requested",
+		},
+		{
+			Name: "run_completed",
+			When: Predicate{
+				EventType: "run_completed",
+			},
+			Kind:    "desktop",
+			Message: "✓ Run completed",
+		},
+		{
+			Name: "run_paused",
+			When: Predicate{
+				EventType: "run_paused",
+			},
+			Kind:    "desktop",
+			Message: "⏸ Run paused by @{{citizen}}",
+		},
+		{
+			Name: "run_resumed",
+			When: Predicate{
+				EventType: "run_resumed",
+			},
+			Kind:    "desktop",
+			Message: "▶ Run resumed by @{{citizen}}",
 		},
 	}
 }

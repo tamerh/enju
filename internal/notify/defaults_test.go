@@ -274,3 +274,121 @@ func TestRunRateLimitSuppressesBurst(t *testing.T) {
 		t.Errorf("expected exactly 5 dispatches (Max=5 over 20 burst events), got %d", got)
 	}
 }
+
+// TestProjectPulseDefaultsFire pins the new Layer 1 additions.
+// Each event type should match its named default and fire to the
+// dispatcher. Pre-Phase 4f the user only got pinged on their own
+// task resolutions; this test locks in the broader "platform
+// pulse" set.
+func TestProjectPulseDefaultsFire(t *testing.T) {
+	cases := []struct {
+		eventType    string
+		wantRuleName string
+	}{
+		{"branch_merged", "branch_merged"},
+		{"issue_filed", "issue_filed"},
+		{"cycle_budget_exhausted", "cycle_budget_exhausted"},
+		{"task_request_changes", "task_request_changes"},
+		{"run_completed", "run_completed"},
+		{"run_paused", "run_paused"},
+		{"run_resumed", "run_resumed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.eventType, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode([]Event{{
+					Timestamp: time.Now().UTC(),
+					Type:      tc.eventType,
+					TaskID:    "1:1:t",
+					Citizen:   "alice",
+				}})
+			}))
+			defer srv.Close()
+
+			var fired []string
+			var mu sync.Mutex
+			cfg := Config{
+				CoordinatorURL: srv.URL,
+				ProjectID:      1,
+				Username:       "tamer",
+				BearerToken:    "test-token",
+				PollWait:       50 * time.Millisecond,
+				HTTPClient:     srv.Client(),
+				Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+				Dispatcher: func(ev Event, rule Rule, cfg Config) error {
+					mu.Lock()
+					defer mu.Unlock()
+					fired = append(fired, rule.Name)
+					return nil
+				},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			_ = Run(ctx, cfg)
+
+			mu.Lock()
+			defer mu.Unlock()
+			found := false
+			for _, name := range fired {
+				if name == tc.wantRuleName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("event %q: expected default %q to fire, got %v", tc.eventType, tc.wantRuleName, fired)
+			}
+		})
+	}
+}
+
+// TestCycleBudgetExhaustedNoRateLimit pins that the "critical
+// signal" carve-out works: Max=0 means no limit, so 50 emissions
+// of cycle_budget_exhausted all dispatch (vs hitting the 5/min
+// or 10/min cap that would suppress the most important signal).
+func TestCycleBudgetExhaustedNoRateLimit(t *testing.T) {
+	var pollCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := pollCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if count == 1 {
+			now := time.Now().UTC()
+			events := make([]Event, 50)
+			for i := range events {
+				events[i] = Event{
+					Timestamp: now.Add(time.Duration(i) * time.Millisecond),
+					Type:      "cycle_budget_exhausted",
+					TaskID:    "1:1:t",
+				}
+			}
+			_ = json.NewEncoder(w).Encode(events)
+			return
+		}
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer srv.Close()
+
+	var dispatched int32
+	cfg := Config{
+		CoordinatorURL: srv.URL,
+		ProjectID:      1,
+		Username:       "tamer",
+		BearerToken:    "test-token",
+		StateFile:      filepath.Join(t.TempDir(), "state.json"),
+		PollWait:       100 * time.Millisecond,
+		HTTPClient:     srv.Client(),
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dispatcher: func(ev Event, rule Rule, cfg Config) error {
+			atomic.AddInt32(&dispatched, 1)
+			return nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	_ = Run(ctx, cfg)
+
+	if got := atomic.LoadInt32(&dispatched); got != 50 {
+		t.Errorf("cycle_budget_exhausted has Max=0 (no limit); 50 emissions should all dispatch, got %d", got)
+	}
+}

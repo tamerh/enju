@@ -8,7 +8,6 @@ import (
 	"net/http"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
-	"github.com/enju-ai/enju/internal/notify"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -60,20 +59,18 @@ type Config struct {
 }
 
 // NotifyOptions carries the boot-time wiring for the auto-
-// subscribe notification supervisor. Exported (vs the internal
-// notifySupervisorConfig) so cmdMCP can populate it without
+// subscribe notification session. Exported (vs the internal
+// notifySessionConfig) so cmdMCP can populate it without
 // importing private types.
+//
+// All notify state is now project-scoped (lives under
+// {project_clone}/enju/events/ and enju/notify.yaml), so the
+// only boot-time inputs are the parent shutdown context and the
+// project clone resolver (Workspace). The previous
+// active-project file is gone — sessions stay dormant until a
+// tool call (create_project / init) calls Switch.
 type NotifyOptions struct {
-	UserConfigPath    string                       // ~/.enju/notify.yaml
-	StateFileFunc     func(projectID int64) string
-	ActiveProjectPath string                       // ~/.enju/notify-active.json
-	CoordinatorKey    string                       // credsKey, scopes active-project records per coordinator
-	ParentCtx         context.Context
-
-	// InitialProjectID, when non-zero, overrides the saved
-	// active-project record at boot. Set by the -notify-project
-	// CLI flag for headless / forced-project setups.
-	InitialProjectID int64
+	ParentCtx context.Context
 }
 
 // New creates and configures the MCP server with all Enju tools.
@@ -119,34 +116,26 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 		httpClient:    &http.Client{},
 	}
 
-	// Notify supervisor — exists when caller opts in via
-	// Config.Notify. Nil supervisor means tool-handler Switch
+	// Notify session — exists when caller opts in via
+	// Config.Notify. Nil session means tool-handler Switch
 	// calls are no-ops, matching the legacy behavior where
-	// nothing happens unless -notify-project was set.
+	// nothing happens unless the user touches a project.
+	//
+	// Session stays dormant until create_project or init fires
+	// Switch. There is no cross-MCP-restart resume — each
+	// session activates on first project touch and dies on
+	// process exit. Multi-session is naturally supported: each
+	// MCP process has its own notifySession with its own
+	// in-memory project pointer, no shared state.
 	if cfg.Notify != nil {
-		client.notifySup = newNotifySupervisor(notifySupervisorConfig{
-			CoordinatorURL:    cfg.CoordinatorURL,
-			BearerToken:       cfg.AuthToken,
-			Username:          cfg.Username,
-			CoordinatorKey:    cfg.Notify.CoordinatorKey,
-			UserConfigPath:    cfg.Notify.UserConfigPath,
-			StateFileFunc:     cfg.Notify.StateFileFunc,
-			ActiveProjectPath: cfg.Notify.ActiveProjectPath,
-			ParentCtx:         cfg.Notify.ParentCtx,
-			Logger:            logger,
+		client.notifySess = newNotifySession(notifySessionConfig{
+			CoordinatorURL: cfg.CoordinatorURL,
+			BearerToken:    cfg.AuthToken,
+			Username:       cfg.Username,
+			Workspace:      cfg.Workspace,
+			ParentCtx:      cfg.Notify.ParentCtx,
+			Logger:         logger,
 		})
-		// Resolve initial project: explicit override beats saved
-		// record beats "do nothing." New users with no override
-		// and no saved project hit the do-nothing path; their
-		// next create_project / init kicks the supervisor on.
-		initialProject := cfg.Notify.InitialProjectID
-		if initialProject == 0 && cfg.Notify.ActiveProjectPath != "" && cfg.Notify.CoordinatorKey != "" {
-			initialProject = notify.LoadActiveProject(cfg.Notify.ActiveProjectPath, cfg.Notify.CoordinatorKey)
-		}
-		if initialProject > 0 {
-			logger.Info("notify: starting poller for initial project", "project_id", initialProject)
-			client.notifySup.Switch(initialProject)
-		}
 	}
 
 	// Register tools

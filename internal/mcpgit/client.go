@@ -159,6 +159,22 @@ func (ws *Workspace) HasLocalClone(projectID int64) bool {
 	return dir != ""
 }
 
+// ProjectDir returns the on-disk working directory for a project,
+// resolving externally-registered paths (from enju_init) before
+// the workspace's standard slug/numeric clone layout. Returns
+// empty when no clone exists. Read-only — does not trigger a
+// clone. Used by the notify subsystem to derive paths for
+// project-scoped state files (cursor, live event log).
+func (ws *Workspace) ProjectDir(projectID int64) string {
+	ws.mu.Lock()
+	if dir, ok := ws.externalDirs[projectID]; ok {
+		ws.mu.Unlock()
+		return dir
+	}
+	ws.mu.Unlock()
+	return ws.findProjectDir(projectID)
+}
+
 // findProjectDir locates the on-disk clone directory for a project,
 // checking both the slug-based ("{slug}-{id}") and legacy numeric
 // ("{id}") naming conventions. Returns empty string if no clone

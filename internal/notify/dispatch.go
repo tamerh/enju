@@ -31,6 +31,8 @@ func dispatch(ev Event, rule Rule, cfg Config) error {
 		return dispatchShell(ev, rule)
 	case "slack":
 		return dispatchSlack(ev, rule)
+	case "log":
+		return dispatchLog(ev, rule)
 	default:
 		return fmt.Errorf("unknown adapter kind %q (rule %q)", rule.Kind, rule.Name)
 	}
@@ -172,6 +174,52 @@ func postSlack(url string, ev Event, rule Rule) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("slack webhook returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// dispatchLog appends a single line per matching event to a
+// file. The "tail-able audit trail" adapter — covers the most
+// common reason users reach for kind:shell (echo to log file)
+// without the security boundary issues of arbitrary shell.
+//
+// Rule.Do is the file path (templated). Rule.Message, if set,
+// is the line written; otherwise a default tab-separated format
+// (timestamp, type[/subtype], task=ID, citizen=name) is used so
+// `awk` and `cut` work cleanly. Trailing newline is appended.
+//
+// Concurrency: opens with O_APPEND, which makes writes <PIPE_BUF
+// (4096 bytes on Linux) atomic on POSIX — multiple log rules
+// pointing at the same file won't interleave. No locking needed.
+func dispatchLog(ev Event, rule Rule) error {
+	if rule.Do == "" {
+		return fmt.Errorf("log rule %q has empty Do (file path required)", rule.Name)
+	}
+	path := renderTemplate(rule.Do, ev)
+	line := renderTemplate(rule.Message, ev)
+	if line == "" {
+		// Default format: timestamp \t type[/subtype] \t task=… \t citizen=…
+		// Tab-separated for awk/cut friendliness; nothing tricky.
+		ts := ev.Timestamp.UTC().Format(time.RFC3339)
+		typ := ev.Type
+		if ev.Subtype != "" {
+			typ += "/" + ev.Subtype
+		}
+		line = ts + "\t" + typ
+		if ev.TaskID != "" {
+			line += "\ttask=" + ev.TaskID
+		}
+		if ev.Citizen != "" {
+			line += "\tcitizen=" + ev.Citizen
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open log %q: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("write log %q: %w", path, err)
 	}
 	return nil
 }

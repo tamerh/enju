@@ -37,7 +37,9 @@ dev-restart: build
 	@echo "==> Wiping DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
 	rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
 	rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
-	rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json
+	# Notify state is project-scoped — lives under each project
+	# clone's enju/events/ and gets wiped along with workspaces
+	# below. Nothing in ~/.enju/ to clean.
 	rm -rf ~/.enju/git-dir ~/.enju/repos
 	rm -rf ~/.enju/workspaces
 	mkdir -p ~/.enju/workspaces

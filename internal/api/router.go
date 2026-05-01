@@ -1689,7 +1689,8 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
 		row := map[string]interface{}{
-			"ts":  e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"seq":  e.Seq, // per-project monotone, used by client cursoring
+			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
 			"type": e.Type,
 		}
 		if e.Subtype != "" {
@@ -1914,6 +1915,17 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		q.Since = ts
 	}
+	if seqParam := r.URL.Query().Get("since_seq"); seqParam != "" {
+		// Streaming-cursor variant of `since`. Strict `>` filter on
+		// the per-project monotone seq. Notify uses this — eliminates
+		// the +1ns cursor dance the timestamp filter requires.
+		n, err := strconv.ParseInt(seqParam, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid since_seq (expected non-negative int)")
+			return
+		}
+		q.SinceSeq = n
+	}
 	if l := r.URL.Query().Get("limit"); l != "" {
 		n, err := strconv.Atoi(l)
 		if err != nil {
@@ -1976,7 +1988,8 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
 		row := map[string]interface{}{
-			"ts":  e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"seq":  e.Seq, // per-project monotone, used by client cursoring
+			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
 			"type": e.Type,
 		}
 		if e.Subtype != "" {

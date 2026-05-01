@@ -1,13 +1,10 @@
 package notify
 
-// last_seen persistence. The notify daemon tracks a cursor
-// across restarts so it can resume where it left off without
-// re-firing notifications for events the user already saw.
-//
-// v1 cursor is the last-seen event timestamp (RFC3339Nano).
-// Future seq-based cursoring (when RunEventRecord exposes Seq
-// — see Phase 4d notes in docs/notifications.md) will be a
-// schema-additive change to State.
+// Notify cursor persistence. Tracks a per-project resume point
+// across MCP restarts so the loop doesn't re-fire notifications
+// for events the user already saw. seq-based — the per-project
+// monotone integer that /events?since_seq=N filters strictly
+// `>` against. No timestamp involved.
 //
 // Atomic write: tmp + rename so a crash mid-write never leaves
 // a half-finished file readable on next start.
@@ -17,26 +14,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 )
 
-// State is the on-disk shape of the notify cursor. Versioned
-// so future schema changes (e.g. adding LastSeq for seq-based
-// cursoring) can detect and migrate old files.
+// State is the on-disk shape of the notify cursor. Versioned so
+// future schema changes can detect and skip mismatched files
+// safely.
 type State struct {
-	Version  int       `json:"version"`
-	LastSeen time.Time `json:"last_seen"`
+	Version int   `json:"version"`
+	LastSeq int64 `json:"last_seq"`
 }
 
 const currentStateVersion = 1
 
 // loadState reads the cursor file. Missing file → zero State
-// (loop starts from "all events ever," which is fine for the
-// first run; users who care about backfill avalanche set
-// PollWait short and skip-to-head logic in 4b will trim).
-//
-// Malformed file logs and returns zero — the wrong cursor is
-// worse than no cursor.
+// (start from seq=0, which the strict-`>` filter on the server
+// resolves to "every event in the project"). Malformed file
+// returns zero — wrong cursor is worse than no cursor.
 func loadState(path string) (State, error) {
 	if path == "" {
 		return State{}, nil
@@ -56,8 +49,8 @@ func loadState(path string) (State, error) {
 }
 
 // saveState writes State atomically: write to a sibling tmp
-// file, fsync, rename. On crash, the original file is intact
-// or the new file is intact — never a half-written one.
+// file, rename. On crash, the original file is intact or the new
+// file is intact — never a half-written one.
 func saveState(path string, s State) error {
 	if path == "" {
 		return nil

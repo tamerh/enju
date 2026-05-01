@@ -371,12 +371,13 @@ func (s *Store) GetEventMetadataForTask(taskID, eventType string) (string, error
 // the exporter can embed it without a double-decode round
 // trip.
 type RunEventRecord struct {
+	Seq       int64 // per-project monotone seq, surfaced for client-side cursoring
 	Timestamp time.Time
-	Type   string
-	Subtype  string
-	TaskID  string
-	Citizen  string
-	Metadata string
+	Type      string
+	Subtype   string
+	TaskID    string
+	Citizen   string
+	Metadata  string
 }
 
 // ListRunEvents returns the chronological event timeline for
@@ -411,12 +412,13 @@ func (s *Store) ListRunEvents(projectID, runID int64) ([]RunEventRecord, error) 
 		usernames := s.lookupUsernames(rawEvents)
 		for _, e := range rawEvents {
 			events = append(events, RunEventRecord{
+				Seq:       e.Seq,
 				Timestamp: e.CreatedAt,
-				Type:   e.EventType,
-				Subtype:  e.EventSubtype,
-				TaskID:  e.TaskID,
-				Citizen:  usernames[e.CitizenID],
-				Metadata: e.Metadata,
+				Type:      e.EventType,
+				Subtype:   e.EventSubtype,
+				TaskID:    e.TaskID,
+				Citizen:   usernames[e.CitizenID],
+				Metadata:  e.Metadata,
 			})
 		}
 	}
@@ -446,12 +448,20 @@ func sortRunEvents(events []RunEventRecord) {
 // or RunID should be set in practice, otherwise the query is
 // "every event ever recorded" which is rarely what callers want.
 type EventQuery struct {
-	ProjectID int64
-	RunID   int64
-	CitizenID int64
-	EventTypes []string // OR-matched if non-empty
-	Since   time.Time // zero value = no lower bound
-	Limit   int    // default 100, max 1000
+	ProjectID  int64
+	RunID      int64
+	CitizenID  int64
+	EventTypes []string  // OR-matched if non-empty
+	Since      time.Time // zero value = no lower bound
+	// SinceSeq is a strict-`>` filter on per-project monotone seq.
+	// Preferred over Since for streaming clients (notify, replay
+	// consumers) — integer comparison eliminates the timestamp
+	// edge cases that bit us with `>=` semantics + nanosecond
+	// rounding on the wire. Zero = no filter. Composes with
+	// Since (both filters AND together when both set, but
+	// callers typically pick one).
+	SinceSeq int64
+	Limit    int // default 100, max 1000
 }
 
 // ListEvents returns the projection layer over the
@@ -482,12 +492,13 @@ func (s *Store) ListEvents(q EventQuery) ([]RunEventRecord, error) {
 	out := make([]RunEventRecord, 0, len(raw))
 	for _, e := range raw {
 		out = append(out, RunEventRecord{
+			Seq:       e.Seq,
 			Timestamp: e.CreatedAt,
-			Type:   e.EventType,
-			Subtype:  e.EventSubtype,
-			TaskID:  e.TaskID,
-			Citizen:  usernames[e.CitizenID],
-			Metadata: e.Metadata,
+			Type:      e.EventType,
+			Subtype:   e.EventSubtype,
+			TaskID:    e.TaskID,
+			Citizen:   usernames[e.CitizenID],
+			Metadata:  e.Metadata,
 		})
 	}
 	return out, nil

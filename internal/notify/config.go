@@ -83,7 +83,7 @@ func LoadUserConfig(path string) (UserConfig, []string, error) {
 // fix their typo.
 func (uc UserConfig) validate() []string {
 	var warnings []string
-	knownKinds := map[string]bool{"desktop": true, "shell": true, "slack": true}
+	knownKinds := map[string]bool{"desktop": true, "shell": true, "slack": true, "log": true}
 	for i, r := range uc.Custom {
 		label := r.Name
 		if label == "" {

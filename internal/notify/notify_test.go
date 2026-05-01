@@ -94,20 +94,21 @@ func TestRenderTemplateBasicTokens(t *testing.T) {
 }
 
 // TestStatePersistRoundTrip pins the on-disk state contract:
-// write a state, read it back, verify versioned + atomic.
+// write a State{LastSeq}, read it back, verify versioned +
+// atomic. Pre-Phase-4f cursor was timestamp-based; v3 is seq.
 func TestStatePersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 
 	// Empty path → no-op, no error, no file created.
-	if err := saveState("", State{LastSeen: time.Now()}); err != nil {
+	if err := saveState("", State{LastSeq: 42}); err != nil {
 		t.Errorf("save with empty path should be no-op: %v", err)
 	}
 	got, err := loadState("")
 	if err != nil {
 		t.Errorf("load empty path: %v", err)
 	}
-	if !got.LastSeen.IsZero() {
+	if got.LastSeq != 0 {
 		t.Errorf("empty path should yield zero state, got %+v", got)
 	}
 
@@ -116,21 +117,21 @@ func TestStatePersistRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Errorf("load missing file should not error: %v", err)
 	}
-	if !got.LastSeen.IsZero() {
+	if got.LastSeq != 0 {
 		t.Errorf("missing file should yield zero state, got %+v", got)
 	}
 
-	// Save + load round-trips the timestamp.
-	want := time.Date(2026, 5, 1, 12, 34, 56, 789000000, time.UTC)
-	if err := saveState(path, State{LastSeen: want}); err != nil {
+	// Save + load round-trips the seq.
+	want := int64(123456)
+	if err := saveState(path, State{LastSeq: want}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	got, err = loadState(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !got.LastSeen.Equal(want) {
-		t.Errorf("round-trip: got %v, want %v", got.LastSeen, want)
+	if got.LastSeq != want {
+		t.Errorf("round-trip: got %d, want %d", got.LastSeq, want)
 	}
 	if got.Version != currentStateVersion {
 		t.Errorf("save should stamp version=%d, got %d", currentStateVersion, got.Version)
@@ -167,6 +168,7 @@ func TestRunDispatchesMatchingEvent(t *testing.T) {
 		if count == 1 {
 			ts := time.Now().UTC()
 			events := []Event{{
+				Seq:       42,
 				Timestamp: ts,
 				Type:      "task_completed",
 				Subtype:   "answer",
@@ -239,13 +241,13 @@ func TestRunDispatchesMatchingEvent(t *testing.T) {
 		t.Errorf("dispatched event type = %q, want task_completed", dispatched[0].Type)
 	}
 
-	// State file should have been written with the event's ts.
+	// State file should have been written with the event's seq.
 	loaded, err := loadState(cfg.StateFile)
 	if err != nil {
 		t.Errorf("load state: %v", err)
 	}
-	if loaded.LastSeen.IsZero() {
-		t.Error("state file should have advanced LastSeen after dispatch")
+	if loaded.LastSeq == 0 {
+		t.Error("state file should have advanced LastSeq after dispatch")
 	}
 }
 

@@ -35,6 +35,21 @@ type rateLimit struct {
 var defaultRateLimits = map[string]rateLimit{
 	"my_task_completed": {Window: time.Minute, Max: 10},
 	"my_task_failed":    {Window: time.Minute, Max: 5},
+
+	// project-pulse defaults — looser than "my-X" since they fire
+	// on any actor's action, but bounded so a runaway emitter
+	// doesn't drown the desktop.
+	"branch_merged":          {Window: time.Minute, Max: 10},
+	"issue_filed":            {Window: time.Minute, Max: 5},
+	"task_request_changes":   {Window: time.Minute, Max: 5},
+	"run_completed":          {Window: time.Minute, Max: 5},
+	"run_paused":             {Window: time.Minute, Max: 5},
+	"run_resumed":            {Window: time.Minute, Max: 5},
+
+	// cycle_budget_exhausted: no limit. Fires once per run by
+	// definition (the run auto-pauses), so dropping it would mask
+	// the most critical signal in the system. Max=0 == disabled.
+	"cycle_budget_exhausted": {Window: time.Minute, Max: 0},
 }
 
 // generalFallbackLimit applies to any rule (built-in or user)

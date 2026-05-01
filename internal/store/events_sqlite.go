@@ -769,6 +769,14 @@ func (s *SQLiteEventStore) Query(ctx context.Context, q EventQuery) ([]Event, er
 		conds = append(conds, "created_at >= ?")
 		args = append(args, formatTimestamp(q.Since))
 	}
+	if q.SinceSeq > 0 {
+		// Strict `>` (vs Since's `>=`). seq is monotone within
+		// (project_id), so this gives clients an exact resume
+		// point: passing the last-seen seq returns "everything
+		// strictly after," no overlap, no skipped events.
+		conds = append(conds, "seq > ?")
+		args = append(args, q.SinceSeq)
+	}
 	where := ""
 	if len(conds) > 0 {
 		where = "WHERE " + conds[0]
