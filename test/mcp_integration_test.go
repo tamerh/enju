@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/mcpserver"
+	"github.com/enju-ai/enju/internal/store"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -325,6 +326,164 @@ func TestMCPHarnessSmokesEnjuMyProfile(t *testing.T) {
 			t.Errorf("expected profile to mention username %q, got: %s", h.username, text)
 		}
 	})
+}
+
+// TestMCPRequestClarification pins the bot-asks-human idiom:
+// the tool spawns a clarification task assigned to the named
+// human, single-citizen, action=answer, with the bot-supplied
+// prompt. Validates the wiring from MCP tool dispatch →
+// handleRequestClarification → /spawn → task creation.
+//
+// Scope: v1 of the tool only spawns the question task; it does
+// NOT auto-pause the calling bot's task (engine doesn't support
+// post-creation dependency mutation today). The bot self-manages
+// the pause via existing primitives.
+func TestMCPRequestClarification(t *testing.T) {
+	h := newMCPHarness(t, "Bot Citizen")
+
+	// Need a second citizen — the human being asked.
+	humanUsername := h.testServer.register("Human Researcher")
+
+	projectID := h.createTestProject()
+
+	// Add both citizens explicitly. Adding any member at all
+	// pulls the project out of the "zero members = open"
+	// bucket the harness leaves it in by default, so we have to
+	// re-add Bot Citizen too — otherwise the bot's MCP calls
+	// would be locked out with "not a member."
+	humanCitizen, err := h.store.GetCitizenByUsername(humanUsername)
+	if err != nil || humanCitizen == nil {
+		t.Fatalf("lookup human citizen: %v", err)
+	}
+	botCitizen, err := h.store.GetCitizenByUsername(h.username)
+	if err != nil || botCitizen == nil {
+		t.Fatalf("lookup bot citizen: %v", err)
+	}
+	if err := h.store.AddProjectMember(projectID, botCitizen.ID, "owner", 0); err != nil {
+		t.Fatalf("add bot to project: %v", err)
+	}
+	if err := h.store.AddProjectMember(projectID, humanCitizen.ID, "member", 0); err != nil {
+		t.Fatalf("add human to project: %v", err)
+	}
+
+	// Create a run so we have somewhere to spawn into.
+	yamlBody, err := readFixture("simple-no-deps.yaml")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yamlBody,
+	})
+
+	// Find the run seq.
+	ready := h.readyTasks("")
+	if len(ready) == 0 {
+		t.Fatal("expected ready tasks after create_run")
+	}
+	firstID, _ := ready[0].(map[string]interface{})["id"].(string)
+	parts := strings.SplitN(firstID, ":", 3)
+	runSeq, _ := strconv.Atoi(parts[1])
+
+	// Call request_clarification.
+	res := h.callOK(t, "enju_request_clarification", map[string]any{
+		"project_id":  float64(projectID),
+		"run_id":      float64(runSeq),
+		"task_def_id": "clarify_input_format",
+		"prompt":      "Should the output be a JSON array or a YAML list?",
+		"assign_to":   humanUsername,
+	})
+	got := mcpText(res)
+
+	// Confirmation surfaces: human's name, task ID, the question.
+	for _, want := range []string{
+		"Clarification requested from @" + humanUsername,
+		"clarify_input_format",
+		"Should the output be a JSON array",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected output to contain %q, got:\n%s", want, got)
+		}
+	}
+
+	// Verify the spawned task actually exists with the expected
+	// shape: action=answer, citizens=1, assigned to the human.
+	clarifyTaskID := fmt.Sprintf("%d:%d:clarify_input_format", projectID, runSeq)
+	task, err := h.store.GetTask(clarifyTaskID)
+	if err != nil || task == nil {
+		t.Fatalf("clarification task not created: %v", err)
+	}
+	if task.Action != "answer" {
+		t.Errorf("clarification task action = %q, want answer", task.Action)
+	}
+	if !strings.Contains(task.Prompt, "JSON array") {
+		t.Errorf("prompt not propagated, got: %q", task.Prompt)
+	}
+	// AssignTo is a JSON-encoded array of usernames.
+	if !strings.Contains(task.AssignTo, humanUsername) {
+		t.Errorf("expected human's username %q in AssignTo, got %q", humanUsername, task.AssignTo)
+	}
+}
+
+// TestMCPRecentEvents pins the assistant-friendly polling tool:
+// concise text output, smaller default limit, returns the
+// no-events sentinel on a fresh project. Validates the wiring
+// from MCP tool dispatch → handleRecentEvents → events endpoint
+// → human-readable formatter. The companion long-poll endpoint
+// behavior is covered by TestEventsLongPoll (transport level).
+func TestMCPRecentEvents(t *testing.T) {
+	h := newMCPHarness(t, "RecentEvents User")
+
+	// Create a project so we have an authorized scope.
+	createRes := h.callOK(t, "enju_create_project", map[string]any{
+		"name": "recent-events-test",
+	})
+	createText := mcpText(createRes)
+	// Extract the project ID via the testServer rather than parsing the
+	// tool's prose response — the create tool prose format isn't pinned.
+	projects, _ := h.store.ListProjects()
+	if len(projects) == 0 {
+		t.Fatalf("expected a project after create; tool said: %s", createText)
+	}
+	projectID := projects[0].ID
+
+	// Empty case: no events yet → sentinel text.
+	res := h.callOK(t, "enju_recent_events", map[string]any{
+		"project_id": float64(projectID),
+	})
+	got := mcpText(res)
+	if !strings.Contains(got, "no recent events") {
+		t.Errorf("expected 'no recent events' sentinel on empty project, got:\n%s", got)
+	}
+
+	// Inject some events directly into the EventStore.
+	h.store.Events().Record(store.Event{
+		CitizenID: 1, EventType: "task_completed", EventSubtype: "answer",
+		TaskID: "1:1:draft", ProjectID: projectID, RunID: 1,
+		CreatedAt: time.Now(),
+	})
+	h.store.Events().Record(store.Event{
+		CitizenID: 1, EventType: "task_failed",
+		TaskID: "1:1:test", ProjectID: projectID, RunID: 1,
+		CreatedAt: time.Now(),
+	})
+	h.store.Events().WaitForDrain(500 * time.Millisecond)
+
+	// Populated case: events appear in the concise format.
+	res = h.callOK(t, "enju_recent_events", map[string]any{
+		"project_id": float64(projectID),
+		"limit":      float64(10),
+	})
+	got = mcpText(res)
+	for _, want := range []string{"task_completed/answer", "task_failed", "task=1:1:draft", "task=1:1:test"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected output to contain %q, got:\n%s", want, got)
+		}
+	}
+	// Sanity: not raw JSON.
+	if strings.Contains(got, `"type":`) {
+		t.Errorf("output should be concise text, not JSON; got:\n%s", got)
+	}
 }
 
 // mcpSubmitSimple runs a simple answer-task submission through

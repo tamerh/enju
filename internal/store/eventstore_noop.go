@@ -29,6 +29,17 @@ func (noopEventStore) QueryByRun(context.Context, int64, int64, time.Time, int) 
 	return nil, ErrEventStoreDisabled
 }
 
+// noopWaitCh is closed at init — the noop store has nothing to
+// notify about, so long-poll waiters return immediately and fall
+// through to their next query (which will also be empty).
+var noopWaitCh = func() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+func (noopEventStore) WaitForEvent() <-chan struct{} { return noopWaitCh }
+
 func (noopEventStore) QueryByCitizen(context.Context, int64, int) ([]Event, error) {
 	return nil, ErrEventStoreDisabled
 }

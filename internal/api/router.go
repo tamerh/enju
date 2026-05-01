@@ -1789,6 +1789,74 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 //
 // Living-workflow phase 2 — see docs/living-workflow-design-notes.md
 // § "The event log is the central data primitive."
+//
+// Long-poll mode (?wait=30s) is the substrate for the
+// notification subsystem (docs/notifications.md). Subscribe-then-
+// query inside longPollEvents closes the missed-event race; see
+// the EventStore.WaitForEvent contract for details.
+
+// longPollEvents is the read loop with optional blocking. When
+// waitDuration <= 0 it's a single ListEvents call. When > 0 it
+// loops:
+//
+//  1. Subscribe to the EventStore notifier (BEFORE querying so
+//   any persist between subscribe and query is observed on
+//   the next iteration's query, not missed).
+//  2. Query the database with the caller's filter.
+//  3. If results are non-empty → return.
+//  4. Otherwise wait on (notifier OR remaining-time OR
+//   request-context-cancelled), then loop.
+//
+// Returns empty slice + nil on timeout or context cancel — the
+// caller treats both as "no events," which is the correct wire
+// shape for long-poll. ctx errors don't propagate up; the
+// response just becomes empty.
+func (s *Server) longPollEvents(ctx context.Context, q store.EventQuery, waitDuration time.Duration) ([]store.RunEventRecord, error) {
+	if waitDuration <= 0 {
+		// Read-after-write consistency for one-shot queries:
+		// give the async writer a brief window to drain in-
+		// flight events. Without this, an assistant calling
+		// enju_recent_events immediately after a submit can
+		// miss the event still in the writer's queue. Matches
+		// the budget used by aggregation reads in the store
+		// package (eventDrainBudget). Long-poll mode skips this
+		// because the subscribe-then-query loop catches new
+		// events directly via the broadcast channel.
+		const oneShotReadDrainBudget = 100 * time.Millisecond
+		s.store.Events().WaitForDrain(oneShotReadDrainBudget)
+		return s.store.ListEvents(q)
+	}
+	deadline := time.Now().Add(waitDuration)
+	for {
+		// Subscribe BEFORE querying. If a persist races between
+		// these two lines, ListEvents sees the committed event
+		// and we return immediately; if the persist happens
+		// after both, the channel is observed closed and the
+		// next iteration catches it.
+		waitCh := s.store.Events().WaitForEvent()
+
+		events, err := s.store.ListEvents(q)
+		if err != nil {
+			return nil, err
+		}
+		if len(events) > 0 {
+			return events, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return events, nil // empty + timed out
+		}
+		select {
+		case <-waitCh:
+			// New event landed; loop and re-query.
+		case <-ctx.Done():
+			return events, nil // client gone; empty response is fine
+		case <-time.After(remaining):
+			return events, nil // wait elapsed
+		}
+	}
+}
+
 func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil {
@@ -1855,7 +1923,51 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 		q.Limit = n
 	}
 
-	events, err := s.store.ListEvents(q)
+	// Long-poll: ?wait=30s holds the connection until either
+	// (a) matching events arrive, (b) the wait elapses, or
+	// (c) the client disconnects. Used by `enju notify` and
+	// the future `enju_recent_events` polling tool to react
+	// to events without busy-polling the database.
+	//
+	// Bound: min(longPollHardCap, httpTimeout - longPollMargin).
+	// The HTTP middleware cap is the real ceiling — wait beyond
+	// it and the middleware fires a 503 before the handler can
+	// respond, leaving the client with a useless error. Subtract
+	// a margin for the response write to flush before the
+	// middleware's deadline. wait <= 0 → immediate return,
+	// legacy shape.
+	const (
+		longPollHardCap = 60 * time.Second
+		longPollMargin  = 5 * time.Second
+	)
+	httpTimeout := s.httpRequestTimeout
+	if httpTimeout <= 0 {
+		httpTimeout = 30 * time.Second
+	}
+	longPollMax := longPollHardCap
+	if safe := httpTimeout - longPollMargin; safe < longPollMax {
+		longPollMax = safe
+	}
+	if longPollMax < 0 {
+		longPollMax = 0
+	}
+	var waitDuration time.Duration
+	if waitParam := r.URL.Query().Get("wait"); waitParam != "" {
+		d, err := time.ParseDuration(waitParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid wait (expected duration like 30s)")
+			return
+		}
+		if d < 0 {
+			d = 0
+		}
+		if d > longPollMax {
+			d = longPollMax
+		}
+		waitDuration = d
+	}
+
+	events, err := s.longPollEvents(r.Context(), q, waitDuration)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
 		return

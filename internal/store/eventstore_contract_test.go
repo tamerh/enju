@@ -112,6 +112,11 @@ func (brokenEventStore) Stats() Stats       { return Stats{} }
 func (brokenEventStore) Enabled() bool       { return true }
 func (brokenEventStore) SetEnabled(bool)      {}
 func (brokenEventStore) WaitForDrain(time.Duration) {}
+func (brokenEventStore) WaitForEvent() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}
 func (brokenEventStore) GapsInProject(context.Context, int64) ([]int64, error) {
 	return nil, errors.New("simulated event store failure")
 }

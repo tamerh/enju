@@ -634,7 +634,7 @@ func toolListIterations() mcp.Tool {
 
 func toolShowEvents() mcp.Tool {
 	return mcp.NewTool("enju_show_events",
-		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over the event store. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events, which writes git-tracked snapshots; this tool is for ad-hoc queries. If results come back empty unexpectedly, run enju_events_status to check whether the event-store kill-switch was flipped (disabled stores serve empty results without an error).`),
+		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over the event store. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events (git-tracked snapshots) and from enju_recent_events (in-conversation "what's new?" surfacing) — use this tool for filter-driven historical queries; use enju_recent_events when the assistant just wants a concise heads-up of the latest activity. If results come back empty unexpectedly, run enju_events_status to check whether the event-store kill-switch was flipped (disabled stores serve empty results without an error).`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project to query"),
@@ -653,6 +653,80 @@ func toolShowEvents() mcp.Tool {
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum events to return (default 100, max 1000)"),
+		),
+	)
+}
+
+// toolRequestClarification is the bot-asks-human idiom — the
+// natural complement to notifications. Encapsulates the spawn
+// pattern that bots use mid-task when they hit ambiguity:
+// "should X mean A or B?" Without this tool, every bot author
+// has to learn the spawn_task shape (action=answer, citizens=1,
+// assign_to=<human>, etc.). With it, the idiom is one line.
+//
+// Mechanics: a thin wrapper over enju_spawn_task with sensible
+// defaults (action=answer, citizens=1, trigger=bot). The
+// resulting task is assigned to the named human; when they
+// answer, a task_completed event fires. The bot can either
+// poll, subscribe via the notification subsystem (Phase 4), or
+// rely on parent_task_id linkage to discover the resolution.
+//
+// In v1 the tool does NOT auto-pause the calling bot's task —
+// that requires post-creation dependency mutation which Enju's
+// engine doesn't support today. Pattern for the bot's prompt:
+// "If you need clarification, call enju_request_clarification
+// then submit your current task with a 'pending clarification'
+// marker; reviewer will request_changes once the answer lands."
+func toolRequestClarification() mcp.Tool {
+	return mcp.NewTool("enju_request_clarification",
+		mcp.WithDescription(`Bot-asks-human pattern: spawn a clarification task assigned to a named human, encapsulating the spawn-task idiom in one tool call. Use mid-task when you hit ambiguity in the spec, the upstream content, or the user's intent. The clarification task is action=answer, single-citizen, assigned to the human you name. Their answer becomes a normal task result the audit log records. Returns the new task ID. Note: in v1 this does NOT auto-pause your current task — submit your current work with a 'awaiting clarification' marker, or wait for the human's task_completed event before resuming. Future notification-bot work will auto-resume on answer.`),
+		mcp.WithNumber("project_id", mcp.Required(),
+			mcp.Description("The project ID"),
+		),
+		mcp.WithNumber("run_id", mcp.Required(),
+			mcp.Description("Run sequence number within the project"),
+		),
+		mcp.WithString("task_def_id", mcp.Required(),
+			mcp.Description("Descriptive id for the clarification task — e.g. 'clarify_review_format', 'clarify_input_units'. Helps the human + audit log identify which question they're answering."),
+		),
+		mcp.WithString("prompt", mcp.Required(),
+			mcp.Description("The question for the human, in plain language"),
+		),
+		mcp.WithString("assign_to", mcp.Required(),
+			mcp.Description("Citizen username to ask (e.g. 'tamer'). The clarification task is single-citizen, assigned to exactly this person."),
+		),
+		mcp.WithString("parent_task_id",
+			mcp.Description("Optional: your current task's full id (project:run:task_def [:instance]). Recorded for audit so 'which task asked this question?' is queryable."),
+		),
+	)
+}
+
+// toolRecentEvents is the assistant-friendly polling tool for
+// in-session "what's new" surfacing. Differs from show_events:
+//
+//   - Tighter description framing ("call at natural pause
+//   points" vs show_events' "ad-hoc filter queries"). The
+//   LLM picks the right tool for the right intent.
+//   - Smaller default limit (20 vs 100) — recent context, not
+//   full history.
+//   - Concise output formatting suited for inline conversation
+//   ("Run #5 completed at 14:32; @bot submitted task X") vs
+//   show_events' raw JSONL.
+//
+// Both tools call the same underlying endpoint; the difference
+// is intent + presentation.
+func toolRecentEvents() mcp.Tool {
+	return mcp.NewTool("enju_recent_events",
+		mcp.WithDescription(`Surface what's recently happened in a project — designed for the assistant to call at natural pause points (after a long bash returns, when the user asks "what's new?", before answering a follow-up). Returns a concise human-readable summary of the latest events. For full filter queries (by run, by citizen, by event type) use enju_show_events instead. For git-tracked snapshots use enju_export_run_events.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to check"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Max events to surface (default 20, max 100). Smaller is better for in-conversation use."),
+		),
+		mcp.WithString("since",
+			mcp.Description("Optional RFC3339 timestamp lower bound — only surface events after this. Useful when the assistant has a 'last checked at' anchor to avoid re-surfacing the same items."),
 		),
 	)
 }

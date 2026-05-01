@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/engine"
 	"github.com/enju-ai/enju/internal/mcpgit"
@@ -209,6 +210,173 @@ func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolReques
 		b.WriteByte('\n')
 	}
 	return mcp.NewToolResultText(b.String()), nil
+}
+
+// handleRecentEvents is the assistant-side counterpart to
+// handleShowEvents — same underlying endpoint, smaller default
+// limit, human-readable output (one line per event). Designed
+// for the LLM to call at natural pause points and surface
+// "what's new" without flooding the conversation with raw JSONL.
+//
+// The "smaller default limit" is the only behavioral difference
+// in v1; future work could add since_seq cursoring once
+// RunEventRecord exposes Seq (Phase 4 territory). For now,
+// timestamp-based filtering via `since` is the resume cursor.
+func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	limit := req.GetInt("limit", 20)
+	if limit > 100 {
+		limit = 100
+	}
+	q := url.Values{}
+	q.Set("limit", fmt.Sprintf("%d", limit))
+	if since := req.GetString("since", ""); since != "" {
+		q.Set("since", since)
+	}
+	endpoint := fmt.Sprintf("/api/v1/projects/%d/events?%s", projectID, q.Encode())
+	data, err := c.get(ctx, endpoint)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if errMsg := errorFromResponse(data); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	var events []map[string]interface{}
+	if err := json.Unmarshal(data, &events); err != nil {
+		return mcp.NewToolResultError("decoding events: " + err.Error()), nil
+	}
+	if len(events) == 0 {
+		return mcp.NewToolResultText("(no recent events)"), nil
+	}
+	// Concise human-readable rendering: "[ts] type[/subtype] task=... by=...".
+	// Newest-first because the underlying endpoint orders that way; the
+	// LLM reads top-down and the most recent is the most likely to matter.
+	var b bytes.Buffer
+	for _, e := range events {
+		ts, _ := e["ts"].(string)
+		// Trim seconds precision to readable. Format: 2026-05-01T12:34:56Z → 12:34:56
+		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			ts = t.UTC().Format("2006-01-02 15:04:05")
+		}
+		etype, _ := e["type"].(string)
+		if subtype, _ := e["subtype"].(string); subtype != "" {
+			etype = etype + "/" + subtype
+		}
+		line := fmt.Sprintf("[%s] %s", ts, etype)
+		if task, _ := e["task_id"].(string); task != "" {
+			line += " task=" + task
+		}
+		if cit, _ := e["citizen"].(string); cit != "" {
+			line += " by=@" + cit
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// handleRequestClarification is the bot-asks-human idiom — a
+// thin wrapper over /spawn with sensible defaults locked in:
+// action=answer, citizens=1, trigger=bot, single human assignee.
+// Bots get a one-line "ask the human a question" tool instead
+// of constructing a full spawn-task call themselves.
+//
+// See toolRequestClarification for the full intent + the
+// "doesn't auto-pause caller's task in v1" caveat.
+func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	taskDefID, err := req.RequireString("task_def_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_def_id is required"), nil
+	}
+	prompt, err := req.RequireString("prompt")
+	if err != nil {
+		return mcp.NewToolResultError("prompt is required"), nil
+	}
+	assignTo, err := req.RequireString("assign_to")
+	if err != nil {
+		return mcp.NewToolResultError("assign_to is required"), nil
+	}
+
+	// Validate assign_to is a member of the project. The
+	// underlying spawn endpoint accepts any string and creates
+	// the task; an unmembered or typo'd assignee produces an
+	// unclaimable task that the bot waits on indefinitely. The
+	// bot-asks-human idiom is exactly the case where this
+	// "silent unclaimable" failure mode hurts most — bots often
+	// don't know the project's membership, and the cure
+	// (rename, retry) is cheap if surfaced.
+	membersData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/members", projectID))
+	if err != nil {
+		return mcp.NewToolResultError("validating assign_to: " + err.Error()), nil
+	}
+	if errMsg := errorFromResponse(membersData); errMsg != "" {
+		return mcp.NewToolResultError("validating assign_to: " + errMsg), nil
+	}
+	var members []map[string]interface{}
+	if err := json.Unmarshal(membersData, &members); err == nil {
+		matched := false
+		usernames := make([]string, 0, len(members))
+		for _, m := range members {
+			u, _ := m["username"].(string)
+			if u == "" {
+				continue
+			}
+			usernames = append(usernames, u)
+			if u == assignTo {
+				matched = true
+			}
+		}
+		if !matched && len(usernames) > 0 {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"@%s is not a member of project %d. Members: %s. Add a citizen with enju_add_project_member, or pick one from the list.",
+				assignTo, projectID, strings.Join(usernames, ", "),
+			)), nil
+		}
+		// Empty members → legacy "open project" mode (zero-member
+		// gating bucket). Skip validation; spawn will accept
+		// anyone, matching pre-Phase-3 behavior.
+	}
+
+	body := map[string]interface{}{
+		"task_def_id":    taskDefID,
+		"action":         "answer",
+		"prompt":         prompt,
+		"assign_to":      []string{assignTo},
+		"citizens":       1,
+		"trigger":        "bot",
+		"parent_task_id": req.GetString("parent_task_id", ""),
+	}
+
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/spawn", projectID, runID), body)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return mcp.NewToolResultError("decoding: " + err.Error()), nil
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+	taskID, _ := resp["task_id"].(string)
+	out := fmt.Sprintf(
+		"✓ Clarification requested from @%s — task %s\n"+
+			"  Question: %s\n"+
+			"  Watch for task_completed on this task to know when answered.",
+		assignTo, taskID, prompt,
+	)
+	return mcp.NewToolResultText(out), nil
 }
 
 // handleSpawnTask creates a new task in an in-flight run.

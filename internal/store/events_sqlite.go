@@ -89,6 +89,31 @@ type SQLiteEventStore struct {
 	done chan struct{} // closed by Close() to signal shutdown
 	wg  sync.WaitGroup
 
+	// notifyMu protects notifyCh, the broadcast channel for
+	// long-poll consumers ("wake me when any event lands").
+	// Pattern: Wait() returns the current channel; Broadcast()
+	// (called after each successful persist) closes it and
+	// installs a fresh one. Closing fan-outs to all waiters at
+	// once; new waiters block on the fresh channel for the next
+	// broadcast. No subscription registry, no per-listener state
+	// — just a single shared channel rotated on each event.
+	//
+	// Use case: handleShowEvents long-poll mode (?wait=30s).
+	// Caller patterns: subscribe-then-query, so a broadcast that
+	// races with the query is observed on the *next* iteration's
+	// query, not missed.
+	//
+	// Scale ceiling (post-v1): broadcast fires on every persist
+	// regardless of project, so every long-poller wakes for
+	// every event. Spurious wakeups cost (events/sec) ×
+	// (active long-pollers) × (one DB query each). Fine while
+	// event rate stays bounded by Phase 7's writer throughput;
+	// when it doesn't, shard into per-project channels
+	// (notifyChByProject map[int64]chan struct{}). Tracked as
+	// scale work, not a v1 blocker.
+	notifyMu sync.Mutex
+	notifyCh chan struct{}
+
 	// Rate-limited drop logging. Prevents log floods under
 	// sustained pressure while keeping the first drop visible.
 	lastDropLogMu sync.Mutex
@@ -180,6 +205,7 @@ func NewSQLiteEventStore(dbPath string, logger *slog.Logger, opts ...EventStoreO
 		queue:    make(chan Event, options.queueSize),
 		done:    make(chan struct{}),
 		seqCounters: map[int64]*atomic.Int64{},
+		notifyCh:   make(chan struct{}),
 	}
 	s.enabled.Store(true)
 	if err := s.migrate(); err != nil {
@@ -368,6 +394,48 @@ func (s *SQLiteEventStore) Stats() Stats {
 	}
 }
 
+// WaitForEvent returns a channel that is closed the next time
+// any event is successfully persisted. Used by long-poll
+// handlers (?wait= on the events endpoint) to block until new
+// events arrive without polling the database.
+//
+// Caller pattern:
+//
+//	for {
+//	  waitCh := es.WaitForEvent()        // subscribe FIRST
+//	  events := query()                  // then check
+//	  if len(events) > 0 { return events }
+//	  select {
+//	  case <-waitCh:                     // woken by new event
+//	  case <-ctx.Done():                 // client gone
+//	  case <-time.After(remaining):      // timeout
+//	  }
+//	}
+//
+// Subscribing before querying closes the missed-event race: if
+// a broadcast fires between Wait and query, the query sees the
+// committed event; if it fires after, the channel is observed
+// closed and the next iteration's query catches it.
+//
+// All waiters share one channel — broadcast-by-close fans out
+// in O(1) regardless of waiter count.
+func (s *SQLiteEventStore) WaitForEvent() <-chan struct{} {
+	s.notifyMu.Lock()
+	defer s.notifyMu.Unlock()
+	return s.notifyCh
+}
+
+// broadcastNotify wakes all current WaitForEvent subscribers
+// (close fans out instantly) and rotates in a fresh channel
+// for the next round of waiters. Called from the writer
+// goroutine after each successful persist.
+func (s *SQLiteEventStore) broadcastNotify() {
+	s.notifyMu.Lock()
+	close(s.notifyCh)
+	s.notifyCh = make(chan struct{})
+	s.notifyMu.Unlock()
+}
+
 // Record enqueues an event for async persistence by the
 // writer goroutine.
 //
@@ -457,6 +525,7 @@ func (s *SQLiteEventStore) writerLoop() {
 			}
 			s.persisted.Add(1)
 			s.queueDepth.Add(-1)
+			s.broadcastNotify()
 		}
 	}
 }

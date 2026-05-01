@@ -177,6 +177,11 @@ func (f *fakeEventStore) SetEnabled(b bool)      { f.enabled = b; f.setCalls++ }
 func (f *fakeEventStore) Stats() store.Stats     { return store.Stats{} }
 func (f *fakeEventStore) Close() error           { return nil }
 func (f *fakeEventStore) WaitForDrain(time.Duration) {}
+func (f *fakeEventStore) WaitForEvent() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}
 func (f *fakeEventStore) QueryByRun(context.Context, int64, int64, time.Time, int) ([]store.Event, error) {
 	return nil, nil
 }

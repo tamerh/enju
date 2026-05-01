@@ -2144,6 +2144,78 @@ func TestEventsStatusEndpoint(t *testing.T) {
 	}
 }
 
+// TestEventsLongPoll pins the long-poll behavior on the events
+// endpoint. Three properties:
+//
+//  1. ?wait=0 (or absent) returns immediately with whatever's
+//   matched right now — preserves the legacy synchronous shape.
+//  2. ?wait=Ns with no matching events blocks for at most N
+//   seconds, then returns an empty array. Doesn't return early
+//   on unrelated activity.
+//  3. ?wait=Ns wakes up promptly when a matching event lands —
+//   the broadcast pathway from EventStore.broadcastNotify is
+//   what makes this faster than dumb polling.
+//
+// All three together are the substrate for the notification
+// subsystem (docs/notifications.md). Without this, every
+// notification consumer would degrade to polling every N seconds.
+func TestEventsLongPoll(t *testing.T) {
+	s := newTestServer(t)
+
+	// Create a project so we have an authorized scope.
+	resp := s.post("/api/v1/projects", map[string]any{"name": "longpoll-test"})
+	projectIDFloat, _ := resp["id"].(float64)
+	projectID := int64(projectIDFloat)
+	eventsURL := fmt.Sprintf("/api/v1/projects/%d/events", projectID)
+
+	// Property 1: no wait param → immediate empty response.
+	start := time.Now()
+	immediate := s.getList(eventsURL)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("no-wait request took %v, want <100ms", elapsed)
+	}
+	if len(immediate) != 0 {
+		t.Errorf("expected empty events on fresh project, got %d", len(immediate))
+	}
+
+	// Property 2: wait=300ms with no matching events → blocks
+	// for ~300ms then returns empty. Tolerance for scheduler
+	// jitter is wide (200ms-1500ms).
+	start = time.Now()
+	blocked := s.getList(eventsURL + "?wait=300ms")
+	elapsed := time.Since(start)
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("wait=300ms returned in %v, expected to block for at least 200ms", elapsed)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("wait=300ms returned in %v, expected to return by 1.5s", elapsed)
+	}
+	if len(blocked) != 0 {
+		t.Errorf("expected empty events from timeout, got %d", len(blocked))
+	}
+
+	// Property 3: wait=5s + a matching event fired mid-wait
+	// returns promptly (well under 5s). Emit the event from a
+	// goroutine after a short delay so the long-poll request is
+	// already blocked when the broadcast fires.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		s.store.Events().Record(store.Event{
+			CitizenID: 1, EventType: "test", ProjectID: projectID, RunID: 1,
+			CreatedAt: time.Now(),
+		})
+	}()
+	start = time.Now()
+	got := s.getList(eventsURL + "?wait=5s")
+	elapsed = time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Errorf("long-poll didn't wake on broadcast: took %v (want <2s); broadcast pathway broken", elapsed)
+	}
+	if len(got) == 0 {
+		t.Error("expected at least one event after broadcast, got 0")
+	}
+}
+
 // TestEvent_BranchMergedEmission pins the audit hook end-to-end:
 // a fat-client (or any merge-driving consumer) reports a
 // successful FF merge, and the coordinator emits a branch_merged

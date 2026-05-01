@@ -272,6 +272,20 @@ type EventStore interface {
 	// were never enqueued are not waited on.
 	WaitForDrain(timeout time.Duration)
 
+	// WaitForEvent returns a channel that is closed the next
+	// time any event is successfully persisted. Used by long-
+	// poll handlers (?wait= on the events endpoint) to block
+	// until new events arrive instead of polling.
+	//
+	// Implementations that don't support push-style notification
+	// (noop store, broken store) MUST return a non-nil channel
+	// that is either already closed (degrades to immediate
+	// re-poll) or never closes for the call's lifetime; the
+	// handler treats it as "subscribe-then-query" regardless.
+	// The SQLiteEventStore broadcasts by close-and-rotate; a
+	// single shared channel fans out to all waiters in O(1).
+	WaitForEvent() <-chan struct{}
+
 	// Close drains the queue (bounded by an internal
 	// shutdown timeout) and closes the file. Idempotent.
 	Close() error

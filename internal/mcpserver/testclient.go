@@ -94,10 +94,14 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleResumeRun(ctx, req)
 	case "enju_spawn_task":
 		return t.c.handleSpawnTask(ctx, req)
+	case "enju_request_clarification":
+		return t.c.handleRequestClarification(ctx, req)
 	case "enju_set_cycle_budget":
 		return t.c.handleSetCycleBudget(ctx, req)
 	case "enju_show_events":
 		return t.c.handleShowEvents(ctx, req)
+	case "enju_recent_events":
+		return t.c.handleRecentEvents(ctx, req)
 	case "enju_list_iterations":
 		return t.c.handleListIterations(ctx, req)
 	case "enju_file_issue":
