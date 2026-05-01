@@ -43,8 +43,7 @@ func compiledDefaults() []Rule {
 				EventType: "task_completed",
 				Citizen:   "{{me}}",
 			},
-			Kind:    "desktop",
-			Message: "✓ Task {{task_id}} completed ({{type}}/{{subtype}})",
+			Message: "Task {{task_id}} completed ({{type}}/{{subtype}})",
 		},
 		{
 			Name: "my_task_failed",
@@ -52,8 +51,7 @@ func compiledDefaults() []Rule {
 				EventType: "task_failed",
 				Citizen:   "{{me}}",
 			},
-			Kind:    "desktop",
-			Message: "✗ Task {{task_id}} failed",
+			Message: "Task {{task_id}} failed",
 		},
 
 		// --- project-pulse defaults — fire on any actor ---
@@ -62,67 +60,68 @@ func compiledDefaults() []Rule {
 			When: Predicate{
 				EventType: "branch_merged",
 			},
-			Kind:    "desktop",
-			Message: "↳ Topic merged ({{task_id}})",
+			Message: "Topic merged for {{task_id}}",
 		},
 		{
 			Name: "issue_filed",
 			When: Predicate{
 				EventType: "issue_filed",
 			},
-			Kind:    "desktop",
-			Message: "🚩 Issue filed by @{{citizen}}",
+			Message: "Issue filed by @{{citizen}}",
 		},
 		{
 			Name: "cycle_budget_exhausted",
 			When: Predicate{
 				EventType: "cycle_budget_exhausted",
 			},
-			Kind:    "desktop",
-			Message: "⏸ Cycle budget exhausted — run auto-paused (runaway loop suspected)",
+			Message: "Cycle budget exhausted — run auto-paused (runaway loop suspected)",
 		},
 		{
 			Name: "task_request_changes",
 			When: Predicate{
 				EventType: "task_request_changes",
 			},
-			Kind:    "desktop",
 			// Without assign_to enrichment we can't say "your work
 			// needs revision." The active-project scope already
 			// narrows this to events the user cares about; the
 			// message points at the task so the user can check.
-			Message: "↩ Review came back on {{task_id}} — changes requested",
+			Message: "Review requested changes on {{task_id}}",
 		},
 		{
 			Name: "run_completed",
 			When: Predicate{
 				EventType: "run_completed",
 			},
-			Kind:    "desktop",
-			Message: "✓ Run completed",
+			Message: "Run completed",
 		},
 		{
 			Name: "run_paused",
 			When: Predicate{
 				EventType: "run_paused",
 			},
-			Kind:    "desktop",
-			Message: "⏸ Run paused by @{{citizen}}",
+			Message: "Run paused by @{{citizen}}",
 		},
 		{
 			Name: "run_resumed",
 			When: Predicate{
 				EventType: "run_resumed",
 			},
-			Kind:    "desktop",
-			Message: "▶ Run resumed by @{{citizen}}",
+			Message: "Run resumed by @{{citizen}}",
 		},
 	}
 }
 
-// effectiveDefaults filters compiledDefaults by the user's
+// EffectiveDefaults filters compiledDefaults by the user's
 // DisableDefaults list. The literal "all" disables every
 // built-in default; otherwise individual names are removed.
+// Exported so consumers (the enju_notifications MCP tool)
+// can reuse the same filter logic the poll loop used.
+func EffectiveDefaults(disabled []string) []Rule {
+	return effectiveDefaults(disabled)
+}
+
+// effectiveDefaults is the unexported variant — kept for
+// backward-compat with internal callers.
 func effectiveDefaults(disabled []string) []Rule {
 	if isDisabled("all", disabled) {
 		return nil

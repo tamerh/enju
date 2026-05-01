@@ -1,27 +1,21 @@
-// Package notify is the fat-client notification subsystem —
-// the "Thunderbird" half of the server-stores-client-routes
-// design (see docs/notifications.md).
+// Package notify is the fat-client poll-and-record substrate
+// for the project notification system (see docs/notifications.md).
 //
 // Run() long-polls the coordinator's events endpoint for one
-// project, matches each event against the rules in the Config,
-// and dispatches matches to local adapters (desktop notify,
-// shell command, etc.). The package is self-contained: callers
-// pass a Config, Run blocks until ctx is cancelled or a non-
-// recoverable error fires.
+// project and appends each received event as a JSON line to
+// {ProjectDir}/enju/events/live.jsonl, advancing the cursor in
+// {ProjectDir}/enju/events/cursor.json after every batch.
 //
-// Two callers are anticipated:
+// That's the entire job. Filtering events into "notifications"
+// and surfacing them to the user is done by the
+// enju_notifications MCP tool, which reads live.jsonl on demand
+// and applies the Layer 1 default rules (defaults.go).
 //
-//   - Tier 1 (default): the `enju mcp` fat-client invokes Run
-//   as a goroutine on startup, using the running citizen's
-//   bearer token. Notifications work whenever the MCP host is
-//   open. Single-process, zero ceremony.
-//   - Tier 2 (post-v1): a standalone `enju notify` subcommand
-//   wraps Run in its own main loop, runs as a registered
-//   child-bot citizen. Useful for 24/7 pings even when the
-//   MCP host is closed (overnight runs, hosted-mode bridges).
-//
-// The package doesn't know which tier is calling — Config is
-// the only input. The same code path handles both.
+// The package is self-contained: callers pass a Config, Run
+// blocks until ctx is cancelled or a non-recoverable error
+// fires. No adapters, no dispatch, no in-process consumers —
+// downstream consumers (the MCP tool, future plugin processes)
+// read live.jsonl independently.
 package notify
 
 import (
@@ -32,7 +26,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -52,9 +45,8 @@ type Config struct {
 	// one Run goroutine per project.
 	ProjectID int64
 
-	// CitizenID is the running citizen's identity. Used to
-	// resolve "me" in default-rule predicates (Phase 4b).
-	// The bearer token must belong to this citizen.
+	// CitizenID is the running citizen's identity. The bearer
+	// token must belong to this citizen.
 	CitizenID int64
 
 	// Username is the running citizen's username, used to
@@ -77,24 +69,6 @@ type Config struct {
 	// failure mode the test team hit twice. Nil → fall back to
 	// BearerToken (the static string).
 	BearerTokenFn func() string
-
-	// Rules is the list of user-defined rules to evaluate per
-	// event. The notify loop composes these with the compiled-
-	// in Layer 1 defaults (see defaults.go); both layers fire
-	// on matching events. Empty Rules is fine — defaults still
-	// run unless DisableDefaults includes "all".
-	Rules []Rule
-
-	// DisableDefaults turns off built-in defaults by name. The
-	// literal "all" disables every default. Lets users opt out
-	// of noisy defaults without abandoning the rest of the
-	// platform-pulse story.
-	DisableDefaults []string
-
-	// RateLimits overrides per-rule rate-limit policy by name.
-	// Applies to defaults and user rules uniformly. Unset rules
-	// fall back to the table in ratelimit.go.
-	RateLimits map[string]rateLimit
 
 	// ProjectDir is the project's local clone directory (e.g.
 	// ~/.enju/workspaces/tp53-paper-5/). All project-scoped state
@@ -135,32 +109,27 @@ type Config struct {
 
 	// Logger receives diagnostic output. nil → slog.Default().
 	Logger *slog.Logger
-
-	// Dispatcher overrides the default adapter dispatch (which
-	// shells out to notify-send / osascript / etc). Tests inject
-	// a capturing fn so they don't need a desktop environment.
-	// nil → use the built-in dispatcher.
-	Dispatcher func(Event, Rule, Config) error
 }
 
-// Run is the long-poll loop. Blocks until ctx is cancelled or
-// an unrecoverable error fires. Transient errors (network
-// blips, coordinator restarts) are logged and retried with
-// backoff; the function only returns on ctx.Err() or
-// configuration errors that can't be retried out of.
+// Run is the poll loop. Blocks until ctx is cancelled. Transient
+// errors (network blips, coordinator restarts, stale tokens) are
+// logged and retried with backoff. Returns only on ctx.Err() or
+// missing-required-config.
 //
-// The contract:
+// What it does, end to end:
 //
-//  1. On startup, load state.last_seq (or default to "now" via
-//   a fresh head fetch — TODO: implement skip-to-head in 4b).
-//  2. For each tick: long-poll /events?wait=PollWait&since=...
-//  3. For each returned event: match against Rules and dispatch.
-//  4. Persist last_seq after each batch (atomic write).
-//  5. Repeat forever.
+//  1. Load saved cursor (last seq seen) from
+//     {ProjectDir}/enju/events/cursor.json.
+//  2. Long-poll /events?since_seq=N&wait=PollWait.
+//  3. Append each returned event as a JSON line to
+//     {ProjectDir}/enju/events/live.jsonl.
+//  4. Advance cursor to the highest seen seq, persist atomically.
+//  5. Repeat.
 //
-// Failures dispatch-side don't stop the loop: a broken adapter
-// logs and continues. Only ctx cancellation or a config error
-// terminates Run.
+// Notification matching + display happens elsewhere — the
+// enju_notifications MCP tool reads live.jsonl on demand,
+// applies the Layer 1 default rules, returns the read/unread
+// list. Run is just the poll-and-record substrate.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.CoordinatorURL == "" {
 		return fmt.Errorf("notify.Run: CoordinatorURL is required")
@@ -186,20 +155,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	state, _ := loadState(cursorPath(cfg)) // missing file = empty state, fine
 
-	// Compose user rules with Layer 1 defaults. The boot-time set
-	// is whatever Switch passed in via Config; mid-loop reloads
-	// (see allRulesForCfg below) re-read enju/notify.yaml on file
-	// mtime change so users editing rules don't need to restart
-	// MCP — the next poll picks up changes.
-	allRules, lastNotifyMtime, lastDisable := allRulesForCfg(cfg, time.Time{}, nil, logger)
-
-	limiter := newRateLimiter(cfg.RateLimits)
-
 	logger.Info("notify loop started",
 		"project_id", cfg.ProjectID,
 		"citizen", cfg.Username,
 		"since_seq", state.LastSeq,
-		"rules", len(allRules),
 	)
 
 	const errorBackoff = 5 * time.Second
@@ -210,31 +169,20 @@ func Run(ctx context.Context, cfg Config) error {
 		default:
 		}
 
-		// Hot-reload notify.yaml on mtime change. Cheap: one stat
-		// per poll cycle (every 30s steady-state). Lets users edit
-		// enju/notify.yaml and have the next poll pick up the
-		// change without restarting MCP.
-		allRules, lastNotifyMtime, lastDisable = allRulesForCfg(cfg, lastNotifyMtime, lastDisable, logger)
-
 		events, err := pollEvents(ctx, httpClient, cfg, pollWait, state.LastSeq)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			// 401/403 means the coordinator currently rejects our
-			// bearer (e.g. DB wipe + re-register flow updated the
-			// token mid-flight). With BearerTokenFn wired, the
-			// next poll picks up the rotated token and recovers
-			// automatically. Log a single warning per consecutive
-			// auth-error streak so users see "supervisor saw 401,
-			// will retry with refreshed token" but don't get
-			// log-spam.
-			logFields := []any{"error", err}
+			// bearer (DB wipe + re-register sequence). With
+			// BearerTokenFn wired, the next poll picks up the
+			// rotated token and recovers automatically.
 			if isAuthError(err) && cfg.BearerTokenFn != nil {
 				logger.Warn("notify: poll auth-rejected; will retry with live token on next cycle",
-					append(logFields, "project_id", cfg.ProjectID)...)
+					"project_id", cfg.ProjectID, "error", err)
 			} else {
-				logger.Warn("notify poll failed; backing off", logFields...)
+				logger.Warn("notify poll failed; backing off", "error", err)
 			}
 			select {
 			case <-ctx.Done():
@@ -245,40 +193,16 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		// Server returns newest-first; iterate oldest-first so
-		// cursor advances monotonically and dispatch order matches
-		// causal order.
+		// cursor advances monotonically.
 		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
 			events[i], events[j] = events[j], events[i]
 		}
 
-		dispatcher := cfg.Dispatcher
-		if dispatcher == nil {
-			dispatcher = dispatch
-		}
 		jsonlPath := liveJSONLPath(cfg)
 		for _, ev := range events {
-			// Append to local audit log BEFORE dispatch. If we
-			// crash between log-write and dispatch, the next run
-			// catches up via cursor — events aren't lost. If we
-			// crash between dispatch and log-write, the user got
-			// notified but the local log lacks the entry — also
-			// recoverable on next poll because the cursor hasn't
-			// advanced yet.
 			if jsonlPath != "" {
 				if err := appendEventToLog(jsonlPath, ev); err != nil {
 					logger.Warn("notify log append failed", "path", jsonlPath, "error", err)
-				}
-			}
-			matched := matchRulesAgainst(allRules, ev, cfg)
-			for _, rule := range matched {
-				if !limiter.allow(rule, cfg) {
-					logger.Debug("notify rate limit hit",
-						"rule", rule.Name, "event_type", ev.Type)
-					continue
-				}
-				if err := dispatcher(ev, rule, cfg); err != nil {
-					logger.Warn("notify dispatch failed",
-						"rule", rule.Name, "event_type", ev.Type, "error", err)
 				}
 			}
 			// Cursor advance: server's since_seq filter is strict
@@ -406,90 +330,3 @@ func isAuthError(err error) bool {
 	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403")
 }
 
-// allRulesForCfg returns the live rule set: Layer 1 defaults
-// (filtered by DisableDefaults) + Layer 3 user rules. On the
-// first call (lastMtime zero), it composes from cfg.Rules /
-// cfg.DisableDefaults as captured by Switch. On subsequent
-// calls, it re-reads enju/notify.yaml if the file's mtime has
-// changed and rebuilds — letting users edit rules and have the
-// next poll pick them up without an MCP restart.
-//
-// Returns (newRules, mtimeUsed, disableSetUsed). Pass mtimeUsed
-// and disableSetUsed back on the next call so we can detect
-// file-deletion (mtime returns to zero) and disable-list edits
-// in the same shape.
-//
-// Best-effort: load failures keep the prior rule set and log a
-// warning. We never silently throw out user rules because the
-// YAML couldn't be parsed.
-func allRulesForCfg(cfg Config, lastMtime time.Time, lastDisable []string, logger *slog.Logger) ([]Rule, time.Time, []string) {
-	cfgPath := UserConfigPath(cfg.ProjectDir)
-
-	// Snapshot mtime first so we can detect change (or absence).
-	var curMtime time.Time
-	if cfgPath != "" {
-		if info, err := os.Stat(cfgPath); err == nil {
-			curMtime = info.ModTime()
-		}
-	}
-
-	// Boot path (lastMtime zero, lastDisable nil): compose from
-	// the cfg captured at Switch time. Subsequent polls always
-	// go through the file-on-disk path so a YAML edit replaces
-	// the boot-time rules.
-	if lastMtime.IsZero() && lastDisable == nil {
-		defaults := effectiveDefaults(cfg.DisableDefaults)
-		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
-		out = append(out, defaults...)
-		out = append(out, cfg.Rules...)
-		return out, curMtime, append([]string(nil), cfg.DisableDefaults...)
-	}
-
-	// Steady state: only re-parse on mtime change. Avoids
-	// re-reading + warn-spamming for every poll when the file
-	// hasn't moved.
-	if curMtime.Equal(lastMtime) {
-		// Recompose from current snapshots — same data, but
-		// returns a fresh slice so callers can safely mutate.
-		defaults := effectiveDefaults(lastDisable)
-		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
-		out = append(out, defaults...)
-		out = append(out, cfg.Rules...)
-		return out, lastMtime, lastDisable
-	}
-
-	// File changed (or appeared/disappeared) — reload.
-	if cfgPath == "" || curMtime.IsZero() {
-		// File removed; fall back to whatever Switch captured.
-		logger.Info("notify: rules file gone, reverting to boot-time rules",
-			"path", cfgPath, "rules", len(cfg.Rules))
-		defaults := effectiveDefaults(cfg.DisableDefaults)
-		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
-		out = append(out, defaults...)
-		out = append(out, cfg.Rules...)
-		return out, curMtime, append([]string(nil), cfg.DisableDefaults...)
-	}
-
-	uc, warnings, err := LoadUserConfig(cfgPath)
-	if err != nil {
-		logger.Warn("notify: hot-reload failed, keeping prior rule set",
-			"path", cfgPath, "error", err)
-		// Keep prior — but bump mtime so we don't retry on every
-		// poll until the file changes again.
-		defaults := effectiveDefaults(lastDisable)
-		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
-		out = append(out, defaults...)
-		out = append(out, cfg.Rules...)
-		return out, curMtime, lastDisable
-	}
-	for _, w := range warnings {
-		logger.Warn("notify: rules issue (hot-reload)", "path", cfgPath, "issue", w)
-	}
-	logger.Info("notify: rules reloaded", "path", cfgPath, "user_rules", len(uc.Custom))
-	defaults := effectiveDefaults(uc.DisableDefaults)
-	userRules := uc.ToRules()
-	out := make([]Rule, 0, len(defaults)+len(userRules))
-	out = append(out, defaults...)
-	out = append(out, userRules...)
-	return out, curMtime, append([]string(nil), uc.DisableDefaults...)
-}

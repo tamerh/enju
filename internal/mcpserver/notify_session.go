@@ -94,39 +94,26 @@ func (s *notifySession) Switch(projectID int64) {
 	}
 	if projectDir == "" {
 		// No clone yet — happens between project creation and
-		// first workspace touch. Notify can still run; cursor
-		// and JSONL writes skip silently when path is empty.
-		// The dispatch path still fires desktop popups etc.
+		// first workspace touch. Notify still runs but cursor +
+		// live.jsonl writes skip silently when path is empty.
 		s.cfg.Logger.Info("notify: no local clone for project, running with no on-disk state",
 			"project_id", projectID)
 	}
 
-	uc, warnings, err := notify.LoadUserConfig(notify.UserConfigPath(projectDir))
-	if err != nil {
-		s.cfg.Logger.Warn("notify: failed to load project notify.yaml — continuing with Layer 1 defaults only",
-			"project_id", projectID, "err", err)
-		uc = notify.UserConfig{}
-	}
-	for _, w := range warnings {
-		s.cfg.Logger.Warn("notify: config issue", "project_id", projectID, "issue", w)
-	}
-
 	runCfg := notify.Config{
-		CoordinatorURL:  s.cfg.CoordinatorURL,
-		ProjectID:       projectID,
-		Username:        s.cfg.Username,
-		BearerTokenFn:   s.cfg.TokenFn,
-		ProjectDir:      projectDir,
-		Rules:           uc.ToRules(),
-		DisableDefaults: uc.DisableDefaults,
-		Logger:          s.cfg.Logger,
+		CoordinatorURL: s.cfg.CoordinatorURL,
+		ProjectID:      projectID,
+		Username:       s.cfg.Username,
+		BearerTokenFn:  s.cfg.TokenFn,
+		ProjectDir:     projectDir,
+		Logger:         s.cfg.Logger,
 	}
 
 	ctx, cancel := context.WithCancel(s.cfg.ParentCtx)
 	s.cancel = cancel
 	go func() {
 		s.cfg.Logger.Info("notify: poller started for project",
-			"project_id", projectID, "rules", len(runCfg.Rules), "project_dir", projectDir)
+			"project_id", projectID, "project_dir", projectDir)
 		if err := notify.Run(ctx, runCfg); err != nil && ctx.Err() == nil {
 			s.cfg.Logger.Error("notify: poller exited with error",
 				"project_id", projectID, "err", err)

@@ -731,6 +731,26 @@ func toolRecentEvents() mcp.Tool {
 	)
 }
 
+// toolNotifications surfaces the per-project notification list
+// — Facebook-style read/unread items derived from the local
+// live.jsonl substrate filtered through the 9 built-in Layer 1
+// default rules. Calling marks the surfaced items as read.
+func toolNotifications() mcp.Tool {
+	return mcp.NewTool("enju_notifications",
+		mcp.WithDescription(`List recent notifications for a project — read/unread style. Reads the local event substrate (enju/events/live.jsonl) and filters through the 9 built-in default rules (task completed, run completed, branch merged, issue filed, cycle budget exhausted, etc). Returns the latest matches with 🔴 unread / ⚪ read markers. Calling this tool marks surfaced items as read; the next call shows them as ⚪. Honors enju/notify.yaml's disable_defaults knob for muting individual default types. Designed for the assistant to call at the start of a turn or when the user asks "any updates?" / "what's new?".`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to surface notifications for."),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Max notifications to return (default 20, max 100)."),
+		),
+		mcp.WithBoolean("mark_read",
+			mcp.Description("Default true. When true, advances the read cursor so this batch shows as ⚪ on the next call. Set false to peek without changing read state."),
+		),
+	)
+}
+
 // toolEventsStatus surfaces the EventStore's runtime state.
 // operators reach for this when diagnosing "is
 // the audit log healthy?" Returns enabled/disabled state +

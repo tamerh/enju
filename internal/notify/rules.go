@@ -1,28 +1,23 @@
 package notify
 
-// Rule matching. v1: simple field-equality predicates on event
-// type/subtype + assign_to/citizen, plus a string-templated
-// "do" command. Layer 1 defaults (bot_failed, my_review_resolved,
-// etc.) come in Phase 4b as compiled-in rules using the same
-// matcher.
+// Rule matching. Simple field-equality predicates on
+// event_type / subtype / task_id / citizen. Used by the 9
+// compiled-in Layer 1 default rules (defaults.go) when the
+// enju_notifications MCP tool filters live.jsonl.
 
 import (
 	"strings"
 )
 
-// Rule is one matcher + delivery instruction. Rules come from
-// three sources (per docs/notifications.md three-layer model):
-//
-//   - Layer 1: compiled-in defaults (Phase 4b)
-//   - Layer 2: project-shared, loaded from enju/conf.yaml (Phase 4d)
-//   - Layer 3: per-user, loaded from ~/.enju/notify.yaml (Phase 4d)
-//
-// All three flow through Config.Rules; Run doesn't distinguish.
+// Rule is one matcher + rendered message template. Rules in v1
+// are compiled-in Layer 1 defaults — the filter that decides
+// "is this event worth showing as a notification." User rules
+// (Layer 3 customization) deferred post-launch; the simpler
+// "9 hardcoded notification types, opt-out via disable_defaults"
+// model is what v1 ships.
 type Rule struct {
-	// Name is a stable identifier used in logs and (Phase 4b)
-	// for rate-limiting bookkeeping. Layer 1 defaults have
-	// reserved names like "assigned_task_ready"; user rules
-	// pick their own.
+	// Name is a stable identifier used in logs and for opt-out
+	// via disable_defaults in enju/notify.yaml.
 	Name string
 
 	// When is the predicate. All non-empty fields must match
@@ -30,19 +25,10 @@ type Rule struct {
 	// Empty fields are wildcards.
 	When Predicate
 
-	// Kind selects the adapter. v1 ships "desktop"; "shell",
-	// "slack", "ntfy", "email" come in 4c.
-	Kind string
-
-	// Message is a human-readable template — basic {{field}}
-	// substitution (4b will harden the template language). For
-	// Kind=desktop it becomes the popup body; for Kind=shell
-	// it's piped to the command via stdin or env.
+	// Message is the rendered notification text shown to the
+	// user. Supports basic {{field}} substitution against the
+	// event — see renderTemplate for the supported tokens.
 	Message string
-
-	// Do is the shell command for Kind=shell rules. Ignored
-	// for built-in adapter kinds.
-	Do string
 }
 
 // Predicate is the When clause of a Rule. All non-empty fields
@@ -58,18 +44,22 @@ type Predicate struct {
 	// for v1.
 }
 
-// matchRules returns the subset of cfg.Rules that match ev.
-// Doesn't include Layer 1 defaults — use matchRulesAgainst
-// when defaults need to participate. Kept as a thin convenience
-// for callers (mostly tests) that explicitly want user rules
-// only.
-func matchRules(ev Event, cfg Config) []Rule {
-	return matchRulesAgainst(cfg.Rules, ev, cfg)
+// PredicateMatches is the exported entry point for
+// predicateMatches — used by the enju_notifications MCP tool
+// to filter live.jsonl events through the same predicate logic
+// the poll loop would have used.
+func PredicateMatches(p Predicate, ev Event, cfg Config) bool {
+	return predicateMatches(p, ev, cfg)
+}
+
+// RenderTemplate is the exported entry point for renderTemplate.
+func RenderTemplate(tmpl string, ev Event) string {
+	return renderTemplate(tmpl, ev)
 }
 
 // matchRulesAgainst evaluates an arbitrary rule list against
-// an event. Run uses this with the merged (defaults + user)
-// list so both layers participate in dispatch.
+// an event. Used by enju_notifications to filter live.jsonl
+// through the Layer 1 default rules.
 func matchRulesAgainst(rules []Rule, ev Event, cfg Config) []Rule {
 	var matched []Rule
 	for _, rule := range rules {
@@ -111,9 +101,9 @@ func predicateMatches(p Predicate, ev Event, cfg Config) bool {
 //
 //   {{type}}, {{subtype}}, {{task_id}}, {{citizen}}, {{ts}}
 //
-// Phase 4b hardens this — proper Go-template-style with safe
-// escaping and explicit field allowlist. v1 is intentionally
-// minimal so the whole notify package stays tight.
+// v1 is intentionally minimal — when custom user rules land
+// (roadmap item #3) this should grow proper Go-template-style
+// rendering with explicit field allowlist.
 func renderTemplate(tmpl string, ev Event) string {
 	if tmpl == "" {
 		return ""

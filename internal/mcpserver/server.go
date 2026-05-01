@@ -157,6 +157,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	s.AddTool(toolSetCycleBudget(), client.handleSetCycleBudget)
 	s.AddTool(toolShowEvents(), client.handleShowEvents)
 	s.AddTool(toolRecentEvents(), client.handleRecentEvents)
+	s.AddTool(toolNotifications(), client.handleNotifications)
 	s.AddTool(toolEventsStatus(), client.handleEventsStatus)
 	s.AddTool(toolListIterations(), client.handleListIterations)
 	s.AddTool(toolFileIssue(), client.handleFileIssue)
