@@ -37,9 +37,12 @@ dev-restart: build
 	@echo "==> Wiping DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
 	rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
 	rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
-	# Notify state is project-scoped — lives under each project
-	# clone's enju/events/ and gets wiped along with workspaces
-	# below. Nothing in ~/.enju/ to clean.
+	# Live notify state is project-scoped (under each clone's
+	# enju/events/) and goes with the workspaces wipe below.
+	# Defensively clean any legacy ~/.enju/notify-* files left
+	# behind from pre-redesign installs — once cleared, notify
+	# never recreates them.
+	rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json ~/.enju/notify.yaml
 	rm -rf ~/.enju/git-dir ~/.enju/repos
 	rm -rf ~/.enju/workspaces
 	mkdir -p ~/.enju/workspaces

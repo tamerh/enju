@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -172,13 +173,12 @@ func Run(ctx context.Context, cfg Config) error {
 
 	state, _ := loadState(cursorPath(cfg)) // missing file = empty state, fine
 
-	// Compose user rules with Layer 1 defaults. Defaults come
-	// first so they're evaluated first; ordering doesn't affect
-	// outcomes (all matching rules dispatch independently).
-	defaults := effectiveDefaults(cfg.DisableDefaults)
-	allRules := make([]Rule, 0, len(defaults)+len(cfg.Rules))
-	allRules = append(allRules, defaults...)
-	allRules = append(allRules, cfg.Rules...)
+	// Compose user rules with Layer 1 defaults. The boot-time set
+	// is whatever Switch passed in via Config; mid-loop reloads
+	// (see allRulesForCfg below) re-read enju/notify.yaml on file
+	// mtime change so users editing rules don't need to restart
+	// MCP — the next poll picks up changes.
+	allRules, lastNotifyMtime, lastDisable := allRulesForCfg(cfg, time.Time{}, nil, logger)
 
 	limiter := newRateLimiter(cfg.RateLimits)
 
@@ -186,8 +186,7 @@ func Run(ctx context.Context, cfg Config) error {
 		"project_id", cfg.ProjectID,
 		"citizen", cfg.Username,
 		"since_seq", state.LastSeq,
-		"defaults", len(defaults),
-		"user_rules", len(cfg.Rules),
+		"rules", len(allRules),
 	)
 
 	const errorBackoff = 5 * time.Second
@@ -198,10 +197,29 @@ func Run(ctx context.Context, cfg Config) error {
 		default:
 		}
 
+		// Hot-reload notify.yaml on mtime change. Cheap: one stat
+		// per poll cycle (every 30s steady-state). Lets users edit
+		// enju/notify.yaml and have the next poll pick up the
+		// change without restarting MCP.
+		allRules, lastNotifyMtime, lastDisable = allRulesForCfg(cfg, lastNotifyMtime, lastDisable, logger)
+
 		events, err := pollEvents(ctx, httpClient, cfg, pollWait, state.LastSeq)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			// 401 = the bearer token is stale relative to what
+			// the coordinator now accepts (e.g. coordinator DB
+			// was wiped, citizen re-registered with new token).
+			// Notify can't recover on its own: it captures the
+			// token at boot and doesn't share apiClient's
+			// auto-reregister path. Fail loudly and exit so the
+			// user sees the problem instead of the previous
+			// "5-min silent backoff loop" failure mode.
+			if isAuthError(err) {
+				logger.Error("notify: bearer token rejected (HTTP 401) — stale credentials. Restart `enju mcp` to refresh.",
+					"project_id", cfg.ProjectID)
+				return fmt.Errorf("notify: stale bearer token (HTTP 401); restart MCP")
 			}
 			logger.Warn("notify poll failed; backing off", "error", err)
 			select {
@@ -351,4 +369,104 @@ func liveJSONLPath(cfg Config) string {
 		return ""
 	}
 	return cfg.ProjectDir + "/enju/events/live.jsonl"
+}
+
+// isAuthError reports whether a poll error came from the
+// coordinator rejecting the bearer token. The notify loop
+// returns on this rather than backing off forever — auth issues
+// don't self-heal because notify caches the token at boot.
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403")
+}
+
+// allRulesForCfg returns the live rule set: Layer 1 defaults
+// (filtered by DisableDefaults) + Layer 3 user rules. On the
+// first call (lastMtime zero), it composes from cfg.Rules /
+// cfg.DisableDefaults as captured by Switch. On subsequent
+// calls, it re-reads enju/notify.yaml if the file's mtime has
+// changed and rebuilds — letting users edit rules and have the
+// next poll pick them up without an MCP restart.
+//
+// Returns (newRules, mtimeUsed, disableSetUsed). Pass mtimeUsed
+// and disableSetUsed back on the next call so we can detect
+// file-deletion (mtime returns to zero) and disable-list edits
+// in the same shape.
+//
+// Best-effort: load failures keep the prior rule set and log a
+// warning. We never silently throw out user rules because the
+// YAML couldn't be parsed.
+func allRulesForCfg(cfg Config, lastMtime time.Time, lastDisable []string, logger *slog.Logger) ([]Rule, time.Time, []string) {
+	cfgPath := UserConfigPath(cfg.ProjectDir)
+
+	// Snapshot mtime first so we can detect change (or absence).
+	var curMtime time.Time
+	if cfgPath != "" {
+		if info, err := os.Stat(cfgPath); err == nil {
+			curMtime = info.ModTime()
+		}
+	}
+
+	// Boot path (lastMtime zero, lastDisable nil): compose from
+	// the cfg captured at Switch time. Subsequent polls always
+	// go through the file-on-disk path so a YAML edit replaces
+	// the boot-time rules.
+	if lastMtime.IsZero() && lastDisable == nil {
+		defaults := effectiveDefaults(cfg.DisableDefaults)
+		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
+		out = append(out, defaults...)
+		out = append(out, cfg.Rules...)
+		return out, curMtime, append([]string(nil), cfg.DisableDefaults...)
+	}
+
+	// Steady state: only re-parse on mtime change. Avoids
+	// re-reading + warn-spamming for every poll when the file
+	// hasn't moved.
+	if curMtime.Equal(lastMtime) {
+		// Recompose from current snapshots — same data, but
+		// returns a fresh slice so callers can safely mutate.
+		defaults := effectiveDefaults(lastDisable)
+		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
+		out = append(out, defaults...)
+		out = append(out, cfg.Rules...)
+		return out, lastMtime, lastDisable
+	}
+
+	// File changed (or appeared/disappeared) — reload.
+	if cfgPath == "" || curMtime.IsZero() {
+		// File removed; fall back to whatever Switch captured.
+		logger.Info("notify: rules file gone, reverting to boot-time rules",
+			"path", cfgPath, "rules", len(cfg.Rules))
+		defaults := effectiveDefaults(cfg.DisableDefaults)
+		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
+		out = append(out, defaults...)
+		out = append(out, cfg.Rules...)
+		return out, curMtime, append([]string(nil), cfg.DisableDefaults...)
+	}
+
+	uc, warnings, err := LoadUserConfig(cfgPath)
+	if err != nil {
+		logger.Warn("notify: hot-reload failed, keeping prior rule set",
+			"path", cfgPath, "error", err)
+		// Keep prior — but bump mtime so we don't retry on every
+		// poll until the file changes again.
+		defaults := effectiveDefaults(lastDisable)
+		out := make([]Rule, 0, len(defaults)+len(cfg.Rules))
+		out = append(out, defaults...)
+		out = append(out, cfg.Rules...)
+		return out, curMtime, lastDisable
+	}
+	for _, w := range warnings {
+		logger.Warn("notify: rules issue (hot-reload)", "path", cfgPath, "issue", w)
+	}
+	logger.Info("notify: rules reloaded", "path", cfgPath, "user_rules", len(uc.Custom))
+	defaults := effectiveDefaults(uc.DisableDefaults)
+	userRules := uc.ToRules()
+	out := make([]Rule, 0, len(defaults)+len(userRules))
+	out = append(out, defaults...)
+	out = append(out, userRules...)
+	return out, curMtime, append([]string(nil), uc.DisableDefaults...)
 }
