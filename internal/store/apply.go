@@ -129,12 +129,18 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 	defer tx.Rollback()
 
 	result := ApplyResult{}
+	// events are no longer written inside the apply
+	// tx — they're collected here and emitted via the EventStore
+	// after commit. A roll-back due to a later mutation failure
+	// cleanly drops the collected events with the rest of the
+	// would-be state.
+	var pendingEvents []Event
 
 	for _, mut := range plan.Mutations {
 		switch m := mut.(type) {
 
 		case SetTaskState:
-			if err := applySetTaskState(tx, m, &result); err != nil {
+			if err := applySetTaskState(tx, m, &result, &pendingEvents); err != nil {
 				return result, err
 			}
 
@@ -159,7 +165,7 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			result.RunSeq = seq
 
 		case SetClaim:
-			if err := applySetClaim(tx, m); err != nil {
+			if err := applySetClaim(tx, m, &pendingEvents); err != nil {
 				return result, err
 			}
 
@@ -169,7 +175,7 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			}
 
 		case RecordSubmission:
-			if err := applyRecordSubmission(tx, m); err != nil {
+			if err := applyRecordSubmission(tx, m, &pendingEvents); err != nil {
 				return result, err
 			}
 
@@ -198,7 +204,7 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			result.TasksReadied += n
 
 		case CompleteRun:
-			completed, err := applyCompleteRun(tx, m)
+			completed, err := applyCompleteRun(tx, m, &pendingEvents)
 			if err != nil {
 				return result, err
 			}
@@ -212,25 +218,30 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("commit: %w", err)
 	}
+	// Drain collected events to the EventStore. Best-effort:
+	// individual Record() calls never block or error.
+	for _, e := range pendingEvents {
+		s.Events().Record(e)
+	}
 	return result, nil
 }
 
 // ApplyResult carries summary data back to the caller
 // after a successful plan application.
 type ApplyResult struct {
-	RunID        int64
-	RunSeq       int
-	CitizenID    int64
+	RunID    int64
+	RunSeq    int
+	CitizenID  int64
 	TasksCreated int
 	TasksDeleted int
 	TasksReadied int
 	RunCompleted bool
-	Changed      int // generic "rows affected" counter
+	Changed   int // generic "rows affected" counter
 }
 
 // --- Per-mutation apply functions ---
 
-func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
+func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *[]Event) error {
 	// Validate: task exists and check current state.
 	var currentState string
 	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, m.TaskID).Scan(&currentState); err != nil {
@@ -241,9 +252,9 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		// Invalidation-style transition. Validate preconditions:
 		// - Target (→READY): must be in ACCEPTED.
 		// - Descendant (→PENDING): skip if already PENDING
-		//   (no-op, not an error).
+		//  (no-op, not an error).
 		// - Descendant (→SKIPPED via fail-cascade): same clear
-		//   semantics as PENDING, but terminal.
+		//  semantics as PENDING, but terminal.
 		if m.NewState == TaskReady && TaskState(currentState) != TaskAccepted && TaskState(currentState) != TaskFailed {
 			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted or failed)", m.TaskID, currentState)
 		}
@@ -273,15 +284,15 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		}
 		// Phase 6c — open claims are NOT implicitly marked
 		// here. The cascade caller decides:
-		//   - Request_changes target: claim stays open
-		//     (revision-within-iteration semantics).
-		//   - Manual invalidate / reject target: caller
-		//     explicitly calls MarkLatestClaimOutcome with
-		//     the right terminal outcome.
-		//   - Cascade descendants: caller marks their open
-		//     claims as 'invalidated' (their work is
-		//     collateral — wasn't a verdict against them, but
-		//     their iteration is gone).
+		//  - Request_changes target: claim stays open
+		//   (revision-within-iteration semantics).
+		//  - Manual invalidate / reject target: caller
+		//   explicitly calls MarkLatestClaimOutcome with
+		//   the right terminal outcome.
+		//  - Cascade descendants: caller marks their open
+		//   claims as 'invalidated' (their work is
+		//   collateral — wasn't a verdict against them, but
+		//   their iteration is gone).
 		// Pre-6c this code unconditionally wrote 'invalidated'
 		// here, which broke request_changes by closing the
 		// target's claim and forcing iter-N to bump.
@@ -305,17 +316,17 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 			args = append(args, m.SkipReason)
 		}
 		// Parking/restore semantics on parked_from_state:
-		//   - Transition TO parked: caller sets
-		//     ParkedFromState to the prior state; we stash
-		//     it so restore is a lossless revert.
-		//   - Transition FROM parked (restore): caller sets
-		//     NewState to the stashed value and leaves
-		//     ParkedFromState zero. We must explicitly clear
-		//     the column — otherwise the row would look
-		//     "previously parked" forever.
-		//   - Other transitions: column is left alone. (A row
-		//     that was never parked has empty parked_from_state;
-		//     nothing to change.)
+		//  - Transition TO parked: caller sets
+		//   ParkedFromState to the prior state; we stash
+		//   it so restore is a lossless revert.
+		//  - Transition FROM parked (restore): caller sets
+		//   NewState to the stashed value and leaves
+		//   ParkedFromState zero. We must explicitly clear
+		//   the column — otherwise the row would look
+		//   "previously parked" forever.
+		//  - Other transitions: column is left alone. (A row
+		//   that was never parked has empty parked_from_state;
+		//   nothing to change.)
 		if m.NewState == TaskParked {
 			q += `, parked_from_state = ?`
 			args = append(args, m.ParkedFromState)
@@ -338,6 +349,43 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult) error {
 		args = append(args, m.TaskID)
 		if _, err := tx.Exec(q, args...); err != nil {
 			return fmt.Errorf("set_task_state: %w", err)
+		}
+		// task_completed fires on the terminal-good
+		// transition. Skip when current already == accepted to
+		// avoid double-emitting on re-issued ACCEPTED writes.
+		// Single-citizen unreviewed paths emit task_completed
+		// from applyRecordSubmission and never come through here
+		// (they UPDATE state inline). The paths that DO route
+		// through this branch are: vote-tally resolve, review-
+		// tally resolve, and any future "operator marks task
+		// accepted" admin tool. They each set NewState=accepted
+		// here.
+		if m.NewState == TaskAccepted && TaskState(currentState) != TaskAccepted {
+			var runID, projectID int64
+			var taskAction string
+			var citizens int
+			_ = tx.QueryRow(
+				`SELECT t.run_id, r.project_id, t.action, t.citizens
+				 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
+				m.TaskID,
+			).Scan(&runID, &projectID, &taskAction, &citizens)
+			commit := m.CommitSHA
+			if commit == "" {
+				_ = tx.QueryRow(`SELECT COALESCE(commit_sha, '') FROM tasks WHERE id = ?`, m.TaskID).Scan(&commit)
+			}
+			*events = append(*events, Event{
+				EventType:  "task_completed",
+				EventSubtype: taskAction,
+				TaskID:    m.TaskID,
+				RunID:    runID,
+				ProjectID:  projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"commit_sha": commit,
+					"citizens":  citizens,
+					"prior_state": currentState,
+				}),
+				CreatedAt: time.Now(),
+			})
 		}
 	}
 	result.Changed++
@@ -404,18 +452,19 @@ func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
 	return id, nextSeq, nil
 }
 
-func applySetClaim(tx *sql.Tx, m SetClaim) error {
+func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
 	// Read citizens count to decide single vs multi behavior;
 	// pull task_def_id + run_slug for the iteration branch
 	// name (living-workflow phase 6a).
 	var citizens int
 	var runSeq int
 	var taskDefID, runSlug, taskAction, instanceKey string
+	var taskRunID, projectID int64
 	if err := tx.QueryRow(
-		`SELECT t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action, COALESCE(t.instance_key, ''), r.seq
+		`SELECT t.citizens, t.task_def_id, COALESCE(t.run_slug, ''), t.action, COALESCE(t.instance_key, ''), r.seq, t.run_id, r.project_id
 		 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
 		m.TaskID,
-	).Scan(&citizens, &taskDefID, &runSlug, &taskAction, &instanceKey, &runSeq); err != nil {
+	).Scan(&citizens, &taskDefID, &runSlug, &taskAction, &instanceKey, &runSeq, &taskRunID, &projectID); err != nil {
 		return fmt.Errorf("set_claim: task %q not found", m.TaskID)
 	}
 	if citizens <= 0 {
@@ -481,6 +530,30 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 			); err != nil {
 				return fmt.Errorf("set_claim abandon: %w", err)
 			}
+			// Stage iteration_completed for the abandoned
+			// claim. Read iter_seq + commit_sha from the row
+			// we just closed so the audit captures whatever
+			// progress the prior citizen made before takeover.
+			var prevIter sql.NullInt64
+			var prevCommit sql.NullString
+			_ = tx.QueryRow(
+				`SELECT iter_seq, COALESCE(commit_sha, '') FROM task_claims WHERE id = ?`,
+				openID,
+			).Scan(&prevIter, &prevCommit)
+			*events = append(*events, Event{
+				CitizenID:  openCitizen,
+				EventType:  "iteration_completed",
+				EventSubtype: "abandoned",
+				TaskID:    m.TaskID,
+				RunID:    taskRunID,
+				ProjectID:  projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":     prevIter.Int64,
+					"final_commit_sha": prevCommit.String,
+					"taken_over_by":  m.CitizenID,
+				}),
+				CreatedAt: now,
+			})
 		}
 	}
 
@@ -547,6 +620,32 @@ func applySetClaim(tx *sql.Tx, m SetClaim) error {
 	if err != nil {
 		return fmt.Errorf("set_claim: %w", err)
 	}
+	// Stage iteration_started. Subtype "fresh" for iter_seq=1
+	// (very first iteration on this task) vs "reopen" for later
+	// iterations created after a prior outcome — both terminal
+	// (rejected/invalidated) and same-citizen-after-takeover
+	// fall here. The phase 6c reuse path (same citizen reclaim
+	// without new INSERT) doesn't emit; that's the
+	// task_request_changes signal instead.
+	startedSubtype := "fresh"
+	if iterSeq > 1 {
+		startedSubtype = "reopen"
+	}
+	*events = append(*events, Event{
+		CitizenID:  m.CitizenID,
+		EventType:  "iteration_started",
+		EventSubtype: startedSubtype,
+		TaskID:    m.TaskID,
+		RunID:    taskRunID,
+		ProjectID:  projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"iter_seq":     iterSeq,
+			"iteration_branch": branch,
+			"deadline":     m.Deadline.Format(time.RFC3339),
+			"action":      taskAction,
+		}),
+		CreatedAt: now,
+	})
 
 	if citizens == 1 {
 		// Single-citizen: flip state to CLAIMED.
@@ -581,18 +680,19 @@ func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim) error {
 	return err
 }
 
-func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
+func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) error {
 	now := time.Now()
 
 	// Read task to determine single vs multi citizen + action.
 	var citizens int
 	var taskAction, taskDefID, instanceKey string
-	var runID int64
+	var runID, projectID int64
 	var claimedBy sql.NullInt64
 	if err := tx.QueryRow(
-		`SELECT citizens, action, task_def_id, COALESCE(instance_key, ''), run_id, claimed_by FROM tasks WHERE id = ?`,
+		`SELECT t.citizens, t.action, t.task_def_id, COALESCE(t.instance_key, ''), t.run_id, t.claimed_by, r.project_id
+		 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
 		m.TaskID,
-	).Scan(&citizens, &taskAction, &taskDefID, &instanceKey, &runID, &claimedBy); err != nil {
+	).Scan(&citizens, &taskAction, &taskDefID, &instanceKey, &runID, &claimedBy, &projectID); err != nil {
 		return fmt.Errorf("submit: task %q not found", m.TaskID)
 	}
 	if citizens <= 0 {
@@ -635,6 +735,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 	// Always record the submission attempt. Even if the claim
 	// stays open (reviewed task awaiting verdict), the
 	// submission row is the audit trail of THIS attempt.
+	var attemptSeq int64
+	var iterSeq sql.NullInt64
 	if claimRowID.Valid {
 		if _, err := tx.Exec(
 			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, content, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -642,6 +744,46 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 		); err != nil {
 			return fmt.Errorf("submit: record submission: %w", err)
 		}
+		// Derive attempt_seq + iter_seq for the event metadata.
+		// attempt_seq counts submissions on this claim including
+		// the one we just inserted. iter_seq comes from the claim
+		// row (set by applySetClaim).
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM task_submissions WHERE claim_id = ?`,
+			claimRowID.Int64,
+		).Scan(&attemptSeq)
+		_ = tx.QueryRow(
+			`SELECT iter_seq FROM task_claims WHERE id = ?`,
+			claimRowID.Int64,
+		).Scan(&iterSeq)
+		// Stage task_submitted: universal "citizen handed in
+		// work" event. Fires once per submission attempt
+		// regardless of action (answer/compute/review/vote).
+		// review_given / vote_cast continue to fire from
+		// engine/submit.go as the domain-specific facets — they
+		// answer different questions ("what was the verdict?",
+		// "which option?") than this universal emit.
+		// estimated_tokens flows through here so the profile
+		// counter that reads SUM(metadata.estimated_tokens)
+		// stays populated after the redefinition (the
+		// pre-existing engine/submit.go emission carried the token
+		// count; with that gone, this is the universal carrier).
+		*events = append(*events, Event{
+			CitizenID:  m.CitizenID,
+			EventType:  "task_submitted",
+			EventSubtype: taskAction,
+			TaskID:    m.TaskID,
+			RunID:    runID,
+			ProjectID:  projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":     iterSeq.Int64,
+				"attempt_seq":   attemptSeq,
+				"commit_sha":    m.CommitSHA,
+				"decision":     m.Decision,
+				"estimated_tokens": m.EstimatedTokens,
+			}),
+			CreatedAt: now,
+		})
 	}
 
 	if citizens == 1 {
@@ -692,6 +834,41 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 			); err != nil {
 				return err
 			}
+			// Single-citizen, no pending review: this submit IS
+			// the terminal-good moment. Fire iteration_completed
+			// + task_completed together. Reviewed paths defer
+			// both to the review-approve handler in router.go.
+			*events = append(*events,
+				Event{
+					CitizenID:  m.CitizenID,
+					EventType:  "iteration_completed",
+					EventSubtype: "completed",
+					TaskID:    m.TaskID,
+					RunID:    runID,
+					ProjectID:  projectID,
+					Metadata: MarshalMetadata(map[string]any{
+						"iter_seq":     iterSeq.Int64,
+						"final_commit_sha": m.CommitSHA,
+						"action":      taskAction,
+					}),
+					CreatedAt: now,
+				},
+				Event{
+					CitizenID:  m.CitizenID,
+					EventType:  "task_completed",
+					EventSubtype: taskAction,
+					TaskID:    m.TaskID,
+					RunID:    runID,
+					ProjectID:  projectID,
+					Metadata: MarshalMetadata(map[string]any{
+						"iter_seq":     iterSeq.Int64,
+						"commit_sha":    m.CommitSHA,
+						"reviewed":     false,
+						"estimated_tokens": m.EstimatedTokens,
+					}),
+					CreatedAt: now,
+				},
+			)
 		} else if claimRowID.Valid {
 			// Stay open — but still update the
 			// denormalized fields on the claim row so legacy
@@ -729,6 +906,26 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission) error {
 				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, content = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
 				now, choice, m.Content, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
 			)
+			// Multi-citizen: this citizen's iteration just
+			// closed. The task itself stays in COLLECTING until
+			// quorum/threshold; task_completed is NOT emitted
+			// here — it fires when the tally resolves the task
+			// to ACCEPTED (separate code path).
+			*events = append(*events, Event{
+				CitizenID:  m.CitizenID,
+				EventType:  "iteration_completed",
+				EventSubtype: "completed",
+				TaskID:    m.TaskID,
+				RunID:    runID,
+				ProjectID:  projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":     iterSeq.Int64,
+					"final_commit_sha": m.CommitSHA,
+					"action":      taskAction,
+					"multi_citizen":  true,
+				}),
+				CreatedAt: now,
+			})
 		}
 		// Token contribution only (score waits for tally).
 		tx.Exec(
@@ -806,16 +1003,16 @@ func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks) (int, error
 //
 // State rule:
 //
-//   - Any task in {ready, claimed, running, collecting} → active
-//   - Else any task in {pending, parked} → idle
-//   - Else (all in {accepted, skipped, failed}) → completed
+//  - Any task in {ready, claimed, running, collecting} → active
+//  - Else any task in {pending, parked} → idle
+//  - Else (all in {accepted, skipped, failed}) → completed
 //
 // Paused is preserved — pause is a deliberate operator action and
 // must only be left via explicit resume. The function returns
 // true when the run transitioned to `completed` so callers that
 // surface "run completed" UX (the existing behavior) keep working
 // unchanged.
-func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
+func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) {
 	var current string
 	var projectID int64
 	var autoTriage string
@@ -833,9 +1030,9 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
 	var active, holding, total int
 	err = tx.QueryRow(
 		`SELECT
-		   COUNT(*),
-		   COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
-		   COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
+		  COUNT(*),
+		  COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
+		  COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
 		 FROM tasks WHERE run_id = ?`,
 		m.RunID,
 	).Scan(&total, &active, &holding)
@@ -879,20 +1076,19 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun) (bool, error) {
 	if _, err := tx.Exec(`UPDATE runs SET state = ?, updated_at = ? WHERE id = ?`, next, now, m.RunID); err != nil {
 		return false, err
 	}
-	// Emit a lifecycle event in the same transaction so the
-	// event log is consistent with the run-state UPDATE.
-	// citizen 0 = system (not initiated by a specific actor —
-	// these transitions fall out of task-graph state).
-	// projectID was already loaded above for the auto-triage
-	// override; reuse it.
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (0, ?, ?, '', ?, ?, ?, ?)`,
-		"run_"+string(next), current, m.RunID, projectID,
-		fmt.Sprintf(`{"from":%q,"to":%q}`, current, next), now,
-	); err != nil {
-		return false, err
-	}
+	// Stage a lifecycle event for post-commit emission. citizen
+	// 0 = system (not initiated by a specific actor — these
+	// transitions fall out of task-graph state). The matching
+	// post-commit drain in applyPlanOnce flushes to the
+	// EventStore only if the whole plan commits.
+	*events = append(*events, Event{
+		EventType:  "run_" + string(next),
+		EventSubtype: current,
+		RunID:    m.RunID,
+		ProjectID:  projectID,
+		Metadata:   MarshalMetadata(map[string]any{"from": current, "to": next}),
+		CreatedAt:  now,
+	})
 	return next == RunCompleted, nil
 }
 

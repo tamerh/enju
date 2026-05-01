@@ -19,13 +19,13 @@ import (
 // and the named-outputs schema (if any) so multi-file submits can
 // compute per-output filenames without a second round-trip.
 type taskMeta struct {
-	ID               string
-	ProjectID        int64
+	ID        string
+	ProjectID    int64
 	ProjectRemoteURL string
-	ProjectName      string
-	RunSeq           int
-	TaskDefID        string
-	InstanceKey      string
+	ProjectName   string
+	RunSeq      int
+	TaskDefID    string
+	InstanceKey   string
 	// State is the task's current lifecycle state. Populated
 	// from the coordinator's task record so the fat-client
 	// submit helper can pre-reject submissions against tasks
@@ -126,6 +126,13 @@ type taskMeta struct {
 	// semantics, no breakage when the topic-branch flow isn't
 	// applicable.
 	IterationBranch string
+	// IterSeq is the iter_seq value for this citizen's open
+	// claim — paired with IterationBranch. wires it
+	// through to the Enju-Iter-Seq commit trailer so a forensic
+	// `git log` can reconstruct iteration counters without the
+	// coordinator. Zero when no active claim has an iter_seq
+	// (vote/review pre-6c, anonymized tasks).
+	IterSeq int
 	// UpstreamIterationBranch is the topic branch of the task
 	// this review is judging — populated only for action:review
 	// tasks. Used as the BaseBranch when forking the review's
@@ -285,6 +292,15 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	if v, ok := raw["iteration_branches"].(map[string]interface{}); ok {
 		if b, ok := v[c.username].(string); ok {
 			meta.IterationBranch = b
+		}
+	}
+	// iteration_seqs is the parallel
+	// username → iter_seq map exposed alongside
+	// iteration_branches. Picked up here so the SubmitTaskResult
+	// trailer renderer can stamp Enju-Iter-Seq onto the commit.
+	if v, ok := raw["iteration_seqs"].(map[string]interface{}); ok {
+		if n, ok := v[c.username].(float64); ok {
+			meta.IterSeq = int(n)
 		}
 	}
 	if v, ok := raw["previous_iteration_commit"].(string); ok {

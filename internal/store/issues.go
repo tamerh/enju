@@ -13,32 +13,32 @@ import (
 //
 // State transitions:
 //
-//	open → triaged       (TriageIssue, manual)
-//	open → in_progress   (MarkIssueInProgress, auto-triage spawn)
+//	open → triaged    (TriageIssue, manual)
+//	open → in_progress  (MarkIssueInProgress, auto-triage spawn)
 //	open → closed/wontfix (CloseIssue, manual close)
 //	triaged → in_progress (MarkIssueInProgress)
 //	triaged → closed/wontfix
 //	in_progress → closed (auto on linked task accept, or manual)
 //	in_progress → wontfix (manual)
 const (
-	IssueStatusOpen       = "open"
-	IssueStatusTriaged    = "triaged"
+	IssueStatusOpen    = "open"
+	IssueStatusTriaged  = "triaged"
 	IssueStatusInProgress = "in_progress"
-	IssueStatusClosed     = "closed"
-	IssueStatusWontfix    = "wontfix"
-	IssueSeverityLow      = "low"
-	IssueSeverityMedium   = "medium"
-	IssueSeverityHigh     = "high"
-	IssueSeverityCrit     = "critical"
+	IssueStatusClosed   = "closed"
+	IssueStatusWontfix  = "wontfix"
+	IssueSeverityLow   = "low"
+	IssueSeverityMedium  = "medium"
+	IssueSeverityHigh   = "high"
+	IssueSeverityCrit   = "critical"
 )
 
 // IssueFilter narrows ListIssues. ProjectID is the only required
 // field — issues are project-scoped by construction.
 type IssueFilter struct {
 	ProjectID int64
-	Status    []string // OR-matched if non-empty
-	Severity  []string
-	Limit     int
+	Status  []string // OR-matched if non-empty
+	Severity []string
+	Limit   int
 }
 
 // CreateIssue inserts a new issue and returns its DB id + the
@@ -52,9 +52,13 @@ type IssueFilter struct {
 // found_in_task_id; downstream-facing fields like triaged_by /
 // closed_by_task_id are populated by TriageIssue / CloseIssue.
 //
-// Emits issue_filed in the same transaction as the INSERT so
-// the event log can't drift from issue state under partial
-// failure. Matches the SpawnTask / applyCompleteRun pattern.
+// issue_filed is emitted via the EventStore *after*
+// commit. The earlier in-tx guarantee ("event log can't drift
+// from issue state under partial failure") is gone — events
+// are now best-effort observability. A successful commit
+// followed by an event-emit drop leaves an audit gap, which
+// shows up as a per-project seq gap (gap detection is the
+// audit-detectable signal). State is always consistent.
 func (s *Store) CreateIssue(rec *IssueRecord) (int64, int, error) {
 	if rec.ProjectID == 0 {
 		return 0, 0, fmt.Errorf("project_id is required")
@@ -102,24 +106,28 @@ func (s *Store) CreateIssue(rec *IssueRecord) (int64, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	// Emit issue_filed in the same tx so the event log can't
-	// drift from the issue row under partial failure. Severity
-	// rides on event_subtype so filters like
-	// `event_types=issue_filed` can further narrow by severity
-	// without metadata parsing.
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'issue_filed', ?, ?, ?, ?, ?, ?)`,
-		rec.FiledBy, rec.Severity, rec.FoundInTaskID, rec.FoundInRunID, rec.ProjectID,
-		fmt.Sprintf(`{"issue_seq":%d,"title":%q,"severity":%q}`, rec.Seq, rec.Title, rec.Severity),
-		rec.FiledAt,
-	); err != nil {
-		return 0, 0, err
-	}
 	if err := tx.Commit(); err != nil {
 		return 0, 0, err
 	}
 	rec.ID = id
+
+	// Severity rides on event_subtype so filters like
+	// `event_types=issue_filed` can further narrow by severity
+	// without metadata parsing.
+	s.Events().Record(Event{
+		CitizenID:  rec.FiledBy,
+		EventType:  "issue_filed",
+		EventSubtype: rec.Severity,
+		TaskID:    rec.FoundInTaskID,
+		RunID:    rec.FoundInRunID,
+		ProjectID:  rec.ProjectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq": rec.Seq,
+			"title":   rec.Title,
+			"severity": rec.Severity,
+		}),
+		CreatedAt:  rec.FiledAt,
+	})
 	return id, rec.Seq, nil
 }
 
@@ -128,7 +136,7 @@ func (s *Store) CreateIssue(rec *IssueRecord) (int64, int, error) {
 func (s *Store) GetIssueBySeq(projectID int64, seq int) (*IssueRecord, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project_id, seq, title, body, status, severity, found_in_run_id, found_in_task_id,
-		        filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
+		    filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
 		 FROM issues WHERE project_id = ? AND seq = ?`,
 		projectID, seq,
 	)
@@ -139,7 +147,7 @@ func (s *Store) GetIssueBySeq(projectID int64, seq int) (*IssueRecord, error) {
 func (s *Store) GetIssue(id int64) (*IssueRecord, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project_id, seq, title, body, status, severity, found_in_run_id, found_in_task_id,
-		        filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
+		    filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
 		 FROM issues WHERE id = ?`,
 		id,
 	)
@@ -205,7 +213,7 @@ func (s *Store) ListIssues(f IssueFilter) ([]IssueRecord, error) {
 	args = append(args, limit)
 	rows, err := s.db.Query(
 		`SELECT id, project_id, seq, title, body, status, severity, found_in_run_id, found_in_task_id,
-		        filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
+		    filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
 		 FROM issues
 		 WHERE `+strings.Join(conds, " AND ")+`
 		 ORDER BY filed_at DESC, id DESC
@@ -267,7 +275,7 @@ func (s *Store) TriageIssue(issueID, citizenID int64, severity string) error {
 
 	now := time.Now()
 	q := `UPDATE issues
-	      SET status = 'triaged', triaged_by = ?, triaged_at = ?, updated_at = ?`
+	   SET status = 'triaged', triaged_by = ?, triaged_at = ?, updated_at = ?`
 	args := []interface{}{citizenID, now, now}
 	if severity != "" {
 		q += `, severity = ?`
@@ -296,16 +304,21 @@ func (s *Store) TriageIssue(issueID, citizenID int64, severity string) error {
 	).Scan(&projectID, &seq, &newSeverity); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'issue_triaged', ?, '', 0, ?, ?, ?)`,
-		citizenID, newSeverity, projectID,
-		fmt.Sprintf(`{"issue_seq":%d,"severity":%q}`, seq, newSeverity),
-		now,
-	); err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	s.Events().Record(Event{
+		CitizenID:  citizenID,
+		EventType:  "issue_triaged",
+		EventSubtype: newSeverity,
+		ProjectID:  projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq": seq,
+			"severity": newSeverity,
+		}),
+		CreatedAt:  now,
+	})
+	return nil
 }
 
 // MarkIssueInProgress transitions open|triaged → in_progress and
@@ -346,16 +359,21 @@ func (s *Store) MarkIssueInProgress(issueID, citizenID int64, fixTaskID string) 
 	).Scan(&projectID, &seq); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'issue_in_progress', '', ?, 0, ?, ?, ?)`,
-		citizenID, fixTaskID, projectID,
-		fmt.Sprintf(`{"issue_seq":%d,"fix_task_id":%q}`, seq, fixTaskID),
-		now,
-	); err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	s.Events().Record(Event{
+		CitizenID: citizenID,
+		EventType: "issue_in_progress",
+		TaskID:  fixTaskID,
+		ProjectID: projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq":  seq,
+			"fix_task_id": fixTaskID,
+		}),
+		CreatedAt: now,
+	})
+	return nil
 }
 
 // FindOldestOpenIssue returns the lowest-seq issue in `open`
@@ -368,7 +386,7 @@ func (s *Store) MarkIssueInProgress(issueID, citizenID int64, fixTaskID string) 
 func (s *Store) FindOldestOpenIssue(projectID int64) (*IssueRecord, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project_id, seq, title, body, status, severity, found_in_run_id, found_in_task_id,
-		        filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
+		    filed_by, filed_at, triaged_by, triaged_at, closed_by_task_id, closed_at, updated_at
 		 FROM issues
 		 WHERE project_id = ? AND status = 'open'
 		 ORDER BY seq ASC LIMIT 1`,
@@ -418,14 +436,21 @@ func (s *Store) CloseIssue(issueID, citizenID int64, status, closedByTaskID stri
 	).Scan(&projectID, &seq); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'issue_closed', ?, ?, 0, ?, ?, ?)`,
-		citizenID, status, closedByTaskID, projectID,
-		fmt.Sprintf(`{"issue_seq":%d,"status":%q,"closed_by_task_id":%q}`, seq, status, closedByTaskID),
-		now,
-	); err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	s.Events().Record(Event{
+		CitizenID:  citizenID,
+		EventType:  "issue_closed",
+		EventSubtype: status,
+		TaskID:    closedByTaskID,
+		ProjectID:  projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq":     seq,
+			"status":      status,
+			"closed_by_task_id": closedByTaskID,
+		}),
+		CreatedAt:  now,
+	})
+	return nil
 }

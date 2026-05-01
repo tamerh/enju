@@ -7,11 +7,11 @@
 // store.ApplyPlan.
 //
 // A handler's job is strictly:
-//   1. Parse the HTTP request
-//   2. Call engine.ComputeX() for the decision
-//   3. Call store.ApplyPlan() for the write
-//   4. Record contribution events (best-effort)
-//   5. Format and return the response
+//  1. Parse the HTTP request
+//  2. Call engine.ComputeX() for the decision
+//  3. Call store.ApplyPlan() for the write
+//  4. Record contribution events (best-effort)
+//  5. Format and return the response
 //
 // If you find yourself writing an if-else that decides "what
 // should happen" in this file, it belongs in the engine.
@@ -65,9 +65,9 @@ func citizenFromRequest(r *http.Request) *store.CitizenRecord {
 // state of its own — clients own their own clones, and the
 // coordinator is pure DAG/state/index metadata.
 type Server struct {
-	store  *store.Store
-	dags   map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
-	runs   map[int64]*enjuYaml.ParsedRun
+	store *store.Store
+	dags  map[int64]*dag.DAG // runID -> DAG (in-memory for fast queries)
+	runs  map[int64]*enjuYaml.ParsedRun
 	logger *slog.Logger
 
 	// triageMu serializes maybeAutoTriage per project to close
@@ -82,9 +82,9 @@ type Server struct {
 // NewServer creates a new API server.
 func NewServer(st *store.Store, logger *slog.Logger) *Server {
 	return &Server{
-		store:  st,
-		dags:   make(map[int64]*dag.DAG),
-		runs:   make(map[int64]*enjuYaml.ParsedRun),
+		store: st,
+		dags:  make(map[int64]*dag.DAG),
+		runs:  make(map[int64]*enjuYaml.ParsedRun),
 		logger: logger,
 	}
 }
@@ -346,6 +346,14 @@ func (s *Server) Router() http.Handler {
 		r.Post("/projects/{projectID}/runs/{runSeq}/resume", s.handleResumeRun)
 		r.Post("/projects/{projectID}/runs/{runSeq}/spawn", s.handleSpawnTask)
 		r.Post("/projects/{projectID}/runs/{runSeq}/cycle_budget", s.handleSetCycleBudget)
+		// fat-client (or any merge-driving consumer)
+		// reports a successful FF-merge of a topic branch onto
+		// the run branch. Coordinator emits a branch_merged
+		// event so the audit timeline shows the moment main
+		// advanced. Idempotent at the event layer (drops are
+		// best-effort like every other event); duplicate POSTs
+		// produce duplicate events but no state corruption.
+		r.Post("/projects/{projectID}/runs/{runSeq}/merges", s.handleReportMerge)
 		r.Get("/projects/{projectID}/events", s.handleShowEvents)
 
 		// Issues — project-level structured artifacts
@@ -357,6 +365,16 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}/issues/{issueSeq}", s.handleGetIssue)
 		r.Post("/projects/{projectID}/issues/{issueSeq}/triage", s.handleTriageIssue)
 		r.Post("/projects/{projectID}/issues/{issueSeq}/close", s.handleCloseIssue)
+
+		// event-store kill-switch admin surface.
+		// Auth gate is the standard authMiddleware (any
+		// citizen with a valid Bearer token can flip),
+		// matching how every other write endpoint here is
+		// protected. A real admin tier with token rotation
+		// is hosted-mode work — tracked in the pre-launch
+		// production-readiness section of TODO.md.
+		r.Get("/admin/events/status", s.handleEventsStatus)
+		r.Post("/admin/events/enabled", s.handleSetEventsEnabled)
 
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
@@ -444,9 +462,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // --- Projects (long-lived containers) ---
 
 type createProjectRequest struct {
-	Name        string `json:"name"`
+	Name    string `json:"name"`
 	Description string `json:"description,omitempty"`
-	RemoteURL   string `json:"remote_url,omitempty"`
+	RemoteURL  string `json:"remote_url,omitempty"`
 	// DefaultBranch is the git branch new runs land on by
 	// default. Optional — falls back to "main" when unset or
 	// empty. Orgs that want Enju activity to stay off their
@@ -461,13 +479,13 @@ type setProjectRemoteRequest struct {
 }
 
 type projectResponse struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Description   string `json:"description,omitempty"`
-	RemoteURL     string `json:"remote_url,omitempty"`
+	ID      int64 `json:"id"`
+	Name     string `json:"name"`
+	Description  string `json:"description,omitempty"`
+	RemoteURL   string `json:"remote_url,omitempty"`
 	DefaultBranch string `json:"default_branch,omitempty"`
-	RunCount      int    `json:"run_count"`
-	CreatedAt     string `json:"created_at"`
+	RunCount   int  `json:"run_count"`
+	CreatedAt   string `json:"created_at"`
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -510,13 +528,13 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id, err := s.store.CreateProject(&store.ProjectRecord{
-		Name:          req.Name,
-		Description:   req.Description,
-		CreatedBy:     creator.Username,
-		RemoteURL:     req.RemoteURL,
+		Name:     req.Name,
+		Description:  req.Description,
+		CreatedBy:   creator.Username,
+		RemoteURL:   req.RemoteURL,
 		DefaultBranch: defaultBranch,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create project: "+err.Error())
@@ -536,11 +554,11 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		effectiveBranch = "main"
 	}
 	writeJSON(w, http.StatusCreated, projectResponse{
-		ID:            id,
-		Name:          req.Name,
-		RemoteURL:     req.RemoteURL,
+		ID:      id,
+		Name:     req.Name,
+		RemoteURL:   req.RemoteURL,
 		DefaultBranch: effectiveBranch,
-		CreatedAt:     now.Format(time.RFC3339),
+		CreatedAt:   now.Format(time.RFC3339),
 	})
 }
 
@@ -647,7 +665,7 @@ func (s *Server) handleSetProjectDefaultBranch(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"project_id":     projectID,
+		"project_id":   projectID,
 		"default_branch": branch,
 	})
 }
@@ -677,13 +695,13 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 // record + a pre-computed run count.
 func toProjectResponse(p store.ProjectRecord, runCount int) projectResponse {
 	return projectResponse{
-		ID:            p.ID,
-		Name:          p.Name,
-		Description:   p.Description,
-		RemoteURL:     p.RemoteURL,
+		ID:      p.ID,
+		Name:     p.Name,
+		Description:  p.Description,
+		RemoteURL:   p.RemoteURL,
 		DefaultBranch: p.DefaultBranch,
-		RunCount:      runCount,
-		CreatedAt:     p.CreatedAt.Format(time.RFC3339),
+		RunCount:   runCount,
+		CreatedAt:   p.CreatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -724,15 +742,15 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 	for _, run := range runs {
 		tasks, _ := s.store.ListTasksByRun(run.ID)
 		resp = append(resp, runResponse{
-			ID:         run.ID,
-			ProjectID:  run.ProjectID,
-			Seq:        run.Seq,
-			Name:       run.Name,
-			State:      string(run.State),
-			TaskCount:  len(tasks),
-			Branch:     run.Branch,
-			Slug:       run.Slug,
-			CreatedAt:  run.CreatedAt.Format(time.RFC3339),
+			ID:     run.ID,
+			ProjectID: run.ProjectID,
+			Seq:    run.Seq,
+			Name:    run.Name,
+			State:   string(run.State),
+			TaskCount: len(tasks),
+			Branch:   run.Branch,
+			Slug:    run.Slug,
+			CreatedAt: run.CreatedAt.Format(time.RFC3339),
 			SourcePath: run.SourcePath,
 		})
 	}
@@ -743,15 +761,15 @@ func (s *Server) handleListProjectRuns(w http.ResponseWriter, r *http.Request) {
 
 type addProjectMemberRequest struct {
 	Username string `json:"username"`
-	Role     string `json:"role,omitempty"` // optional; defaults to "member"
+	Role   string `json:"role,omitempty"` // optional; defaults to "member"
 }
 
 type projectMemberResponse struct {
 	Username string `json:"username"`
-	Name     string `json:"name,omitempty"`
-	Role     string `json:"role"`
-	AddedAt  string `json:"added_at"`
-	AddedBy  string `json:"added_by,omitempty"` // username of adder; empty for the creator row
+	Name   string `json:"name,omitempty"`
+	Role   string `json:"role"`
+	AddedAt string `json:"added_at"`
+	AddedBy string `json:"added_by,omitempty"` // username of adder; empty for the creator row
 }
 
 type setProjectMemberRoleRequest struct {
@@ -787,10 +805,10 @@ func (s *Server) handleListProjectMembers(w http.ResponseWriter, r *http.Request
 		}
 		resp = append(resp, projectMemberResponse{
 			Username: username,
-			Name:     name,
-			Role:     string(m.Role),
-			AddedAt:  m.AddedAt.Format(time.RFC3339),
-			AddedBy:  s.citizenUsername(m.AddedBy),
+			Name:   name,
+			Role:   string(m.Role),
+			AddedAt: m.AddedAt.Format(time.RFC3339),
+			AddedBy: s.citizenUsername(m.AddedBy),
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -852,10 +870,10 @@ func (s *Server) handleAddProjectMember(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, http.StatusCreated, projectMemberResponse{
 		Username: target.Username,
-		Name:     target.Name,
-		Role:     string(role),
-		AddedAt:  time.Now().Format(time.RFC3339),
-		AddedBy:  s.citizenUsername(adder),
+		Name:   target.Name,
+		Role:   string(role),
+		AddedAt: time.Now().Format(time.RFC3339),
+		AddedBy: s.citizenUsername(adder),
 	})
 }
 
@@ -913,8 +931,8 @@ func (s *Server) handleRemoveProjectMember(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"project_id": projectID,
-		"citizen":    s.citizenUsername(targetID),
-		"removed":    true,
+		"citizen":  s.citizenUsername(targetID),
+		"removed":  true,
 		"self_leave": isSelf,
 	})
 }
@@ -992,9 +1010,9 @@ func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Reque
 	if target.Role == newRole {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"project_id": projectID,
-			"citizen":    s.citizenUsername(targetID),
-			"role":       string(newRole),
-			"changed":    false,
+			"citizen":  s.citizenUsername(targetID),
+			"role":    string(newRole),
+			"changed":  false,
 		})
 		return
 	}
@@ -1013,26 +1031,26 @@ func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"project_id": projectID,
-		"citizen":    s.citizenUsername(targetID),
-		"role":       string(newRole),
-		"changed":    true,
+		"citizen":  s.citizenUsername(targetID),
+		"role":    string(newRole),
+		"changed":  true,
 	})
 }
 
 // --- Artifacts ---
 
 type artifactResponse struct {
-	Path       string `json:"path"`
+	Path    string `json:"path"`
 	LastWriter string `json:"last_writer,omitempty"` // username of the last writer
 	LastTaskID string `json:"last_task_id,omitempty"`
-	LastRunID  int64  `json:"last_run_id,omitempty"`
-	CommitSHA  string `json:"commit_sha,omitempty"` // empty iff tracked=false
+	LastRunID int64 `json:"last_run_id,omitempty"`
+	CommitSHA string `json:"commit_sha,omitempty"` // empty iff tracked=false
 	// Tracked reflects whether the artifact's bytes live in git.
 	// Defaults to true for every entry in pre-untracked DB rows;
 	// new untracked entries (writes_artifacts: track: false) land
 	// with Tracked=false and CommitSHA="". Serialized as a pointer
 	// so `false` is distinguishable from omitted on older clients.
-	Tracked   *bool  `json:"tracked,omitempty"`
+	Tracked  *bool `json:"tracked,omitempty"`
 	UpdatedAt string `json:"updated_at"`
 }
 
@@ -1087,13 +1105,13 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 	resp := make([]artifactResponse, 0, len(rows))
 	for _, a := range rows {
 		resp = append(resp, artifactResponse{
-			Path:       a.Path,
+			Path:    a.Path,
 			LastWriter: s.citizenUsername(a.LastWriter),
 			LastTaskID: a.LastTaskID,
-			LastRunID:  a.LastRunID,
-			CommitSHA:  a.CommitSHA,
-			Tracked:    trackedPtr(a.Tracked),
-			UpdatedAt:  a.UpdatedAt.Format(time.RFC3339),
+			LastRunID: a.LastRunID,
+			CommitSHA: a.CommitSHA,
+			Tracked:  trackedPtr(a.Tracked),
+			UpdatedAt: a.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -1142,13 +1160,13 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"path":         path,
-		"last_writer":  s.citizenUsername(meta.LastWriter),
+		"path":     path,
+		"last_writer": s.citizenUsername(meta.LastWriter),
 		"last_task_id": meta.LastTaskID,
-		"last_run_id":  meta.LastRunID,
-		"commit_sha":   meta.CommitSHA,
-		"tracked":      meta.Tracked,
-		"updated_at":   meta.UpdatedAt.Format(time.RFC3339),
+		"last_run_id": meta.LastRunID,
+		"commit_sha":  meta.CommitSHA,
+		"tracked":   meta.Tracked,
+		"updated_at":  meta.UpdatedAt.Format(time.RFC3339),
 	})
 }
 
@@ -1243,37 +1261,37 @@ func validateBranchName(s string) error {
 }
 
 type createRunRequest struct {
-	YAML            string                 `json:"yaml"`
-	RepoURL         string                 `json:"repo_url,omitempty"`
-	Params          map[string]interface{} `json:"params,omitempty"`
-	SourcePath      string                 `json:"source_path,omitempty"`
-	SourceCommitSHA string                 `json:"source_commit_sha,omitempty"`
-	Username        string                 `json:"username,omitempty"` // citizen who created this run, for contribution tracking
+	YAML      string         `json:"yaml"`
+	RepoURL     string         `json:"repo_url,omitempty"`
+	Params     map[string]interface{} `json:"params,omitempty"`
+	SourcePath   string         `json:"source_path,omitempty"`
+	SourceCommitSHA string         `json:"source_commit_sha,omitempty"`
+	Username    string         `json:"username,omitempty"` // citizen who created this run, for contribution tracking
 	// Branch is the git branch this run should commit to.
 	// Three forms:
-	//   - empty → fall back to the project's DefaultBranch
-	//   - "auto" → the coordinator picks an unused branch name
-	//     of the shape "run-N" so parallel variants don't force
-	//     the caller to invent names
-	//   - explicit name → use it verbatim
+	//  - empty → fall back to the project's DefaultBranch
+	//  - "auto" → the coordinator picks an unused branch name
+	//   of the shape "run-N" so parallel variants don't force
+	//   the caller to invent names
+	//  - explicit name → use it verbatim
 	// Refused when there's already an active run on the resolved
 	// branch (serial-per-branch invariant).
 	Branch string `json:"branch,omitempty"`
 }
 
 type runResponse struct {
-	ID              int64    `json:"id"`                   // global DB ID
-	ProjectID       int64    `json:"project_id,omitempty"` // parent project
-	Seq             int      `json:"seq"`                  // sequence within project (this is the user-facing run #)
-	Name            string   `json:"name"`
-	State           string   `json:"state"`
-	TaskCount       int      `json:"task_count"`
-	Branch          string   `json:"branch,omitempty"`            // git branch this run commits to
-	Slug            string   `json:"slug,omitempty"`              // per-run slug used in enju/runs/{seq}-{slug}/
-	CreatedAt       string   `json:"created_at"`
-	SourcePath      string   `json:"source_path,omitempty"`       // Phase H.1 — template this run came from, if any
-	SourceCommitSHA string   `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
-	Warnings        []string `json:"warnings,omitempty"`          // non-fatal advisories from the parser
+	ID       int64  `json:"id"`          // global DB ID
+	ProjectID    int64  `json:"project_id,omitempty"` // parent project
+	Seq       int   `json:"seq"`         // sequence within project (this is the user-facing run #)
+	Name      string  `json:"name"`
+	State      string  `json:"state"`
+	TaskCount    int   `json:"task_count"`
+	Branch     string  `json:"branch,omitempty"`      // git branch this run commits to
+	Slug      string  `json:"slug,omitempty"`       // per-run slug used in enju/runs/{seq}-{slug}/
+	CreatedAt    string  `json:"created_at"`
+	SourcePath   string  `json:"source_path,omitempty"`    // Phase H.1 — template this run came from, if any
+	SourceCommitSHA string  `json:"source_commit_sha,omitempty"` // Phase H.1 — project HEAD at instantiation time
+	Warnings    []string `json:"warnings,omitempty"`     // non-fatal advisories from the parser
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -1325,10 +1343,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Branch resolution — three paths:
-	//   - empty → project default
-	//   - "auto" → pick an unused "<slug>-N" name sharing the
-	//     slug with the run directory
-	//   - explicit → use verbatim, just validate shape
+	//  - empty → project default
+	//  - "auto" → pick an unused "<slug>-N" name sharing the
+	//   slug with the run directory
+	//  - explicit → use verbatim, just validate shape
 	branch, err := s.resolveRunBranch(projectID, proj.DefaultBranch, req.Branch, req.SourcePath, parsed.Run.Name)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -1376,19 +1394,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 	runSlug := engine.ComputeRunSlug(req.SourcePath, parsed.Run.Name)
 	runID, runSeq, err := s.store.CreateRun(&store.RunRecord{
-		ProjectID:       projectID,
-		Name:            parsed.Run.Name,
-		Ref:             parsed.Run.Ref,
-		YAMLData:        req.YAML,
-		RepoURL:         req.RepoURL,
-		State:           store.RunActive,
-		SourcePath:      req.SourcePath,
+		ProjectID:    projectID,
+		Name:      parsed.Run.Name,
+		Ref:       parsed.Run.Ref,
+		YAMLData:    req.YAML,
+		RepoURL:     req.RepoURL,
+		State:      store.RunActive,
+		SourcePath:   req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
-		Params:          paramsJSON,
-		Branch:          branch,
-		Slug:            runSlug,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		Params:     paramsJSON,
+		Branch:     branch,
+		Slug:      runSlug,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	})
 	if err != nil {
 		// SQLite's partial unique index on (project_id, branch)
@@ -1437,7 +1455,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(mutations) > 0 {
 		plan := store.Plan{
-			Version:   engine.EngineVersion,
+			Version:  engine.EngineVersion,
 			Mutations: mutations,
 		}
 		if _, err := s.store.ApplyPlan(plan); err != nil {
@@ -1458,12 +1476,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if req.Username != "" {
 		if citizen, _ := s.store.GetCitizenByUsername(req.Username); citizen != nil {
 			s.store.RecordContributionEvent(&store.ContributionEvent{
-				CitizenID:    citizen.ID,
-				EventType:    "run_created",
-				RunID:        runID,
-				ProjectID:    projectID,
-				Metadata:     fmt.Sprintf(`{"tasks":%d}`, taskCount),
-				CreatedAt:    now,
+				CitizenID:  citizen.ID,
+				EventType:  "run_created",
+				RunID:    runID,
+				ProjectID:  projectID,
+				Metadata: store.MarshalMetadata(map[string]any{
+					"tasks": taskCount,
+				}),
+				CreatedAt:  now,
 			})
 		}
 	}
@@ -1474,18 +1494,18 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, runResponse{
-		ID:              runID,
-		ProjectID:       projectID,
-		Seq:             runSeq,
-		Name:            parsed.Run.Name,
-		State:           string(store.RunActive),
-		TaskCount:       taskCount,
-		Branch:          branch,
-		Slug:            runSlug,
-		CreatedAt:       now.Format(time.RFC3339),
-		SourcePath:      req.SourcePath,
+		ID:       runID,
+		ProjectID:    projectID,
+		Seq:       runSeq,
+		Name:      parsed.Run.Name,
+		State:      string(store.RunActive),
+		TaskCount:    taskCount,
+		Branch:     branch,
+		Slug:      runSlug,
+		CreatedAt:    now.Format(time.RFC3339),
+		SourcePath:   req.SourcePath,
 		SourceCommitSHA: req.SourceCommitSHA,
-		Warnings:        parsed.Warnings,
+		Warnings:    parsed.Warnings,
 	})
 }
 
@@ -1518,15 +1538,15 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		tasks, _ := s.store.ListTasksByRun(p.ID)
 		resp = append(resp, runResponse{
-			ID:         p.ID,
-			ProjectID:  p.ProjectID,
-			Seq:        p.Seq,
-			Name:       p.Name,
-			State:      string(p.State),
-			TaskCount:  len(tasks),
-			Branch:     p.Branch,
-			Slug:       p.Slug,
-			CreatedAt:  p.CreatedAt.Format(time.RFC3339),
+			ID:     p.ID,
+			ProjectID: p.ProjectID,
+			Seq:    p.Seq,
+			Name:    p.Name,
+			State:   string(p.State),
+			TaskCount: len(tasks),
+			Branch:   p.Branch,
+			Slug:    p.Slug,
+			CreatedAt: p.CreatedAt.Format(time.RFC3339),
 			SourcePath: p.SourcePath,
 		})
 	}
@@ -1596,21 +1616,21 @@ func (s *Server) handleGetRunCostSummary(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"project_id":       projectID,
-		"run_seq":          runSeq,
-		"tasks_total":      len(tasks),
-		"tasks_accepted":   countByState(tasks, store.TaskAccepted),
-		"prompt_chars":     totalPromptChars,
-		"content_chars":    totalContentChars,
+		"project_id":    projectID,
+		"run_seq":     runSeq,
+		"tasks_total":   len(tasks),
+		"tasks_accepted":  countByState(tasks, store.TaskAccepted),
+		"prompt_chars":   totalPromptChars,
+		"content_chars":  totalContentChars,
 		"estimated_tokens": totalEstTokens,
-		"citizen_count":    len(citizenSet),
-		"wall_clock":       wallClock,
+		"citizen_count":  len(citizenSet),
+		"wall_clock":    wallClock,
 	})
 }
 
 // handleListRunEvents returns the synthesized event timeline
 // for one run — chronological JSON list built from
-// contribution_events + task_claims. Consumed by the fat-
+// events + task_claims. Consumed by the fat-
 // client's enju_export_run_events tool which materializes
 // the list into `enju/runs/{seq}/events/{phase}.jsonl`
 // on demand. Authoritative data stays in the coordinator DB;
@@ -1626,6 +1646,15 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
 	}
+	// kill-switch UX. ListRunEvents synthesizes
+	// from EventStore + state-DB task_claims; with events
+	// disabled it serves a claims-only timeline (no signal
+	// that audit is off). Header lets the MCP tool prepend
+	// a "audit disabled — claims-only" warning. Body shape
+	// stays the same for direct REST consumers.
+	if !s.store.Events().Enabled() {
+		w.Header().Set("X-Enju-Audit-Disabled", "true")
+	}
 	events, err := s.store.ListRunEvents(run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "listing events: "+err.Error())
@@ -1637,7 +1666,7 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
 		row := map[string]interface{}{
-			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"ts":  e.Timestamp.UTC().Format(time.RFC3339Nano),
 			"type": e.Type,
 		}
 		if e.Subtype != "" {
@@ -1689,9 +1718,9 @@ func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
 		status = "already_paused"
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  status,
-		"run_id":  fmt.Sprintf("%d:%d", projectID, runSeq),
-		"state":   string(updated.State),
+		"status": status,
+		"run_id": fmt.Sprintf("%d:%d", projectID, runSeq),
+		"state":  string(updated.State),
 		"changed": changed,
 		"message": "run paused — SpawnTask now refuses on paused runs, but claims and submits still pass through.",
 	})
@@ -1720,12 +1749,12 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status": "resumed",
 		"run_id": fmt.Sprintf("%d:%d", projectID, runSeq),
-		"state":  string(next),
+		"state": string(next),
 	})
 }
 
 // handleShowEvents is the read-only projection over
-// contribution_events — the JSONL-shaped event log view.
+// events — the JSONL-shaped event log view.
 // Distinct from /events (run-scoped) and from
 // enju_export_run_events (which writes git-tracked snapshots).
 // This endpoint is for ad-hoc queries: "what happened in this
@@ -1745,6 +1774,17 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
 		return
+	}
+
+	// kill-switch UX. When the EventStore is
+	// disabled, ListEvents returns nil/nil so the response
+	// is an empty array — indistinguishable from "no events
+	// match" in the wire shape. Stamp a response header so
+	// the MCP tool layer can prepend an explicit warning.
+	// Header (not body) keeps the JSON array contract intact
+	// for direct REST consumers.
+	if !s.store.Events().Enabled() {
+		w.Header().Set("X-Enju-Audit-Disabled", "true")
 	}
 
 	q := store.EventQuery{ProjectID: projectID}
@@ -1801,7 +1841,7 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
 		row := map[string]interface{}{
-			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"ts":  e.Timestamp.UTC().Format(time.RFC3339Nano),
 			"type": e.Type,
 		}
 		if e.Subtype != "" {
@@ -1908,13 +1948,13 @@ func (s *Server) maybeAutoTriage(runID int64) {
 	}
 
 	taskID, err := s.store.SpawnTask(store.SpawnSpec{
-		RunID:          runID,
-		TaskDefID:      defID,
-		Action:         spec.Action,
-		Prompt:         prompt,
-		AssignTo:       assignTo,
-		RequireRole:    spec.RequireRole,
-		Trigger:        "auto_triage",
+		RunID:     runID,
+		TaskDefID:   defID,
+		Action:     spec.Action,
+		Prompt:     prompt,
+		AssignTo:    assignTo,
+		RequireRole:  spec.RequireRole,
+		Trigger:    "auto_triage",
 		ClosesIssueSeq: issue.Seq,
 		// SpawnedBy = 0 — system-initiated, not a specific
 		// citizen. The audit trail records this as
@@ -1992,14 +2032,14 @@ func (s *Server) maybeAutoCloseIssue(task *store.TaskRecord) {
 // behavior.
 //
 // The spawned remediation:
-//   - Carries the reviewer's feedback in metadata so an audit
-//     reader can reconstruct the why
-//   - Has the reviewer's content substituted into prompt via
-//     {{review.feedback}} and {{review.decision}}
-//   - depends_on names the original target so any future
-//     re-claim chain naturally waits for the remediation
-//   - Trigger = "template_rule" — distinguishes auto-spawned
-//     remediations from human/bot-initiated spawns in the audit log
+//  - Carries the reviewer's feedback in metadata so an audit
+//   reader can reconstruct the why
+//  - Has the reviewer's content substituted into prompt via
+//   {{review.feedback}} and {{review.decision}}
+//  - depends_on names the original target so any future
+//   re-claim chain naturally waits for the remediation
+//  - Trigger = "template_rule" — distinguishes auto-spawned
+//   remediations from human/bot-initiated spawns in the audit log
 //
 // Failure modes: rule unset, target not found, malformed
 // remediation_template JSON, or SpawnTask error (cycle budget
@@ -2054,16 +2094,16 @@ func (s *Server) maybeSpawnRemediation(reviewTaskID, targetTaskID, eventKind, de
 	}
 
 	taskID, err := s.store.SpawnTask(store.SpawnSpec{
-		RunID:        target.RunID,
+		RunID:    target.RunID,
 		ParentTaskID: targetTaskID,
-		TaskDefID:    remediationDefID,
-		Action:       tmpl.Action,
-		Prompt:       prompt,
-		DependsOn:    []string{targetTaskID},
-		AssignTo:     assignTo,
-		RequireRole:  tmpl.RequireRole,
-		Trigger:      "template_rule",
-		SpawnedBy:    submitterID,
+		TaskDefID:  remediationDefID,
+		Action:    tmpl.Action,
+		Prompt:    prompt,
+		DependsOn:  []string{targetTaskID},
+		AssignTo:   assignTo,
+		RequireRole: tmpl.RequireRole,
+		Trigger:   "template_rule",
+		SpawnedBy:  submitterID,
 	})
 	if err != nil {
 		s.logger.Error("auto-spawn remediation failed", "target", targetTaskID, "error", err)
@@ -2097,17 +2137,17 @@ func (s *Server) nextRemediationDefID(target *store.TaskRecord) string {
 // --- Spawn primitive (living-workflow phase 4a) ---
 
 type spawnTaskRequest struct {
-	ParentTaskID string   `json:"parent_task_id,omitempty"`
-	TaskDefID    string   `json:"task_def_id"`
-	Action       string   `json:"action"`
-	Prompt       string   `json:"prompt,omitempty"`
-	UserPrompt   string   `json:"user_prompt,omitempty"`
-	Citizens     int      `json:"citizens,omitempty"`
-	DependsOn    []string `json:"depends_on,omitempty"`
-	AssignTo     []string `json:"assign_to,omitempty"`
-	RequireRole  string   `json:"require_role,omitempty"`
-	ResultType   string   `json:"result_type,omitempty"`
-	Trigger      string   `json:"trigger,omitempty"`
+	ParentTaskID string  `json:"parent_task_id,omitempty"`
+	TaskDefID  string  `json:"task_def_id"`
+	Action    string  `json:"action"`
+	Prompt    string  `json:"prompt,omitempty"`
+	UserPrompt  string  `json:"user_prompt,omitempty"`
+	Citizens   int   `json:"citizens,omitempty"`
+	DependsOn  []string `json:"depends_on,omitempty"`
+	AssignTo   []string `json:"assign_to,omitempty"`
+	RequireRole string  `json:"require_role,omitempty"`
+	ResultType  string  `json:"result_type,omitempty"`
+	Trigger   string  `json:"trigger,omitempty"`
 }
 
 // handleSpawnTask creates a new task in an existing run at
@@ -2156,19 +2196,19 @@ func (s *Server) handleSpawnTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taskID, err := s.store.SpawnTask(store.SpawnSpec{
-		RunID:        run.ID,
+		RunID:    run.ID,
 		ParentTaskID: req.ParentTaskID,
-		TaskDefID:    req.TaskDefID,
-		Action:       req.Action,
-		Prompt:       req.Prompt,
-		UserPrompt:   req.UserPrompt,
-		Citizens:     req.Citizens,
-		DependsOn:    req.DependsOn,
-		AssignTo:     req.AssignTo,
-		RequireRole:  req.RequireRole,
-		ResultType:   req.ResultType,
-		Trigger:      req.Trigger,
-		SpawnedBy:    member.CitizenID,
+		TaskDefID:  req.TaskDefID,
+		Action:    req.Action,
+		Prompt:    req.Prompt,
+		UserPrompt:  req.UserPrompt,
+		Citizens:   req.Citizens,
+		DependsOn:  req.DependsOn,
+		AssignTo:   req.AssignTo,
+		RequireRole: req.RequireRole,
+		ResultType:  req.ResultType,
+		Trigger:   req.Trigger,
+		SpawnedBy:  member.CitizenID,
 	})
 	if err != nil {
 		// Cycle-budget exhaustion is a distinct condition —
@@ -2186,12 +2226,12 @@ func (s *Server) handleSpawnTask(w http.ResponseWriter, r *http.Request) {
 
 	used, max, _ := s.store.GetCycleBudget(run.ID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":           "spawned",
-		"task_id":          taskID,
-		"task_def_id":      req.TaskDefID,
-		"parent_task_id":   req.ParentTaskID,
-		"trigger":          req.Trigger,
-		"cycle_budget":     map[string]int{"used": used, "max": max},
+		"status":      "spawned",
+		"task_id":     taskID,
+		"task_def_id":   req.TaskDefID,
+		"parent_task_id":  req.ParentTaskID,
+		"trigger":     req.Trigger,
+		"cycle_budget":   map[string]int{"used": used, "max": max},
 	})
 }
 
@@ -2241,18 +2281,150 @@ func (s *Server) handleSetCycleBudget(w http.ResponseWriter, r *http.Request) {
 	}
 	used, max, _ := s.store.GetCycleBudget(run.ID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":       "updated",
+		"status":    "updated",
 		"cycle_budget": map[string]int{"used": used, "max": max},
+	})
+}
+
+// reportMergeRequest is the body shape for
+// POST /projects/{p}/runs/{r}/merges. 's audit hook —
+// the fat-client (or any merge-driving consumer) reports a
+// successful FF-merge of a topic branch onto the run branch
+// so the coordinator can emit a branch_merged event for the
+// audit timeline. The coordinator does NOT verify the git
+// state; it trusts the reporter (under linear progression
+// the merge is already locked-in by git's FF check on the
+// reporter side).
+type reportMergeRequest struct {
+	TopicBranch string `json:"topic_branch"`
+	RunBranch  string `json:"run_branch"`
+	MergeSHA  string `json:"merge_sha"`
+	TaskID   string `json:"task_id,omitempty"` // optional — task whose ACCEPTED state drove this merge
+}
+
+// handleReportMerge — endpoint. Emits branch_merged
+// with topic + run_branch + merge_sha. Validation is light:
+// just enough to reject obvious garbage (empty fields, runs
+// that don't exist). Returns 200 on success with status="recorded".
+func (s *Server) handleReportMerge(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	runSeq, err := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid run_seq")
+		return
+	}
+	run, err := s.store.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil || run == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	var req reportMergeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.TopicBranch == "" || req.RunBranch == "" || req.MergeSHA == "" {
+		writeError(w, http.StatusBadRequest, "topic_branch, run_branch, and merge_sha are required")
+		return
+	}
+	citizenID := int64(0)
+	if c := citizenFromRequest(r); c != nil {
+		citizenID = c.ID
+	}
+	s.store.Events().Record(store.Event{
+		CitizenID: citizenID,
+		EventType: "branch_merged",
+		TaskID:  req.TaskID,
+		RunID:   run.ID,
+		ProjectID: projectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"topic_branch": req.TopicBranch,
+			"run_branch":  req.RunBranch,
+			"merge_sha":  req.MergeSHA,
+			"run_seq":   run.Seq,
+		}),
+		CreatedAt: time.Now(),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":    "recorded",
+		"topic_branch": req.TopicBranch,
+		"run_branch":  req.RunBranch,
+		"merge_sha":  req.MergeSHA,
+	})
+}
+
+// --- event-store kill-switch admin endpoints ---
+
+// setEventsEnabledRequest is the body shape for
+// POST /admin/events/enabled. The coordinator flips the
+// in-memory enabled flag on the EventStore (no restart
+// needed). Disabling stops new emissions immediately and
+// makes reads return ErrEventStoreDisabled. Re-enabling
+// resumes emissions with NO backfill — events that would
+// have fired during the disabled window are gone.
+type setEventsEnabledRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// handleEventsStatus returns the EventStore's runtime state:
+// enabled flag + Stats() snapshot. Unauthenticated callers
+// already get blocked by authMiddleware; we don't gate
+// further. Surfaces enough for an operator to answer "are
+// events landing?" without grepping logs.
+func (s *Server) handleEventsStatus(w http.ResponseWriter, r *http.Request) {
+	es := s.store.Events()
+	stats := es.Stats()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled":   stats.Enabled,
+		"enqueued":  stats.Enqueued,
+		"persisted":  stats.Persisted,
+		"dropped":   stats.Dropped,
+		"queue_depth": stats.QueueDepth,
+	})
+}
+
+// handleSetEventsEnabled flips the kill-switch at runtime.
+// Logs the toggling citizen for the audit trail (since the
+// kill-switch event itself can't fire through a disabled
+// store, this log line is the only record of who flipped
+// what when).
+func (s *Server) handleSetEventsEnabled(w http.ResponseWriter, r *http.Request) {
+	var req setEventsEnabledRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	caller := citizenFromRequest(r)
+	es := s.store.Events()
+	prior := es.Enabled()
+	es.SetEnabled(req.Enabled)
+	s.logger.Warn("event store kill-switch toggled",
+		"citizen_id", caller.ID,
+		"citizen", caller.Username,
+		"prior", prior,
+		"now", req.Enabled,
+	)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled": req.Enabled,
+		"prior":  prior,
+		"changed": prior != req.Enabled,
 	})
 }
 
 // --- Issues (living-workflow phase 3) ---
 
 type fileIssueRequest struct {
-	Title         string `json:"title"`
-	Body          string `json:"body"`
-	Severity      string `json:"severity"`
-	FoundInRunSeq int    `json:"found_in_run_seq,omitempty"`
+	Title     string `json:"title"`
+	Body     string `json:"body"`
+	Severity   string `json:"severity"`
+	FoundInRunSeq int  `json:"found_in_run_seq,omitempty"`
 	FoundInTaskID string `json:"found_in_task_id,omitempty"`
 }
 
@@ -2296,12 +2468,12 @@ func (s *Server) handleFileIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := &store.IssueRecord{
-		ProjectID:     projectID,
-		Title:         req.Title,
-		Body:          req.Body,
-		Severity:      req.Severity,
+		ProjectID:   projectID,
+		Title:     req.Title,
+		Body:     req.Body,
+		Severity:   req.Severity,
 		FoundInTaskID: req.FoundInTaskID,
-		FiledBy:       caller.ID,
+		FiledBy:    caller.ID,
 	}
 	// found_in_run_seq is project-scoped; resolve to the run's
 	// global ID before storing. Hard-fail on lookup miss so the
@@ -2345,12 +2517,12 @@ func (s *Server) handleFileIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":        id,
-		"seq":       seq,
-		"slug":      fmt.Sprintf("ISSUE-%03d", seq),
-		"status":    rec.Status,
-		"severity":  rec.Severity,
-		"title":     rec.Title,
+		"id":    id,
+		"seq":    seq,
+		"slug":   fmt.Sprintf("ISSUE-%03d", seq),
+		"status":  rec.Status,
+		"severity": rec.Severity,
+		"title":   rec.Title,
 	})
 }
 
@@ -2472,7 +2644,7 @@ func (s *Server) handleTriageIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 type closeIssueRequest struct {
-	Status         string `json:"status"`            // "closed" | "wontfix"
+	Status     string `json:"status"`      // "closed" | "wontfix"
 	ClosedByTaskID string `json:"closed_by_task_id"` // optional
 }
 
@@ -2528,16 +2700,16 @@ func (s *Server) handleCloseIssue(w http.ResponseWriter, r *http.Request) {
 // vote/review submission rendering.
 func (s *Server) issueToMap(it *store.IssueRecord) map[string]interface{} {
 	m := map[string]interface{}{
-		"id":         fmt.Sprintf("ISSUE-%03d", it.Seq),
-		"db_id":      it.ID,
-		"seq":        it.Seq,
+		"id":     fmt.Sprintf("ISSUE-%03d", it.Seq),
+		"db_id":   it.ID,
+		"seq":    it.Seq,
 		"project_id": it.ProjectID,
-		"title":      it.Title,
-		"body":       it.Body,
-		"status":     it.Status,
-		"severity":   it.Severity,
-		"filed_by":   s.citizenUsername(it.FiledBy),
-		"filed_at":   it.FiledAt.UTC().Format(time.RFC3339),
+		"title":   it.Title,
+		"body":    it.Body,
+		"status":   it.Status,
+		"severity":  it.Severity,
+		"filed_by":  s.citizenUsername(it.FiledBy),
+		"filed_at":  it.FiledAt.UTC().Format(time.RFC3339),
 		"updated_at": it.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 	// Surface the per-project run seq (#1, #2, ...) — the
@@ -2600,14 +2772,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	tasks, _ := s.store.ListTasksByRun(p.ID)
 
 	resp := map[string]interface{}{
-		"id":         p.ID,
+		"id":     p.ID,
 		"project_id": p.ProjectID,
-		"seq":        p.Seq,
-		"name":       p.Name,
-		"state":      p.State,
-		"repo_url":   p.RepoURL,
-		"branch":     p.Branch,
-		"slug":       p.Slug,
+		"seq":    p.Seq,
+		"name":    p.Name,
+		"state":   p.State,
+		"repo_url":  p.RepoURL,
+		"branch":   p.Branch,
+		"slug":    p.Slug,
 		"task_count": len(tasks),
 		"created_at": p.CreatedAt.Format(time.RFC3339),
 	}
@@ -2644,38 +2816,38 @@ func (s *Server) handleListRunTasks(w http.ResponseWriter, r *http.Request) {
 // --- Tasks ---
 
 type taskResponse struct {
-	ID               string `json:"id"`
-	RunID            int64  `json:"run_id"`                       // global run ID
-	RunSeq           int    `json:"run_seq"`                      // per-project run sequence
-	ProjectID        int64  `json:"project_id"`                   // parent project
+	ID        string `json:"id"`
+	RunID      int64 `json:"run_id"`            // global run ID
+	RunSeq      int  `json:"run_seq"`           // per-project run sequence
+	ProjectID    int64 `json:"project_id"`          // parent project
 	ProjectRemoteURL string `json:"project_remote_url,omitempty"` // parent project's git remote (for fat clients)
-	ProjectName      string `json:"project_name,omitempty"`       // human-readable project name (for workspace dirs)
-	Seq              int    `json:"seq"`                          // task sequence within run
-	TaskDefID       string   `json:"task_def_id"`
-	InstanceKey     string   `json:"instance_key,omitempty"`
-	IterationLabel  string   `json:"iteration_label,omitempty"` // "gene=BRCA1, tissue=breast" — human-readable for_each context
+	ProjectName   string `json:"project_name,omitempty"`    // human-readable project name (for workspace dirs)
+	Seq       int  `json:"seq"`             // task sequence within run
+	TaskDefID    string  `json:"task_def_id"`
+	InstanceKey   string  `json:"instance_key,omitempty"`
+	IterationLabel string  `json:"iteration_label,omitempty"` // "gene=BRCA1, tissue=breast" — human-readable for_each context
 	// ResultDir is the pre-computed repo-relative path for
 	// this task's result files. Layout is a coordinator-
 	// owned schema (see engine.ComputeResultDir); clients
 	// consume the string directly rather than rebuilding it
 	// from (runSeq, instanceKey, taskDefID). Keeps future
 	// layout changes to one function edit.
-	ResultDir       string   `json:"result_dir,omitempty"`
+	ResultDir    string  `json:"result_dir,omitempty"`
 	// RunSlug is the per-run slug that appears in ResultDir
 	// (enju/runs/{seq}-{slug}/). Surfaced on the wire so the
 	// fat-client executor can locate the template-snapshot
 	// dir without duplicating the slug rule client-side.
-	RunSlug         string   `json:"run_slug,omitempty"`
-	Ref             string   `json:"ref,omitempty"`
-	Action          string   `json:"action"`
-	Prompt          string   `json:"prompt,omitempty"`
-	UserPrompt      string   `json:"user_prompt,omitempty"`
-	Script          string   `json:"script,omitempty"`
-	Outputs         string   `json:"outputs,omitempty"`
-	Requirements    string   `json:"requirements,omitempty"`
-	ResultType      string   `json:"result_type"`
-	State           string   `json:"state"`
-	ClaimedBy       string   `json:"claimed_by,omitempty"` // username of the claimer
+	RunSlug     string  `json:"run_slug,omitempty"`
+	Ref       string  `json:"ref,omitempty"`
+	Action     string  `json:"action"`
+	Prompt     string  `json:"prompt,omitempty"`
+	UserPrompt   string  `json:"user_prompt,omitempty"`
+	Script     string  `json:"script,omitempty"`
+	Outputs     string  `json:"outputs,omitempty"`
+	Requirements  string  `json:"requirements,omitempty"`
+	ResultType   string  `json:"result_type"`
+	State      string  `json:"state"`
+	ClaimedBy    string  `json:"claimed_by,omitempty"` // username of the claimer
 	// Model is the model citizen username credited for the most
 	// recent completed submission on this task. Populated for
 	// single-citizen tasks once they reach a terminal/submitted
@@ -2684,33 +2856,33 @@ type taskResponse struct {
 	// has happened yet, when the operator was a human submitting
 	// unaided, or for pre-1.4 rows that never recorded a model.
 	Model string `json:"model,omitempty"`
-	ResultPath      string   `json:"result_path,omitempty"`
-	CommitSHA       string   `json:"commit_sha,omitempty"` // git SHA of the accepted result (iteration A+)
-	DependsOn       string   `json:"depends_on,omitempty"`
-	ReadsArtifacts  []string               `json:"reads_artifacts,omitempty"`
+	ResultPath   string  `json:"result_path,omitempty"`
+	CommitSHA    string  `json:"commit_sha,omitempty"` // git SHA of the accepted result (iteration A+)
+	DependsOn    string  `json:"depends_on,omitempty"`
+	ReadsArtifacts []string        `json:"reads_artifacts,omitempty"`
 	WritesArtifacts enjuYaml.WriteArtifacts `json:"writes_artifacts,omitempty"`
-	AssignTo        []string `json:"assign_to,omitempty"` // usernames
-	RequireRole     string   `json:"require_role,omitempty"`
-	ReviewsTarget   string   `json:"reviews_target,omitempty"`   // Phase E: target task id this review evaluates
-	ReviewDecision  string   `json:"review_decision,omitempty"`  // Phase E: approve/reject once submitted
-	VoteOptions     string   `json:"vote_options,omitempty"`     // Phase E.2: declared options JSON
-	VoteChoice      string   `json:"vote_choice,omitempty"`      // Phase E.2: winning option id
-	Citizens        int      `json:"citizens,omitempty"`         // Phase E.2: invited voter count
-	MinQuorum       int      `json:"min_quorum,omitempty"`       // Phase E.2: required submitted count
-	VoteThreshold   string   `json:"vote_threshold,omitempty"`   // Phase E.2: agreement rule
-	VoteDeadline    string   `json:"vote_deadline,omitempty"`    // Phase E.2: voting-closes duration
-	VoteDeadlineAt  string   `json:"vote_deadline_at,omitempty"` // Phase E.2: absolute expiry (ISO), empty until first claim
-	Anonymize       bool     `json:"anonymize,omitempty"`        // Phase E.2: hide citizen usernames
-	Visibility      string   `json:"visibility,omitempty"`       // Phase E.2: open|blind during collection
-	FailReason      string   `json:"fail_reason,omitempty"`     // reason for FAILED state
-	SkipReason      string   `json:"skip_reason,omitempty"`     // reason for SKIPPED via fail-cascade, e.g. "upstream failed: 1:4:write_data"
-	ParkedFromState string   `json:"parked_from_state,omitempty"` // stashed prior state for a parked task; empty otherwise
+	AssignTo    []string `json:"assign_to,omitempty"` // usernames
+	RequireRole   string  `json:"require_role,omitempty"`
+	ReviewsTarget  string  `json:"reviews_target,omitempty"`  // Phase E: target task id this review evaluates
+	ReviewDecision string  `json:"review_decision,omitempty"` // Phase E: approve/reject once submitted
+	VoteOptions   string  `json:"vote_options,omitempty"`   // Phase E.2: declared options JSON
+	VoteChoice   string  `json:"vote_choice,omitempty"`   // Phase E.2: winning option id
+	Citizens    int   `json:"citizens,omitempty"`     // Phase E.2: invited voter count
+	MinQuorum    int   `json:"min_quorum,omitempty"`    // Phase E.2: required submitted count
+	VoteThreshold  string  `json:"vote_threshold,omitempty"`  // Phase E.2: agreement rule
+	VoteDeadline  string  `json:"vote_deadline,omitempty"`  // Phase E.2: voting-closes duration
+	VoteDeadlineAt string  `json:"vote_deadline_at,omitempty"` // Phase E.2: absolute expiry (ISO), empty until first claim
+	Anonymize    bool   `json:"anonymize,omitempty"`    // Phase E.2: hide citizen usernames
+	Visibility   string  `json:"visibility,omitempty"`    // Phase E.2: open|blind during collection
+	FailReason   string  `json:"fail_reason,omitempty"`   // reason for FAILED state
+	SkipReason   string  `json:"skip_reason,omitempty"`   // reason for SKIPPED via fail-cascade, e.g. "upstream failed: 1:4:write_data"
+	ParkedFromState string  `json:"parked_from_state,omitempty"` // stashed prior state for a parked task; empty otherwise
 	// RunSourcePath mirrors run.source_path so the fat-client
 	// executor can resolve a compute task's `script:` field
 	// against the run's per-run template snapshot
 	// (enju/runs/{seq}/template-snapshot/) instead of the live
 	// enju/templates/ path. Empty for inline-YAML runs.
-	RunSourcePath   string   `json:"run_source_path,omitempty"`
+	RunSourcePath  string  `json:"run_source_path,omitempty"`
 	// RunBranch is the git branch this task's run commits to.
 	// Fat-client submit/execute paths feed this into
 	// mcpgit.SubmitRequest so parallel runs on distinct
@@ -2763,6 +2935,13 @@ type taskResponse struct {
 	// no active claim has a branch (vote/review actions, or
 	// pre-phase-5 rows).
 	IterationBranches map[string]string `json:"iteration_branches,omitempty"`
+	// IterationSeqs is the per-claimant parallel of
+	// IterationBranches: maps username → iter_seq for the
+	// active claim. wires this through to the
+	// fat-client's commit trailer (`Enju-Iter-Seq`) so a
+	// forensic `git log` can reconstruct iteration counters
+	// without consulting the coordinator.
+	IterationSeqs map[string]int `json:"iteration_seqs,omitempty"`
 	// ArtifactProvenance shows who last wrote each artifact
 	// this task reads.
 	ArtifactProvenance []artifactProvenance `json:"artifact_provenance,omitempty"`
@@ -2811,26 +2990,26 @@ type taskResponse struct {
 }
 
 type taskHistoryEntry struct {
-	Citizen     string  `json:"citizen"`
-	ClaimedAt   string  `json:"claimed_at"`
-	SubmittedAt string  `json:"submitted_at,omitempty"`
-	Outcome     string  `json:"outcome"` // completed, invalidated, released, timed_out
-	Decision    string  `json:"decision,omitempty"`
+	Citizen   string `json:"citizen"`
+	ClaimedAt  string `json:"claimed_at"`
+	SubmittedAt string `json:"submitted_at,omitempty"`
+	Outcome   string `json:"outcome"` // completed, invalidated, released, timed_out
+	Decision  string `json:"decision,omitempty"`
 }
 
 type artifactProvenance struct {
-	Path       string `json:"path"`
+	Path    string `json:"path"`
 	LastWriter string `json:"last_writer,omitempty"` // username
 	LastTaskID string `json:"last_task_id,omitempty"`
-	CommitSHA  string `json:"commit_sha,omitempty"`
+	CommitSHA string `json:"commit_sha,omitempty"`
 }
 
 // voteSubmissionRef is one citizen's submitted vote on a
 // multi-citizen task, rendered for the task response so
 // formatters can show the tally without a separate fetch.
 type voteSubmissionRef struct {
-	Username    string `json:"username"`
-	Option      string `json:"option"`
+	Username  string `json:"username"`
+	Option   string `json:"option"`
 	SubmittedAt string `json:"submitted_at,omitempty"`
 	// Model is the model citizen username credited for this
 	// submission's words (operator/model design — the operator
@@ -2958,10 +3137,10 @@ func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
 			store.SetTaskState{
-				TaskID:     task.ID,
-				NewState:   store.TaskAccepted,
+				TaskID:   task.ID,
+				NewState:  store.TaskAccepted,
 				VoteChoice: outcome.WinningOption,
-				CommitSHA:  task.CommitSHA,
+				CommitSHA: task.CommitSHA,
 			},
 		},
 	}); err != nil {
@@ -3130,7 +3309,7 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	// needed here.
 	updatedTask, _ := s.store.GetTask(taskID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"task":     s.toTaskResponse(*updatedTask),
+		"task":   s.toTaskResponse(*updatedTask),
 		"deadline": deadline.Format(time.RFC3339),
 	})
 }
@@ -3171,8 +3350,8 @@ func (s *Server) handleListIterations(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(iters))
 	for _, it := range iters {
 		row := map[string]interface{}{
-			"seq":        it.Seq,
-			"citizen":    it.Username,
+			"seq":    it.Seq,
+			"citizen":  it.Username,
 			"claimed_at": it.ClaimedAt.UTC().Format(time.RFC3339),
 		}
 		// Outcome — render the active iteration explicitly so
@@ -3249,8 +3428,8 @@ type submitResultRequest struct {
 	// client wrote in the same commit. All share CommitSHA.
 	ArtifactsWritten []string `json:"artifacts_written,omitempty"`
 
-	TokensUsed int64  `json:"tokens_used,omitempty"`
-	Model      string `json:"model,omitempty"`
+	TokensUsed int64 `json:"tokens_used,omitempty"`
+	Model   string `json:"model,omitempty"`
 
 	// Username identifies the submitting citizen. Required for
 	// multi-citizen tasks so the server can credit the right
@@ -3304,19 +3483,19 @@ type submitResultRequest struct {
 //
 // Per-action contract:
 //
-//   - compute / answer / contribute → commit_sha REQUIRED. The
-//     400 fires below if missing. Submission lives in git
-//     (metadata.json + result.md + writes_artifacts paths) and
-//     the DB stores commit_sha + result_path as the pointer.
+//  - compute / answer / contribute → commit_sha REQUIRED. The
+//   400 fires below if missing. Submission lives in git
+//   (metadata.json + result.md + writes_artifacts paths) and
+//   the DB stores commit_sha + result_path as the pointer.
 //
-//   - vote / review → commit_sha OPTIONAL. The DB row
-//     (task_claims.content + tasks.vote_choice / review_decision)
-//     is the load-bearing record; the state machine, scheduler,
-//     and tally engine all read from it. A direct-HTTP submit
-//     without commit_sha is state-machine-correct but loses the
-//     immutable git audit artifact (metadata.json with action +
-//     option/decision + model + timestamp) that the MCP fat
-//     client produces.
+//  - vote / review → commit_sha OPTIONAL. The DB row
+//   (task_claims.content + tasks.vote_choice / review_decision)
+//   is the load-bearing record; the state machine, scheduler,
+//   and tally engine all read from it. A direct-HTTP submit
+//   without commit_sha is state-machine-correct but loses the
+//   immutable git audit artifact (metadata.json with action +
+//   option/decision + model + timestamp) that the MCP fat
+//   client produces.
 //
 // See docs/coordinator.md § REST API § Tasks for the full
 // per-action table and the two-tier (DB-mutable, git-immutable)
@@ -3344,9 +3523,9 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if store.TaskState(task.State) == store.TaskAccepted {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":  "already_resolved",
+			"status": "already_resolved",
 			"task_id": taskID,
-			"state":   task.State,
+			"state":  task.State,
 			"message": "task is already accepted — nothing to tally",
 		})
 		return
@@ -3358,7 +3537,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]interface{}{
 		"task_id": taskID,
-		"state":   task.State,
+		"state":  task.State,
 	}
 
 	if task.Action == "vote" {
@@ -3368,10 +3547,10 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp["tally"] = map[string]interface{}{
-			"resolved":    outcome.Resolved,
+			"resolved":  outcome.Resolved,
 			"total_votes": outcome.TotalVotes,
-			"counts":      outcome.Counts,
-			"reason":      outcome.Reason,
+			"counts":   outcome.Counts,
+			"reason":   outcome.Reason,
 		}
 		if outcome.Resolved {
 			// Build a Plan and apply atomically.
@@ -3379,10 +3558,10 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 				Version: engine.EngineVersion,
 				Mutations: []store.Mutation{
 					store.SetTaskState{
-						TaskID:     taskID,
-						NewState:   store.TaskAccepted,
+						TaskID:   taskID,
+						NewState:  store.TaskAccepted,
 						VoteChoice: outcome.WinningOption,
-						CommitSHA:  task.CommitSHA,
+						CommitSHA: task.CommitSHA,
 					},
 					store.UpdateReadyTasks{RunID: task.RunID},
 					store.CompleteRun{RunID: task.RunID},
@@ -3414,12 +3593,12 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp["tally"] = map[string]interface{}{
-			"resolved":      outcome.Resolved,
-			"verdict":       outcome.Verdict,
-			"approves":      outcome.Approves,
-			"rejects":       outcome.Rejects,
+			"resolved":   outcome.Resolved,
+			"verdict":    outcome.Verdict,
+			"approves":   outcome.Approves,
+			"rejects":    outcome.Rejects,
 			"total_reviews": outcome.TotalReviews,
-			"reason":        outcome.Reason,
+			"reason":    outcome.Reason,
 		}
 		if outcome.Resolved {
 			// Build a Plan and apply atomically.
@@ -3427,7 +3606,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 				Version: engine.EngineVersion,
 				Mutations: []store.Mutation{
 					store.SetTaskState{
-						TaskID:   taskID,
+						TaskID:  taskID,
 						NewState: store.TaskAccepted,
 					},
 					store.UpdateReadyTasks{RunID: task.RunID},
@@ -3556,15 +3735,15 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 // TaskID + CommitSHA + ExitCode — the fetch-path scanner extracts
 // them from commit trailers and forwards whatever it parsed.
 type reconcileEntry struct {
-	TaskID           string   `json:"task_id"`
-	CommitSHA        string   `json:"commit_sha"`
-	ExitCode         int      `json:"exit_code"`
-	ResultPath       string   `json:"result_path,omitempty"`
+	TaskID      string  `json:"task_id"`
+	CommitSHA    string  `json:"commit_sha"`
+	ExitCode     int   `json:"exit_code"`
+	ResultPath    string  `json:"result_path,omitempty"`
 	ArtifactsWritten []string `json:"artifacts_written,omitempty"`
-	Content          string   `json:"content,omitempty"`
-	FailReason       string   `json:"fail_reason,omitempty"` // optional override when ExitCode != 0
-	Username         string   `json:"username,omitempty"`
-	Model            string   `json:"model,omitempty"`
+	Content     string  `json:"content,omitempty"`
+	FailReason    string  `json:"fail_reason,omitempty"` // optional override when ExitCode != 0
+	Username     string  `json:"username,omitempty"`
+	Model      string  `json:"model,omitempty"`
 }
 
 // reconcileBatchRequest is the top-level shape posted to
@@ -3582,10 +3761,10 @@ type reconcileBatchRequest struct {
 // persistent error doesn't wedge the queue, but surfaces the
 // error text so humans can diagnose.
 type reconcileResult struct {
-	TaskID    string `json:"task_id"`
+	TaskID  string `json:"task_id"`
 	CommitSHA string `json:"commit_sha,omitempty"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
+	Status  string `json:"status"`
+	Error   string `json:"error,omitempty"`
 }
 
 // handleReconcileTasks processes a batch of task-completion
@@ -3727,12 +3906,12 @@ func (s *Server) reconcileOne(r *http.Request, entry reconcileEntry) reconcileRe
 		return res
 	}
 	req := &submitResultRequest{
-		CommitSHA:        entry.CommitSHA,
-		ResultPath:       entry.ResultPath,
+		CommitSHA:    entry.CommitSHA,
+		ResultPath:    entry.ResultPath,
 		ArtifactsWritten: entry.ArtifactsWritten,
-		Content:          entry.Content,
-		Username:         entry.Username,
-		Model:            entry.Model,
+		Content:     entry.Content,
+		Username:     entry.Username,
+		Model:      entry.Model,
 	}
 	if err := s.reconcileAcceptTask(task, req); err != nil {
 		res.Status = "error"
@@ -3770,11 +3949,11 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 	// endpoint). The shared core accepts a full SubmitRequest
 	// so sync can pass its richer payload without branching.
 	engineReq := &engine.SubmitRequest{
-		TaskID:           task.ID,
-		ResultPath:       req.ResultPath,
-		CommitSHA:        req.CommitSHA,
-		Username:         req.Username,
-		Content:          req.Content,
+		TaskID:      task.ID,
+		ResultPath:    req.ResultPath,
+		CommitSHA:    req.CommitSHA,
+		Username:     req.Username,
+		Content:     req.Content,
 		ArtifactsWritten: req.ArtifactsWritten,
 	}
 	_, err = s.acceptComputeTaskCore(task, run, engineReq, req.Model)
@@ -3808,11 +3987,11 @@ func (s *Server) reconcileAcceptTask(task *store.TaskRecord, req *submitResultRe
 // ignores most of them and just does the ready sweep +
 // run-complete check.
 type acceptComputeTaskCoreResult struct {
-	Outcome     *engine.SubmissionOutcome
-	Actions     *engine.PostSubmitActions
-	ResultPath  string
-	Decision    string
-	VoteChoice  string
+	Outcome   *engine.SubmissionOutcome
+	Actions   *engine.PostSubmitActions
+	ResultPath string
+	Decision  string
+	VoteChoice string
 	SubmitterID int64
 }
 
@@ -3820,12 +3999,12 @@ type acceptComputeTaskCoreResult struct {
 // consequences" dance that both sync submit-result and async
 // reconcile paths need:
 //
-//  1. ValidateSubmitRequest (artifacts, paths, citizen).
-//  2. ComputeSubmission → state-transition plan.
-//  3. ApplyPlan(submit plan).
-//  4. Record contribution events (best-effort, logged).
-//  5. ComputePostSubmitActions (artifacts + tally + resolution).
-//  6. ApplyPlan(artifact mutations).
+// 1. ValidateSubmitRequest (artifacts, paths, citizen).
+// 2. ComputeSubmission → state-transition plan.
+// 3. ApplyPlan(submit plan).
+// 4. Record contribution events (best-effort, logged).
+// 5. ComputePostSubmitActions (artifacts + tally + resolution).
+// 6. ApplyPlan(artifact mutations).
 //
 // Each step mirrors one named phase in handleSubmitResultReport.
 // Factoring them here closes the "reconcile forgot step X" bug
@@ -3836,13 +4015,13 @@ type acceptComputeTaskCoreResult struct {
 //
 // Deliberately does NOT include:
 //
-//   - The ready-task sweep + run-complete check (callers run
-//     those at different positions in their own flow — sync
-//     after cascades, reconcile right after core — so leaving
-//     them to the caller preserves current ordering byte-for-
-//     byte).
-//   - Review/vote/reject cascades, materialization, HTTP
-//     response — those only apply to the sync path.
+//  - The ready-task sweep + run-complete check (callers run
+//   those at different positions in their own flow — sync
+//   after cascades, reconcile right after core — so leaving
+//   them to the caller preserves current ordering byte-for-
+//   byte).
+//  - Review/vote/reject cascades, materialization, HTTP
+//   response — those only apply to the sync path.
 //
 // Returns (&result, nil) on success. On engine validation or
 // apply failure, returns an error with the submit state
@@ -3893,7 +4072,18 @@ func (s *Server) acceptComputeTaskCore(
 			evt.ProjectID = run.ProjectID
 		}
 		if model != "" && evt.Metadata != "" {
-			evt.Metadata = strings.TrimSuffix(evt.Metadata, "}") + fmt.Sprintf(`,"model":%q}`, model)
+			// parse-modify-marshal instead of the
+			// pre-existing string-suffix trick, which broke on `{}`
+			// metadata and on any value containing a literal
+			// `}`. Roundtrip via map[string]any survives both.
+			var kv map[string]any
+			if err := json.Unmarshal([]byte(evt.Metadata), &kv); err == nil {
+				if kv == nil {
+					kv = map[string]any{}
+				}
+				kv["model"] = model
+				evt.Metadata = store.MarshalMetadata(kv)
+			}
 		}
 		if err := s.store.RecordContributionEvent(evt); err != nil {
 			s.logger.Warn("recording contribution event", "task_id", task.ID, "error", err)
@@ -3913,7 +4103,7 @@ func (s *Server) acceptComputeTaskCore(
 
 	if actions != nil && len(actions.ArtifactMutations) > 0 {
 		if _, err := s.store.ApplyPlan(store.Plan{
-			Version:   engine.EngineVersion,
+			Version:  engine.EngineVersion,
 			Mutations: actions.ArtifactMutations,
 		}); err != nil {
 			// Log-and-continue rather than hard-fail: the
@@ -3927,11 +4117,11 @@ func (s *Server) acceptComputeTaskCore(
 	}
 
 	return &acceptComputeTaskCoreResult{
-		Outcome:     submitOutcome,
-		Actions:     actions,
-		ResultPath:  resultPath,
-		Decision:    decision,
-		VoteChoice:  voteChoice,
+		Outcome:   submitOutcome,
+		Actions:   actions,
+		ResultPath: resultPath,
+		Decision:  decision,
+		VoteChoice: voteChoice,
 		SubmitterID: submitterID,
 	}, nil
 }
@@ -3944,18 +4134,18 @@ func (s *Server) acceptComputeTaskCore(
 // Response shape mirrors mcpgit.ResolveInput:
 //
 //	{
-//	  "task_id": "1:2:analyze",
-//	  "prompt_template": "Analyze {{gather.content}} for {{gene}}",
-//	  "user_prompt_template": "",
-//	  "for_each_params": {"gene": "BRCA1"},
-//	  "dependencies": [
-//	    {"task_def_id": "gather", "instance_key": "",
-//	     "instance_params": {}, "commit_sha": "abc...",
-//	     "result_path": "runs/1/gather"}
-//	  ],
-//	  "artifact_reads": [
-//	    {"path": "notes/intro.md", "commit_sha": "def..."}
-//	  ]
+//	 "task_id": "1:2:analyze",
+//	 "prompt_template": "Analyze {{gather.content}} for {{gene}}",
+//	 "user_prompt_template": "",
+//	 "for_each_params": {"gene": "BRCA1"},
+//	 "dependencies": [
+//	  {"task_def_id": "gather", "instance_key": "",
+//	   "instance_params": {}, "commit_sha": "abc...",
+//	   "result_path": "runs/1/gather"}
+//	 ],
+//	 "artifact_reads": [
+//	  {"path": "notes/intro.md", "commit_sha": "def..."}
+//	 ]
 //	}
 func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
@@ -3999,20 +4189,20 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		s.store.RecordContributionEvent(&store.ContributionEvent{
 			CitizenID: task.ClaimedBy,
 			EventType: "task_failed",
-			TaskID:    taskID,
-			RunID:     task.RunID,
+			TaskID:  taskID,
+			RunID:   task.RunID,
 			ProjectID: projectID,
-			Metadata:  fmt.Sprintf(`{"reason":%q}`, req.Reason),
+			Metadata: store.MarshalMetadata(map[string]any{"reason": req.Reason}),
 			CreatedAt: time.Now(),
 		})
 	}
 
 	resp := map[string]interface{}{
-		"status":              "failed",
-		"task_id":             taskID,
-		"reason":              req.Reason,
+		"status":       "failed",
+		"task_id":       taskID,
+		"reason":       req.Reason,
 		"skipped_descendants": res.SkippedDescendants,
-		"rollbacks":           res.Rollbacks,
+		"rollbacks":      res.Rollbacks,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -4046,16 +4236,16 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	// rest: review/vote/reject cascades, dynamic materialization,
 	// tail ready-sweep, and HTTP response shape.
 	engineReq := &engine.SubmitRequest{
-		TaskID:           taskID,
-		ResultPath:       req.ResultPath,
-		CommitSHA:        req.CommitSHA,
-		Decision:         req.Decision,
-		Option:           req.Option,
-		Username:         req.Username,
-		Content:          req.Content,
-		TokensUsed:       req.TokensUsed,
+		TaskID:      taskID,
+		ResultPath:    req.ResultPath,
+		CommitSHA:    req.CommitSHA,
+		Decision:     req.Decision,
+		Option:      req.Option,
+		Username:     req.Username,
+		Content:     req.Content,
+		TokensUsed:    req.TokensUsed,
 		ArtifactsWritten: req.ArtifactsWritten,
-		OutputLists:      req.OutputLists,
+		OutputLists:   req.OutputLists,
 	}
 	core, err := s.acceptComputeTaskCore(task, run, engineReq, req.Model)
 	if err != nil {
@@ -4086,6 +4276,27 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			s.store.ApplyPlan(*actions.ReviewResolvePlan)
 		}
 		if actions.ShouldRejectTarget && actions.RejectTargetID != "" {
+			// emit task_request_changes BEFORE the
+			// remediation/invalidate branches so audit consumers
+			// see the verdict regardless of which downstream
+			// flow runs. The reviewer's identity is submitterID
+			// (the citizen submitting the review). Target's
+			// iter_seq is read from the still-open claim.
+			targetIter, _ := s.store.GetOpenClaimIterSeq(actions.RejectTargetID)
+			s.store.Events().Record(store.Event{
+				CitizenID: submitterID,
+				EventType: "task_request_changes",
+				TaskID:  actions.RejectTargetID,
+				RunID:   task.RunID,
+				ProjectID: run.ProjectID,
+				Metadata: store.MarshalMetadata(map[string]any{
+					"reviewer_id":  submitterID,
+					"review_task_id": taskID,
+					"iter_seq":    targetIter,
+					"decision":    req.Decision,
+				}),
+				CreatedAt: time.Now(),
+			})
 			// Living-workflow phase 4b — if the target opted into
 			// spawn_remediation on request_changes, skip the
 			// invalidate cascade and spawn the remediation
@@ -4135,11 +4346,11 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 					s.logger.Error("review-reject fail: cascade", "target", actions.RejectTargetID, "error", err)
 				} else {
 					rejectResult = &invalidationResult{
-						Task:           res.Task,
-						Descendants:    res.SkippedDescendants,
+						Task:      res.Task,
+						Descendants:  res.SkippedDescendants,
 						Dematerialized: res.Dematerialized,
-						Changed:        res.Changed,
-						Rollbacks:      res.Rollbacks,
+						Changed:    res.Changed,
+						Rollbacks:   res.Rollbacks,
 					}
 				}
 				// Phase 6c — reject is terminal; close the
@@ -4240,9 +4451,9 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		status = "collecting"
 	}
 	resp := map[string]interface{}{
-		"status":      status,
+		"status":   status,
 		"result_path": resultPath,
-		"commit_sha":  req.CommitSHA,
+		"commit_sha": req.CommitSHA,
 		"newly_ready": readied,
 	}
 	// Contribution counter — "Contribution #N".
@@ -4261,9 +4472,9 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		// so the cascade block itself doesn't need to carry
 		// a verdict field.
 		resp["review_cascade"] = map[string]interface{}{
-			"target":          task.ReviewsTarget,
-			"descendants":     rejectResult.Descendants,
-			"changed":         rejectResult.Changed,
+			"target":     task.ReviewsTarget,
+			"descendants":   rejectResult.Descendants,
+			"changed":     rejectResult.Changed,
 			"rollbacks_count": len(rejectResult.Rollbacks),
 		}
 	}
@@ -4309,10 +4520,10 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	// fat-client iterates these and pushes <topic-sha> :
 	// refs/heads/<run-branch> for each one. Two cases:
 	//
-	//   - The submitter's own task auto-accepted (single-citizen
-	//     answer/compute, no review).
-	//   - A review's target transitioned to accepted because the
-	//     reviewer approved.
+	//  - The submitter's own task auto-accepted (single-citizen
+	//   answer/compute, no review).
+	//  - A review's target transitioned to accepted because the
+	//   reviewer approved.
 	//
 	// Vote tasks have no topic branch (generateIterationBranch
 	// returns "" for vote/review actions), so they don't appear
@@ -4321,6 +4532,14 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	// candidates.
 	if merges := s.collectAcceptedMerges(taskID, task, actions, run.Branch); len(merges) > 0 {
 		resp["accepted_merges"] = merges
+		// surface project_id + run_seq alongside the
+		// merge list so the fat-client can POST a branch_merged
+		// report after each successful FF push. Both fields are
+		// noise for older clients but cost nothing on the wire;
+		// new fat-clients pick them up and fire the report,
+		// older ones ignore them and skip the audit hop.
+		resp["project_id"] = run.ProjectID
+		resp["run_seq"] = run.Seq
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -4330,10 +4549,10 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 // the run branch onto the accepted iteration's tip. Phase 6b.1
 // + auto-merge wedge.
 type acceptedMergeTarget struct {
-	TaskID      string `json:"task_id"`
+	TaskID   string `json:"task_id"`
 	TopicBranch string `json:"topic_branch"`
-	RunBranch   string `json:"run_branch"`
-	CommitSHA   string `json:"commit_sha"`
+	RunBranch  string `json:"run_branch"`
+	CommitSHA  string `json:"commit_sha"`
 }
 
 // collectAcceptedMerges builds the post-submit list of tasks
@@ -4361,27 +4580,27 @@ func (s *Server) collectAcceptedMerges(
 	// Three suppression rules, all variants of "this commit
 	// doesn't yet belong on main":
 	//
-	//  (a) Review that did NOT approve. Per the design:
-	//      "Reject → branch stays where it is, main untouched."
-	//      A request_changes / reject review's topic stays as
-	//      audit, never merged.
+	// (a) Review that did NOT approve. Per the design:
+	//   "Reject → branch stays where it is, main untouched."
+	//   A request_changes / reject review's topic stays as
+	//   audit, never merged.
 	//
-	//  (b) Task with a downstream review (phase 6b.2 fix for
-	//      ISSUE-001). The existing engine auto-accepts answer/
-	//      compute tasks on submit even when a reviewer is
-	//      pending; without this guard those topics merged to
-	//      main BEFORE the reviewer ever saw them, polluting
-	//      main with rejected work. The merge moment must be
-	//      "the review approves," not "the task transitions to
-	//      accepted." The review's own topic was forked from
-	//      this task's topic and carries its content forward —
-	//      so on approve, Case 1 fires for the review, and the
-	//      single FF push lands both upstream content and
-	//      verdict prose on main.
+	// (b) Task with a downstream review (phase 6b.2 fix for
+	//   ISSUE-001). The existing engine auto-accepts answer/
+	//   compute tasks on submit even when a reviewer is
+	//   pending; without this guard those topics merged to
+	//   main BEFORE the reviewer ever saw them, polluting
+	//   main with rejected work. The merge moment must be
+	//   "the review approves," not "the task transitions to
+	//   accepted." The review's own topic was forked from
+	//   this task's topic and carries its content forward —
+	//   so on approve, Case 1 fires for the review, and the
+	//   single FF push lands both upstream content and
+	//   verdict prose on main.
 	//
-	//  (c) Whatever future state-machine cases land here —
-	//      keep this gate the only place merge eligibility is
-	//      decided so nothing slips around it.
+	// (c) Whatever future state-machine cases land here —
+	//   keep this gate the only place merge eligibility is
+	//   decided so nothing slips around it.
 	skipMergeOfSelf := false
 	if submittedTask != nil && submittedTask.Action == "review" &&
 		actions != nil && (actions.ShouldRejectTarget || actions.ShouldFailTarget) {
@@ -4506,10 +4725,10 @@ func (s *Server) acceptedMergeForTask(taskID, runBranch string) *acceptedMergeTa
 			return nil
 		}
 		return &acceptedMergeTarget{
-			TaskID:      taskID,
+			TaskID:   taskID,
 			TopicBranch: c.Branch,
-			RunBranch:   runBranch,
-			CommitSHA:   c.CommitSHA,
+			RunBranch:  runBranch,
+			CommitSHA:  c.CommitSHA,
 		}
 	}
 	return nil
@@ -4601,7 +4820,7 @@ func (s *Server) getOrLoadParsedRun(runID int64) (*enjuYaml.ParsedRun, error) {
 // render the response body and by the review-reject path in
 // handleSubmitResultReport to log what happened.
 type invalidationResult struct {
-	Task        *store.TaskRecord
+	Task    *store.TaskRecord
 	Descendants []string
 	// Dematerialized lists task IDs that were deleted
 	// rather than flipped to PENDING. Populated for
@@ -4611,14 +4830,14 @@ type invalidationResult struct {
 	// entirely and re-created on the next accept. See
 	// [docs/dynamic-outputs.md] for the rationale.
 	Dematerialized []string
-	Changed        int
-	Rollbacks      []rollbackOutcome
+	Changed    int
+	Rollbacks   []rollbackOutcome
 }
 
 type rollbackOutcome struct {
-	Path              string
-	Deleted           bool
-	RestoredFromTask  string
+	Path       string
+	Deleted      bool
+	RestoredFromTask string
 	RestoredCommitSHA string
 }
 
@@ -4660,8 +4879,8 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 		if rb.Delete {
 			mutations = append(mutations, store.DeleteArtifact{
 				ProjectID: rb.ProjectID,
-				Branch:    rb.Branch,
-				Path:      rb.Path,
+				Branch:  rb.Branch,
+				Path:   rb.Path,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
 		} else if rb.RestoreTo != nil {
@@ -4669,8 +4888,8 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 				Artifact: *rb.RestoreTo,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{
-				Path:              rb.Path,
-				RestoredFromTask:  rb.RestoreTo.LastTaskID,
+				Path:       rb.Path,
+				RestoredFromTask: rb.RestoreTo.LastTaskID,
 				RestoredCommitSHA: rb.RestoreTo.CommitSHA,
 			})
 		}
@@ -4678,16 +4897,16 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 
 	// 2. Target: ACCEPTED → READY with claim clear.
 	mutations = append(mutations, store.SetTaskState{
-		TaskID:     taskID,
-		NewState:   store.TaskReady,
+		TaskID:   taskID,
+		NewState:  store.TaskReady,
 		ClearClaim: true,
 	})
 
 	// 3. Regular descendants → PENDING with claim clear.
 	for _, descID := range outcome.RegularDescendants {
 		mutations = append(mutations, store.SetTaskState{
-			TaskID:     descID,
-			NewState:   store.TaskPending,
+			TaskID:   descID,
+			NewState:  store.TaskPending,
 			ClearClaim: true,
 		})
 	}
@@ -4700,20 +4919,20 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 	// invariant means only one run is active on any branch.
 
 	// 5. Dynamic descendants → PARK (J.2 partial re-mat
-	//    Phase 1). Previously these were deleted outright,
-	//    destroying any in-flight reviews / ballots / accepted
-	//    work on a re-accept with a near-identical list. Parking
-	//    preserves the row (state flips to 'parked', prior state
-	//    stashed in parked_from_state) so the Phase 2
-	//    reconciliation pass on re-accept can restore matched
-	//    keys losslessly. Stale keys still get deleted at that
-	//    point — but the judgment is deferred to when we have
-	//    the new output list in hand.
+	//  Phase 1). Previously these were deleted outright,
+	//  destroying any in-flight reviews / ballots / accepted
+	//  work on a re-accept with a near-identical list. Parking
+	//  preserves the row (state flips to 'parked', prior state
+	//  stashed in parked_from_state) so the Phase 2
+	//  reconciliation pass on re-accept can restore matched
+	//  keys losslessly. Stale keys still get deleted at that
+	//  point — but the judgment is deferred to when we have
+	//  the new output list in hand.
 	//
-	//    Fail-cascade keeps deleting (see performFailCascade
-	//    below, D5 in PARTIAL_REMAT_PLAN.md): a terminally
-	//    failed source will never re-accept, so its parked
-	//    descendants would orphan forever.
+	//  Fail-cascade keeps deleting (see performFailCascade
+	//  below, D5 in PARTIAL_REMAT_PLAN.md): a terminally
+	//  failed source will never re-accept, so its parked
+	//  descendants would orphan forever.
 	for _, descID := range outcome.DematerializedIDs {
 		dt, err := s.store.GetTask(descID)
 		if err != nil || dt == nil {
@@ -4723,14 +4942,14 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 			continue
 		}
 		mutations = append(mutations, store.SetTaskState{
-			TaskID:          descID,
-			NewState:        store.TaskParked,
+			TaskID:     descID,
+			NewState:    store.TaskParked,
 			ParkedFromState: store.TaskState(dt.State),
 		})
 	}
 
 	plan := store.Plan{
-		Version:   engine.EngineVersion,
+		Version:  engine.EngineVersion,
 		Mutations: mutations,
 	}
 	result, err := s.store.ApplyPlan(plan)
@@ -4777,12 +4996,31 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 
 	changed := result.Changed + result.TasksDeleted
 
+	// cascade_fired captures "this set of
+	// invalidations all came from one cause." Subtype is the
+	// cascade flavor; the immediately-preceding event in the
+	// timeline (task_request_changes / task_invalidated /
+	// review_given) supplies the trigger context.
+	s.store.Events().Record(store.Event{
+		EventType:  "cascade_fired",
+		EventSubtype: "invalidate",
+		TaskID:    taskID,
+		RunID:    task.RunID,
+		ProjectID:  run.ProjectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"descendants_count": len(outcome.RegularDescendants),
+			"parked_count":   len(outcome.DematerializedIDs),
+			"rollbacks":     len(rollbacks),
+		}),
+		CreatedAt: time.Now(),
+	})
+
 	return &invalidationResult{
-		Task:           task,
-		Descendants:    outcome.RegularDescendants,
+		Task:      task,
+		Descendants:  outcome.RegularDescendants,
 		Dematerialized: outcome.DematerializedIDs,
-		Changed:        changed,
-		Rollbacks:      rollbacks,
+		Changed:    changed,
+		Rollbacks:   rollbacks,
 	}, nil
 }
 
@@ -4791,12 +5029,12 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 // but with terminal semantics — the target is FAILED (not back to
 // READY) and intra-run descendants are SKIPPED (not PENDING).
 type failCascadeResult struct {
-	Task               *store.TaskRecord
-	Reason             string
+	Task        *store.TaskRecord
+	Reason       string
 	SkippedDescendants []string
-	Dematerialized     []string
-	Changed            int
-	Rollbacks          []rollbackOutcome
+	Dematerialized   []string
+	Changed      int
+	Rollbacks     []rollbackOutcome
 }
 
 // performFailCascade is the reject/fail analogue of performInvalidate.
@@ -4807,25 +5045,25 @@ type failCascadeResult struct {
 //
 // Semantic contract (see docs/rollback.md § Rejection vs invalidation):
 //
-//  1. Target → FAILED with the supplied reason. Terminal — unlike
-//     request_changes which bounces back to READY.
-//  2. Intra-run DAG descendants of the target → SKIPPED with
-//     skip_reason = "upstream failed: <targetID>". Terminal, and
-//     carries the reason so run_status can render ⊘ "(upstream
-//     failed: X)" distinctly from vote-cascade skips.
-//  3. Artifact rollback — identical to invalidation. The target's
-//     writes roll back to the prior accepted writer (or delete if
-//     none). Otherwise the artifact index would silently keep
-//     pointing at a rejected commit, which downstream readers would
-//     then consume.
-//  4. Cross-run artifact readers that were ACCEPTED against the
-//     rolled-back path → PENDING (not SKIPPED). They weren't DAG
-//     descendants of the rejected task; they're independent runs
-//     whose basis moved. Put them back on the queue to re-run with
-//     the restored content.
-//  5. Dynamic-for_each descendants of the target → DELETE (same as
-//     invalidation — their instance keys are tied to the rejected
-//     output list and can't survive).
+// 1. Target → FAILED with the supplied reason. Terminal — unlike
+//   request_changes which bounces back to READY.
+// 2. Intra-run DAG descendants of the target → SKIPPED with
+//   skip_reason = "upstream failed: <targetID>". Terminal, and
+//   carries the reason so run_status can render ⊘ "(upstream
+//   failed: X)" distinctly from vote-cascade skips.
+// 3. Artifact rollback — identical to invalidation. The target's
+//   writes roll back to the prior accepted writer (or delete if
+//   none). Otherwise the artifact index would silently keep
+//   pointing at a rejected commit, which downstream readers would
+//   then consume.
+// 4. Cross-run artifact readers that were ACCEPTED against the
+//   rolled-back path → PENDING (not SKIPPED). They weren't DAG
+//   descendants of the rejected task; they're independent runs
+//   whose basis moved. Put them back on the queue to re-run with
+//   the restored content.
+// 5. Dynamic-for_each descendants of the target → DELETE (same as
+//   invalidation — their instance keys are tied to the rejected
+//   output list and can't survive).
 //
 // The computation (DAG walk + rollback decisions) reuses
 // engine.ComputeInvalidation; only the Plan that gets applied
@@ -4853,14 +5091,14 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	var mutations []store.Mutation
 
 	// 1. Artifact rollbacks (same as invalidation — the
-	//    artifact index shouldn't point at rejected content).
+	//  artifact index shouldn't point at rejected content).
 	var rollbacks []rollbackOutcome
 	for _, rb := range outcome.ArtifactRollbacks {
 		if rb.Delete {
 			mutations = append(mutations, store.DeleteArtifact{
 				ProjectID: rb.ProjectID,
-				Branch:    rb.Branch,
-				Path:      rb.Path,
+				Branch:  rb.Branch,
+				Path:   rb.Path,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{Path: rb.Path, Deleted: true})
 		} else if rb.RestoreTo != nil {
@@ -4868,33 +5106,33 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 				Artifact: *rb.RestoreTo,
 			})
 			rollbacks = append(rollbacks, rollbackOutcome{
-				Path:              rb.Path,
-				RestoredFromTask:  rb.RestoreTo.LastTaskID,
+				Path:       rb.Path,
+				RestoredFromTask: rb.RestoreTo.LastTaskID,
 				RestoredCommitSHA: rb.RestoreTo.CommitSHA,
 			})
 		}
 	}
 
 	// 2. Target → FAILED (terminal). Preserve commit_sha and
-	//    claim info for audit; applySetTaskState without
-	//    ClearClaim writes the fail_reason as-is.
+	//  claim info for audit; applySetTaskState without
+	//  ClearClaim writes the fail_reason as-is.
 	mutations = append(mutations, store.SetTaskState{
-		TaskID:     taskID,
-		NewState:   store.TaskFailed,
+		TaskID:   taskID,
+		NewState:  store.TaskFailed,
 		FailReason: reason,
 	})
 
 	// 3. Intra-run descendants → SKIPPED with reason. ClearClaim
-	//    so any in-flight claims are invalidated and per-claim
-	//    state wiped — a skipped task should not look half-claimed.
+	//  so any in-flight claims are invalidated and per-claim
+	//  state wiped — a skipped task should not look half-claimed.
 	//
-	//    Filter to non-terminal descendants only. Terminal states
-	//    stay terminal:
-	//      - ACCEPTED review/vote that *caused* this failure
-	//        already did its job; overwriting it as "skipped
-	//        because upstream failed" is semantically backwards.
-	//      - Already-FAILED/SKIPPED descendants are no-ops; no
-	//        need to re-flip them and lose their original reason.
+	//  Filter to non-terminal descendants only. Terminal states
+	//  stay terminal:
+	//   - ACCEPTED review/vote that *caused* this failure
+	//    already did its job; overwriting it as "skipped
+	//    because upstream failed" is semantically backwards.
+	//   - Already-FAILED/SKIPPED descendants are no-ops; no
+	//    need to re-flip them and lose their original reason.
 	skipReason := fmt.Sprintf("upstream failed: %s", taskID)
 	var skippedDescendants []string
 	for _, descID := range outcome.RegularDescendants {
@@ -4906,8 +5144,8 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 			continue
 		}
 		mutations = append(mutations, store.SetTaskState{
-			TaskID:     descID,
-			NewState:   store.TaskSkipped,
+			TaskID:   descID,
+			NewState:  store.TaskSkipped,
 			ClearClaim: true,
 			SkipReason: skipReason,
 		})
@@ -4915,10 +5153,10 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	}
 
 	// 4. Cross-run readers → PENDING. They're in other runs, not
-	//    Cross-run reader cascade was removed with the branch-
-	//    per-run model — see performInvalidate comment for the
-	//    rationale. A branch owns its artifact history; other
-	//    branches are unaffected.
+	//  Cross-run reader cascade was removed with the branch-
+	//  per-run model — see performInvalidate comment for the
+	//  rationale. A branch owns its artifact history; other
+	//  branches are unaffected.
 
 	// 5. Dematerialized dynamic descendants → delete.
 	for _, descID := range outcome.DematerializedIDs {
@@ -4926,7 +5164,7 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	}
 
 	plan := store.Plan{
-		Version:   engine.EngineVersion,
+		Version:  engine.EngineVersion,
 		Mutations: mutations,
 	}
 	result, err := s.store.ApplyPlan(plan)
@@ -4964,13 +5202,36 @@ func (s *Server) performFailCascade(taskID, reason string) (*failCascadeResult, 
 	_, _ = s.store.UpdateReadyTasks(task.RunID)
 	s.evaluateRunStateAndMaybeTriage(task.RunID)
 
+	// cascade_fired records the fail-cascade origin.
+	// Subtype "fail" distinguishes it from the invalidate flavor.
+	{
+		var projectID int64
+		if run, _ := s.store.GetRun(task.RunID); run != nil {
+			projectID = run.ProjectID
+		}
+		s.store.Events().Record(store.Event{
+			EventType:  "cascade_fired",
+			EventSubtype: "fail",
+			TaskID:    taskID,
+			RunID:    task.RunID,
+			ProjectID:  projectID,
+			Metadata: store.MarshalMetadata(map[string]any{
+				"reason":      reason,
+				"descendants_count": len(skippedDescendants),
+				"dematerialized":  len(outcome.DematerializedIDs),
+				"rollbacks":     len(rollbacks),
+			}),
+			CreatedAt: time.Now(),
+		})
+	}
+
 	return &failCascadeResult{
-		Task:               task,
-		Reason:             reason,
+		Task:        task,
+		Reason:       reason,
 		SkippedDescendants: skippedDescendants,
-		Dematerialized:     outcome.DematerializedIDs,
-		Changed:            result.Changed + result.TasksDeleted,
-		Rollbacks:          rollbacks,
+		Dematerialized:   outcome.DematerializedIDs,
+		Changed:      result.Changed + result.TasksDeleted,
+		Rollbacks:     rollbacks,
 	}, nil
 }
 
@@ -5001,8 +5262,8 @@ type skipCascadeResult struct {
 // task has been accepted. The rule:
 //
 //	winning_set = winning_activates ∪ descendants(winning_activates)
-//	losing_set  = ⋃ losing_activates ∪ descendants(losing_activates)
-//	skip_set    = losing_set − winning_set
+//	losing_set = ⋃ losing_activates ∪ descendants(losing_activates)
+//	skip_set  = losing_set − winning_set
 //
 // Tasks in skip_set transition to SKIPPED. Tasks in winning_set
 // stay alive. Tasks in neither set are unrelated to any branch
@@ -5014,21 +5275,21 @@ type skipCascadeResult struct {
 //
 // The algorithm:
 //
-//  1. Load the ParsedRun (cached from run creation or
-//     lazily re-parsed from stored YAML).
-//  2. For each DeferredTaskDef whose for_each refs point at
-//     this accepting task, resolve the list values from
-//     req.OutputLists and run for_each expansion.
-//  3. Insert one task row per expanded instance via
-//     store.CreateTask, with depends_on computed against
-//     the instance key (matching siblings for per-instance
-//     chaining).
-//  4. For transitively-deferred tasks (singletons that
-//     consume the dynamic upstream via fan-in), materialize
-//     them with depends_on listing every newly-inserted
-//     instance ID for the upstream.
-//  5. Add nodes + edges to the cached in-memory DAG so
-//     cascade-invalidation walks see the new rows.
+// 1. Load the ParsedRun (cached from run creation or
+//   lazily re-parsed from stored YAML).
+// 2. For each DeferredTaskDef whose for_each refs point at
+//   this accepting task, resolve the list values from
+//   req.OutputLists and run for_each expansion.
+// 3. Insert one task row per expanded instance via
+//   store.CreateTask, with depends_on computed against
+//   the instance key (matching siblings for per-instance
+//   chaining).
+// 4. For transitively-deferred tasks (singletons that
+//   consume the dynamic upstream via fan-in), materialize
+//   them with depends_on listing every newly-inserted
+//   instance ID for the upstream.
+// 5. Add nodes + edges to the cached in-memory DAG so
+//   cascade-invalidation walks see the new rows.
 //
 // Non-atomic: runs after the upstream's SubmitTaskResult
 // transaction has committed. A failure here leaves the
@@ -5057,17 +5318,17 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 	// with half-restored / half-deleted rows.
 	//
 	// Ordering within the plan:
-	//   1. Restore (unpark to stashed state) — safe to apply
-	//      before deletes because restored rows have matching
-	//      keys that won't collide with anything else.
-	//   2. Singleton re-opens (state → PENDING, new deps).
-	//   3. Delete stale subtrees.
-	//   4. Create new-only instances.
+	//  1. Restore (unpark to stashed state) — safe to apply
+	//   before deletes because restored rows have matching
+	//   keys that won't collide with anything else.
+	//  2. Singleton re-opens (state → PENDING, new deps).
+	//  3. Delete stale subtrees.
+	//  4. Create new-only instances.
 	var muts []store.Mutation
 
 	for _, r := range outcome.TasksToRestore {
 		muts = append(muts, store.SetTaskState{
-			TaskID:   r.TaskID,
+			TaskID:  r.TaskID,
 			NewState: r.ToState,
 		})
 	}
@@ -5079,9 +5340,9 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 		// the singleton at PENDING with stale parents.
 		newDeps := strings.Split(so.NewDependsOn, ",")
 		muts = append(muts, store.SetTaskState{
-			TaskID:       so.TaskID,
-			NewState:     store.TaskPending,
-			ClearClaim:   true,
+			TaskID:    so.TaskID,
+			NewState:   store.TaskPending,
+			ClearClaim:  true,
 			NewDependsOn: &newDeps,
 		})
 	}
@@ -5094,7 +5355,7 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 
 	if len(muts) > 0 {
 		if _, err := s.store.ApplyPlan(store.Plan{
-			Version:   engine.EngineVersion,
+			Version:  engine.EngineVersion,
 			Mutations: muts,
 		}); err != nil {
 			return fmt.Errorf("applying materialization plan: %w", err)
@@ -5136,8 +5397,8 @@ func (s *Server) materializeDeferredTasks(task *store.TaskRecord, run *store.Run
 func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID string) (*skipCascadeResult, error) {
 	// Decode the declared options.
 	var declared []struct {
-		ID        string   `json:"id"`
-		Label     string   `json:"label,omitempty"`
+		ID    string  `json:"id"`
+		Label   string  `json:"label,omitempty"`
 		Activates []string `json:"activates,omitempty"`
 	}
 	if task.VoteOptions == "" {
@@ -5282,19 +5543,38 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 	var skipMuts []store.Mutation
 	for _, id := range skipIDs {
 		skipMuts = append(skipMuts, store.SetTaskState{
-			TaskID:   id,
+			TaskID:  id,
 			NewState: store.TaskSkipped,
 		})
 	}
 	if _, err := s.store.ApplyPlan(store.Plan{
-		Version:   engine.EngineVersion,
+		Version:  engine.EngineVersion,
 		Mutations: skipMuts,
 	}); err != nil {
 		return nil, fmt.Errorf("marking tasks skipped: %w", err)
 	}
+	// cascade_fired for the vote-skip flavor.
+	{
+		var projectID int64
+		if run, _ := s.store.GetRun(task.RunID); run != nil {
+			projectID = run.ProjectID
+		}
+		s.store.Events().Record(store.Event{
+			EventType:  "cascade_fired",
+			EventSubtype: "skip",
+			TaskID:    task.ID,
+			RunID:    task.RunID,
+			ProjectID:  projectID,
+			Metadata: store.MarshalMetadata(map[string]any{
+				"winning_option": winningOptionID,
+				"skipped_count": len(skipIDs),
+			}),
+			CreatedAt: time.Now(),
+		})
+	}
 	return &skipCascadeResult{
 		WinningOption: winningOptionID,
-		Skipped:       skipIDs,
+		Skipped:    skipIDs,
 	}, nil
 }
 
@@ -5304,7 +5584,8 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	var req invalidateRequest
 	json.NewDecoder(r.Body).Decode(&req)
 
-	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
 		return
 	}
 
@@ -5340,29 +5621,46 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	// the moment the cascade fired. Best-effort — failure to
 	// record shouldn't un-invalidate the task.
 	if result.Task != nil {
-		metaJSON := fmt.Sprintf(`{"reason":%q,"descendants":%d,"rollbacks":%d}`,
-			req.Reason, len(result.Descendants), len(result.Rollbacks))
+		// enrichment: include the invalidator citizen
+		// + descendant/rollback counts so the audit timeline
+		// answers "who invalidated what, how much fell out."
+		// member may be nil on un-migrated legacy projects (the
+		// no-members-yet "open" path); fall back to the auth
+		// context citizen so attribution is still captured.
+		var invalidator int64
+		if member != nil {
+			invalidator = member.CitizenID
+		} else if c := citizenFromRequest(r); c != nil {
+			invalidator = c.ID
+		}
+		metaJSON := store.MarshalMetadata(map[string]any{
+			"reason":       req.Reason,
+			"invalidator_citizen": invalidator,
+			"descendants":     len(result.Descendants),
+			"rollbacks":      len(result.Rollbacks),
+		})
 		s.store.RecordContributionEvent(&store.ContributionEvent{
+			CitizenID: invalidator,
 			EventType: "task_invalidated",
-			TaskID:    taskID,
-			RunID:     result.Task.RunID,
+			TaskID:  taskID,
+			RunID:   result.Task.RunID,
 			ProjectID: func() int64 {
 				if run, _ := s.store.GetRun(result.Task.RunID); run != nil {
 					return run.ProjectID
 				}
 				return 0
 			}(),
-			Metadata:  metaJSON,
+			Metadata: metaJSON,
 			CreatedAt: time.Now(),
 		})
 	}
 
 	resp := map[string]interface{}{
-		"status":      "invalidated",
-		"task_id":     taskID,
+		"status":   "invalidated",
+		"task_id":   taskID,
 		"descendants": result.Descendants,
-		"changed":     result.Changed,
-		"reason":      req.Reason,
+		"changed":   result.Changed,
+		"reason":   req.Reason,
 	}
 	if len(result.Dematerialized) > 0 {
 		// J.2 renamed the semantic from "deleted" to
@@ -5393,9 +5691,9 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 // --- Citizens ---
 
 type registerRequest struct {
-	Name     string `json:"name"`
+	Name   string `json:"name"`
 	Username string `json:"username,omitempty"` // optional, auto-generated from name if omitted
-	Email    string `json:"email,omitempty"`
+	Email  string `json:"email,omitempty"`
 }
 
 // generateUniqueUsername picks an unused username based on the display
@@ -5449,13 +5747,13 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 
 	id, err := s.store.CreateCitizen(&store.CitizenRecord{
-		Username:     username,
-		Name:         req.Name,
-		Email:        req.Email,
-		Role:         "citizen",
-		Token:        token,
+		Username:   username,
+		Name:     req.Name,
+		Email:    req.Email,
+		Role:     "citizen",
+		Token:    token,
 		RegisteredAt: now,
-		LastSeen:     now,
+		LastSeen:   now,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "email already exists") ||
@@ -5468,12 +5766,12 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":       id,
+		"id":    id,
 		"username": username,
-		"name":     req.Name,
-		"email":    req.Email,
-		"role":     "citizen",
-		"token":    token,
+		"name":   req.Name,
+		"email":  req.Email,
+		"role":   "citizen",
+		"token":  token,
 	})
 }
 
@@ -5498,10 +5796,10 @@ func (s *Server) handleGetCitizenByUsername(w http.ResponseWriter, r *http.Reque
 // gating deferred per the design doc).
 
 type registerBotRequest struct {
-	Name     string `json:"name"`               // display name, required
+	Name   string `json:"name"`        // display name, required
 	Username string `json:"username,omitempty"` // optional — auto-slugified
-	Role     string `json:"role,omitempty"`     // optional — defaults to 'citizen'
-	Label    string `json:"label,omitempty"`    // optional initial-token label
+	Role   string `json:"role,omitempty"`   // optional — defaults to 'citizen'
+	Label  string `json:"label,omitempty"`  // optional initial-token label
 }
 
 // handleRegisterBot creates a new kind='bot' citizen owned by the
@@ -5542,14 +5840,14 @@ func (s *Server) handleRegisterBot(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 
 	id, err := s.store.CreateCitizen(&store.CitizenRecord{
-		Username:     username,
-		Name:         req.Name,
-		Role:         role,
-		Token:        token,
+		Username:   username,
+		Name:     req.Name,
+		Role:     role,
+		Token:    token,
 		RegisteredAt: now,
-		LastSeen:     now,
-		Kind:         "bot",
-		ParentID:     &caller.ID,
+		LastSeen:   now,
+		Kind:     "bot",
+		ParentID:   &caller.ID,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "already taken") {
@@ -5571,15 +5869,15 @@ func (s *Server) handleRegisterBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":          id,
-		"username":    username,
-		"name":        req.Name,
-		"kind":        "bot",
-		"parent_id":   caller.ID,
+		"id":     id,
+		"username":  username,
+		"name":    req.Name,
+		"kind":    "bot",
+		"parent_id":  caller.ID,
 		"parent_name": caller.Username,
-		"token":       token,
-		"label":       req.Label,
-		"warning":     "Stash this token now — it cannot be retrieved later. Revoke + re-issue if lost.",
+		"token":    token,
+		"label":    req.Label,
+		"warning":   "Stash this token now — it cannot be retrieved later. Revoke + re-issue if lost.",
 	})
 }
 
@@ -5603,8 +5901,8 @@ func (s *Server) handleListMyBots(w http.ResponseWriter, r *http.Request) {
 		tokenInfo := make([]map[string]interface{}, 0, len(tokens))
 		for _, t := range tokens {
 			info := map[string]interface{}{
-				"id":        t.ID,
-				"label":     t.Label,
+				"id":    t.ID,
+				"label":   t.Label,
 				"issued_at": t.IssuedAt.Format(time.RFC3339),
 			}
 			if t.RevokedAt != nil {
@@ -5613,20 +5911,20 @@ func (s *Server) handleListMyBots(w http.ResponseWriter, r *http.Request) {
 			tokenInfo = append(tokenInfo, info)
 		}
 		out = append(out, map[string]interface{}{
-			"id":         b.ID,
-			"username":   b.Username,
-			"name":       b.Name,
-			"role":       b.Role,
+			"id":     b.ID,
+			"username":  b.Username,
+			"name":    b.Name,
+			"role":    b.Role,
 			"registered": b.RegisteredAt.Format(time.RFC3339),
-			"tokens":     tokenInfo,
+			"tokens":   tokenInfo,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"bots": out})
 }
 
 type revokeTokenRequest struct {
-	Token   string `json:"token,omitempty"`    // revoke by value (caller already holds it)
-	TokenID int64  `json:"token_id,omitempty"` // revoke by row id (from list endpoint)
+	Token  string `json:"token,omitempty"`  // revoke by value (caller already holds it)
+	TokenID int64 `json:"token_id,omitempty"` // revoke by row id (from list endpoint)
 }
 
 // handleRevokeToken marks a token as revoked. The caller must own
@@ -5694,16 +5992,16 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(models))
 	for _, m := range models {
 		out = append(out, map[string]interface{}{
-			"id":       m.ID,
+			"id":    m.ID,
 			"username": m.Username,
-			"name":     m.Name,
+			"name":   m.Name,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"models": out})
 }
 
 type registerModelRequest struct {
-	Username    string `json:"username"`               // required, slug-form
+	Username  string `json:"username"`        // required, slug-form
 	DisplayName string `json:"display_name,omitempty"` // optional, defaults to username
 }
 
@@ -5741,10 +6039,10 @@ func (s *Server) handleRegisterModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":           id,
-		"username":     req.Username,
+		"id":      id,
+		"username":   req.Username,
 		"display_name": displayName,
-		"kind":         "model",
+		"kind":     "model",
 	})
 }
 
@@ -5761,7 +6059,7 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	// caller wants to clear the value). Requires json.Decoder with
 	// a pointer-typed struct.
 	var req struct {
-		Name  *string `json:"name"`
+		Name *string `json:"name"`
 		Email *string `json:"email"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -5805,22 +6103,22 @@ func (s *Server) handleCitizenContributions(w http.ResponseWriter, r *http.Reque
 	downstreamTasks, downstreamProjects, _ := s.store.GetDownstreamImpact(citizen.ID)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"username":           username,
-		"tasks_completed":    summary.TasksCompleted,
-		"tasks_rejected":     summary.TasksRejected,
-		"tasks_timed_out":    summary.TasksTimedOut,
-		"tasks_released":     summary.TasksReleased,
-		"reviews_given":      summary.ReviewsGiven,
-		"review_approves":    summary.ReviewApproves,
-		"review_rejects":     summary.ReviewRejects,
-		"votes_cast":         summary.VotesCast,
-		"runs_created":       summary.RunsCreated,
-		"tokens_total":       summary.TokensTotal,
-		"project_count":      summary.ProjectCount,
+		"username":      username,
+		"tasks_completed":  summary.TasksCompleted,
+		"tasks_rejected":   summary.TasksRejected,
+		"tasks_timed_out":  summary.TasksTimedOut,
+		"tasks_released":   summary.TasksReleased,
+		"reviews_given":   summary.ReviewsGiven,
+		"review_approves":  summary.ReviewApproves,
+		"review_rejects":   summary.ReviewRejects,
+		"votes_cast":     summary.VotesCast,
+		"runs_created":    summary.RunsCreated,
+		"tokens_total":    summary.TokensTotal,
+		"project_count":   summary.ProjectCount,
 		"total_contributions": totalEvents,
 		"projects_this_month": projectsThisMonth,
 		"downstream_impact": map[string]interface{}{
-			"tasks":    downstreamTasks,
+			"tasks":  downstreamTasks,
 			"projects": downstreamProjects,
 		},
 	})
@@ -5839,7 +6137,7 @@ func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) 
 	recent, _ := s.store.ListCitizenCompletedTasks(citizen.ID, 5)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"citizen":      citizenToMap(citizen),
+		"citizen":   citizenToMap(citizen),
 		"active_tasks": s.toTaskResponses(active),
 		"recent_tasks": s.toTaskResponses(recent),
 	})
@@ -5850,16 +6148,16 @@ func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) 
 // read `citizen.id` directly from the store.
 func citizenToMap(c *store.CitizenRecord) map[string]interface{} {
 	return map[string]interface{}{
-		"username":           c.Username,
-		"name":               c.Name,
-		"email":              c.Email,
-		"role":               c.Role,
-		"score":              c.Score,
-		"tasks_completed":    c.TasksCompleted,
-		"tasks_timed_out":    c.TasksTimedOut,
-		"tasks_released":     c.TasksReleased,
+		"username":      c.Username,
+		"name":        c.Name,
+		"email":       c.Email,
+		"role":        c.Role,
+		"score":       c.Score,
+		"tasks_completed":  c.TasksCompleted,
+		"tasks_timed_out":  c.TasksTimedOut,
+		"tasks_released":   c.TasksReleased,
 		"tokens_contributed": c.TokensContrib,
-		"registered_at":      c.RegisteredAt.Format(time.RFC3339),
+		"registered_at":   c.RegisteredAt.Format(time.RFC3339),
 	}
 }
 
@@ -5940,55 +6238,55 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 		iterationLabel = formatIterationLabel(t.InstanceParams, t.InstanceKey)
 	}
 	resp := taskResponse{
-		ID:               t.ID,
-		RunID:            t.RunID,
-		RunSeq:           runSeq,
-		ProjectID:        projectID,
+		ID:        t.ID,
+		RunID:      t.RunID,
+		RunSeq:      runSeq,
+		ProjectID:    projectID,
 		ProjectRemoteURL: remoteURL,
-		ProjectName:      projectName,
-		Seq:              t.Seq,
-		TaskDefID:        t.TaskDefID,
-		InstanceKey:      t.InstanceKey,
-		ResultDir:        engine.ComputeResultDir(&t),
-		RunSlug:          t.RunSlug,
-		IterationLabel:   iterationLabel,
-		Ref:              t.Ref,
-		Action:          t.Action,
-		Prompt:          t.Prompt,
-		UserPrompt:      t.UserPrompt,
-		Script:          t.Script,
-		Outputs:         t.Outputs,
-		Requirements:    t.Requirements,
-		ResultType:      t.ResultType,
-		State:           string(t.State),
-		ClaimedBy:       s.citizenUsername(t.ClaimedBy),
-		ResultPath:      t.ResultPath,
-		CommitSHA:       t.CommitSHA,
-		DependsOn:       t.DependsOn,
-		ReadsArtifacts:  unmarshalStringSlice(t.ReadsArtifacts),
+		ProjectName:   projectName,
+		Seq:       t.Seq,
+		TaskDefID:    t.TaskDefID,
+		InstanceKey:   t.InstanceKey,
+		ResultDir:    engine.ComputeResultDir(&t),
+		RunSlug:     t.RunSlug,
+		IterationLabel:  iterationLabel,
+		Ref:       t.Ref,
+		Action:     t.Action,
+		Prompt:     t.Prompt,
+		UserPrompt:   t.UserPrompt,
+		Script:     t.Script,
+		Outputs:     t.Outputs,
+		Requirements:  t.Requirements,
+		ResultType:   t.ResultType,
+		State:      string(t.State),
+		ClaimedBy:    s.citizenUsername(t.ClaimedBy),
+		ResultPath:   t.ResultPath,
+		CommitSHA:    t.CommitSHA,
+		DependsOn:    t.DependsOn,
+		ReadsArtifacts: unmarshalStringSlice(t.ReadsArtifacts),
 		WritesArtifacts: unmarshalWriteArtifacts(t.WritesArtifacts),
-		AssignTo:        unmarshalStringSlice(t.AssignTo),
-		RequireRole:     t.RequireRole,
-		ReviewsTarget:   t.ReviewsTarget,
-		ReviewDecision:  t.ReviewDecision,
-		VoteOptions:     t.VoteOptions,
-		VoteChoice:      t.VoteChoice,
-		Citizens:        t.Citizens,
-		MinQuorum:       t.MinQuorum,
-		VoteThreshold:   t.VoteThreshold,
-		VoteDeadline:    t.VoteDeadline,
-		Anonymize:       t.Anonymize,
-		Visibility:      t.Visibility,
-		FailReason:        t.FailReason,
-		SkipReason:        t.SkipReason,
-		ParkedFromState:   t.ParkedFromState,
-		RunSourcePath:     runSourcePath,
-		RunBranch:         runBranch,
-		RunParams:         runParams,
+		AssignTo:    unmarshalStringSlice(t.AssignTo),
+		RequireRole:   t.RequireRole,
+		ReviewsTarget:  t.ReviewsTarget,
+		ReviewDecision: t.ReviewDecision,
+		VoteOptions:   t.VoteOptions,
+		VoteChoice:   t.VoteChoice,
+		Citizens:    t.Citizens,
+		MinQuorum:    t.MinQuorum,
+		VoteThreshold:  t.VoteThreshold,
+		VoteDeadline:  t.VoteDeadline,
+		Anonymize:    t.Anonymize,
+		Visibility:   t.Visibility,
+		FailReason:    t.FailReason,
+		SkipReason:    t.SkipReason,
+		ParkedFromState:  t.ParkedFromState,
+		RunSourcePath:   runSourcePath,
+		RunBranch:     runBranch,
+		RunParams:     runParams,
 		InstanceParamsMap: instanceParams,
-		Env:               unmarshalStringMapField(t.Env),
-		Mode:              t.Mode,
-		Container:         t.Container,
+		Env:        unmarshalStringMapField(t.Env),
+		Mode:       t.Mode,
+		Container:     t.Container,
 	}
 	// Single-citizen task model attribution. For multi-citizen
 	// tasks we expose per-voter models on VoteSubmissions[].Model
@@ -6040,7 +6338,7 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 				}
 				ref := voteSubmissionRef{
 					Username: uname,
-					Option:   sub.Option,
+					Option:  sub.Option,
 				}
 				if sub.SubmittedAt != nil {
 					ref.SubmittedAt = sub.SubmittedAt.Format(time.RFC3339)
@@ -6071,6 +6369,12 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 						resp.IterationBranches = map[string]string{}
 					}
 					resp.IterationBranches[uname] = c.Branch
+				}
+				if c.IterSeq > 0 {
+					if resp.IterationSeqs == nil {
+						resp.IterationSeqs = map[string]int{}
+					}
+					resp.IterationSeqs[uname] = c.IterSeq
 				}
 			}
 		}
@@ -6139,14 +6443,14 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	// Match any claim that produced a commit, regardless of
 	// outcome state. Phase 6b.2 + 6c semantics:
 	//
-	//  - "completed": single-citizen unreviewed task that
-	//    auto-accepted, or reviewed task whose review approved.
-	//  - "rejected" / "invalidated" / "abandoned" / "released":
-	//    terminal outcomes from cascades.
-	//  - NULL with a non-empty CommitSHA: 6c reviewed-task
-	//    claim that submitted but the review verdict is
-	//    still pending (the claim stays open through
-	//    request_changes rounds for revision).
+	// - "completed": single-citizen unreviewed task that
+	//  auto-accepted, or reviewed task whose review approved.
+	// - "rejected" / "invalidated" / "abandoned" / "released":
+	//  terminal outcomes from cascades.
+	// - NULL with a non-empty CommitSHA: 6c reviewed-task
+	//  claim that submitted but the review verdict is
+	//  still pending (the claim stays open through
+	//  request_changes rounds for revision).
 	//
 	// All five shapes have valid commits the UI may need
 	// (previous-submission, merge collector); match on
@@ -6193,6 +6497,12 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 					resp.IterationBranches = map[string]string{}
 				}
 				resp.IterationBranches[uname] = c.Branch
+				if c.IterSeq > 0 {
+					if resp.IterationSeqs == nil {
+						resp.IterationSeqs = map[string]int{}
+					}
+					resp.IterationSeqs[uname] = c.IterSeq
+				}
 			}
 		}
 	}
@@ -6204,10 +6514,10 @@ func (s *Server) toTaskResponse(t store.TaskRecord) taskResponse {
 	if history, err := s.store.ListTaskHistory(t.ID); err == nil && len(history) > 1 {
 		for _, h := range history {
 			entry := taskHistoryEntry{
-				Citizen:   s.citizenUsername(h.CitizenID),
+				Citizen:  s.citizenUsername(h.CitizenID),
 				ClaimedAt: h.ClaimedAt.Format(time.RFC3339),
-				Outcome:   h.Outcome,
-				Decision:  h.Option,
+				Outcome:  h.Outcome,
+				Decision: h.Option,
 			}
 			if h.SubmittedAt != nil {
 				entry.SubmittedAt = h.SubmittedAt.Format(time.RFC3339)

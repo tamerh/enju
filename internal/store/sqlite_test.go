@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,14 +17,14 @@ func TestValidateUsername(t *testing.T) {
 	}
 
 	bad := []string{
-		"",                       // empty
-		"-leading",               // leading hyphen
-		"trailing-",              // trailing hyphen
-		"With-Caps",              // uppercase
-		"spaces in it",           // spaces
-		"under_score",            // underscore
-		"dot.ed",                 // dot
-		strings.Repeat("a", 40),  // too long
+		"",            // empty
+		"-leading",        // leading hyphen
+		"trailing-",       // trailing hyphen
+		"With-Caps",       // uppercase
+		"spaces in it",      // spaces
+		"under_score",      // underscore
+		"dot.ed",         // dot
+		strings.Repeat("a", 40), // too long
 	}
 	for _, u := range bad {
 		if err := ValidateUsername(u); err == nil {
@@ -34,17 +35,17 @@ func TestValidateUsername(t *testing.T) {
 
 func TestSlugifyName(t *testing.T) {
 	cases := map[string]string{
-		"alice":              "alice",
-		"Alice":              "alice",
-		"Tamer Gur":          "tamer-gur",
-		"  weird  spacing  ": "weird-spacing",
-		"mixed_ _ underscores":  "mixed-underscores",
-		"with.dots.here":     "with-dots-here",
-		"UPPER CASE":         "upper-case",
-		"trailing-":          "trailing",
-		"---leading---":      "leading",
-		"":                   "",
-		"!!!":                "",
+		"alice":       "alice",
+		"Alice":       "alice",
+		"Tamer Gur":     "tamer-gur",
+		" weird spacing ": "weird-spacing",
+		"mixed_ _ underscores": "mixed-underscores",
+		"with.dots.here":   "with-dots-here",
+		"UPPER CASE":     "upper-case",
+		"trailing-":     "trailing",
+		"---leading---":   "leading",
+		"":          "",
+		"!!!":        "",
 	}
 	for in, want := range cases {
 		if got := SlugifyName(in); got != want {
@@ -59,7 +60,21 @@ func newTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	// events live in a separate subsystem. Tests that
+	// inspect the event log need a real EventStore wired in;
+	// without one, Store.Events() returns the noop store and
+	// every emission silently drops. Use a temp-dir events.db
+	// so each test gets its own isolated event log.
+	dir := t.TempDir()
+	es, err := NewSQLiteEventStore(filepath.Join(dir, "events.db"), nil)
+	if err != nil {
+		t.Fatalf("attach events store: %v", err)
+	}
+	s.AttachEventStore(es)
+	t.Cleanup(func() {
+		s.Close()
+		es.Close()
+	})
 	return s
 }
 
@@ -67,7 +82,7 @@ func createTestProject(t *testing.T, s *Store) int64 {
 	t.Helper()
 	now := time.Now()
 	id, err := s.CreateProject(&ProjectRecord{
-		Name:      "test-project",
+		Name:   "test-project",
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
@@ -83,9 +98,9 @@ func createTestRun(t *testing.T, s *Store) int64 {
 	now := time.Now()
 	id, _, err := s.CreateRun(&RunRecord{
 		ProjectID: projectID,
-		Name:      "Test Run",
-		YAMLData:  "name: test",
-		State:     RunActive,
+		Name:   "Test Run",
+		YAMLData: "name: test",
+		State:   RunActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
@@ -101,11 +116,11 @@ func createTestCitizen(t *testing.T, s *Store, username, token string) int64 {
 	t.Helper()
 	now := time.Now()
 	id, err := s.CreateCitizen(&CitizenRecord{
-		Username:     username,
-		Name:         username,
-		Token:        token,
+		Username:   username,
+		Name:     username,
+		Token:    token,
 		RegisteredAt: now,
-		LastSeen:     now,
+		LastSeen:   now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -354,18 +369,18 @@ func TestInvalidateTaskClearsClaims(t *testing.T) {
 	s.CreateTask(&TaskRecord{
 		ID: "target", RunID: pid, Seq: 1, TaskDefID: "target",
 		Action: "answer", ResultType: "text",
-		State:       TaskAccepted,
-		ClaimedBy:   alice,
-		ClaimedAt:   &acceptedAt,
+		State:    TaskAccepted,
+		ClaimedBy:  alice,
+		ClaimedAt:  &acceptedAt,
 		SubmittedAt: &acceptedAt,
-		ResultPath:  "runs/1/target",
-		CreatedAt:   now,
+		ResultPath: "runs/1/target",
+		CreatedAt:  now,
 	})
 	// Descendant is currently claimed by alice (in-progress).
 	s.CreateTask(&TaskRecord{
 		ID: "descendant", RunID: pid, Seq: 2, TaskDefID: "descendant",
 		Action: "answer", ResultType: "text",
-		State:     TaskClaimed,
+		State:   TaskClaimed,
 		ClaimedBy: alice,
 		ClaimedAt: &acceptedAt,
 		CreatedAt: now,
@@ -562,18 +577,38 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 // --- Run-lifecycle event emission (living-workflow phase 2) ---
 
 // countEvents returns how many events of the given type exist
-// for the run (regardless of citizen). Tiny query helper for the
-// emission tests below.
+// for the run (regardless of citizen). emissions are
+// async, so we let the writer drain briefly before counting.
 func countEvents(t *testing.T, s *Store, runID int64, eventType string) int {
 	t.Helper()
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM contribution_events WHERE run_id = ? AND event_type = ?`,
-		runID, eventType,
-	).Scan(&n); err != nil {
+	waitForEventsDrained(t, s)
+	events, err := s.ListEvents(EventQuery{RunID: runID, EventTypes: []string{eventType}, Limit: 1000})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return n
+	return len(events)
+}
+
+// waitForEventsDrained blocks until the EventStore writer has
+// persisted everything it has enqueued so far, or a short
+// budget elapses. Tests that mutate state and then read events
+// need this because Record() is async — without the wait,
+// reads can race ahead of the writer goroutine.
+func waitForEventsDrained(t *testing.T, s *Store) {
+	t.Helper()
+	es, ok := s.Events().(*SQLiteEventStore)
+	if !ok {
+		return
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := es.Stats()
+		if st.Persisted+st.Dropped >= st.Enqueued {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for event store to drain: %+v", es.Stats())
 }
 
 func TestEvaluateRunState_EmitsLifecycleEvents(t *testing.T) {
@@ -636,12 +671,15 @@ func TestPauseResume_EmitEventsAttributedToCitizen(t *testing.T) {
 		t.Fatalf("expected one run_resumed event, got %d", got)
 	}
 
-	// Verify attribution: pause+resume events should be tied to alice
-	var paused, resumed int64
-	s.db.QueryRow(`SELECT citizen_id FROM contribution_events WHERE run_id = ? AND event_type = 'run_paused'`, runID).Scan(&paused)
-	s.db.QueryRow(`SELECT citizen_id FROM contribution_events WHERE run_id = ? AND event_type = 'run_resumed'`, runID).Scan(&resumed)
-	if paused != alice || resumed != alice {
-		t.Fatalf("expected pause/resume attributed to alice (%d), got paused=%d resumed=%d", alice, paused, resumed)
+	// Verify attribution: pause+resume events should be tied to alice.
+	waitForEventsDrained(t, s)
+	pausedEvts, _ := s.Events().Query(t.Context(), EventQuery{RunID: runID, EventTypes: []string{"run_paused"}, Limit: 10})
+	resumedEvts, _ := s.Events().Query(t.Context(), EventQuery{RunID: runID, EventTypes: []string{"run_resumed"}, Limit: 10})
+	if len(pausedEvts) == 0 || len(resumedEvts) == 0 {
+		t.Fatalf("expected one of each: paused=%d resumed=%d", len(pausedEvts), len(resumedEvts))
+	}
+	if pausedEvts[0].CitizenID != alice || resumedEvts[0].CitizenID != alice {
+		t.Fatalf("expected pause/resume attributed to alice (%d), got paused=%d resumed=%d", alice, pausedEvts[0].CitizenID, resumedEvts[0].CitizenID)
 	}
 }
 
@@ -656,7 +694,8 @@ func TestListEvents_FiltersByTypeAndRun(t *testing.T) {
 	if _, err := s.EvaluateRunState(runID); err != nil {
 		t.Fatal(err)
 	}
-	// → run_idle event recorded.
+	// → run_idle event recorded; let async writer drain.
+	waitForEventsDrained(t, s)
 
 	// Project-scoped, no filter: should include the run_idle.
 	all, err := s.ListEvents(EventQuery{ProjectID: projectID})
@@ -669,7 +708,7 @@ func TestListEvents_FiltersByTypeAndRun(t *testing.T) {
 
 	// event_types filter narrows.
 	idleOnly, err := s.ListEvents(EventQuery{
-		ProjectID:  projectID,
+		ProjectID: projectID,
 		EventTypes: []string{"run_idle"},
 	})
 	if err != nil {
@@ -698,16 +737,16 @@ func TestCreateIssue_AssignsPerProjectSeq(t *testing.T) {
 
 	id1, seq1, err := s.CreateIssue(&IssueRecord{
 		ProjectID: projectID,
-		Title:     "first finding",
-		FiledBy:   alice,
+		Title:   "first finding",
+		FiledBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	id2, seq2, err := s.CreateIssue(&IssueRecord{
 		ProjectID: projectID,
-		Title:     "second finding",
-		FiledBy:   alice,
+		Title:   "second finding",
+		FiledBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -737,9 +776,9 @@ func TestTriageIssue_RefusedOnAlreadyTriaged(t *testing.T) {
 
 	id, _, err := s.CreateIssue(&IssueRecord{
 		ProjectID: projectID,
-		Title:     "needs triage",
-		Severity:  "high",
-		FiledBy:   alice,
+		Title:   "needs triage",
+		Severity: "high",
+		FiledBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -772,8 +811,8 @@ func TestCloseIssue_StatusValidation(t *testing.T) {
 
 	id, _, err := s.CreateIssue(&IssueRecord{
 		ProjectID: projectID,
-		Title:     "to close",
-		FiledBy:   alice,
+		Title:   "to close",
+		FiledBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -837,13 +876,13 @@ func TestSpawnTask_BasicHappyPath(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-1")
 
 	taskID, err := s.SpawnTask(SpawnSpec{
-		RunID:        runID,
+		RunID:    runID,
 		ParentTaskID: "1:1:root",
-		TaskDefID:    "remediation_1",
-		Action:       "answer",
-		Prompt:       "fix what review flagged",
-		Trigger:      "bot",
-		SpawnedBy:    alice,
+		TaskDefID:  "remediation_1",
+		Action:    "answer",
+		Prompt:    "fix what review flagged",
+		Trigger:   "bot",
+		SpawnedBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -870,6 +909,7 @@ func TestSpawnTask_BasicHappyPath(t *testing.T) {
 	}
 
 	// task_spawned event emitted with attribution.
+	waitForEventsDrained(t, s)
 	events, _ := s.ListEvents(EventQuery{RunID: runID, EventTypes: []string{"task_spawned"}})
 	if len(events) != 1 {
 		t.Fatalf("expected 1 task_spawned event, got %d", len(events))
@@ -886,9 +926,9 @@ func TestSpawnTask_DependsOnLandsAsPending(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-2")
 
 	taskID, err := s.SpawnTask(SpawnSpec{
-		RunID:     runID,
+		RunID:   runID,
 		TaskDefID: "downstream",
-		Action:    "answer",
+		Action:  "answer",
 		DependsOn: []string{"1:1:upstream"},
 		SpawnedBy: alice,
 	})
@@ -914,9 +954,9 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		_, err := s.SpawnTask(SpawnSpec{
-			RunID:     runID,
+			RunID:   runID,
 			TaskDefID: fmt.Sprintf("spawn_%d", i),
-			Action:    "answer",
+			Action:  "answer",
 			SpawnedBy: alice,
 		})
 		if err != nil {
@@ -926,9 +966,9 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 
 	// Third spawn should refuse + pause.
 	_, err := s.SpawnTask(SpawnSpec{
-		RunID:     runID,
+		RunID:   runID,
 		TaskDefID: "spawn_3",
-		Action:    "answer",
+		Action:  "answer",
 		SpawnedBy: alice,
 	})
 	if err == nil {
@@ -944,6 +984,7 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 	}
 
 	// cycle_budget_exhausted event recorded.
+	waitForEventsDrained(t, s)
 	events, _ := s.ListEvents(EventQuery{RunID: runID, EventTypes: []string{"cycle_budget_exhausted"}})
 	if len(events) != 1 {
 		t.Fatalf("expected 1 cycle_budget_exhausted event, got %d", len(events))
@@ -960,9 +1001,9 @@ func TestSpawnTask_RefusedOnPausedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := s.SpawnTask(SpawnSpec{
-		RunID:     runID,
+		RunID:   runID,
 		TaskDefID: "remediation",
-		Action:    "answer",
+		Action:  "answer",
 		SpawnedBy: alice,
 	})
 	if err == nil || !strings.Contains(err.Error(), "paused") {
@@ -987,9 +1028,9 @@ func TestSpawnTask_LiftsIdleRunToActive(t *testing.T) {
 	}
 
 	if _, err := s.SpawnTask(SpawnSpec{
-		RunID:     runID,
+		RunID:   runID,
 		TaskDefID: "wakeup",
-		Action:    "answer",
+		Action:  "answer",
 		SpawnedBy: alice,
 	}); err != nil {
 		t.Fatal(err)
@@ -1009,9 +1050,9 @@ func TestSetCycleBudgetMax_RefusesBelowUsed(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		if _, err := s.SpawnTask(SpawnSpec{
-			RunID:     runID,
+			RunID:   runID,
 			TaskDefID: fmt.Sprintf("t%d", i),
-			Action:    "answer",
+			Action:  "answer",
 			SpawnedBy: alice,
 		}); err != nil {
 			t.Fatal(err)
@@ -1066,8 +1107,8 @@ func TestMarkIssueInProgress_StatusTransition(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-mip-1")
 	id, _, err := s.CreateIssue(&IssueRecord{
 		ProjectID: projectID,
-		Title:     "needs fix",
-		FiledBy:   alice,
+		Title:   "needs fix",
+		FiledBy:  alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1148,12 +1189,12 @@ func TestSpawnTask_PersistsClosesIssueSeq(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-cis-1")
 
 	taskID, err := s.SpawnTask(SpawnSpec{
-		RunID:          runID,
-		TaskDefID:      "fix_ISSUE_001_1",
-		Action:         "answer",
-		Trigger:        "auto_triage",
+		RunID:     runID,
+		TaskDefID:   "fix_ISSUE_001_1",
+		Action:     "answer",
+		Trigger:    "auto_triage",
 		ClosesIssueSeq: 7,
-		SpawnedBy:      alice,
+		SpawnedBy:   alice,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1195,7 +1236,7 @@ func TestListTaskIterations_OrdersByClaimAndComputesSeq(t *testing.T) {
 	if err := s.CreateTask(&TaskRecord{
 		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
 		Action: "answer", ResultType: "text",
-		State:     TaskReady,
+		State:   TaskReady,
 		CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
@@ -1457,10 +1498,10 @@ func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 	now := time.Now()
 	_, _, err := s.CreateRun(&RunRecord{
 		ProjectID: r1.ProjectID,
-		Name:      "second",
-		YAMLData:  "name: dup",
-		Branch:    r1.Branch,
-		State:     RunActive,
+		Name:   "second",
+		YAMLData: "name: dup",
+		Branch:  r1.Branch,
+		State:   RunActive,
 		CreatedAt: now,
 		UpdatedAt: now,
 	})

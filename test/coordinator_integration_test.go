@@ -194,6 +194,16 @@ func newTestServer(t *testing.T) *testServer {
 	}
 	t.Cleanup(func() { st.Close() })
 
+	// Events live in their own DB. Place it next to the
+	// state DB the same way `enju serve` does.
+	eventsPath := strings.TrimSuffix(dbPath, ".db") + "-events.db"
+	es, err := store.NewSQLiteEventStore(eventsPath, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { es.Close() })
+	st.AttachEventStore(es)
+
 	ws, err := mcpgit.NewWorkspace(workspaceDir, logger)
 	if err != nil {
 		t.Fatal(err)
@@ -2089,6 +2099,186 @@ func TestSetProjectRemoteRejectsEmptyURLAtAPI(t *testing.T) {
 		}
 		if !strings.Contains(string(bodyBytes), "cannot be empty") {
 			t.Errorf("remote_url=%q: expected 'cannot be empty' in body, got: %s", badURL, bodyBytes)
+		}
+	}
+}
+
+// findEvent queries the project event log filtered by event type
+// and returns the first match (newest-first) after waiting briefly
+// for the async writer to drain. nil when no match. Used by the
+// emission tests below.
+func (s *testServer) findEvent(projectID int64, eventType string) map[string]interface{} {
+	s.t.Helper()
+	s.store.Events().WaitForDrain(2 * time.Second)
+	path := fmt.Sprintf("/api/v1/projects/%d/events?event_types=%s&limit=100",
+		projectID, eventType)
+	_, data := s.doAuthed("GET", path, s.defaultToken(), nil)
+	var events []map[string]interface{}
+	if err := json.Unmarshal(data, &events); err != nil {
+		s.t.Fatalf("decoding events: %v (raw: %s)", err, data)
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	return events[0]
+}
+
+// TestEventsAdminEndpoints pins the operator-surface contract
+// for the EventStore kill-switch HTTP endpoints. Covers the
+// whole shape:
+//
+//   - GET /admin/events/status returns enabled + the four Stats
+//     counters when the store is enabled
+//   - GET works the same way when the store is DISABLED — the
+//     disabled state is queryable, not an error path
+//   - POST /admin/events/enabled with {enabled: false} returns
+//     {enabled: false, prior: true, changed: true}
+//   - Idempotent toggle (POST same value twice) reports
+//     changed: false on the second call
+//   - Re-enable flips changed: true again
+//
+// A regression — wrong field name, missing Stats field, status
+// path that 5xx's instead of returning the snapshot — would
+// silently break the operator UX without anything else failing.
+func TestEventsAdminEndpoints(t *testing.T) {
+	s := newTestServer(t)
+
+	got := s.get("/api/v1/admin/events/status")
+	if enabled, _ := got["enabled"].(bool); !enabled {
+		t.Fatalf("expected enabled=true at boot, got %+v", got)
+	}
+	for _, field := range []string{"enabled", "enqueued", "persisted", "dropped", "queue_depth"} {
+		if _, ok := got[field]; !ok {
+			t.Errorf("status missing field %q (got %+v)", field, got)
+		}
+	}
+
+	resp := s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": false})
+	if enabled, _ := resp["enabled"].(bool); enabled {
+		t.Fatalf("expected enabled=false after toggle, got %+v", resp)
+	}
+	if prior, _ := resp["prior"].(bool); !prior {
+		t.Errorf("expected prior=true (was enabled), got %+v", resp)
+	}
+	if changed, _ := resp["changed"].(bool); !changed {
+		t.Errorf("expected changed=true on first disable, got %+v", resp)
+	}
+
+	got = s.get("/api/v1/admin/events/status")
+	if enabled, _ := got["enabled"].(bool); enabled {
+		t.Fatalf("expected enabled=false on status while disabled, got %+v", got)
+	}
+
+	resp = s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": false})
+	if changed, _ := resp["changed"].(bool); changed {
+		t.Errorf("expected changed=false on idempotent disable, got %+v", resp)
+	}
+
+	resp = s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": true})
+	if enabled, _ := resp["enabled"].(bool); !enabled {
+		t.Fatalf("expected enabled=true after re-enable, got %+v", resp)
+	}
+	if prior, _ := resp["prior"].(bool); prior {
+		t.Errorf("expected prior=false (was disabled), got %+v", resp)
+	}
+	if changed, _ := resp["changed"].(bool); !changed {
+		t.Errorf("expected changed=true on re-enable, got %+v", resp)
+	}
+}
+
+// TestEvent_BranchMergedEmission pins the audit hook end-to-end:
+// a fat-client (or any merge-driving consumer) reports a
+// successful FF merge, and the coordinator emits a branch_merged
+// event with the right metadata fields.
+func TestEvent_BranchMergedEmission(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch": "run-1/task_a/iter-1",
+			"run_branch":   "main",
+			"merge_sha":    "deadbeef0000000000000000000000000000beef",
+			"task_id":      fmt.Sprintf("%d:1:task_a", projectID),
+		})
+	if status, _ := resp["status"].(string); status != "recorded" {
+		t.Fatalf("expected status=recorded, got %+v", resp)
+	}
+
+	ev := s.findEvent(projectID, "branch_merged")
+	if ev == nil {
+		t.Fatal("branch_merged event not emitted after /merges report")
+	}
+	meta, _ := ev["metadata"].(map[string]interface{})
+	if meta == nil {
+		if metaStr, ok := ev["metadata"].(string); ok {
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+		}
+	}
+	if meta == nil {
+		t.Fatalf("event metadata missing or unparseable: %+v", ev)
+	}
+	for _, key := range []string{"topic_branch", "run_branch", "merge_sha", "run_seq"} {
+		if _, ok := meta[key]; !ok {
+			t.Errorf("branch_merged metadata missing %q (got %+v)", key, meta)
+		}
+	}
+	if meta["merge_sha"] != "deadbeef0000000000000000000000000000beef" {
+		t.Errorf("merge_sha not preserved: got %v", meta["merge_sha"])
+	}
+}
+
+// TestEvent_CascadeFiredOnInvalidate pins cascade_fired for the
+// invalidate flavor. handleInvalidateTask → performInvalidate
+// emits the event at end of cascade.
+//
+// Setup: create a single-task run, force the task into ACCEPTED
+// so it can be invalidated, then POST to invalidate.
+func TestEvent_CascadeFiredOnInvalidate(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	taskID := fmt.Sprintf("%s:%s:task_a", parts[0], parts[1])
+
+	if _, err := s.store.DB().Exec(
+		`UPDATE tasks SET state = 'accepted', commit_sha = ? WHERE id = ?`,
+		"feedface", taskID,
+	); err != nil {
+		t.Fatalf("force accept: %v", err)
+	}
+
+	resp := s.post(fmt.Sprintf("/api/v1/tasks/%s/invalidate", taskID),
+		map[string]string{"reason": "cascade test"})
+	if status, _ := resp["status"].(string); status != "invalidated" {
+		t.Fatalf("expected status=invalidated, got %+v", resp)
+	}
+
+	ev := s.findEvent(projectID, "cascade_fired")
+	if ev == nil {
+		t.Fatal("cascade_fired event not emitted after invalidate")
+	}
+	if subtype, _ := ev["subtype"].(string); subtype != "invalidate" {
+		t.Errorf("cascade_fired subtype = %q, want invalidate", subtype)
+	}
+	meta, _ := ev["metadata"].(map[string]interface{})
+	if meta == nil {
+		if metaStr, ok := ev["metadata"].(string); ok {
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+		}
+	}
+	if meta == nil {
+		t.Fatalf("cascade_fired metadata unparseable: %+v", ev)
+	}
+	for _, key := range []string{"descendants_count", "parked_count", "rollbacks"} {
+		if _, ok := meta[key]; !ok {
+			t.Errorf("cascade_fired metadata missing %q (got %+v)", key, meta)
 		}
 	}
 }

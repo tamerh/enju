@@ -12,12 +12,12 @@ import (
 // / etc.); the engine owns the lineage bookkeeping
 // (cycle budget, parent linkage, event emission).
 type SpawnSpec struct {
-	RunID          int64    // run to spawn into
-	ParentTaskID   string   // optional — empty for top-level human/operator spawns
-	TaskDefID      string   // unique within the run; the new task's id is "<projectID>:<runSeq>:<TaskDefID>"
-	Action         string   // "answer" | "compute" | "contribute" | "review" | "vote"
-	Prompt         string   // optional
-	UserPrompt     string   // optional
+	RunID     int64  // run to spawn into
+	ParentTaskID  string  // optional — empty for top-level human/operator spawns
+	TaskDefID   string  // unique within the run; the new task's id is "<projectID>:<runSeq>:<TaskDefID>"
+	Action     string  // "answer" | "compute" | "contribute" | "review" | "vote"
+	Prompt     string  // optional
+	UserPrompt   string  // optional
 	// Citizens is the multi-citizen count for the spawned
 	// task. Defaults to 1.
 	//
@@ -35,23 +35,26 @@ type SpawnSpec struct {
 	// is vacuous; v2 (rebase-on-non-FF + multi-citizen topic
 	// flow) lifts this. See docs/living-workflow.md § v2
 	// follow-ups.
-	Citizens       int
-	DependsOn      []string // optional — fully-qualified task ids the spawned task must wait on
-	AssignTo       []string // optional — restrict claim to specific usernames
-	RequireRole    string   // optional
-	ResultType     string   // "text" | "json"; defaults to "text"
-	Trigger        string   // "human" | "bot" | "template_rule" | "auto_triage"
-	SpawnedBy      int64    // citizen ID for attribution; 0 for system
-	ClosesIssueSeq int      // > 0 when this is an auto-triage fix task; on accept, the named issue auto-closes (phase 4c)
+	Citizens    int
+	DependsOn   []string // optional — fully-qualified task ids the spawned task must wait on
+	AssignTo    []string // optional — restrict claim to specific usernames
+	RequireRole  string  // optional
+	ResultType   string  // "text" | "json"; defaults to "text"
+	Trigger    string  // "human" | "bot" | "template_rule" | "auto_triage"
+	SpawnedBy   int64  // citizen ID for attribution; 0 for system
+	ClosesIssueSeq int   // > 0 when this is an auto-triage fix task; on accept, the named issue auto-closes (phase 4c)
 }
 
 // SpawnTask creates a new task in an existing run, enforcing the
 // per-run cycle budget. Returns the new fully-qualified task id.
 //
-// Atomicity: budget check, INSERT, counter increment, and
-// task_spawned event all run in one transaction. Budget exhaustion
-// is also transactional — pause + cycle_budget_exhausted event
-// land together so the run state and event log can't drift.
+// Atomicity: budget check, INSERT, and counter increment run in
+// one transaction. events (task_spawned,
+// cycle_budget_exhausted, run_active) are emitted via the
+// EventStore *after* commit — the audit log can no longer drift
+// from state under partial failure, but the inverse (committed
+// state, dropped audit) is now possible. Drops show up as
+// per-project seq gaps once 7k ships.
 //
 // Refuses on terminal/paused runs. The cycle_budget_exhausted
 // path returns an error AND pauses the run; the caller can resume
@@ -85,15 +88,15 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 	defer tx.Rollback()
 
 	// 1. Load run state + budget. Lock the run row by selecting
-	//    inside the tx so concurrent spawns serialize through
-	//    SQLite's WAL writer (busy_timeout handles contention).
+	//  inside the tx so concurrent spawns serialize through
+	//  SQLite's WAL writer (busy_timeout handles contention).
 	var (
-		runState   string
-		projectID  int64
-		runSeq     int
-		runSlug    string
+		runState  string
+		projectID int64
+		runSeq   int
+		runSlug  string
 		budgetUsed int
-		budgetMax  int
+		budgetMax int
 	)
 	err = tx.QueryRow(
 		`SELECT state, project_id, seq, slug, cycle_budget_used, cycle_budget_max
@@ -105,9 +108,9 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 	}
 
 	// 2. Refuse on terminal/paused runs. Paused runs need an
-	//    explicit resume before they accept new spawns —
-	//    operators pause precisely to stop the runaway, so
-	//    auto-resuming on spawn would defeat the purpose.
+	//  explicit resume before they accept new spawns —
+	//  operators pause precisely to stop the runaway, so
+	//  auto-resuming on spawn would defeat the purpose.
 	switch RunState(runState) {
 	case RunCompleted, RunFailed:
 		return "", fmt.Errorf("run %d is %s — cannot spawn into a terminal run", spec.RunID, runState)
@@ -115,9 +118,10 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 		return "", fmt.Errorf("run %d is paused — resume it first with enju_resume_run", spec.RunID)
 	}
 
-	// 3. Cycle budget check. If exhausted, pause the run +
-	//    emit cycle_budget_exhausted event in this same tx so
-	//    the audit log is consistent with the state flip.
+	// 3. Cycle budget check. If exhausted, pause the run, then
+	//  after commit emit cycle_budget_exhausted via the
+	//  EventStore. The state flip is the load-bearing part;
+	//  the event is best-effort observability.
 	if budgetUsed >= budgetMax {
 		now := time.Now()
 		if _, err := tx.Exec(
@@ -126,19 +130,21 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 		); err != nil {
 			return "", fmt.Errorf("auto-pausing run on budget exhaustion: %w", err)
 		}
-		if _, err := tx.Exec(
-			`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-			 VALUES (0, 'cycle_budget_exhausted', '', '', ?, ?, ?, ?)`,
-			spec.RunID, projectID,
-			fmt.Sprintf(`{"used":%d,"max":%d,"attempted_task":%q,"attempted_by":%d}`,
-				budgetUsed, budgetMax, spec.TaskDefID, spec.SpawnedBy),
-			now,
-		); err != nil {
-			return "", fmt.Errorf("recording cycle_budget_exhausted: %w", err)
-		}
 		if err := tx.Commit(); err != nil {
 			return "", err
 		}
+		s.Events().Record(Event{
+			EventType: "cycle_budget_exhausted",
+			RunID:   spec.RunID,
+			ProjectID: projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"used":      budgetUsed,
+				"max":      budgetMax,
+				"attempted_task": spec.TaskDefID,
+				"attempted_by":  spec.SpawnedBy,
+			}),
+			CreatedAt: now,
+		})
 		return "", fmt.Errorf("cycle budget exhausted for run %d (%d/%d) — run paused; extend budget and resume to allow further spawns", spec.RunID, budgetUsed, budgetMax)
 	}
 
@@ -151,11 +157,11 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 	taskID := fmt.Sprintf("%d:%d:%s", projectID, runSeq, spec.TaskDefID)
 
 	// 5. INSERT the task row. Spawned tasks start ready unless
-	//    they declare upstream deps; UpdateReadyTasks would
-	//    promote them on the next sweep but starting them ready
-	//    when there are no deps avoids one wakeup-cycle of
-	//    latency. depends_on is a comma-separated list (existing
-	//    convention).
+	//  they declare upstream deps; UpdateReadyTasks would
+	//  promote them on the next sweep but starting them ready
+	//  when there are no deps avoids one wakeup-cycle of
+	//  latency. depends_on is a comma-separated list (existing
+	//  convention).
 	state := TaskReady
 	if len(spec.DependsOn) > 0 {
 		state = TaskPending
@@ -177,15 +183,15 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 	now := time.Now()
 	if _, err := tx.Exec(
 		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref,
-		                    action, prompt, user_prompt, script, outputs, requirements, result_type,
-		                    timeout, state, depends_on, reads_artifacts, writes_artifacts,
-		                    assign_to, require_role, citizens, run_slug,
-		                    spawned_from, spawn_trigger, closes_issue_seq, created_at)
+		          action, prompt, user_prompt, script, outputs, requirements, result_type,
+		          timeout, state, depends_on, reads_artifacts, writes_artifacts,
+		          assign_to, require_role, citizens, run_slug,
+		          spawned_from, spawn_trigger, closes_issue_seq, created_at)
 		 VALUES (?, ?, ?, ?, '', '', '',
-		         ?, ?, ?, '', '', '', ?,
-		         '', ?, ?, '[]', '[]',
-		         ?, ?, ?, ?,
-		         ?, ?, ?, ?)`,
+		     ?, ?, ?, '', '', '', ?,
+		     '', ?, ?, '[]', '[]',
+		     ?, ?, ?, ?,
+		     ?, ?, ?, ?)`,
 		taskID, spec.RunID, nextSeq, spec.TaskDefID,
 		spec.Action, spec.Prompt, spec.UserPrompt, spec.ResultType,
 		state, dependsOn,
@@ -211,38 +217,55 @@ func (s *Store) SpawnTask(spec SpawnSpec) (string, error) {
 	}
 
 	// 7. If the run was idle, the new ready task lifts it back
-	//    to active — within the same tx so the state is correct
-	//    by the time SpawnTask returns.
+	//  to active — within the same tx so the state is correct
+	//  by the time SpawnTask returns. The matching run_active
+	//  event fires after commit (below).
+	runReactivated := false
 	if state == TaskReady && runState == string(RunIdle) {
 		if _, err := tx.Exec(`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'idle'`, now, spec.RunID); err != nil {
 			return "", err
 		}
-		if _, err := tx.Exec(
-			`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-			 VALUES (0, 'run_active', 'idle', '', ?, ?, ?, ?)`,
-			spec.RunID, projectID,
-			fmt.Sprintf(`{"from":"idle","to":"active","trigger":"spawn"}`),
-			now,
-		); err != nil {
-			return "", err
-		}
-	}
-
-	// 8. Emit task_spawned event with attribution + lineage.
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'task_spawned', ?, ?, ?, ?, ?, ?)`,
-		spec.SpawnedBy, spec.Trigger, taskID, spec.RunID, projectID,
-		fmt.Sprintf(`{"task_def_id":%q,"action":%q,"parent_task_id":%q,"trigger":%q,"depends_on":%q}`,
-			spec.TaskDefID, spec.Action, spec.ParentTaskID, spec.Trigger, dependsOn),
-		now,
-	); err != nil {
-		return "", err
+		runReactivated = true
 	}
 
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+
+	// 8. Post-commit events. Order matches the prior in-tx
+	//  sequence (run_active before task_spawned) so audit
+	//  consumers reading a chronological tail see the same
+	//  interleaving they used to.
+	if runReactivated {
+		s.Events().Record(Event{
+			EventType:  "run_active",
+			EventSubtype: "idle",
+			RunID:    spec.RunID,
+			ProjectID:  projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"from":  "idle",
+				"to":   "active",
+				"trigger": "spawn",
+			}),
+			CreatedAt:  now,
+		})
+	}
+	s.Events().Record(Event{
+		CitizenID:  spec.SpawnedBy,
+		EventType:  "task_spawned",
+		EventSubtype: spec.Trigger,
+		TaskID:    taskID,
+		RunID:    spec.RunID,
+		ProjectID:  projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"task_def_id":  spec.TaskDefID,
+			"action":     spec.Action,
+			"parent_task_id": spec.ParentTaskID,
+			"trigger":    spec.Trigger,
+			"depends_on":   dependsOn,
+		}),
+		CreatedAt: now,
+	})
 	return taskID, nil
 }
 
@@ -480,14 +503,20 @@ func (s *Store) SetCycleBudgetMax(runID int64, citizenID int64, newMax int) erro
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, 'cycle_budget_changed', '', '', ?, ?, ?, ?)`,
-		citizenID, runID, projectID,
-		fmt.Sprintf(`{"old_max":%d,"new_max":%d,"used":%d}`, oldMax, newMax, used),
-		now,
-	); err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	s.Events().Record(Event{
+		CitizenID: citizenID,
+		EventType: "cycle_budget_changed",
+		RunID:   runID,
+		ProjectID: projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"old_max": oldMax,
+			"new_max": newMax,
+			"used":  used,
+		}),
+		CreatedAt: now,
+	})
+	return nil
 }

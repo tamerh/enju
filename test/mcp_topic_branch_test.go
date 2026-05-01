@@ -9,6 +9,7 @@ package test
 // produce green CI. Each test asserts ONE specific contract.
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -385,6 +386,67 @@ tasks:
 		}
 		if !strings.Contains(out, "[completed]") {
 			t.Errorf("iter-1 should be [completed] after final approve, got:\n%s", out)
+		}
+	})
+}
+
+// TestMCPTaskRequestChangesEmitsEvent pins the audit hook for
+// the request_changes review path: a reviewer's "request_changes"
+// verdict produces a task_request_changes event with the right
+// metadata (reviewer_id, review_task_id, iter_seq, decision).
+// Without this test, a regression that drops the emission or
+// muddles the metadata fields would silently break the audit
+// timeline.
+func TestMCPTaskRequestChangesEmitsEvent(t *testing.T) {
+	eachRemoteMode(t, "RequestChangesEmits", func(t *testing.T, h *mcpHarness) {
+		reviewer := h.newMCPClientAs(t, "RcEmitReviewer")
+		projectID := h.createTestProject()
+
+		yaml := `name: "request_changes emits event"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write."
+  - id: gate
+    action: review
+    reviews: draft
+    prompt: "Approve."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		h.mcpClaimOK(t, "draft")
+		h.mcpSubmitText(t, "draft", "first attempt")
+		h.mcpClaimAs(t, reviewer, "gate")
+		h.mcpSubmitReviewAs(t, reviewer, "gate", "needs work", "request_changes")
+
+		ev := h.findEvent(projectID, "task_request_changes")
+		if ev == nil {
+			t.Fatal("task_request_changes event not emitted after request_changes review")
+		}
+		meta, _ := ev["metadata"].(map[string]interface{})
+		if meta == nil {
+			if metaStr, ok := ev["metadata"].(string); ok {
+				_ = json.Unmarshal([]byte(metaStr), &meta)
+			}
+		}
+		if meta == nil {
+			t.Fatalf("task_request_changes metadata unparseable: %+v", ev)
+		}
+		if _, ok := meta["reviewer_id"].(float64); !ok {
+			t.Errorf("metadata missing reviewer_id (got %+v)", meta)
+		}
+		if rid, _ := meta["review_task_id"].(string); rid == "" {
+			t.Errorf("metadata missing review_task_id (got %+v)", meta)
+		}
+		if iter, ok := meta["iter_seq"].(float64); !ok || iter < 1 {
+			t.Errorf("metadata iter_seq missing or zero (got %+v)", meta)
+		}
+		if dec, _ := meta["decision"].(string); dec != "request_changes" {
+			t.Errorf("metadata decision = %q, want request_changes", dec)
+		}
+		if tid, _ := ev["task_id"].(string); tid == "" || !strings.HasSuffix(tid, ":draft") {
+			t.Errorf("task_request_changes task_id should target the draft, got %q", tid)
 		}
 	})
 }

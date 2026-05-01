@@ -48,7 +48,7 @@ type Mutation interface {
 // JSON round-tripping. Without it, json.Unmarshal doesn't
 // know which concrete type to decode into.
 type mutationEnvelope struct {
-	Kind    MutationKind    `json:"kind"`
+	Kind  MutationKind  `json:"kind"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -62,15 +62,15 @@ func (p Plan) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 		envelopes = append(envelopes, mutationEnvelope{
-			Kind:    m.mutationKind(),
+			Kind:  m.mutationKind(),
 			Payload: payload,
 		})
 	}
 	return json.Marshal(struct {
-		Version   string             `json:"version"`
+		Version  string       `json:"version"`
 		Mutations []mutationEnvelope `json:"mutations"`
 	}{
-		Version:   p.Version,
+		Version:  p.Version,
 		Mutations: envelopes,
 	})
 }
@@ -79,7 +79,7 @@ func (p Plan) MarshalJSON() ([]byte, error) {
 // envelope into its concrete type based on the kind tag.
 func (p *Plan) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Version   string             `json:"version"`
+		Version  string       `json:"version"`
 		Mutations []mutationEnvelope `json:"mutations"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -144,18 +144,18 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 type MutationKind string
 
 const (
-	MutSetTaskState     MutationKind = "set_task_state"
-	MutCreateTask       MutationKind = "create_task"
-	MutDeleteTask       MutationKind = "delete_task"
-	MutCreateRun        MutationKind = "create_run"
-	MutSetClaim         MutationKind = "set_claim"
-	MutReleaseClaim     MutationKind = "release_claim"
-	MutRecordSubmission     MutationKind = "submit_result"
-	MutMoveArtifact     MutationKind = "move_artifact"
-	MutDeleteArtifact   MutationKind = "delete_artifact"
-	MutCreateCitizen    MutationKind = "create_citizen"
+	MutSetTaskState   MutationKind = "set_task_state"
+	MutCreateTask    MutationKind = "create_task"
+	MutDeleteTask    MutationKind = "delete_task"
+	MutCreateRun    MutationKind = "create_run"
+	MutSetClaim     MutationKind = "set_claim"
+	MutReleaseClaim   MutationKind = "release_claim"
+	MutRecordSubmission   MutationKind = "submit_result"
+	MutMoveArtifact   MutationKind = "move_artifact"
+	MutDeleteArtifact  MutationKind = "delete_artifact"
+	MutCreateCitizen  MutationKind = "create_citizen"
 	MutUpdateReadyTasks MutationKind = "update_ready_tasks"
-	MutCompleteRun      MutationKind = "complete_run"
+	MutCompleteRun   MutationKind = "complete_run"
 )
 
 // --- Concrete mutation types ---
@@ -166,11 +166,11 @@ const (
 // (COLLECTING → ACCEPTED). Optional fields carry
 // action-specific data (vote choice, review verdict).
 type SetTaskState struct {
-	TaskID     string
-	NewState   TaskState
-	ClearClaim bool   // invalidation: clear claimed_by/claimed_at/submitted_at/result_path/commit_sha
+	TaskID   string
+	NewState  TaskState
+	ClearClaim bool  // invalidation: clear claimed_by/claimed_at/submitted_at/result_path/commit_sha
 	VoteChoice string // vote resolution: the winning option id
-	CommitSHA  string // resolution: the commit to record
+	CommitSHA string // resolution: the commit to record
 	FailReason string // fail: reason for failure
 	SkipReason string // skip (upstream-failure cascade): e.g. "upstream failed: 1:4:write_data"
 	// ParkedFromState carries the state to stash when
@@ -243,10 +243,10 @@ func (CreateRun) mutationKind() MutationKind { return MutCreateRun }
 // think on their own. The constraint is enforced at apply
 // time, not in SQLite, since CHECK can't cross-table-reference.
 type SetClaim struct {
-	TaskID    string
+	TaskID  string
 	CitizenID int64
-	Deadline  time.Time
-	ModelID   *int64
+	Deadline time.Time
+	ModelID  *int64
 }
 
 func (SetClaim) mutationKind() MutationKind { return MutSetClaim }
@@ -255,7 +255,7 @@ func (SetClaim) mutationKind() MutationKind { return MutSetClaim }
 // Removes the task_claims row and (for single-citizen tasks)
 // resets the task's claimed_by field.
 type ReleaseClaim struct {
-	TaskID    string
+	TaskID  string
 	CitizenID int64
 }
 
@@ -269,14 +269,23 @@ func (ReleaseClaim) mutationKind() MutationKind { return MutReleaseClaim }
 // to subsequent SetTaskState mutations (the engine decides
 // whether to resolve based on tally computation).
 type RecordSubmission struct {
-	TaskID     string
-	CitizenID  int64
+	TaskID   string
+	CitizenID int64
 	ResultPath string
-	CommitSHA  string
-	Decision   string // review: approve/reject
+	CommitSHA string
+	Decision  string // review: approve/reject
 	VoteChoice string // vote: chosen option id
-	Content    string // prose commentary
+	Content  string // prose commentary
 	TokensUsed int64
+	// EstimatedTokens carries a (prompt+content)/4 estimate
+	// for events.estimated_tokens metadata. rewires
+	// the token-tracking emission from engine/submit.go to
+	// applyRecordSubmission, so the engine now passes its
+	// computed estimate through the mutation rather than
+	// embedding it in a metadata blob. Profile counters
+	// (SUM(json_extract(metadata, '$.estimated_tokens')))
+	// stay populated.
+	EstimatedTokens int64
 	// ModelID attributes the submission to a model
 	// citizen. Optional for human operators (a hand-review has
 	// no model); REQUIRED for bot operators — applyRecordSubmission
@@ -300,8 +309,8 @@ func (MoveArtifact) mutationKind() MutationKind { return MutMoveArtifact }
 // invalidation rollback when no prior writer exists.
 type DeleteArtifact struct {
 	ProjectID int64
-	Branch    string // branch this artifact row lives on; "" → "main"
-	Path      string
+	Branch  string // branch this artifact row lives on; "" → "main"
+	Path   string
 }
 
 func (DeleteArtifact) mutationKind() MutationKind { return MutDeleteArtifact }

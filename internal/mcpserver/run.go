@@ -150,7 +150,7 @@ func (c *apiClient) handleResumeRun(ctx context.Context, req mcp.CallToolRequest
 // JSONL — one event per line, newest-first. Filters: run_id,
 // citizen, event_types (comma-separated), since (RFC3339),
 // limit (default 100, max 1000). Living-workflow phase 2: this
-// is the read-only projection over contribution_events. For
+// is the read-only projection over events. For
 // git-tracked snapshots use enju_export_run_events instead.
 func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")

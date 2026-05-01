@@ -370,7 +370,7 @@ Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 // toolExportRunEvents materializes a run's event timeline
 // (claims, submits, invalidations, tally resolutions) as a
 // JSONL file under enju/runs/{seq}/events/. The authoritative
-// data lives in the coordinator's contribution_events +
+// data lives in the coordinator's events +
 // task_claims; this tool just snapshots it into git so the
 // run's directory becomes self-documenting for audits /
 // postmortems / preprint figures.
@@ -616,7 +616,7 @@ func toolListIterations() mcp.Tool {
 
 func toolShowEvents() mcp.Tool {
 	return mcp.NewTool("enju_show_events",
-		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over contribution_events — the canonical event log. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events, which writes git-tracked snapshots; this tool is for ad-hoc queries.`),
+		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over the event store. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events, which writes git-tracked snapshots; this tool is for ad-hoc queries. If results come back empty unexpectedly, run enju_events_status to check whether the event-store kill-switch was flipped (disabled stores serve empty results without an error).`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project to query"),
@@ -635,6 +635,35 @@ func toolShowEvents() mcp.Tool {
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum events to return (default 100, max 1000)"),
+		),
+	)
+}
+
+// toolEventsStatus surfaces the EventStore's runtime state.
+// operators reach for this when diagnosing "is
+// the audit log healthy?" Returns enabled/disabled state +
+// monotone counters (enqueued, persisted, dropped, queue
+// depth). The dropped counter is the load-bearing signal:
+// non-zero means the writer can't keep up and gaps are
+// accumulating.
+func toolEventsStatus() mcp.Tool {
+	return mcp.NewTool("enju_events_status",
+		mcp.WithDescription(`Report the EventStore's runtime state — enabled flag + monotone counters (enqueued, persisted, dropped, queue depth). Operators read this when triaging audit-log health. Non-zero dropped means the writer can't keep up and gaps are accumulating in the per-project sequence.`),
+	)
+}
+
+// toolSetEventsEnabled flips the runtime kill-switch.
+// Wide-blast operation: flips for the whole coordinator,
+// all tenants, all projects. Disabling stops new emissions
+// AND makes reads return ErrEventStoreDisabled (which surfaces
+// as "audit emission disabled by operator" in the user-facing
+// tools). Re-enabling resumes emissions with NO backfill.
+// Logged on the server side with the toggling citizen.
+func toolSetEventsEnabled() mcp.Tool {
+	return mcp.NewTool("enju_set_events_enabled",
+		mcp.WithDescription(`Flip the EventStore kill-switch at runtime — wide-blast: affects every project on this coordinator. Disabling stops new audit emissions and makes audit reads return "audit emission disabled by operator." Re-enabling resumes emissions with NO backfill — events that would have fired during the disabled window are gone forever. Use to triage runaway events.db, capacity spikes, or to investigate without piling on more emissions.`),
+		mcp.WithBoolean("enabled", mcp.Required(),
+			mcp.Description("True to enable emissions + reads, false to kill the switch"),
 		),
 	)
 }

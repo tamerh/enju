@@ -47,10 +47,10 @@ func printUsage() {
 	fmt.Println(`Enju (槐) — Distributed Human-AI Collaborative Problem Solving
 
 Usage:
-  enju serve      Start the coordinator server
-  enju mcp        Start the MCP server (for Claude Desktop/Code)
-  enju wrap-task  Run a compute task's script + commit (internal)
-  enju version    Print version
+ enju serve   Start the coordinator server
+ enju mcp    Start the MCP server (for Claude Desktop/Code)
+ enju wrap-task Run a compute task's script + commit (internal)
+ enju version  Print version
 
 Run 'enju <command> -h' for command-specific help.`)
 }
@@ -61,6 +61,15 @@ func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 8000, "Port to listen on")
 	dbPath := fs.String("db", "enju.db", "Path to SQLite database")
+	// boot-time kill-switch. When false, the
+	// EventStore opens but starts in disabled mode: Record()
+	// is a no-op and reads return ErrEventStoreDisabled. The
+	// runtime toggle (POST /api/v1/admin/events/enabled) can
+	// flip it back on without restart. Useful for booting a
+	// coordinator with a corrupted events.db to investigate
+	// without firing more emissions, or for capacity-spike
+	// triage where audit can wait.
+	eventsEnabled := fs.Bool("events-enabled", true, "Enable the event store at boot (false = disabled until toggled via admin endpoint)")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -71,6 +80,23 @@ func cmdServe(args []string) {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// Events live in their own database alongside the state DB,
+	// with their own connection pool and async writer goroutine.
+	// Path is derived from the state DB so operators don't have
+	// to pass a second flag.
+	eventsPath := deriveEventsDBPath(*dbPath)
+	es, err := store.NewSQLiteEventStore(eventsPath, logger)
+	if err != nil {
+		logger.Error("opening events database", "path", eventsPath, "error", err)
+		os.Exit(1)
+	}
+	defer es.Close()
+	es.SetEnabled(*eventsEnabled)
+	st.AttachEventStore(es)
+	if !*eventsEnabled {
+		logger.Warn("event store booted disabled — emissions and reads will no-op until toggled via admin endpoint")
+	}
 
 	// Start task reaper.
 	reaper := scheduler.NewReaper(st, 60*time.Second, logger)
@@ -104,6 +130,12 @@ func cmdMCP(args []string) {
 	model := fs.String("model", "", "LLM model name for contribution tracking (e.g. claude-opus-4, gpt-4o)")
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running multiple MCP processes for different citizens on one host — see docs/multi-citizen.md § Running multiple citizens on one host.")
+	// local-mode parity with `enju serve`. Useful
+	// for testers reproducing "events disabled" behavior end-
+	// to-end without hitting a runtime tool first. Default
+	// true: local mode is normally a single-user dev path
+	// where the kill-switch isn't load-bearing.
+	localEventsEnabled := fs.Bool("events-enabled", true, "Local-mode only: enable the embedded coordinator's event store at boot")
 	fs.Parse(args)
 
 	resolvedCredsPath := resolveCredentialsPath(*credsPath)
@@ -126,6 +158,19 @@ func cmdMCP(args []string) {
 			os.Exit(1)
 		}
 		defer st.Close()
+
+		eventsPath := deriveEventsDBPath(dbPath)
+		es, err := store.NewSQLiteEventStore(eventsPath, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open events database: %v\n", err)
+			os.Exit(1)
+		}
+		defer es.Close()
+		es.SetEnabled(*localEventsEnabled)
+		st.AttachEventStore(es)
+		if !*localEventsEnabled {
+			fmt.Fprintf(os.Stderr, "Local mode: event store booted disabled — emissions and reads no-op until toggled.\n")
+		}
 
 		reaper := scheduler.NewReaper(st, 60*time.Second, logger)
 		reaper.Start()
@@ -209,13 +254,13 @@ func cmdMCP(args []string) {
 
 	s := mcpserver.New(mcpserver.Config{
 		CoordinatorURL: *coordinator,
-		Username:       *username,
-		CitizenName:    *name,
-		CitizenEmail:   *email,
-		ModelName:      *model,
-		AuthToken:      token,
-		Workspace:      ws,
-		Logger:         logger,
+		Username:    *username,
+		CitizenName:  *name,
+		CitizenEmail:  *email,
+		ModelName:   *model,
+		AuthToken:   token,
+		Workspace:   ws,
+		Logger:     logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)
 		},
@@ -254,15 +299,33 @@ func cmdWrapTask(args []string) {
 // username via the API.
 type credentials struct {
 	Coordinator string `json:"coordinator"`
-	Username    string `json:"username"`
-	Name        string `json:"name"`
-	Email       string `json:"email,omitempty"`
-	Token       string `json:"token,omitempty"` // auth token from registration
+	Username  string `json:"username"`
+	Name    string `json:"name"`
+	Email    string `json:"email,omitempty"`
+	Token    string `json:"token,omitempty"` // auth token from registration
 }
 
 func credentialsPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".enju", "credentials.json")
+}
+
+// deriveEventsDBPath turns a state-DB path like "/var/enju/state.db"
+// into the sibling "/var/enju/events.db". Bare ":memory:" stays
+// in-memory (used by some tests). The two databases live in the
+// same directory so operators inspecting the deployment see them
+// next to each other.
+func deriveEventsDBPath(stateDBPath string) string {
+	if stateDBPath == ":memory:" {
+		return ":memory:"
+	}
+	dir, base := filepath.Split(stateDBPath)
+	ext := filepath.Ext(base)
+	stem := base[:len(base)-len(ext)]
+	if stem == "" {
+		stem = "state"
+	}
+	return filepath.Join(dir, stem+"-events"+ext)
 }
 
 // resolveCredentialsPath returns override when non-empty, else the
@@ -321,7 +384,7 @@ func saveCredentialsAt(coordinator, username, name, email, token, path string) {
 	if token != "" {
 		creds["token"] = token
 	}
-	data, _ := json.MarshalIndent(creds, "", "  ")
+	data, _ := json.MarshalIndent(creds, "", " ")
 	dir := filepath.Dir(path)
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(path, data, 0600)

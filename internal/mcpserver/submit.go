@@ -33,12 +33,12 @@ import (
 // composing a batch rarely has to learn new shapes — it's the
 // same per-task dict, just list-wrapped.
 type batchSubmission struct {
-	TaskID        string                 `json:"task_id"`
-	Content       string                 `json:"content,omitempty"`
-	Decision      string                 `json:"decision,omitempty"`
-	Option        string                 `json:"option,omitempty"`
-	OutputsJSON   string                 `json:"outputs_json,omitempty"`
-	ArtifactsJSON string                 `json:"artifacts_json,omitempty"`
+	TaskID    string         `json:"task_id"`
+	Content    string         `json:"content,omitempty"`
+	Decision   string         `json:"decision,omitempty"`
+	Option    string         `json:"option,omitempty"`
+	OutputsJSON  string         `json:"outputs_json,omitempty"`
+	ArtifactsJSON string         `json:"artifacts_json,omitempty"`
 	// Model is an optional per-entry override. Empty falls back
 	// to the session default (the -model flag). Per-entry rather
 	// than batch-level because cross-model workflows want each
@@ -57,8 +57,8 @@ type batchSubmission struct {
 // aggregated batch response. IsError surfaces per-entry so the
 // caller can inspect without parsing the Text.
 type batchEntryResult struct {
-	TaskID  string `json:"task_id"`
-	Status  string `json:"status"` // "accepted", "collecting", "error"
+	TaskID string `json:"task_id"`
+	Status string `json:"status"` // "accepted", "collecting", "error"
 	Message string `json:"message,omitempty"`
 }
 
@@ -68,35 +68,35 @@ type batchEntryResult struct {
 //
 // Contract:
 //
-//   - Scope: one caller (this citizen), one project, one run.
-//     Cross-run or cross-project batching is rejected upfront
-//     rather than routed through — the submit path's workspace
-//     + branch handling assumes a single repo+branch.
-//   - Pre-validation: each entry's task must exist, be claimed
-//     by this citizen, and carry the action-specific fields
-//     (decision for review, option for vote, at least one of
-//     content/outputs_json/artifacts_json otherwise). Intra-
-//     batch dependency conflicts (one entry's task listed in
-//     another's depends_on) are rejected so later entries
-//     don't silently operate on post-cascade state. Any
-//     validation failure rejects the whole batch before any
-//     git or coordinator state mutates — no phantom commits.
-//   - Execution: loops prepareFatSubmit → loops
-//     Project.PrepareCommit under one lock → single
-//     Project.PushPendingCommits → Project.CommitSHAsByTaskID
-//     to remap post-rebase SHAs → per-entry coordinator
-//     report. Legacy coordinator-writes projects (no
-//     remote_url) fall back to per-entry submit calls in the
-//     same loop — they have no local git step to coalesce.
-//   - Failure semantics: best-effort within the batch. A
-//     mid-loop PrepareCommit failure triggers a hard reset
-//     of the branch back to the pre-batch HEAD so orphan
-//     commits don't accumulate on retry (every retry
-//     composes from a clean state). A push failure surfaces
-//     for every entry — local commits stay in the reflog
-//     for manual recovery. A coordinator-POST failure on a
-//     single entry leaves that entry in error while
-//     subsequent entries still attempt.
+//  - Scope: one caller (this citizen), one project, one run.
+//   Cross-run or cross-project batching is rejected upfront
+//   rather than routed through — the submit path's workspace
+//   + branch handling assumes a single repo+branch.
+//  - Pre-validation: each entry's task must exist, be claimed
+//   by this citizen, and carry the action-specific fields
+//   (decision for review, option for vote, at least one of
+//   content/outputs_json/artifacts_json otherwise). Intra-
+//   batch dependency conflicts (one entry's task listed in
+//   another's depends_on) are rejected so later entries
+//   don't silently operate on post-cascade state. Any
+//   validation failure rejects the whole batch before any
+//   git or coordinator state mutates — no phantom commits.
+//  - Execution: loops prepareFatSubmit → loops
+//   Project.PrepareCommit under one lock → single
+//   Project.PushPendingCommits → Project.CommitSHAsByTaskID
+//   to remap post-rebase SHAs → per-entry coordinator
+//   report. Legacy coordinator-writes projects (no
+//   remote_url) fall back to per-entry submit calls in the
+//   same loop — they have no local git step to coalesce.
+//  - Failure semantics: best-effort within the batch. A
+//   mid-loop PrepareCommit failure triggers a hard reset
+//   of the branch back to the pre-batch HEAD so orphan
+//   commits don't accumulate on retry (every retry
+//   composes from a clean state). A push failure surfaces
+//   for every entry — local commits stay in the reflog
+//   for manual recovery. A coordinator-POST failure on a
+//   single entry leaves that entry in error while
+//   subsequent entries still attempt.
 func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	submissionsJSON, err := req.RequireString("submissions")
 	if err != nil {
@@ -146,7 +146,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 	// every entry must share one project + one run.
 	type batchCtx struct {
 		entry batchSubmission
-		meta  *taskMeta
+		meta *taskMeta
 	}
 	loaded := make([]batchCtx, 0, len(entries))
 	var projectID int64
@@ -313,14 +313,14 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 		taskIDs := make([]string, 0, len(prepared))
 		for _, prep := range prepared {
 			if _, err := proj.PrepareCommit(mcpgit.SubmitRequest{
-				TaskID:        prep.TaskID,
-				Username:      c.username,
-				AuthorName:    prep.AuthorName,
-				AuthorEmail:   prep.AuthorEmail,
-				ModelName:     prep.EffectiveModel,
-				Files:         prep.Files,
+				TaskID:    prep.TaskID,
+				Username:   c.username,
+				AuthorName:  prep.AuthorName,
+				AuthorEmail:  prep.AuthorEmail,
+				ModelName:   prep.EffectiveModel,
+				Files:     prep.Files,
 				ArtifactPaths: prep.ArtifactPaths,
-				Branch:        branch,
+				Branch:    branch,
 			}); err != nil {
 				commitErr = fmt.Sprintf("writing commit for %s to local clone: %v", prep.TaskID, err)
 				break
@@ -361,8 +361,8 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 			if pushErr != nil {
 				for k, prep := range prepared {
 					results[preparedIdx[k]] = batchEntryResult{
-						TaskID:  prep.TaskID,
-						Status:  "error",
+						TaskID: prep.TaskID,
+						Status: "error",
 						Message: "pushing coalesced batch commits: " + pushErr.Error(),
 					}
 				}
@@ -596,7 +596,7 @@ func formatBatchResults(results []batchEntryResult, anySuccess bool) string {
 			// a failure list.
 			for _, line := range strings.Split(r.Message, "\n") {
 				if line != "" {
-					b.WriteString("    " + line + "\n")
+					b.WriteString("  " + line + "\n")
 				}
 			}
 		}
@@ -760,14 +760,14 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 // go through submitResultFatClient which composes prepare +
 // push + report into one call.
 type preparedFatSubmit struct {
-	TaskID        string
-	Meta          *taskMeta
-	Project       *mcpgit.Project
-	Files         []mcpgit.FileWrite
+	TaskID    string
+	Meta     *taskMeta
+	Project    *mcpgit.Project
+	Files     []mcpgit.FileWrite
 	ArtifactPaths []string
-	ResultDir     string
-	AuthorName    string
-	AuthorEmail   string
+	ResultDir   string
+	AuthorName  string
+	AuthorEmail  string
 	// ReportBody is the POST payload for /tasks/{id}/result.
 	// commit_sha + resolved SHA are filled in by the caller
 	// after the push completes (the prep step doesn't know
@@ -783,6 +783,17 @@ type preparedFatSubmit struct {
 	// field the trailer would silently use c.modelName even when
 	// the caller overrode for attribution.
 	EffectiveModel string
+	// Decision is the review verdict ("approve"/"reject"/
+	// "request_changes"/"comment") when the task is action:review.
+	// Empty for non-review submissions. Surfaced on the prep
+	// struct so the SubmitTaskResult call site can stamp it
+	// onto the Enju-Verdict trailer alongside the
+	// other trailer values.
+	Decision string
+	// Option is the chosen vote option id when the task is
+	// action:vote. Empty for non-vote submissions. Same
+	// rationale as Decision — feeds into Enju-Verdict.
+	Option string
 }
 
 // prepareFatSubmit runs every pre-commit step the fat-client
@@ -795,14 +806,14 @@ type preparedFatSubmit struct {
 // either a prepared bundle or an MCP tool-error result.
 //
 // Invariants:
-//   - Terminal-state rejection before any git write (no
-//     phantom commits).
-//   - Review decision / vote option validation client-side.
-//   - Per-citizen result subdir for multi-citizen tasks.
-//   - Named outputs honoured (per-output file when schema
-//     declares one, else result.json blob).
-//   - Artifact paths sorted for deterministic commit-message
-//     ordering.
+//  - Terminal-state rejection before any git write (no
+//   phantom commits).
+//  - Review decision / vote option validation client-side.
+//  - Per-citizen result subdir for multi-citizen tasks.
+//  - Named outputs honoured (per-output file when schema
+//   declares one, else result.json blob).
+//  - Artifact paths sorted for deterministic commit-message
+//   ordering.
 func (c *apiClient) prepareFatSubmit(
 	ctx context.Context,
 	taskID string,
@@ -897,11 +908,11 @@ func (c *apiClient) prepareFatSubmit(
 		resultType = "json"
 	}
 	metadata := map[string]interface{}{
-		"task_id":     taskID,
-		"username":    c.username,
-		"model":       effectiveModel,
+		"task_id":   taskID,
+		"username":  c.username,
+		"model":    effectiveModel,
 		"result_type": resultType,
-		"timestamp":   time.Now().Format(time.RFC3339),
+		"timestamp":  time.Now().Format(time.RFC3339),
 	}
 	// Review-action metadata: persist decision + target into
 	// metadata.json so git-log archaeology can reconstruct the
@@ -941,7 +952,7 @@ func (c *apiClient) prepareFatSubmit(
 	if content != "" {
 		files = append(files, mcpgit.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
-			Content:     []byte(content),
+			Content:   []byte(content),
 		})
 	}
 
@@ -982,24 +993,24 @@ func (c *apiClient) prepareFatSubmit(
 			files = append(files, outFiles...)
 			metadata["output_files"] = fileIndex
 		} else {
-			outputsBytes, err := json.MarshalIndent(outputs, "", "  ")
+			outputsBytes, err := json.MarshalIndent(outputs, "", " ")
 			if err != nil {
 				return nil, mcp.NewToolResultError("encoding outputs: " + err.Error())
 			}
 			files = append(files, mcpgit.FileWrite{
 				RepoRelPath: filepath.Join(resultDir, "result.json"),
-				Content:     outputsBytes,
+				Content:   outputsBytes,
 			})
 		}
 	}
 
-	metaBytes, err := json.MarshalIndent(metadata, "", "  ")
+	metaBytes, err := json.MarshalIndent(metadata, "", " ")
 	if err != nil {
 		return nil, mcp.NewToolResultError("encoding metadata: " + err.Error())
 	}
 	files = append(files, mcpgit.FileWrite{
 		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
-		Content:     metaBytes,
+		Content:   metaBytes,
 	})
 
 	// Artifact writes. Kept in sorted-key order for deterministic
@@ -1014,7 +1025,7 @@ func (c *apiClient) prepareFatSubmit(
 		for _, p := range artifactPaths {
 			files = append(files, mcpgit.FileWrite{
 				RepoRelPath: mcpgit.ArtifactPath(p),
-				Content:     []byte(artifacts[p]),
+				Content:   []byte(artifacts[p]),
 			})
 		}
 	}
@@ -1027,11 +1038,11 @@ func (c *apiClient) prepareFatSubmit(
 	// needs to defer this assignment until after the single
 	// coalesced push + CommitSHAsByTaskID remap).
 	reportBody := map[string]interface{}{
-		"commit_sha":        "", // filled in post-push
-		"result_path":       resultDir,
+		"commit_sha":    "", // filled in post-push
+		"result_path":    resultDir,
 		"artifacts_written": artifactPaths,
-		"tokens_used":       0,
-		"model":             effectiveModel,
+		"tokens_used":    0,
+		"model":       effectiveModel,
 		// Username identifies the submitting citizen for
 		// multi-citizen task bookkeeping (so the coordinator
 		// credits the right task_claims row). Single-citizen
@@ -1060,16 +1071,18 @@ func (c *apiClient) prepareFatSubmit(
 		reportBody["option"] = option
 	}
 	return &preparedFatSubmit{
-		TaskID:         taskID,
-		Meta:           meta,
-		Project:        proj,
-		Files:          files,
-		ArtifactPaths:  artifactPaths,
-		ResultDir:      resultDir,
-		AuthorName:     authorName,
-		AuthorEmail:    authorEmail,
-		ReportBody:     reportBody,
+		TaskID:     taskID,
+		Meta:      meta,
+		Project:    proj,
+		Files:     files,
+		ArtifactPaths: artifactPaths,
+		ResultDir:   resultDir,
+		AuthorName:   authorName,
+		AuthorEmail:  authorEmail,
+		ReportBody:   reportBody,
 		EffectiveModel: effectiveModel,
+		Decision:    decision,
+		Option:     option,
 	}, nil
 }
 
@@ -1135,19 +1148,35 @@ func (c *apiClient) submitResultFatClient(
 			baseBranch = prep.Meta.UpstreamIterationBranch
 		}
 	}
+	// populate verdict + iter_seq trailers so
+	// `git log` over a project's history can reconstruct
+	// review verdicts and iteration counters without the
+	// events.db. Verdict comes from the submission decision
+	// (review) or vote choice (vote); IterSeq comes from the
+	// active claim that the coordinator surfaced alongside
+	// the iteration branch.
+	verdict := prep.Decision
+	if verdict == "" {
+		verdict = prep.Option
+	}
 	prep.Project.Lock()
 	submitRes, err := prep.Project.SubmitTaskResult(mcpgit.SubmitRequest{
-		TaskID:        prep.TaskID,
-		Username:      c.username,
-		AuthorName:    prep.AuthorName,
-		AuthorEmail:   prep.AuthorEmail,
-		ModelName:     prep.EffectiveModel,
-		Files:         prep.Files,
+		TaskID:    prep.TaskID,
+		Username:   c.username,
+		AuthorName:  prep.AuthorName,
+		AuthorEmail:  prep.AuthorEmail,
+		ModelName:   prep.EffectiveModel,
+		Files:     prep.Files,
 		ArtifactPaths: prep.ArtifactPaths,
-		Branch:        commitBranch,
-		BaseBranch:    baseBranch,
-		ProjectID:     prep.Meta.ProjectID,
-		StateDir:      c.stateDir(),
+		Branch:    commitBranch,
+		BaseBranch:  baseBranch,
+		ProjectID:   prep.Meta.ProjectID,
+		StateDir:   c.stateDir(),
+		Trailers: mcpgit.EnjuTrailers{
+			TaskID: prep.TaskID,
+			Verdict: verdict,
+			IterSeq: prep.Meta.IterSeq,
+		},
 	})
 	prep.Project.Unlock()
 	if err != nil {
@@ -1162,10 +1191,32 @@ func (c *apiClient) submitResultFatClient(
 	if errMsg := extractErrorString(data); errMsg != "" {
 		return mcp.NewToolResultError(decorateCoordinatorRejection(errMsg)), nil
 	}
-	if err := c.applyAcceptedMerges(prep.Project, data); err != nil {
+	if err := c.applyAcceptedMerges(ctx, prep.Project, data); err != nil {
 		return mcp.NewToolResultError("auto-merging accepted topic branch: " + err.Error()), nil
 	}
 	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
+}
+
+// reportMerge POSTs a branch_merged report to the coordinator.
+// fires after each successful FF push from
+// applyAcceptedMerges. Best-effort: on transport / coordinator
+// error we log and move on. The merge has already landed in
+// git; the audit gap is the only consequence and it's already
+// part of the "events are a strict consumer" contract.
+func (c *apiClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) {
+	body := map[string]interface{}{
+		"topic_branch": topicBranch,
+		"run_branch":  runBranch,
+		"merge_sha":  mergeSHA,
+	}
+	if taskID != "" {
+		body["task_id"] = taskID
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/merges", projectID, runSeq)
+	if _, err := c.post(ctx, path, body); err != nil {
+		// Soft-log; never bubble up.
+		_ = err
+	}
 }
 
 // applyAcceptedMerges drives the post-submit FF-merge of any
@@ -1181,7 +1232,7 @@ func (c *apiClient) submitResultFatClient(
 // is idempotent: a re-submit that resurfaces the same merge
 // targets just performs a same-SHA push, which mcpgit treats
 // as already-up-to-date.
-func (c *apiClient) applyAcceptedMerges(proj *mcpgit.Project, responseBody []byte) error {
+func (c *apiClient) applyAcceptedMerges(ctx context.Context, proj *mcpgit.Project, responseBody []byte) error {
 	if proj == nil || len(responseBody) == 0 {
 		return nil
 	}
@@ -1193,8 +1244,24 @@ func (c *apiClient) applyAcceptedMerges(proj *mcpgit.Project, responseBody []byt
 	if !ok || len(merges) == 0 {
 		return nil
 	}
+	// Capture project + run identifiers for the post-merge
+	// branch_merged report. Best-effort: a missing
+	// project_id / run_id (coordinator that doesn't surface
+	// either, or older payload shapes) means we skip the
+	// report; the merge itself still happens.
+	var reportProjectID, reportRunSeq int64
+	if v, ok := raw["project_id"].(float64); ok {
+		reportProjectID = int64(v)
+	}
+	if v, ok := raw["run_seq"].(float64); ok {
+		reportRunSeq = int64(v)
+	}
 	proj.Lock()
 	defer proj.Unlock()
+	type mergeReport struct {
+		taskID, topicBranch, runBranch, mergeSHA string
+	}
+	var reports []mergeReport
 	var lastRunBranch string
 	for _, m := range merges {
 		entry, ok := m.(map[string]interface{})
@@ -1203,17 +1270,32 @@ func (c *apiClient) applyAcceptedMerges(proj *mcpgit.Project, responseBody []byt
 		}
 		runBranch, _ := entry["run_branch"].(string)
 		commitSHA, _ := entry["commit_sha"].(string)
+		topicBranch, _ := entry["topic_branch"].(string)
+		taskID, _ := entry["task_id"].(string)
 		if runBranch == "" || commitSHA == "" {
 			continue
 		}
 		if err := proj.FastForwardBranchToCommit(runBranch, commitSHA); err != nil {
-			topicBranch, _ := entry["topic_branch"].(string)
-			taskID, _ := entry["task_id"].(string)
 			return fmt.Errorf(
 				"task %s: ff-merging topic %q onto run branch %q at %s: %w",
 				taskID, topicBranch, runBranch, commitSHA, err)
 		}
+		reports = append(reports, mergeReport{
+			taskID: taskID, topicBranch: topicBranch,
+			runBranch: runBranch, mergeSHA: commitSHA,
+		})
 		lastRunBranch = runBranch
+	}
+	// Report each successful merge to the coordinator so the
+	// audit timeline gets a branch_merged event. Fire after
+	// the FF push to avoid emitting a phantom event for a
+	// merge that didn't actually land. Best-effort: a network
+	// blip drops the report but the merge stands. .
+	if reportProjectID > 0 && reportRunSeq > 0 {
+		for _, rep := range reports {
+			c.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
+				rep.topicBranch, rep.runBranch, rep.mergeSHA)
+		}
 	}
 	// Switch the workspace HEAD back to the run branch after a
 	// successful merge so the next operation in this session

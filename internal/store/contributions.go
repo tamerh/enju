@@ -1,22 +1,67 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"sort"
 	"time"
 )
 
-// RecordContributionEvent inserts an append-only event into
-// the contribution log. Events are never deleted — even if
-// the underlying task is invalidated, the original event
-// stays and the invalidation gets its own event.
+// eventDrainBudget is the per-aggregation-read window we let
+// the async event writer drain. Profile/audit reads are user-
+// facing; the read-after-write race "submit then immediately
+// read your own counters" is rare enough in human time but
+// trivial to hit in tests and bots that immediately verify.
+// 100ms is generous given the writer drains at ~1000ev/sec —
+// covers any normal queue depth without blocking visibly.
+//
+// Failure mode: if the writer is stalled (disk full, lock
+// contention) the drain returns after the budget elapses
+// regardless of completion, and the aggregation reads stale
+// data. Callers see the result as "best-effort up-to-date":
+// counts reflect everything persisted at read time, missing
+// only events still in the in-flight queue. The Stats()
+// counter (Persisted vs Enqueued) is the authoritative signal
+// for monitoring; this constant is the user-experience knob.
+// Bumping it past 1s starts being perceptible; lower it under
+// 10ms and tests start flaking.
+const eventDrainBudget = 100 * time.Millisecond
+
+// RecordContributionEvent enqueues an event into the
+// EventStore (events.db, separate connection pool, async
+// writer). this used to write directly to the
+// state-DB events table inside the same SQL
+// connection — events now live in a strict-consumer
+// subsystem that can fail without taking down state.
+//
+// The function still returns an error for backward
+// compatibility with existing call sites that check it,
+// but the EventStore.Record contract is "never returns an
+// error to caller" — so this always returns nil. Callers
+// can drop the error check at their convenience; leaving
+// it in place is harmless.
+//
+// Caveat for callers that were previously relying on the
+// in-transaction guarantee (issues.go's "issue_filed
+// emitted in same tx as the issue row, can't drift under
+// partial failure"): that contract is gone. Events are now
+// best-effort observability. A successful state mutation
+// followed by an event-emit failure leaves an audit gap,
+// detectable future via gaps in the per-project monotone
+// seq. State correctness is preserved either way.
 func (s *Store) RecordContributionEvent(e *ContributionEvent) error {
-	_, err := s.db.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.CitizenID, e.EventType, e.EventSubtype, e.TaskID, e.RunID, e.ProjectID, e.Metadata, e.CreatedAt,
-	)
-	return err
+	s.Events().Record(Event{
+		CitizenID:  e.CitizenID,
+		EventType:  e.EventType,
+		EventSubtype: e.EventSubtype,
+		TaskID:    e.TaskID,
+		RunID:    e.RunID,
+		ProjectID:  e.ProjectID,
+		Metadata:   e.Metadata,
+		CreatedAt:  e.CreatedAt,
+	})
+	return nil
 }
 
 // ContributionSummary is a per-citizen aggregate across all
@@ -24,80 +69,75 @@ func (s *Store) RecordContributionEvent(e *ContributionEvent) error {
 // render the factual breakdown without a scoring formula.
 type ContributionSummary struct {
 	TasksCompleted int
-	TasksRejected  int
-	TasksTimedOut  int
-	TasksReleased  int
-	ReviewsGiven   int
+	TasksRejected int
+	TasksTimedOut int
+	TasksReleased int
+	ReviewsGiven  int
 	ReviewApproves int
-	ReviewRejects  int
-	VotesCast      int
-	RunsCreated    int
-	TokensTotal    int64
-	ProjectCount   int
+	ReviewRejects int
+	VotesCast   int
+	RunsCreated  int
+	TokensTotal  int64
+	ProjectCount  int
 }
 
 // GetContributionSummary aggregates a citizen's contribution
 // events into a display-ready summary. No scoring formula —
 // just factual counts.
+//
+// All three component queries delegate to the EventStore. When
+// the kill-switch is engaged the EventStore returns
+// ErrEventStoreDisabled; we swallow it and return a zero
+// summary + nil so the profile page renders "no contributions"
+// instead of an error. Operators flipping the kill-switch
+// expect the audit surface to soft-degrade.
 func (s *Store) GetContributionSummary(citizenID int64) (*ContributionSummary, error) {
 	summary := &ContributionSummary{}
+	ctx := context.Background()
+	es := s.Events()
+	// Read-after-write consistency: a profile fetched
+	// immediately after a submit must see that submit's
+	// events. Brief wait covers the async-writer hop without
+	// blocking the request perceptibly. Callers willing to
+	// accept eventual consistency can pre-flush at a higher
+	// level; this helper is the safe default.
+	es.WaitForDrain(eventDrainBudget)
 
-	rows, err := s.db.Query(
-		`SELECT event_type, event_subtype, COUNT(*) FROM contribution_events WHERE citizen_id = ? GROUP BY event_type, event_subtype`,
-		citizenID,
-	)
-	if err != nil {
+	counts, err := es.CountByCitizenAndType(ctx, citizenID)
+	if err != nil && !errors.Is(err, ErrEventStoreDisabled) {
 		return summary, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var eventType, subtype string
-		var count int
-		if err := rows.Scan(&eventType, &subtype, &count); err != nil {
-			continue
-		}
-		switch eventType {
-		case "task_completed":
-			summary.TasksCompleted += count
-		case "task_rejected":
-			summary.TasksRejected += count
-		case "task_timed_out":
-			summary.TasksTimedOut += count
-		case "task_released":
-			summary.TasksReleased += count
-		case "review_given":
-			summary.ReviewsGiven += count
-			if subtype == "approve" {
-				summary.ReviewApproves += count
-			} else if subtype == "reject" {
-				summary.ReviewRejects += count
+	for eventType, subtypes := range counts {
+		for subtype, count := range subtypes {
+			switch eventType {
+			case "task_completed":
+				summary.TasksCompleted += count
+			case "task_rejected":
+				summary.TasksRejected += count
+			case "task_timed_out":
+				summary.TasksTimedOut += count
+			case "task_released":
+				summary.TasksReleased += count
+			case "review_given":
+				summary.ReviewsGiven += count
+				if subtype == "approve" {
+					summary.ReviewApproves += count
+				} else if subtype == "reject" {
+					summary.ReviewRejects += count
+				}
+			case "vote_cast":
+				summary.VotesCast += count
+			case "run_created":
+				summary.RunsCreated += count
 			}
-		case "vote_cast":
-			summary.VotesCast += count
-		case "run_created":
-			summary.RunsCreated += count
 		}
 	}
 
-	// Estimated tokens from metadata (prompt + content chars / 4).
-	var estimatedTokens int64
-	err = s.db.QueryRow(
-		`SELECT COALESCE(SUM(CAST(json_extract(metadata, '$.estimated_tokens') AS INTEGER)), 0) FROM contribution_events WHERE citizen_id = ? AND json_extract(metadata, '$.estimated_tokens') IS NOT NULL`,
-		citizenID,
-	).Scan(&estimatedTokens)
-	if err == nil {
-		summary.TokensTotal = estimatedTokens
+	if tokens, err := es.SumTokensForCitizen(ctx, citizenID); err == nil {
+		summary.TokensTotal = tokens
 	}
-
-	// Distinct project count.
-	var projectCount int
-	err = s.db.QueryRow(
-		`SELECT COUNT(DISTINCT project_id) FROM contribution_events WHERE citizen_id = ? AND project_id > 0`,
-		citizenID,
-	).Scan(&projectCount)
-	if err == nil {
-		summary.ProjectCount = projectCount
+	if projects, err := es.CountDistinctProjectsForCitizen(ctx, citizenID); err == nil {
+		summary.ProjectCount = projects
 	}
 
 	return summary, nil
@@ -105,27 +145,28 @@ func (s *Store) GetContributionSummary(citizenID int64) (*ContributionSummary, e
 
 // CountContributionEvents returns the total number of
 // events for a citizen (the "Contribution #N" counter).
+// Disabled EventStore → 0, nil so callers (profile cards)
+// render "0" rather than an error.
 func (s *Store) CountContributionEvents(citizenID int64) (int, error) {
-	var count int
-	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM contribution_events WHERE citizen_id = ?`,
-		citizenID,
-	).Scan(&count)
-	return count, err
+	s.Events().WaitForDrain(eventDrainBudget)
+	n, err := s.Events().CountContributionEvents(context.Background(), citizenID)
+	if errors.Is(err, ErrEventStoreDisabled) {
+		return 0, nil
+	}
+	return n, err
 }
 
-// CountContributionEventsThisMonth returns the distinct
-// project count for a citizen in the current calendar
-// month (the "X projects this month" display).
+// CountProjectsThisMonth returns the distinct project count
+// for a citizen since the start of the current calendar month
+// (the "X projects this month" display).
 func (s *Store) CountProjectsThisMonth(citizenID int64) (int, error) {
-	var count int
 	now := time.Now()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	err := s.db.QueryRow(
-		`SELECT COUNT(DISTINCT project_id) FROM contribution_events WHERE citizen_id = ? AND project_id > 0 AND created_at >= ?`,
-		citizenID, monthStart,
-	).Scan(&count)
-	return count, err
+	n, err := s.Events().CountProjectsThisMonth(context.Background(), citizenID, monthStart)
+	if errors.Is(err, ErrEventStoreDisabled) {
+		return 0, nil
+	}
+	return n, err
 }
 
 // ListTaskHistory returns all task_claims rows for a task,
@@ -185,13 +226,13 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 	// fields). The tasks join is dropped entirely.
 	rows, err := s.db.Query(
 		`SELECT
-		   tc.task_id, tc.citizen_id, tc.claimed_at, tc.deadline,
-		   COALESCE(tc.outcome, '') AS outcome,
-		   tc.submitted_at, tc.option, tc.content, tc.model_id,
-		   COALESCE(c.username, '') AS username,
-		   COALESCE(tc.commit_sha, '') AS commit_sha,
-		   COALESCE(tc.decision, '') AS decision,
-		   COALESCE(tc.branch, '') AS branch
+		  tc.task_id, tc.citizen_id, tc.claimed_at, tc.deadline,
+		  COALESCE(tc.outcome, '') AS outcome,
+		  tc.submitted_at, tc.option, tc.content, tc.model_id,
+		  COALESCE(c.username, '') AS username,
+		  COALESCE(tc.commit_sha, '') AS commit_sha,
+		  COALESCE(tc.decision, '') AS decision,
+		  COALESCE(tc.branch, '') AS branch
 		 FROM task_claims tc
 		 LEFT JOIN citizens c ON tc.citizen_id = c.id
 		 WHERE tc.task_id = ?
@@ -233,41 +274,71 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 
 // GetTemplateReuseCount returns how many runs were
 // instantiated from templates committed by this citizen.
-// Uses runs.source_path + contribution_events to correlate:
-// the citizen authored the template file that other runs
-// instantiate. For v1 simplicity, we count all runs with
-// a non-empty source_path that match a template path this
-// citizen has associated events for. This is approximate
-// but useful for the profile display.
+//
+// the original was a single events↔runs JOIN. With
+// events in a separate DB the correlation moves to two stages:
+// fetch this citizen's run_created events from the EventStore,
+// then ask the state DB which of those run_ids have a non-empty
+// source_path. The "project-wide template adoption" metric is
+// state-only and unchanged.
+//
+// EventStore disabled → authored=0; the project-wide reused
+// count still computes from state. Profile renders the
+// project metric without misclaiming personal authorship.
+//
+// Caveats: (1) async-writer drops can cause undercount —
+// missing events mean missing run_ids, mean lower authored.
+// (2) The QueryByCitizen limit (1000) caps how far back we
+// scan; a power user with >1000 lifetime events will see a
+// further undercount. Both are acceptable for a profile-page
+// metric; replace with a state-only counter (e.g.,
+// runs.authored_template_by) if either becomes load-bearing.
 func (s *Store) GetTemplateReuseCount(citizenID int64) (authored int, reused int, err error) {
-	// Count runs created by this citizen that used a template.
-	err = s.db.QueryRow(
-		`SELECT COUNT(DISTINCT e.task_id) FROM contribution_events e
-		 JOIN runs r ON e.run_id = r.id
-		 WHERE e.citizen_id = ? AND e.event_type = 'run_created' AND r.source_path != ''`,
-		citizenID,
-	).Scan(&authored)
-	if err != nil {
+	ctx := context.Background()
+	events, qerr := s.Events().QueryByCitizen(ctx, citizenID, 1000)
+	if qerr != nil && !errors.Is(qerr, ErrEventStoreDisabled) {
 		return 0, 0, nil
 	}
-	// Count total runs that used any template (project-wide
-	// template adoption metric).
+	// Dedupe run_ids of run_created events.
+	runIDs := map[int64]struct{}{}
+	for _, e := range events {
+		if e.EventType == "run_created" && e.RunID > 0 {
+			runIDs[e.RunID] = struct{}{}
+		}
+	}
+	if len(runIDs) > 0 {
+		// Build IN clause.
+		ids := make([]interface{}, 0, len(runIDs))
+		placeholders := ""
+		i := 0
+		for id := range runIDs {
+			if i > 0 {
+				placeholders += ", "
+			}
+			placeholders += "?"
+			ids = append(ids, id)
+			i++
+		}
+		s.db.QueryRow(
+			`SELECT COUNT(*) FROM runs WHERE source_path != '' AND id IN (`+placeholders+`)`,
+			ids...,
+		).Scan(&authored)
+	}
+	// Project-wide template adoption (state-only).
 	s.db.QueryRow(`SELECT COUNT(*) FROM runs WHERE source_path != ''`).Scan(&reused)
 	return authored, reused, nil
 }
 
 // GetEventMetadataForTask returns the metadata JSON from the
 // most recent contribution event of a given type for a task.
+// Disabled EventStore → "", nil; missing event → "", nil
+// (caller treats empty as soft-fail and proceeds).
 func (s *Store) GetEventMetadataForTask(taskID, eventType string) (string, error) {
-	var metadata string
-	err := s.db.QueryRow(
-		`SELECT metadata FROM contribution_events WHERE task_id = ? AND event_type = ? ORDER BY created_at DESC LIMIT 1`,
-		taskID, eventType,
-	).Scan(&metadata)
-	if err != nil {
-		return "", err
+	meta, err := s.Events().LatestMetadataForTask(context.Background(), taskID, eventType)
+	if errors.Is(err, ErrEventStoreDisabled) {
+		return "", nil
 	}
-	return metadata, nil
+	return meta, err
 }
 
 // RunEventRecord is one line of a run's synthesized timeline.
@@ -278,22 +349,22 @@ func (s *Store) GetEventMetadataForTask(taskID, eventType string) (string, error
 // trip.
 type RunEventRecord struct {
 	Timestamp time.Time
-	Type      string
-	Subtype   string
-	TaskID    string
-	Citizen   string
-	Metadata  string
+	Type   string
+	Subtype  string
+	TaskID  string
+	Citizen  string
+	Metadata string
 }
 
 // ListRunEvents synthesizes a chronological timeline for a
 // run by unioning two sources:
 //
-//  1. contribution_events scoped to this run — already a
-//     typed event log (task_completed, review_given,
-//     vote_cast, task_failed, task_invalidated, run_created).
-//  2. task_claims for this run's tasks — synthesized into
-//     task_claimed events since the claim path doesn't
-//     write contribution_events today.
+// 1. events scoped to this run — already a
+//   typed event log (task_completed, review_given,
+//   vote_cast, task_failed, task_invalidated, run_created).
+// 2. task_claims for this run's tasks — synthesized into
+//   task_claimed events since the claim path doesn't
+//   write events today.
 //
 // Result is sorted by timestamp. Caller (the export tool)
 // formats each record as a single JSONL line. Matches the
@@ -303,36 +374,37 @@ type RunEventRecord struct {
 func (s *Store) ListRunEvents(runID int64) ([]RunEventRecord, error) {
 	var events []RunEventRecord
 
-	// Source 1: typed events already in contribution_events.
-	ceRows, err := s.db.Query(
-		`SELECT ce.created_at, ce.event_type, ce.event_subtype, ce.task_id, ce.metadata,
-		        COALESCE(c.username, '') AS citizen
-		 FROM contribution_events ce
-		 LEFT JOIN citizens c ON ce.citizen_id = c.id
-		 WHERE ce.run_id = ?
-		 ORDER BY ce.created_at ASC`,
-		runID,
-	)
-	if err != nil {
+	// Source 1: typed events from the EventStore. Cross-DB
+	// JOIN on citizens is gone; we collect citizen_ids first
+	// then resolve usernames in a single state-DB lookup.
+	// Disabled EventStore → degrade silently to source-2-only
+	// (matches the rest of the read API: audit emission off
+	// means the run timeline shows fewer rows, not an error).
+	ctx := context.Background()
+	rawEvents, err := s.Events().QueryByRun(ctx, runID, time.Time{}, 0)
+	if err != nil && !errors.Is(err, ErrEventStoreDisabled) {
 		return nil, err
 	}
-	for ceRows.Next() {
-		var r RunEventRecord
-		var metadata sql.NullString
-		if err := ceRows.Scan(&r.Timestamp, &r.Type, &r.Subtype, &r.TaskID, &metadata, &r.Citizen); err != nil {
-			continue
+	if len(rawEvents) > 0 {
+		usernames := s.lookupUsernames(rawEvents)
+		for _, e := range rawEvents {
+			events = append(events, RunEventRecord{
+				Timestamp: e.CreatedAt,
+				Type:   e.EventType,
+				Subtype:  e.EventSubtype,
+				TaskID:  e.TaskID,
+				Citizen:  usernames[e.CitizenID],
+				Metadata: e.Metadata,
+			})
 		}
-		r.Metadata = metadata.String
-		events = append(events, r)
 	}
-	ceRows.Close()
 
 	// Source 2: claims synthesized as task_claimed events.
 	// JOIN to citizens for the username, and to tasks to
 	// scope by run_id. Outcome carries the follow-up event
 	// (completed / invalidated / released / timed_out) so
 	// we only emit the *claimed* moment — the resolution
-	// moment is already in contribution_events.
+	// moment is already in events.
 	clRows, err := s.db.Query(
 		`SELECT tc.claimed_at, tc.task_id, COALESCE(c.username, '') AS citizen
 		 FROM task_claims tc
@@ -374,124 +446,139 @@ func sortRunEvents(events []RunEventRecord) {
 }
 
 // EventQuery is a filter for ListEvents — the projection layer
-// over contribution_events. All fields are optional; Limit caps
+// over events. All fields are optional; Limit caps
 // at 1000 to keep responses bounded. At least one of ProjectID
 // or RunID should be set in practice, otherwise the query is
 // "every event ever recorded" which is rarely what callers want.
 type EventQuery struct {
-	ProjectID  int64
-	RunID      int64
-	CitizenID  int64
-	EventTypes []string  // OR-matched if non-empty
-	Since      time.Time // zero value = no lower bound
-	Limit      int       // default 100, max 1000
+	ProjectID int64
+	RunID   int64
+	CitizenID int64
+	EventTypes []string // OR-matched if non-empty
+	Since   time.Time // zero value = no lower bound
+	Limit   int    // default 100, max 1000
 }
 
 // ListEvents returns the projection layer over the
-// contribution_events table — the read-only counterpart to the
+// events table — the read-only counterpart to the
 // `enju_export_run_events` git-tracked snapshot. Ordered newest-
 // first so log-tailing UX is natural; reverse on the client when
 // you want chronological order.
 //
-// Living-workflow phase 2: the contribution_events table is the
+// Living-workflow phase 2: the events table is the
 // canonical event log (per design notes). This method exposes
 // it with filters; the MCP tool `enju_show_events` formats the
 // result as JSONL.
 func (s *Store) ListEvents(q EventQuery) ([]RunEventRecord, error) {
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 100
+	if q.Limit <= 0 {
+		q.Limit = 100
 	}
-	if limit > 1000 {
-		limit = 1000
+	if q.Limit > 1000 {
+		q.Limit = 1000
 	}
+	raw, err := s.Events().Query(context.Background(), q)
+	if err != nil {
+		if errors.Is(err, ErrEventStoreDisabled) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	usernames := s.lookupUsernames(raw)
+	out := make([]RunEventRecord, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, RunEventRecord{
+			Timestamp: e.CreatedAt,
+			Type:   e.EventType,
+			Subtype:  e.EventSubtype,
+			TaskID:  e.TaskID,
+			Citizen:  usernames[e.CitizenID],
+			Metadata: e.Metadata,
+		})
+	}
+	return out, nil
+}
 
-	conds := []string{}
-	args := []interface{}{}
-	if q.ProjectID > 0 {
-		conds = append(conds, "ce.project_id = ?")
-		args = append(args, q.ProjectID)
+// lookupUsernames batch-resolves citizen_id → username from
+// the state DB for a slice of events. Cross-DB JOIN replacement
+// since events live in events.db and citizens in state.db.
+// Missing citizens map to "".
+//
+// Chunked at 500 ids per query to stay well below SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER default of 999. ListEvents is
+// capped at Limit=1000, so a project-scoped query covering
+// many distinct citizens could otherwise blow the parameter
+// budget. Chunking keeps the contract simple — N round-trips
+// in the worst case, all small.
+func (s *Store) lookupUsernames(events []Event) map[int64]string {
+	const chunk = 500
+	out := map[int64]string{}
+	if len(events) == 0 {
+		return out
 	}
-	if q.RunID > 0 {
-		conds = append(conds, "ce.run_id = ?")
-		args = append(args, q.RunID)
+	idSet := map[int64]struct{}{}
+	for _, e := range events {
+		if e.CitizenID > 0 {
+			idSet[e.CitizenID] = struct{}{}
+		}
 	}
-	if q.CitizenID > 0 {
-		conds = append(conds, "ce.citizen_id = ?")
-		args = append(args, q.CitizenID)
+	if len(idSet) == 0 {
+		return out
 	}
-	if len(q.EventTypes) > 0 {
+	ids := make([]int64, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	for start := 0; start < len(ids); start += chunk {
+		end := start + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		args := make([]interface{}, len(batch))
 		placeholders := ""
-		for i := range q.EventTypes {
+		for i, id := range batch {
 			if i > 0 {
 				placeholders += ", "
 			}
 			placeholders += "?"
-			args = append(args, q.EventTypes[i])
+			args[i] = id
 		}
-		conds = append(conds, "ce.event_type IN ("+placeholders+")")
-	}
-	if !q.Since.IsZero() {
-		conds = append(conds, "ce.created_at >= ?")
-		args = append(args, q.Since)
-	}
-
-	where := ""
-	if len(conds) > 0 {
-		where = "WHERE " + conds[0]
-		for i := 1; i < len(conds); i++ {
-			where += " AND " + conds[i]
-		}
-	}
-
-	args = append(args, limit)
-	rows, err := s.db.Query(
-		`SELECT ce.created_at, ce.event_type, ce.event_subtype, ce.task_id, ce.metadata,
-		        COALESCE(c.username, '') AS citizen
-		 FROM contribution_events ce
-		 LEFT JOIN citizens c ON ce.citizen_id = c.id
-		 `+where+`
-		 ORDER BY ce.created_at DESC, ce.id DESC
-		 LIMIT ?`,
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var events []RunEventRecord
-	for rows.Next() {
-		var r RunEventRecord
-		var metadata sql.NullString
-		if err := rows.Scan(&r.Timestamp, &r.Type, &r.Subtype, &r.TaskID, &metadata, &r.Citizen); err != nil {
+		rows, err := s.db.Query(
+			`SELECT id, COALESCE(username, '') FROM citizens WHERE id IN (`+placeholders+`)`,
+			args...,
+		)
+		if err != nil {
 			continue
 		}
-		r.Metadata = metadata.String
-		events = append(events, r)
+		for rows.Next() {
+			var id int64
+			var name string
+			if err := rows.Scan(&id, &name); err == nil {
+				out[id] = name
+			}
+		}
+		rows.Close()
 	}
-	return events, nil
+	return out
 }
 
 // GetDownstreamImpact counts how many tasks transitively
 // depended on tasks this citizen completed. This is the
 // "Your outputs were used by N downstream tasks" metric.
+//
+// the "tasks completed by citizen" set comes from
+// the EventStore; "tasks that depend on those" stays in
+// state DB. Disabled EventStore → 0/0/nil (profile renders
+// the metric as zero rather than an error).
 func (s *Store) GetDownstreamImpact(citizenID int64) (int, int, error) {
-	// Find all task IDs this citizen completed.
-	rows, err := s.db.Query(
-		`SELECT DISTINCT task_id FROM contribution_events WHERE citizen_id = ? AND event_type = 'task_completed'`,
-		citizenID,
+	completedIDs, err := s.Events().DistinctTaskIDsForCitizenAndType(
+		context.Background(), citizenID, "task_completed",
 	)
 	if err != nil {
+		if errors.Is(err, ErrEventStoreDisabled) {
+			return 0, 0, nil
+		}
 		return 0, 0, err
-	}
-	defer rows.Close()
-
-	var completedIDs []string
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		completedIDs = append(completedIDs, id)
 	}
 	if len(completedIDs) == 0 {
 		return 0, 0, nil

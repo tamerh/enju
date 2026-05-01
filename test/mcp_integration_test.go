@@ -6035,7 +6035,7 @@ tasks:
 
 // TestMCPExportRunEvents covers the event-timeline export:
 // coordinator synthesizes a JSONL stream from
-// contribution_events + task_claims, client snapshots it to
+// events + task_claims, client snapshots it to
 // enju/runs/{seq}/events/{phase}.jsonl. Same pattern as
 // enju_export_diagram — authoritative data stays in the DB,
 // git gets a materialization on demand.
@@ -6113,7 +6113,7 @@ tasks:
 			typesSeen[event["type"].(string)] = true
 		}
 		// The key promises of the synthesizer: claim events come
-		// from task_claims (synthesized; contribution_events
+		// from task_claims (synthesized; events
 		// doesn't emit them), invalidation events were just added
 		// so the timeline has an entry at the cascade moment,
 		// completions land at submit time.

@@ -23,11 +23,22 @@ import (
 // agree on the exact strings. Changing any of these is a
 // cross-component protocol bump.
 const (
-	TrailerTaskComplete        = "Enju-Task-Complete"
-	TrailerExit                = "Enju-Exit"
-	TrailerArtifacts           = "Enju-Artifacts"
-	TrailerUntrackedArtifacts  = "Enju-Untracked-Artifacts"
-	TrailerDurationSeconds     = "Enju-Duration-Seconds"
+	TrailerTaskComplete    = "Enju-Task-Complete"
+	TrailerExit        = "Enju-Exit"
+	TrailerArtifacts      = "Enju-Artifacts"
+	TrailerUntrackedArtifacts = "Enju-Untracked-Artifacts"
+	TrailerDurationSeconds   = "Enju-Duration-Seconds"
+	// verdict + iter-seq trailers carry per-
+	// submission semantics into the commit message itself,
+	// so a forensic `git log` over a project's history can
+	// reconstruct review outcomes and iteration counters
+	// without needing the events.db. Verdict mirrors the
+	// review/vote decision string ("approve", "reject",
+	// "request_changes", "comment"); IterSeq mirrors the
+	// task_claims.iter_seq value for the iteration this
+	// commit belongs to.
+	TrailerVerdict = "Enju-Verdict"
+	TrailerIterSeq = "Enju-Iter-Seq"
 )
 
 // EnjuTrailers carries the parsed Enju-* trailer values from a
@@ -43,7 +54,7 @@ type EnjuTrailers struct {
 	// ExitCode — compute tasks only. Absent ⇒ ExitSet == false.
 	// Encoded as `Enju-Exit: 0` / `Enju-Exit: 137`.
 	ExitCode int
-	ExitSet  bool
+	ExitSet bool
 
 	// Artifacts — tracked artifact paths actually written
 	// by the task AND included in this commit. Comma-
@@ -76,6 +87,19 @@ type EnjuTrailers struct {
 	// tasks. Zero when absent. Useful for the fetch-path
 	// scanner's "task has been running for …" annotation.
 	DurationSeconds int
+
+	// Verdict — review/vote outcome carried into the commit
+	// message ("approve", "reject", "request_changes",
+	// "comment" for reviews; vote_choice id for votes).
+	// . Empty for answer/compute submits.
+	Verdict string
+
+	// IterSeq — the task_claims.iter_seq value for the
+	// iteration this commit belongs to. . Zero when
+	// the commit isn't tied to a phase-6c claim row (vote/
+	// review pre-6c paths, or future single-shot scripted
+	// commits).
+	IterSeq int
 }
 
 // RenderEnjuTrailers produces the trailer block that goes at the
@@ -119,6 +143,18 @@ func RenderEnjuTrailers(t EnjuTrailers) string {
 		b.WriteString(TrailerUntrackedArtifacts)
 		b.WriteString(": ")
 		b.WriteString(strings.Join(t.UntrackedArtifacts, ", "))
+	}
+	if t.Verdict != "" {
+		b.WriteString("\n")
+		b.WriteString(TrailerVerdict)
+		b.WriteString(": ")
+		b.WriteString(t.Verdict)
+	}
+	if t.IterSeq > 0 {
+		b.WriteString("\n")
+		b.WriteString(TrailerIterSeq)
+		b.WriteString(": ")
+		b.WriteString(strconv.Itoa(t.IterSeq))
 	}
 	return b.String()
 }
@@ -180,6 +216,12 @@ func ParseEnjuTrailers(msg string) EnjuTrailers {
 				if p != "" {
 					t.UntrackedArtifacts = append(t.UntrackedArtifacts, p)
 				}
+			}
+		case TrailerVerdict:
+			t.Verdict = val
+		case TrailerIterSeq:
+			if n, err := strconv.Atoi(val); err == nil {
+				t.IterSeq = n
 			}
 		}
 	}

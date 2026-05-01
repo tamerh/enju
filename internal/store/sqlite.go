@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -12,9 +13,9 @@ import (
 )
 
 // usernameRe matches the GitHub username rules:
-//   - 1 to 39 characters
-//   - Starts and ends with alphanumeric
-//   - Middle can contain alphanumerics and hyphens
+//  - 1 to 39 characters
+//  - Starts and ends with alphanumeric
+//  - Middle can contain alphanumerics and hyphens
 //
 // Picking the same shape as GitHub means that when we add GitHub OAuth
 // later, existing usernames don't need translation.
@@ -64,41 +65,53 @@ func SlugifyName(name string) string {
 	return s
 }
 
-// Store is the SQLite-backed state store.
+// Store is the SQLite-backed state store. A sibling
+// EventStore (typically SQLiteEventStore) lives in its own
+// database file with its own connection pool; callers that
+// need events go through Store.Events(). The two are
+// completely independent — events failures cannot affect
+// state operations and vice versa. See eventstore.go for
+// the architectural contract.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	events EventStore
 }
 
 // New creates a new Store and initializes the schema.
+//
+// The events DB is NOT opened here — call AttachEventStore
+// after construction to wire it up. Callers that don't need
+// events (unit tests, local-only fixtures) can leave it
+// unset; Store.Events() returns a no-op store in that case.
 func New(dbPath string) (*Store, error) {
 	// Two DSN parameters carry the concurrent-write story:
 	//
-	//   _pragma=busy_timeout(5000)
-	//     Per-connection wait-for-lock budget. Pool-wide
-	//     because modernc applies _pragma DSN params on every
-	//     new connection it opens. Without this, a writer
-	//     contending with another writer fails fast with
-	//     SQLITE_BUSY instead of waiting.
+	//  _pragma=busy_timeout(5000)
+	//   Per-connection wait-for-lock budget. Pool-wide
+	//   because modernc applies _pragma DSN params on every
+	//   new connection it opens. Without this, a writer
+	//   contending with another writer fails fast with
+	//   SQLITE_BUSY instead of waiting.
 	//
-	//   _txlock=immediate
-	//     Makes db.Begin() issue `BEGIN IMMEDIATE` instead of
-	//     the default `BEGIN DEFERRED`. This is the LOAD-
-	//     BEARING bit for parallel execute_run.
+	//  _txlock=immediate
+	//   Makes db.Begin() issue `BEGIN IMMEDIATE` instead of
+	//   the default `BEGIN DEFERRED`. This is the LOAD-
+	//   BEARING bit for parallel execute_run.
 	//
-	//     Why: ApplyPlan runs mutations like applySetClaim
-	//     that SELECT then INSERT in the same transaction.
-	//     Under DEFERRED, the SELECT acquires a read snapshot
-	//     and the INSERT later upgrades to a write — but if
-	//     another transaction committed between the SELECT
-	//     and the INSERT, SQLite returns SQLITE_BUSY_SNAPSHOT
-	//     and busy_timeout does NOT retry it. Application
-	//     would have to roll back and retry the whole
-	//     transaction. IMMEDIATE acquires the writer lock
-	//     upfront, before any reads, so snapshot drift can't
-	//     happen — busy_timeout fully covers the remaining
-	//     writer-vs-writer contention. See
-	//     TestReadThenWriteInDeferredTxHitsSnapshotBusy for
-	//     the failing repro that motivated this.
+	//   Why: ApplyPlan runs mutations like applySetClaim
+	//   that SELECT then INSERT in the same transaction.
+	//   Under DEFERRED, the SELECT acquires a read snapshot
+	//   and the INSERT later upgrades to a write — but if
+	//   another transaction committed between the SELECT
+	//   and the INSERT, SQLite returns SQLITE_BUSY_SNAPSHOT
+	//   and busy_timeout does NOT retry it. Application
+	//   would have to roll back and retry the whole
+	//   transaction. IMMEDIATE acquires the writer lock
+	//   upfront, before any reads, so snapshot drift can't
+	//   happen — busy_timeout fully covers the remaining
+	//   writer-vs-writer contention. See
+	//   TestReadThenWriteInDeferredTxHitsSnapshotBusy for
+	//   the failing repro that motivated this.
 	dsn := dbPath + "?_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -124,7 +137,33 @@ func New(dbPath string) (*Store, error) {
 	return s, nil
 }
 
-// Close closes the database connection.
+// AttachEventStore wires an EventStore (typically opened via
+// NewSQLiteEventStore against ~/.enju/events.db) to this state
+// store. Called by the coordinator's startup path AFTER New
+// returns. Optional — if no event store is attached, Events()
+// returns a no-op store that silently drops all writes (used
+// by unit tests and offline fixtures that don't care about
+// the audit ledger).
+func (s *Store) AttachEventStore(events EventStore) {
+	s.events = events
+}
+
+// Events returns the attached EventStore, or a no-op store if
+// none has been attached. Callers can always call Record on
+// the returned EventStore — it never panics, never errors.
+func (s *Store) Events() EventStore {
+	if s.events == nil {
+		return noopEventStore{}
+	}
+	return s.events
+}
+
+// Close closes the database connection. The attached
+// EventStore (if any) is NOT closed here — the coordinator's
+// shutdown path closes both stores in order: events first
+// (so any final emissions drain), then state. Closing them
+// in the wrong order on a busy system would lose late
+// events.
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -297,21 +336,15 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_project_members_citizen ON project_members(citizen_id);
 
 	-- Phase G: contribution events log. Append-only — events
-	-- are never deleted, even when the underlying task is
-	-- invalidated (the invalidation is recorded as a separate
-	-- event). This mirrors the append-only git philosophy and
-	-- gives future scoring functions a complete audit trail.
-	CREATE TABLE IF NOT EXISTS contribution_events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		citizen_id INTEGER NOT NULL,
-		event_type TEXT NOT NULL,
-		event_subtype TEXT NOT NULL DEFAULT '',
-		task_id TEXT NOT NULL DEFAULT '',
-		run_id INTEGER NOT NULL DEFAULT 0,
-		project_id INTEGER NOT NULL DEFAULT 0,
-		metadata TEXT NOT NULL DEFAULT '{}',
-		created_at TIMESTAMP NOT NULL
-	);
+	-- (, 2026-04-30) Audit events moved to a separate
+	-- subsystem. State.db no longer carries the
+	-- events table; emissions and reads route
+	-- through Store.Events() (the EventStore interface backed
+	-- by SQLiteEventStore in events_sqlite.go), which lives in
+	-- its own events.db with its own connection pool and an
+	-- async writer goroutine. Architectural rationale: events
+	-- are a strict consumer of the system, never on the
+	-- critical path. See docs/event-log.md.
 
 	-- operator/model design — tokens move out of the
 	-- citizens row into their own table. Multiple tokens per
@@ -321,13 +354,13 @@ func (s *Store) migrate() error {
 	-- intact as a legacy mirror until a future cleanup phase can
 	-- safely drop it. See docs/operator-model-design.md.
 	CREATE TABLE IF NOT EXISTS tokens (
-		id              INTEGER PRIMARY KEY AUTOINCREMENT,
-		citizen_id      INTEGER NOT NULL REFERENCES citizens(id),
-		token           TEXT NOT NULL UNIQUE,
-		label           TEXT NOT NULL DEFAULT '',
-		issued_at       TIMESTAMP NOT NULL,
-		revoked_at      TIMESTAMP,
-		last_used_at    TIMESTAMP
+		id       INTEGER PRIMARY KEY AUTOINCREMENT,
+		citizen_id   INTEGER NOT NULL REFERENCES citizens(id),
+		token      TEXT NOT NULL UNIQUE,
+		label      TEXT NOT NULL DEFAULT '',
+		issued_at    TIMESTAMP NOT NULL,
+		revoked_at   TIMESTAMP,
+		last_used_at  TIMESTAMP
 	);
 
 	-- Issues are project-level structured artifacts (living-
@@ -339,22 +372,22 @@ func (s *Store) migrate() error {
 	-- doubles as the racing-create guard. See
 	-- docs/living-workflow-design-notes.md § 6.
 	CREATE TABLE IF NOT EXISTS issues (
-		id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-		project_id          INTEGER NOT NULL,
-		seq                 INTEGER NOT NULL,
-		title               TEXT NOT NULL,
-		body                TEXT NOT NULL DEFAULT '',
-		status              TEXT NOT NULL DEFAULT 'open',
-		severity            TEXT NOT NULL DEFAULT 'medium',
-		found_in_run_id     INTEGER NOT NULL DEFAULT 0,
-		found_in_task_id    TEXT NOT NULL DEFAULT '',
-		filed_by            INTEGER NOT NULL,
-		filed_at            TIMESTAMP NOT NULL,
-		triaged_by          INTEGER NOT NULL DEFAULT 0,
-		triaged_at          TIMESTAMP,
-		closed_by_task_id   TEXT NOT NULL DEFAULT '',
-		closed_at           TIMESTAMP,
-		updated_at          TIMESTAMP NOT NULL,
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id     INTEGER NOT NULL,
+		seq         INTEGER NOT NULL,
+		title        TEXT NOT NULL,
+		body        TEXT NOT NULL DEFAULT '',
+		status       TEXT NOT NULL DEFAULT 'open',
+		severity      TEXT NOT NULL DEFAULT 'medium',
+		found_in_run_id   INTEGER NOT NULL DEFAULT 0,
+		found_in_task_id  TEXT NOT NULL DEFAULT '',
+		filed_by      INTEGER NOT NULL,
+		filed_at      TIMESTAMP NOT NULL,
+		triaged_by     INTEGER NOT NULL DEFAULT 0,
+		triaged_at     TIMESTAMP,
+		closed_by_task_id  TEXT NOT NULL DEFAULT '',
+		closed_at      TIMESTAMP,
+		updated_at     TIMESTAMP NOT NULL,
 		UNIQUE (project_id, seq)
 	);
 
@@ -364,8 +397,8 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 	CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by);
 	CREATE INDEX IF NOT EXISTS idx_tasks_reviews_target
-	  ON tasks(run_id, reviews_target)
-	  WHERE reviews_target != '' AND action = 'review';
+	 ON tasks(run_id, reviews_target)
+	 WHERE reviews_target != '' AND action = 'review';
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
 	CREATE INDEX IF NOT EXISTS idx_citizens_token ON citizens(token);
 	CREATE INDEX IF NOT EXISTS idx_tokens_citizen ON tokens(citizen_id);
@@ -373,8 +406,6 @@ func (s *Store) migrate() error {
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_username ON citizens(username);
 	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 	CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id);
-	CREATE INDEX IF NOT EXISTS idx_contribution_events_citizen ON contribution_events(citizen_id);
-	CREATE INDEX IF NOT EXISTS idx_contribution_events_type ON contribution_events(event_type);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -520,7 +551,7 @@ func (s *Store) migrate() error {
 		// the parent task that triggered a spawn (or 0 for tasks
 		// authored at run-create time) and the spawn trigger source
 		// (human / bot / template_rule / auto_triage). The audit
-		// log lives in contribution_events as task_spawned; these
+		// log lives in events as task_spawned; these
 		// columns make the lineage queryable without a join.
 		`ALTER TABLE tasks ADD COLUMN spawned_from TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN spawn_trigger TEXT NOT NULL DEFAULT ''`,
@@ -610,7 +641,7 @@ func (s *Store) migrate() error {
 		SELECT id, token, 'legacy', registered_at
 		FROM citizens
 		WHERE token != ''
-		  AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.citizen_id = citizens.id)
+		 AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.citizen_id = citizens.id)
 	`); err != nil {
 		return fmt.Errorf("schema: backfill tokens: %w", err)
 	}
@@ -1230,9 +1261,9 @@ func (s *Store) EvaluateRunState(runID int64) (RunState, error) {
 	var active, holding, total int
 	err := s.db.QueryRow(
 		`SELECT
-		   COUNT(*),
-		   COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
-		   COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
+		  COUNT(*),
+		  COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
+		  COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
 		 FROM tasks WHERE run_id = ?`,
 		runID,
 	).Scan(&total, &active, &holding)
@@ -1276,12 +1307,13 @@ func (s *Store) EvaluateRunState(runID int64) (RunState, error) {
 	return next, nil
 }
 
-// recordRunLifecycleEvent inserts a contribution event for a
-// run-state transition. Used by the standalone (non-tx) state
-// transition paths — EvaluateRunState, PauseRun, ResumeRun. The
-// tx-bound applyCompleteRun emits its own event inside the
-// transaction. Best-effort: a logging failure here must not
-// surface to the caller (state is already authoritative).
+// recordRunLifecycleEvent emits a run-state-transition event
+// via the EventStore. Used by the standalone (non-tx) state
+// transition paths — EvaluateRunState, PauseRun, ResumeRun.
+// The tx-bound applyCompleteRun stages its event in the apply
+// pendingEvents slice; this path fires directly because the
+// caller's UPDATE has already committed. Best-effort:
+// EventStore.Record never errors and never blocks.
 //
 // citizenID = 0 marks system-initiated transitions (idle,
 // completed). PauseRun / ResumeRun pass the calling citizen so
@@ -1289,12 +1321,15 @@ func (s *Store) EvaluateRunState(runID int64) (RunState, error) {
 func (s *Store) recordRunLifecycleEvent(runID int64, eventType, fromState, toState string, citizenID int64, ts time.Time) {
 	var projectID int64
 	_ = s.db.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID)
-	_, _ = s.db.Exec(
-		`INSERT INTO contribution_events (citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
-		 VALUES (?, ?, ?, '', ?, ?, ?, ?)`,
-		citizenID, eventType, fromState, runID, projectID,
-		fmt.Sprintf(`{"from":%q,"to":%q}`, fromState, toState), ts,
-	)
+	s.Events().Record(Event{
+		CitizenID:  citizenID,
+		EventType:  eventType,
+		EventSubtype: fromState,
+		RunID:    runID,
+		ProjectID:  projectID,
+		Metadata:   MarshalMetadata(map[string]any{"from": fromState, "to": toState}),
+		CreatedAt:  ts,
+	})
 }
 
 // PauseRun moves a run into the `paused` state. Refuses if the
@@ -1795,8 +1830,8 @@ func (s *Store) SubmitTaskResult(taskID string, citizenID int64, resultPath, com
 	}
 	// Mark this citizen's claim as completed. The `option`
 	// column carries whatever "choice" this citizen made:
-	//   - vote tasks: the selected option id
-	//   - review tasks: "approve" or "reject"
+	//  - vote tasks: the selected option id
+	//  - review tasks: "approve" or "reject"
 	// The router's tally function interprets the column
 	// depending on task.Action. `content` stores the prose
 	// commentary so {{task.responses}} can render it without
@@ -1942,11 +1977,11 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 // (or worse, would case-fall-through and look "completed"
 // to a string-equality check).
 var validRelabelOutcomes = map[string]bool{
-	"completed":   true, // review approve transitions an open reviewed-task claim to terminal-success
-	"rejected":    true, // request_changes / reject cascade (review verdict)
+	"completed":  true, // review approve transitions an open reviewed-task claim to terminal-success
+	"rejected":  true, // request_changes / reject cascade (review verdict)
 	"invalidated": true, // manual enju_invalidate_task — operator wiped the task without a verdict
-	"abandoned":   true, // citizen-takeover: a different citizen claimed an open row, prior is closed without verdict
-	"released":    true, // timeout / voluntary release
+	"abandoned":  true, // citizen-takeover: a different citizen claimed an open row, prior is closed without verdict
+	"released":  true, // timeout / voluntary release
 }
 
 // HasReviewerOfTarget reports whether any task in `runID` is
@@ -2000,6 +2035,38 @@ func (s *Store) HasReviewerOfTarget(runID int64, taskDefID, instanceKey string) 
 // the target gets its own explicit MarkLatestClaimOutcome
 // call with the appropriate terminal outcome.
 func (s *Store) MarkOpenClaimsInvalidated(taskID string) (int64, error) {
+	// Snapshot affected rows BEFORE the UPDATE so the audit
+	// captures one iteration_completed per closed claim. For
+	// single-citizen tasks this is at most one row; for multi-
+	// citizen tasks it can be many (cascade closes every open
+	// citizen's iteration). Read-then-write is safe under
+	// SQLite's writer lock.
+	type closedClaim struct {
+		claimID, citizenID, runID, projectID int64
+		iterSeq               sql.NullInt64
+		commit                sql.NullString
+		taskAction              string
+	}
+	var affected []closedClaim
+	rows, err := s.db.Query(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ? AND tc.outcome IS NULL`,
+		taskID,
+	)
+	if err == nil {
+		for rows.Next() {
+			var c closedClaim
+			if err := rows.Scan(&c.claimID, &c.citizenID, &c.iterSeq, &c.commit,
+				&c.runID, &c.projectID, &c.taskAction); err == nil {
+				affected = append(affected, c)
+			}
+		}
+		rows.Close()
+	}
 	res, err := s.db.Exec(
 		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`,
 		taskID,
@@ -2007,7 +2074,28 @@ func (s *Store) MarkOpenClaimsInvalidated(taskID string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		now := time.Now()
+		for _, c := range affected {
+			s.Events().Record(Event{
+				CitizenID:  c.citizenID,
+				EventType:  "iteration_completed",
+				EventSubtype: "invalidated",
+				TaskID:    taskID,
+				RunID:    c.runID,
+				ProjectID:  c.projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":     c.iterSeq.Int64,
+					"final_commit_sha": c.commit.String,
+					"action":      c.taskAction,
+					"reason":      "cascade_invalidate",
+				}),
+				CreatedAt: now,
+			})
+		}
+	}
+	return n, nil
 }
 
 // MarkLatestClaimOutcome sets the outcome of the most recent
@@ -2031,19 +2119,80 @@ func (s *Store) MarkLatestClaimOutcome(taskID, outcome string) (int64, error) {
 	if !validRelabelOutcomes[outcome] {
 		return 0, fmt.Errorf("invalid claim outcome %q (must be one of: completed, rejected, invalidated, abandoned, released)", outcome)
 	}
+	// Read the target claim's metadata BEFORE the UPDATE so the
+	// emitted iteration_completed event captures iter_seq +
+	// commit_sha + citizen at the moment of close. Read-then-
+	// write is safe: this method serializes through SQLite's
+	// writer lock, and the row we identify by the same
+	// id-DESC-LIMIT-1 selector below stays addressable across
+	// the two statements.
+	var claimID, citizenID, runID, projectID int64
+	var iterSeq sql.NullInt64
+	var commit sql.NullString
+	var taskAction string
+	var citizens int
+	_ = s.db.QueryRow(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action, t.citizens
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ?
+		 ORDER BY tc.id DESC LIMIT 1`,
+		taskID,
+	).Scan(&claimID, &citizenID, &iterSeq, &commit, &runID, &projectID, &taskAction, &citizens)
 	res, err := s.db.Exec(
 		`UPDATE task_claims SET outcome = ?
 		 WHERE id = (
-		   SELECT id FROM task_claims
-		   WHERE task_id = ?
-		   ORDER BY id DESC LIMIT 1
+		  SELECT id FROM task_claims
+		  WHERE task_id = ?
+		  ORDER BY id DESC LIMIT 1
 		 )`,
 		outcome, taskID,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if n > 0 && claimID > 0 {
+		now := time.Now()
+		s.Events().Record(Event{
+			CitizenID:  citizenID,
+			EventType:  "iteration_completed",
+			EventSubtype: outcome,
+			TaskID:    taskID,
+			RunID:    runID,
+			ProjectID:  projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":     iterSeq.Int64,
+				"final_commit_sha": commit.String,
+				"action":      taskAction,
+			}),
+			CreatedAt: now,
+		})
+		// outcome="completed" via this path is the review-
+		// approve closing the upstream's claim (Phase 6c). The
+		// task itself was already in ACCEPTED state from the
+		// earlier submit, so applySetTaskState's task_completed
+		// emission won't fire — emit it here instead.
+		if outcome == "completed" {
+			s.Events().Record(Event{
+				CitizenID:  citizenID,
+				EventType:  "task_completed",
+				EventSubtype: taskAction,
+				TaskID:    taskID,
+				RunID:    runID,
+				ProjectID:  projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":  iterSeq.Int64,
+					"commit_sha": commit.String,
+					"reviewed":  true,
+				}),
+				CreatedAt: now,
+			})
+		}
+	}
+	return n, nil
 }
 
 // MarkLatestCompletedClaimOutcome rewrites the outcome of the
@@ -2073,19 +2222,60 @@ func (s *Store) MarkLatestCompletedClaimOutcome(taskID, outcome string) (int64, 
 	if !validRelabelOutcomes[outcome] {
 		return 0, fmt.Errorf("invalid relabel outcome %q (must be one of: rejected, abandoned)", outcome)
 	}
+	// Capture the to-be-relabeled row's metadata for the event
+	// — same pattern as MarkLatestClaimOutcome.
+	var claimID, citizenID, runID, projectID int64
+	var iterSeq sql.NullInt64
+	var commit sql.NullString
+	var taskAction string
+	_ = s.db.QueryRow(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ? AND tc.outcome = 'completed'
+		 ORDER BY tc.submitted_at DESC, tc.id DESC LIMIT 1`,
+		taskID,
+	).Scan(&claimID, &citizenID, &iterSeq, &commit, &runID, &projectID, &taskAction)
 	res, err := s.db.Exec(
 		`UPDATE task_claims SET outcome = ?
 		 WHERE id = (
-		   SELECT id FROM task_claims
-		   WHERE task_id = ? AND outcome = 'completed'
-		   ORDER BY submitted_at DESC, id DESC LIMIT 1
+		  SELECT id FROM task_claims
+		  WHERE task_id = ? AND outcome = 'completed'
+		  ORDER BY submitted_at DESC, id DESC LIMIT 1
 		 )`,
 		outcome, taskID,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if n > 0 && claimID > 0 {
+		// The original iteration_completed("completed") event
+		// already fired at submit time; this relabel emits a
+		// SECOND iteration_completed with subtype matching the
+		// final outcome (rejected/abandoned). Audit consumers
+		// can spot the pair and reconstruct the relabel
+		// retroactively. Note: the prior event isn't deleted —
+		// events are append-only.
+		s.Events().Record(Event{
+			CitizenID:  citizenID,
+			EventType:  "iteration_completed",
+			EventSubtype: outcome,
+			TaskID:    taskID,
+			RunID:    runID,
+			ProjectID:  projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":     iterSeq.Int64,
+				"final_commit_sha": commit.String,
+				"action":      taskAction,
+				"relabel_from":   "completed",
+			}),
+			CreatedAt: time.Now(),
+		})
+	}
+	return n, nil
 }
 
 // ListActiveClaims returns every open (outcome = NULL) claim row
@@ -2111,7 +2301,7 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 // reads. model_id is the current attribution column; future
 // operator/model-design columns (route, model_resolved, paid_by)
 // extend this list when they ship.
-const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, model_id, branch, commit_sha, decision`
+const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, content, model_id, branch, commit_sha, decision, iter_seq`
 
 // scanTaskClaims is the shared scanner used by ListVoteSubmissions
 // and ListActiveClaims. Centralizing the scan keeps the two paths
@@ -2123,12 +2313,16 @@ func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 		var outcome sql.NullString
 		var submittedAt sql.NullTime
 		var modelID sql.NullInt64
+		var iterSeq sql.NullInt64
 		if err := rows.Scan(
 			&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
 			&outcome, &submittedAt, &r.Option, &r.Content, &modelID,
-			&r.Branch, &r.CommitSHA, &r.Decision,
+			&r.Branch, &r.CommitSHA, &r.Decision, &iterSeq,
 		); err != nil {
 			return nil, err
+		}
+		if iterSeq.Valid {
+			r.IterSeq = int(iterSeq.Int64)
 		}
 		if outcome.Valid {
 			r.Outcome = outcome.String
@@ -2412,8 +2606,8 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	defer rows.Close()
 
 	type pendingTask struct {
-		id             string
-		dependsOn      string
+		id       string
+		dependsOn   string
 		readsArtifacts string
 	}
 	var pending []pendingTask
@@ -2732,10 +2926,10 @@ func (s *Store) UpdateCitizenProfile(id int64, name, email *string) error {
 func (s *Store) GetCitizenByToken(token string) (*CitizenRecord, error) {
 	return scanCitizen(s.db.QueryRow(
 		`SELECT `+citizenColumns+`
-		   FROM citizens
-		   JOIN tokens ON tokens.citizen_id = citizens.id
-		  WHERE tokens.token = ?
-		    AND tokens.revoked_at IS NULL`,
+		  FROM citizens
+		  JOIN tokens ON tokens.citizen_id = citizens.id
+		 WHERE tokens.token = ?
+		  AND tokens.revoked_at IS NULL`,
 		token,
 	))
 }
@@ -2843,7 +3037,7 @@ func (s *Store) RevokeTokenByValue(token string) error {
 func (s *Store) ListTokensByCitizen(citizenID int64) ([]TokenRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT id, citizen_id, token, label, issued_at, revoked_at, last_used_at
-		   FROM tokens WHERE citizen_id = ? ORDER BY issued_at DESC`,
+		  FROM tokens WHERE citizen_id = ? ORDER BY issued_at DESC`,
 		citizenID,
 	)
 	if err != nil {
@@ -2906,7 +3100,7 @@ func (s *Store) ListTokensByCitizen(citizenID int64) ([]TokenRecord, error) {
 // — "Provider routing" and "Model drift / snapshot pinning".
 var modelCatalogSeed = []struct {
 	Username string
-	Name     string
+	Name   string
 }{
 	{"claude-opus-4-7", "Claude Opus 4.7"},
 	{"claude-sonnet-4-6", "Claude Sonnet 4.6"},
@@ -3075,6 +3269,30 @@ func (s *Store) LookupTokenOwner(token string, tokenID int64) (int64, error) {
 // adding a typed helper.
 func (s *Store) DB() *sql.DB { return s.db }
 
+// GetOpenClaimIterSeq returns the iter_seq of the most recent
+// open (outcome IS NULL) claim row for taskID, or 0 if none
+// exists. 's task_request_changes emission needs this
+// to stamp iter_seq into the event metadata; future iter_seq /
+// branch lookups should grow as siblings here rather than
+// reaching for Store.DB(). Returns nil error on no-row (zero
+// is the well-defined "no open claim" answer).
+func (s *Store) GetOpenClaimIterSeq(taskID string) (int64, error) {
+	var n sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT iter_seq FROM task_claims
+		 WHERE task_id = ? AND outcome IS NULL
+		 ORDER BY id DESC LIMIT 1`,
+		taskID,
+	).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return n.Int64, nil
+}
+
 // ListModelCitizens returns all kind='model' citizens in
 // alphabetical-by-username order. Used by run_status / dashboard /
 // `enju_list_models` to render the catalog. Filters out
@@ -3203,8 +3421,8 @@ func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactReco
 func (s *Store) ListTasksWritingArtifact(projectID int64, path string, acceptedOnly bool) ([]TaskRecord, error) {
 	pattern := `%"` + path + `"%`
 	query := `SELECT ` + taskColumns + ` FROM tasks
-	          WHERE writes_artifacts LIKE ?
-	            AND run_id IN (SELECT id FROM runs WHERE project_id = ?)`
+	     WHERE writes_artifacts LIKE ?
+	      AND run_id IN (SELECT id FROM runs WHERE project_id = ?)`
 	args := []interface{}{pattern, projectID}
 	if acceptedOnly {
 		query += ` AND state = 'accepted'`
@@ -3299,7 +3517,7 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 		branch = "main"
 	}
 	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
-	          FROM artifacts WHERE project_id = ? AND branch = ?`
+	     FROM artifacts WHERE project_id = ? AND branch = ?`
 	args := []interface{}{projectID, branch}
 	if pathPrefix != "" {
 		query += ` AND path LIKE ?`
