@@ -21,7 +21,42 @@ type UserConfig struct {
 	// DisableDefaults turns off built-in Layer 1 defaults by
 	// name. The literal "all" disables every default. Names match
 	// the Rule.Name values in compiledDefaults().
+	//
+	// On disk this accepts either a list (`disable_defaults:
+	// [branch_merged, run_paused]`) or a bare scalar
+	// (`disable_defaults: all`). The bare-scalar form is parsed
+	// by the custom UnmarshalYAML on UserConfig.
 	DisableDefaults []string `yaml:"disable_defaults"`
+}
+
+// UnmarshalYAML accepts both list and bare-scalar forms of
+// `disable_defaults`. The list form is the canonical one; the
+// scalar form exists so `disable_defaults: all` works as users
+// naturally write it (matches the doc's "# or: \"all\"" hint).
+// Without this, a bare scalar is rejected by yaml.v3's strict
+// list typing and the user's "silence everything" intent is
+// silently dropped.
+func (u *UserConfig) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		DisableDefaults yaml.Node `yaml:"disable_defaults"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	switch raw.DisableDefaults.Kind {
+	case 0:
+		// field absent — leave zero value.
+	case yaml.ScalarNode:
+		// `disable_defaults: all` (or any bare string) → one-element list.
+		u.DisableDefaults = []string{raw.DisableDefaults.Value}
+	case yaml.SequenceNode:
+		if err := raw.DisableDefaults.Decode(&u.DisableDefaults); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("disable_defaults must be a string or a list of strings")
+	}
+	return nil
 }
 
 // LoadUserConfig reads enju/notify.yaml (or whatever path the
