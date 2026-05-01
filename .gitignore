@@ -1,5 +1,7 @@
-# Binary
-enju
+# Binary (anchored to repo root — without the leading slash, this
+# pattern would also match the cmd/enju/ directory and silently
+# exclude its source files from commits).
+/enju
 
 # Database
 *.db

@@ -41,7 +41,6 @@ var allToolFactories = []struct {
 	{"enju_set_cycle_budget", toolSetCycleBudget},
 	{"enju_show_events", toolShowEvents},
 	{"enju_events_status", toolEventsStatus},
-	{"enju_set_events_enabled", toolSetEventsEnabled},
 	{"enju_list_iterations", toolListIterations},
 	{"enju_file_issue", toolFileIssue},
 	{"enju_list_issues", toolListIssues},

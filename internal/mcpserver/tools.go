@@ -487,7 +487,7 @@ func toolListProjects() mcp.Tool {
 
 func toolCreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription("Create a brand-new Enju project from scratch. Use this when the user wants to start fresh with no existing folder or code. If the user mentions an existing directory, paper draft, or code repository they want to work with, use enju_init instead."),
+		mcp.WithDescription(`Create a brand-new Enju project from scratch. The workspace lives at ~/.enju/workspaces/<slug>-<id>/ — Enju manages it, no cwd magic, no risk of adopting whichever directory the calling LLM happens to be in. Use this when the user wants to start fresh with no existing folder or code. If they mention an existing directory, paper draft, or code repo they want to add Enju on top of, use enju_init instead.`),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Unique project name"),
@@ -649,22 +649,6 @@ func toolShowEvents() mcp.Tool {
 func toolEventsStatus() mcp.Tool {
 	return mcp.NewTool("enju_events_status",
 		mcp.WithDescription(`Report the EventStore's runtime state — enabled flag + monotone counters (enqueued, persisted, dropped, queue depth). Operators read this when triaging audit-log health. Non-zero dropped means the writer can't keep up and gaps are accumulating in the per-project sequence.`),
-	)
-}
-
-// toolSetEventsEnabled flips the runtime kill-switch.
-// Wide-blast operation: flips for the whole coordinator,
-// all tenants, all projects. Disabling stops new emissions
-// AND makes reads return ErrEventStoreDisabled (which surfaces
-// as "audit emission disabled by operator" in the user-facing
-// tools). Re-enabling resumes emissions with NO backfill.
-// Logged on the server side with the toggling citizen.
-func toolSetEventsEnabled() mcp.Tool {
-	return mcp.NewTool("enju_set_events_enabled",
-		mcp.WithDescription(`Flip the EventStore kill-switch at runtime — wide-blast: affects every project on this coordinator. Disabling stops new audit emissions and makes audit reads return "audit emission disabled by operator." Re-enabling resumes emissions with NO backfill — events that would have fired during the disabled window are gone forever. Use to triage runaway events.db, capacity spikes, or to investigate without piling on more emissions.`),
-		mcp.WithBoolean("enabled", mcp.Required(),
-			mcp.Description("True to enable emissions + reads, false to kill the switch"),
-		),
 	)
 }
 

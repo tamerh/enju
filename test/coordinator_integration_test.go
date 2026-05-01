@@ -2123,27 +2123,17 @@ func (s *testServer) findEvent(projectID int64, eventType string) map[string]int
 	return events[0]
 }
 
-// TestEventsAdminEndpoints pins the operator-surface contract
-// for the EventStore kill-switch HTTP endpoints. Covers the
-// whole shape:
-//
-//   - GET /admin/events/status returns enabled + the four Stats
-//     counters when the store is enabled
-//   - GET works the same way when the store is DISABLED — the
-//     disabled state is queryable, not an error path
-//   - POST /admin/events/enabled with {enabled: false} returns
-//     {enabled: false, prior: true, changed: true}
-//   - Idempotent toggle (POST same value twice) reports
-//     changed: false on the second call
-//   - Re-enable flips changed: true again
-//
-// A regression — wrong field name, missing Stats field, status
-// path that 5xx's instead of returning the snapshot — would
-// silently break the operator UX without anything else failing.
-func TestEventsAdminEndpoints(t *testing.T) {
+// TestEventsStatusEndpoint pins the read-only status surface:
+// GET /events/status returns enabled + the four Stats counters,
+// usable by monitoring without grepping logs. The kill-switch
+// itself is flipped via SIGHUP-driven config reload (covered by
+// the cmd/enju config tests), not via HTTP — exposing a write
+// endpoint to any authenticated citizen would let one tenant
+// kill audit for the whole deployment.
+func TestEventsStatusEndpoint(t *testing.T) {
 	s := newTestServer(t)
 
-	got := s.get("/api/v1/admin/events/status")
+	got := s.get("/api/v1/events/status")
 	if enabled, _ := got["enabled"].(bool); !enabled {
 		t.Fatalf("expected enabled=true at boot, got %+v", got)
 	}
@@ -2151,38 +2141,6 @@ func TestEventsAdminEndpoints(t *testing.T) {
 		if _, ok := got[field]; !ok {
 			t.Errorf("status missing field %q (got %+v)", field, got)
 		}
-	}
-
-	resp := s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": false})
-	if enabled, _ := resp["enabled"].(bool); enabled {
-		t.Fatalf("expected enabled=false after toggle, got %+v", resp)
-	}
-	if prior, _ := resp["prior"].(bool); !prior {
-		t.Errorf("expected prior=true (was enabled), got %+v", resp)
-	}
-	if changed, _ := resp["changed"].(bool); !changed {
-		t.Errorf("expected changed=true on first disable, got %+v", resp)
-	}
-
-	got = s.get("/api/v1/admin/events/status")
-	if enabled, _ := got["enabled"].(bool); enabled {
-		t.Fatalf("expected enabled=false on status while disabled, got %+v", got)
-	}
-
-	resp = s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": false})
-	if changed, _ := resp["changed"].(bool); changed {
-		t.Errorf("expected changed=false on idempotent disable, got %+v", resp)
-	}
-
-	resp = s.post("/api/v1/admin/events/enabled", map[string]any{"enabled": true})
-	if enabled, _ := resp["enabled"].(bool); !enabled {
-		t.Fatalf("expected enabled=true after re-enable, got %+v", resp)
-	}
-	if prior, _ := resp["prior"].(bool); prior {
-		t.Errorf("expected prior=false (was disabled), got %+v", resp)
-	}
-	if changed, _ := resp["changed"].(bool); !changed {
-		t.Errorf("expected changed=true on re-enable, got %+v", resp)
 	}
 }
 

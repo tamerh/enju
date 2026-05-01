@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/enju-ai/enju/internal/api"
@@ -59,8 +61,9 @@ Run 'enju <command> -h' for command-specific help.`)
 
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", 8000, "Port to listen on")
-	dbPath := fs.String("db", "enju.db", "Path to SQLite database")
+	configPath := fs.String("config", defaultConfigPath(), "Path to enju.conf (YAML). Missing file is OK — built-in defaults apply.")
+	port := fs.Int("port", 0, "Port to listen on (overrides config)")
+	dbPath := fs.String("db", "", "Path to SQLite state database (overrides config)")
 	// boot-time kill-switch. When false, the
 	// EventStore opens but starts in disabled mode: Record()
 	// is a no-op and reads return ErrEventStoreDisabled. The
@@ -69,12 +72,47 @@ func cmdServe(args []string) {
 	// coordinator with a corrupted events.db to investigate
 	// without firing more emissions, or for capacity-spike
 	// triage where audit can wait.
-	eventsEnabled := fs.Bool("events-enabled", true, "Enable the event store at boot (false = disabled until toggled via admin endpoint)")
+	eventsEnabled := fs.Bool("events-enabled", true, "Enable the event store at boot (overrides config)")
 	fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg, err := LoadServerConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		os.Exit(1)
+	}
 
-	st, err := store.New(*dbPath)
+	// Apply CLI overrides only when the user explicitly set the flag.
+	// flag.Visit walks set-flags only — unset flags keep their
+	// config-supplied value.
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "port":
+			cfg.Coordinator.Port = *port
+		case "db":
+			cfg.Data.StateDB = *dbPath
+		case "events-enabled":
+			b := *eventsEnabled
+			cfg.Events.EmissionEnabled = &b
+		}
+	})
+
+	logWriter, logCloser, err := resolveLogOutput(cfg.Logging.Output)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logging: %v\n", err)
+		os.Exit(1)
+	}
+	if logCloser != nil {
+		defer logCloser.Close()
+	}
+	// LevelVar lets SIGHUP-driven config reload mutate the log
+	// level at runtime — slog.HandlerOptions{Level} is static
+	// and would require rebuilding the handler.
+	logLevel := new(slog.LevelVar)
+	logLevel.Set(parseLogLevel(cfg.Logging.Level))
+	logger := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
+
+	stateDBPath := expandPath(cfg.Data.StateDB)
+	st, err := store.New(stateDBPath)
 	if err != nil {
 		logger.Error("opening database", "error", err)
 		os.Exit(1)
@@ -83,18 +121,24 @@ func cmdServe(args []string) {
 
 	// Events live in their own database alongside the state DB,
 	// with their own connection pool and async writer goroutine.
-	// Path is derived from the state DB so operators don't have
-	// to pass a second flag.
-	eventsPath := deriveEventsDBPath(*dbPath)
+	// Path is derived from the state DB unless explicitly set in
+	// config so operators don't have to pass a second flag.
+	eventsPath := cfg.Data.EventsDB
+	if eventsPath == "" {
+		eventsPath = deriveEventsDBPath(stateDBPath)
+	} else {
+		eventsPath = expandPath(eventsPath)
+	}
 	es, err := store.NewSQLiteEventStore(eventsPath, logger)
 	if err != nil {
 		logger.Error("opening events database", "path", eventsPath, "error", err)
 		os.Exit(1)
 	}
 	defer es.Close()
-	es.SetEnabled(*eventsEnabled)
+	emissionEnabled := cfg.Events.EmissionEnabled == nil || *cfg.Events.EmissionEnabled
+	es.SetEnabled(emissionEnabled)
 	st.AttachEventStore(es)
-	if !*eventsEnabled {
+	if !emissionEnabled {
 		logger.Warn("event store booted disabled — emissions and reads will no-op until toggled via admin endpoint")
 	}
 
@@ -105,15 +149,86 @@ func cmdServe(args []string) {
 
 	srv := api.NewServer(st, logger)
 
-	addr := fmt.Sprintf(":%d", *port)
+	// SIGHUP reload: re-read enju.conf and apply the subset of
+	// changes that are safe to mutate live (events kill-switch,
+	// log level). Bind/port and DB paths require restart — we
+	// log a warning if the operator changes them and SIGHUPs,
+	// rather than silently ignoring or doing something dangerous
+	// like rebinding sockets / closing DBs mid-flight.
+	go reloadOnSIGHUP(*configPath, cfg, es, logLevel, logger)
+
+	addr := fmt.Sprintf("%s:%d", cfg.Coordinator.Bind, cfg.Coordinator.Port)
 	logger.Info("Enju coordinator starting",
-		"port", *port,
-		"db", *dbPath,
+		"bind", cfg.Coordinator.Bind,
+		"port", cfg.Coordinator.Port,
+		"db", stateDBPath,
+		"events_db", eventsPath,
 	)
 
 	if err := http.ListenAndServe(addr, srv.Router()); err != nil {
 		logger.Error("server error", "error", err)
 		os.Exit(1)
+	}
+}
+
+// reloadOnSIGHUP listens for SIGHUP, re-reads the config file, and
+// applies the subset of fields that are safe to mutate at runtime:
+//
+//   - events.emission_enabled → es.SetEnabled(...)
+//   - logging.level           → logLevel.Set(...)
+//
+// Restart-only fields (bind, port, state_db, events_db, log output)
+// log a warning if they changed in the new config — silent ignoring
+// would be the worst kind of footgun.
+//
+// `current` is the live config pointer; reload mutates its fields
+// in place so subsequent reloads see the latest applied state.
+func reloadOnSIGHUP(path string, current *ServerConfig, es store.EventStore, logLevel *slog.LevelVar, logger *slog.Logger) {
+	if path == "" {
+		return
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	for range ch {
+		fresh, err := LoadServerConfig(path)
+		if err != nil {
+			logger.Error("config reload failed — keeping previous values", "error", err)
+			continue
+		}
+		applyConfigReload(current, fresh, es, logLevel, logger)
+	}
+}
+
+// applyConfigReload diffs `fresh` against `current`, applies the
+// runtime-safe fields, and warns about restart-only fields that
+// changed. Mutates `current` in place to track latest applied state.
+// Extracted from reloadOnSIGHUP so it's directly testable without
+// sending real signals.
+func applyConfigReload(current, fresh *ServerConfig, es store.EventStore, logLevel *slog.LevelVar, logger *slog.Logger) {
+	warnRestartOnly(logger, "coordinator.bind", current.Coordinator.Bind, fresh.Coordinator.Bind)
+	warnRestartOnly(logger, "coordinator.port", current.Coordinator.Port, fresh.Coordinator.Port)
+	warnRestartOnly(logger, "data.state_db", current.Data.StateDB, fresh.Data.StateDB)
+	warnRestartOnly(logger, "data.events_db", current.Data.EventsDB, fresh.Data.EventsDB)
+	warnRestartOnly(logger, "logging.output", current.Logging.Output, fresh.Logging.Output)
+
+	if fresh.Logging.Level != current.Logging.Level {
+		logLevel.Set(parseLogLevel(fresh.Logging.Level))
+		logger.Info("config reload: log level changed", "from", current.Logging.Level, "to", fresh.Logging.Level)
+		current.Logging.Level = fresh.Logging.Level
+	}
+	freshEnabled := fresh.Events.EmissionEnabled == nil || *fresh.Events.EmissionEnabled
+	currentEnabled := current.Events.EmissionEnabled == nil || *current.Events.EmissionEnabled
+	if freshEnabled != currentEnabled {
+		es.SetEnabled(freshEnabled)
+		logger.Warn("config reload: events kill-switch flipped", "from", currentEnabled, "to", freshEnabled)
+		current.Events.EmissionEnabled = fresh.Events.EmissionEnabled
+	}
+	logger.Info("config reload complete")
+}
+
+func warnRestartOnly[T comparable](logger *slog.Logger, key string, old, new T) {
+	if old != new {
+		logger.Warn("config reload: field changed but requires restart — ignoring", "key", key, "current", old, "in_file", new)
 	}
 }
 

@@ -366,15 +366,13 @@ func (s *Server) Router() http.Handler {
 		r.Post("/projects/{projectID}/issues/{issueSeq}/triage", s.handleTriageIssue)
 		r.Post("/projects/{projectID}/issues/{issueSeq}/close", s.handleCloseIssue)
 
-		// event-store kill-switch admin surface.
-		// Auth gate is the standard authMiddleware (any
-		// citizen with a valid Bearer token can flip),
-		// matching how every other write endpoint here is
-		// protected. A real admin tier with token rotation
-		// is hosted-mode work — tracked in the pre-launch
-		// production-readiness section of TODO.md.
-		r.Get("/admin/events/status", s.handleEventsStatus)
-		r.Post("/admin/events/enabled", s.handleSetEventsEnabled)
+		// event-store status (read-only). Operators flip the
+		// kill-switch by editing enju.conf and sending SIGHUP
+		// to the coordinator, not via HTTP — no admin tier
+		// exists yet, and exposing a write endpoint to any
+		// authenticated citizen would let one tenant kill
+		// audit for the whole deployment.
+		r.Get("/events/status", s.handleEventsStatus)
 
 		// Legacy flat listing — still useful for dashboards
 		r.Get("/runs", s.handleListRuns)
@@ -2360,24 +2358,13 @@ func (s *Server) handleReportMerge(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- event-store kill-switch admin endpoints ---
-
-// setEventsEnabledRequest is the body shape for
-// POST /admin/events/enabled. The coordinator flips the
-// in-memory enabled flag on the EventStore (no restart
-// needed). Disabling stops new emissions immediately and
-// makes reads return ErrEventStoreDisabled. Re-enabling
-// resumes emissions with NO backfill — events that would
-// have fired during the disabled window are gone.
-type setEventsEnabledRequest struct {
-	Enabled bool `json:"enabled"`
-}
+// --- event-store status (read-only) ---
 
 // handleEventsStatus returns the EventStore's runtime state:
-// enabled flag + Stats() snapshot. Unauthenticated callers
-// already get blocked by authMiddleware; we don't gate
-// further. Surfaces enough for an operator to answer "are
-// events landing?" without grepping logs.
+// enabled flag + Stats() snapshot. Read-only — the kill-switch
+// is flipped by editing enju.conf and SIGHUP, not via HTTP.
+// Useful for monitoring "are events landing? are we dropping?"
+// without grepping logs.
 func (s *Server) handleEventsStatus(w http.ResponseWriter, r *http.Request) {
 	es := s.store.Events()
 	stats := es.Stats()
@@ -2387,34 +2374,6 @@ func (s *Server) handleEventsStatus(w http.ResponseWriter, r *http.Request) {
 		"persisted":  stats.Persisted,
 		"dropped":   stats.Dropped,
 		"queue_depth": stats.QueueDepth,
-	})
-}
-
-// handleSetEventsEnabled flips the kill-switch at runtime.
-// Logs the toggling citizen for the audit trail (since the
-// kill-switch event itself can't fire through a disabled
-// store, this log line is the only record of who flipped
-// what when).
-func (s *Server) handleSetEventsEnabled(w http.ResponseWriter, r *http.Request) {
-	var req setEventsEnabledRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	caller := citizenFromRequest(r)
-	es := s.store.Events()
-	prior := es.Enabled()
-	es.SetEnabled(req.Enabled)
-	s.logger.Warn("event store kill-switch toggled",
-		"citizen_id", caller.ID,
-		"citizen", caller.Username,
-		"prior", prior,
-		"now", req.Enabled,
-	)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"enabled": req.Enabled,
-		"prior":  prior,
-		"changed": prior != req.Enabled,
 	})
 }
 
