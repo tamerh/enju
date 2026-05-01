@@ -58,6 +58,13 @@ type apiClient struct {
 	profileOnce  sync.Once
 	profileName  string
 	profileEmail string
+	profileKind  string // "human" | "bot" | "model" — see citizenKind()
+
+	// notifySup is the auto-subscribe notification supervisor.
+	// Nil when Config.Notify wasn't supplied; handlers that call
+	// notifySup.Switch tolerate nil receivers as a no-op so the
+	// "notify disabled" path costs nothing at the call site.
+	notifySup *notifySupervisor
 }
 
 func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {
@@ -254,14 +261,39 @@ func (c *apiClient) ensureCitizenFresh(ctx context.Context) error {
 // least make different citizens' commits distinguishable in
 // contributor graphs instead of collapsing to one bot identity.
 func (c *apiClient) commitAuthor(ctx context.Context) (name, email string) {
+	c.loadProfile(ctx)
+	return c.profileName, c.profileEmail
+}
+
+// citizenKind returns the calling citizen's kind ("human" |
+// "bot" | "model"), populated lazily through the same one-shot
+// fetch as commitAuthor. Defaults to "human" on lookup failure
+// or unmigrated rows where Kind is empty server-side. Used by
+// handlers that need to attribute behavior by kind (e.g.
+// request_clarification's trigger field) without paying a per-
+// call HTTP round-trip.
+func (c *apiClient) citizenKind(ctx context.Context) string {
+	c.loadProfile(ctx)
+	if c.profileKind == "" {
+		return "human"
+	}
+	return c.profileKind
+}
+
+// loadProfile fetches the citizen profile once and stashes the
+// fields we care about on apiClient. Shared by commitAuthor and
+// citizenKind so a single GET populates both. Safe to call
+// repeatedly — sync.Once gates the network.
+func (c *apiClient) loadProfile(ctx context.Context) {
 	c.profileOnce.Do(func() {
 		// Default values — used if the fetch fails.
 		c.profileName = c.username
 		c.profileEmail = c.username + "@enju.local"
+		c.profileKind = "human"
 
 		data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username)
 		if err != nil {
-			c.logger.Warn("commitAuthor: failed to fetch profile, using defaults",
+			c.logger.Warn("loadProfile: failed to fetch profile, using defaults",
 				"username", c.username, "error", err)
 			return
 		}
@@ -275,8 +307,10 @@ func (c *apiClient) commitAuthor(ctx context.Context) (name, email string) {
 		if e, ok := p["email"].(string); ok && e != "" {
 			c.profileEmail = e
 		}
+		if k, ok := p["kind"].(string); ok && k != "" {
+			c.profileKind = k
+		}
 	})
-	return c.profileName, c.profileEmail
 }
 
 // fetchProjectMeta reads a project's metadata from the coordinator.

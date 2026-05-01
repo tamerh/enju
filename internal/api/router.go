@@ -6258,11 +6258,19 @@ func (s *Server) handleCitizenDashboard(w http.ResponseWriter, r *http.Request) 
 // responses. The internal int id is omitted — callers who need it can
 // read `citizen.id` directly from the store.
 func citizenToMap(c *store.CitizenRecord) map[string]interface{} {
+	// kind defaults to "human" in the wire shape — pre-Phase-1.1
+	// citizens have c.Kind="" in the DB, and the human/bot/model
+	// discriminator is the v1 default for unmigrated rows.
+	kind := c.Kind
+	if kind == "" {
+		kind = "human"
+	}
 	return map[string]interface{}{
 		"username":      c.Username,
 		"name":        c.Name,
 		"email":       c.Email,
 		"role":        c.Role,
+		"kind":        kind,
 		"score":       c.Score,
 		"tasks_completed":  c.TasksCompleted,
 		"tasks_timed_out":  c.TasksTimedOut,

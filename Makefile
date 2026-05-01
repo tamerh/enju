@@ -34,8 +34,11 @@ PORT ?= 8333
 dev-restart: build
 	@echo "==> Stopping existing enju processes..."
 	-@pkill -f "enju serve" 2>/dev/null; sleep 1
-	@echo "==> Wiping DB + git-dir + workspaces (keeping credentials)..."
-	rm -rf ~/.enju/enju.db ~/.enju/git-dir ~/.enju/repos
+	@echo "==> Wiping DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
+	rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
+	rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
+	rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json
+	rm -rf ~/.enju/git-dir ~/.enju/repos
 	rm -rf ~/.enju/workspaces
 	mkdir -p ~/.enju/workspaces
 	@echo "==> Starting coordinator on port $(PORT)..."

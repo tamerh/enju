@@ -19,7 +19,6 @@ import (
 	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
-	"github.com/enju-ai/enju/internal/notify"
 	"github.com/enju-ai/enju/internal/scheduler"
 	"github.com/enju-ai/enju/internal/store"
 	"github.com/mark3labs/mcp-go/server"
@@ -409,6 +408,16 @@ func cmdMCP(args []string) {
 		os.Exit(1)
 	}
 
+	// Tier 1 notification poller — auto-subscribes to the project
+	// the user is working with. The supervisor inside mcpserver
+	// resumes from ~/.enju/notify-active.json on startup; tool
+	// handlers (create_project, init) call Switch when the user
+	// touches a project, so the active record stays current.
+	// -notify-project, when non-zero, overrides the saved record.
+	notifyCtx, cancelNotify := context.WithCancel(context.Background())
+	defer cancelNotify()
+	notifyOpts := buildNotifyOptions(notifyCtx, logger, credsKey, *notifyConfigPath, *notifyProject)
+
 	s := mcpserver.New(mcpserver.Config{
 		CoordinatorURL: *coordinator,
 		Username:    *username,
@@ -421,20 +430,8 @@ func cmdMCP(args []string) {
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)
 		},
+		Notify: notifyOpts,
 	})
-
-	// Tier 1 notification poller. Opt-in via -notify-project so
-	// users who don't want background HTTP traffic pay nothing.
-	// The goroutine polls the coordinator's /events long-poll
-	// endpoint, matches against Layer 1 defaults + Layer 3 user
-	// rules, and dispatches via desktop/shell/slack adapters. It
-	// dies when ctx is cancelled (which happens on stdio close
-	// after ServeStdio returns).
-	notifyCtx, cancelNotify := context.WithCancel(context.Background())
-	defer cancelNotify()
-	if *notifyProject != 0 {
-		startNotifySubsystem(notifyCtx, logger, *notifyProject, *notifyConfigPath, *coordinator, *username, token)
-	}
 
 	fmt.Fprintf(os.Stderr, "MCP server starting (stdio mode)...\n")
 	if err := server.ServeStdio(s); err != nil {
@@ -444,57 +441,38 @@ func cmdMCP(args []string) {
 	fmt.Fprintf(os.Stderr, "MCP server exited cleanly\n")
 }
 
-// startNotifySubsystem boots the bundled notify poller. Loads
-// Layer 3 user rules from notify.yaml (or default path) and
-// kicks off notify.Run in a goroutine. Layer 1 defaults fire
-// automatically unless DisableDefaults says otherwise.
+// buildNotifyOptions assembles the boot-time wiring the
+// mcpserver supervisor needs to manage notify lifecycles. The
+// supervisor itself takes over from here: it auto-resumes from
+// ~/.enju/notify-active.json on startup, switches projects when
+// tool handlers (create_project, init) fire, and dies cleanly
+// when ctx is cancelled. Returns nil when home-dir discovery
+// fails (Layer 3 config can't be located), which mcpserver
+// treats as "notify disabled" and the cost is zero.
 //
-// Failure modes (config parse error, transient HTTP issues) are
-// logged but never block MCP startup — the user's primary tool
-// is the MCP server itself, and missing notifications is a soft
-// degradation.
-func startNotifySubsystem(ctx context.Context, logger *slog.Logger, projectID int64, configPath, coordinator, username, token string) {
+// initialProjectID, when non-zero, is the explicit -notify-project
+// flag override; mcpserver kicks off polling for that project
+// regardless of any saved active record.
+func buildNotifyOptions(ctx context.Context, logger *slog.Logger, coordinatorKey, configPath string, initialProjectID int64) *mcpserver.NotifyOptions {
 	home, homeErr := os.UserHomeDir()
 	if homeErr != nil {
-		logger.Warn("notify: cannot resolve user home dir — config + state file paths will be empty (defaults still fire, no cross-restart cursor persistence)",
+		logger.Warn("notify: cannot resolve user home dir — disabling notification subsystem for this session",
 			"err", homeErr)
+		return nil
 	}
-	if configPath == "" && home != "" {
+	if configPath == "" {
 		configPath = filepath.Join(home, ".enju", "notify.yaml")
 	}
-
-	uc, warnings, err := notify.LoadUserConfig(configPath)
-	if err != nil {
-		logger.Warn("notify: failed to load user config — continuing with Layer 1 defaults only",
-			"path", configPath, "err", err)
-		uc = notify.UserConfig{}
+	return &mcpserver.NotifyOptions{
+		UserConfigPath:    configPath,
+		StateFileFunc:     func(pid int64) string {
+			return filepath.Join(home, ".enju", fmt.Sprintf("notify-state-%d.json", pid))
+		},
+		ActiveProjectPath: filepath.Join(home, ".enju", "notify-active.json"),
+		CoordinatorKey:    coordinatorKey,
+		ParentCtx:         ctx,
+		InitialProjectID:  initialProjectID,
 	}
-	for _, w := range warnings {
-		logger.Warn("notify: config issue", "path", configPath, "issue", w)
-	}
-
-	stateFile := ""
-	if home != "" {
-		stateFile = filepath.Join(home, ".enju", fmt.Sprintf("notify-state-%d.json", projectID))
-	}
-
-	cfg := notify.Config{
-		CoordinatorURL:  coordinator,
-		ProjectID:       projectID,
-		Username:        username,
-		BearerToken:     token,
-		Rules:           uc.ToRules(),
-		DisableDefaults: uc.DisableDefaults,
-		StateFile:       stateFile,
-		Logger:          logger,
-	}
-
-	go func() {
-		logger.Info("notify: starting Tier 1 poller", "project_id", projectID, "rules", len(cfg.Rules), "config", configPath)
-		if err := notify.Run(ctx, cfg); err != nil && ctx.Err() == nil {
-			logger.Error("notify: poller exited with error", "err", err)
-		}
-	}()
 }
 
 // --- wrap-task ---

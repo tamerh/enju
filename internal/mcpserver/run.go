@@ -348,13 +348,27 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 		// anyone, matching pre-Phase-3 behavior.
 	}
 
+	// Trigger reflects who asked — derived from the calling
+	// citizen's kind (cached on apiClient via citizenKind, no
+	// per-call round-trip). Bots calling this idiom emit
+	// trigger=bot (the common case, audit-clear "bot needed
+	// clarification"). Humans calling are valid too (a reviewer
+	// pinging the author for context); we don't want their spawn
+	// event mislabeled. Fall back to "human" on lookup failure:
+	// that's spawn.go's own default for an empty trigger, and the
+	// citizen field on the event still carries the actual identity.
+	trigger := "human"
+	if c.citizenKind(ctx) == "bot" {
+		trigger = "bot"
+	}
+
 	body := map[string]interface{}{
 		"task_def_id":    taskDefID,
 		"action":         "answer",
 		"prompt":         prompt,
 		"assign_to":      []string{assignTo},
 		"citizens":       1,
-		"trigger":        "bot",
+		"trigger":        trigger,
 		"parent_task_id": req.GetString("parent_task_id", ""),
 	}
 

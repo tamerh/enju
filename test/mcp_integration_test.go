@@ -423,6 +423,151 @@ func TestMCPRequestClarification(t *testing.T) {
 	if !strings.Contains(task.AssignTo, humanUsername) {
 		t.Errorf("expected human's username %q in AssignTo, got %q", humanUsername, task.AssignTo)
 	}
+
+	// Spawn event's subtype must reflect the CALLER'S kind, not
+	// a hardcoded "bot". The "Bot Citizen" registered above is
+	// actually kind=human (default for register()), so the spawn
+	// event should carry subtype=human. A regression that re-
+	// hardcodes trigger="bot" would surface here. The bot-caller
+	// path is exercised by TestMCPRequestClarificationBotCaller.
+	h.store.Events().WaitForDrain(500 * time.Millisecond)
+	spawnEvents, err := h.store.ListEvents(store.EventQuery{
+		ProjectID:  projectID,
+		EventTypes: []string{"task_spawned"},
+	})
+	if err != nil {
+		t.Fatalf("query spawn events: %v", err)
+	}
+	var clarifySpawn *store.RunEventRecord
+	for i, ev := range spawnEvents {
+		if ev.TaskID == clarifyTaskID {
+			clarifySpawn = &spawnEvents[i]
+			break
+		}
+	}
+	if clarifySpawn == nil {
+		t.Fatalf("no task_spawned event found for %s; got %d spawn events", clarifyTaskID, len(spawnEvents))
+	}
+	if clarifySpawn.Subtype != "human" {
+		t.Errorf("spawn subtype = %q, want %q (caller is kind=human, not the hardcoded \"bot\")",
+			clarifySpawn.Subtype, "human")
+	}
+}
+
+// TestMCPRequestClarificationBotCaller pins the bot-caller arm
+// of the kind-derived trigger fix. Registers a kind=bot citizen
+// (via the same /citizens/me/bots endpoint real bots use), runs
+// the clarification request as that bot, and verifies the spawn
+// event's subtype is "bot". Without this, a regression that
+// dropped the citizenKind() branch in handleRequestClarification
+// would only break for bots — humans would still emit subtype=
+// human and the existing test would pass.
+func TestMCPRequestClarificationBotCaller(t *testing.T) {
+	h := newMCPHarness(t, "Parent Human")
+
+	humanUsername := h.testServer.register("Human Researcher")
+	projectID := h.createTestProject()
+
+	// Spawn a bot owned by the harness's parent human via the
+	// real registration endpoint. Returns the bot's token, which
+	// we plug into a separate TestClient.
+	resp := h.post("/api/v1/citizens/me/bots", map[string]string{
+		"name": "Notify Bot",
+	})
+	botUsername, _ := resp["username"].(string)
+	botToken, _ := resp["token"].(string)
+	if botUsername == "" || botToken == "" {
+		t.Fatalf("register bot: %v", resp)
+	}
+
+	// Add bot, parent, and human to the project so all three
+	// pass membership gating. Without bot membership, its MCP
+	// calls would hit "not a member of project" before reaching
+	// the trigger logic we're testing.
+	humanCitizen, _ := h.store.GetCitizenByUsername(humanUsername)
+	parentCitizen, _ := h.store.GetCitizenByUsername(h.username)
+	botCitizen, _ := h.store.GetCitizenByUsername(botUsername)
+	if humanCitizen == nil || parentCitizen == nil || botCitizen == nil {
+		t.Fatal("missing one of: human, parent, bot citizen")
+	}
+	if err := h.store.AddProjectMember(projectID, parentCitizen.ID, "owner", 0); err != nil {
+		t.Fatalf("add parent: %v", err)
+	}
+	if err := h.store.AddProjectMember(projectID, humanCitizen.ID, "member", 0); err != nil {
+		t.Fatalf("add human: %v", err)
+	}
+	if err := h.store.AddProjectMember(projectID, botCitizen.ID, "member", 0); err != nil {
+		t.Fatalf("add bot: %v", err)
+	}
+
+	// Build a TestClient identified as the bot.
+	botClient := mcpserver.NewTestClient(mcpserver.Config{
+		CoordinatorURL: h.url,
+		Username:       botUsername,
+		CitizenName:    "Notify Bot",
+		AuthToken:      botToken,
+		ModelName:      "test-model",
+		Workspace:      h.workspace,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// Need a run for the spawn target.
+	yamlBody, err := readFixture("simple-no-deps.yaml")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"yaml":       yamlBody,
+	})
+	ready := h.readyTasks("")
+	if len(ready) == 0 {
+		t.Fatal("expected ready tasks after create_run")
+	}
+	firstID, _ := ready[0].(map[string]interface{})["id"].(string)
+	parts := strings.SplitN(firstID, ":", 3)
+	runSeq, _ := strconv.Atoi(parts[1])
+
+	// Bot calls the clarification tool — this is the case the
+	// reviewer flagged as untested.
+	res := h.mcpCallOKVia(t, botClient, "enju_request_clarification", map[string]any{
+		"project_id":  float64(projectID),
+		"run_id":      float64(runSeq),
+		"task_def_id": "ask_human_clarification",
+		"prompt":      "Should I use ISO-8601 or Unix timestamps?",
+		"assign_to":   humanUsername,
+	})
+	if res.IsError {
+		t.Fatalf("clarification tool errored: %s", mcpText(res))
+	}
+
+	clarifyTaskID := fmt.Sprintf("%d:%d:ask_human_clarification", projectID, runSeq)
+	h.store.Events().WaitForDrain(500 * time.Millisecond)
+	spawnEvents, err := h.store.ListEvents(store.EventQuery{
+		ProjectID:  projectID,
+		EventTypes: []string{"task_spawned"},
+	})
+	if err != nil {
+		t.Fatalf("query spawn events: %v", err)
+	}
+	var clarifySpawn *store.RunEventRecord
+	for i, ev := range spawnEvents {
+		if ev.TaskID == clarifyTaskID {
+			clarifySpawn = &spawnEvents[i]
+			break
+		}
+	}
+	if clarifySpawn == nil {
+		t.Fatalf("no task_spawned event for %s", clarifyTaskID)
+	}
+	if clarifySpawn.Subtype != "bot" {
+		t.Errorf("bot caller: spawn subtype = %q, want %q (kind-derived trigger broken on the bot arm)",
+			clarifySpawn.Subtype, "bot")
+	}
+	// Citizen field carries the actual handle regardless — sanity check.
+	if clarifySpawn.Citizen != botUsername {
+		t.Errorf("spawn citizen = %q, want %q", clarifySpawn.Citizen, botUsername)
+	}
 }
 
 // TestMCPRecentEvents pins the assistant-friendly polling tool:

@@ -211,6 +211,10 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 							"project_id", projectID, "remote", remote, "error", err)
 					}
 				}
+				// Auto-subscribe notifications to the just-created
+				// project. Nil supervisor (notify-disabled session)
+				// no-ops cleanly.
+				c.notifySup.Switch(projectID)
 			}
 		}
 	}
@@ -444,6 +448,10 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 				if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
 					c.logger.Warn("opening init'd folder", "error", perr)
 				}
+				// Auto-subscribe notifications. Same rationale
+				// as create_project — init signals "I'm working
+				// here now" so the cross-restart record updates.
+				c.notifySup.Switch(projectID)
 			}
 		}
 	}
