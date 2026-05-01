@@ -675,6 +675,306 @@ func TestCreateProjectLocalOnlyWorkingTree(t *testing.T) {
 	}
 }
 
+// TestCreateProjectCustomPathFresh verifies the optional path=
+// parameter on enju_create_project: the workspace lands at the
+// caller-supplied absolute path (registered as an external dir),
+// not under ~/.enju/workspaces/<slug>-<id>/.
+func TestCreateProjectCustomPathFresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo","remote_url":""}`))
+	})
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	wsDir := t.TempDir()
+	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new workspace: %v", err)
+	}
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	customPath := filepath.Join(t.TempDir(), "my-project")
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": customPath,
+			},
+		},
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
+	}
+
+	// Workspace should resolve to the custom path, not the
+	// default ~/.enju/workspaces/ location.
+	proj, err := ws.ForProject(1, "")
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+	if proj.WorkDir() != customPath {
+		t.Errorf("WorkDir = %q, want %q", proj.WorkDir(), customPath)
+	}
+}
+
+// TestCreateProjectCustomPathRefusesPopulated pins the safety
+// guarantee on enju_create_project: a path with existing content
+// is refused with a curative error pointing to enju_init.
+func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	customPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(customPath, "existing.txt"), []byte("user data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": customPath,
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected curative error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for populated path")
+	}
+	// The error must point the user at enju_init, not just refuse.
+	gotText := mcpResultText(t, result)
+	if !strings.Contains(gotText, "enju_init") {
+		t.Errorf("error message should route to enju_init, got: %s", gotText)
+	}
+	// Also: existing file must remain untouched.
+	if _, err := os.Stat(filepath.Join(customPath, "existing.txt")); err != nil {
+		t.Errorf("existing file disturbed: %v", err)
+	}
+}
+
+// TestCreateProjectCustomPathRejectsWithRemoteURL pins the
+// path-vs-remote_url mutex: passing both is a config-drift bug
+// (the custom-path branch seeds a local tree without cloning the
+// remote, so the project record would persist a remote_url it
+// never actually pulled from). Refuse the combo upfront.
+func TestCreateProjectCustomPathRejectsWithRemoteURL(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name":       "demo",
+				"path":       filepath.Join(t.TempDir(), "ws"),
+				"remote_url": "git@github.com:org/repo.git",
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for path+remote_url combo")
+	}
+	gotText := mcpResultText(t, result)
+	if !strings.Contains(gotText, "mutually exclusive") {
+		t.Errorf("error message should explain mutual exclusion, got: %s", gotText)
+	}
+}
+
+// TestCreateProjectCustomPathCreatesNonExistentParents pins the
+// "user passes /var/enju_runs/my-project where /var/enju_runs/
+// doesn't exist yet" case. MkdirAll handles it; the test ensures
+// the contract doesn't regress to refusing missing parents.
+func TestCreateProjectCustomPathCreatesNonExistentParents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo","remote_url":""}`))
+	})
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	wsDir := t.TempDir()
+	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("new workspace: %v", err)
+	}
+
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	deepPath := filepath.Join(t.TempDir(), "missing", "parent", "chain", "project")
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": deepPath,
+			},
+		},
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("handleCreateProject: err=%v result=%+v text=%s", err, result, mcpResultText(t, result))
+	}
+	if _, statErr := os.Stat(deepPath); statErr != nil {
+		t.Errorf("expected mkdir -p to create %q, got: %v", deepPath, statErr)
+	}
+}
+
+// TestCreateProjectCustomPathRefusesSymlink pins the symlink
+// rejection. Following symlinks silently is a footgun: a user
+// passing path=link-to-populated-repo would either get a
+// confusing "not empty" error (mentioning the link path, not
+// the target) or, if the target is empty, end up with the
+// project's working tree dual-rooted via the symlink.
+func TestCreateProjectCustomPathRefusesSymlink(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "real-target")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported on this filesystem: %v", err)
+	}
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": link,
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for symlink path")
+	}
+	gotText := mcpResultText(t, result)
+	if !strings.Contains(gotText, "symlink") {
+		t.Errorf("error message should mention symlink + suggest readlink, got: %s", gotText)
+	}
+}
+
+// TestCreateProjectCustomPathRefusesRegularFile pins the "user
+// passed a file path" case — confusing without a clear error.
+func TestCreateProjectCustomPathRefusesRegularFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	tmp := t.TempDir()
+	filePath := filepath.Join(tmp, "not-a-dir.txt")
+	if err := os.WriteFile(filePath, []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": filePath,
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for file path")
+	}
+	gotText := mcpResultText(t, result)
+	if !strings.Contains(gotText, "not a directory") {
+		t.Errorf("error message should mention 'not a directory', got: %s", gotText)
+	}
+}
+
+// TestCreateProjectCustomPathRefusesRelative pins the absolute-
+// path requirement.
+func TestCreateProjectCustomPathRefusesRelative(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_create_project",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": "relative/path",
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for relative path")
+	}
+}
+
 // TestInitFolderWithoutGit verifies that enju_init on a plain
 // folder (no .git) initializes git, writes the scaffold, and
 // registers the external dir so ForProject opens it directly.

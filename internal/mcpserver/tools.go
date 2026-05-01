@@ -487,10 +487,19 @@ func toolListProjects() mcp.Tool {
 
 func toolCreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription(`Create a brand-new Enju project from scratch. The workspace lives at ~/.enju/workspaces/<slug>-<id>/ — Enju manages it, no cwd magic, no risk of adopting whichever directory the calling LLM happens to be in. Use this when the user wants to start fresh with no existing folder or code. If they mention an existing directory, paper draft, or code repo they want to add Enju on top of, use enju_init instead.`),
+		mcp.WithDescription(`Create a brand-new Enju project from scratch. Always creates a fresh workspace — guaranteed not to overwrite anything in an existing populated directory.
+
+Workspace location:
+  - Default: ~/.enju/workspaces/<slug>-<id>/ — Enju picks the location, no cwd magic.
+  - With path=: the absolute path you provide. Must be empty or not yet exist; populated paths are refused with a pointer to enju_init.
+
+Use this when the user wants to start fresh. If they have an existing folder, paper draft, or code repo to add Enju on top of, use enju_init instead.`),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Unique project name"),
+		),
+		mcp.WithString("path",
+			mcp.Description(`Optional absolute path for the workspace. Empty or non-existent only — populated paths are refused (use enju_init for those). Mutually exclusive with remote_url: path= seeds a fresh local working tree, it does not clone. Default: ~/.enju/workspaces/<slug>-<id>/.`),
 		),
 		mcp.WithString("description",
 			mcp.Description("Optional project description"),

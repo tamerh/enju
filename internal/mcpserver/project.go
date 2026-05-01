@@ -102,6 +102,63 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	description := req.GetString("description", "")
 	remoteURL := req.GetString("remote_url", "")
 	defaultBranch := req.GetString("default_branch", "")
+	customPath := req.GetString("path", "")
+
+	// Validate optional `path`: must be absolute, must be empty
+	// or non-existent. The "fresh" guarantee on this tool means
+	// callers can trust we won't overwrite anything — populated
+	// directories must go through enju_init instead.
+	if customPath != "" {
+		// path + remote_url combined would be ambiguous: the
+		// custom-path code path seeds a fresh local working tree
+		// rather than cloning, so the project record would persist
+		// a remote_url it never actually cloned from. Refuse loudly
+		// rather than create that drift silently. Users who want
+		// "clone <remote> into <path>" run `git clone` manually
+		// then `enju_init`.
+		if remoteURL != "" {
+			return mcp.NewToolResultError("path and remote_url are mutually exclusive — enju_create_project with path= seeds a fresh local working tree, it does not clone. To use a remote, either omit path= (workspace lands at ~/.enju/workspaces/) or git-clone the remote yourself and run enju_init on the resulting directory."), nil
+		}
+		if !filepath.IsAbs(customPath) {
+			return mcp.NewToolResultError(fmt.Sprintf("path must be absolute, got %q", customPath)), nil
+		}
+		// Lstat (not Stat) so symlinks surface as symlinks rather
+		// than being silently followed. Following symlinks would
+		// be a footgun: a user passing path=/home/me/proj where
+		// proj is a symlink to a populated repo would either get
+		// "refused, not empty" (confusing — they thought proj was
+		// fresh) or, worse if the target is empty, end up with
+		// the project's working tree dual-rooted via the symlink.
+		// Real directory paths only.
+		info, lstatErr := os.Lstat(customPath)
+		switch {
+		case lstatErr == nil:
+			if info.Mode()&os.ModeSymlink != 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("path %q is a symlink — pass a real directory path. If you intended the link target, resolve it with `readlink -f` and pass that instead.", customPath)), nil
+			}
+			if !info.IsDir() {
+				return mcp.NewToolResultError(fmt.Sprintf("path %q exists but is not a directory", customPath)), nil
+			}
+			entries, readErr := os.ReadDir(customPath)
+			if readErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("reading %q: %v", customPath, readErr)), nil
+			}
+			if len(entries) > 0 {
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"path %q exists and is not empty — enju_create_project requires an empty or non-existent directory. To adopt a populated folder, use enju_init with the same path.",
+					customPath,
+				)), nil
+			}
+		case os.IsNotExist(lstatErr):
+			// Doesn't exist — fall through to MkdirAll, which
+			// handles non-existent parent chains too.
+		default:
+			return mcp.NewToolResultError(fmt.Sprintf("checking path %q: %v", customPath, lstatErr)), nil
+		}
+		if mkErr := os.MkdirAll(customPath, 0755); mkErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("creating %q: %v", customPath, mkErr)), nil
+		}
+	}
 
 	body := map[string]string{
 		"name":        name,
@@ -118,18 +175,21 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 
 	// Eagerly initialize the workspace so the project directory
 	// exists immediately after creation — not lazily on first
-	// claim. Two paths:
+	// claim. Three paths:
 	//
+	//   - customPath set: register as external dir, ForProject
+	//     opens it directly (and git-inits if needed). Skips the
+	//     ~/.enju/workspaces/<slug>-<id>/ default and the
+	//     remote-clone path; the workspace IS the user's chosen
+	//     directory.
 	//   - remote_url set: ForProject clones from the remote.
 	//     Confirms the git remote is reachable at creation time
 	//     instead of failing at first task.
-	//
-	//   - remote_url empty: ForProject's local-only path
-	//     init's the working tree and seeds it with one commit
-	//     (README + enju/templates/.gitkeep). No shadow bare —
-	//     async reconciliation works via the scanner's
-	//     refs/heads/<branch> fallback. The user sees a single
-	//     git folder, behaves like `git init` would.
+	//   - both empty: ForProject's local-only path init's the
+	//     working tree under ~/.enju/workspaces/<slug>-<id>/ and
+	//     seeds it with one commit (README + enju/templates/
+	//     .gitkeep). No shadow bare — async reconciliation works
+	//     via the scanner's refs/heads/<branch> fallback.
 	//
 	// Failures are non-fatal at this point: the project record
 	// is registered, and the next tool call will retry the
@@ -138,10 +198,18 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
-				remote, projName, _ := c.fetchProjectMetaFull(ctx, projectID)
-				if _, err := c.workspace.ForProject(projectID, remote, projName); err != nil {
-					c.logger.Warn("eager workspace init failed (will retry on first task)",
-						"project_id", projectID, "remote", remote, "error", err)
+				if customPath != "" {
+					c.workspace.RegisterExternalDir(projectID, customPath)
+					if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
+						c.logger.Warn("eager workspace init at custom path failed",
+							"project_id", projectID, "path", customPath, "error", perr)
+					}
+				} else {
+					remote, projName, _ := c.fetchProjectMetaFull(ctx, projectID)
+					if _, err := c.workspace.ForProject(projectID, remote, projName); err != nil {
+						c.logger.Warn("eager workspace init failed (will retry on first task)",
+							"project_id", projectID, "remote", remote, "error", err)
+					}
 				}
 			}
 		}
