@@ -129,7 +129,9 @@ func cmdServe(args []string) {
 	} else {
 		eventsPath = expandPath(eventsPath)
 	}
-	es, err := store.NewSQLiteEventStore(eventsPath, logger)
+	es, err := store.NewSQLiteEventStore(eventsPath, logger,
+		store.WithQueueSize(cfg.Performance.EventQueueSize),
+	)
 	if err != nil {
 		logger.Error("opening events database", "path", eventsPath, "error", err)
 		os.Exit(1)
@@ -141,13 +143,16 @@ func cmdServe(args []string) {
 	if !emissionEnabled {
 		logger.Warn("event store booted disabled — emissions and reads will no-op until toggled via admin endpoint")
 	}
+	store.SetEventDrainBudget(parseDurationOr(cfg.Performance.EventDrainBudget, 100*time.Millisecond))
 
-	// Start task reaper.
-	reaper := scheduler.NewReaper(st, 60*time.Second, logger)
+	// Start task reaper at the operator-configured interval.
+	reaper := scheduler.NewReaper(st, parseDurationOr(cfg.Performance.ReaperInterval, 60*time.Second), logger)
 	reaper.Start()
 	defer reaper.Stop()
 
-	srv := api.NewServer(st, logger)
+	srv := api.NewServerWithOptions(st, logger, api.ServerOptions{
+		HTTPRequestTimeout: parseDurationOr(cfg.Performance.HTTPRequestTimeout, 30*time.Second),
+	})
 
 	// SIGHUP reload: re-read enju.conf and apply the subset of
 	// changes that are safe to mutate live (events kill-switch,
@@ -210,6 +215,14 @@ func applyConfigReload(current, fresh *ServerConfig, es store.EventStore, logLev
 	warnRestartOnly(logger, "data.state_db", current.Data.StateDB, fresh.Data.StateDB)
 	warnRestartOnly(logger, "data.events_db", current.Data.EventsDB, fresh.Data.EventsDB)
 	warnRestartOnly(logger, "logging.output", current.Logging.Output, fresh.Logging.Output)
+	// Performance fields — most of the perf knobs aren't safely
+	// mutable mid-process. event_queue_size is baked into a
+	// channel; reaper_interval into a goroutine ticker;
+	// http_request_timeout into the chi middleware chain. Warn
+	// if changed; require restart to apply.
+	warnRestartOnly(logger, "performance.event_queue_size", current.Performance.EventQueueSize, fresh.Performance.EventQueueSize)
+	warnRestartOnly(logger, "performance.reaper_interval", current.Performance.ReaperInterval, fresh.Performance.ReaperInterval)
+	warnRestartOnly(logger, "performance.http_request_timeout", current.Performance.HTTPRequestTimeout, fresh.Performance.HTTPRequestTimeout)
 
 	if fresh.Logging.Level != current.Logging.Level {
 		logLevel.Set(parseLogLevel(fresh.Logging.Level))
@@ -222,6 +235,26 @@ func applyConfigReload(current, fresh *ServerConfig, es store.EventStore, logLev
 		es.SetEnabled(freshEnabled)
 		logger.Warn("config reload: events kill-switch flipped", "from", currentEnabled, "to", freshEnabled)
 		current.Events.EmissionEnabled = fresh.Events.EmissionEnabled
+	}
+	// event_drain_budget is the only perf field that's safely
+	// hot-reloadable — it's read on each aggregation call from
+	// an atomic, no goroutine ownership. Parse strictly here:
+	// a typo like "100mss" would otherwise silently fall back
+	// to the default while the log claims the new value was
+	// applied. The operator who SIGHUPed needs an unambiguous
+	// signal of "did this take or not."
+	if fresh.Performance.EventDrainBudget != current.Performance.EventDrainBudget {
+		newDur, parseErr := time.ParseDuration(fresh.Performance.EventDrainBudget)
+		if parseErr != nil {
+			logger.Warn("config reload: event_drain_budget unparseable, keeping previous value",
+				"value", fresh.Performance.EventDrainBudget, "error", parseErr)
+		} else {
+			store.SetEventDrainBudget(newDur)
+			logger.Info("config reload: event drain budget changed",
+				"from", current.Performance.EventDrainBudget,
+				"to", fresh.Performance.EventDrainBudget)
+			current.Performance.EventDrainBudget = fresh.Performance.EventDrainBudget
+		}
 	}
 	logger.Info("config reload complete")
 }

@@ -120,6 +120,28 @@ type SQLiteEventStore struct {
 	closeOnce sync.Once
 }
 
+// EventStoreOption tunes EventStore construction. Use the
+// With* helpers below; passing none yields the production
+// defaults.
+type EventStoreOption func(*eventStoreOptions)
+
+type eventStoreOptions struct {
+	queueSize int
+}
+
+// WithQueueSize overrides the bounded async-write buffer size.
+// Default is eventQueueSize (1000). Operators raise this for
+// high-throughput hosted multi-tenant deployments where 1000
+// events isn't enough headroom across all tenants combined.
+// Values <= 0 fall back to the default.
+func WithQueueSize(n int) EventStoreOption {
+	return func(o *eventStoreOptions) {
+		if n > 0 {
+			o.queueSize = n
+		}
+	}
+}
+
 // NewSQLiteEventStore opens (or creates) the events database
 // at dbPath, runs the schema migration, and returns a ready
 // EventStore. Default state: enabled.
@@ -132,9 +154,13 @@ type SQLiteEventStore struct {
 // busy_timeout for writer-vs-writer contention,
 // _txlock=immediate for SELECT-then-INSERT atomicity. WAL is
 // enabled at startup for concurrent reads.
-func NewSQLiteEventStore(dbPath string, logger *slog.Logger) (*SQLiteEventStore, error) {
+func NewSQLiteEventStore(dbPath string, logger *slog.Logger, opts ...EventStoreOption) (*SQLiteEventStore, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	options := eventStoreOptions{queueSize: eventQueueSize}
+	for _, fn := range opts {
+		fn(&options)
 	}
 	dsn := dbPath + "?_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
@@ -151,7 +177,7 @@ func NewSQLiteEventStore(dbPath string, logger *slog.Logger) (*SQLiteEventStore,
 	s := &SQLiteEventStore{
 		db:     db,
 		logger:   logger,
-		queue:    make(chan Event, eventQueueSize),
+		queue:    make(chan Event, options.queueSize),
 		done:    make(chan struct{}),
 		seqCounters: map[int64]*atomic.Int64{},
 	}
@@ -333,11 +359,12 @@ func (s *SQLiteEventStore) WaitForDrain(timeout time.Duration) {
 // Stats returns a runtime observability snapshot.
 func (s *SQLiteEventStore) Stats() Stats {
 	return Stats{
-		Enabled:  s.enabled.Load(),
-		Enqueued:  s.enqueued.Load(),
-		Persisted: s.persisted.Load(),
-		Dropped:  s.dropped.Load(),
-		QueueDepth: int(s.queueDepth.Load()),
+		Enabled:       s.enabled.Load(),
+		Enqueued:      s.enqueued.Load(),
+		Persisted:     s.persisted.Load(),
+		Dropped:       s.dropped.Load(),
+		QueueDepth:    int(s.queueDepth.Load()),
+		QueueCapacity: cap(s.queue),
 	}
 }
 

@@ -70,6 +70,11 @@ type Server struct {
 	runs  map[int64]*enjuYaml.ParsedRun
 	logger *slog.Logger
 
+	// httpRequestTimeout caps per-request middleware latency.
+	// Set via NewServerWithOptions; zero falls back to the
+	// pre-config default of 30s in Router().
+	httpRequestTimeout time.Duration
+
 	// triageMu serializes maybeAutoTriage per project to close
 	// the bounded race where two concurrent submits both pass
 	// the open-issue check, both spawn a fix task, and one
@@ -79,13 +84,29 @@ type Server struct {
 	triageMu sync.Map // projectID(int64) -> *sync.Mutex
 }
 
-// NewServer creates a new API server.
+// NewServer creates a new API server with the default HTTP
+// request timeout (30s). Use NewServerWithOptions to override.
 func NewServer(st *store.Store, logger *slog.Logger) *Server {
+	return NewServerWithOptions(st, logger, ServerOptions{})
+}
+
+// ServerOptions tunes runtime knobs that operators surface via
+// enju.conf. Zero values fall back to documented defaults.
+type ServerOptions struct {
+	// HTTPRequestTimeout caps the per-request middleware
+	// timeout. Zero = 30s (the pre-config default).
+	HTTPRequestTimeout time.Duration
+}
+
+// NewServerWithOptions creates an API server with operator-tuned
+// runtime knobs.
+func NewServerWithOptions(st *store.Store, logger *slog.Logger, opts ServerOptions) *Server {
 	return &Server{
-		store: st,
-		dags:  make(map[int64]*dag.DAG),
-		runs:  make(map[int64]*enjuYaml.ParsedRun),
-		logger: logger,
+		store:              st,
+		dags:               make(map[int64]*dag.DAG),
+		runs:               make(map[int64]*enjuYaml.ParsedRun),
+		logger:             logger,
+		httpRequestTimeout: opts.HTTPRequestTimeout,
 	}
 }
 
@@ -302,7 +323,11 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	httpTimeout := s.httpRequestTimeout
+	if httpTimeout <= 0 {
+		httpTimeout = 30 * time.Second
+	}
+	r.Use(middleware.Timeout(httpTimeout))
 
 	r.Get("/health", s.handleHealth)
 
@@ -2369,11 +2394,12 @@ func (s *Server) handleEventsStatus(w http.ResponseWriter, r *http.Request) {
 	es := s.store.Events()
 	stats := es.Stats()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"enabled":   stats.Enabled,
-		"enqueued":  stats.Enqueued,
-		"persisted":  stats.Persisted,
-		"dropped":   stats.Dropped,
-		"queue_depth": stats.QueueDepth,
+		"enabled":        stats.Enabled,
+		"enqueued":       stats.Enqueued,
+		"persisted":      stats.Persisted,
+		"dropped":        stats.Dropped,
+		"queue_depth":    stats.QueueDepth,
+		"queue_capacity": stats.QueueCapacity,
 	})
 }
 

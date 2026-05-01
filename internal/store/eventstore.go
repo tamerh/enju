@@ -112,11 +112,14 @@ type Event struct {
 // All counters are monotone since process start (no decay,
 // no reset). Operators correlate against process start time.
 type Stats struct {
-	Enabled  bool // kill-switch state
-	Enqueued  int64 // events successfully placed on the queue
-	Persisted int64 // events successfully written to disk
-	Dropped  int64 // events dropped (queue full, persist failure)
-	QueueDepth int  // current in-flight queue size
+	Enabled       bool  // kill-switch state
+	Enqueued      int64 // events successfully placed on the queue
+	Persisted     int64 // events successfully written to disk
+	Dropped       int64 // events dropped (queue full, persist failure)
+	QueueDepth    int   // current in-flight queue size
+	QueueCapacity int   // bounded buffer size — set at boot via WithQueueSize, exposed so
+	// operators can confirm a SIGHUP-driven config change
+	// requiring restart actually took effect after restart.
 }
 
 // EventStore is the persistence layer for the audit ledger.

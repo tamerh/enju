@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +24,7 @@ type ServerConfig struct {
 	Data        DataConfig        `yaml:"data"`
 	Events      EventsConfig      `yaml:"events"`
 	Logging     LoggingConfig     `yaml:"logging"`
+	Performance PerformanceConfig `yaml:"performance"`
 }
 
 type CoordinatorConfig struct {
@@ -44,6 +46,19 @@ type LoggingConfig struct {
 	Output string `yaml:"output"` // "stdout" | "stderr" | file path
 }
 
+// PerformanceConfig groups the runtime-tuning knobs operators
+// reach for when they hit a workload that doesn't match the
+// "small lab" defaults — high-throughput hosted multi-tenant,
+// HPC compute clusters, slow-link environments, etc. Durations
+// are strings (Go's time.ParseDuration syntax: "100ms", "30s",
+// "2m") so the YAML stays readable.
+type PerformanceConfig struct {
+	EventQueueSize     int    `yaml:"event_queue_size"`     // bounded async event-store buffer; full = drop
+	EventDrainBudget   string `yaml:"event_drain_budget"`   // duration: read-after-write wait window for aggregations
+	ReaperInterval     string `yaml:"reaper_interval"`      // duration: how often the claim reaper sweeps expired claims
+	HTTPRequestTimeout string `yaml:"http_request_timeout"` // duration: coordinator HTTP middleware cap
+}
+
 // defaultServerConfig returns the built-in defaults — what `enju serve`
 // runs as without any config file or flags.
 func defaultServerConfig() *ServerConfig {
@@ -63,6 +78,12 @@ func defaultServerConfig() *ServerConfig {
 		Logging: LoggingConfig{
 			Level:  "info",
 			Output: "stdout",
+		},
+		Performance: PerformanceConfig{
+			EventQueueSize:     1000,
+			EventDrainBudget:   "100ms",
+			ReaperInterval:     "60s",
+			HTTPRequestTimeout: "30s",
 		},
 	}
 }
@@ -116,6 +137,32 @@ func mergeServerConfig(dst, src *ServerConfig) {
 	if src.Logging.Output != "" {
 		dst.Logging.Output = src.Logging.Output
 	}
+	if src.Performance.EventQueueSize != 0 {
+		dst.Performance.EventQueueSize = src.Performance.EventQueueSize
+	}
+	if src.Performance.EventDrainBudget != "" {
+		dst.Performance.EventDrainBudget = src.Performance.EventDrainBudget
+	}
+	if src.Performance.ReaperInterval != "" {
+		dst.Performance.ReaperInterval = src.Performance.ReaperInterval
+	}
+	if src.Performance.HTTPRequestTimeout != "" {
+		dst.Performance.HTTPRequestTimeout = src.Performance.HTTPRequestTimeout
+	}
+}
+
+// parseDurationOr returns the parsed duration, or the fallback if
+// the string is empty or unparseable. Used for performance.* fields
+// where a config typo shouldn't keep the coordinator from booting.
+func parseDurationOr(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 // expandPath turns a leading "~" into the user's home directory.

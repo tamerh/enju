@@ -234,6 +234,62 @@ func TestEventStoreDropsOnFullQueue(t *testing.T) {
 	_ = tx.Rollback()
 }
 
+// TestEventStoreWithQueueSizeAppliesOption pins the
+// WithQueueSize plumbing: passing it must actually shrink
+// (or grow) the bounded buffer. Without this regression test,
+// a refactor that drops the option-application path would
+// silently keep the default 1000 — opposite of operator intent.
+//
+// Constructs an event store with a 50-cap queue, stalls the
+// writer, and floods 150 events. With a working option, drops
+// must be > 0 well before reaching the default-1000 threshold;
+// QueueCapacity in Stats confirms the smaller cap took effect.
+func TestEventStoreWithQueueSizeAppliesOption(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "events.db")
+	es, err := NewSQLiteEventStore(dbPath, nil, WithQueueSize(50))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer es.Close()
+
+	if got := es.Stats().QueueCapacity; got != 50 {
+		t.Errorf("Stats().QueueCapacity = %d, want 50 — WithQueueSize didn't apply", got)
+	}
+
+	tx, err := es.db.Begin()
+	if err != nil {
+		t.Fatalf("begin stall tx: %v", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO events (citizen_id, event_type, created_at)
+		 VALUES (0, 'stall_holder', ?)`,
+		time.Now(),
+	); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("seed stall tx: %v", err)
+	}
+
+	const flood = 150
+	for i := 0; i < flood; i++ {
+		es.Record(Event{
+			CitizenID: 1, EventType: "task_completed", RunID: 1, ProjectID: 1,
+			CreatedAt: time.Now(),
+		})
+	}
+
+	stats := es.Stats()
+	if stats.Dropped == 0 {
+		t.Errorf("expected drops > 0 when flooding 150 events through a 50-cap queue, got stats %+v", stats)
+	}
+	if int(stats.Enqueued+stats.Dropped) < flood {
+		t.Errorf("counter drift: enqueued=%d dropped=%d (sum %d) < flood %d",
+			stats.Enqueued, stats.Dropped, stats.Enqueued+stats.Dropped, flood)
+	}
+
+	_ = tx.Rollback()
+}
+
 // TestEventStoreGracefulShutdownDrainsQueue verifies that
 // Close() drains queued events to disk before the underlying
 // DB is closed (bounded by shutdownDrainTimeout). Without

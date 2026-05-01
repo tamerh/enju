@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,10 +24,32 @@ import (
 // counts reflect everything persisted at read time, missing
 // only events still in the in-flight queue. The Stats()
 // counter (Persisted vs Enqueued) is the authoritative signal
-// for monitoring; this constant is the user-experience knob.
+// for monitoring; this knob is the user-experience tradeoff.
 // Bumping it past 1s starts being perceptible; lower it under
 // 10ms and tests start flaking.
-const eventDrainBudget = 100 * time.Millisecond
+//
+// Stored as nanoseconds in an atomic.Int64 so SetEventDrainBudget
+// can mutate it at runtime (SIGHUP-driven config reload) without
+// a mutex on the read path.
+var eventDrainBudgetNs atomic.Int64
+
+func init() {
+	eventDrainBudgetNs.Store(int64(100 * time.Millisecond))
+}
+
+func eventDrainBudget() time.Duration {
+	return time.Duration(eventDrainBudgetNs.Load())
+}
+
+// SetEventDrainBudget overrides the read-after-write wait window
+// at runtime. Used by the SIGHUP reload path to apply config
+// changes without restart. Values <= 0 are ignored.
+func SetEventDrainBudget(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	eventDrainBudgetNs.Store(int64(d))
+}
 
 // RecordContributionEvent enqueues an event into the
 // EventStore (events.db, separate connection pool, async
@@ -101,7 +124,7 @@ func (s *Store) GetContributionSummary(citizenID int64) (*ContributionSummary, e
 	// blocking the request perceptibly. Callers willing to
 	// accept eventual consistency can pre-flush at a higher
 	// level; this helper is the safe default.
-	es.WaitForDrain(eventDrainBudget)
+	es.WaitForDrain(eventDrainBudget())
 
 	counts, err := es.CountByCitizenAndType(ctx, citizenID)
 	if err != nil && !errors.Is(err, ErrEventStoreDisabled) {
@@ -148,7 +171,7 @@ func (s *Store) GetContributionSummary(citizenID int64) (*ContributionSummary, e
 // Disabled EventStore → 0, nil so callers (profile cards)
 // render "0" rather than an error.
 func (s *Store) CountContributionEvents(citizenID int64) (int, error) {
-	s.Events().WaitForDrain(eventDrainBudget)
+	s.Events().WaitForDrain(eventDrainBudget())
 	n, err := s.Events().CountContributionEvents(context.Background(), citizenID)
 	if errors.Is(err, ErrEventStoreDisabled) {
 		return 0, nil

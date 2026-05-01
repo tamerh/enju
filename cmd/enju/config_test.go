@@ -44,6 +44,11 @@ events:
 logging:
   level: "debug"
   output: "stderr"
+performance:
+  event_queue_size: 5000
+  event_drain_budget: "250ms"
+  reaper_interval: "30s"
+  http_request_timeout: "60s"
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +73,36 @@ logging:
 	}
 	if cfg.Logging.Output != "stderr" {
 		t.Errorf("output = %q", cfg.Logging.Output)
+	}
+	if cfg.Performance.EventQueueSize != 5000 {
+		t.Errorf("event_queue_size = %d, want 5000", cfg.Performance.EventQueueSize)
+	}
+	if cfg.Performance.EventDrainBudget != "250ms" {
+		t.Errorf("event_drain_budget = %q, want 250ms", cfg.Performance.EventDrainBudget)
+	}
+	if cfg.Performance.ReaperInterval != "30s" {
+		t.Errorf("reaper_interval = %q, want 30s", cfg.Performance.ReaperInterval)
+	}
+	if cfg.Performance.HTTPRequestTimeout != "60s" {
+		t.Errorf("http_request_timeout = %q, want 60s", cfg.Performance.HTTPRequestTimeout)
+	}
+}
+
+func TestParseDurationOr(t *testing.T) {
+	cases := []struct {
+		in       string
+		fallback time.Duration
+		want     time.Duration
+	}{
+		{"", time.Second, time.Second},
+		{"100ms", time.Hour, 100 * time.Millisecond},
+		{"not-a-duration", time.Second, time.Second},
+		{"5s", time.Hour, 5 * time.Second},
+	}
+	for _, c := range cases {
+		if got := parseDurationOr(c.in, c.fallback); got != c.want {
+			t.Errorf("parseDurationOr(%q, %v) = %v, want %v", c.in, c.fallback, got, c.want)
+		}
 	}
 }
 
@@ -201,6 +236,68 @@ func TestApplyConfigReloadChangesLogLevel(t *testing.T) {
 	}
 	if current.Logging.Level != "debug" {
 		t.Errorf("current cfg should track applied level, got %q", current.Logging.Level)
+	}
+}
+
+func TestApplyConfigReloadHotReloadsEventDrainBudget(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logLevel := new(slog.LevelVar)
+
+	current := &ServerConfig{Performance: PerformanceConfig{EventDrainBudget: "100ms"}}
+	fresh := &ServerConfig{Performance: PerformanceConfig{EventDrainBudget: "500ms"}}
+
+	applyConfigReload(current, fresh, &fakeEventStore{}, logLevel, logger)
+
+	if current.Performance.EventDrainBudget != "500ms" {
+		t.Errorf("current cfg should track applied budget, got %q", current.Performance.EventDrainBudget)
+	}
+}
+
+func TestApplyConfigReloadRejectsUnparseableEventDrainBudget(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logLevel := new(slog.LevelVar)
+
+	current := &ServerConfig{Performance: PerformanceConfig{EventDrainBudget: "100ms"}}
+	fresh := &ServerConfig{Performance: PerformanceConfig{EventDrainBudget: "100mss"}} // typo
+
+	applyConfigReload(current, fresh, &fakeEventStore{}, logLevel, logger)
+
+	if current.Performance.EventDrainBudget != "100ms" {
+		t.Errorf("current cfg should NOT track unparseable value, got %q", current.Performance.EventDrainBudget)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "unparseable") {
+		t.Errorf("expected 'unparseable' warning naming the bad value, got: %s", out)
+	}
+	if !strings.Contains(out, "100mss") {
+		t.Errorf("expected warning to name the bad value '100mss', got: %s", out)
+	}
+}
+
+func TestApplyConfigReloadWarnsOnRestartOnlyPerfFields(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logLevel := new(slog.LevelVar)
+
+	current := &ServerConfig{Performance: PerformanceConfig{
+		EventQueueSize: 1000, ReaperInterval: "60s", HTTPRequestTimeout: "30s",
+	}}
+	fresh := &ServerConfig{Performance: PerformanceConfig{
+		EventQueueSize: 5000, ReaperInterval: "10s", HTTPRequestTimeout: "120s",
+	}}
+
+	applyConfigReload(current, fresh, &fakeEventStore{}, logLevel, logger)
+
+	out := buf.String()
+	for _, key := range []string{"performance.event_queue_size", "performance.reaper_interval", "performance.http_request_timeout"} {
+		if !strings.Contains(out, key) {
+			t.Errorf("expected restart-only warning for %q, got: %s", key, out)
+		}
+	}
+	// Restart-only fields must NOT propagate into current.
+	if current.Performance.EventQueueSize == 5000 {
+		t.Error("event_queue_size should not be applied at runtime")
 	}
 }
 

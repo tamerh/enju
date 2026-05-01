@@ -24,11 +24,12 @@ func (c *apiClient) handleEventsStatus(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(msg), nil
 	}
 	var status struct {
-		Enabled    bool  `json:"enabled"`
-		Enqueued   int64 `json:"enqueued"`
-		Persisted  int64 `json:"persisted"`
-		Dropped    int64 `json:"dropped"`
-		QueueDepth int   `json:"queue_depth"`
+		Enabled       bool  `json:"enabled"`
+		Enqueued      int64 `json:"enqueued"`
+		Persisted     int64 `json:"persisted"`
+		Dropped       int64 `json:"dropped"`
+		QueueDepth    int   `json:"queue_depth"`
+		QueueCapacity int   `json:"queue_capacity"`
 	}
 	if err := json.Unmarshal(data, &status); err != nil {
 		return mcp.NewToolResultError("decoding events status: " + err.Error()), nil
@@ -42,8 +43,8 @@ func (c *apiClient) handleEventsStatus(ctx context.Context, req mcp.CallToolRequ
 			"  Enqueued:    %d events\n"+
 			"  Persisted:   %d events\n"+
 			"  Dropped:     %d events\n"+
-			"  Queue depth: %d (in-flight)\n",
-		state, status.Enqueued, status.Persisted, status.Dropped, status.QueueDepth,
+			"  Queue depth: %d / %d (in-flight / capacity)\n",
+		state, status.Enqueued, status.Persisted, status.Dropped, status.QueueDepth, status.QueueCapacity,
 	)
 	return mcp.NewToolResultText(text), nil
 }
