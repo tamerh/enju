@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/store"
@@ -133,15 +134,30 @@ func (e *Engine) ComputeSubmission(
 	// "completed" until the tally resolves; the individual
 	// submission is a review/vote contribution).
 	//
-	// review_given / vote_cast metadata mirrors the pre-existing
-	// shape so existing audit consumers keep working. The
-	// estimate computed above is inlined here for the same
-	// reason — review/vote profile counts read it.
+	// review_given metadata carries target_task_id so consumers
+	// can link the verdict to the upstream task it reviews
+	// without parsing task IDs themselves. Builds the full ID
+	// from the review task's own ID prefix (project:run:) plus
+	// task.ReviewsTarget. Empty target_task_id for non-review
+	// actions; vote_cast doesn't carry it because a vote tallies
+	// against the vote task itself, not an upstream.
 	now := time.Now()
-	metadata := fmt.Sprintf(
-		`{"tokens":%d,"prompt_chars":%d,"content_chars":%d,"estimated_tokens":%d,"action":%q}`,
-		tokensUsed, promptChars, contentChars, estimatedTokens, task.Action,
-	)
+	metaFields := map[string]any{
+		"tokens":           tokensUsed,
+		"prompt_chars":     promptChars,
+		"content_chars":    contentChars,
+		"estimated_tokens": estimatedTokens,
+		"action":           task.Action,
+	}
+	if task.Action == "review" && task.ReviewsTarget != "" {
+		// task.ID is "<projectID>:<runSeq>:<taskDefID>"; replace
+		// the task-def segment with ReviewsTarget to form the
+		// upstream's full ID.
+		if parts := strings.SplitN(task.ID, ":", 3); len(parts) == 3 {
+			metaFields["target_task_id"] = parts[0] + ":" + parts[1] + ":" + task.ReviewsTarget
+		}
+	}
+	metadata := store.MarshalMetadata(metaFields)
 	// task_completed is no longer emitted from the
 	// submit path. It now fires from the terminal-ACCEPTED
 	// transition (applySetTaskState for tally / review-approve

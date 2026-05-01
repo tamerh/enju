@@ -217,6 +217,48 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 
 	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
 }
+
+// detectPopulatedUnrelatedRepo returns a non-empty refusal reason
+// if dirPath looks like an unrelated user git repo that the
+// caller almost certainly didn't mean to adopt: it has commits
+// AND no Enju marker (enju/ subdirectory or enju/conf.yaml).
+//
+// The check is deliberately narrow — no heuristics about commit
+// counts, file counts, or "looks like a code repo." Only two
+// existence checks: HEAD resolves to a commit, and no enju
+// marker is present. Fresh `git init` (no commits) passes.
+// Previously-adopted Enju projects pass (their scaffold IS the
+// marker).
+//
+// Returns "" if it's safe to proceed; non-empty string is the
+// refusal reason for the caller to splice into a curative error.
+func detectPopulatedUnrelatedRepo(dirPath string) string {
+	repo, err := gogit.PlainOpen(dirPath)
+	if err != nil {
+		// Not a git repo at all — handleInit will run git init
+		// and seed it. No risk of overwriting unrelated history.
+		return ""
+	}
+	if _, err := repo.Head(); err != nil {
+		// Repo exists but has no commits (fresh `git init`).
+		// Adoption here is unambiguously safe.
+		return ""
+	}
+	// Has commits. Check for Enju markers — either the scaffold
+	// directory or the project conf file. Either signals "this
+	// directory is already an Enju project, adoption is a re-
+	// adoption (idempotent)."
+	for _, marker := range []string{"enju", "enju/conf.yaml", "enju.yaml"} {
+		if _, err := os.Stat(filepath.Join(dirPath, marker)); err == nil {
+			return ""
+		}
+	}
+	return fmt.Sprintf(
+		"path %q is a populated git repo with no Enju metadata — refusing to adopt it as an Enju project to avoid accidentally writing into the wrong directory (common when the calling LLM is running inside a different project than the one being adopted)",
+		dirPath,
+	)
+}
+
 // handleInit adopts an existing folder as an Enju project. It:
 // 1. Validates the path exists
 // 2. Initializes git if not present
@@ -234,6 +276,7 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	force := req.GetBool("force", false)
 
 	// Validate path exists.
 	stat, err := os.Stat(dirPath)
@@ -242,6 +285,26 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	if !stat.IsDir() {
 		return mcp.NewToolResultError(fmt.Sprintf("path %q is not a directory", dirPath)), nil
+	}
+
+	// Safety check: refuse populated unrelated git repos unless
+	// force=true. The footgun this catches: a calling LLM running
+	// inside /repo/A passes path=/repo/B but typos to /repo/A —
+	// without this gate, Enju silently writes its scaffold + a
+	// commit into the wrong repo. Criterion is unambiguous (no
+	// heuristics): a repo is "populated unrelated" iff it has
+	// any commits AND no Enju marker (enju/ directory or enju.yaml
+	// at the project conf path). Fresh `git init` with no commits
+	// passes through; previously-adopted Enju projects (carrying
+	// enju/) pass through. The cure is in the message — operator
+	// can re-invoke with force=true.
+	if !force {
+		if reason := detectPopulatedUnrelatedRepo(dirPath); reason != "" {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"%s. To adopt this directory anyway, re-invoke enju_init with force=true. To initialize a fresh project elsewhere, pass a different path or use enju_create_project.",
+				reason,
+			)), nil
+		}
 	}
 
 	// Detect git state.

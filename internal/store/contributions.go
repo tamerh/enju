@@ -379,33 +379,32 @@ type RunEventRecord struct {
 	Metadata string
 }
 
-// ListRunEvents synthesizes a chronological timeline for a
-// run by unioning two sources:
+// ListRunEvents returns the chronological event timeline for
+// a run, sorted by timestamp. Reads directly from the
+// EventStore — no synthesis, no UNION with task_claims.
 //
-// 1. events scoped to this run — already a
-//   typed event log (task_completed, review_given,
-//   vote_cast, task_failed, task_invalidated, run_created).
-// 2. task_claims for this run's tasks — synthesized into
-//   task_claimed events since the claim path doesn't
-//   write events today.
+// Used to fold task_claims rows in here as synthetic
+// task_claimed events because the old claim path didn't write
+// to the event log. Phase 6c+ emits iteration_started at
+// claim time, which carries the same "who claimed when"
+// signal plus iter_seq, branch, and reopen flag — strict
+// superset. Synthesis would have caused a divergence with
+// enju_show_events (which reads the EventStore directly), so
+// the cleanup converges both views on iteration_started as
+// the canonical claim event.
 //
-// Result is sorted by timestamp. Caller (the export tool)
-// formats each record as a single JSONL line. Matches the
-// "git is the ledger" pattern: no ambient file writes,
-// authoritative data lives in the DB, snapshot materializes
-// to git on demand.
+// Disabled EventStore → returns an empty slice + nil error.
+// Matches the rest of the read API: audit emission off means
+// the run timeline shows nothing, not a 5xx.
 func (s *Store) ListRunEvents(runID int64) ([]RunEventRecord, error) {
 	var events []RunEventRecord
 
-	// Source 1: typed events from the EventStore. Cross-DB
-	// JOIN on citizens is gone; we collect citizen_ids first
-	// then resolve usernames in a single state-DB lookup.
-	// Disabled EventStore → degrade silently to source-2-only
-	// (matches the rest of the read API: audit emission off
-	// means the run timeline shows fewer rows, not an error).
 	ctx := context.Background()
 	rawEvents, err := s.Events().QueryByRun(ctx, runID, time.Time{}, 0)
-	if err != nil && !errors.Is(err, ErrEventStoreDisabled) {
+	if err != nil {
+		if errors.Is(err, ErrEventStoreDisabled) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	if len(rawEvents) > 0 {
@@ -422,46 +421,19 @@ func (s *Store) ListRunEvents(runID int64) ([]RunEventRecord, error) {
 		}
 	}
 
-	// Source 2: claims synthesized as task_claimed events.
-	// JOIN to citizens for the username, and to tasks to
-	// scope by run_id. Outcome carries the follow-up event
-	// (completed / invalidated / released / timed_out) so
-	// we only emit the *claimed* moment — the resolution
-	// moment is already in events.
-	clRows, err := s.db.Query(
-		`SELECT tc.claimed_at, tc.task_id, COALESCE(c.username, '') AS citizen
-		 FROM task_claims tc
-		 JOIN tasks t ON tc.task_id = t.id
-		 LEFT JOIN citizens c ON tc.citizen_id = c.id
-		 WHERE t.run_id = ?
-		 ORDER BY tc.claimed_at ASC`,
-		runID,
-	)
-	if err != nil {
-		return events, nil // best-effort; degrade rather than fail the whole export
-	}
-	for clRows.Next() {
-		var r RunEventRecord
-		if err := clRows.Scan(&r.Timestamp, &r.TaskID, &r.Citizen); err != nil {
-			continue
-		}
-		r.Type = "task_claimed"
-		events = append(events, r)
-	}
-	clRows.Close()
-
-	// Merge-sort by timestamp. Small N (per-run scope), so
-	// a single sort.Slice is cheaper than maintaining two
-	// cursors during the scan.
+	// Sort by timestamp for determinism. EventStore queries
+	// return in seq order which is monotonically increasing
+	// per project at emission time but can diverge slightly
+	// from wall-clock for events emitted across goroutines
+	// in flight at once. Stable sort so equal-timestamp events
+	// keep their seq order.
 	sortRunEvents(events)
 	return events, nil
 }
 
-// sortRunEvents orders the merged timeline by timestamp,
-// stable so events with identical timestamps keep their
-// source-order (contribution events before synthesized
-// claim events, matching the intuitive "result recorded
-// moments before a new claim" reading when they collide).
+// sortRunEvents orders the timeline by timestamp, stable so
+// events with identical timestamps keep their original (seq)
+// order.
 func sortRunEvents(events []RunEventRecord) {
 	sort.SliceStable(events, func(i, j int) bool {
 		return events[i].Timestamp.Before(events[j].Timestamp)

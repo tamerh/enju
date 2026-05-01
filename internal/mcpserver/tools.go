@@ -519,6 +519,8 @@ func toolInit() mcp.Tool {
 
 Path is required and must be explicit: pass the absolute path to the folder. There is no cwd default — the calling LLM may be running inside a different project's directory than the one being adopted (very common when running Claude in /repo/A while creating an Enju project for /repo/B), and silently adopting cwd would be a footgun. If the user says "this folder" or "the current directory," confirm what cwd is and pass it explicitly.
 
+Safety gate: enju_init refuses to adopt a populated git repo that has no Enju metadata — that pattern is almost always a typo'd path pointing at the wrong repo. The error message names the cure: re-invoke with force=true to adopt anyway, or pick a different path. Fresh "git init" with no commits, empty directories, and previously-adopted Enju projects pass through without force.
+
 If the user wants to start fresh with no existing files, use enju_create_project instead.`),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -527,6 +529,9 @@ If the user wants to start fresh with no existing files, use enju_create_project
 		mcp.WithString("path",
 			mcp.Required(),
 			mcp.Description("Absolute path to the existing folder to adopt. Pass explicitly — no cwd default."),
+		),
+		mcp.WithBoolean("force",
+			mcp.Description("Override the populated-git-repo safety gate. Default false. Set true only when the user has explicitly confirmed they want to add Enju orchestration on top of an existing populated git repository."),
 		),
 	)
 }

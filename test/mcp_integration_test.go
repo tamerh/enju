@@ -6112,12 +6112,12 @@ tasks:
 			}
 			typesSeen[event["type"].(string)] = true
 		}
-		// The key promises of the synthesizer: claim events come
-		// from task_claims (synthesized; events
-		// doesn't emit them), invalidation events were just added
-		// so the timeline has an entry at the cascade moment,
-		// completions land at submit time.
-		for _, want := range []string{"task_claimed", "task_completed", "task_invalidated"} {
+		// Key promises: claim events come from iteration_started
+		// (Phase 6c+ — strict superset of the legacy task_claimed
+		// synthesis that ListRunEvents used to fold in), the
+		// invalidate cascade has an entry at the moment it fires,
+		// and completions land at the terminal-ACCEPTED transition.
+		for _, want := range []string{"iteration_started", "task_completed", "task_invalidated"} {
 			if !typesSeen[want] {
 				t.Errorf("expected event type %q in timeline; got %v", want, typesSeen)
 			}

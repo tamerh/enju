@@ -3608,7 +3608,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 				run, _ := s.store.GetRun(task.RunID)
 				if run != nil {
 					targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
-					if _, err := s.performInvalidate(targetFullID); err != nil {
+					if _, err := s.performInvalidate(targetFullID, "review_reject"); err != nil {
 						s.logger.Warn("tally review-reject cascade failed",
 							"review_task", taskID, "target", targetFullID, "error", err)
 					}
@@ -4291,7 +4291,7 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 			if spawned, ok := s.maybeSpawnRemediation(taskID, actions.RejectTargetID, "request_changes", req.Decision, req.Content, submitterID); ok {
 				rejectResult = spawned
 			} else {
-				res, err := s.performInvalidate(actions.RejectTargetID)
+				res, err := s.performInvalidate(actions.RejectTargetID, "request_changes")
 				if err != nil {
 					s.logger.Error("review-request_changes cascade", "target", actions.RejectTargetID, "error", err)
 				} else {
@@ -4830,11 +4830,20 @@ type rollbackOutcome struct {
 // used by handleInvalidateTask (external API) and the review-reject
 // path inside handleSubmitResultReport.
 //
+// triggerSubtype is the cascade flavor recorded on the cascade_fired
+// audit event — distinct values let consumers tell "operator manually
+// invalidated" from "review request_changes" from "review reject" from
+// "downstream propagation." Callers should pick one of:
+//   "invalidate"      — explicit operator/API invalidate
+//   "request_changes" — review request_changes path
+//   "review_reject"   — multi-citizen vote/review rejection cascade
+//   "downstream"      — propagation from another invalidation
+//
 // The computation (DAG walk, artifact rollback decisions, dynamic
 // descendant identification) is delegated to engine.ComputeInvalidation.
 // This function applies the outcome's mutations to the store and
 // manages the in-memory DAG cache.
-func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
+func (s *Server) performInvalidate(taskID string, triggerSubtype string) (*invalidationResult, error) {
 	task, err := s.store.GetTask(taskID)
 	if err != nil || task == nil {
 		return nil, fmt.Errorf("task %q not found", taskID)
@@ -4983,12 +4992,17 @@ func (s *Server) performInvalidate(taskID string) (*invalidationResult, error) {
 
 	// cascade_fired captures "this set of
 	// invalidations all came from one cause." Subtype is the
-	// cascade flavor; the immediately-preceding event in the
-	// timeline (task_request_changes / task_invalidated /
-	// review_given) supplies the trigger context.
+	// caller-supplied trigger flavor (invalidate / request_changes
+	// / review_reject / downstream); the immediately-preceding
+	// event in the timeline (task_request_changes / task_invalidated
+	// / review_given) supplies the trigger context.
+	subtype := triggerSubtype
+	if subtype == "" {
+		subtype = "invalidate"
+	}
 	s.store.Events().Record(store.Event{
 		EventType:  "cascade_fired",
-		EventSubtype: "invalidate",
+		EventSubtype: subtype,
 		TaskID:    taskID,
 		RunID:    task.RunID,
 		ProjectID:  run.ProjectID,
@@ -5574,7 +5588,7 @@ func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.performInvalidate(taskID)
+	result, err := s.performInvalidate(taskID, "invalidate")
 	if err != nil {
 		// Not-found vs bad-state vs internal are indistinguishable
 		// from the helper's single error return. Use 400 as the

@@ -975,6 +975,157 @@ func TestCreateProjectCustomPathRefusesRelative(t *testing.T) {
 	}
 }
 
+// TestInitRefusesPopulatedUnrelatedRepo pins the safety contract:
+// enju_init refuses to adopt a git repo that has commits AND no
+// Enju marker. The footgun this catches is the calling LLM
+// running inside /repo/A and typo'ing path=/repo/B → /repo/A,
+// which would otherwise silently scaffold + commit Enju into the
+// caller's source repo.
+func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("user code"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("README.md"); err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "User", Email: "user@example.com", When: time.Now()}
+	if _, err := wt.Commit("user's own work", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &apiClient{
+		username:   "tester",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_init",
+			Arguments: map[string]interface{}{
+				"name": "demo",
+				"path": dir,
+			},
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("expected error result, got err=%v result=%+v", err, result)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for populated unrelated git repo")
+	}
+	gotText := mcpResultText(t, result)
+	for _, want := range []string{"populated git repo", "force=true"} {
+		if !strings.Contains(gotText, want) {
+			t.Errorf("error should mention %q, got: %s", want, gotText)
+		}
+	}
+	// The user's commit must remain intact — refusal must not
+	// mutate the repo at all.
+	if _, err := os.Stat(filepath.Join(dir, "enju")); err == nil {
+		t.Error("enju/ scaffold should NOT exist after refused init")
+	}
+}
+
+// TestInitForceAdoptsPopulatedRepo pins the cure: with force=true,
+// enju_init adopts the repo, scaffolds it, and proceeds normally.
+func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("user code"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wt, _ := repo.Worktree()
+	wt.Add("README.md")
+	sig := &object.Signature{Name: "User", Email: "user@example.com", When: time.Now()}
+	wt.Commit("user's work", &gogit.CommitOptions{Author: sig, Committer: sig})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo","remote_url":""}`))
+	})
+	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"demo"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := &apiClient{
+		baseURL:    ts.URL,
+		username:   "tester",
+		workspace:  ws,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		httpClient: &http.Client{},
+	}
+
+	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_init",
+			Arguments: map[string]interface{}{
+				"name":  "demo",
+				"path":  dir,
+				"force": true,
+			},
+		},
+	})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("handleInit with force=true: err=%v result=%+v text=%s",
+			err, result, mcpResultText(t, result))
+	}
+	// Scaffold must exist now.
+	if _, err := os.Stat(filepath.Join(dir, "enju")); err != nil {
+		t.Errorf("expected enju/ scaffold after force adopt, got: %v", err)
+	}
+}
+
+// TestInitAcceptsAlreadyAdoptedRepo pins idempotency: re-running
+// enju_init on a repo that was previously adopted (carries enju/
+// scaffold) passes through without force, even though it has
+// commits.
+func TestInitAcceptsAlreadyAdoptedRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	repo, err := gogit.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing Enju scaffold + commit.
+	if err := os.MkdirAll(filepath.Join(dir, "enju"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "enju", ".gitkeep"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wt, _ := repo.Worktree()
+	wt.Add("enju/.gitkeep")
+	sig := &object.Signature{Name: "Enju", Email: "enju@localhost", When: time.Now()}
+	wt.Commit("prior adoption", &gogit.CommitOptions{Author: sig, Committer: sig})
+
+	if reason := detectPopulatedUnrelatedRepo(dir); reason != "" {
+		t.Errorf("repo with enju/ marker should pass safety check, got refusal: %s", reason)
+	}
+}
+
 // TestInitFolderWithoutGit verifies that enju_init on a plain
 // folder (no .git) initializes git, writes the scaffold, and
 // registers the external dir so ForProject opens it directly.
@@ -1103,8 +1254,10 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "enju_init",
-			Arguments: map[string]interface{}{"name": "existing-git", "path": dir},
+			Name: "enju_init",
+			Arguments: map[string]interface{}{
+				"name": "existing-git", "path": dir, "force": true,
+			},
 		},
 	})
 	if err != nil || result.IsError {
@@ -1260,8 +1413,10 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "enju_init",
-			Arguments: map[string]interface{}{"name": "tp53", "path": dir},
+			Name: "enju_init",
+			Arguments: map[string]interface{}{
+				"name": "tp53", "path": dir, "force": true,
+			},
 		},
 	})
 	if err != nil || result.IsError {
@@ -1354,8 +1509,10 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "enju_init",
-			Arguments: map[string]interface{}{"name": "with-origin", "path": dir},
+			Name: "enju_init",
+			Arguments: map[string]interface{}{
+				"name": "with-origin", "path": dir, "force": true,
+			},
 		},
 	})
 	if err != nil || result.IsError {
