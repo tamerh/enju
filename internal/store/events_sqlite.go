@@ -612,6 +612,31 @@ func (s *SQLiteEventStore) logRateLimited(msg string, kv ...any) {
 	}
 }
 
+// timestampLayout pins a fixed-width UTC layout for the
+// created_at column. Critical for two reasons:
+//
+//  1. Default time.Time → SQL conversion via the modernc/sqlite
+//     driver renders via time.Time.String() — which embeds
+//     monotonic-clock garbage ("m=+0.073...") and the local
+//     timezone abbreviation ("CEST"). Lexicographic comparison
+//     against a Go-side parameter formatted differently
+//     (different TZ, different layout) silently picks the wrong
+//     side.
+//  2. .999999999 layouts strip trailing zeros — a stored
+//     `.387655150` would serialize as `.38765515`, making a
+//     re-parse return a different time. Fixed-width .000000000
+//     pins all 9 digits.
+//
+// Format choice: T-separator + Z suffix (UTC). Comparison-stable
+// across timezones; sorts identically lexically and temporally.
+const timestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// formatTimestamp normalizes a time.Time for storage and SQL
+// parameter binding. UTC + fixed-width nanos → comparison-safe.
+func formatTimestamp(t time.Time) string {
+	return t.UTC().Format(timestampLayout)
+}
+
 // persistOne is the actual INSERT — used by both the placeholder
 // Record() above and by the writer goroutine.
 //
@@ -624,7 +649,7 @@ func (s *SQLiteEventStore) persistOne(event Event) error {
 		 (seq, citizen_id, event_type, event_subtype, task_id, run_id, project_id, metadata, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.Seq, event.CitizenID, event.EventType, event.EventSubtype,
-		event.TaskID, event.RunID, event.ProjectID, event.Metadata, event.CreatedAt,
+		event.TaskID, event.RunID, event.ProjectID, event.Metadata, formatTimestamp(event.CreatedAt),
 	)
 	return err
 }
@@ -659,7 +684,7 @@ func (s *SQLiteEventStore) QueryByRun(ctx context.Context, projectID, runID int6
 		 WHERE project_id = ? AND run_id = ? AND created_at >= ?
 		 ORDER BY seq ASC, id ASC
 		 LIMIT ?`,
-		projectID, runID, since, limit,
+		projectID, runID, formatTimestamp(since), limit,
 	)
 	if err != nil {
 		return nil, err
@@ -742,7 +767,7 @@ func (s *SQLiteEventStore) Query(ctx context.Context, q EventQuery) ([]Event, er
 	}
 	if !q.Since.IsZero() {
 		conds = append(conds, "created_at >= ?")
-		args = append(args, q.Since)
+		args = append(args, formatTimestamp(q.Since))
 	}
 	where := ""
 	if len(conds) > 0 {
@@ -867,7 +892,7 @@ func (s *SQLiteEventStore) CountProjectsThisMonth(ctx context.Context, citizenID
 		`SELECT COUNT(DISTINCT project_id)
 		 FROM events
 		 WHERE citizen_id = ? AND project_id > 0 AND created_at >= ?`,
-		citizenID, since,
+		citizenID, formatTimestamp(since),
 	).Scan(&n)
 	if err != nil {
 		return 0, err

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/enju-ai/enju/internal/compute"
 	"github.com/enju-ai/enju/internal/mcpgit"
 	"github.com/enju-ai/enju/internal/mcpserver"
+	"github.com/enju-ai/enju/internal/notify"
 	"github.com/enju-ai/enju/internal/scheduler"
 	"github.com/enju-ai/enju/internal/store"
 	"github.com/mark3labs/mcp-go/server"
@@ -284,6 +286,13 @@ func cmdMCP(args []string) {
 	// true: local mode is normally a single-user dev path
 	// where the kill-switch isn't load-bearing.
 	localEventsEnabled := fs.Bool("events-enabled", true, "Local-mode only: enable the embedded coordinator's event store at boot")
+	// Notify-bot opt-in. When set, this MCP process also runs an
+	// embedded notification poller for the named project (Tier 1
+	// of docs/notifications.md). Layer 1 defaults plus any rules
+	// from ~/.enju/notify.yaml apply. Unset (default) → no
+	// background polling, zero added cost.
+	notifyProject := fs.Int64("notify-project", 0, "If non-zero, run the bundled notification poller for this project ID. Honors ~/.enju/notify.yaml.")
+	notifyConfigPath := fs.String("notify-config", "", "Path to notify.yaml (default ~/.enju/notify.yaml)")
 	fs.Parse(args)
 
 	resolvedCredsPath := resolveCredentialsPath(*credsPath)
@@ -414,12 +423,78 @@ func cmdMCP(args []string) {
 		},
 	})
 
+	// Tier 1 notification poller. Opt-in via -notify-project so
+	// users who don't want background HTTP traffic pay nothing.
+	// The goroutine polls the coordinator's /events long-poll
+	// endpoint, matches against Layer 1 defaults + Layer 3 user
+	// rules, and dispatches via desktop/shell/slack adapters. It
+	// dies when ctx is cancelled (which happens on stdio close
+	// after ServeStdio returns).
+	notifyCtx, cancelNotify := context.WithCancel(context.Background())
+	defer cancelNotify()
+	if *notifyProject != 0 {
+		startNotifySubsystem(notifyCtx, logger, *notifyProject, *notifyConfigPath, *coordinator, *username, token)
+	}
+
 	fmt.Fprintf(os.Stderr, "MCP server starting (stdio mode)...\n")
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "MCP server exited cleanly\n")
+}
+
+// startNotifySubsystem boots the bundled notify poller. Loads
+// Layer 3 user rules from notify.yaml (or default path) and
+// kicks off notify.Run in a goroutine. Layer 1 defaults fire
+// automatically unless DisableDefaults says otherwise.
+//
+// Failure modes (config parse error, transient HTTP issues) are
+// logged but never block MCP startup — the user's primary tool
+// is the MCP server itself, and missing notifications is a soft
+// degradation.
+func startNotifySubsystem(ctx context.Context, logger *slog.Logger, projectID int64, configPath, coordinator, username, token string) {
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		logger.Warn("notify: cannot resolve user home dir — config + state file paths will be empty (defaults still fire, no cross-restart cursor persistence)",
+			"err", homeErr)
+	}
+	if configPath == "" && home != "" {
+		configPath = filepath.Join(home, ".enju", "notify.yaml")
+	}
+
+	uc, warnings, err := notify.LoadUserConfig(configPath)
+	if err != nil {
+		logger.Warn("notify: failed to load user config — continuing with Layer 1 defaults only",
+			"path", configPath, "err", err)
+		uc = notify.UserConfig{}
+	}
+	for _, w := range warnings {
+		logger.Warn("notify: config issue", "path", configPath, "issue", w)
+	}
+
+	stateFile := ""
+	if home != "" {
+		stateFile = filepath.Join(home, ".enju", fmt.Sprintf("notify-state-%d.json", projectID))
+	}
+
+	cfg := notify.Config{
+		CoordinatorURL:  coordinator,
+		ProjectID:       projectID,
+		Username:        username,
+		BearerToken:     token,
+		Rules:           uc.ToRules(),
+		DisableDefaults: uc.DisableDefaults,
+		StateFile:       stateFile,
+		Logger:          logger,
+	}
+
+	go func() {
+		logger.Info("notify: starting Tier 1 poller", "project_id", projectID, "rules", len(cfg.Rules), "config", configPath)
+		if err := notify.Run(ctx, cfg); err != nil && ctx.Err() == nil {
+			logger.Error("notify: poller exited with error", "err", err)
+		}
+	}()
 }
 
 // --- wrap-task ---
