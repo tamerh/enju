@@ -109,12 +109,12 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 		citizenName:   cfg.CitizenName,
 		citizenEmail:  cfg.CitizenEmail,
 		modelName:    cfg.ModelName,
-		authToken:    cfg.AuthToken,
 		saveCreds:     cfg.SaveCredentials,
 		workspace:     cfg.Workspace,
 		logger:        logger,
 		httpClient:    &http.Client{},
 	}
+	client.setToken(cfg.AuthToken)
 
 	// Notify session — exists when caller opts in via
 	// Config.Notify. Nil session means tool-handler Switch
@@ -130,7 +130,7 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 	if cfg.Notify != nil {
 		client.notifySess = newNotifySession(notifySessionConfig{
 			CoordinatorURL: cfg.CoordinatorURL,
-			BearerToken:    cfg.AuthToken,
+			TokenFn:        client.Token, // live read — picks up auto-reregister rotations
 			Username:       cfg.Username,
 			Workspace:      cfg.Workspace,
 			ParentCtx:      cfg.Notify.ParentCtx,

@@ -38,20 +38,19 @@ func NewTestClient(cfg Config) *TestClient {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &TestClient{
-		c: &apiClient{
-			baseURL:      cfg.CoordinatorURL,
-			username:     cfg.Username,
-			citizenName:  cfg.CitizenName,
-			citizenEmail: cfg.CitizenEmail,
-			modelName:    cfg.ModelName,
-			authToken:    cfg.AuthToken,
-			saveCreds:    cfg.SaveCredentials,
-			workspace:    cfg.Workspace,
-			logger:       logger,
-			httpClient:   &http.Client{},
-		},
+	c := &apiClient{
+		baseURL:      cfg.CoordinatorURL,
+		username:     cfg.Username,
+		citizenName:  cfg.CitizenName,
+		citizenEmail: cfg.CitizenEmail,
+		modelName:    cfg.ModelName,
+		saveCreds:    cfg.SaveCredentials,
+		workspace:    cfg.Workspace,
+		logger:       logger,
+		httpClient:   &http.Client{},
 	}
+	c.setToken(cfg.AuthToken)
+	return &TestClient{c: c}
 }
 
 // Username returns the citizen username the TestClient was built

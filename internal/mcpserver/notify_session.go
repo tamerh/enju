@@ -36,11 +36,16 @@ import (
 // from Config.Notify.
 type notifySessionConfig struct {
 	CoordinatorURL string
-	BearerToken    string
-	Username       string
-	Workspace      *mcpgit.Workspace // resolves project clone dirs
-	ParentCtx      context.Context   // cancels every child goroutine on shutdown
-	Logger         *slog.Logger
+	// TokenFn returns the live bearer token. Critical for the
+	// "coordinator DB wiped, citizen re-registered" recovery
+	// path: apiClient's auto-reregister updates its atomic.Value
+	// token, this getter reads from there, the next notify poll
+	// uses the fresh token. No MCP restart required.
+	TokenFn   func() string
+	Username  string
+	Workspace *mcpgit.Workspace // resolves project clone dirs
+	ParentCtx context.Context   // cancels every child goroutine on shutdown
+	Logger    *slog.Logger
 }
 
 // notifySession is the runtime handle. Methods are safe for
@@ -110,7 +115,7 @@ func (s *notifySession) Switch(projectID int64) {
 		CoordinatorURL:  s.cfg.CoordinatorURL,
 		ProjectID:       projectID,
 		Username:        s.cfg.Username,
-		BearerToken:     s.cfg.BearerToken,
+		BearerTokenFn:   s.cfg.TokenFn,
 		ProjectDir:      projectDir,
 		Rules:           uc.ToRules(),
 		DisableDefaults: uc.DisableDefaults,

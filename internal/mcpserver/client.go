@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/enju-ai/enju/internal/mcpgit"
 )
@@ -28,7 +29,16 @@ type apiClient struct {
 	citizenName  string // display name, used when re-registering after a DB wipe
 	citizenEmail string // optional, passed to the register endpoint
 	modelName   string // LLM model for contribution tracking
-	authToken   string // registration token for identity verification
+
+	// authToken is the bearer the client sends on every request.
+	// Mutated by doWithAutoReregister when the coordinator hands
+	// back a new token, read from many goroutines (tool handlers
+	// + the notify session's poll loop). atomic.Value keeps the
+	// reads/writes race-free without per-request locking.
+	//
+	// Always holds a string (possibly empty). Never nil.
+	authToken atomic.Value
+
 	saveCreds    func(username, name, email, token string)
 	workspace    *mcpgit.Workspace
 	logger       *slog.Logger
@@ -67,14 +77,32 @@ type apiClient struct {
 	notifySess *notifySession
 }
 
+// Token returns the current bearer token. Safe to call from any
+// goroutine; readers see whatever the most recent setToken
+// completed. Returns "" before initial setToken (shouldn't
+// happen — server.New seeds it).
+func (c *apiClient) Token() string {
+	v := c.authToken.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+// setToken atomically replaces the bearer. Called from boot and
+// from doWithAutoReregister after a successful re-register.
+func (c *apiClient) setToken(tok string) {
+	c.authToken.Store(tok)
+}
+
 func (c *apiClient) get(ctx context.Context, path string) ([]byte, error) {
 	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
 		if err != nil {
 			return nil, err
 		}
-		if c.authToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		if tok := c.Token(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		return c.httpClient.Do(req)
 	})
@@ -91,8 +119,8 @@ func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]b
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.authToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		if tok := c.Token(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		return c.httpClient.Do(req)
 	})
@@ -104,8 +132,8 @@ func (c *apiClient) delete(ctx context.Context, path string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if c.authToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		if tok := c.Token(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		return c.httpClient.Do(req)
 	})
@@ -122,8 +150,8 @@ func (c *apiClient) post(ctx context.Context, path string, body interface{}) ([]
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.authToken != "" {
-			req.Header.Set("Authorization", "Bearer "+c.authToken)
+		if tok := c.Token(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		return c.httpClient.Do(req)
 	})
@@ -238,7 +266,7 @@ func (c *apiClient) ensureCitizenFresh(ctx context.Context) error {
 	gotToken, _ := result["token"].(string)
 	c.username = got
 	if gotToken != "" {
-		c.authToken = gotToken
+		c.setToken(gotToken)
 	}
 	if c.saveCreds != nil {
 		c.saveCreds(got, c.citizenName, c.citizenEmail, gotToken)

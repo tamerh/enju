@@ -278,13 +278,14 @@ func TestModelRegisterAndListE2E(t *testing.T) {
 // authenticate as a bot, where the bot's username doesn't match
 // the parent's).
 func newE2EClient(url, username, token string) *apiClient {
-	return &apiClient{
+	c := &apiClient{
 		baseURL:    url,
 		username:   username,
-		authToken:  token,
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		httpClient: httptest.NewServer(nil).Client(), // doesn't matter — we need the *http.Client default
 	}
+	c.setToken(token)
+	return c
 }
 
 // mcpResultText extracts the text content from an MCP tool result.

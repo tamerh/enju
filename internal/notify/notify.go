@@ -61,9 +61,22 @@ type Config struct {
 	// match string-keyed event fields like assign_to.
 	Username string
 
-	// BearerToken authenticates the long-poll requests. Same
-	// shape as any other coordinator API call.
+	// BearerToken is the static fallback token. Used when
+	// BearerTokenFn is nil (tests, simple callers). Production
+	// callers (mcpserver's notifySession) should set
+	// BearerTokenFn instead so token rotations from the surrounding
+	// apiClient's auto-reregister flow propagate to the poll loop.
 	BearerToken string
+
+	// BearerTokenFn returns the current live bearer token on each
+	// call. When set, takes precedence over BearerToken — every
+	// HTTP request fetches a fresh value, so a token rotation
+	// (apiClient's auto-reregister updating its atomic.Value)
+	// reaches the next poll without needing to restart MCP. The
+	// real fix to the "stale token after coordinator DB wipe"
+	// failure mode the test team hit twice. Nil → fall back to
+	// BearerToken (the static string).
+	BearerTokenFn func() string
 
 	// Rules is the list of user-defined rules to evaluate per
 	// event. The notify loop composes these with the compiled-
@@ -155,8 +168,8 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.ProjectID <= 0 {
 		return fmt.Errorf("notify.Run: ProjectID is required")
 	}
-	if cfg.BearerToken == "" {
-		return fmt.Errorf("notify.Run: BearerToken is required")
+	if cfg.BearerToken == "" && cfg.BearerTokenFn == nil {
+		return fmt.Errorf("notify.Run: BearerToken or BearerTokenFn is required")
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -208,20 +221,21 @@ func Run(ctx context.Context, cfg Config) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// 401 = the bearer token is stale relative to what
-			// the coordinator now accepts (e.g. coordinator DB
-			// was wiped, citizen re-registered with new token).
-			// Notify can't recover on its own: it captures the
-			// token at boot and doesn't share apiClient's
-			// auto-reregister path. Fail loudly and exit so the
-			// user sees the problem instead of the previous
-			// "5-min silent backoff loop" failure mode.
-			if isAuthError(err) {
-				logger.Error("notify: bearer token rejected (HTTP 401) — stale credentials. Restart `enju mcp` to refresh.",
-					"project_id", cfg.ProjectID)
-				return fmt.Errorf("notify: stale bearer token (HTTP 401); restart MCP")
+			// 401/403 means the coordinator currently rejects our
+			// bearer (e.g. DB wipe + re-register flow updated the
+			// token mid-flight). With BearerTokenFn wired, the
+			// next poll picks up the rotated token and recovers
+			// automatically. Log a single warning per consecutive
+			// auth-error streak so users see "supervisor saw 401,
+			// will retry with refreshed token" but don't get
+			// log-spam.
+			logFields := []any{"error", err}
+			if isAuthError(err) && cfg.BearerTokenFn != nil {
+				logger.Warn("notify: poll auth-rejected; will retry with live token on next cycle",
+					append(logFields, "project_id", cfg.ProjectID)...)
+			} else {
+				logger.Warn("notify poll failed; backing off", logFields...)
 			}
-			logger.Warn("notify poll failed; backing off", "error", err)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -300,7 +314,16 @@ func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	tok := cfg.BearerToken
+	if cfg.BearerTokenFn != nil {
+		// Live read: picks up token rotations performed by the
+		// surrounding apiClient's auto-reregister flow without
+		// restarting the poll loop.
+		if live := cfg.BearerTokenFn(); live != "" {
+			tok = live
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 
 	resp, err := client.Do(req)
 	if err != nil {
