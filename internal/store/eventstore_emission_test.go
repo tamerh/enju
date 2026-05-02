@@ -357,6 +357,115 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	}
 }
 
+// TestApplyCreateTask_BornReadyEmitsTaskReady pins the
+// run-creation gap: tasks materialized straight into READY (no
+// upstream deps — root tasks at run start, dynamic for_each
+// instances, spawned tasks with no `depends_on`) emit a
+// task_ready event, so the assigned human gets the
+// notification. Pre-fix this fired only on the cascade path,
+// so a fresh run landed silently on the assignee's plate.
+func TestApplyCreateTask_BornReadyEmitsTaskReady(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	// Insert a task born in READY via ApplyPlan{CreateTask{...}}
+	// — this is what materialize.go does for tasks with no deps.
+	now := time.Now()
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		CreateTask{Task: TaskRecord{
+			ID: "5:1:write_blurb", RunID: runID, Seq: 1, TaskDefID: "write_blurb",
+			Action: "answer", ResultType: "text",
+			State: TaskReady, AssignTo: `["tamer"]`,
+			CreatedAt: now,
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForEventsDrained(t, s)
+
+	got := hasEventWithMetadata(t, s, runID, "task_ready", `"assign_to":"tamer"`)
+	if got == nil {
+		t.Fatal("expected task_ready event for born-ready task with assign_to=tamer")
+	}
+	if got.TaskID != "5:1:write_blurb" {
+		t.Errorf("task_id = %q, want 5:1:write_blurb", got.TaskID)
+	}
+	if got.Subtype != "answer" {
+		t.Errorf("subtype = %q, want answer (action)", got.Subtype)
+	}
+}
+
+// TestApplyCreateTask_BornPendingDoesNotEmit pins the negative:
+// tasks born in PENDING (waiting on upstream) must NOT fire a
+// task_ready event — they fire later via the cascade when their
+// deps land. Without this guard, every for_each instance would
+// double-emit (once at materialize, once at promote).
+func TestApplyCreateTask_BornPendingDoesNotEmit(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	now := time.Now()
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		CreateTask{Task: TaskRecord{
+			ID: "5:1:later", RunID: runID, Seq: 1, TaskDefID: "later",
+			Action: "answer", ResultType: "text",
+			State: TaskPending, DependsOn: "5:1:something",
+			AssignTo:  `["tamer"]`,
+			CreatedAt: now,
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForEventsDrained(t, s)
+
+	if hasEventWithMetadata(t, s, runID, "task_ready", `"task_id":"5:1:later"`) != nil {
+		t.Error("PENDING task must not emit task_ready at create time")
+	}
+}
+
+// TestApplySetTaskState_ReboundReadyEmitsTaskReady pins the
+// request_changes gap: when the cascade flips a target task
+// ACCEPTED→READY via SetTaskState{ClearClaim:true,
+// NewState:TaskReady}, the assignee gets a task_ready event so
+// they know their work needs revision. Pre-fix this fired
+// nothing — only task_request_changes + cascade_fired emitted.
+func TestApplySetTaskState_ReboundReadyEmitsTaskReady(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	// Set up a task in ACCEPTED state — the cascade target.
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "5:1:write_blurb", RunID: runID, Seq: 1, TaskDefID: "write_blurb",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, AssignTo: `["tamer"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the request_changes cascade rebounding the
+	// target back to READY with claim cleared.
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{
+			TaskID:     "5:1:write_blurb",
+			NewState:   TaskReady,
+			ClearClaim: true,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForEventsDrained(t, s)
+
+	got := hasEventWithMetadata(t, s, runID, "task_ready", `"assign_to":"tamer"`)
+	if got == nil {
+		t.Fatal("expected task_ready event after request_changes rebound to READY")
+	}
+	if got.TaskID != "5:1:write_blurb" {
+		t.Errorf("task_id = %q, want 5:1:write_blurb", got.TaskID)
+	}
+}
+
 // TestUpdateReadyTasks_DirectCallEmitsEvents pins the
 // production-load-bearing path: most callers invoke
 // s.UpdateReadyTasks(runID) directly (after ApplyPlan returns),

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -162,7 +163,7 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			}
 
 		case CreateTask:
-			if err := applyCreateTask(tx, m); err != nil {
+			if err := applyCreateTask(tx, m, &pendingEvents); err != nil {
 				return result, err
 			}
 			result.TasksCreated++
@@ -299,6 +300,24 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 		if _, err := tx.Exec(q, args...); err != nil {
 			return fmt.Errorf("set_task_state (clear): %w", err)
 		}
+		// Rebound-ready emission: when this clear-claim flips a
+		// task ACCEPTED→READY (request_changes cascade) or
+		// FAILED→READY (manual unfail), the human assignee needs
+		// to know the work is back on their plate. Skipped for
+		// non-READY transitions (PENDING / SKIPPED descendants);
+		// the cascade emission covers the eventual re-promote.
+		if m.NewState == TaskReady {
+			var action, assignToJSON string
+			var runID int64
+			if err := tx.QueryRow(
+				`SELECT action, COALESCE(assign_to, ''), run_id FROM tasks WHERE id = ?`, m.TaskID,
+			).Scan(&action, &assignToJSON, &runID); err != nil {
+				return fmt.Errorf("set_task_state (clear) emit lookup: %w", err)
+			}
+			if err := emitBirthReadyEvent(tx, m.TaskID, action, assignToJSON, runID, events); err != nil {
+				return err
+			}
+		}
 		// Phase 6c — open claims are NOT implicitly marked
 		// here. The cascade caller decides:
 		//  - Request_changes target: claim stays open
@@ -409,7 +428,7 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 	return nil
 }
 
-func applyCreateTask(tx *sql.Tx, m CreateTask) error {
+func applyCreateTask(tx *sql.Tx, m CreateTask, events *[]Event) error {
 	t := &m.Task
 	citizens := t.Citizens
 	if citizens == 0 {
@@ -432,7 +451,51 @@ func applyCreateTask(tx *sql.Tx, m CreateTask) error {
 		t.ClosesIssueSeq,
 		t.CreatedAt,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	// Birth-ready emission: tasks materialized straight into
+	// READY state (root tasks at run-create time, dynamic
+	// for_each instances with no upstream deps, spawned tasks
+	// with no `depends_on`) need a task_ready event so the
+	// assigned_task_ready notification rule fires for the human.
+	// Without this, a fresh run lands silently on the assignee's
+	// plate. Production was missing ~1/3 of "ready transitions"
+	// before this fix.
+	if TaskState(t.State) == TaskReady {
+		if err := emitBirthReadyEvent(tx, t.ID, t.Action, t.AssignTo, t.RunID, events); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emitBirthReadyEvent appends task_ready events for one task
+// that landed in READY without going through the cascade
+// (s.UpdateReadyTasks). The cascade has its own emit path; this
+// covers the other two paths: born-ready (applyCreateTask) and
+// rebound-ready (applySetTaskState clear-claim → READY).
+//
+// Looks up project_id via the run row so callers don't pre-fetch.
+// Reuses buildTaskReadyEvents so the wire shape stays identical
+// across all three paths (cascade, birth, rebound).
+func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON string, runID int64, events *[]Event) error {
+	var projectID int64
+	if err := tx.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
+		return fmt.Errorf("task_ready emit: loading project for run %d: %w", runID, err)
+	}
+	var assignees []string
+	if assignToJSON != "" {
+		_ = json.Unmarshal([]byte(assignToJSON), &assignees)
+	}
+	*events = append(*events, buildTaskReadyEvents([]ReadiedTask{{
+		TaskID:    taskID,
+		Action:    action,
+		Assignees: assignees,
+		RunID:     runID,
+		ProjectID: projectID,
+	}}, time.Now())...)
+	return nil
 }
 
 func applyDeleteTask(tx *sql.Tx, m DeleteTask) error {
