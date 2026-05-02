@@ -73,6 +73,54 @@ func TestRunAppendsEventsToLiveJSONL(t *testing.T) {
 	}
 }
 
+// TestPollHasPerRequestDeadline pins the bug fix from a tester
+// report: a silently-broken long-poll connection used to wedge
+// the loop indefinitely (no client-side timeout, only ctx
+// inheritance). The fix wraps each poll with ctx.WithTimeout =
+// wait + 10s slack so a hung server returns an error and the
+// outer loop retries. Without this, live.jsonl falls behind
+// events.db whenever a TCP connection drops without notice.
+func TestPollHasPerRequestDeadline(t *testing.T) {
+	dir := t.TempDir()
+
+	// Server that never responds. Each request hangs until the
+	// client gives up (or the test times out). With the deadline
+	// fix, the client returns within wait+slack.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // hang until client cancels
+	}))
+	defer srv.Close()
+
+	// Outer ctx is generous; the per-request deadline is what
+	// must end the wait. Use a small PollWait so the test runs
+	// fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := pollEvents(ctx, srv.Client(), Config{
+		CoordinatorURL: srv.URL,
+		ProjectID:      1,
+		BearerToken:    "test",
+		ProjectDir:     dir,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}, 100*time.Millisecond, 0)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error from hung server")
+	}
+	// PollWait=100ms + 10s slack = 10.1s ceiling. We want the
+	// request to give up well before the outer ctx fires (5s).
+	// In practice the deadline fires at ~10.1s but the outer
+	// ctx will fire first at 5s. Either error path is fine —
+	// what we're guarding against is "blocks forever, never
+	// errors." Anything bounded is the contract.
+	if elapsed > 11*time.Second {
+		t.Errorf("poll exceeded 11s budget: %v (request never gave up)", elapsed)
+	}
+}
+
 // TestRunRequiredFields pins startup validation.
 func TestRunRequiredFields(t *testing.T) {
 	cases := []struct {

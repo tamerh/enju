@@ -225,6 +225,17 @@ func Run(ctx context.Context, cfg Config) error {
 // pollEvents issues one long-poll request and returns the
 // decoded events. sinceSeq is the strict-`>` cursor; the
 // coordinator returns events with seq > sinceSeq.
+//
+// Per-request deadline: each poll caps at wait + pollSlack so a
+// silently-broken TCP connection (NAT timeout, proxy hold, server
+// hang) can never wedge the loop indefinitely. Without this, a
+// dropped long-poll connection leaves the client awaiting a
+// response that will never come — the outer loop never retries
+// and live.jsonl falls behind events.db. Tester report: cursor
+// stuck at seq=13 with seqs 14-17 visible on the coordinator
+// but never reaching the file. Server side already self-clamps
+// to its own httpTimeout-5s; the client must also self-clamp so
+// transport-level hangs don't bypass the server's limit.
 func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.Duration, sinceSeq int64) ([]Event, error) {
 	q := url.Values{}
 	q.Set("wait", wait.String())
@@ -234,7 +245,10 @@ func pollEvents(ctx context.Context, client *http.Client, cfg Config, wait time.
 	endpoint := fmt.Sprintf("%s/api/v1/projects/%d/events?%s",
 		strings.TrimRight(cfg.CoordinatorURL, "/"), cfg.ProjectID, q.Encode())
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	const pollSlack = 10 * time.Second
+	reqCtx, cancel := context.WithTimeout(ctx, wait+pollSlack)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
