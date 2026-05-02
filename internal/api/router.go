@@ -381,6 +381,12 @@ func (s *Server) Router() http.Handler {
 		r.Post("/projects/{projectID}/runs/{runSeq}/merges", s.handleReportMerge)
 		r.Get("/projects/{projectID}/events", s.handleShowEvents)
 
+		// Inbox: tasks waiting on the requesting citizen with
+		// upstream submission(s) inlined. The fat-client's
+		// enju_inbox tool and `enju inbox` CLI both consume
+		// this — same data, two surfaces.
+		r.Get("/projects/{projectID}/inbox", s.handleInbox)
+
 		// Issues — project-level structured artifacts
 		// (living-workflow phase 3). Outlive runs; filed by
 		// any project member, triaged or closed by any member,
@@ -1873,6 +1879,60 @@ func (s *Server) longPollEvents(ctx context.Context, q store.EventQuery, waitDur
 			return events, nil // wait elapsed
 		}
 	}
+}
+
+// handleInbox returns the requesting citizen's inbox for one
+// project: tasks where state=ready AND assign_to includes the
+// caller's username, with each upstream task's latest submission
+// inlined so the reviewer can read the work without claiming.
+//
+// Auth: standard project-membership gate. Returns the caller's
+// own inbox; there's no "list someone else's inbox" surface.
+func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
+	projectID, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project_id")
+		return
+	}
+	if _, ok := s.requireProjectMembership(w, r, projectID); !ok {
+		return
+	}
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	items, err := s.store.ListInbox(projectID, caller.Username)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing inbox: "+err.Error())
+		return
+	}
+	// Wire shape mirrors store.InboxItem 1:1 with snake_case
+	// keys. Empty inbox returns [] (not null) so direct REST
+	// consumers don't have to special-case JSON null.
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, it := range items {
+		row := map[string]interface{}{
+			"task_id": it.TaskID,
+			"action":  it.Action,
+			"prompt":  it.Prompt,
+		}
+		if it.PromptTruncated {
+			row["prompt_truncated"] = true
+		}
+		ups := make([]map[string]interface{}, 0, len(it.Upstream))
+		for _, up := range it.Upstream {
+			ups = append(ups, map[string]interface{}{
+				"task_id":    up.TaskID,
+				"action":     up.Action,
+				"commit_sha": up.CommitSHA,
+				"content":    up.Content,
+			})
+		}
+		row["upstream"] = ups
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {

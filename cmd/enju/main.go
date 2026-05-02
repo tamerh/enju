@@ -37,6 +37,10 @@ func main() {
 		cmdMCP(os.Args[2:])
 	case "wrap-task":
 		cmdWrapTask(os.Args[2:])
+	case "inbox":
+		cmdInbox(os.Args[2:])
+	case "review":
+		cmdReview(os.Args[2:])
 	case "version":
 		fmt.Println("enju v0.1.0-dev")
 	default:
@@ -52,6 +56,8 @@ func printUsage() {
 Usage:
  enju serve   Start the coordinator server
  enju mcp    Start the MCP server (for Claude Desktop/Code)
+ enju inbox   Show tasks waiting on you in a project
+ enju review  Submit a verdict on a claimed review task
  enju wrap-task Run a compute task's script + commit (internal)
  enju version  Print version
 

@@ -731,6 +731,53 @@ func toolRecentEvents() mcp.Tool {
 	)
 }
 
+// toolReview is the action-verb counterpart to enju_inbox: a
+// constrained submit for action:review tasks. Same coordinator
+// contract as enju_submit_result with a review-specific decision,
+// but with a narrower input schema so the assistant doesn't have
+// to think about outputs/artifacts/options it never uses on a
+// review.
+func toolReview() mcp.Tool {
+	return mcp.NewTool("enju_review",
+		mcp.WithDescription(`Submit a verdict on an action:review task you've claimed. Companion to enju_inbox: read what's waiting, then decide. The four decisions match enju_submit_result's verbatim — semantics are identical, this is just a narrower wrapper. Calls the same underlying submit endpoint.
+
+  - "approve"          — target → ACCEPTED, downstream unblocks
+  - "request_changes"  — retry cascade: target → READY, descendants → PENDING (author revises + resubmits)
+  - "reject"           — fail cascade: target → FAILED (terminal), descendants → SKIPPED
+  - "comment"          — non-blocking; target state unchanged
+
+Always pair the decision with prose 'content' explaining your reasoning — the author/team reads it. For non-review tasks (answer/vote/compute) use enju_submit_result instead.`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The review task you've claimed. Must be action:review."),
+		),
+		mcp.WithString("decision",
+			mcp.Required(),
+			mcp.Description(`One of "approve", "request_changes", "reject", "comment". approve = ship it; request_changes = send back for revision; reject = hard stop; comment = non-blocking note.`),
+		),
+		mcp.WithString("content",
+			mcp.Description("Your review prose. Required in practice — readers need to know why you decided this. Empty content is technically accepted by the coordinator but produces a useless review row."),
+		),
+		mcp.WithString("model",
+			mcp.Description(`Optional per-call model override. Same semantics as enju_submit_result's model field; defaults to the session's -model flag.`),
+		),
+	)
+}
+
+// toolInbox surfaces the caller's inbox for one project — every
+// ready task assigned to the calling citizen, with each parent's
+// latest submission inlined so the assistant/user can read the
+// work without claiming the reviewer task first.
+func toolInbox() mcp.Tool {
+	return mcp.NewTool("enju_inbox",
+		mcp.WithDescription(`List tasks waiting on the calling citizen in a project — review/vote/answer tasks where assign_to includes you and state is ready. Each item carries the task's prompt plus the latest submission(s) of the upstream task(s) it depends on, so you can read the work in-place. Designed as the human-facing "what's on my plate?" view, complementing enju_notifications (event-stream) and enju_my_dashboard (multi-project summary). Cap on inlined prompt is ~2KB; follow up with enju_get_task for the full text. Known v1 limitation: compute and vote parents leave content empty (their work lives in git artifacts or the option column, respectively); the upstream's task_id + commit_sha are still surfaced.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to surface inbox for."),
+		),
+	)
+}
+
 // toolNotifications surfaces the per-project notification list
 // — Facebook-style read/unread items derived from the local
 // live.jsonl substrate filtered through the 9 built-in Layer 1

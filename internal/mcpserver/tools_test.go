@@ -43,6 +43,8 @@ var allToolFactories = []struct {
 	{"enju_show_events", toolShowEvents},
 	{"enju_recent_events", toolRecentEvents},
 	{"enju_notifications", toolNotifications},
+	{"enju_inbox", toolInbox},
+	{"enju_review", toolReview},
 	{"enju_events_status", toolEventsStatus},
 	{"enju_list_iterations", toolListIterations},
 	{"enju_file_issue", toolFileIssue},

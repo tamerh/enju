@@ -29,6 +29,23 @@ import (
 // existing one, e.g. SetTaskState) so it rides the plan's
 // transaction instead. See plan.go for the mutation shape.
 //
+// Tx discipline for applyXxx functions: every read and write
+// inside an applyXxx body MUST go through the `tx` parameter,
+// never `s.db` or a method on `s` that wraps `s.db`. SQLite
+// holds the write lock on the tx's connection until commit; a
+// sibling call that grabs a different pool connection (a) can't
+// see the in-tx writes (it sees pre-commit state) and (b) busy-
+// waits or deadlocks on its own write. The applyUpdateReadyTasks
+// + s.UpdateReadyTasks pairing was a real instance of this trap:
+// the deadline-driven vote/review resolve path silently lost
+// downstream readiness propagation until the cascade became
+// tx-aware (see updateReadyTasksOn in sqlite.go).
+//
+// If you need shared logic between an applyXxx and a standalone
+// post-commit method, parameterize it over the dbExecQueryer
+// interface like updateReadyTasksOn — the apply path passes tx,
+// the standalone path passes s.db.
+//
 // ApplyPlan validates and applies a Plan's mutations inside
 // a single transaction. If any mutation fails validation,
 // the entire plan is rolled back — no partial commits.
