@@ -1,34 +1,40 @@
 package main
 
-// `enju inbox` — terminal counterpart to the enju_inbox MCP
-// tool. Calls the coordinator's /projects/{id}/inbox endpoint
-// and renders the response with the same formatter the MCP
-// tool uses (mcpserver.FormatInbox), so both surfaces stay
-// textually identical.
+// `enju inbox` — thin wrapper over internal/inbox. Same
+// projection logic the MCP tool runs, with a workspace-based
+// git read instead of HTTP. Zero coordinator round-trips.
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
-	"time"
 
-	"github.com/enju-ai/enju/internal/mcpserver"
+	"github.com/enju-ai/enju/internal/inbox"
+	"github.com/enju-ai/enju/internal/mcpgit"
 )
 
 func cmdInbox(args []string) {
 	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL (only used to look up identity from credentials.json — inbox itself reads only local files)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running for a non-default citizen.")
+	workspaceRoot := fs.String("workspace", "", "Workspace root (default ~/.enju/workspaces/). The project clone is expected at <workspace>/{slug}-{id}/.")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: enju inbox <project_id> [flags]
 
 Show ready tasks assigned to you in the given project, with each
 upstream task's latest submission inlined so you can read the
 work without claiming first.
+
+The inbox is derived entirely from local files: live.jsonl
+provides the event stream and the project clone provides upstream
+content via git. The project must already be cloned locally —
+typically by running 'enju mcp' once. If you've only used the
+CLI, the workspace won't exist; the command prints a helpful
+error.
 
 Flags:`)
 		fs.PrintDefaults()
@@ -52,47 +58,44 @@ Flags:`)
 		os.Exit(1)
 	}
 
-	rows, err := fetchInbox(*coordinator, creds.Token, projectID)
+	wsRoot := *workspaceRoot
+	if wsRoot == "" {
+		home, _ := os.UserHomeDir()
+		wsRoot = filepath.Join(home, ".enju", "workspaces")
+	}
+	ws, err := mcpgit.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "opening workspace %s: %v\n", wsRoot, err)
+		os.Exit(1)
+	}
+	projectDir := ws.ProjectDir(projectID)
+	if projectDir == "" {
+		fmt.Fprintf(os.Stderr, "project %d has no local clone at %s — run `enju mcp` once with this credentials file to materialize the clone.\n", projectID, wsRoot)
+		os.Exit(1)
+	}
+
+	proj, err := ws.ForProject(projectID, "", "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "opening project clone: %v\n", err)
+		os.Exit(1)
+	}
+
+	livePath := filepath.Join(projectDir, "enju", "events", "live.jsonl")
+	rows, err := inbox.BuildInbox(livePath, creds.Username, &cliInboxDeps{proj: proj})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println(mcpserver.FormatInbox(rows))
+	fmt.Println(inbox.FormatInbox(rows))
 }
 
-// fetchInbox calls GET /api/v1/projects/{id}/inbox with the
-// bearer token and decodes the response. Surfaces the
-// coordinator's error message verbatim on a non-2xx status so
-// the user sees the real cause (auth, membership, etc.) instead
-// of a generic transport error.
-func fetchInbox(coordinator, token string, projectID int64) ([]mcpserver.InboxRow, error) {
-	url := fmt.Sprintf("%s/api/v1/projects/%d/inbox", coordinator, projectID)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("calling coordinator: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		// Coordinator returns {"error": "..."} on 4xx/5xx;
-		// surface that message rather than the raw decode error.
-		var errBody struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errBody) == nil && errBody.Error != "" {
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errBody.Error)
-		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	var rows []mcpserver.InboxRow
-	if err := json.Unmarshal(body, &rows); err != nil {
-		return nil, fmt.Errorf("decoding inbox response: %w", err)
-	}
-	return rows, nil
+// cliInboxDeps adapts mcpgit.Project to inbox.Deps. The shared
+// inbox core needs only a single method — git read at commit —
+// so this is intentionally tiny.
+type cliInboxDeps struct {
+	proj *mcpgit.Project
+}
+
+func (d *cliInboxDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
+	return d.proj.ReadFileAtCommit(commitSHA, repoRelPath)
 }

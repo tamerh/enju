@@ -3,8 +3,6 @@ package main
 import (
 	"strings"
 	"testing"
-
-	"github.com/enju-ai/enju/internal/mcpserver"
 )
 
 // TestStripCommentLines pins git-style comment stripping in the
@@ -51,90 +49,31 @@ func TestStripCommentLines(t *testing.T) {
 	}
 }
 
-// TestBuildReviewTemplate_BareFallback pins the no-context
-// fallback: when the inbox fetch fails or returns no match,
-// the template still renders, with just the task id and the
-// usage instructions. The user gets a usable editor, not an
-// error.
-func TestBuildReviewTemplate_BareFallback(t *testing.T) {
-	out := buildReviewTemplate("5:1:review", nil)
-	if !strings.Contains(out, "Reviewing 5:1:review") {
-		t.Errorf("missing task header, got:\n%s", out)
-	}
-	if !strings.Contains(out, "Lines starting with '#' are") {
-		t.Errorf("missing usage instructions, got:\n%s", out)
-	}
-	if strings.Contains(out, "Upstream") {
-		t.Errorf("bare fallback should not have Upstream section, got:\n%s", out)
-	}
-}
-
-// TestBuildReviewTemplate_RichContext pins the populated
-// editor template: action, prompt, and upstream submissions
-// all surface as comment lines so the reviewer can read what
-// they're reviewing inline.
-func TestBuildReviewTemplate_RichContext(t *testing.T) {
-	ctx := &mcpserver.InboxRow{
-		TaskID: "5:1:review",
-		Action: "review",
-		Prompt: "review the abstract for clarity",
-		Upstream: []mcpserver.InboxUpstreamRow{
-			{TaskID: "5:1:abstract", Action: "answer", CommitSHA: "abc1234", Content: "The TP53 gene encodes a tumor\nsuppressor protein."},
-		},
-	}
-	out := buildReviewTemplate("5:1:review", ctx)
-
+// TestBuildReviewTemplate_BareTemplate pins the editor pre-fill:
+// just task header + usage hint, no rich context. Reviewers run
+// `enju inbox` first if they want to see the prompt + upstream
+// submissions before writing.
+func TestBuildReviewTemplate_BareTemplate(t *testing.T) {
+	out := buildReviewTemplate("5:1:review")
 	mustContain := []string{
-		"Reviewing 5:1:review — review",
-		"This task's prompt:",
-		"# > review the abstract for clarity",
-		"Upstream 5:1:abstract (answer) commit abc1234:",
-		"# > The TP53 gene encodes a tumor",
-		"# > suppressor protein.",
-		"Decision: pass -decision flag",
+		"Reviewing 5:1:review",
+		"enju inbox <project_id>",
+		"Lines starting with '#' are",
+		"-decision",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(out, want) {
 			t.Errorf("template missing %q\nfull:\n%s", want, out)
 		}
 	}
-}
-
-// TestBuildReviewTemplate_TruncatedPromptHint pins the trailer
-// note when the inbox-side cap clipped the task prompt — the
-// reviewer should know to fetch the full text if the snippet
-// is incomplete.
-func TestBuildReviewTemplate_TruncatedPromptHint(t *testing.T) {
-	ctx := &mcpserver.InboxRow{
-		TaskID:          "5:1:review",
-		Action:          "review",
-		Prompt:          "trailing fragment",
-		PromptTruncated: true,
+	mustNotContain := []string{
+		"Upstream",
+		"This task's prompt:",
 	}
-	out := buildReviewTemplate("5:1:review", ctx)
-	if !strings.Contains(out, "[truncated") {
-		t.Errorf("expected truncation marker, got:\n%s", out)
-	}
-}
-
-// TestBuildReviewTemplate_EmptyUpstreamContent pins the
-// compute/vote-parent callout: still surface task_id +
-// commit_sha, suggest pulling from git.
-func TestBuildReviewTemplate_EmptyUpstreamContent(t *testing.T) {
-	ctx := &mcpserver.InboxRow{
-		TaskID: "5:1:review",
-		Action: "review",
-		Prompt: "review compute output",
-		Upstream: []mcpserver.InboxUpstreamRow{
-			{TaskID: "5:1:analyze", Action: "compute", CommitSHA: "def5678"},
-		},
-	}
-	out := buildReviewTemplate("5:1:review", ctx)
-	if !strings.Contains(out, "Upstream 5:1:analyze (compute) commit def5678") {
-		t.Errorf("expected upstream header even without content, got:\n%s", out)
-	}
-	if !strings.Contains(out, "no inlined content") {
-		t.Errorf("expected pull-from-git hint, got:\n%s", out)
+	for _, banned := range mustNotContain {
+		if strings.Contains(out, banned) {
+			t.Errorf("bare template should not contain %q\nfull:\n%s", banned, out)
+		}
 	}
 }
 

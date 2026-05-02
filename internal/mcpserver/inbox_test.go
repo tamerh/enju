@@ -5,6 +5,12 @@ import (
 	"testing"
 )
 
+// FormatInbox is a re-export of internal/inbox.FormatInbox.
+// Detailed projection + rendering tests live in internal/inbox/;
+// this file just pins that the re-export wires through correctly
+// and keeps a couple of shape regressions guarded at the
+// mcpserver layer where callers consume it.
+
 // TestFormatInbox_Empty pins the no-items message — assistants
 // pattern-match this to skip rendering.
 func TestFormatInbox_Empty(t *testing.T) {
@@ -14,25 +20,21 @@ func TestFormatInbox_Empty(t *testing.T) {
 	}
 }
 
-// TestFormatInbox_BasicShape pins the readable layout: one
-// section per task, prompt with `> ` prefix, upstream with
-// `[task_id]` markers and indented content.
+// TestFormatInbox_BasicShape pins the header + per-task shape via
+// the re-exported FormatInbox.
 func TestFormatInbox_BasicShape(t *testing.T) {
 	rows := []InboxRow{
 		{
 			TaskID: "5:1:review", Action: "review",
-			Prompt: "review the abstract",
 			Upstream: []InboxUpstreamRow{
 				{TaskID: "5:1:abstract", Action: "answer", CommitSHA: "abc1234", Content: "The TP53 gene encodes...\nadditional line"},
 			},
 		},
 	}
 	out := FormatInbox(rows)
-
 	mustContain := []string{
 		"Inbox: 1 task(s) waiting on you",
 		"[5:1:review] review",
-		"> review the abstract",
 		"Upstream [5:1:abstract] answer (commit abc1234)",
 		"  The TP53 gene encodes...",
 		"  additional line",
@@ -44,25 +46,6 @@ func TestFormatInbox_BasicShape(t *testing.T) {
 	}
 }
 
-// TestFormatInbox_TruncatedPromptHint pins that callers see the
-// "fetch full text" hint when the coordinator clipped the prompt.
-func TestFormatInbox_TruncatedPromptHint(t *testing.T) {
-	rows := []InboxRow{
-		{
-			TaskID: "5:1:review", Action: "review",
-			Prompt:          "short here but truncated upstream",
-			PromptTruncated: true,
-		},
-	}
-	out := FormatInbox(rows)
-	if !strings.Contains(out, "prompt truncated") {
-		t.Errorf("expected truncation hint, got:\n%s", out)
-	}
-	if !strings.Contains(out, "enju_get_task") {
-		t.Errorf("expected pointer to enju_get_task, got:\n%s", out)
-	}
-}
-
 // TestFormatInbox_EmptyUpstreamContent pins the v1 limitation
 // callout: compute/vote parents have no inlined content but
 // still surface task_id + commit_sha. The hint tells the
@@ -71,7 +54,6 @@ func TestFormatInbox_EmptyUpstreamContent(t *testing.T) {
 	rows := []InboxRow{
 		{
 			TaskID: "5:1:review", Action: "review",
-			Prompt: "review the analysis output",
 			Upstream: []InboxUpstreamRow{
 				{TaskID: "5:1:analyze", Action: "compute", CommitSHA: "def5678", Content: ""},
 			},
@@ -93,7 +75,6 @@ func TestFormatInbox_NoUpstream(t *testing.T) {
 	rows := []InboxRow{
 		{
 			TaskID: "5:1:askyou", Action: "answer",
-			Prompt:   "what's the title?",
 			Upstream: nil,
 		},
 	}

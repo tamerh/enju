@@ -179,6 +179,23 @@ type taskMeta struct {
 	// this, the client would have to recompute the slug and
 	// risk drifting from the server's stored value.
 	RunSlug string
+	// Prompt is the raw prompt template (with `{{...}}`
+	// placeholders unresolved). Surfaced for the inbox view —
+	// reviewers see what they're being asked to do without
+	// claiming first. Resolution still happens client-side at
+	// claim time.
+	Prompt string
+	// CommitSHA is the commit recorded for the task's current
+	// state. Empty for non-terminal tasks. The inbox uses the
+	// parent task's CommitSHA to read upstream submission
+	// content from git via mcpgit.Project.ReadFileAtCommit.
+	CommitSHA string
+	// AssignTo is the parsed list of usernames the task is
+	// assigned to (the wire format is JSON-array). Empty
+	// means open to anyone with the right role. Used by the
+	// inbox to filter "still mine" after the live.jsonl scan
+	// finds a candidate.
+	AssignTo []string
 	// DependsOn is the task's direct upstream dependency list,
 	// comma-separated full task ids (e.g.
 	// "1:2:foundation,1:2:review"). Used by the batch submit
@@ -334,6 +351,23 @@ func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta
 	}
 	if v, ok := raw["depends_on"].(string); ok {
 		meta.DependsOn = v
+	}
+	if v, ok := raw["prompt"].(string); ok {
+		meta.Prompt = v
+	}
+	if v, ok := raw["commit_sha"].(string); ok {
+		meta.CommitSHA = v
+	}
+	// assign_to on the wire is already parsed to []string by
+	// the coordinator's toTaskResponse (unmarshalStringSlice
+	// over the JSON-array column). Decode the typed list so the
+	// inbox handler doesn't have to parse the JSON shape itself.
+	if v, ok := raw["assign_to"].([]interface{}); ok {
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				meta.AssignTo = append(meta.AssignTo, s)
+			}
+		}
 	}
 	return meta, nil
 }

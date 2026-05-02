@@ -27,6 +27,7 @@ type notifyEvent struct {
 	Subtype   string    `json:"subtype,omitempty"`
 	TaskID    string    `json:"task_id,omitempty"`
 	Citizen   string    `json:"citizen,omitempty"`
+	AssignTo  string    `json:"assign_to,omitempty"`
 }
 
 // seedLiveJSONL writes events into a project's live.jsonl. Used

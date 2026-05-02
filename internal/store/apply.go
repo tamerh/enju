@@ -307,14 +307,14 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 		// non-READY transitions (PENDING / SKIPPED descendants);
 		// the cascade emission covers the eventual re-promote.
 		if m.NewState == TaskReady {
-			var action, assignToJSON string
+			var action, assignToJSON, dependsOn string
 			var runID int64
 			if err := tx.QueryRow(
-				`SELECT action, COALESCE(assign_to, ''), run_id FROM tasks WHERE id = ?`, m.TaskID,
-			).Scan(&action, &assignToJSON, &runID); err != nil {
+				`SELECT action, COALESCE(assign_to, ''), COALESCE(depends_on, ''), run_id FROM tasks WHERE id = ?`, m.TaskID,
+			).Scan(&action, &assignToJSON, &dependsOn, &runID); err != nil {
 				return fmt.Errorf("set_task_state (clear) emit lookup: %w", err)
 			}
-			if err := emitBirthReadyEvent(tx, m.TaskID, action, assignToJSON, runID, events); err != nil {
+			if err := emitBirthReadyEvent(tx, m.TaskID, action, assignToJSON, dependsOn, runID, events); err != nil {
 				return err
 			}
 		}
@@ -463,7 +463,7 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, events *[]Event) error {
 	// plate. Production was missing ~1/3 of "ready transitions"
 	// before this fix.
 	if TaskState(t.State) == TaskReady {
-		if err := emitBirthReadyEvent(tx, t.ID, t.Action, t.AssignTo, t.RunID, events); err != nil {
+		if err := emitBirthReadyEvent(tx, t.ID, t.Action, t.AssignTo, t.DependsOn, t.RunID, events); err != nil {
 			return err
 		}
 	}
@@ -479,7 +479,7 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, events *[]Event) error {
 // Looks up project_id via the run row so callers don't pre-fetch.
 // Reuses buildTaskReadyEvents so the wire shape stays identical
 // across all three paths (cascade, birth, rebound).
-func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON string, runID int64, events *[]Event) error {
+func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON, dependsOn string, runID int64, events *[]Event) error {
 	var projectID int64
 	if err := tx.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
 		return fmt.Errorf("task_ready emit: loading project for run %d: %w", runID, err)
@@ -488,12 +488,17 @@ func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON string, runID 
 	if assignToJSON != "" {
 		_ = json.Unmarshal([]byte(assignToJSON), &assignees)
 	}
+	parents, err := lookupReadiedParents(tx, dependsOn)
+	if err != nil {
+		return fmt.Errorf("task_ready emit: parent lookup for %s: %w", taskID, err)
+	}
 	*events = append(*events, buildTaskReadyEvents([]ReadiedTask{{
 		TaskID:    taskID,
 		Action:    action,
 		Assignees: assignees,
 		RunID:     runID,
 		ProjectID: projectID,
+		Parents:   parents,
 	}}, time.Now())...)
 	return nil
 }
@@ -818,9 +823,18 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 	var attemptSeq int64
 	var iterSeq sql.NullInt64
 	if claimRowID.Valid {
+		// m.Content is intentionally not persisted on the
+		// coordinator. Submission prose lives in git as the
+		// result.md the fat-client committed at the recorded
+		// commit_sha — that's the canonical truth.
+		// ARCHITECTURE.md #3 ("coordinator never stores
+		// content") rules this out at the principle level;
+		// hosted-mode scaling rules it out at the operational
+		// level. Readers needing prose use mcpgit.Project.
+		// ReadFileAtCommit against the fat-client's clone.
 		if _, err := tx.Exec(
-			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, content, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			claimRowID.Int64, now, m.CommitSHA, m.Decision, choice, m.Content, nullableInt64(m.ModelID),
+			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, model_id) VALUES (?, ?, ?, ?, ?, ?)`,
+			claimRowID.Int64, now, m.CommitSHA, m.Decision, choice, nullableInt64(m.ModelID),
 		); err != nil {
 			return fmt.Errorf("submit: record submission: %w", err)
 		}
@@ -1106,17 +1120,32 @@ func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, events *[]E
 func buildTaskReadyEvents(readied []ReadiedTask, now time.Time) []Event {
 	var out []Event
 	for _, rt := range readied {
+		// Render parent snapshot once per readied task — same
+		// payload regardless of how many assignees fan out below.
+		var parentsMeta []map[string]any
+		for _, p := range rt.Parents {
+			parentsMeta = append(parentsMeta, map[string]any{
+				"task_id":    p.TaskID,
+				"action":     p.Action,
+				"commit_sha": p.CommitSHA,
+				"result_dir": p.ResultDir,
+			})
+		}
 		emit := func(assignee string) {
+			meta := map[string]any{
+				"assign_to": assignee,
+			}
+			if len(parentsMeta) > 0 {
+				meta["parents"] = parentsMeta
+			}
 			out = append(out, Event{
 				EventType:    "task_ready",
 				EventSubtype: rt.Action,
 				TaskID:       rt.TaskID,
 				RunID:        rt.RunID,
 				ProjectID:    rt.ProjectID,
-				Metadata: MarshalMetadata(map[string]any{
-					"assign_to": assignee,
-				}),
-				CreatedAt: now,
+				Metadata:     MarshalMetadata(meta),
+				CreatedAt:    now,
 			})
 		}
 		if len(rt.Assignees) == 0 {

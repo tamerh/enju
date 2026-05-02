@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	enjuYaml "github.com/enju-ai/enju/internal/yaml"
 	_ "modernc.org/sqlite"
 )
 
@@ -291,18 +295,34 @@ func (s *Store) migrate() error {
 	-- here, hung off the claim row by claim_id.
 	--
 	-- Coexistence with the denormalized fields on task_claims
-	-- (submitted_at, commit_sha, content, option, decision,
+	-- (submitted_at, commit_sha, option, content, decision,
 	-- model_id): applyRecordSubmission writes BOTH for now.
 	-- The task_submissions row is the audit-of-record (each
 	-- attempt is preserved); the task_claims fields hold the
 	-- "latest attempt" denormalization for legacy readers
-	-- that haven't been migrated to JOIN with
-	-- task_submissions yet (notably ListVoteSubmissions and
-	-- ListActiveClaims via taskClaimColumns). Pre-launch the
-	-- DB resets on each rollout, so no data migration is
-	-- needed; a post-launch cleanup pass can drop the
+	-- that haven't been migrated to JOIN with task_submissions
+	-- yet (notably ListVoteSubmissions and ListActiveClaims via
+	-- taskClaimColumns). Future cleanup pass can drop the
 	-- duplicated columns once every reader pulls from
 	-- task_submissions.
+	--
+	-- Note: task_claims.content stays for now — it's read by
+	-- the for_each fan-in aggregation in mcpgit/resolve.go and
+	-- the multi-citizen vote/review flows, which haven't yet
+	-- migrated to the git-content-only model. Removing
+	-- task_submissions.content (this table) is one step of
+	-- the broader content-off-coordinator cleanup; dropping
+	-- task_claims.content is a separate follow-up that touches
+	-- the fan-in machinery.
+	--
+	-- Schema note: there is no content column. Submission
+	-- prose lives in git as the result.md committed by the
+	-- fat-client at the recorded commit_sha — that is the
+	-- canonical truth (ARCHITECTURE.md #3, "coordinator never
+	-- stores content"). Readers fetch via mcpgit.Project.
+	-- ReadFileAtCommit. See ARCHITECTURE.md #25 (audit log +
+	-- state DB + git, not event sourcing) for the broader
+	-- architecture.
 	CREATE TABLE IF NOT EXISTS task_submissions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		claim_id INTEGER NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
@@ -310,7 +330,6 @@ func (s *Store) migrate() error {
 		commit_sha TEXT NOT NULL DEFAULT '',
 		decision TEXT NOT NULL DEFAULT '',
 		option TEXT NOT NULL DEFAULT '',
-		content TEXT NOT NULL DEFAULT '',
 		model_id INTEGER REFERENCES citizens(id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_submissions_claim ON task_submissions(claim_id);
@@ -2349,12 +2368,34 @@ func (s *Store) ReleaseTask(taskID string, citizenID int64) error {
 // against the user's username; unassigned tasks still fire one
 // event with an empty assignee so the audit timeline records
 // every transition.
+//
+// Parents is the snapshot of every dependency at the moment this
+// task became ready, with each parent's commit_sha + result_dir
+// + action embedded. Parents are guaranteed terminal (accepted
+// or skipped) at this moment by the cascade's gating, so the
+// snapshot is well-defined. Embedding parent info here makes the
+// task_ready event self-contained for the fat-client inbox view —
+// no event-correlation, no coordinator round-trips.
 type ReadiedTask struct {
 	TaskID    string
 	Action    string
 	Assignees []string
 	ProjectID int64
 	RunID     int64
+	Parents   []ReadiedParent
+}
+
+// ReadiedParent is one upstream task captured at the moment its
+// downstream became ready. CommitSHA + ResultDir together let the
+// fat-client read the parent's submitted result.md from git
+// (`git show {commit_sha}:{result_dir}/result.md`) without any
+// coordinator call. CommitSHA may be empty for skipped parents
+// (no submission); inbox renders those with an explanatory note.
+type ReadiedParent struct {
+	TaskID    string
+	Action    string
+	CommitSHA string
+	ResultDir string
 }
 
 // dbExecQueryer is the read+write surface shared by *sql.DB and
@@ -2373,6 +2414,109 @@ type dbExecQueryer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
+}
+
+// lookupReadiedParents resolves a comma-separated depends_on list
+// into the snapshot the inbox needs at task_ready emit time:
+// each parent's action, commit_sha, and result_dir. Result_dir is
+// computed inline using the same convention as
+// engine.ComputeResultDir; we duplicate the few lines of layout
+// logic here rather than circular-import engine. SlugInstanceKey
+// is shared with the parser via internal/yaml.
+//
+// Empty input returns nil. A parent that doesn't exist (deleted
+// task) is skipped. CommitSHA is empty for skipped parents — they
+// have no submission.
+func lookupReadiedParents(q dbExecQueryer, dependsOn string) ([]ReadiedParent, error) {
+	if dependsOn == "" {
+		return nil, nil
+	}
+	var out []ReadiedParent
+	for _, raw := range strings.Split(dependsOn, ",") {
+		parentID := strings.TrimSpace(raw)
+		if parentID == "" {
+			continue
+		}
+		var (
+			action         string
+			commitSHA      sql.NullString
+			runSlug        sql.NullString
+			taskDefID      string
+			instanceParams sql.NullString
+		)
+		err := q.QueryRow(
+			`SELECT action, commit_sha, run_slug, task_def_id, instance_params
+			 FROM tasks WHERE id = ?`,
+			parentID,
+		).Scan(&action, &commitSHA, &runSlug, &taskDefID, &instanceParams)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lookup parent %s: %w", parentID, err)
+		}
+		out = append(out, ReadiedParent{
+			TaskID:    parentID,
+			Action:    action,
+			CommitSHA: commitSHA.String,
+			ResultDir: renderResultDir(parentID, runSlug.String, taskDefID, instanceParams.String),
+		})
+	}
+	return out, nil
+}
+
+// renderResultDir mirrors engine.ComputeResultDir for callers
+// inside the store package (which can't import engine without
+// breaking the dep direction). On any parse error we fall back
+// to the singleton layout — same defensive choice the engine
+// version makes; a corrupted instance_params row should not take
+// down the readiness cascade.
+func renderResultDir(taskID, runSlug, taskDefID, instanceParamsJSON string) string {
+	runSeq := runSeqFromTaskID(taskID)
+	base := filepath.Join("enju", "runs", runDirSegment(runSeq, runSlug), taskDefID)
+	if instanceParamsJSON == "" {
+		return base
+	}
+	var params map[string]string
+	if err := json.Unmarshal([]byte(instanceParamsJSON), &params); err != nil || len(params) == 0 {
+		return base
+	}
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		seg := fmt.Sprintf("%s=%s", k, enjuYaml.SlugInstanceKey(params[k]))
+		base = filepath.Join(base, seg)
+	}
+	return base
+}
+
+// runDirSegment renders the per-run path segment, mirroring
+// engine.RunDir. Slug is optional; without it the segment is
+// just the seq, which matches the engine helper's fallback.
+func runDirSegment(runSeq int, slug string) string {
+	if slug == "" {
+		return strconv.Itoa(runSeq)
+	}
+	return fmt.Sprintf("%d-%s", runSeq, slug)
+}
+
+// runSeqFromTaskID parses `{projID}:{runSeq}:...`. Returns 0
+// on malformed input (matches engine.runSeqFromTask) — callers
+// render `enju/runs/0/...` which is loud-wrong rather than
+// silently routing to a plausible-but-wrong path.
+func runSeqFromTaskID(taskID string) int {
+	parts := strings.SplitN(taskID, ":", 3)
+	if len(parts) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
@@ -2539,12 +2683,21 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 			if pt.assignTo != "" {
 				_ = json.Unmarshal([]byte(pt.assignTo), &assignees)
 			}
+			// Snapshot parents at the moment of readiness so the
+			// task_ready event is self-contained for the fat-
+			// client inbox view (no event-correlation, no
+			// coordinator round-trips).
+			parents, perr := lookupReadiedParents(q, pt.dependsOn)
+			if perr != nil {
+				return readied, perr
+			}
 			readied = append(readied, ReadiedTask{
 				TaskID:    pt.id,
 				Action:    pt.action,
 				Assignees: assignees,
 				ProjectID: projectID,
 				RunID:     runID,
+				Parents:   parents,
 			})
 		}
 	}

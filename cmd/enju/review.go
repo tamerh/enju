@@ -22,11 +22,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/enju-ai/enju/internal/mcpserver"
 )
 
 // validReviewDecisions is the canonical verb set, kept verbatim
@@ -81,15 +78,11 @@ Flags:`)
 	// Compose content. -content wins; otherwise $EDITOR.
 	content := *contentFlag
 	if content == "" {
-		// Best-effort: fetch the task's inbox row so the editor
-		// template includes the prompt + upstream submission.
-		// On any failure (task not in inbox, network blip, parse
-		// error) we fall back to a bare template — better than
-		// blocking the user.
-		ctx := tryFetchReviewContext(*coordinator, creds.Token, taskID)
-
+		// Editor opens with a bare template (just the task id).
+		// Run `enju inbox <project_id>` first if you want to read
+		// the task prompt + upstream submissions before writing.
 		var err error
-		content, err = composeReviewInEditor(taskID, ctx)
+		content, err = composeReviewInEditor(taskID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -118,15 +111,10 @@ Flags:`)
 }
 
 // composeReviewInEditor opens $EDITOR (or vi) on a temp file
-// pre-populated with a comment-marked template. Returns the
-// non-comment body. Lines starting with `#` (after optional
+// pre-populated with a bare comment-marked template. Returns
+// the non-comment body. Lines starting with `#` (after optional
 // whitespace) are stripped — same convention git uses.
-//
-// ctx, when non-nil, is the inbox row for this task — its
-// prompt and upstream submissions get rendered as comment lines
-// at the top of the template so the reviewer sees what they're
-// reviewing without leaving the editor.
-func composeReviewInEditor(taskID string, ctx *mcpserver.InboxRow) (string, error) {
+func composeReviewInEditor(taskID string) (string, error) {
 	editor := os.Getenv("VISUAL")
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
@@ -141,7 +129,7 @@ func composeReviewInEditor(taskID string, ctx *mcpserver.InboxRow) (string, erro
 	safe := strings.NewReplacer(":", "-", "/", "-").Replace(taskID)
 	path := filepath.Join(dir, fmt.Sprintf("enju-REVIEW-%s.md", safe))
 
-	tmpl := buildReviewTemplate(taskID, ctx)
+	tmpl := buildReviewTemplate(taskID)
 	if err := os.WriteFile(path, []byte(tmpl), 0o600); err != nil {
 		return "", fmt.Errorf("creating review buffer: %w", err)
 	}
@@ -162,87 +150,29 @@ func composeReviewInEditor(taskID string, ctx *mcpserver.InboxRow) (string, erro
 	return stripCommentLines(string(raw)), nil
 }
 
-// buildReviewTemplate composes the editor pre-fill. When ctx is
-// nil, falls back to a bare template (task id only) — the
-// best-effort fetch failed and we don't want to block the user.
-// Comment lines use `#` so stripCommentLines drops them on save.
-func buildReviewTemplate(taskID string, ctx *mcpserver.InboxRow) string {
+// buildReviewTemplate composes a bare editor pre-fill — task id
+// in a comment header, then a usage hint. Comment lines use `#`
+// so stripCommentLines drops them on save.
+//
+// Why so bare: the inbox surface (`enju inbox`) already renders
+// the prompt + upstream content for a task. Reviewers should run
+// inbox first if they want context, then review. Pre-fetching
+// here would either duplicate inbox's projection or do its own
+// coordinator round-trip — neither is worth the complexity.
+func buildReviewTemplate(taskID string) string {
 	var b strings.Builder
 	b.WriteString("# Reviewing ")
 	b.WriteString(taskID)
-	if ctx != nil && ctx.Action != "" {
-		fmt.Fprintf(&b, " — %s", ctx.Action)
-	}
 	b.WriteString("\n")
-
-	if ctx != nil && ctx.Prompt != "" {
-		b.WriteString("#\n# This task's prompt:\n")
-		for _, line := range strings.Split(strings.TrimRight(ctx.Prompt, "\n"), "\n") {
-			fmt.Fprintf(&b, "# > %s\n", line)
-		}
-		if ctx.PromptTruncated {
-			b.WriteString("# > [truncated — run `enju_get_task` for full text]\n")
-		}
-	}
-
-	if ctx != nil {
-		for _, up := range ctx.Upstream {
-			b.WriteString("#\n# Upstream ")
-			b.WriteString(up.TaskID)
-			if up.Action != "" {
-				fmt.Fprintf(&b, " (%s)", up.Action)
-			}
-			if up.CommitSHA != "" {
-				fmt.Fprintf(&b, " commit %s", up.CommitSHA)
-			}
-			b.WriteString(":\n")
-			if up.Content == "" {
-				b.WriteString("# > (no inlined content — pull from git via the commit_sha)\n")
-				continue
-			}
-			for _, line := range strings.Split(strings.TrimRight(up.Content, "\n"), "\n") {
-				fmt.Fprintf(&b, "# > %s\n", line)
-			}
-		}
-	}
-
 	b.WriteString(`#
-# Write your review prose below. Lines starting with '#' are
-# stripped before submission. Save and exit; empty body aborts.
-# Decision: pass -decision flag, or you'll be prompted after save.
+# Run 'enju inbox <project_id>' first if you want to see the
+# task prompt and upstream submissions. Write your review prose
+# below. Lines starting with '#' are stripped before submission.
+# Save and exit; empty body aborts. Decision: pass -decision
+# flag, or you'll be prompted after save.
 
 `)
 	return b.String()
-}
-
-// tryFetchReviewContext attempts to find the task in the
-// caller's inbox so the editor template can show the prompt +
-// upstream content. Best-effort — returns nil on any failure
-// (task not in inbox, parse errors, network blips). The user
-// gets a bare template in that case, not an error.
-//
-// Task IDs are <projectID>:<runSeq>:<taskName> by convention,
-// so we parse the project from the id and call the inbox
-// endpoint. No new endpoint needed.
-func tryFetchReviewContext(coordinator, token, taskID string) *mcpserver.InboxRow {
-	parts := strings.SplitN(taskID, ":", 3)
-	if len(parts) < 1 {
-		return nil
-	}
-	projectID, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || projectID <= 0 {
-		return nil
-	}
-	rows, err := fetchInbox(coordinator, token, projectID)
-	if err != nil {
-		return nil
-	}
-	for i, r := range rows {
-		if r.TaskID == taskID {
-			return &rows[i]
-		}
-	}
-	return nil
 }
 
 // stripCommentLines removes lines whose first non-whitespace
