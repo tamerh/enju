@@ -357,6 +357,79 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	}
 }
 
+// TestApplyPlan_CascadeSeesInTxWrites pins the tx-aware
+// behavior: a Plan that flips an upstream task to ACCEPTED
+// and runs the cascade in the same Plan must see the new
+// state and promote downstream tasks. Pre-fix the cascade ran
+// via s.db (separate connection, pre-commit view), so it
+// silently saw the upstream as still claimed/collecting and
+// promoted nothing — the deadline-driven vote/review resolve
+// path's bug.
+func TestApplyPlan_CascadeSeesInTxWrites(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	alice := createTestCitizen(t, s, "alice", "tok-tx")
+
+	// Drive an upstream task through claim+submit so it lands
+	// in collecting/accepted state via the standard path.
+	taskID := makeTaskWithAction(t, s, runID, "tup", "answer", TaskReady)
+	deadline := time.Now().Add(time.Hour)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetClaim{TaskID: taskID, CitizenID: alice, Deadline: deadline},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		RecordSubmission{
+			TaskID: taskID, CitizenID: alice,
+			CommitSHA: "deadbeef", Content: "x", TokensUsed: 1, EstimatedTokens: 1,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert a downstream task that depends on the upstream.
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tdown", RunID: runID, Seq: 99, TaskDefID: "tdown",
+		Action: "review", ResultType: "text",
+		State: TaskPending, DependsOn: taskID,
+		AssignTo:  `["alice"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Single Plan: bump tup to ACCEPTED + run cascade. The
+	// cascade must see the in-tx accept and promote tdown.
+	result, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: taskID, NewState: TaskAccepted, CommitSHA: "deadbeef"},
+		UpdateReadyTasks{RunID: runID},
+	}})
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	if result.TasksReadied != 1 {
+		t.Errorf("TasksReadied = %d, want 1 — cascade did not see the in-tx accept", result.TasksReadied)
+	}
+
+	// Verify post-commit: tdown is now ready.
+	tdown, _ := s.GetTask("tdown")
+	if tdown == nil {
+		t.Fatal("tdown missing")
+	}
+	if tdown.State != TaskReady {
+		t.Errorf("tdown.State = %q, want ready", tdown.State)
+	}
+
+	// Verify the task_ready event landed for alice.
+	waitForEventsDrained(t, s)
+	if hasEventWithMetadata(t, s, runID, "task_ready", `"assign_to":"alice"`) == nil {
+		t.Error("missing task_ready event for alice")
+	}
+}
+
 // TestUpdateReadyTasks_ParsesJSONArrayAssignTo pins the parse
 // of the on-disk shape: tasks.assign_to is a JSON-encoded array
 // (`["alice"]`) per engine.materialize / store.spawn. The

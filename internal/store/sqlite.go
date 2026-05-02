@@ -2607,23 +2607,43 @@ type ReadiedTask struct {
 	RunID     int64
 }
 
+// dbExecQueryer is the read+write surface shared by *sql.DB and
+// *sql.Tx. The cascade (updateReadyTasksOn) is parameterized over
+// this so it can run inside the ApplyPlan transaction (taking
+// `tx`) or as a standalone post-commit call (taking `s.db`).
+//
+// Why this matters: a tx holds the SQLite write lock until commit.
+// If the cascade runs through `s.db`, it grabs a different pool
+// connection that (a) sees pre-commit state — readiness updates
+// from the same plan are invisible — and (b) busy-waits on the
+// write lock when it tries to UPDATE. Pre-fix this manifested as
+// the deadline-driven vote/review resolve path silently missing
+// downstream readiness propagation; post-fix it's a single tx.
+type dbExecQueryer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
+	return updateReadyTasksOn(s.db, runID)
+}
+
+// updateReadyTasksOn is the tx-aware cascade body. Callers pick:
+//   - applyUpdateReadyTasks passes the open ApplyPlan tx so the
+//     cascade reads in-tx writes (e.g. the SetTaskState-just-
+//     accepted upstream) and its own UPDATE shares the lock.
+//   - s.UpdateReadyTasks passes s.db for standalone callers
+//     (router post-ApplyPlan, scheduler ticks, etc.).
+func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 	// Pull project_id + branch once for this run — every
 	// pending task shares both, and the artifact index lookups
 	// below need (project, branch) to find the right row.
 	var projectID int64
 	var runBranch string
-	if err := s.db.QueryRow(`SELECT project_id, branch FROM runs WHERE id = ?`, runID).Scan(&projectID, &runBranch); err != nil {
+	if err := q.QueryRow(`SELECT project_id, branch FROM runs WHERE id = ?`, runID).Scan(&projectID, &runBranch); err != nil {
 		return nil, fmt.Errorf("loading run project: %w", err)
 	}
-
-	rows, err := s.db.Query(
-		`SELECT id, depends_on, reads_artifacts, action, COALESCE(assign_to, '') FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 
 	type pendingTask struct {
 		id             string
@@ -2633,15 +2653,30 @@ func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
 		assignTo       string
 	}
 	var pending []pendingTask
-	for rows.Next() {
-		var pt pendingTask
-		if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts, &pt.action, &pt.assignTo); err != nil {
+	{
+		rows, err := q.Query(
+			`SELECT id, depends_on, reads_artifacts, action, COALESCE(assign_to, '') FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
+		)
+		if err != nil {
 			return nil, err
 		}
-		pending = append(pending, pt)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		// Drain + close eagerly — when q is a *sql.Tx the same
+		// connection is needed for the next Query, and an open
+		// Rows on that connection would error. With *sql.DB
+		// closing here is a no-op cost. Same pattern below.
+		for rows.Next() {
+			var pt pendingTask
+			if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts, &pt.action, &pt.assignTo); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			pending = append(pending, pt)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 
 	// "Satisfied" parents for dependency readiness include both
@@ -2650,21 +2685,27 @@ func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
 	// skipped-by-gate is still unblocked — the gate decided that
 	// branch is done, not pending. FAILED is NOT satisfied — a
 	// failed upstream should block its downstream, not unblock it.
-	acceptedRows, err := s.db.Query(
-		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer acceptedRows.Close()
-
 	accepted := make(map[string]bool)
-	for acceptedRows.Next() {
-		var id string
-		if err := acceptedRows.Scan(&id); err != nil {
+	{
+		acceptedRows, err := q.Query(
+			`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
+		)
+		if err != nil {
 			return nil, err
 		}
-		accepted[id] = true
+		for acceptedRows.Next() {
+			var id string
+			if err := acceptedRows.Scan(&id); err != nil {
+				acceptedRows.Close()
+				return nil, err
+			}
+			accepted[id] = true
+		}
+		if err := acceptedRows.Err(); err != nil {
+			acceptedRows.Close()
+			return nil, err
+		}
+		acceptedRows.Close()
 	}
 
 	var readied []ReadiedTask
@@ -2687,27 +2728,39 @@ func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
 		// in other runs that read artifacts from this one. Without
 		// this, cross-run readers land in READY immediately (the
 		// known limitation from iteration 3.2).
+		//
+		// Inlined existence check (not a call out to GetArtifact)
+		// so the read shares the cascade's connection — see the
+		// dbExecQueryer doc.
 		if allDone && pt.readsArtifacts != "" {
+			branch := runBranch
+			if branch == "" {
+				branch = "main"
+			}
 			var paths []string
 			if err := json.Unmarshal([]byte(pt.readsArtifacts), &paths); err == nil {
 				for _, p := range paths {
 					if p == "" {
 						continue
 					}
-					a, err := s.GetArtifact(projectID, runBranch, p)
-					if err != nil {
-						return readied, fmt.Errorf("checking artifact %s: %w", p, err)
-					}
-					if a == nil {
+					var one int
+					err := q.QueryRow(
+						`SELECT 1 FROM artifacts WHERE project_id = ? AND branch = ? AND path = ? LIMIT 1`,
+						projectID, branch, p,
+					).Scan(&one)
+					if err == sql.ErrNoRows {
 						allDone = false
 						break
+					}
+					if err != nil {
+						return readied, fmt.Errorf("checking artifact %s: %w", p, err)
 					}
 				}
 			}
 		}
 
 		if allDone {
-			_, err := s.db.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
+			_, err := q.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
 			if err != nil {
 				return readied, err
 			}

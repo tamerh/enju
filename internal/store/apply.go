@@ -990,10 +990,16 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen) (int64, error) {
 }
 
 func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, events *[]Event) (int, error) {
-	// Delegate to the existing UpdateReadyTasks logic but
-	// it runs outside the tx for now. TODO: inline the
-	// ready-task sweep into the transaction.
-	readied, err := s.UpdateReadyTasks(m.RunID)
+	// Run the cascade against the open tx so it sees in-tx
+	// writes (e.g. an upstream task's accept transition earlier
+	// in the same Plan) and shares the SQLite write lock for
+	// its own UPDATEs. Pre-fix this delegated to s.UpdateReadyTasks
+	// (which uses s.db) — that's a separate connection that
+	// neither sees uncommitted state nor can write while the
+	// tx holds the lock. Symptom was deadline-driven vote/
+	// review resolve missing readiness propagation. See
+	// dbExecQueryer doc.
+	readied, err := updateReadyTasksOn(tx, m.RunID)
 	if err != nil {
 		return len(readied), err
 	}
