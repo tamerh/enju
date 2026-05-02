@@ -1867,90 +1867,6 @@ func (s *Store) SubmitTaskResult(taskID string, citizenID int64, resultPath, com
 	return &SubmitResult{Collecting: true}, nil
 }
 
-// ResolveMultiCitizenVote transitions a task from COLLECTING to
-// ACCEPTED with the given winning option. Called by the router
-// after the tally function says "winner found." Also credits the
-// completed task to every citizen who submitted (score rolls up
-// once the group decision lands, not per-vote).
-func (s *Store) ResolveMultiCitizenVote(taskID, winningOption, commitSHA string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	now := time.Now()
-
-	var state string
-	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state); err != nil {
-		return fmt.Errorf("task %q not found: %w", taskID, err)
-	}
-	if TaskState(state) != TaskCollecting {
-		return fmt.Errorf("task %q is not in collecting state (state: %s)", taskID, state)
-	}
-	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'accepted', submitted_at = ?, vote_choice = ?, commit_sha = ? WHERE id = ?`,
-		now, winningOption, commitSHA, taskID,
-	)
-	if err != nil {
-		return err
-	}
-	// Credit every submitting citizen.
-	if _, err := tx.Exec(
-		`UPDATE citizens SET
-			tasks_completed = tasks_completed + 1,
-			score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
-			last_seen = ?
-		WHERE id IN (SELECT citizen_id FROM task_claims WHERE task_id = ? AND outcome = 'completed')`,
-		now, taskID,
-	); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// ResolveMultiCitizenReview transitions a multi-reviewer review
-// task from COLLECTING to ACCEPTED, recording the tally's final
-// verdict ("approve" or "reject") on the task's review_decision
-// column. Credits the completed task to every submitting reviewer
-// (score rolls up once the group decision lands, same as the
-// vote path). Called by the router after the review tally
-// resolves. The caller then fires the existing reject cascade if
-// the verdict was "reject".
-func (s *Store) ResolveMultiCitizenReview(taskID, verdict, commitSHA string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	now := time.Now()
-
-	var state string
-	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state); err != nil {
-		return fmt.Errorf("task %q not found: %w", taskID, err)
-	}
-	if TaskState(state) != TaskCollecting {
-		return fmt.Errorf("task %q is not in collecting state (state: %s)", taskID, state)
-	}
-	_, err = tx.Exec(
-		`UPDATE tasks SET state = 'accepted', submitted_at = ?, review_decision = ?, commit_sha = ? WHERE id = ?`,
-		now, verdict, commitSHA, taskID,
-	)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(
-		`UPDATE citizens SET
-			tasks_completed = tasks_completed + 1,
-			score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
-			last_seen = ?
-		WHERE id IN (SELECT citizen_id FROM task_claims WHERE task_id = ? AND outcome = 'completed')`,
-		now, taskID,
-	); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // ListVoteSubmissions returns the per-citizen votes cast so far on
 // a multi-citizen vote task. One row per submitted claim, in
 // submission order. Used by the router's tally function and by
@@ -2421,172 +2337,6 @@ func (s *Store) ReleaseTask(taskID string, citizenID int64) error {
 	return tx.Commit()
 }
 
-// MarkTasksSkipped is the Phase E.2 skip-cascade's state flip.
-// Called by performSkipCascade after a vote resolves with an
-// `activates:` option that leaves some branch tasks stranded.
-// Each task in skipIDs transitions to SKIPPED (terminal) and has
-// its claim/result fields cleared so stale provenance doesn't
-// leak into subsequent re-runs if the vote is later invalidated.
-// Tasks already in a terminal state (accepted / skipped / invalid)
-// are left alone — only non-terminal rows flip.
-func (s *Store) MarkTasksSkipped(skipIDs []string) (int, error) {
-	if len(skipIDs) == 0 {
-		return 0, nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	count := 0
-	for _, id := range skipIDs {
-		var state string
-		err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, id).Scan(&state)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return 0, err
-		}
-		switch TaskState(state) {
-		case TaskAccepted, TaskSkipped, TaskInvalid, TaskInvalidated:
-			// Already terminal — leave alone.
-			continue
-		}
-		if _, err := tx.Exec(
-			`UPDATE tasks SET state = 'skipped', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL WHERE id = ?`,
-			id,
-		); err != nil {
-			return 0, err
-		}
-		count++
-	}
-	return count, tx.Commit()
-}
-
-// ResetSkippedTasksToPending flips every SKIPPED task in the given
-// set back to PENDING. Used during invalidation cascade when a
-// previously-resolved vote gets invalidated — the branches that
-// were dead because of the vote need to reconsider themselves.
-// The scheduler's UpdateReadyTasks will then re-evaluate them
-// from PENDING and promote to READY once their deps line up.
-func (s *Store) ResetSkippedTasksToPending(ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, id := range ids {
-		if _, err := tx.Exec(
-			`UPDATE tasks SET state = 'pending' WHERE id = ? AND state = 'skipped'`,
-			id,
-		); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-// InvalidateTask cascades an invalidation starting from taskID. The
-// target transitions to READY (ready to re-claim) and each descendant
-// transitions to PENDING (waiting for the target to re-complete).
-// claimed_by, claimed_at, and result_path are cleared on every touched
-// task, so old provenance doesn't leak into the next run.
-//
-// Git history preserves the previous results — the new result written
-// on re-claim overwrites the same files, but git keeps both versions.
-//
-// Returns the number of tasks that actually changed state (useful for
-// logging and for returning in the API response).
-func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	// Verify the target exists and is in a state we can invalidate.
-	// Only ACCEPTED tasks make sense to invalidate — they've produced
-	// a result that we now believe is wrong.
-	var state string
-	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&state); err != nil {
-		return 0, fmt.Errorf("task %q not found: %w", taskID, err)
-	}
-	if TaskState(state) != TaskAccepted {
-		return 0, fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted)", taskID, state)
-	}
-
-	changed := 0
-
-	// Target: ACCEPTED → READY. Clear all claim/result fields so a
-	// fresh citizen sees no stale provenance when they claim. Also
-	// clears review_decision and vote_choice so a re-run of a
-	// review/vote task lands a fresh verdict instead of re-using
-	// the previous one.
-	if _, err = tx.Exec(
-		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '', vote_choice = '' WHERE id = ?`,
-		taskID,
-	); err != nil {
-		return 0, err
-	}
-	changed++
-
-	// Record the invalidation in the task_claims history so the audit
-	// trail captures what happened. Any open claim row for this task
-	// that doesn't already have an outcome gets marked 'invalidated'.
-	if _, err = tx.Exec(
-		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`,
-		taskID,
-	); err != nil {
-		return 0, err
-	}
-
-	// Descendants: any state that implies they're running, ran, or
-	// about to run against now-stale upstream data → PENDING. Already
-	// PENDING descendants are left alone.
-	//
-	// TaskPending is explicitly the no-op case; everything else
-	// (READY, CLAIMED, RUNNING, SUBMITTED, ACCEPTED, INVALID,
-	// INVALIDATED, REJECTED) transitions to PENDING so the scheduler
-	// re-evaluates it when the target re-completes.
-	for _, descID := range descendantIDs {
-		var descState string
-		err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, descID).Scan(&descState)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return 0, err
-		}
-		if TaskState(descState) == TaskPending {
-			continue
-		}
-		if _, err := tx.Exec(
-			`UPDATE tasks SET state = 'pending', claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, review_decision = '', vote_choice = '' WHERE id = ?`,
-			descID,
-		); err != nil {
-			return 0, err
-		}
-		// Also clear any open claim row so re-claims get a fresh
-		// history entry instead of overwriting the original.
-		if _, err := tx.Exec(
-			`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`,
-			descID,
-		); err != nil {
-			return 0, err
-		}
-		changed++
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return changed, nil
-}
-
 // ReadiedTask describes one task that flipped pending→ready in
 // a single UpdateReadyTasks pass. Returned so the caller can emit
 // task_ready events carrying the assignee(s) — the field the
@@ -2626,7 +2376,22 @@ type dbExecQueryer interface {
 }
 
 func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
-	return updateReadyTasksOn(s.db, runID)
+	readied, err := updateReadyTasksOn(s.db, runID)
+	if err != nil {
+		return readied, err
+	}
+	// Emit task_ready events. The mutation-driven path
+	// (applyUpdateReadyTasks) accumulates these into a Plan's
+	// pendingEvents and records after commit; the direct-call
+	// path (most production callers — router.go's submit/
+	// invalidate/fail-cascade paths all hit s.UpdateReadyTasks
+	// post-ApplyPlan) needs to record directly here, otherwise
+	// task_ready never fires for those flows. Both paths share
+	// buildTaskReadyEvents so the wire shape stays identical.
+	for _, ev := range buildTaskReadyEvents(readied, time.Now()) {
+		s.Events().Record(ev)
+	}
+	return readied, nil
 }
 
 // updateReadyTasksOn is the tx-aware cascade body. Callers pick:
@@ -3533,53 +3298,6 @@ func (s *Store) ListTasksWritingArtifact(projectID int64, path string, acceptedO
 // caller needs to enumerate readers across runs. Within a
 // single run the reads_artifacts declaration plus UpdateReadyTasks
 // gating is enough to sequence things correctly.
-
-// DeleteTasksByDefInRun removes every task row in the given
-// run whose task_def_id matches. Used by the Phase J.1
-// dynamic for_each materializer to clean up stale instances
-// before re-materializing after an upstream invalidation +
-// re-accept with a different output list. Also removes any
-// associated task_claims rows so the re-materialization
-// starts from a clean slate.
-func (s *Store) DeleteTasksByDefInRun(runID int64, defID string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Find the affected task IDs first so we can also delete
-	// their task_claims rows (foreign-key-style cleanup even
-	// though SQLite isn't enforcing it here).
-	rows, err := tx.Query(
-		`SELECT id FROM tasks WHERE run_id = ? AND task_def_id = ?`,
-		runID, defID,
-	)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	for _, id := range ids {
-		if _, err := tx.Exec(`DELETE FROM task_claims WHERE task_id = ?`, id); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(
-		`DELETE FROM tasks WHERE run_id = ? AND task_def_id = ?`,
-		runID, defID,
-	); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
 
 // DeleteArtifact removes an artifact's index row by (project_id, path).
 // Used by the rollback path when an invalidated task was the file's

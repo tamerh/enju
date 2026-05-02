@@ -357,6 +357,51 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	}
 }
 
+// TestUpdateReadyTasks_DirectCallEmitsEvents pins the
+// production-load-bearing path: most callers invoke
+// s.UpdateReadyTasks(runID) directly (after ApplyPlan returns),
+// not as a Plan mutation. That direct path must emit task_ready
+// events too, otherwise the assigned_task_ready notification
+// rule never fires in the standard submit→cascade flow. Pre-fix
+// the emit lived only in applyUpdateReadyTasks (the mutation
+// handler), so direct callers — vote/review submit, invalidate,
+// fail-cascade — silently dropped task_ready events.
+func TestUpdateReadyTasks_DirectCallEmitsEvents(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTask(&TaskRecord{
+		ID: "trev", RunID: runID, Seq: 2, TaskDefID: "trev",
+		Action: "review", ResultType: "text",
+		State: TaskPending, DependsOn: "tup",
+		AssignTo:  `["alice"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	readied, err := s.UpdateReadyTasks(runID)
+	if err != nil {
+		t.Fatalf("UpdateReadyTasks: %v", err)
+	}
+	if len(readied) != 1 {
+		t.Fatalf("expected 1 readied, got %d", len(readied))
+	}
+
+	waitForEventsDrained(t, s)
+	if hasEventWithMetadata(t, s, runID, "task_ready", `"assign_to":"alice"`) == nil {
+		t.Fatal("direct s.UpdateReadyTasks call must emit task_ready event with assign_to in metadata")
+	}
+}
+
 // TestApplyPlan_CascadeSeesInTxWrites pins the tx-aware
 // behavior: a Plan that flips an upstream task to ACCEPTED
 // and runs the cascade in the same Plan must see the new
