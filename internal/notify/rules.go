@@ -38,10 +38,10 @@ type Predicate struct {
 	Subtype   string // exact match on event.subtype
 	TaskID    string // exact match on event.task_id
 	Citizen   string // exact match on event.citizen — supports the literal "{{me}}"
+	AssignTo  string // exact match on event.assign_to — supports the literal "{{me}}"
 	// Future fields here as Layer 1 default predicates need
-	// them (assign_to, project_owner, parent_of, etc.). Keep
-	// the predicate flat; nested boolean logic is over-design
-	// for v1.
+	// them (project_owner, parent_of, etc.). Keep the predicate
+	// flat; nested boolean logic is over-design for v1.
 }
 
 // PredicateMatches is the exported entry point for
@@ -90,6 +90,15 @@ func predicateMatches(p Predicate, ev Event, cfg Config) bool {
 			want = cfg.Username
 		}
 		if want != ev.Citizen {
+			return false
+		}
+	}
+	if p.AssignTo != "" {
+		want := p.AssignTo
+		if want == "{{me}}" {
+			want = cfg.Username
+		}
+		if want != ev.AssignTo {
 			return false
 		}
 	}

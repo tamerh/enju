@@ -18,6 +18,9 @@ package notify
 //     my_task_completed
 //     my_task_failed
 //
+//   "assigned to me" defaults — fire on tasks routed to me
+//     assigned_task_ready
+//
 //   project-pulse defaults — fire on any project member's events
 //     branch_merged
 //     issue_filed
@@ -27,9 +30,9 @@ package notify
 //     run_paused
 //     run_resumed
 //
-// Adding richer "for me specifically" rules (assigned_task_ready,
-// my_review_resolved, my_run_failed) needs server-side
-// enrichment of /events — see notifications.md.
+// Adding richer "for me specifically" rules (my_review_resolved,
+// my_run_failed) needs further server-side enrichment of
+// /events — see notifications.md.
 
 // compiledDefaults returns the built-in Layer 1 rules.
 // Returned fresh each call so callers can safely mutate the
@@ -52,6 +55,16 @@ func compiledDefaults() []Rule {
 				Citizen:   "{{me}}",
 			},
 			Message: "Task {{task_id}} failed",
+		},
+
+		// --- "assigned to me" defaults ---
+		{
+			Name: "assigned_task_ready",
+			When: Predicate{
+				EventType: "task_ready",
+				AssignTo:  "{{me}}",
+			},
+			Message: "Task {{task_id}} is ready for you ({{type}}/{{subtype}})",
 		},
 
 		// --- project-pulse defaults — fire on any actor ---

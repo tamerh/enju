@@ -284,6 +284,201 @@ func TestEventEmission_IterationStartedReopen(t *testing.T) {
 	}
 }
 
+// TestUpdateReadyTasks_ReturnsAssignTo verifies that the cascade
+// surfaces assign_to in the ReadiedTask list — parsed from the
+// JSON-array shape the engine writes (e.g. `["alice"]`). This
+// is the data applyUpdateReadyTasks fans out into one task_ready
+// event per assignee for the assigned_task_ready notification
+// rule.
+func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the production shape: assign_to is JSON-encoded
+	// (engine.materialize writes `["alice"]`, store.spawn writes
+	// the same). The cascade must parse this back into a slice.
+	if err := s.CreateTask(&TaskRecord{
+		ID: "trev", RunID: runID, Seq: 2, TaskDefID: "trev",
+		Action: "review", ResultType: "text",
+		State: TaskPending, DependsOn: "tup",
+		AssignTo:  `["tamer"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tnoassign", RunID: runID, Seq: 3, TaskDefID: "tnoassign",
+		Action: "answer", ResultType: "text",
+		State: TaskPending, DependsOn: "tup",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	readied, err := s.UpdateReadyTasks(runID)
+	if err != nil {
+		t.Fatalf("UpdateReadyTasks: %v", err)
+	}
+	if len(readied) != 2 {
+		t.Fatalf("expected 2 readied (trev, tnoassign), got %d: %+v", len(readied), readied)
+	}
+
+	byID := map[string]ReadiedTask{}
+	for _, rt := range readied {
+		byID[rt.TaskID] = rt
+	}
+
+	if rt, ok := byID["trev"]; !ok {
+		t.Error("trev missing from readied")
+	} else {
+		if len(rt.Assignees) != 1 || rt.Assignees[0] != "tamer" {
+			t.Errorf("trev.Assignees = %#v, want [tamer]", rt.Assignees)
+		}
+		if rt.Action != "review" {
+			t.Errorf("trev.Action = %q, want review", rt.Action)
+		}
+		if rt.RunID != runID {
+			t.Errorf("trev.RunID = %d, want %d", rt.RunID, runID)
+		}
+	}
+
+	if rt, ok := byID["tnoassign"]; !ok {
+		t.Error("tnoassign missing from readied")
+	} else if len(rt.Assignees) != 0 {
+		t.Errorf("tnoassign.Assignees = %#v, want [] (unassigned task)", rt.Assignees)
+	}
+}
+
+// TestUpdateReadyTasks_ParsesJSONArrayAssignTo pins the parse
+// of the on-disk shape: tasks.assign_to is a JSON-encoded array
+// (`["alice"]`) per engine.materialize / store.spawn. The
+// cascade must unmarshal it before handing off to the apply
+// emit-site — without this, the wire-level assign_to leaks the
+// JSON literal and predicate matchers never fire.
+func TestUpdateReadyTasks_ParsesJSONArrayAssignTo(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	now := time.Now()
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Single-assignee, JSON-array shape.
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tsingle", RunID: runID, Seq: 2, TaskDefID: "tsingle",
+		Action: "review", ResultType: "text",
+		State: TaskPending, DependsOn: "tup",
+		AssignTo:  `["alice"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Multi-assignee, JSON-array shape.
+	if err := s.CreateTask(&TaskRecord{
+		ID: "tdual", RunID: runID, Seq: 3, TaskDefID: "tdual",
+		Action: "review", ResultType: "text",
+		State: TaskPending, DependsOn: "tup",
+		AssignTo:  `["alice","bob"]`,
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	readied, err := s.UpdateReadyTasks(runID)
+	if err != nil {
+		t.Fatalf("UpdateReadyTasks: %v", err)
+	}
+	byID := map[string]ReadiedTask{}
+	for _, rt := range readied {
+		byID[rt.TaskID] = rt
+	}
+
+	if rt := byID["tsingle"]; len(rt.Assignees) != 1 || rt.Assignees[0] != "alice" {
+		t.Errorf("tsingle.Assignees = %#v, want [alice] (parsed from JSON-array)", rt.Assignees)
+	}
+	if rt := byID["tdual"]; len(rt.Assignees) != 2 || rt.Assignees[0] != "alice" || rt.Assignees[1] != "bob" {
+		t.Errorf("tdual.Assignees = %#v, want [alice bob]", rt.Assignees)
+	}
+}
+
+// TestBuildTaskReadyEvents pins the fan-out shape that
+// applyUpdateReadyTasks delegates to. Pure function — easier to
+// test than the ApplyPlan-driven path (which has its own
+// pre-existing same-process write-lock interaction with
+// s.UpdateReadyTasks). Covers:
+//
+//   - single-assignee → one event with bare username in metadata
+//   - multi-assignee → N events, one per assignee
+//   - unassigned → one event with empty assign_to (audit row)
+func TestBuildTaskReadyEvents(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	readied := []ReadiedTask{
+		{TaskID: "trev", Action: "review", Assignees: []string{"alice"}, RunID: 7, ProjectID: 1},
+		{TaskID: "tdual", Action: "review", Assignees: []string{"alice", "bob"}, RunID: 7, ProjectID: 1},
+		{TaskID: "tnoassign", Action: "answer", Assignees: nil, RunID: 7, ProjectID: 1},
+	}
+
+	events := buildTaskReadyEvents(readied, now)
+
+	// trev → 1, tdual → 2, tnoassign → 1: total 4.
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(events))
+	}
+
+	// Every event should be type=task_ready with the right subtype.
+	// Pull assign_to from metadata to verify the fan-out and the
+	// bare-username shape (no JSON-array literal).
+	type emitted struct {
+		taskID, subtype, assignTo string
+	}
+	var got []emitted
+	for _, e := range events {
+		if e.EventType != "task_ready" {
+			t.Errorf("event type = %q, want task_ready", e.EventType)
+		}
+		if e.RunID != 7 || e.ProjectID != 1 {
+			t.Errorf("event scope = run=%d project=%d, want run=7 project=1", e.RunID, e.ProjectID)
+		}
+		// The metadata is a marshaled string; use contains to
+		// avoid a JSON parse — tests stay readable.
+		var assignTo string
+		if contains(e.Metadata, `"assign_to":"alice"`) {
+			assignTo = "alice"
+		} else if contains(e.Metadata, `"assign_to":"bob"`) {
+			assignTo = "bob"
+		} else if contains(e.Metadata, `"assign_to":""`) {
+			assignTo = ""
+		} else {
+			t.Errorf("unexpected metadata: %s", e.Metadata)
+		}
+		got = append(got, emitted{e.TaskID, e.EventSubtype, assignTo})
+	}
+
+	want := []emitted{
+		{"trev", "review", "alice"},
+		{"tdual", "review", "alice"},
+		{"tdual", "review", "bob"},
+		{"tnoassign", "answer", ""},
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("event[%d] = %+v, want %+v", i, got[i], w)
+		}
+	}
+}
+
 // TestEventEmission_IterationCompletedOnInvalidate verifies
 // MarkOpenClaimsInvalidated emits iteration_completed(invalidated)
 // for every closed claim. .2.

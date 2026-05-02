@@ -281,7 +281,13 @@ type Event struct {
 	Subtype   string    `json:"subtype,omitempty"`
 	TaskID    string    `json:"task_id,omitempty"`
 	Citizen   string    `json:"citizen,omitempty"`
-	Metadata  any       `json:"metadata,omitempty"`
+	// AssignTo is the username the task is assigned to. The
+	// coordinator hoists this from event metadata to a top-level
+	// wire field so the predicate matcher can treat it like the
+	// other identity fields. Empty when the event isn't task-
+	// scoped or the task has no assignee.
+	AssignTo string `json:"assign_to,omitempty"`
+	Metadata any    `json:"metadata,omitempty"`
 }
 
 

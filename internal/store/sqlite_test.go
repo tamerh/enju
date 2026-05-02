@@ -237,24 +237,24 @@ func TestUpdateReadyTasks(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-123")
 
 	// Nothing accepted — no tasks should become ready
-	count, err := s.UpdateReadyTasks(pid)
+	readied, err := s.UpdateReadyTasks(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("expected 0 newly ready, got %d", count)
+	if len(readied) != 0 {
+		t.Fatalf("expected 0 newly ready, got %d", len(readied))
 	}
 
 	// Accept a → b should become ready, c still pending
 	s.ClaimTask("a", alice, now.Add(30*time.Minute))
 	s.SubmitTaskResult("a", alice, "results/a", "", "", "", "", 100)
 
-	count, err = s.UpdateReadyTasks(pid)
+	readied, err = s.UpdateReadyTasks(pid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("expected 1 newly ready (b), got %d", count)
+	if len(readied) != 1 {
+		t.Fatalf("expected 1 newly ready (b), got %d", len(readied))
 	}
 
 	taskB, _ := s.GetTask("b")

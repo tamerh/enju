@@ -197,7 +197,7 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			result.CitizenID = id
 
 		case UpdateReadyTasks:
-			n, err := applyUpdateReadyTasks(tx, s, m)
+			n, err := applyUpdateReadyTasks(tx, s, m, &pendingEvents)
 			if err != nil {
 				return result, err
 			}
@@ -989,11 +989,59 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen) (int64, error) {
 	return result.LastInsertId()
 }
 
-func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks) (int, error) {
+func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, events *[]Event) (int, error) {
 	// Delegate to the existing UpdateReadyTasks logic but
 	// it runs outside the tx for now. TODO: inline the
 	// ready-task sweep into the transaction.
-	return s.UpdateReadyTasks(m.RunID)
+	readied, err := s.UpdateReadyTasks(m.RunID)
+	if err != nil {
+		return len(readied), err
+	}
+	*events = append(*events, buildTaskReadyEvents(readied, time.Now())...)
+	return len(readied), nil
+}
+
+// buildTaskReadyEvents fans out one task_ready event per
+// assignee (or one with empty assign_to for unassigned tasks).
+// Pure function so the emit shape is unit-testable without
+// driving the full ApplyPlan transaction.
+//
+// Why fan-out: the assigned_task_ready notification rule does
+// bare-string equality against assign_to. Stuffing the JSON
+// array (`["alice","bob"]`) into metadata would never match
+// any user — flattening to per-recipient events keeps the
+// predicate simple.
+//
+// Event-count amplification: a 50-task cascade produces 50+
+// events; multi-assignee adds N per task. Display caps at
+// limit=20 (notify tool); for_each runs can produce noticeable
+// spikes here, but each event is small and the EventStore is
+// async.
+func buildTaskReadyEvents(readied []ReadiedTask, now time.Time) []Event {
+	var out []Event
+	for _, rt := range readied {
+		emit := func(assignee string) {
+			out = append(out, Event{
+				EventType:    "task_ready",
+				EventSubtype: rt.Action,
+				TaskID:       rt.TaskID,
+				RunID:        rt.RunID,
+				ProjectID:    rt.ProjectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"assign_to": assignee,
+				}),
+				CreatedAt: now,
+			})
+		}
+		if len(rt.Assignees) == 0 {
+			emit("")
+			continue
+		}
+		for _, a := range rt.Assignees {
+			emit(a)
+		}
+	}
+	return out
 }
 
 // applyCompleteRun re-evaluates the run's state from the current

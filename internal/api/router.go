@@ -1688,29 +1688,7 @@ func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	// as raw JSON (not a quoted string) when parseable.
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
-		row := map[string]interface{}{
-			"seq":  e.Seq, // per-project monotone, used by client cursoring
-			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
-			"type": e.Type,
-		}
-		if e.Subtype != "" {
-			row["subtype"] = e.Subtype
-		}
-		if e.TaskID != "" {
-			row["task_id"] = e.TaskID
-		}
-		if e.Citizen != "" {
-			row["citizen"] = e.Citizen
-		}
-		if e.Metadata != "" {
-			var md interface{}
-			if json.Unmarshal([]byte(e.Metadata), &md) == nil {
-				row["metadata"] = md
-			} else {
-				row["metadata"] = e.Metadata
-			}
-		}
-		out = append(out, row)
+		out = append(out, eventRowFromStore(e))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1812,6 +1790,45 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 // caller treats both as "no events," which is the correct wire
 // shape for long-poll. ctx errors don't propagate up; the
 // response just becomes empty.
+// eventRowFromStore renders a store event into the wire shape
+// shared by /events and /runs/{seq}/events. Centralizes the
+// metadata-parsing + assign_to hoist so both endpoints stay in
+// sync. The hoist promotes assign_to (a metadata field) to a
+// top-level wire field so notify-supervisor predicates can read
+// it like citizen/task_id without parsing metadata themselves.
+// Future "X is the load-bearing match key" fields (project_owner,
+// parent_id) plug in here.
+func eventRowFromStore(e store.RunEventRecord) map[string]interface{} {
+	row := map[string]interface{}{
+		"seq":  e.Seq,
+		"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
+		"type": e.Type,
+	}
+	if e.Subtype != "" {
+		row["subtype"] = e.Subtype
+	}
+	if e.TaskID != "" {
+		row["task_id"] = e.TaskID
+	}
+	if e.Citizen != "" {
+		row["citizen"] = e.Citizen
+	}
+	if e.Metadata != "" {
+		var md interface{}
+		if json.Unmarshal([]byte(e.Metadata), &md) == nil {
+			row["metadata"] = md
+			if mdMap, ok := md.(map[string]interface{}); ok {
+				if at, ok := mdMap["assign_to"].(string); ok && at != "" {
+					row["assign_to"] = at
+				}
+			}
+		} else {
+			row["metadata"] = e.Metadata
+		}
+	}
+	return row
+}
+
 func (s *Server) longPollEvents(ctx context.Context, q store.EventQuery, waitDuration time.Duration) ([]store.RunEventRecord, error) {
 	if waitDuration <= 0 {
 		// Read-after-write consistency for one-shot queries:
@@ -1987,29 +2004,7 @@ func (s *Server) handleShowEvents(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]map[string]interface{}, 0, len(events))
 	for _, e := range events {
-		row := map[string]interface{}{
-			"seq":  e.Seq, // per-project monotone, used by client cursoring
-			"ts":   e.Timestamp.UTC().Format(time.RFC3339Nano),
-			"type": e.Type,
-		}
-		if e.Subtype != "" {
-			row["subtype"] = e.Subtype
-		}
-		if e.TaskID != "" {
-			row["task_id"] = e.TaskID
-		}
-		if e.Citizen != "" {
-			row["citizen"] = e.Citizen
-		}
-		if e.Metadata != "" {
-			var md interface{}
-			if json.Unmarshal([]byte(e.Metadata), &md) == nil {
-				row["metadata"] = md
-			} else {
-				row["metadata"] = e.Metadata
-			}
-		}
-		out = append(out, row)
+		out = append(out, eventRowFromStore(e))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -3742,7 +3737,7 @@ func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
 			readied, _ := s.store.UpdateReadyTasks(task.RunID)
 			resp["status"] = "resolved"
 			resp["verdict"] = outcome.Verdict
-			resp["newly_ready"] = readied
+			resp["newly_ready"] = len(readied)
 		} else {
 			resp["status"] = "collecting"
 		}
@@ -4526,6 +4521,7 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	// fan-out — branch isolation means other runs' readiness
 	// is unaffected by this submission.
 	readied, _ := s.store.UpdateReadyTasks(task.RunID)
+	readiedCount := len(readied)
 	completed, _ := s.store.CheckAndCompleteRun(task.RunID)
 
 	// 7b. Living-workflow phase 4c — auto-triage hook.
@@ -4550,7 +4546,7 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 	}
 
 	// 8. Build response.
-	s.logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", req.CommitSHA, "newly_ready", readied)
+	s.logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", req.CommitSHA, "newly_ready", readiedCount)
 
 	status := "accepted"
 	reviewTally := actions.ReviewTally

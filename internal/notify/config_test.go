@@ -60,7 +60,7 @@ func TestLoadUserConfigDisableSpecific(t *testing.T) {
 			t.Errorf("rule %q should be suppressed", r.Name)
 		}
 	}
-	if len(rules) != 7 {
-		t.Errorf("expected 7 rules after disabling 2 of 9, got %d", len(rules))
+	if len(rules) != 8 {
+		t.Errorf("expected 8 rules after disabling 2 of 10, got %d", len(rules))
 	}
 }

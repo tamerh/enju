@@ -2587,39 +2587,61 @@ func (s *Store) InvalidateTask(taskID string, descendantIDs []string) (int, erro
 	return changed, nil
 }
 
-func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
+// ReadiedTask describes one task that flipped pending→ready in
+// a single UpdateReadyTasks pass. Returned so the caller can emit
+// task_ready events carrying the assignee(s) — the field the
+// assigned_task_ready notification rule filters on.
+//
+// Assignees is the parsed list from the tasks.assign_to column
+// (JSON-encoded array on disk). Empty/nil means unassigned.
+// applyUpdateReadyTasks fans out one task_ready event per
+// assignee so the predicate matcher can do bare-string equality
+// against the user's username; unassigned tasks still fire one
+// event with an empty assignee so the audit timeline records
+// every transition.
+type ReadiedTask struct {
+	TaskID    string
+	Action    string
+	Assignees []string
+	ProjectID int64
+	RunID     int64
+}
+
+func (s *Store) UpdateReadyTasks(runID int64) ([]ReadiedTask, error) {
 	// Pull project_id + branch once for this run — every
 	// pending task shares both, and the artifact index lookups
 	// below need (project, branch) to find the right row.
 	var projectID int64
 	var runBranch string
 	if err := s.db.QueryRow(`SELECT project_id, branch FROM runs WHERE id = ?`, runID).Scan(&projectID, &runBranch); err != nil {
-		return 0, fmt.Errorf("loading run project: %w", err)
+		return nil, fmt.Errorf("loading run project: %w", err)
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, depends_on, reads_artifacts FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
+		`SELECT id, depends_on, reads_artifacts, action, COALESCE(assign_to, '') FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
 	)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer rows.Close()
 
 	type pendingTask struct {
-		id       string
-		dependsOn   string
+		id             string
+		dependsOn      string
 		readsArtifacts string
+		action         string
+		assignTo       string
 	}
 	var pending []pendingTask
 	for rows.Next() {
 		var pt pendingTask
-		if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts); err != nil {
-			return 0, err
+		if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts, &pt.action, &pt.assignTo); err != nil {
+			return nil, err
 		}
 		pending = append(pending, pt)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// "Satisfied" parents for dependency readiness include both
@@ -2632,7 +2654,7 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 		`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
 	)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer acceptedRows.Close()
 
@@ -2640,12 +2662,12 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 	for acceptedRows.Next() {
 		var id string
 		if err := acceptedRows.Scan(&id); err != nil {
-			return 0, err
+			return nil, err
 		}
 		accepted[id] = true
 	}
 
-	count := 0
+	var readied []ReadiedTask
 	for _, pt := range pending {
 		allDone := true
 
@@ -2674,7 +2696,7 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 					}
 					a, err := s.GetArtifact(projectID, runBranch, p)
 					if err != nil {
-						return count, fmt.Errorf("checking artifact %s: %w", p, err)
+						return readied, fmt.Errorf("checking artifact %s: %w", p, err)
 					}
 					if a == nil {
 						allDone = false
@@ -2687,13 +2709,29 @@ func (s *Store) UpdateReadyTasks(runID int64) (int, error) {
 		if allDone {
 			_, err := s.db.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
 			if err != nil {
-				return count, err
+				return readied, err
 			}
-			count++
+			// assign_to on disk is a JSON-encoded array (engine
+			// materialize + spawn both write `["alice"]` /
+			// `["alice","bob"]`). Parse it; empty string and
+			// malformed both surface as zero-len assignees so
+			// the apply emit-site can treat them uniformly as
+			// "unassigned, emit one event with empty assignee."
+			var assignees []string
+			if pt.assignTo != "" {
+				_ = json.Unmarshal([]byte(pt.assignTo), &assignees)
+			}
+			readied = append(readied, ReadiedTask{
+				TaskID:    pt.id,
+				Action:    pt.action,
+				Assignees: assignees,
+				ProjectID: projectID,
+				RunID:     runID,
+			})
 		}
 	}
 
-	return count, nil
+	return readied, nil
 }
 
 func (s *Store) GetExpiredClaims() ([]TaskClaimRecord, error) {
