@@ -830,7 +830,7 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 		// ARCHITECTURE.md #3 ("coordinator never stores
 		// content") rules this out at the principle level;
 		// hosted-mode scaling rules it out at the operational
-		// level. Readers needing prose use mcpgit.Project.
+		// level. Readers needing prose use workspace.Project.
 		// ReadFileAtCommit against the fat-client's clone.
 		if _, err := tx.Exec(
 			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, model_id) VALUES (?, ?, ?, ?, ?, ?)`,

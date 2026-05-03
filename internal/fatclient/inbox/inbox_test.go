@@ -9,7 +9,7 @@ import (
 )
 
 // fakeGit is a stand-in inbox.Deps for unit tests. The real
-// implementations wrap mcpgit.Project.ReadFileAtCommit; tests
+// implementations wrap workspace.Project.ReadFileAtCommit; tests
 // inject scripted blob responses keyed by "<sha>:<path>".
 type fakeGit struct {
 	files   map[string]string

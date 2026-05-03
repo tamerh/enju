@@ -3,21 +3,20 @@ package mcphandlers
 // Run-lifecycle handlers. enju_create_run instantiates a DAG
 // (from inline YAML, a saved template path, or either + a
 // params map); enju_list_runs / enju_run_status surface state;
+// enju_export_* persist run artifacts as git commits;
 // enju_export_run assembles every task result in DAG order
-// into one markdown document.
+// into one markdown document. Workspace-heavy bodies live in
+// internal/fatclient/service/run_ops.go.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
-	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -34,6 +33,7 @@ func (c *apiClient) handleListRuns(ctx context.Context, req mcp.CallToolRequest)
 	}
 	return mcp.NewToolResultText(format.RunList(data)), nil
 }
+
 func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -56,7 +56,7 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	// render reflects the freshest coordinator state. Best-
 	// effort — a fetch or reconcile failure just means stale
 	// status this cycle, not a tool error.
-	c.reconcileRunBranch(ctx, int64(projectID), run)
+	c.session.ReconcileRunBranch(ctx, int64(projectID), run)
 
 	tasks, err := c.get(ctx, base+"/tasks")
 	if err != nil {
@@ -64,7 +64,7 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// Inject project name into the run data for the header.
-	_, projName, _ := c.fetchProjectMetaFull(ctx, int64(projectID))
+	_, projName, _ := c.session.FetchProjectMetaFull(ctx, int64(projectID))
 	if projName != "" {
 		var runMap map[string]interface{}
 		if json.Unmarshal(run, &runMap) == nil {
@@ -81,14 +81,11 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	case "mermaid":
 		return mcp.NewToolResultText(format.RunStatusMermaid(run, tasks)), nil
 	default:
-		return mcp.NewToolResultText(format.RunStatus(run, tasks, c.username)), nil
+		return mcp.NewToolResultText(format.RunStatus(run, tasks, c.username())), nil
 	}
 }
-// handlePauseRun moves a run into the `paused` state. Living-
-// workflow phase 1: the state value is observable now; spawn-time
-// gating (refusing claims/submits while paused) arrives with
-// phase 4. Use to inspect a run mid-flight without auto-state
-// transitions racing against you.
+
+// handlePauseRun moves a run into the `paused` state.
 func (c *apiClient) handlePauseRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -133,9 +130,7 @@ func (c *apiClient) handleResumeRun(ctx context.Context, req mcp.CallToolRequest
 // handleShowEvents queries the project event log and returns
 // JSONL — one event per line, newest-first. Filters: run_id,
 // citizen, event_types (comma-separated), since (RFC3339),
-// limit (default 100, max 1000). Living-workflow phase 2: this
-// is the read-only projection over events. For
-// git-tracked snapshots use enju_export_run_events instead.
+// limit (default 100, max 1000).
 func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -185,14 +180,7 @@ func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolReques
 
 // handleRecentEvents is the assistant-side counterpart to
 // handleShowEvents — same underlying endpoint, smaller default
-// limit, human-readable output (one line per event). Designed
-// for the LLM to call at natural pause points and surface
-// "what's new" without flooding the conversation with raw JSONL.
-//
-// The "smaller default limit" is the only behavioral difference
-// in v1; future work could add since_seq cursoring once
-// RunEventRecord exposes Seq (Phase 4 territory). For now,
-// timestamp-based filtering via `since` is the resume cursor.
+// limit, human-readable output (one line per event).
 func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -225,11 +213,6 @@ func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequ
 // handleRequestClarification is the bot-asks-human idiom — a
 // thin wrapper over /spawn with sensible defaults locked in:
 // action=answer, citizens=1, trigger=bot, single human assignee.
-// Bots get a one-line "ask the human a question" tool instead
-// of constructing a full spawn-task call themselves.
-//
-// See toolRequestClarification for the full intent + the
-// "doesn't auto-pause caller's task in v1" caveat.
 func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -257,9 +240,7 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 	// the task; an unmembered or typo'd assignee produces an
 	// unclaimable task that the bot waits on indefinitely. The
 	// bot-asks-human idiom is exactly the case where this
-	// "silent unclaimable" failure mode hurts most — bots often
-	// don't know the project's membership, and the cure
-	// (rename, retry) is cheap if surfaced.
+	// "silent unclaimable" failure mode hurts most.
 	membersData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/members", projectID))
 	if err != nil {
 		return mcp.NewToolResultError("validating assign_to: " + err.Error()), nil
@@ -293,14 +274,11 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 	}
 
 	// Trigger reflects who asked — derived from the calling
-	// citizen's kind (cached on apiClient via citizenKind, no
-	// per-call round-trip). Bots calling this idiom emit
-	// trigger=bot (the common case, audit-clear "bot needed
-	// clarification"). Humans calling are valid too (a reviewer
-	// pinging the author for context); we don't want their spawn
-	// event mislabeled. Fall back to "human" on lookup failure:
-	// that's spawn.go's own default for an empty trigger, and the
-	// citizen field on the event still carries the actual identity.
+	// citizen's kind. Bots calling this idiom emit trigger=bot
+	// (the common case, audit-clear "bot needed clarification").
+	// Humans calling are valid too (a reviewer pinging the
+	// author for context); we don't want their spawn event
+	// mislabeled.
 	trigger := "human"
 	if c.citizenKind(ctx) == "bot" {
 		trigger = "bot"
@@ -338,10 +316,6 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 }
 
 // handleSpawnTask creates a new task in an in-flight run.
-// Living-workflow phase 4a — manual spawn primitive. The
-// spawning citizen is the authenticated caller; trigger
-// defaults to "human". Subject to the per-run cycle budget;
-// budget exhaustion auto-pauses the run.
 func (c *apiClient) handleSpawnTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -399,8 +373,7 @@ func (c *apiClient) handleSpawnTask(ctx context.Context, req mcp.CallToolRequest
 	return mcp.NewToolResultText(out), nil
 }
 
-// handleSetCycleBudget bumps the per-run spawn cap. Use to
-// extend room after a runaway has been triaged.
+// handleSetCycleBudget bumps the per-run spawn cap.
 func (c *apiClient) handleSetCycleBudget(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -428,38 +401,12 @@ func (c *apiClient) handleSetCycleBudget(ctx context.Context, req mcp.CallToolRe
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Cycle budget set to %d for run %d:%d", max, projectID, runID)), nil
 }
 
-// runBranchFromData pulls the `branch` field out of a run JSON
-// payload as returned by GET /runs/{seq} or POST /runs. Empty
-// when the payload is malformed or missing — callers pass the
-// empty string through to CommitFiles, which falls back to the
-// project default. Central so every export-style tool threads
-// the value identically.
-func runBranchFromData(runData []byte) string {
-	var run map[string]interface{}
-	if err := json.Unmarshal(runData, &run); err != nil {
-		return ""
-	}
-	if b, ok := run["branch"].(string); ok {
-		return b
-	}
-	return ""
-}
-
-// runSlugFromData extracts the run's filesystem slug (the
-// tail of enju/runs/{seq}-{slug}/) from a coordinator
-// run-detail payload. Empty means "fall back to the engine
-// default" — callers pass the empty string to
-// corelayout.RunDir, which treats it as "run".
-func runSlugFromData(runData []byte) string {
-	var run map[string]interface{}
-	if err := json.Unmarshal(runData, &run); err != nil {
-		return ""
-	}
-	if s, ok := run["slug"].(string); ok {
-		return s
-	}
-	return ""
-}
+// runBranchFromData and runSlugFromData are local forwarders so
+// existing callers + tests in the mcphandlers package keep
+// reading these as package-level functions. The actual
+// implementations live on the service side.
+func runBranchFromData(runData []byte) string { return service.RunBranchFromData(runData) }
+func runSlugFromData(runData []byte) string   { return service.RunSlugFromData(runData) }
 
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
@@ -467,7 +414,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("project_id is required — create a project first with enju_create_project"), nil
 	}
 
-	// Phase H.1: three input shapes —
+	// Three input shapes —
 	//   1. yaml (inline definition, no params)
 	//   2. path (template file under enju/templates/, optional params)
 	//   3. yaml + params (inline definition with a declared params: block)
@@ -494,68 +441,25 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
 	}
 
-	// Template-mode state kept through the flow so the
-	// post-create snapshot commit has everything it needs.
-	var (
-		sourceCommitSHA string
-		proj            *mcpgit.Project
-		loadedTemplate  *mcpgit.LoadedTemplate
-	)
+	// Template-mode prep: open project, pull, load bundle, pin
+	// to default branch. Returns the YAML body to POST and the
+	// state needed for the post-create snapshot commit.
+	var prep *service.RunTemplatePrep
+	var sourceCommitSHA string
 	if templatePath != "" {
-		// Template mode: pull the project's local clone so new
-		// templates pushed by other citizens show up, then load
-		// the bundle and capture the project HEAD for provenance.
-		// Substitution + validation happen server-side in the
-		// coordinator's parser (consistent with the existing
-		// inline-YAML path).
-		if c.workspace == nil {
-			return mcp.NewToolResultError("enju_create_run with 'path' requires a local workspace (MCP client mode)"), nil
-		}
-		openedProj, _, _, _, err := c.openProject(ctx, int64(projectID))
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		proj = openedProj
-		// Best-effort pull. If the remote is unreachable or has
-		// diverged, fall through and scan whatever's on disk —
-		// the loader will surface a clear "template not found"
-		// if the file truly isn't there yet.
-		proj.Lock()
-		_ = proj.Pull()
-		proj.Unlock()
-		loadedTemplate, err = proj.LoadTemplate(templatePath)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		yamlContent = string(loadedTemplate.Raw)
-		// Template-as-recipe invariant: templates live on the
-		// project's default branch. If the bundle files aren't
-		// tracked there yet (e.g. user authored them in the
-		// worktree and hasn't committed), auto-commit to
-		// default before the run branches off. Without this,
-		// the snapshot+branch-create flow below would sweep
-		// untracked template files onto the run's branch only,
-		// leaving the template unreachable on the default
-		// branch — so subsequent runs on other branches would
-		// see "template not found." See docs/runs-and-branches.md
-		// § Templates.
 		authorName, authorEmail := c.commitAuthor(ctx)
-		proj.Lock()
-		committedSHA, bundleErr := proj.EnsureBundleOnDefault(loadedTemplate.BundleDir, authorName, authorEmail, c.modelName)
-		proj.Unlock()
-		if bundleErr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("pinning template to default branch: %v", bundleErr)), nil
+		p, err := c.session.PrepareRunTemplate(ctx, int64(projectID), templatePath, authorName, authorEmail)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
-		if committedSHA != "" {
-			sourceCommitSHA = committedSHA
-		} else if head, herr := proj.HeadHash(); herr == nil {
-			sourceCommitSHA = head
-		}
+		prep = p
+		yamlContent = prep.YAMLContent
+		sourceCommitSHA = prep.SourceCommit
 	}
 
 	body := map[string]interface{}{
 		"yaml":     yamlContent,
-		"username": c.username,
+		"username": c.username(),
 	}
 	if paramMap != nil {
 		body["params"] = paramMap
@@ -578,61 +482,14 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	// Template mode: after the coordinator assigns a run seq,
 	// commit a frozen copy of the bundle into
-	// `enju/runs/{seq}/template-snapshot/` so the run owns its scripts,
-	// data, and docs. A live template edit after this point
-	// cannot retroactively change this run's behavior — the
-	// executor resolves `script:` paths from the snapshot (see
-	// handleExecuteTask).
-	//
-	// Errors here are non-fatal for the API response (the run
-	// exists on the coordinator side) but surface as a warning
-	// so the author knows the snapshot didn't land.
+	// enju/runs/{seq}-{slug}/template-snapshot/. Errors here
+	// are non-fatal for the API response (the run exists on
+	// the coordinator side) but surface as a warning so the
+	// author knows the snapshot didn't land.
 	var snapshotWarning string
-	if loadedTemplate != nil && proj != nil {
-		var created map[string]interface{}
-		if err := json.Unmarshal(data, &created); err == nil {
-			if seqF, ok := created["seq"].(float64); ok {
-				seq := int(seqF)
-				// The run's branch — pass to CommitFiles so the
-				// template snapshot lands on THIS run's branch
-				// (not whatever branch the worktree is currently
-				// on). Missing this caused template-mode create_run
-				// to commit snapshots to main regardless of the
-				// run's branch= value, leaving the branch ref
-				// uncreated and the run's first submit pushing to
-				// main.
-				runBranch, _ := created["branch"].(string)
-				// Use the server-computed slug so the snapshot
-				// target matches the run's result-dir prefix.
-				// Falls back to client-side slug computation if
-				// the coordinator response predates the slug
-				// field (defense-in-depth for mid-rollout).
-				runSlug, _ := created["slug"].(string)
-				if runSlug == "" {
-					runSlug = corelayout.ComputeRunSlug(templatePath, "")
-				}
-				snapshotTarget := corelayout.RunTemplateSnapshotDir(int(seq), runSlug)
-				files, ferr := proj.ReadBundleFiles(loadedTemplate.BundleDir, snapshotTarget)
-				if ferr != nil {
-					snapshotWarning = fmt.Sprintf("snapshot skipped: %v", ferr)
-				} else if len(files) > 0 {
-					authorName, authorEmail := c.commitAuthor(ctx)
-					proj.Lock()
-					_, cerr := proj.CommitFiles(mcpgit.CommitFilesRequest{
-						Files:       files,
-						CommitMsg:   fmt.Sprintf("Snapshot template %s into run %d", loadedTemplate.BundleDir, seq),
-						AuthorName:  authorName,
-						AuthorEmail: authorEmail,
-						ModelName:   c.modelName,
-						Branch:      runBranch,
-					})
-					proj.Unlock()
-					if cerr != nil {
-						snapshotWarning = fmt.Sprintf("snapshot commit failed: %v", cerr)
-					}
-				}
-			}
-		}
+	if prep != nil {
+		authorName, authorEmail := c.commitAuthor(ctx)
+		snapshotWarning = c.session.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
 	}
 
 	text := format.CreateRun(data)
@@ -641,24 +498,10 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 	return mcp.NewToolResultText(text), nil
 }
+
 // handleExportDiagram snapshots the run's current DAG as raw
-// Mermaid and commits it to enju/runs/{seq}/graph/{phase}.mmd.
-// See toolExportDiagram for the tool-facing contract; design
-// notes:
-//
-//   - File is pure .mmd source (no markdown fences). Consumers
-//     (GitHub, mermaid.live, `mmdc`, preprint minted blocks)
-//     wrap it themselves.
-//   - Same phase overwrites — "final.mmd" is always the current
-//     final state. If the user invalidates and re-runs, the new
-//     export replaces the previous final. History is in git.
-//   - No-op optimization: if the would-be content is byte-
-//     identical to what's on disk, we skip the write + commit
-//     so repeated calls don't produce empty "export again"
-//     commits.
-//   - Response includes both the file path and the fenced
-//     rendered Mermaid so the LLM can paste the image into
-//     its reply while also citing the archival location.
+// Mermaid and commits it to enju/runs/{seq}-{slug}/graph/{phase}.mmd.
+// See toolExportDiagram for the tool-facing contract.
 func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -672,67 +515,11 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 	if err := validateDiagramPhase(phase); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if c.workspace == nil {
-		return mcp.NewToolResultError("enju_export_diagram requires a local workspace (MCP client mode)"), nil
-	}
 
-	// Fetch run + tasks from coordinator — same inputs as
-	// handleRunStatus so the diagram reflects the state the
-	// coordinator has committed, not anything the client
-	// might be holding locally.
-	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
-	runData, err := c.get(ctx, base)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	tasksData, err := c.get(ctx, base+"/tasks")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Render the raw body for the file. The body is "" when
-	// the run lookup failed (coordinator returned an error
-	// object) — surface that to the caller rather than
-	// committing an empty .mmd. The include_external flag that
-	// used to render cross-run artifact edges was removed with
-	// the branch-per-run model — branches isolate runs, so
-	// there's no "external" edge to visualize.
-	body := format.RenderMermaidBody(runData, tasksData)
-	if body == "" {
-		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
-	}
-
-	// Pull the run's branch out of the coordinator response so
-	// CommitFiles lands the export on the right branch — not
-	// the worktree's current HEAD (which could be any prior
-	// run's branch).
-	runBranch := runBranchFromData(runData)
-
-	// Acquire a workspace for the project so we can commit.
-	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	repoPath := filepath.Join(corelayout.RunDir(int(runID), runSlugFromData(runData)), "graph", fmt.Sprintf("%s.mmd", phase))
 	authorName, authorEmail := c.commitAuthor(ctx)
-	commitMsg := fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase)
-
-	proj.Lock()
-	res, err := proj.CommitFiles(mcpgit.CommitFilesRequest{
-		Files: []mcpgit.FileWrite{{
-			RepoRelPath: repoPath,
-			Content:     []byte(body),
-		}},
-		CommitMsg:   commitMsg,
-		AuthorName:  authorName,
-		AuthorEmail: authorEmail,
-		ModelName:   c.modelName,
-		Branch:      runBranch,
-	})
-	proj.Unlock()
+	body, res, err := c.session.ExportDiagramFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
 	if err != nil {
-		return mcp.NewToolResultError("writing diagram to clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Build the reply: path + embed hint + fenced inline render
@@ -740,11 +527,11 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 	// the diagram right now and cite where it lives.
 	var b strings.Builder
 	if res.NoOp {
-		b.WriteString(fmt.Sprintf("✓ Diagram unchanged — skipped commit. File: %s\n", repoPath))
+		b.WriteString(fmt.Sprintf("✓ Diagram unchanged — skipped commit. File: %s\n", res.RepoRelPath))
 	} else {
-		b.WriteString(fmt.Sprintf("✓ Diagram written to %s (commit %s)\n", repoPath, format.ShortSHA(res.CommitSHA)))
+		b.WriteString(fmt.Sprintf("✓ Diagram written to %s (commit %s)\n", res.RepoRelPath, format.ShortSHA(res.CommitSHA)))
 	}
-	b.WriteString(fmt.Sprintf("  Embed in markdown: ![](%s)\n\n", repoPath))
+	b.WriteString(fmt.Sprintf("  Embed in markdown: ![](%s)\n\n", res.RepoRelPath))
 	b.WriteString("```mermaid\n")
 	b.WriteString(body)
 	b.WriteString("```\n")
@@ -771,20 +558,7 @@ func validateDiagramPhase(phase string) error {
 
 // handleExportRunEvents pulls the coordinator's synthesized
 // event timeline for a run and commits it as JSONL under
-// enju/runs/{seq}/events/{phase}.jsonl. Same snapshot-
-// on-demand pattern as handleExportDiagram: authoritative
-// data stays in the DB, git gets a frozen copy when the
-// caller explicitly asks.
-//
-// Design notes:
-//   - Lines are JSONL (one event per line, pretty-printed
-//     to match `jq -c` style) so shell tooling and Python's
-//     jsonl libraries consume it without extra parsing.
-//   - Same-phase re-export overwrites the existing file;
-//     CommitFiles treats byte-identical content as a no-op
-//     so calling repeatedly doesn't churn history.
-//   - Response inlines the first ~10 events for a quick
-//     glance — the full file is on disk + committed.
+// enju/runs/{seq}-{slug}/events/{phase}.jsonl.
 func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -798,77 +572,21 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	if err := validateDiagramPhase(phase); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if c.workspace == nil {
-		return mcp.NewToolResultError("enju_export_run_events requires a local workspace (MCP client mode)"), nil
-	}
 
-	// Fetch the run record first so the events commit lands on
-	// the run's branch, not the worktree's current HEAD.
-	runData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	runBranch := runBranchFromData(runData)
-
-	// Pull events from the coordinator.
-	eventsData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/events", projectID, runID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	var events []map[string]interface{}
-	if err := json.Unmarshal(eventsData, &events); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("parsing events response: %v", err)), nil
-	}
-
-	// JSONL = one compact JSON object per line. json.Marshal
-	// (not MarshalIndent) keeps each event on a single line,
-	// which is the contract downstream consumers expect.
-	var body bytes.Buffer
-	for _, e := range events {
-		line, merr := json.Marshal(e)
-		if merr != nil {
-			continue
-		}
-		body.Write(line)
-		body.WriteByte('\n')
-	}
-
-	// Commit the snapshot into git. Matches the
-	// handleExportDiagram pattern exactly — workspace lock,
-	// CommitFiles, embed path in response.
-	proj, _, _, _, err := c.openProject(ctx, int64(projectID))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	repoPath := filepath.Join(corelayout.RunDir(int(runID), runSlugFromData(runData)), "events", fmt.Sprintf("%s.jsonl", phase))
 	authorName, authorEmail := c.commitAuthor(ctx)
-	commitMsg := fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events))
-
-	proj.Lock()
-	res, err := proj.CommitFiles(mcpgit.CommitFilesRequest{
-		Files: []mcpgit.FileWrite{{
-			RepoRelPath: repoPath,
-			Content:     body.Bytes(),
-		}},
-		CommitMsg:   commitMsg,
-		AuthorName:  authorName,
-		AuthorEmail: authorEmail,
-		ModelName:   c.modelName,
-		Branch:      runBranch,
-	})
-	proj.Unlock()
+	events, res, err := c.session.ExportRunEventsFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
 	if err != nil {
-		return mcp.NewToolResultError("writing events to clone: " + err.Error()), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	var b strings.Builder
 	if res.NoOp {
-		b.WriteString(fmt.Sprintf("✓ Events unchanged (%d total) — skipped commit. File: %s\n", len(events), repoPath))
+		b.WriteString(fmt.Sprintf("✓ Events unchanged (%d total) — skipped commit. File: %s\n", len(events), res.RepoRelPath))
 	} else {
-		b.WriteString(fmt.Sprintf("✓ %d events written to %s (commit %s)\n", len(events), repoPath, format.ShortSHA(res.CommitSHA)))
+		b.WriteString(fmt.Sprintf("✓ %d events written to %s (commit %s)\n", len(events), res.RepoRelPath, format.ShortSHA(res.CommitSHA)))
 	}
-	// Inline preview — up to 10 lines so the LLM can show
-	// the tail of the timeline without opening the file.
+	// Inline preview — up to 10 lines so the LLM can show the
+	// tail of the timeline without opening the file.
 	preview := events
 	if len(preview) > 10 {
 		b.WriteString(fmt.Sprintf("  (showing first 10 of %d)\n", len(events)))
@@ -893,85 +611,9 @@ func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError("run_seq is required"), nil
 	}
-
-	// Fetch run + tasks from coordinator.
-	runData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	md, err := c.session.ExportRunMarkdown(ctx, int64(projectID), runSeq)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	var run map[string]interface{}
-	json.Unmarshal(runData, &run)
-	if errMsg, _ := run["error"].(string); errMsg != "" {
-		return mcp.NewToolResultError(errMsg), nil
-	}
-
-	tasksData, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runSeq))
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	var tasks []map[string]interface{}
-	json.Unmarshal(tasksData, &tasks)
-
-	// Read each accepted task's result from the local clone.
-	var remoteURL, projName string
-	if c.workspace != nil {
-		if u, n, err := c.fetchProjectMetaFull(ctx, int64(projectID)); err == nil {
-			remoteURL = u
-			projName = n
-		}
-	}
-
-	var b strings.Builder
-	runName, _ := run["name"].(string)
-	runState, _ := run["state"].(string)
-	b.WriteString(fmt.Sprintf("# Run: %s\n\n", runName))
-	b.WriteString(fmt.Sprintf("Project: #%d, Run: #%d, State: %s, Tasks: %d\n\n", projectID, runSeq, runState, len(tasks)))
-	b.WriteString("---\n\n")
-
-	for _, t := range tasks {
-		tid, _ := t["id"].(string)
-		tstate, _ := t["state"].(string)
-		action, _ := t["action"].(string)
-		prompt, _ := t["prompt"].(string)
-		commitSHA, _ := t["commit_sha"].(string)
-		resultPath, _ := t["result_path"].(string)
-		claimedBy, _ := t["claimed_by"].(string)
-		defID, _ := t["task_def_id"].(string)
-
-		b.WriteString(fmt.Sprintf("## %s\n\n", tid))
-		b.WriteString(fmt.Sprintf("Action: %s | State: %s", action, tstate))
-		if claimedBy != "" {
-			b.WriteString(fmt.Sprintf(" | By: @%s", claimedBy))
-		}
-		b.WriteString("\n\n")
-
-		// Read result from git first — for the preprint,
-		// the output is what matters. Show the prompt only
-		// as context below the result.
-		resultShown := false
-		if tstate == "accepted" && commitSHA != "" && c.workspace != nil && remoteURL != "" {
-			if proj, err := c.workspace.ForProject(int64(projectID), remoteURL, projName); err == nil {
-				resultFile := resultPath + "/result.md"
-				if defID != "" && resultPath != "" {
-					content, found, err := proj.ReadFileAtCommit(commitSHA, resultFile)
-					if err == nil && found && len(content) > 0 {
-						b.WriteString(string(content) + "\n\n")
-						resultShown = true
-					}
-				}
-				_ = defID
-			}
-		}
-		if tstate == "skipped" {
-			b.WriteString("*(skipped — losing branch of a vote)*\n\n")
-		}
-		if !resultShown && prompt != "" {
-			// No result available — show the prompt template
-			// so the reader at least knows what was asked.
-			b.WriteString("**Prompt:** " + prompt + "\n\n")
-		}
-		b.WriteString("---\n\n")
-	}
-
-	return mcp.NewToolResultText(b.String()), nil
+	return mcp.NewToolResultText(md), nil
 }

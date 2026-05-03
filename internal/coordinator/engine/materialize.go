@@ -781,7 +781,7 @@ func (e *Engine) ComputeMaterialization(
 			// becomes one dep edge. Gives the singleton's
 			// resolver N DependencyRef entries with the same
 			// TaskDefID → triggers the Option 4 fan-in block
-			// assembly in mcpgit.Project.Resolve.
+			// assembly in workspace.Project.Resolve.
 			if instances, ok := newInstances[dep]; ok {
 				for _, m := range instances {
 					resolved = append(resolved, m.FullID)

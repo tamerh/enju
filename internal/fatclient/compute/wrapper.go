@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 // GitSubmitFailedPrefix is the leading text of the wrapper's
@@ -229,7 +229,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// so the cross-process flock is honored — the MCP handler and
 	// this wrapper run in distinct processes and MUST NOT race on
 	// .git/index.lock.
-	ws, err := mcpgit.NewWorkspace(spec.WorkspaceRoot, logger)
+	ws, err := workspace.NewWorkspace(spec.WorkspaceRoot, logger)
 	if err != nil {
 		res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
 		return res
@@ -254,7 +254,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		if err := mcpgit.EnsureSharedSymlink(mcpgit.ArtifactPath(rel), workDir,
+		if err := workspace.EnsureSharedSymlink(workspace.ArtifactPath(rel), workDir,
 			spec.ProjectID, spec.ProjectName, spec.Branch, rel); err != nil {
 			logger.Warn("shared-root symlink setup failed",
 				"path", rel, "error", err)
@@ -319,7 +319,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 	res.Content = content
 
-	files := []mcpgit.FileWrite{
+	files := []workspace.FileWrite{
 		{
 			RepoRelPath: filepath.Join(spec.ResultDir, "result.md"),
 			Content:     []byte(content),
@@ -331,13 +331,13 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// the commit alone.
 	contextPath := filepath.Join(workDir, spec.ResultDir, "context.json")
 	if ctxBytes, cerr := os.ReadFile(contextPath); cerr == nil {
-		files = append(files, mcpgit.FileWrite{
+		files = append(files, workspace.FileWrite{
 			RepoRelPath: filepath.Join(spec.ResultDir, "context.json"),
 			Content:     ctxBytes,
 		})
 	}
 	// script.log — full stdout+stderr transcript on success.
-	files = append(files, mcpgit.FileWrite{
+	files = append(files, workspace.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "script.log"),
 		Content:     scriptLog.Bytes(),
 	})
@@ -352,7 +352,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		"timestamp":   time.Now().Format(time.RFC3339),
 	}
 	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, mcpgit.FileWrite{
+	files = append(files, workspace.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -382,14 +382,14 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		full := filepath.Join(workDir, mcpgit.ArtifactPath(rel))
+		full := filepath.Join(workDir, workspace.ArtifactPath(rel))
 		body, rerr := os.ReadFile(full)
 		if rerr != nil {
 			res.MissingArtifacts = append(res.MissingArtifacts, rel)
 			continue
 		}
-		files = append(files, mcpgit.FileWrite{
-			RepoRelPath: mcpgit.ArtifactPath(rel),
+		files = append(files, workspace.FileWrite{
+			RepoRelPath: workspace.ArtifactPath(rel),
 			Content:     body,
 		})
 		committedPaths = append(committedPaths, rel)
@@ -399,7 +399,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		full := filepath.Join(workDir, mcpgit.ArtifactPath(rel))
+		full := filepath.Join(workDir, workspace.ArtifactPath(rel))
 		if _, err := os.Stat(full); err != nil {
 			res.MissingArtifacts = append(res.MissingArtifacts, rel)
 			continue
@@ -420,9 +420,9 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	if len(spec.UntrackedArtifacts) > 0 {
 		gitignorePath := filepath.Join(workDir, ".gitignore")
 		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
-		updated, changed := mcpgit.UpdateGitignoreManagedBlock(existing, spec.UntrackedArtifacts)
+		updated, changed := workspace.UpdateGitignoreManagedBlock(existing, spec.UntrackedArtifacts)
 		if changed {
-			files = append(files, mcpgit.FileWrite{
+			files = append(files, workspace.FileWrite{
 				RepoRelPath: ".gitignore",
 				Content:     updated,
 			})
@@ -464,7 +464,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 
 	proj.Lock()
-	submitRes, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+	submitRes, err := proj.SubmitTaskResult(workspace.SubmitRequest{
 		TaskID:        spec.TaskID,
 		Username:      spec.Username,
 		AuthorName:    spec.AuthorName,
@@ -478,7 +478,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		// async reconcile path can see them too.
 		ArtifactPaths: committedPaths,
 		Branch:        spec.Branch,
-		Trailers: mcpgit.EnjuTrailers{
+		Trailers: workspace.EnjuTrailers{
 			TaskID:             spec.TaskID,
 			ExitCode:           0,
 			ExitSet:            true,

@@ -14,7 +14,7 @@ import (
 	"strconv"
 
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 func cmdInbox(args []string) {
@@ -63,7 +63,7 @@ Flags:`)
 		home, _ := os.UserHomeDir()
 		wsRoot = filepath.Join(home, ".enju", "workspaces")
 	}
-	ws, err := mcpgit.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "opening workspace %s: %v\n", wsRoot, err)
 		os.Exit(1)
@@ -89,11 +89,11 @@ Flags:`)
 	fmt.Println(inbox.FormatInbox(rows))
 }
 
-// cliInboxDeps adapts mcpgit.Project to inbox.Deps. The shared
+// cliInboxDeps adapts workspace.Project to inbox.Deps. The shared
 // inbox core needs only a single method — git read at commit —
 // so this is intentionally tiny.
 type cliInboxDeps struct {
-	proj *mcpgit.Project
+	proj *workspace.Project
 }
 
 func (d *cliInboxDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {

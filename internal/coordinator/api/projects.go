@@ -158,7 +158,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 // handleProjectRemoteStatus / handleProjectSync were deleted during
 // the iteration A orchestrator rewrite. The coordinator no longer
 // owns a clone to compare or push from — the MCP client runs these
-// diagnostics against its own local clone via mcpgit. The MCP tool
+// diagnostics against its own local clone via workspace. The MCP tool
 // names are unchanged; see internal/mcpserver/server.go for the new
 // implementations.
 

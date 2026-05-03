@@ -51,7 +51,7 @@ type Deps interface {
 	// ReadFileAtCommit reads a file from the project clone at
 	// the given commit SHA. Returns (data, true) on hit,
 	// (nil, false) on miss. Implementations typically wrap
-	// mcpgit.Project.ReadFileAtCommit.
+	// workspace.Project.ReadFileAtCommit.
 	ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error)
 }
 

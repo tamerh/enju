@@ -22,6 +22,8 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/coordinator/store"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -208,23 +210,25 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 // would end up credited to the -model session value, regardless of
 // what the caller passed.
 func TestEffectiveModelPrecedence(t *testing.T) {
-	c := &apiClient{modelName: "session-default"}
+	sess := service.New(service.Config{ModelName: "session-default"})
+	c := &apiClient{session: sess}
 
 	// Override empty → fall back to session default.
-	if got := c.effectiveModel(""); got != "session-default" {
+	if got := c.session.EffectiveModel(""); got != "session-default" {
 		t.Errorf("empty override: got %q, want session-default", got)
 	}
 	// Override non-empty → win over session default.
-	if got := c.effectiveModel("call-override"); got != "call-override" {
+	if got := c.session.EffectiveModel("call-override"); got != "call-override" {
 		t.Errorf("non-empty override: got %q, want call-override", got)
 	}
 	// Override non-empty even when session default is empty.
-	c2 := &apiClient{modelName: ""}
-	if got := c2.effectiveModel("call-override"); got != "call-override" {
+	sess2 := service.New(service.Config{ModelName: ""})
+	c2 := &apiClient{session: sess2}
+	if got := c2.session.EffectiveModel("call-override"); got != "call-override" {
 		t.Errorf("override with empty session: got %q, want call-override", got)
 	}
 	// Both empty → empty (the unaided-human case).
-	if got := c2.effectiveModel(""); got != "" {
+	if got := c2.session.EffectiveModel(""); got != "" {
 		t.Errorf("both empty: got %q, want empty (unaided human)", got)
 	}
 }
@@ -278,14 +282,14 @@ func TestModelRegisterAndListE2E(t *testing.T) {
 // authenticate as a bot, where the bot's username doesn't match
 // the parent's).
 func newE2EClient(url, username, token string) *apiClient {
-	c := &apiClient{
-		baseURL:    url,
-		username:   username,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: httptest.NewServer(nil).Client(), // doesn't matter — we need the *http.Client default
-	}
-	c.setToken(token)
-	return c
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	coordClient := coord.New(coord.Config{
+		BaseURL:   url,
+		Username:  username,
+		AuthToken: token,
+		Logger:    logger,
+	})
+	return newClient(coordClient, nil, logger)
 }
 
 // mcpResultText extracts the text content from an MCP tool result.

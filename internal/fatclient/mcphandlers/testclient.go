@@ -4,7 +4,7 @@ package mcphandlers
 // so integration suites can drive the exact code path a real MCP
 // client takes, without spinning up a stdio subprocess. It wraps the
 // unexported apiClient so test code can construct one with a real
-// coordinator URL, real mcpgit.Workspace, real credentials — the
+// coordinator URL, real workspace.Workspace, real credentials — the
 // same wiring the production New() constructor uses — and call tool
 // handlers directly.
 //
@@ -16,8 +16,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 
+	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -38,25 +39,29 @@ func NewTestClient(cfg Config) *TestClient {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	c := &apiClient{
-		baseURL:      cfg.CoordinatorURL,
-		username:     cfg.Username,
-		citizenName:  cfg.CitizenName,
-		citizenEmail: cfg.CitizenEmail,
-		modelName:    cfg.ModelName,
-		saveCreds:    cfg.SaveCredentials,
-		workspace:    cfg.Workspace,
-		logger:       logger,
-		httpClient:   &http.Client{},
-	}
-	c.setToken(cfg.AuthToken)
+	coordClient := coord.New(coord.Config{
+		BaseURL:         cfg.CoordinatorURL,
+		Username:        cfg.Username,
+		CitizenName:     cfg.CitizenName,
+		CitizenEmail:    cfg.CitizenEmail,
+		AuthToken:       cfg.AuthToken,
+		SaveCredentials: cfg.SaveCredentials,
+		Logger:          logger,
+	})
+	sess := service.New(service.Config{
+		Coord:     coordClient,
+		Workspace: cfg.Workspace,
+		ModelName: cfg.ModelName,
+		Logger:    logger,
+	})
+	c := &apiClient{session: sess}
 	return &TestClient{c: c}
 }
 
 // Username returns the citizen username the TestClient was built
 // with. Handy for tests that claim + submit as a specific citizen
 // and want to spot-check who the submission credits.
-func (t *TestClient) Username() string { return t.c.username }
+func (t *TestClient) Username() string { return t.c.username() }
 
 // Call invokes an MCP tool handler by its registered tool name with
 // a map of arguments. Returns the tool-level *mcp.CallToolResult

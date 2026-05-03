@@ -27,7 +27,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	"github.com/enju-ai/enju/internal/fatclient/notify"
 )
 
@@ -43,7 +43,7 @@ type notifySessionConfig struct {
 	// uses the fresh token. No MCP restart required.
 	TokenFn   func() string
 	Username  string
-	Workspace *mcpgit.Workspace // resolves project clone dirs
+	Workspace *workspace.Workspace // resolves project clone dirs
 	ParentCtx context.Context   // cancels every child goroutine on shutdown
 	Logger    *slog.Logger
 }

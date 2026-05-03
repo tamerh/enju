@@ -199,7 +199,7 @@ func match(result interface{}, field string) string {
 // []interface{} of map[string]interface{} entries with keys
 // "username", "option", and "content". Missing fields render as
 // empty strings; unknown shapes fall back to JSON. Exported so
-// the mcpgit fan-in aggregator can pre-render per-iteration
+// the workspace fan-in aggregator can pre-render per-iteration
 // response blocks when a for_each upstream is consumed via
 // {{task.responses}}.
 func RenderResponsesMarkdown(responses interface{}) string {

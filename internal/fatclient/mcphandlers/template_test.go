@@ -4,10 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -18,12 +18,12 @@ import (
 // contract without booting a real workspace.
 
 func newClientNoWorkspace() *apiClient {
-	return &apiClient{
-		baseURL:    "http://unused",
-		username:   "tester",
-		httpClient: &http.Client{},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newClient(coord.New(coord.Config{
+			BaseURL:  "http://unused",
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 }
 
 func callTool(fn func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), args map[string]any) (*mcp.CallToolResult, error) {

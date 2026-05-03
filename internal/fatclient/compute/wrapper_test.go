@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 // script, the wrapper returns a structured Result via the
 // output file with Error set — not a silent exit code.
 // Proves the fork+exec+IO round-trip works end-to-end without
-// pulling in the git + mcpgit machinery.
+// pulling in the git + workspace machinery.
 func TestWrapMainReadsSpecWritesResult(t *testing.T) {
 	tmp := t.TempDir()
 	specPath := filepath.Join(tmp, "spec.json")

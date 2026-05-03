@@ -52,7 +52,7 @@ func indexOfNewline(s string) int {
 // commitTaskSubjectRe matches the first line of commit
 // messages the enju client writes, so get_artifact_history
 // can enrich each entry with the submitting task_id and
-// owner. Kept in sync with mcpgit.buildCommitMessage's
+// owner. Kept in sync with workspace.buildCommitMessage's
 // format. A non-match means the commit wasn't produced by a
 // task submission (project init, rollback, manual commit),
 // in which case the entry's task_id / owner fields stay

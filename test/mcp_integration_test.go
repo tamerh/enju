@@ -5,7 +5,7 @@ package test
 //
 // Tests in this file drive the MCP tool handlers (handleClaimTask,
 // handleSubmitResult, ...) end-to-end against a real httptest
-// coordinator and a real mcpgit.Workspace. They cover the layer
+// coordinator and a real workspace.Workspace. They cover the layer
 // where real users hit bugs: client-side pre-validation, review
 // feedback replay, inline review content, multi-citizen result
 // routing, format output on real data, workspace git
@@ -1232,7 +1232,7 @@ func TestMCPClaimReviewTaskInlinesTargetContent(t *testing.T) {
 // inline the next time the author claims. The current integration
 // suite can't exercise this path because the replay logic lives
 // entirely inside handleClaimTask (fetchReviewFeedback +
-// workspace ReadFile) and reads from the local mcpgit clone —
+// workspace ReadFile) and reads from the local workspace clone —
 // neither of which the direct-REST path touches.
 //
 // Flow:

@@ -13,10 +13,11 @@ package mcphandlers
 import (
 	"context"
 	"log/slog"
-	"net/http"
 
 	"github.com/enju-ai/enju/internal/enjumcp"
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/service"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -32,7 +33,7 @@ type Config struct {
 	// local clone here and reports commit SHAs back to the
 	// coordinator, bypassing the legacy content-over-wire path.
 	// When nil, only the legacy path is used.
-	Workspace *mcpgit.Workspace
+	Workspace *workspace.Workspace
 	// SaveCredentials is called after a successful auto re-register
 	// so the new server-side identity is persisted to disk. The
 	// username passed back may be the same (DB wipe case) or new
@@ -148,18 +149,22 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		logger = slog.Default()
 	}
 
-	client := &apiClient{
-		baseURL:      cfg.CoordinatorURL,
-		username:     cfg.Username,
-		citizenName:  cfg.CitizenName,
-		citizenEmail: cfg.CitizenEmail,
-		modelName:    cfg.ModelName,
-		saveCreds:    cfg.SaveCredentials,
-		workspace:    cfg.Workspace,
-		logger:       logger,
-		httpClient:   &http.Client{},
-	}
-	client.setToken(cfg.AuthToken)
+	coordClient := coord.New(coord.Config{
+		BaseURL:        cfg.CoordinatorURL,
+		Username:        cfg.Username,
+		CitizenName:      cfg.CitizenName,
+		CitizenEmail:     cfg.CitizenEmail,
+		AuthToken:       cfg.AuthToken,
+		SaveCredentials: cfg.SaveCredentials,
+		Logger:         logger,
+	})
+	sess := service.New(service.Config{
+		Coord:     coordClient,
+		Workspace: cfg.Workspace,
+		ModelName: cfg.ModelName,
+		Logger:    logger,
+	})
+	client := &apiClient{session: sess}
 
 	// Notify session — exists when caller opts in via
 	// Config.Notify. Nil session means tool-handler Switch

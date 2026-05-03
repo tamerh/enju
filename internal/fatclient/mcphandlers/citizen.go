@@ -43,7 +43,7 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("at least one of name or email must be provided"), nil
 	}
 
-	data, err := c.put(ctx, "/api/v1/citizens/by-username/"+c.username+"/profile", body)
+	data, err := c.put(ctx, "/api/v1/citizens/by-username/"+c.username()+"/profile", body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -66,7 +66,7 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 	// handle.
 	label := providedName
 	if !haveName {
-		if profileData, perr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username); perr == nil {
+		if profileData, perr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username()); perr == nil {
 			var prof map[string]interface{}
 			if json.Unmarshal(profileData, &prof) == nil {
 				if n, _ := prof["name"].(string); n != "" {
@@ -75,27 +75,27 @@ func (c *apiClient) handleUpdateProfile(ctx context.Context, req mcp.CallToolReq
 			}
 		}
 		if label == "" {
-			label = c.username
+			label = c.username()
 		}
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Profile updated: %s", label)), nil
 }
 func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username)
+	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username())
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	// Inject model name from client config so the profile
 	// display shows which model this session is using.
-	if c.modelName != "" {
+	if c.session.ModelName() != "" {
 		var profileMap map[string]interface{}
 		if json.Unmarshal(data, &profileMap) == nil {
-			profileMap["model"] = c.modelName
+			profileMap["model"] = c.session.ModelName()
 			data, _ = json.Marshal(profileMap)
 		}
 	}
 	// Fetch contribution summary for the enriched profile.
-	contribData, contribErr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/contributions")
+	contribData, contribErr := c.get(ctx, "/api/v1/citizens/by-username/"+c.username()+"/contributions")
 	if contribErr != nil {
 		// Contributions are best-effort — show the basic
 		// profile if contributions endpoint fails.
@@ -104,7 +104,7 @@ func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest
 	return mcp.NewToolResultText(format.Profile(data, contribData)), nil
 }
 func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/dashboard")
+	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username()+"/dashboard")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

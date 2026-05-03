@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 // ContainerWorkDir is where the host workspace clone is
@@ -51,7 +51,7 @@ const RuntimeDocker = "docker"
 // not a guess).
 //
 // When ENJU_SHARED_ROOT is configured (via the env that
-// mcpgit.SharedRoot() reads), its host path is also
+// workspace.SharedRoot() reads), its host path is also
 // bind-mounted at the same path inside the container —
 // read-write, because untracked artifact symlinks in the
 // workspace point at it and the script needs to write through.
@@ -103,7 +103,7 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 	// untracked artifacts written through workspace-side
 	// symlinks reach shared storage. Same SELinux-label
 	// rationale as the workspace mount above.
-	if shared := mcpgit.SharedRoot(); shared != "" {
+	if shared := workspace.SharedRoot(); shared != "" {
 		args = append(args, "-v", shared+":"+shared+":z")
 	}
 

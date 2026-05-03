@@ -307,7 +307,7 @@ func (s *Store) migrate() error {
 	-- by the fat-client at the recorded commit_sha — that is
 	-- the canonical truth (ARCHITECTURE.md #3, "coordinator
 	-- never stores content"). Multi-citizen fan-in
-	-- (mcpgit/resolve.go) reads each citizen's result.md from
+	-- (workspace/resolve.go) reads each citizen's result.md from
 	-- their commit_sha. See ARCHITECTURE.md #25 (audit log +
 	-- state DB + git, not event sourcing) for the broader
 	-- architecture.

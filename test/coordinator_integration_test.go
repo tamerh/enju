@@ -45,7 +45,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	gogit "github.com/go-git/go-git/v5"
@@ -94,7 +94,7 @@ func answer(t *testing.T, prompt string, canned string) string {
 // iteration A orchestrator rewrite, the coordinator holds no git
 // state of its own — each project gets a bare repo under
 // `bareBaseDir` which acts as the project's "remote", and submits
-// are routed through a mcpgit.Workspace under `workspaceDir` so the
+// are routed through a workspace.Workspace under `workspaceDir` so the
 // test client exercises the exact same fat-client code path the
 // real MCP server uses.
 type testServer struct {
@@ -103,7 +103,7 @@ type testServer struct {
 	url           string
 	bareBaseDir   string // base directory containing per-project bare remotes
 	workspaceDir  string // base directory for fat-client working clones
-	workspace     *mcpgit.Workspace
+	workspace     *workspace.Workspace
 	store         *store.Store // direct store access for testing reaper/internals
 	lastRunID     string       // "projectID:runSeq" of last submitted run
 	lastProjectID int64
@@ -204,7 +204,7 @@ func newTestServer(t *testing.T) *testServer {
 	t.Cleanup(func() { es.Close() })
 	st.AttachEventStore(es)
 
-	ws, err := mcpgit.NewWorkspace(workspaceDir, logger)
+	ws, err := workspace.NewWorkspace(workspaceDir, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +683,7 @@ func (s *testServer) claim(taskID, username string) map[string]interface{} {
 
 // submit writes a text result via the fat-client path: compute the
 // task's expected result layout, write result.md + metadata.json to
-// the project's local clone, commit+push via mcpgit, then POST the
+// the project's local clone, commit+push via workspace, then POST the
 // report with commit_sha to the coordinator. This exercises the
 // exact code path the real MCP client uses.
 func (s *testServer) submit(taskID, content string) map[string]interface{} {
@@ -816,7 +816,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 		resultDir = filepath.Join(baseResultDir, "citizen-"+voterUser)
 	}
-	files := []mcpgit.FileWrite{}
+	files := []workspace.FileWrite{}
 	metadata := map[string]interface{}{
 		"task_id":     fullTaskID,
 		"model":       "test",
@@ -847,7 +847,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 	}
 	if content != "" {
-		files = append(files, mcpgit.FileWrite{
+		files = append(files, workspace.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
 			Content:     []byte(content),
 		})
@@ -859,7 +859,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		// each output to its own file per the schema. Otherwise
 		// serialize the outputs map as a single result.json.
 		schemaJSON, _ := task["outputs"].(string)
-		schema := mcpgit.ParseNamedOutputSchema(schemaJSON)
+		schema := workspace.ParseNamedOutputSchema(schemaJSON)
 		hasFileSpec := false
 		for _, sp := range schema {
 			if sp.File != "" {
@@ -868,12 +868,12 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			}
 		}
 		if hasFileSpec {
-			outFiles, fileIndex := mcpgit.BuildNamedOutputFiles(resultDir, schema, outputs)
+			outFiles, fileIndex := workspace.BuildNamedOutputFiles(resultDir, schema, outputs)
 			files = append(files, outFiles...)
 			metadata["output_files"] = fileIndex
 		} else {
 			outBytes, _ := json.MarshalIndent(outputs, "", "  ")
-			files = append(files, mcpgit.FileWrite{
+			files = append(files, workspace.FileWrite{
 				RepoRelPath: filepath.Join(resultDir, "result.json"),
 				Content:     outBytes,
 			})
@@ -883,7 +883,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		s.t.Fatalf("submit with no content, outputs, or artifacts")
 	}
 	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, mcpgit.FileWrite{
+	files = append(files, workspace.FileWrite{
 		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -899,15 +899,15 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			}
 		}
 		for _, p := range artifactPaths {
-			files = append(files, mcpgit.FileWrite{
-				RepoRelPath: mcpgit.ArtifactPath(p),
+			files = append(files, workspace.FileWrite{
+				RepoRelPath: workspace.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
 		}
 	}
 
 	proj.Lock()
-	res, err := proj.SubmitTaskResult(mcpgit.SubmitRequest{
+	res, err := proj.SubmitTaskResult(workspace.SubmitRequest{
 		TaskID:        fullTaskID,
 		Username:      "test",
 		AuthorName:    "Test Citizen",
@@ -972,7 +972,7 @@ func (s *testServer) readArtifactFile(projectID int64, path string) (string, boo
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		return "", false
 	}
-	data, err := os.ReadFile(filepath.Join(cloneDir, mcpgit.ArtifactPath(path)))
+	data, err := os.ReadFile(filepath.Join(cloneDir, workspace.ArtifactPath(path)))
 	if err != nil {
 		return "", false
 	}
@@ -1098,7 +1098,7 @@ func (s *testServer) taskGet(taskID string) map[string]interface{} {
 // legacy response shape: `resolved_prompt`, `artifacts`,
 // `missing_artifacts`. In the iteration A model the coordinator only
 // serves the dependency descriptor; the test helper does the
-// client-side resolution via mcpgit.Project.Resolve so existing
+// client-side resolution via workspace.Project.Resolve so existing
 // tests can keep asserting on `resolved_prompt`.
 func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 	s.t.Helper()
@@ -1108,7 +1108,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		s.t.Fatalf("taskInputs descriptor: %s", errMsg)
 	}
 
-	// Marshal the dependency descriptor back into the mcpgit types
+	// Marshal the dependency descriptor back into the workspace types
 	// so we can use the shared resolver. JSON → struct is the
 	// simplest path that doesn't re-implement the resolver.
 	raw, _ := json.Marshal(desc)
@@ -1143,7 +1143,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 	_ = proj.Pull()
 	proj.Unlock()
 
-	input := mcpgit.ResolveInput{
+	input := workspace.ResolveInput{
 		PromptTemplate:     d.PromptTemplate,
 		UserPromptTemplate: d.UserPromptTemplate,
 		ForEachParams:      d.ForEachParams,
@@ -1156,7 +1156,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 				params[k] = sv
 			}
 		}
-		ref := mcpgit.DependencyRef{
+		ref := workspace.DependencyRef{
 			TaskDefID:      asString(dep["task_def_id"]),
 			InstanceKey:    asString(dep["instance_key"]),
 			InstanceParams: params,
@@ -1175,7 +1175,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 				if pathUser == "" {
 					pathUser = asString(rm["username"])
 				}
-				ref.Responses = append(ref.Responses, mcpgit.CitizenResponseRef{
+				ref.Responses = append(ref.Responses, workspace.CitizenResponseRef{
 					Username:     asString(rm["username"]),
 					PathUsername: pathUser,
 					Option:       asString(rm["option"]),
@@ -1186,7 +1186,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		input.Dependencies = append(input.Dependencies, ref)
 	}
 	for _, a := range d.ArtifactReads {
-		input.ArtifactReads = append(input.ArtifactReads, mcpgit.ArtifactRef{
+		input.ArtifactReads = append(input.ArtifactReads, workspace.ArtifactRef{
 			Path:      asString(a["path"]),
 			CommitSHA: asString(a["commit_sha"]),
 		})

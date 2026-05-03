@@ -8,16 +8,18 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 func newAPIClient(baseURL string) *apiClient {
-	return &apiClient{
-		baseURL:    baseURL,
-		username:   "tester",
-		httpClient: &http.Client{},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	coordClient := coord.New(coord.Config{
+		BaseURL:  baseURL,
+		Username: "tester",
+		Logger:  logger,
+	})
+	return newClient(coordClient, nil, logger)
 }
 
 // TestFetchTaskMetaFullPayload verifies every field on taskMeta gets
@@ -55,7 +57,7 @@ func TestFetchTaskMetaFullPayload(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(ts.URL)
-	meta, err := c.fetchTaskMeta(context.Background(), "t-1")
+	meta, err := c.session.FetchTaskMeta(context.Background(), "t-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +114,7 @@ func TestFetchTaskMetaServerError(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(ts.URL)
-	_, err := c.fetchTaskMeta(context.Background(), "nope")
+	_, err := c.session.FetchTaskMeta(context.Background(), "nope")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -131,7 +133,7 @@ func TestFetchTaskMetaPartialPayload(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(ts.URL)
-	meta, err := c.fetchTaskMeta(context.Background(), "minimal")
+	meta, err := c.session.FetchTaskMeta(context.Background(), "minimal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +162,7 @@ func TestFetchTaskMetaEmptyEnvStaysNil(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(ts.URL)
-	meta, err := c.fetchTaskMeta(context.Background(), "t")
+	meta, err := c.session.FetchTaskMeta(context.Background(), "t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +179,7 @@ func TestFetchTaskMetaMalformedJSON(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(ts.URL)
-	_, err := c.fetchTaskMeta(context.Background(), "t")
+	_, err := c.session.FetchTaskMeta(context.Background(), "t")
 	if err == nil {
 		t.Fatal("expected parse error, got nil")
 	}
@@ -185,48 +187,58 @@ func TestFetchTaskMetaMalformedJSON(t *testing.T) {
 
 // --- useFatClient ---
 
+// newAPIClientWithWorkspace builds an apiClient bound to a real
+// workspace + a service.Session that wraps it, so the useFatClient
+// forwarder has somewhere to dispatch to. Tests below use this in
+// place of the bare `newClient(nil, ws, nil)` literal.
+func newAPIClientWithWorkspace(ws *workspace.Workspace) *apiClient {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newClient(nil, ws, logger)
+}
+
 func TestUseFatClientNoWorkspaceReturnsFalse(t *testing.T) {
-	c := &apiClient{} // no workspace
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(nil, nil, logger)
 	meta := &taskMeta{ProjectID: 1, ProjectRemoteURL: "git@x.com:p.git"}
-	if c.useFatClient(meta) {
+	if c.session.UseFatClient(meta) {
 		t.Fatal("expected false when workspace is nil")
 	}
 }
 
 func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
-	ws, err := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &apiClient{workspace: ws}
-	if c.useFatClient(nil) {
+	c := newAPIClientWithWorkspace(ws)
+	if c.session.UseFatClient(nil) {
 		t.Fatal("expected false on nil meta")
 	}
 }
 
 func TestUseFatClientWithRemoteURL(t *testing.T) {
-	ws, err := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &apiClient{workspace: ws}
+	c := newAPIClientWithWorkspace(ws)
 	meta := &taskMeta{ProjectID: 1, ProjectRemoteURL: "git@x.com:p.git"}
-	if !c.useFatClient(meta) {
+	if !c.session.UseFatClient(meta) {
 		t.Fatal("expected true when remote URL present")
 	}
 }
 
 func TestUseFatClientWithExternalDir(t *testing.T) {
-	ws, err := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	extDir := t.TempDir()
 	ws.RegisterExternalDir(42, extDir)
 
-	c := &apiClient{workspace: ws}
+	c := newAPIClientWithWorkspace(ws)
 	meta := &taskMeta{ProjectID: 42} // no remote URL
-	if !c.useFatClient(meta) {
+	if !c.session.UseFatClient(meta) {
 		t.Fatal("expected true when external dir registered")
 	}
 }
@@ -241,13 +253,13 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 // state=accepted with empty commit_sha and no on-disk directory.
 // Only compute tasks worked because they bypass useFatClient.
 func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
-	ws, err := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &apiClient{workspace: ws}
+	c := newAPIClientWithWorkspace(ws)
 	meta := &taskMeta{ProjectID: 99} // no remote, not registered
-	if !c.useFatClient(meta) {
+	if !c.session.UseFatClient(meta) {
 		t.Fatal("expected true: workspace exists, fat-client path commits to local clone even without a remote")
 	}
 }

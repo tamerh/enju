@@ -7,15 +7,15 @@ package mcphandlers
 // multi-citizen resolution), execute (action:compute).
 
 import (
-	"github.com/enju-ai/enju/internal/common/format"
 	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -89,7 +89,7 @@ func (c *apiClient) handleReleaseTask(ctx context.Context, req mcp.CallToolReque
 	}
 
 	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/release", map[string]string{
-		"username": c.username,
+		"username": c.username(),
 	})
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -136,10 +136,10 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 							taskMap["_review_target_claimed_by"] = target["claimed_by"]
 
 							// Read preview from local workspace if available.
-							if c.workspace != nil && resultPath != "" {
+							if c.session.Workspace() != nil && resultPath != "" {
 								remoteURL, _ := taskMap["project_remote_url"].(string)
 								projName, _ := taskMap["project_name"].(string)
-								if proj, perr := c.workspace.ForProject(int64(projectID), remoteURL, projName); perr == nil {
+								if proj, perr := c.session.Workspace().ForProject(int64(projectID), remoteURL, projName); perr == nil {
 									taskMap["_review_target_abs_path"] = filepath.Join(proj.WorkDir(), resultPath, "result.md")
 									contentPath := filepath.Join(resultPath, "result.md")
 									if content, rerr := proj.ReadFile(contentPath); rerr == nil {
@@ -161,7 +161,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
-	return mcp.NewToolResultText(format.TaskDetail(data, inputs, c.username)), nil
+	return mcp.NewToolResultText(format.TaskDetail(data, inputs, c.username())), nil
 }
 // handleListTemplates — pure client-side tool. Walks the
 // project's enju/templates/ directory in the local clone and
@@ -193,7 +193,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
-	outcome, err := c.executeComputeTask(ctx, taskID)
+	outcome, err := c.session.ExecuteComputeTask(ctx, taskID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -203,7 +203,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 // formatExecuteOutcome renders the free-text response returned
 // to MCP callers. Split out so enju_execute_task and the batch
 // tool can share the formatter for per-task entries.
-func formatExecuteOutcome(out *executeOutcome) string {
+func formatExecuteOutcome(out *service.ExecuteOutcome) string {
 	var b strings.Builder
 	elapsed := time.Duration(out.ElapsedMS) * time.Millisecond
 	switch out.Status {
@@ -259,60 +259,3 @@ func formatExecuteOutcome(out *executeOutcome) string {
 	return b.String()
 }
 
-// stringSliceNonNil normalizes a possibly-nil []string to an
-// empty slice. context.json consumers expect `reads_artifacts`
-// / `writes_artifacts` to always be JSON arrays — `null` forces
-// every script to special-case absent keys. `[]` is equally
-// valid JSON and skips the null-check.
-func stringSliceNonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
-}
-
-// encodeParamEnv renders a run param or for_each iteration
-// value as a shell-safe env var string. Scalars → fmt.Sprint;
-// []interface{} → comma-joined (list<string> round-trips
-// through JSON as []interface{} of strings). Nested structures
-// fall back to JSON — unlikely for param types Enju supports
-// today (string / int / bool / list<string>) but keeps the
-// encoder defensible if the type surface grows later.
-//
-// Comma-joining loses fidelity when list elements contain
-// commas; that's what the upcoming context.json Phase B
-// exists to cover (structured, language-agnostic JSON drop).
-// For the common case — identifiers, paths, gene symbols —
-// comma-joining is exactly what shell authors want.
-func encodeParamEnv(v interface{}) string {
-	switch x := v.(type) {
-	case nil:
-		return ""
-	case string:
-		return x
-	case bool:
-		if x {
-			return "true"
-		}
-		return "false"
-	case float64:
-		// JSON numbers decode as float64. Render integers
-		// without trailing ".000000" so scripts can use them
-		// directly (count math, seed args).
-		if x == float64(int64(x)) {
-			return strconv.FormatInt(int64(x), 10)
-		}
-		return strconv.FormatFloat(x, 'f', -1, 64)
-	case []interface{}:
-		parts := make([]string, 0, len(x))
-		for _, e := range x {
-			parts = append(parts, encodeParamEnv(e))
-		}
-		return strings.Join(parts, ",")
-	default:
-		if b, err := json.Marshal(x); err == nil {
-			return string(b)
-		}
-		return fmt.Sprint(x)
-	}
-}

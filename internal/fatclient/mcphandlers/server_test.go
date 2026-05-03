@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/service"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/go-git/go-git/v5/config"
@@ -70,20 +72,20 @@ func TestAutoReregisterOnStaleCitizen(t *testing.T) {
 
 	var savedUser, savedName, savedEmail string
 	var saveCalls atomic.Int32
-	c := &apiClient{
-		baseURL:      ts.URL,
-		username:     "alice",
-		citizenName:  "Alice",
-		citizenEmail: "alice@example.com",
-		httpClient:   &http.Client{},
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		saveCreds: func(u, n, e, t string) {
-			savedUser = u
-			savedName = n
-			savedEmail = e
-			saveCalls.Add(1)
-		},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:    ts.URL,
+			Username:    "alice",
+			CitizenName:  "Alice",
+			CitizenEmail: "alice@example.com",
+			Logger:     logger,
+			SaveCredentials: func(u, n, e, t string) {
+				savedUser = u
+				savedName = n
+				savedEmail = e
+				saveCalls.Add(1)
+			},
+		}), nil, logger)
 
 	data, err := c.get(context.Background(), "/api/v1/citizens/by-username/alice")
 	if err != nil {
@@ -120,13 +122,13 @@ func TestStaleCitizenWithoutNameGivesUp(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "alice",
-		// citizenName intentionally empty
-		httpClient: &http.Client{},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "alice",
+			// CitizenName intentionally empty
+			Logger:  logger,
+		}), nil, logger)
 	data, err := c.get(context.Background(), "/api/v1/citizens/by-username/alice")
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -189,14 +191,12 @@ func TestValidateReviewDecision(t *testing.T) {
 // effect" invariant that iteration E.1's phantom-commit feedback
 // round forced into the design.
 func TestSubmitReviewPreValidationBlocksGit(t *testing.T) {
-	c := &apiClient{
-		baseURL:    "http://unused.invalid",
-		username:   "tamer",
-		httpClient: &http.Client{},
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		// workspace is intentionally nil — pre-validation must
-		// fire before any workspace access or this test crashes.
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  "http://unused.invalid",
+			Username: "tamer",
+			Logger:  logger,
+		}), nil, logger)
 	reviewMeta := &taskMeta{
 		ID:            "1:1:check",
 		ProjectID:     1,
@@ -308,7 +308,7 @@ func toolResultText(res interface{}) string {
 //
 // Setup: a bare git repo seeded with a draft result.md at a known
 // commit SHA, an httptest coordinator that serves a fake /inputs
-// descriptor pointing at that commit, and a real mcpgit.Workspace
+// descriptor pointing at that commit, and a real workspace.Workspace
 // that clones the bare on first access. The test asserts the
 // resolved inputs JSON contains a "reviewing" key with the target
 // content, the target task def id, and the claimer's username.
@@ -421,18 +421,17 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 
 	// 3. Real Workspace. Clones the bare on first ForProject.
 	wsDir := t.TempDir()
-	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "bob",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "bob",
+			Logger:  logger,
+		}), ws, logger)
 	meta := &taskMeta{
 		ID:               reviewID,
 		ProjectID:        projectID,
@@ -443,7 +442,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 		ReviewsTarget:    "draft",
 	}
 
-	data, err := c.fetchAndResolveLocally(context.Background(), meta)
+	data, err := c.session.FetchAndResolveLocally(context.Background(), meta)
 	if err != nil {
 		t.Fatalf("fetchAndResolveLocally: %v", err)
 	}
@@ -469,38 +468,13 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	}
 }
 
-// TestStaleCitizenDetection covers the status/body classifier.
-func TestStaleCitizenDetection(t *testing.T) {
-	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   bool
-	}{
-		{"quoted form", http.StatusNotFound, `{"error":"citizen \"alice\" not found"}`, true},
-		{"plain form", http.StatusNotFound, `{"error":"citizen not found"}`, true},
-		{"404 other", http.StatusNotFound, `{"error":"project not found"}`, false},
-		{"200 with phrase", http.StatusOK, `{"error":"citizen not found"}`, false},
-		{"500 with phrase", http.StatusInternalServerError, `{"error":"citizen not found"}`, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := isStaleCitizenResponse(tc.status, []byte(tc.body))
-			if got != tc.want {
-				t.Errorf("isStaleCitizenResponse(%d, %q) = %v, want %v",
-					tc.status, tc.body, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestEagerCloneOnCreateProject verifies that handleCreateProject
 // clones the workspace directory immediately, so it exists before
 // any task is claimed.
 func TestEagerCloneOnCreateProject(t *testing.T) {
 	// 1. Seed a bare repo to act as the project's remote.
 	bareDir := t.TempDir()
-	mcpgit.InitBareWithSeed(bareDir)
+	workspace.InitBareWithSeed(bareDir)
 
 	// 2. Fake coordinator: POST /projects returns id=1,
 	//    GET /projects/1 returns remote_url + name.
@@ -522,18 +496,17 @@ func TestEagerCloneOnCreateProject(t *testing.T) {
 
 	// 3. Real workspace.
 	wsDir := t.TempDir()
-	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	// Before: no clone exists.
 	if ws.HasLocalClone(1) {
@@ -618,18 +591,17 @@ func TestCreateProjectLocalOnlyWorkingTree(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -696,18 +668,17 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	customPath := filepath.Join(t.TempDir(), "my-project")
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
@@ -745,11 +716,11 @@ func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -785,11 +756,11 @@ func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
 func TestCreateProjectCustomPathRejectsWithRemoteURL(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -833,18 +804,17 @@ func TestCreateProjectCustomPathCreatesNonExistentParents(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := mcpgit.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	deepPath := filepath.Join(t.TempDir(), "missing", "parent", "chain", "project")
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
@@ -883,11 +853,11 @@ func TestCreateProjectCustomPathRefusesSymlink(t *testing.T) {
 		t.Skipf("symlink unsupported on this filesystem: %v", err)
 	}
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -921,11 +891,11 @@ func TestCreateProjectCustomPathRefusesRegularFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -953,11 +923,11 @@ func TestCreateProjectCustomPathRefusesRegularFile(t *testing.T) {
 func TestCreateProjectCustomPathRefusesRelative(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1005,11 +975,11 @@ func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := &apiClient{
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1069,14 +1039,13 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1122,7 +1091,7 @@ func TestInitAcceptsAlreadyAdoptedRepo(t *testing.T) {
 	sig := &object.Signature{Name: "Enju", Email: "enju@localhost", When: time.Now()}
 	wt.Commit("prior adoption", &gogit.CommitOptions{Author: sig, Committer: sig})
 
-	if reason := detectPopulatedUnrelatedRepo(dir); reason != "" {
+	if reason := service.DetectPopulatedUnrelatedRepo(dir); reason != "" {
 		t.Errorf("repo with enju/ marker should pass safety check, got refusal: %s", reason)
 	}
 }
@@ -1156,7 +1125,7 @@ func TestInitDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 	sig := &object.Signature{Name: "User", Email: "u@e.com", When: time.Now()}
 	wt.Commit("source repo with enju binary", &gogit.CommitOptions{Author: sig, Committer: sig})
 
-	if reason := detectPopulatedUnrelatedRepo(dir); reason == "" {
+	if reason := service.DetectPopulatedUnrelatedRepo(dir); reason == "" {
 		t.Error("expected refusal for populated repo with regular-file 'enju' (compiled binary), got empty (mistaken for scaffold)")
 	}
 }
@@ -1191,14 +1160,13 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# My Paper"), 0644)
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1278,14 +1246,13 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "test@test", When: time.Now()},
 	})
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1353,14 +1320,13 @@ func TestInitIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "data.csv"), []byte("a,b,c"), 0644)
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	makeReq := func() mcp.CallToolRequest {
 		return mcp.CallToolRequest{
@@ -1437,14 +1403,13 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
 	})
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1533,14 +1498,13 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 		URLs: []string{preExistingOrigin},
 	})
 
-	ws, _ := mcpgit.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1644,23 +1608,23 @@ func TestIsLocalWorkingTree(t *testing.T) {
 			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
 		},
 	})
-	if !mcpgit.IsLocalWorkingTree(wtDir) {
+	if !workspace.IsLocalWorkingTree(wtDir) {
 		t.Error("expected working tree detected")
 	}
 
 	// Case 2: plain folder → false.
 	plainDir := t.TempDir()
-	if mcpgit.IsLocalWorkingTree(plainDir) {
+	if workspace.IsLocalWorkingTree(plainDir) {
 		t.Error("plain dir should not be detected as working tree")
 	}
 
 	// Case 3: non-existent path → false.
-	if mcpgit.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
+	if workspace.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
 		t.Error("non-existent path should not be detected")
 	}
 
 	// Case 4: SSH URL → false.
-	if mcpgit.IsLocalWorkingTree("git@github.com:org/repo.git") {
+	if workspace.IsLocalWorkingTree("git@github.com:org/repo.git") {
 		t.Error("SSH URL should not be detected as working tree")
 	}
 }
@@ -1679,7 +1643,7 @@ func TestIsSSHURL(t *testing.T) {
 		{"/home/tamer/.enju/repos/1.git", false},
 	}
 	for _, tc := range cases {
-		if got := mcpgit.IsSSHURL(tc.url); got != tc.want {
+		if got := workspace.IsSSHURL(tc.url); got != tc.want {
 			t.Errorf("IsSSHURL(%q) = %v, want %v", tc.url, got, tc.want)
 		}
 	}
@@ -1969,7 +1933,7 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 
 	// Wire the workspace + project.
 	wsRoot := t.TempDir()
-	ws, _ := mcpgit.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := workspace.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ws.RegisterExternalDir(2, workDir)
 	if _, err := ws.ForProject(2, ""); err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -1977,17 +1941,16 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 
 	// Fresh empty bare for the new remote.
 	bareDir := filepath.Join(t.TempDir(), "bare.git")
-	if err := mcpgit.InitBareEmpty(bareDir); err != nil {
+	if err := workspace.InitBareEmpty(bareDir); err != nil {
 		t.Fatalf("init bare: %v", err)
 	}
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		workspace:  ws,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), ws, logger)
 
 	result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -2022,13 +1985,13 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// local branch — main and run-1. Without this, the next
 	// scan would baseline tip and miss the historical trailer
 	// commit on run-1.
-	cursors, err := mcpgit.LoadCursors(c.stateDir(), 2)
+	cursors, err := workspace.LoadCursors(c.stateDir(), 2)
 	if err != nil {
 		t.Fatalf("loading cursors: %v", err)
 	}
 	for _, b := range []string{"main", "run-1"} {
-		if got := cursors.Get(b); got != mcpgit.RescanSentinelSHA {
-			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, mcpgit.RescanSentinelSHA)
+		if got := cursors.Get(b); got != workspace.RescanSentinelSHA {
+			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, workspace.RescanSentinelSHA)
 		}
 	}
 }
@@ -2054,12 +2017,12 @@ func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newClient(coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:  logger,
+		}), nil, logger)
 
 	for _, badURL := range []string{"", "   ", "\t\n"} {
 		result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
@@ -2089,93 +2052,7 @@ func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
 	}
 }
 
-// TestClaimTransientRetryRecovers is the regression for the
-// claim-with-retry path added after the SQLITE_BUSY parallel-
-// claims bug. The store layer's _txlock=immediate normally
-// prevents this, but the claim-time retry is defense-in-depth
-// for any other transient HTTP/network blip the coordinator
-// might surface (5xx during restart, reconcile race, etc.).
-//
-// The stub coordinator returns a transient SQLITE_BUSY error
-// on the first claim attempt, then succeeds on the second.
-// claimWithTransientRetry must mask the first attempt and
-// surface only the success.
-func TestClaimTransientRetryRecovers(t *testing.T) {
-	var attempts int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/tasks/1:1:t/claim", func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&attempts, 1)
-		w.Header().Set("Content-Type", "application/json")
-		if n == 1 {
-			// First call: transient SQLITE_BUSY-style error in
-			// the response body. Don't return non-200 — c.post
-			// returns the body either way; the retry path keys
-			// off the body's "error" field.
-			_, _ = w.Write([]byte(`{"error":"set_claim: database is locked (5) (SQLITE_BUSY)"}`))
-			return
-		}
-		// Second call: success.
-		_, _ = w.Write([]byte(`{"task":{"id":"1:1:t","action":"compute"},"deadline":"2026-04-30T00:00:00Z"}`))
-	})
-	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
-
-	if err := c.claimWithTransientRetry(context.Background(), "1:1:t"); err != nil {
-		t.Fatalf("claimWithTransientRetry: %v (expected success after one transient retry)", err)
-	}
-	if got := atomic.LoadInt32(&attempts); got != 2 {
-		t.Errorf("expected 2 coordinator calls (1 transient + 1 success), got %d", got)
-	}
-}
-
-// TestClaimTransientRetrySkipsSubstantiveErrors verifies the
-// retry logic does NOT swallow real claim refusals. A "task
-// not in claimable state" or role-mismatch error is the
-// coordinator's deterministic verdict; retrying would just
-// burn time and produce the same refusal. The retry path must
-// surface immediately on substantive errors.
-func TestClaimTransientRetrySkipsSubstantiveErrors(t *testing.T) {
-	var attempts int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/tasks/1:1:t/claim", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&attempts, 1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"error":"task is not in claimable state"}`))
-	})
-	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	c := &apiClient{
-		baseURL:    ts.URL,
-		username:   "tester",
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		httpClient: &http.Client{},
-	}
-
-	err := c.claimWithTransientRetry(context.Background(), "1:1:t")
-	if err == nil {
-		t.Fatalf("claimWithTransientRetry: expected error for non-claimable task, got nil")
-	}
-	if !strings.Contains(err.Error(), "not in claimable state") {
-		t.Errorf("expected substantive error to surface, got: %v", err)
-	}
-	// Substantive errors must NOT trigger retry.
-	if got := atomic.LoadInt32(&attempts); got != 1 {
-		t.Errorf("expected 1 coordinator call (substantive error, no retry), got %d", got)
-	}
-}
+// Note: TestClaimTransientRetryRecovers and
+// TestClaimTransientRetrySkipsSubstantiveErrors moved to
+// internal/fatclient/service/execute_test.go alongside the
+// claimWithTransientRetry implementation.
