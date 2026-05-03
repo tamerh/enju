@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/coordinator/service"
 )
 
 // --- Artifact helpers ---
@@ -92,71 +92,12 @@ func marshalVoteOptions(options []enjuYaml.VoteOption) string {
 	return string(b)
 }
 
-// unmarshalStringSlice parses the storage form back to a slice. An
-// empty string yields nil (no entries).
-func unmarshalStringSlice(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var xs []string
-	if err := json.Unmarshal([]byte(s), &xs); err != nil {
-		return nil
-	}
-	return xs
-}
+// Thin in-package wrappers that delegate to the canonical
+// helpers in service. Kept so existing api call sites keep
+// reading the same way they always did; new code should call
+// service directly.
 
-// unmarshalWriteArtifacts parses the storage form of the
-// writes_artifacts column (legacy []string OR current
-// [{path,track}] form — yaml.WriteArtifacts.UnmarshalJSON
-// handles both) into the typed slice used on the wire.
-func unmarshalWriteArtifacts(s string) enjuYaml.WriteArtifacts {
-	if s == "" {
-		return nil
-	}
-	var w enjuYaml.WriteArtifacts
-	if err := json.Unmarshal([]byte(s), &w); err != nil {
-		return nil
-	}
-	return w
-}
-
-// unmarshalStringMapField decodes the JSON-encoded env: map
-// stored on tasks.env back into a map[string]string. Empty
-// string yields nil. Malformed JSON yields nil (defense in
-// depth — a corrupted row shouldn't crash the executor).
-func unmarshalStringMapField(s string) map[string]string {
-	if s == "" {
-		return nil
-	}
-	var m map[string]string
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
-		return nil
-	}
-	return m
-}
-
-// formatIterationLabel renders a task's iteration context as
-// "key1=val1, key2=val2" using the persisted instance_params JSON
-// when available, falling back to the raw instance key slug for
-// rows that predate the instance_params column. Keys are sorted so
-// the output is deterministic. Used by toTaskResponse to populate
-// the iteration_label field.
-func formatIterationLabel(instanceParams, instanceKey string) string {
-	if instanceParams == "" {
-		return instanceKey
-	}
-	var m map[string]string
-	if err := json.Unmarshal([]byte(instanceParams), &m); err != nil || len(m) == 0 {
-		return instanceKey
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+m[k])
-	}
-	return strings.Join(parts, ", ")
-}
+func unmarshalStringSlice(s string) []string                { return service.UnmarshalStringSlice(s) }
+func unmarshalWriteArtifacts(s string) enjuYaml.WriteArtifacts { return service.UnmarshalWriteArtifacts(s) }
+func unmarshalStringMapField(s string) map[string]string    { return service.UnmarshalStringMapField(s) }
+func formatIterationLabel(ip, ik string) string             { return service.FormatIterationLabel(ip, ik) }

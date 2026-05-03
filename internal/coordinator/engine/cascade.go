@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/enju-ai/enju/internal/core/dag"
+	"github.com/enju-ai/enju/internal/common/dag"
 	"github.com/enju-ai/enju/internal/coordinator/store"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
 
 // InvalidationOutcome is the pure-computation result of

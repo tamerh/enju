@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/enju-ai/enju/internal/core/template"
+	"github.com/enju-ai/enju/internal/common/template"
 )
 
 // ResolveInput is the structured dependency descriptor a client

@@ -1,0 +1,101 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/enju-ai/enju/internal/coordinator/store"
+	"github.com/go-chi/chi/v5"
+)
+
+type invalidateRequest struct {
+	Reason string `json:"reason"`
+}
+
+func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+
+	var req invalidateRequest
+	json.NewDecoder(r.Body).Decode(&req)
+
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+
+	// member may be nil on legacy zero-member projects; fall
+	// back to the auth-context citizen so attribution still
+	// gets captured.
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+
+	resp, err := s.coord.InvalidateTask(caller, taskID, req.Reason)
+	if err != nil {
+		// Not-found vs bad-state vs internal collapse into
+		// service.ErrInvalidArgument; preserve the historical
+		// 400 + message-as-detail behavior.
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+
+	resp, err := s.coord.FailTask(caller, taskID, req.Reason)
+	if err != nil {
+		writeFailErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleTallyTask forces a tally evaluation on a collecting
+// vote or review task. Any user can trigger it; it runs the
+// same tally logic as a submission would, resolves if the
+// threshold + quorum permit, and reports the outcome. Useful
+// when a vote is stuck past its deadline or has enough
+// submissions to short-circuit but nobody has submitted lately
+// to re-trigger the evaluation.
+func (s *Server) handleTallyTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+	resp, err := s.coord.TallyTask(caller, taskID)
+	if err != nil {
+		writeFailErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}

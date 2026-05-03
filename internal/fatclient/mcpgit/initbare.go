@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	corelayout "github.com/enju-ai/enju/internal/core/layout"
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"

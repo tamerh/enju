@@ -1,7 +1,7 @@
 package engine
 
 // Engine-side typed wrappers over the pure path layout logic
-// in internal/core/layout. Pure primitives + constants live in
+// in internal/common/layout. Pure primitives + constants live in
 // core; engine adds the typed conveniences that need a
 // store.TaskRecord. Re-exports of the constants keep all
 // existing callsites compiling without forcing an audit in this
@@ -10,12 +10,12 @@ package engine
 import (
 	"encoding/json"
 
-	"github.com/enju-ai/enju/internal/core/layout"
+	"github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // Re-exports of the layout constants. Callers may import
-// internal/core/layout directly for new code; these stay so
+// internal/common/layout directly for new code; these stay so
 // in-tree callers don't churn during the boundary refactor.
 const (
 	ResultDirRoot           = layout.ResultDirRoot

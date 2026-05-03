@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/enju-ai/enju/internal/core/layout"
+	"github.com/enju-ai/enju/internal/common/layout"
 	_ "modernc.org/sqlite"
 )
 
@@ -2436,7 +2436,7 @@ func lookupReadiedParents(q dbExecQueryer, dependsOn string) ([]ReadiedParent, e
 	return out, nil
 }
 
-// renderResultDir delegates to internal/core/layout. Lives in
+// renderResultDir delegates to internal/common/layout. Lives in
 // the cascade emit path so task_ready events can carry the
 // parent's result_dir; the layout convention is shared with
 // engine via the core package, no duplication.

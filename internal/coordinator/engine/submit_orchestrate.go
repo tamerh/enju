@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/store"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
 
 // SubmitRequest carries the fields from the HTTP submit

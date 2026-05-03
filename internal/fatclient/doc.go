@@ -8,5 +8,5 @@
 // internal/coordinator/ — enforced at compile time via
 // tools/check-imports.sh.
 //
-// Fat-client may import internal/core/* for shared pure logic.
+// Fat-client may import internal/common/* for shared pure logic.
 package fatclient

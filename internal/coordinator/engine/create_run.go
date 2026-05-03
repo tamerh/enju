@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/store"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
 
 // ValidateRunCreation checks pre-flight constraints that

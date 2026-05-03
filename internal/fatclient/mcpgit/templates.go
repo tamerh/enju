@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	corelayout "github.com/enju-ai/enju/internal/core/layout"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )

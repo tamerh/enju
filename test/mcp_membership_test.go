@@ -18,14 +18,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // mcpCreateProjectAs fires enju_create_project through the given
 // TestClient and returns the new project's ID. The calling client
 // is auto-added as owner by the coordinator.
-func mcpCreateProjectAs(t *testing.T, h *mcpHarness, client *mcpserver.TestClient, name string) int64 {
+func mcpCreateProjectAs(t *testing.T, h *mcpHarness, client *mcphandlers.TestClient, name string) int64 {
 	t.Helper()
 	res, err := client.Call(context.Background(), "enju_create_project", map[string]any{
 		"name": name,
@@ -282,13 +282,13 @@ func TestMCPMembershipOwnerRemovesMember(t *testing.T) {
 // newTestClientFor wires a second TestClient as a specific
 // pre-registered citizen. Mirrors newMCPClientAs but takes an
 // already-known username rather than registering a new one.
-func newTestClientFor(t *testing.T, h *mcpHarness, username, displayName string) *mcpserver.TestClient {
+func newTestClientFor(t *testing.T, h *mcpHarness, username, displayName string) *mcphandlers.TestClient {
 	t.Helper()
 	cz, err := h.store.GetCitizenByUsername(username)
 	if err != nil || cz == nil {
 		t.Fatalf("lookup %s: %v", username, err)
 	}
-	cfg := mcpserver.Config{
+	cfg := mcphandlers.Config{
 		CoordinatorURL: h.url,
 		Username:       username,
 		CitizenName:    displayName,
@@ -298,7 +298,7 @@ func newTestClientFor(t *testing.T, h *mcpHarness, username, displayName string)
 		Workspace:      h.workspace,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return mcpserver.NewTestClient(cfg)
+	return mcphandlers.NewTestClient(cfg)
 }
 
 // nowNano returns a monotonic-ish suffix for unique names.

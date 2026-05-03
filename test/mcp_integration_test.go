@@ -20,7 +20,7 @@ package test
 // in handler code, it belongs here.
 //
 // Harness: each test builds a fresh mcpHarness (embeds testServer
-// + a real *mcpserver.TestClient), registers one or more citizens,
+// + a real *mcphandlers.TestClient), registers one or more citizens,
 // creates a project with a bare remote, and drives tool handlers
 // via h.call / h.callOK / h.callExpectError. TestClient.Call
 // dispatches by tool name matching what mark3labs/mcp-go routes
@@ -42,7 +42,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -52,13 +52,13 @@ import (
 // can build without re-importing exec symbols in multiple spots.
 var execCommand = exec.Command
 
-// mcpHarness extends testServer with a *mcpserver.TestClient wired
+// mcpHarness extends testServer with a *mcphandlers.TestClient wired
 // to the same coordinator URL and workspace. Tests drive handle*
 // methods via h.call(name, args) instead of hitting the REST API
 // directly.
 type mcpHarness struct {
 	*testServer
-	client *mcpserver.TestClient
+	client *mcphandlers.TestClient
 	// Cached citizen username the client was registered under.
 	// Equal to client.Username().
 	username string
@@ -103,7 +103,7 @@ func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 		t.Fatalf("lookup citizen %q after register: %v", username, err)
 	}
 
-	cfg := mcpserver.Config{
+	cfg := mcphandlers.Config{
 		CoordinatorURL: ts.url,
 		Username:       username,
 		CitizenName:    citizenName,
@@ -115,7 +115,7 @@ func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 	}
 	return &mcpHarness{
 		testServer: ts,
-		client:     mcpserver.NewTestClient(cfg),
+		client:     mcphandlers.NewTestClient(cfg),
 		username:   username,
 		useRemote:  true, // default: backward-compatible with all flat (un-wrapped) tests
 	}
@@ -199,14 +199,14 @@ func requireRemote(t *testing.T, h *mcpHarness) {
 // coordinator and workspace under a different citizen identity.
 // Used by multi-citizen tests where each citizen has its own
 // handler instance.
-func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcpserver.TestClient {
+func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcphandlers.TestClient {
 	t.Helper()
 	username := h.register(citizenName)
 	citizen, err := h.store.GetCitizenByUsername(username)
 	if err != nil || citizen == nil {
 		t.Fatalf("lookup citizen %q: %v", username, err)
 	}
-	cfg := mcpserver.Config{
+	cfg := mcphandlers.Config{
 		CoordinatorURL: h.url,
 		Username:       username,
 		CitizenName:    citizenName,
@@ -216,7 +216,7 @@ func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcpserver
 		Workspace:      h.workspace,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return mcpserver.NewTestClient(cfg)
+	return mcphandlers.NewTestClient(cfg)
 }
 
 // call invokes the named MCP tool with args and fails the test on
@@ -501,7 +501,7 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 	}
 
 	// Build a TestClient identified as the bot.
-	botClient := mcpserver.NewTestClient(mcpserver.Config{
+	botClient := mcphandlers.NewTestClient(mcphandlers.Config{
 		CoordinatorURL: h.url,
 		Username:       botUsername,
 		CitizenName:    "Notify Bot",
@@ -1108,7 +1108,7 @@ func TestMCPMultiCitizenSubmitRoutesPerCitizen(t *testing.T) {
 		// TestClient. We pair (client, prose) so we can assert on the
 		// prose landing under the right citizen directory later.
 		reviewers := []struct {
-			client *mcpserver.TestClient
+			client *mcphandlers.TestClient
 			prose  string
 		}{
 			{reviewerA, "Alice says approve."},
@@ -10408,7 +10408,7 @@ tasks:
 		h.mcpSubmitDiscoverListAs(t, "items", []string{"alpha", "beta"})
 
 		// alpha cycle: all 3 vote "yes" → resolves as yes.
-		clients := []*mcpserver.TestClient{h.client, bob, carol}
+		clients := []*mcphandlers.TestClient{h.client, bob, carol}
 		for _, c := range clients {
 			h.mcpClaimAs(t, c, "alpha:decide")
 		}
@@ -10488,7 +10488,7 @@ tasks:
 
 		// All three reviewers claim + approve alpha:check. Independent
 		// tally: alpha should resolve, beta should still be idle.
-		clients := []*mcpserver.TestClient{h.client, bob, carol}
+		clients := []*mcphandlers.TestClient{h.client, bob, carol}
 		for _, c := range clients {
 			h.mcpClaimAs(t, c, "alpha:check")
 		}

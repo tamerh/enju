@@ -47,7 +47,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
 	"github.com/enju-ai/enju/internal/coordinator/store"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"

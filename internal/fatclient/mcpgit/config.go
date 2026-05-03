@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	corelayout "github.com/enju-ai/enju/internal/core/layout"
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 

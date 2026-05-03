@@ -7,5 +7,5 @@
 // the runtime separation is enforced at compile time via
 // tools/check-imports.sh.
 //
-// Coordinator may import internal/core/* for shared pure logic.
+// Coordinator may import internal/common/* for shared pure logic.
 package coordinator

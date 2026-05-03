@@ -11,7 +11,7 @@ package test
 //   - All helpers take *testing.T first and call t.Helper() so
 //     failure line numbers point at the caller.
 //   - Helpers that can operate "as" a specific citizen take a
-//     *mcpserver.TestClient first (after t). The default-client
+//     *mcphandlers.TestClient first (after t). The default-client
 //     convenience wrappers delegate to h.client.
 //   - Helpers that compose tool args return the CallToolResult
 //     raw — the caller decides whether success or error is
@@ -28,7 +28,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -40,7 +40,7 @@ import (
 // default-client helpers elsewhere in this file delegate to this.
 // Used by multi-citizen tests where each citizen has its own
 // TestClient.
-func (h *mcpHarness) mcpCallVia(t *testing.T, client *mcpserver.TestClient, toolName string, args map[string]any) *mcp.CallToolResult {
+func (h *mcpHarness) mcpCallVia(t *testing.T, client *mcphandlers.TestClient, toolName string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	res, err := client.Call(context.Background(), toolName, args)
 	if err != nil {
@@ -53,7 +53,7 @@ func (h *mcpHarness) mcpCallVia(t *testing.T, client *mcpserver.TestClient, tool
 }
 
 // mcpCallOKVia asserts a non-error tool result from the given client.
-func (h *mcpHarness) mcpCallOKVia(t *testing.T, client *mcpserver.TestClient, toolName string, args map[string]any) *mcp.CallToolResult {
+func (h *mcpHarness) mcpCallOKVia(t *testing.T, client *mcphandlers.TestClient, toolName string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	res := h.mcpCallVia(t, client, toolName, args)
 	if res.IsError {
@@ -64,7 +64,7 @@ func (h *mcpHarness) mcpCallOKVia(t *testing.T, client *mcpserver.TestClient, to
 
 // mcpCallExpectErrorVia asserts a tool-level error result from the
 // given client and returns the error text for substring checks.
-func (h *mcpHarness) mcpCallExpectErrorVia(t *testing.T, client *mcpserver.TestClient, toolName string, args map[string]any) string {
+func (h *mcpHarness) mcpCallExpectErrorVia(t *testing.T, client *mcphandlers.TestClient, toolName string, args map[string]any) string {
 	t.Helper()
 	res := h.mcpCallVia(t, client, toolName, args)
 	if !res.IsError {
@@ -205,13 +205,13 @@ func (h *mcpHarness) mcpTally(t *testing.T, shortID string) *mcp.CallToolResult 
 // mcpClaimAs claims a task via a non-default client. Used when a
 // specific citizen's identity matters (multi-reviewer, access
 // control, attribution).
-func (h *mcpHarness) mcpClaimAs(t *testing.T, client *mcpserver.TestClient, shortID string) *mcp.CallToolResult {
+func (h *mcpHarness) mcpClaimAs(t *testing.T, client *mcphandlers.TestClient, shortID string) *mcp.CallToolResult {
 	t.Helper()
 	return h.mcpCallOKVia(t, client, "enju_claim_task", map[string]any{"task_id": h.taskID(shortID)})
 }
 
 // mcpSubmitTextAs is the multi-citizen variant of mcpSubmitText.
-func (h *mcpHarness) mcpSubmitTextAs(t *testing.T, client *mcpserver.TestClient, shortID, content string) *mcp.CallToolResult {
+func (h *mcpHarness) mcpSubmitTextAs(t *testing.T, client *mcphandlers.TestClient, shortID, content string) *mcp.CallToolResult {
 	t.Helper()
 	return h.mcpCallOKVia(t, client, "enju_submit_result", map[string]any{
 		"task_id": h.taskID(shortID),
@@ -220,7 +220,7 @@ func (h *mcpHarness) mcpSubmitTextAs(t *testing.T, client *mcpserver.TestClient,
 }
 
 // mcpSubmitReviewAs is the multi-citizen variant of mcpSubmitReview.
-func (h *mcpHarness) mcpSubmitReviewAs(t *testing.T, client *mcpserver.TestClient, shortID, content, decision string) *mcp.CallToolResult {
+func (h *mcpHarness) mcpSubmitReviewAs(t *testing.T, client *mcphandlers.TestClient, shortID, content, decision string) *mcp.CallToolResult {
 	t.Helper()
 	return h.mcpCallOKVia(t, client, "enju_submit_result", map[string]any{
 		"task_id":  h.taskID(shortID),
@@ -230,7 +230,7 @@ func (h *mcpHarness) mcpSubmitReviewAs(t *testing.T, client *mcpserver.TestClien
 }
 
 // mcpSubmitVoteAs is the multi-citizen variant of mcpSubmitVote.
-func (h *mcpHarness) mcpSubmitVoteAs(t *testing.T, client *mcpserver.TestClient, shortID, content, option string) *mcp.CallToolResult {
+func (h *mcpHarness) mcpSubmitVoteAs(t *testing.T, client *mcphandlers.TestClient, shortID, content, option string) *mcp.CallToolResult {
 	t.Helper()
 	return h.mcpCallOKVia(t, client, "enju_submit_result", map[string]any{
 		"task_id": h.taskID(shortID),
@@ -352,7 +352,7 @@ func (h *mcpHarness) mcpProfileText(t *testing.T) string {
 }
 
 // mcpProfileTextAs returns the profile for any TestClient.
-func (h *mcpHarness) mcpProfileTextAs(t *testing.T, client *mcpserver.TestClient) string {
+func (h *mcpHarness) mcpProfileTextAs(t *testing.T, client *mcphandlers.TestClient) string {
 	t.Helper()
 	res := h.mcpCallOKVia(t, client, "enju_my_profile", map[string]any{})
 	return mcpText(res)
@@ -570,7 +570,7 @@ func (h *mcpHarness) mcpInstancesOf(t *testing.T, defID string) []string {
 // distinction is deliberate — the handler-formatter renders the
 // full server error so users see it in-line — but it means tests
 // need a specific assertion shape for these paths.
-func (h *mcpHarness) mcpExpectProseRejection(t *testing.T, client *mcpserver.TestClient, toolName string, args map[string]any, substrs ...string) string {
+func (h *mcpHarness) mcpExpectProseRejection(t *testing.T, client *mcphandlers.TestClient, toolName string, args map[string]any, substrs ...string) string {
 	t.Helper()
 	res := h.mcpCallOKVia(t, client, toolName, args)
 	text := mcpText(res)

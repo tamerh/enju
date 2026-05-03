@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/store"
-	"github.com/enju-ai/enju/internal/core/template"
-	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
+	"github.com/enju-ai/enju/internal/common/template"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
 
 // MaterializationOutcome is the pure-computation result of

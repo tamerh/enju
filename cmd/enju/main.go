@@ -18,7 +18,7 @@ import (
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
-	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/scheduler"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/mark3labs/mcp-go/server"
@@ -415,9 +415,9 @@ func cmdMCP(args []string) {
 	// in ~/.enju/.
 	notifyCtx, cancelNotify := context.WithCancel(context.Background())
 	defer cancelNotify()
-	notifyOpts := &mcpserver.NotifyOptions{ParentCtx: notifyCtx}
+	notifyOpts := &mcphandlers.NotifyOptions{ParentCtx: notifyCtx}
 
-	s := mcpserver.New(mcpserver.Config{
+	s := mcphandlers.New(mcphandlers.Config{
 		CoordinatorURL: *coordinator,
 		Username:    *username,
 		CitizenName:  *name,
