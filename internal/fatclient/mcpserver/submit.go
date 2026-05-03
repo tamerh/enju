@@ -16,6 +16,7 @@ package mcpserver
 // the workspace touch.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -394,7 +395,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 						results[preparedIdx[k]] = batchEntryResult{TaskID: prep.TaskID, Status: "error", Message: decorateCoordinatorRejection(errMsg)}
 						continue
 					}
-					results[preparedIdx[k]] = batchEntryResult{TaskID: prep.TaskID, Status: "accepted", Message: formatSubmitResult(data, prep.TaskID)}
+					results[preparedIdx[k]] = batchEntryResult{TaskID: prep.TaskID, Status: "accepted", Message: format.SubmitResult(data, prep.TaskID)}
 				}
 			}
 		}
@@ -1156,7 +1157,7 @@ func (c *apiClient) submitResultFatClient(
 	if err := c.applyAcceptedMerges(ctx, prep.Project, data); err != nil {
 		return mcp.NewToolResultError("auto-merging accepted topic branch: " + err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatSubmitResult(data, taskID)), nil
+	return mcp.NewToolResultText(format.SubmitResult(data, taskID)), nil
 }
 
 // reportMerge POSTs a branch_merged report to the coordinator.

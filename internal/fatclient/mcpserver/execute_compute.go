@@ -8,6 +8,7 @@ package mcpserver
 // per entry without re-parsing formatted text.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -302,10 +303,10 @@ func (c *apiClient) executeComputeTask(ctx context.Context, taskID string) (*exe
 	}
 	var report map[string]interface{}
 	if json.Unmarshal(reportData, &report) == nil {
-		if n := jsonFloat(report["contribution_number"]); n > 0 {
+		if n := format.JsonFloat(report["contribution_number"]); n > 0 {
 			out.ContribNum = int(n)
 		}
-		if r := jsonFloat(report["newly_ready"]); r > 0 {
+		if r := format.JsonFloat(report["newly_ready"]); r > 0 {
 			out.NewlyReady = int(r)
 		}
 	}

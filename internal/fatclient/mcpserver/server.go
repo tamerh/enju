@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/enju-ai/enju/internal/core/mcptools"
 	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -138,80 +139,178 @@ Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · 
 		})
 	}
 
-	// Register tools
-	s.AddTool(toolListRuns(), client.handleListRuns)
-	s.AddTool(toolListReadyTasks(), client.handleListReadyTasks)
-	s.AddTool(toolClaimTask(), client.handleClaimTask)
-	s.AddTool(toolGetTaskInputs(), client.handleGetTaskInputs)
-	s.AddTool(toolSubmitResult(), client.handleSubmitResult)
-	s.AddTool(toolSubmitResultsBatch(), client.handleSubmitResultsBatch)
-	s.AddTool(toolClaimReadyMatching(), client.handleClaimReadyMatching)
-	s.AddTool(toolReleaseTask(), client.handleReleaseTask)
-	s.AddTool(toolGetTask(), client.handleGetTask)
-	s.AddTool(toolRunStatus(), client.handleRunStatus)
-	s.AddTool(toolCreateRun(), client.handleCreateRun)
-	s.AddTool(toolPauseRun(), client.handlePauseRun)
-	s.AddTool(toolResumeRun(), client.handleResumeRun)
-	s.AddTool(toolSpawnTask(), client.handleSpawnTask)
-	s.AddTool(toolRequestClarification(), client.handleRequestClarification)
-	s.AddTool(toolSetCycleBudget(), client.handleSetCycleBudget)
-	s.AddTool(toolShowEvents(), client.handleShowEvents)
-	s.AddTool(toolRecentEvents(), client.handleRecentEvents)
-	s.AddTool(toolNotifications(), client.handleNotifications)
-	s.AddTool(toolInbox(), client.handleInbox)
-	s.AddTool(toolReview(), client.handleReview)
-	s.AddTool(toolEventsStatus(), client.handleEventsStatus)
-	s.AddTool(toolListIterations(), client.handleListIterations)
-	s.AddTool(toolFileIssue(), client.handleFileIssue)
-	s.AddTool(toolListIssues(), client.handleListIssues)
-	s.AddTool(toolGetIssue(), client.handleGetIssue)
-	s.AddTool(toolTriageIssue(), client.handleTriageIssue)
-	s.AddTool(toolCloseIssue(), client.handleCloseIssue)
-	s.AddTool(toolMyDashboard(), client.handleMyDashboard)
-	s.AddTool(toolUpdateProfile(), client.handleUpdateProfile)
-	s.AddTool(toolListProjects(), client.handleListProjects)
-	s.AddTool(toolCreateProject(), client.handleCreateProject)
-	s.AddTool(toolInit(), client.handleInit)
-	s.AddTool(toolSetProjectRemote(), client.handleSetProjectRemote)
-	s.AddTool(toolSetProjectDefaultBranch(), client.handleSetProjectDefaultBranch)
-	s.AddTool(toolProjectRemoteStatus(), client.handleProjectRemoteStatus)
-	s.AddTool(toolProjectSync(), client.handleProjectSync)
-	s.AddTool(toolLeaveProject(), client.handleLeaveProject)
-	s.AddTool(toolAddProjectMember(), client.handleAddProjectMember)
-	s.AddTool(toolRemoveProjectMember(), client.handleRemoveProjectMember)
-	s.AddTool(toolListProjectMembers(), client.handleListProjectMembers)
-	s.AddTool(toolPromoteMember(), client.handlePromoteMember)
-	s.AddTool(toolDemoteOwner(), client.handleDemoteOwner)
-	s.AddTool(toolListArtifacts(), client.handleListArtifacts)
-	s.AddTool(toolGetArtifact(), client.handleGetArtifact)
-	s.AddTool(toolGetArtifactHistory(), client.handleGetArtifactHistory)
-	s.AddTool(toolListUntrackedArtifacts(), client.handleListUntrackedArtifacts)
-	s.AddTool(toolMyProfile(), client.handleMyProfile)
-	s.AddTool(toolInvalidateTask(), client.handleInvalidateTask)
-	s.AddTool(toolTallyTask(), client.handleTallyTask)
-	s.AddTool(toolFailTask(), client.handleFailTask)
-	s.AddTool(toolExecuteTask(), client.handleExecuteTask)
-	s.AddTool(toolExecuteRun(), client.handleExecuteRun)
-	s.AddTool(toolExportRun(), client.handleExportRun)
-	s.AddTool(toolExportDiagram(), client.handleExportDiagram)
-	s.AddTool(toolExportRunEvents(), client.handleExportRunEvents)
-	s.AddTool(toolListTemplates(), client.handleListTemplates)
-	s.AddTool(toolDescribeTemplate(), client.handleDescribeTemplate)
-
-	// operator/model design — bot + model
-	// registration tools. See docs/operator-model-design.md.
-	s.AddTool(toolRegisterBot(), client.handleRegisterBot)
-	s.AddTool(toolListMyBots(), client.handleListMyBots)
-	s.AddTool(toolRevokeToken(), client.handleRevokeToken)
-	s.AddTool(toolListModels(), client.handleListModels)
-	s.AddTool(toolRegisterModel(), client.handleRegisterModel)
+	// Drive registration off the registry. The handler map is
+	// the load-bearing contract: every entry in mcptools.All()
+	// must have a handler here, or startup panics. Adding a tool
+	// to the registry without a handler in this map fails fast
+	// at process start, not silently at first call.
+	//
+	// Until coord-side native handlers exist (Phase 3.4), the
+	// fat-client registers handlers for every tool — heavy ones
+	// natively, thin ones as HTTP-forwarders living in the same
+	// per-tool handler files. After 3.4/3.5 land, this map will
+	// shrink to fat-client-side tools only and the thin ones
+	// will be registered via a generic forwarder.
+	for _, t := range mcptools.All() {
+		h, ok := client.handlerByToolName(t.Tool.Name)
+		if !ok {
+			panic("mcpserver: no handler registered for tool: " + t.Tool.Name)
+		}
+		s.AddTool(t.Tool, h)
+	}
 
 	return s
 }
 
+// handlerByToolName returns the apiClient method that handles the
+// given MCP tool. Centralized here so the registry-driven loop in
+// New() can validate that every tool in mcptools.All() has a
+// handler at startup. Adding a tool to the registry = add an entry
+// here; the build won't fail but startup will panic, surfacing the
+// gap loudly.
+func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool) {
+	switch name {
+	// Read-side / listings
+	case "enju_list_runs":
+		return c.handleListRuns, true
+	case "enju_list_ready_tasks":
+		return c.handleListReadyTasks, true
+	case "enju_list_iterations":
+		return c.handleListIterations, true
+	case "enju_list_projects":
+		return c.handleListProjects, true
+	case "enju_list_project_members":
+		return c.handleListProjectMembers, true
+	case "enju_list_artifacts":
+		return c.handleListArtifacts, true
+	case "enju_list_my_bots":
+		return c.handleListMyBots, true
+	case "enju_list_models":
+		return c.handleListModels, true
+	case "enju_list_issues":
+		return c.handleListIssues, true
+	case "enju_recent_events":
+		return c.handleRecentEvents, true
+	case "enju_show_events":
+		return c.handleShowEvents, true
+	case "enju_run_status":
+		return c.handleRunStatus, true
+	case "enju_events_status":
+		return c.handleEventsStatus, true
+	case "enju_my_dashboard":
+		return c.handleMyDashboard, true
+	case "enju_my_profile":
+		return c.handleMyProfile, true
+	case "enju_get_issue":
+		return c.handleGetIssue, true
+	case "enju_get_task":
+		return c.handleGetTask, true
+	case "enju_get_artifact":
+		return c.handleGetArtifact, true
+	case "enju_get_artifact_history":
+		return c.handleGetArtifactHistory, true
+	case "enju_list_untracked_artifacts":
+		return c.handleListUntrackedArtifacts, true
+	case "enju_list_templates":
+		return c.handleListTemplates, true
+	case "enju_describe_template":
+		return c.handleDescribeTemplate, true
 
+	// Run admin
+	case "enju_pause_run":
+		return c.handlePauseRun, true
+	case "enju_resume_run":
+		return c.handleResumeRun, true
+	case "enju_set_cycle_budget":
+		return c.handleSetCycleBudget, true
+	case "enju_spawn_task":
+		return c.handleSpawnTask, true
+	case "enju_request_clarification":
+		return c.handleRequestClarification, true
 
-// --- Tool Handlers ---
+	// Task lifecycle
+	case "enju_claim_task":
+		return c.handleClaimTask, true
+	case "enju_claim_ready_matching":
+		return c.handleClaimReadyMatching, true
+	case "enju_get_task_inputs":
+		return c.handleGetTaskInputs, true
+	case "enju_release_task":
+		return c.handleReleaseTask, true
+	case "enju_submit_result":
+		return c.handleSubmitResult, true
+	case "enju_submit_results_batch":
+		return c.handleSubmitResultsBatch, true
+	case "enju_review":
+		return c.handleReview, true
+	case "enju_invalidate_task":
+		return c.handleInvalidateTask, true
+	case "enju_tally_task":
+		return c.handleTallyTask, true
+	case "enju_fail_task":
+		return c.handleFailTask, true
+	case "enju_execute_task":
+		return c.handleExecuteTask, true
+	case "enju_execute_run":
+		return c.handleExecuteRun, true
 
+	// Project lifecycle
+	case "enju_create_project":
+		return c.handleCreateProject, true
+	case "enju_create_run":
+		return c.handleCreateRun, true
+	case "enju_init":
+		return c.handleInit, true
+	case "enju_set_project_remote":
+		return c.handleSetProjectRemote, true
+	case "enju_set_project_default_branch":
+		return c.handleSetProjectDefaultBranch, true
+	case "enju_project_remote_status":
+		return c.handleProjectRemoteStatus, true
+	case "enju_project_sync":
+		return c.handleProjectSync, true
+	case "enju_leave_project":
+		return c.handleLeaveProject, true
+	case "enju_add_project_member":
+		return c.handleAddProjectMember, true
+	case "enju_remove_project_member":
+		return c.handleRemoveProjectMember, true
+	case "enju_promote_member":
+		return c.handlePromoteMember, true
+	case "enju_demote_owner":
+		return c.handleDemoteOwner, true
+	case "enju_update_profile":
+		return c.handleUpdateProfile, true
 
+	// Notifications + inbox
+	case "enju_notifications":
+		return c.handleNotifications, true
+	case "enju_inbox":
+		return c.handleInbox, true
 
+	// Issues
+	case "enju_file_issue":
+		return c.handleFileIssue, true
+	case "enju_triage_issue":
+		return c.handleTriageIssue, true
+	case "enju_close_issue":
+		return c.handleCloseIssue, true
+
+	// Exports
+	case "enju_export_run":
+		return c.handleExportRun, true
+	case "enju_export_diagram":
+		return c.handleExportDiagram, true
+	case "enju_export_run_events":
+		return c.handleExportRunEvents, true
+
+	// Bot + model registration
+	case "enju_register_bot":
+		return c.handleRegisterBot, true
+	case "enju_revoke_token":
+		return c.handleRevokeToken, true
+	case "enju_register_model":
+		return c.handleRegisterModel, true
+	}
+	return nil, false
+}

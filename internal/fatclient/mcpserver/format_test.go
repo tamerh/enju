@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ func TestFormatVotingBlockVoteShape(t *testing.T) {
 		map[string]interface{}{"username": "alice", "option": "duckdb"},
 		map[string]interface{}{"username": "bob", "option": "duckdb"},
 	}
-	out := formatVotingBlock("vote", 3, 3, "majority", "collecting", voteSubs, []string{"charlie"}, "", "", false, "", "")
+	out := format.VotingBlock("vote", 3, 3, "majority", "collecting", voteSubs, []string{"charlie"}, "", "", false, "", "")
 
 	mustContain(t, out,
 		"── Voting ──",
@@ -50,7 +51,7 @@ func TestFormatVotingBlockReviewShape(t *testing.T) {
 		map[string]interface{}{"username": "bob", "option": "approve"},
 		map[string]interface{}{"username": "charlie", "option": "approve"},
 	}
-	out := formatVotingBlock("review", 3, 0, "", "accepted", voteSubs, nil, "", "", false, "", "")
+	out := format.VotingBlock("review", 3, 0, "", "accepted", voteSubs, nil, "", "", false, "", "")
 
 	mustContain(t, out,
 		"── Review ──",
@@ -79,7 +80,7 @@ func TestFormatVotingBlockReviewShape(t *testing.T) {
 // say "reviewed" instead of "submitted" so the text reads
 // naturally.
 func TestFormatVotingBlockReviewReadyPhase(t *testing.T) {
-	out := formatVotingBlock("review", 3, 0, "", "ready",
+	out := format.VotingBlock("review", 3, 0, "", "ready",
 		[]interface{}{}, []string{"alice", "bob"}, "", "", false, "", "")
 	mustContain(t, out,
 		"── Review ──",
@@ -99,7 +100,7 @@ func TestFormatVotingBlockBlindFilter(t *testing.T) {
 		map[string]interface{}{"username": "charlie", "option": "approve"},
 	}
 	// Viewer is bob — should only see bob's ballot plus a hint.
-	out := formatVotingBlock("review", 3, 0, "", "collecting", voteSubs, nil, "blind", "bob", false, "", "")
+	out := format.VotingBlock("review", 3, 0, "", "collecting", voteSubs, nil, "blind", "bob", false, "", "")
 	mustContain(t, out,
 		"bob→reject",
 		"sibling ballots hidden",
@@ -119,7 +120,7 @@ func TestFormatVotingBlockBlindOpenOnceAccepted(t *testing.T) {
 		map[string]interface{}{"username": "bob", "option": "reject"},
 		map[string]interface{}{"username": "charlie", "option": "approve"},
 	}
-	out := formatVotingBlock("review", 3, 0, "", "accepted", voteSubs, nil, "blind", "bob", false, "", "")
+	out := format.VotingBlock("review", 3, 0, "", "accepted", voteSubs, nil, "blind", "bob", false, "", "")
 	mustContain(t, out,
 		"alice→approve",
 		"bob→reject",
@@ -143,7 +144,7 @@ func TestWriteArtifactsDisplayHandlesObjectForm(t *testing.T) {
 		map[string]interface{}{"path": "out/summary.json", "track": true},
 		map[string]interface{}{"path": "out/big.bam", "track": false},
 	}
-	got := writeArtifactPathsFromAny(obj)
+	got := format.WriteArtifactPathsFromAny(obj)
 	if len(got) != 2 || got[0] != "out/summary.json" || got[1] != "out/big.bam" {
 		t.Errorf("object form wrong: %v", got)
 	}
@@ -152,7 +153,7 @@ func TestWriteArtifactsDisplayHandlesObjectForm(t *testing.T) {
 	// surface. Must still work for any consumer who hasn't
 	// re-saved.
 	legacy := []interface{}{"out/a.md", "out/b.md"}
-	got = writeArtifactPathsFromAny(legacy)
+	got = format.WriteArtifactPathsFromAny(legacy)
 	if len(got) != 2 || got[0] != "out/a.md" || got[1] != "out/b.md" {
 		t.Errorf("legacy form wrong: %v", got)
 	}
@@ -163,16 +164,16 @@ func TestWriteArtifactsDisplayHandlesObjectForm(t *testing.T) {
 		"bare/a.md",
 		map[string]interface{}{"path": "obj/b.md", "track": true},
 	}
-	got = writeArtifactPathsFromAny(mixed)
+	got = format.WriteArtifactPathsFromAny(mixed)
 	if len(got) != 2 || got[0] != "bare/a.md" || got[1] != "obj/b.md" {
 		t.Errorf("mixed form wrong: %v", got)
 	}
 
 	// Nil / empty / wrong-type inputs → nil, never panic.
-	if writeArtifactPathsFromAny(nil) != nil {
+	if format.WriteArtifactPathsFromAny(nil) != nil {
 		t.Error("nil should return nil")
 	}
-	if got := writeArtifactPathsFromAny([]interface{}{}); len(got) != 0 {
+	if got := format.WriteArtifactPathsFromAny([]interface{}{}); len(got) != 0 {
 		t.Errorf("empty should return empty, got %v", got)
 	}
 }
@@ -180,7 +181,7 @@ func TestWriteArtifactsDisplayHandlesObjectForm(t *testing.T) {
 // TestFormatGetTaskIncludesWritesArtifactsSection is the end-to-end
 // regression guard: a task payload carrying the object-form
 // writes_artifacts must render a visible "Writes" block in
-// formatGetTask's output. Before the fix, stringSliceFromAny's
+// format.GetTask's output. Before the fix, format.StringSliceFromAny's
 // string-only type assert silently dropped every entry and the
 // entire Artifacts block disappeared.
 func TestFormatGetTaskIncludesWritesArtifactsSection(t *testing.T) {
@@ -194,9 +195,9 @@ func TestFormatGetTaskIncludesWritesArtifactsSection(t *testing.T) {
 			map[string]interface{}{"path": "out/scratch.bam", "track": false},
 		},
 	}
-	out := formatArtifactsSchema(
-		writeArtifactPathsFromAny(task["reads_artifacts"]),
-		writeArtifactPathsFromAny(task["writes_artifacts"]),
+	out := format.ArtifactsSchema(
+		format.WriteArtifactPathsFromAny(task["reads_artifacts"]),
+		format.WriteArtifactPathsFromAny(task["writes_artifacts"]),
 	)
 	mustContain(t, out,
 		"── Artifacts",

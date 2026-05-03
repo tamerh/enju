@@ -25,6 +25,7 @@ package mcpserver
 //      lines.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -107,7 +108,7 @@ func (c *apiClient) handleClaimReadyMatching(ctx context.Context, req mcp.CallTo
 		// assign_to pre-filter: if declared non-empty, this
 		// citizen must be in the list. Silently drop any
 		// task we're not eligible to claim.
-		if assigned := stringSliceFromAny(t["assign_to"]); len(assigned) > 0 {
+		if assigned := format.StringSliceFromAny(t["assign_to"]); len(assigned) > 0 {
 			allowed := false
 			for _, u := range assigned {
 				if u == c.username {
@@ -229,7 +230,7 @@ func (c *apiClient) claimOneForSelector(ctx context.Context, taskID string, incl
 
 	// Build the per-entry summary. Default (lean) form: task
 	// id + action + deadline + one-line action-specific
-	// hint. Full-context form: hand off to formatClaimResult
+	// hint. Full-context form: hand off to format.ClaimResult
 	// with the inputs fetched like a single claim.
 	if includeContext {
 		var inputs []byte
@@ -244,7 +245,7 @@ func (c *apiClient) claimOneForSelector(ctx context.Context, taskID string, incl
 		return batchClaimEntry{
 			TaskID:  taskID,
 			Status:  "claimed",
-			Summary: formatClaimResult(data, inputs, c.username),
+			Summary: format.ClaimResult(data, inputs, c.username),
 		}
 	}
 	return batchClaimEntry{
@@ -282,7 +283,7 @@ func formatClaimMatchingEntryLean(claim map[string]interface{}) string {
 		b.WriteString("reviews=" + reviews)
 	}
 	if optsRaw, _ := task["vote_options"].(string); optsRaw != "" {
-		opts := parseVoteOptionsForDisplay(optsRaw)
+		opts := format.ParseVoteOptionsForDisplay(optsRaw)
 		if len(opts) > 0 {
 			ids := make([]string, 0, len(opts))
 			for _, o := range opts {
@@ -353,7 +354,7 @@ func writeClaimEntryLine(b *strings.Builder, r batchClaimEntry) {
 			return
 		}
 		// include_context=true response: the summary is a
-		// full formatClaimResult render. Put it on its own
+		// full format.ClaimResult render. Put it on its own
 		// indented block underneath the header row.
 		b.WriteString("\n")
 		for _, line := range strings.Split(r.Summary, "\n") {

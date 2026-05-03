@@ -7,6 +7,7 @@ package mcpserver
 // back to the coordinator.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -100,12 +101,12 @@ func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest
 		// profile if contributions endpoint fails.
 		contribData = nil
 	}
-	return mcp.NewToolResultText(formatProfile(data, contribData)), nil
+	return mcp.NewToolResultText(format.Profile(data, contribData)), nil
 }
 func (c *apiClient) handleMyDashboard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	data, err := c.get(ctx, "/api/v1/citizens/by-username/"+c.username+"/dashboard")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatDashboard(data)), nil
+	return mcp.NewToolResultText(format.Dashboard(data)), nil
 }

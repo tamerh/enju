@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1596,7 +1597,7 @@ func TestFormatClaimResultShowsRevisionContext(t *testing.T) {
 		"content": "This was my first attempt at writing."
 	}`)
 
-	result := formatClaimResult(claimData, nil, "alice", feedback, prevSubmission)
+	result := format.ClaimResult(claimData, nil, "alice", feedback, prevSubmission)
 
 	if !strings.Contains(result, "Previous submission") {
 		t.Errorf("expected 'Previous submission' section, got:\n%s", result)
@@ -1623,7 +1624,7 @@ func TestFormatClaimResultNoFeedbackOnFirstClaim(t *testing.T) {
 		"deadline": "2026-04-17T10:00:00Z"
 	}`)
 
-	result := formatClaimResult(claimData, nil, "alice")
+	result := format.ClaimResult(claimData, nil, "alice")
 
 	if strings.Contains(result, "Previous submission") {
 		t.Errorf("should not show previous submission on first claim, got:\n%s", result)
@@ -1691,7 +1692,7 @@ func TestRenderDAGTree(t *testing.T) {
 		{"id": "1:1:check", "task_def_id": "check", "state": "ready", "seq": float64(2), "depends_on": "1:1:draft"},
 		{"id": "1:1:publish", "task_def_id": "publish", "state": "pending", "seq": float64(3), "depends_on": "1:1:draft,1:1:check"},
 	}
-	result := renderDAGTree(tasks)
+	result := format.RenderDAGTree(tasks)
 	// draft should be root.
 	if !strings.Contains(result, "draft") {
 		t.Error("expected draft in tree")
@@ -1728,7 +1729,7 @@ func TestRenderYourQueueClipsLargeGroups(t *testing.T) {
 			"instance_key": fmt.Sprintf("t%02d", i),
 		})
 	}
-	out := renderYourQueue(tasks, "alice")
+	out := format.RenderYourQueue(tasks, "alice")
 	if out == "" {
 		t.Fatalf("expected queue output for 30 ready tasks, got empty")
 	}
@@ -1737,11 +1738,11 @@ func TestRenderYourQueueClipsLargeGroups(t *testing.T) {
 	}
 	// Must clip — 30 rows is the UX problem we're fixing.
 	yellowCount := strings.Count(out, "🟡")
-	if yellowCount > maxQueueEntriesPerTemplate {
-		t.Errorf("expected at most %d 🟡 rows per template, got %d; output:\n%s", maxQueueEntriesPerTemplate, yellowCount, out)
+	if yellowCount > format.MaxQueueEntriesPerTemplate {
+		t.Errorf("expected at most %d 🟡 rows per template, got %d; output:\n%s", format.MaxQueueEntriesPerTemplate, yellowCount, out)
 	}
 	// Must tell the reader about the clipped remainder.
-	want := fmt.Sprintf("...plus %d more of same template (expand)", 30-maxQueueEntriesPerTemplate)
+	want := fmt.Sprintf("...plus %d more of same template (expand)", 30-format.MaxQueueEntriesPerTemplate)
 	if !strings.Contains(out, want) {
 		t.Errorf("expected %q in output; got:\n%s", want, out)
 	}
@@ -1762,7 +1763,7 @@ func TestFormatRunStatusMermaid(t *testing.T) {
   {"id":"1:1:check","task_def_id":"check","state":"claimed","depends_on":"1:1:draft"},
   {"id":"1:1:publish","task_def_id":"publish","state":"pending","depends_on":"1:1:draft,1:1:check"}
 ]`)
-	out := formatRunStatusMermaid(runJSON, tasksJSON)
+	out := format.RunStatusMermaid(runJSON, tasksJSON)
 
 	// Fenced block + flowchart header.
 	if !strings.HasPrefix(out, "```mermaid") {
@@ -1813,36 +1814,36 @@ func TestFormatRunStatusMermaid(t *testing.T) {
 //     from the other): keep both.
 func TestTransitivelyReduce(t *testing.T) {
 	// Diamond: discover → expand → tag, discover → tag (redundant).
-	in := []edge{
+	in := []format.Edge{
 		{"discover", "expand"},
 		{"discover", "tag"},
 		{"expand", "tag"},
 	}
-	out := transitivelyReduce(in)
+	out := format.TransitivelyReduce(in)
 	if len(out) != 2 {
 		t.Errorf("diamond reduce: expected 2 edges, got %d: %v", len(out), out)
 	}
 	for _, e := range out {
-		if e.from == "discover" && e.to == "tag" {
+		if e.From == "discover" && e.To == "tag" {
 			t.Errorf("expected direct discover→tag to be dropped; got %v", out)
 		}
 	}
 
 	// Chain: a → b → c, a → c (redundant).
-	in2 := []edge{{"a", "b"}, {"b", "c"}, {"a", "c"}}
-	out2 := transitivelyReduce(in2)
+	in2 := []format.Edge{{"a", "b"}, {"b", "c"}, {"a", "c"}}
+	out2 := format.TransitivelyReduce(in2)
 	if len(out2) != 2 {
 		t.Errorf("chain reduce: expected 2 edges, got %d: %v", len(out2), out2)
 	}
 	for _, e := range out2 {
-		if e.from == "a" && e.to == "c" {
+		if e.From == "a" && e.To == "c" {
 			t.Errorf("expected direct a→c to be dropped; got %v", out2)
 		}
 	}
 
 	// No redundancy: fan-out only, each child disjoint.
-	in3 := []edge{{"a", "b"}, {"a", "c"}, {"a", "d"}}
-	out3 := transitivelyReduce(in3)
+	in3 := []format.Edge{{"a", "b"}, {"a", "c"}, {"a", "d"}}
+	out3 := format.TransitivelyReduce(in3)
 	if len(out3) != 3 {
 		t.Errorf("no-redundancy case: expected all 3 edges kept, got %d: %v", len(out3), out3)
 	}
@@ -1863,7 +1864,7 @@ func TestRenderMermaidBodyTransitiveReduction(t *testing.T) {
   {"id":"1:1:expand","task_def_id":"expand","state":"accepted","depends_on":"1:1:discover"},
   {"id":"1:1:tag","task_def_id":"tag","state":"ready","depends_on":"1:1:discover,1:1:expand"}
 ]`)
-	out := renderMermaidBody(runJSON, tasksJSON)
+	out := format.RenderMermaidBody(runJSON, tasksJSON)
 	// Expect exactly 2 edges: discover→expand, expand→tag.
 	// The direct discover→tag should be pruned.
 	if got := strings.Count(out, "-->"); got != 2 {
@@ -1888,7 +1889,7 @@ func TestRenderYourQueueNoClipBelowThreshold(t *testing.T) {
 		{"id": "1:1:draft", "task_def_id": "draft", "state": "ready"},
 		{"id": "1:1:check", "task_def_id": "check", "state": "ready"},
 	}
-	out := renderYourQueue(tasks, "alice")
+	out := format.RenderYourQueue(tasks, "alice")
 	if strings.Contains(out, "plus") {
 		t.Errorf("did not expect clipping at 2 tasks; got:\n%s", out)
 	}

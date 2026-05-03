@@ -7,6 +7,7 @@ package mcpserver
 // into one markdown document.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -32,7 +33,7 @@ func (c *apiClient) handleListRuns(ctx context.Context, req mcp.CallToolRequest)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatRunList(data)), nil
+	return mcp.NewToolResultText(format.RunList(data)), nil
 }
 func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
@@ -79,9 +80,9 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	// older clients that don't know the param never error.
 	switch req.GetString("format", "default") {
 	case "mermaid":
-		return mcp.NewToolResultText(formatRunStatusMermaid(run, tasks)), nil
+		return mcp.NewToolResultText(format.RunStatusMermaid(run, tasks)), nil
 	default:
-		return mcp.NewToolResultText(formatRunStatus(run, tasks, c.username)), nil
+		return mcp.NewToolResultText(format.RunStatus(run, tasks, c.username)), nil
 	}
 }
 // handlePauseRun moves a run into the `paused` state. Living-
@@ -691,7 +692,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
-	text := formatCreateRun(data)
+	text := format.CreateRun(data)
 	if snapshotWarning != "" {
 		text += fmt.Sprintf("\n⚠ Template %s\n", snapshotWarning)
 	}
@@ -753,7 +754,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 	// used to render cross-run artifact edges was removed with
 	// the branch-per-run model — branches isolate runs, so
 	// there's no "external" edge to visualize.
-	body := renderMermaidBody(runData, tasksData)
+	body := format.RenderMermaidBody(runData, tasksData)
 	if body == "" {
 		return mcp.NewToolResultError(fmt.Sprintf("could not render diagram for run %d:%d (run not found or no tasks yet)", projectID, runID)), nil
 	}
@@ -798,7 +799,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 	if res.NoOp {
 		b.WriteString(fmt.Sprintf("✓ Diagram unchanged — skipped commit. File: %s\n", repoPath))
 	} else {
-		b.WriteString(fmt.Sprintf("✓ Diagram written to %s (commit %s)\n", repoPath, shortSHA(res.CommitSHA)))
+		b.WriteString(fmt.Sprintf("✓ Diagram written to %s (commit %s)\n", repoPath, format.ShortSHA(res.CommitSHA)))
 	}
 	b.WriteString(fmt.Sprintf("  Embed in markdown: ![](%s)\n\n", repoPath))
 	b.WriteString("```mermaid\n")
@@ -921,7 +922,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	if res.NoOp {
 		b.WriteString(fmt.Sprintf("✓ Events unchanged (%d total) — skipped commit. File: %s\n", len(events), repoPath))
 	} else {
-		b.WriteString(fmt.Sprintf("✓ %d events written to %s (commit %s)\n", len(events), repoPath, shortSHA(res.CommitSHA)))
+		b.WriteString(fmt.Sprintf("✓ %d events written to %s (commit %s)\n", len(events), repoPath, format.ShortSHA(res.CommitSHA)))
 	}
 	// Inline preview — up to 10 lines so the LLM can show
 	// the tail of the timeline without opening the file.

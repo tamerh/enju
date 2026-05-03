@@ -30,6 +30,7 @@ package mcpserver
 // runCascadeParallel for the full machinery.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -331,7 +332,7 @@ func pickNextComputeCandidate(ready []map[string]interface{}, username string) (
 		// the list. Skip (RFC decision: assigned compute tasks
 		// are treated as blockers, not auto-executed by
 		// whoever called execute_run).
-		if assigned := stringSliceFromAny(r.raw["assign_to"]); len(assigned) > 0 {
+		if assigned := format.StringSliceFromAny(r.raw["assign_to"]); len(assigned) > 0 {
 			allowed := false
 			for _, u := range assigned {
 				if u == username {
@@ -575,7 +576,7 @@ func writeExecuteRunEntryLine(b *strings.Builder, e executeRunEntry) {
 		b.WriteString(fmt.Sprintf(" (%dms)", e.ElapsedMS))
 	}
 	if e.CommitSHA != "" {
-		b.WriteString(fmt.Sprintf(" commit=%s", shortSHA(e.CommitSHA)))
+		b.WriteString(fmt.Sprintf(" commit=%s", format.ShortSHA(e.CommitSHA)))
 	}
 	if len(e.Artifacts) > 0 {
 		b.WriteString(fmt.Sprintf(" artifacts=%s", strings.Join(e.Artifacts, ",")))
@@ -902,7 +903,7 @@ func pickAllEligibleCompute(ready []map[string]interface{}, username string, dis
 	var picks []computeCandidate
 	var ineligibleCompute *executeRunBlocker
 	for _, r := range computePool {
-		if assigned := stringSliceFromAny(r.raw["assign_to"]); len(assigned) > 0 {
+		if assigned := format.StringSliceFromAny(r.raw["assign_to"]); len(assigned) > 0 {
 			allowed := false
 			for _, u := range assigned {
 				if u == username {

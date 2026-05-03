@@ -1,12 +1,52 @@
 package mcpserver
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+// TestEveryRegisteredToolHasHandler pins the registry-handler
+// contract: every entry in mcptools.All() must have a handler
+// returned by handlerByToolName. The runtime panic in New()
+// would also catch this, but a test catches it pre-deploy with
+// a clearer error.
+func TestEveryRegisteredToolHasHandler(t *testing.T) {
+	c := &apiClient{} // empty — we only call handlerByToolName, not the handlers
+	for _, tool := range mcptools.All() {
+		if _, ok := c.handlerByToolName(tool.Tool.Name); !ok {
+			t.Errorf("tool %q is in mcptools.Registry but has no handler in handlerByToolName", tool.Tool.Name)
+		}
+	}
+}
+
+// TestNoOrphanHandlers walks the symmetric direction: every tool
+// name handlerByToolName recognizes must exist in the registry.
+// Catches the case where someone deletes a tool from the registry
+// but forgets to clean up the handler switch case.
+//
+// Implementation note: there's no introspection helper for "what
+// names does the switch accept?" — instead we exercise a handful
+// of representative names and trust that the forward test
+// (TestEveryRegisteredToolHasHandler) plus the visible enumeration
+// in the switch covers the rest.
+func TestNoOrphanHandlers_Spot(t *testing.T) {
+	c := &apiClient{}
+	for _, name := range []string{
+		"enju_list_runs", "enju_get_task", "enju_claim_task",
+		"enju_submit_result", "enju_register_bot",
+	} {
+		if _, ok := c.handlerByToolName(name); !ok {
+			t.Errorf("expected handlerByToolName(%q) to find a handler", name)
+		}
+		if _, ok := mcptools.ByName(name); !ok {
+			t.Errorf("registry missing tool %q referenced by handler switch", name)
+		}
+	}
+}
 
 // allToolFactories is the canonical list of every MCP tool Enju
 // exposes. Keep this in sync with the AddTool calls in server.go's
@@ -17,70 +57,70 @@ var allToolFactories = []struct {
 	name    string
 	factory func() mcp.Tool
 }{
-	{"enju_list_runs", toolListRuns},
-	{"enju_list_ready_tasks", toolListReadyTasks},
-	{"enju_claim_task", toolClaimTask},
-	{"enju_get_task_inputs", toolGetTaskInputs},
-	{"enju_submit_result", toolSubmitResult},
-	{"enju_submit_results_batch", toolSubmitResultsBatch},
-	{"enju_claim_ready_matching", toolClaimReadyMatching},
-	{"enju_list_artifacts", toolListArtifacts},
-	{"enju_get_artifact", toolGetArtifact},
-	{"enju_get_artifact_history", toolGetArtifactHistory},
-	{"enju_list_untracked_artifacts", toolListUntrackedArtifacts},
-	{"enju_release_task", toolReleaseTask},
-	{"enju_get_task", toolGetTask},
-	{"enju_run_status", toolRunStatus},
-	{"enju_create_run", toolCreateRun},
-	{"enju_fail_task", toolFailTask},
-	{"enju_execute_task", toolExecuteTask},
-	{"enju_execute_run", toolExecuteRun},
-	{"enju_pause_run", toolPauseRun},
-	{"enju_resume_run", toolResumeRun},
-	{"enju_spawn_task", toolSpawnTask},
-	{"enju_request_clarification", toolRequestClarification},
-	{"enju_set_cycle_budget", toolSetCycleBudget},
-	{"enju_show_events", toolShowEvents},
-	{"enju_recent_events", toolRecentEvents},
-	{"enju_notifications", toolNotifications},
-	{"enju_inbox", toolInbox},
-	{"enju_review", toolReview},
-	{"enju_events_status", toolEventsStatus},
-	{"enju_list_iterations", toolListIterations},
-	{"enju_file_issue", toolFileIssue},
-	{"enju_list_issues", toolListIssues},
-	{"enju_get_issue", toolGetIssue},
-	{"enju_triage_issue", toolTriageIssue},
-	{"enju_close_issue", toolCloseIssue},
-	{"enju_export_run_events", toolExportRunEvents},
-	{"enju_export_diagram", toolExportDiagram},
-	{"enju_export_run", toolExportRun},
-	{"enju_list_templates", toolListTemplates},
-	{"enju_describe_template", toolDescribeTemplate},
-	{"enju_list_projects", toolListProjects},
-	{"enju_create_project", toolCreateProject},
-	{"enju_init", toolInit},
-	{"enju_set_project_default_branch", toolSetProjectDefaultBranch},
-	{"enju_set_project_remote", toolSetProjectRemote},
-	{"enju_project_remote_status", toolProjectRemoteStatus},
-	{"enju_project_sync", toolProjectSync},
-	{"enju_leave_project", toolLeaveProject},
-	{"enju_add_project_member", toolAddProjectMember},
-	{"enju_remove_project_member", toolRemoveProjectMember},
-	{"enju_list_project_members", toolListProjectMembers},
-	{"enju_promote_member", toolPromoteMember},
-	{"enju_demote_owner", toolDemoteOwner},
-	{"enju_update_profile", toolUpdateProfile},
-	{"enju_my_dashboard", toolMyDashboard},
-	{"enju_my_profile", toolMyProfile},
-	{"enju_invalidate_task", toolInvalidateTask},
-	{"enju_tally_task", toolTallyTask},
+	{"enju_list_runs", mcptools.ListRuns},
+	{"enju_list_ready_tasks", mcptools.ListReadyTasks},
+	{"enju_claim_task", mcptools.ClaimTask},
+	{"enju_get_task_inputs", mcptools.GetTaskInputs},
+	{"enju_submit_result", mcptools.SubmitResult},
+	{"enju_submit_results_batch", mcptools.SubmitResultsBatch},
+	{"enju_claim_ready_matching", mcptools.ClaimReadyMatching},
+	{"enju_list_artifacts", mcptools.ListArtifacts},
+	{"enju_get_artifact", mcptools.GetArtifact},
+	{"enju_get_artifact_history", mcptools.GetArtifactHistory},
+	{"enju_list_untracked_artifacts", mcptools.ListUntrackedArtifacts},
+	{"enju_release_task", mcptools.ReleaseTask},
+	{"enju_get_task", mcptools.GetTask},
+	{"enju_run_status", mcptools.RunStatus},
+	{"enju_create_run", mcptools.CreateRun},
+	{"enju_fail_task", mcptools.FailTask},
+	{"enju_execute_task", mcptools.ExecuteTask},
+	{"enju_execute_run", mcptools.ExecuteRun},
+	{"enju_pause_run", mcptools.PauseRun},
+	{"enju_resume_run", mcptools.ResumeRun},
+	{"enju_spawn_task", mcptools.SpawnTask},
+	{"enju_request_clarification", mcptools.RequestClarification},
+	{"enju_set_cycle_budget", mcptools.SetCycleBudget},
+	{"enju_show_events", mcptools.ShowEvents},
+	{"enju_recent_events", mcptools.RecentEvents},
+	{"enju_notifications", mcptools.Notifications},
+	{"enju_inbox", mcptools.Inbox},
+	{"enju_review", mcptools.Review},
+	{"enju_events_status", mcptools.EventsStatus},
+	{"enju_list_iterations", mcptools.ListIterations},
+	{"enju_file_issue", mcptools.FileIssue},
+	{"enju_list_issues", mcptools.ListIssues},
+	{"enju_get_issue", mcptools.GetIssue},
+	{"enju_triage_issue", mcptools.TriageIssue},
+	{"enju_close_issue", mcptools.CloseIssue},
+	{"enju_export_run_events", mcptools.ExportRunEvents},
+	{"enju_export_diagram", mcptools.ExportDiagram},
+	{"enju_export_run", mcptools.ExportRun},
+	{"enju_list_templates", mcptools.ListTemplates},
+	{"enju_describe_template", mcptools.DescribeTemplate},
+	{"enju_list_projects", mcptools.ListProjects},
+	{"enju_create_project", mcptools.CreateProject},
+	{"enju_init", mcptools.Init},
+	{"enju_set_project_default_branch", mcptools.SetProjectDefaultBranch},
+	{"enju_set_project_remote", mcptools.SetProjectRemote},
+	{"enju_project_remote_status", mcptools.ProjectRemoteStatus},
+	{"enju_project_sync", mcptools.ProjectSync},
+	{"enju_leave_project", mcptools.LeaveProject},
+	{"enju_add_project_member", mcptools.AddProjectMember},
+	{"enju_remove_project_member", mcptools.RemoveProjectMember},
+	{"enju_list_project_members", mcptools.ListProjectMembers},
+	{"enju_promote_member", mcptools.PromoteMember},
+	{"enju_demote_owner", mcptools.DemoteOwner},
+	{"enju_update_profile", mcptools.UpdateProfile},
+	{"enju_my_dashboard", mcptools.MyDashboard},
+	{"enju_my_profile", mcptools.MyProfile},
+	{"enju_invalidate_task", mcptools.InvalidateTask},
+	{"enju_tally_task", mcptools.TallyTask},
 	// operator/model design — bot + model registration tools.
-	{"enju_register_bot", toolRegisterBot},
-	{"enju_list_my_bots", toolListMyBots},
-	{"enju_revoke_token", toolRevokeToken},
-	{"enju_list_models", toolListModels},
-	{"enju_register_model", toolRegisterModel},
+	{"enju_register_bot", mcptools.RegisterBot},
+	{"enju_list_my_bots", mcptools.ListMyBots},
+	{"enju_revoke_token", mcptools.RevokeToken},
+	{"enju_list_models", mcptools.ListModels},
+	{"enju_register_model", mcptools.RegisterModel},
 }
 
 // TestAllToolsValidShape invokes every tool-schema factory and
@@ -148,20 +188,20 @@ func TestKeySchemasHaveRequiredArgs(t *testing.T) {
 		factory  func() mcp.Tool
 		required []string
 	}{
-		{"enju_claim_task", toolClaimTask, []string{"task_id"}},
-		{"enju_submit_result", toolSubmitResult, []string{"task_id"}},
-		{"enju_submit_results_batch", toolSubmitResultsBatch, []string{"submissions"}},
-		{"enju_claim_ready_matching", toolClaimReadyMatching, []string{"project_id", "run_id"}},
-		{"enju_get_task", toolGetTask, []string{"task_id"}},
-		{"enju_get_task_inputs", toolGetTaskInputs, []string{"task_id"}},
-		{"enju_release_task", toolReleaseTask, []string{"task_id"}},
-		{"enju_fail_task", toolFailTask, []string{"task_id"}},
-		{"enju_invalidate_task", toolInvalidateTask, []string{"task_id"}},
-		{"enju_execute_task", toolExecuteTask, []string{"task_id"}},
-		{"enju_execute_run", toolExecuteRun, []string{"project_id", "run_id"}},
-		{"enju_describe_template", toolDescribeTemplate, []string{"project_id", "path"}},
-		{"enju_list_templates", toolListTemplates, []string{"project_id"}},
-		{"enju_create_run", toolCreateRun, []string{"project_id"}},
+		{"enju_claim_task", mcptools.ClaimTask, []string{"task_id"}},
+		{"enju_submit_result", mcptools.SubmitResult, []string{"task_id"}},
+		{"enju_submit_results_batch", mcptools.SubmitResultsBatch, []string{"submissions"}},
+		{"enju_claim_ready_matching", mcptools.ClaimReadyMatching, []string{"project_id", "run_id"}},
+		{"enju_get_task", mcptools.GetTask, []string{"task_id"}},
+		{"enju_get_task_inputs", mcptools.GetTaskInputs, []string{"task_id"}},
+		{"enju_release_task", mcptools.ReleaseTask, []string{"task_id"}},
+		{"enju_fail_task", mcptools.FailTask, []string{"task_id"}},
+		{"enju_invalidate_task", mcptools.InvalidateTask, []string{"task_id"}},
+		{"enju_execute_task", mcptools.ExecuteTask, []string{"task_id"}},
+		{"enju_execute_run", mcptools.ExecuteRun, []string{"project_id", "run_id"}},
+		{"enju_describe_template", mcptools.DescribeTemplate, []string{"project_id", "path"}},
+		{"enju_list_templates", mcptools.ListTemplates, []string{"project_id"}},
+		{"enju_create_run", mcptools.CreateRun, []string{"project_id"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.toolName, func(t *testing.T) {

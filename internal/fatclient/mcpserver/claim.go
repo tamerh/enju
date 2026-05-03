@@ -17,6 +17,7 @@ package mcpserver
 // so def id + instance key are matched together.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -154,7 +155,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
-	return mcp.NewToolResultText(formatClaimResult(data, inputs, c.username, reviewFeedback, previousSubmission)), nil
+	return mcp.NewToolResultText(format.ClaimResult(data, inputs, c.username, reviewFeedback, previousSubmission)), nil
 }
 // fetchReviewFeedback looks up the most recent review task that
 // targets this task and returned request_changes or reject. Returns
@@ -502,7 +503,7 @@ func (c *apiClient) fetchAndResolveLocally(ctx context.Context, meta *taskMeta) 
 	}
 
 	// Shape the output to match the legacy /inputs response so
-	// existing formatters (formatClaimResult, etc.) keep working.
+	// existing formatters (format.ClaimResult, etc.) keep working.
 	out := map[string]interface{}{
 		"task_id":         meta.ID,
 		"resolved_prompt": resolved.Prompt,

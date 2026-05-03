@@ -9,6 +9,7 @@ package mcpserver
 // proper Enju project.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -37,7 +38,7 @@ func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequ
 	// restoring the at-a-glance `✓ last push: ...` indicator that was
 	// server-side in Phase 1 / iteration 4.
 	decorated := c.decorateProjectListWithPushStatus(data)
-	return mcp.NewToolResultText(formatProjectList(decorated)), nil
+	return mcp.NewToolResultText(format.ProjectList(decorated)), nil
 }
 // decorateProjectListWithPushStatus reads the coordinator's JSON
 // project list and injects per-project `last_push_at` fields
@@ -197,7 +198,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	if c.workspace != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
-			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
 				if customPath != "" {
 					c.workspace.RegisterExternalDir(projectID, customPath)
 					if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
@@ -219,7 +220,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
-	return mcp.NewToolResultText(formatCreateProjectResult(data)), nil
+	return mcp.NewToolResultText(format.CreateProjectResult(data)), nil
 }
 
 // detectPopulatedUnrelatedRepo returns a non-empty refusal reason
@@ -442,7 +443,7 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 	if c.workspace != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
-			if projectID := int64(jsonFloat(result["id"])); projectID > 0 {
+			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
 				c.workspace.RegisterExternalDir(projectID, dirPath)
 				// Open it immediately to verify it works.
 				if _, perr := c.workspace.ForProject(projectID, ""); perr != nil {
@@ -484,7 +485,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 	if remoteURL == "" {
 		resp["status"] = string(mcpgit.RemoteNoRemote)
 		data, _ := json.Marshal(resp)
-		return mcp.NewToolResultText(formatProjectRemoteStatus(data)), nil
+		return mcp.NewToolResultText(format.ProjectRemoteStatus(data)), nil
 	}
 
 	cmp, err := proj.CompareToRemote()
@@ -517,7 +518,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 		resp["last_push_error"] = e
 	}
 	data, _ := json.Marshal(resp)
-	return mcp.NewToolResultText(formatProjectRemoteStatus(data)), nil
+	return mcp.NewToolResultText(format.ProjectRemoteStatus(data)), nil
 }
 // handleProjectSync force-syncs the client's local clone to its
 // remote. Runs entirely client-side: open the clone, preflight via
@@ -566,12 +567,12 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 			resp["result"] = "noop"
 			resp["message"] = "already in sync"
 			data, _ := json.Marshal(resp)
-			return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+			return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
 		case mcpgit.RemoteBehind:
 			resp["result"] = "noop"
 			resp["message"] = fmt.Sprintf("local is behind remote by %d commit(s); nothing to push — fetch+merge to catch up", cmp.BehindBy)
 			data, _ := json.Marshal(resp)
-			return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+			return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
 		case mcpgit.RemoteDiverged, mcpgit.RemoteUnrelated:
 			if !force {
 				resp["result"] = "refused"
@@ -580,7 +581,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 					cmp.AheadBy, cmp.BehindBy,
 				)
 				data, _ := json.Marshal(resp)
-				return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+				return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
 			}
 		}
 	}
@@ -595,7 +596,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		resp["result"] = "failed"
 		resp["error"] = pushErr.Error()
 		data, _ := json.Marshal(resp)
-		return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+		return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
 	}
 	if force {
 		resp["result"] = "force_pushed"
@@ -603,7 +604,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		resp["result"] = "pushed"
 	}
 	data, _ := json.Marshal(resp)
-	return mcp.NewToolResultText(formatProjectSyncResult(data)), nil
+	return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
 }
 // handleLeaveProject removes the caller's membership on the
 // coordinator and wipes their local clone of a project. The
@@ -745,7 +746,7 @@ func (c *apiClient) handleListProjectMembers(ctx context.Context, req mcp.CallTo
 			return mcp.NewToolResultError(msg), nil
 		}
 	}
-	return mcp.NewToolResultText(formatProjectMemberList(data, int64(projectID))), nil
+	return mcp.NewToolResultText(format.ProjectMemberList(data, int64(projectID))), nil
 }
 
 // handlePromoteMember sets a member's role to owner.

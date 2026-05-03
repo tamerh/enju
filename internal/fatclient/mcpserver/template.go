@@ -8,6 +8,7 @@ package mcpserver
 // beyond a run's source_path provenance column.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 
@@ -45,7 +46,7 @@ func (c *apiClient) handleListTemplates(ctx context.Context, req mcp.CallToolReq
 		"project_id": projectID,
 		"templates":  templates,
 	})
-	return mcp.NewToolResultText(formatListTemplates(data)), nil
+	return mcp.NewToolResultText(format.ListTemplates(data)), nil
 }
 // handleDescribeTemplate — pure client-side tool. Loads one
 // template file from the local clone and returns its full
@@ -79,5 +80,5 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	data, _ := json.Marshal(loaded.Summary)
-	return mcp.NewToolResultText(formatDescribeTemplate(data)), nil
+	return mcp.NewToolResultText(format.DescribeTemplate(data)), nil
 }

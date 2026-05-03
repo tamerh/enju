@@ -1,4 +1,4 @@
-package mcpserver
+package mcptools
 
 // MCP tool-schema constructors. Each toolX() returns the
 // mcp.Tool describing a single enju_X tool: its name,
@@ -11,7 +11,7 @@ import "github.com/mark3labs/mcp-go/mcp"
 
 // --- Tool Definitions ---
 
-func toolListRuns() mcp.Tool {
+func ListRuns() mcp.Tool {
 	return mcp.NewTool("enju_list_runs",
 		mcp.WithDescription("List runs. Optionally filter by project."),
 		mcp.WithNumber("project_id",
@@ -20,7 +20,7 @@ func toolListRuns() mcp.Tool {
 	)
 }
 
-func toolListReadyTasks() mcp.Tool {
+func ListReadyTasks() mcp.Tool {
 	return mcp.NewTool("enju_list_ready_tasks",
 		mcp.WithDescription("List tasks that are ready to be claimed. Paste the output verbatim in your reply — it's pre-formatted for the human. Optionally filter by project and run."),
 		mcp.WithNumber("project_id",
@@ -32,7 +32,7 @@ func toolListReadyTasks() mcp.Tool {
 	)
 }
 
-func toolClaimTask() mcp.Tool {
+func ClaimTask() mcp.Tool {
 	return mcp.NewTool("enju_claim_task",
 		mcp.WithDescription(`Claim a task to work on. This opens a collaboration window — iterate with the human, discuss, refine. Only submit when the result is ready. Returns the task prompt and upstream context. After claiming, tell the human which task you're now working on.
 
@@ -47,7 +47,7 @@ Set include_context=false for a lean response: task id, deadline, action schema 
 	)
 }
 
-func toolClaimReadyMatching() mcp.Tool {
+func ClaimReadyMatching() mcp.Tool {
 	return mcp.NewTool("enju_claim_ready_matching",
 		mcp.WithDescription(`Bulk-claim every ready task in a run that matches the filter. Symmetric to enju_submit_results_batch — one MCP call instead of N, designed for bulk-work flows: a reviewer approving all ready reviews, a rater handling every item in a labeling cohort, an agent running a paper-scale evaluation.
 
@@ -88,7 +88,7 @@ Pipelined runs:
 	)
 }
 
-func toolGetTaskInputs() mcp.Tool {
+func GetTaskInputs() mcp.Tool {
 	return mcp.NewTool("enju_get_task_inputs",
 		mcp.WithDescription("Get the upstream dependency results for a task. Use this to see what previous tasks produced."),
 		mcp.WithString("task_id",
@@ -98,7 +98,7 @@ func toolGetTaskInputs() mcp.Tool {
 	)
 }
 
-func toolSubmitResult() mcp.Tool {
+func SubmitResult() mcp.Tool {
 	return mcp.NewTool("enju_submit_result",
 		mcp.WithDescription(`Submit a result for a claimed task. The task must be claimed by you first.
 
@@ -139,7 +139,7 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 	)
 }
 
-func toolSubmitResultsBatch() mcp.Tool {
+func SubmitResultsBatch() mcp.Tool {
 	return mcp.NewTool("enju_submit_results_batch",
 		mcp.WithDescription(`Submit N results in one MCP call. Same citizen, same project + run, pre-validated upfront. Each entry mirrors enju_submit_result's body: {task_id, content?, decision?, option?, outputs_json?, artifacts_json?, model?}.
 
@@ -157,7 +157,7 @@ Use for bulk-approval workflows (one reviewer approving N modules), multi-item l
 	)
 }
 
-func toolListArtifacts() mcp.Tool {
+func ListArtifacts() mcp.Tool {
 	return mcp.NewTool("enju_list_artifacts",
 		mcp.WithDescription("List artifacts in a project's repository. Artifacts are mutable project-scoped files (source code, datasets, templates, docs) shared across all runs in the project."),
 		mcp.WithNumber("project_id",
@@ -170,7 +170,7 @@ func toolListArtifacts() mcp.Tool {
 	)
 }
 
-func toolGetArtifact() mcp.Tool {
+func GetArtifact() mcp.Tool {
 	return mcp.NewTool("enju_get_artifact",
 		mcp.WithDescription("Read the current content of an artifact in a project's repository, plus its provenance (who last wrote it, in which task and run)."),
 		mcp.WithNumber("project_id",
@@ -184,7 +184,7 @@ func toolGetArtifact() mcp.Tool {
 	)
 }
 
-func toolGetArtifactHistory() mcp.Tool {
+func GetArtifactHistory() mcp.Tool {
 	return mcp.NewTool("enju_get_artifact_history",
 		mcp.WithDescription("List the chronological write history of an artifact in a project's repository. Returns each commit that touched the artifact, newest first, with the task that produced it when applicable."),
 		mcp.WithNumber("project_id",
@@ -198,7 +198,7 @@ func toolGetArtifactHistory() mcp.Tool {
 	)
 }
 
-func toolReleaseTask() mcp.Tool {
+func ReleaseTask() mcp.Tool {
 	return mcp.NewTool("enju_release_task",
 		mcp.WithDescription("Release a claimed task back to the pool if you can't complete it. No penalty for voluntary release."),
 		mcp.WithString("task_id",
@@ -208,7 +208,7 @@ func toolReleaseTask() mcp.Tool {
 	)
 }
 
-func toolGetTask() mcp.Tool {
+func GetTask() mcp.Tool {
 	return mcp.NewTool("enju_get_task",
 		mcp.WithDescription("Get details of a specific task including its state, prompt, and dependencies. Paste the output verbatim in your reply — it's pre-formatted."),
 		mcp.WithString("task_id",
@@ -218,7 +218,7 @@ func toolGetTask() mcp.Tool {
 	)
 }
 
-func toolRunStatus() mcp.Tool {
+func RunStatus() mcp.Tool {
 	return mcp.NewTool("enju_run_status",
 		mcp.WithDescription("Get the status of a run including DAG tree view of all tasks. Paste the output verbatim in your reply — it's pre-formatted with progress bar, state icons, and tree structure. Use format=\"mermaid\" when the user wants a visual diagram (shareable, README-friendly, or for large DAGs where the text tree is too wide)."),
 		mcp.WithNumber("project_id",
@@ -236,7 +236,7 @@ func toolRunStatus() mcp.Tool {
 	)
 }
 
-func toolCreateRun() mcp.Tool {
+func CreateRun() mcp.Tool {
 	return mcp.NewTool("enju_create_run",
 		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
@@ -291,7 +291,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 // enju/templates/ directory with its name, description, and
 // parameter summary so the LLM can pick a recipe that fits
 // the user's request without reading each file.
-func toolFailTask() mcp.Tool {
+func FailTask() mcp.Tool {
 	return mcp.NewTool("enju_fail_task",
 		mcp.WithDescription(`Mark a task as failed with a reason. Works for any action type (answer, contribute, compute, review, vote).
 
@@ -309,7 +309,7 @@ Recovery: the run author or any citizen can use enju_invalidate_task to bounce a
 	)
 }
 
-func toolExecuteRun() mcp.Tool {
+func ExecuteRun() mcp.Tool {
 	return mcp.NewTool("enju_execute_run",
 		mcp.WithDescription(`Drain all ready action:compute tasks in a run in one call. Stops at the next human decision point (any ready citizen task — vote, review, answer, contribute) and reports it as next_blocker.
 
@@ -342,7 +342,7 @@ Parallel execution: parallel=N (default 4, max 32) dispatches up to N compute ta
 	)
 }
 
-func toolExecuteTask() mcp.Tool {
+func ExecuteTask() mcp.Tool {
 	return mcp.NewTool("enju_execute_task",
 		mcp.WithDescription(`Execute a compute task's script, capture its output, and submit the result — all in one call.
 
@@ -374,7 +374,7 @@ Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 // task_claims; this tool just snapshots it into git so the
 // run's directory becomes self-documenting for audits /
 // postmortems / preprint figures.
-func toolExportRunEvents() mcp.Tool {
+func ExportRunEvents() mcp.Tool {
 	return mcp.NewTool("enju_export_run_events",
 		mcp.WithDescription(`Snapshot a run's event timeline (claims, submits, invalidations, tally resolutions) to a git-tracked JSONL file under enju/runs/{seq}/events/{phase}.jsonl.
 
@@ -400,7 +400,7 @@ Phase is a free-form label: 'final' on completion, 'checkpoint' mid-run, or any 
 // source to a git-tracked file under enju/runs/{seq}/graph/.
 // See handleExportDiagram for the semantics (idempotent same-
 // phase overwrite, no-op on unchanged content, response shape).
-func toolExportDiagram() mcp.Tool {
+func ExportDiagram() mcp.Tool {
 	return mcp.NewTool("enju_export_diagram",
 		mcp.WithDescription(`Snapshot the run's DAG to a git-tracked Mermaid file for archival, preprint figures, or README embedding.
 
@@ -427,7 +427,7 @@ Skip during routine enju_run_status checks — only call when the snapshot itsel
 	)
 }
 
-func toolExportRun() mcp.Tool {
+func ExportRun() mcp.Tool {
 	return mcp.NewTool("enju_export_run",
 		mcp.WithDescription(`Export a completed run as a single markdown document. Assembles all task results in DAG order — each task becomes a section with its prompt and result. Use this for the preprint appendix or to review the full output of a run in one place.`),
 		mcp.WithNumber("project_id",
@@ -441,7 +441,7 @@ func toolExportRun() mcp.Tool {
 	)
 }
 
-func toolListTemplates() mcp.Tool {
+func ListTemplates() mcp.Tool {
 	return mcp.NewTool("enju_list_templates",
 		mcp.WithDescription(`List reusable run recipes (templates) in a project. Use before hand-writing YAML — a template usually matches a user's request.
 
@@ -465,7 +465,7 @@ Call enju_describe_template for a template's parameters; enju_create_run with pa
 // single template so the LLM can turn each param into a
 // user-facing question ("which disease?", "which tissue?")
 // before filling in values and calling enju_create_run.
-func toolDescribeTemplate() mcp.Tool {
+func DescribeTemplate() mcp.Tool {
 	return mcp.NewTool("enju_describe_template",
 		mcp.WithDescription(`Show full metadata for one template bundle: name, description, declared params with types/defaults/descriptions. Use after picking a template from enju_list_templates to gather param values before enju_create_run.`),
 		mcp.WithNumber("project_id",
@@ -479,13 +479,13 @@ func toolDescribeTemplate() mcp.Tool {
 	)
 }
 
-func toolListProjects() mcp.Tool {
+func ListProjects() mcp.Tool {
 	return mcp.NewTool("enju_list_projects",
 		mcp.WithDescription("List all long-lived projects. Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
-func toolCreateProject() mcp.Tool {
+func CreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
 		mcp.WithDescription(`Create a brand-new Enju project from scratch. Always creates a fresh workspace — guaranteed not to overwrite anything in an existing populated directory.
 
@@ -513,7 +513,7 @@ Use this when the user wants to start fresh. If they have an existing folder, pa
 	)
 }
 
-func toolInit() mcp.Tool {
+func Init() mcp.Tool {
 	return mcp.NewTool("enju_init",
 		mcp.WithDescription(`Adopt an existing folder as an Enju project. The folder IS the workspace — Enju writes its scaffold (enju/, enju/templates/) into it, respects all existing files, and runs git init if there isn't one already. Use this when the user has a directory, paper draft, or code repo they want to add Enju orchestration on top of.
 
@@ -536,7 +536,7 @@ If the user wants to start fresh with no existing files, use enju_create_project
 	)
 }
 
-func toolFileIssue() mcp.Tool {
+func FileIssue() mcp.Tool {
 	return mcp.NewTool("enju_file_issue",
 		mcp.WithDescription(`File a project-level issue (living-workflow phase 3). Issues outlive runs — file in run #2, fix in run #7 is normal. Tester bots use this to record structured findings (one issue per failure mode); humans use it for ad-hoc bug reports. Filing ≠ fixing — triage and fix-task linkage are separate steps. Emits an issue_filed event.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -560,7 +560,7 @@ func toolFileIssue() mcp.Tool {
 	)
 }
 
-func toolListIssues() mcp.Tool {
+func ListIssues() mcp.Tool {
 	return mcp.NewTool("enju_list_issues",
 		mcp.WithDescription(`List issues in a project, newest-first. Filters compose: leave them empty to see everything, narrow by status/severity. Returns a one-line summary per issue. For full body + frontmatter, use enju_get_issue.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -578,7 +578,7 @@ func toolListIssues() mcp.Tool {
 	)
 }
 
-func toolGetIssue() mcp.Tool {
+func GetIssue() mcp.Tool {
 	return mcp.NewTool("enju_get_issue",
 		mcp.WithDescription(`Get full detail for one issue, formatted as YAML frontmatter + body — the same shape the future enju/issues/ISSUE-<NNN>.md filesystem mirror will write to disk.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -590,7 +590,7 @@ func toolGetIssue() mcp.Tool {
 	)
 }
 
-func toolTriageIssue() mcp.Tool {
+func TriageIssue() mcp.Tool {
 	return mcp.NewTool("enju_triage_issue",
 		mcp.WithDescription(`Move an open issue to "triaged" state, optionally adjusting severity. Triage is the "we've looked at this and decided what to do" signal — it's distinct from filing (recording the finding) and from closing (the issue's resolved). Phase 4 will let triage spawn fix-tasks; in phase 3 it's just a status update.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -605,7 +605,7 @@ func toolTriageIssue() mcp.Tool {
 	)
 }
 
-func toolCloseIssue() mcp.Tool {
+func CloseIssue() mcp.Tool {
 	return mcp.NewTool("enju_close_issue",
 		mcp.WithDescription(`Move an issue into terminal status. Use status="closed" when fixed (optionally pass closed_by_task_id pointing at the fix-task that resolved it); use status="wontfix" when the issue is a duplicate, won't-do, or a misclassification. Refuses on already-terminal issues.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -623,7 +623,7 @@ func toolCloseIssue() mcp.Tool {
 	)
 }
 
-func toolListIterations() mcp.Tool {
+func ListIterations() mcp.Tool {
 	return mcp.NewTool("enju_list_iterations",
 		mcp.WithDescription(`List the iteration history of a task — one row per claim attempt, with per-task seq counter, claimant, claim/submit timestamps, commit SHA, review decision, and outcome (active | completed | invalidated | released | timed_out). Living-workflow phase 5: this is how you reconstruct "what happened with this task" without grepping the event log. For aggregate timelines across the whole run, use enju_show_events instead.`),
 		mcp.WithString("task_id", mcp.Required(),
@@ -632,7 +632,7 @@ func toolListIterations() mcp.Tool {
 	)
 }
 
-func toolShowEvents() mcp.Tool {
+func ShowEvents() mcp.Tool {
 	return mcp.NewTool("enju_show_events",
 		mcp.WithDescription(`Query the project event log and return JSONL (one event per line, newest first). Read-only projection over the event store. Filters compose: leave them empty to get the project-wide stream, narrow with run_id/citizen/event_types/since/limit. Distinct from enju_export_run_events (git-tracked snapshots) and from enju_recent_events (in-conversation "what's new?" surfacing) — use this tool for filter-driven historical queries; use enju_recent_events when the assistant just wants a concise heads-up of the latest activity. If results come back empty unexpectedly, run enju_events_status to check whether the event-store kill-switch was flipped (disabled stores serve empty results without an error).`),
 		mcp.WithNumber("project_id",
@@ -677,7 +677,7 @@ func toolShowEvents() mcp.Tool {
 // "If you need clarification, call enju_request_clarification
 // then submit your current task with a 'pending clarification'
 // marker; reviewer will request_changes once the answer lands."
-func toolRequestClarification() mcp.Tool {
+func RequestClarification() mcp.Tool {
 	return mcp.NewTool("enju_request_clarification",
 		mcp.WithDescription(`Bot-asks-human pattern: spawn a clarification task assigned to a named human, encapsulating the spawn-task idiom in one tool call. Use mid-task when you hit ambiguity in the spec, the upstream content, or the user's intent. The clarification task is action=answer, single-citizen, assigned to the human you name. Their answer becomes a normal task result the audit log records. Returns the new task ID. Note: in v1 this does NOT auto-pause your current task — submit your current work with a 'awaiting clarification' marker, or wait for the human's task_completed event before resuming. Future notification-bot work will auto-resume on answer.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -715,7 +715,7 @@ func toolRequestClarification() mcp.Tool {
 //
 // Both tools call the same underlying endpoint; the difference
 // is intent + presentation.
-func toolRecentEvents() mcp.Tool {
+func RecentEvents() mcp.Tool {
 	return mcp.NewTool("enju_recent_events",
 		mcp.WithDescription(`Surface what's recently happened in a project — designed for the assistant to call at natural pause points (after a long bash returns, when the user asks "what's new?", before answering a follow-up). Returns a concise human-readable summary of the latest events. For full filter queries (by run, by citizen, by event type) use enju_show_events instead. For git-tracked snapshots use enju_export_run_events.`),
 		mcp.WithNumber("project_id",
@@ -737,7 +737,7 @@ func toolRecentEvents() mcp.Tool {
 // but with a narrower input schema so the assistant doesn't have
 // to think about outputs/artifacts/options it never uses on a
 // review.
-func toolReview() mcp.Tool {
+func Review() mcp.Tool {
 	return mcp.NewTool("enju_review",
 		mcp.WithDescription(`Submit a verdict on an action:review task you've claimed. Companion to enju_inbox: read what's waiting, then decide. The four decisions match enju_submit_result's verbatim — semantics are identical, this is just a narrower wrapper. Calls the same underlying submit endpoint.
 
@@ -768,7 +768,7 @@ Always pair the decision with prose 'content' explaining your reasoning — the 
 // ready task assigned to the calling citizen, with each parent's
 // latest submission inlined so the assistant/user can read the
 // work without claiming the reviewer task first.
-func toolInbox() mcp.Tool {
+func Inbox() mcp.Tool {
 	return mcp.NewTool("enju_inbox",
 		mcp.WithDescription(`List tasks waiting on the calling citizen in a project — review/vote/answer tasks where assign_to includes you and state is ready. Each item carries the task's prompt plus the latest submission(s) of the upstream task(s) it depends on, so you can read the work in-place. Designed as the human-facing "what's on my plate?" view, complementing enju_notifications (event-stream) and enju_my_dashboard (multi-project summary). Cap on inlined prompt is ~2KB; follow up with enju_get_task for the full text. Known v1 limitation: compute and vote parents leave content empty (their work lives in git artifacts or the option column, respectively); the upstream's task_id + commit_sha are still surfaced.`),
 		mcp.WithNumber("project_id",
@@ -782,7 +782,7 @@ func toolInbox() mcp.Tool {
 // — Facebook-style read/unread items derived from the local
 // live.jsonl substrate filtered through the 9 built-in Layer 1
 // default rules. Calling marks the surfaced items as read.
-func toolNotifications() mcp.Tool {
+func Notifications() mcp.Tool {
 	return mcp.NewTool("enju_notifications",
 		mcp.WithDescription(`List recent notifications for a project — read/unread style. Reads the local event substrate (enju/events/live.jsonl) and filters through the 9 built-in default rules (task completed, run completed, branch merged, issue filed, cycle budget exhausted, etc). Returns the latest matches with 🔴 unread / ⚪ read markers. Calling this tool marks surfaced items as read; the next call shows them as ⚪. Honors enju/notify.yaml's disable_defaults knob for muting individual default types. Designed for the assistant to call at the start of a turn or when the user asks "any updates?" / "what's new?".`),
 		mcp.WithNumber("project_id",
@@ -805,13 +805,13 @@ func toolNotifications() mcp.Tool {
 // depth). The dropped counter is the load-bearing signal:
 // non-zero means the writer can't keep up and gaps are
 // accumulating.
-func toolEventsStatus() mcp.Tool {
+func EventsStatus() mcp.Tool {
 	return mcp.NewTool("enju_events_status",
 		mcp.WithDescription(`Report the EventStore's runtime state — enabled flag + monotone counters (enqueued, persisted, dropped, queue depth). Operators read this when triaging audit-log health. Non-zero dropped means the writer can't keep up and gaps are accumulating in the per-project sequence.`),
 	)
 }
 
-func toolSpawnTask() mcp.Tool {
+func SpawnTask() mcp.Tool {
 	return mcp.NewTool("enju_spawn_task",
 		mcp.WithDescription(`Spawn a new task into an in-flight run at runtime (living-workflow phase 4a). This is the tasks-spawn-tasks primitive — used to add remediation tasks after a review reject, or fix-tasks after a tester files an issue, or any other "we discovered we need this work" pattern. Subject to the per-run cycle budget (default 200); exhaustion auto-pauses the run. Spawned task starts ready unless depends_on names existing tasks. Emits task_spawned event with parent + trigger attribution.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -856,7 +856,7 @@ func toolSpawnTask() mcp.Tool {
 	)
 }
 
-func toolSetCycleBudget() mcp.Tool {
+func SetCycleBudget() mcp.Tool {
 	return mcp.NewTool("enju_set_cycle_budget",
 		mcp.WithDescription(`Bump the per-run cycle budget (max number of spawned tasks). Use to extend room after a runaway has been triaged and the underlying loop fixed; the run remains paused until enju_resume_run is called. Default budget is 200 per run.`),
 		mcp.WithNumber("project_id", mcp.Required(),
@@ -871,7 +871,7 @@ func toolSetCycleBudget() mcp.Tool {
 	)
 }
 
-func toolPauseRun() mcp.Tool {
+func PauseRun() mcp.Tool {
 	return mcp.NewTool("enju_pause_run",
 		mcp.WithDescription(`Pause a run. The run's state moves to "paused" and stays there until enju_resume_run is called. Refused on terminal (completed/failed) runs. SpawnTask refuses while paused (a runaway can't keep growing the task graph); claim and submit currently pass through, full claim/submit gating lands later. Use this to inspect a run mid-flight without state transitions racing against you, or as a circuit-breaker when something looks wrong.`),
 		mcp.WithNumber("project_id",
@@ -885,7 +885,7 @@ func toolPauseRun() mcp.Tool {
 	)
 }
 
-func toolResumeRun() mcp.Tool {
+func ResumeRun() mcp.Tool {
 	return mcp.NewTool("enju_resume_run",
 		mcp.WithDescription(`Resume a paused run. The run's state is re-evaluated based on current task counts: lands on "active" if there's ready or in-flight work, "idle" if only pending tasks remain, "completed" if everything is terminal. No-op on already-alive runs; refused on terminal runs.`),
 		mcp.WithNumber("project_id",
@@ -899,7 +899,7 @@ func toolResumeRun() mcp.Tool {
 	)
 }
 
-func toolSetProjectDefaultBranch() mcp.Tool {
+func SetProjectDefaultBranch() mcp.Tool {
 	return mcp.NewTool("enju_set_project_default_branch",
 		mcp.WithDescription(`Change a project's default branch. Owner-only. The default is where new runs land when enju_create_run is called without an explicit branch=. Use this to move a project's Enju activity off "main" onto e.g. "enju/work" so repo main stays human-curated. Existing runs are unaffected — they stay on the branch they were created with.`),
 		mcp.WithNumber("project_id",
@@ -913,7 +913,7 @@ func toolSetProjectDefaultBranch() mcp.Tool {
 	)
 }
 
-func toolSetProjectRemote() mcp.Tool {
+func SetProjectRemote() mcp.Tool {
 	return mcp.NewTool("enju_set_project_remote",
 		mcp.WithDescription("Set the external git remote URL for a project, or migrate from one remote to another. Subsequent task result commits push to this remote. Pass the new URL directly to migrate; use enju_leave_project to stop using the project on this machine. Empty strings are rejected — clearing a remote on a multi-machine project would silently fork the team."),
 		mcp.WithNumber("project_id",
@@ -927,7 +927,7 @@ func toolSetProjectRemote() mcp.Tool {
 	)
 }
 
-func toolProjectRemoteStatus() mcp.Tool {
+func ProjectRemoteStatus() mcp.Tool {
 	return mcp.NewTool("enju_project_remote_status",
 		mcp.WithDescription("Show live git remote status for a project: local HEAD vs remote HEAD (via ls-remote), last push timestamp, and last push error if any. Use this when enju_list_projects shows a remote warning."),
 		mcp.WithNumber("project_id",
@@ -937,7 +937,7 @@ func toolProjectRemoteStatus() mcp.Tool {
 	)
 }
 
-func toolProjectSync() mcp.Tool {
+func ProjectSync() mcp.Tool {
 	return mcp.NewTool("enju_project_sync",
 		mcp.WithDescription("Push a project's local HEAD to its configured remote without requiring a new commit. Safe by default: a fast-forward push succeeds, a diverged remote is REFUSED unless force=true. Use this to sweep stuck commits (e.g. after a push failure or an earlier invalidation that didn't push). Set force=true ONLY when you intentionally want to overwrite the remote — force-push is destructive and can discard remote-side contributions."),
 		mcp.WithNumber("project_id",
@@ -950,7 +950,7 @@ func toolProjectSync() mcp.Tool {
 	)
 }
 
-func toolLeaveProject() mcp.Tool {
+func LeaveProject() mcp.Tool {
 	return mcp.NewTool("enju_leave_project",
 		mcp.WithDescription(`Leave a project. Two things happen: (1) your membership row is removed from the project, and (2) your local clone is wiped to reclaim disk space. The remote repo is untouched — other members keep their access.
 
@@ -965,7 +965,7 @@ Refused when you are the sole remaining owner — promote another member to owne
 	)
 }
 
-func toolAddProjectMember() mcp.Tool {
+func AddProjectMember() mcp.Tool {
 	return mcp.NewTool("enju_add_project_member",
 		mcp.WithDescription(`Grant a registered citizen membership of a project. Any existing member can add others — this is the trust-based delegation that lets projects spread without owner-gated invitations.
 
@@ -984,7 +984,7 @@ New members default to 'member' role. Only project owners may add someone as 'ow
 	)
 }
 
-func toolRemoveProjectMember() mcp.Tool {
+func RemoveProjectMember() mcp.Tool {
 	return mcp.NewTool("enju_remove_project_member",
 		mcp.WithDescription(`Remove a member from a project. Owner-only — use enju_leave_project to remove yourself. Refused when the target is the last owner (promote a successor first).`),
 		mcp.WithNumber("project_id",
@@ -998,7 +998,7 @@ func toolRemoveProjectMember() mcp.Tool {
 	)
 }
 
-func toolListProjectMembers() mcp.Tool {
+func ListProjectMembers() mcp.Tool {
 	return mcp.NewTool("enju_list_project_members",
 		mcp.WithDescription("List every member on a project, with role and when they were added. Members only. Paste the output verbatim in your reply — it's pre-formatted."),
 		mcp.WithNumber("project_id",
@@ -1008,7 +1008,7 @@ func toolListProjectMembers() mcp.Tool {
 	)
 }
 
-func toolPromoteMember() mcp.Tool {
+func PromoteMember() mcp.Tool {
 	return mcp.NewTool("enju_promote_member",
 		mcp.WithDescription("Promote a member to owner. Owner-only — any owner can promote any member. Projects support multiple owners; this is the main way to grow the owner pool and avoid a single-point-of-failure."),
 		mcp.WithNumber("project_id",
@@ -1022,7 +1022,7 @@ func toolPromoteMember() mcp.Tool {
 	)
 }
 
-func toolDemoteOwner() mcp.Tool {
+func DemoteOwner() mcp.Tool {
 	return mcp.NewTool("enju_demote_owner",
 		mcp.WithDescription("Demote an owner to regular member. Owner-only. Refused when the target is the last owner (promote a successor first to preserve the ≥1 owner invariant)."),
 		mcp.WithNumber("project_id",
@@ -1036,7 +1036,7 @@ func toolDemoteOwner() mcp.Tool {
 	)
 }
 
-func toolUpdateProfile() mcp.Tool {
+func UpdateProfile() mcp.Tool {
 	return mcp.NewTool("enju_update_profile",
 		mcp.WithDescription("Update your citizen profile. Merge semantics: any field you omit from the call is left untouched on both the server and in your local credentials file. Pass only what you want to change. At least one of name or email must be provided."),
 		mcp.WithString("name",
@@ -1048,19 +1048,19 @@ func toolUpdateProfile() mcp.Tool {
 	)
 }
 
-func toolMyDashboard() mcp.Tool {
+func MyDashboard() mcp.Tool {
 	return mcp.NewTool("enju_my_dashboard",
 		mcp.WithDescription("Show your citizen dashboard: stats, active tasks, and recent completions. Paste the output verbatim in your reply — it's pre-formatted for the human."),
 	)
 }
 
-func toolMyProfile() mcp.Tool {
+func MyProfile() mcp.Tool {
 	return mcp.NewTool("enju_my_profile",
 		mcp.WithDescription("Show your own citizen profile. Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
-func toolInvalidateTask() mcp.Tool {
+func InvalidateTask() mcp.Tool {
 	return mcp.NewTool("enju_invalidate_task",
 		mcp.WithDescription(`Mark an accepted task as invalid (its result was wrong). Target → READY for re-claim; intra-run descendants → PENDING until the target re-completes. Artifact index rolls back to the prior writer. Git history preserves the previous result.
 
@@ -1077,7 +1077,7 @@ Only tasks in the 'accepted' state can be invalidated.`),
 	)
 }
 
-func toolListUntrackedArtifacts() mcp.Tool {
+func ListUntrackedArtifacts() mcp.Tool {
 	return mcp.NewTool("enju_list_untracked_artifacts",
 		mcp.WithDescription(`List artifacts produced by this project that are NOT tracked in git (declared with track:false in writes_artifacts). For each entry, reports whether the file is visible in this citizen's workspace so you can spot missing untracked dependencies before claiming a downstream task.
 
@@ -1097,7 +1097,7 @@ Use this to debug a "cannot claim — task reads untracked artifact(s) that aren
 	)
 }
 
-func toolTallyTask() mcp.Tool {
+func TallyTask() mcp.Tool {
 	return mcp.NewTool("enju_tally_task",
 		mcp.WithDescription(`Force a tally evaluation on a multi-citizen vote or review task that is currently in the 'collecting' state. Runs the same tally logic as a submission would: counts the per-citizen submissions, applies the task's threshold + quorum + deadline rules, and resolves the task to 'accepted' if a winner emerges. Reports the current tally state either way.
 
@@ -1117,7 +1117,7 @@ The tally response includes the current counts, whether the task resolved, and i
 
 // --- operator/model design: bot + model registration ---
 
-func toolRegisterBot() mcp.Tool {
+func RegisterBot() mcp.Tool {
 	return mcp.NewTool("enju_register_bot",
 		mcp.WithDescription(`Register a bot citizen owned by you. Returns the bot's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the bot's launcher (CI env var, daemon config, ~/.enju/bot-credentials.json) so the bot can authenticate as itself.
 
@@ -1138,13 +1138,13 @@ Use cases: autonomous overnight agents, CI runners, role-bots (developer-bot / r
 	)
 }
 
-func toolListMyBots() mcp.Tool {
+func ListMyBots() mcp.Tool {
 	return mcp.NewTool("enju_list_my_bots",
 		mcp.WithDescription("List every bot you own, with each bot's active and revoked tokens (token VALUES are not returned — only labels and timestamps; token strings are shown once at registration). Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
-func toolRevokeToken() mcp.Tool {
+func RevokeToken() mcp.Tool {
 	return mcp.NewTool("enju_revoke_token",
 		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of a bot whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_bots)."),
 		mcp.WithString("token",
@@ -1156,13 +1156,13 @@ func toolRevokeToken() mcp.Tool {
 	)
 }
 
-func toolListModels() mcp.Tool {
+func ListModels() mcp.Tool {
 	return mcp.NewTool("enju_list_models",
 		mcp.WithDescription("Browse the model catalog. Returns every kind='model' citizen — the seeded popular models (Claude Opus / Sonnet / Haiku, GPT-4o, Gemini, Llama, etc.) plus any custom models registered locally. Use before submitting if you're unsure what -model name to pass."),
 	)
 }
 
-func toolRegisterModel() mcp.Tool {
+func RegisterModel() mcp.Tool {
 	return mcp.NewTool("enju_register_model",
 		mcp.WithDescription(`Register a custom model in the catalog so submits can attribute work to it. Local-mode use case: you're running Ollama / llama.cpp / a lab-internal finetune that the seed catalog doesn't cover. Any authenticated citizen can register in local mode; hosted-mode policy gating is deferred.
 

@@ -7,6 +7,7 @@ package mcpserver
 // multi-citizen resolution), execute (action:compute).
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,7 +32,7 @@ func (c *apiClient) handleInvalidateTask(ctx context.Context, req mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatInvalidateResult(data, taskID)), nil
+	return mcp.NewToolResultText(format.InvalidateResult(data, taskID)), nil
 }
 func (c *apiClient) handleTallyTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
@@ -45,7 +46,7 @@ func (c *apiClient) handleTallyTask(ctx context.Context, req mcp.CallToolRequest
 	if errMsg := extractErrorString(data); errMsg != "" {
 		return mcp.NewToolResultError(errMsg), nil
 	}
-	return mcp.NewToolResultText(formatTallyResult(data, taskID)), nil
+	return mcp.NewToolResultText(format.TallyResult(data, taskID)), nil
 }
 // handleListIterations is the living-workflow phase 5 surface
 // for the iteration history of a task. Returns one row per
@@ -125,7 +126,7 @@ func (c *apiClient) handleListReadyTasks(ctx context.Context, req mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatReadyTasks(data)), nil
+	return mcp.NewToolResultText(format.ReadyTasks(data)), nil
 }
 func (c *apiClient) handleReleaseTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
@@ -206,7 +207,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
-	return mcp.NewToolResultText(formatTaskDetail(data, inputs, c.username)), nil
+	return mcp.NewToolResultText(format.TaskDetail(data, inputs, c.username)), nil
 }
 // handleListTemplates — pure client-side tool. Walks the
 // project's enju/templates/ directory in the local clone and
@@ -287,7 +288,7 @@ func formatExecuteOutcome(out *executeOutcome) string {
 		b.WriteString(fmt.Sprintf("✓ Script completed (exit 0, %s)\n", elapsed))
 		b.WriteString(fmt.Sprintf("  Script:  %s\n", out.Script))
 		b.WriteString(fmt.Sprintf("  Output:  %d bytes written to result.md\n", out.ContentLen))
-		b.WriteString(fmt.Sprintf("  Commit:  %s\n", shortSHA(out.CommitSHA)))
+		b.WriteString(fmt.Sprintf("  Commit:  %s\n", format.ShortSHA(out.CommitSHA)))
 		if len(out.ArtifactsWritten) > 0 {
 			b.WriteString(fmt.Sprintf("  Artifacts: %s\n", strings.Join(out.ArtifactsWritten, ", ")))
 		}

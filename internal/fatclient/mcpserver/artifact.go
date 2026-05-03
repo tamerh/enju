@@ -8,6 +8,7 @@ package mcpserver
 // history via git log.
 
 import (
+	"github.com/enju-ai/enju/internal/core/mcptools/format"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,7 +35,7 @@ func (c *apiClient) handleListArtifacts(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatArtifactList(data, int64(projectID))), nil
+	return mcp.NewToolResultText(format.ArtifactList(data, int64(projectID))), nil
 }
 // handleGetArtifact reads an artifact's current content from the
 // client's local clone. The coordinator provides the provenance
@@ -100,7 +101,7 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 	meta["path"] = path
 	meta["content"] = string(content)
 	out, _ := json.Marshal(meta)
-	return mcp.NewToolResultText(formatArtifactDetail(out)), nil
+	return mcp.NewToolResultText(format.ArtifactDetail(out)), nil
 }
 // handleGetArtifactHistory walks the local clone's git log for a
 // specific file, then enriches each commit with current-pointer
@@ -254,7 +255,7 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 		"path":    path,
 		"history": entries,
 	})
-	return mcp.NewToolResultText(formatArtifactHistory(out)), nil
+	return mcp.NewToolResultText(format.ArtifactHistory(out)), nil
 }
 
 // handleListUntrackedArtifacts filters the coordinator's artifact

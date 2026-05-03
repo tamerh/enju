@@ -1,4 +1,25 @@
-package mcpserver
+// Package format renders the human-readable text that MCP tools
+// return to the agent. Inputs are typically JSON bytes from a
+// store/HTTP layer; outputs are formatted strings ready to send
+// over the MCP wire.
+//
+// Lives in core/ because both the fat-client and (post-Phase-3.4)
+// the coordinator's MCP handlers produce identical textual
+// responses for the same conceptual operation. Sharing the
+// formatter here keeps the two surfaces in lockstep — a wording
+// change shows up in both places automatically.
+//
+// Pure logic only: no I/O, no DB, no internal-package
+// dependencies on either side. See docs/architecture-boundaries.md.
+//
+// Surface caveat (Phase 3.3 — pre 3.4): every formatter and
+// helper is exported here in anticipation of cross-side use,
+// even though the coord-side handlers don't exist yet. Once
+// 3.4 settles and the actually-used coord-side subset is
+// visible, do a re-internalization pass — anything still
+// fat-client-only goes back to lowercase. Tracked in TODO.md
+// as "format/ surface re-audit post-3.4".
+package format
 
 import (
 	"encoding/json"
@@ -8,9 +29,7 @@ import (
 	"time"
 )
 
-// --- Rich formatting for MCP tool responses ---
-
-func formatProjectMemberList(data []byte, projectID int64) string {
+func ProjectMemberList(data []byte, projectID int64) string {
 	var members []map[string]interface{}
 	if err := json.Unmarshal(data, &members); err != nil {
 		var errEnv map[string]interface{}
@@ -50,7 +69,7 @@ func formatProjectMemberList(data []byte, projectID int64) string {
 	return b.String()
 }
 
-func formatProjectList(data []byte) string {
+func ProjectList(data []byte) string {
 	var projects []map[string]interface{}
 	if err := json.Unmarshal(data, &projects); err != nil {
 		return string(data)
@@ -65,7 +84,7 @@ func formatProjectList(data []byte) string {
 		name, _ := p["name"].(string)
 		desc, _ := p["description"].(string)
 		runCount, _ := p["run_count"].(float64)
-		id := jsonID(p["id"])
+		id := JsonID(p["id"])
 
 		b.WriteString(fmt.Sprintf("  #%s  %-30s  %d runs", id, name, int(runCount)))
 		if desc != "" {
@@ -98,11 +117,11 @@ func formatProjectList(data []byte) string {
 	return b.String()
 }
 
-// formatProjectRemoteStatus renders the live remote-status diagnostic
+// ProjectRemoteStatus renders the live remote-status diagnostic
 // returned by GET /projects/{id}/remote/status. Renders different
 // guidance for ahead vs diverged so the user knows whether a plain
 // sync is safe or whether force-push would be destructive.
-func formatProjectRemoteStatus(data []byte) string {
+func ProjectRemoteStatus(data []byte) string {
 	var r map[string]interface{}
 	if err := json.Unmarshal(data, &r); err != nil {
 		return string(data)
@@ -110,11 +129,11 @@ func formatProjectRemoteStatus(data []byte) string {
 	if errMsg, ok := r["error"].(string); ok {
 		return "✗ " + errMsg
 	}
-	projectID := jsonID(r["project_id"])
+	projectID := JsonID(r["project_id"])
 	remote, _ := r["remote_url"].(string)
 	status, _ := r["status"].(string)
-	ahead := intFromJSON(r["ahead_by"])
-	behind := intFromJSON(r["behind_by"])
+	ahead := IntFromJSON(r["ahead_by"])
+	behind := IntFromJSON(r["behind_by"])
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Project #%s remote status\n", projectID))
@@ -131,7 +150,7 @@ func formatProjectRemoteStatus(data []byte) string {
 	} else {
 		b.WriteString("  remote:    " + remote + "\n")
 	}
-	b.WriteString("  status:    " + humanRemoteStatus(status, ahead, behind) + "\n")
+	b.WriteString("  status:    " + HumanRemoteStatus(status, ahead, behind) + "\n")
 	if localHead, ok := r["local_head"].(string); ok && localHead != "" {
 		short := localHead
 		if len(short) > 8 {
@@ -175,15 +194,15 @@ func formatProjectRemoteStatus(data []byte) string {
 	return b.String()
 }
 
-// formatProjectSyncResult renders the outcome of a sync attempt,
+// ProjectSyncResult renders the outcome of a sync attempt,
 // including the non-error "refused" and "noop" paths where the
 // server declined to push for safety reasons.
-func formatProjectSyncResult(data []byte) string {
+func ProjectSyncResult(data []byte) string {
 	var r map[string]interface{}
 	if err := json.Unmarshal(data, &r); err != nil {
 		return string(data)
 	}
-	projectID := jsonID(r["project_id"])
+	projectID := JsonID(r["project_id"])
 	remote, _ := r["remote_url"].(string)
 	result, _ := r["result"].(string)
 	message, _ := r["message"].(string)
@@ -210,10 +229,10 @@ func formatProjectSyncResult(data []byte) string {
 	return fmt.Sprintf("Project #%s sync: %s", projectID, result)
 }
 
-// humanRemoteStatus translates the structured RemoteComparison
+// HumanRemoteStatus translates the structured RemoteComparison
 // status code into a human-readable label with ahead/behind counts
 // where applicable.
-func humanRemoteStatus(code string, ahead, behind int) string {
+func HumanRemoteStatus(code string, ahead, behind int) string {
 	switch code {
 	case "in_sync":
 		return "in sync"
@@ -238,17 +257,17 @@ func humanRemoteStatus(code string, ahead, behind int) string {
 	}
 }
 
-// intFromJSON coerces a numeric JSON field (always decoded as
+// IntFromJSON coerces a numeric JSON field (always decoded as
 // float64 by encoding/json) into an int. Returns 0 if the field is
 // missing or not a number.
-func intFromJSON(v interface{}) int {
+func IntFromJSON(v interface{}) int {
 	if f, ok := v.(float64); ok {
 		return int(f)
 	}
 	return 0
 }
 
-func formatCreateProjectResult(data []byte) string {
+func CreateProjectResult(data []byte) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return string(data)
@@ -257,11 +276,11 @@ func formatCreateProjectResult(data []byte) string {
 		return fmt.Sprintf("✗ Failed to create project: %s", errMsg)
 	}
 	name, _ := result["name"].(string)
-	id := jsonID(result["id"])
+	id := JsonID(result["id"])
 	return fmt.Sprintf("✓ Project #%s created: %s", id, name)
 }
 
-func formatRunList(data []byte) string {
+func RunList(data []byte) string {
 	var runs []map[string]interface{}
 	if err := json.Unmarshal(data, &runs); err != nil {
 		return string(data)
@@ -278,10 +297,10 @@ func formatRunList(data []byte) string {
 		name, _ := p["name"].(string)
 		state, _ := p["state"].(string)
 		taskCount, _ := p["task_count"].(float64)
-		projectID := jsonID(p["project_id"])
+		projectID := JsonID(p["project_id"])
 		seq, _ := p["seq"].(float64)
 
-		icon := stateIcon(state)
+		icon := StateIcon(state)
 		b.WriteString(fmt.Sprintf("  %s project #%s → run #%d  %-30s [%s]  %d tasks\n",
 			icon, projectID, int(seq), name, state, int(taskCount)))
 	}
@@ -289,7 +308,7 @@ func formatRunList(data []byte) string {
 	return b.String()
 }
 
-func formatReadyTasks(data []byte) string {
+func ReadyTasks(data []byte) string {
 	var tasks []map[string]interface{}
 	if err := json.Unmarshal(data, &tasks); err != nil {
 		return string(data)
@@ -306,7 +325,7 @@ func formatReadyTasks(data []byte) string {
 	byRun := map[string][]map[string]interface{}{}
 	runOrder := []string{}
 	for _, t := range tasks {
-		runNum := jsonID(t["run_id"])
+		runNum := JsonID(t["run_id"])
 		if _, seen := byRun[runNum]; !seen {
 			runOrder = append(runOrder, runNum)
 		}
@@ -334,7 +353,7 @@ func formatReadyTasks(data []byte) string {
 			if deps != "" {
 				b.WriteString(fmt.Sprintf("    upstream: %s ✓\n", deps))
 			}
-			b.WriteString(fmt.Sprintf("    \"%s\"\n", truncate(prompt, 120)))
+			b.WriteString(fmt.Sprintf("    \"%s\"\n", Truncate(prompt, 120)))
 		}
 		b.WriteString("\n")
 	}
@@ -342,9 +361,9 @@ func formatReadyTasks(data []byte) string {
 	return b.String()
 }
 
-// formatRequirements renders the task environment requirements for display.
+// Requirements renders the task environment requirements for display.
 // Returns empty string if no requirements declared.
-func formatRequirements(reqRaw string) string {
+func Requirements(reqRaw string) string {
 	if reqRaw == "" {
 		return ""
 	}
@@ -363,14 +382,14 @@ func formatRequirements(reqRaw string) string {
 
 	for _, cat := range categoryOrder {
 		if v, ok := reqs[cat]; ok {
-			writeRequirementCategory(&b, cat, v)
+			WriteRequirementCategory(&b, cat, v)
 			seen[cat] = true
 		}
 	}
 	// Any other keys not in the standard list
 	for k, v := range reqs {
 		if !seen[k] {
-			writeRequirementCategory(&b, k, v)
+			WriteRequirementCategory(&b, k, v)
 		}
 	}
 
@@ -378,7 +397,7 @@ func formatRequirements(reqRaw string) string {
 	return b.String()
 }
 
-func writeRequirementCategory(b *strings.Builder, name string, value interface{}) {
+func WriteRequirementCategory(b *strings.Builder, name string, value interface{}) {
 	b.WriteString(fmt.Sprintf("  %s:\n", name))
 	switch v := value.(type) {
 	case map[string]interface{}:
@@ -394,13 +413,13 @@ func writeRequirementCategory(b *strings.Builder, name string, value interface{}
 	}
 }
 
-// formatOutputsSchema renders the named outputs schema for display.
+// OutputsSchema renders the named outputs schema for display.
 // Returns empty string if no outputs declared.
-// formatAssignmentSchema renders the assign_to and require_role
+// AssignmentSchema renders the assign_to and require_role
 // restrictions on a task. Both are optional — when neither is set the
 // task is open to any citizen and this function returns "" so the
 // formatter doesn't show any assignment box at all.
-func formatAssignmentSchema(assignTo []string, requireRole string) string {
+func AssignmentSchema(assignTo []string, requireRole string) string {
 	if len(assignTo) == 0 && requireRole == "" {
 		return ""
 	}
@@ -420,10 +439,10 @@ func formatAssignmentSchema(assignTo []string, requireRole string) string {
 	return b.String()
 }
 
-// formatArtifactsSchema renders the reads_artifacts and writes_artifacts
+// ArtifactsSchema renders the reads_artifacts and writes_artifacts
 // declarations on a task. Either or both can be empty. Returns "" if
 // nothing to show.
-func formatArtifactsSchema(reads, writes []string) string {
+func ArtifactsSchema(reads, writes []string) string {
 	if len(reads) == 0 && len(writes) == 0 {
 		return ""
 	}
@@ -463,7 +482,7 @@ func formatArtifactsSchema(reads, writes []string) string {
 // dataset accidentally getting declared as a read.
 const artifactInlineLimit = 4096
 
-// formatResolvedArtifactsBlock renders the Resolved Artifacts box for
+// ResolvedArtifactsBlock renders the Resolved Artifacts box for
 // a claim/task-detail response. It has two parts:
 //
 //   - A warning section listing any declared reads_artifacts paths
@@ -479,7 +498,7 @@ const artifactInlineLimit = 4096
 // The caller should not call this function when both `artifacts` and
 // `missing` are empty — the Resolved Artifacts block is meaningless
 // in that case and should simply be omitted from the response.
-func formatResolvedArtifactsBlock(artifacts map[string]interface{}, missing []string) string {
+func ResolvedArtifactsBlock(artifacts map[string]interface{}, missing []string) string {
 	if len(artifacts) == 0 && len(missing) == 0 {
 		return ""
 	}
@@ -492,7 +511,7 @@ func formatResolvedArtifactsBlock(artifacts map[string]interface{}, missing []st
 	// warning before scrolling to the content.
 	if len(missing) > 0 {
 		sortedMissing := append([]string(nil), missing...)
-		sortStrings(sortedMissing)
+		SortStrings(sortedMissing)
 		for _, p := range sortedMissing {
 			b.WriteString(fmt.Sprintf("⚠ %s (missing — artifact does not exist)\n", p))
 		}
@@ -508,7 +527,7 @@ func formatResolvedArtifactsBlock(artifacts map[string]interface{}, missing []st
 	for p := range artifacts {
 		paths = append(paths, p)
 	}
-	sortStrings(paths)
+	SortStrings(paths)
 
 	for i, path := range paths {
 		raw := artifacts[path]
@@ -550,13 +569,13 @@ func formatResolvedArtifactsBlock(artifacts map[string]interface{}, missing []st
 	return b.String()
 }
 
-// formatReviewingBlock renders the target's content for an
+// ReviewingBlock renders the target's content for an
 // action:review claim so the reviewer can see what they're
 // evaluating without a second enju_get_task call. Mirrors the
 // resolved-artifacts block in shape: header line + indented
 // content, truncated with a pointer to a richer tool for large
 // payloads.
-func formatReviewingBlock(reviewing map[string]interface{}) string {
+func ReviewingBlock(reviewing map[string]interface{}) string {
 	if len(reviewing) == 0 {
 		return ""
 	}
@@ -577,7 +596,7 @@ func formatReviewingBlock(reviewing map[string]interface{}) string {
 		b.WriteString(fmt.Sprintf("  Path:   %s/result.md\n", resultPath))
 	}
 	if commitSHA != "" {
-		b.WriteString(fmt.Sprintf("  Commit: %s\n", shortSHA(commitSHA)))
+		b.WriteString(fmt.Sprintf("  Commit: %s\n", ShortSHA(commitSHA)))
 	}
 	header += fmt.Sprintf(" — %d chars", len(content))
 
@@ -601,9 +620,9 @@ func formatReviewingBlock(reviewing map[string]interface{}) string {
 	return b.String()
 }
 
-// sortStrings sorts a slice of strings in place. Tiny helper to avoid
+// SortStrings sorts a slice of strings in place. Tiny helper to avoid
 // pulling sort into format.go for a single call site.
-func sortStrings(xs []string) {
+func SortStrings(xs []string) {
 	for i := 1; i < len(xs); i++ {
 		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
 			xs[j-1], xs[j] = xs[j], xs[j-1]
@@ -611,9 +630,9 @@ func sortStrings(xs []string) {
 	}
 }
 
-// stringSliceFromAny extracts a []string from a JSON-decoded value
+// StringSliceFromAny extracts a []string from a JSON-decoded value
 // (which is []interface{} when it came through json.Unmarshal).
-func stringSliceFromAny(v interface{}) []string {
+func StringSliceFromAny(v interface{}) []string {
 	if v == nil {
 		return nil
 	}
@@ -632,7 +651,7 @@ func stringSliceFromAny(v interface{}) []string {
 	return nil
 }
 
-// writeArtifactPathsFromAny extracts just the path strings from a
+// WriteArtifactPathsFromAny extracts just the path strings from a
 // writes_artifacts payload — paths live at different shapes
 // depending on the source:
 //
@@ -641,11 +660,11 @@ func stringSliceFromAny(v interface{}) []string {
 //     [{"path":"a","track":true}, {"path":"b","track":false}].
 //
 // Bug-fix helper: an earlier version of the display path used
-// stringSliceFromAny, which silently dropped every entry once
+// StringSliceFromAny, which silently dropped every entry once
 // the wire shape became polymorphic — the entire "Writes" block
 // disappeared from claim + get_task output. This helper handles
 // both forms and mixed lists.
-func writeArtifactPathsFromAny(v interface{}) []string {
+func WriteArtifactPathsFromAny(v interface{}) []string {
 	if v == nil {
 		return nil
 	}
@@ -653,7 +672,7 @@ func writeArtifactPathsFromAny(v interface{}) []string {
 	if !ok {
 		// Fall back to the plain extractor for legacy typed
 		// inputs (e.g. []string directly from a test fixture).
-		return stringSliceFromAny(v)
+		return StringSliceFromAny(v)
 	}
 	out := make([]string, 0, len(xs))
 	for _, x := range xs {
@@ -669,11 +688,11 @@ func writeArtifactPathsFromAny(v interface{}) []string {
 	return out
 }
 
-// truncateRunes returns a rune-aware truncation of s to at most max
+// TruncateRunes returns a rune-aware truncation of s to at most max
 // runes. Falls back to s unchanged if the string already fits. Used to
 // keep fixed-width dashboard boxes from overflowing when the user has
 // a long display name.
-func truncateRunes(s string, max int) string {
+func TruncateRunes(s string, max int) string {
 	if max <= 0 {
 		return ""
 	}
@@ -687,12 +706,12 @@ func truncateRunes(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
-// humanizeRelTime formats a timestamp as a short relative duration
+// HumanizeRelTime formats a timestamp as a short relative duration
 // suitable for list views. Falls back to the full string on parse errors.
 //
 // Examples: "5s ago", "2m ago", "3h ago", "yesterday", "4d ago",
 // "2026-04-13" for anything older than 30 days.
-func humanizeRelTime(ts string) string {
+func HumanizeRelTime(ts string) string {
 	if ts == "" {
 		return ""
 	}
@@ -719,7 +738,7 @@ func humanizeRelTime(ts string) string {
 	}
 }
 
-func formatOutputsSchema(outputsRaw string) string {
+func OutputsSchema(outputsRaw string) string {
 	if outputsRaw == "" {
 		return ""
 	}
@@ -780,7 +799,7 @@ func formatOutputsSchema(outputsRaw string) string {
 	// output_name_1/output_name_2 placeholders.
 	var pairs []string
 	for _, f := range fields {
-		pairs = append(pairs, fmt.Sprintf("%q: %s", f.name, exampleValueForFormat(f.format)))
+		pairs = append(pairs, fmt.Sprintf("%q: %s", f.name, ExampleValueForFormat(f.format)))
 	}
 	b.WriteString("\nExample:\n")
 	b.WriteString("  outputs_json='{" + strings.Join(pairs, ", ") + "}'\n")
@@ -788,11 +807,11 @@ func formatOutputsSchema(outputsRaw string) string {
 	return b.String()
 }
 
-// exampleValueForFormat returns a JSON-literal example value
+// ExampleValueForFormat returns a JSON-literal example value
 // matching the declared format. Used in the outputs_json
 // example so the LLM sees a shape-correct template instead
 // of a generic "content here" placeholder.
-func exampleValueForFormat(format string) string {
+func ExampleValueForFormat(format string) string {
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "list<string>":
 		return `["item1", "item2"]`
@@ -806,10 +825,10 @@ func exampleValueForFormat(format string) string {
 	return `"content here"`
 }
 
-// formatClaimResult renders the response from claiming a task.
+// ClaimResult renders the response from claiming a task.
 // Optional trailing args: reviewFeedback (JSON from fetchReviewFeedback)
 // and previousSubmission (JSON with "content" key).
-func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra ...[]byte) string {
+func ClaimResult(claimData []byte, inputsData []byte, viewer string, extra ...[]byte) string {
 	var claim map[string]interface{}
 	if err := json.Unmarshal(claimData, &claim); err != nil {
 		return string(claimData)
@@ -840,27 +859,27 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 
 	// Show environment requirements if present
 	if reqRaw, ok := task["requirements"].(string); ok && reqRaw != "" {
-		b.WriteString(formatRequirements(reqRaw))
+		b.WriteString(Requirements(reqRaw))
 	}
 
 	// Show outputs schema if present
 	if outputsRaw, ok := task["outputs"].(string); ok && outputsRaw != "" {
-		b.WriteString(formatOutputsSchema(outputsRaw))
+		b.WriteString(OutputsSchema(outputsRaw))
 	}
 
 	// Show access restrictions (assign_to, require_role) if any.
-	assignTo := stringSliceFromAny(task["assign_to"])
+	assignTo := StringSliceFromAny(task["assign_to"])
 	requireRole, _ := task["require_role"].(string)
-	if s := formatAssignmentSchema(assignTo, requireRole); s != "" {
+	if s := AssignmentSchema(assignTo, requireRole); s != "" {
 		b.WriteString(s)
 	}
 
 	// Show artifact reads/writes schema if present.
 	// writes_artifacts is polymorphic on the wire post-Phase-A
 	// (object form {path,track}) — extractor handles both.
-	reads := stringSliceFromAny(task["reads_artifacts"])
-	writes := writeArtifactPathsFromAny(task["writes_artifacts"])
-	if s := formatArtifactsSchema(reads, writes); s != "" {
+	reads := StringSliceFromAny(task["reads_artifacts"])
+	writes := WriteArtifactPathsFromAny(task["writes_artifacts"])
+	if s := ArtifactsSchema(reads, writes); s != "" {
 		b.WriteString(s)
 	}
 
@@ -873,7 +892,7 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 		var inputs map[string]interface{}
 		if json.Unmarshal(inputsData, &inputs) == nil {
 			resolvedArtifacts, _ = inputs["artifacts"].(map[string]interface{})
-			missingArtifacts = stringSliceFromAny(inputs["missing_artifacts"])
+			missingArtifacts = StringSliceFromAny(inputs["missing_artifacts"])
 
 			if resolved, ok := inputs["resolved_prompt"].(string); ok && resolved != "" && resolved != prompt {
 				b.WriteString("── Prompt (with upstream context) ──────────\n")
@@ -903,7 +922,7 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 			// Missing declared reads get a warning line in the same
 			// block so the claimer can see the contract was broken.
 			if len(resolvedArtifacts) > 0 || len(missingArtifacts) > 0 {
-				b.WriteString(formatResolvedArtifactsBlock(resolvedArtifacts, missingArtifacts))
+				b.WriteString(ResolvedArtifactsBlock(resolvedArtifacts, missingArtifacts))
 			}
 
 			// Review tasks: surface the reviewed target's content
@@ -914,7 +933,7 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 			// block — the claimer shouldn't need a second
 			// round-trip to see what they're evaluating.
 			if reviewing, ok := inputs["reviewing"].(map[string]interface{}); ok {
-				b.WriteString(formatReviewingBlock(reviewing))
+				b.WriteString(ReviewingBlock(reviewing))
 			}
 		}
 	}
@@ -925,8 +944,8 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 	// branch because options live on the task record itself,
 	// not in the resolved prompt.
 	if voteOptsRaw, _ := task["vote_options"].(string); voteOptsRaw != "" {
-		if opts := parseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
-			b.WriteString(formatVoteOptionsBlock(opts, task))
+		if opts := ParseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
+			b.WriteString(VoteOptionsBlock(opts, task))
 		}
 	}
 
@@ -942,14 +961,14 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 		}
 		threshold, _ := task["vote_threshold"].(string)
 		voteSubs, _ := task["vote_submissions"].([]interface{})
-		activeClaimants := stringSliceFromAny(task["active_claimants"])
+		activeClaimants := StringSliceFromAny(task["active_claimants"])
 		state, _ := task["state"].(string)
 		taskAction, _ := task["action"].(string)
 		visibility, _ := task["visibility"].(string)
 		anonymize, _ := task["anonymize"].(bool)
 		deadline, _ := task["vote_deadline"].(string)
 		deadlineAt, _ := task["vote_deadline_at"].(string)
-		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaimants, visibility, viewer, anonymize, deadline, deadlineAt))
+		b.WriteString(VotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaimants, visibility, viewer, anonymize, deadline, deadlineAt))
 	}
 
 	if inputsData == nil {
@@ -1017,11 +1036,11 @@ func formatClaimResult(claimData []byte, inputsData []byte, viewer string, extra
 	return b.String()
 }
 
-// formatTallyResult renders the response from
+// TallyResult renders the response from
 // /tasks/{id}/tally as a short status summary. Distinguishes
 // "resolved → winning option/verdict + cascade" from
 // "still collecting → reason + current counts".
-func formatTallyResult(data []byte, taskID string) string {
+func TallyResult(data []byte, taskID string) string {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return string(data)
@@ -1064,7 +1083,7 @@ func formatTallyResult(data []byte, taskID string) string {
 				for k, v := range counts {
 					parts = append(parts, fmt.Sprintf("%s=%v", k, v))
 				}
-				sortStrings(parts)
+				SortStrings(parts)
 				b.WriteString(strings.Join(parts, ", "))
 				b.WriteString("\n")
 			}
@@ -1081,10 +1100,10 @@ func formatTallyResult(data []byte, taskID string) string {
 	return b.String()
 }
 
-// formatInvalidateResult renders the response from /tasks/{id}/invalidate.
+// InvalidateResult renders the response from /tasks/{id}/invalidate.
 // Shows the target, cascaded descendants, rolled-back artifacts, and
 // the reason if provided.
-func formatInvalidateResult(data []byte, taskID string) string {
+func InvalidateResult(data []byte, taskID string) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return string(data)
@@ -1177,7 +1196,7 @@ func formatInvalidateResult(data []byte, taskID string) string {
 	return b.String()
 }
 
-func formatSubmitResult(data []byte, taskID string) string {
+func SubmitResult(data []byte, taskID string) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return string(data)
@@ -1298,8 +1317,8 @@ func formatSubmitResult(data []byte, taskID string) string {
 	}
 
 	// Contribution counter — attribution, not scoring.
-	contribNum := int(jsonFloat(result["contribution_number"]))
-	projectsMonth := int(jsonFloat(result["projects_this_month"]))
+	contribNum := int(JsonFloat(result["contribution_number"]))
+	projectsMonth := int(JsonFloat(result["projects_this_month"]))
 	if contribNum > 0 {
 		line := fmt.Sprintf("Contribution #%d", contribNum)
 		if projectsMonth > 0 {
@@ -1312,8 +1331,8 @@ func formatSubmitResult(data []byte, taskID string) string {
 	return b.String()
 }
 
-// formatArtifactList renders the list of artifacts in a project.
-func formatArtifactList(data []byte, projectID int64) string {
+// ArtifactList renders the list of artifacts in a project.
+func ArtifactList(data []byte, projectID int64) string {
 	var artifacts []map[string]interface{}
 	if err := json.Unmarshal(data, &artifacts); err != nil {
 		return string(data)
@@ -1355,14 +1374,14 @@ func formatArtifactList(data []byte, projectID int64) string {
 		b.WriteString(fmt.Sprintf("  %-*s   %-*s   %s\n",
 			pathW, displayPath,
 			taskW, taskID,
-			humanizeRelTime(updatedAt),
+			HumanizeRelTime(updatedAt),
 		))
 	}
 	return b.String()
 }
 
-// formatArtifactDetail renders the content + provenance of one artifact.
-func formatArtifactDetail(data []byte) string {
+// ArtifactDetail renders the content + provenance of one artifact.
+func ArtifactDetail(data []byte) string {
 	var a map[string]interface{}
 	if err := json.Unmarshal(data, &a); err != nil {
 		return string(data)
@@ -1395,8 +1414,8 @@ func formatArtifactDetail(data []byte) string {
 	return b.String()
 }
 
-// formatArtifactHistory renders the git commit history of one artifact.
-func formatArtifactHistory(data []byte) string {
+// ArtifactHistory renders the git commit history of one artifact.
+func ArtifactHistory(data []byte) string {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return string(data)
@@ -1443,7 +1462,7 @@ func formatArtifactHistory(data []byte) string {
 	return b.String()
 }
 
-func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string {
+func RunStatus(runData []byte, tasksData []byte, viewer ...string) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return string(runData)
@@ -1465,7 +1484,7 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 	if len(viewer) > 0 {
 		viewerName = viewer[0]
 	}
-	_ = viewerName // used below in renderYourQueue
+	_ = viewerName // used below in RenderYourQueue
 
 	var tasks []map[string]interface{}
 	if err := json.Unmarshal(tasksData, &tasks); err != nil {
@@ -1476,7 +1495,7 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 
 	name, _ := run["name"].(string)
 	state, _ := run["state"].(string)
-	projectID := jsonID(run["project_id"])
+	projectID := JsonID(run["project_id"])
 	projectName, _ := run["_project_name"].(string)
 	seq, _ := run["seq"].(float64)
 
@@ -1523,12 +1542,12 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 	if sourcePath, _ := run["source_path"].(string); sourcePath != "" {
 		line := fmt.Sprintf("Source: %s", sourcePath)
 		if sourceSHA, _ := run["source_commit_sha"].(string); sourceSHA != "" {
-			line += fmt.Sprintf(" @%s", shortSHA(sourceSHA))
+			line += fmt.Sprintf(" @%s", ShortSHA(sourceSHA))
 		}
 		b.WriteString(line + "\n")
 	}
 	b.WriteString(progressLine + "\n")
-	b.WriteString(fmt.Sprintf("%s\n\n", progressBar(done, total, 30)))
+	b.WriteString(fmt.Sprintf("%s\n\n", ProgressBar(done, total, 30)))
 
 	// Failed tasks at top — needs immediate attention.
 	var failedTasks []map[string]interface{}
@@ -1553,16 +1572,16 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 
 	// Template-level summary: group by task_def_id, show
 	// counts per state. Readable regardless of DAG size.
-	b.WriteString(renderTemplateSummary(tasks))
+	b.WriteString(RenderTemplateSummary(tasks))
 
 	// Your queue: tasks the current viewer can act on
 	// (claimed by them or available to claim).
-	b.WriteString(renderYourQueue(tasks, viewerName))
+	b.WriteString(RenderYourQueue(tasks, viewerName))
 
 	return b.String()
 }
 
-// renderDAGTree builds a tree-shaped task list from dependency edges.
+// RenderDAGTree builds a tree-shaped task list from dependency edges.
 // Root tasks (no dependencies) are top-level; children are indented
 // under their parent with box-drawing connectors.
 //
@@ -1574,7 +1593,7 @@ func formatRunStatus(runData []byte, tasksData []byte, viewer ...string) string 
 //	├── TP53:analyze →
 //	│   └── TP53:check ○
 //	└── synthesize ○
-func renderDAGTree(tasks []map[string]interface{}) string {
+func RenderDAGTree(tasks []map[string]interface{}) string {
 	// Build index: full task ID → task map.
 	byID := make(map[string]map[string]interface{}, len(tasks))
 	for _, t := range tasks {
@@ -1675,10 +1694,10 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		state, _ := t["state"].(string)
 		claimedBy, _ := t["claimed_by"].(string)
 		skipReason, _ := t["skip_reason"].(string)
-		icon := stateIconFor(state, skipReason)
+		icon := StateIconFor(state, skipReason)
 
 		// Build the display name with task ID.
-		displayName := taskShortName(t)
+		displayName := TaskShortName(t)
 		tid, _ := t["id"].(string)
 
 		// Connector.
@@ -1725,8 +1744,8 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 		t := byID[r]
 		state, _ := t["state"].(string)
 		claimedBy, _ := t["claimed_by"].(string)
-		icon := stateIcon(state)
-		displayName := taskShortName(t)
+		icon := StateIcon(state)
+		displayName := TaskShortName(t)
 		tid, _ := t["id"].(string)
 
 		line := fmt.Sprintf("%s %s [%s]", displayName, icon, tid)
@@ -1744,9 +1763,9 @@ func renderDAGTree(tasks []map[string]interface{}) string {
 	return b.String()
 }
 
-// taskShortName returns a compact display name for a task:
+// TaskShortName returns a compact display name for a task:
 // "instance:taskdef" for for_each instances, just "taskdef" otherwise.
-func taskShortName(t map[string]interface{}) string {
+func TaskShortName(t map[string]interface{}) string {
 	taskDefID, _ := t["task_def_id"].(string)
 	instanceKey, _ := t["instance_key"].(string)
 	if instanceKey != "" {
@@ -1755,7 +1774,7 @@ func taskShortName(t map[string]interface{}) string {
 	return taskDefID
 }
 
-// renderTemplateSummary groups tasks by task_def_id and shows a
+// RenderTemplateSummary groups tasks by task_def_id and shows a
 // one-line summary per template: "discover  4/4 ✅" or
 // "review  1 in progress · 3 available".
 //
@@ -1764,7 +1783,7 @@ func taskShortName(t map[string]interface{}) string {
 // skips today), it's rendered as ⊘ with the reason suffix so the
 // reader can tell "skipped because the gate picked the other
 // branch" apart from "skipped because an upstream task failed."
-func renderTemplateSummary(tasks []map[string]interface{}) string {
+func RenderTemplateSummary(tasks []map[string]interface{}) string {
 	type templateInfo struct {
 		defID   string
 		total   int
@@ -1832,7 +1851,7 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 				suffix := ""
 				if len(info.skipReasons) > 0 {
 					glyph = "⊘"
-					suffix = " (" + joinSkipReasons(info.skipReasons) + ")"
+					suffix = " (" + JoinSkipReasons(info.skipReasons) + ")"
 				}
 				statusParts = append(statusParts, fmt.Sprintf("%d %s skipped%s", skipped, glyph, suffix))
 			}
@@ -1874,12 +1893,12 @@ func renderTemplateSummary(tasks []map[string]interface{}) string {
 	return b.String()
 }
 
-// joinSkipReasons renders the unique skip_reason set (from the
+// JoinSkipReasons renders the unique skip_reason set (from the
 // template's skipped tasks) as a compact suffix for the summary
 // line. One reason → verbatim; multiple distinct reasons →
 // deduped and comma-joined in sorted order so output is stable
 // across runs.
-func joinSkipReasons(set map[string]bool) string {
+func JoinSkipReasons(set map[string]bool) string {
 	if len(set) == 0 {
 		return ""
 	}
@@ -1891,24 +1910,24 @@ func joinSkipReasons(set map[string]bool) string {
 	return strings.Join(out, ", ")
 }
 
-// maxQueueEntriesPerTemplate caps how many "🟡 ready" rows we
+// MaxQueueEntriesPerTemplate caps how many "🟡 ready" rows we
 // spell out per task_def_id before collapsing the rest to a
 // single "...plus N more" line. Picked so a for_each producing
 // tens of instances stops drowning the status output while the
 // first few are still individually callable-out for a glance.
 // Claimed-by-viewer rows are always shown in full — those are
 // the tasks the user is actively holding.
-const maxQueueEntriesPerTemplate = 6
+const MaxQueueEntriesPerTemplate = 6
 
-// renderYourQueue shows tasks the viewer can act on: claimed by
+// RenderYourQueue shows tasks the viewer can act on: claimed by
 // them (finish first) and available to claim.
 //
 // Available tasks are grouped by task_def_id and clipped past
-// maxQueueEntriesPerTemplate per group. For a run where one
+// MaxQueueEntriesPerTemplate per group. For a run where one
 // template has fanned out into dozens of instances, the output
 // stays scannable instead of listing 30+ near-identical rows.
 // Full list is always reachable via enju_list_ready_tasks.
-func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
+func RenderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	var claimed, available []map[string]interface{}
 	for _, t := range tasks {
 		s, _ := t["state"].(string)
@@ -1929,7 +1948,7 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 
 	// Claimed-by-viewer first — the reader's own work in flight.
 	for _, t := range claimed {
-		name := taskShortName(t)
+		name := TaskShortName(t)
 		tid, _ := t["id"].(string)
 		b.WriteString(fmt.Sprintf("  🔵 %s [%s] — in progress\n", name, tid))
 	}
@@ -1963,12 +1982,12 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	for _, g := range groups {
 		n := len(g.tasks)
 		head := n
-		if head > maxQueueEntriesPerTemplate {
-			head = maxQueueEntriesPerTemplate
+		if head > MaxQueueEntriesPerTemplate {
+			head = MaxQueueEntriesPerTemplate
 		}
 		for i := 0; i < head; i++ {
 			t := g.tasks[i]
-			name := taskShortName(t)
+			name := TaskShortName(t)
 			tid, _ := t["id"].(string)
 			b.WriteString(fmt.Sprintf("  🟡 %s [%s]\n", name, tid))
 		}
@@ -1983,17 +2002,17 @@ func renderYourQueue(tasks []map[string]interface{}, viewer string) string {
 	return b.String()
 }
 
-// edge is a single directed connection in the Mermaid graph —
+// Edge is a single directed connection in the Mermaid graph —
 // from source (either an in-run full task id, or a
 // pre-sanitized external-artifact node id) to a destination
-// full task id. Kept at package scope so transitivelyReduce
+// full task id. Kept at package scope so TransitivelyReduce
 // can operate on slices of it without an anonymous-struct
 // signature.
-type edge struct {
-	from, to string
+type Edge struct {
+	From, To string
 }
 
-// renderMermaidBody produces the **raw** Mermaid source for a
+// RenderMermaidBody produces the **raw** Mermaid source for a
 // run's DAG — `flowchart TD` header, node declarations, edges,
 // classDef lines. No ``` fences, no ``%% run N`` comment header.
 // This is the bytes that go into a `.mmd` file: consumers
@@ -2016,7 +2035,7 @@ type edge struct {
 // response carried an error — callers that want an error
 // surface should check for that and decide whether to write
 // the file anyway.
-func renderMermaidBody(runData []byte, tasksData []byte) string {
+func RenderMermaidBody(runData []byte, tasksData []byte) string {
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
 		return ""
@@ -2030,7 +2049,7 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	}
 
 	// Index full-task-id → sanitized node id. We keep this
-	// map so edge declarations can look up the node id without
+	// map so Edge declarations can look up the node id without
 	// re-sanitizing and risking drift.
 	nodeID := make(map[string]string, len(tasks))
 	// Track only task ids present in this run — edges pointing
@@ -2043,19 +2062,19 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 			continue
 		}
 		present[id] = true
-		nodeID[id] = mermaidNodeID(id)
+		nodeID[id] = MermaidNodeID(id)
 	}
 
-	// Build the edge set from depends_on. Collect first, reduce,
+	// Build the Edge set from depends_on. Collect first, reduce,
 	// emit — so transitive reduction has the full picture before
 	// any output lands. Without collecting upfront, a naive
-	// emit-as-you-go would need a second pass anyway. The `edge`
-	// type is package-level so transitivelyReduce can take and
+	// emit-as-you-go would need a second pass anyway. The `Edge`
+	// type is package-level so TransitivelyReduce can take and
 	// return slices of it without an anonymous-struct dance.
-	var edges []edge
-	edgeSet := map[edge]bool{}
+	var edges []Edge
+	edgeSet := map[Edge]bool{}
 	addEdge := func(from, to string) {
-		e := edge{from, to}
+		e := Edge{from, to}
 		if edgeSet[e] {
 			return
 		}
@@ -2082,8 +2101,8 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	// artifact state from other runs, so there's no cross-run
 	// writer to surface as a dashed external node.
 
-	// Transitive reduction on the combined edge set. For each
-	// edge u→v, drop it if v is reachable from any other
+	// Transitive reduction on the combined Edge set. For each
+	// Edge u→v, drop it if v is reachable from any other
 	// out-neighbor of u through the remaining edges. Canonical
 	// DAG form for visualization: no edges whose endpoint is
 	// already reachable via a longer path. Applied uniformly to
@@ -2091,7 +2110,7 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	// tag" redundancy disappears the same way a "📎 path → tag"
 	// redundancy would if `tag` transitively already depends on
 	// it through another task.
-	edges = transitivelyReduce(edges)
+	edges = TransitivelyReduce(edges)
 
 	// Emit.
 	var b strings.Builder
@@ -2105,8 +2124,8 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 		}
 		state, _ := t["state"].(string)
 		skipReason, _ := t["skip_reason"].(string)
-		label := mermaidEscape(taskShortName(t)) + " " + stateIconFor(state, skipReason)
-		cls := mermaidStateClass(state)
+		label := MermaidEscape(TaskShortName(t)) + " " + StateIconFor(state, skipReason)
+		cls := MermaidStateClass(state)
 		b.WriteString(fmt.Sprintf("    %s[\"%s\"]", nodeID[id], label))
 		if cls != "" {
 			b.WriteString(":::" + cls)
@@ -2118,13 +2137,13 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	// nodes were removed with the branch-per-run model.
 	b.WriteString("\n")
 	for _, e := range edges {
-		from := nodeID[e.from]
+		from := nodeID[e.From]
 		if from == "" {
-			from = e.from
+			from = e.From
 		}
-		to := nodeID[e.to]
+		to := nodeID[e.To]
 		if to == "" {
-			to = e.to
+			to = e.To
 		}
 		b.WriteString(fmt.Sprintf("    %s --> %s\n", from, to))
 	}
@@ -2145,14 +2164,14 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 	return b.String()
 }
 
-// transitivelyReduce removes edges whose endpoint is already
+// TransitivelyReduce removes edges whose endpoint is already
 // reachable from the source through other edges. The canonical
 // DAG visualization convention: if u → v and u → w → ... → v
 // both exist, drop u → v so the diagram doesn't clutter with
-// a redundant direct edge.
+// a redundant direct Edge.
 //
 // Algorithm: build the forward adjacency once, then for each
-// edge (u, v) BFS from every other out-neighbor of u looking
+// Edge (u, v) BFS from every other out-neighbor of u looking
 // for v. If any reaches v through the remaining edges, u → v
 // is redundant. O(V·E) for the reachability checks — trivially
 // fast for the scale of runs we visualize.
@@ -2162,17 +2181,17 @@ func renderMermaidBody(runData []byte, tasksData []byte) string {
 // across calls (useful for the no-op detection in
 // enju_export_diagram — re-export should produce byte-identical
 // content when the graph hasn't changed).
-func transitivelyReduce(edges []edge) []edge {
+func TransitivelyReduce(edges []Edge) []Edge {
 	if len(edges) < 2 {
 		return edges
 	}
 	// Forward adjacency.
 	adj := map[string][]string{}
 	for _, e := range edges {
-		adj[e.from] = append(adj[e.from], e.to)
+		adj[e.From] = append(adj[e.From], e.To)
 	}
 	// Reachable(w, target) with a BFS that skips the direct
-	// edge u→v we're testing. We parameterize the skip so the
+	// Edge u→v we're testing. We parameterize the skip so the
 	// caller can ask "is v reachable from w without using u→v
 	// directly?" — critical when u→v is a redundancy candidate
 	// that would also count itself as a "longer path."
@@ -2201,14 +2220,14 @@ func transitivelyReduce(edges []edge) []edge {
 		}
 		return false
 	}
-	kept := make([]edge, 0, len(edges))
+	kept := make([]Edge, 0, len(edges))
 	for _, e := range edges {
 		redundant := false
-		for _, w := range adj[e.from] {
-			if w == e.to {
+		for _, w := range adj[e.From] {
+			if w == e.To {
 				continue
 			}
-			if reachableSkipping(w, e.to, e.from, e.to) {
+			if reachableSkipping(w, e.To, e.From, e.To) {
 				redundant = true
 				break
 			}
@@ -2220,18 +2239,18 @@ func transitivelyReduce(edges []edge) []edge {
 	return kept
 }
 
-// formatRunStatusMermaid is the tool-reply wrapper: renders the
-// raw body (see renderMermaidBody) and wraps it in a ```mermaid
+// RunStatusMermaid is the tool-reply wrapper: renders the
+// raw body (see RenderMermaidBody) and wraps it in a ```mermaid
 // code fence + a %% comment header naming the run, so the LLM
 // can paste the whole block into its reply and have it render
 // in any Markdown viewer. For **file** writes (enju_export_diagram)
-// use renderMermaidBody directly — the file should be pure
+// use RenderMermaidBody directly — the file should be pure
 // Mermaid source, no fence.
 //
-func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
+func RunStatusMermaid(runData []byte, tasksData []byte) string {
 	// Error paths: mirror the old behavior so existing callers
 	// still see a friendly "✗ Run not found" line instead of an
-	// empty fenced block. renderMermaidBody returns "" on those
+	// empty fenced block. RenderMermaidBody returns "" on those
 	// inputs, so we detect them here by re-peeking at the run.
 	var run map[string]interface{}
 	if err := json.Unmarshal(runData, &run); err != nil {
@@ -2240,13 +2259,13 @@ func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
 	if errMsg, ok := run["error"].(string); ok && errMsg != "" {
 		return fmt.Sprintf("✗ Run not found: %s", errMsg)
 	}
-	body := renderMermaidBody(runData, tasksData)
+	body := RenderMermaidBody(runData, tasksData)
 	if body == "" {
 		return string(tasksData)
 	}
 
 	runName, _ := run["name"].(string)
-	projectID := jsonID(run["project_id"])
+	projectID := JsonID(run["project_id"])
 	seq, _ := run["seq"].(float64)
 
 	var b strings.Builder
@@ -2257,12 +2276,12 @@ func formatRunStatusMermaid(runData []byte, tasksData []byte) string {
 	return b.String()
 }
 
-// mermaidNodeID sanitizes a full task id like "1:2:alpha:expand"
+// MermaidNodeID sanitizes a full task id like "1:2:alpha:expand"
 // into a valid Mermaid node identifier. Mermaid requires ids to
 // start with a letter and contain only [A-Za-z0-9_], so we
 // prefix with "t_" and replace any non-alphanumeric run with a
 // single underscore.
-func mermaidNodeID(taskID string) string {
+func MermaidNodeID(taskID string) string {
 	var b strings.Builder
 	b.WriteString("t_")
 	prevUnderscore := false
@@ -2281,22 +2300,22 @@ func mermaidNodeID(taskID string) string {
 	return b.String()
 }
 
-// mermaidEscape escapes the handful of characters that would
+// MermaidEscape escapes the handful of characters that would
 // break a Mermaid node label quoted with ". `"` becomes `#quot;`
 // (Mermaid's own HTML-entity escape) and literal `]` is swapped
 // for `)` since it's the bracket we use to delimit the label.
 // No-op for most task names in practice.
-func mermaidEscape(s string) string {
+func MermaidEscape(s string) string {
 	s = strings.ReplaceAll(s, `"`, `#quot;`)
 	s = strings.ReplaceAll(s, `]`, `)`)
 	return s
 }
 
-// mermaidStateClass maps a task state to the Mermaid class
+// MermaidStateClass maps a task state to the Mermaid class
 // name declared at the bottom of the flowchart. Non-terminal
 // "claimed" / "running" / "collecting" all share the `active`
 // class — they're all "in flight" to the reader.
-func mermaidStateClass(state string) string {
+func MermaidStateClass(state string) string {
 	switch state {
 	case "accepted", "completed":
 		return "accepted"
@@ -2317,7 +2336,7 @@ func mermaidStateClass(state string) string {
 	}
 }
 
-func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string {
+func TaskDetail(taskData []byte, inputsData []byte, viewer string) string {
 	var task map[string]interface{}
 	if err := json.Unmarshal(taskData, &task); err != nil {
 		return string(taskData)
@@ -2330,7 +2349,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	var b strings.Builder
 
 	id, _ := task["id"].(string)
-	runID := jsonID(task["run_id"])
+	runID := JsonID(task["run_id"])
 	state, _ := task["state"].(string)
 	prompt, _ := task["prompt"].(string)
 	userPrompt, _ := task["user_prompt"].(string)
@@ -2342,11 +2361,11 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	action, _ := task["action"].(string)
 
 	seq, _ := task["seq"].(float64)
-	icon := stateIcon(state)
+	icon := StateIcon(state)
 	b.WriteString(fmt.Sprintf("Task #%d: %s %s\n", int(seq), id, icon))
 	b.WriteString(fmt.Sprintf("  Run:  #%s\n", runID))
-	b.WriteString(fmt.Sprintf("  Action:   %s\n", friendlyActionLabel(action)))
-	b.WriteString(fmt.Sprintf("  State:    %s\n", stateLabel(state)))
+	b.WriteString(fmt.Sprintf("  Action:   %s\n", FriendlyActionLabel(action)))
+	b.WriteString(fmt.Sprintf("  State:    %s\n", StateLabel(state)))
 	if iterationLabel != "" {
 		b.WriteString(fmt.Sprintf("  Iteration: %s\n", iterationLabel))
 	} else if instanceKey != "" {
@@ -2394,7 +2413,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 			b.WriteString(fmt.Sprintf("  Path:     %s/result.md\n", p))
 		}
 		if c, _ := task["_review_target_commit"].(string); c != "" {
-			b.WriteString(fmt.Sprintf("  Commit:   %s\n", shortSHA(c)))
+			b.WriteString(fmt.Sprintf("  Commit:   %s\n", ShortSHA(c)))
 		}
 		if preview, _ := task["_review_target_preview"].(string); preview != "" {
 			b.WriteString(fmt.Sprintf("  Preview:  %s\n", preview))
@@ -2419,7 +2438,7 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	// the task has resolved. Declared once at run creation,
 	// vote_choice set at submit time, cleared on invalidation.
 	if voteOptsRaw, _ := task["vote_options"].(string); voteOptsRaw != "" {
-		if opts := parseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
+		if opts := ParseVoteOptionsForDisplay(voteOptsRaw); len(opts) > 0 {
 			winningID, _ := task["vote_choice"].(string)
 			b.WriteString("  Options:\n")
 			for _, o := range opts {
@@ -2470,39 +2489,39 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 		}
 		threshold, _ := task["vote_threshold"].(string)
 		voteSubs, _ := task["vote_submissions"].([]interface{})
-		activeClaims := stringSliceFromAny(task["active_claimants"])
+		activeClaims := StringSliceFromAny(task["active_claimants"])
 		state, _ := task["state"].(string)
 		taskAction, _ := task["action"].(string)
 		visibility, _ := task["visibility"].(string)
 		anonymize, _ := task["anonymize"].(bool)
 		deadline, _ := task["vote_deadline"].(string)
 		deadlineAt, _ := task["vote_deadline_at"].(string)
-		b.WriteString(formatVotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaims, visibility, viewer, anonymize, deadline, deadlineAt))
+		b.WriteString(VotingBlock(taskAction, citizens, minQuorum, threshold, state, voteSubs, activeClaims, visibility, viewer, anonymize, deadline, deadlineAt))
 	}
 
 	// Show environment requirements if present
 	if reqRaw, ok := task["requirements"].(string); ok {
-		b.WriteString(formatRequirements(reqRaw))
+		b.WriteString(Requirements(reqRaw))
 	}
 
 	// Show named outputs schema if present
 	if outputsRaw, ok := task["outputs"].(string); ok {
-		b.WriteString(formatOutputsSchema(outputsRaw))
+		b.WriteString(OutputsSchema(outputsRaw))
 	}
 
 	// Show access restrictions (assign_to, require_role) if any.
-	assignTo := stringSliceFromAny(task["assign_to"])
+	assignTo := StringSliceFromAny(task["assign_to"])
 	requireRole, _ := task["require_role"].(string)
-	if s := formatAssignmentSchema(assignTo, requireRole); s != "" {
+	if s := AssignmentSchema(assignTo, requireRole); s != "" {
 		b.WriteString(s)
 	}
 
 	// Show artifact reads/writes schema if present.
 	// writes_artifacts is polymorphic on the wire post-Phase-A
 	// (object form {path,track}) — extractor handles both.
-	reads := stringSliceFromAny(task["reads_artifacts"])
-	writes := writeArtifactPathsFromAny(task["writes_artifacts"])
-	if s := formatArtifactsSchema(reads, writes); s != "" {
+	reads := StringSliceFromAny(task["reads_artifacts"])
+	writes := WriteArtifactPathsFromAny(task["writes_artifacts"])
+	if s := ArtifactsSchema(reads, writes); s != "" {
 		b.WriteString(s)
 	}
 
@@ -2546,10 +2565,10 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 			// separate get_artifact round trip. Missing declared reads
 			// get a warning line in the same block.
 			artMap, _ := inputs["artifacts"].(map[string]interface{})
-			missingArts := stringSliceFromAny(inputs["missing_artifacts"])
+			missingArts := StringSliceFromAny(inputs["missing_artifacts"])
 			if len(artMap) > 0 || len(missingArts) > 0 {
 				b.WriteString("\n")
-				b.WriteString(formatResolvedArtifactsBlock(artMap, missingArts))
+				b.WriteString(ResolvedArtifactsBlock(artMap, missingArts))
 			}
 		}
 	}
@@ -2580,12 +2599,12 @@ func formatTaskDetail(taskData []byte, inputsData []byte, viewer string) string 
 	return b.String()
 }
 
-// formatListTemplates renders the enju_list_templates response
+// ListTemplates renders the enju_list_templates response
 // as a scannable menu. Each entry includes the template's path,
 // name, one-line description snippet, and a compact param
 // summary ("disease, tissue=whole blood") so the LLM can pick
 // a recipe without drilling into each one.
-func formatListTemplates(data []byte) string {
+func ListTemplates(data []byte) string {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return string(data)
@@ -2650,12 +2669,12 @@ func formatListTemplates(data []byte) string {
 	return b.String()
 }
 
-// formatDescribeTemplate renders the full metadata for one
+// DescribeTemplate renders the full metadata for one
 // template as a drill-down view. This is what the LLM reads
 // right before gathering param values from the user: it has
 // the full description prose, plus every param's type,
 // default, and human-readable description.
-func formatDescribeTemplate(data []byte) string {
+func DescribeTemplate(data []byte) string {
 	var tmpl map[string]interface{}
 	if err := json.Unmarshal(data, &tmpl); err != nil {
 		return string(data)
@@ -2716,7 +2735,7 @@ func formatDescribeTemplate(data []byte) string {
 	return b.String()
 }
 
-func formatCreateRun(data []byte) string {
+func CreateRun(data []byte) string {
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return string(data)
@@ -2727,7 +2746,7 @@ func formatCreateRun(data []byte) string {
 	}
 
 	name, _ := result["name"].(string)
-	projectID := jsonID(result["project_id"])
+	projectID := JsonID(result["project_id"])
 	seq, _ := result["seq"].(float64)
 	taskCount, _ := result["task_count"].(float64)
 	sourcePath, _ := result["source_path"].(string)
@@ -2744,7 +2763,7 @@ func formatCreateRun(data []byte) string {
 	if sourcePath != "" {
 		line := fmt.Sprintf("  Source: %s", sourcePath)
 		if sourceSHA != "" {
-			line += fmt.Sprintf(" @%s", shortSHA(sourceSHA))
+			line += fmt.Sprintf(" @%s", ShortSHA(sourceSHA))
 		}
 		b.WriteString(line + "\n")
 	}
@@ -2769,9 +2788,9 @@ func formatCreateRun(data []byte) string {
 	return b.String()
 }
 
-// shortSHA returns the first 7 chars of a git commit SHA, the
+// ShortSHA returns the first 7 chars of a git commit SHA, the
 // standard abbreviation. Leaves short inputs alone.
-func shortSHA(sha string) string {
+func ShortSHA(sha string) string {
 	if len(sha) <= 7 {
 		return sha
 	}
@@ -2780,11 +2799,11 @@ func shortSHA(sha string) string {
 
 // --- Helpers ---
 
-// formatProfile renders a citizen's profile with their
+// Profile renders a citizen's profile with their
 // contribution record. Phase G: no scoring formula, just
 // factual counts from the contribution-events log.
 // contribData may be nil (best-effort fetch).
-func formatProfile(data []byte, contribData []byte) string {
+func Profile(data []byte, contribData []byte) string {
 	var c map[string]interface{}
 	if err := json.Unmarshal(data, &c); err != nil {
 		return string(data)
@@ -2818,15 +2837,15 @@ func formatProfile(data []byte, contribData []byte) string {
 	if contribData != nil {
 		var contrib map[string]interface{}
 		if json.Unmarshal(contribData, &contrib) == nil {
-			completed := int(jsonFloat(contrib["tasks_completed"]))
-			rejected := int(jsonFloat(contrib["tasks_rejected"]))
-			released := int(jsonFloat(contrib["tasks_released"]))
-			reviews := int(jsonFloat(contrib["reviews_given"]))
-			approves := int(jsonFloat(contrib["review_approves"]))
-			rejects := int(jsonFloat(contrib["review_rejects"]))
-			votes := int(jsonFloat(contrib["votes_cast"]))
-			tokens := int64(jsonFloat(contrib["tokens_total"]))
-			projects := int(jsonFloat(contrib["project_count"]))
+			completed := int(JsonFloat(contrib["tasks_completed"]))
+			rejected := int(JsonFloat(contrib["tasks_rejected"]))
+			released := int(JsonFloat(contrib["tasks_released"]))
+			reviews := int(JsonFloat(contrib["reviews_given"]))
+			approves := int(JsonFloat(contrib["review_approves"]))
+			rejects := int(JsonFloat(contrib["review_rejects"]))
+			votes := int(JsonFloat(contrib["votes_cast"]))
+			tokens := int64(JsonFloat(contrib["tokens_total"]))
+			projects := int(JsonFloat(contrib["project_count"]))
 
 			b.WriteString("\n── Contributions ───────────────────────────\n")
 			b.WriteString(fmt.Sprintf("Tasks:     %d completed", completed))
@@ -2853,8 +2872,8 @@ func formatProfile(data []byte, contribData []byte) string {
 			// Downstream impact — show per-project breakdown
 			// when multiple projects are involved.
 			if impact, ok := contrib["downstream_impact"].(map[string]interface{}); ok {
-				impactTasks := int(jsonFloat(impact["tasks"]))
-				impactProjects := int(jsonFloat(impact["projects"]))
+				impactTasks := int(JsonFloat(impact["tasks"]))
+				impactProjects := int(JsonFloat(impact["projects"]))
 				if impactTasks > 0 {
 					if impactProjects > 1 {
 						b.WriteString(fmt.Sprintf("\nImpact:\n  Your outputs were used by %d downstream task(s)\n  across %d projects.\n", impactTasks, impactProjects))
@@ -2871,14 +2890,14 @@ func formatProfile(data []byte, contribData []byte) string {
 	return b.String()
 }
 
-func jsonFloat(v interface{}) float64 {
+func JsonFloat(v interface{}) float64 {
 	if f, ok := v.(float64); ok {
 		return f
 	}
 	return 0
 }
 
-func formatDashboard(data []byte) string {
+func Dashboard(data []byte) string {
 	var dash map[string]interface{}
 	if err := json.Unmarshal(data, &dash); err != nil {
 		return string(data)
@@ -2935,7 +2954,7 @@ func formatDashboard(data []byte) string {
 			tm, _ := t.(map[string]interface{})
 			tid, _ := tm["id"].(string)
 			seq, _ := tm["seq"].(float64)
-			runID := jsonID(tm["run_id"])
+			runID := JsonID(tm["run_id"])
 			b.WriteString(fmt.Sprintf("  ⏳ #%d [%s]    run #%s\n", int(seq), tid, runID))
 		}
 	} else {
@@ -2949,7 +2968,7 @@ func formatDashboard(data []byte) string {
 			tm, _ := t.(map[string]interface{})
 			tid, _ := tm["id"].(string)
 			seq, _ := tm["seq"].(float64)
-			runID := jsonID(tm["run_id"])
+			runID := JsonID(tm["run_id"])
 			b.WriteString(fmt.Sprintf("  ✓ #%d [%s]    run #%s\n", int(seq), tid, runID))
 		}
 	}
@@ -2957,8 +2976,8 @@ func formatDashboard(data []byte) string {
 	return b.String()
 }
 
-// jsonID extracts an ID that could be a string or a number from JSON.
-func jsonID(v interface{}) string {
+// JsonID extracts an ID that could be a string or a number from JSON.
+func JsonID(v interface{}) string {
 	switch id := v.(type) {
 	case float64:
 		return fmt.Sprintf("%d", int64(id))
@@ -2969,7 +2988,7 @@ func jsonID(v interface{}) string {
 	}
 }
 
-// formatVotingBlock renders the multi-citizen voting / review
+// VotingBlock renders the multi-citizen voting / review
 // status for citizens > 1 tasks: citizens count, quorum,
 // effective rule, live tally, per-voter ballots, and any
 // still-claimed-but-not-submitted citizens. Action-aware so
@@ -2981,7 +3000,7 @@ func jsonID(v interface{}) string {
 // current viewer; once the task resolves everyone sees
 // everything regardless. viewerUsername identifies the caller
 // so the blind filter can still show their own submission.
-func formatVotingBlock(action string, citizens, minQuorum int, threshold, state string, voteSubs []interface{}, activeClaimants []string, visibility, viewerUsername string, anonymize bool, deadline, deadlineAt string) string {
+func VotingBlock(action string, citizens, minQuorum int, threshold, state string, voteSubs []interface{}, activeClaimants []string, visibility, viewerUsername string, anonymize bool, deadline, deadlineAt string) string {
 	// Blind-collection filter: during COLLECTING, hide sibling
 	// ballots from the current viewer. They can still see
 	// their own submission (if any) so the claim response
@@ -3107,7 +3126,7 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 		for k := range counts {
 			keys = append(keys, k)
 		}
-		sortStrings(keys)
+		SortStrings(keys)
 		tally := make([]string, 0, len(keys))
 		for _, k := range keys {
 			tally = append(tally, fmt.Sprintf("%s=%d", k, counts[k]))
@@ -3160,15 +3179,15 @@ func formatVotingBlock(action string, citizens, minQuorum int, threshold, state 
 	return b.String()
 }
 
-// formatVoteOptionsBlock renders a vote task's declared options as
+// VoteOptionsBlock renders a vote task's declared options as
 // a `── Options ──` block for inclusion in the claim response,
-// mirroring formatReviewingBlock. Highlights the winning option
+// mirroring ReviewingBlock. Highlights the winning option
 // if one has already been recorded (vote_choice is populated),
 // labels each option, and surfaces `activates:` targets so the
 // voter can see the structural consequences of each choice.
 // When vote_threshold / vote_deadline / min_quorum are set, they
 // ride along as a trailing summary line.
-func formatVoteOptionsBlock(opts []voteOptionView, task map[string]interface{}) string {
+func VoteOptionsBlock(opts []voteOptionView, task map[string]interface{}) string {
 	if len(opts) == 0 {
 		return ""
 	}
@@ -3221,12 +3240,12 @@ type voteOptionView struct {
 	Activates []string
 }
 
-// parseVoteOptionsForDisplay decodes the JSON-encoded vote_options
+// ParseVoteOptionsForDisplay decodes the JSON-encoded vote_options
 // column into the display projection. Returns nil on any parse
 // failure rather than propagating an error — the formatter
 // should degrade gracefully if the column is malformed (a
 // storage-side consistency bug is surfaced elsewhere).
-func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
+func ParseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
 	if optionsJSON == "" {
 		return nil
 	}
@@ -3245,16 +3264,16 @@ func parseVoteOptionsForDisplay(optionsJSON string) []voteOptionView {
 	return out
 }
 
-func stateIcon(state string) string {
-	return stateIconFor(state, "")
+func StateIcon(state string) string {
+	return StateIconFor(state, "")
 }
 
-// stateIconFor is stateIcon with skip-reason context so the
+// StateIconFor is StateIcon with skip-reason context so the
 // tree renderer can distinguish "skipped because upstream
 // failed" (blocked by a real failure — ⊘) from vote-cascade
 // skips (intentional gating — ⚫). Callers that don't have
-// the reason handy use the plain stateIcon wrapper.
-func stateIconFor(state, skipReason string) string {
+// the reason handy use the plain StateIcon wrapper.
+func StateIconFor(state, skipReason string) string {
 	switch state {
 	// Emoji icons — colorful, double-width but scannable at a glance.
 	// To switch to monochrome single-width, swap the return values:
@@ -3295,7 +3314,7 @@ func stateIconFor(state, skipReason string) string {
 	}
 }
 
-func friendlyActionLabel(action string) string {
+func FriendlyActionLabel(action string) string {
 	switch action {
 	case "answer":
 		return "Answer a question"
@@ -3313,7 +3332,7 @@ func friendlyActionLabel(action string) string {
 }
 
 
-func stateLabel(state string) string {
+func StateLabel(state string) string {
 	switch state {
 	case "accepted":
 		return "completed"
@@ -3338,7 +3357,7 @@ func stateLabel(state string) string {
 	}
 }
 
-func progressBar(done, total, width int) string {
+func ProgressBar(done, total, width int) string {
 	if total == 0 {
 		return ""
 	}
@@ -3348,7 +3367,7 @@ func progressBar(done, total, width int) string {
 	return fmt.Sprintf("%s %d%%", bar, pct)
 }
 
-func truncate(s string, maxLen int) string {
+func Truncate(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.TrimSpace(s)
 	if len(s) > maxLen {
