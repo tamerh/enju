@@ -43,11 +43,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/api"
-	"github.com/enju-ai/enju/internal/compute"
-	"github.com/enju-ai/enju/internal/mcpgit"
-	"github.com/enju-ai/enju/internal/store"
-	enjuYaml "github.com/enju-ai/enju/internal/yaml"
+	"github.com/enju-ai/enju/internal/coordinator/api"
+	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/coordinator/store"
+	enjuYaml "github.com/enju-ai/enju/internal/core/yaml"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -1171,10 +1171,15 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		if respsRaw, ok := dep["responses"].([]interface{}); ok {
 			for _, r := range respsRaw {
 				rm, _ := r.(map[string]interface{})
+				pathUser := asString(rm["real_username"])
+				if pathUser == "" {
+					pathUser = asString(rm["username"])
+				}
 				ref.Responses = append(ref.Responses, mcpgit.CitizenResponseRef{
-					Username: asString(rm["username"]),
-					Option:   asString(rm["option"]),
-					Content:  asString(rm["content"]),
+					Username:     asString(rm["username"]),
+					PathUsername: pathUser,
+					Option:       asString(rm["option"]),
+					CommitSHA:    asString(rm["commit_sha"]),
 				})
 			}
 		}

@@ -1,0 +1,1061 @@
+package yaml
+
+// Validation. Given a decoded Run (already passed through
+// resolveDefaults), validate() enforces the schema invariants
+// and returns any non-fatal warnings. It composes narrow
+// sub-validators (one per concern) so adding a new check is a
+// localized edit, not a scroll through a 400-line function.
+//
+// A note on mutation: pure defaulting (e.g. Action="answer")
+// lives in resolveDefaults in parse.go; validators here don't
+// fill missing fields. HOWEVER, two validators still mutate:
+//
+//   - validateDependsOnReferences auto-appends reviews-target
+//     to depends_on so review tasks always run after their
+//     target.
+//   - injectReviewGating + injectVoteActivation auto-insert
+//     the review-waits-on-target and activated-waits-on-vote
+//     edges that authors would otherwise have to hand-write on
+//     every downstream task.
+//
+// These are DAG-correctness derivations — the validated Run
+// wouldn't be semantically complete without them — not
+// defaulting. The function names (Inject, Derive) signal the
+// mutation at every call site.
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/enju-ai/enju/internal/core/template"
+)
+
+// validActions is the set of supported action values. Declared
+// at package scope so it's not rebuilt every call.
+var validActions = map[string]bool{
+	"answer":     true,
+	"contribute": true,
+	"compute":    true,
+	"review":     true,
+	"vote":       true,
+}
+
+// validate orchestrates every parse-time check on the decoded
+// Run. Each sub-step is a named function so readers can see
+// the pipeline shape without tracing individual conditions.
+// Returns the collected warnings (non-fatal authoring hints)
+// plus the first fatal error encountered.
+func validate(p *Run) ([]string, error) {
+	if err := validateHeader(p); err != nil {
+		return nil, err
+	}
+	if err := validateRunForEach(p); err != nil {
+		return nil, err
+	}
+	paramWarnings, err := validateParams(p)
+	if err != nil {
+		return nil, err
+	}
+	ids, hasTaskLevelForEach, err := validateTasks(p)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateNoDuplicateReviewTargets(p); err != nil {
+		return nil, err
+	}
+	if err := validateForEachScopes(p, hasTaskLevelForEach); err != nil {
+		return nil, err
+	}
+	if err := validateDependsOnReferences(p, ids); err != nil {
+		return nil, err
+	}
+	reviewWarnings := injectReviewGating(p)
+	injectVoteActivation(p)
+	if err := validateTemplateReferences(p, ids); err != nil {
+		return nil, err
+	}
+	if err := validateDynamicForEach(p, ids); err != nil {
+		return nil, err
+	}
+	computeWarnings := validateComputeDependsDeclared(p)
+	contentRefWarnings := validateComputeContentRefs(p)
+	warnings := append(paramWarnings, reviewWarnings...)
+	warnings = append(warnings, computeWarnings...)
+	warnings = append(warnings, contentRefWarnings...)
+	return warnings, nil
+}
+
+// validateComputeDependsDeclared flags compute tasks that
+// declare no visible dependencies — no `{{task.*}}` refs in
+// prompt / user_prompt / script, no `reads_artifacts`, no
+// `depends_on`. Since compute scripts run opaquely (Enju can't
+// inspect what the script actually reads), a task with zero
+// declared deps whose script secretly reads another task's
+// private `enju/runs/...` output produces a dep-less DAG.
+// The scheduler then marks producer and consumer ready in
+// parallel, and whichever claimant hits the consumer first
+// fails mid-script with a file-not-found that looks unrelated
+// to authoring.
+//
+// Warnings are non-fatal (false positives exist: a truly
+// independent compute task reading only config is valid).
+// The message is actionable — tell the author what the three
+// declaration forms are so they can pick one or dismiss the
+// warning knowingly.
+//
+// Not applied to non-compute actions because their dependency
+// surface is parseable (prompts for answer/review/vote,
+// template refs for any action). Only compute is opaque
+// enough to warrant the structural fallback check.
+func validateComputeDependsDeclared(p *Run) []string {
+	var warnings []string
+	for _, t := range p.Tasks {
+		if t.Action != "compute" {
+			continue
+		}
+		// Task-field refs (`{{upstream.content}}`) imply a
+		// DAG edge — suppress as before.
+		if hasTaskFieldReference(t.Prompt) ||
+			hasTaskFieldReference(t.UserPrompt) ||
+			hasTaskFieldReference(t.Script) ||
+			len(t.ReadsArtifacts) > 0 ||
+			len(t.DependsOn) > 0 {
+			continue
+		}
+		// Bare `{{param}}` refs (no dot) indicate the task
+		// is parameterized by run-level context — `{{source_repo}}`,
+		// `{{file}}` for_each variable, etc. Scripts that
+		// reach run context explicitly aren't the class of
+		// compute task the lint was designed to catch
+		// (stealth-readers of peer task outputs). Suppress to
+		// clear the false-positive tester hit on templates
+		// that ingest external data via ENJU_PARAM_* /
+		// context.json.
+		if hasParamReference(t.Prompt) ||
+			hasParamReference(t.UserPrompt) ||
+			hasParamReference(t.Script) {
+			continue
+		}
+		// Leaf-and-self-contained suppression: if no other
+		// task in the run consumes this one's output (no
+		// depends_on, no {{X.*}} ref, no review target, no
+		// reads_artifacts path match, no dynamic for_each
+		// source), the "stealth-reader" risk has no cascade.
+		// Even if the script does happen to read external
+		// state, only this task fails — there's nothing
+		// downstream to break. Prototype / test / one-shot
+		// compute tasks are exactly this shape and shouldn't
+		// nag the author.
+		if !hasDeclaredConsumer(p, t.ID, t.WritesArtifacts.Paths()) {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"compute task %q has no declared dependencies "+
+				"(no {{task.*}} refs, no {{param}} refs, no reads_artifacts, no depends_on). "+
+				"If its script reads output from another task, declare that "+
+				"dependency explicitly — otherwise the scheduler may run this "+
+				"task in parallel with its unknown upstream and a citizen "+
+				"will hit a file-not-found error mid-script. "+
+				"See docs/task-actions.md § compute — Dependency declaration.",
+			t.ID))
+	}
+	return warnings
+}
+
+// hasDeclaredConsumer reports whether any task in the run
+// consumes taskID's output via any declared mechanism:
+//
+//   - `depends_on: [taskID]` — explicit edge
+//   - `{{taskID.anything}}` in prompt or user_prompt — resolver
+//     injects the upstream result
+//   - `reviews: taskID` — review task gates on this one
+//   - `reads_artifacts` path that matches one of taskID's
+//     writes_artifacts paths — implicit artifact edge
+//   - `for_each: var: "{{taskID.field}}"` — dynamic fan-out
+//     source
+//
+// Pure inspection of the parsed Run; no side effects. Used by
+// the compute-dep lint to decide whether a "no declared
+// upstream" warning would be speculative (no cascade possible)
+// or load-bearing (something downstream depends on this).
+func hasDeclaredConsumer(p *Run, taskID string, writesArtifactPaths []string) bool {
+	writeSet := make(map[string]struct{}, len(writesArtifactPaths))
+	for _, w := range writesArtifactPaths {
+		if w != "" {
+			writeSet[w] = struct{}{}
+		}
+	}
+	refPrefix := "{{" + taskID + "."
+	for _, t := range p.Tasks {
+		if t.ID == taskID {
+			continue
+		}
+		for _, d := range t.DependsOn {
+			if d == taskID {
+				return true
+			}
+		}
+		if t.Reviews == taskID {
+			return true
+		}
+		if strings.Contains(t.Prompt, refPrefix) ||
+			strings.Contains(t.UserPrompt, refPrefix) {
+			return true
+		}
+		for _, r := range t.ReadsArtifacts {
+			if _, ok := writeSet[r]; ok {
+				return true
+			}
+		}
+		for _, src := range t.ForEach {
+			if src.Ref != "" && strings.Contains(src.Ref, refPrefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// contentRefPattern matches `{{taskID.content}}` — mirrors the
+// resolver's ref pattern (see internal/template/resolve.go)
+// except pinned specifically to the `.content` field. No
+// whitespace tolerance: the resolver itself doesn't accept
+// `{{ x.content }}`, so the lint's coverage matches reality.
+var contentRefPattern = regexp.MustCompile(`\{\{(\w+)\.content\}\}`)
+
+// validateComputeContentRefs flags `{{X.content}}` references
+// where X is a compute task that declared `writes_artifacts`.
+// The resolver will inline X's stdout (what the script printed,
+// captured in result.md) — NOT the artifact file's bytes. A
+// compute script that emits a status line like
+// "aggregated 12345 rows" and writes the real output to a TSV
+// will silently surface the status line downstream instead of
+// the data, and the author only discovers it when the
+// downstream task hallucinates or produces garbage summaries.
+//
+// Warning names the producer, the declared artifacts, and the
+// replacement syntax so the fix is a one-line swap:
+//
+//	{{aggregate.content}}          → ✗ stdout echo
+//	{{artifact:out/totals.tsv}}    → ✓ file bytes
+//
+// Suppressed when the prompt also contains `{{artifact:<one of
+// X's declared paths>}}` — the author clearly knows the
+// distinction and is pulling both on purpose (status + data).
+// Also suppressed for non-compute upstreams (stdout IS the
+// canonical output there) and for compute producers that
+// didn't declare any writes_artifacts (stdout really is all
+// they have).
+func validateComputeContentRefs(p *Run) []string {
+	// Build lookup: task ID → declared writes_artifacts paths
+	// (only compute tasks with at least one entry).
+	computeWrites := map[string][]string{}
+	for _, t := range p.Tasks {
+		if t.Action == "compute" && len(t.WritesArtifacts) > 0 {
+			computeWrites[t.ID] = t.WritesArtifacts.Paths()
+		}
+	}
+	if len(computeWrites) == 0 {
+		return nil
+	}
+
+	var warnings []string
+	for _, t := range p.Tasks {
+		// Scan every prompt-shaped string the resolver touches.
+		// Script strings aren't resolved, so they stay out of
+		// the scan.
+		for _, text := range []string{t.Prompt, t.UserPrompt} {
+			if text == "" {
+				continue
+			}
+			matches := contentRefPattern.FindAllStringSubmatch(text, -1)
+			for _, m := range matches {
+				producerID := m[1]
+				paths, ok := computeWrites[producerID]
+				if !ok {
+					continue
+				}
+				// Suppress if the author already references ANY
+				// of the producer's artifacts via
+				// {{artifact:path}} in the same prompt — they
+				// know the distinction.
+				if hasArtifactRefFor(text, paths) {
+					continue
+				}
+				warnings = append(warnings, fmt.Sprintf(
+					"task %q: {{%s.content}} references compute task %q's stdout (result.md), "+
+						"not its declared writes_artifacts (%s). "+
+						"Most compute scripts write data to artifacts and echo a status line to stdout — "+
+						"the downstream will see the status line, not the data. "+
+						"To pull the artifact bytes, use {{artifact:%s}} instead "+
+						"(resolves through the artifact index; no second depends_on needed). "+
+						"See docs/template-reference.md § {{artifact:path}}.",
+					t.ID, producerID, producerID,
+					strings.Join(paths, ", "),
+					paths[0]))
+			}
+		}
+	}
+	return warnings
+}
+
+// hasArtifactRefFor reports whether `text` contains a
+// `{{artifact:<path>}}` reference for any of the given paths.
+// Used to suppress the compute-content lint when the author is
+// visibly pulling both stdout (status line) and the artifact
+// (data) on purpose.
+func hasArtifactRefFor(text string, paths []string) bool {
+	for _, p := range paths {
+		if strings.Contains(text, "{{artifact:"+p+"}}") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasParamReference returns true when the string contains a
+// bare `{{name}}` reference — no dot inside the braces. Those
+// resolve to run-level params or for_each iteration variables
+// at creation / materialization time, never to a peer task's
+// output. Used by the compute-dep-lint to suppress warnings
+// on tasks that visibly reach run context rather than
+// stealth-read peer outputs.
+func hasParamReference(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '{' || s[i+1] != '{' {
+			continue
+		}
+		sawDot := false
+		sawContent := false
+		for j := i + 2; j+1 < len(s); j++ {
+			if s[j] == '}' && s[j+1] == '}' {
+				if sawContent && !sawDot {
+					return true
+				}
+				break
+			}
+			if s[j] == '.' {
+				sawDot = true
+			}
+			sawContent = true
+		}
+	}
+	return false
+}
+
+// hasTaskFieldReference returns true when the string contains
+// a `{{task.field}}` / `{{task.content}}` / `{{task.responses}}`
+// / `{{task.winning_option}}` reference — i.e. anything Enju's
+// prompt resolver would translate into a DAG edge. Param-only
+// refs (`{{paramname}}`) don't count because those are
+// substituted at run creation and don't establish task
+// dependencies.
+//
+// Heuristic: the prompt resolver treats `{{word.anything}}` as
+// a task reference (the dot is the discriminator). Plain
+// `{{word}}` is a param. So we look for `.` inside `{{ ... }}`.
+func hasTaskFieldReference(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '{' || s[i+1] != '{' {
+			continue
+		}
+		// Walk to the matching `}}` or end-of-string. Track
+		// whether we saw a `.` inside — that's the task-ref
+		// marker.
+		sawDot := false
+		for j := i + 2; j+1 < len(s); j++ {
+			if s[j] == '}' && s[j+1] == '}' {
+				if sawDot {
+					return true
+				}
+				break
+			}
+			if s[j] == '.' {
+				sawDot = true
+			}
+		}
+	}
+	return false
+}
+
+// validateHeader checks the minimal "is this a run at all"
+// invariants: a name is present, at least one task is declared.
+func validateHeader(p *Run) error {
+	if p.Name == "" {
+		return fmt.Errorf("run name is required")
+	}
+	if len(p.Tasks) == 0 {
+		return fmt.Errorf("at least one task is required")
+	}
+	return nil
+}
+
+// validateRunForEach enforces the run-level for_each shape.
+// Run-level supports literal lists AND {{paramname}} refs
+// (substituted at ParseWithParams time from a declared
+// top-level list<string> param). Task-refs at run-level are
+// nonsense (no task context when the run's tasks are being
+// built) and rejected with a clear hint about the correct
+// shapes.
+func validateRunForEach(p *Run) error {
+	for name, src := range p.ForEach {
+		switch {
+		case src.Ref != "":
+			if _, ok := parseForEachParamRef(src.Ref); ok {
+				continue // substitution resolves it later
+			}
+			if _, _, ok := parseForEachRef(src.Ref); ok {
+				return fmt.Errorf("run for_each: variable %q: task references like %q are not supported at run-level — use a static list or a {{paramname}} reference from a top-level param", name, src.Ref)
+			}
+			return fmt.Errorf("run for_each: variable %q: %q is not a valid template reference (expected \"{{paramname}}\")", name, src.Ref)
+		case len(src.Values) == 0:
+			return fmt.Errorf("run for_each: variable %q has an empty list — declare at least one value, a {{paramname}} reference, or remove the variable", name)
+		default:
+			if err := validateForEachLiteralMap("run", map[string][]string{name: src.Values}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateParams enforces the top-level params: names are
+// unique, types recognized, required/default mutually
+// exclusive. Returns non-fatal warnings for params missing a
+// description (the LLM needs prose to turn the param into a
+// follow-up question for the user).
+func validateParams(p *Run) ([]string, error) {
+	var warnings []string
+	paramNames := make(map[string]bool, len(p.Params))
+	for i := range p.Params {
+		pp := &p.Params[i]
+		if pp.Name == "" {
+			return nil, fmt.Errorf("params[%d]: name is required", i)
+		}
+		if paramNames[pp.Name] {
+			return nil, fmt.Errorf("params[%d]: duplicate name %q", i, pp.Name)
+		}
+		paramNames[pp.Name] = true
+		if !isValidParamType(pp.Type) {
+			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, or list<string>)", pp.Name, pp.Type)
+		}
+		if pp.Required && pp.Default != nil {
+			return nil, fmt.Errorf("param %q: required and default are mutually exclusive", pp.Name)
+		}
+		if pp.Default != nil {
+			if err := checkParamValueType(pp.Name, pp.Type, pp.Default); err != nil {
+				return nil, err
+			}
+		}
+		if pp.Description == "" {
+			warnings = append(warnings, fmt.Sprintf("param %q has no description — the LLM needs prose to turn this into a question for the user", pp.Name))
+		}
+	}
+	return warnings, nil
+}
+
+// validateTasks walks every task def and enforces per-task
+// invariants: action is valid, required fields for the action
+// are present, vote options / review targets / task-level
+// for_each shape are well-formed, result_type is recognized.
+//
+// Returns the ID set (used downstream by depends_on and
+// template-reference validators) and a flag indicating whether
+// any task declared a task-level for_each (used by the scope
+// validator to enforce run-level/task-level mutual exclusion).
+//
+// By the time this runs, resolveDefaults has already set
+// t.Action = "answer" for tasks that left it blank — so the
+// action check below expects every task to have an action.
+func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err error) {
+	ids = make(map[string]bool)
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+
+		if t.ID == "" {
+			return nil, false, fmt.Errorf("task ID is required")
+		}
+		if ids[t.ID] {
+			return nil, false, fmt.Errorf("duplicate task ID %q", t.ID)
+		}
+		ids[t.ID] = true
+
+		if !validActions[t.Action] {
+			return nil, false, fmt.Errorf("task %q: invalid action %q (must be answer, contribute, compute, review, or vote)", t.ID, t.Action)
+		}
+
+		switch t.Action {
+		case "answer", "contribute", "review":
+			if t.Prompt == "" {
+				return nil, false, fmt.Errorf("task %q: prompt is required for %s action", t.ID, t.Action)
+			}
+		case "compute":
+			if t.Script == "" {
+				return nil, false, fmt.Errorf("task %q: script is required for compute action", t.ID)
+			}
+		}
+
+		if err := validateReviewTarget(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateActionFields(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskEnv(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskMode(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskContainer(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskContainerRuntime(t); err != nil {
+			return nil, false, err
+		}
+		if err := validateTaskExecutor(t); err != nil {
+			return nil, false, err
+		}
+
+		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
+			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
+		}
+
+		if len(t.ForEach) > 0 {
+			hasTaskLevelForEach = true
+			if err := validateForEachMap("task "+t.ID, t.ForEach); err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	return ids, hasTaskLevelForEach, nil
+}
+
+// validateTaskMode enforces the shape of the `mode:` field on a
+// task definition: only "sync" or "async", only on action:
+// compute. Empty means "default" and is always accepted —
+// compute tasks default to sync, non-compute tasks ignore it
+// entirely (the field being set without a declared purpose
+// would be a template-author confusion, so reject that up front).
+func validateTaskMode(t *TaskDef) error {
+	if t.Mode == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: mode: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.Mode {
+	case "sync", "async":
+		return nil
+	default:
+		return fmt.Errorf("task %q: mode %q is invalid (must be \"sync\" or \"async\")", t.ID, t.Mode)
+	}
+}
+
+// validateTaskContainer enforces the shape of the `container:`
+// field: only valid on action: compute, and the image reference
+// must be non-empty when declared (`container: ""` is a typo
+// risk, not an intentional "no container" — leave the field out
+// entirely to run script-on-host).
+//
+// The image reference itself is NOT parsed — docker's own CLI
+// arbitrates registry/tag/digest validity at pull time, and
+// re-implementing that grammar here would drift. We only check
+// for empty and for trivially-bad characters (whitespace,
+// newlines) that almost always indicate a template-author
+// mistake.
+func validateTaskContainer(t *TaskDef) error {
+	if t.Container == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: container: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	if strings.ContainsAny(t.Container, " \t\n\r") {
+		return fmt.Errorf("task %q: container %q contains whitespace — image references should be a single token (e.g. biocontainers/samtools:1.18)", t.ID, t.Container)
+	}
+	return nil
+}
+
+// validateTaskContainerRuntime enforces the reserved-field
+// contract on `container_runtime:`. v1 accepts only "docker"
+// (or empty, which defaults to docker). Future runtimes
+// (apptainer, singularity, podman) are rejected with a
+// concrete "not yet supported" message rather than a generic
+// "unknown field" — template authors who write against the
+// planned roadmap get a clear signal today, and when those
+// runtimes eventually ship, the existing templates just
+// start working.
+//
+// Only valid on action: compute (the concept of a runtime
+// doesn't apply to answer/review/vote tasks).
+func validateTaskContainerRuntime(t *TaskDef) error {
+	if t.ContainerRuntime == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: container_runtime: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.ContainerRuntime {
+	case "docker":
+		return nil
+	default:
+		return fmt.Errorf("task %q: container_runtime %q is not yet supported in v1 (only \"docker\" is available). "+
+			"Apptainer/Singularity is planned alongside the SLURM executor post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
+			t.ID, t.ContainerRuntime)
+	}
+}
+
+// validateTaskExecutor enforces the reserved-field contract
+// on `executor:`. v1 accepts only "local" (or empty, which
+// defaults to local). Remote executors (SLURM, Kubernetes,
+// AWS Batch, GCP Batch) are rejected with a "not yet
+// supported" message pointing at the roadmap.
+//
+// Only valid on action: compute.
+func validateTaskExecutor(t *TaskDef) error {
+	if t.Executor == "" {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: executor: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	switch t.Executor {
+	case "local":
+		return nil
+	default:
+		return fmt.Errorf("task %q: executor %q is not yet supported in v1 (only \"local\" is available). "+
+			"Remote executors (SLURM, Kubernetes, AWS Batch, GCP Batch) are planned post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
+			t.ID, t.Executor)
+	}
+}
+
+// ResolvedMode returns the mode a compute task should run in,
+// applying the default. Non-compute tasks return "" since the
+// concept doesn't apply; callers that branch on mode (the
+// scheduler, the MCP execute handler) should scope the check
+// to compute tasks first.
+func ResolvedMode(t *TaskDef) string {
+	return ResolvedModeFields(t.Action, t.Mode)
+}
+
+// ResolvedModeFields is the field-level variant of ResolvedMode.
+// Useful for sites like the MCP execute handler that have an
+// action + mode string pair from a task record (not a full
+// TaskDef struct) — avoids constructing a synthetic TaskDef
+// purely to call the defaulting logic.
+func ResolvedModeFields(action, mode string) string {
+	if action != "compute" {
+		return ""
+	}
+	if mode == "" {
+		return "sync"
+	}
+	return mode
+}
+
+// validateTaskEnv enforces the compute-only + reserved-prefix
+// rules for a task's env: block. The shape is dead simple on
+// purpose: keys become env var names, values become env var
+// values, and the three compute-context namespaces (system
+// ENJU_*, run params ENJU_PARAM_*, task env) are kept disjoint
+// by rejecting anything starting with ENJU_ here.
+func validateTaskEnv(t *TaskDef) error {
+	if len(t.Env) == 0 {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: env: is only valid on action: compute tasks", t.ID)
+	}
+	for k := range t.Env {
+		if k == "" {
+			return fmt.Errorf("task %q: env: has an empty key", t.ID)
+		}
+		if strings.HasPrefix(k, "ENJU_") {
+			return fmt.Errorf("task %q: env key %q: the ENJU_ prefix is reserved for system and run-param env vars — pick a different name", t.ID, k)
+		}
+		if !isValidEnvName(k) {
+			return fmt.Errorf("task %q: env key %q: must match [A-Za-z_][A-Za-z0-9_]* (standard env var name rules)", t.ID, k)
+		}
+	}
+	return nil
+}
+
+// isValidEnvName matches the POSIX-ish rule for environment
+// variable names: starts with a letter or underscore, followed
+// by letters, digits, or underscores. Anything else is rejected
+// so authors don't ship env: blocks that the shell can't
+// express.
+func isValidEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		isAlpha := (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if !isAlpha && r != '_' {
+				return false
+			}
+			continue
+		}
+		if !isAlpha && !isDigit && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// validateNoDuplicateReviewTargets refuses YAML where two
+// distinct review tasks both target the same task. Living-
+// workflow phase 6b.2 / multi-reviewer-per-task gate.
+//
+// The topic-branch + auto-merge model can't coherently merge
+// two review topics that fork from the same upstream: the
+// first approve advances main to review_a's tip, then the
+// second approve attempts to FF main → review_b's tip — which
+// isn't a descendant (review_b shares only the upstream's
+// commit with review_a, not review_a's verdict commit). The
+// FF refuses, surfacing the failure mode the reviewer can't
+// recover from.
+//
+// v1 stance is "refuse at parse time with a clear path
+// forward." Two recovery shapes for the YAML author:
+//
+//   - Use citizens: N on a single review task for quorum-
+//     style multi-citizen review (handled by the run-level
+//     multi-citizen gate).
+//   - Split the reviewers into sequential review stages
+//     (review_a depends_on draft, review_b depends_on
+//     review_a). Each stage merges in turn.
+//
+// v2 will lift the restriction once rebase-on-non-FF and
+// parallel-merge handling land; until then, parse-time
+// rejection beats silent breakage on the second approve.
+func validateNoDuplicateReviewTargets(p *Run) error {
+	// targetID → first reviewer task that claimed it. Compared
+	// pre-instance-expansion (against the bare `reviews:` field
+	// from the YAML) since for_each-scoped reviews of the same
+	// per-instance target are fine — each instance is a
+	// different upstream task.
+	firstReviewer := make(map[string]string)
+	for _, t := range p.Tasks {
+		if t.Action != "review" || t.Reviews == "" {
+			continue
+		}
+		if prior, dup := firstReviewer[t.Reviews]; dup {
+			return fmt.Errorf(
+				"task %q reviews %q but task %q already does; "+
+					"multi-reviewer-per-task is not supported in v1 "+
+					"(would produce non-FF merge on the second approve). "+
+					"Use citizens: N on a single review task for quorum-style "+
+					"multi-citizen review, or split the reviewers into "+
+					"sequential review stages (e.g. add depends_on so they "+
+					"approve in turn).",
+				t.ID, t.Reviews, prior)
+		}
+		firstReviewer[t.Reviews] = t.ID
+	}
+	return nil
+}
+
+// validateReviewTarget enforces the "reviews:" field contract:
+// required on action:review tasks, must differ from the
+// reviewing task itself, forbidden on non-review tasks.
+func validateReviewTarget(t *TaskDef) error {
+	if t.Action == "review" {
+		if t.Reviews == "" {
+			return fmt.Errorf("task %q: reviews: <target_task_id> is required on review-action tasks", t.ID)
+		}
+		if t.Reviews == t.ID {
+			return fmt.Errorf("task %q: reviews cannot reference the review task itself", t.ID)
+		}
+	} else if t.Reviews != "" {
+		return fmt.Errorf("task %q: reviews is only valid on action: review tasks", t.ID)
+	}
+	return nil
+}
+
+// validateActionFields enforces the action-specific field
+// matrix: vote options / threshold / deadline / quorum,
+// review threshold / deadline / quorum / visibility /
+// anonymize, and rejection of those fields on non-vote /
+// non-review tasks.
+func validateActionFields(t *TaskDef) error {
+	if t.Action == "vote" {
+		if len(t.Options) < 2 {
+			return fmt.Errorf("task %q: action: vote requires at least 2 options", t.ID)
+		}
+		seenOptIDs := make(map[string]bool, len(t.Options))
+		for i, opt := range t.Options {
+			if opt.ID == "" {
+				return fmt.Errorf("task %q: option #%d is missing an id", t.ID, i+1)
+			}
+			if seenOptIDs[opt.ID] {
+				return fmt.Errorf("task %q: duplicate option id %q", t.ID, opt.ID)
+			}
+			seenOptIDs[opt.ID] = true
+		}
+		if t.Threshold != "" {
+			if err := validateThreshold(t.Threshold); err != nil {
+				return fmt.Errorf("task %q: %w", t.ID, err)
+			}
+		}
+		if t.Deadline != "" {
+			if _, err := time.ParseDuration(t.Deadline); err != nil {
+				return fmt.Errorf("task %q: invalid deadline %q (expected a Go duration like 2h, 30m, 1d is NOT supported — use 24h): %w", t.ID, t.Deadline, err)
+			}
+		}
+		citizens := t.Citizens
+		if citizens == 0 {
+			citizens = 1
+		}
+		if t.MinQuorum > 0 && t.MinQuorum > citizens {
+			return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, citizens)
+		}
+		if t.Visibility != "" && t.Visibility != "open" && t.Visibility != "blind" {
+			return fmt.Errorf("task %q: invalid visibility %q (must be 'open' or 'blind')", t.ID, t.Visibility)
+		}
+		return nil
+	}
+
+	// Non-vote action.
+	if len(t.Options) > 0 {
+		return fmt.Errorf("task %q: options is only valid on action: vote tasks", t.ID)
+	}
+	if t.Threshold != "" && t.Action != "review" {
+		return fmt.Errorf("task %q: threshold is only valid on action: vote or action: review tasks", t.ID)
+	}
+	if t.Deadline != "" && t.Action != "review" {
+		return fmt.Errorf("task %q: deadline is only valid on action: vote or action: review tasks", t.ID)
+	}
+	if t.MinQuorum > 0 && t.Action != "review" {
+		return fmt.Errorf("task %q: min_quorum is only valid on action: vote or action: review tasks", t.ID)
+	}
+
+	if t.Action == "review" {
+		rc := t.Citizens
+		if rc == 0 {
+			rc = 1
+		}
+		if t.MinQuorum > 0 && t.MinQuorum > rc {
+			return fmt.Errorf("task %q: min_quorum %d exceeds citizens %d", t.ID, t.MinQuorum, rc)
+		}
+		if t.Deadline != "" {
+			if _, err := time.ParseDuration(t.Deadline); err != nil {
+				return fmt.Errorf("task %q: invalid deadline %q: %w", t.ID, t.Deadline, err)
+			}
+		}
+		if t.Threshold != "" {
+			if err := validateReviewThreshold(t.Threshold); err != nil {
+				return fmt.Errorf("task %q: %w", t.ID, err)
+			}
+		}
+		if t.Visibility != "" && t.Visibility != "open" && t.Visibility != "blind" {
+			return fmt.Errorf("task %q: invalid visibility %q (must be 'open' or 'blind')", t.ID, t.Visibility)
+		}
+		return nil
+	}
+
+	// Neither vote nor review — anonymize/visibility are
+	// multi-citizen-only concepts and don't belong here.
+	if t.Anonymize {
+		return fmt.Errorf("task %q: anonymize is only valid on action: vote or action: review tasks", t.ID)
+	}
+	if t.Visibility != "" {
+		return fmt.Errorf("task %q: visibility is only valid on action: vote or action: review tasks", t.ID)
+	}
+	return nil
+}
+
+// validateForEachScopes enforces the two run-wide invariants
+// on for_each use:
+//
+//   1. Run-level and task-level for_each are mutually
+//      exclusive. Authors pick one or the other per run.
+//   2. If multiple tasks declare task-level for_each, they
+//      must agree on the same variable space. A single run
+//      supports one iteration dimension at a time.
+func validateForEachScopes(p *Run, hasTaskLevelForEach bool) error {
+	if len(p.ForEach) > 0 && hasTaskLevelForEach {
+		return fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
+	}
+	if !hasTaskLevelForEach {
+		return nil
+	}
+	var firstID string
+	var firstFE ForEachMap
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		if len(t.ForEach) == 0 {
+			continue
+		}
+		if firstFE == nil {
+			firstID = t.ID
+			firstFE = t.ForEach
+			continue
+		}
+		if !forEachEqual(firstFE, t.ForEach) {
+			return fmt.Errorf("task %q declares a for_each that differs from task %q — all tasks in a run that use task-level for_each must declare the same variables and sources", t.ID, firstID)
+		}
+	}
+	return nil
+}
+
+// validateDependsOnReferences checks every task's explicit
+// depends_on list + its reviews target against the known
+// task-ID set. Also auto-appends the reviews-target to
+// depends_on so a review task always runs after whatever it
+// reviews (mutation — authors don't have to declare the same
+// relationship twice).
+func validateDependsOnReferences(p *Run, ids map[string]bool) error {
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		for _, dep := range t.DependsOn {
+			if !ids[dep] {
+				return fmt.Errorf("task %q depends on %q which does not exist", t.ID, dep)
+			}
+		}
+		if t.Reviews != "" {
+			if !ids[t.Reviews] {
+				return fmt.Errorf("task %q: reviews target %q does not exist", t.ID, t.Reviews)
+			}
+			hasDep := false
+			for _, dep := range t.DependsOn {
+				if dep == t.Reviews {
+					hasDep = true
+					break
+				}
+			}
+			if !hasDep {
+				t.DependsOn = append(t.DependsOn, t.Reviews)
+			}
+		}
+		if t.Action == "vote" && len(t.Options) > 0 {
+			for optIdx, opt := range t.Options {
+				for _, target := range opt.Activates {
+					if !ids[target] {
+						return fmt.Errorf("task %q: option %q (#%d) activates unknown task %q", t.ID, opt.ID, optIdx+1, target)
+					}
+					if target == t.ID {
+						return fmt.Errorf("task %q: option %q cannot activate the vote task itself", t.ID, opt.ID)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// injectReviewGating is the "if you added a review, everything
+// downstream waits for the verdict" pass. For every review task
+// R with reviews: T, inject an implicit dep from every task
+// that consumes T (via explicit depends_on OR {{T.content}} /
+// {{T.field}} references) to R. Without this pass, draft →
+// {check, publish} runs in parallel and publish can ship an
+// unreviewed draft before the review finishes.
+//
+// Returns non-fatal warnings for review tasks whose targets
+// have zero downstream consumers (review runs but gates
+// nothing — probably an authoring mistake).
+//
+// Mutation: appends to consumer.DependsOn.
+func injectReviewGating(p *Run) []string {
+	var warnings []string
+	for i := range p.Tasks {
+		reviewTask := &p.Tasks[i]
+		if reviewTask.Action != "review" || reviewTask.Reviews == "" {
+			continue
+		}
+		target := reviewTask.Reviews
+		consumersCount := 0
+		for j := range p.Tasks {
+			if i == j {
+				continue
+			}
+			consumer := &p.Tasks[j]
+			// Skip other review tasks reviewing the same
+			// target — each review is independent and
+			// shouldn't wait on another reviewer's verdict.
+			if consumer.Action == "review" && consumer.Reviews == target {
+				continue
+			}
+			consumes := false
+			for _, dep := range consumer.DependsOn {
+				if dep == target {
+					consumes = true
+					break
+				}
+			}
+			if !consumes {
+				for _, inferred := range template.InferDependencies(consumer.Prompt) {
+					if inferred == target {
+						consumes = true
+						break
+					}
+				}
+			}
+			if !consumes {
+				continue
+			}
+			consumersCount++
+			hasDep := false
+			for _, dep := range consumer.DependsOn {
+				if dep == reviewTask.ID {
+					hasDep = true
+					break
+				}
+			}
+			if !hasDep {
+				consumer.DependsOn = append(consumer.DependsOn, reviewTask.ID)
+			}
+		}
+		if consumersCount == 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"task %q reviews %q but %q has no downstream consumers — the review runs but gates nothing (possibly an authoring mistake)",
+				reviewTask.ID, target, target,
+			))
+		}
+	}
+	return warnings
+}
+
+// injectVoteActivation injects the reverse "activated →
+// vote" depends_on edges so vote-routed branches can't start
+// running until the vote resolves. A separate pass because
+// activated tasks might appear after the vote task in source
+// order — doing this inline in the initial task walk would
+// miss forward references.
+//
+// Mutation: appends to activated.DependsOn.
+func injectVoteActivation(p *Run) {
+	for i := range p.Tasks {
+		voteTask := &p.Tasks[i]
+		if voteTask.Action != "vote" {
+			continue
+		}
+		for _, opt := range voteTask.Options {
+			for _, target := range opt.Activates {
+				for j := range p.Tasks {
+					activated := &p.Tasks[j]
+					if activated.ID != target {
+						continue
+					}
+					hasDep := false
+					for _, dep := range activated.DependsOn {
+						if dep == voteTask.ID {
+							hasDep = true
+							break
+						}
+					}
+					if !hasDep {
+						activated.DependsOn = append(activated.DependsOn, voteTask.ID)
+					}
+					break
+				}
+			}
+		}
+	}
+}

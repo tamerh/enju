@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/enju-ai/enju/internal/inbox"
-	"github.com/enju-ai/enju/internal/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/inbox"
+	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
 )
 
 func cmdInbox(args []string) {

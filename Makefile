@@ -1,8 +1,13 @@
-.PHONY: build test test-v test-llm clean run
+.PHONY: build test test-v test-llm clean run check-imports
 
 # Build
 build:
 	go build -o enju ./cmd/enju/
+
+# Enforce the coordinator/fat-client/core import direction.
+# See docs/architecture-boundaries.md.
+check-imports:
+	@bash tools/check-imports.sh
 
 # Unit + integration tests (fast, no LLM).
 test:

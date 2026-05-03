@@ -42,8 +42,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/mcpserver"
-	"github.com/enju-ai/enju/internal/store"
+	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 )

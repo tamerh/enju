@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/store"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 func TestLoadServerConfigMissingFileReturnsDefaults(t *testing.T) {

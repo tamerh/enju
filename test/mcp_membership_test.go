@@ -18,8 +18,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/mcpserver"
-	"github.com/enju-ai/enju/internal/store"
+	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // mcpCreateProjectAs fires enju_create_project through the given

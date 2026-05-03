@@ -15,12 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/enju-ai/enju/internal/api"
-	"github.com/enju-ai/enju/internal/compute"
-	"github.com/enju-ai/enju/internal/mcpgit"
-	"github.com/enju-ai/enju/internal/mcpserver"
-	"github.com/enju-ai/enju/internal/scheduler"
-	"github.com/enju-ai/enju/internal/store"
+	"github.com/enju-ai/enju/internal/coordinator/api"
+	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/mcpgit"
+	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
+	"github.com/enju-ai/enju/internal/coordinator/scheduler"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/mark3labs/mcp-go/server"
 )
 

@@ -28,7 +28,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/mcpserver"
+	"github.com/enju-ai/enju/internal/fatclient/mcpserver"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
