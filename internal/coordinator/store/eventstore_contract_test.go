@@ -144,7 +144,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	// 1. CreateProject + CreateRun. Both fire run_created
 	//  events that the broken store will refuse.
 	now := time.Now()
-	pid, err := s.CreateProject(&ProjectRecord{
+	pid, err := helperCreateProject(s, &ProjectRecord{
 		Name: "events-broken-project", CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
@@ -168,7 +168,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, issueSeq, err := s.CreateIssue(&IssueRecord{
+	_, issueSeq, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: pid, Title: "broken-events finding",
 		FiledBy: alice, Severity: IssueSeverityLow,
 	})
@@ -195,7 +195,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	taskID, err := s.SpawnTask(SpawnSpec{
+	taskID, err := helperSpawnTask(s, SpawnSpec{
 		RunID: runID, TaskDefID: "spawned", Action: "answer",
 		SpawnedBy: alice, Trigger: "human",
 	})
@@ -212,7 +212,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 
 	// 4. PauseRun — runs through recordRunLifecycleEvent which
 	//  is best-effort by design.
-	changed, err := s.PauseRun(runID, alice)
+	changed, err := helperPauseRun(s, runID, alice)
 	if err != nil {
 		t.Fatalf("PauseRun failed despite broken events: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestEventStoreFileFailureDoesNotPropagate(t *testing.T) {
 	// Now drive a state mutation. It must succeed — the broken
 	// downstream is invisible to the state path.
 	now := time.Now()
-	pid, err := s.CreateProject(&ProjectRecord{
+	pid, err := helperCreateProject(s, &ProjectRecord{
 		Name: "post-close-project", CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {

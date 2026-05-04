@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -33,8 +34,15 @@ func PauseRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runS
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
-	changed, err := s.PauseRun(run.ID, caller.ID)
-	if err != nil {
+	// Snapshot the prior state so we can report changed=true
+	// only when we actually flipped active|idle → paused.
+	priorState := string(run.State)
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.PauseRun{RunID: run.ID, CitizenID: caller.ID},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	updated, _ := s.GetRun(run.ID)
@@ -42,6 +50,7 @@ func PauseRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runS
 	if updated != nil {
 		state = string(updated.State)
 	}
+	changed := priorState != state
 	status := "paused"
 	if !changed {
 		status = "already_paused"
@@ -77,13 +86,27 @@ func ResumeRun(s *store.Store, caller *store.CitizenRecord, projectID int64, run
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
-	next, err := s.ResumeRun(run.ID, caller.ID)
-	if err != nil {
+	// ResumeRun lifts paused → active. The follow-on CompleteRun
+	// in the same plan re-evaluates the task graph so the run
+	// lands on active or idle (or even completed if every task
+	// is already terminal). Single transaction, single drain.
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.ResumeRun{RunID: run.ID, CitizenID: caller.ID},
+			store.CompleteRun{RunID: run.ID},
+		},
+	}); err != nil {
 		return nil, err
+	}
+	updated, _ := s.GetRun(run.ID)
+	state := ""
+	if updated != nil {
+		state = string(updated.State)
 	}
 	return &ResumeRunResponse{
 		Status: "resumed",
 		RunID:  fmt.Sprintf("%d:%d", projectID, runSeq),
-		State:  string(next),
+		State:  state,
 	}, nil
 }

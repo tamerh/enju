@@ -230,7 +230,10 @@ func TestEventEmission_TaskCompletedFiresOnReviewApprove(t *testing.T) {
 	waitForEventsDrained(t, s)
 
 	// Now trigger the review-approve path.
-	if _, err := s.MarkLatestClaimOutcome(taskID, "completed"); err != nil {
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{MarkLatestClaimOutcome{TaskID: taskID, Outcome: "completed"}},
+	}); err != nil {
 		t.Fatalf("MarkLatestClaimOutcome: %v", err)
 	}
 
@@ -294,7 +297,7 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	runID := createTestRun(t, s)
 
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
 		Action: "answer", ResultType: "text",
 		State: TaskAccepted, CreatedAt: now,
@@ -304,7 +307,7 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	// Mirror the production shape: assign_to is JSON-encoded
 	// (engine.materialize writes `["alice"]`, store.spawn writes
 	// the same). The cascade must parse this back into a slice.
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "trev", RunID: runID, Seq: 2, TaskDefID: "trev",
 		Action: "review", ResultType: "text",
 		State: TaskPending, DependsOn: "tup",
@@ -313,7 +316,7 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tnoassign", RunID: runID, Seq: 3, TaskDefID: "tnoassign",
 		Action: "answer", ResultType: "text",
 		State: TaskPending, DependsOn: "tup",
@@ -322,10 +325,7 @@ func TestUpdateReadyTasks_ReturnsAssignTo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	readied, err := s.UpdateReadyTasks(runID)
-	if err != nil {
-		t.Fatalf("UpdateReadyTasks: %v", err)
-	}
+	readied := helperUpdateReadyTasks(t, s, runID)
 	if len(readied) != 2 {
 		t.Fatalf("expected 2 readied (trev, tnoassign), got %d: %+v", len(readied), readied)
 	}
@@ -434,7 +434,7 @@ func TestApplySetTaskState_ReboundReadyEmitsTaskReady(t *testing.T) {
 
 	// Set up a task in ACCEPTED state — the cascade target.
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "5:1:write_blurb", RunID: runID, Seq: 1, TaskDefID: "write_blurb",
 		Action: "answer", ResultType: "text",
 		State: TaskAccepted, AssignTo: `["tamer"]`,
@@ -462,51 +462,6 @@ func TestApplySetTaskState_ReboundReadyEmitsTaskReady(t *testing.T) {
 	}
 	if got.TaskID != "5:1:write_blurb" {
 		t.Errorf("task_id = %q, want 5:1:write_blurb", got.TaskID)
-	}
-}
-
-// TestUpdateReadyTasks_DirectCallEmitsEvents pins the
-// production-load-bearing path: most callers invoke
-// s.UpdateReadyTasks(runID) directly (after ApplyPlan returns),
-// not as a Plan mutation. That direct path must emit task_ready
-// events too, otherwise the assigned_task_ready notification
-// rule never fires in the standard submit→cascade flow. Pre-fix
-// the emit lived only in applyUpdateReadyTasks (the mutation
-// handler), so direct callers — vote/review submit, invalidate,
-// fail-cascade — silently dropped task_ready events.
-func TestUpdateReadyTasks_DirectCallEmitsEvents(t *testing.T) {
-	s := newTestStore(t)
-	runID := createTestRun(t, s)
-
-	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
-		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
-		Action: "answer", ResultType: "text",
-		State: TaskAccepted, CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateTask(&TaskRecord{
-		ID: "trev", RunID: runID, Seq: 2, TaskDefID: "trev",
-		Action: "review", ResultType: "text",
-		State: TaskPending, DependsOn: "tup",
-		AssignTo:  `["alice"]`,
-		CreatedAt: now,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	readied, err := s.UpdateReadyTasks(runID)
-	if err != nil {
-		t.Fatalf("UpdateReadyTasks: %v", err)
-	}
-	if len(readied) != 1 {
-		t.Fatalf("expected 1 readied, got %d", len(readied))
-	}
-
-	waitForEventsDrained(t, s)
-	if hasEventWithMetadata(t, s, runID, "task_ready", `"assign_to":"alice"`) == nil {
-		t.Fatal("direct s.UpdateReadyTasks call must emit task_ready event with assign_to in metadata")
 	}
 }
 
@@ -543,7 +498,7 @@ func TestApplyPlan_CascadeSeesInTxWrites(t *testing.T) {
 
 	// Insert a downstream task that depends on the upstream.
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tdown", RunID: runID, Seq: 99, TaskDefID: "tdown",
 		Action: "review", ResultType: "text",
 		State: TaskPending, DependsOn: taskID,
@@ -594,7 +549,7 @@ func TestUpdateReadyTasks_ParsesJSONArrayAssignTo(t *testing.T) {
 	runID := createTestRun(t, s)
 
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tup", RunID: runID, Seq: 1, TaskDefID: "tup",
 		Action: "answer", ResultType: "text",
 		State: TaskAccepted, CreatedAt: now,
@@ -602,7 +557,7 @@ func TestUpdateReadyTasks_ParsesJSONArrayAssignTo(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Single-assignee, JSON-array shape.
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tsingle", RunID: runID, Seq: 2, TaskDefID: "tsingle",
 		Action: "review", ResultType: "text",
 		State: TaskPending, DependsOn: "tup",
@@ -612,7 +567,7 @@ func TestUpdateReadyTasks_ParsesJSONArrayAssignTo(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Multi-assignee, JSON-array shape.
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "tdual", RunID: runID, Seq: 3, TaskDefID: "tdual",
 		Action: "review", ResultType: "text",
 		State: TaskPending, DependsOn: "tup",
@@ -622,10 +577,7 @@ func TestUpdateReadyTasks_ParsesJSONArrayAssignTo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	readied, err := s.UpdateReadyTasks(runID)
-	if err != nil {
-		t.Fatalf("UpdateReadyTasks: %v", err)
-	}
+	readied := helperUpdateReadyTasks(t, s, runID)
 	byID := map[string]ReadiedTask{}
 	for _, rt := range readied {
 		byID[rt.TaskID] = rt
@@ -722,7 +674,10 @@ func TestEventEmission_IterationCompletedOnInvalidate(t *testing.T) {
 	}
 	waitForEventsDrained(t, s)
 
-	if _, err := s.MarkOpenClaimsInvalidated(taskID); err != nil {
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{MarkOpenClaimsInvalidated{TaskID: taskID}},
+	}); err != nil {
 		t.Fatalf("MarkOpenClaimsInvalidated: %v", err)
 	}
 	ic := hasEventWithMetadata(t, s, runID, "iteration_completed", "cascade_invalidate")

@@ -42,8 +42,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
+	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -359,11 +360,14 @@ func TestMCPRequestClarification(t *testing.T) {
 	if err != nil || botCitizen == nil {
 		t.Fatalf("lookup bot citizen: %v", err)
 	}
-	if err := h.store.AddProjectMember(projectID, botCitizen.ID, "owner", 0); err != nil {
-		t.Fatalf("add bot to project: %v", err)
-	}
-	if err := h.store.AddProjectMember(projectID, humanCitizen.ID, "member", 0); err != nil {
-		t.Fatalf("add human to project: %v", err)
+	if _, err := h.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.AddProjectMember{ProjectID: projectID, CitizenID: botCitizen.ID, Role: store.ProjectRoleOwner},
+			store.AddProjectMember{ProjectID: projectID, CitizenID: humanCitizen.ID, Role: store.ProjectRoleMember},
+		},
+	}); err != nil {
+		t.Fatalf("add citizens to project: %v", err)
 	}
 
 	// Create a run so we have somewhere to spawn into.
@@ -490,14 +494,15 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 	if humanCitizen == nil || parentCitizen == nil || botCitizen == nil {
 		t.Fatal("missing one of: human, parent, bot citizen")
 	}
-	if err := h.store.AddProjectMember(projectID, parentCitizen.ID, "owner", 0); err != nil {
-		t.Fatalf("add parent: %v", err)
-	}
-	if err := h.store.AddProjectMember(projectID, humanCitizen.ID, "member", 0); err != nil {
-		t.Fatalf("add human: %v", err)
-	}
-	if err := h.store.AddProjectMember(projectID, botCitizen.ID, "member", 0); err != nil {
-		t.Fatalf("add bot: %v", err)
+	if _, err := h.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.AddProjectMember{ProjectID: projectID, CitizenID: parentCitizen.ID, Role: store.ProjectRoleOwner},
+			store.AddProjectMember{ProjectID: projectID, CitizenID: humanCitizen.ID, Role: store.ProjectRoleMember},
+			store.AddProjectMember{ProjectID: projectID, CitizenID: botCitizen.ID, Role: store.ProjectRoleMember},
+		},
+	}); err != nil {
+		t.Fatalf("add citizens to project: %v", err)
 	}
 
 	// Build a TestClient identified as the bot.
@@ -592,13 +597,20 @@ func TestMCPRecentEvents(t *testing.T) {
 	}
 	projectID := projects[0].ID
 
-	// Empty case: no events yet → sentinel text.
+	// Baseline case: a freshly-created project has its
+	// project_created and project_member_added events from the
+	// chokepoint emission — they're the "happens automatically"
+	// signals citizens see post-creation. Assert both appear so
+	// any regression in the project-mutations pipeline shows up
+	// here.
 	res := h.callOK(t, "enju_recent_events", map[string]any{
 		"project_id": float64(projectID),
 	})
 	got := mcpText(res)
-	if !strings.Contains(got, "no recent events") {
-		t.Errorf("expected 'no recent events' sentinel on empty project, got:\n%s", got)
+	for _, want := range []string{"project_created", "project_member_added"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected baseline event %q on fresh project, got:\n%s", want, got)
+		}
 	}
 
 	// Inject some events directly into the EventStore.

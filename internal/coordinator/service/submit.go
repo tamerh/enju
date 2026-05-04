@@ -157,19 +157,25 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 			// consumers see the verdict regardless of which
 			// downstream flow runs.
 			targetIter, _ := c.Store.GetOpenClaimIterSeq(actions.RejectTargetID)
-			c.Store.Events().Record(store.Event{
-				CitizenID: submitterID,
-				EventType: "task_request_changes",
-				TaskID:  actions.RejectTargetID,
-				RunID:   task.RunID,
-				ProjectID: run.ProjectID,
-				Metadata: store.MarshalMetadata(map[string]any{
-					"reviewer_id":  submitterID,
-					"review_task_id": taskID,
-					"iter_seq":    targetIter,
-					"decision":    params.Decision,
-				}),
-				CreatedAt: time.Now(),
+			// Route through ApplyPlan so the chokepoint contract
+			// holds. Single-mutation plan, post-commit drain
+			// fires the event to EventStore as before.
+			c.Store.ApplyPlan(store.Plan{
+				Version: engine.EngineVersion,
+				Mutations: []store.Mutation{store.EmitEvent{Event: store.Event{
+					CitizenID: submitterID,
+					EventType: "task_request_changes",
+					TaskID:    actions.RejectTargetID,
+					RunID:     task.RunID,
+					ProjectID: run.ProjectID,
+					Metadata: store.MarshalMetadata(map[string]any{
+						"reviewer_id":    submitterID,
+						"review_task_id": taskID,
+						"iter_seq":       targetIter,
+						"decision":       params.Decision,
+					}),
+					CreatedAt: time.Now(),
+				}}},
 			})
 			// Phase 4b — if the target opted into
 			// spawn_remediation on request_changes, skip the
@@ -214,8 +220,15 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 					}
 				}
 				// Phase 6c — reject is terminal; close the
-				// claim with outcome=rejected.
-				if _, cerr := c.Store.MarkLatestClaimOutcome(actions.RejectTargetID, "rejected"); cerr != nil {
+				// claim with outcome=rejected. Routed through
+				// ApplyPlan so the iteration_completed event
+				// rides the chokepoint.
+				if _, cerr := c.Store.ApplyPlan(store.Plan{
+					Version: engine.EngineVersion,
+					Mutations: []store.Mutation{
+						store.MarkLatestClaimOutcome{TaskID: actions.RejectTargetID, Outcome: "rejected"},
+					},
+				}); cerr != nil {
 					c.Logger.Warn("close claim on review reject",
 						"target", actions.RejectTargetID, "error", cerr)
 				}
@@ -235,7 +248,12 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 				if rt.TaskDefID != targetDef || rt.InstanceKey != targetInstance {
 					continue
 				}
-				if _, cerr := c.Store.MarkLatestClaimOutcome(rt.ID, "completed"); cerr != nil {
+				if _, cerr := c.Store.ApplyPlan(store.Plan{
+					Version: engine.EngineVersion,
+					Mutations: []store.Mutation{
+						store.MarkLatestClaimOutcome{TaskID: rt.ID, Outcome: "completed"},
+					},
+				}); cerr != nil {
 					c.Logger.Warn("close upstream claim on review approve",
 						"target", rt.ID, "error", cerr)
 				}
@@ -263,9 +281,27 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 
 	// Step 7. Ready-task sweep + run completion.
-	readied, _ := c.Store.UpdateReadyTasks(task.RunID)
-	readiedCount := len(readied)
-	completed, _ := c.Store.CheckAndCompleteRun(task.RunID)
+	// Fire the cascade as a dedicated plan through ApplyPlan so
+	// the single emit site (applyUpdateReadyTasks) handles it —
+	// step 5's review/vote-resolve plans + step 6's
+	// materialization may all have left tasks newly-ready, but
+	// none of them appended the cascade individually because we
+	// want ONE cascade after the whole sequence, not one per
+	// intermediate plan (avoids duplicate task_ready events for
+	// tasks that briefly looked ready then resolved further).
+	// Cascade + run-state evaluation in one plan: the readiness
+	// pass fires task_ready for any newly-promoted tasks; the
+	// CompleteRun re-evaluates the run's state from the
+	// resulting task counts (active / idle / completed). One tx,
+	// one drain.
+	cascadeResult, _ := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CompleteRun{RunID: task.RunID},
+		},
+	}.AppendCascade(task.RunID))
+	readied := cascadeResult.ReadiedTasks
+	completed := cascadeResult.RunCompleted
 
 	// Step 7b. Living-workflow phase 4c — auto-triage hook on
 	// idle. CheckAndCompleteRun returns true only on the
@@ -283,7 +319,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 
 	// Step 8. Build response.
-	c.Logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", params.CommitSHA, "newly_ready", readiedCount)
+	c.Logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", params.CommitSHA, "newly_ready", len(readied))
 
 	status := "accepted"
 	reviewTally := actions.ReviewTally
@@ -396,7 +432,17 @@ func (c *Coordinator) maybeAutoCloseIssue(task *store.TaskRecord) {
 	// citizen_id = 0 (system close on auto-triage). The audit
 	// event records closed_by_task_id pointing at the fix
 	// task — better attribution.
-	if err := c.Store.CloseIssue(issue.ID, 0, store.IssueStatusClosed, task.ID); err != nil {
+	if _, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CloseIssue{
+				IssueID:        issue.ID,
+				CitizenID:      0,
+				Status:         store.IssueStatusClosed,
+				ClosedByTaskID: task.ID,
+			},
+		},
+	}); err != nil {
 		c.Logger.Warn("auto-close issue failed", "issue", issue.ID, "task", task.ID, "error", err)
 	}
 }

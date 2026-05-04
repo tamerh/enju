@@ -143,52 +143,50 @@ func (c *Coordinator) PerformInvalidate(taskID, triggerSubtype string) (*Invalid
 		})
 	}
 
-	plan := store.Plan{
-		Version:  engine.EngineVersion,
-		Mutations: mutations,
+	subtype := triggerSubtype
+	if subtype == "" {
+		subtype = "invalidate"
 	}
+	// Fold descendants' open-claim closures into the same plan
+	// so the state flips and the claim outcome closures land
+	// atomically. Pre-chokepoint these ran as a separate loop
+	// after ApplyPlan; that left a window where descendants
+	// were PENDING but their claim rows still showed open.
+	for _, descID := range outcome.RegularDescendants {
+		mutations = append(mutations, store.MarkOpenClaimsInvalidated{TaskID: descID})
+	}
+	plan := store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: mutations,
+	}.AppendCascade(task.RunID)
+	plan.Mutations = append(plan.Mutations, store.EmitEvent{Event: store.Event{
+		EventType:    "cascade_fired",
+		EventSubtype: subtype,
+		TaskID:       taskID,
+		RunID:        task.RunID,
+		ProjectID:    run.ProjectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"descendants_count": len(outcome.RegularDescendants),
+			"parked_count":      len(outcome.DematerializedIDs),
+			"rollbacks":         len(rollbacks),
+		}),
+		CreatedAt: time.Now(),
+	}})
 	result, err := c.Store.ApplyPlan(plan)
 	if err != nil {
 		return nil, err
-	}
-
-	// Phase 6c — descendants' open claims become collateral
-	// damage of the cascade. Mark them invalidated. The
-	// target's claim policy is set by the caller, not here.
-	for _, descID := range outcome.RegularDescendants {
-		if _, err := c.Store.MarkOpenClaimsInvalidated(descID); err != nil {
-			c.Logger.Debug("invalidate descendant open claims", "task_id", descID, "error", err)
-		}
 	}
 
 	// Parked rows keep their nodes/edges intact — no DAG
 	// cache wipe (reconciliation diffs the live DAG against
 	// the incoming output list).
 
-	// Ready-task sweep + run state re-evaluation (with auto-
-	// triage hook on idle).
-	_, _ = c.Store.UpdateReadyTasks(task.RunID)
+	// Run-state re-evaluation (with auto-triage hook on idle).
+	// Readiness cascade fired inside the ApplyPlan transaction
+	// above via AppendCascade.
 	c.EvaluateRunStateAndMaybeTriage(task.RunID)
 
 	changed := result.Changed + result.TasksDeleted
-
-	subtype := triggerSubtype
-	if subtype == "" {
-		subtype = "invalidate"
-	}
-	c.Store.Events().Record(store.Event{
-		EventType:  "cascade_fired",
-		EventSubtype: subtype,
-		TaskID:    taskID,
-		RunID:    task.RunID,
-		ProjectID:  run.ProjectID,
-		Metadata: store.MarshalMetadata(map[string]any{
-			"descendants_count": len(outcome.RegularDescendants),
-			"parked_count":   len(outcome.DematerializedIDs),
-			"rollbacks":     len(rollbacks),
-		}),
-		CreatedAt: time.Now(),
-	})
 
 	return &InvalidationResult{
 		Task:      task,
@@ -199,15 +197,24 @@ func (c *Coordinator) PerformInvalidate(taskID, triggerSubtype string) (*Invalid
 	}, nil
 }
 
-// EvaluateRunStateAndMaybeTriage wraps EvaluateRunState with
-// the post-evaluation auto-triage hook. Used at every site
+// EvaluateRunStateAndMaybeTriage applies a CompleteRun mutation
+// (which re-evaluates the run state from current task counts)
+// then runs the auto-triage hook on idle. Used at every site
 // that re-evaluates a run's state after a task transition.
 func (c *Coordinator) EvaluateRunStateAndMaybeTriage(runID int64) {
-	next, err := c.Store.EvaluateRunState(runID)
-	if err != nil {
+	if _, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CompleteRun{RunID: runID},
+		},
+	}); err != nil {
 		return
 	}
-	if next == store.RunIdle {
+	r, err := c.Store.GetRun(runID)
+	if err != nil || r == nil {
+		return
+	}
+	if r.State == store.RunIdle {
 		c.maybeAutoTriage(runID)
 	}
 }
@@ -280,22 +287,38 @@ func (c *Coordinator) maybeAutoTriage(runID int64) {
 		assignTo = []string(spec.AssignTo)
 	}
 
-	taskID, err := c.Store.SpawnTask(store.SpawnSpec{
-		RunID:     runID,
-		TaskDefID:   defID,
-		Action:     spec.Action,
-		Prompt:     prompt,
-		AssignTo:    assignTo,
-		RequireRole:  spec.RequireRole,
-		Trigger:    "auto_triage",
-		ClosesIssueSeq: issue.Seq,
+	res, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SpawnTask{Spec: store.SpawnSpec{
+				RunID:          runID,
+				TaskDefID:      defID,
+				Action:         spec.Action,
+				Prompt:         prompt,
+				AssignTo:       assignTo,
+				RequireRole:    spec.RequireRole,
+				Trigger:        "auto_triage",
+				ClosesIssueSeq: issue.Seq,
+			}},
+		},
 	})
 	if err != nil {
 		c.Logger.Error("auto-triage spawn failed", "run", runID, "issue", issue.Seq, "error", err)
 		return
 	}
+	if res.BudgetExhausted {
+		c.Logger.Warn("auto-triage spawn refused: cycle budget exhausted",
+			"run", runID, "issue", issue.Seq)
+		return
+	}
+	taskID := res.SpawnedTaskID
 
-	if err := c.Store.MarkIssueInProgress(issue.ID, 0, taskID); err != nil {
+	if _, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.MarkIssueInProgress{IssueID: issue.ID, CitizenID: 0, FixTaskID: taskID},
+		},
+	}); err != nil {
 		c.Logger.Warn("auto-triage in_progress transition failed", "issue", issue.ID, "task", taskID, "error", err)
 	}
 }
@@ -350,8 +373,14 @@ func (c *Coordinator) InvalidateTask(caller *store.CitizenRecord, taskID, reason
 	}
 
 	// Manual invalidate is terminal for the latest claim,
-	// regardless of its prior outcome.
-	if _, err := c.Store.MarkLatestClaimOutcome(taskID, "invalidated"); err != nil {
+	// regardless of its prior outcome. Routed through ApplyPlan
+	// so the iteration_completed event rides the chokepoint.
+	if _, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.MarkLatestClaimOutcome{TaskID: taskID, Outcome: "invalidated"},
+		},
+	}); err != nil {
 		c.Logger.Warn("close claim on manual invalidate",
 			"task_id", taskID, "error", err)
 	}

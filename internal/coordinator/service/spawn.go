@@ -3,8 +3,8 @@ package service
 import (
 	"errors"
 	"fmt"
-	"strings"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -78,31 +78,43 @@ func SpawnTask(s *store.Store, caller *store.CitizenRecord, projectID int64, run
 		return nil, fmt.Errorf("%w: not a member of this project", ErrNotMember)
 	}
 
-	taskID, err := s.SpawnTask(store.SpawnSpec{
-		RunID:    run.ID,
-		ParentTaskID: params.ParentTaskID,
-		TaskDefID:  params.TaskDefID,
-		Action:    params.Action,
-		Prompt:    params.Prompt,
-		UserPrompt:  params.UserPrompt,
-		Citizens:   params.Citizens,
-		DependsOn:  params.DependsOn,
-		AssignTo:   params.AssignTo,
-		RequireRole: params.RequireRole,
-		ResultType:  params.ResultType,
-		Trigger:   params.Trigger,
-		SpawnedBy:  caller.ID,
+	res, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SpawnTask{Spec: store.SpawnSpec{
+				RunID:        run.ID,
+				ParentTaskID: params.ParentTaskID,
+				TaskDefID:    params.TaskDefID,
+				Action:       params.Action,
+				Prompt:       params.Prompt,
+				UserPrompt:   params.UserPrompt,
+				Citizens:     params.Citizens,
+				DependsOn:    params.DependsOn,
+				AssignTo:     params.AssignTo,
+				RequireRole:  params.RequireRole,
+				ResultType:   params.ResultType,
+				Trigger:      params.Trigger,
+				SpawnedBy:    caller.ID,
+			}},
+		},
 	})
 	if err != nil {
-		// The underlying store error is a string-typed message;
-		// translate the cycle-budget case to a typed sentinel so
-		// transports can render a distinct UX without scraping
-		// strings.
-		if strings.Contains(err.Error(), "cycle budget exhausted") {
-			return nil, fmt.Errorf("%w: %s", ErrCycleBudgetExhausted, err.Error())
-		}
+		// The underlying store error is a string-typed message
+		// (validation/not-found cases). Cycle exhaustion is now
+		// signaled via ApplyResult.BudgetExhausted, not via the
+		// error path — see below.
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
 	}
+	if res.BudgetExhausted {
+		// The handler committed the pause + emitted
+		// cycle_budget_exhausted; convert the result flag to a
+		// typed sentinel so transports can render a distinct UX
+		// without scraping strings.
+		used, maxBudget, _ := s.GetCycleBudget(run.ID)
+		return nil, fmt.Errorf("%w: cycle budget exhausted for run %d (%d/%d) — run paused; extend budget and resume to allow further spawns",
+			ErrCycleBudgetExhausted, run.ID, used, maxBudget)
+	}
+	taskID := res.SpawnedTaskID
 
 	used, maxBudget, _ := s.GetCycleBudget(run.ID)
 	return &SpawnTaskResponse{

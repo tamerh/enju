@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -35,12 +36,18 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 	t.Helper()
 	now := time.Now()
 
-	projectID, err := s.CreateProject(&store.ProjectRecord{
-		Name: "test-project", CreatedAt: now, UpdatedAt: now,
+	createRes, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateProject{Project: store.ProjectRecord{
+				Name: "test-project", CreatedAt: now, UpdatedAt: now,
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	projectID := createRes.ProjectID
 
 	runID, _, err := s.CreateRun(&store.RunRecord{
 		ProjectID: projectID, Name: "Test Run",
@@ -52,10 +59,15 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 		t.Fatal(err)
 	}
 
-	if err := s.CreateTask(&store.TaskRecord{
-		ID: taskID, RunID: runID, Seq: 1, TaskDefID: "t",
-		Action: "answer", ResultType: "text",
-		State:  store.TaskReady, CreatedAt: now,
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateTask{Task: store.TaskRecord{
+				ID: taskID, RunID: runID, Seq: 1, TaskDefID: "t",
+				Action: "answer", ResultType: "text",
+				State:  store.TaskReady, CreatedAt: now,
+			}},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +83,12 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 		t.Fatal(err)
 	}
 
-	if err := s.ClaimTask(taskID, citizenID, deadline); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetClaim{TaskID: taskID, CitizenID: citizenID, Deadline: deadline},
+		},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return taskID, citizenID

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -38,7 +39,12 @@ func SetCycleBudget(s *store.Store, caller *store.CitizenRecord, projectID int64
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
-	if err := s.SetCycleBudgetMax(run.ID, caller.ID, max); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetCycleBudgetMax{RunID: run.ID, CitizenID: caller.ID, NewMax: max},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	used, newMax, _ := s.GetCycleBudget(run.ID)

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -60,7 +61,15 @@ func (r *Reaper) sweep() {
 	}
 
 	for _, claim := range expired {
-		if err := r.store.ExpireClaimedTask(claim.TaskID, claim.CitizenID); err != nil {
+		// Expired task goes CLAIMED → READY. No cascade needed:
+		// the reaped task IS the one becoming ready; nothing
+		// downstream unblocks because no upstream resolved.
+		if _, err := r.store.ApplyPlan(store.Plan{
+			Version: engine.EngineVersion,
+			Mutations: []store.Mutation{
+				store.ExpireClaim{TaskID: claim.TaskID, CitizenID: claim.CitizenID},
+			},
+		}); err != nil {
 			r.logger.Error("reaper: expiring task", "task_id", claim.TaskID, "error", err)
 			continue
 		}

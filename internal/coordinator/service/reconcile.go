@@ -150,16 +150,23 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 		res.Error = aerr.Error()
 		return res
 	}
-	// Ready-task sweep + run completion. Without this, any
-	// downstream whose only remaining blocker was this task
-	// stays in PENDING. Errors logged-and-swallowed (the same
-	// pattern the sync path uses) since a sweep failure mid-
-	// flight still leaves the submission applied correctly.
-	if _, uerr := c.Store.UpdateReadyTasks(task.RunID); uerr != nil {
+	// Ready-task sweep. Without this, any downstream whose only
+	// remaining blocker was this task stays in PENDING. Errors
+	// logged-and-swallowed (the same pattern the sync path uses)
+	// since a sweep failure mid-flight still leaves the
+	// submission applied correctly. Fired through ApplyPlan so
+	// the single emit site (applyUpdateReadyTasks) handles it —
+	// AcceptComputeTaskCore's submit plan doesn't itself include
+	// the cascade.
+	// Cascade + run-state evaluation in one plan: same shape
+	// as submit.go's step 7 — one tx, one drain.
+	if _, uerr := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CompleteRun{RunID: task.RunID},
+		},
+	}.AppendCascade(task.RunID)); uerr != nil {
 		c.Logger.Warn("reconcile ready-sweep", "task_id", task.ID, "run_id", task.RunID, "error", uerr)
-	}
-	if _, cerr := c.Store.CheckAndCompleteRun(task.RunID); cerr != nil {
-		c.Logger.Warn("reconcile run-complete check", "run_id", task.RunID, "error", cerr)
 	}
 	res.Status = "accepted"
 	return res

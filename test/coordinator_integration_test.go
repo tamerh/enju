@@ -46,6 +46,7 @@ import (
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	gogit "github.com/go-git/go-git/v5"
@@ -269,7 +270,12 @@ func (s *testServer) wipeProjectMembers(projectID int64) {
 	s.t.Helper()
 	members, _ := s.store.ListProjectMembers(projectID)
 	for _, m := range members {
-		_ = s.store.RemoveProjectMember(projectID, m.CitizenID)
+		_, _ = s.store.ApplyPlan(store.Plan{
+			Version: engine.EngineVersion,
+			Mutations: []store.Mutation{
+				store.RemoveProjectMember{ProjectID: projectID, CitizenID: m.CitizenID},
+			},
+		})
 	}
 }
 
@@ -1458,8 +1464,12 @@ func TestTaskTimeout(t *testing.T) {
 	}
 
 	// Expire it (simulating what the reaper does)
-	err = s.store.ExpireClaimedTask(expired[0].TaskID, expired[0].CitizenID)
-	if err != nil {
+	if _, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.ExpireClaim{TaskID: expired[0].TaskID, CitizenID: expired[0].CitizenID},
+		},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2171,7 +2181,22 @@ func TestEventsLongPoll(t *testing.T) {
 	resp := s.post("/api/v1/projects", map[string]any{"name": "longpoll-test"})
 	projectIDFloat, _ := resp["id"].(float64)
 	projectID := int64(projectIDFloat)
-	eventsURL := fmt.Sprintf("/api/v1/projects/%d/events", projectID)
+	// Capture the seq of the last event from project creation
+	// (project_created + project_member_added) so the long-poll
+	// queries below see a quiet baseline. Without since_seq
+	// these tests would be polluted by the creation events.
+	baselineEvents := s.getList(fmt.Sprintf("/api/v1/projects/%d/events", projectID))
+	var baselineSeq int64
+	for _, raw := range baselineEvents {
+		ev, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if seqFloat, ok := ev["seq"].(float64); ok && int64(seqFloat) > baselineSeq {
+			baselineSeq = int64(seqFloat)
+		}
+	}
+	eventsURL := fmt.Sprintf("/api/v1/projects/%d/events?since_seq=%d", projectID, baselineSeq)
 
 	// Property 1: no wait param → immediate empty response.
 	start := time.Now()
@@ -2180,14 +2205,14 @@ func TestEventsLongPoll(t *testing.T) {
 		t.Errorf("no-wait request took %v, want <100ms", elapsed)
 	}
 	if len(immediate) != 0 {
-		t.Errorf("expected empty events on fresh project, got %d", len(immediate))
+		t.Errorf("expected empty events past baseline, got %d", len(immediate))
 	}
 
 	// Property 2: wait=300ms with no matching events → blocks
 	// for ~300ms then returns empty. Tolerance for scheduler
 	// jitter is wide (200ms-1500ms).
 	start = time.Now()
-	blocked := s.getList(eventsURL + "?wait=300ms")
+	blocked := s.getList(eventsURL + "&wait=300ms")
 	elapsed := time.Since(start)
 	if elapsed < 200*time.Millisecond {
 		t.Errorf("wait=300ms returned in %v, expected to block for at least 200ms", elapsed)
@@ -2211,7 +2236,7 @@ func TestEventsLongPoll(t *testing.T) {
 		})
 	}()
 	start = time.Now()
-	got := s.getList(eventsURL + "?wait=5s")
+	got := s.getList(eventsURL + "&wait=5s")
 	elapsed = time.Since(start)
 	if elapsed > 2*time.Second {
 		t.Errorf("long-poll didn't wake on broadcast: took %v (want <2s); broadcast pathway broken", elapsed)

@@ -81,7 +81,7 @@ func newTestStore(t *testing.T) *Store {
 func createTestProject(t *testing.T, s *Store) int64 {
 	t.Helper()
 	now := time.Now()
-	id, err := s.CreateProject(&ProjectRecord{
+	id, err := helperCreateProject(s, &ProjectRecord{
 		Name:   "test-project",
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -149,7 +149,7 @@ func TestCreateAndClaimTask(t *testing.T) {
 	pid := createTestRun(t, s)
 	now := time.Now()
 
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
@@ -159,7 +159,7 @@ func TestCreateAndClaimTask(t *testing.T) {
 	bob := createTestCitizen(t, s, "bob", "tok-456")
 
 	deadline := now.Add(30 * time.Minute)
-	err := s.ClaimTask("task-1", alice, deadline)
+	err := helperClaimTask(s, "task-1", alice, deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,10 +175,20 @@ func TestCreateAndClaimTask(t *testing.T) {
 		t.Fatalf("expected claimed by %d, got %d", alice, task.ClaimedBy)
 	}
 
-	// Can't claim again
-	err = s.ClaimTask("task-1", bob, deadline)
-	if err == nil {
-		t.Fatal("expected error claiming already claimed task")
+	// Different citizen taking over (phase 6c): the current
+	// claim is marked outcome=abandoned and a new claim row
+	// inserted for bob. iter_seq bumps. ApplyPlan succeeds.
+	// Pre-phase-6c the legacy Store.ClaimTask refused this
+	// outright; the production semantics now allow takeover.
+	if err := helperClaimTask(s, "task-1", bob, deadline); err != nil {
+		t.Fatalf("different-citizen takeover should succeed under phase 6c, got: %v", err)
+	}
+	task, err = s.GetTask("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ClaimedBy != bob {
+		t.Fatalf("after takeover expected claimed by %d, got %d", bob, task.ClaimedBy)
 	}
 }
 
@@ -187,14 +197,14 @@ func TestSubmitResult(t *testing.T) {
 	pid := createTestRun(t, s)
 	now := time.Now()
 
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
 	alice := createTestCitizen(t, s, "alice", "tok-123")
 
-	s.ClaimTask("task-1", alice, now.Add(30*time.Minute))
+	helperClaimTask(s, "task-1", alice, now.Add(30*time.Minute))
 
 	_, err := s.submitTaskResultForTest("task-1", alice, "results/step1", "", "", "", 1500)
 	if err != nil {
@@ -218,17 +228,17 @@ func TestUpdateReadyTasks(t *testing.T) {
 	now := time.Now()
 
 	// a (ready) -> b (pending) -> c (pending, depends on a,b)
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "a", RunID: pid, Seq: 1, TaskDefID: "a",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "b", RunID: pid, Seq: 2, TaskDefID: "b",
 		Action: "answer", ResultType: "text",
 		State: TaskPending, DependsOn: "a", CreatedAt: now,
 	})
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "c", RunID: pid, Seq: 3, TaskDefID: "c",
 		Action: "answer", ResultType: "text",
 		State: TaskPending, DependsOn: "a,b", CreatedAt: now,
@@ -237,22 +247,16 @@ func TestUpdateReadyTasks(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-123")
 
 	// Nothing accepted — no tasks should become ready
-	readied, err := s.UpdateReadyTasks(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	readied := helperUpdateReadyTasks(t, s, pid)
 	if len(readied) != 0 {
 		t.Fatalf("expected 0 newly ready, got %d", len(readied))
 	}
 
 	// Accept a → b should become ready, c still pending
-	s.ClaimTask("a", alice, now.Add(30*time.Minute))
+	helperClaimTask(s, "a", alice, now.Add(30*time.Minute))
 	s.submitTaskResultForTest("a", alice, "results/a", "", "", "", 100)
 
-	readied, err = s.UpdateReadyTasks(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	readied = helperUpdateReadyTasks(t, s, pid)
 	if len(readied) != 1 {
 		t.Fatalf("expected 1 newly ready (b), got %d", len(readied))
 	}
@@ -273,16 +277,16 @@ func TestReleaseTask(t *testing.T) {
 	pid := createTestRun(t, s)
 	now := time.Now()
 
-	s.CreateTask(&TaskRecord{
+	helperCreateTask(s, &TaskRecord{
 		ID: "task-1", RunID: pid, Seq: 1, TaskDefID: "step1",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, CreatedAt: now,
 	})
 	alice := createTestCitizen(t, s, "alice", "tok-123")
 
-	s.ClaimTask("task-1", alice, now.Add(30*time.Minute))
+	helperClaimTask(s, "task-1", alice, now.Add(30*time.Minute))
 
-	err := s.ReleaseTask("task-1", alice)
+	err := helperReleaseTask(s, "task-1", alice)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +302,7 @@ func TestReleaseTask(t *testing.T) {
 // makeTask is a tiny helper for the run-state tests below.
 func makeTask(t *testing.T, s *Store, runID int64, id string, state TaskState) {
 	t.Helper()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: id, RunID: runID, Seq: 1, TaskDefID: id,
 		Action: "answer", ResultType: "text",
 		State: state, CreatedAt: time.Now(),
@@ -322,7 +326,7 @@ func TestEvaluateRunState_AllTerminalGoesCompleted(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskAccepted)
 	makeTask(t, s, runID, "t2", TaskSkipped)
 
-	got, err := s.EvaluateRunState(runID)
+	got, err := helperEvaluateRunState(s, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +341,7 @@ func TestEvaluateRunState_ReadyOrInFlightStaysActive(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskAccepted)
 	makeTask(t, s, runID, "t2", TaskReady)
 
-	got, err := s.EvaluateRunState(runID)
+	got, err := helperEvaluateRunState(s, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +356,7 @@ func TestEvaluateRunState_OnlyPendingGoesIdle(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskAccepted)
 	makeTask(t, s, runID, "t2", TaskPending)
 
-	got, err := s.EvaluateRunState(runID)
+	got, err := helperEvaluateRunState(s, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,13 +370,13 @@ func TestEvaluateRunState_PausedRunIsPreserved(t *testing.T) {
 	runID := createTestRun(t, s)
 	makeTask(t, s, runID, "t1", TaskReady)
 
-	if _, err := s.PauseRun(runID, 0); err != nil {
+	if _, err := helperPauseRun(s, runID, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Even though there's a ready task, EvaluateRunState
 	// should NOT transition out of paused — explicit resume
 	// only.
-	got, err := s.EvaluateRunState(runID)
+	got, err := helperEvaluateRunState(s, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +390,7 @@ func TestPauseRun_IdempotentReturnsChangedFalse(t *testing.T) {
 	runID := createTestRun(t, s)
 	makeTask(t, s, runID, "t1", TaskReady)
 
-	changed, err := s.PauseRun(runID, 0)
+	changed, err := helperPauseRun(s, runID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +401,7 @@ func TestPauseRun_IdempotentReturnsChangedFalse(t *testing.T) {
 	// Second pause is a no-op — same final state, but the
 	// store reports changed=false so callers can render
 	// "[no-op]" instead of pretending the action took effect.
-	changed, err = s.PauseRun(runID, 0)
+	changed, err = helperPauseRun(s, runID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,14 +419,14 @@ func TestPauseRun_RefusedOnTerminalRun(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
 	makeTask(t, s, runID, "t1", TaskAccepted)
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	r, _ := s.GetRun(runID)
 	if r.State != RunCompleted {
 		t.Fatalf("setup: expected completed, got %s", r.State)
 	}
-	if _, err := s.PauseRun(runID, 0); err == nil {
+	if _, err := helperPauseRun(s, runID, 0); err == nil {
 		t.Fatal("expected error pausing completed run")
 	}
 }
@@ -433,11 +437,11 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskReady)
 	makeTask(t, s, runID, "t2", TaskPending)
 
-	if _, err := s.PauseRun(runID, 0); err != nil {
+	if _, err := helperPauseRun(s, runID, 0); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.ResumeRun(runID, 0)
+	got, err := helperResumeRun(s, runID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,11 +451,11 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 
 	// Now pause again, downgrade the only ready task to pending,
 	// resume — should land on idle.
-	if _, err := s.PauseRun(runID, 0); err != nil {
+	if _, err := helperPauseRun(s, runID, 0); err != nil {
 		t.Fatal(err)
 	}
 	setTaskState(t, s, "t1", TaskPending)
-	got, err = s.ResumeRun(runID, 0)
+	got, err = helperResumeRun(s, runID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +508,7 @@ func TestEvaluateRunState_EmitsLifecycleEvents(t *testing.T) {
 	makeTask(t, s, runID, "t2", TaskPending)
 
 	// active → idle
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_idle"); got != 1 {
@@ -513,7 +517,7 @@ func TestEvaluateRunState_EmitsLifecycleEvents(t *testing.T) {
 
 	// idle → completed by clearing the pending task
 	setTaskState(t, s, "t2", TaskAccepted)
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_completed"); got != 1 {
@@ -522,7 +526,7 @@ func TestEvaluateRunState_EmitsLifecycleEvents(t *testing.T) {
 
 	// Re-running EvaluateRunState on a stable state must NOT
 	// emit a duplicate event.
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_completed"); got != 1 {
@@ -536,21 +540,21 @@ func TestPauseResume_EmitEventsAttributedToCitizen(t *testing.T) {
 	makeTask(t, s, runID, "t1", TaskReady)
 	alice := createTestCitizen(t, s, "alice", "tok-pause")
 
-	if _, err := s.PauseRun(runID, alice); err != nil {
+	if _, err := helperPauseRun(s, runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_paused"); got != 1 {
 		t.Fatalf("expected one run_paused event, got %d", got)
 	}
 	// Idempotent second pause should NOT emit.
-	if _, err := s.PauseRun(runID, alice); err != nil {
+	if _, err := helperPauseRun(s, runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_paused"); got != 1 {
 		t.Fatalf("re-pause must not double-emit, got %d", got)
 	}
 
-	if _, err := s.ResumeRun(runID, alice); err != nil {
+	if _, err := helperResumeRun(s, runID, alice); err != nil {
 		t.Fatal(err)
 	}
 	if got := countEvents(t, s, runID, "run_resumed"); got != 1 {
@@ -577,7 +581,7 @@ func TestListEvents_FiltersByTypeAndRun(t *testing.T) {
 
 	makeTask(t, s, runID, "t1", TaskAccepted)
 	makeTask(t, s, runID, "t2", TaskPending)
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	// → run_idle event recorded; let async writer drain.
@@ -621,7 +625,7 @@ func TestCreateIssue_AssignsPerProjectSeq(t *testing.T) {
 	projectID := createTestProject(t, s)
 	alice := createTestCitizen(t, s, "alice", "tok-i1")
 
-	id1, seq1, err := s.CreateIssue(&IssueRecord{
+	id1, seq1, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: projectID,
 		Title:   "first finding",
 		FiledBy:  alice,
@@ -629,7 +633,7 @@ func TestCreateIssue_AssignsPerProjectSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, seq2, err := s.CreateIssue(&IssueRecord{
+	id2, seq2, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: projectID,
 		Title:   "second finding",
 		FiledBy:  alice,
@@ -660,7 +664,7 @@ func TestTriageIssue_RefusedOnAlreadyTriaged(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-i2")
 	bob := createTestCitizen(t, s, "bob", "tok-i3")
 
-	id, _, err := s.CreateIssue(&IssueRecord{
+	id, _, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: projectID,
 		Title:   "needs triage",
 		Severity: "high",
@@ -670,7 +674,7 @@ func TestTriageIssue_RefusedOnAlreadyTriaged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.TriageIssue(id, bob, "critical"); err != nil {
+	if err := helperTriageIssue(s, id, bob, "critical"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetIssue(id)
@@ -685,7 +689,7 @@ func TestTriageIssue_RefusedOnAlreadyTriaged(t *testing.T) {
 	}
 
 	// Re-triage refused.
-	if err := s.TriageIssue(id, bob, ""); err == nil {
+	if err := helperTriageIssue(s, id, bob, ""); err == nil {
 		t.Fatal("expected error re-triaging an already-triaged issue")
 	}
 }
@@ -695,7 +699,7 @@ func TestCloseIssue_StatusValidation(t *testing.T) {
 	projectID := createTestProject(t, s)
 	alice := createTestCitizen(t, s, "alice", "tok-i4")
 
-	id, _, err := s.CreateIssue(&IssueRecord{
+	id, _, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: projectID,
 		Title:   "to close",
 		FiledBy:  alice,
@@ -705,12 +709,12 @@ func TestCloseIssue_StatusValidation(t *testing.T) {
 	}
 
 	// Invalid status rejected.
-	if err := s.CloseIssue(id, alice, "in_progress", ""); err == nil {
+	if err := helperCloseIssue(s, id, alice, "in_progress", ""); err == nil {
 		t.Fatal("expected error for invalid close status")
 	}
 
 	// Valid close.
-	if err := s.CloseIssue(id, alice, "closed", "1:1:fix"); err != nil {
+	if err := helperCloseIssue(s, id, alice, "closed", "1:1:fix"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetIssue(id)
@@ -719,7 +723,7 @@ func TestCloseIssue_StatusValidation(t *testing.T) {
 	}
 
 	// Re-close refused.
-	if err := s.CloseIssue(id, alice, "wontfix", ""); err == nil {
+	if err := helperCloseIssue(s, id, alice, "wontfix", ""); err == nil {
 		t.Fatal("expected error re-closing an already-closed issue")
 	}
 }
@@ -730,11 +734,11 @@ func TestListIssues_FiltersByStatusAndSeverity(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-i5")
 
 	// Three issues with mixed status / severity.
-	id1, _, _ := s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "a", Severity: "low", FiledBy: alice})
-	_, _, _ = s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "b", Severity: "high", FiledBy: alice})
-	id3, _, _ := s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "c", Severity: "high", FiledBy: alice})
-	s.CloseIssue(id1, alice, "closed", "")
-	s.TriageIssue(id3, alice, "")
+	id1, _, _ := helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "a", Severity: "low", FiledBy: alice})
+	_, _, _ = helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "b", Severity: "high", FiledBy: alice})
+	id3, _, _ := helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "c", Severity: "high", FiledBy: alice})
+	helperCloseIssue(s, id1, alice, "closed", "")
+	helperTriageIssue(s, id3, alice, "")
 
 	openOnly, err := s.ListIssues(IssueFilter{ProjectID: projectID, Status: []string{"open"}})
 	if err != nil {
@@ -761,7 +765,7 @@ func TestSpawnTask_BasicHappyPath(t *testing.T) {
 	makeTask(t, s, runID, "1:1:root", TaskAccepted)
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-1")
 
-	taskID, err := s.SpawnTask(SpawnSpec{
+	taskID, err := helperSpawnTask(s, SpawnSpec{
 		RunID:    runID,
 		ParentTaskID: "1:1:root",
 		TaskDefID:  "remediation_1",
@@ -811,7 +815,7 @@ func TestSpawnTask_DependsOnLandsAsPending(t *testing.T) {
 	makeTask(t, s, runID, "1:1:upstream", TaskReady)
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-2")
 
-	taskID, err := s.SpawnTask(SpawnSpec{
+	taskID, err := helperSpawnTask(s, SpawnSpec{
 		RunID:   runID,
 		TaskDefID: "downstream",
 		Action:  "answer",
@@ -834,12 +838,12 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-3")
 
 	// Tighten the budget so we can exhaust it cheaply.
-	if err := s.SetCycleBudgetMax(runID, 0, 2); err != nil {
+	if err := helperSetCycleBudgetMax(s, runID, 0, 2); err != nil {
 		t.Fatal(err)
 	}
 
 	for i := 0; i < 2; i++ {
-		_, err := s.SpawnTask(SpawnSpec{
+		_, err := helperSpawnTask(s, SpawnSpec{
 			RunID:   runID,
 			TaskDefID: fmt.Sprintf("spawn_%d", i),
 			Action:  "answer",
@@ -851,7 +855,7 @@ func TestSpawnTask_BudgetExhaustedPausesRun(t *testing.T) {
 	}
 
 	// Third spawn should refuse + pause.
-	_, err := s.SpawnTask(SpawnSpec{
+	_, err := helperSpawnTask(s, SpawnSpec{
 		RunID:   runID,
 		TaskDefID: "spawn_3",
 		Action:  "answer",
@@ -883,10 +887,10 @@ func TestSpawnTask_RefusedOnPausedRun(t *testing.T) {
 	makeTask(t, s, runID, "1:1:root", TaskReady)
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-4")
 
-	if _, err := s.PauseRun(runID, alice); err != nil {
+	if _, err := helperPauseRun(s, runID, alice); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.SpawnTask(SpawnSpec{
+	_, err := helperSpawnTask(s, SpawnSpec{
 		RunID:   runID,
 		TaskDefID: "remediation",
 		Action:  "answer",
@@ -905,7 +909,7 @@ func TestSpawnTask_LiftsIdleRunToActive(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-5")
 
 	// Force idle.
-	if _, err := s.EvaluateRunState(runID); err != nil {
+	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
 	r, _ := s.GetRun(runID)
@@ -913,7 +917,7 @@ func TestSpawnTask_LiftsIdleRunToActive(t *testing.T) {
 		t.Fatalf("setup: expected idle, got %s", r.State)
 	}
 
-	if _, err := s.SpawnTask(SpawnSpec{
+	if _, err := helperSpawnTask(s, SpawnSpec{
 		RunID:   runID,
 		TaskDefID: "wakeup",
 		Action:  "answer",
@@ -935,7 +939,7 @@ func TestSetCycleBudgetMax_RefusesBelowUsed(t *testing.T) {
 	alice := createTestCitizen(t, s, "alice", "tok-spawn-6")
 
 	for i := 0; i < 5; i++ {
-		if _, err := s.SpawnTask(SpawnSpec{
+		if _, err := helperSpawnTask(s, SpawnSpec{
 			RunID:   runID,
 			TaskDefID: fmt.Sprintf("t%d", i),
 			Action:  "answer",
@@ -944,10 +948,10 @@ func TestSetCycleBudgetMax_RefusesBelowUsed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.SetCycleBudgetMax(runID, 0, 3); err == nil {
+	if err := helperSetCycleBudgetMax(s, runID, 0, 3); err == nil {
 		t.Fatal("expected refusal: new max below current used")
 	}
-	if err := s.SetCycleBudgetMax(runID, 0, 10); err != nil {
+	if err := helperSetCycleBudgetMax(s, runID, 0, 10); err != nil {
 		t.Fatalf("legitimate bump rejected: %v", err)
 	}
 }
@@ -991,7 +995,7 @@ func TestMarkIssueInProgress_StatusTransition(t *testing.T) {
 	s := newTestStore(t)
 	projectID := createTestProject(t, s)
 	alice := createTestCitizen(t, s, "alice", "tok-mip-1")
-	id, _, err := s.CreateIssue(&IssueRecord{
+	id, _, err := helperCreateIssue(s, &IssueRecord{
 		ProjectID: projectID,
 		Title:   "needs fix",
 		FiledBy:  alice,
@@ -1000,7 +1004,7 @@ func TestMarkIssueInProgress_StatusTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.MarkIssueInProgress(id, 0, "1:1:fix_task"); err != nil {
+	if err := helperMarkIssueInProgress(s, id, 0, "1:1:fix_task"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetIssue(id)
@@ -1012,7 +1016,7 @@ func TestMarkIssueInProgress_StatusTransition(t *testing.T) {
 	}
 
 	// Re-mark refused.
-	if err := s.MarkIssueInProgress(id, 0, "1:1:other"); err == nil {
+	if err := helperMarkIssueInProgress(s, id, 0, "1:1:other"); err == nil {
 		t.Fatal("expected refusal on already-in-progress issue")
 	}
 }
@@ -1021,11 +1025,11 @@ func TestCloseIssue_AcceptsFromInProgress(t *testing.T) {
 	s := newTestStore(t)
 	projectID := createTestProject(t, s)
 	alice := createTestCitizen(t, s, "alice", "tok-cii-1")
-	id, _, _ := s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "x", FiledBy: alice})
-	if err := s.MarkIssueInProgress(id, 0, "1:1:fix"); err != nil {
+	id, _, _ := helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "x", FiledBy: alice})
+	if err := helperMarkIssueInProgress(s, id, 0, "1:1:fix"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CloseIssue(id, 0, IssueStatusClosed, "1:1:fix"); err != nil {
+	if err := helperCloseIssue(s, id, 0, IssueStatusClosed, "1:1:fix"); err != nil {
 		t.Fatalf("close from in_progress should be allowed: %v", err)
 	}
 	got, _ := s.GetIssue(id)
@@ -1039,16 +1043,16 @@ func TestFindOldestOpenIssue_PicksLowestSeq(t *testing.T) {
 	projectID := createTestProject(t, s)
 	alice := createTestCitizen(t, s, "alice", "tok-foi-1")
 
-	id1, _, _ := s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "a", FiledBy: alice})
-	_, _, _ = s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "b", FiledBy: alice})
-	id3, _, _ := s.CreateIssue(&IssueRecord{ProjectID: projectID, Title: "c", FiledBy: alice})
+	id1, _, _ := helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "a", FiledBy: alice})
+	_, _, _ = helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "b", FiledBy: alice})
+	id3, _, _ := helperCreateIssue(s, &IssueRecord{ProjectID: projectID, Title: "c", FiledBy: alice})
 
 	// Triage the first one — it shouldn't be picked.
-	if err := s.TriageIssue(id1, alice, ""); err != nil {
+	if err := helperTriageIssue(s, id1, alice, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Mark the third in_progress — it shouldn't be picked.
-	if err := s.MarkIssueInProgress(id3, 0, "x"); err != nil {
+	if err := helperMarkIssueInProgress(s, id3, 0, "x"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1061,7 +1065,7 @@ func TestFindOldestOpenIssue_PicksLowestSeq(t *testing.T) {
 	}
 
 	// Close it — no open issues left.
-	s.CloseIssue(got.ID, 0, IssueStatusClosed, "")
+	helperCloseIssue(s, got.ID, 0, IssueStatusClosed, "")
 	got, _ = s.FindOldestOpenIssue(projectID)
 	if got != nil {
 		t.Fatalf("expected nil, got %+v", got)
@@ -1074,7 +1078,7 @@ func TestSpawnTask_PersistsClosesIssueSeq(t *testing.T) {
 	makeTask(t, s, runID, "1:1:root", TaskAccepted)
 	alice := createTestCitizen(t, s, "alice", "tok-cis-1")
 
-	taskID, err := s.SpawnTask(SpawnSpec{
+	taskID, err := helperSpawnTask(s, SpawnSpec{
 		RunID:     runID,
 		TaskDefID:   "fix_ISSUE_001_1",
 		Action:     "answer",
@@ -1119,7 +1123,7 @@ func TestListTaskIterations_OrdersByClaimAndComputesSeq(t *testing.T) {
 	// Single-citizen task gets claimed, submitted, invalidated,
 	// re-claimed. The two task_claims rows should surface as
 	// iter-1 (invalidated) and iter-2 (active).
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
 		Action: "answer", ResultType: "text",
 		State:   TaskReady,
@@ -1131,7 +1135,7 @@ func TestListTaskIterations_OrdersByClaimAndComputesSeq(t *testing.T) {
 	bob := createTestCitizen(t, s, "bob", "tok-iter-2")
 
 	// Iteration 1: alice claims, submits, gets invalidated.
-	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.submitTaskResultForTest("1:1:dev", alice, "out/dev", "abc123", "", "", 100); err != nil {
@@ -1154,7 +1158,7 @@ func TestListTaskIterations_OrdersByClaimAndComputesSeq(t *testing.T) {
 	}
 
 	// Iteration 2: bob claims, still active.
-	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1196,7 +1200,7 @@ func TestListTaskIterations_PreservesHistoricalCommitAndDecision(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, RunSlug: "build",
@@ -1208,7 +1212,7 @@ func TestListTaskIterations_PreservesHistoricalCommitAndDecision(t *testing.T) {
 	bob := createTestCitizen(t, s, "bob", "tok-fid-2")
 
 	// Iter-1: alice claims and submits with commit "abc123".
-	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.submitTaskResultForTest("1:1:dev", alice, "out/dev", "abc123def456abc123def456abc123def456abcd", "", "", 100); err != nil {
@@ -1231,7 +1235,7 @@ func TestListTaskIterations_PreservesHistoricalCommitAndDecision(t *testing.T) {
 	}
 
 	// Iter-2: bob claims and submits with a different commit.
-	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.submitTaskResultForTest("1:1:dev", bob, "out/dev", "fedcbafedcbafedcbafedcbafedcbafedcbafedc", "", "", 100); err != nil {
@@ -1270,7 +1274,7 @@ func TestClaimTask_StampsIterationBranch(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "1:1:dev", RunID: runID, Seq: 1, TaskDefID: "dev",
 		Action: "answer", ResultType: "text",
 		State: TaskReady, RunSlug: "build",
@@ -1282,7 +1286,7 @@ func TestClaimTask_StampsIterationBranch(t *testing.T) {
 	bob := createTestCitizen(t, s, "bob", "tok-b2")
 
 	// Iteration 1.
-	if err := s.ClaimTask("1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", alice, now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	iters, _ := s.ListTaskIterations("1:1:dev")
@@ -1306,7 +1310,7 @@ func TestClaimTask_StampsIterationBranch(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ClaimTask("1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:dev", bob, now.Add(60*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	iters, _ = s.ListTaskIterations("1:1:dev")
@@ -1322,7 +1326,7 @@ func TestClaimTask_VoteSkipsBranchGeneration(t *testing.T) {
 	s := newTestStore(t)
 	runID := createTestRun(t, s)
 	now := time.Now()
-	if err := s.CreateTask(&TaskRecord{
+	if err := helperCreateTask(s, &TaskRecord{
 		ID: "1:1:tally", RunID: runID, Seq: 1, TaskDefID: "tally",
 		Action: "vote", ResultType: "text",
 		State: TaskReady, RunSlug: "build",
@@ -1331,7 +1335,7 @@ func TestClaimTask_VoteSkipsBranchGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	alice := createTestCitizen(t, s, "alice", "tok-vrb")
-	if err := s.ClaimTask("1:1:tally", alice, now.Add(30*time.Minute)); err != nil {
+	if err := helperClaimTask(s, "1:1:tally", alice, now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	iters, _ := s.ListTaskIterations("1:1:tally")
@@ -1372,7 +1376,7 @@ func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 	s := newTestStore(t)
 	first := createTestRun(t, s)
 	makeTask(t, s, first, "t1", TaskPending)
-	if _, err := s.EvaluateRunState(first); err != nil {
+	if _, err := helperEvaluateRunState(s, first); err != nil {
 		t.Fatal(err)
 	}
 	r, _ := s.GetRun(first)

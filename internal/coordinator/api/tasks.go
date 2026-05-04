@@ -119,7 +119,7 @@ func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
 				CommitSHA: task.CommitSHA,
 			},
 		},
-	}); err != nil {
+	}.AppendCascade(task.RunID)); err != nil {
 		s.logger.Warn("deadline-triggered vote resolve failed",
 			"task_id", task.ID, "error", err)
 		return
@@ -133,8 +133,7 @@ func (s *Server) maybeResolveDeadlineVote(task *store.TaskRecord) {
 				"task_id", task.ID, "error", err)
 		}
 	}
-	// Re-run readiness so downstream tasks unblock.
-	_, _ = s.store.UpdateReadyTasks(task.RunID)
+	// Cascade above already ran via AppendCascade.
 	s.logger.Info("vote resolved via deadline sweep",
 		"task_id", task.ID, "winning_option", outcome.WinningOption)
 }

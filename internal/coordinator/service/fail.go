@@ -125,45 +125,43 @@ func (c *Coordinator) PerformFailCascade(taskID, reason string) (*FailCascadeRes
 	for _, descID := range outcome.DematerializedIDs {
 		mutations = append(mutations, store.DeleteTask{TaskID: descID})
 	}
+	// Phase 6c — invalidate descendants' open claims (collateral).
+	// Folded into the same plan so the state flips and the claim
+	// outcome closures land atomically.
+	for _, descID := range skippedDescendants {
+		mutations = append(mutations, store.MarkOpenClaimsInvalidated{TaskID: descID})
+	}
 
 	plan := store.Plan{
-		Version:  engine.EngineVersion,
+		Version:   engine.EngineVersion,
 		Mutations: mutations,
-	}
+	}.AppendCascade(task.RunID)
+	// cascade_fired rides the same plan via EmitEvent so the
+	// chokepoint contract holds — no out-of-band Events().Record.
+	plan.Mutations = append(plan.Mutations, store.EmitEvent{Event: store.Event{
+		EventType:    "cascade_fired",
+		EventSubtype: "fail",
+		TaskID:       taskID,
+		RunID:        task.RunID,
+		ProjectID:    run.ProjectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"reason":            reason,
+			"descendants_count": len(skippedDescendants),
+			"dematerialized":    len(outcome.DematerializedIDs),
+			"rollbacks":         len(rollbacks),
+		}),
+		CreatedAt: time.Now(),
+	}})
 	result, err := c.Store.ApplyPlan(plan)
 	if err != nil {
 		return nil, err
-	}
-
-	// Phase 6c — invalidate descendants' open claims (collateral).
-	for _, descID := range skippedDescendants {
-		if _, err := c.Store.MarkOpenClaimsInvalidated(descID); err != nil {
-			c.Logger.Debug("invalidate descendant open claims (fail-cascade)",
-				"task_id", descID, "error", err)
-		}
 	}
 
 	if len(outcome.DematerializedDefs) > 0 {
 		c.Cache.Invalidate(task.RunID)
 	}
 
-	_, _ = c.Store.UpdateReadyTasks(task.RunID)
 	c.EvaluateRunStateAndMaybeTriage(task.RunID)
-
-	c.Store.Events().Record(store.Event{
-		EventType:  "cascade_fired",
-		EventSubtype: "fail",
-		TaskID:    taskID,
-		RunID:    task.RunID,
-		ProjectID:  run.ProjectID,
-		Metadata: store.MarshalMetadata(map[string]any{
-			"reason":      reason,
-			"descendants_count": len(skippedDescendants),
-			"dematerialized":  len(outcome.DematerializedIDs),
-			"rollbacks":     len(rollbacks),
-		}),
-		CreatedAt: time.Now(),
-	})
 
 	return &FailCascadeResult{
 		Task:        task,

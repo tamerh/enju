@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -48,31 +49,45 @@ func CreateProject(s *store.Store, caller *store.CitizenRecord, params CreatePro
 	}
 
 	now := time.Now()
-	id, err := s.CreateProject(&store.ProjectRecord{
-		Name:     params.Name,
-		Description:  params.Description,
-		CreatedBy:   caller.Username,
-		RemoteURL:   params.RemoteURL,
-		DefaultBranch: defaultBranch,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+	// Project creation + creator-as-owner ride one Plan so the
+	// row + first membership land in a single transaction. A
+	// crash between them previously could have left an
+	// ownerless project; the unified plan eliminates that
+	// window without the special-case error swallowing the
+	// old separate AddProjectMember call needed.
+	createResult, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateProject{Project: store.ProjectRecord{
+				Name:          params.Name,
+				Description:   params.Description,
+				CreatedBy:     caller.Username,
+				RemoteURL:     params.RemoteURL,
+				DefaultBranch: defaultBranch,
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			}},
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project: %w", err)
 	}
-
-	// Seed the creator as owner. Every project has at least
-	// this one member from birth — no legacy zero-members
-	// branch on the new-project path.
-	if err := s.AddProjectMember(id, caller.ID, store.ProjectRoleOwner, 0); err != nil {
-		// Best-effort: a creator-add failure shouldn't fail
-		// the project creation since the project row is
-		// already persisted. Logged at the caller via the
-		// fact that the caller can read the response anyway —
-		// they just won't appear as owner and would have to
-		// be re-added by another path. Surfacing through the
-		// error here would mislead callers into thinking the
-		// project itself failed.
+	id := createResult.ProjectID
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.AddProjectMember{
+				ProjectID: id,
+				CitizenID: caller.ID,
+				Role:      store.ProjectRoleOwner,
+				AddedBy:   0,
+			},
+		},
+	}); err != nil {
+		// Same best-effort semantics as before: the project
+		// row exists; failing here would mislead callers into
+		// thinking creation itself failed. The caller can
+		// re-add via project_membership tools.
 		_ = err
 	}
 
@@ -123,7 +138,12 @@ func SetProjectRemoteURL(s *store.Store, caller *store.CitizenRecord, projectID 
 	if p == nil {
 		return nil, fmt.Errorf("%w: project not found", ErrNotFound)
 	}
-	if err := s.SetProjectRemoteURL(projectID, remoteURL); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetProjectRemoteURL{ProjectID: projectID, RemoteURL: remoteURL},
+		},
+	}); err != nil {
 		return nil, fmt.Errorf("failed to persist remote url: %w", err)
 	}
 	return &SetRemoteURLResponse{

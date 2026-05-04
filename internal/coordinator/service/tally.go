@@ -103,15 +103,14 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 			Version: engine.EngineVersion,
 			Mutations: []store.Mutation{
 				store.SetTaskState{
-					TaskID:   taskID,
-					NewState:  store.TaskAccepted,
+					TaskID:     taskID,
+					NewState:   store.TaskAccepted,
 					VoteChoice: outcome.WinningOption,
-					CommitSHA: task.CommitSHA,
+					CommitSHA:  task.CommitSHA,
 				},
-				store.UpdateReadyTasks{RunID: task.RunID},
 				store.CompleteRun{RunID: task.RunID},
 			},
-		}
+		}.AppendCascade(task.RunID)
 		result, err := c.Store.ApplyPlan(plan)
 		if err != nil {
 			return nil, fmt.Errorf("resolve failed: %w", err)
@@ -154,14 +153,14 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
 			store.SetTaskState{
-				TaskID:  taskID,
+				TaskID:   taskID,
 				NewState: store.TaskAccepted,
 			},
-			store.UpdateReadyTasks{RunID: task.RunID},
 			store.CompleteRun{RunID: task.RunID},
 		},
-	}
-	if _, err := c.Store.ApplyPlan(plan); err != nil {
+	}.AppendCascade(task.RunID)
+	result, err := c.Store.ApplyPlan(plan)
+	if err != nil {
 		return nil, fmt.Errorf("resolve failed: %w", err)
 	}
 	if outcome.Verdict == "reject" && task.ReviewsTarget != "" {
@@ -171,9 +170,13 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 				"review_task", taskID, "target", targetFullID, "error", err)
 		}
 	}
-	readied, _ := c.Store.UpdateReadyTasks(task.RunID)
+	// Cascade fired inside ApplyPlan above (UpdateReadyTasks
+	// mutation in the plan). The pre-refactor extra
+	// s.UpdateReadyTasks call here was redundant (idempotent
+	// re-run finds 0 pending tasks because the first call
+	// already promoted them).
 	resp.Status = "resolved"
 	resp.Verdict = outcome.Verdict
-	resp.NewlyReady = len(readied)
+	resp.NewlyReady = result.TasksReadied
 	return resp, nil
 }

@@ -20,15 +20,37 @@ import (
 // no partial commits, no half-applied cascades.
 //
 // Invariant: this file is the only place that writes to the
-// tasks table (aside from a small set of legitimate
-// escape-hatch helpers for scheduler sweeps in sqlite.go —
-// UpdateReadyTasks, ExpireClaimedTask, ReleaseTask — which
-// don't participate in per-feature atomicity because they
-// run as separate follow-up passes). If you're about to add
-// a new `store.UpdateX` helper to mutate task rows
-// per-feature, stop — add a new mutation type (or extend an
-// existing one, e.g. SetTaskState) so it rides the plan's
-// transaction instead. See plan.go for the mutation shape.
+// tasks table. If you're about to add a new `store.UpdateX`
+// helper to mutate task rows per-feature, stop — add a new
+// mutation type (or extend an existing one, e.g. SetTaskState)
+// so it rides the plan's transaction instead. See plan.go for
+// the mutation shape.
+//
+// Scope status (what's covered vs what isn't):
+//
+//   - tasks, task_claims, task_submissions, artifacts,
+//     citizens, projects, project_members — fully governed by
+//     ApplyPlan. The corresponding mutation types (CreateTask,
+//     SetClaim, RecordSubmission, MoveArtifact, CreateCitizen,
+//     CreateProject, AddProjectMember, etc.) are the only
+//     supported write path.
+//
+//   - runs.state — partially governed. The CompleteRun mutation
+//     handles task-graph-driven transitions (active → idle →
+//     completed). PauseRun / ResumeRun / EvaluateRunState in
+//     sqlite.go still UPDATE runs.state directly through s.db
+//     and emit run_paused / run_resumed / run_active via
+//     s.Events().Record (see recordRunLifecycleEvent). Folding
+//     these into mutations is the next phase of the chokepoint
+//     migration. Until then they're a documented exception:
+//     the only events outside the post-commit drain.
+//
+//   - citizens.last_seen, citizens.role, tokens — direct writes
+//     via TouchCitizen / SetCitizenRole / IssueToken / RevokeToken.
+//     High-frequency (last_seen) or low-stakes (token revocation)
+//     paths intentionally bypass ApplyPlan today. Future phases
+//     may migrate them; the heartbeat case will likely stay
+//     direct for cost reasons.
 //
 // Tx discipline for applyXxx functions: every read and write
 // inside an applyXxx body MUST go through the `tx` parameter,
@@ -135,6 +157,67 @@ func isSQLiteBusy(err error) bool {
 		strings.Contains(msg, "SQLITE_BUSY")
 }
 
+// EventSink is the contract every applyXxx handler honors for
+// event emission. A handler must call either Emit (one or more
+// times) or SkipEvents (exactly once) before returning. The
+// dispatcher enforces this with a runtime check; a handler that
+// returns without doing either panics.
+//
+// Why the contract: the bug class this prevents is "I added a
+// new mutation handler and silently forgot to think about
+// events." Pre-contract, the events plumbing was a *[]Event
+// pointer that handlers could ignore — so they did, leaving
+// task_ready / claim_released / claim_timed_out / etc.
+// quietly missing for entire production paths. SkipEvents
+// forces the author to write down WHY there's nothing to emit,
+// which makes the audit obvious to the next reader and to grep.
+//
+// Use Emit when the mutation is citizen-observable (a state
+// transition someone outside the coordinator should learn
+// about). Use SkipEvents when the mutation is pure bookkeeping
+// (e.g. a derived-column refresh, an artifact-index move whose
+// visibility is covered by a downstream task_ready). The reason
+// string is documentation, not telemetry — pick something a
+// reviewer can match against the handler's behavior.
+//
+// Scope: the contract covers mutations routed through ApplyPlan.
+// A handful of legacy direct-write methods on Store still exist
+// outside this path (project create/membership/default-branch,
+// citizen role/heartbeat updates, run pause/resume) and emit
+// events from their service-layer callers when they emit at all.
+// Migrating them to ApplyPlan-based mutations would extend the
+// contract to cover them; see the diff-walk invariant test
+// (Phase 4d) for the runtime check that catches gaps regardless
+// of routing.
+type EventSink interface {
+	Emit(Event)
+	SkipEvents(reason string)
+}
+
+// trackingSink is the dispatcher-internal EventSink. One per
+// mutation; the dispatcher inspects `handled` after the handler
+// returns to enforce the "must declare intent" rule, then drains
+// `events` into the plan-wide pending list.
+type trackingSink struct {
+	events  []Event
+	handled bool
+}
+
+func newTrackingSink() *trackingSink { return &trackingSink{} }
+
+func (s *trackingSink) Emit(e Event) {
+	s.events = append(s.events, e)
+	s.handled = true
+}
+
+// SkipEvents declares that this mutation has no citizen-
+// observable effect. The reason is discarded at runtime but
+// reads as documentation at the call site — keep it specific
+// so a reviewer can verify it against the handler body.
+func (s *trackingSink) SkipEvents(_ string) {
+	s.handled = true
+}
+
 // applyPlanOnce is the body of ApplyPlan, extracted so the
 // retry wrapper can call it multiple times. Same single-
 // transaction semantics: any mutation failure rolls back the
@@ -155,27 +238,28 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 	var pendingEvents []Event
 
 	for _, mut := range plan.Mutations {
+		sink := newTrackingSink()
 		switch m := mut.(type) {
 
 		case SetTaskState:
-			if err := applySetTaskState(tx, m, &result, &pendingEvents); err != nil {
+			if err := applySetTaskState(tx, m, &result, sink); err != nil {
 				return result, err
 			}
 
 		case CreateTask:
-			if err := applyCreateTask(tx, m, &pendingEvents); err != nil {
+			if err := applyCreateTask(tx, m, sink); err != nil {
 				return result, err
 			}
 			result.TasksCreated++
 
 		case DeleteTask:
-			if err := applyDeleteTask(tx, m); err != nil {
+			if err := applyDeleteTask(tx, m, sink); err != nil {
 				return result, err
 			}
 			result.TasksDeleted++
 
 		case CreateRun:
-			id, seq, err := applyCreateRun(tx, m)
+			id, seq, err := applyCreateRun(tx, m, sink)
 			if err != nil {
 				return result, err
 			}
@@ -183,54 +267,155 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			result.RunSeq = seq
 
 		case SetClaim:
-			if err := applySetClaim(tx, m, &pendingEvents); err != nil {
+			if err := applySetClaim(tx, m, sink); err != nil {
 				return result, err
 			}
 
 		case ReleaseClaim:
-			if err := applyReleaseClaim(tx, m); err != nil {
+			if err := applyReleaseClaim(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case ExpireClaim:
+			if err := applyExpireClaim(tx, m, sink); err != nil {
 				return result, err
 			}
 
 		case RecordSubmission:
-			if err := applyRecordSubmission(tx, m, &pendingEvents); err != nil {
+			if err := applyRecordSubmission(tx, m, sink); err != nil {
 				return result, err
 			}
 
 		case MoveArtifact:
-			if err := applyMoveArtifact(tx, m); err != nil {
+			if err := applyMoveArtifact(tx, m, sink); err != nil {
 				return result, err
 			}
 
 		case DeleteArtifact:
-			if err := applyDeleteArtifact(tx, m); err != nil {
+			if err := applyDeleteArtifact(tx, m, sink); err != nil {
 				return result, err
 			}
 
 		case CreateCitizen:
-			id, err := applyCreateCitizen(tx, m)
+			id, err := applyCreateCitizen(tx, m, sink)
 			if err != nil {
 				return result, err
 			}
 			result.CitizenID = id
 
 		case UpdateReadyTasks:
-			n, err := applyUpdateReadyTasks(tx, s, m, &pendingEvents)
+			readied, err := applyUpdateReadyTasks(tx, s, m, sink)
 			if err != nil {
 				return result, err
 			}
-			result.TasksReadied += n
+			result.TasksReadied += len(readied)
+			result.ReadiedTasks = append(result.ReadiedTasks, readied...)
 
 		case CompleteRun:
-			completed, err := applyCompleteRun(tx, m, &pendingEvents)
+			completed, err := applyCompleteRun(tx, m, sink)
 			if err != nil {
 				return result, err
 			}
 			result.RunCompleted = completed
 
+		case EmitEvent:
+			applyEmitEvent(m, sink)
+
+		case CreateProject:
+			id, err := applyCreateProject(tx, m, sink)
+			if err != nil {
+				return result, err
+			}
+			result.ProjectID = id
+
+		case SetProjectDefaultBranch:
+			if err := applySetProjectDefaultBranch(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case SetProjectRemoteURL:
+			if err := applySetProjectRemoteURL(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case AddProjectMember:
+			if err := applyAddProjectMember(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case RemoveProjectMember:
+			if err := applyRemoveProjectMember(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case SetProjectMemberRole:
+			if err := applySetProjectMemberRole(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case MarkOpenClaimsInvalidated:
+			if err := applyMarkOpenClaimsInvalidated(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case MarkLatestClaimOutcome:
+			if err := applyMarkLatestClaimOutcome(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case PauseRun:
+			if err := applyPauseRun(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case ResumeRun:
+			if err := applyResumeRun(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case CreateIssue:
+			id, seq, err := applyCreateIssue(tx, m, sink)
+			if err != nil {
+				return result, err
+			}
+			result.IssueID = id
+			result.IssueSeq = seq
+
+		case TriageIssue:
+			if err := applyTriageIssue(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case MarkIssueInProgress:
+			if err := applyMarkIssueInProgress(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case CloseIssue:
+			if err := applyCloseIssue(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case SpawnTask:
+			taskID, exhausted, err := applySpawnTask(tx, m, sink)
+			if err != nil {
+				return result, err
+			}
+			result.SpawnedTaskID = taskID
+			result.BudgetExhausted = exhausted
+
+		case SetCycleBudgetMax:
+			if err := applySetCycleBudgetMax(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		default:
 			return result, fmt.Errorf("unknown mutation type: %T", mut)
 		}
+		if !sink.handled {
+			panic(fmt.Sprintf("apply handler for %T returned without calling sink.Emit or sink.SkipEvents — every mutation must declare event intent (see EventSink doc)", mut))
+		}
+		pendingEvents = append(pendingEvents, sink.events...)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -247,19 +432,37 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 // ApplyResult carries summary data back to the caller
 // after a successful plan application.
 type ApplyResult struct {
-	RunID    int64
-	RunSeq    int
-	CitizenID  int64
-	TasksCreated int
-	TasksDeleted int
-	TasksReadied int
+	ProjectID     int64
+	RunID         int64
+	RunSeq        int
+	CitizenID     int64
+	IssueID       int64
+	IssueSeq      int
+	SpawnedTaskID string
+	// BudgetExhausted is true when an applySpawnTask handler
+	// found the run's cycle budget exhausted. The handler still
+	// commits the pause + emits cycle_budget_exhausted (the
+	// legacy split between "we paused you" and "we're telling
+	// you it failed" stays intact); the service caller checks
+	// this flag and converts to a typed user-facing error.
+	BudgetExhausted bool
+	TasksCreated    int
+	TasksDeleted    int
+	TasksReadied    int
+	// ReadiedTasks is the full per-task detail from the
+	// readiness cascade (one entry per task that transitioned
+	// PENDING → READY in this Plan). Populated when the Plan
+	// includes an UpdateReadyTasks mutation. Callers that only
+	// need the count read TasksReadied; callers that need
+	// per-task data (assign_to, action, parents) read this.
+	ReadiedTasks []ReadiedTask
 	RunCompleted bool
-	Changed   int // generic "rows affected" counter
+	Changed      int // generic "rows affected" counter
 }
 
 // --- Per-mutation apply functions ---
 
-func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *[]Event) error {
+func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink EventSink) error {
 	// Validate: task exists and check current state.
 	var currentState string
 	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, m.TaskID).Scan(&currentState); err != nil {
@@ -279,6 +482,7 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 		if m.NewState == TaskPending && TaskState(currentState) == TaskPending {
 			// Already pending — skip silently, matching the
 			// old InvalidateTask behavior.
+			sink.SkipEvents("set_task_state clear-claim no-op: task already in pending")
 			return nil
 		}
 		// Fail-cascade skip carries a reason; everything else
@@ -314,9 +518,16 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 			).Scan(&action, &assignToJSON, &dependsOn, &runID); err != nil {
 				return fmt.Errorf("set_task_state (clear) emit lookup: %w", err)
 			}
-			if err := emitBirthReadyEvent(tx, m.TaskID, action, assignToJSON, dependsOn, runID, events); err != nil {
+			if err := emitBirthReadyEvent(tx, m.TaskID, action, assignToJSON, dependsOn, runID, sink); err != nil {
 				return err
 			}
+		} else {
+			// Clear-claim transitions to PENDING/SKIPPED/etc. are
+			// cascade descendants. The cascade origin (caller of
+			// the Plan) emits cascade_fired; per-descendant events
+			// would just be noise. Phase 4b may add task_invalidated
+			// here if we decide descendants warrant their own signal.
+			sink.SkipEvents("set_task_state clear-claim non-ready: cascade descendant, origin emits cascade_fired")
 		}
 		// Phase 6c — open claims are NOT implicitly marked
 		// here. The cascade caller decides:
@@ -409,26 +620,35 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, events *
 			if commit == "" {
 				_ = tx.QueryRow(`SELECT COALESCE(commit_sha, '') FROM tasks WHERE id = ?`, m.TaskID).Scan(&commit)
 			}
-			*events = append(*events, Event{
-				EventType:  "task_completed",
+			sink.Emit(Event{
+				EventType:    "task_completed",
 				EventSubtype: taskAction,
-				TaskID:    m.TaskID,
-				RunID:    runID,
-				ProjectID:  projectID,
+				TaskID:       m.TaskID,
+				RunID:        runID,
+				ProjectID:    projectID,
 				Metadata: MarshalMetadata(map[string]any{
-					"commit_sha": commit,
-					"citizens":  citizens,
+					"commit_sha":  commit,
+					"citizens":    citizens,
 					"prior_state": currentState,
 				}),
 				CreatedAt: time.Now(),
 			})
+		} else {
+			// Non-clear path covers many transitions: COLLECTING,
+			// FAILED tally, parking, restore, depends_on rewrite.
+			// Per-state-change events for these are intentionally
+			// not emitted today — most are intermediate steps
+			// that pair with a downstream cascade. Phase 4b may
+			// add task_failed or task_collecting if we find a
+			// notification rule that needs them.
+			sink.SkipEvents("set_task_state non-clear non-accepted: intermediate transition, no per-step event today")
 		}
 	}
 	result.Changed++
 	return nil
 }
 
-func applyCreateTask(tx *sql.Tx, m CreateTask, events *[]Event) error {
+func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 	t := &m.Task
 	citizens := t.Citizens
 	if citizens == 0 {
@@ -463,23 +683,29 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, events *[]Event) error {
 	// plate. Production was missing ~1/3 of "ready transitions"
 	// before this fix.
 	if TaskState(t.State) == TaskReady {
-		if err := emitBirthReadyEvent(tx, t.ID, t.Action, t.AssignTo, t.DependsOn, t.RunID, events); err != nil {
+		if err := emitBirthReadyEvent(tx, t.ID, t.Action, t.AssignTo, t.DependsOn, t.RunID, sink); err != nil {
 			return err
 		}
+	} else {
+		// Non-ready creation (PENDING for tasks awaiting deps,
+		// or skipped/parked seed states for materialization).
+		// The downstream cascade emits task_ready when this task
+		// later promotes; no per-create event is needed.
+		sink.SkipEvents("create_task non-ready: cascade emits task_ready when deps satisfied")
 	}
 	return nil
 }
 
-// emitBirthReadyEvent appends task_ready events for one task
-// that landed in READY without going through the cascade
-// (s.UpdateReadyTasks). The cascade has its own emit path; this
-// covers the other two paths: born-ready (applyCreateTask) and
-// rebound-ready (applySetTaskState clear-claim → READY).
+// emitBirthReadyEvent emits task_ready events for one task that
+// landed in READY without going through the cascade. Covers two
+// paths: born-ready (applyCreateTask) and rebound-ready
+// (applySetTaskState clear-claim → READY). The cascade itself
+// has its own emit (applyUpdateReadyTasks).
 //
 // Looks up project_id via the run row so callers don't pre-fetch.
 // Reuses buildTaskReadyEvents so the wire shape stays identical
 // across all three paths (cascade, birth, rebound).
-func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON, dependsOn string, runID int64, events *[]Event) error {
+func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON, dependsOn string, runID int64, sink EventSink) error {
 	var projectID int64
 	if err := tx.QueryRow(`SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
 		return fmt.Errorf("task_ready emit: loading project for run %d: %w", runID, err)
@@ -492,24 +718,62 @@ func emitBirthReadyEvent(tx *sql.Tx, taskID, action, assignToJSON, dependsOn str
 	if err != nil {
 		return fmt.Errorf("task_ready emit: parent lookup for %s: %w", taskID, err)
 	}
-	*events = append(*events, buildTaskReadyEvents([]ReadiedTask{{
+	for _, ev := range buildTaskReadyEvents([]ReadiedTask{{
 		TaskID:    taskID,
 		Action:    action,
 		Assignees: assignees,
 		RunID:     runID,
 		ProjectID: projectID,
 		Parents:   parents,
-	}}, time.Now())...)
+	}}, time.Now()) {
+		sink.Emit(ev)
+	}
 	return nil
 }
 
-func applyDeleteTask(tx *sql.Tx, m DeleteTask) error {
+func applyDeleteTask(tx *sql.Tx, m DeleteTask, sink EventSink) error {
+	// Capture run/project + action BEFORE the row is gone, so
+	// the event carries the same shape downstream consumers
+	// expect (run-scoped routing, action-typed subtype).
+	var action string
+	var runID, projectID int64
+	_ = tx.QueryRow(
+		`SELECT t.action, t.run_id, r.project_id
+		 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
+		m.TaskID,
+	).Scan(&action, &runID, &projectID)
+
 	tx.Exec(`DELETE FROM task_claims WHERE task_id = ?`, m.TaskID)
 	_, err := tx.Exec(`DELETE FROM tasks WHERE id = ?`, m.TaskID)
-	return err
+	if err != nil {
+		return err
+	}
+	if runID > 0 {
+		// task_dematerialized fires when a previously-existing
+		// task row is removed by a cascade — partial-remat
+		// reconciliation (instance set shrank) or fail-cascade
+		// pruning. The cascade origin emits cascade_fired; this
+		// per-row event lets diff-walk consumers reconcile the
+		// state.db delete with a corresponding event.
+		sink.Emit(Event{
+			EventType:    "task_dematerialized",
+			EventSubtype: action,
+			TaskID:       m.TaskID,
+			RunID:        runID,
+			ProjectID:    projectID,
+			Metadata:     MarshalMetadata(map[string]any{}),
+			CreatedAt:    time.Now(),
+		})
+	} else {
+		// DELETE against a non-existent row — likely a
+		// double-delete in a misordered cascade. UPDATE rows-
+		// affected was zero; nothing to announce.
+		sink.SkipEvents("delete_task no-op: task row not found at lookup time")
+	}
+	return nil
 }
 
-func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
+func applyCreateRun(tx *sql.Tx, m CreateRun, sink EventSink) (int64, int, error) {
 	r := &m.Run
 	// Compute next seq.
 	var maxSeq sql.NullInt64
@@ -534,10 +798,16 @@ func applyCreateRun(tx *sql.Tx, m CreateRun) (int64, int, error) {
 		return 0, 0, err
 	}
 	id, _ := result.LastInsertId()
+	// run_created is emitted by the service layer
+	// (service/create_run.go) once the run + initial task plan
+	// have all committed. Emitting from here would fire before
+	// the tasks land, which would make the event misleading
+	// for any subscriber that reads run state on receipt.
+	sink.SkipEvents("run_created emitted by service/create_run.go after the full run+tasks plan commits")
 	return id, nextSeq, nil
 }
 
-func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
+func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 	// Read citizens count to decide single vs multi behavior;
 	// pull task_def_id + run_slug for the iteration branch
 	// name (living-workflow phase 6a).
@@ -604,6 +874,12 @@ func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
 				); err != nil {
 					return err
 				}
+				// Same-citizen reclaim is the request_changes
+				// reopen path. The task_request_changes event
+				// fires from the cascade that reopened the
+				// claim; this re-claim itself doesn't add new
+				// signal beyond that.
+				sink.SkipEvents("set_claim same-citizen reuse: request_changes reopen, the request_changes event already fired upstream")
 				return nil
 			}
 			// Different citizen taking over: mark old
@@ -625,17 +901,17 @@ func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
 				`SELECT iter_seq, COALESCE(commit_sha, '') FROM task_claims WHERE id = ?`,
 				openID,
 			).Scan(&prevIter, &prevCommit)
-			*events = append(*events, Event{
-				CitizenID:  openCitizen,
-				EventType:  "iteration_completed",
+			sink.Emit(Event{
+				CitizenID:    openCitizen,
+				EventType:    "iteration_completed",
 				EventSubtype: "abandoned",
-				TaskID:    m.TaskID,
-				RunID:    taskRunID,
-				ProjectID:  projectID,
+				TaskID:       m.TaskID,
+				RunID:        taskRunID,
+				ProjectID:    projectID,
 				Metadata: MarshalMetadata(map[string]any{
-					"iter_seq":     prevIter.Int64,
+					"iter_seq":         prevIter.Int64,
 					"final_commit_sha": prevCommit.String,
-					"taken_over_by":  m.CitizenID,
+					"taken_over_by":    m.CitizenID,
 				}),
 				CreatedAt: now,
 			})
@@ -716,18 +992,18 @@ func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
 	if iterSeq > 1 {
 		startedSubtype = "reopen"
 	}
-	*events = append(*events, Event{
-		CitizenID:  m.CitizenID,
-		EventType:  "iteration_started",
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "iteration_started",
 		EventSubtype: startedSubtype,
-		TaskID:    m.TaskID,
-		RunID:    taskRunID,
-		ProjectID:  projectID,
+		TaskID:       m.TaskID,
+		RunID:        taskRunID,
+		ProjectID:    projectID,
 		Metadata: MarshalMetadata(map[string]any{
-			"iter_seq":     iterSeq,
+			"iter_seq":         iterSeq,
 			"iteration_branch": branch,
-			"deadline":     m.Deadline.Format(time.RFC3339),
-			"action":      taskAction,
+			"deadline":         m.Deadline.Format(time.RFC3339),
+			"action":           taskAction,
 		}),
 		CreatedAt: now,
 	})
@@ -749,23 +1025,137 @@ func applySetClaim(tx *sql.Tx, m SetClaim, events *[]Event) error {
 	return err
 }
 
-func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim) error {
-	_, err := tx.Exec(
-		`DELETE FROM task_claims WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim, sink EventSink) error {
+	// Capture iter_seq + run/project context BEFORE the claim
+	// row's outcome flips, so the iteration_completed event
+	// carries the same metadata shape applySetClaim uses for
+	// abandoned and applyRecordSubmission uses for completed.
+	var iterSeq sql.NullInt64
+	var commitSHA sql.NullString
+	var runID, projectID int64
+	_ = tx.QueryRow(
+		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id
+		 FROM task_claims c JOIN tasks t ON c.task_id = t.id JOIN runs r ON t.run_id = r.id
+		 WHERE c.task_id = ? AND c.citizen_id = ? AND c.outcome IS NULL`,
 		m.TaskID, m.CitizenID,
-	)
-	if err != nil {
-		return err
-	}
-	// Reset task state if it was claimed by this citizen.
-	_, err = tx.Exec(
+	).Scan(&iterSeq, &commitSHA, &runID, &projectID)
+
+	// Reset the task to READY only if this citizen actually
+	// holds the claim. Guard prevents one citizen accidentally
+	// releasing another citizen's claim if the call sites ever
+	// drift.
+	if _, err := tx.Exec(
 		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL WHERE id = ? AND claimed_by = ?`,
 		m.TaskID, m.CitizenID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	// Mark the open claim row outcome=released. Preserves the
+	// row as audit history (who claimed it, when, why it ended)
+	// rather than deleting it. Matches the legacy
+	// Store.ReleaseTask behavior this mutation now subsumes.
+	if _, err := tx.Exec(
+		`UPDATE task_claims SET outcome = 'released' WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+		m.TaskID, m.CitizenID,
+	); err != nil {
+		return err
+	}
+	// Emit only if we actually closed an open claim. The pre-
+	// query returns zero rows when the citizen wasn't holding
+	// the claim — UPDATE was a no-op, so no state change to
+	// announce. iteration_completed{released} mirrors the
+	// {abandoned} and {completed} subtypes for consistent
+	// downstream consumption.
+	if runID > 0 {
+		sink.Emit(Event{
+			CitizenID:    m.CitizenID,
+			EventType:    "iteration_completed",
+			EventSubtype: "released",
+			TaskID:       m.TaskID,
+			RunID:        runID,
+			ProjectID:    projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":         iterSeq.Int64,
+				"final_commit_sha": commitSHA.String,
+			}),
+			CreatedAt: time.Now(),
+		})
+	} else {
+		sink.SkipEvents("release_claim no-op: citizen did not hold the claim")
+	}
+	return nil
 }
 
-func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) error {
+// applyExpireClaim handles a deadline-driven claim expiration
+// (scheduler/reaper). Resets the task to READY without the
+// claimant guard (the reaper expires whoever holds it), marks
+// the open claim row outcome=timed_out, and applies the
+// citizen-stats penalty (timeout counter + score recompute).
+//
+// Distinct from applyReleaseClaim because (a) the outcome
+// string differs and (b) only involuntary timeouts touch the
+// citizen score.
+//
+// Emits iteration_completed{timed_out} for the closed claim
+// (parallel to {released}, {abandoned}, {completed}).
+func applyExpireClaim(tx *sql.Tx, m ExpireClaim, sink EventSink) error {
+	// Capture iter_seq + run/project context BEFORE the claim
+	// row's outcome flips, same pattern as applyReleaseClaim.
+	var iterSeq sql.NullInt64
+	var commitSHA sql.NullString
+	var runID, projectID int64
+	_ = tx.QueryRow(
+		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id
+		 FROM task_claims c JOIN tasks t ON c.task_id = t.id JOIN runs r ON t.run_id = r.id
+		 WHERE c.task_id = ? AND c.citizen_id = ? AND c.outcome IS NULL`,
+		m.TaskID, m.CitizenID,
+	).Scan(&iterSeq, &commitSHA, &runID, &projectID)
+
+	if _, err := tx.Exec(
+		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL WHERE id = ?`,
+		m.TaskID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE task_claims SET outcome = 'timed_out' WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+		m.TaskID, m.CitizenID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE citizens SET
+			tasks_timed_out = tasks_timed_out + 1,
+			score = tasks_completed - ((tasks_timed_out + 1) * 0.5) - (tasks_rejected * 1.0)
+		WHERE id = ?`,
+		m.CitizenID,
+	); err != nil {
+		return err
+	}
+	if runID > 0 {
+		sink.Emit(Event{
+			CitizenID:    m.CitizenID,
+			EventType:    "iteration_completed",
+			EventSubtype: "timed_out",
+			TaskID:       m.TaskID,
+			RunID:        runID,
+			ProjectID:    projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":         iterSeq.Int64,
+				"final_commit_sha": commitSHA.String,
+			}),
+			CreatedAt: time.Now(),
+		})
+	} else {
+		// Reaper found an expired-deadline row but the JOIN-
+		// driven lookup didn't see it (claim already closed by
+		// a concurrent path). UPDATE was a no-op.
+		sink.SkipEvents("expire_claim no-op: open claim not found at emit-time lookup")
+	}
+	return nil
+}
+
+func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error {
 	now := time.Now()
 
 	// Read task to determine single vs multi citizen + action.
@@ -862,18 +1252,18 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 		// stays populated after the redefinition (the
 		// pre-existing engine/submit.go emission carried the token
 		// count; with that gone, this is the universal carrier).
-		*events = append(*events, Event{
-			CitizenID:  m.CitizenID,
-			EventType:  "task_submitted",
+		sink.Emit(Event{
+			CitizenID:    m.CitizenID,
+			EventType:    "task_submitted",
 			EventSubtype: taskAction,
-			TaskID:    m.TaskID,
-			RunID:    runID,
-			ProjectID:  projectID,
+			TaskID:       m.TaskID,
+			RunID:        runID,
+			ProjectID:    projectID,
 			Metadata: MarshalMetadata(map[string]any{
-				"iter_seq":     iterSeq.Int64,
-				"attempt_seq":   attemptSeq,
-				"commit_sha":    m.CommitSHA,
-				"decision":     m.Decision,
+				"iter_seq":         iterSeq.Int64,
+				"attempt_seq":      attemptSeq,
+				"commit_sha":       m.CommitSHA,
+				"decision":         m.Decision,
 				"estimated_tokens": m.EstimatedTokens,
 			}),
 			CreatedAt: now,
@@ -932,37 +1322,35 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 			// the terminal-good moment. Fire iteration_completed
 			// + task_completed together. Reviewed paths defer
 			// both to the review-approve handler in router.go.
-			*events = append(*events,
-				Event{
-					CitizenID:  m.CitizenID,
-					EventType:  "iteration_completed",
-					EventSubtype: "completed",
-					TaskID:    m.TaskID,
-					RunID:    runID,
-					ProjectID:  projectID,
-					Metadata: MarshalMetadata(map[string]any{
-						"iter_seq":     iterSeq.Int64,
-						"final_commit_sha": m.CommitSHA,
-						"action":      taskAction,
-					}),
-					CreatedAt: now,
-				},
-				Event{
-					CitizenID:  m.CitizenID,
-					EventType:  "task_completed",
-					EventSubtype: taskAction,
-					TaskID:    m.TaskID,
-					RunID:    runID,
-					ProjectID:  projectID,
-					Metadata: MarshalMetadata(map[string]any{
-						"iter_seq":     iterSeq.Int64,
-						"commit_sha":    m.CommitSHA,
-						"reviewed":     false,
-						"estimated_tokens": m.EstimatedTokens,
-					}),
-					CreatedAt: now,
-				},
-			)
+			sink.Emit(Event{
+				CitizenID:    m.CitizenID,
+				EventType:    "iteration_completed",
+				EventSubtype: "completed",
+				TaskID:       m.TaskID,
+				RunID:        runID,
+				ProjectID:    projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":         iterSeq.Int64,
+					"final_commit_sha": m.CommitSHA,
+					"action":           taskAction,
+				}),
+				CreatedAt: now,
+			})
+			sink.Emit(Event{
+				CitizenID:    m.CitizenID,
+				EventType:    "task_completed",
+				EventSubtype: taskAction,
+				TaskID:       m.TaskID,
+				RunID:        runID,
+				ProjectID:    projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"iter_seq":         iterSeq.Int64,
+					"commit_sha":       m.CommitSHA,
+					"reviewed":         false,
+					"estimated_tokens": m.EstimatedTokens,
+				}),
+				CreatedAt: now,
+			})
 		} else if claimRowID.Valid {
 			// Stay open — but still update the
 			// denormalized fields on the claim row so legacy
@@ -1005,18 +1393,18 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 			// quorum/threshold; task_completed is NOT emitted
 			// here — it fires when the tally resolves the task
 			// to ACCEPTED (separate code path).
-			*events = append(*events, Event{
-				CitizenID:  m.CitizenID,
-				EventType:  "iteration_completed",
+			sink.Emit(Event{
+				CitizenID:    m.CitizenID,
+				EventType:    "iteration_completed",
 				EventSubtype: "completed",
-				TaskID:    m.TaskID,
-				RunID:    runID,
-				ProjectID:  projectID,
+				TaskID:       m.TaskID,
+				RunID:        runID,
+				ProjectID:    projectID,
 				Metadata: MarshalMetadata(map[string]any{
-					"iter_seq":     iterSeq.Int64,
+					"iter_seq":         iterSeq.Int64,
 					"final_commit_sha": m.CommitSHA,
-					"action":      taskAction,
-					"multi_citizen":  true,
+					"action":           taskAction,
+					"multi_citizen":    true,
 				}),
 				CreatedAt: now,
 			})
@@ -1027,10 +1415,18 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, events *[]Event) erro
 			m.TokensUsed, now, m.CitizenID,
 		)
 	}
+	if !claimRowID.Valid {
+		// Degenerate: submit landed without an open claim row.
+		// All downstream emits are gated on claimRowID.Valid, so
+		// nothing fires. Phase 4b should decide whether to reject
+		// this case at the apply layer; today the state UPDATE
+		// still ran (submitted_at, etc.) but no signal escapes.
+		sink.SkipEvents("submit without open claim row: degenerate path, no events fire (phase 4b: reject at apply?)")
+	}
 	return nil
 }
 
-func applyMoveArtifact(tx *sql.Tx, m MoveArtifact) error {
+func applyMoveArtifact(tx *sql.Tx, m MoveArtifact, sink EventSink) error {
 	a := &m.Artifact
 	branch := a.Branch
 	if branch == "" {
@@ -1048,6 +1444,11 @@ func applyMoveArtifact(tx *sql.Tx, m MoveArtifact) error {
 		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.CreatedAt, a.UpdatedAt,
 		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.UpdatedAt,
 	)
+	// Artifact moves are bookkeeping for the index. Citizen-
+	// observable visibility is covered by the downstream
+	// task_ready event of the consuming task; an "artifact_moved"
+	// event would be redundant noise.
+	sink.SkipEvents("artifact index update is bookkeeping; downstream task_ready covers consumer visibility")
 	return err
 }
 
@@ -1061,16 +1462,20 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-func applyDeleteArtifact(tx *sql.Tx, m DeleteArtifact) error {
+func applyDeleteArtifact(tx *sql.Tx, m DeleteArtifact, sink EventSink) error {
 	branch := m.Branch
 	if branch == "" {
 		branch = "main"
 	}
 	_, err := tx.Exec(`DELETE FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`, m.ProjectID, branch, m.Path)
+	// Same rationale as applyMoveArtifact: index bookkeeping,
+	// no citizen-observable signal beyond what downstream task
+	// state already conveys.
+	sink.SkipEvents("artifact index delete is bookkeeping; cascade emits task_ready/cascade_fired downstream")
 	return err
 }
 
-func applyCreateCitizen(tx *sql.Tx, m CreateCitizen) (int64, error) {
+func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, error) {
 	c := &m.Citizen
 	result, err := tx.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen)
@@ -1080,10 +1485,33 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	newID, _ := result.LastInsertId()
+	// Subtype carries the kind discriminator so consumers
+	// (audit views, attribution dashboards) can split humans
+	// vs bots without re-querying. Kind defaults to "human"
+	// pre-migration; the SQL column DEFAULTs the same.
+	subtype := c.Kind
+	if subtype == "" {
+		subtype = "human"
+	}
+	meta := map[string]any{
+		"username": c.Username,
+		"role":     c.Role,
+	}
+	if c.ParentID != nil {
+		meta["parent_id"] = *c.ParentID
+	}
+	sink.Emit(Event{
+		CitizenID:    newID,
+		EventType:    "citizen_registered",
+		EventSubtype: subtype,
+		Metadata:     MarshalMetadata(meta),
+		CreatedAt:    time.Now(),
+	})
+	return newID, nil
 }
 
-func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, events *[]Event) (int, error) {
+func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, sink EventSink) ([]ReadiedTask, error) {
 	// Run the cascade against the open tx so it sees in-tx
 	// writes (e.g. an upstream task's accept transition earlier
 	// in the same Plan) and shares the SQLite write lock for
@@ -1095,10 +1523,20 @@ func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, events *[]E
 	// dbExecQueryer doc.
 	readied, err := updateReadyTasksOn(tx, m.RunID)
 	if err != nil {
-		return len(readied), err
+		return readied, err
 	}
-	*events = append(*events, buildTaskReadyEvents(readied, time.Now())...)
-	return len(readied), nil
+	readyEvents := buildTaskReadyEvents(readied, time.Now())
+	if len(readyEvents) == 0 {
+		// Cascade pass found no PENDING task whose deps just
+		// satisfied. Common when the cascade fires defensively
+		// after every Plan; not every Plan promotes anything.
+		sink.SkipEvents("cascade pass found no newly-ready tasks")
+	} else {
+		for _, ev := range readyEvents {
+			sink.Emit(ev)
+		}
+	}
+	return readied, nil
 }
 
 // buildTaskReadyEvents fans out one task_ready event per
@@ -1175,7 +1613,7 @@ func buildTaskReadyEvents(readied []ReadiedTask, now time.Time) []Event {
 // true when the run transitioned to `completed` so callers that
 // surface "run completed" UX (the existing behavior) keep working
 // unchanged.
-func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) {
+func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	var current string
 	var projectID int64
 	var autoTriage string
@@ -1187,6 +1625,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) 
 	}
 	// Paused / failed runs don't auto-transition.
 	if current == string(RunPaused) || current == string(RunFailed) {
+		sink.SkipEvents("complete_run no-op: run is paused/failed, no auto-transition")
 		return false, nil
 	}
 
@@ -1209,6 +1648,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) 
 		// Empty run — keep current. Run is freshly created and
 		// tasks haven't been inserted yet; CompleteRun fired
 		// from a stale plan should not flip an empty run.
+		sink.SkipEvents("complete_run no-op: empty run (tasks not yet inserted)")
 		return false, nil
 	case active > 0:
 		next = RunActive
@@ -1233,6 +1673,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) 
 	}
 
 	if string(next) == current {
+		sink.SkipEvents("complete_run no-op: state unchanged")
 		return next == RunCompleted, nil
 	}
 	now := time.Now()
@@ -1244,13 +1685,13 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, events *[]Event) (bool, error) 
 	// transitions fall out of task-graph state). The matching
 	// post-commit drain in applyPlanOnce flushes to the
 	// EventStore only if the whole plan commits.
-	*events = append(*events, Event{
-		EventType:  "run_" + string(next),
+	sink.Emit(Event{
+		EventType:    "run_" + string(next),
 		EventSubtype: current,
-		RunID:    m.RunID,
-		ProjectID:  projectID,
-		Metadata:   MarshalMetadata(map[string]any{"from": current, "to": next}),
-		CreatedAt:  now,
+		RunID:        m.RunID,
+		ProjectID:    projectID,
+		Metadata:     MarshalMetadata(map[string]any{"from": current, "to": next}),
+		CreatedAt:    now,
 	})
 	return next == RunCompleted, nil
 }
@@ -1290,4 +1731,770 @@ func nullableInt64(p *int64) interface{} {
 		return nil
 	}
 	return *p
+}
+
+// applyEmitEvent handles the EmitEvent mutation: pure pass-
+// through of one event to the sink. No state change, no
+// validation. Exists so metadata-only emits (cascade_fired,
+// branch_merged, etc.) can ride the EventSink contract instead
+// of an out-of-band Store.Events().Record call.
+func applyEmitEvent(m EmitEvent, sink EventSink) {
+	sink.Emit(m.Event)
+}
+
+func applyCreateProject(tx *sql.Tx, m CreateProject, sink EventSink) (int64, error) {
+	p := &m.Project
+	var remote sql.NullString
+	if p.RemoteURL != "" {
+		remote = sql.NullString{String: p.RemoteURL, Valid: true}
+	}
+	branch := p.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
+	res, err := tx.Exec(
+		`INSERT INTO projects (name, description, created_by, remote_url, default_branch, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.Name, p.Description, p.CreatedBy, remote, branch, p.CreatedAt, p.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	sink.Emit(Event{
+		EventType: "project_created",
+		ProjectID: id,
+		Metadata: MarshalMetadata(map[string]any{
+			"name":           p.Name,
+			"created_by":     p.CreatedBy,
+			"default_branch": branch,
+		}),
+		CreatedAt: time.Now(),
+	})
+	return id, nil
+}
+
+func applySetProjectDefaultBranch(tx *sql.Tx, m SetProjectDefaultBranch, sink EventSink) error {
+	branch := m.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if _, err := tx.Exec(
+		`UPDATE projects SET default_branch = ?, updated_at = ? WHERE id = ?`,
+		branch, time.Now(), m.ProjectID,
+	); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		EventType:    "project_settings_changed",
+		EventSubtype: "default_branch",
+		ProjectID:    m.ProjectID,
+		Metadata:     MarshalMetadata(map[string]any{"default_branch": branch}),
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+func applySetProjectRemoteURL(tx *sql.Tx, m SetProjectRemoteURL, sink EventSink) error {
+	var remote sql.NullString
+	if m.RemoteURL != "" {
+		remote = sql.NullString{String: m.RemoteURL, Valid: true}
+	}
+	if _, err := tx.Exec(
+		`UPDATE projects SET remote_url = ?, updated_at = ? WHERE id = ?`,
+		remote, time.Now(), m.ProjectID,
+	); err != nil {
+		return err
+	}
+	// remote_url itself is not in the metadata — could be a
+	// secret-bearing URL (token@host syntax). Subscribers that
+	// need it can read the projects row; the event signals
+	// "the value changed" without leaking what to.
+	sink.Emit(Event{
+		EventType:    "project_settings_changed",
+		EventSubtype: "remote_url",
+		ProjectID:    m.ProjectID,
+		Metadata:     MarshalMetadata(map[string]any{"remote_set": m.RemoteURL != ""}),
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+func applyAddProjectMember(tx *sql.Tx, m AddProjectMember, sink EventSink) error {
+	if m.ProjectID == 0 || m.CitizenID == 0 {
+		return fmt.Errorf("project_id and citizen_id are required")
+	}
+	role := m.Role
+	if role == "" {
+		role = ProjectRoleMember
+	}
+	var addedByVal sql.NullInt64
+	if m.AddedBy != 0 {
+		addedByVal = sql.NullInt64{Int64: m.AddedBy, Valid: true}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO project_members (project_id, citizen_id, role, added_at, added_by)
+		 VALUES (?, ?, ?, ?, ?)`,
+		m.ProjectID, m.CitizenID, string(role), time.Now(), addedByVal,
+	); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "project_member_added",
+		EventSubtype: string(role),
+		ProjectID:    m.ProjectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"role":     string(role),
+			"added_by": m.AddedBy,
+		}),
+		CreatedAt: time.Now(),
+	})
+	return nil
+}
+
+func applyRemoveProjectMember(tx *sql.Tx, m RemoveProjectMember, sink EventSink) error {
+	res, err := tx.Exec(
+		`DELETE FROM project_members WHERE project_id = ? AND citizen_id = ?`,
+		m.ProjectID, m.CitizenID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// Idempotent no-op (citizen wasn't a member). No row
+		// change means nothing to announce.
+		sink.SkipEvents("remove_project_member no-op: citizen was not a member")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "project_member_removed",
+		ProjectID: m.ProjectID,
+		Metadata:  MarshalMetadata(map[string]any{}),
+		CreatedAt: time.Now(),
+	})
+	return nil
+}
+
+func applySpawnTask(tx *sql.Tx, m SpawnTask, sink EventSink) (string, bool, error) {
+	spec := m.Spec
+	if spec.RunID == 0 {
+		return "", false, fmt.Errorf("spawn_task: run_id is required")
+	}
+	if spec.TaskDefID == "" {
+		return "", false, fmt.Errorf("spawn_task: task_def_id is required")
+	}
+	if spec.Action == "" {
+		return "", false, fmt.Errorf("spawn_task: action is required")
+	}
+	if spec.Trigger == "" {
+		spec.Trigger = "human"
+	}
+	if spec.Citizens <= 0 {
+		spec.Citizens = 1
+	}
+	if spec.ResultType == "" {
+		spec.ResultType = "text"
+	}
+
+	var (
+		runState   string
+		projectID  int64
+		runSeq     int
+		runSlug    string
+		budgetUsed int
+		budgetMax  int
+	)
+	if err := tx.QueryRow(
+		`SELECT state, project_id, seq, slug, cycle_budget_used, cycle_budget_max
+		 FROM runs WHERE id = ?`,
+		spec.RunID,
+	).Scan(&runState, &projectID, &runSeq, &runSlug, &budgetUsed, &budgetMax); err != nil {
+		return "", false, fmt.Errorf("loading run: %w", err)
+	}
+
+	switch RunState(runState) {
+	case RunCompleted, RunFailed:
+		return "", false, fmt.Errorf("run %d is %s — cannot spawn into a terminal run", spec.RunID, runState)
+	case RunPaused:
+		return "", false, fmt.Errorf("run %d is paused — resume it first with enju_resume_run", spec.RunID)
+	}
+
+	if budgetUsed >= budgetMax {
+		now := time.Now()
+		// Pause the run + emit cycle_budget_exhausted in this
+		// tx. The handler returns (taskID="", exhausted=true,
+		// err=nil) so the dispatcher commits — the legacy
+		// inline-commit-then-return-error pattern would have
+		// undone the pause when the chokepoint rollback ran.
+		// Service caller checks ApplyResult.BudgetExhausted
+		// and converts to a typed user error.
+		if _, err := tx.Exec(
+			`UPDATE runs SET state = 'paused', updated_at = ? WHERE id = ? AND state IN ('active', 'idle')`,
+			now, spec.RunID,
+		); err != nil {
+			return "", false, fmt.Errorf("auto-pausing run on budget exhaustion: %w", err)
+		}
+		sink.Emit(Event{
+			EventType: "cycle_budget_exhausted",
+			RunID:     spec.RunID,
+			ProjectID: projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"used":           budgetUsed,
+				"max":            budgetMax,
+				"attempted_task": spec.TaskDefID,
+				"attempted_by":   spec.SpawnedBy,
+			}),
+			CreatedAt: now,
+		})
+		return "", true, nil
+	}
+
+	var maxSeq int
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM tasks WHERE run_id = ?`, spec.RunID).Scan(&maxSeq); err != nil {
+		return "", false, err
+	}
+	nextSeq := maxSeq + 1
+	taskID := fmt.Sprintf("%d:%d:%s", projectID, runSeq, spec.TaskDefID)
+
+	state := TaskReady
+	if len(spec.DependsOn) > 0 {
+		state = TaskPending
+	}
+	dependsOn := strings.Join(spec.DependsOn, ",")
+	assignTo := ""
+	if len(spec.AssignTo) > 0 {
+		quoted := make([]string, len(spec.AssignTo))
+		for i, u := range spec.AssignTo {
+			quoted[i] = fmt.Sprintf("%q", u)
+		}
+		assignTo = "[" + strings.Join(quoted, ",") + "]"
+	}
+
+	now := time.Now()
+	if _, err := tx.Exec(
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref,
+		                    action, prompt, user_prompt, script, outputs, requirements, result_type,
+		                    timeout, state, depends_on, reads_artifacts, writes_artifacts,
+		                    assign_to, require_role, citizens, run_slug,
+		                    spawned_from, spawn_trigger, closes_issue_seq, created_at)
+		 VALUES (?, ?, ?, ?, '', '', '',
+		         ?, ?, ?, '', '', '', ?,
+		         '', ?, ?, '[]', '[]',
+		         ?, ?, ?, ?,
+		         ?, ?, ?, ?)`,
+		taskID, spec.RunID, nextSeq, spec.TaskDefID,
+		spec.Action, spec.Prompt, spec.UserPrompt, spec.ResultType,
+		state, dependsOn,
+		assignTo, spec.RequireRole, spec.Citizens, runSlug,
+		spec.ParentTaskID, spec.Trigger, spec.ClosesIssueSeq, now,
+	); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: tasks.id") {
+			return "", false, fmt.Errorf("task_def_id %q already exists in run %d — pick a different id (or bump the suffix on a re-spawn)", spec.TaskDefID, spec.RunID)
+		}
+		return "", false, fmt.Errorf("inserting spawned task: %w", err)
+	}
+
+	if _, err := tx.Exec(`UPDATE runs SET cycle_budget_used = cycle_budget_used + 1, updated_at = ? WHERE id = ?`, now, spec.RunID); err != nil {
+		return "", false, err
+	}
+
+	runReactivated := false
+	if state == TaskReady && runState == string(RunIdle) {
+		if _, err := tx.Exec(`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'idle'`, now, spec.RunID); err != nil {
+			return "", false, err
+		}
+		runReactivated = true
+	}
+
+	if runReactivated {
+		sink.Emit(Event{
+			EventType:    "run_active",
+			EventSubtype: "idle",
+			RunID:        spec.RunID,
+			ProjectID:    projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"from":    "idle",
+				"to":      "active",
+				"trigger": "spawn",
+			}),
+			CreatedAt: now,
+		})
+	}
+	sink.Emit(Event{
+		CitizenID:    spec.SpawnedBy,
+		EventType:    "task_spawned",
+		EventSubtype: spec.Trigger,
+		TaskID:       taskID,
+		RunID:        spec.RunID,
+		ProjectID:    projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"task_def_id":    spec.TaskDefID,
+			"action":         spec.Action,
+			"parent_task_id": spec.ParentTaskID,
+			"trigger":        spec.Trigger,
+			"depends_on":     dependsOn,
+		}),
+		CreatedAt: now,
+	})
+	return taskID, false, nil
+}
+
+func applySetCycleBudgetMax(tx *sql.Tx, m SetCycleBudgetMax, sink EventSink) error {
+	var used, oldMax int
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT cycle_budget_used, cycle_budget_max, project_id FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&used, &oldMax, &projectID); err != nil {
+		return err
+	}
+	if m.NewMax < used {
+		return fmt.Errorf("new max %d is below current used %d — would be immediately exhausted", m.NewMax, used)
+	}
+	if m.NewMax == oldMax {
+		// Idempotent no-op; the column doesn't change so nothing
+		// to announce.
+		sink.SkipEvents("set_cycle_budget_max no-op: new max equals current max")
+		return nil
+	}
+	now := time.Now()
+	if _, err := tx.Exec(
+		`UPDATE runs SET cycle_budget_max = ?, updated_at = ? WHERE id = ?`,
+		m.NewMax, now, m.RunID,
+	); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "cycle_budget_changed",
+		RunID:     m.RunID,
+		ProjectID: projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"old_max": oldMax,
+			"new_max": m.NewMax,
+			"used":    used,
+		}),
+		CreatedAt: now,
+	})
+	return nil
+}
+
+func applyCreateIssue(tx *sql.Tx, m CreateIssue, sink EventSink) (int64, int, error) {
+	rec := m.Issue
+	if rec.ProjectID == 0 {
+		return 0, 0, fmt.Errorf("create_issue: project_id is required")
+	}
+	if rec.Title == "" {
+		return 0, 0, fmt.Errorf("create_issue: title is required")
+	}
+	if rec.FiledBy == 0 {
+		return 0, 0, fmt.Errorf("create_issue: filed_by is required")
+	}
+	if rec.Status == "" {
+		rec.Status = IssueStatusOpen
+	}
+	if rec.Severity == "" {
+		rec.Severity = IssueSeverityMedium
+	}
+	now := time.Now()
+	if rec.FiledAt.IsZero() {
+		rec.FiledAt = now
+	}
+	rec.UpdatedAt = now
+
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM issues WHERE project_id = ?`, rec.ProjectID).Scan(&maxSeq); err != nil {
+		return 0, 0, err
+	}
+	rec.Seq = int(maxSeq.Int64) + 1
+
+	res, err := tx.Exec(
+		`INSERT INTO issues (project_id, seq, title, body, status, severity, found_in_run_id, found_in_task_id, filed_by, filed_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.ProjectID, rec.Seq, rec.Title, rec.Body, rec.Status, rec.Severity,
+		rec.FoundInRunID, rec.FoundInTaskID, rec.FiledBy, rec.FiledAt, rec.UpdatedAt,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, 0, err
+	}
+	sink.Emit(Event{
+		CitizenID:    rec.FiledBy,
+		EventType:    "issue_filed",
+		EventSubtype: rec.Severity,
+		TaskID:       rec.FoundInTaskID,
+		RunID:        rec.FoundInRunID,
+		ProjectID:    rec.ProjectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq": rec.Seq,
+			"title":     rec.Title,
+			"severity":  rec.Severity,
+		}),
+		CreatedAt: rec.FiledAt,
+	})
+	return id, rec.Seq, nil
+}
+
+func applyTriageIssue(tx *sql.Tx, m TriageIssue, sink EventSink) error {
+	now := time.Now()
+	q := `UPDATE issues
+	     SET status = 'triaged', triaged_by = ?, triaged_at = ?, updated_at = ?`
+	args := []interface{}{m.CitizenID, now, now}
+	if m.Severity != "" {
+		q += `, severity = ?`
+		args = append(args, m.Severity)
+	}
+	q += ` WHERE id = ? AND status = 'open'`
+	args = append(args, m.IssueID)
+
+	res, err := tx.Exec(q, args...)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("issue %d cannot be triaged (already triaged/closed/wontfix or not found)", m.IssueID)
+	}
+
+	var seq int
+	var newSeverity string
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT project_id, seq, severity FROM issues WHERE id = ?`, m.IssueID,
+	).Scan(&projectID, &seq, &newSeverity); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "issue_triaged",
+		EventSubtype: newSeverity,
+		ProjectID:    projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq": seq,
+			"severity":  newSeverity,
+		}),
+		CreatedAt: now,
+	})
+	return nil
+}
+
+func applyMarkIssueInProgress(tx *sql.Tx, m MarkIssueInProgress, sink EventSink) error {
+	now := time.Now()
+	res, err := tx.Exec(
+		`UPDATE issues
+		 SET status = 'in_progress', closed_by_task_id = ?, updated_at = ?
+		 WHERE id = ? AND status IN ('open', 'triaged')`,
+		m.FixTaskID, now, m.IssueID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("issue %d cannot move to in_progress (already terminal/in_progress or not found)", m.IssueID)
+	}
+
+	var seq int
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT project_id, seq FROM issues WHERE id = ?`, m.IssueID,
+	).Scan(&projectID, &seq); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "issue_in_progress",
+		TaskID:    m.FixTaskID,
+		ProjectID: projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq":   seq,
+			"fix_task_id": m.FixTaskID,
+		}),
+		CreatedAt: now,
+	})
+	return nil
+}
+
+func applyCloseIssue(tx *sql.Tx, m CloseIssue, sink EventSink) error {
+	if m.Status != IssueStatusClosed && m.Status != IssueStatusWontfix {
+		return fmt.Errorf("close_issue: status must be 'closed' or 'wontfix', got %q", m.Status)
+	}
+	now := time.Now()
+	res, err := tx.Exec(
+		`UPDATE issues
+		 SET status = ?, closed_by_task_id = ?, closed_at = ?, updated_at = ?
+		 WHERE id = ? AND status IN ('open', 'triaged', 'in_progress')`,
+		m.Status, m.ClosedByTaskID, now, now, m.IssueID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("issue %d cannot be closed (already terminal or not found)", m.IssueID)
+	}
+
+	var seq int
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT project_id, seq FROM issues WHERE id = ?`, m.IssueID,
+	).Scan(&projectID, &seq); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "issue_closed",
+		EventSubtype: m.Status,
+		TaskID:       m.ClosedByTaskID,
+		ProjectID:    projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"issue_seq":         seq,
+			"status":            m.Status,
+			"closed_by_task_id": m.ClosedByTaskID,
+		}),
+		CreatedAt: now,
+	})
+	return nil
+}
+
+func applyPauseRun(tx *sql.Tx, m PauseRun, sink EventSink) error {
+	var current string
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT state, project_id FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID); err != nil {
+		return err
+	}
+	if RunState(current) == RunPaused {
+		// Idempotent: already paused, no state change to announce.
+		sink.SkipEvents("pause_run no-op: run already paused")
+		return nil
+	}
+	now := time.Now()
+	res, err := tx.Exec(
+		`UPDATE runs SET state = 'paused', updated_at = ?
+		 WHERE id = ? AND state IN ('active', 'idle')`,
+		now, m.RunID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("run %d cannot be paused (already terminal or not found)", m.RunID)
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "run_paused",
+		EventSubtype: current,
+		RunID:        m.RunID,
+		ProjectID:    projectID,
+		Metadata:     MarshalMetadata(map[string]any{"from": current, "to": "paused"}),
+		CreatedAt:    now,
+	})
+	return nil
+}
+
+func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
+	var current string
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT state, project_id FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID); err != nil {
+		return err
+	}
+	switch RunState(current) {
+	case RunCompleted, RunFailed:
+		return fmt.Errorf("run %d is %s — cannot resume a terminal run", m.RunID, current)
+	case RunActive, RunIdle:
+		// Idempotent: already non-paused, nothing to lift.
+		sink.SkipEvents("resume_run no-op: run already in active/idle")
+		return nil
+	}
+	now := time.Now()
+	if _, err := tx.Exec(
+		`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'paused'`,
+		now, m.RunID,
+	); err != nil {
+		return err
+	}
+	// Emit run_resumed; the caller's CompleteRun mutation later
+	// in the plan may further transition active → idle, which
+	// emits its own run_idle event with citizen 0 (system).
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "run_resumed",
+		EventSubtype: "paused",
+		RunID:        m.RunID,
+		ProjectID:    projectID,
+		Metadata:     MarshalMetadata(map[string]any{"from": "paused", "to": "active"}),
+		CreatedAt:    now,
+	})
+	return nil
+}
+
+func applyMarkOpenClaimsInvalidated(tx *sql.Tx, m MarkOpenClaimsInvalidated, sink EventSink) error {
+	type closedClaim struct {
+		claimID, citizenID, runID, projectID int64
+		iterSeq                              sql.NullInt64
+		commit                               sql.NullString
+		taskAction                           string
+	}
+	var affected []closedClaim
+	rows, err := tx.Query(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ? AND tc.outcome IS NULL`,
+		m.TaskID,
+	)
+	if err == nil {
+		for rows.Next() {
+			var c closedClaim
+			if scanErr := rows.Scan(&c.claimID, &c.citizenID, &c.iterSeq, &c.commit,
+				&c.runID, &c.projectID, &c.taskAction); scanErr == nil {
+				affected = append(affected, c)
+			}
+		}
+		rows.Close()
+	}
+	res, err := tx.Exec(
+		`UPDATE task_claims SET outcome = 'invalidated' WHERE task_id = ? AND outcome IS NULL`,
+		m.TaskID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("mark_open_claims_invalidated no-op: no open claims to close")
+		return nil
+	}
+	now := time.Now()
+	for _, c := range affected {
+		sink.Emit(Event{
+			CitizenID:    c.citizenID,
+			EventType:    "iteration_completed",
+			EventSubtype: "invalidated",
+			TaskID:       m.TaskID,
+			RunID:        c.runID,
+			ProjectID:    c.projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":         c.iterSeq.Int64,
+				"final_commit_sha": c.commit.String,
+				"action":           c.taskAction,
+				"reason":           "cascade_invalidate",
+			}),
+			CreatedAt: now,
+		})
+	}
+	return nil
+}
+
+func applyMarkLatestClaimOutcome(tx *sql.Tx, m MarkLatestClaimOutcome, sink EventSink) error {
+	if m.Outcome == "" {
+		return fmt.Errorf("mark_latest_claim_outcome: outcome is required")
+	}
+	if !validRelabelOutcomes[m.Outcome] {
+		return fmt.Errorf("mark_latest_claim_outcome: invalid outcome %q", m.Outcome)
+	}
+	var claimID, citizenID, runID, projectID int64
+	var iterSeq sql.NullInt64
+	var commit sql.NullString
+	var taskAction string
+	var citizens int
+	_ = tx.QueryRow(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action, t.citizens
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ?
+		 ORDER BY tc.id DESC LIMIT 1`,
+		m.TaskID,
+	).Scan(&claimID, &citizenID, &iterSeq, &commit, &runID, &projectID, &taskAction, &citizens)
+	res, err := tx.Exec(
+		`UPDATE task_claims SET outcome = ?
+		 WHERE id = (
+		  SELECT id FROM task_claims
+		  WHERE task_id = ?
+		  ORDER BY id DESC LIMIT 1
+		 )`,
+		m.Outcome, m.TaskID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 || claimID == 0 {
+		sink.SkipEvents("mark_latest_claim_outcome no-op: no claim row found")
+		return nil
+	}
+	now := time.Now()
+	sink.Emit(Event{
+		CitizenID:    citizenID,
+		EventType:    "iteration_completed",
+		EventSubtype: m.Outcome,
+		TaskID:       m.TaskID,
+		RunID:        runID,
+		ProjectID:    projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"iter_seq":         iterSeq.Int64,
+			"final_commit_sha": commit.String,
+			"action":           taskAction,
+		}),
+		CreatedAt: now,
+	})
+	// outcome="completed" via this path is review-approve closing
+	// the upstream's claim (Phase 6c). The task itself was already
+	// in ACCEPTED state from the earlier submit, so applySetTaskState's
+	// task_completed emission won't fire — emit it here instead.
+	if m.Outcome == "completed" {
+		sink.Emit(Event{
+			CitizenID:    citizenID,
+			EventType:    "task_completed",
+			EventSubtype: taskAction,
+			TaskID:       m.TaskID,
+			RunID:        runID,
+			ProjectID:    projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":   iterSeq.Int64,
+				"commit_sha": commit.String,
+				"reviewed":   true,
+			}),
+			CreatedAt: now,
+		})
+	}
+	return nil
+}
+
+func applySetProjectMemberRole(tx *sql.Tx, m SetProjectMemberRole, sink EventSink) error {
+	res, err := tx.Exec(
+		`UPDATE project_members SET role = ? WHERE project_id = ? AND citizen_id = ?`,
+		string(m.Role), m.ProjectID, m.CitizenID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("set_project_member_role no-op: citizen is not a member")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "project_member_role_changed",
+		EventSubtype: string(m.Role),
+		ProjectID:    m.ProjectID,
+		Metadata:     MarshalMetadata(map[string]any{"role": string(m.Role)}),
+		CreatedAt:    time.Now(),
+	})
+	return nil
 }

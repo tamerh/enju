@@ -10,6 +10,7 @@ import (
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/common/dag"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -49,14 +50,18 @@ func newCacheStore(t *testing.T) *store.Store {
 func createRun(t *testing.T, s *store.Store, yaml string) int64 {
 	t.Helper()
 	now := time.Now()
-	pid, err := s.CreateProject(&store.ProjectRecord{
-		Name:   "p",
-		CreatedAt: now,
-		UpdatedAt: now,
+	createRes, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateProject{Project: store.ProjectRecord{
+				Name: "p", CreatedAt: now, UpdatedAt: now,
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	pid := createRes.ProjectID
 	id, _, err := s.CreateRun(&store.RunRecord{
 		ProjectID: pid,
 		Name:   "r",

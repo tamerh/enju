@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -62,9 +63,23 @@ func FileIssue(s *store.Store, caller *store.CitizenRecord, p FileIssueParams) (
 		}
 		rec.FoundInRunID = run.ID
 	}
-	id, seq, err := s.CreateIssue(rec)
+	res, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateIssue{Issue: *rec},
+		},
+	})
 	if err != nil {
 		return nil, err
+	}
+	id := res.IssueID
+	seq := res.IssueSeq
+	// Re-read to get the resolved status/severity defaults the
+	// apply handler may have filled in.
+	created, _ := s.GetIssue(id)
+	if created != nil {
+		rec.Status = created.Status
+		rec.Severity = created.Severity
 	}
 	return &FileIssueResponse{
 		ID:       id,
@@ -90,7 +105,12 @@ func TriageIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, s
 	if it == nil {
 		return nil, ErrNotFound
 	}
-	if err := s.TriageIssue(it.ID, caller.ID, severity); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.TriageIssue{IssueID: it.ID, CitizenID: caller.ID, Severity: severity},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	updated, _ := s.GetIssue(it.ID)
@@ -118,7 +138,17 @@ func CloseIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, se
 	if it == nil {
 		return nil, ErrNotFound
 	}
-	if err := s.CloseIssue(it.ID, caller.ID, status, closedByTaskID); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CloseIssue{
+				IssueID:        it.ID,
+				CitizenID:      caller.ID,
+				Status:         status,
+				ClosedByTaskID: closedByTaskID,
+			},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	updated, _ := s.GetIssue(it.ID)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -47,19 +48,24 @@ func ReportMerge(s *store.Store, caller *store.CitizenRecord, projectID int64, r
 		return nil, fmt.Errorf("%w: topic_branch, run_branch, and merge_sha are required", ErrInvalidArgument)
 	}
 	citizenID := callerID(caller)
-	s.Events().Record(store.Event{
-		CitizenID: citizenID,
-		EventType: "branch_merged",
-		TaskID:  params.TaskID,
-		RunID:   run.ID,
-		ProjectID: projectID,
-		Metadata: store.MarshalMetadata(map[string]any{
-			"topic_branch": params.TopicBranch,
-			"run_branch":  params.RunBranch,
-			"merge_sha":  params.MergeSHA,
-			"run_seq":   run.Seq,
-		}),
-		CreatedAt: time.Now(),
+	// Route through ApplyPlan via EmitEvent so the chokepoint
+	// contract holds — every event flows through one path.
+	s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{store.EmitEvent{Event: store.Event{
+			CitizenID: citizenID,
+			EventType: "branch_merged",
+			TaskID:    params.TaskID,
+			RunID:     run.ID,
+			ProjectID: projectID,
+			Metadata: store.MarshalMetadata(map[string]any{
+				"topic_branch": params.TopicBranch,
+				"run_branch":   params.RunBranch,
+				"merge_sha":    params.MergeSHA,
+				"run_seq":      run.Seq,
+			}),
+			CreatedAt: time.Now(),
+		}}},
 	})
 	return &ReportMergeResponse{
 		Status:    "recorded",

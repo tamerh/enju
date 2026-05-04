@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -29,7 +30,12 @@ func SetProjectDefaultBranch(s *store.Store, caller *store.CitizenRecord, projec
 	if err := requireOwner(s, projectID, caller.ID); err != nil {
 		return nil, err
 	}
-	if err := s.SetProjectDefaultBranch(projectID, branch); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetProjectDefaultBranch{ProjectID: projectID, Branch: branch},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	return &SetDefaultBranchResponse{
@@ -82,7 +88,17 @@ func AddProjectMember(s *store.Store, caller *store.CitizenRecord, projectID int
 	default:
 		return nil, fmt.Errorf("%w: unknown role %q (expected 'member' or 'owner')", ErrInvalidArgument, roleStr)
 	}
-	if err := s.AddProjectMember(projectID, target.ID, role, caller.ID); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.AddProjectMember{
+				ProjectID: projectID,
+				CitizenID: target.ID,
+				Role:      role,
+				AddedBy:   caller.ID,
+			},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	return &AddMemberResponse{
@@ -142,7 +158,12 @@ func RemoveProjectMember(s *store.Store, caller *store.CitizenRecord, projectID 
 			return nil, fmt.Errorf("%w: cannot remove the last owner — promote another member to owner first", ErrConflict)
 		}
 	}
-	if err := s.RemoveProjectMember(projectID, target.ID); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.RemoveProjectMember{ProjectID: projectID, CitizenID: target.ID},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	return &RemoveMemberResponse{
@@ -212,7 +233,16 @@ func SetProjectMemberRole(s *store.Store, caller *store.CitizenRecord, projectID
 			return nil, fmt.Errorf("%w: cannot demote the last owner — promote another member to owner first", ErrConflict)
 		}
 	}
-	if err := s.SetProjectMemberRole(projectID, target.ID, newRole); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetProjectMemberRole{
+				ProjectID: projectID,
+				CitizenID: target.ID,
+				Role:      newRole,
+			},
+		},
+	}); err != nil {
 		return nil, err
 	}
 	return &SetMemberRoleResponse{

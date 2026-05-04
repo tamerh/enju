@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
@@ -80,23 +81,33 @@ func (c *Coordinator) MaybeSpawnRemediation(reviewTaskID, targetTaskID, eventKin
 		assignTo = []string(tmpl.AssignTo)
 	}
 
-	taskID, err := c.Store.SpawnTask(store.SpawnSpec{
-		RunID:    target.RunID,
-		ParentTaskID: targetTaskID,
-		TaskDefID:  remediationDefID,
-		Action:    tmpl.Action,
-		Prompt:    prompt,
-		DependsOn:  []string{targetTaskID},
-		AssignTo:   assignTo,
-		RequireRole: tmpl.RequireRole,
-		Trigger:   "template_rule",
-		SpawnedBy:  submitterID,
+	res, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SpawnTask{Spec: store.SpawnSpec{
+				RunID:        target.RunID,
+				ParentTaskID: targetTaskID,
+				TaskDefID:    remediationDefID,
+				Action:       tmpl.Action,
+				Prompt:       prompt,
+				DependsOn:    []string{targetTaskID},
+				AssignTo:     assignTo,
+				RequireRole:  tmpl.RequireRole,
+				Trigger:      "template_rule",
+				SpawnedBy:    submitterID,
+			}},
+		},
 	})
 	if err != nil {
 		c.Logger.Error("auto-spawn remediation failed", "target", targetTaskID, "error", err)
 		return nil, false
 	}
-
+	if res.BudgetExhausted {
+		c.Logger.Error("auto-spawn remediation refused: cycle budget exhausted",
+			"target", targetTaskID, "run", target.RunID)
+		return nil, false
+	}
+	taskID := res.SpawnedTaskID
 	updated, _ := c.Store.GetTask(taskID)
 	return &RemediationSpawnResult{Task: updated}, true
 }

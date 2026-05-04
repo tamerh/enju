@@ -143,25 +143,29 @@ func (c *Coordinator) PerformSkipCascade(task *store.TaskRecord, winningOptionID
 			NewState: store.TaskSkipped,
 		})
 	}
+	// Fold cascade_fired into the same plan as the skip
+	// mutations: one ApplyPlan, one transaction, one post-
+	// commit drain. The chokepoint contract — every event
+	// rides EventSink — is preserved without an out-of-band
+	// Store.Events().Record call.
+	skipMuts = append(skipMuts, store.EmitEvent{Event: store.Event{
+		EventType:    "cascade_fired",
+		EventSubtype: "skip",
+		TaskID:       task.ID,
+		RunID:        task.RunID,
+		ProjectID:    run.ProjectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"winning_option": winningOptionID,
+			"skipped_count":  len(skipIDs),
+		}),
+		CreatedAt: time.Now(),
+	}})
 	if _, err := c.Store.ApplyPlan(store.Plan{
-		Version:  engine.EngineVersion,
+		Version:   engine.EngineVersion,
 		Mutations: skipMuts,
 	}); err != nil {
 		return nil, fmt.Errorf("marking tasks skipped: %w", err)
 	}
-
-	c.Store.Events().Record(store.Event{
-		EventType:  "cascade_fired",
-		EventSubtype: "skip",
-		TaskID:    task.ID,
-		RunID:    task.RunID,
-		ProjectID:  run.ProjectID,
-		Metadata: store.MarshalMetadata(map[string]any{
-			"winning_option": winningOptionID,
-			"skipped_count": len(skipIDs),
-		}),
-		CreatedAt: time.Now(),
-	})
 
 	return &SkipCascadeResult{
 		WinningOption: winningOptionID,
