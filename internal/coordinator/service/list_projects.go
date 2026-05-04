@@ -1,27 +1,15 @@
 package service
 
 import (
-	"time"
-
+	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
-// ProjectResponse is the wire shape for one project. Used by
-// REST (writeJSON), MCP (json.Marshal → format.ProjectList),
-// and future Web UI.
-//
-// JSON tags are load-bearing — format.ProjectList consumes
-// these key names. Renaming any of them silently breaks the
-// formatter.
-type ProjectResponse struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Description   string `json:"description,omitempty"`
-	RemoteURL     string `json:"remote_url,omitempty"`
-	DefaultBranch string `json:"default_branch,omitempty"`
-	RunCount      int    `json:"run_count"`
-	CreatedAt     string `json:"created_at"`
-}
+// ProjectResponse is an alias for wire.Project — the JSON shape
+// shared with the fat-client. The alias keeps existing
+// coord-side call sites readable; rename to wire.Project on
+// touch.
+type ProjectResponse = wire.Project
 
 // ToProjectResponse builds the wire shape from a store record
 // + a pre-computed run count. Exported so other service
@@ -35,7 +23,7 @@ func ToProjectResponse(p store.ProjectRecord, runCount int) ProjectResponse {
 		RemoteURL:     p.RemoteURL,
 		DefaultBranch: p.DefaultBranch,
 		RunCount:      runCount,
-		CreatedAt:     p.CreatedAt.Format(time.RFC3339),
+		CreatedAt:     p.CreatedAt,
 	}
 }
 

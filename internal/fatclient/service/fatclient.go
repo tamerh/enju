@@ -26,6 +26,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -37,6 +38,15 @@ type Config struct {
 	Workspace *workspace.Workspace
 	ModelName string
 	Logger    *slog.Logger
+
+	// ProjectRegistry tracks the projects this fat-client knows
+	// about (standard clones + externally adopted dirs). Optional
+	// — when nil, ListMaterializedProjects falls back to walking
+	// the workspace root, and Register/Touch/Unregister are
+	// no-ops. Production wiring (`enju mcp`, `enju ui`) supplies
+	// projectreg.Open(projectreg.DefaultPath()); tests can inject
+	// a temp-path registry or omit it entirely.
+	ProjectRegistry *projectreg.Registry
 }
 
 // FatClient is the published consumer handle for the fat-client
@@ -52,10 +62,11 @@ type Config struct {
 // themselves goroutine-safe; the profile-cache load is gated by
 // sync.Once.
 type FatClient struct {
-	coord     *coord.Client
-	workspace *workspace.Workspace
-	modelName string
-	logger    *slog.Logger
+	coord       *coord.Client
+	workspace   *workspace.Workspace
+	modelName   string
+	logger      *slog.Logger
+	projectRegistry  *projectreg.Registry
 
 	// Cached citizen profile (name + email + kind) used to
 	// populate git commit author fields on the fat-client submit
@@ -77,10 +88,64 @@ func New(cfg Config) *FatClient {
 		logger = slog.Default()
 	}
 	return &FatClient{
-		coord:     cfg.Coord,
-		workspace: cfg.Workspace,
-		modelName: cfg.ModelName,
-		logger:    logger,
+		coord:      cfg.Coord,
+		workspace:  cfg.Workspace,
+		modelName:  cfg.ModelName,
+		logger:     logger,
+		projectRegistry: cfg.ProjectRegistry,
+	}
+}
+
+// ProjectRegistry returns the per-machine registry the FatClient
+// reads/writes for project-machine bindings. Nil when no
+// registry was supplied at construction (test fixtures, hosted
+// read-only setups).
+func (s *FatClient) ProjectRegistry() *projectreg.Registry { return s.projectRegistry }
+
+// RegisterProject upserts a registry entry. Called from the
+// project-creation paths (EagerInitProjectClone for standard
+// clones, RegisterAdoptedDir for externally adopted dirs) so
+// the UI's cross-project landing finds the project on next
+// render, including external dirs that aren't discoverable from
+// the workspace root.
+//
+// No-op when no registry is configured.
+func (s *FatClient) RegisterProject(e projectreg.Entry) {
+	if s.projectRegistry == nil {
+		return
+	}
+	if err := s.projectRegistry.Upsert(e); err != nil {
+		s.logger.Warn("project registry upsert failed",
+			"id", e.ID, "path", e.LocalPath, "error", err)
+	}
+}
+
+// TouchProject bumps LastTouched for an existing entry.
+// Idempotent — no-op if the entry doesn't exist or no registry
+// is configured. Wired into ClaimTask (claim.go) and
+// SubmitTaskResult (submit.go), and from the handleCreateRun
+// MCP handler. Drives "recently active project" sorting on the
+// cross-project landing.
+func (s *FatClient) TouchProject(id int64) {
+	if s.projectRegistry == nil {
+		return
+	}
+	if err := s.projectRegistry.Touch(id); err != nil {
+		s.logger.Warn("project registry touch failed",
+			"id", id, "error", err)
+	}
+}
+
+// UnregisterProject drops the entry. Called from
+// LocalLeaveProject after the local clone has been removed.
+// No-op when no registry is configured.
+func (s *FatClient) UnregisterProject(id int64) {
+	if s.projectRegistry == nil {
+		return
+	}
+	if err := s.projectRegistry.Remove(id); err != nil {
+		s.logger.Warn("project registry remove failed",
+			"id", id, "error", err)
 	}
 }
 

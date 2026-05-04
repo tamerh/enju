@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/service"
 	"github.com/go-chi/chi/v5"
@@ -15,13 +14,11 @@ type addProjectMemberRequest struct {
 	Role   string `json:"role,omitempty"` // optional; defaults to "member"
 }
 
-type projectMemberResponse struct {
-	Username string `json:"username"`
-	Name   string `json:"name,omitempty"`
-	Role   string `json:"role"`
-	AddedAt string `json:"added_at"`
-	AddedBy string `json:"added_by,omitempty"` // username of adder; empty for the creator row
-}
+// projectMemberResponse aliases service.MemberResponse (which
+// itself aliases wire.Member). Kept as a type alias so the
+// handler call sites keep their tight names and the JSON wire
+// shape stays anchored to a single source of truth.
+type projectMemberResponse = service.MemberResponse
 
 type setProjectMemberRoleRequest struct {
 	Role string `json:"role"`
@@ -56,10 +53,10 @@ func (s *Server) handleListProjectMembers(w http.ResponseWriter, r *http.Request
 		}
 		resp = append(resp, projectMemberResponse{
 			Username: username,
-			Name:   name,
-			Role:   string(m.Role),
-			AddedAt: m.AddedAt.Format(time.RFC3339),
-			AddedBy: s.citizenUsername(m.AddedBy),
+			Name:     name,
+			Role:     string(m.Role),
+			AddedAt:  m.AddedAt,
+			AddedBy:  s.citizenUsername(m.AddedBy),
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)

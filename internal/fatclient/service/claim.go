@@ -130,6 +130,7 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	// before.
 	if meta != nil && meta.ProjectID > 0 {
 		result.ReviewFeedback = s.fetchReviewFeedback(ctx, meta)
+		s.TouchProject(meta.ProjectID)
 	}
 
 	// Read the previous submission if it still exists on disk.

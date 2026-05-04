@@ -96,11 +96,11 @@ func CreateProject(s store.CoordinatorStore, caller *store.CitizenRecord, params
 		effectiveBranch = "main"
 	}
 	return &ProjectResponse{
-		ID:      id,
-		Name:     params.Name,
-		RemoteURL:   params.RemoteURL,
+		ID:            id,
+		Name:          params.Name,
+		RemoteURL:     params.RemoteURL,
 		DefaultBranch: effectiveBranch,
-		CreatedAt:   now.Format(time.RFC3339),
+		CreatedAt:     now,
 	}, nil
 }
 

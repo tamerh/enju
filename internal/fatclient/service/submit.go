@@ -175,6 +175,9 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	if err := s.applyAcceptedMerges(ctx, prep.Project, data); err != nil {
 		return &SubmitResult{ErrorMessage: "auto-merging accepted topic branch: " + err.Error()}
 	}
+	if prep.Meta != nil && prep.Meta.ProjectID > 0 {
+		s.TouchProject(prep.Meta.ProjectID)
+	}
 	return &SubmitResult{ResponseBody: data}
 }
 

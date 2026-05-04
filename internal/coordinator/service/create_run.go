@@ -222,7 +222,7 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 		TaskCount:    taskCount,
 		Branch:     branch,
 		Slug:      runSlug,
-		CreatedAt:    now.Format(time.RFC3339),
+		CreatedAt:    now,
 		SourcePath:   params.SourcePath,
 		SourceCommitSHA: params.SourceCommitSHA,
 		Warnings:    parsed.Warnings,

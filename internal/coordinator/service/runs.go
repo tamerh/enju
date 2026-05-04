@@ -1,29 +1,14 @@
 package service
 
 import (
-	"time"
-
+	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
-// RunResponse is the wire shape for one run. Used by REST,
-// MCP, and future Web UI. Field names + JSON tags are
-// load-bearing — format.RunList and format.RunStatus consume
-// these key names.
-type RunResponse struct {
-	ID              int64    `json:"id"`
-	ProjectID       int64    `json:"project_id,omitempty"`
-	Seq             int      `json:"seq"`
-	Name            string   `json:"name"`
-	State           string   `json:"state"`
-	TaskCount       int      `json:"task_count"`
-	Branch          string   `json:"branch,omitempty"`
-	Slug            string   `json:"slug,omitempty"`
-	CreatedAt       string   `json:"created_at"`
-	SourcePath      string   `json:"source_path,omitempty"`
-	SourceCommitSHA string   `json:"source_commit_sha,omitempty"`
-	Warnings        []string `json:"warnings,omitempty"`
-}
+// RunResponse is an alias for wire.Run — the shared JSON shape.
+// Existing call sites keep using `service.RunResponse`; rename
+// to wire.Run on touch.
+type RunResponse = wire.Run
 
 // ToRunResponse builds the wire shape from a store record + a
 // pre-computed task count. Exported so other service functions
@@ -38,7 +23,7 @@ func ToRunResponse(r store.RunRecord, taskCount int) RunResponse {
 		TaskCount:       taskCount,
 		Branch:          r.Branch,
 		Slug:            r.Slug,
-		CreatedAt:       r.CreatedAt.Format(time.RFC3339),
+		CreatedAt:       r.CreatedAt,
 		SourcePath:      r.SourcePath,
 		SourceCommitSHA: r.SourceCommitSHA,
 	}

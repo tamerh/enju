@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -106,13 +107,24 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 	if customPath != "" {
 		s.workspace.RegisterExternalDir(projectID, customPath)
 		_, err := s.workspace.ForProject(projectID, "")
+		s.RegisterProject(projectreg.Entry{
+			ID:        projectID,
+			LocalPath: customPath,
+		})
 		return err
 	}
-	remote, projName, _, err := s.FetchProjectMetaExpanded(ctx, projectID)
+	remote, projName, defaultBranch, err := s.FetchProjectMetaExpanded(ctx, projectID)
 	if err != nil {
 		return err
 	}
 	_, err = s.workspace.ForProject(projectID, remote, projName)
+	s.RegisterProject(projectreg.Entry{
+		ID:            projectID,
+		LocalPath:     s.workspace.ProjectDir(projectID),
+		Name:          projName,
+		RemoteURL:     remote,
+		DefaultBranch: defaultBranch,
+	})
 	return err
 }
 
@@ -264,6 +276,13 @@ func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 	}
 	s.workspace.RegisterExternalDir(projectID, dirPath)
 	_, err := s.workspace.ForProject(projectID, "")
+	// External dirs aren't discoverable from the workspace
+	// root; the registry is the only durable record. Without
+	// this, restarting `enju mcp` loses the adoption.
+	s.RegisterProject(projectreg.Entry{
+		ID:        projectID,
+		LocalPath: dirPath,
+	})
 	return err
 }
 
@@ -458,6 +477,7 @@ func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error
 	if err := s.workspace.LeaveProject(projectID); err != nil {
 		return hadClone, fmt.Errorf("removing local clone: %w", err)
 	}
+	s.UnregisterProject(projectID)
 	return hadClone, nil
 }
 

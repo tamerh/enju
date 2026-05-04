@@ -1,21 +1,14 @@
 package service
 
 import (
-	"time"
-
+	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
-// MemberResponse is the wire shape for one project membership
-// row. Used by REST + MCP. JSON tags are load-bearing —
-// format.ProjectMemberList consumes them.
-type MemberResponse struct {
-	Username string `json:"username"`
-	Name     string `json:"name,omitempty"`
-	Role     string `json:"role"`
-	AddedAt  string `json:"added_at"`
-	AddedBy  string `json:"added_by,omitempty"`
-}
+// MemberResponse is an alias for wire.Member — the shared JSON
+// shape. Existing call sites stay readable; rename to wire.Member
+// on touch.
+type MemberResponse = wire.Member
 
 // ListProjectMembers returns every member on the project,
 // gated on caller membership. Mirrors api.handleListProjectMembers.
@@ -39,7 +32,7 @@ func ListProjectMembers(s store.CoordinatorStore, caller *store.CitizenRecord, p
 			Username: username,
 			Name:     name,
 			Role:     string(m.Role),
-			AddedAt:  m.AddedAt.Format(time.RFC3339),
+			AddedAt:  m.AddedAt,
 			AddedBy:  CitizenUsername(s, m.AddedBy),
 		})
 	}

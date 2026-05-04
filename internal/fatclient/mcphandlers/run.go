@@ -493,6 +493,8 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		snapshotWarning = c.fc.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
 	}
 
+	c.fc.TouchProject(int64(projectID))
+
 	text := format.CreateRun(data)
 	if snapshotWarning != "" {
 		text += fmt.Sprintf("\n⚠ Template %s\n", snapshotWarning)

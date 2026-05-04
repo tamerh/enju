@@ -16,6 +16,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/enjumcp"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	"github.com/mark3labs/mcp-go/server"
@@ -159,10 +160,11 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		Logger:         logger,
 	})
 	fc := service.New(service.Config{
-		Coord:     coordClient,
-		Workspace: cfg.Workspace,
-		ModelName: cfg.ModelName,
-		Logger:    logger,
+		Coord:           coordClient,
+		Workspace:       cfg.Workspace,
+		ModelName:       cfg.ModelName,
+		Logger:          logger,
+		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
 	client := &apiClient{fc: fc}
 
