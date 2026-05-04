@@ -1,13 +1,34 @@
 package store
 
-// Test helpers that wrap ApplyPlan for the kinds of state
-// transitions that test setup needs. These exist so the legacy
-// direct-write methods (Store.CreateTask, Store.ClaimTask, etc.)
-// can be deleted while keeping test sites compact.
+// Test fixtures (Creation Methods, per Meszaros, *xUnit Test
+// Patterns*) for the kinds of state transitions test setup
+// needs.
 //
-// Production code goes through ApplyPlan; tests do too. The
-// helpers just spare each test site from rebuilding the same
-// 6-line Plan boilerplate.
+// These are NOT historical scaffolding for deleted methods —
+// they're test fixtures that abstract the standard Plan +
+// Mutation + ApplyPlan boilerplate so a test can read at the
+// level of "claim this task" rather than "construct a Plan
+// containing a SetClaim mutation, apply it, check the
+// error." Both forms exercise the same chokepoint code path;
+// only the test's signal-to-noise ratio changes.
+//
+// Two principles:
+//
+//   - The chokepoint discipline ("every state write goes
+//     through ApplyPlan") is enforced architecturally by the
+//     CoordinatorStore interface (compile-time, external
+//     callers) and by the apply-package layout (in-package
+//     review, plus the chokepoint lint). Tests do not need
+//     to visually re-prove it via 7-line Plan literals at
+//     every call site.
+//
+//   - Each fixture below faithfully wraps ApplyPlan +
+//     Mutation; none introduce shadow semantics. If a fixture
+//     ever drifts from production behavior, it stops being a
+//     Creation Method and becomes a Mystery Guest — delete it.
+//
+// Singletons (1-2 call sites) get inlined; helpers below are
+// all 3+ call sites and earn their place per DAMP > DRY.
 
 import (
 	"fmt"
@@ -47,38 +68,8 @@ func helperClaimTask(s *Store, taskID string, citizenID int64, deadline time.Tim
 	return err
 }
 
-// helperReleaseTask releases a citizen's claim via ApplyPlan.
-// Matches the legacy Store.ReleaseTask shape: task → READY,
-// claim row marked outcome=released.
-func helperReleaseTask(s *Store, taskID string, citizenID int64) error {
-	plan := Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			ReleaseClaim{TaskID: taskID, CitizenID: citizenID},
-		},
-	}
-	_, err := s.ApplyPlan(plan)
-	return err
-}
-
-// helperExpireClaimedTask expires a claimed task via ApplyPlan.
-// Matches the legacy Store.ExpireClaimedTask shape: task →
-// READY, claim row marked outcome=timed_out, citizen score
-// penalty applied.
-func helperExpireClaimedTask(s *Store, taskID string, citizenID int64) error {
-	plan := Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			ExpireClaim{TaskID: taskID, CitizenID: citizenID},
-		},
-	}
-	_, err := s.ApplyPlan(plan)
-	return err
-}
-
 // helperUpdateReadyTasks runs the readiness cascade via
-// ApplyPlan. Returns the readied slice (matching the legacy
-// Store.UpdateReadyTasks return shape) so tests that count
+// ApplyPlan. Returns the readied slice so tests that count
 // or inspect newly-ready tasks keep working.
 func helperUpdateReadyTasks(t *testing.T, s *Store, runID int64) []ReadiedTask {
 	t.Helper()
@@ -93,8 +84,7 @@ func helperUpdateReadyTasks(t *testing.T, s *Store, runID int64) []ReadiedTask {
 }
 
 // helperCreateProject creates a project via ApplyPlan, returning
-// the new project ID. Replaces the legacy Store.CreateProject
-// for test setup.
+// the new project ID.
 func helperCreateProject(s *Store, p *ProjectRecord) (int64, error) {
 	res, err := s.ApplyPlan(Plan{
 		Version:   testEngineVersion,
@@ -106,36 +96,10 @@ func helperCreateProject(s *Store, p *ProjectRecord) (int64, error) {
 	return res.ProjectID, nil
 }
 
-// helperAddProjectMember adds a project member via ApplyPlan.
-func helperAddProjectMember(s *Store, projectID, citizenID int64, role ProjectRole, addedBy int64) error {
-	_, err := s.ApplyPlan(Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			AddProjectMember{
-				ProjectID: projectID,
-				CitizenID: citizenID,
-				Role:      role,
-				AddedBy:   addedBy,
-			},
-		},
-	})
-	return err
-}
-
-// helperRemoveProjectMember removes a project member via ApplyPlan.
-func helperRemoveProjectMember(s *Store, projectID, citizenID int64) error {
-	_, err := s.ApplyPlan(Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			RemoveProjectMember{ProjectID: projectID, CitizenID: citizenID},
-		},
-	})
-	return err
-}
-
-// helperPauseRun pauses a run via ApplyPlan, matching the
-// legacy Store.PauseRun shape: returns (changed, error). Reads
-// the prior state to compute the changed flag.
+// helperPauseRun pauses a run via ApplyPlan. Returns
+// (changed, error) where `changed` is true iff the run's
+// state actually transitioned. Reads the prior state to
+// compute the changed flag.
 func helperPauseRun(s *Store, runID, citizenID int64) (bool, error) {
 	r, err := s.GetRun(runID)
 	if err != nil {
@@ -179,8 +143,9 @@ func helperResumeRun(s *Store, runID, citizenID int64) (RunState, error) {
 	return r.State, nil
 }
 
-// helperCreateIssue creates an issue via ApplyPlan, matching
-// the legacy Store.CreateIssue shape: returns (id, seq, error).
+// helperCreateIssue creates an issue via ApplyPlan, returning
+// (id, seq, error). Stamps the IDs back onto the input record
+// so callers that retain it see the assigned values.
 func helperCreateIssue(s *Store, rec *IssueRecord) (int64, int, error) {
 	res, err := s.ApplyPlan(Plan{
 		Version:   testEngineVersion,
@@ -212,12 +177,13 @@ func helperMarkIssueInProgress(s *Store, issueID, citizenID int64, fixTaskID str
 	return err
 }
 
-// helperSpawnTask runs the SpawnTask mutation via ApplyPlan,
-// matching the legacy Store.SpawnTask shape: returns
-// (taskID, error). Cycle exhaustion is converted from
-// ApplyResult.BudgetExhausted to a stringy error to keep
-// existing test assertions working — production callers
-// (service.SpawnTask) check the field directly.
+// helperSpawnTask runs the SpawnTask mutation via ApplyPlan.
+// Cycle exhaustion is converted from ApplyResult.BudgetExhausted
+// to a stringy error so existing test assertions can keep
+// using error-message matching. Production callers
+// (service.SpawnTask) check the BudgetExhausted field directly
+// — tests that want the typed flag should call ApplyPlan
+// inline instead of using this fixture.
 func helperSpawnTask(s *Store, spec SpawnSpec) (string, error) {
 	res, err := s.ApplyPlan(Plan{
 		Version:   testEngineVersion,
@@ -258,8 +224,7 @@ func helperCloseIssue(s *Store, issueID, citizenID int64, status IssueStatus, cl
 }
 
 // helperEvaluateRunState re-evaluates run state via the
-// CompleteRun mutation (which now subsumes the legacy
-// EvaluateRunState path). Returns the resulting RunState.
+// CompleteRun mutation. Returns the resulting RunState.
 func helperEvaluateRunState(s *Store, runID int64) (RunState, error) {
 	if _, err := s.ApplyPlan(Plan{
 		Version: testEngineVersion,
@@ -276,10 +241,8 @@ func helperEvaluateRunState(s *Store, runID int64) (RunState, error) {
 	return r.State, nil
 }
 
-// helperCreateCitizen wraps the CreateCitizen mutation in
-// the legacy direct-method shape: takes a *CitizenRecord,
-// returns (int64, error). Used by tests that previously
-// called s.CreateCitizen directly.
+// helperCreateCitizen wraps the CreateCitizen mutation:
+// takes a *CitizenRecord, returns (id, error).
 func helperCreateCitizen(s *Store, c *CitizenRecord) (int64, error) {
 	res, err := s.ApplyPlan(Plan{
 		Version:  testEngineVersion,
@@ -291,9 +254,8 @@ func helperCreateCitizen(s *Store, c *CitizenRecord) (int64, error) {
 	return res.CitizenID, nil
 }
 
-// helperCreateModelCitizen mirrors the deleted Store.CreateModelCitizen
-// shape — register a kind='model' citizen with the conventional
-// "model:<username>" synthetic token.
+// helperCreateModelCitizen registers a kind='model' citizen
+// with the conventional "model:<username>" synthetic token.
 func helperCreateModelCitizen(s *Store, username, displayName string) (int64, error) {
 	if displayName == "" {
 		displayName = username
@@ -319,22 +281,8 @@ func helperCreateModelCitizen(s *Store, username, displayName string) (int64, er
 	return res.CitizenID, nil
 }
 
-// helperIssueToken mirrors the deleted Store.IssueToken shape.
-func helperIssueToken(s *Store, citizenID int64, token, label string) (int64, error) {
-	res, err := s.ApplyPlan(Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			IssueToken{CitizenID: citizenID, Token: token, Label: label},
-		},
-	})
-	if err != nil {
-		return 0, err
-	}
-	return res.TokenID, nil
-}
-
-// helperRevokeTokenByValue mirrors the deleted
-// Store.RevokeTokenByValue shape.
+// helperRevokeTokenByValue revokes a token by string value
+// via ApplyPlan.
 func helperRevokeTokenByValue(s *Store, token string) error {
 	_, err := s.ApplyPlan(Plan{
 		Version:  testEngineVersion,
@@ -343,36 +291,8 @@ func helperRevokeTokenByValue(s *Store, token string) error {
 	return err
 }
 
-// helperRevokeToken mirrors the deleted Store.RevokeToken shape.
-func helperRevokeToken(s *Store, tokenID int64) error {
-	_, err := s.ApplyPlan(Plan{
-		Version:  testEngineVersion,
-		Mutations: []Mutation{RevokeToken{TokenID: tokenID}},
-	})
-	return err
-}
-
-// helperSetCitizenRole mirrors the deleted Store.SetCitizenRole.
-func helperSetCitizenRole(s *Store, citizenID int64, role string) error {
-	_, err := s.ApplyPlan(Plan{
-		Version:  testEngineVersion,
-		Mutations: []Mutation{SetCitizenRole{CitizenID: citizenID, Role: role}},
-	})
-	return err
-}
-
-// helperUpdateCitizenProfile mirrors the deleted
-// Store.UpdateCitizenProfile.
-func helperUpdateCitizenProfile(s *Store, citizenID int64, name, email *string) error {
-	_, err := s.ApplyPlan(Plan{
-		Version:  testEngineVersion,
-		Mutations: []Mutation{UpdateCitizenProfile{CitizenID: citizenID, Name: name, Email: email}},
-	})
-	return err
-}
-
-// helperCreateRun mirrors the legacy Store.CreateRun shape:
-// takes a *RunRecord, returns (id, seq, error).
+// helperCreateRun creates a run via ApplyPlan, returning
+// (id, seq, error).
 func helperCreateRun(s *Store, r *RunRecord) (int64, int, error) {
 	res, err := s.ApplyPlan(Plan{
 		Version:  testEngineVersion,
@@ -382,14 +302,4 @@ func helperCreateRun(s *Store, r *RunRecord) (int64, int, error) {
 		return 0, 0, err
 	}
 	return res.RunID, res.RunSeq, nil
-}
-
-// helperSetAutoTriageTemplate mirrors the deleted
-// Store.SetAutoTriageTemplate.
-func helperSetAutoTriageTemplate(s *Store, runID int64, templateJSON string) error {
-	_, err := s.ApplyPlan(Plan{
-		Version:  testEngineVersion,
-		Mutations: []Mutation{SetAutoTriageTemplate{RunID: runID, TemplateJSON: templateJSON}},
-	})
-	return err
 }

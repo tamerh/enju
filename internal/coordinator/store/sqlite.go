@@ -132,8 +132,8 @@ func New(dbPath string) (*Store, error) {
 	}
 
 	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		return nil, fmt.Errorf("migration: %w", err)
+	if err := s.initSchema(); err != nil {
+		return nil, fmt.Errorf("schema init: %w", err)
 	}
 	return s, nil
 }
@@ -169,7 +169,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) migrate() error {
+// initSchema is the schema-bootstrap function (formerly named
+// migrate). Despite its old name it does no versioned data
+// migration — every statement is CREATE TABLE IF NOT EXISTS,
+// CREATE INDEX IF NOT EXISTS, or ALTER TABLE … ADD COLUMN
+// guarded by "duplicate column" error tolerance. Plus the
+// model-citizen catalog seed.
+//
+// Lifecycle position: runs once inside New() at startup,
+// before the EventStore is attached and before any service
+// caller exists. That's why the in-function s.db.Exec calls
+// are NOT chokepoint violations — the chokepoint contract
+// ("every state mutation flows through ApplyPlan and emits
+// an audit event") applies to runtime state mutations, not
+// to schema DDL or pre-EventStore seed inserts.
+func (s *Store) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS projects (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2029,7 +2043,7 @@ var modelCatalogSeed = []struct {
 
 // seedModelCitizens inserts the hand-curated catalog entries that
 // don't already exist. Idempotent on username collision. Called from
-// migrate() after schema is in place.
+// initSchema() after schema is in place.
 func (s *Store) seedModelCitizens() error {
 	for _, m := range modelCatalogSeed {
 		if err := s.upsertModelCitizen(m.Username, m.Name); err != nil {
@@ -2061,7 +2075,7 @@ func (s *Store) seedModelCitizens() error {
 // touching auth and considering "fall back to citizens.token" — DO
 // NOT. Read this comment first; the placeholder rule depends on it.
 //
-// CHOKEPOINT EXEMPTION: ONLY called from migrate() at startup,
+// CHOKEPOINT EXEMPTION: ONLY called from initSchema() at startup,
 // before the EventStore is attached and before any service
 // caller can issue an ApplyPlan. This direct write deliberately
 // bypasses the chokepoint because the schema-seeding phase

@@ -9,7 +9,7 @@
 // Schemas are pure data with no I/O dependency. Both sides could
 // read this if a hosted-mode MCP transport ever ships; today
 // only fat-client imports it. The boundary check
-// (tools/check-imports.sh) prevents either side from accidentally
+// (./build.sh check-imports) prevents either side from accidentally
 // becoming a writer.
 package enjumcp
 

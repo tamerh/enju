@@ -286,7 +286,10 @@ func TestReleaseTask(t *testing.T) {
 
 	helperClaimTask(s, "task-1", alice, now.Add(30*time.Minute))
 
-	err := helperReleaseTask(s, "task-1", alice)
+	_, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{ReleaseClaim{TaskID: "task-1", CitizenID: alice}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1104,10 @@ func TestAutoTriageTemplate_GetSetRoundtrip(t *testing.T) {
 	if got, _ := s.GetAutoTriageTemplate(runID); got != "" {
 		t.Fatalf("default should be empty, got %q", got)
 	}
-	if err := helperSetAutoTriageTemplate(s, runID, `{"action":"answer","prompt":"fix"}`); err != nil {
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{SetAutoTriageTemplate{RunID: runID, TemplateJSON: `{"action":"answer","prompt":"fix"}`}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetAutoTriageTemplate(runID)

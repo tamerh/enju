@@ -54,7 +54,7 @@ func TestSeedCatalogPopulatedOnFirstMigration(t *testing.T) {
 	}
 }
 
-// TestSeedIsIdempotent — running migrate() on a populated DB must
+// TestSeedIsIdempotent — running initSchema() on a populated DB must
 // not crash, duplicate, or modify catalog rows. The implementation
 // uses an existence check in upsertModelCitizen rather than INSERT
 // OR IGNORE; this test pins that behavior so a future refactor

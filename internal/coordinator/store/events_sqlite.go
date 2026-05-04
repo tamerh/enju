@@ -208,9 +208,9 @@ func NewSQLiteEventStore(dbPath string, logger *slog.Logger, opts ...EventStoreO
 		notifyCh:   make(chan struct{}),
 	}
 	s.enabled.Store(true)
-	if err := s.migrate(); err != nil {
+	if err := s.initSchema(); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("events migration: %w", err)
+		return nil, fmt.Errorf("events schema init: %w", err)
 	}
 	// recover per-project seq counters. New events
 	// will start above the highest persisted seq for each
@@ -233,7 +233,7 @@ func NewSQLiteEventStore(dbPath string, logger *slog.Logger, opts ...EventStoreO
 
 // recoverSeqCounters reads MAX(seq) per project from
 // events and seeds the in-memory counter map.
-// Idempotent — safe to call from migrate() if needed in the
+// Idempotent — safe to call from initSchema() if needed in the
 // future, though today only NewSQLiteEventStore invokes it.
 //
 // Bootstrap semantics: empty events table → empty map. The
@@ -294,7 +294,10 @@ func (s *SQLiteEventStore) claimSeq(projectID int64) int64 {
 // "Record() never blocks" architectural contract trumps the
 // added durability of a persisted next-seq. The event_seq_counters
 // table from earlier drafts is gone.
-func (s *SQLiteEventStore) migrate() error {
+// initSchema bootstraps the events.db schema. Same lifecycle
+// position + chokepoint reasoning as Store.initSchema: pure DDL
+// run at startup, not subject to the chokepoint contract.
+func (s *SQLiteEventStore) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

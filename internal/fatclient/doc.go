@@ -5,8 +5,8 @@
 // the workspace, the live.jsonl event log, the local git repo.
 // It talks to the coordinator exclusively over HTTP — no direct
 // DB access. It MUST NOT import anything from
-// internal/coordinator/ — enforced at compile time via
-// tools/check-imports.sh.
+// internal/coordinator/ — enforced at lint time via
+// ./build.sh check-imports.
 //
 // Fat-client may import internal/common/* for shared pure logic.
 package fatclient

@@ -3,7 +3,7 @@
 // on the wire-format strings for review decisions, claim
 // outcomes, citizen kinds, etc., so the canonical typed form
 // lives in common where either side can import it without
-// violating the layering rule (tools/check-imports.sh).
+// violating the layering rule (./build.sh check-imports).
 //
 // Keep this package small and dependency-free. It must not
 // import anything from internal/coordinator/ or

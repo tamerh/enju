@@ -74,7 +74,7 @@ func TestLegacyTokensGetMigratedLabelOnBackfill(t *testing.T) {
 	cid, _ := res.LastInsertId()
 
 	// Re-run the backfill explicitly. In production it runs once
-	// during migrate(); calling it again proves idempotency.
+	// during initSchema(); calling it again proves idempotency.
 	for i := 0; i < 2; i++ {
 		if _, err := s.db.Exec(`
 			INSERT INTO tokens (citizen_id, token, label, issued_at)
@@ -173,7 +173,10 @@ func TestMultipleTokensPerCitizen(t *testing.T) {
 	cid := createTestCitizen(t, s, "tamer", "tok-original")
 
 	// Issue a second token labeled 'rotation'.
-	if _, err := helperIssueToken(s, cid, "tok-new", "rotation"); err != nil {
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{IssueToken{CitizenID: cid, Token: "tok-new", Label: "rotation"}},
+	}); err != nil {
 		t.Fatalf("issue second: %v", err)
 	}
 
@@ -216,7 +219,10 @@ func TestMultipleTokensPerCitizen(t *testing.T) {
 func TestIssueTokenRejectsEmpty(t *testing.T) {
 	s := newTestStore(t)
 	cid := createTestCitizen(t, s, "tamer", "tok-tamer")
-	if _, err := helperIssueToken(s, cid, "", "label"); err == nil {
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{IssueToken{CitizenID: cid, Token: "", Label: "label"}},
+	}); err == nil {
 		t.Fatal("expected error for empty token, got nil")
 	}
 }
