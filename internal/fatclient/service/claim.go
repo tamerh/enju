@@ -13,7 +13,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
-// ClaimParams is the input shape for Session.ClaimTask. Mirrors
+// ClaimParams is the input shape for FatClient.ClaimTask. Mirrors
 // the MCP tool's surface: the task to claim plus a flag for the
 // optional inputs/feedback context bundle.
 type ClaimParams struct {
@@ -53,7 +53,7 @@ type ClaimResult struct {
 // useFatClient check) tolerate missing workspaces silently —
 // claim still works for legacy non-workspace clients. The hard
 // gates (claim POST, untracked-presence) propagate errors.
-func (s *Session) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimResult, error) {
+func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimResult, error) {
 	if params.TaskID == "" {
 		return nil, fmt.Errorf("task_id is required")
 	}
@@ -174,7 +174,7 @@ func (s *Session) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimResu
 // Returns the reviewer's content as JSON, or nil if no review
 // feedback exists. Best-effort — failures return nil so the
 // claim still succeeds with whatever we did manage to fetch.
-func (s *Session) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []byte {
+func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []byte {
 	tasksData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", meta.ProjectID, meta.RunSeq))
 	if err != nil {
 		return nil
@@ -288,7 +288,7 @@ func (s *Session) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []byt
 // untracked upstream is missing — the caller surfaces it as a
 // tool-result-error so the task stays claimable by another
 // citizen who does have the file.
-func (s *Session) checkUntrackedReadsPresence(ctx context.Context, meta *TaskMeta) error {
+func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskMeta) error {
 	if len(meta.ReadsArtifacts) == 0 {
 		return nil
 	}
@@ -389,7 +389,7 @@ func (s *Session) checkUntrackedReadsPresence(ctx context.Context, meta *TaskMet
 // the local-resolve path) can call it. Eventually
 // handleGetTaskInputs ports to its own service method and the
 // export can go away.
-func (s *Session) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) ([]byte, error) {
+func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) ([]byte, error) {
 	descData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/tasks/%s/inputs?client_mode=true", meta.ID))
 	if err != nil {
 		return nil, err

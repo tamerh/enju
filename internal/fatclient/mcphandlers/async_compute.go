@@ -1,7 +1,7 @@
 package mcphandlers
 
 // Async compute kickoff display. The kickoff itself
-// (Session.kickoffAsyncWrapTask) lives in service.execute.go
+// (FatClient.kickoffAsyncWrapTask) lives in service.execute.go
 // alongside the rest of compute orchestration; this file is
 // just the per-handler formatter that renders the spawned
 // subprocess's PID and log path back to the MCP caller.

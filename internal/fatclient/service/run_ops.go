@@ -53,8 +53,8 @@ func RunSlugFromData(runData []byte) string {
 	return ""
 }
 
-// RunTemplatePrep is the state Session.PrepareRunTemplate
-// returns and Session.CommitRunTemplateSnapshot consumes. Holds
+// RunTemplatePrep is the state FatClient.PrepareRunTemplate
+// returns and FatClient.CommitRunTemplateSnapshot consumes. Holds
 // the opened project + loaded bundle so the post-create snapshot
 // commit doesn't have to re-load anything.
 type RunTemplatePrep struct {
@@ -74,7 +74,7 @@ type RunTemplatePrep struct {
 // source-commit SHA for provenance, and a prep handle the
 // caller passes to CommitRunTemplateSnapshot after the
 // coordinator assigns the run's seq.
-func (s *Session) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, authorName, authorEmail string) (*RunTemplatePrep, error) {
+func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, authorName, authorEmail string) (*RunTemplatePrep, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_create_run with 'path' requires a local workspace (MCP client mode)")
 	}
@@ -131,7 +131,7 @@ func (s *Session) PrepareRunTemplate(ctx context.Context, projectID int64, templ
 // Errors are returned as a warning message (non-fatal): the run
 // already exists on the coordinator side; only the snapshot
 // commit is in question. Empty string means success or no-op.
-func (s *Session) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []byte, templatePath, authorName, authorEmail string) string {
+func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []byte, templatePath, authorName, authorEmail string) string {
 	if prep == nil || prep.Project == nil || prep.LoadedTemplate == nil {
 		return ""
 	}
@@ -196,7 +196,7 @@ type ExportFileResult struct {
 // Mermaid and commits it to enju/runs/{seq}-{slug}/graph/{phase}.mmd.
 // Returns the rendered Mermaid body so handlers can both report
 // the commit and inline the diagram in the response.
-func (s *Session) ExportDiagramFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (body string, res *ExportFileResult, err error) {
+func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (body string, res *ExportFileResult, err error) {
 	if s.workspace == nil {
 		return "", nil, fmt.Errorf("enju_export_diagram requires a local workspace (MCP client mode)")
 	}
@@ -252,7 +252,7 @@ func (s *Session) ExportDiagramFile(ctx context.Context, projectID int64, runID 
 // timeline for a run and commits it as JSONL under
 // enju/runs/{seq}-{slug}/events/{phase}.jsonl. Returns the
 // decoded event slice so handlers can render an inline preview.
-func (s *Session) ExportRunEventsFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (events []map[string]interface{}, res *ExportFileResult, err error) {
+func (s *FatClient) ExportRunEventsFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (events []map[string]interface{}, res *ExportFileResult, err error) {
 	if s.workspace == nil {
 		return nil, nil, fmt.Errorf("enju_export_run_events requires a local workspace (MCP client mode)")
 	}
@@ -319,7 +319,7 @@ func (s *Session) ExportRunEventsFile(ctx context.Context, projectID int64, runI
 // one markdown document. Reads results from the local clone at
 // each task's commit_sha so the export captures exactly what was
 // accepted (not a current-HEAD overlay).
-func (s *Session) ExportRunMarkdown(ctx context.Context, projectID int64, runSeq int) (string, error) {
+func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runSeq int) (string, error) {
 	runData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
 	if err != nil {
 		return "", err

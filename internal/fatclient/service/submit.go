@@ -9,7 +9,7 @@ package service
 //
 // The handlers in mcphandlers/submit.go now do args parse +
 // validation + format only; this file holds the orchestration
-// they call into via Session.SubmitTaskResult.
+// they call into via FatClient.SubmitTaskResult.
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
-// SubmitParams is the input shape for Session.SubmitTaskResult.
+// SubmitParams is the input shape for FatClient.SubmitTaskResult.
 // Every field a submit needs travels through here so the
 // service layer doesn't reach back into mcphandlers state.
 //
@@ -79,7 +79,7 @@ type SubmitResult struct {
 // folded into this method too — it returns a validation error
 // because git is a hard prerequisite for write operations
 // post-Option-B.
-func (s *Session) SubmitTaskResult(ctx context.Context, params SubmitParams) *SubmitResult {
+func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *SubmitResult {
 	if params.Meta == nil {
 		return &SubmitResult{ErrorMessage: "task metadata is required", IsValidationError: true}
 	}
@@ -242,7 +242,7 @@ type preparedFatSubmit struct {
 //     declares one, else result.json blob).
 //   - Artifact paths sorted for deterministic commit-message
 //     ordering.
-func (s *Session) prepareFatSubmit(ctx context.Context, params SubmitParams) (*preparedFatSubmit, error) {
+func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (*preparedFatSubmit, error) {
 	taskID := params.TaskID
 	meta := params.Meta
 	content := params.Content
@@ -520,7 +520,7 @@ func (s *Session) prepareFatSubmit(ctx context.Context, params SubmitParams) (*p
 // error we log and move on. The merge has already landed in
 // git; the audit gap is the only consequence and it's already
 // part of the "events are a strict consumer" contract.
-func (s *Session) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) {
+func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) {
 	body := map[string]interface{}{
 		"topic_branch": topicBranch,
 		"run_branch":   runBranch,
@@ -549,7 +549,7 @@ func (s *Session) reportMerge(ctx context.Context, projectID, runSeq int64, task
 // is idempotent: a re-submit that resurfaces the same merge
 // targets just performs a same-SHA push, which workspace treats
 // as already-up-to-date.
-func (s *Session) applyAcceptedMerges(ctx context.Context, proj *workspace.Project, responseBody []byte) error {
+func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *workspace.Project, responseBody []byte) error {
 	if proj == nil || len(responseBody) == 0 {
 		return nil
 	}

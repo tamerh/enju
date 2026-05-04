@@ -31,7 +31,7 @@ type TestClientConfig struct {
 	Logger    *slog.Logger
 }
 
-// newAPIClientForTest constructs an apiClient + Session in
+// newAPIClientForTest constructs an apiClient + FatClient in
 // lock-step using the same wiring shape mcphandlers.Register
 // uses in production. Returns the apiClient so tests can call
 // handler methods directly. Logger defaults to slog.Default()
@@ -41,13 +41,13 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	sess := service.New(service.Config{
+	fc := service.New(service.Config{
 		Coord:     cfg.Coord,
 		Workspace: cfg.Workspace,
 		ModelName: cfg.ModelName,
 		Logger:    logger,
 	})
-	return &apiClient{session: sess}
+	return &apiClient{fc: fc}
 }
 
 // newClient is the shorter test fixture form. Tests construct

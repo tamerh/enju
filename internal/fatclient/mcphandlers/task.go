@@ -136,10 +136,10 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 							taskMap["_review_target_claimed_by"] = target["claimed_by"]
 
 							// Read preview from local workspace if available.
-							if c.session.Workspace() != nil && resultPath != "" {
+							if c.fc.Workspace() != nil && resultPath != "" {
 								remoteURL, _ := taskMap["project_remote_url"].(string)
 								projName, _ := taskMap["project_name"].(string)
-								if proj, perr := c.session.Workspace().ForProject(int64(projectID), remoteURL, projName); perr == nil {
+								if proj, perr := c.fc.Workspace().ForProject(int64(projectID), remoteURL, projName); perr == nil {
 									taskMap["_review_target_abs_path"] = filepath.Join(proj.WorkDir(), resultPath, "result.md")
 									contentPath := filepath.Join(resultPath, "result.md")
 									if content, rerr := proj.ReadFile(contentPath); rerr == nil {
@@ -193,7 +193,7 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
-	outcome, err := c.session.ExecuteComputeTask(ctx, taskID)
+	outcome, err := c.fc.ExecuteComputeTask(ctx, taskID)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

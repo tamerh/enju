@@ -801,7 +801,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 	// Phase E.2 session 2a — multi-citizen tasks route each
 	// submission into `citizen-<username>/` under the task's
 	// base result directory so parallel submitters don't race
-	// on the same result.md. Session-1 single-citizen tasks
+	// on the same result.md. FatClient-1 single-citizen tasks
 	// keep the flat layout.
 	// Server-computed result_dir on the task response is the
 	// canonical layout — use it directly rather than

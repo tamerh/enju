@@ -210,25 +210,25 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 // would end up credited to the -model session value, regardless of
 // what the caller passed.
 func TestEffectiveModelPrecedence(t *testing.T) {
-	sess := service.New(service.Config{ModelName: "session-default"})
-	c := &apiClient{session: sess}
+	fc := service.New(service.Config{ModelName: "session-default"})
+	c := &apiClient{fc: fc}
 
 	// Override empty → fall back to session default.
-	if got := c.session.EffectiveModel(""); got != "session-default" {
+	if got := c.fc.EffectiveModel(""); got != "session-default" {
 		t.Errorf("empty override: got %q, want session-default", got)
 	}
 	// Override non-empty → win over session default.
-	if got := c.session.EffectiveModel("call-override"); got != "call-override" {
+	if got := c.fc.EffectiveModel("call-override"); got != "call-override" {
 		t.Errorf("non-empty override: got %q, want call-override", got)
 	}
 	// Override non-empty even when session default is empty.
-	sess2 := service.New(service.Config{ModelName: ""})
-	c2 := &apiClient{session: sess2}
-	if got := c2.session.EffectiveModel("call-override"); got != "call-override" {
+	fc2 := service.New(service.Config{ModelName: ""})
+	c2 := &apiClient{fc: fc2}
+	if got := c2.fc.EffectiveModel("call-override"); got != "call-override" {
 		t.Errorf("override with empty session: got %q, want call-override", got)
 	}
 	// Both empty → empty (the unaided-human case).
-	if got := c2.session.EffectiveModel(""); got != "" {
+	if got := c2.fc.EffectiveModel(""); got != "" {
 		t.Errorf("both empty: got %q, want empty (unaided human)", got)
 	}
 }

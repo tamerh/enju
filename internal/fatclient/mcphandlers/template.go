@@ -22,7 +22,7 @@ func (c *apiClient) handleListTemplates(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
-	templates, err := c.session.ListTemplates(ctx, int64(projectID))
+	templates, err := c.fc.ListTemplates(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -45,7 +45,7 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 	if err != nil {
 		return mcp.NewToolResultError("path is required (e.g. 'enju/templates/gwas.yaml')"), nil
 	}
-	loaded, err := c.session.DescribeTemplate(ctx, int64(projectID), templatePath)
+	loaded, err := c.fc.DescribeTemplate(ctx, int64(projectID), templatePath)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

@@ -37,7 +37,7 @@ import (
 // of a listing call). Returns the input bytes verbatim if the
 // workspace is unset, the body doesn't unmarshal, or no
 // decoration applied.
-func (s *Session) DecorateProjectListWithPushStatus(data []byte) []byte {
+func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 	if s.workspace == nil {
 		return data
 	}
@@ -99,7 +99,7 @@ func (s *Session) DecorateProjectListWithPushStatus(data []byte) []byte {
 // Errors are returned but treated as warnings by callers (the
 // project record is registered; the next tool call will retry the
 // init/clone).
-func (s *Session) EagerInitProjectClone(ctx context.Context, projectID int64, customPath string) error {
+func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, customPath string) error {
 	if s.workspace == nil {
 		return nil
 	}
@@ -179,7 +179,7 @@ func DetectPopulatedUnrelatedRepo(dirPath string) string {
 // default_branch when registering with the coordinator. Empty
 // adoptedBranch means HEAD couldn't be resolved (rare; falls
 // back to coordinator default).
-func (s *Session) InitDirAsProject(dirPath string) (adoptedBranch string, err error) {
+func (s *FatClient) InitDirAsProject(dirPath string) (adoptedBranch string, err error) {
 	repo, openErr := gogit.PlainOpen(dirPath)
 	if openErr != nil {
 		var initErr error
@@ -258,7 +258,7 @@ func (s *Session) InitDirAsProject(dirPath string) (adoptedBranch string, err er
 // after the coordinator has registered the project: marks the
 // directory as external (so ForProject opens it directly instead
 // of cloning), then opens it once to verify it works.
-func (s *Session) RegisterAdoptedDir(projectID int64, dirPath string) error {
+func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 	if s.workspace == nil {
 		return nil
 	}
@@ -273,7 +273,7 @@ func (s *Session) RegisterAdoptedDir(projectID int64, dirPath string) error {
 // expects (status, local/remote heads, ahead/behind counts,
 // optional last_push_*, optional remote_error). Returns the
 // no-remote payload directly when the project has no remote URL.
-func (s *Session) RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error) {
+func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("remote status is only available in MCP client mode")
 	}
@@ -320,7 +320,7 @@ func (s *Session) RemoteStatusReport(ctx context.Context, projectID int64) (map[
 // enju_project_sync: open the clone, lock it, preflight via
 // CompareToRemote (refuse diverged state without force), push.
 // Returns the response payload the formatter renders.
-func (s *Session) SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error) {
+func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("project sync is only available in MCP client mode")
 	}
@@ -404,7 +404,7 @@ func (s *Session) SyncProjectToRemote(ctx context.Context, projectID int64, forc
 //
 // Returns a warning message when push fails (non-fatal — remote
 // is set, but seeding failed). Empty workspace is a no-op.
-func (s *Session) MirrorRemoteAfterSet(projectID int64, remoteURL string) string {
+func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) string {
 	if s.workspace == nil {
 		return ""
 	}
@@ -450,7 +450,7 @@ func (s *Session) MirrorRemoteAfterSet(projectID int64, remoteURL string) string
 // LocalLeaveProject wipes the project's local clone (best-effort)
 // and reports whether one existed beforehand. Caller decides
 // what to do with the membership row on the coordinator side.
-func (s *Session) LocalLeaveProject(projectID int64) (hadClone bool, err error) {
+func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error) {
 	if s.workspace == nil {
 		return false, nil
 	}

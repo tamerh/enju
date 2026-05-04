@@ -31,7 +31,7 @@ type InboxResult struct {
 // when the workspace knows the project but no clone has been
 // materialized yet — handler surfaces a friendly message
 // rather than treating it as an error.
-func (s *Session) BuildInbox(ctx context.Context, projectID int64, username string) (*InboxResult, error) {
+func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username string) (*InboxResult, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("workspace not configured")
 	}

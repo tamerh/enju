@@ -87,10 +87,10 @@ func (c *apiClient) handleMyProfile(ctx context.Context, req mcp.CallToolRequest
 	}
 	// Inject model name from client config so the profile
 	// display shows which model this session is using.
-	if c.session.ModelName() != "" {
+	if c.fc.ModelName() != "" {
 		var profileMap map[string]interface{}
 		if json.Unmarshal(data, &profileMap) == nil {
-			profileMap["model"] = c.session.ModelName()
+			profileMap["model"] = c.fc.ModelName()
 			data, _ = json.Marshal(profileMap)
 		}
 	}

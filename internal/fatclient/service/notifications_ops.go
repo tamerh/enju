@@ -57,7 +57,7 @@ type NotificationsResult struct {
 // ProjectClonePresent=false when the project has no local
 // clone yet — the caller should surface a friendly message
 // rather than treat it as an error.
-func (s *Session) ReadNotifications(projectID int64, username string, limit int) (*NotificationsResult, error) {
+func (s *FatClient) ReadNotifications(projectID int64, username string, limit int) (*NotificationsResult, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("workspace not configured")
 	}
@@ -90,7 +90,7 @@ func (s *Session) ReadNotifications(projectID int64, username string, limit int)
 // highest seq in `matches` (which the caller obtained from
 // ReadNotifications). No-op when there are no matches or when
 // the highest seq isn't ahead of the persisted cursor.
-func (s *Session) MarkNotificationsRead(projectID int64, matches []Notification) error {
+func (s *FatClient) MarkNotificationsRead(projectID int64, matches []Notification) error {
 	if s.workspace == nil || len(matches) == 0 {
 		return nil
 	}

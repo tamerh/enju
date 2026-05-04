@@ -4,8 +4,8 @@ package mcphandlers
 // internal/fatclient/service — TaskMeta + FetchTaskMeta +
 // UseFatClient are session methods now. The alias + apiClient
 // shims here let handlers keep saying `*taskMeta` and
-// `c.session.FetchTaskMeta(...)` without per-call edits while they
-// gradually migrate to call service.Session directly.
+// `c.fc.FetchTaskMeta(...)` without per-call edits while they
+// gradually migrate to call service.FatClient directly.
 
 import (
 	"context"
@@ -21,10 +21,10 @@ type taskMeta = service.TaskMeta
 
 // fetchTaskMeta forwards to the service layer.
 func (c *apiClient) fetchTaskMeta(ctx context.Context, taskID string) (*taskMeta, error) {
-	return c.session.FetchTaskMeta(ctx, taskID)
+	return c.fc.FetchTaskMeta(ctx, taskID)
 }
 
 // useFatClient forwards to the service layer.
 func (c *apiClient) useFatClient(meta *taskMeta) bool {
-	return c.session.UseFatClient(meta)
+	return c.fc.UseFatClient(meta)
 }

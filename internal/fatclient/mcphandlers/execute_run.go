@@ -7,7 +7,7 @@ package mcphandlers
 // gate and reports it as next_blocker.
 //
 // This file is now a thin transport-layer translator: parses
-// MCP args, forwards to service.Session.ExecuteRun, formats
+// MCP args, forwards to service.FatClient.ExecuteRun, formats
 // the structured cascade result back to MCP text. All
 // orchestration (serial loop, parallel dispatch, claim retry,
 // compute execution, cold-reconcile fallback) lives in
@@ -42,7 +42,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError("run_id is required"), nil
 	}
-	if c.session.Workspace() == nil {
+	if c.fc.Workspace() == nil {
 		return mcp.NewToolResultError("enju_execute_run requires a local workspace"), nil
 	}
 	maxTasks := req.GetInt("max_tasks", defaultExecuteRunLimit)
@@ -64,7 +64,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 			parallel, maxParallel)), nil
 	}
 
-	res, err := c.session.ExecuteRun(ctx, service.ExecuteRunParams{
+	res, err := c.fc.ExecuteRun(ctx, service.ExecuteRunParams{
 		ProjectID: projectID,
 		RunID:     runID,
 		MaxTasks:  maxTasks,

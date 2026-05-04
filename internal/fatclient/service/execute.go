@@ -1,13 +1,13 @@
 package service
 
-// Compute-task execution. Session.ExecuteComputeTask is the
+// Compute-task execution. FatClient.ExecuteComputeTask is the
 // per-task worker that backs both enju_execute_task (single
 // task) and enju_execute_run (batch cascade). Returns the
 // structured ExecuteOutcome so the batch caller can stop /
 // continue per entry without re-parsing formatted text;
 // handlers translate the outcome to MCP text.
 //
-// Async kickoff lives on Session too — same dependencies
+// Async kickoff lives on FatClient too — same dependencies
 // (workspace + compute.Spec assembly), and keeping it here
 // means the per-tool flows pull from one place.
 
@@ -84,7 +84,7 @@ func ResolvedMode(meta *TaskMeta) string {
 // (outcome{Status:"failed"}, nil) so the batch caller can
 // record it and stop the cascade gracefully without unwinding
 // as a generic failure.
-func (s *Session) ExecuteComputeTask(ctx context.Context, taskID string) (*ExecuteOutcome, error) {
+func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*ExecuteOutcome, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_execute_task requires a local workspace")
 	}
@@ -361,7 +361,7 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir string, meta *TaskM
 // 3 attempts with 50/100/200ms backoff. Total max wait ~350ms,
 // short enough that callers don't notice the retries unless
 // the network is really down.
-func (s *Session) claimWithTransientRetry(ctx context.Context, taskID string) error {
+func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) error {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -450,7 +450,7 @@ func sleepBackoff(attempt int) {
 // process exits, the child is adopted by init rather than
 // killed. The parent doesn't Wait() — a background goroutine
 // reaps to avoid a zombie.
-func (s *Session) kickoffAsyncWrapTask(spec compute.Spec, env []string, resultDir, workDir string) (*AsyncKickoffResult, error) {
+func (s *FatClient) kickoffAsyncWrapTask(spec compute.Spec, env []string, resultDir, workDir string) (*AsyncKickoffResult, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("locating enju binary: %w", err)

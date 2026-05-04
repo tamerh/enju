@@ -158,22 +158,22 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:         logger,
 	})
-	sess := service.New(service.Config{
+	fc := service.New(service.Config{
 		Coord:     coordClient,
 		Workspace: cfg.Workspace,
 		ModelName: cfg.ModelName,
 		Logger:    logger,
 	})
-	client := &apiClient{session: sess}
+	client := &apiClient{fc: fc}
 
 	// Notify session — exists when caller opts in via
 	// Config.Notify. Nil session means tool-handler Switch
 	// calls are no-ops, matching the legacy behavior where
 	// nothing happens unless the user touches a project.
 	//
-	// Session stays dormant until create_project or init fires
-	// Switch. There is no cross-MCP-restart resume — each
-	// session activates on first project touch and dies on
+	// The notify session stays dormant until create_project or
+	// init fires Switch. There is no cross-MCP-restart resume —
+	// each session activates on first project touch and dies on
 	// process exit. Multi-session is naturally supported: each
 	// MCP process has its own notifySession with its own
 	// in-memory project pointer, no shared state.

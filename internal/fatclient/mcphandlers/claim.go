@@ -1,7 +1,7 @@
 package mcphandlers
 
 // Claim handlers. handleClaimTask is now a thin translator
-// over service.Session.ClaimTask — orchestration (pre-claim
+// over service.FatClient.ClaimTask — orchestration (pre-claim
 // reconcile, untracked-presence check, review-feedback +
 // previous-submission gather) lives in
 // internal/fatclient/service/claim.go. handleGetTaskInputs is
@@ -24,7 +24,7 @@ func (c *apiClient) handleClaimTask(ctx context.Context, req mcp.CallToolRequest
 	}
 	includeContext := req.GetBool("include_context", true)
 
-	result, err := c.session.ClaimTask(ctx, service.ClaimParams{
+	result, err := c.fc.ClaimTask(ctx, service.ClaimParams{
 		TaskID:     taskID,
 		IncludeContext: includeContext,
 	})
@@ -43,13 +43,13 @@ func (c *apiClient) handleGetTaskInputs(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
 
-	meta, metaErr := c.session.FetchTaskMeta(ctx, taskID)
+	meta, metaErr := c.fc.FetchTaskMeta(ctx, taskID)
 	if metaErr != nil {
 		return mcp.NewToolResultError(metaErr.Error()), nil
 	}
 
-	if c.session.UseFatClient(meta) {
-		data, err := c.session.FetchAndResolveLocally(ctx, meta)
+	if c.fc.UseFatClient(meta) {
+		data, err := c.fc.FetchAndResolveLocally(ctx, meta)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

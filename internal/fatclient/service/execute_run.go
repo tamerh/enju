@@ -1,6 +1,6 @@
 package service
 
-// Cascade execution. Session.ExecuteRun drains all auto-
+// Cascade execution. FatClient.ExecuteRun drains all auto-
 // advanceable compute tasks in a run; citizen tasks (vote,
 // review, answer, contribute) are never auto-advanced and the
 // cascade stops at the next human gate, reporting it as
@@ -70,7 +70,7 @@ const (
 	StopContextCancelled   = "context_cancelled"
 )
 
-// ExecuteRunParams is the input for Session.ExecuteRun.
+// ExecuteRunParams is the input for FatClient.ExecuteRun.
 type ExecuteRunParams struct {
 	ProjectID int
 	RunID     int
@@ -89,7 +89,7 @@ type ExecuteRunResult struct {
 // until a stop condition fires. Both serial and parallel
 // modes share the same per-task ExecuteComputeTask path so a
 // single fix to the worker propagates to both.
-func (s *Session) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*ExecuteRunResult, error) {
+func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*ExecuteRunResult, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_execute_run requires a local workspace")
 	}
@@ -377,7 +377,7 @@ func pickAllEligibleCompute(ready []map[string]interface{}, username string, dis
 // a nonexistent run surfaces as a clear "run not found" error
 // here rather than bleeding through the main loop as a
 // misleading "no_ready_compute" (empty /ready).
-func (s *Session) fetchRunBranch(ctx context.Context, projectID, runID int) (string, error) {
+func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runID int) (string, error) {
 	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
 	data, err := s.coord.Get(ctx, path)
 	if err != nil {
@@ -396,7 +396,7 @@ func (s *Session) fetchRunBranch(ctx context.Context, projectID, runID int) (str
 
 // fetchReadyTasksForRun wraps the /api/v1/tasks/ready endpoint
 // scoped to (project, run).
-func (s *Session) fetchReadyTasksForRun(ctx context.Context, projectID, runID int) ([]map[string]interface{}, error) {
+func (s *FatClient) fetchReadyTasksForRun(ctx context.Context, projectID, runID int) ([]map[string]interface{}, error) {
 	path := fmt.Sprintf("/api/v1/tasks/ready?project_id=%d&run_id=%d", projectID, runID)
 	data, err := s.coord.Get(ctx, path)
 	if err != nil {
@@ -456,7 +456,7 @@ func EntryFromOutcome(out *ExecuteOutcome) ExecuteRunEntry {
 // have variable wall-clock — callers who need a stable audit
 // trail should sort by seq downstream. The git log is the
 // canonical chronological record.
-func (s *Session) runCascadeParallel(
+func (s *FatClient) runCascadeParallel(
 	ctx context.Context,
 	projectID, runID int,
 	runBranch string,

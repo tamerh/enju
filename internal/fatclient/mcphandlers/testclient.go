@@ -48,13 +48,13 @@ func NewTestClient(cfg Config) *TestClient {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:          logger,
 	})
-	sess := service.New(service.Config{
+	fc := service.New(service.Config{
 		Coord:     coordClient,
 		Workspace: cfg.Workspace,
 		ModelName: cfg.ModelName,
 		Logger:    logger,
 	})
-	c := &apiClient{session: sess}
+	c := &apiClient{fc: fc}
 	return &TestClient{c: c}
 }
 

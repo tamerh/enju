@@ -5,7 +5,7 @@ package mcphandlers
 // push, coordinator report, accepted-merges FF — moved to
 // internal/fatclient/service/submit*.go. Each handler here is
 // args parse → action-specific input validation → call into
-// service.Session → render the structured result via the
+// service.FatClient → render the structured result via the
 // formatters at the bottom of this file.
 //
 // What stays in mcphandlers:
@@ -98,7 +98,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 	// meta is coherent. Also pins project + run scope.
 	metas := make([]*service.TaskMeta, len(entries))
 	for i, entry := range entries {
-		meta, err := c.session.FetchTaskMeta(ctx, entry.TaskID)
+		meta, err := c.fc.FetchTaskMeta(ctx, entry.TaskID)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("submissions[%d] (%s): task not found: %v", i, entry.TaskID, err)), nil
 		}
@@ -152,7 +152,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 	}
 
 	authorName, authorEmail := c.commitAuthor(ctx)
-	result, err := c.session.SubmitResultsBatch(ctx, service.SubmitBatchParams{
+	result, err := c.fc.SubmitResultsBatch(ctx, service.SubmitBatchParams{
 		Entries:     entries,
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
@@ -165,7 +165,7 @@ func (c *apiClient) handleSubmitResultsBatch(ctx context.Context, req mcp.CallTo
 
 // handleSubmitResult is the single-submit MCP handler. Parse
 // args + validate the per-tool surface, then delegate to
-// service.Session.SubmitTaskResult.
+// service.FatClient.SubmitTaskResult.
 func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
 	if err != nil {
@@ -206,11 +206,11 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 	// DB, wrong ID). Surface that as a clean "task not found"
 	// instead of letting the legacy fallback path POST into a
 	// void.
-	meta, metaErr := c.session.FetchTaskMeta(ctx, taskID)
+	meta, metaErr := c.fc.FetchTaskMeta(ctx, taskID)
 	if metaErr != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, metaErr)), nil
 	}
-	if !c.session.UseFatClient(meta) {
+	if !c.fc.UseFatClient(meta) {
 		// Git is a hard prerequisite for write operations: the
 		// coordinator no longer accepts content directly (per
 		// ARCHITECTURE.md #3, content lives only in git). When
@@ -226,14 +226,14 @@ func (c *apiClient) handleSubmitResult(ctx context.Context, req mcp.CallToolRequ
 }
 
 // submitResultFatClient is a thin forwarder over
-// Session.SubmitTaskResult. Kept on apiClient because:
+// FatClient.SubmitTaskResult. Kept on apiClient because:
 //   - enju_review (review.go) calls it for its own slim
 //     surface that ends in the same submit dance.
 //   - server_test.go pins the pre-validation behaviour by
 //     calling it directly with crafted task meta.
 //
 // Will go away when both call sites move to call
-// c.session.SubmitTaskResult(...) themselves.
+// c.fc.SubmitTaskResult(...) themselves.
 func (c *apiClient) submitResultFatClient(
 	ctx context.Context,
 	taskID string,
@@ -247,7 +247,7 @@ func (c *apiClient) submitResultFatClient(
 	modelOverride string,
 ) (*mcp.CallToolResult, error) {
 	authorName, authorEmail := c.commitAuthor(ctx)
-	res := c.session.SubmitTaskResult(ctx, service.SubmitParams{
+	res := c.fc.SubmitTaskResult(ctx, service.SubmitParams{
 		TaskID:        taskID,
 		Meta:          meta,
 		Content:       content,

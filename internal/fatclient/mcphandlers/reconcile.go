@@ -24,10 +24,10 @@ func buildReconcileBody(trailers []workspace.CommitTrailer) map[string]interface
 
 // stateDir forwards to the service layer.
 func (c *apiClient) stateDir() string {
-	return c.session.StateDir()
+	return c.fc.StateDir()
 }
 
 // pullBranchWithReconcile forwards to the service layer.
 func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *workspace.Project, projectID int64, branch string) error {
-	return c.session.PullBranchWithReconcile(ctx, proj, projectID, branch)
+	return c.fc.PullBranchWithReconcile(ctx, proj, projectID, branch)
 }

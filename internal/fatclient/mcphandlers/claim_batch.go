@@ -43,7 +43,7 @@ func (c *apiClient) handleClaimReadyMatching(ctx context.Context, req mcp.CallTo
 			limit, maxClaimSelectorLimit)), nil
 	}
 
-	result, err := c.session.ClaimReadyMatching(ctx, service.ClaimMatchingParams{
+	result, err := c.fc.ClaimReadyMatching(ctx, service.ClaimMatchingParams{
 		ProjectID:      int64(projectID),
 		RunID:          int64(runID),
 		ActionFilter:   actionFilter,

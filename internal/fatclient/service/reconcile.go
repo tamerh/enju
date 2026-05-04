@@ -7,7 +7,7 @@ package service
 // endpoint, plus an async-wrapper failure reaper that catches
 // non-zero exits the trailer scanner can't see.
 //
-// Lives on Session because every per-tool service call that
+// Lives on FatClient because every per-tool service call that
 // touches a project's branch wants the same "freshen + sweep"
 // semantics. Hook points: places the fat client naturally touches
 // git + talks to the coordinator already, so reconciliation adds
@@ -72,7 +72,7 @@ func BuildReconcileBody(trailers []workspace.CommitTrailer) map[string]interface
 //
 // Falls back to ~/.enju/state/ only when no workspace is
 // configured (local-only / legacy callers).
-func (s *Session) StateDir() string {
+func (s *FatClient) StateDir() string {
 	if s.workspace != nil {
 		return filepath.Join(s.workspace.RootDir(), ".state")
 	}
@@ -109,7 +109,7 @@ func (s *Session) StateDir() string {
 // across this call (it would deadlock); subsequent operations
 // that need the lock (resolver reads, commit writes) re-acquire
 // after this returns.
-func (s *Session) PullBranchWithReconcile(ctx context.Context, proj *workspace.Project, projectID int64, branch string) error {
+func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *workspace.Project, projectID int64, branch string) error {
 	if proj == nil {
 		return nil
 	}
@@ -249,7 +249,7 @@ func (s *Session) PullBranchWithReconcile(ctx context.Context, proj *workspace.P
 // reaps wrapper failures. Best-effort throughout — fetch /
 // scan / post errors are logged at Debug and the call returns
 // without surfacing them.
-func (s *Session) ReconcileRunBranch(ctx context.Context, projectID int64, runData []byte) {
+func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, runData []byte) {
 	if s.workspace == nil {
 		return
 	}
@@ -336,7 +336,7 @@ func (s *Session) ReconcileRunBranch(ctx context.Context, projectID int64, runDa
 // (matching the sync path) doesn't commit on exit != 0 so a
 // failed async task has no scanner-visible signal — the reaper
 // fills that gap when the submitter comes back online.
-func (s *Session) ReapWrapperFailures(ctx context.Context, proj *workspace.Project, projectID int64) {
+func (s *FatClient) ReapWrapperFailures(ctx context.Context, proj *workspace.Project, projectID int64) {
 	if proj == nil {
 		return
 	}
@@ -365,7 +365,7 @@ func (s *Session) ReapWrapperFailures(ctx context.Context, proj *workspace.Proje
 // Idempotent — the coordinator rejects /fail on tasks already
 // in terminal state, which we treat as "already handled, move
 // on."
-func (s *Session) handleOneWrapperResult(ctx context.Context, resultPath string) {
+func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath string) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return

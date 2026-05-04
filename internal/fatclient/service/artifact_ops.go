@@ -59,7 +59,7 @@ func indexOfNewline(s string) int {
 // content matches what the index points at, or from the working
 // tree as a fallback. Returns the marshaled JSON ready for
 // format.ArtifactDetail.
-func (s *Session) GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error) {
+func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("get_artifact requires a local workspace (MCP client mode)")
 	}
@@ -111,7 +111,7 @@ func (s *Session) GetArtifactContent(ctx context.Context, projectID int64, path 
 // superseded annotations by cross-referencing the coordinator's
 // artifact index and the task state machine. Returns the
 // marshaled JSON ready for format.ArtifactHistory.
-func (s *Session) GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error) {
+func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("get_artifact_history requires a local workspace (MCP client mode)")
 	}
@@ -246,7 +246,7 @@ type UntrackedArtifactReport struct {
 // ENJU_SHARED_ROOT makes it a noop) so calling this tool can
 // fix downstream "untracked artifact missing" claim errors
 // in-place when shared storage is available.
-func (s *Session) ListUntrackedArtifacts(ctx context.Context, projectID int64, branch string) (*UntrackedArtifactReport, error) {
+func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64, branch string) (*UntrackedArtifactReport, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_list_untracked_artifacts requires a local workspace (MCP client mode)")
 	}

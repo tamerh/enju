@@ -57,7 +57,7 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	// render reflects the freshest coordinator state. Best-
 	// effort — a fetch or reconcile failure just means stale
 	// status this cycle, not a tool error.
-	c.session.ReconcileRunBranch(ctx, int64(projectID), run)
+	c.fc.ReconcileRunBranch(ctx, int64(projectID), run)
 
 	tasks, err := c.get(ctx, base+"/tasks")
 	if err != nil {
@@ -65,7 +65,7 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// Inject project name into the run data for the header.
-	_, projName, _ := c.session.FetchProjectMetaFull(ctx, int64(projectID))
+	_, projName, _ := c.fc.FetchProjectMetaFull(ctx, int64(projectID))
 	if projName != "" {
 		var runMap map[string]interface{}
 		if json.Unmarshal(run, &runMap) == nil {
@@ -449,7 +449,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	var sourceCommitSHA string
 	if templatePath != "" {
 		authorName, authorEmail := c.commitAuthor(ctx)
-		p, err := c.session.PrepareRunTemplate(ctx, int64(projectID), templatePath, authorName, authorEmail)
+		p, err := c.fc.PrepareRunTemplate(ctx, int64(projectID), templatePath, authorName, authorEmail)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -490,7 +490,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	var snapshotWarning string
 	if prep != nil {
 		authorName, authorEmail := c.commitAuthor(ctx)
-		snapshotWarning = c.session.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
+		snapshotWarning = c.fc.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
 	}
 
 	text := format.CreateRun(data)
@@ -518,7 +518,7 @@ func (c *apiClient) handleExportDiagram(ctx context.Context, req mcp.CallToolReq
 	}
 
 	authorName, authorEmail := c.commitAuthor(ctx)
-	body, res, err := c.session.ExportDiagramFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
+	body, res, err := c.fc.ExportDiagramFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -575,7 +575,7 @@ func (c *apiClient) handleExportRunEvents(ctx context.Context, req mcp.CallToolR
 	}
 
 	authorName, authorEmail := c.commitAuthor(ctx)
-	events, res, err := c.session.ExportRunEventsFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
+	events, res, err := c.fc.ExportRunEventsFile(ctx, int64(projectID), runID, phase, authorName, authorEmail)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -612,7 +612,7 @@ func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultError("run_seq is required"), nil
 	}
-	md, err := c.session.ExportRunMarkdown(ctx, int64(projectID), runSeq)
+	md, err := c.fc.ExportRunMarkdown(ctx, int64(projectID), runSeq)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

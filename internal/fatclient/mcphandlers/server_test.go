@@ -442,7 +442,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 		ReviewsTarget:    "draft",
 	}
 
-	data, err := c.session.FetchAndResolveLocally(context.Background(), meta)
+	data, err := c.fc.FetchAndResolveLocally(context.Background(), meta)
 	if err != nil {
 		t.Fatalf("fetchAndResolveLocally: %v", err)
 	}

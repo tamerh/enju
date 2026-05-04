@@ -32,7 +32,7 @@ func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequ
 	// info from the MCP workspace — but only for projects whose clone
 	// already exists on disk. Cheap by design: no fresh clones get
 	// triggered as a side effect of a listing call.
-	decorated := c.session.DecorateProjectListWithPushStatus(data)
+	decorated := c.fc.DecorateProjectListWithPushStatus(data)
 	return mcp.NewToolResultText(format.ProjectList(decorated)), nil
 }
 
@@ -117,12 +117,12 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	// claim. Failures are non-fatal at this point: the project
 	// record is registered, and the next tool call will retry
 	// the init/clone.
-	if c.session.Workspace() != nil {
+	if c.fc.Workspace() != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
-				if ierr := c.session.EagerInitProjectClone(ctx, projectID, customPath); ierr != nil {
-					c.session.Logger().Warn("eager workspace init failed (will retry on first task)",
+				if ierr := c.fc.EagerInitProjectClone(ctx, projectID, customPath); ierr != nil {
+					c.fc.Logger().Warn("eager workspace init failed (will retry on first task)",
 						"project_id", projectID, "path", customPath, "error", ierr)
 				}
 				// Auto-subscribe notifications to the just-created
@@ -138,11 +138,11 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 
 // handleInit adopts an existing folder as an Enju project. It:
 // 1. Validates the path exists and refuses populated unrelated repos.
-// 2. Hands off to service.Session.InitDirAsProject for git init +
+// 2. Hands off to service.FatClient.InitDirAsProject for git init +
 //    scaffold + commit (returns the adopted branch name).
 // 3. Registers the project with the coordinator, passing the
 //    adopted branch as default_branch.
-// 4. Calls service.Session.RegisterAdoptedDir to wire the folder
+// 4. Calls service.FatClient.RegisterAdoptedDir to wire the folder
 //    into the workspace as external, then opens it once to verify.
 func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	name, err := req.RequireString("name")
@@ -177,7 +177,7 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 
-	adoptedBranch, err := c.session.InitDirAsProject(dirPath)
+	adoptedBranch, err := c.fc.InitDirAsProject(dirPath)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -199,12 +199,12 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	if c.session.Workspace() != nil {
+	if c.fc.Workspace() != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
-				if rerr := c.session.RegisterAdoptedDir(projectID, dirPath); rerr != nil {
-					c.session.Logger().Warn("opening init'd folder", "error", rerr)
+				if rerr := c.fc.RegisterAdoptedDir(projectID, dirPath); rerr != nil {
+					c.fc.Logger().Warn("opening init'd folder", "error", rerr)
 				}
 				// Auto-subscribe notifications. Same rationale as
 				// create_project — init signals "I'm working here
@@ -222,7 +222,7 @@ func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallT
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
-	resp, err := c.session.RemoteStatusReport(ctx, int64(projectID))
+	resp, err := c.fc.RemoteStatusReport(ctx, int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -236,7 +236,7 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
 	force := req.GetBool("force", false)
-	resp, err := c.session.SyncProjectToRemote(ctx, int64(projectID), force)
+	resp, err := c.fc.SyncProjectToRemote(ctx, int64(projectID), force)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -257,11 +257,11 @@ func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
 	keepMembership := req.GetBool("keep_membership", false)
-	if c.session.Workspace() == nil {
+	if c.fc.Workspace() == nil {
 		return mcp.NewToolResultError("leave project is only available in MCP client mode"), nil
 	}
 	// Existence check.
-	if _, err := c.session.FetchProjectMeta(ctx, int64(projectID)); err != nil {
+	if _, err := c.fc.FetchProjectMeta(ctx, int64(projectID)); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("✗ Project #%d not found", projectID)), nil
 	}
 	// Remove the coordinator-side membership row before wiping
@@ -285,7 +285,7 @@ func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequ
 		}
 		membershipMsg = fmt.Sprintf("✓ Project #%d: membership removed. ", projectID)
 	}
-	hadClone, err := c.session.LocalLeaveProject(int64(projectID))
+	hadClone, err := c.fc.LocalLeaveProject(int64(projectID))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -492,7 +492,7 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 	// Mirror the remote change into the existing local clone
 	// (origin URL update + push every local branch to seed the
 	// new bare + cursor reset to force full-history rescan).
-	pushWarning := c.session.MirrorRemoteAfterSet(int64(projectID), remoteURL)
+	pushWarning := c.fc.MirrorRemoteAfterSet(int64(projectID), remoteURL)
 
 	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s", projectID, remoteURL, pushWarning)), nil
 }

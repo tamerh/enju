@@ -21,7 +21,7 @@ import (
 // logged at Debug and the scan proceeds against whatever's on
 // disk — the user still gets a menu, and the error surfaces
 // on the next branch-touching tool call if it's load-bearing.
-func (s *Session) ListTemplates(ctx context.Context, projectID int64) ([]workspace.TemplateSummary, error) {
+func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]workspace.TemplateSummary, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_list_templates requires a local workspace (MCP client mode)")
 	}
@@ -39,7 +39,7 @@ func (s *Session) ListTemplates(ctx context.Context, projectID int64) ([]workspa
 
 // DescribeTemplate opens the project clone, best-effort pulls,
 // and loads one template by path.
-func (s *Session) DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*workspace.LoadedTemplate, error) {
+func (s *FatClient) DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*workspace.LoadedTemplate, error) {
 	if s.workspace == nil {
 		return nil, fmt.Errorf("enju_describe_template requires a local workspace (MCP client mode)")
 	}

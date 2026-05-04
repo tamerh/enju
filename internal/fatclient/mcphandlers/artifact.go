@@ -46,7 +46,7 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	out, err := c.session.GetArtifactContent(ctx, int64(projectID), path)
+	out, err := c.fc.GetArtifactContent(ctx, int64(projectID), path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -66,7 +66,7 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	out, err := c.session.GetArtifactHistory(ctx, int64(projectID), path)
+	out, err := c.fc.GetArtifactHistory(ctx, int64(projectID), path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -92,7 +92,7 @@ func (c *apiClient) handleListUntrackedArtifacts(ctx context.Context, req mcp.Ca
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
 	branch := req.GetString("branch", "")
-	report, err := c.session.ListUntrackedArtifacts(ctx, int64(projectID), branch)
+	report, err := c.fc.ListUntrackedArtifacts(ctx, int64(projectID), branch)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

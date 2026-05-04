@@ -39,7 +39,7 @@ func (c *apiClient) handleReview(ctx context.Context, req mcp.CallToolRequest) (
 	// fat-client/legacy split. Mirrors handleSubmitResult's
 	// preflight — surface "task not found" cleanly instead of
 	// letting the legacy path POST into a void.
-	meta, metaErr := c.session.FetchTaskMeta(ctx, taskID)
+	meta, metaErr := c.fc.FetchTaskMeta(ctx, taskID)
 	if metaErr != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("task %q not found: %v", taskID, metaErr)), nil
 	}
@@ -47,7 +47,7 @@ func (c *apiClient) handleReview(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("task %q is action:%s, not action:review — use enju_submit_result", taskID, meta.Action)), nil
 	}
 
-	if !c.session.UseFatClient(meta) {
+	if !c.fc.UseFatClient(meta) {
 		// Git is a hard prerequisite for review submissions:
 		// the verdict is committed to the iteration topic
 		// branch and the commit_sha is what the coordinator

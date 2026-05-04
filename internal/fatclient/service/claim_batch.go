@@ -28,7 +28,7 @@ import (
 )
 
 // ClaimMatchingParams is the input shape for
-// Session.ClaimReadyMatching. Mirrors the MCP tool's surface.
+// FatClient.ClaimReadyMatching. Mirrors the MCP tool's surface.
 type ClaimMatchingParams struct {
 	ProjectID      int64
 	RunID          int64
@@ -58,7 +58,7 @@ type ClaimMatchingResult struct {
 
 // ClaimReadyMatching executes the bulk-claim-by-filter flow.
 // Returns the aggregated outcome; the caller renders it.
-func (s *Session) ClaimReadyMatching(ctx context.Context, params ClaimMatchingParams) (*ClaimMatchingResult, error) {
+func (s *FatClient) ClaimReadyMatching(ctx context.Context, params ClaimMatchingParams) (*ClaimMatchingResult, error) {
 	// Step 1: fetch ready tasks for (project, run).
 	path := fmt.Sprintf("/api/v1/tasks/ready?project_id=%d&run_id=%d", params.ProjectID, params.RunID)
 	data, err := s.coord.Get(ctx, path)
@@ -185,7 +185,7 @@ func (s *Session) ClaimReadyMatching(ctx context.Context, params ClaimMatchingPa
 // the latter's per-task pre-reconcile (done once upfront)
 // nor its verbose context-fetch path by default (the whole
 // point of the selector is lean bulk-work responses).
-func (s *Session) claimOneForSelector(ctx context.Context, taskID string, includeContext bool) BatchClaimEntry {
+func (s *FatClient) claimOneForSelector(ctx context.Context, taskID string, includeContext bool) BatchClaimEntry {
 	data, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 		"username": s.Username(),
 		"model":    s.modelName, // operator/model design — empty for unaided humans

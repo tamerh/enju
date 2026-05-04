@@ -208,7 +208,7 @@ type TaskMeta struct {
 // FetchTaskMeta reads a task's metadata from the coordinator. Used
 // by handleClaimTask, handleGetTaskInputs, and handleSubmitResult to
 // decide whether to use the fat-client or legacy path.
-func (s *Session) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta, error) {
+func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta, error) {
 	data, err := s.coord.Get(ctx, "/api/v1/tasks/"+taskID)
 	if err != nil {
 		return nil, err
@@ -396,7 +396,7 @@ func (s *Session) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta, 
 // a remote. Projects with no remote keep their commit history in
 // the local workspace, recoverable and intact, just not synced
 // anywhere.
-func (s *Session) UseFatClient(meta *TaskMeta) bool {
+func (s *FatClient) UseFatClient(meta *TaskMeta) bool {
 	if s.workspace == nil || meta == nil {
 		return false
 	}

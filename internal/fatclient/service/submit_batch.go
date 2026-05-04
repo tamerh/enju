@@ -36,7 +36,7 @@ type SubmitBatchEntry struct {
 }
 
 // SubmitBatchParams is the input shape for
-// Session.SubmitResultsBatch.
+// FatClient.SubmitResultsBatch.
 //
 // AuthorName + AuthorEmail are resolved by the handler (the
 // apiClient profile cache is handler-side); the service layer
@@ -83,7 +83,7 @@ type SubmitBatchResult struct {
 // batch dependency conflicts, action-specific field presence)
 // happens in the handler before this is called — service-side
 // failures here are git or coordinator-transport issues.
-func (s *Session) SubmitResultsBatch(ctx context.Context, params SubmitBatchParams) (*SubmitBatchResult, error) {
+func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchParams) (*SubmitBatchResult, error) {
 	if len(params.Entries) == 0 {
 		return nil, fmt.Errorf("entries is empty")
 	}
@@ -281,7 +281,7 @@ func (s *Session) SubmitResultsBatch(ctx context.Context, params SubmitBatchPara
 // coordinator-writes fallback (projects without a remote_url) —
 // fat-client entries go through the coalesced prepare +
 // single-push path in SubmitResultsBatch.
-func (s *Session) submitOneForBatch(ctx context.Context, e SubmitBatchEntry, meta *TaskMeta, authorName, authorEmail string) SubmitBatchEntryResult {
+func (s *FatClient) submitOneForBatch(ctx context.Context, e SubmitBatchEntry, meta *TaskMeta, authorName, authorEmail string) SubmitBatchEntryResult {
 	if !s.UseFatClient(meta) {
 		// Same git-required contract as SubmitTaskResult.
 		return SubmitBatchEntryResult{TaskID: e.TaskID, Status: "error", Message: "submit requires a local workspace; run via `enju mcp`"}
@@ -312,7 +312,7 @@ func (s *Session) submitOneForBatch(ctx context.Context, e SubmitBatchEntry, met
 // a pushed commit. Encapsulates the (project id, state dir,
 // branch, sha) wiring so single + batch submit share the same
 // call shape.
-func (s *Session) advanceScanCursor(projectID int64, branch, sha string) {
+func (s *FatClient) advanceScanCursor(projectID int64, branch, sha string) {
 	if sha == "" {
 		return
 	}

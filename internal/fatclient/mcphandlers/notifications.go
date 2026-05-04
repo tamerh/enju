@@ -31,7 +31,7 @@ func (c *apiClient) handleNotifications(ctx context.Context, req mcp.CallToolReq
 	limit := req.GetInt("limit", 20)
 	markRead := req.GetBool("mark_read", true)
 
-	res, err := c.session.ReadNotifications(int64(projectID), c.username(), limit)
+	res, err := c.fc.ReadNotifications(int64(projectID), c.username(), limit)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("read live log: %v", err)), nil
 	}
@@ -42,8 +42,8 @@ func (c *apiClient) handleNotifications(ctx context.Context, req mcp.CallToolReq
 	out := formatNotifications(res.Matches, res.LastReadSeq)
 
 	if markRead {
-		if err := c.session.MarkNotificationsRead(int64(projectID), res.Matches); err != nil {
-			c.session.Logger().Warn("notifications: failed to persist read-seq", "err", err)
+		if err := c.fc.MarkNotificationsRead(int64(projectID), res.Matches); err != nil {
+			c.fc.Logger().Warn("notifications: failed to persist read-seq", "err", err)
 		}
 	}
 
