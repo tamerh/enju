@@ -9,29 +9,27 @@ import (
 )
 
 // Coordinator bundles the cross-cutting state that cascade
-// operations need beyond the bare *store.Store: the parsed-run
+// operations need beyond the bare store.CoordinatorStore: the parsed-run
 // cache and the per-project auto-triage mutex.
 //
 // Why a struct rather than free functions: the per-project
-// triage mutex MUST be a single shared instance across both the
-// REST and MCP transports — otherwise two concurrent calls (one
-// REST claim, one MCP invalidate) racing on the same project
-// could both pass FindOldestOpenIssue and both spawn a fix task,
-// orphaning one. Plain free functions can't share that state.
+// triage mutex MUST be a single shared instance across every
+// caller into the service layer — otherwise two concurrent
+// requests racing on the same project could both pass
+// FindOldestOpenIssue and both spawn a fix task, orphaning
+// one. Plain free functions can't share that state.
 //
-// Construct one Coordinator at coordinator startup, share it
-// with both api.Server (so its existing handlers can call
-// through) and mcphandlers.Config (so native MCP handlers can
-// call the same service path). The two transports thereby
-// converge on identical cascade behavior + identical
-// concurrency semantics.
+// Construct one Coordinator at coordinator startup and pass
+// it to api.Server (today's only transport). Future transports
+// must share the same Coordinator instance to inherit the
+// per-project triage mutex and parsed-run cache.
 //
-// Most service functions still take *store.Store directly — the
+// Most service functions still take store.CoordinatorStore directly — the
 // Coordinator only carries weight for cascade-touching code
 // paths (invalidate/fail/tally/spawn). Read-only and simple-
 // mutation handlers don't need it.
 type Coordinator struct {
-	Store  *store.Store
+	Store  store.CoordinatorStore
 	Cache  *dagcache.Cache
 	Logger *slog.Logger
 
@@ -46,7 +44,7 @@ type Coordinator struct {
 // NewCoordinator constructs the cross-cutting Coordinator state.
 // Pass the cache from dagcache.New(store) so api.Server and the
 // MCP handlers share the same parsed-run cache.
-func NewCoordinator(st *store.Store, cache *dagcache.Cache, logger *slog.Logger) *Coordinator {
+func NewCoordinator(st store.CoordinatorStore, cache *dagcache.Cache, logger *slog.Logger) *Coordinator {
 	return &Coordinator{
 		Store:  st,
 		Cache:  cache,

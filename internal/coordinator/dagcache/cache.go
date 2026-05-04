@@ -35,7 +35,7 @@ import (
 // Cache is the coordinator's parsed-run cache. Construct via New.
 // Methods are safe for concurrent use.
 type Cache struct {
-	store *store.Store
+	store store.CoordinatorStore
 
 	mu  sync.RWMutex
 	dags map[int64]*dag.DAG
@@ -44,7 +44,7 @@ type Cache struct {
 
 // New returns a fresh empty cache backed by the given store.
 // The store handle is used to load + parse YAML on cache misses.
-func New(s *store.Store) *Cache {
+func New(s store.CoordinatorStore) *Cache {
 	return &Cache{
 		store: s,
 		dags: make(map[int64]*dag.DAG),

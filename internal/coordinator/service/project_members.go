@@ -19,7 +19,7 @@ type MemberResponse struct {
 
 // ListProjectMembers returns every member on the project,
 // gated on caller membership. Mirrors api.handleListProjectMembers.
-func ListProjectMembers(s *store.Store, caller *store.CitizenRecord, projectID int64) ([]MemberResponse, error) {
+func ListProjectMembers(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64) ([]MemberResponse, error) {
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}

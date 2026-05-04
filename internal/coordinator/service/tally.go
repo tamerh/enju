@@ -139,7 +139,7 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 	}
 	resp.Tally = &TallyView{
 		Resolved:   outcome.Resolved,
-		Verdict:    outcome.Verdict,
+		Verdict:    string(outcome.Verdict),
 		Approves:    outcome.Approves,
 		Rejects:    outcome.Rejects,
 		TotalReviews: outcome.TotalReviews,
@@ -163,7 +163,7 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 	if err != nil {
 		return nil, fmt.Errorf("resolve failed: %w", err)
 	}
-	if outcome.Verdict == "reject" && task.ReviewsTarget != "" {
+	if outcome.Verdict == store.ReviewDecisionReject && task.ReviewsTarget != "" {
 		targetFullID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
 		if _, err := c.PerformInvalidate(targetFullID, "review_reject"); err != nil {
 			c.Logger.Warn("tally review-reject cascade failed",
@@ -176,7 +176,7 @@ func (c *Coordinator) TallyTask(caller *store.CitizenRecord, taskID string) (*Ta
 	// re-run finds 0 pending tasks because the first call
 	// already promoted them).
 	resp.Status = "resolved"
-	resp.Verdict = outcome.Verdict
+	resp.Verdict = string(outcome.Verdict)
 	resp.NewlyReady = result.TasksReadied
 	return resp, nil
 }

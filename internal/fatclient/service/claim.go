@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -249,7 +250,8 @@ func (s *Session) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []byt
 			continue
 		}
 		decision, _ := metaJSON["decision"].(string)
-		if decision != "request_changes" && decision != "reject" {
+		d := types.ReviewDecision(decision)
+		if d != types.ReviewDecisionRequestChanges && d != types.ReviewDecisionReject {
 			continue
 		}
 		contentPath := filepath.Join(reviewResultDir, "result.md")

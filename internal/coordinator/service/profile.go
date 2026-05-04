@@ -41,7 +41,7 @@ type ProfileContributions struct {
 // No model-name decoration on the coord side; the fat-client
 // injects its local c.modelName separately. A future MCP-over-
 // HTTP transport could surface this via a per-request header.
-func GetMyProfile(s *store.Store, caller *store.CitizenRecord) (*ProfileResponse, *ProfileContributions, error) {
+func GetMyProfile(s store.CoordinatorStore, caller *store.CitizenRecord) (*ProfileResponse, *ProfileContributions, error) {
 	citizen, err := s.GetCitizen(caller.ID)
 	if err != nil {
 		return nil, nil, err

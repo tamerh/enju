@@ -195,7 +195,7 @@ func helperCreateIssue(s *Store, rec *IssueRecord) (int64, int, error) {
 }
 
 // helperTriageIssue runs the TriageIssue mutation via ApplyPlan.
-func helperTriageIssue(s *Store, issueID, citizenID int64, severity string) error {
+func helperTriageIssue(s *Store, issueID, citizenID int64, severity IssueSeverity) error {
 	_, err := s.ApplyPlan(Plan{
 		Version:   testEngineVersion,
 		Mutations: []Mutation{TriageIssue{IssueID: issueID, CitizenID: citizenID, Severity: severity}},
@@ -244,7 +244,7 @@ func helperSetCycleBudgetMax(s *Store, runID, citizenID int64, newMax int) error
 }
 
 // helperCloseIssue runs the CloseIssue mutation via ApplyPlan.
-func helperCloseIssue(s *Store, issueID, citizenID int64, status, closedByTaskID string) error {
+func helperCloseIssue(s *Store, issueID, citizenID int64, status IssueStatus, closedByTaskID string) error {
 	_, err := s.ApplyPlan(Plan{
 		Version: testEngineVersion,
 		Mutations: []Mutation{CloseIssue{
@@ -274,4 +274,122 @@ func helperEvaluateRunState(s *Store, runID int64) (RunState, error) {
 		return "", err
 	}
 	return r.State, nil
+}
+
+// helperCreateCitizen wraps the CreateCitizen mutation in
+// the legacy direct-method shape: takes a *CitizenRecord,
+// returns (int64, error). Used by tests that previously
+// called s.CreateCitizen directly.
+func helperCreateCitizen(s *Store, c *CitizenRecord) (int64, error) {
+	res, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{CreateCitizen{Citizen: *c}},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return res.CitizenID, nil
+}
+
+// helperCreateModelCitizen mirrors the deleted Store.CreateModelCitizen
+// shape — register a kind='model' citizen with the conventional
+// "model:<username>" synthetic token.
+func helperCreateModelCitizen(s *Store, username, displayName string) (int64, error) {
+	if displayName == "" {
+		displayName = username
+	}
+	now := time.Now()
+	res, err := s.ApplyPlan(Plan{
+		Version: testEngineVersion,
+		Mutations: []Mutation{
+			CreateCitizen{Citizen: CitizenRecord{
+				Username:    username,
+				Name:        displayName,
+				Role:        "citizen",
+				Token:       "model:" + username,
+				RegisteredAt: now,
+				LastSeen:     now,
+				Kind:        "model",
+			}},
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return res.CitizenID, nil
+}
+
+// helperIssueToken mirrors the deleted Store.IssueToken shape.
+func helperIssueToken(s *Store, citizenID int64, token, label string) (int64, error) {
+	res, err := s.ApplyPlan(Plan{
+		Version: testEngineVersion,
+		Mutations: []Mutation{
+			IssueToken{CitizenID: citizenID, Token: token, Label: label},
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return res.TokenID, nil
+}
+
+// helperRevokeTokenByValue mirrors the deleted
+// Store.RevokeTokenByValue shape.
+func helperRevokeTokenByValue(s *Store, token string) error {
+	_, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{RevokeTokenByValue{Token: token}},
+	})
+	return err
+}
+
+// helperRevokeToken mirrors the deleted Store.RevokeToken shape.
+func helperRevokeToken(s *Store, tokenID int64) error {
+	_, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{RevokeToken{TokenID: tokenID}},
+	})
+	return err
+}
+
+// helperSetCitizenRole mirrors the deleted Store.SetCitizenRole.
+func helperSetCitizenRole(s *Store, citizenID int64, role string) error {
+	_, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{SetCitizenRole{CitizenID: citizenID, Role: role}},
+	})
+	return err
+}
+
+// helperUpdateCitizenProfile mirrors the deleted
+// Store.UpdateCitizenProfile.
+func helperUpdateCitizenProfile(s *Store, citizenID int64, name, email *string) error {
+	_, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{UpdateCitizenProfile{CitizenID: citizenID, Name: name, Email: email}},
+	})
+	return err
+}
+
+// helperCreateRun mirrors the legacy Store.CreateRun shape:
+// takes a *RunRecord, returns (id, seq, error).
+func helperCreateRun(s *Store, r *RunRecord) (int64, int, error) {
+	res, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{CreateRun{Run: *r}},
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return res.RunID, res.RunSeq, nil
+}
+
+// helperSetAutoTriageTemplate mirrors the deleted
+// Store.SetAutoTriageTemplate.
+func helperSetAutoTriageTemplate(s *Store, runID int64, templateJSON string) error {
+	_, err := s.ApplyPlan(Plan{
+		Version:  testEngineVersion,
+		Mutations: []Mutation{SetAutoTriageTemplate{RunID: runID, TemplateJSON: templateJSON}},
+	})
+	return err
 }

@@ -38,7 +38,7 @@ type DownstreamImpactView struct {
 // derived metrics for one citizen. Public read — no membership
 // gate; the citizen's username is enough to look them up.
 // Returns ErrNotFound when the citizen doesn't exist.
-func CitizenContributions(s *store.Store, username string) (*CitizenContributionsResponse, error) {
+func CitizenContributions(s store.CoordinatorStore, username string) (*CitizenContributionsResponse, error) {
 	citizen, err := s.GetCitizenByUsername(username)
 	if err != nil {
 		return nil, err

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/service"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/go-chi/chi/v5"
@@ -50,7 +52,7 @@ func (s *Server) resolveModelByUsername(modelName string) (*int64, error) {
 		return nil, fmt.Errorf("look up model %q: %w", modelName, err)
 	}
 	if c != nil {
-		if c.Kind != "model" {
+		if c.Kind != store.CitizenKindModel {
 			return nil, fmt.Errorf("citizen %q has kind %q, not %q — operators cannot be self-attributed as their own model", modelName, c.Kind, "model")
 		}
 		return &c.ID, nil
@@ -67,10 +69,25 @@ func (s *Server) resolveModelByUsername(modelName string) (*int64, error) {
 	// don't authenticate or grant access. A "delete unused model"
 	// admin tool can land later if catalog hygiene becomes a real
 	// problem in hosted mode.
-	id, err := s.store.CreateModelCitizen(modelName, modelName)
+	now := time.Now()
+	res, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{Citizen: store.CitizenRecord{
+				Username:     modelName,
+				Name:         modelName,
+				Role:         "citizen",
+				Token:        "model:" + modelName,
+				RegisteredAt: now,
+				LastSeen:     now,
+				Kind:         store.CitizenKindModel,
+			}},
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("auto-register model %q: %w", modelName, err)
 	}
+	id := res.CitizenID
 	return &id, nil
 }
 

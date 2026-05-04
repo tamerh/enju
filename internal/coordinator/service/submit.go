@@ -181,7 +181,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 			// spawn_remediation on request_changes, skip the
 			// invalidate cascade and spawn the remediation
 			// instead.
-			if spawned, ok := c.MaybeSpawnRemediation(taskID, actions.RejectTargetID, "request_changes", params.Decision, params.Content, submitterID); ok {
+			if spawned, ok := c.MaybeSpawnRemediation(taskID, actions.RejectTargetID, store.ReviewDecisionRequestChanges, store.ReviewDecision(params.Decision), params.Content, submitterID); ok {
 				rejectResult = &RemediationOrInvalidation{Task: spawned.Task}
 			} else {
 				res, cerr := c.PerformInvalidate(actions.RejectTargetID, "request_changes")
@@ -202,7 +202,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 			}
 		}
 		if actions.ShouldFailTarget && actions.RejectTargetID != "" {
-			if spawned, ok := c.MaybeSpawnRemediation(taskID, actions.RejectTargetID, "reject", params.Decision, params.Content, submitterID); ok {
+			if spawned, ok := c.MaybeSpawnRemediation(taskID, actions.RejectTargetID, store.ReviewDecisionReject, store.ReviewDecision(params.Decision), params.Content, submitterID); ok {
 				rejectResult = &RemediationOrInvalidation{Task: spawned.Task}
 			} else {
 				// Validate fail-ability (engine precondition)
@@ -251,7 +251,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 				if _, cerr := c.Store.ApplyPlan(store.Plan{
 					Version: engine.EngineVersion,
 					Mutations: []store.Mutation{
-						store.MarkLatestClaimOutcome{TaskID: rt.ID, Outcome: "completed"},
+						store.MarkLatestClaimOutcome{TaskID: rt.ID, Outcome: store.ClaimOutcomeCompleted},
 					},
 				}); cerr != nil {
 					c.Logger.Warn("close upstream claim on review approve",
@@ -356,7 +356,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	if reviewTally != nil {
 		resp.ReviewTally = &ReviewTallyView{
 			Resolved:   reviewTally.Resolved,
-			Verdict:   reviewTally.Verdict,
+			Verdict:   string(reviewTally.Verdict),
 			Approves:   reviewTally.Approves,
 			Rejects:   reviewTally.Rejects,
 			TotalReviews: reviewTally.TotalReviews,

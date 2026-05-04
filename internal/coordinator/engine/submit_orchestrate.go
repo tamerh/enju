@@ -79,10 +79,10 @@ func (e *Engine) ValidateSubmitRequest(
 
 	// Decision validation for review tasks.
 	if task.Action == "review" {
-		switch req.Decision {
-		case "approve", "reject", "request_changes", "comment":
+		switch {
+		case store.IsValidReviewDecision(req.Decision):
 			decision = req.Decision
-		case "":
+		case req.Decision == "":
 			return "", "", "", 0, fmt.Errorf(`decision is required on action:review tasks (must be "approve", "request_changes", "reject", or "comment")`)
 		default:
 			return "", "", "", 0, fmt.Errorf(`decision %q is invalid (must be "approve", "request_changes", "reject", or "comment")`, req.Decision)
@@ -232,11 +232,11 @@ func (e *Engine) ComputePostSubmitActions(
 			// Single-reviewer — decision is final.
 			// comment is non-blocking (no state change on target).
 			targetID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
-			switch decision {
-			case "request_changes":
+			switch store.ReviewDecision(decision) {
+			case store.ReviewDecisionRequestChanges:
 				actions.ShouldRejectTarget = true
 				actions.RejectTargetID = targetID
-			case "reject":
+			case store.ReviewDecisionReject:
 				actions.ShouldFailTarget = true
 				actions.RejectTargetID = targetID
 			}
@@ -248,10 +248,10 @@ func (e *Engine) ComputePostSubmitActions(
 				if outcome.Resolved {
 					targetID := fmt.Sprintf("%d:%d:", run.ProjectID, run.Seq) + task.ReviewsTarget
 					switch outcome.Verdict {
-					case "reject":
+					case store.ReviewDecisionReject:
 						actions.ShouldFailTarget = true
 						actions.RejectTargetID = targetID
-					case "request_changes":
+					case store.ReviewDecisionRequestChanges:
 						actions.ShouldRejectTarget = true
 						actions.RejectTargetID = targetID
 					}

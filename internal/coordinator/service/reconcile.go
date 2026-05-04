@@ -77,7 +77,7 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 	// state at THIS commit is a no-op success. Different
 	// commit at terminal state means the caller is trying to
 	// rewrite history — error, not a silent overwrite.
-	if task.State == "accepted" || task.State == "failed" {
+	if task.State == store.TaskAccepted || task.State == store.TaskFailed {
 		if task.CommitSHA == entry.CommitSHA {
 			res.Status = "noop"
 			return res
@@ -93,7 +93,7 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 	// task that has since been invalidated). Advancing would
 	// silently resurrect the old completion and clobber any
 	// in-progress re-run, so treat as no-op.
-	if task.State != "claimed" && task.State != "running" {
+	if task.State != store.TaskClaimed && task.State != store.TaskRunning {
 		res.Status = "noop"
 		return res
 	}

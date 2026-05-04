@@ -25,7 +25,7 @@ func (s *Server) maybeAutoTriageIfIdle(runID int64) {
 // invalidationResult shape (the in-api submit handler reuses
 // that type to carry the spawned task in its response).
 // Body-of-truth is in internal/coordinator/service/remediation.go.
-func (s *Server) maybeSpawnRemediation(reviewTaskID, targetTaskID, eventKind, decision, feedback string, submitterID int64) (*invalidationResult, bool) {
+func (s *Server) maybeSpawnRemediation(reviewTaskID, targetTaskID string, eventKind, decision store.ReviewDecision, feedback string, submitterID int64) (*invalidationResult, bool) {
 	out, ok := s.coord.MaybeSpawnRemediation(reviewTaskID, targetTaskID, eventKind, decision, feedback, submitterID)
 	if !ok {
 		return nil, false

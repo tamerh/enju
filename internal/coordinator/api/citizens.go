@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/service"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -70,14 +71,19 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 	token := uuid.New().String()
 	now := time.Now()
 
-	id, err := s.store.CreateCitizen(&store.CitizenRecord{
-		Username:   username,
-		Name:     req.Name,
-		Email:    req.Email,
-		Role:     "citizen",
-		Token:    token,
-		RegisteredAt: now,
-		LastSeen:   now,
+	res, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{Citizen: store.CitizenRecord{
+				Username:     username,
+				Name:         req.Name,
+				Email:        req.Email,
+				Role:         "citizen",
+				Token:        token,
+				RegisteredAt: now,
+				LastSeen:     now,
+			}},
+		},
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "email already exists") ||
@@ -88,6 +94,7 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to register: "+err.Error())
 		return
 	}
+	id := res.CitizenID
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"id":    id,
@@ -188,7 +195,7 @@ func citizenToMap(c *store.CitizenRecord) map[string]interface{} {
 	// discriminator is the v1 default for unmigrated rows.
 	kind := c.Kind
 	if kind == "" {
-		kind = "human"
+		kind = store.CitizenKindHuman
 	}
 	return map[string]interface{}{
 		"username":      c.Username,

@@ -44,7 +44,7 @@ func ToProjectResponse(p store.ProjectRecord, runCount int) ProjectResponse {
 // non-members never see the project at all.
 //
 // Caller must be non-nil (the transport layer enforces auth).
-func ListProjects(s *store.Store, caller *store.CitizenRecord) ([]ProjectResponse, error) {
+func ListProjects(s store.CoordinatorStore, caller *store.CitizenRecord) ([]ProjectResponse, error) {
 	projects, err := s.ListProjectsForCitizen(caller.ID)
 	if err != nil {
 		return nil, err

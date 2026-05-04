@@ -150,7 +150,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateProject failed despite broken events: %v", err)
 	}
-	runID, _, err := s.CreateRun(&RunRecord{
+	runID, _, err := helperCreateRun(s, &RunRecord{
 		ProjectID: pid, Name: "Test", YAMLData: "name: t",
 		State: RunActive, CreatedAt: now, UpdatedAt: now,
 	})
@@ -161,7 +161,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	// 2. CreateIssue — issues.go was migrated to post-commit
 	//  Record(). State must survive the simulated emission
 	//  failure.
-	alice, err := s.CreateCitizen(&CitizenRecord{
+	alice, err := helperCreateCitizen(s, &CitizenRecord{
 		Username: "alice-broken", Name: "Alice", Token: "tok-broken",
 		RegisteredAt: now, LastSeen: now,
 	})

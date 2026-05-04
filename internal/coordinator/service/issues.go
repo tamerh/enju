@@ -40,7 +40,7 @@ type IssueResponse struct {
 // Resolves the run seq + citizen usernames best-effort (a
 // hard-deleted run silently drops the field rather than
 // blocking the render).
-func ToIssueResponse(s *store.Store, it *store.IssueRecord) IssueResponse {
+func ToIssueResponse(s store.CoordinatorStore, it *store.IssueRecord) IssueResponse {
 	resp := IssueResponse{
 		ID:        fmt.Sprintf("ISSUE-%03d", it.Seq),
 		DBID:      it.ID,
@@ -48,8 +48,8 @@ func ToIssueResponse(s *store.Store, it *store.IssueRecord) IssueResponse {
 		ProjectID: it.ProjectID,
 		Title:     it.Title,
 		Body:      it.Body,
-		Status:    it.Status,
-		Severity:  it.Severity,
+		Status:    string(it.Status),
+		Severity:  string(it.Severity),
 		FiledBy:   CitizenUsername(s, it.FiledBy),
 		FiledAt:   it.FiledAt.UTC().Format(time.RFC3339),
 		UpdatedAt: it.UpdatedAt.UTC().Format(time.RFC3339),
@@ -88,16 +88,20 @@ type IssueListParams struct {
 
 // ListIssues returns issues in the project matching the
 // filters, gated on caller membership.
-func ListIssues(s *store.Store, caller *store.CitizenRecord, p IssueListParams) ([]IssueResponse, error) {
+func ListIssues(s store.CoordinatorStore, caller *store.CitizenRecord, p IssueListParams) ([]IssueResponse, error) {
 	if !CanReadProject(s, p.ProjectID, caller.ID) {
 		return nil, ErrNotMember
 	}
 	f := store.IssueFilter{ProjectID: p.ProjectID}
 	if p.Status != "" {
-		f.Status = strings.Split(p.Status, ",")
+		for _, s := range strings.Split(p.Status, ",") {
+			f.Status = append(f.Status, store.IssueStatus(s))
+		}
 	}
 	if p.Severity != "" {
-		f.Severity = strings.Split(p.Severity, ",")
+		for _, s := range strings.Split(p.Severity, ",") {
+			f.Severity = append(f.Severity, store.IssueSeverity(s))
+		}
 	}
 	if p.Limit > 0 {
 		f.Limit = p.Limit
@@ -115,7 +119,7 @@ func ListIssues(s *store.Store, caller *store.CitizenRecord, p IssueListParams) 
 
 // GetIssue returns one issue by (project, seq). Membership-
 // gated; ErrNotFound when the issue doesn't exist.
-func GetIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, seq int) (*IssueResponse, error) {
+func GetIssue(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, seq int) (*IssueResponse, error) {
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}

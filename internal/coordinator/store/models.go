@@ -1,7 +1,56 @@
 // Package store provides the SQLite database layer for Cedar state management.
 package store
 
-import "time"
+import (
+	"time"
+
+	"github.com/enju-ai/enju/internal/common/types"
+)
+
+// Re-exports of shared domain types from internal/common/types.
+// The canonical definitions live there so the fat-client can
+// import them without violating the coord↔fatclient boundary;
+// the store package re-exports them so coordinator-side code
+// keeps writing `store.ReviewDecisionApprove` without having
+// to add a second import.
+type ReviewDecision = types.ReviewDecision
+
+const (
+	ReviewDecisionApprove        = types.ReviewDecisionApprove
+	ReviewDecisionReject         = types.ReviewDecisionReject
+	ReviewDecisionRequestChanges = types.ReviewDecisionRequestChanges
+	ReviewDecisionComment        = types.ReviewDecisionComment
+)
+
+// IsValidReviewDecision is the package-local re-export of
+// types.IsValidReviewDecision. Same body, single source of
+// truth in common.
+func IsValidReviewDecision(s string) bool { return types.IsValidReviewDecision(s) }
+
+type ClaimOutcome = types.ClaimOutcome
+
+const (
+	ClaimOutcomeCompleted   = types.ClaimOutcomeCompleted
+	ClaimOutcomeRejected    = types.ClaimOutcomeRejected
+	ClaimOutcomeReleased    = types.ClaimOutcomeReleased
+	ClaimOutcomeTimedOut    = types.ClaimOutcomeTimedOut
+	ClaimOutcomeInvalidated = types.ClaimOutcomeInvalidated
+	ClaimOutcomeAbandoned   = types.ClaimOutcomeAbandoned
+)
+
+// IsValidClaimOutcome re-exports types.IsValidClaimOutcome.
+func IsValidClaimOutcome(s string) bool { return types.IsValidClaimOutcome(s) }
+
+type CitizenKind = types.CitizenKind
+
+const (
+	CitizenKindHuman = types.CitizenKindHuman
+	CitizenKindBot   = types.CitizenKindBot
+	CitizenKindModel = types.CitizenKindModel
+)
+
+// IsValidCitizenKind re-exports types.IsValidCitizenKind.
+func IsValidCitizenKind(s string) bool { return types.IsValidCitizenKind(s) }
 
 // TaskState represents the lifecycle state of a task.
 type TaskState string
@@ -253,7 +302,7 @@ type TaskRecord struct {
 	// review can land a fresh verdict without the old one leaking
 	// through.
 	ReviewsTarget string
-	ReviewDecision string
+	ReviewDecision ReviewDecision
 
 	// Vote action fields (Phase E.2). VoteOptions is the JSON-
 	// encoded list of declared options with their id/label/activates
@@ -418,9 +467,9 @@ type IterationRecord struct {
 	ClaimedAt   time.Time
 	Deadline    time.Time
 	SubmittedAt  *time.Time
-	Outcome    string
+	Outcome    ClaimOutcome
 	CommitSHA   string // the task's commit at submit time; "" until submitted
-	ReviewDecision string // approve | request_changes | reject | "" (no decision yet)
+	ReviewDecision ReviewDecision // approve | request_changes | reject | comment | "" (no decision yet)
 	Option     string // vote choice (vote tasks)
 	ModelID    *int64 // attribution (per-claim model)
 	// Branch is the iteration-scoped topic branch identifier
@@ -443,8 +492,8 @@ type IssueRecord struct {
 	Seq      int  // per-project counter — ISSUE-001, ISSUE-002, ...
 	Title     string
 	Body      string
-	Status     string // "open" | "triaged" | "closed" | "wontfix"
-	Severity    string // "low" | "medium" | "high" | "critical"
+	Status     IssueStatus  // "open" | "triaged" | "in_progress" | "closed" | "wontfix"
+	Severity    IssueSeverity // "low" | "medium" | "high" | "critical"
 	FoundInRunID  int64 // 0 if not run-scoped (rare)
 	FoundInTaskID string // empty if not task-scoped (e.g. filed against the project as a whole)
 	FiledBy    int64 // citizen ID
@@ -534,13 +583,19 @@ type CitizenRecord struct {
 	TasksReleased  int
 	TokensContrib  int64
 	RegisteredAt  time.Time
+	// LastSeen is reserved for a future presence/online-indicator
+	// feature. The column + struct field are populated on
+	// citizen registration but NOT updated thereafter — the
+	// per-API-request UPDATE was removed because nothing in
+	// production reads this value. When a future feature needs
+	// it, re-add the writes deliberately at that point.
 	LastSeen    time.Time
 	// operator/model design — citizen kind discriminator.
 	// "human" (default for everyone pre-migration), "bot" (owned by a
 	// human or project, has its own token), "model" (LLM catalog
 	// entry, no token, attribution-only). See
 	// docs/operator-model-design.md.
-	Kind      string
+	Kind      CitizenKind // empty string = legacy/normalized to Human at read time
 	// ParentID is the owner chain for bots. Non-nil for kind='bot'
 	// (points at the citizen that owns this bot); nil for humans
 	// and models. Used by enju_my_bots and revocation cascades.
@@ -573,7 +628,7 @@ type TaskClaimRecord struct {
 	CitizenID  int64
 	ClaimedAt  time.Time
 	Deadline  time.Time
-	Outcome   string // "completed", "timed_out", "released", "rejected"
+	Outcome   ClaimOutcome // empty while open; one of the typed constants once closed
 	SubmittedAt *time.Time
 	// Option is the citizen's submitted choice on a vote-action
 	// task. Empty for non-vote submissions and for claims that
@@ -597,10 +652,10 @@ type TaskClaimRecord struct {
 	// the claim hasn't been submitted yet.
 	CommitSHA string
 	// Decision is the reviewer verdict captured at submit time
-	// for action:review claims ("accept" / "request_changes" /
-	// "reject"). Empty for non-review claims and for unresolved
-	// claims.
-	Decision string
+	// for action:review claims (approve / request_changes /
+	// reject / comment). Empty for non-review claims and for
+	// unresolved claims.
+	Decision ReviewDecision
 	// IterSeq is the iteration counter the apply path stamped
 	// on this claim row (Phase 6c). Increments across reopens;
 	// stays the same across multiple submissions within one

@@ -38,7 +38,7 @@ type FileIssueResponse struct {
 // that re-evaluates completed runs in projects with
 // auto_triage. Native MCP transport doesn't run the hook today
 // — see the DAG/parsed-run cache extraction TODO.
-func FileIssue(s *store.Store, caller *store.CitizenRecord, p FileIssueParams) (*FileIssueResponse, error) {
+func FileIssue(s store.CoordinatorStore, caller *store.CitizenRecord, p FileIssueParams) (*FileIssueResponse, error) {
 	if p.Title == "" {
 		return nil, fmt.Errorf("%w: title is required", ErrInvalidArgument)
 	}
@@ -49,7 +49,7 @@ func FileIssue(s *store.Store, caller *store.CitizenRecord, p FileIssueParams) (
 		ProjectID:     p.ProjectID,
 		Title:         p.Title,
 		Body:          p.Body,
-		Severity:      p.Severity,
+		Severity:      store.IssueSeverity(p.Severity),
 		FoundInTaskID: p.FoundInTaskID,
 		FiledBy:       caller.ID,
 	}
@@ -85,8 +85,8 @@ func FileIssue(s *store.Store, caller *store.CitizenRecord, p FileIssueParams) (
 		ID:       id,
 		Seq:      seq,
 		Slug:     fmt.Sprintf("ISSUE-%03d", seq),
-		Status:   rec.Status,
-		Severity: rec.Severity,
+		Status:   string(rec.Status),
+		Severity: string(rec.Severity),
 		Title:    rec.Title,
 	}, nil
 }
@@ -94,7 +94,7 @@ func FileIssue(s *store.Store, caller *store.CitizenRecord, p FileIssueParams) (
 // TriageIssue moves an issue to triaged with optional severity
 // update. Membership-gated. Returns ErrNotFound when the issue
 // doesn't exist.
-func TriageIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, seq int, severity string) (*IssueResponse, error) {
+func TriageIssue(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, seq int, severity string) (*IssueResponse, error) {
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
@@ -108,7 +108,7 @@ func TriageIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, s
 	if _, err := s.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
-			store.TriageIssue{IssueID: it.ID, CitizenID: caller.ID, Severity: severity},
+			store.TriageIssue{IssueID: it.ID, CitizenID: caller.ID, Severity: store.IssueSeverity(severity)},
 		},
 	}); err != nil {
 		return nil, err
@@ -124,12 +124,12 @@ func TriageIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, s
 // CloseIssue moves an issue to closed (or wontfix). Optional
 // closed_by_task_id links the resolving fix task. Membership-
 // gated.
-func CloseIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, seq int, status, closedByTaskID string) (*IssueResponse, error) {
+func CloseIssue(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, seq int, status, closedByTaskID string) (*IssueResponse, error) {
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
 	if status == "" {
-		status = store.IssueStatusClosed
+		status = string(store.IssueStatusClosed)
 	}
 	it, err := s.GetIssueBySeq(projectID, seq)
 	if err != nil {
@@ -144,7 +144,7 @@ func CloseIssue(s *store.Store, caller *store.CitizenRecord, projectID int64, se
 			store.CloseIssue{
 				IssueID:        it.ID,
 				CitizenID:      caller.ID,
-				Status:         status,
+				Status:         store.IssueStatus(status),
 				ClosedByTaskID: closedByTaskID,
 			},
 		},

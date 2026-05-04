@@ -275,7 +275,7 @@ func (c *Coordinator) maybeAutoTriage(runID int64) {
 	prompt := spec.Prompt
 	prompt = strings.ReplaceAll(prompt, "{{issue.title}}", issue.Title)
 	prompt = strings.ReplaceAll(prompt, "{{issue.body}}", issue.Body)
-	prompt = strings.ReplaceAll(prompt, "{{issue.severity}}", issue.Severity)
+	prompt = strings.ReplaceAll(prompt, "{{issue.severity}}", string(issue.Severity))
 	prompt = strings.ReplaceAll(prompt, "{{issue.id}}", fmt.Sprintf("ISSUE-%03d", issue.Seq))
 
 	base := fmt.Sprintf("fix_ISSUE_%03d", issue.Seq)
@@ -325,7 +325,7 @@ func (c *Coordinator) maybeAutoTriage(runID int64) {
 
 // InvalidateTaskResponse is the wire shape for enju_invalidate_task.
 type InvalidateTaskResponse struct {
-	Status      string         `json:"status"`
+	Status      store.ClaimOutcome `json:"status"`
 	TaskID      string         `json:"task_id"`
 	Descendants    []string       `json:"descendants"`
 	Changed     int          `json:"changed"`
@@ -378,7 +378,7 @@ func (c *Coordinator) InvalidateTask(caller *store.CitizenRecord, taskID, reason
 	if _, err := c.Store.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
-			store.MarkLatestClaimOutcome{TaskID: taskID, Outcome: "invalidated"},
+			store.MarkLatestClaimOutcome{TaskID: taskID, Outcome: store.ClaimOutcomeInvalidated},
 		},
 	}); err != nil {
 		c.Logger.Warn("close claim on manual invalidate",
@@ -420,7 +420,7 @@ func (c *Coordinator) InvalidateTask(caller *store.CitizenRecord, taskID, reason
 	}
 
 	resp := &InvalidateTaskResponse{
-		Status:    "invalidated",
+		Status:    store.ClaimOutcomeInvalidated,
 		TaskID:    taskID,
 		Descendants: result.Descendants,
 		Changed:   result.Changed,

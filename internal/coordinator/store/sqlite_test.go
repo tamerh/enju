@@ -96,7 +96,7 @@ func createTestRun(t *testing.T, s *Store) int64 {
 	t.Helper()
 	projectID := createTestProject(t, s)
 	now := time.Now()
-	id, _, err := s.CreateRun(&RunRecord{
+	id, _, err := helperCreateRun(s, &RunRecord{
 		ProjectID: projectID,
 		Name:   "Test Run",
 		YAMLData: "name: test",
@@ -115,7 +115,7 @@ func createTestRun(t *testing.T, s *Store) int64 {
 func createTestCitizen(t *testing.T, s *Store, username, token string) int64 {
 	t.Helper()
 	now := time.Now()
-	id, err := s.CreateCitizen(&CitizenRecord{
+	id, err := helperCreateCitizen(s, &CitizenRecord{
 		Username:   username,
 		Name:     username,
 		Token:    token,
@@ -740,7 +740,7 @@ func TestListIssues_FiltersByStatusAndSeverity(t *testing.T) {
 	helperCloseIssue(s, id1, alice, "closed", "")
 	helperTriageIssue(s, id3, alice, "")
 
-	openOnly, err := s.ListIssues(IssueFilter{ProjectID: projectID, Status: []string{"open"}})
+	openOnly, err := s.ListIssues(IssueFilter{ProjectID: projectID, Status: []IssueStatus{IssueStatusOpen}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +748,7 @@ func TestListIssues_FiltersByStatusAndSeverity(t *testing.T) {
 		t.Fatalf("status filter mismatch: %+v", openOnly)
 	}
 
-	highOnly, err := s.ListIssues(IssueFilter{ProjectID: projectID, Severity: []string{"high"}})
+	highOnly, err := s.ListIssues(IssueFilter{ProjectID: projectID, Severity: []IssueSeverity{IssueSeverityHigh}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1101,7 @@ func TestAutoTriageTemplate_GetSetRoundtrip(t *testing.T) {
 	if got, _ := s.GetAutoTriageTemplate(runID); got != "" {
 		t.Fatalf("default should be empty, got %q", got)
 	}
-	if err := s.SetAutoTriageTemplate(runID, `{"action":"answer","prompt":"fix"}`); err != nil {
+	if err := helperSetAutoTriageTemplate(s, runID, `{"action":"answer","prompt":"fix"}`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetAutoTriageTemplate(runID)
@@ -1386,7 +1386,7 @@ func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 	r1, _ := s.GetRun(first)
 
 	now := time.Now()
-	_, _, err := s.CreateRun(&RunRecord{
+	_, _, err := helperCreateRun(s, &RunRecord{
 		ProjectID: r1.ProjectID,
 		Name:   "second",
 		YAMLData: "name: dup",

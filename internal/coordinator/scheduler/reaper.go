@@ -11,14 +11,14 @@ import (
 
 // Reaper checks for expired task claims and resets them to READY.
 type Reaper struct {
-	store    *store.Store
+	store    store.CoordinatorStore
 	interval time.Duration
 	logger   *slog.Logger
 	stop     chan struct{}
 }
 
 // NewReaper creates a new task reaper.
-func NewReaper(st *store.Store, interval time.Duration, logger *slog.Logger) *Reaper {
+func NewReaper(st store.CoordinatorStore, interval time.Duration, logger *slog.Logger) *Reaper {
 	return &Reaper{
 		store:    st,
 		interval: interval,

@@ -56,7 +56,7 @@ var ErrCycleBudgetExhausted = errors.New("cycle budget exhausted")
 // Returns ErrCycleBudgetExhausted when the run's cycle cap is
 // hit — the underlying store-side spawn auto-pauses the run as
 // part of that error.
-func SpawnTask(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int, params SpawnTaskParams) (*SpawnTaskResponse, error) {
+func SpawnTask(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int, params SpawnTaskParams) (*SpawnTaskResponse, error) {
 	if caller == nil {
 		return nil, fmt.Errorf("%w: authentication required", ErrForbidden)
 	}

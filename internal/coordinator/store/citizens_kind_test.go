@@ -138,7 +138,7 @@ func TestCreateCitizenHonorsKindAndParent(t *testing.T) {
 
 	// Register a bot the way enju_register_bot does.
 	now := time.Now()
-	botID, err := s.CreateCitizen(&CitizenRecord{
+	botID, err := helperCreateCitizen(s, &CitizenRecord{
 		Username:     "claude-tamer-bot",
 		Name:         "Tamer's Claude bot",
 		Token:        "tok-bot",

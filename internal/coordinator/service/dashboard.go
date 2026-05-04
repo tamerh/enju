@@ -40,7 +40,7 @@ type DashboardResponse struct {
 // claims, and 5 most-recent completions. Re-fetches the
 // citizen row so counters reflect the latest state (the
 // auth-context snapshot can be stale).
-func GetMyDashboard(s *store.Store, caller *store.CitizenRecord) (*DashboardResponse, error) {
+func GetMyDashboard(s store.CoordinatorStore, caller *store.CitizenRecord) (*DashboardResponse, error) {
 	citizen, err := s.GetCitizen(caller.ID)
 	if err != nil {
 		return nil, err
@@ -53,14 +53,14 @@ func GetMyDashboard(s *store.Store, caller *store.CitizenRecord) (*DashboardResp
 
 	kind := citizen.Kind
 	if kind == "" {
-		kind = "human"
+		kind = store.CitizenKindHuman
 	}
 	resp := &DashboardResponse{
 		Citizen: DashboardCitizen{
 			Username:       citizen.Username,
 			Name:           citizen.Name,
 			Role:           citizen.Role,
-			Kind:           kind,
+			Kind:           string(kind),
 			TasksCompleted: citizen.TasksCompleted,
 			TasksTimedOut:  citizen.TasksTimedOut,
 			RegisteredAt:   citizen.RegisteredAt.Format(time.RFC3339),

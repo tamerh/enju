@@ -36,7 +36,7 @@ type ArtifactListParams struct {
 // ListArtifacts returns the project's artifact index rows
 // matching the filters. Membership-gated. Branch defaults to
 // the project's configured default_branch when empty.
-func ListArtifacts(s *store.Store, caller *store.CitizenRecord, p ArtifactListParams) ([]ArtifactResponse, error) {
+func ListArtifacts(s store.CoordinatorStore, caller *store.CitizenRecord, p ArtifactListParams) ([]ArtifactResponse, error) {
 	if !CanReadProject(s, p.ProjectID, caller.ID) {
 		return nil, ErrNotMember
 	}

@@ -143,9 +143,10 @@ func (s *Store) GetContributionSummary(citizenID int64) (*ContributionSummary, e
 				summary.TasksReleased += count
 			case "review_given":
 				summary.ReviewsGiven += count
-				if subtype == "approve" {
+				switch ReviewDecision(subtype) {
+				case ReviewDecisionApprove:
 					summary.ReviewApproves += count
-				} else if subtype == "reject" {
+				case ReviewDecisionReject:
 					summary.ReviewRejects += count
 				}
 			case "vote_cast":
@@ -213,7 +214,7 @@ func (s *Store) ListTaskHistory(taskID string) ([]TaskClaimRecord, error) {
 		if err := rows.Scan(&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline, &outcome, &submittedAt, &r.Option, &r.Branch, &r.CommitSHA, &r.Decision); err != nil {
 			continue
 		}
-		r.Outcome = outcome.String
+		r.Outcome = ClaimOutcome(outcome.String)
 		if submittedAt.Valid {
 			t := submittedAt.Time
 			r.SubmittedAt = &t

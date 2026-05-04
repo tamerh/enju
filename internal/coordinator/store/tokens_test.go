@@ -119,7 +119,7 @@ func TestRevokedTokenStopsAuthenticating(t *testing.T) {
 
 	// Revoke by value (the convenience path most callers use —
 	// API/CLI code holds the token, not the row id).
-	if err := s.RevokeTokenByValue("tok-tamer"); err != nil {
+	if err := helperRevokeTokenByValue(s, "tok-tamer"); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 
@@ -147,14 +147,14 @@ func TestRevokeIsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	cid := createTestCitizen(t, s, "tamer", "tok-tamer")
 
-	if err := s.RevokeTokenByValue("tok-tamer"); err != nil {
+	if err := helperRevokeTokenByValue(s, "tok-tamer"); err != nil {
 		t.Fatalf("first revoke: %v", err)
 	}
 	tokens, _ := s.ListTokensByCitizen(cid)
 	firstTime := *tokens[0].RevokedAt
 
 	time.Sleep(2 * time.Millisecond) // ensure clock would advance
-	if err := s.RevokeTokenByValue("tok-tamer"); err != nil {
+	if err := helperRevokeTokenByValue(s, "tok-tamer"); err != nil {
 		t.Fatalf("second revoke: %v", err)
 	}
 	tokens, _ = s.ListTokensByCitizen(cid)
@@ -173,7 +173,7 @@ func TestMultipleTokensPerCitizen(t *testing.T) {
 	cid := createTestCitizen(t, s, "tamer", "tok-original")
 
 	// Issue a second token labeled 'rotation'.
-	if _, err := s.IssueToken(cid, "tok-new", "rotation"); err != nil {
+	if _, err := helperIssueToken(s, cid, "tok-new", "rotation"); err != nil {
 		t.Fatalf("issue second: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestMultipleTokensPerCitizen(t *testing.T) {
 	}
 
 	// Revoke the original. New still works; original is dead.
-	if err := s.RevokeTokenByValue("tok-original"); err != nil {
+	if err := helperRevokeTokenByValue(s, "tok-original"); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if c, _ := s.GetCitizenByToken("tok-original"); c != nil {
@@ -216,7 +216,7 @@ func TestMultipleTokensPerCitizen(t *testing.T) {
 func TestIssueTokenRejectsEmpty(t *testing.T) {
 	s := newTestStore(t)
 	cid := createTestCitizen(t, s, "tamer", "tok-tamer")
-	if _, err := s.IssueToken(cid, "", "label"); err == nil {
+	if _, err := helperIssueToken(s, cid, "", "label"); err == nil {
 		t.Fatal("expected error for empty token, got nil")
 	}
 }

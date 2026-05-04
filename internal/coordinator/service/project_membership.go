@@ -19,7 +19,7 @@ type SetDefaultBranchResponse struct {
 
 // SetProjectDefaultBranch updates the project's default branch.
 // Owner-only. Validates the branch name.
-func SetProjectDefaultBranch(s *store.Store, caller *store.CitizenRecord, projectID int64, branch string) (*SetDefaultBranchResponse, error) {
+func SetProjectDefaultBranch(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, branch string) (*SetDefaultBranchResponse, error) {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return nil, fmt.Errorf("%w: branch is required", ErrInvalidArgument)
@@ -55,7 +55,7 @@ type AddMemberResponse struct {
 
 // AddProjectMember grants membership to a citizen. Any member
 // can add as 'member'; only owners can add as 'owner'.
-func AddProjectMember(s *store.Store, caller *store.CitizenRecord, projectID int64, username, roleStr string) (*AddMemberResponse, error) {
+func AddProjectMember(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, username, roleStr string) (*AddMemberResponse, error) {
 	if username == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
 	}
@@ -122,7 +122,7 @@ type RemoveMemberResponse struct {
 // RemoveProjectMember removes a citizen from the project.
 // Caller must be an owner OR removing themselves. Refuses to
 // drop owner count to zero.
-func RemoveProjectMember(s *store.Store, caller *store.CitizenRecord, projectID int64, targetUsername string) (*RemoveMemberResponse, error) {
+func RemoveProjectMember(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, targetUsername string) (*RemoveMemberResponse, error) {
 	if targetUsername == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
 	}
@@ -179,7 +179,7 @@ func RemoveProjectMember(s *store.Store, caller *store.CitizenRecord, projectID 
 // remove path. Used by enju_leave_project. Native MCP doesn't
 // touch the local clone (no workspace); the fat-client tool
 // adds the workspace.LeaveProject step on top.
-func LeaveProject(s *store.Store, caller *store.CitizenRecord, projectID int64) (*RemoveMemberResponse, error) {
+func LeaveProject(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64) (*RemoveMemberResponse, error) {
 	return RemoveProjectMember(s, caller, projectID, caller.Username)
 }
 
@@ -193,7 +193,7 @@ type SetMemberRoleResponse struct {
 
 // SetProjectMemberRole promotes or demotes a member.
 // Owner-only. Refuses to demote the last owner.
-func SetProjectMemberRole(s *store.Store, caller *store.CitizenRecord, projectID int64, targetUsername, roleStr string) (*SetMemberRoleResponse, error) {
+func SetProjectMemberRole(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, targetUsername, roleStr string) (*SetMemberRoleResponse, error) {
 	if targetUsername == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
 	}
@@ -256,7 +256,7 @@ func SetProjectMemberRole(s *store.Store, caller *store.CitizenRecord, projectID
 // requireMembership fetches the caller's member row. Returns
 // (nil, nil) for legacy zero-member projects (open access);
 // (record, nil) for explicit members; ErrNotMember otherwise.
-func requireMembership(s *store.Store, projectID, citizenID int64) (*store.ProjectMemberRecord, error) {
+func requireMembership(s store.CoordinatorStore, projectID, citizenID int64) (*store.ProjectMemberRecord, error) {
 	total, err := s.CountProjectMembers(projectID)
 	if err != nil {
 		return nil, err
@@ -284,7 +284,7 @@ func requireMembership(s *store.Store, projectID, citizenID int64) (*store.Proje
 // open, matching the api's pre-service behavior. Once the
 // project has any explicit member, owner-only gating kicks in
 // normally.
-func requireOwner(s *store.Store, projectID, citizenID int64) error {
+func requireOwner(s store.CoordinatorStore, projectID, citizenID int64) error {
 	m, err := requireMembership(s, projectID, citizenID)
 	if err != nil {
 		return err

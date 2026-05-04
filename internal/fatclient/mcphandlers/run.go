@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -279,9 +280,9 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 	// Humans calling are valid too (a reviewer pinging the
 	// author for context); we don't want their spawn event
 	// mislabeled.
-	trigger := "human"
-	if c.citizenKind(ctx) == "bot" {
-		trigger = "bot"
+	trigger := string(types.CitizenKindHuman)
+	if c.citizenKind(ctx) == string(types.CitizenKindBot) {
+		trigger = string(types.CitizenKindBot)
 	}
 
 	body := map[string]interface{}{

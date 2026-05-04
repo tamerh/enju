@@ -113,7 +113,7 @@ func TestModelPlaceholderTokenDoesNotAuthenticate(t *testing.T) {
 func TestCreateModelCitizenAddsToCatalog(t *testing.T) {
 	s := newTestStore(t)
 
-	id, err := s.CreateModelCitizen("ollama-llama-3-1-70b-local", "Llama 3.1 70B (local)")
+	id, err := helperCreateModelCitizen(s, "ollama-llama-3-1-70b-local", "Llama 3.1 70B (local)")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestCreateModelCitizenAddsToCatalog(t *testing.T) {
 func TestCreateModelCitizenRejectsDuplicate(t *testing.T) {
 	s := newTestStore(t)
 
-	_, err := s.CreateModelCitizen("claude-opus-4-7", "Claude Opus 4.7")
+	_, err := helperCreateModelCitizen(s, "claude-opus-4-7", "Claude Opus 4.7")
 	if err == nil {
 		t.Fatal("expected duplicate-username error, got nil")
 	}
@@ -158,7 +158,7 @@ func TestCreateModelCitizenRejectsBadUsername(t *testing.T) {
 	s := newTestStore(t)
 	bad := []string{"With-Caps", "has spaces", "trailing-", "-leading", "has.dot"}
 	for _, name := range bad {
-		if _, err := s.CreateModelCitizen(name, "x"); err == nil {
+		if _, err := helperCreateModelCitizen(s, name, "x"); err == nil {
 			t.Errorf("%q registered, expected validation error", name)
 		}
 	}

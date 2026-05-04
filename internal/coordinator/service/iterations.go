@@ -26,7 +26,7 @@ type IterationResponse struct {
 // task, gated through the task's parent project. Returns
 // ErrNotFound for missing task or run; ErrNotMember for caller
 // outside the project's membership.
-func ListTaskIterations(s *store.Store, caller *store.CitizenRecord, taskID string) ([]IterationResponse, error) {
+func ListTaskIterations(s store.CoordinatorStore, caller *store.CitizenRecord, taskID string) ([]IterationResponse, error) {
 	task, err := s.GetTask(taskID)
 	if err != nil {
 		return nil, err
@@ -56,13 +56,13 @@ func ListTaskIterations(s *store.Store, caller *store.CitizenRecord, taskID stri
 			ClaimedAt:      it.ClaimedAt.UTC().Format(time.RFC3339),
 			CommitSHA:      it.CommitSHA,
 			Branch:         it.Branch,
-			ReviewDecision: it.ReviewDecision,
+			ReviewDecision: string(it.ReviewDecision),
 			Option:         it.Option,
 		}
 		if it.Outcome == "" {
 			row.Outcome = "active"
 		} else {
-			row.Outcome = it.Outcome
+			row.Outcome = string(it.Outcome)
 		}
 		if it.SubmittedAt != nil {
 			row.SubmittedAt = it.SubmittedAt.UTC().Format(time.RFC3339)

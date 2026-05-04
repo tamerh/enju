@@ -53,7 +53,7 @@ type ClaimTaskResponse struct {
 //   - ErrForbidden: assign_to / require_role gate refuses
 //   - ErrConflict: claim collision (slot full, race lost) —
 //   wraps the engine.ComputeClaim error verbatim
-func ClaimTask(s *store.Store, logger *slog.Logger, taskID string, params ClaimTaskParams) (*ClaimTaskResponse, error) {
+func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, params ClaimTaskParams) (*ClaimTaskResponse, error) {
 	if params.Username == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
 	}
@@ -109,8 +109,6 @@ func ClaimTask(s *store.Store, logger *slog.Logger, taskID string, params ClaimT
 		return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
 	}
 
-	s.TouchCitizen(caller.ID)
-
 	updated, _ := s.GetTask(taskID)
 	resp := &ClaimTaskResponse{
 		Deadline: deadline.Format(time.RFC3339),
@@ -130,7 +128,7 @@ func ClaimTask(s *store.Store, logger *slog.Logger, taskID string, params ClaimT
 // citizen so callers can't attribute their submit to a teammate's
 // account. Hosted-mode policy gating (require pre-registration)
 // is deferred — see the operator/model design doc.
-func ResolveModelByUsername(s *store.Store, modelName string) (*int64, error) {
+func ResolveModelByUsername(s store.CoordinatorStore, modelName string) (*int64, error) {
 	if modelName == "" {
 		return nil, nil
 	}
@@ -139,15 +137,30 @@ func ResolveModelByUsername(s *store.Store, modelName string) (*int64, error) {
 		return nil, fmt.Errorf("look up model %q: %w", modelName, err)
 	}
 	if c != nil {
-		if c.Kind != "model" {
+		if c.Kind != store.CitizenKindModel {
 			return nil, fmt.Errorf("citizen %q has kind %q, not %q — operators cannot be self-attributed as their own model", modelName, c.Kind, "model")
 		}
 		return &c.ID, nil
 	}
-	id, err := s.CreateModelCitizen(modelName, modelName)
+	now := time.Now()
+	res, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{Citizen: store.CitizenRecord{
+				Username:     modelName,
+				Name:         modelName,
+				Role:         "citizen",
+				Token:        "model:" + modelName,
+				RegisteredAt: now,
+				LastSeen:     now,
+				Kind:         store.CitizenKindModel,
+			}},
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("auto-register model %q: %w", modelName, err)
 	}
+	id := res.CitizenID
 	return &id, nil
 }
 

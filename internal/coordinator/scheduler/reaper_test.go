@@ -49,15 +49,21 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 	}
 	projectID := createRes.ProjectID
 
-	runID, _, err := s.CreateRun(&store.RunRecord{
-		ProjectID: projectID, Name: "Test Run",
-		YAMLData:  "name: test",
-		State:     store.RunActive,
-		CreatedAt: now, UpdatedAt: now,
+	runRes, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateRun{Run: store.RunRecord{
+				ProjectID: projectID, Name: "Test Run",
+				YAMLData:  "name: test",
+				State:     store.RunActive,
+				CreatedAt: now, UpdatedAt: now,
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	runID := runRes.RunID
 
 	if _, err := s.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
@@ -72,16 +78,22 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 		t.Fatal(err)
 	}
 
-	citizenID, err := s.CreateCitizen(&store.CitizenRecord{
-		Username:     "alice-" + taskID,
-		Name:         "alice",
-		Token:        "tok-" + taskID,
-		RegisteredAt: now,
-		LastSeen:     now,
+	citRes, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{Citizen: store.CitizenRecord{
+				Username:     "alice-" + taskID,
+				Name:         "alice",
+				Token:        "tok-" + taskID,
+				RegisteredAt: now,
+				LastSeen:     now,
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	citizenID := citRes.CitizenID
 
 	if _, err := s.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,

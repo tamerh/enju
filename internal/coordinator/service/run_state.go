@@ -23,7 +23,7 @@ type PauseRunResponse struct {
 // parent project (legacy zero-member projects stay open).
 // Returns ErrNotFound when the run doesn't exist;
 // ErrNotMember when the caller can't write to the project.
-func PauseRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int) (*PauseRunResponse, error) {
+func PauseRun(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int) (*PauseRunResponse, error) {
 	run, err := s.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		return nil, err
@@ -75,7 +75,7 @@ type ResumeRunResponse struct {
 // ResumeRun lifts a paused run back to active or idle,
 // depending on whether ready tasks exist. Membership-gated.
 // Refuses on terminal runs (Store.ResumeRun returns the error).
-func ResumeRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int) (*ResumeRunResponse, error) {
+func ResumeRun(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int) (*ResumeRunResponse, error) {
 	run, err := s.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		return nil, err

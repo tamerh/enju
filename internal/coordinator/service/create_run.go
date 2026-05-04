@@ -107,21 +107,27 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 		}
 	}
 	runSlug := engine.ComputeRunSlug(params.SourcePath, parsed.Run.Name)
-	runID, runSeq, err := c.Store.CreateRun(&store.RunRecord{
-		ProjectID:    projectID,
-		Name:      parsed.Run.Name,
-		Ref:       parsed.Run.Ref,
-		YAMLData:    params.YAML,
-		RepoURL:     params.RepoURL,
-		State:      store.RunActive,
-		SourcePath:   params.SourcePath,
-		SourceCommitSHA: params.SourceCommitSHA,
-		Params:     paramsJSON,
-		Branch:     branch,
-		Slug:      runSlug,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+	runRes, err := c.Store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateRun{Run: store.RunRecord{
+				ProjectID:       projectID,
+				Name:            parsed.Run.Name,
+				Ref:             parsed.Run.Ref,
+				YAMLData:        params.YAML,
+				RepoURL:         params.RepoURL,
+				State:           store.RunActive,
+				SourcePath:      params.SourcePath,
+				SourceCommitSHA: params.SourceCommitSHA,
+				Params:          paramsJSON,
+				Branch:          branch,
+				Slug:            runSlug,
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			}},
+		},
 	})
+	runID, runSeq := runRes.RunID, runRes.RunSeq
 	if err != nil {
 		// Partial unique index on (project_id, branch) WHERE
 		// state='active' fires when a concurrent request wins
@@ -152,7 +158,12 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 	if t := parsed.Run.AutoTriage; t != nil &&
 		(t.Action != "" || t.Prompt != "" || len(t.AssignTo) > 0 || t.RequireRole != "") {
 		if data, jerr := json.Marshal(t); jerr == nil {
-			if serr := c.Store.SetAutoTriageTemplate(runID, string(data)); serr != nil {
+			if _, serr := c.Store.ApplyPlan(store.Plan{
+				Version: engine.EngineVersion,
+				Mutations: []store.Mutation{
+					store.SetAutoTriageTemplate{RunID: runID, TemplateJSON: string(data)},
+				},
+			}); serr != nil {
 				c.Logger.Error("setting auto_triage_template", "run_id", runID, "error", serr)
 			}
 		}

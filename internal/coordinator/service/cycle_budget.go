@@ -25,7 +25,7 @@ var ErrInvalidArgument = errors.New("invalid argument")
 
 // SetCycleBudget bumps the per-run spawn cap. Membership-gated.
 // Returns ErrInvalidArgument when max <= 0.
-func SetCycleBudget(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int, max int) (*SetCycleBudgetResponse, error) {
+func SetCycleBudget(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int, max int) (*SetCycleBudgetResponse, error) {
 	if max <= 0 {
 		return nil, fmt.Errorf("%w: max must be positive", ErrInvalidArgument)
 	}

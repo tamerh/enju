@@ -32,7 +32,7 @@ type EventListParams struct {
 //
 // Unknown citizen → empty result (matches the legacy HTTP
 // behaviour that writes `[]` rather than 404).
-func ListEvents(s *store.Store, caller *store.CitizenRecord, p EventListParams) ([]map[string]interface{}, error) {
+func ListEvents(s store.CoordinatorStore, caller *store.CitizenRecord, p EventListParams) ([]map[string]interface{}, error) {
 	if !CanReadProject(s, p.ProjectID, caller.ID) {
 		return nil, ErrNotMember
 	}
@@ -139,7 +139,7 @@ type EventsStatusResponse struct {
 // project scope; caller must be authenticated (admin-style
 // tool). Read-only — operators flip the kill-switch via
 // enju.conf + SIGHUP.
-func GetEventsStatus(s *store.Store, caller *store.CitizenRecord) EventsStatusResponse {
+func GetEventsStatus(s store.CoordinatorStore, caller *store.CitizenRecord) EventsStatusResponse {
 	stats := s.Events().Stats()
 	return EventsStatusResponse{
 		Enabled:       stats.Enabled,

@@ -208,7 +208,7 @@ func ParseReviewsTargetForMerge(target string) (taskDefID, instanceKey string) {
 //
 // Wire shape is preserved from api.toTaskResponse exactly so
 // no caller observes a change.
-func ToTaskResponse(s *store.Store, t store.TaskRecord) TaskResponse {
+func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 	var (
 		projectID     int64
 		runSeq        int
@@ -270,7 +270,7 @@ func ToTaskResponse(s *store.Store, t store.TaskRecord) TaskResponse {
 		AssignTo:          UnmarshalStringSlice(t.AssignTo),
 		RequireRole:       t.RequireRole,
 		ReviewsTarget:     t.ReviewsTarget,
-		ReviewDecision:    t.ReviewDecision,
+		ReviewDecision:    string(t.ReviewDecision),
 		VoteOptions:       t.VoteOptions,
 		VoteChoice:        t.VoteChoice,
 		Citizens:          t.Citizens,
@@ -436,7 +436,7 @@ func ToTaskResponse(s *store.Store, t store.TaskRecord) TaskResponse {
 			entry := TaskHistoryEntry{
 				Citizen:   CitizenUsername(s, h.CitizenID),
 				ClaimedAt: h.ClaimedAt.Format(time.RFC3339),
-				Outcome:   h.Outcome,
+				Outcome:   string(h.Outcome),
 				Decision:  h.Option,
 			}
 			if h.SubmittedAt != nil {
@@ -476,7 +476,7 @@ type ReadyTasksParams struct {
 // queries (project_id=0) get the same membership filter as
 // list_runs: legacy zero-member projects stay open, member-
 // gated projects require the caller on the list.
-func ListReadyTasks(s *store.Store, caller *store.CitizenRecord, p ReadyTasksParams) ([]TaskResponse, error) {
+func ListReadyTasks(s store.CoordinatorStore, caller *store.CitizenRecord, p ReadyTasksParams) ([]TaskResponse, error) {
 	if p.ProjectID > 0 {
 		if !CanReadProject(s, p.ProjectID, caller.ID) {
 			return nil, ErrNotMember
@@ -528,7 +528,7 @@ func ListReadyTasks(s *store.Store, caller *store.CitizenRecord, p ReadyTasksPar
 // resolution; that's an api-side concern (the HTTP path's lazy
 // sweep) and stays in the api handler. Native MCP callers
 // don't currently trigger it.
-func GetTask(s *store.Store, caller *store.CitizenRecord, taskID string) (*TaskResponse, error) {
+func GetTask(s store.CoordinatorStore, caller *store.CitizenRecord, taskID string) (*TaskResponse, error) {
 	task, err := s.GetTask(taskID)
 	if err != nil {
 		return nil, err
@@ -555,7 +555,7 @@ func GetTask(s *store.Store, caller *store.CitizenRecord, taskID string) (*TaskR
 // 100-task run, expect O(N) GetRun lookups all returning the
 // same row. Fine for now; if it ever shows up in profiles, an
 // optional pre-fetched-run hint makes a clean optimization.
-func ToTaskResponses(s *store.Store, tasks []store.TaskRecord) []TaskResponse {
+func ToTaskResponses(s store.CoordinatorStore, tasks []store.TaskRecord) []TaskResponse {
 	out := make([]TaskResponse, 0, len(tasks))
 	for _, t := range tasks {
 		out = append(out, ToTaskResponse(s, t))

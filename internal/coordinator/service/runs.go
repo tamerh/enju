@@ -48,7 +48,7 @@ func ToRunResponse(r store.RunRecord, taskCount int) RunResponse {
 // projects: legacy zero-member projects plus member-gated
 // projects the caller belongs to. Builds the membership
 // allow-set once for the loop.
-func ListRuns(s *store.Store, caller *store.CitizenRecord) ([]RunResponse, error) {
+func ListRuns(s store.CoordinatorStore, caller *store.CitizenRecord) ([]RunResponse, error) {
 	runs, err := s.ListRuns()
 	if err != nil {
 		return nil, err
@@ -73,7 +73,7 @@ func ListRuns(s *store.Store, caller *store.CitizenRecord) ([]RunResponse, error
 // ListRunsByProject returns every run in one project. Returns
 // ErrNotMember if the caller isn't on the membership list (and
 // the project isn't a legacy zero-member open project).
-func ListRunsByProject(s *store.Store, caller *store.CitizenRecord, projectID int64) ([]RunResponse, error) {
+func ListRunsByProject(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64) ([]RunResponse, error) {
 	if !CanReadProject(s, projectID, caller.ID) {
 		return nil, ErrNotMember
 	}
@@ -92,7 +92,7 @@ func ListRunsByProject(s *store.Store, caller *store.CitizenRecord, projectID in
 // GetRun returns one run by its (project, seq) pair. Returns
 // ErrNotFound when the run doesn't exist; ErrNotMember when
 // the caller can't read the parent project.
-func GetRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int) (*RunResponse, error) {
+func GetRun(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int) (*RunResponse, error) {
 	run, err := s.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		return nil, err
@@ -113,7 +113,7 @@ func GetRun(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq
 // the caller on the list. Exported because both service
 // functions and (via mcphandlers callerCanReadProject) the
 // older path reuse the same rule.
-func CanReadProject(s *store.Store, projectID, citizenID int64) bool {
+func CanReadProject(s store.CoordinatorStore, projectID, citizenID int64) bool {
 	total, err := s.CountProjectMembers(projectID)
 	if err != nil {
 		return false

@@ -35,7 +35,7 @@ import (
 // state of its own — clients own their own clones, and the
 // coordinator is pure DAG/state/index metadata.
 type Server struct {
-	store *store.Store
+	store store.CoordinatorStore
 	// dagCache holds the parsed-run + DAG cache shared with the
 	// service layer. Was two raw maps directly on Server until
 	// the cascade handlers needed cache access from outside the
@@ -58,7 +58,7 @@ type Server struct {
 
 // NewServer creates a new API server with the default HTTP
 // request timeout (30s). Use NewServerWithOptions to override.
-func NewServer(st *store.Store, logger *slog.Logger) *Server {
+func NewServer(st store.CoordinatorStore, logger *slog.Logger) *Server {
 	return NewServerWithOptions(st, logger, ServerOptions{})
 }
 
@@ -72,7 +72,7 @@ type ServerOptions struct {
 
 // NewServerWithOptions creates an API server with operator-tuned
 // runtime knobs.
-func NewServerWithOptions(st *store.Store, logger *slog.Logger, opts ServerOptions) *Server {
+func NewServerWithOptions(st store.CoordinatorStore, logger *slog.Logger, opts ServerOptions) *Server {
 	cache := dagcache.New(st)
 	return &Server{
 		store:              st,

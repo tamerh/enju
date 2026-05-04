@@ -8,12 +8,12 @@ import (
 // ReleaseTaskResponse is the wire shape for enju_release_task /
 // POST /tasks/{id}/release.
 type ReleaseTaskResponse struct {
-	Status string `json:"status"` // "released"
+	Status store.ClaimOutcome `json:"status"` // always ClaimOutcomeReleased
 }
 
 // ReleaseTask releases a task back to ready state. Caller must
 // be a member of the task's parent project.
-func ReleaseTask(s *store.Store, caller *store.CitizenRecord, taskID string) (*ReleaseTaskResponse, error) {
+func ReleaseTask(s store.CoordinatorStore, caller *store.CitizenRecord, taskID string) (*ReleaseTaskResponse, error) {
 	task, err := s.GetTask(taskID)
 	if err != nil {
 		return nil, err
@@ -42,5 +42,5 @@ func ReleaseTask(s *store.Store, caller *store.CitizenRecord, taskID string) (*R
 	}); err != nil {
 		return nil, err
 	}
-	return &ReleaseTaskResponse{Status: "released"}, nil
+	return &ReleaseTaskResponse{Status: store.ClaimOutcomeReleased}, nil
 }

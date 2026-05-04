@@ -53,7 +53,7 @@ type RunStatus struct {
 // GetRunStatus returns the run + task projections needed for
 // the run_status render. Membership-gated through the run's
 // parent project.
-func GetRunStatus(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int) (*RunStatus, error) {
+func GetRunStatus(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int) (*RunStatus, error) {
 	run, err := s.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		return nil, err

@@ -223,6 +223,24 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutSetCycleBudgetMax:
 		var m SetCycleBudgetMax
 		return m, json.Unmarshal(data, &m)
+	case MutSetCitizenRole:
+		var m SetCitizenRole
+		return m, json.Unmarshal(data, &m)
+	case MutUpdateCitizenProfile:
+		var m UpdateCitizenProfile
+		return m, json.Unmarshal(data, &m)
+	case MutIssueToken:
+		var m IssueToken
+		return m, json.Unmarshal(data, &m)
+	case MutRevokeToken:
+		var m RevokeToken
+		return m, json.Unmarshal(data, &m)
+	case MutRevokeTokenByValue:
+		var m RevokeTokenByValue
+		return m, json.Unmarshal(data, &m)
+	case MutSetAutoTriageTemplate:
+		var m SetAutoTriageTemplate
+		return m, json.Unmarshal(data, &m)
 	}
 	return nil, fmt.Errorf("unknown mutation kind %q", kind)
 }
@@ -267,6 +285,14 @@ const (
 
 	MutSpawnTask         MutationKind = "spawn_task"
 	MutSetCycleBudgetMax MutationKind = "set_cycle_budget_max"
+
+	MutSetCitizenRole       MutationKind = "set_citizen_role"
+	MutUpdateCitizenProfile MutationKind = "update_citizen_profile"
+	MutIssueToken           MutationKind = "issue_token"
+	MutRevokeToken          MutationKind = "revoke_token"
+	MutRevokeTokenByValue   MutationKind = "revoke_token_by_value"
+
+	MutSetAutoTriageTemplate MutationKind = "set_auto_triage_template"
 )
 
 // AllMutationKinds enumerates every supported MutationKind.
@@ -308,6 +334,12 @@ var AllMutationKinds = []MutationKind{
 	MutCloseIssue,
 	MutSpawnTask,
 	MutSetCycleBudgetMax,
+	MutSetCitizenRole,
+	MutUpdateCitizenProfile,
+	MutIssueToken,
+	MutRevokeToken,
+	MutRevokeTokenByValue,
+	MutSetAutoTriageTemplate,
 }
 
 // --- Concrete mutation types ---
@@ -484,9 +516,13 @@ type DeleteArtifact struct {
 
 func (DeleteArtifact) mutationKind() MutationKind { return MutDeleteArtifact }
 
-// CreateCitizen registers a new citizen.
+// CreateCitizen registers a new citizen plus its initial
+// token. TokenLabel is the optional label for the auto-issued
+// token row (e.g. "primary", "rotation-2026-05"). Empty label
+// matches the historical default for unlabeled tokens.
 type CreateCitizen struct {
-	Citizen CitizenRecord
+	Citizen    CitizenRecord
+	TokenLabel string
 }
 
 func (CreateCitizen) mutationKind() MutationKind { return MutCreateCitizen }
@@ -615,7 +651,7 @@ func (MarkOpenClaimsInvalidated) mutationKind() MutationKind { return MutMarkOpe
 // long after the fact). Outcome must be in validRelabelOutcomes.
 type MarkLatestClaimOutcome struct {
 	TaskID  string
-	Outcome string
+	Outcome ClaimOutcome
 }
 
 func (MarkLatestClaimOutcome) mutationKind() MutationKind { return MutMarkLatestClaimOutcome }
@@ -657,7 +693,7 @@ func (CreateIssue) mutationKind() MutationKind { return MutCreateIssue }
 type TriageIssue struct {
 	IssueID   int64
 	CitizenID int64
-	Severity  string // optional override; empty keeps current
+	Severity  IssueSeverity // optional override; empty keeps current
 }
 
 func (TriageIssue) mutationKind() MutationKind { return MutTriageIssue }
@@ -678,7 +714,7 @@ func (MarkIssueInProgress) mutationKind() MutationKind { return MutMarkIssueInPr
 type CloseIssue struct {
 	IssueID        int64
 	CitizenID      int64
-	Status         string // "closed" or "wontfix"
+	Status         IssueStatus // must be IssueStatusClosed or IssueStatusWontfix
 	ClosedByTaskID string
 }
 
@@ -708,3 +744,64 @@ type SetCycleBudgetMax struct {
 }
 
 func (SetCycleBudgetMax) mutationKind() MutationKind { return MutSetCycleBudgetMax }
+
+// SetCitizenRole updates a citizen's global role
+// (citizen / author / reviewer). Privileged operation —
+// admin-only in production.
+type SetCitizenRole struct {
+	CitizenID int64
+	Role      string
+}
+
+func (SetCitizenRole) mutationKind() MutationKind { return MutSetCitizenRole }
+
+// UpdateCitizenProfile updates a citizen's name/email. Username
+// is intentionally immutable. Pass nil for fields you don't
+// want to change. Email uniqueness is checked at apply time.
+type UpdateCitizenProfile struct {
+	CitizenID int64
+	Name      *string
+	Email     *string
+}
+
+func (UpdateCitizenProfile) mutationKind() MutationKind { return MutUpdateCitizenProfile }
+
+// IssueToken creates a new bearer-token row for a citizen.
+// Multiple active tokens per citizen are allowed (rotation,
+// per-deployment labels). The new token's id is returned via
+// ApplyResult.TokenID.
+type IssueToken struct {
+	CitizenID int64
+	Token     string
+	Label     string
+}
+
+func (IssueToken) mutationKind() MutationKind { return MutIssueToken }
+
+// RevokeToken marks a token as revoked by row id. Idempotent
+// (double-revoke is a no-op). The row is preserved for audit.
+type RevokeToken struct {
+	TokenID int64
+}
+
+func (RevokeToken) mutationKind() MutationKind { return MutRevokeToken }
+
+// RevokeTokenByValue is the same as RevokeToken but keyed by
+// the token string instead of the row id. Convenience for
+// CLI/API callers that hold the token but not its row id.
+type RevokeTokenByValue struct {
+	Token string
+}
+
+func (RevokeTokenByValue) mutationKind() MutationKind { return MutRevokeTokenByValue }
+
+// SetAutoTriageTemplate persists the run-level auto-triage
+// rule (JSON-encoded RemediationTemplate). Empty TemplateJSON
+// clears the rule. Used by the create-run path to plumb the
+// rule through the chokepoint instead of a side-channel write.
+type SetAutoTriageTemplate struct {
+	RunID        int64
+	TemplateJSON string
+}
+
+func (SetAutoTriageTemplate) mutationKind() MutationKind { return MutSetAutoTriageTemplate }

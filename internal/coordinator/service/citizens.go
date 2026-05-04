@@ -8,7 +8,7 @@ import "github.com/enju-ai/enju/internal/coordinator/store"
 // attribution and "added by" lookups are best-effort metadata,
 // not load-bearing). Replaces the per-package
 // lookupCitizenUsername / s.citizenUsername helpers.
-func CitizenUsername(s *store.Store, id int64) string {
+func CitizenUsername(s store.CoordinatorStore, id int64) string {
 	if id == 0 {
 		return ""
 	}

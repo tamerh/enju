@@ -98,10 +98,14 @@ func (s *Server) handleListIssues(w http.ResponseWriter, r *http.Request) {
 
 	f := store.IssueFilter{ProjectID: projectID}
 	if st := r.URL.Query().Get("status"); st != "" {
-		f.Status = strings.Split(st, ",")
+		for _, s := range strings.Split(st, ",") {
+			f.Status = append(f.Status, store.IssueStatus(s))
+		}
 	}
 	if sv := r.URL.Query().Get("severity"); sv != "" {
-		f.Severity = strings.Split(sv, ",")
+		for _, s := range strings.Split(sv, ",") {
+			f.Severity = append(f.Severity, store.IssueSeverity(s))
+		}
 	}
 	if l := r.URL.Query().Get("limit"); l != "" {
 		n, err := strconv.Atoi(l)

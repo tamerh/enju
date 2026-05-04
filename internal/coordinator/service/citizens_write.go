@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/google/uuid"
 )
@@ -34,7 +35,7 @@ type UpdateProfileResponse struct {
 // parameter must match caller.Username. The legacy api endpoint
 // took a URL path username and didn't enforce this; service
 // closes that gap.
-func UpdateProfile(s *store.Store, caller *store.CitizenRecord, username string, name, email *string) (*UpdateProfileResponse, error) {
+func UpdateProfile(s store.CoordinatorStore, caller *store.CitizenRecord, username string, name, email *string) (*UpdateProfileResponse, error) {
 	if username == "" {
 		username = caller.Username
 	}
@@ -51,7 +52,12 @@ func UpdateProfile(s *store.Store, caller *store.CitizenRecord, username string,
 	if citizen == nil {
 		return nil, ErrNotFound
 	}
-	if err := s.UpdateCitizenProfile(citizen.ID, name, email); err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.UpdateCitizenProfile{CitizenID: citizen.ID, Name: name, Email: email},
+		},
+	}); err != nil {
 		if strings.Contains(err.Error(), "email already exists") {
 			return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
 		}
@@ -73,21 +79,21 @@ type RegisterBotParams struct {
 // RegisterBotResponse is the wire shape — includes the token,
 // which is shown EXACTLY ONCE (no recovery path).
 type RegisterBotResponse struct {
-	ID         int64  `json:"id"`
-	Username   string `json:"username"`
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	ParentID   int64  `json:"parent_id"`
-	ParentName string `json:"parent_name"`
-	Token      string `json:"token"`
-	Label      string `json:"label,omitempty"`
-	Warning    string `json:"warning"`
+	ID         int64              `json:"id"`
+	Username   string             `json:"username"`
+	Name       string             `json:"name"`
+	Kind       store.CitizenKind  `json:"kind"`
+	ParentID   int64              `json:"parent_id"`
+	ParentName string             `json:"parent_name"`
+	Token      string             `json:"token"`
+	Label      string             `json:"label,omitempty"`
+	Warning    string             `json:"warning"`
 }
 
 // RegisterBot creates a new kind='bot' citizen parented by the
 // caller, plus its initial token. Returns ErrInvalidArgument on
 // missing name; ErrConflict on username collision.
-func RegisterBot(s *store.Store, caller *store.CitizenRecord, p RegisterBotParams) (*RegisterBotResponse, error) {
+func RegisterBot(s store.CoordinatorStore, caller *store.CitizenRecord, p RegisterBotParams) (*RegisterBotResponse, error) {
 	if p.Name == "" {
 		return nil, fmt.Errorf("%w: name is required", ErrInvalidArgument)
 	}
@@ -105,15 +111,23 @@ func RegisterBot(s *store.Store, caller *store.CitizenRecord, p RegisterBotParam
 	}
 	token := uuid.New().String()
 	now := time.Now()
-	id, err := s.CreateCitizen(&store.CitizenRecord{
-		Username:     username,
-		Name:         p.Name,
-		Role:         role,
-		Token:        token,
-		RegisteredAt: now,
-		LastSeen:     now,
-		Kind:         "bot",
-		ParentID:     &caller.ID,
+	res, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{
+				Citizen: store.CitizenRecord{
+					Username:     username,
+					Name:         p.Name,
+					Role:         role,
+					Token:        token,
+					RegisteredAt: now,
+					LastSeen:     now,
+					Kind:         store.CitizenKindBot,
+					ParentID:     &caller.ID,
+				},
+				TokenLabel: p.Label,
+			},
+		},
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "already taken") {
@@ -121,18 +135,12 @@ func RegisterBot(s *store.Store, caller *store.CitizenRecord, p RegisterBotParam
 		}
 		return nil, err
 	}
-	// Retag the auto-issued token with the caller-supplied label,
-	// if any. CreateCitizen always inserts under label=''; this
-	// is the cheapest way to keep label semantics out of the
-	// citizen-create API.
-	if p.Label != "" {
-		_, _ = s.DB().Exec(`UPDATE tokens SET label = ? WHERE citizen_id = ? AND token = ?`, p.Label, id, token)
-	}
+	id := res.CitizenID
 	return &RegisterBotResponse{
 		ID:         id,
 		Username:   username,
 		Name:       p.Name,
-		Kind:       "bot",
+		Kind:       store.CitizenKindBot,
 		ParentID:   caller.ID,
 		ParentName: caller.Username,
 		Token:      token,
@@ -151,7 +159,7 @@ type RevokeTokenResponse struct {
 // ErrInvalidArgument when neither identifier is provided;
 // ErrNotFound when the token doesn't exist; ErrForbidden when
 // the caller doesn't own it.
-func RevokeToken(s *store.Store, caller *store.CitizenRecord, token string, tokenID int64) (*RevokeTokenResponse, error) {
+func RevokeToken(s store.CoordinatorStore, caller *store.CitizenRecord, token string, tokenID int64) (*RevokeTokenResponse, error) {
 	if token == "" && tokenID == 0 {
 		return nil, fmt.Errorf("%w: either token or token_id is required", ErrInvalidArgument)
 	}
@@ -164,16 +172,20 @@ func RevokeToken(s *store.Store, caller *store.CitizenRecord, token string, toke
 	}
 	if ownerID != caller.ID {
 		owner, _ := s.GetCitizen(ownerID)
-		if owner == nil || owner.Kind != "bot" || owner.ParentID == nil || *owner.ParentID != caller.ID {
+		if owner == nil || owner.Kind != store.CitizenKindBot || owner.ParentID == nil || *owner.ParentID != caller.ID {
 			return nil, fmt.Errorf("%w: you don't own this token", ErrForbidden)
 		}
 	}
+	var muts []store.Mutation
 	if tokenID != 0 {
-		err = s.RevokeToken(tokenID)
+		muts = []store.Mutation{store.RevokeToken{TokenID: tokenID}}
 	} else {
-		err = s.RevokeTokenByValue(token)
+		muts = []store.Mutation{store.RevokeTokenByValue{Token: token}}
 	}
-	if err != nil {
+	if _, err := s.ApplyPlan(store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: muts,
+	}); err != nil {
 		return nil, err
 	}
 	return &RevokeTokenResponse{Revoked: true}, nil
@@ -181,10 +193,10 @@ func RevokeToken(s *store.Store, caller *store.CitizenRecord, token string, toke
 
 // RegisterModelResponse is the wire shape.
 type RegisterModelResponse struct {
-	ID          int64  `json:"id"`
-	Username    string `json:"username"`
-	DisplayName string `json:"display_name"`
-	Kind        string `json:"kind"`
+	ID          int64             `json:"id"`
+	Username    string            `json:"username"`
+	DisplayName string            `json:"display_name"`
+	Kind        store.CitizenKind `json:"kind"`
 }
 
 // RegisterModel creates a new kind='model' citizen in the
@@ -193,31 +205,46 @@ type RegisterModelResponse struct {
 //
 // Open to any authenticated citizen (per design doc's free-form
 // + soft validation stance for local mode).
-func RegisterModel(s *store.Store, caller *store.CitizenRecord, username, displayName string) (*RegisterModelResponse, error) {
+func RegisterModel(s store.CoordinatorStore, caller *store.CitizenRecord, username, displayName string) (*RegisterModelResponse, error) {
 	if username == "" {
 		return nil, fmt.Errorf("%w: username is required (e.g. 'ollama-llama-3-1-70b')", ErrInvalidArgument)
 	}
 	if displayName == "" {
 		displayName = username
 	}
-	id, err := s.CreateModelCitizen(username, displayName)
+	now := time.Now()
+	res, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateCitizen{Citizen: store.CitizenRecord{
+				Username:     username,
+				Name:         displayName,
+				Role:         "citizen",
+				Token:        "model:" + username,
+				RegisteredAt: now,
+				LastSeen:     now,
+				Kind:         store.CitizenKindModel,
+			}},
+		},
+	})
 	if err != nil {
 		if strings.Contains(err.Error(), "already taken") {
 			return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
 		}
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
 	}
+	id := res.CitizenID
 	return &RegisterModelResponse{
 		ID:          id,
 		Username:    username,
 		DisplayName: displayName,
-		Kind:        "model",
+		Kind:        store.CitizenKindModel,
 	}, nil
 }
 
 // generateUniqueUsername picks an unused slug derived from
 // displayName. Mirrors api.Server.generateUniqueUsername.
-func generateUniqueUsername(s *store.Store, displayName string) string {
+func generateUniqueUsername(s store.CoordinatorStore, displayName string) string {
 	base := store.SlugifyName(displayName)
 	if base == "" {
 		base = "user"

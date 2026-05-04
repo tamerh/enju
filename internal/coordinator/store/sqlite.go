@@ -212,6 +212,10 @@ func (s *Store) migrate() error {
 		tasks_released INTEGER NOT NULL DEFAULT 0,
 		tokens_contributed INTEGER NOT NULL DEFAULT 0,
 		registered_at TIMESTAMP NOT NULL,
+		-- last_seen is reserved for a future presence indicator.
+		-- Populated on registration only; not updated per-request
+		-- (the per-API UPDATE was costly with no readers). See
+		-- CitizenRecord.LastSeen in models.go.
 		last_seen TIMESTAMP NOT NULL
 	);
 
@@ -954,56 +958,10 @@ func (s *Store) ListProjectsForCitizen(citizenID int64) ([]ProjectRecord, error)
 
 // --- Runs ---
 
-// CreateRun inserts a new run. The run's sequence number within its project
-// is computed automatically. Returns (global_id, project_seq).
-func (s *Store) CreateRun(p *RunRecord) (int64, int, error) {
-	if p.ProjectID == 0 {
-		return 0, 0, fmt.Errorf("project_id is required")
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback()
-
-	// Compute next seq within this project
-	var maxSeq sql.NullInt64
-	err = tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM runs WHERE project_id = ?`, p.ProjectID).Scan(&maxSeq)
-	if err != nil {
-		return 0, 0, err
-	}
-	nextSeq := int(maxSeq.Int64) + 1
-
-	// Branch fallback: empty in → "main". Mirrors the schema
-	// default so the column is always populated with something
-	// meaningful (not the empty string).
-	branch := p.Branch
-	if branch == "" {
-		branch = "main"
-	}
-	slug := p.Slug
-	if slug == "" {
-		slug = "run"
-	}
-	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ProjectID, nextSeq, p.Name, p.Ref, p.YAMLData, p.RepoURL, p.State, p.SourcePath, p.SourceCommitSHA, p.Params, branch, slug, p.CreatedAt, p.UpdatedAt,
-	)
-	if err != nil {
-		return 0, 0, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, 0, err
-	}
-	return id, nextSeq, nil
-}
+// CreateRun (direct method) was removed in the chokepoint
+// migration — callers route through ApplyPlan with a
+// store.CreateRun mutation. The handler in apply.go preserves
+// the per-project seq computation; tests use helperCreateRun.
 
 // GetRun retrieves a run by its global ID.
 func (s *Store) GetRun(id int64) (*RunRecord, error) {
@@ -1271,14 +1229,15 @@ func (s *Store) submitTaskResultForTest(taskID string, citizenID int64, resultPa
 			return nil, err
 		}
 		if claimedBy.Valid {
+			// last_seen is intentionally not touched — see the
+			// citizens.last_seen note in models.go.
 			_, err = tx.Exec(
 				`UPDATE citizens SET
 					tasks_completed = tasks_completed + 1,
 					tokens_contributed = tokens_contributed + ?,
-					score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0),
-					last_seen = ?
+					score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0)
 				WHERE id = ?`,
-				tokensUsed, now, claimedBy.Int64,
+				tokensUsed, claimedBy.Int64,
 			)
 			if err != nil {
 				return nil, err
@@ -1353,10 +1312,12 @@ func (s *Store) submitTaskResultForTest(taskID string, citizenID int64, resultPa
 	// increment tasks_completed until the tally actually resolves
 	// (score should reflect "I completed a task," not "I
 	// submitted a vote that's still being tallied"). Token
-	// contribution can still be credited per submit.
+	// contribution can still be credited per submit. last_seen is
+	// intentionally not touched — see citizens.last_seen note in
+	// models.go.
 	_, err = tx.Exec(
-		`UPDATE citizens SET tokens_contributed = tokens_contributed + ?, last_seen = ? WHERE id = ?`,
-		tokensUsed, now, citizenID,
+		`UPDATE citizens SET tokens_contributed = tokens_contributed + ? WHERE id = ?`,
+		tokensUsed, citizenID,
 	)
 	if err != nil {
 		return nil, err
@@ -1392,12 +1353,12 @@ func (s *Store) ListVoteSubmissions(taskID string) ([]TaskClaimRecord, error) {
 // projection layer doesn't know how to render (or worse, would
 // case-fall-through and look "completed" to a string-equality
 // check).
-var validRelabelOutcomes = map[string]bool{
-	"completed":  true, // review approve transitions an open reviewed-task claim to terminal-success
-	"rejected":  true, // request_changes / reject cascade (review verdict)
-	"invalidated": true, // manual enju_invalidate_task — operator wiped the task without a verdict
-	"abandoned":  true, // citizen-takeover: a different citizen claimed an open row, prior is closed without verdict
-	"released":  true, // timeout / voluntary release
+var validRelabelOutcomes = map[ClaimOutcome]bool{
+	ClaimOutcomeCompleted:   true, // review approve transitions an open reviewed-task claim to terminal-success
+	ClaimOutcomeRejected:    true, // request_changes / reject cascade (review verdict)
+	ClaimOutcomeInvalidated: true, // manual enju_invalidate_task — operator wiped the task without a verdict
+	ClaimOutcomeAbandoned:   true, // citizen-takeover: a different citizen claimed an open row, prior is closed without verdict
+	ClaimOutcomeReleased:    true, // timeout / voluntary release
 }
 
 // HasReviewerOfTarget reports whether any task in `runID` is
@@ -1483,7 +1444,7 @@ func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 			r.IterSeq = int(iterSeq.Int64)
 		}
 		if outcome.Valid {
-			r.Outcome = outcome.String
+			r.Outcome = ClaimOutcome(outcome.String)
 		}
 		if submittedAt.Valid {
 			r.SubmittedAt = &submittedAt.Time
@@ -1901,124 +1862,14 @@ func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	return &p, nil
 }
 
-// CreateCitizen inserts a new citizen and returns the generated int64
-// primary key. The caller must provide a validated, unique username.
-// Uniqueness of email (if provided) and username is checked here and
-// enforced again by the DB.
-func (s *Store) CreateCitizen(p *CitizenRecord) (int64, error) {
-	if err := ValidateUsername(p.Username); err != nil {
-		return 0, err
-	}
-	// Check email uniqueness if provided
-	if p.Email != "" {
-		var count int
-		s.db.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ?`, p.Email).Scan(&count)
-		if count > 0 {
-			return 0, fmt.Errorf("a citizen with this email already exists")
-		}
-	}
-	// Check username uniqueness
-	var uCount int
-	s.db.QueryRow(`SELECT COUNT(*) FROM citizens WHERE username = ?`, p.Username).Scan(&uCount)
-	if uCount > 0 {
-		return 0, fmt.Errorf("username %q is already taken", p.Username)
-	}
-
-	role := p.Role
-	if role == "" {
-		role = "citizen"
-	}
-
-	// Insert citizen + matching tokens row in one transaction so we
-	// can't leave a citizen authenticatable through citizens.token
-	// (legacy mirror) but invisible to the tokens-table auth path.
-	// Model citizens won't have a token; the conditional insert
-	// below skips the tokens row when p.Token is empty.
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	// operator/model design — kind and parent_id MUST be in the INSERT
-	// or the schema's column defaults silently override the
-	// caller's intent (kind=>'human', parent_id=>NULL). That's
-	// the exact bug a previous iteration shipped: enju_register_bot
-	// produced kind='human' rows that ListBotsByParent never
-	// returned, and requireModelForBot became dead code. The Phase
-	// 1.1 test already pinned that scanCitizen reads these
-	// columns; this insert path is the matching write side.
-	kind := p.Kind
-	if kind == "" {
-		kind = "human"
-	}
-	res, err := tx.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
-		p.Username, p.Name, p.Email, role, p.Token, p.RegisteredAt, p.LastSeen, kind, nullableInt64(p.ParentID),
-	)
-	if err != nil {
-		return 0, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if p.Token != "" {
-		if _, err := tx.Exec(
-			`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, '', ?)`,
-			id, p.Token, p.RegisteredAt,
-		); err != nil {
-			return 0, fmt.Errorf("issue initial token: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit citizen+token: %w", err)
-	}
-	return id, nil
-}
-
-// SetCitizenRole updates a citizen's global role (citizen / author /
-// reviewer / etc). This is a privileged operation — no admin UI yet, so
-// it's set via the store directly by tests and (eventually) an admin
-// CLI. Per-project roles are a Phase 2 feature.
-func (s *Store) SetCitizenRole(id int64, role string) error {
-	_, err := s.db.Exec(`UPDATE citizens SET role = ? WHERE id = ?`, role, id)
-	return err
-}
+// CreateCitizen / SetCitizenRole logic lives in apply.go
+// (applyCreateCitizen, applySetCitizenRole). Callers build
+// store.Plan with the matching mutation and call ApplyPlan.
 
 // UpdateCitizenProfile updates a citizen's name and/or email with
-// merge semantics: nil pointers mean "leave this column alone",
-// non-nil pointers mean "set to the pointed-at value (which may
-// be the empty string if the caller explicitly wants to clear it)".
-// Username is intentionally immutable — never touched.
-func (s *Store) UpdateCitizenProfile(id int64, name, email *string) error {
-	if name == nil && email == nil {
-		return nil
-	}
-	if email != nil && *email != "" {
-		var count int
-		s.db.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ? AND id != ?`, *email, id).Scan(&count)
-		if count > 0 {
-			return fmt.Errorf("a citizen with this email already exists")
-		}
-	}
-	sets := []string{}
-	args := []interface{}{}
-	if name != nil {
-		sets = append(sets, "name = ?")
-		args = append(args, *name)
-	}
-	if email != nil {
-		sets = append(sets, "email = ?")
-		args = append(args, *email)
-	}
-	args = append(args, id)
-	_, err := s.db.Exec(
-		"UPDATE citizens SET "+strings.Join(sets, ", ")+" WHERE id = ?",
-		args...,
-	)
-	return err
-}
+// UpdateCitizenProfile logic lives in apply.go
+// (applyUpdateCitizenProfile). Caller builds a store.Plan with
+// the UpdateCitizenProfile mutation and calls ApplyPlan.
 
 // GetCitizenByToken resolves a token to its owning citizen for
 // authentication. Reads from the tokens table and
@@ -2039,11 +1890,6 @@ func (s *Store) GetCitizenByToken(token string) (*CitizenRecord, error) {
 		  AND tokens.revoked_at IS NULL`,
 		token,
 	))
-}
-
-func (s *Store) TouchCitizen(id int64) error {
-	_, err := s.db.Exec(`UPDATE citizens SET last_seen = ? WHERE id = ?`, time.Now(), id)
-	return err
 }
 
 // GetCitizen retrieves a citizen by internal int64 ID. For user-facing
@@ -2093,50 +1939,10 @@ func (s *Store) ListCitizenCompletedTasks(citizenID int64, limit int) ([]TaskRec
 // below are the management surface (issue, revoke, list) that
 // the bot-registration tools lean on.
 
-// IssueToken creates a new token row for the given citizen. Returns
-// the new token's primary key. Multiple active tokens per citizen
-// are allowed — used for rotation (issue new, distribute, revoke
-// old) and per-deployment labels (e.g. "ci-server", "laptop").
-// Token uniqueness is enforced by the schema; callers must supply
-// an unguessable random value.
-func (s *Store) IssueToken(citizenID int64, token, label string) (int64, error) {
-	if token == "" {
-		return 0, fmt.Errorf("token must be non-empty")
-	}
-	res, err := s.db.Exec(
-		`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
-		citizenID, token, label, time.Now(),
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-// RevokeToken marks a token as revoked. Subsequent
-// GetCitizenByToken calls return nil for the same token string.
-// The row is preserved for audit (never deleted). Idempotent: a
-// double-revoke is a no-op (the WHERE clause filters already-
-// revoked rows so revoked_at doesn't get overwritten with a later
-// timestamp).
-func (s *Store) RevokeToken(tokenID int64) error {
-	_, err := s.db.Exec(
-		`UPDATE tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		time.Now(), tokenID,
-	)
-	return err
-}
-
-// RevokeTokenByValue is the same as RevokeToken but keyed by the
-// token string instead of the row id. Convenience for callers (CLI,
-// API) that hold the token but not its row id.
-func (s *Store) RevokeTokenByValue(token string) error {
-	_, err := s.db.Exec(
-		`UPDATE tokens SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL`,
-		time.Now(), token,
-	)
-	return err
-}
+// IssueToken / RevokeToken / RevokeTokenByValue logic lives in
+// apply.go (applyIssueToken, applyRevokeToken,
+// applyRevokeTokenByValue). Callers build a store.Plan with
+// the matching mutation and call ApplyPlan.
 
 // ListTokensByCitizen returns all tokens for the given citizen,
 // active and revoked, most recently issued first. Callers that
@@ -2254,6 +2060,15 @@ func (s *Store) seedModelCitizens() error {
 // path to be dropped entirely in a future cleanup phase. If you're
 // touching auth and considering "fall back to citizens.token" — DO
 // NOT. Read this comment first; the placeholder rule depends on it.
+//
+// CHOKEPOINT EXEMPTION: ONLY called from migrate() at startup,
+// before the EventStore is attached and before any service
+// caller can issue an ApplyPlan. This direct write deliberately
+// bypasses the chokepoint because the schema-seeding phase
+// runs serially with no contention and predates the EventSink
+// contract (no mutation event would have anywhere to land).
+// DO NOT call this at runtime; route runtime model registration
+// through service.RegisterModel → CreateCitizen{Kind:"model"}.
 func (s *Store) upsertModelCitizen(username, displayName string) error {
 	if err := ValidateUsername(username); err != nil {
 		return err
@@ -2275,34 +2090,11 @@ func (s *Store) upsertModelCitizen(username, displayName string) error {
 	return err
 }
 
-// CreateModelCitizen registers a new model in the catalog. Called by
-// the API handler behind enju_register_model (any authenticated
-// citizen in local mode; hosted-mode policy gating deferred — see
-// docs/operator-model-design.md). Returns the new citizen ID and
-// the standard "username taken" error on conflict.
-func (s *Store) CreateModelCitizen(username, displayName string) (int64, error) {
-	if err := ValidateUsername(username); err != nil {
-		return 0, err
-	}
-	var existingID int64
-	err := s.db.QueryRow(`SELECT id FROM citizens WHERE username = ?`, username).Scan(&existingID)
-	if err == nil {
-		return 0, fmt.Errorf("username %q is already taken", username)
-	}
-	if err != sql.ErrNoRows {
-		return 0, err
-	}
-	now := time.Now()
-	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'model')`,
-		username, displayName, "model:"+username, now, now,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
+// CreateModelCitizen logic absorbed into applyCreateCitizen with
+// kind="model" — callers build a CreateCitizen mutation with that
+// kind and the synthetic "model:<username>" token convention.
+// See service/citizens_write.go RegisterModel for the canonical
+// caller shape.
 
 // ListBotsByParent returns every kind='bot' citizen whose parent_id
 // matches the given citizen, ordered by registration time (newest

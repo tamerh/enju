@@ -38,18 +38,19 @@ type RemediationSpawnResult struct {
 // and log internally — a remediation-spawn failure must not
 // stop a review submission from being recorded.
 //
-// eventKind is "reject" or "request_changes" — selects which
-// of the two on_review_* rules applies.
-func (c *Coordinator) MaybeSpawnRemediation(reviewTaskID, targetTaskID, eventKind, decision, feedback string, submitterID int64) (*RemediationSpawnResult, bool) {
+// eventKind is ReviewDecisionReject or ReviewDecisionRequestChanges
+// — selects which of the two on_review_* rules applies. Other
+// values (Approve, Comment) short-circuit to (nil, false).
+func (c *Coordinator) MaybeSpawnRemediation(reviewTaskID, targetTaskID string, eventKind, decision store.ReviewDecision, feedback string, submitterID int64) (*RemediationSpawnResult, bool) {
 	target, err := c.Store.GetTask(targetTaskID)
 	if err != nil || target == nil {
 		return nil, false
 	}
 	var rule string
 	switch eventKind {
-	case "reject":
+	case store.ReviewDecisionReject:
 		rule = target.OnReviewReject
-	case "request_changes":
+	case store.ReviewDecisionRequestChanges:
 		rule = target.OnReviewRequestChanges
 	}
 	if rule != "spawn_remediation" || target.RemediationTemplate == "" {
@@ -72,7 +73,7 @@ func (c *Coordinator) MaybeSpawnRemediation(reviewTaskID, targetTaskID, eventKin
 	// later edited or invalidated.
 	prompt := tmpl.Prompt
 	prompt = strings.ReplaceAll(prompt, "{{review.feedback}}", feedback)
-	prompt = strings.ReplaceAll(prompt, "{{review.decision}}", decision)
+	prompt = strings.ReplaceAll(prompt, "{{review.decision}}", string(decision))
 
 	remediationDefID := c.nextRemediationDefID(target)
 

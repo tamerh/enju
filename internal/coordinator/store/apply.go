@@ -35,22 +35,35 @@ import (
 //     CreateProject, AddProjectMember, etc.) are the only
 //     supported write path.
 //
-//   - runs.state — partially governed. The CompleteRun mutation
-//     handles task-graph-driven transitions (active → idle →
-//     completed). PauseRun / ResumeRun / EvaluateRunState in
-//     sqlite.go still UPDATE runs.state directly through s.db
-//     and emit run_paused / run_resumed / run_active via
-//     s.Events().Record (see recordRunLifecycleEvent). Folding
-//     these into mutations is the next phase of the chokepoint
-//     migration. Until then they're a documented exception:
-//     the only events outside the post-commit drain.
+//   - runs.state — fully governed. PauseRun / ResumeRun /
+//     CompleteRun all flow through ApplyPlan (Phase 4c.5);
+//     run_paused / run_resumed / run_active / run_idle /
+//     run_completed events ride the EventSink and post-commit
+//     drain like every other event.
 //
-//   - citizens.last_seen, citizens.role, tokens — direct writes
-//     via TouchCitizen / SetCitizenRole / IssueToken / RevokeToken.
-//     High-frequency (last_seen) or low-stakes (token revocation)
-//     paths intentionally bypass ApplyPlan today. Future phases
-//     may migrate them; the heartbeat case will likely stay
-//     direct for cost reasons.
+//   - issues, cycle budget, spawned tasks — fully governed via
+//     CreateIssue / TriageIssue / MarkIssueInProgress /
+//     CloseIssue / SpawnTask / SetCycleBudgetMax mutations
+//     (Phase 4c.6 + 4c.7).
+//
+//   - citizens.role, tokens — fully governed via SetCitizenRole /
+//     UpdateCitizenProfile / IssueToken / RevokeToken /
+//     RevokeTokenByValue mutations (Phase 4c.8). The auto-issued
+//     token's label rides on CreateCitizen.TokenLabel so bot
+//     registration is one atomic plan. (citizens.last_seen is
+//     written once at registration only; the column is reserved
+//     for a future presence indicator and is no longer touched
+//     per-request — the heartbeat exception is gone.)
+//
+//   - runs.auto_triage_template — fully governed via
+//     SetAutoTriageTemplate (Phase 4d).
+//
+// Phase 4d additionally narrowed coordinator-side packages
+// (service, api, scheduler, dagcache) to a CoordinatorStore
+// interface that exposes ApplyPlan + reads only. Direct
+// mutation methods still exist on *Store for in-package use
+// by apply handlers, but external callers cannot reach them
+// — the chokepoint is now compile-time enforced.
 //
 // Tx discipline for applyXxx functions: every read and write
 // inside an applyXxx body MUST go through the `tx` parameter,
@@ -409,6 +422,38 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case SetCitizenRole:
+			if err := applySetCitizenRole(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case UpdateCitizenProfile:
+			if err := applyUpdateCitizenProfile(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case IssueToken:
+			id, err := applyIssueToken(tx, m, sink)
+			if err != nil {
+				return result, err
+			}
+			result.TokenID = id
+
+		case RevokeToken:
+			if err := applyRevokeToken(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case RevokeTokenByValue:
+			if err := applyRevokeTokenByValue(tx, m, sink); err != nil {
+				return result, err
+			}
+
+		case SetAutoTriageTemplate:
+			if err := applySetAutoTriageTemplate(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		default:
 			return result, fmt.Errorf("unknown mutation type: %T", mut)
 		}
@@ -436,6 +481,7 @@ type ApplyResult struct {
 	RunID         int64
 	RunSeq        int
 	CitizenID     int64
+	TokenID       int64
 	IssueID       int64
 	IssueSeq      int
 	SpawnedTaskID string
@@ -790,9 +836,9 @@ func applyCreateRun(tx *sql.Tx, m CreateRun, sink EventSink) (int64, int, error)
 		slug = "run"
 	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, branch, slug, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, branch, slug, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, r.Params, branch, slug, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err
@@ -904,7 +950,7 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 			sink.Emit(Event{
 				CitizenID:    openCitizen,
 				EventType:    "iteration_completed",
-				EventSubtype: "abandoned",
+				EventSubtype: string(ClaimOutcomeAbandoned),
 				TaskID:       m.TaskID,
 				RunID:        taskRunID,
 				ProjectID:    projectID,
@@ -1070,7 +1116,7 @@ func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim, sink EventSink) error {
 		sink.Emit(Event{
 			CitizenID:    m.CitizenID,
 			EventType:    "iteration_completed",
-			EventSubtype: "released",
+			EventSubtype: string(ClaimOutcomeReleased),
 			TaskID:       m.TaskID,
 			RunID:        runID,
 			ProjectID:    projectID,
@@ -1136,7 +1182,7 @@ func applyExpireClaim(tx *sql.Tx, m ExpireClaim, sink EventSink) error {
 		sink.Emit(Event{
 			CitizenID:    m.CitizenID,
 			EventType:    "iteration_completed",
-			EventSubtype: "timed_out",
+			EventSubtype: string(ClaimOutcomeTimedOut),
 			TaskID:       m.TaskID,
 			RunID:        runID,
 			ProjectID:    projectID,
@@ -1325,7 +1371,7 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 			sink.Emit(Event{
 				CitizenID:    m.CitizenID,
 				EventType:    "iteration_completed",
-				EventSubtype: "completed",
+				EventSubtype: string(ClaimOutcomeCompleted),
 				TaskID:       m.TaskID,
 				RunID:        runID,
 				ProjectID:    projectID,
@@ -1364,11 +1410,12 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 				return err
 			}
 		}
-		// Score accounting.
+		// Score accounting. last_seen is intentionally not
+		// touched — see the citizens.last_seen note in models.go.
 		if claimedBy.Valid {
 			tx.Exec(
-				`UPDATE citizens SET tasks_completed = tasks_completed + 1, tokens_contributed = tokens_contributed + ?, score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0), last_seen = ? WHERE id = ?`,
-				m.TokensUsed, now, claimedBy.Int64,
+				`UPDATE citizens SET tasks_completed = tasks_completed + 1, tokens_contributed = tokens_contributed + ?, score = (tasks_completed + 1) - (tasks_timed_out * 0.5) - (tasks_rejected * 1.0) WHERE id = ?`,
+				m.TokensUsed, claimedBy.Int64,
 			)
 		}
 	} else {
@@ -1396,7 +1443,7 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 			sink.Emit(Event{
 				CitizenID:    m.CitizenID,
 				EventType:    "iteration_completed",
-				EventSubtype: "completed",
+				EventSubtype: string(ClaimOutcomeCompleted),
 				TaskID:       m.TaskID,
 				RunID:        runID,
 				ProjectID:    projectID,
@@ -1410,9 +1457,11 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 			})
 		}
 		// Token contribution only (score waits for tally).
+		// last_seen is intentionally not touched — see the
+		// citizens.last_seen note in models.go.
 		tx.Exec(
-			`UPDATE citizens SET tokens_contributed = tokens_contributed + ?, last_seen = ? WHERE id = ?`,
-			m.TokensUsed, now, m.CitizenID,
+			`UPDATE citizens SET tokens_contributed = tokens_contributed + ? WHERE id = ?`,
+			m.TokensUsed, m.CitizenID,
 		)
 	}
 	if !claimRowID.Valid {
@@ -1477,26 +1526,63 @@ func applyDeleteArtifact(tx *sql.Tx, m DeleteArtifact, sink EventSink) error {
 
 func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, error) {
 	c := &m.Citizen
-	result, err := tx.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen)
-		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)`,
-		c.Username, c.Name, c.Email, c.Role, c.Token, c.RegisteredAt, c.LastSeen,
+	if err := ValidateUsername(c.Username); err != nil {
+		return 0, err
+	}
+	// Email + username uniqueness checks. Pre-INSERT so we can
+	// surface a friendly error instead of an opaque CONSTRAINT
+	// violation. Same logic the legacy Store.CreateCitizen had.
+	if c.Email != "" {
+		var count int
+		_ = tx.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ?`, c.Email).Scan(&count)
+		if count > 0 {
+			return 0, fmt.Errorf("a citizen with this email already exists")
+		}
+	}
+	var uCount int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM citizens WHERE username = ?`, c.Username).Scan(&uCount)
+	if uCount > 0 {
+		return 0, fmt.Errorf("username %q is already taken", c.Username)
+	}
+
+	role := c.Role
+	if role == "" {
+		role = "citizen"
+	}
+	// kind + parent_id MUST be in the INSERT or the schema's
+	// column defaults silently override the caller's intent
+	// (kind=>'human', parent_id=>NULL). Phase 1.1 bug history.
+	kind := c.Kind
+	if kind == "" {
+		kind = CitizenKindHuman
+	}
+	res, err := tx.Exec(
+		`INSERT INTO citizens (username, name, email, role, token, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
+		c.Username, c.Name, c.Email, role, c.Token, c.RegisteredAt, c.LastSeen, kind, nullableInt64(c.ParentID),
 	)
 	if err != nil {
 		return 0, err
 	}
-	newID, _ := result.LastInsertId()
+	newID, _ := res.LastInsertId()
+	// Mirror the initial token into the tokens table (auth path
+	// joins through there). Model citizens have synthetic tokens
+	// like "model:<username>" that aren't real bearer tokens but
+	// still get a row for join symmetry.
+	if c.Token != "" {
+		if _, err := tx.Exec(
+			`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
+			newID, c.Token, m.TokenLabel, c.RegisteredAt,
+		); err != nil {
+			return 0, fmt.Errorf("issue initial token: %w", err)
+		}
+	}
 	// Subtype carries the kind discriminator so consumers
 	// (audit views, attribution dashboards) can split humans
-	// vs bots without re-querying. Kind defaults to "human"
-	// pre-migration; the SQL column DEFAULTs the same.
-	subtype := c.Kind
-	if subtype == "" {
-		subtype = "human"
-	}
+	// vs bots vs models without re-querying.
 	meta := map[string]any{
 		"username": c.Username,
-		"role":     c.Role,
+		"role":     role,
 	}
 	if c.ParentID != nil {
 		meta["parent_id"] = *c.ParentID
@@ -1504,11 +1590,167 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 	sink.Emit(Event{
 		CitizenID:    newID,
 		EventType:    "citizen_registered",
-		EventSubtype: subtype,
+		EventSubtype: string(kind),
 		Metadata:     MarshalMetadata(meta),
 		CreatedAt:    time.Now(),
 	})
 	return newID, nil
+}
+
+func applySetCitizenRole(tx *sql.Tx, m SetCitizenRole, sink EventSink) error {
+	res, err := tx.Exec(`UPDATE citizens SET role = ? WHERE id = ?`, m.Role, m.CitizenID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("set_citizen_role no-op: citizen not found")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "citizen_role_changed",
+		EventSubtype: m.Role,
+		Metadata:     MarshalMetadata(map[string]any{"role": m.Role}),
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+func applyUpdateCitizenProfile(tx *sql.Tx, m UpdateCitizenProfile, sink EventSink) error {
+	if m.Name == nil && m.Email == nil {
+		sink.SkipEvents("update_citizen_profile no-op: no fields supplied")
+		return nil
+	}
+	if m.Email != nil && *m.Email != "" {
+		var count int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM citizens WHERE email = ? AND id != ?`,
+			*m.Email, m.CitizenID,
+		).Scan(&count)
+		if count > 0 {
+			return fmt.Errorf("a citizen with this email already exists")
+		}
+	}
+	sets := []string{}
+	args := []interface{}{}
+	changed := map[string]any{}
+	if m.Name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *m.Name)
+		changed["name"] = *m.Name
+	}
+	if m.Email != nil {
+		sets = append(sets, "email = ?")
+		args = append(args, *m.Email)
+		changed["email"] = *m.Email
+	}
+	args = append(args, m.CitizenID)
+	res, err := tx.Exec(
+		"UPDATE citizens SET "+strings.Join(sets, ", ")+" WHERE id = ?",
+		args...,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("update_citizen_profile no-op: citizen not found")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "citizen_profile_updated",
+		Metadata:  MarshalMetadata(changed),
+		CreatedAt: time.Now(),
+	})
+	return nil
+}
+
+func applyIssueToken(tx *sql.Tx, m IssueToken, sink EventSink) (int64, error) {
+	if m.Token == "" {
+		return 0, fmt.Errorf("issue_token: token must be non-empty")
+	}
+	res, err := tx.Exec(
+		`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
+		m.CitizenID, m.Token, m.Label, time.Now(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "token_issued",
+		Metadata: MarshalMetadata(map[string]any{
+			"token_id": id,
+			"label":    m.Label,
+		}),
+		CreatedAt: time.Now(),
+	})
+	return id, nil
+}
+
+func applyRevokeToken(tx *sql.Tx, m RevokeToken, sink EventSink) error {
+	// Look up citizen_id before the UPDATE so the event carries
+	// it; the WHERE clause filters already-revoked rows so a
+	// double-revoke is a no-op (matches the legacy semantics).
+	var citizenID int64
+	_ = tx.QueryRow(
+		`SELECT citizen_id FROM tokens WHERE id = ? AND revoked_at IS NULL`,
+		m.TokenID,
+	).Scan(&citizenID)
+	res, err := tx.Exec(
+		`UPDATE tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
+		time.Now(), m.TokenID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("revoke_token no-op: token already revoked or not found")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID: citizenID,
+		EventType: "token_revoked",
+		Metadata: MarshalMetadata(map[string]any{
+			"token_id": m.TokenID,
+		}),
+		CreatedAt: time.Now(),
+	})
+	return nil
+}
+
+func applyRevokeTokenByValue(tx *sql.Tx, m RevokeTokenByValue, sink EventSink) error {
+	var tokenID, citizenID int64
+	_ = tx.QueryRow(
+		`SELECT id, citizen_id FROM tokens WHERE token = ? AND revoked_at IS NULL`,
+		m.Token,
+	).Scan(&tokenID, &citizenID)
+	res, err := tx.Exec(
+		`UPDATE tokens SET revoked_at = ? WHERE token = ? AND revoked_at IS NULL`,
+		time.Now(), m.Token,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("revoke_token_by_value no-op: token already revoked or not found")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID:    citizenID,
+		EventType:    "token_revoked",
+		EventSubtype: "by_value",
+		Metadata: MarshalMetadata(map[string]any{
+			"token_id": tokenID,
+		}),
+		CreatedAt: time.Now(),
+	})
+	return nil
 }
 
 func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, sink EventSink) ([]ReadiedTask, error) {
@@ -1711,11 +1953,11 @@ func requireModelForBot(tx *sql.Tx, operatorID int64, modelID *int64, op string)
 	if modelID != nil {
 		return nil // model named — fine for any operator kind
 	}
-	var kind string
-	if err := tx.QueryRow(`SELECT kind FROM citizens WHERE id = ?`, operatorID).Scan(&kind); err != nil {
+	var rawKind string
+	if err := tx.QueryRow(`SELECT kind FROM citizens WHERE id = ?`, operatorID).Scan(&rawKind); err != nil {
 		return fmt.Errorf("%s: read operator kind: %w", op, err)
 	}
-	if kind == "bot" {
+	if CitizenKind(rawKind) == CitizenKindBot {
 		return fmt.Errorf("%s: operator citizen %d is a bot — model_id is required (bots cannot act without naming a model)", op, operatorID)
 	}
 	return nil
@@ -2126,7 +2368,7 @@ func applyCreateIssue(tx *sql.Tx, m CreateIssue, sink EventSink) (int64, int, er
 	sink.Emit(Event{
 		CitizenID:    rec.FiledBy,
 		EventType:    "issue_filed",
-		EventSubtype: rec.Severity,
+		EventSubtype: string(rec.Severity),
 		TaskID:       rec.FoundInTaskID,
 		RunID:        rec.FoundInRunID,
 		ProjectID:    rec.ProjectID,
@@ -2249,7 +2491,7 @@ func applyCloseIssue(tx *sql.Tx, m CloseIssue, sink EventSink) error {
 	sink.Emit(Event{
 		CitizenID:    m.CitizenID,
 		EventType:    "issue_closed",
-		EventSubtype: m.Status,
+		EventSubtype: string(m.Status),
 		TaskID:       m.ClosedByTaskID,
 		ProjectID:    projectID,
 		Metadata: MarshalMetadata(map[string]any{
@@ -2382,7 +2624,7 @@ func applyMarkOpenClaimsInvalidated(tx *sql.Tx, m MarkOpenClaimsInvalidated, sin
 		sink.Emit(Event{
 			CitizenID:    c.citizenID,
 			EventType:    "iteration_completed",
-			EventSubtype: "invalidated",
+			EventSubtype: string(ClaimOutcomeInvalidated),
 			TaskID:       m.TaskID,
 			RunID:        c.runID,
 			ProjectID:    c.projectID,
@@ -2441,7 +2683,7 @@ func applyMarkLatestClaimOutcome(tx *sql.Tx, m MarkLatestClaimOutcome, sink Even
 	sink.Emit(Event{
 		CitizenID:    citizenID,
 		EventType:    "iteration_completed",
-		EventSubtype: m.Outcome,
+		EventSubtype: string(m.Outcome),
 		TaskID:       m.TaskID,
 		RunID:        runID,
 		ProjectID:    projectID,
@@ -2456,7 +2698,7 @@ func applyMarkLatestClaimOutcome(tx *sql.Tx, m MarkLatestClaimOutcome, sink Even
 	// the upstream's claim (Phase 6c). The task itself was already
 	// in ACCEPTED state from the earlier submit, so applySetTaskState's
 	// task_completed emission won't fire — emit it here instead.
-	if m.Outcome == "completed" {
+	if m.Outcome == ClaimOutcomeCompleted {
 		sink.Emit(Event{
 			CitizenID:    citizenID,
 			EventType:    "task_completed",
@@ -2496,5 +2738,19 @@ func applySetProjectMemberRole(tx *sql.Tx, m SetProjectMemberRole, sink EventSin
 		Metadata:     MarshalMetadata(map[string]any{"role": string(m.Role)}),
 		CreatedAt:    time.Now(),
 	})
+	return nil
+}
+
+// applySetAutoTriageTemplate persists the run-level auto-triage
+// rule. Pure state write — no event emission (the rule is run
+// metadata, not a citizen-facing contribution).
+func applySetAutoTriageTemplate(tx *sql.Tx, m SetAutoTriageTemplate, sink EventSink) error {
+	if _, err := tx.Exec(
+		`UPDATE runs SET auto_triage_template = ?, updated_at = ? WHERE id = ?`,
+		m.TemplateJSON, time.Now(), m.RunID,
+	); err != nil {
+		return err
+	}
+	sink.SkipEvents("auto_triage_template is run metadata, not a contribution event")
 	return nil
 }

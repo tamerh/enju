@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -349,10 +350,10 @@ func parseReviewsTarget(target string) (defID, instanceKey string) {
 // submit time (after the args parse); this handler-side copy
 // gives a friendlier per-tool error before the service call.
 func validateReviewDecision(decision string) string {
-	switch decision {
-	case "approve", "reject", "request_changes", "comment":
+	switch {
+	case types.IsValidReviewDecision(decision):
 		return ""
-	case "":
+	case decision == "":
 		return "decision is required on action:review tasks (must be \"approve\", \"request_changes\", \"reject\", or \"comment\")"
 	default:
 		return invalidDecisionMessage(decision)

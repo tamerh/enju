@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
@@ -137,7 +138,7 @@ func (s *Session) CommitAuthor(ctx context.Context) (name, email string) {
 func (s *Session) CitizenKind(ctx context.Context) string {
 	s.loadProfile(ctx)
 	if s.profileKind == "" {
-		return "human"
+		return string(types.CitizenKindHuman)
 	}
 	return s.profileKind
 }
@@ -151,7 +152,7 @@ func (s *Session) loadProfile(ctx context.Context) {
 		username := s.coord.Username()
 		s.profileName = username
 		s.profileEmail = username + "@enju.local"
-		s.profileKind = "human"
+		s.profileKind = string(types.CitizenKindHuman)
 
 		data, err := s.coord.Get(ctx, "/api/v1/citizens/by-username/"+username)
 		if err != nil {

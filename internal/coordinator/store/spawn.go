@@ -1,9 +1,28 @@
 package store
 
+// File scope (post-chokepoint migration):
+//
+//   - SpawnSpec — input shape for the SpawnTask mutation.
+//     Lives here because SpawnTask + auto-triage callers all
+//     reference it; the mutation handler in apply.go consumes
+//     SpawnSpec by value.
+//
+//   - GetCycleBudget, ListRunsWithAutoTriage,
+//     SetAutoTriageTemplate, GetAutoTriageTemplate,
+//     CountTasksWithDefIDPrefix — read methods used by the
+//     spawn / auto-triage paths and by status renders. Reads
+//     are not under the chokepoint contract; only writes are.
+//
+//   - BuildReviewsTargetKey — pure helper for the
+//     reviews_target column shape, kept here because the spawn
+//     code and the merge-gate query both consume it.
+//
+// All write logic for spawn / cycle budget moved to apply.go
+// (applySpawnTask, applySetCycleBudgetMax) in Phase 4c.7.
+
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 // SpawnSpec describes a new task to add to an in-flight run.
@@ -193,18 +212,6 @@ func generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug string,
 		defSegment = instanceKey + "/" + taskDefID
 	}
 	return fmt.Sprintf("%s/%s/iter-%d", runSegment, defSegment, priorClaims+1)
-}
-
-// SetAutoTriageTemplate persists the run-level auto-triage rule
-// (JSON-encoded RemediationTemplate). Called by the create-run
-// path after the RunRecord is inserted; runs without a rule
-// keep the schema default ('').
-func (s *Store) SetAutoTriageTemplate(runID int64, templateJSON string) error {
-	_, err := s.db.Exec(
-		`UPDATE runs SET auto_triage_template = ?, updated_at = ? WHERE id = ?`,
-		templateJSON, time.Now(), runID,
-	)
-	return err
 }
 
 // GetAutoTriageTemplate returns the run's auto-triage rule, or

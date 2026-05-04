@@ -1,15 +1,39 @@
 package store
 
+// File scope (post-chokepoint migration):
+//
+//   - IssueStatus* / IssueSeverity* constants — shared schema
+//     values referenced by mutation handlers and read paths.
+//
+//   - IssueFilter, GetIssueBySeq, GetIssue, ListIssues,
+//     FindOldestOpenIssue, scanIssue, placeholders — read
+//     helpers used by the file_issue / triage / close service
+//     paths and by run_status renders. Reads are not under the
+//     chokepoint contract; only writes are.
+//
+// All write logic for issues moved to apply.go
+// (applyCreateIssue, applyTriageIssue, applyMarkIssueInProgress,
+// applyCloseIssue) in Phase 4c.6.
+
 import (
 	"database/sql"
 	"fmt"
 	"strings"
 )
 
-// Issue status values. Kept in code (not enforced by SQL CHECK) so
-// future additions don't require a schema migration. Validated at
-// the handler layer.
-//
+// IssueStatus is the named lifecycle phase of an issue.
+// Stored as the underlying string, but typed at the Go
+// level so a typo'd literal becomes a compile error and so
+// IDEs offer the closed set on completion. Same pattern as
+// TaskState / RunState. Kept in code (not enforced by SQL
+// CHECK) so future additions don't require a schema
+// migration; validated at the handler layer.
+type IssueStatus string
+
+// IssueSeverity is the named urgency level. Same typing
+// rationale as IssueStatus.
+type IssueSeverity string
+
 // State transitions:
 //
 //	open → triaged    (TriageIssue, manual)
@@ -20,24 +44,25 @@ import (
 //	in_progress → closed (auto on linked task accept, or manual)
 //	in_progress → wontfix (manual)
 const (
-	IssueStatusOpen    = "open"
-	IssueStatusTriaged  = "triaged"
-	IssueStatusInProgress = "in_progress"
-	IssueStatusClosed   = "closed"
-	IssueStatusWontfix  = "wontfix"
-	IssueSeverityLow   = "low"
-	IssueSeverityMedium  = "medium"
-	IssueSeverityHigh   = "high"
-	IssueSeverityCrit   = "critical"
+	IssueStatusOpen       IssueStatus = "open"
+	IssueStatusTriaged    IssueStatus = "triaged"
+	IssueStatusInProgress IssueStatus = "in_progress"
+	IssueStatusClosed     IssueStatus = "closed"
+	IssueStatusWontfix    IssueStatus = "wontfix"
+
+	IssueSeverityLow    IssueSeverity = "low"
+	IssueSeverityMedium IssueSeverity = "medium"
+	IssueSeverityHigh   IssueSeverity = "high"
+	IssueSeverityCrit   IssueSeverity = "critical"
 )
 
 // IssueFilter narrows ListIssues. ProjectID is the only required
 // field — issues are project-scoped by construction.
 type IssueFilter struct {
 	ProjectID int64
-	Status  []string // OR-matched if non-empty
-	Severity []string
-	Limit   int
+	Status   []IssueStatus  // OR-matched if non-empty
+	Severity []IssueSeverity
+	Limit    int
 }
 
 // GetIssueBySeq fetches an issue by its (project, seq) pair —

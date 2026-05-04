@@ -29,7 +29,7 @@ type CreateProjectParams struct {
 //   - ErrInvalidArgument: missing name, malformed default_branch
 //   - ErrConflict: project name already exists
 //   - ErrForbidden: missing caller (auth precondition)
-func CreateProject(s *store.Store, caller *store.CitizenRecord, params CreateProjectParams) (*ProjectResponse, error) {
+func CreateProject(s store.CoordinatorStore, caller *store.CitizenRecord, params CreateProjectParams) (*ProjectResponse, error) {
 	if caller == nil {
 		return nil, fmt.Errorf("%w: authentication required to create a project", ErrForbidden)
 	}
@@ -118,7 +118,7 @@ func CreateProject(s *store.Store, caller *store.CitizenRecord, params CreatePro
 // URL directly. (POST /projects still accepts empty remote_url
 // for local-only project creation — that's the create-time
 // solo-work entry point, deliberate.)
-func SetProjectRemoteURL(s *store.Store, caller *store.CitizenRecord, projectID int64, remoteURL string) (*SetRemoteURLResponse, error) {
+func SetProjectRemoteURL(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, remoteURL string) (*SetRemoteURLResponse, error) {
 	if caller == nil {
 		return nil, fmt.Errorf("%w: authentication required", ErrForbidden)
 	}

@@ -62,18 +62,23 @@ func createRun(t *testing.T, s *store.Store, yaml string) int64 {
 		t.Fatal(err)
 	}
 	pid := createRes.ProjectID
-	id, _, err := s.CreateRun(&store.RunRecord{
-		ProjectID: pid,
-		Name:   "r",
-		YAMLData: yaml,
-		State:   store.RunActive,
-		CreatedAt: now,
-		UpdatedAt: now,
+	runRes, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.CreateRun{Run: store.RunRecord{
+				ProjectID: pid,
+				Name:      "r",
+				YAMLData:  yaml,
+				State:     store.RunActive,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return id
+	return runRes.RunID
 }
 
 func TestGetParsedRunLazyLoadAndCache(t *testing.T) {

@@ -28,6 +28,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/enju-ai/enju/internal/coordinator/engine"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -596,7 +598,12 @@ func (h *mcpHarness) mcpSetRole(t *testing.T, username, role string) {
 	if err != nil || citizen == nil {
 		t.Fatalf("mcpSetRole: citizen %q not found: %v", username, err)
 	}
-	if err := h.store.SetCitizenRole(citizen.ID, role); err != nil {
+	if _, err := h.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetCitizenRole{CitizenID: citizen.ID, Role: role},
+		},
+	}); err != nil {
 		t.Fatalf("mcpSetRole: set role %q on %s: %v", role, username, err)
 	}
 }

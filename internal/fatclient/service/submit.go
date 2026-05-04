@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -637,10 +638,10 @@ func (s *Session) applyAcceptedMerges(ctx context.Context, proj *workspace.Proje
 // without circular imports — the handler keeps its own copy
 // for the per-tool args parse path.
 func ValidateReviewDecision(decision string) string {
-	switch decision {
-	case "approve", "reject", "request_changes", "comment":
+	switch {
+	case types.IsValidReviewDecision(decision):
 		return ""
-	case "":
+	case decision == "":
 		return "decision is required on action:review tasks (must be \"approve\", \"request_changes\", \"reject\", or \"comment\")"
 	default:
 		return fmt.Sprintf("decision %q is invalid (must be \"approve\", \"request_changes\", \"reject\", or \"comment\")", decision)

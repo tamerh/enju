@@ -33,7 +33,7 @@ type ReportMergeResponse struct {
 // is already locked-in by git's FF check on the reporter side
 // — the coordinator trusts the report and just stamps the
 // audit timeline.
-func ReportMerge(s *store.Store, caller *store.CitizenRecord, projectID int64, runSeq int, params ReportMergeParams) (*ReportMergeResponse, error) {
+func ReportMerge(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int, params ReportMergeParams) (*ReportMergeResponse, error) {
 	run, err := s.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
 		return nil, err

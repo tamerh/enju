@@ -137,7 +137,7 @@ func TestConcurrentWritesDoNotHitSQLITE_BUSY(t *testing.T) {
 			defer wg.Done()
 			for op := 0; op < opsPerGoroutine; op++ {
 				name := nextUniqueCitizenName(gid, op)
-				_, err := s.CreateCitizen(&CitizenRecord{
+				_, err := helperCreateCitizen(s, &CitizenRecord{
 					Username:     name,
 					Name:         name,
 					Token:        name + "-token",

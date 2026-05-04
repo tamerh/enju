@@ -15,7 +15,7 @@ import (
 // task's dissent-policy threshold.
 type ReviewTallyOutcome struct {
 	Resolved     bool
-	Verdict      string // "approve" or "reject" when Resolved
+	Verdict      store.ReviewDecision // approve / reject / request_changes when Resolved
 	Approves     int
 	Rejects      int
 	TotalReviews int
@@ -67,15 +67,15 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 	out := &ReviewTallyOutcome{TotalReviews: len(submissions)}
 	hasHardReject := false
 	for _, sub := range submissions {
-		switch sub.Option {
-		case "approve":
+		switch store.ReviewDecision(sub.Option) {
+		case store.ReviewDecisionApprove:
 			out.Approves++
-		case "reject":
+		case store.ReviewDecisionReject:
 			out.Rejects++
 			hasHardReject = true
-		case "request_changes":
+		case store.ReviewDecisionRequestChanges:
 			out.Rejects++
-		// "comment" is non-blocking — doesn't count toward tally.
+		// ReviewDecisionComment is non-blocking — doesn't count toward tally.
 		}
 	}
 
@@ -95,9 +95,9 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 	// negativeVerdict picks the strongest negative: any hard reject
 	// overrides request_changes. Multi-reviewer consensus: if even
 	// one reviewer said "reject" (hard kill), the verdict is reject.
-	negativeVerdict := "request_changes"
+	negativeVerdict := store.ReviewDecisionRequestChanges
 	if hasHardReject {
-		negativeVerdict = "reject"
+		negativeVerdict = store.ReviewDecisionReject
 	}
 
 	switch {
@@ -112,7 +112,7 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 			return out, nil
 		}
 		out.Resolved = true
-		out.Verdict = "approve"
+		out.Verdict = store.ReviewDecisionApprove
 	case policy == "unanimous-approve":
 		if out.Rejects > 0 {
 			out.Resolved = true
@@ -124,11 +124,11 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 			return out, nil
 		}
 		out.Resolved = true
-		out.Verdict = "approve"
+		out.Verdict = store.ReviewDecisionApprove
 	case policy == "majority-approve":
 		if out.Approves*2 > needed {
 			out.Resolved = true
-			out.Verdict = "approve"
+			out.Verdict = store.ReviewDecisionApprove
 			return out, nil
 		}
 		if out.Rejects*2 >= needed {
@@ -152,7 +152,7 @@ func (e *Engine) EvaluateReviewTally(task *store.TaskRecord) (*ReviewTallyOutcom
 		requiredApproves := (pct*needed + 99) / 100
 		if out.Approves >= requiredApproves {
 			out.Resolved = true
-			out.Verdict = "approve"
+			out.Verdict = store.ReviewDecisionApprove
 			return out, nil
 		}
 		pending := needed - out.TotalReviews

@@ -36,7 +36,7 @@ type BotListResponse struct {
 
 // ListMyBots returns the bots the caller parents, each with
 // their tokens. Caller must be authenticated.
-func ListMyBots(s *store.Store, caller *store.CitizenRecord) (*BotListResponse, error) {
+func ListMyBots(s store.CoordinatorStore, caller *store.CitizenRecord) (*BotListResponse, error) {
 	bots, err := s.ListBotsByParent(caller.ID)
 	if err != nil {
 		return nil, err
@@ -83,7 +83,7 @@ type ModelListResponse struct {
 
 // ListModels returns the model catalog. Open to any
 // authenticated citizen — the catalog is public information.
-func ListModels(s *store.Store) (*ModelListResponse, error) {
+func ListModels(s store.CoordinatorStore) (*ModelListResponse, error) {
 	models, err := s.ListModelCitizens()
 	if err != nil {
 		return nil, err
