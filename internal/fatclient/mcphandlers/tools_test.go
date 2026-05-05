@@ -178,6 +178,66 @@ func TestToolsCatalogueMatchesRegistry(t *testing.T) {
 	}
 }
 
+// TestAllowTools_FiltersServerSurface verifies the --allow-tools
+// pinning the bot runner relies on: when AllowTools is set, the
+// MCP server registers exactly those tools and no others.
+// Critical for the "runner pins the allowlist at process boundary"
+// trust leg — if filtering broke, a reviewer-bot manifest of
+// [Read, Grep, Glob] could end up with Write/Edit silently
+// reachable.
+func TestAllowTools_FiltersServerSurface(t *testing.T) {
+	allow := []string{"enju_get_task", "enju_list_runs", "enju_run_status"}
+	s := New(Config{
+		CoordinatorURL: "http://unused",
+		AllowTools:     allow,
+	})
+	registered := s.ListTools()
+	if len(registered) != len(allow) {
+		t.Errorf("AllowTools=%d tools, server registered %d", len(allow), len(registered))
+	}
+	for _, name := range allow {
+		if _, ok := registered[name]; !ok {
+			t.Errorf("expected %q to be registered, but missing", name)
+		}
+	}
+	// Confirm something definitely-not-in-the-allowlist isn't
+	// reachable.
+	for _, blocked := range []string{"enju_submit_result", "enju_claim_task", "enju_terminate_run"} {
+		if _, ok := registered[blocked]; ok {
+			t.Errorf("tool %q must NOT be registered when AllowTools excludes it", blocked)
+		}
+	}
+}
+
+// TestAllowTools_EmptyMeansAll keeps the backwards-compatible
+// default: callers (the human's normal `enju mcp`) that don't
+// pass AllowTools see every tool, exactly as before the flag
+// existed.
+func TestAllowTools_EmptyMeansAll(t *testing.T) {
+	s := New(Config{CoordinatorURL: "http://unused"})
+	registered := s.ListTools()
+	if len(registered) != len(allToolFactories) {
+		t.Errorf("empty AllowTools should yield all %d tools, got %d", len(allToolFactories), len(registered))
+	}
+}
+
+// TestAllowTools_UnknownNamesDropped keeps a manifest stable
+// across tool renames: an entry that doesn't match a real tool
+// is silently dropped (not panicked on, not fatal).
+func TestAllowTools_UnknownNamesDropped(t *testing.T) {
+	s := New(Config{
+		CoordinatorURL: "http://unused",
+		AllowTools:     []string{"enju_get_task", "Read"}, // "Read" is not an enju MCP tool name
+	})
+	registered := s.ListTools()
+	if len(registered) != 1 {
+		t.Errorf("expected 1 registered tool (unknown 'Read' dropped), got %d", len(registered))
+	}
+	if _, ok := registered["enju_get_task"]; !ok {
+		t.Error("enju_get_task should be present")
+	}
+}
+
 // TestKeySchemasHaveRequiredArgs spot-checks the most load-bearing
 // tools — the contract the LLM depends on. Broken required lists
 // here would cause tool calls to succeed at the protocol layer but

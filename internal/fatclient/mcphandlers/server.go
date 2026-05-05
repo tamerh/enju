@@ -67,6 +67,29 @@ type Config struct {
 	// coordinator URL, citizen identity, config paths, and
 	// shutdown context. mcpserver consumes it through Switch().
 	Notify *NotifyOptions
+
+	// AllowTools, when non-empty, restricts the MCP server's
+	// tool surface to exactly the named tools. The dispatcher
+	// only registers tools whose names appear in the list, so
+	// the LLM never sees the others — they don't exist as far
+	// as the MCP host is concerned. Empty (nil or zero-length)
+	// means "all tools," matching the previous default.
+	//
+	// Used by the bot runner to pin a per-bot tool allowlist
+	// at process boundary: a reviewer bot started with
+	// AllowTools=[Read, Grep, Glob] cannot call Edit/Write
+	// because those tools are physically absent from the
+	// toolbox the LLM sees. This is the "runner pins" leg of
+	// the manifest+runner+audit-log trust model — see
+	// docs/bots.md.
+	//
+	// Names that don't match any tool in enjumcp.All() are
+	// silently dropped. We could panic for a clearer signal,
+	// but that would couple bot-manifest authoring tightly to
+	// the current tool catalog (a tool rename would break
+	// every bot manifest). Drop-and-warn is the more humane
+	// trade.
+	AllowTools []string
 }
 
 // NotifyOptions carries the boot-time wiring for the auto-
@@ -192,7 +215,25 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		})
 	}
 
+	// Build the allowlist set once outside the loop. Empty
+	// AllowTools means "no filter" — register every tool.
+	var allow map[string]struct{}
+	if len(cfg.AllowTools) > 0 {
+		allow = make(map[string]struct{}, len(cfg.AllowTools))
+		for _, name := range cfg.AllowTools {
+			allow[name] = struct{}{}
+		}
+	}
+
 	for _, t := range enjumcp.All() {
+		if allow != nil {
+			if _, ok := allow[t.Name]; !ok {
+				// Tool not in the allowlist — skip
+				// registration. The dispatcher won't see
+				// it; the LLM won't see it.
+				continue
+			}
+		}
 		h, ok := client.handlerByToolName(t.Name)
 		if !ok {
 			panic("mcphandlers: no handler registered for tool: " + t.Name)

@@ -49,6 +49,27 @@ const BundleManifestName = "enju.yaml"
 // Enju-owned paths live under enju/."
 const ProjectConfigPath = "enju/conf.yaml"
 
+// BotManifestPath is the optional per-project bot roster. When
+// present, declares the bots a project uses (name, model, system
+// prompt, tool allowlist, credentials path). Read by `enju bot
+// setup` to register identities and by `enju bot run` to spawn
+// each daemon with the declared configuration. Coordinator never
+// touches this file — bot execution is fatclient-local.
+const BotManifestPath = "enju/bots.yaml"
+
+// BotsRuntimeDir is the per-project runtime root where each bot
+// daemon's git worktree lives. Sibling to enju/runs/, both
+// transient runtime state. Conventionally git-ignored — worktrees
+// have their own .git pointer files anyway, so they never round-
+// trip through `git add` even if the ignore is missing.
+const BotsRuntimeDir = "enju/bots"
+
+// BotPromptsDir is the conventional location bot system prompts
+// live in. Convention only — the manifest's `system_prompt:`
+// field can point anywhere repo-relative; this constant just
+// names the place tooling expects to find them by default.
+const BotPromptsDir = "enju/prompts"
+
 // TemplateSnapshotDirName is the per-run subdirectory name that
 // holds the frozen bundle copy. Named with the -snapshot suffix
 // to disambiguate from the live templates dir — otherwise a

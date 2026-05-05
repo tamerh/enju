@@ -396,3 +396,58 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 
 	return b.String(), nil
 }
+
+// PauseRun moves a run to the `paused` state. Idempotent on
+// already-paused runs; coord refuses on terminal runs and
+// returns an error. Member-gated server-side.
+//
+// Pure HTTP wrapper — same shape as ReleaseTask. Exists so
+// in-process consumers (web UI) can pause without importing
+// the coord client directly.
+func (s *FatClient) PauseRun(ctx context.Context, projectID int64, runSeq int) error {
+	return s.runStateAction(ctx, projectID, runSeq, "pause", nil)
+}
+
+// ResumeRun moves a paused run back to active or idle (coord
+// picks based on whether ready work exists). No-op on already-
+// alive runs; refuses on terminal.
+func (s *FatClient) ResumeRun(ctx context.Context, projectID int64, runSeq int) error {
+	return s.runStateAction(ctx, projectID, runSeq, "resume", nil)
+}
+
+// TerminateRun is the irreversible "human pulled the plug"
+// action: cascade-skips every non-terminal task, abandons
+// every open claim, transitions the run to `terminated`.
+// Reason is optional; coord caps it server-side.
+func (s *FatClient) TerminateRun(ctx context.Context, projectID int64, runSeq int, reason string) error {
+	body := map[string]string{}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	return s.runStateAction(ctx, projectID, runSeq, "terminate", body)
+}
+
+// runStateAction is the common pattern for pause/resume/
+// terminate — same path shape, same error decode, same return
+// contract. Centralized so a future "abort", "force-fail", etc.
+// can hang off the same helper.
+func (s *FatClient) runStateAction(ctx context.Context, projectID int64, runSeq int, action string, body interface{}) error {
+	if projectID <= 0 || runSeq <= 0 {
+		return fmt.Errorf("project_id and run_seq are required")
+	}
+	if body == nil {
+		body = map[string]string{}
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/%s", projectID, runSeq, action)
+	data, err := s.coord.Post(ctx, path, body)
+	if err != nil {
+		return err
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) == nil {
+		if msg, ok := result["error"].(string); ok && msg != "" {
+			return fmt.Errorf("%s", msg)
+		}
+	}
+	return nil
+}

@@ -86,6 +86,132 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 	return out
 }
 
+// CreateProjectParams bundles the inputs for creating a fresh
+// project from in-process consumers (web UI). Mirrors the
+// surface enju_create_project exposes: required name, optional
+// description / default_branch / path.
+//
+// Path: when non-empty, the project's working tree IS this
+// directory (filesystem-validated below — must be absolute,
+// must be empty or non-existent, no symlinks). When empty the
+// workspace lands at the standard ~/.enju/workspaces/{slug}-{id}/.
+//
+// RemoteURL: when non-empty, configured as `origin` on the
+// fresh clone; every task-result commit is pushed there
+// (GitHub/GitLab/Gitea/self-hosted). Mutually exclusive with
+// Path — path-mode seeds a fresh local tree without a remote;
+// remote-url-mode pulls from the URL.
+type CreateProjectParams struct {
+	Name          string
+	Description   string
+	DefaultBranch string
+	Path          string
+	RemoteURL     string
+}
+
+// CreateProjectResult bundles the coord response with the
+// resolved project ID for the caller's redirect target.
+type CreateProjectResult struct {
+	CoordResponse []byte
+	ProjectID     int64
+}
+
+// CreateProject creates a project on the coordinator and
+// eagerly materializes the local workspace clone. Mirrors
+// mcphandlers.handleCreateProject: optional Path makes the
+// project's working tree be the user's chosen directory
+// (filesystem-validated below); empty Path falls back to the
+// standard ~/.enju/workspaces/ layout.
+//
+// Eager init is best-effort: if the project record is created
+// on the coord but workspace init fails, we still return
+// success with a logged warning. Subsequent tool calls retry.
+func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParams) (*CreateProjectResult, error) {
+	if params.Name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	if params.Path != "" && params.RemoteURL != "" {
+		return nil, fmt.Errorf("path and remote_url are mutually exclusive — path seeds a fresh local working tree (no remote); remote_url clones the URL into the default workspace location")
+	}
+	if params.Path != "" {
+		if err := validateCreateProjectPath(params.Path); err != nil {
+			return nil, err
+		}
+	}
+	body := map[string]string{
+		"name":        params.Name,
+		"description": params.Description,
+	}
+	if params.DefaultBranch != "" {
+		body["default_branch"] = params.DefaultBranch
+	}
+	if params.RemoteURL != "" {
+		body["remote_url"] = params.RemoteURL
+	}
+	data, err := s.coord.Post(ctx, "/api/v1/projects", body)
+	if err != nil {
+		return nil, err
+	}
+	if msg := errorMsg(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	var result map[string]interface{}
+	_ = json.Unmarshal(data, &result)
+	pid := int64(0)
+	if idF, ok := result["id"].(float64); ok {
+		pid = int64(idF)
+	}
+	if pid > 0 && s.workspace != nil {
+		if ierr := s.EagerInitProjectClone(ctx, pid, params.Path); ierr != nil {
+			s.logger.Warn("eager workspace init failed (will retry on first task)",
+				"project_id", pid, "path", params.Path, "error", ierr)
+		}
+	}
+	return &CreateProjectResult{CoordResponse: data, ProjectID: pid}, nil
+}
+
+// validateCreateProjectPath enforces the same rules
+// mcphandlers.handleCreateProject does:
+//
+//   - absolute path required
+//   - no symlinks (Lstat — silently following would dual-root
+//     the working tree if the link target is empty, or be a
+//     confusing "not empty" error if populated)
+//   - must be empty or non-existent (populated dirs go through
+//     enju_init, not create_project)
+//   - parent directories created on the empty path so the
+//     fat-client's EagerInitProjectClone has somewhere to land
+func validateCreateProjectPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("path must be absolute, got %q", path)
+	}
+	info, lstatErr := os.Lstat(path)
+	switch {
+	case lstatErr == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path %q is a symlink — pass a real directory path. If you intended the link target, resolve it with `readlink -f` and pass that instead", path)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("path %q exists but is not a directory", path)
+		}
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
+			return fmt.Errorf("reading %q: %w", path, readErr)
+		}
+		if len(entries) > 0 {
+			return fmt.Errorf("path %q exists and is not empty — create_project requires an empty or non-existent directory. To adopt a populated folder, use enju_init via MCP", path)
+		}
+	case os.IsNotExist(lstatErr):
+		// Will be created by MkdirAll below.
+	default:
+		return fmt.Errorf("checking path %q: %w", path, lstatErr)
+	}
+	if mkErr := os.MkdirAll(path, 0755); mkErr != nil {
+		return fmt.Errorf("creating %q: %w", path, mkErr)
+	}
+	return nil
+}
+
 // EagerInitProjectClone materializes the local workspace clone for
 // a freshly-created project. Two paths:
 //

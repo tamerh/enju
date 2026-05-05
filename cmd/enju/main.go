@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +44,8 @@ func main() {
 		cmdInbox(os.Args[2:])
 	case "review":
 		cmdReview(os.Args[2:])
+	case "bot":
+		cmdBot(os.Args[2:])
 	case "version":
 		fmt.Println("enju v0.1.0-dev")
 	default:
@@ -61,6 +64,7 @@ Usage:
  enju ui     Start the web UI (browser, peer to enju mcp)
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
+ enju bot    Bot lifecycle (setup, run, status — see 'enju bot')
  enju wrap-task Run a compute task's script + commit (internal)
  enju version  Print version
 
@@ -294,7 +298,20 @@ func cmdMCP(args []string) {
 	// true: local mode is normally a single-user dev path
 	// where the kill-switch isn't load-bearing.
 	localEventsEnabled := fs.Bool("events-enabled", true, "Local-mode only: enable the embedded coordinator's event store at boot")
+	allowTools := fs.String("allow-tools", "", "Comma-separated MCP tool allowlist (e.g. \"enju_get_task,enju_submit_result\"). When set, the LLM only sees these tools — used by the bot runner to pin a per-bot toolbox at process boundary. Empty = all tools (default; matches existing behavior).")
 	fs.Parse(args)
+
+	// Split the allowlist on commas, trim whitespace, drop
+	// empties. Resulting slice (possibly nil/empty) flows to
+	// mcphandlers.Config.AllowTools where empty means "all".
+	var allowedTools []string
+	if *allowTools != "" {
+		for _, name := range strings.Split(*allowTools, ",") {
+			if t := strings.TrimSpace(name); t != "" {
+				allowedTools = append(allowedTools, t)
+			}
+		}
+	}
 
 	resolvedCredsPath := resolveCredentialsPath(*credsPath)
 
@@ -432,7 +449,8 @@ func cmdMCP(args []string) {
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)
 		},
-		Notify: notifyOpts,
+		Notify:   notifyOpts,
+		AllowTools: allowedTools,
 	})
 
 	fmt.Fprintf(os.Stderr, "MCP server starting (stdio mode)...\n")
