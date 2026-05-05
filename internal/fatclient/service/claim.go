@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,15 +79,18 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	if s.workspace == nil {
 		return "", true, fmt.Errorf("no workspace configured")
 	}
-	// Reading a known commit doesn't need the coord-side
-	// metadata that OpenProject fetches (remote_url, name,
-	// default_branch). For projects already opened or
-	// registered as adopted external dirs, ForProject with an
-	// empty remoteURL resolves the existing clone — no HTTP
-	// hop required, and the read works against any commit
-	// reachable in the local refs.
-	proj, perr := s.workspace.ForProject(projectID, "")
+	// Read-only: resolve the existing on-disk clone via
+	// OpenExisting. Critically NOT ForProject(id, "") — that
+	// path falls into a clone/init branch when the computed
+	// numeric directory doesn't match the actual slug-form
+	// clone on disk, silently creating an orphan empty repo
+	// at "{rootDir}/{id}" that outranks the real clone in
+	// subsequent lookups.
+	proj, perr := s.workspace.OpenExisting(projectID)
 	if perr != nil {
+		if errors.Is(perr, workspace.ErrCloneNotFound) {
+			return "", false, nil
+		}
 		return "", true, fmt.Errorf("open project clone: %w", perr)
 	}
 	repoPath := resultDir + "/result.md"

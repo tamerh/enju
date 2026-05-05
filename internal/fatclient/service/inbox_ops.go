@@ -10,6 +10,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -40,12 +41,20 @@ func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username st
 		return &InboxResult{ProjectClonePresent: false}, nil
 	}
 
-	remoteURL, projName, _, err := s.FetchProjectMetaExpanded(ctx, projectID)
+	// Read-only: use OpenExisting to resolve the on-disk
+	// clone via findProjectDir's slug-then-numeric lookup.
+	// Avoids the latent ForProject bug where a coord-side
+	// project rename would have ForProject(id, newName)
+	// compute a fresh slug path that doesn't exist, fall into
+	// the clone-from-remote branch, and create a second
+	// clone with a different slug suffix. The inbox
+	// projection only reads (live.jsonl + git tree at
+	// committed SHAs) — it has no business creating clones.
+	proj, err := s.workspace.OpenExisting(projectID)
 	if err != nil {
-		return nil, err
-	}
-	proj, err := s.workspace.ForProject(projectID, remoteURL, projName)
-	if err != nil {
+		if errors.Is(err, workspace.ErrCloneNotFound) {
+			return &InboxResult{ProjectClonePresent: false}, nil
+		}
 		return nil, fmt.Errorf("opening project clone: %w", err)
 	}
 

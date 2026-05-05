@@ -179,6 +179,13 @@ func (ws *Workspace) ProjectDir(projectID int64) string {
 // checking both the slug-based ("{slug}-{id}") and legacy numeric
 // ("{id}") naming conventions. Returns empty string if no clone
 // exists. This is used by callers that don't know the project name.
+//
+// Tie-break: prefer slug-form when both exist. The numeric form is
+// legacy plus a known accidental-init shape (a buggy read-only
+// caller using ForProject(id, "") could create an empty
+// "{rootDir}/{id}" stub). Alphabetical os.ReadDir order would
+// otherwise return the numeric stub before the real slug clone.
+// Two-pass: collect both candidates, return slug if present.
 func (ws *Workspace) findProjectDir(projectID int64) string {
 	suffix := fmt.Sprintf("-%d", projectID)
 	numericName := fmt.Sprintf("%d", projectID)
@@ -186,20 +193,28 @@ func (ws *Workspace) findProjectDir(projectID int64) string {
 	if err != nil {
 		return ""
 	}
+	var slugMatch, numericMatch string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		// Match "{slug}-{id}" or plain "{id}".
-		if name == numericName || strings.HasSuffix(name, suffix) {
-			gitDir := filepath.Join(ws.rootDir, name, ".git")
-			if st, err := os.Stat(gitDir); err == nil && st.IsDir() {
-				return filepath.Join(ws.rootDir, name)
-			}
+		gitDir := filepath.Join(ws.rootDir, name, ".git")
+		st, err := os.Stat(gitDir)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		switch {
+		case name == numericName:
+			numericMatch = filepath.Join(ws.rootDir, name)
+		case strings.HasSuffix(name, suffix):
+			slugMatch = filepath.Join(ws.rootDir, name)
 		}
 	}
-	return ""
+	if slugMatch != "" {
+		return slugMatch
+	}
+	return numericMatch
 }
 
 // RegisterExternalDir tells the workspace that a given project's
@@ -332,6 +347,13 @@ func (ws *Workspace) LeaveProject(projectID int64) error {
 // projectName is optional — when provided, the on-disk directory uses
 // a human-readable "{slug}-{id}" format (e.g. "battle-test-7") instead
 // of a bare numeric id. Pass "" when the name isn't available.
+//
+// READ-ONLY callers (any path that just wants to read git data —
+// ReadResultAtCommit, BuildInbox, UI views) should call
+// OpenExisting instead. ForProject's clone/init path can
+// silently create an orphan stub when remoteURL=="" and the
+// computed numeric path doesn't match the actual slug-form
+// clone on disk; OpenExisting refuses to materialize state.
 func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName ...string) (*Project, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
@@ -398,6 +420,70 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 	ws.clients[projectID] = p
 	return p, nil
 }
+
+// OpenExisting returns a handle to an already-on-disk project
+// clone. Resolves via findProjectDir (handles slug-form,
+// numeric-form, and externally-registered paths). Returns
+// ErrCloneNotFound when no clone exists — never inits, never
+// clones.
+//
+// Use this for read-only callers (ReadResultAtCommit,
+// BuildInbox, UI views) that should fail fast rather than
+// silently materialize an empty stub. ForProject's clone-from-
+// remote path is the historical accidental-init source: when
+// remoteURL=="" and the computed numeric path doesn't match
+// the actual slug-form clone on disk, ForProject would
+// PlainInit a fresh empty repo at "{rootDir}/{id}", outranking
+// the real clone in subsequent findProjectDir scans.
+func (ws *Workspace) OpenExisting(projectID int64) (*Project, error) {
+	if projectID == 0 {
+		return nil, fmt.Errorf("projectID is required")
+	}
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if p, ok := ws.clients[projectID]; ok {
+		return p, nil
+	}
+
+	// Resolve the on-disk path: external dir wins, then
+	// findProjectDir (slug-form preferred, numeric fallback).
+	var workDir string
+	if extDir, ok := ws.externalDirs[projectID]; ok {
+		workDir = extDir
+	} else {
+		workDir = ws.findProjectDir(projectID)
+	}
+	if workDir == "" {
+		return nil, ErrCloneNotFound
+	}
+
+	// PlainOpen only — no fallback to init. If the .git dir
+	// disappeared between findProjectDir and now, that's a
+	// real I/O error worth surfacing.
+	repo, err := gogit.PlainOpen(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("open existing clone at %s: %w", workDir, err)
+	}
+	p := &Project{
+		projectID: projectID,
+		workDir:   workDir,
+		repo:      repo,
+		logger:    ws.logger,
+	}
+	lockPath := filepath.Join(ws.rootDir, fmt.Sprintf("project-%d.lock", projectID))
+	p.fileLock = flock.New(lockPath)
+	ws.clients[projectID] = p
+	return p, nil
+}
+
+// ErrCloneNotFound is returned by OpenExisting when no on-disk
+// clone exists for the given project. Distinct from a generic
+// "open failed" so read-only callers can render a friendly
+// "clone not yet materialized" message rather than treating
+// the absence as a hard error.
+var ErrCloneNotFound = fmt.Errorf("workspace: no clone exists for project")
 
 // Project is a handle to one project's local clone. All writes for
 // this project are serialized through a two-layer lock:
