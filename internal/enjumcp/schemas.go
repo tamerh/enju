@@ -1191,3 +1191,80 @@ Note: unknown model names passed to -model auto-register on first use, so explic
 		),
 	)
 }
+
+// --- Bot supervisor (Phase 4) ---
+//
+// These tools are fatclient-side: they manage local bot daemon
+// subprocesses. The coordinator never sees them — bot lifecycle
+// is fatclient-local per the design memo (project_bot_execution_architecture.md).
+
+func BotStart() mcp.Tool {
+	return mcp.NewTool("enju_bot_start",
+		mcp.WithDescription(`Start a bot daemon defined in the project's enju/bots.yaml. The fatclient forks 'enju bot run --bot=<name>' as a subprocess, captures stdout/stderr to a per-bot log file (~/.enju/bots/logs/<name>.log), and tracks the PID for graceful stop.
+
+One daemon per (machine, bot) for v1. Calling start on an already-running bot returns an error — call enju_bot_stop first if you want to restart.
+
+Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. Walking-skeleton scope: action=review and action=vote only. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.`),
+		mcp.WithString("bot",
+			mcp.Required(),
+			mcp.Description("Bot name from enju/bots.yaml"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project directory containing enju/bots.yaml. Defaults to the fatclient's current working directory."),
+		),
+		mcp.WithNumber("project_id",
+			mcp.Description("Optional project id to scope task discovery (0 / omitted = across every project the bot is a member of)"),
+		),
+	)
+}
+
+func BotStop() mcp.Tool {
+	return mcp.NewTool("enju_bot_stop",
+		mcp.WithDescription(`Gracefully stop a running bot daemon. The supervisor closes the daemon's stdin pipe, which triggers its watchStdinEOF goroutine to cancel the run loop and release any in-flight claim. Falls back to hard-kill (SIGKILL on Unix, TerminateProcess on Windows) after a 5s graceful timeout if the daemon is unresponsive.
+
+Returns an error if the named bot isn't running (or wasn't started by this fatclient session — bots started by a previous fatclient instance are orphans the operator must kill manually).`),
+		mcp.WithString("bot",
+			mcp.Required(),
+			mcp.Description("Bot name (must match a previously-started daemon)"),
+		),
+	)
+}
+
+func BotStatus() mcp.Tool {
+	return mcp.NewTool("enju_bot_status",
+		mcp.WithDescription(`List every bot daemon the fatclient is currently supervising. For each: name, PID, started_at timestamp, log file path. Use this to confirm what's running before reading logs or deciding to stop.
+
+Empty list = no bots running in this fatclient session.`),
+	)
+}
+
+func BotLogs() mcp.Tool {
+	return mcp.NewTool("enju_bot_logs",
+		mcp.WithDescription(`Tail the most recent N lines of a bot daemon's log file. Logs are append-mode across restarts so post-crash investigation can read what the bot was doing before it died. Returns the empty list when the bot was never started (no log file exists yet).`),
+		mcp.WithString("bot",
+			mcp.Required(),
+			mcp.Description("Bot name"),
+		),
+		mcp.WithNumber("lines",
+			mcp.Description("How many trailing lines to return (default 50, max 10000)"),
+		),
+	)
+}
+
+func BotStartAll() mcp.Tool {
+	return mcp.NewTool("enju_bot_start_all",
+		mcp.WithDescription(`Start every bot declared in enju/bots.yaml. Convenience for first-touch demos where the operator wants the whole fleet up in one command. Skips bots that are already running. Returns the per-bot result list.`),
+		mcp.WithString("project",
+			mcp.Description("Project directory containing enju/bots.yaml. Defaults to the fatclient's current working directory."),
+		),
+		mcp.WithNumber("project_id",
+			mcp.Description("Optional project id passed through to each daemon"),
+		),
+	)
+}
+
+func BotStopAll() mcp.Tool {
+	return mcp.NewTool("enju_bot_stop_all",
+		mcp.WithDescription(`Stop every bot the supervisor is currently tracking. Best-effort — individual stop failures are reported per-bot but don't short-circuit the loop. Useful at session end so the operator's bots don't outlive their fatclient.`),
+	)
+}

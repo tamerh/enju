@@ -199,6 +199,18 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleListModels(ctx, req)
 	case "enju_register_model":
 		return t.c.handleRegisterModel(ctx, req)
+	case "enju_bot_start":
+		return t.c.handleBotStart(ctx, req)
+	case "enju_bot_stop":
+		return t.c.handleBotStop(ctx, req)
+	case "enju_bot_status":
+		return t.c.handleBotStatus(ctx, req)
+	case "enju_bot_logs":
+		return t.c.handleBotLogs(ctx, req)
+	case "enju_bot_start_all":
+		return t.c.handleBotStartAll(ctx, req)
+	case "enju_bot_stop_all":
+		return t.c.handleBotStopAll(ctx, req)
 	default:
 		return nil, fmt.Errorf("mcpserver.TestClient: unknown tool %q", toolName)
 	}

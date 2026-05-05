@@ -319,6 +319,7 @@ func cmdBotRun(args []string) {
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
 	pollInterval := fs.Duration("poll-interval", 1*time.Second, "Floor sleep between empty polls (doubles up to --backoff-max)")
 	backoffMax := fs.Duration("backoff-max", 30*time.Second, "Max sleep between empty polls — caps the exponential backoff")
+	allowTools := fs.String("allow-tools", "", "Comma-separated MCP tool allowlist forwarded to any MCP host the daemon spawns. Defaults to the manifest's mcp_tools.allow when empty. v1 review/vote actions don't currently spawn MCP — the allowlist is declarative-only until action=contribute (Phase 2.4+).")
 	fs.Parse(args)
 
 	if *botName == "" {
@@ -397,6 +398,21 @@ func cmdBotRun(args []string) {
 
 	fmt.Fprintf(os.Stderr, "Bot %q running against %s (model=%s, project_id=%d)\n",
 		bot.Name, *coordinator, bot.Model, *projectID)
+	// Resolve the tool allowlist: --allow-tools flag wins;
+	// otherwise the manifest's mcp_tools.allow. Recording it
+	// loudly so operators see the trust-model wiring even
+	// though v1 actions don't currently spawn an MCP host
+	// for the LLM (review/vote are text-only). When Phase 2.4
+	// adds action=contribute the daemon will spawn `enju mcp
+	// --allow-tools=...` for claude code's MCP toolbox; this
+	// resolution path already feeds the right list.
+	allowList := splitAllowTools(*allowTools)
+	if len(allowList) == 0 && bot.MCPTools != nil {
+		allowList = bot.MCPTools.Allow
+	}
+	if len(allowList) > 0 {
+		fmt.Fprintf(os.Stderr, "Tool allowlist (declarative for v1 review/vote; pinned in MCP host for action=contribute): %v\n", allowList)
+	}
 	fmt.Fprintln(os.Stderr, "Walking-skeleton scope: action=review and action=vote only. Tasks with {{task.X.content}} upstream-content references will see literal placeholders (no git resolution yet — Phase 2.4+).")
 	if *once {
 		fmt.Fprintln(os.Stderr, "Single-iteration mode (--once): will exit after one claim+submit cycle (or no-work).")
@@ -468,6 +484,24 @@ func cmdBotRun(args []string) {
 		os.Exit(2)
 	}
 	fmt.Fprintln(os.Stderr, "bot daemon stopped (signal or stdin EOF received)")
+}
+
+// splitAllowTools parses the --allow-tools comma-separated
+// flag into a slice. Whitespace is trimmed, empties dropped.
+// Mirrors the parsing in cmd/enju/main.go's cmdMCP so the bot
+// daemon's flag and the MCP server's flag have identical
+// semantics.
+func splitAllowTools(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // watchStdinEOF reads os.Stdin into a discard buffer until EOF

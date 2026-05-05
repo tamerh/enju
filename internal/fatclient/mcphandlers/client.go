@@ -22,12 +22,21 @@ package mcphandlers
 import (
 	"context"
 
+	"github.com/enju-ai/enju/internal/fatclient/bots"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
 type apiClient struct {
 	fc         *service.FatClient
 	notifySess *notifySession
+
+	// supervisor is the long-lived bot daemon manager. Created
+	// at first need (lazy) so a fatclient that never starts a
+	// bot doesn't pay the os.UserHomeDir + path-resolution
+	// cost. Concurrent MCP tool calls share a single
+	// Supervisor instance so the in-memory tracking map is
+	// the authoritative state for this fatclient session.
+	supervisor *bots.Supervisor
 }
 
 // username forwards to the FatClient's coord client. Updated
@@ -71,4 +80,30 @@ func (c *apiClient) commitAuthor(ctx context.Context) (name, email string) {
 // citizenKind forwards to the FatClient's profile cache.
 func (c *apiClient) citizenKind(ctx context.Context) string {
 	return c.fc.CitizenKind(ctx)
+}
+
+// botSupervisor returns the lazily-constructed bot supervisor.
+// First call resolves ~/.enju/bots/{pids,logs} and the enju
+// binary path; subsequent calls return the cached instance.
+// Errors from NewSupervisor (no $HOME, no os.Executable) are
+// surfaced once at the call site so the MCP tool can return a
+// friendly message instead of panicking.
+//
+// Thread-safety note: this is a "first-use init" pattern not
+// guarded by a mutex. Concurrent first calls would each
+// construct a Supervisor and the last one written wins. In
+// practice MCP tool dispatch is serialized at the transport
+// layer (mcp-go's stdio handler is single-threaded per
+// connection), so the race window doesn't fire. If we ever
+// see concurrent MCP dispatch the obvious fix is sync.Once.
+func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
+	if c.supervisor != nil {
+		return c.supervisor, nil
+	}
+	s, err := bots.NewSupervisor()
+	if err != nil {
+		return nil, err
+	}
+	c.supervisor = s
+	return s, nil
 }

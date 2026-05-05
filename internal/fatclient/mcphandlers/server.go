@@ -391,6 +391,18 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleRevokeToken, true
 	case "enju_register_model":
 		return c.handleRegisterModel, true
+	case "enju_bot_start":
+		return c.handleBotStart, true
+	case "enju_bot_stop":
+		return c.handleBotStop, true
+	case "enju_bot_status":
+		return c.handleBotStatus, true
+	case "enju_bot_logs":
+		return c.handleBotLogs, true
+	case "enju_bot_start_all":
+		return c.handleBotStartAll, true
+	case "enju_bot_stop_all":
+		return c.handleBotStopAll, true
 	}
 	return nil, false
 }

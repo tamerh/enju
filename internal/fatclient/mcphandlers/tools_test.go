@@ -121,6 +121,12 @@ var allToolFactories = []struct {
 	{"enju_revoke_token", enjumcp.RevokeToken},
 	{"enju_list_models", enjumcp.ListModels},
 	{"enju_register_model", enjumcp.RegisterModel},
+	{"enju_bot_start", enjumcp.BotStart},
+	{"enju_bot_stop", enjumcp.BotStop},
+	{"enju_bot_status", enjumcp.BotStatus},
+	{"enju_bot_logs", enjumcp.BotLogs},
+	{"enju_bot_start_all", enjumcp.BotStartAll},
+	{"enju_bot_stop_all", enjumcp.BotStopAll},
 }
 
 // TestAllToolsValidShape invokes every tool-schema factory and
