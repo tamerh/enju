@@ -6,8 +6,9 @@
 // Walking-skeleton scope: action=review and action=vote only.
 // These are the LLM-friendly text-output cases that don't need
 // the git/commit machinery action=answer/contribute/compute
-// require. Phase 2.4+ will add a workspace-aware path for the
-// commit-bearing actions.
+// require. A future workspace-aware path adds per-bot worktrees
+// + claim-checkout-edit-commit-submit for the commit-bearing
+// actions.
 
 package bots
 
@@ -127,8 +128,8 @@ func (h *HTTPCoordClient) Claim(ctx context.Context, taskID, botUsername, model 
 //     system prompt is responsible for instructing the LLM to
 //     return exactly one vote option.
 //   - any other action: returns an error directing the operator
-//     to assign the task to a human until the git-aware path
-//     lands (Phase 2.4+).
+//     to assign the task to a human until the workspace-aware
+//     daemon path lands.
 //
 // commit_sha is omitted — review and vote submissions are
 // commit-less per the coord's per-action contract (see
@@ -146,7 +147,7 @@ func (h *HTTPCoordClient) Submit(ctx context.Context, task TaskInfo, response, m
 	case "vote":
 		body["option"] = strings.TrimSpace(response)
 	default:
-		return fmt.Errorf("bot daemon doesn't support action=%q yet — assign to a human or wait for git-aware bot support (Phase 2.4+)", task.Action)
+		return fmt.Errorf("bot daemon doesn't support action=%q yet — only review/vote are wired today; assign to a human, or wait for the workspace-aware daemon path that adds git/commit support", task.Action)
 	}
 	data, err := h.C.Post(ctx, "/api/v1/tasks/"+task.ID+"/result", body)
 	if err != nil {

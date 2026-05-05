@@ -114,6 +114,23 @@ func (s *Supervisor) logger() *slog.Logger {
 	return slog.Default()
 }
 
+// NewSupervisorForTest constructs a Supervisor with caller-
+// supplied EnjuExec / PIDDir / LogDir, skipping the
+// NewSupervisor()-default home-dir resolution and stale-PID
+// pruning. Test-only seam: callers in other packages can
+// build a Supervisor pointed at a fake binary without
+// reaching into unexported fields. Production code calls
+// NewSupervisor.
+func NewSupervisorForTest(enjuExec, pidDir, logDir string) *Supervisor {
+	return &Supervisor{
+		EnjuExec:        enjuExec,
+		PIDDir:          pidDir,
+		LogDir:          logDir,
+		GracefulTimeout: 500 * time.Millisecond,
+		procs:           make(map[string]*botProcess),
+	}
+}
+
 // botProcess is the supervisor's per-daemon state. Held only
 // in memory; the PID file on disk is the authoritative source
 // for tools that don't have access to the supervisor instance.
@@ -226,10 +243,11 @@ type StartParams struct {
 
 	// AllowTools, when non-empty, is forwarded to the daemon
 	// as --allow-tools=tool1,tool2,... — the daemon passes
-	// it on to the MCP host the LLM eventually talks to (in
-	// the Phase 2.4+ action=contribute path; v1 review/vote
-	// actions don't invoke MCP tools so the allowlist is
-	// declarative-only for them). Sourced from the bot's
+	// it on to the MCP host the LLM eventually talks to
+	// (once action=contribute ships and the daemon spawns
+	// claude code with MCP). Today's review/vote actions
+	// don't invoke MCP tools, so the allowlist is
+	// declarative-only for them. Sourced from the bot's
 	// manifest mcp_tools.allow at handleBotStart-time so the
 	// trust-model story (manifest declares → runner pins →
 	// audit log records) is wired end-to-end now even if the

@@ -391,14 +391,13 @@ func (r *Runner) logger() *slog.Logger {
 // strings and grade based on the prompt scaffolding alone —
 // useless for substantive review.
 //
-// For Phase 2 / walking-skeleton, the supported review/vote
+// For walking-skeleton scope, the supported review/vote
 // shapes are SELF-CONTAINED prompts (no `{{task.*.content}}`
-// dependencies). Phase 2.4+ adds the workspace-aware
-// resolution path (calls /tasks/{id}/inputs descriptor +
-// reads from git via workspace.ReadFileAtCommit) so bots can
-// review tasks with upstream dependencies. cmdBotRun's
-// startup banner advertises this so operators don't get a
-// surprise.
+// dependencies). The workspace-aware daemon path will add the
+// resolution step (calls /tasks/{id}/inputs descriptor + reads
+// from git via workspace.ReadFileAtCommit) so bots can review
+// tasks with upstream dependencies. cmdBotRun's startup
+// banner advertises this so operators don't get a surprise.
 func composeTaskPrompt(task *TaskInfo) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("[Task %s — action: %s]\n\n", task.ID, task.Action))

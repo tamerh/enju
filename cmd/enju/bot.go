@@ -309,7 +309,8 @@ func writeBotCredentials(path, coordinator, username, name, token string) error 
 // Walking-skeleton scope: action=review + action=vote only.
 // Anything else surfaces an error from the runner; operators
 // should leave non-supported tasks for humans (or wait for
-// the git-aware bot path in Phase 2.4+).
+// the workspace-aware daemon path that adds git/commit
+// support).
 func cmdBotRun(args []string) {
 	fs := flag.NewFlagSet("bot run", flag.ExitOnError)
 	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
@@ -319,7 +320,7 @@ func cmdBotRun(args []string) {
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
 	pollInterval := fs.Duration("poll-interval", 1*time.Second, "Floor sleep between empty polls (doubles up to --backoff-max)")
 	backoffMax := fs.Duration("backoff-max", 30*time.Second, "Max sleep between empty polls — caps the exponential backoff")
-	allowTools := fs.String("allow-tools", "", "Comma-separated MCP tool allowlist forwarded to any MCP host the daemon spawns. Defaults to the manifest's mcp_tools.allow when empty. v1 review/vote actions don't currently spawn MCP — the allowlist is declarative-only until action=contribute (Phase 2.4+).")
+	allowTools := fs.String("allow-tools", "", "Comma-separated MCP tool allowlist forwarded to any MCP host the daemon spawns. Defaults to the manifest's mcp_tools.allow when empty. Today's review/vote actions don't spawn an MCP host (text-in / text-out), so the allowlist is declarative-only — it'll be pinned at process boundary once action=contribute ships and the daemon spawns claude code with MCP.")
 	fs.Parse(args)
 
 	if *botName == "" {
@@ -401,9 +402,9 @@ func cmdBotRun(args []string) {
 	// Resolve the tool allowlist: --allow-tools flag wins;
 	// otherwise the manifest's mcp_tools.allow. Recording it
 	// loudly so operators see the trust-model wiring even
-	// though v1 actions don't currently spawn an MCP host
-	// for the LLM (review/vote are text-only). When Phase 2.4
-	// adds action=contribute the daemon will spawn `enju mcp
+	// though today's actions don't currently spawn an MCP
+	// host for the LLM (review/vote are text-only). Once
+	// action=contribute ships the daemon will spawn `enju mcp
 	// --allow-tools=...` for claude code's MCP toolbox; this
 	// resolution path already feeds the right list.
 	allowList := splitAllowTools(*allowTools)
@@ -413,7 +414,7 @@ func cmdBotRun(args []string) {
 	if len(allowList) > 0 {
 		fmt.Fprintf(os.Stderr, "Tool allowlist (declarative for v1 review/vote; pinned in MCP host for action=contribute): %v\n", allowList)
 	}
-	fmt.Fprintln(os.Stderr, "Walking-skeleton scope: action=review and action=vote only. Tasks with {{task.X.content}} upstream-content references will see literal placeholders (no git resolution yet — Phase 2.4+).")
+	fmt.Fprintln(os.Stderr, "Walking-skeleton scope: action=review and action=vote only. Tasks with {{task.X.content}} upstream-content references will see literal placeholders (no git resolution yet — that lands with the workspace-aware daemon path).")
 	if *once {
 		fmt.Fprintln(os.Stderr, "Single-iteration mode (--once): will exit after one claim+submit cycle (or no-work).")
 	}
