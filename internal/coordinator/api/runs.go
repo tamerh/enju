@@ -305,6 +305,53 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// terminateRunRequest is the JSON body for POST /terminate.
+// Reason is optional, capped server-side to ~500 chars.
+type terminateRunRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// handleTerminateRun is the human-pulled-the-plug endpoint:
+// moves a run to the terminal "terminated" state, cascade-skips
+// every non-terminal task, abandons every open claim. Member-
+// gated. Refuses on already-terminal runs.
+//
+// Distinct from pause (reversible) and from a fail-cascade
+// (system semantics). See store.TerminateRun for the cascade
+// contract.
+func (s *Server) handleTerminateRun(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req terminateRunRequest
+	// Body is optional — empty body means no reason. Decode
+	// errors on a non-empty body still surface as 400 so a
+	// caller can't silently send malformed JSON.
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+	}
+	resp, err := service.TerminateRun(s.store, caller, projectID, runSeq, req.Reason)
+	if err != nil {
+		switch err {
+		case service.ErrNotFound:
+			writeError(w, http.StatusNotFound, "run not found")
+		case service.ErrNotMember:
+			writeError(w, http.StatusForbidden, "not a member of this project")
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 type setCycleBudgetRequest struct {
 	Max int `json:"max"`
 }

@@ -140,11 +140,21 @@ const (
 type RunState string
 
 const (
-	RunActive  RunState = "active"
-	RunIdle   RunState = "idle"
-	RunPaused  RunState = "paused"
+	RunActive    RunState = "active"
+	RunIdle      RunState = "idle"
+	RunPaused    RunState = "paused"
 	RunCompleted RunState = "completed"
-	RunFailed  RunState = "failed"
+	RunFailed    RunState = "failed"
+	// RunTerminated is the human-pulled-the-plug terminal
+	// state. Distinct from RunFailed so audit / dashboards
+	// can distinguish "operator aborted" from "validation
+	// said no" — different signals about workflow quality.
+	// All non-terminal tasks of the run get marked
+	// TaskSkipped with skip_reason="run_terminated"; open
+	// claims close with outcome=abandoned. Topic branches
+	// stay (immutable git audit). Terminate is irreversible
+	// — distinct from pause/resume.
+	RunTerminated RunState = "terminated"
 )
 
 // IsAlive reports whether a run still owns its (project, branch)

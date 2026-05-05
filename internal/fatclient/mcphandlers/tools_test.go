@@ -77,6 +77,7 @@ var allToolFactories = []struct {
 	{"enju_execute_run", enjumcp.ExecuteRun},
 	{"enju_pause_run", enjumcp.PauseRun},
 	{"enju_resume_run", enjumcp.ResumeRun},
+	{"enju_terminate_run", enjumcp.TerminateRun},
 	{"enju_spawn_task", enjumcp.SpawnTask},
 	{"enju_request_clarification", enjumcp.RequestClarification},
 	{"enju_set_cycle_budget", enjumcp.SetCycleBudget},

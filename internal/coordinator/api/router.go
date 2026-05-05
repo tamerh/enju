@@ -143,6 +143,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}/runs/{runSeq}/events", s.handleListRunEvents)
 		r.Post("/projects/{projectID}/runs/{runSeq}/pause", s.handlePauseRun)
 		r.Post("/projects/{projectID}/runs/{runSeq}/resume", s.handleResumeRun)
+		r.Post("/projects/{projectID}/runs/{runSeq}/terminate", s.handleTerminateRun)
 		r.Post("/projects/{projectID}/runs/{runSeq}/spawn", s.handleSpawnTask)
 		r.Post("/projects/{projectID}/runs/{runSeq}/cycle_budget", s.handleSetCycleBudget)
 		// fat-client (or any merge-driving consumer)

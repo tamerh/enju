@@ -127,6 +127,17 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
+	// Refuse late-arriving submits on terminated runs. The
+	// fat-client compute that ran when terminate fired may
+	// reach this endpoint after the cascade has already
+	// skipped the task. Topic branch may exist in git, but
+	// no commit lands on main and no coord state changes —
+	// the work is honestly lost. Friendly error so the
+	// fat-client can log and stop retrying.
+	if reason, ok := s.runTerminatedRefusal(task); ok {
+		writeError(w, http.StatusConflict, reason)
+		return
+	}
 
 	// Claim validity check comes next — a submit from someone
 	// who never claimed the task has no legitimate path, and

@@ -3593,6 +3593,32 @@ func ResumeRunResult(data []byte) string {
 	return fmt.Sprintf("✓ Run %s resumed (state: %s)", resp.RunID, resp.State)
 }
 
+// TerminateRunResult renders the JSON returned by POST
+// /projects/{p}/runs/{r}/terminate. Surfaces the cascade
+// fan-out (skipped tasks + abandoned claims) so the caller
+// sees how much in-flight work just got dropped without a
+// follow-up read.
+func TerminateRunResult(data []byte) string {
+	var resp struct {
+		RunID           string `json:"run_id"`
+		State           string `json:"state"`
+		PriorState      string `json:"prior_state"`
+		SkippedTasks    int    `json:"skipped_tasks"`
+		AbandonedClaims int    `json:"abandoned_claims"`
+		Reason          string `json:"reason"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return string(data)
+	}
+	out := fmt.Sprintf("⊘ Run %s terminated (was: %s)\n", resp.RunID, resp.PriorState)
+	out += fmt.Sprintf("  %d task(s) skipped, %d open claim(s) abandoned\n", resp.SkippedTasks, resp.AbandonedClaims)
+	if resp.Reason != "" {
+		out += fmt.Sprintf("  reason: %s\n", resp.Reason)
+	}
+	out += "  topic branches preserved in git; late-arriving submits will be refused"
+	return out
+}
+
 // BotList renders the JSON returned by GET /citizens/me/bots
 // (and the equivalent native MCP handler). Empty list returns
 // the friendly bootstrap hint pointing at enju_register_bot.

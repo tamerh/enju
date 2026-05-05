@@ -106,6 +106,33 @@ func (c *apiClient) handlePauseRun(ctx context.Context, req mcp.CallToolRequest)
 	return mcp.NewToolResultText(format.PauseRunResult(data)), nil
 }
 
+// handleTerminateRun is the human-pulled-the-plug operation.
+// Thin pass-through to POST
+// /projects/{id}/runs/{seq}/terminate. The schema description
+// covers what terminate means and its limitations.
+func (c *apiClient) handleTerminateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	runID, err := req.RequireInt("run_id")
+	if err != nil {
+		return mcp.NewToolResultError("run_id is required"), nil
+	}
+	body := map[string]string{}
+	if reason := req.GetString("reason", ""); reason != "" {
+		body["reason"] = reason
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/terminate", projectID, runID), body)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if msg := errorFromResponse(data); msg != "" {
+		return mcp.NewToolResultError(msg), nil
+	}
+	return mcp.NewToolResultText(format.TerminateRunResult(data)), nil
+}
+
 // handleResumeRun lifts a paused run back to active or idle.
 // Lands on idle when no ready work exists, active when ready
 // tasks are present; the response carries the resolved state.

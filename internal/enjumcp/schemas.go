@@ -887,6 +887,33 @@ func ResumeRun() mcp.Tool {
 	)
 }
 
+func TerminateRun() mcp.Tool {
+	return mcp.NewTool("enju_terminate_run",
+		mcp.WithDescription(`Irreversibly abandon a run. Use when a run is structurally stuck (bot looping on request_changes, requirements changed mid-run, design flaw discovered) and continuing isn't the answer — pause is reversible, terminate is not.
+
+Effect: run state moves to "terminated"; every non-terminal task in the run is cascade-marked "skipped" with skip_reason="run_terminated"; every open claim closes with outcome="abandoned". Topic branches stay in git (immutable audit). Late-arriving submits — compute that was running when terminate fired — are refused at the coordinator with a clear error; the work is honestly lost.
+
+Distinct from pause/resume (reversible) and from a fail cascade (system-said-no semantics). The audit signal is "operator aborted" not "validation failed" — different stories for dashboards.
+
+Limitations to be honest about:
+  - In-flight compute on this or other machines may run for up to one notify-poll-interval (~30s) after terminate before its fat-client receives the event and kills it. Bounded waste, no correctness loss — the late submit is refused.
+  - No cross-machine kill primitive: the coordinator can't reach into other citizens' machines. Each fat-client cleans up its own local processes when it sees the run_terminated event. If a citizen's MCP isn't running, their compute keeps going until natural exit, then submit is refused.
+
+Refused on already-terminal runs (completed / failed / terminated). Pause→terminate IS valid; a paused run rolls forward into terminated cleanly.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project containing the run"),
+		),
+		mcp.WithNumber("run_id",
+			mcp.Required(),
+			mcp.Description("The run sequence number within the project"),
+		),
+		mcp.WithString("reason",
+			mcp.Description(`Optional free-text explanation, capped at 500 chars (longer strings are silently truncated). Lands verbatim in the run_terminated event metadata for audit. Examples: "bot stuck in request_changes loop on review:gate", "requirements changed after kickoff", "design flaw — restarting with the new template".`),
+		),
+	)
+}
+
 func SetProjectDefaultBranch() mcp.Tool {
 	return mcp.NewTool("enju_set_project_default_branch",
 		mcp.WithDescription(`Change a project's default branch. Owner-only. The default is where new runs land when enju_create_run is called without an explicit branch=. Use this to move a project's Enju activity off "main" onto e.g. "enju/work" so repo main stays human-curated. Existing runs are unaffected — they stay on the branch they were created with.`),

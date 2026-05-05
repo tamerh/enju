@@ -110,3 +110,85 @@ func ResumeRun(s store.CoordinatorStore, caller *store.CitizenRecord, projectID 
 		State:  state,
 	}, nil
 }
+
+// reasonMaxLen caps the reason field on TerminateRun. The
+// reason is operator-supplied free text (often LLM-generated)
+// that lands verbatim in the run_terminated event metadata.
+// Bounding at ~500 chars keeps the event log from bloating on
+// a too-eager assistant while still leaving room for an honest
+// paragraph of explanation.
+const reasonMaxLen = 500
+
+// TerminateRunResponse is the wire shape for enju_terminate_run /
+// POST /projects/{p}/runs/{r}/terminate. SkippedTasks +
+// AbandonedClaims surface the cascade fan-out so the caller can
+// audit "how much in-flight work just got dropped" without a
+// follow-up read.
+type TerminateRunResponse struct {
+	Status          string `json:"status"` // "terminated"
+	RunID           string `json:"run_id"` // "{project}:{seq}"
+	State           string `json:"state"`  // current run state ("terminated")
+	PriorState      string `json:"prior_state"`
+	SkippedTasks    int    `json:"skipped_tasks"`
+	AbandonedClaims int    `json:"abandoned_claims"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+// TerminateRun is the human-pulled-the-plug operation. Membership-
+// gated through the run's parent project. Refuses on already-
+// terminal runs. Pause→terminate IS valid (paused is a
+// non-terminal state).
+//
+// Reason is optional, capped to reasonMaxLen bytes; longer
+// strings are silently truncated rather than rejected so the
+// caller doesn't have to count bytes — the operator's intent
+// to abandon is what matters, not the exact prose length.
+//
+// Cascade behavior is documented on the store-side TerminateRun
+// mutation: non-terminal tasks → skipped, open claims →
+// abandoned, topic branches untouched, single run_terminated
+// event emitted.
+func TerminateRun(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, runSeq int, reason string) (*TerminateRunResponse, error) {
+	run, err := s.GetRunByProjectSeq(projectID, runSeq)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil {
+		return nil, ErrNotFound
+	}
+	if !CanReadProject(s, projectID, caller.ID) {
+		return nil, ErrNotMember
+	}
+	if len(reason) > reasonMaxLen {
+		reason = reason[:reasonMaxLen]
+	}
+	priorState := string(run.State)
+	// applyTerminateRun populates result.SkippedTasks +
+	// result.AbandonedClaims atomically with the cascade UPDATEs;
+	// reading them off ApplyResult avoids racing the async event
+	// writer for the same numbers (and the ambiguous 0,0 we'd
+	// have to live with if the metadata wasn't yet visible).
+	result, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.TerminateRun{RunID: run.ID, CitizenID: caller.ID, Reason: reason},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	updated, _ := s.GetRun(run.ID)
+	state := ""
+	if updated != nil {
+		state = string(updated.State)
+	}
+	return &TerminateRunResponse{
+		Status:          "terminated",
+		RunID:           fmt.Sprintf("%d:%d", projectID, runSeq),
+		State:           state,
+		PriorState:      priorState,
+		SkippedTasks:    result.SkippedTasks,
+		AbandonedClaims: result.AbandonedClaims,
+		Reason:          reason,
+	}, nil
+}

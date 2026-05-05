@@ -118,6 +118,15 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireProjectMembershipForTask(w, r, taskID); !ok {
 		return
 	}
+	// Refuse claims on terminated runs. Same reasoning as
+	// late-submit refusal — terminate is irreversible and the
+	// task has already been cascade-skipped.
+	if task, _ := s.store.GetTask(taskID); task != nil {
+		if reason, ok := s.runTerminatedRefusal(task); ok {
+			writeError(w, http.StatusConflict, reason)
+			return
+		}
+	}
 
 	resp, err := service.ClaimTask(s.store, s.logger, taskID, service.ClaimTaskParams{
 		Username: req.Username,

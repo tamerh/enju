@@ -260,6 +260,8 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handlePauseRun, true
 	case "enju_resume_run":
 		return c.handleResumeRun, true
+	case "enju_terminate_run":
+		return c.handleTerminateRun, true
 	case "enju_set_cycle_budget":
 		return c.handleSetCycleBudget, true
 	case "enju_spawn_task":

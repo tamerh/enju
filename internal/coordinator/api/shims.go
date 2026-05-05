@@ -1,6 +1,8 @@
 package api
 
 import (
+	"fmt"
+
 	"github.com/enju-ai/enju/internal/common/dag"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -169,4 +171,36 @@ func (s *Server) performSkipCascade(task *store.TaskRecord, winningOptionID stri
 		WinningOption: out.WinningOption,
 		Skipped:    out.Skipped,
 	}, nil
+}
+
+// runTerminatedRefusal returns (message, true) when the task's
+// parent run was terminated — the caller (claim or submit
+// handler) should refuse the request with that message.
+// Returns ("", false) otherwise.
+//
+// Hot-path performance note: we key off the task fields the
+// terminate cascade ALREADY set in the same transaction —
+// task.State == TaskSkipped && task.SkipReason ==
+// "run_terminated" — instead of adding a per-request GetRun
+// lookup. applyTerminateRun atomically updates the run row,
+// every non-terminal task's (state, skip_reason), and every
+// open claim's outcome inside one tx; checking the task fields
+// is equivalent to reading the run state, with one fewer DB
+// hit per legitimate claim/submit.
+//
+// Caveat the task-field check buys us: it ONLY catches "this
+// task was cascade-skipped by terminate." It would miss a
+// terminate that didn't cascade-touch the task (already in a
+// terminal state pre-terminate). Those tasks are already
+// terminal — the existing terminal-task guard refuses them
+// with a different message. So the post-terminate refusal
+// surface is fully covered between the two checks.
+func (s *Server) runTerminatedRefusal(task *store.TaskRecord) (string, bool) {
+	if task.State == store.TaskSkipped && task.SkipReason == "run_terminated" {
+		return fmt.Sprintf(
+			"task %s belongs to a terminated run — submission rejected (operator aborted the run; topic branch may exist in git but no commit will land on main)",
+			task.ID,
+		), true
+	}
+	return "", false
 }

@@ -96,6 +96,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handlePauseRun(ctx, req)
 	case "enju_resume_run":
 		return t.c.handleResumeRun(ctx, req)
+	case "enju_terminate_run":
+		return t.c.handleTerminateRun(ctx, req)
 	case "enju_spawn_task":
 		return t.c.handleSpawnTask(ctx, req)
 	case "enju_request_clarification":

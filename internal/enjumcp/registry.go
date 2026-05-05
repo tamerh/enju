@@ -26,6 +26,7 @@ var Registry = []mcp.Tool{
 	RunStatus(),
 	PauseRun(),
 	ResumeRun(),
+	TerminateRun(),
 	SpawnTask(),
 	RequestClarification(),
 	SetCycleBudget(),

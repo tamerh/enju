@@ -386,6 +386,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case TerminateRun:
+			if err := applyTerminateRun(tx, m, &result, sink); err != nil {
+				return result, err
+			}
+
 		case CreateIssue:
 			id, seq, err := applyCreateIssue(tx, m, sink)
 			if err != nil {
@@ -503,7 +508,15 @@ type ApplyResult struct {
 	// per-task data (assign_to, action, parents) read this.
 	ReadiedTasks []ReadiedTask
 	RunCompleted bool
-	Changed      int // generic "rows affected" counter
+	// SkippedTasks and AbandonedClaims are populated by
+	// applyTerminateRun. The service layer reads these directly
+	// from the result so it can render them in the response
+	// without re-querying the event log (which would race with
+	// the async event writer and ambiguously report 0,0 if the
+	// metadata isn't yet visible).
+	SkippedTasks    int
+	AbandonedClaims int
+	Changed         int // generic "rows affected" counter
 }
 
 // --- Per-mutation apply functions ---
@@ -1865,9 +1878,14 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Paused / failed runs don't auto-transition.
-	if current == string(RunPaused) || current == string(RunFailed) {
-		sink.SkipEvents("complete_run no-op: run is paused/failed, no auto-transition")
+	// Paused / failed / terminated runs don't auto-transition.
+	// Terminate is irreversible — a stale CompleteRun mutation
+	// firing afterward (e.g. from a plan composed before the
+	// terminate) must NOT walk task counts and silently flip a
+	// terminated run to completed. Terminated belongs in this
+	// guard for the same reason failed does.
+	if current == string(RunPaused) || current == string(RunFailed) || current == string(RunTerminated) {
+		sink.SkipEvents("complete_run no-op: run is paused/failed/terminated, no auto-transition")
 		return false, nil
 	}
 
@@ -2158,7 +2176,7 @@ func applySpawnTask(tx *sql.Tx, m SpawnTask, sink EventSink) (string, bool, erro
 	}
 
 	switch RunState(runState) {
-	case RunCompleted, RunFailed:
+	case RunCompleted, RunFailed, RunTerminated:
 		return "", false, fmt.Errorf("run %d is %s — cannot spawn into a terminal run", spec.RunID, runState)
 	case RunPaused:
 		return "", false, fmt.Errorf("run %d is paused — resume it first with enju_resume_run", spec.RunID)
@@ -2551,7 +2569,7 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 		return err
 	}
 	switch RunState(current) {
-	case RunCompleted, RunFailed:
+	case RunCompleted, RunFailed, RunTerminated:
 		return fmt.Errorf("run %d is %s — cannot resume a terminal run", m.RunID, current)
 	case RunActive, RunIdle:
 		// Idempotent: already non-paused, nothing to lift.
@@ -2576,6 +2594,115 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 		ProjectID:    projectID,
 		Metadata:     MarshalMetadata(map[string]any{"from": "paused", "to": "active"}),
 		CreatedAt:    now,
+	})
+	return nil
+}
+
+// applyTerminateRun is the human-pulled-the-plug operation.
+// Atomic in one transaction:
+//
+//  1. Read current run state. Refuse if already terminal
+//     (completed/failed/terminated). Pause→terminate IS valid;
+//     active|idle|paused all roll forward.
+//  2. UPDATE run state → 'terminated'.
+//  3. UPDATE every non-terminal task in the run → state='skipped',
+//     skip_reason='run_terminated'. Counts the affected rows for
+//     the event metadata.
+//  4. UPDATE every open claim (outcome IS NULL) on tasks of this
+//     run → outcome='abandoned', completed_at=now.
+//  5. Emit one run_terminated event with operator + reason +
+//     prior state + counts of skipped tasks / abandoned claims.
+//
+// Topic branches stay (no git work). Late-arriving submits are
+// refused at the submit handler — see the run-state guard there.
+func applyTerminateRun(tx *sql.Tx, m TerminateRun, result *ApplyResult, sink EventSink) error {
+	var current string
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT state, project_id FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID); err != nil {
+		return err
+	}
+	switch RunState(current) {
+	case RunCompleted, RunFailed, RunTerminated:
+		return fmt.Errorf("run %d is %s — cannot terminate a terminal run", m.RunID, current)
+	}
+	now := time.Now()
+
+	// 1. Run state → terminated.
+	res, err := tx.Exec(
+		`UPDATE runs SET state = 'terminated', updated_at = ?
+		 WHERE id = ? AND state IN ('active', 'idle', 'paused')`,
+		now, m.RunID,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("run %d cannot be terminated (already terminal or not found)", m.RunID)
+	}
+
+	// 2. Non-terminal tasks → skipped with run_terminated reason.
+	// "Terminal" task states are the ones the cascade leaves alone:
+	// already-accepted work stays accepted, already-failed stays
+	// failed, etc. Everything else (pending, ready, claimed,
+	// running, submitted, collecting, parked) flips to skipped.
+	taskRes, err := tx.Exec(
+		`UPDATE tasks SET state = 'skipped', skip_reason = 'run_terminated'
+		 WHERE run_id = ? AND state NOT IN
+		 ('accepted', 'rejected', 'invalid', 'invalidated', 'skipped', 'failed')`,
+		m.RunID,
+	)
+	if err != nil {
+		return fmt.Errorf("skipping non-terminal tasks: %w", err)
+	}
+	skippedTasks, _ := taskRes.RowsAffected()
+
+	// 3. Open claims → outcome='abandoned'.
+	// JOIN through tasks to scope by run_id. The schema has no
+	// per-claim completion timestamp; outcome alone marks the
+	// row closed (abandoned matches what cascade-skip already
+	// uses elsewhere — see applyMarkOpenClaimsInvalidated).
+	claimRes, err := tx.Exec(
+		`UPDATE task_claims SET outcome = 'abandoned'
+		 WHERE outcome IS NULL
+		 AND task_id IN (SELECT id FROM tasks WHERE run_id = ?)`,
+		m.RunID,
+	)
+	if err != nil {
+		return fmt.Errorf("abandoning open claims: %w", err)
+	}
+	abandonedClaims, _ := claimRes.RowsAffected()
+	result.SkippedTasks = int(skippedTasks)
+	result.AbandonedClaims = int(abandonedClaims)
+
+	// 4. Emit ONE coarse-grained run_terminated event. We
+	// deliberately do NOT emit per-task task_skipped events for
+	// the cascade. Terminate is the human-pulled-the-plug
+	// operation; flooding the event log with N task_skipped
+	// rows would conflate "operator aborted everything in one
+	// stroke" with "this specific task was skipped because its
+	// upstream rejected" — they're different signals to the
+	// inbox/audit consumers. Counts of skipped tasks and
+	// abandoned claims ride in this event's metadata so
+	// downstream still has the totals.
+	//
+	// Reason capping is the service layer's job; if a too-long
+	// reason slips through it'll be persisted as-is.
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "run_terminated",
+		EventSubtype: current,
+		RunID:        m.RunID,
+		ProjectID:    projectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"from":             current,
+			"to":               "terminated",
+			"reason":           m.Reason,
+			"skipped_tasks":    skippedTasks,
+			"abandoned_claims": abandonedClaims,
+		}),
+		CreatedAt: now,
 	})
 	return nil
 }

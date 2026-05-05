@@ -205,6 +205,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutResumeRun:
 		var m ResumeRun
 		return m, json.Unmarshal(data, &m)
+	case MutTerminateRun:
+		var m TerminateRun
+		return m, json.Unmarshal(data, &m)
 	case MutCreateIssue:
 		var m CreateIssue
 		return m, json.Unmarshal(data, &m)
@@ -275,8 +278,9 @@ const (
 	MutMarkOpenClaimsInvalidated MutationKind = "mark_open_claims_invalidated"
 	MutMarkLatestClaimOutcome    MutationKind = "mark_latest_claim_outcome"
 
-	MutPauseRun  MutationKind = "pause_run"
-	MutResumeRun MutationKind = "resume_run"
+	MutPauseRun     MutationKind = "pause_run"
+	MutResumeRun    MutationKind = "resume_run"
+	MutTerminateRun MutationKind = "terminate_run"
 
 	MutCreateIssue         MutationKind = "create_issue"
 	MutTriageIssue         MutationKind = "triage_issue"
@@ -328,6 +332,7 @@ var AllMutationKinds = []MutationKind{
 	MutMarkLatestClaimOutcome,
 	MutPauseRun,
 	MutResumeRun,
+	MutTerminateRun,
 	MutCreateIssue,
 	MutTriageIssue,
 	MutMarkIssueInProgress,
@@ -678,6 +683,28 @@ type ResumeRun struct {
 }
 
 func (ResumeRun) mutationKind() MutationKind { return MutResumeRun }
+
+// TerminateRun is the human-pulled-the-plug operation: moves a
+// run to the terminal "terminated" state, cascade-skips every
+// non-terminal task with skip_reason="run_terminated", and
+// closes every open claim with outcome=abandoned. Topic
+// branches stay (immutable git audit). Refuses if the run is
+// already terminal. Reason is optional, capped to ReasonMaxLen
+// bytes by the service layer before reaching this mutation.
+//
+// Distinct from PauseRun (reversible, no task cascade) and
+// FailRun (system-said-no semantics). Use this when an operator
+// gives up on a run before natural completion — bot stuck in a
+// request_changes loop, requirements changed mid-run, design
+// flaw discovered. Audit signals "operator aborted" rather than
+// "validation failed" — different workflow-quality stories.
+type TerminateRun struct {
+	RunID     int64
+	CitizenID int64
+	Reason    string
+}
+
+func (TerminateRun) mutationKind() MutationKind { return MutTerminateRun }
 
 // CreateIssue inserts a new issue. Returns the new issue's
 // (id, seq) via ApplyResult.IssueID and ApplyResult.IssueSeq.
