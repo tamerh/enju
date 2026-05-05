@@ -1,26 +1,14 @@
 package service
 
 import (
-	"time"
-
+	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
-// IterationResponse is the wire shape for one iteration of a
-// task (one row in task_claims). Used by REST + MCP. JSON tags
-// are load-bearing — format.IterationList consumes them.
-type IterationResponse struct {
-	Seq            int    `json:"seq"`
-	Citizen        string `json:"citizen"`
-	Outcome        string `json:"outcome"`
-	ClaimedAt      string `json:"claimed_at"`
-	SubmittedAt    string `json:"submitted_at,omitempty"`
-	CommitSHA      string `json:"commit_sha,omitempty"`
-	Branch         string `json:"branch,omitempty"`
-	ReviewDecision string `json:"review_decision,omitempty"`
-	Option         string `json:"option,omitempty"`
-	Model          string `json:"model,omitempty"`
-}
+// IterationResponse is an alias for wire.Iteration — the shared
+// JSON shape. Existing call sites stay readable; rename to
+// wire.Iteration on touch.
+type IterationResponse = wire.Iteration
 
 // ListTaskIterations returns the iteration history for one
 // task, gated through the task's parent project. Returns
@@ -53,7 +41,7 @@ func ListTaskIterations(s store.CoordinatorStore, caller *store.CitizenRecord, t
 		row := IterationResponse{
 			Seq:            it.Seq,
 			Citizen:        it.Username,
-			ClaimedAt:      it.ClaimedAt.UTC().Format(time.RFC3339),
+			ClaimedAt:      it.ClaimedAt.UTC(),
 			CommitSHA:      it.CommitSHA,
 			Branch:         it.Branch,
 			ReviewDecision: string(it.ReviewDecision),
@@ -65,7 +53,8 @@ func ListTaskIterations(s store.CoordinatorStore, caller *store.CitizenRecord, t
 			row.Outcome = string(it.Outcome)
 		}
 		if it.SubmittedAt != nil {
-			row.SubmittedAt = it.SubmittedAt.UTC().Format(time.RFC3339)
+			t := it.SubmittedAt.UTC()
+			row.SubmittedAt = &t
 		}
 		if it.ModelID != nil {
 			row.Model = CitizenUsername(s, *it.ModelID)

@@ -21,6 +21,111 @@ type ClaimParams struct {
 	IncludeContext bool // false = skip inputs + review-feedback + previous-submission
 }
 
+// ReadTaskResult reads the rendered result.md for a task at
+// its current CommitSHA. Used by surfaces that want to show
+// "what was submitted" — the web UI's task detail page,
+// future export-style views.
+//
+// Returns ("", false, nil) when the task hasn't reached a
+// state with a recorded commit (state=ready, claimed without
+// completion, etc.). Returns ("", true, error) on a real I/O
+// failure (project clone unreachable, git read failed). The
+// (string, found, error) shape lets callers distinguish
+// "no submission yet" from "submission exists but unreadable."
+//
+// Reads via ReadFileAtCommit at the task's CommitSHA — the
+// content lives in git, not on the coordinator. ResultDir
+// (computed coord-side at task creation) is stitched with
+// "result.md" to form the repo-relative path.
+func (s *FatClient) ReadTaskResult(ctx context.Context, taskID string) (content string, found bool, err error) {
+	meta, err := s.FetchTaskMeta(ctx, taskID)
+	if err != nil {
+		return "", false, err
+	}
+	if meta == nil || meta.CommitSHA == "" {
+		return "", false, nil
+	}
+	if meta.ResultDir == "" {
+		// Fallback for legacy rows without coord-computed
+		// ResultDir: compose from runSeq/slug/taskDefID. Best-
+		// effort; if it doesn't match the actual commit tree we
+		// just return found=false.
+		return "", false, nil
+	}
+	return s.ReadResultAtCommit(ctx, meta.ProjectID, meta.CommitSHA, meta.ResultDir)
+}
+
+// ReadResultAtCommit reads {resultDir}/result.md from the
+// project's local clone at the given commit SHA. Generic over
+// any (commit, dir) pair so callers can iterate a task's
+// history (each iteration row carries its own commit + the
+// task's stable ResultDir) rather than seeing only the latest.
+//
+// Returns (content, true, nil) on hit, ("", false, nil) when
+// the file isn't in the tree at that commit, ("", true, error)
+// on a real I/O failure (project clone unreachable, git read
+// failed). The (string, found, error) shape lets callers
+// distinguish "no submission for this iter" from "git read
+// broke."
+//
+// The caller supplies resultDir directly because it lives on
+// the task (TaskMeta.ResultDir), not on the iteration —
+// iterations differ in commit_sha, not in result-dir layout.
+func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, commitSHA, resultDir string) (string, bool, error) {
+	if commitSHA == "" || resultDir == "" {
+		return "", false, nil
+	}
+	if s.workspace == nil {
+		return "", true, fmt.Errorf("no workspace configured")
+	}
+	// Reading a known commit doesn't need the coord-side
+	// metadata that OpenProject fetches (remote_url, name,
+	// default_branch). For projects already opened or
+	// registered as adopted external dirs, ForProject with an
+	// empty remoteURL resolves the existing clone — no HTTP
+	// hop required, and the read works against any commit
+	// reachable in the local refs.
+	proj, perr := s.workspace.ForProject(projectID, "")
+	if perr != nil {
+		return "", true, fmt.Errorf("open project clone: %w", perr)
+	}
+	repoPath := resultDir + "/result.md"
+	data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)
+	if rerr != nil {
+		return "", true, fmt.Errorf("read at commit: %w", rerr)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return string(data), true, nil
+}
+
+// ReleaseTask hands a claimed task back to the queue. Coord
+// flips state CLAIMED → READY and clears the claim row. Used
+// by the web UI's Release button and the MCP enju_release_task
+// tool. Username is read from the coord client.
+//
+// Idempotent at the coord layer: releasing an already-released
+// task is a no-op response, not an error. This is intentional
+// — UI double-click ergonomics shouldn't surface as a 4xx.
+func (s *FatClient) ReleaseTask(ctx context.Context, taskID string) error {
+	if taskID == "" {
+		return fmt.Errorf("task_id is required")
+	}
+	data, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/release",
+		map[string]string{"username": s.coord.Username()})
+	if err != nil {
+		return err
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) == nil {
+		if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+			return fmt.Errorf("%s", errMsg)
+		}
+	}
+	return nil
+}
+
 // ClaimResult bundles every byte slice the format.ClaimResult
 // renderer wants. Each field can be nil — the formatter omits
 // the corresponding section. Lean-mode (IncludeContext=false)

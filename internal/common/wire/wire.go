@@ -88,3 +88,25 @@ type Member struct {
 	AddedAt  time.Time `json:"added_at"`
 	AddedBy  string    `json:"added_by,omitempty"`
 }
+
+// Iteration is the JSON shape for one iteration of a task —
+// one row in task_claims. Used by the iterations endpoint
+// (GET /api/v1/tasks/{id}/iterations) and consumed by both
+// the format renderer and the web UI's task-history panel.
+type Iteration struct {
+	Seq            int        `json:"seq"`
+	Citizen        string     `json:"citizen"`
+	Outcome        string     `json:"outcome"`
+	ClaimedAt      time.Time  `json:"claimed_at"`
+	// SubmittedAt is a pointer so omitempty actually drops it
+	// from the wire when the iteration is still open.
+	// time.Time's zero value would otherwise marshal as
+	// "0001-01-01T00:00:00Z" — a wire regression vs the
+	// previous string-with-omitempty shape.
+	SubmittedAt    *time.Time `json:"submitted_at,omitempty"`
+	CommitSHA      string     `json:"commit_sha,omitempty"`
+	Branch         string     `json:"branch,omitempty"`
+	ReviewDecision string     `json:"review_decision,omitempty"`
+	Option         string     `json:"option,omitempty"`
+	Model          string     `json:"model,omitempty"`
+}
