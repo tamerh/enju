@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/bots"
 )
@@ -115,6 +117,35 @@ func TestWriteBotCredentials_RoundTrip(t *testing.T) {
 	}
 	if mode := st.Mode().Perm(); mode != 0600 {
 		t.Errorf("credentials file mode: got %o, want 0600", mode)
+	}
+}
+
+func TestWatchStdinEOF_TriggersOnEOF(t *testing.T) {
+	// bytes.Reader hits EOF immediately (zero-length input).
+	// watchStdinEOF should call cancel and return.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchStdinEOF(bytes.NewReader(nil), cancel)
+	select {
+	case <-ctx.Done():
+		// Shutdown triggered as expected.
+	case <-time.After(1 * time.Second):
+		t.Fatal("watchStdinEOF didn't cancel ctx within 1s of EOF")
+	}
+}
+
+func TestWatchStdinEOF_DiscardsBytesUntilEOF(t *testing.T) {
+	// Supervisor pre-sends a few bytes (heartbeat, junk, etc.)
+	// before closing. The watcher should ignore the bytes and
+	// only react to EOF.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchStdinEOF(bytes.NewReader([]byte("ignore me\n")), cancel)
+	select {
+	case <-ctx.Done():
+		// EOF reached after the bytes were drained.
+	case <-time.After(1 * time.Second):
+		t.Fatal("watchStdinEOF didn't cancel ctx after draining input")
 	}
 }
 

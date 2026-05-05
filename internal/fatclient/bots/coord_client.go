@@ -158,6 +158,23 @@ func (h *HTTPCoordClient) Submit(ctx context.Context, task TaskInfo, response, m
 	return nil
 }
 
+// Release POSTs to /api/v1/tasks/{id}/release to abandon the
+// claim. Best-effort: surfaces an error string if the coord
+// rejects the request, but the runner's shutdown path
+// downgrades that to a warning — the reaper handles failures.
+func (h *HTTPCoordClient) Release(ctx context.Context, taskID, botUsername string) error {
+	data, err := h.C.Post(ctx, "/api/v1/tasks/"+taskID+"/release", map[string]string{
+		"username": botUsername,
+	})
+	if err != nil {
+		return fmt.Errorf("coord release: %w", err)
+	}
+	if msg := errorFromResponse(data); msg != "" {
+		return fmt.Errorf("coord release: %s", msg)
+	}
+	return nil
+}
+
 // errorFromResponse pulls the "error" field out of a coord
 // JSON response body. Returns "" when the body has no error
 // field (success path). Mirrors the helper in mcphandlers but

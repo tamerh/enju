@@ -31,12 +31,24 @@ type fakeCoord struct {
 	listCalls    int
 	claimCalls   []string // task IDs, in call order
 	submitCalls  []submitRecord
+	releaseCalls []releaseRecord
+
+	// blockSubmit, when non-nil, holds the Submit call until
+	// the channel is closed. Lets tests pause an iteration
+	// mid-flight to exercise the shutdown-during-LLM path.
+	blockSubmit chan struct{}
 }
 
 type submitRecord struct {
 	TaskID   string
 	Response string
 	Model    string
+}
+
+// releaseRecord captures Release calls for shutdown-path tests.
+type releaseRecord struct {
+	TaskID      string
+	BotUsername string
 }
 
 func (f *fakeCoord) ListReadyForBot(ctx context.Context, projectID int64, botUsername string) ([]TaskInfo, error) {
@@ -63,9 +75,26 @@ func (f *fakeCoord) Claim(ctx context.Context, taskID, botUsername, model string
 
 func (f *fakeCoord) Submit(ctx context.Context, task TaskInfo, response, model string) error {
 	f.mu.Lock()
+	if f.blockSubmit != nil {
+		ch := f.blockSubmit
+		f.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		f.mu.Lock()
+	}
 	defer f.mu.Unlock()
 	f.submitCalls = append(f.submitCalls, submitRecord{TaskID: task.ID, Response: response, Model: model})
 	return f.submitError
+}
+
+func (f *fakeCoord) Release(ctx context.Context, taskID, botUsername string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseCalls = append(f.releaseCalls, releaseRecord{TaskID: taskID, BotUsername: botUsername})
+	return nil
 }
 
 func newRunner(coord *fakeCoord, llm LLMBackend) *Runner {
@@ -278,6 +307,109 @@ func (f *fakeCoordWithTiming) Claim(ctx context.Context, taskID, botUsername, mo
 
 func (f *fakeCoordWithTiming) Submit(ctx context.Context, task TaskInfo, response, model string) error {
 	return nil
+}
+
+func (f *fakeCoordWithTiming) Release(ctx context.Context, taskID, botUsername string) error {
+	return nil
+}
+
+func TestRun_ReleasesActiveClaimOnShutdown(t *testing.T) {
+	// One task ready, but Submit blocks indefinitely. Cancel
+	// the runner's ctx mid-submit; the deferred ReleaseActiveClaim
+	// should release the in-flight claim before Run returns.
+	block := make(chan struct{})
+	coord := &fakeCoord{
+		readyQueue:  [][]TaskInfo{{{ID: "1:1:r", Action: "review", Prompt: "p"}}},
+		blockSubmit: block,
+	}
+	r := newRunner(coord, &StubBackend{RespondWith: "approve"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// Wait until Submit is blocked (claim has been recorded).
+	for {
+		coord.mu.Lock()
+		claimed := len(coord.claimCalls) > 0
+		coord.mu.Unlock()
+		if claimed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Trigger shutdown; unblock Submit so it returns ctx.Err.
+	cancel()
+	close(block)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run didn't exit after ctx cancel")
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if len(coord.releaseCalls) != 1 || coord.releaseCalls[0].TaskID != "1:1:r" {
+		t.Errorf("expected one Release for 1:1:r, got %v", coord.releaseCalls)
+	}
+}
+
+func TestRun_NoReleaseAfterSuccessfulSubmit(t *testing.T) {
+	// Submit succeeds, then ctx cancels with no claim active.
+	// ReleaseActiveClaim should be a no-op (nothing to release).
+	coord := &fakeCoord{
+		readyQueue: [][]TaskInfo{
+			{{ID: "1:1:a", Action: "review", Prompt: "p"}},
+		},
+	}
+	r := newRunner(coord, &StubBackend{RespondWith: "approve"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if len(coord.submitCalls) != 1 {
+		t.Errorf("submit count: got %d, want 1", len(coord.submitCalls))
+	}
+	if len(coord.releaseCalls) != 0 {
+		t.Errorf("expected no Release after successful submit, got %v", coord.releaseCalls)
+	}
+}
+
+func TestRun_ReleasesAfterClaimButNoSubmit(t *testing.T) {
+	// LLM fails — RunOnce returns an error mid-iteration with
+	// the claim still tracked. Then ctx cancels. The deferred
+	// release should fire even though the LLM step failed.
+	coord := &fakeCoord{
+		readyQueue: [][]TaskInfo{
+			{{ID: "1:1:b", Action: "review", Prompt: "p"}},
+		},
+	}
+	llm := &StubBackend{Err: errors.New("simulated LLM failure")}
+	r := newRunner(coord, llm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	// At least one release should have fired for the claimed
+	// task. The runner may have looped a couple times before
+	// ctx expired (each iteration claims, LLM fails, no
+	// release until shutdown — only the final iteration's
+	// claim should be tracked when ctx hits).
+	found := false
+	for _, rel := range coord.releaseCalls {
+		if rel.TaskID == "1:1:b" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a release for 1:1:b after LLM-error iteration, got %v", coord.releaseCalls)
+	}
 }
 
 func TestComposeTaskPrompt_IncludesUserPrompt(t *testing.T) {

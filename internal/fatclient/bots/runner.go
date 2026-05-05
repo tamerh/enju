@@ -9,6 +9,18 @@
 // vote, plain answer with no git work). action=contribute /
 // compute land in a later phase along with worktree
 // management — see docs/bots.md for the staging plan.
+//
+// Claim-leak policy: the runner only tracks one in-flight
+// claim at a time (activeTaskID). When an LLM invocation
+// fails, the claim stays open coord-side and the runner
+// remembers it so the deferred shutdown release covers it.
+// But under continuous operation, successive LLM failures
+// overwrite activeTaskID — only the most recent failed
+// claim is tracked. Earlier failed claims are cleaned up by
+// the coord's reaper, NOT by the runner. This is intentional
+// — building a "release every prior failed claim before next
+// iteration" loop would slow normal operation for what's
+// already covered by the reaper's safety net.
 
 package bots
 
@@ -18,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +68,16 @@ type CoordClient interface {
 	// and trusts the implementation to wire content/decision/
 	// vote_choice/etc. correctly per the task's action.
 	Submit(ctx context.Context, task TaskInfo, response string, model string) error
+
+	// Release abandons an in-flight claim without submitting.
+	// Called by the runner on graceful shutdown — leaving
+	// claims open would wedge work for the next bot until
+	// the coord's reaper times them out.
+	//
+	// Best-effort: failures are logged but don't block
+	// shutdown. The reaper handles the worst case if the
+	// release POST itself fails.
+	Release(ctx context.Context, taskID, botUsername string) error
 }
 
 // TaskInfo is the runner's view of a coord task. Only the
@@ -106,6 +129,79 @@ type Runner struct {
 	// the manifest's system_prompt path. The runner sets this
 	// once at construction and reuses it across every iteration.
 	SystemPrompt string
+
+	// activeMu guards activeTaskID — set by RunOnce after a
+	// successful claim, cleared after submit. The shutdown
+	// path reads it under the same lock so a race between
+	// "submit completes" and "ctx cancels" can't double-release
+	// or release the wrong task.
+	//
+	// Defensive locking note: today, Run() and the deferred
+	// ReleaseActiveClaim run serially (the defer fires after
+	// Run returns, not concurrently). The mutex's actual users
+	// are tests that probe state from a goroutine. We keep it
+	// because Phase 4+ may add concurrent supervision (e.g. a
+	// status-reporter goroutine reading activeTaskID for
+	// `enju_bot_status`) — getting the locking right once is
+	// cheaper than a future race-during-shipping retrofit.
+	activeMu     sync.Mutex
+	activeTaskID string
+}
+
+// setActiveTask records the in-flight claim. Used internally
+// by RunOnce; exposed via the unexported method for symmetry
+// with clearActiveTask. Single setter so the locking
+// discipline lives in one place.
+func (r *Runner) setActiveTask(id string) {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	r.activeTaskID = id
+}
+
+func (r *Runner) clearActiveTask() {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	r.activeTaskID = ""
+}
+
+// snapshotActiveTask returns the current in-flight claim id
+// (or "" if none). Used by ReleaseActiveClaim under shutdown.
+func (r *Runner) snapshotActiveTask() string {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	return r.activeTaskID
+}
+
+// ReleaseActiveClaim asks the coord to abandon any in-flight
+// claim this runner currently holds. Called by Run() on exit
+// (deferred) so a graceful shutdown — stdin-EOF, signal,
+// context cancellation — frees the claim instead of leaving
+// it dangling until the reaper notices.
+//
+// Best-effort: a release failure is logged but doesn't bubble
+// up. The shutdown path is already short on options at that
+// point; the reaper is the safety net.
+//
+// Uses a fresh context with a short deadline rather than the
+// runner's (already-cancelled) ctx, since the cancel is what
+// triggered us in the first place. 5s is enough for one HTTP
+// roundtrip; if the coord is unreachable, the reaper will
+// clean up eventually.
+func (r *Runner) ReleaseActiveClaim() {
+	taskID := r.snapshotActiveTask()
+	if taskID == "" {
+		return
+	}
+	logger := r.logger()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.Coord.Release(ctx, taskID, r.Bot.Name); err != nil {
+		logger.Warn("failed to release claim on shutdown — coord reaper will clean up",
+			"task_id", taskID, "error", err)
+		return
+	}
+	r.clearActiveTask()
+	logger.Info("released active claim on shutdown", "task_id", taskID)
 }
 
 // RunOnce performs one iteration: list ready tasks, claim one,
@@ -147,6 +243,20 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 		return ErrNoWork
 	}
 
+	// Record the in-flight claim so ReleaseActiveClaim can
+	// find it on shutdown. Cleared ONLY after Submit succeeds
+	// (see clearActiveTask call below). The LLM-error path
+	// deliberately leaves activeTaskID set so the deferred
+	// shutdown release covers it — better to release on a
+	// later shutdown than to silently lose the tracking.
+	//
+	// Caveat: under continuous operation, successive LLM
+	// failures overwrite activeTaskID each iteration. Only
+	// the most recent failed claim is tracked; earlier
+	// failures stay open until the coord's reaper times them
+	// out. See package doc for the intent.
+	r.setActiveTask(task.ID)
+
 	logger.Info("claimed task, invoking LLM",
 		"task_id", task.ID, "action", task.Action, "model", r.Bot.Model)
 
@@ -172,6 +282,9 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("submit %s: %w", task.ID, err)
 	}
 
+	// Submit succeeded — the claim is now closed coord-side,
+	// so we shouldn't release it on shutdown anymore.
+	r.clearActiveTask()
 	logger.Info("submitted task", "task_id", task.ID, "response_len", len(response))
 	return nil
 }
@@ -185,12 +298,33 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 //
 // Iteration errors (claim failures, LLM errors, submit errors)
 // are logged and treated as no-op for the backoff schedule —
-// the loop sleeps PollInterval and tries again. Phase 3 will
-// add stdin-EOF graceful shutdown + run-terminate cooperative
-// exit per the design memo.
+// the loop sleeps PollInterval and tries again.
+//
+// Shutdown shape (Phase 3, shipped):
+//   - stdin-EOF: cmdBotRun's watchStdinEOF goroutine cancels
+//     ctx when its Stdin reaches EOF; the supervisor (Phase 4)
+//     uses this by closing the daemon's stdin pipe.
+//   - SIGINT/SIGTERM: cmdBotRun installs signal.NotifyContext.
+//   - In-flight LLM: exec.CommandContext kills the subprocess
+//     when ctx cancels (ClaudeBackend's WaitDelay caps the
+//     I/O drain at 5s).
+//   - Active claim: defer r.ReleaseActiveClaim() abandons it
+//     so the next bot doesn't have to wait for the reaper.
+//
+// Run-terminate cooperative exit (operator fires
+// enju_terminate_run mid-iteration) is observed at submit
+// time — the coord rejects the late submit, the runner logs,
+// the loop continues. Mid-iteration polling for "is my run
+// still alive?" is deferred; the submit-time signal is
+// already coherent given the cooperative-shutdown design.
 func (r *Runner) Run(ctx context.Context) error {
 	r.applyDefaults()
 	logger := r.logger()
+	// Defer the release pass: any in-flight claim still tracked
+	// by the runner when Run exits gets abandoned. Covers all
+	// exit paths uniformly — ctx cancellation, signal, panic-
+	// recovery, etc. Cheap no-op when no claim is active.
+	defer r.ReleaseActiveClaim()
 	backoff := r.PollInterval
 	for {
 		if ctx.Err() != nil {

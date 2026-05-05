@@ -402,13 +402,50 @@ func cmdBotRun(args []string) {
 		fmt.Fprintln(os.Stderr, "Single-iteration mode (--once): will exit after one claim+submit cycle (or no-work).")
 	}
 
-	// Signal handling: SIGINT/SIGTERM cancels the runner's
-	// context so Run exits cleanly. Phase 3 will also wire
-	// stdin-EOF as a portable shutdown trigger.
+	// Signal handling + stdin-EOF: two ways the daemon's
+	// owner can request a graceful shutdown.
+	//
+	//  - SIGINT/SIGTERM: standard Unix; covers operator Ctrl-C
+	//    and `kill PID`. Windows handles SIGINT but NOT SIGTERM
+	//    (no symbolic equivalent), so signal.NotifyContext
+	//    falls back to os.Interrupt-only there.
+	//  - stdin-EOF: the supervisor (Phase 4 fatclient MCP tool)
+	//    closes the daemon's stdin pipe; the daemon notices
+	//    EOF and triggers the same shutdown path. Cross-platform
+	//    via stdlib only — no signal-tree gymnastics.
+	//
+	// Both feed the same context cancel so the runner's defer
+	// ReleaseActiveClaim fires uniformly across exit paths.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Pre-flight: warn loudly if stdin is /dev/null or a
+	// regular file. Both EOF immediately and would shut the
+	// daemon down before it does any work — a confusing
+	// silent-no-op for operators who try `nohup enju bot run
+	// &` (which redirects stdin to /dev/null by default). The
+	// warning tells them to use a long-lived stdin (pipe from
+	// supervisor, interactive terminal, or `< /dev/zero` as
+	// an escape hatch for service managers without a pipe).
+	if st, err := os.Stdin.Stat(); err == nil {
+		mode := st.Mode()
+		// Heuristic: a regular file or /dev/null shows up as
+		// "regular" (mode.IsRegular()) or with the 0 size +
+		// no terminal/pipe bits. We flag both — false
+		// positives (rare custom setups) just see a warning.
+		if mode.IsRegular() || (mode&os.ModeCharDevice == 0 && mode&os.ModeNamedPipe == 0 && mode&os.ModeSocket == 0) {
+			fmt.Fprintln(os.Stderr, "WARNING: stdin is not a TTY/pipe/socket — the daemon may shut down immediately on EOF. To run detached, pass `< /dev/zero` or use a supervisor that pipes stdin (Phase 4 fatclient supervisor handles this; nohup alone redirects stdin to /dev/null and triggers immediate shutdown).")
+		}
+	}
+
+	go watchStdinEOF(os.Stdin, cancel)
+
 	if *once {
+		// --once skips Run() (and thus its deferred release).
+		// Do the same release pass here so a Ctrl-C or LLM
+		// failure during a single iteration doesn't leak the
+		// claim for the reaper to clean up later.
+		defer runner.ReleaseActiveClaim()
 		err := runner.RunOnce(ctx)
 		switch {
 		case err == nil:
@@ -430,5 +467,42 @@ func cmdBotRun(args []string) {
 		fmt.Fprintf(os.Stderr, "bot daemon exited: %v\n", err)
 		os.Exit(2)
 	}
-	fmt.Fprintln(os.Stderr, "bot daemon stopped (signal received)")
+	fmt.Fprintln(os.Stderr, "bot daemon stopped (signal or stdin EOF received)")
+}
+
+// watchStdinEOF reads os.Stdin into a discard buffer until EOF
+// (or any read error), then calls the supplied cancel func to
+// trigger graceful shutdown.
+//
+// Cross-platform shutdown trigger: a supervisor process (the
+// fatclient MCP tool that started this daemon) closes its end
+// of the stdin pipe; the daemon's read returns io.EOF; we
+// cancel the context; the runner's deferred ReleaseActiveClaim
+// fires; clean exit.
+//
+// Edge cases:
+//   - Operator runs the daemon interactively (terminal stdin):
+//     the goroutine blocks reading until the operator hits
+//     Ctrl-D. That's intentional — Ctrl-D is also the canonical
+//     "I'm done with this process" signal.
+//   - Stdin is /dev/null (e.g. nohup): read returns EOF
+//     immediately, daemon shuts down at startup. Operators who
+//     want a detached daemon should set up a long-lived stdin
+//     (e.g. `enju bot run < /dev/null` is the wrong answer; use
+//     a pipe from a supervisor or a service manager).
+//   - Stdin is a pipe but the writer never closes: read blocks;
+//     shutdown via SIGINT/SIGTERM still works. Win-win.
+func watchStdinEOF(stdin io.Reader, cancel context.CancelFunc) {
+	buf := make([]byte, 256)
+	for {
+		_, err := stdin.Read(buf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bot daemon: stdin EOF — initiating graceful shutdown")
+			cancel()
+			return
+		}
+		// Discard whatever bytes the supervisor sent. We
+		// don't read commands over stdin (yet); this
+		// goroutine exists solely to detect EOF.
+	}
 }
