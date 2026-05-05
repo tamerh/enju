@@ -102,6 +102,8 @@ Starting: If the user wants to start fresh, use enju_create_project — workspac
 
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 
+Catching up: "what's on my plate?" → enju_inbox (action queue — tasks waiting on you). "what's been happening?" or "any updates for me?" → enju_recent_events with for_me=true (descriptive history of events about you). For incremental "what's new since last check?" remember the highest event seq from your previous response and pass it as since_seq next time — there is no implicit read/unread cursor.
+
 Conventions: After claiming, remind the human which task is active. After submitting, show the updated run status so progress is visible. When working on a task, keep the human oriented — a brief context line (e.g. "Working on 1:1:draft") at the start of task-related responses helps.
 
 Status icons: ✅ completed · 🔵 in progress · 🟡 available (claim it) · ⚪ waiting · 🔴 failed · ⚫ skipped · ⊘ skipped (upstream failed) · ⏸ parked (awaiting reconciliation).`
@@ -319,9 +321,7 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 	case "enju_update_profile":
 		return c.handleUpdateProfile, true
 
-	// Notifications + inbox
-	case "enju_notifications":
-		return c.handleNotifications, true
+	// Inbox
 	case "enju_inbox":
 		return c.handleInbox, true
 

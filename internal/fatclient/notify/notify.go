@@ -1,21 +1,23 @@
 // Package notify is the fat-client poll-and-record substrate
-// for the project notification system (see docs/notifications.md).
+// that maintains a per-project event log on local disk.
 //
 // Run() long-polls the coordinator's events endpoint for one
 // project and appends each received event as a JSON line to
 // {ProjectDir}/enju/events/live.jsonl, advancing the cursor in
 // {ProjectDir}/enju/events/cursor.json after every batch.
 //
-// That's the entire job. Filtering events into "notifications"
-// and surfacing them to the user is done by the
-// enju_notifications MCP tool, which reads live.jsonl on demand
-// and applies the Layer 1 default rules (defaults.go).
+// That's the entire job. The historical "notifications" tool
+// (with hardcoded interesting-events rules + read/unread
+// tracking) was removed; consumers now read live.jsonl
+// directly: enju_inbox projects "what should I act on" out of
+// it, and enju_recent_events queries the coordinator (with
+// for_me=true for citizen-scoped views).
 //
 // The package is self-contained: callers pass a Config, Run
 // blocks until ctx is cancelled or a non-recoverable error
 // fires. No adapters, no dispatch, no in-process consumers —
-// downstream consumers (the MCP tool, future plugin processes)
-// read live.jsonl independently.
+// downstream consumers (the inbox tool, future plugin
+// processes) read live.jsonl independently.
 package notify
 
 import (
@@ -126,10 +128,10 @@ type Config struct {
 //  4. Advance cursor to the highest seen seq, persist atomically.
 //  5. Repeat.
 //
-// Notification matching + display happens elsewhere — the
-// enju_notifications MCP tool reads live.jsonl on demand,
-// applies the Layer 1 default rules, returns the read/unread
-// list. Run is just the poll-and-record substrate.
+// Display happens elsewhere — enju_inbox projects live.jsonl
+// into the citizen's actionable queue, enju_recent_events
+// goes through the coordinator. Run is just the
+// poll-and-record substrate.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.CoordinatorURL == "" {
 		return fmt.Errorf("notify.Run: CoordinatorURL is required")
@@ -316,17 +318,6 @@ func cursorPath(cfg Config) string {
 		return ""
 	}
 	return cfg.ProjectDir + "/enju/events/cursor.json"
-}
-
-// UserConfigPath returns the canonical project-scoped notify.yaml
-// location for a given project clone dir. Exported so callers
-// outside the package (notifySession) can compute it from a path
-// they have but resolve the layout convention from one place.
-func UserConfigPath(projectDir string) string {
-	if projectDir == "" {
-		return ""
-	}
-	return projectDir + "/enju/notify.yaml"
 }
 
 // liveJSONLPath resolves the append-only event log path. Empty

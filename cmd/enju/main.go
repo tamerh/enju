@@ -35,6 +35,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
+	case "ui":
+		cmdUI(os.Args[2:])
 	case "wrap-task":
 		cmdWrapTask(os.Args[2:])
 	case "inbox":
@@ -56,6 +58,7 @@ func printUsage() {
 Usage:
  enju serve   Start the coordinator server
  enju mcp    Start the MCP server (for Claude Desktop/Code)
+ enju ui     Start the web UI (browser, peer to enju mcp)
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
  enju wrap-task Run a compute task's script + commit (internal)

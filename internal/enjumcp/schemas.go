@@ -717,16 +717,24 @@ func RequestClarification() mcp.Tool {
 // is intent + presentation.
 func RecentEvents() mcp.Tool {
 	return mcp.NewTool("enju_recent_events",
-		mcp.WithDescription(`Surface what's recently happened in a project — designed for the assistant to call at natural pause points (after a long bash returns, when the user asks "what's new?", before answering a follow-up). Returns a concise human-readable summary of the latest events. For full filter queries (by run, by citizen, by event type) use enju_show_events instead. For git-tracked snapshots use enju_export_run_events.`),
+		mcp.WithDescription(`Surface what's recently happened in a project — designed for the assistant to call at natural pause points (after a long bash returns, when the user asks "what's new?", before answering a follow-up). Returns a concise human-readable summary of the latest events.
+
+To answer "any updates for me?" pass for_me=true. To make a delta query (only items since a previous check), remember the highest seq from your last call and pass it as since_seq next time — this replaces the implicit read/unread cursor the deleted enju_notifications tool used to manage. For full filter queries (by run, by citizen, by event type) use enju_show_events. For git-tracked snapshots use enju_export_run_events.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project to check"),
 		),
 		mcp.WithNumber("limit",
-			mcp.Description("Max events to surface (default 20, max 100). Smaller is better for in-conversation use."),
+			mcp.Description("Max events to surface (default 20, max 100). Smaller is better for in-conversation use. With for_me=true the limit applies pre-filter, so the result may be smaller than limit."),
 		),
 		mcp.WithString("since",
 			mcp.Description("Optional RFC3339 timestamp lower bound — only surface events after this. Useful when the assistant has a 'last checked at' anchor to avoid re-surfacing the same items."),
+		),
+		mcp.WithNumber("since_seq",
+			mcp.Description("Optional monotone-seq lower bound (strict >). Preferred over `since` for delta queries — pass the highest seq from your last response to get only newer events."),
+		),
+		mcp.WithBoolean("for_me",
+			mcp.Description(`Default false. When true, return only events the calling citizen is named in: event.citizen == me OR event.assign_to == me. Limitations: events on tasks you submitted but didn't claim (branch_merged after approval, task_completed where the closer is the reviewer), issue_filed events you authored without explicit assignment, and project-wide events without a citizen (run_completed) are NOT surfaced. The honest "events about entities I authored" join is a future refinement.`),
 		),
 	)
 }
@@ -770,30 +778,10 @@ Always pair the decision with prose 'content' explaining your reasoning — the 
 // work without claiming the reviewer task first.
 func Inbox() mcp.Tool {
 	return mcp.NewTool("enju_inbox",
-		mcp.WithDescription(`List tasks waiting on the calling citizen in a project — review/vote/answer tasks where assign_to includes you and state is ready. Each item carries the task's prompt plus the latest submission(s) of the upstream task(s) it depends on, so you can read the work in-place. Designed as the human-facing "what's on my plate?" view, complementing enju_notifications (event-stream) and enju_my_dashboard (multi-project summary). Cap on inlined prompt is ~2KB; follow up with enju_get_task for the full text. Known v1 limitation: compute and vote parents leave content empty (their work lives in git artifacts or the option column, respectively); the upstream's task_id + commit_sha are still surfaced.`),
+		mcp.WithDescription(`List tasks waiting on the calling citizen in a project — review/vote/answer tasks where assign_to includes you and state is ready. Each item carries the task's prompt plus the latest submission(s) of the upstream task(s) it depends on, so you can read the work in-place. Designed as the "what's on my plate?" action queue, complementing enju_recent_events?for_me=true (which is descriptive — what happened recently — rather than actionable) and enju_my_dashboard (multi-project summary). Cap on inlined prompt is ~2KB; follow up with enju_get_task for the full text. Known v1 limitation: compute and vote parents leave content empty (their work lives in git artifacts or the option column, respectively); the upstream's task_id + commit_sha are still surfaced.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project to surface inbox for."),
-		),
-	)
-}
-
-// toolNotifications surfaces the per-project notification list
-// — Facebook-style read/unread items derived from the local
-// live.jsonl substrate filtered through the 9 built-in Layer 1
-// default rules. Calling marks the surfaced items as read.
-func Notifications() mcp.Tool {
-	return mcp.NewTool("enju_notifications",
-		mcp.WithDescription(`List recent notifications for a project — read/unread style. Reads the local event substrate (enju/events/live.jsonl) and filters through the 9 built-in default rules (task completed, run completed, branch merged, issue filed, cycle budget exhausted, etc). Returns the latest matches with 🔴 unread / ⚪ read markers. Calling this tool marks surfaced items as read; the next call shows them as ⚪. Honors enju/notify.yaml's disable_defaults knob for muting individual default types. Designed for the assistant to call at the start of a turn or when the user asks "any updates?" / "what's new?".`),
-		mcp.WithNumber("project_id",
-			mcp.Required(),
-			mcp.Description("The project to surface notifications for."),
-		),
-		mcp.WithNumber("limit",
-			mcp.Description("Max notifications to return (default 20, max 100)."),
-		),
-		mcp.WithBoolean("mark_read",
-			mcp.Description("Default true. When true, advances the read cursor so this batch shows as ⚪ on the next call. Set false to peek without changing read state."),
 		),
 	)
 }

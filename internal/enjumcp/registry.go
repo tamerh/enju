@@ -75,7 +75,6 @@ var Registry = []mcp.Tool{
 	GetArtifact(),
 	GetArtifactHistory(),
 	ListUntrackedArtifacts(),
-	Notifications(),
 	Inbox(),
 	Review(),
 	CreateProject(),

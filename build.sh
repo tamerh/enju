@@ -112,13 +112,41 @@ cmd_check_imports() {
         fail=1
     fi
 
+    # Rule 5: webui is a peer consumer. It may DIRECTLY import
+    # common/* and internal/fatclient/service (the FatClient
+    # surface) only — no reach-arounds into workspace, inbox,
+    # notify, mcphandlers, or coordinator. Transitive deps via
+    # service are fine (service legitimately uses workspace etc.
+    # under the hood); we only block what webui's own files
+    # import. The gap-fill discipline says: if you need something
+    # not on FatClient, raise the gap and add the method there.
+    direct_imports_of() {
+        local pattern="$1"
+        go list -f '{{ $p := .ImportPath }}{{ range .Imports }}{{ $p }} {{ . }}{{ "\n" }}{{ end }}' "$pattern" 2>/dev/null \
+            | grep -E ' github\.com/enju-ai/enju/internal/' \
+            || true
+    }
+    local webui_offenders
+    webui_offenders=$(direct_imports_of './internal/webui/...' \
+        | awk '{ print $2 }' \
+        | grep -vE '^github\.com/enju-ai/enju/internal/(common|fatclient/service)(/|$)' \
+        | sort -u \
+        || true)
+    if [ -n "$webui_offenders" ]; then
+        echo "❌ Rule 5 violated: internal/webui/* directly imports outside the allowed surface"
+        echo "$webui_offenders" | sed 's/^/   /'
+        echo "   webui may import only internal/common/* and internal/fatclient/service."
+        echo "   Reach through service.FatClient — raise a gap if a method is missing."
+        fail=1
+    fi
+
     if [ "$fail" -eq 0 ]; then
         echo "✅ import direction OK"
         return 0
     fi
 
     echo
-    echo "These edges break the coordinator/fat-client/common/enjumcp layering."
+    echo "These edges break the coordinator/fat-client/common/enjumcp/webui layering."
     echo "Fix by moving the offending package to its correct tree, or"
     echo "by moving the shared symbol into internal/common/."
     return 1
@@ -193,24 +221,43 @@ cmd_lint() {
 # Dev workflow: restart coordinator with wiped state.
 # ---------------------------------------------------------------
 
-# Build, wipe state (preserving credentials), restart coordinator.
-# Usage: ./build.sh dev-restart [PORT]
+# Build and restart coordinator. Preserves DB + workspaces by
+# default — pass --wipe to clean state for a fresh-install dev
+# loop. Credentials at ~/.enju/credentials.json are NEVER
+# wiped (re-registering would invalidate the MCP client).
+#
+# Usage: ./build.sh dev-restart [PORT] [--wipe]
 cmd_dev_restart() {
-    local port="${1:-8333}"
+    local port="8333"
+    local wipe=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --wipe) wipe=true ;;
+            *)      port="$1" ;;
+        esac
+        shift
+    done
+
     cmd_build
     echo "==> Stopping existing enju processes..."
     pkill -f "enju serve" 2>/dev/null || true
     sleep 1
-    echo "==> Wiping DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
-    rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
-    rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
-    # Live notify state is project-scoped (under each clone's
-    # enju/events/) and goes with the workspaces wipe below.
-    # Defensively clean any legacy ~/.enju/notify-* files left
-    # behind from pre-redesign installs — once cleared, notify
-    # never recreates them.
-    rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json ~/.enju/notify.yaml
-    rm -rf ~/.enju/git-dir ~/.enju/workspaces
+
+    if $wipe; then
+        echo "==> --wipe: clearing DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
+        rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
+        rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
+        # Live notify state is project-scoped (under each clone's
+        # enju/events/) and goes with the workspaces wipe below.
+        # Defensively clean any legacy ~/.enju/notify-* files left
+        # behind from pre-redesign installs — once cleared, notify
+        # never recreates them.
+        rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json ~/.enju/notify.yaml
+        rm -rf ~/.enju/git-dir ~/.enju/workspaces
+    else
+        echo "==> Preserving DB + workspaces (pass --wipe for fresh state)"
+    fi
+
     echo "==> Starting coordinator on port $port..."
     ./enju serve --port "$port" &
     echo "==> Coordinator running on :$port (PID $!)"
@@ -241,7 +288,10 @@ Lints:
   lint               Run all architectural lints.
 
 Dev workflow:
-  dev-restart [PORT] Build, wipe state (keeping credentials), restart on PORT (default 8333).
+  dev-restart [PORT] [--wipe]
+                     Build + restart coordinator (default port 8333).
+                     Preserves DB + workspaces by default. Pass --wipe
+                     to clear state (credentials always preserved).
 
   help               Show this message.
 EOF

@@ -182,6 +182,14 @@ func (c *apiClient) handleShowEvents(ctx context.Context, req mcp.CallToolReques
 // handleRecentEvents is the assistant-side counterpart to
 // handleShowEvents — same underlying endpoint, smaller default
 // limit, human-readable output (one line per event).
+//
+// for_me filtering happens client-side (post-fetch): we filter
+// events where event.citizen == self OR event.assign_to == self.
+// Limit applies pre-filter, so the result with for_me=true may
+// be smaller than the requested limit. Coord-side filtering
+// would be more efficient but requires a json_extract on the
+// metadata column; deferred until projects with high event
+// volume actually need it.
 func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -196,6 +204,11 @@ func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequ
 	if since := req.GetString("since", ""); since != "" {
 		q.Set("since", since)
 	}
+	if sinceSeq := req.GetInt("since_seq", 0); sinceSeq > 0 {
+		q.Set("since_seq", fmt.Sprintf("%d", sinceSeq))
+	}
+	forMe := req.GetBool("for_me", false)
+
 	endpoint := fmt.Sprintf("/api/v1/projects/%d/events?%s", projectID, q.Encode())
 	data, err := c.get(ctx, endpoint)
 	if err != nil {
@@ -208,7 +221,39 @@ func (c *apiClient) handleRecentEvents(ctx context.Context, req mcp.CallToolRequ
 	if err := json.Unmarshal(data, &events); err != nil {
 		return mcp.NewToolResultError("decoding events: " + err.Error()), nil
 	}
+	if forMe {
+		events = filterEventsForCitizen(events, c.username())
+	}
 	return mcp.NewToolResultText(format.EventListRecent(events)), nil
+}
+
+// filterEventsForCitizen keeps events where the calling citizen
+// is named in event.citizen (the actor) or event.assign_to (the
+// task assignee that the coord hoists out of metadata at
+// emit-time). Both are top-level string fields on the wire.
+//
+// Limitations are documented on the for_me parameter in the
+// schema: events on tasks the citizen submitted but didn't claim
+// (branch_merged after approval, task_completed where the closer
+// is the reviewer), self-filed issues without explicit
+// assignment, and project-wide events without a citizen
+// (run_completed) are NOT surfaced. The honest "events about
+// entities I authored" join is a future refinement.
+func filterEventsForCitizen(events []map[string]interface{}, username string) []map[string]interface{} {
+	if username == "" {
+		return events
+	}
+	out := events[:0]
+	for _, e := range events {
+		if c, _ := e["citizen"].(string); c == username {
+			out = append(out, e)
+			continue
+		}
+		if a, _ := e["assign_to"].(string); a == username {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // handleRequestClarification is the bot-asks-human idiom — a

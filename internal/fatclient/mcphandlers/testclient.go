@@ -106,8 +106,6 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleShowEvents(ctx, req)
 	case "enju_recent_events":
 		return t.c.handleRecentEvents(ctx, req)
-	case "enju_notifications":
-		return t.c.handleNotifications(ctx, req)
 	case "enju_inbox":
 		return t.c.handleInbox(ctx, req)
 	case "enju_review":
