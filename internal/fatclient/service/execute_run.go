@@ -25,6 +25,7 @@ import (
 	"sort"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 )
 
 // ExecuteRunEntry captures one task's outcome in the batch
@@ -392,6 +393,34 @@ func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runID int) (s
 	}
 	branch, _ := resp["branch"].(string)
 	return branch, nil
+}
+
+// ListReadyTasks returns the READY tasks for a (project, run)
+// pair. Same wire shape the coord-side `enju_list_ready_tasks`
+// MCP tool returns, surfaced as a typed FatClient method so
+// in-process consumers (bot daemon, future UI surfaces) don't
+// need the raw coord escape hatch.
+//
+// runID == 0 fetches across every run in the project; non-zero
+// scopes to that run. The legacy fetchReadyTasksForRun helper
+// below now delegates here.
+func (s *FatClient) ListReadyTasks(ctx context.Context, projectID, runID int64) ([]map[string]interface{}, error) {
+	path := fmt.Sprintf("/api/v1/tasks/ready?project_id=%d", projectID)
+	if runID > 0 {
+		path += fmt.Sprintf("&run_id=%d", runID)
+	}
+	data, err := s.coord.Get(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if msg := coord.ExtractError(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	var out []map[string]interface{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decoding ready-tasks response: %w", err)
+	}
+	return out, nil
 }
 
 // fetchReadyTasksForRun wraps the /api/v1/tasks/ready endpoint

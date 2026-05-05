@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/common/gitignore"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
@@ -40,6 +40,24 @@ import (
 type Manifest struct {
 	Version int   `yaml:"version,omitempty"`
 	Bots    []Bot `yaml:"bots"`
+
+	// ProjectID is the coordinator-assigned project id this
+	// manifest's bots belong to. Optional — when set, `enju bot
+	// setup` auto-adds each registered bot to the project's
+	// membership so the daemon can read /projects/{id}/runs and
+	// /tasks/ready scoped to this project. When empty, setup
+	// skips the membership step and the operator must add bots
+	// manually via enju_add_project_member.
+	//
+	// Why optional: manifests are committed to git and shared
+	// across operators / coord instances; project_id is
+	// instance-specific (different coord = different ids), so
+	// hard-coding it in the committed manifest is brittle. The
+	// recommended pattern is to omit it from the committed
+	// manifest and pass --project-id=N to `enju bot setup` per
+	// machine, OR to commit it for projects with a stable
+	// single coord (solo dev, fixed deployment).
+	ProjectID int64 `yaml:"project_id,omitempty"`
 }
 
 // Bot is one entry in the manifest. Every field has either a
@@ -88,6 +106,19 @@ type Bot struct {
 	// ~/.enju/credentials/<name>.json. Tilde expansion happens
 	// in Resolve.
 	Credentials string `yaml:"credentials,omitempty"`
+
+	// Handler picks which Handler implementation the daemon
+	// instantiates for this bot. Bots aren't necessarily LLMs:
+	// a "linter-bot" might run a deterministic command, a
+	// "review-by-rules" bot might match commit metadata.
+	// Implementations are registered in handler.go's NewHandler
+	// switch.
+	//
+	// Empty = "claude" (back-compat with pre-Phase-7.2 manifests
+	// where every bot was implicitly an LLM via `claude -p`).
+	// Validate rejects unknown values so a typo'd handler type
+	// surfaces before the daemon starts.
+	Handler string `yaml:"handler,omitempty"`
 }
 
 // MCPTools holds the per-bot tool allowlist the runner pins on
@@ -230,8 +261,21 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("bots[%d]: duplicate name %q (each bot must have a unique name in the manifest)", i, b.Name)
 		}
 		seen[b.Name] = struct{}{}
-		if b.Model == "" {
-			return fmt.Errorf("bot %q: model is required (e.g. \"claude-sonnet-4-6\")", b.Name)
+		// Handler discriminator: empty (=claude back-compat),
+		// "claude", or "stub". Future handlers extend this list
+		// here AND in NewHandler — keep them in sync.
+		switch HandlerType(b.Handler) {
+		case "", HandlerTypeClaude, HandlerTypeStub:
+			// ok
+		default:
+			return fmt.Errorf("bot %q: unknown handler %q (supported: claude, stub)", b.Name, b.Handler)
+		}
+		// Model is required only for handlers that drive an LLM.
+		// A future ShellHandler / RuleHandler bot has nothing to
+		// pass --model to; insisting on it there would be cargo.
+		needsModel := b.Handler == "" || HandlerType(b.Handler) == HandlerTypeClaude
+		if needsModel && b.Model == "" {
+			return fmt.Errorf("bot %q: model is required for handler %q (e.g. \"claude-sonnet-4-6\")", b.Name, b.Handler)
 		}
 		if b.SystemPrompt != "" {
 			// system_prompt is repo-relative; reject absolute
@@ -303,7 +347,7 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	if st, statErr := os.Stat(gitignorePath); statErr == nil {
 		mode = st.Mode().Perm()
 	}
-	updated, changed := workspace.UpdateGitignoreManagedBlock(existing, []string{corelayout.BotsRuntimeDir + "/"})
+	updated, changed := gitignore.UpdateManagedBlock(existing, []string{corelayout.BotsRuntimeDir + "/"})
 	if !changed {
 		return false, nil
 	}

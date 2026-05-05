@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/bots"
+	"github.com/enju-ai/enju/internal/bots"
 )
 
 // fakeCoord stands in for the coordinator's bot-registration
@@ -92,6 +92,67 @@ func TestRegisterBot_CoordError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "injected failure") {
 		t.Errorf("error should surface coord body, got: %v", err)
+	}
+}
+
+func TestAddBotToProject_HappyPath(t *testing.T) {
+	var got struct {
+		path string
+		body map[string]string
+		auth string
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.path = r.URL.Path
+		got.auth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&got.body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"username":"reviewer-bot","role":"member"}`))
+	}))
+	defer srv.Close()
+
+	err := addBotToProject(context.Background(), srv.URL, "owner-token", 42, "reviewer-bot")
+	if err != nil {
+		t.Fatalf("addBotToProject: %v", err)
+	}
+	if got.path != "/api/v1/projects/42/members" {
+		t.Errorf("path: got %q", got.path)
+	}
+	if got.body["username"] != "reviewer-bot" || got.body["role"] != "member" {
+		t.Errorf("body: %+v", got.body)
+	}
+	if got.auth != "Bearer owner-token" {
+		t.Errorf("auth header: got %q", got.auth)
+	}
+}
+
+func TestAddBotToProject_AlreadyMemberIsSuccess(t *testing.T) {
+	// Re-running setup against the same project shouldn't fail
+	// at the membership step. Both 409 and "already a member"
+	// substring forms are treated as no-op success.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"already a member"}`))
+	}))
+	defer srv.Close()
+
+	if err := addBotToProject(context.Background(), srv.URL, "owner-token", 42, "x"); err != nil {
+		t.Errorf("already-a-member should be treated as success, got: %v", err)
+	}
+}
+
+func TestAddBotToProject_RealError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"only project owners can add members"}`))
+	}))
+	defer srv.Close()
+
+	err := addBotToProject(context.Background(), srv.URL, "owner-token", 42, "x")
+	if err == nil {
+		t.Fatal("expected error from 403 forbidden response")
+	}
+	if !strings.Contains(err.Error(), "only project owners") {
+		t.Errorf("error should carry coord message, got: %v", err)
 	}
 }
 

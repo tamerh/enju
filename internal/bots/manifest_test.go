@@ -224,6 +224,84 @@ bots:
 	}
 }
 
+func TestLoad_ProjectIDOptional(t *testing.T) {
+	// Manifest without project_id: legal — operator passes it
+	// at setup time via --project-id, or skips auto-add
+	// entirely.
+	root := writeManifest(t, `
+bots:
+  - name: x
+    model: m
+`)
+	m, err := Load(root)
+	if err != nil {
+		t.Fatalf("missing project_id should be accepted, got: %v", err)
+	}
+	if m.ProjectID != 0 {
+		t.Errorf("ProjectID: got %d, want 0 when omitted", m.ProjectID)
+	}
+}
+
+func TestLoad_ProjectIDParsed(t *testing.T) {
+	// Manifest with project_id: surfaced through Load so cmdBotSetup
+	// can default to it when --project-id isn't passed.
+	root := writeManifest(t, `
+project_id: 42
+bots:
+  - name: x
+    model: m
+`)
+	m, err := Load(root)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if m.ProjectID != 42 {
+		t.Errorf("ProjectID: got %d, want 42", m.ProjectID)
+	}
+}
+
+func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
+	for _, h := range []string{"", "claude", "stub"} {
+		t.Run("handler="+h, func(t *testing.T) {
+			body := "bots:\n  - name: x\n    model: m\n"
+			if h != "" {
+				body += "    handler: " + h + "\n"
+			}
+			root := writeManifest(t, body)
+			if _, err := Load(root); err != nil {
+				t.Errorf("expected handler %q to validate, got: %v", h, err)
+			}
+		})
+	}
+}
+
+func TestValidate_RejectsUnknownHandler(t *testing.T) {
+	root := writeManifest(t, `
+bots:
+  - name: x
+    model: m
+    handler: shell
+`)
+	_, err := Load(root)
+	if err == nil || !strings.Contains(err.Error(), "unknown handler") {
+		t.Errorf("expected unknown-handler error, got: %v", err)
+	}
+}
+
+func TestValidate_StubHandlerNoModelRequired(t *testing.T) {
+	// Non-LLM handlers don't need a model. A future linter-bot
+	// or rule-bot wouldn't have a model to declare; insisting
+	// would be cargo from the LLM-only past.
+	root := writeManifest(t, `
+bots:
+  - name: x
+    handler: stub
+`)
+	if _, err := Load(root); err != nil {
+		t.Errorf("stub handler should validate without model, got: %v", err)
+	}
+}
+
 func TestValidate_RejectsDuplicateName(t *testing.T) {
 	root := writeManifest(t, `
 bots:

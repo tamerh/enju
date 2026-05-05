@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/gitignore"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -420,7 +421,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	if len(spec.UntrackedArtifacts) > 0 {
 		gitignorePath := filepath.Join(workDir, ".gitignore")
 		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
-		updated, changed := workspace.UpdateGitignoreManagedBlock(existing, spec.UntrackedArtifacts)
+		updated, changed := gitignore.UpdateManagedBlock(existing, spec.UntrackedArtifacts)
 		if changed {
 			files = append(files, workspace.FileWrite{
 				RepoRelPath: ".gitignore",

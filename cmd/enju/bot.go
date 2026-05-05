@@ -11,15 +11,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/bots"
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
+	"github.com/enju-ai/enju/internal/fatclient/service"
+	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 // cmdBot is the parent dispatcher for `enju bot <subcommand>`.
@@ -42,10 +44,13 @@ func cmdBot(args []string) {
 		cmdBotSetup(args[1:])
 	case "run":
 		cmdBotRun(args[1:])
-	// TODO(phase4): add "stop", "status", "logs" cases for
-	// supervisor MCP-tool wrappers. Update printBotUsage when
-	// each lands so the help text stays in sync with the
-	// dispatcher.
+	// Stop / status / logs are MCP tools (enju_bot_stop,
+	// enju_bot_status, enju_bot_logs) rather than CLI
+	// subcommands — operators manage the running fleet through
+	// the same MCP host they use for every other coord
+	// interaction. CLI subcommand mirrors aren't planned for
+	// v1; if a CLI-only operator workflow appears the dispatcher
+	// is the place to add them.
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown bot subcommand: %s\n", args[0])
 		printBotUsage()
@@ -99,6 +104,7 @@ func cmdBotSetup(args []string) {
 	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
 	credsPath := fs.String("credentials", "", "Path to OWNER credentials.json (default ~/.enju/credentials.json). Used only to authenticate the registration calls — bot tokens land at each bot's manifest-declared path.")
 	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
+	projectIDFlag := fs.Int64("project-id", 0, "Project id to add bots to as members (overrides manifest's project_id). 0 = no auto-add; operator must call enju_add_project_member manually.")
 	dryRun := fs.Bool("dry-run", false, "Print what would happen without registering or writing files")
 	fs.Parse(args)
 
@@ -128,6 +134,15 @@ func cmdBotSetup(args []string) {
 		os.Exit(1)
 	}
 
+	// Resolve effective project id for membership auto-add. Flag
+	// wins so an operator can override the committed manifest
+	// without editing it; manifest is the convenient default for
+	// projects with a single stable coord.
+	effectiveProjectID := *projectIDFlag
+	if effectiveProjectID == 0 {
+		effectiveProjectID = manifest.ProjectID
+	}
+
 	// Pre-loop summary so the operator sees what's about to
 	// happen before any coord write fires. Especially valuable
 	// on first-time setup against an example project (clones
@@ -140,7 +155,13 @@ func cmdBotSetup(args []string) {
 		names = append(names, manifest.Bots[i].Name)
 	}
 	fmt.Fprintf(os.Stderr, "Setting up %d bot(s) declared in %s/enju/bots.yaml: %s\n", len(manifest.Bots), absProject, strings.Join(names, ", "))
-	fmt.Fprintf(os.Stderr, "Coordinator: %s — owner: %s\n\n", *coordinator, owner.Username)
+	fmt.Fprintf(os.Stderr, "Coordinator: %s — owner: %s\n", *coordinator, owner.Username)
+	if effectiveProjectID > 0 {
+		fmt.Fprintf(os.Stderr, "Project membership: bots will be added to project #%d\n\n", effectiveProjectID)
+	} else {
+		fmt.Fprintln(os.Stderr, "Project membership: skipped (pass --project-id=N or set project_id in manifest to auto-add)")
+		fmt.Fprintln(os.Stderr)
+	}
 
 	// Tally counters for the trailing summary; feels small but
 	// the user wants to see "what happened" at a glance,
@@ -156,9 +177,28 @@ func cmdBotSetup(args []string) {
 		// means setup has already run for this bot. We don't
 		// validate its contents — the daemon will surface a
 		// clearer error if the token is bad than we would here.
+		//
+		// We still run the membership add for already-registered
+		// bots when --project-id is set: the bot might have been
+		// registered before the auto-add path existed, or the
+		// previous setup ran without a project id. Membership is
+		// idempotent on the coord side, so re-running is safe and
+		// fixes the legacy "registered but not a project member"
+		// state.
 		if _, err := os.Stat(b.Credentials); err == nil {
 			fmt.Printf("  %-20s ✓ already set up — credentials at %s\n", b.Name, b.Credentials)
 			skipped++
+			if effectiveProjectID > 0 && !*dryRun {
+				existing := loadCredentialsAt(*coordinator, b.Credentials)
+				if existing != nil && existing.Username != "" {
+					if err := addBotToProject(ctx, *coordinator, owner.Token, effectiveProjectID, existing.Username); err != nil {
+						fmt.Fprintf(os.Stderr, "  %-20s ⚠ couldn't add to project %d: %v\n   add manually: enju_add_project_member project_id=%d username=%s\n",
+							b.Name, effectiveProjectID, err, effectiveProjectID, existing.Username)
+					} else {
+						fmt.Printf("  %-20s ✓ ensured member of project #%d\n", b.Name, effectiveProjectID)
+					}
+				}
+			}
 			continue
 		}
 		if *dryRun {
@@ -188,6 +228,27 @@ func cmdBotSetup(args []string) {
 		}
 		fmt.Printf("  %-20s ✓ registered as %s, credentials at %s\n", b.Name, username, b.Credentials)
 		registered++
+
+		// Auto-add to project membership when configured. Without
+		// this, the freshly-registered bot is a citizen but has no
+		// access to its project's runs — `enju bot run` would
+		// poll, get 403s on /projects/{id}/runs, and never claim
+		// anything. The owner's token authorizes the add (operator
+		// who ran `enju bot setup` must be a project member; the
+		// coord enforces that on the POST).
+		//
+		// "already a member" is treated as success — the operator
+		// re-running setup after a partial registration shouldn't
+		// see a failure when the membership step succeeded the
+		// first time around.
+		if effectiveProjectID > 0 {
+			if err := addBotToProject(ctx, *coordinator, owner.Token, effectiveProjectID, username); err != nil {
+				fmt.Fprintf(os.Stderr, "  %-20s ⚠ registered but couldn't add to project %d: %v\n   add manually: enju_add_project_member project_id=%d username=%s\n",
+					b.Name, effectiveProjectID, err, effectiveProjectID, username)
+			} else {
+				fmt.Printf("  %-20s ✓ added to project #%d as member\n", b.Name, effectiveProjectID)
+			}
+		}
 	}
 
 	// Ensure enju/bots/ (per-bot worktree dir) is in the
@@ -258,6 +319,52 @@ func registerBot(ctx context.Context, coordURL, ownerToken string, b *bots.Bot) 
 	return out.Token, out.Username, nil
 }
 
+// addBotToProject POSTs to /api/v1/projects/{id}/members to add
+// the freshly-registered bot as a project member. The owner's
+// bearer authenticates the call; the coord enforces that the
+// caller is itself a member with permission to add (typically
+// owner role for new members).
+//
+// Idempotency: if the bot is already a member, the coord's
+// "already a member" / 409-ish response is treated as success
+// rather than error. The exact wording is keyed off substrings
+// from the coord's add-member handler; a future structured-
+// error-code refactor coord-side would make this less brittle.
+//
+// We re-use net/http directly here for the same reason
+// registerBot does — one-shot CLI calls don't need the long-
+// lived auto-reregister coord.Client machinery.
+func addBotToProject(ctx context.Context, coordURL, ownerToken string, projectID int64, botUsername string) error {
+	body := map[string]string{"username": botUsername, "role": "member"}
+	jsonBody, _ := json.Marshal(body)
+	url := fmt.Sprintf("%s/api/v1/projects/%d/members", coordURL, projectID)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ownerToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// 2xx = added or already-member happy paths.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	// Treat already-a-member as success regardless of status code.
+	// The coord's add-member handler can surface this as either
+	// 409 with `{"error": "already a member"}` or 200 with the
+	// existing membership row; both shapes mean "done."
+	if strings.Contains(strings.ToLower(string(respBody)), "already") {
+		return nil
+	}
+	return fmt.Errorf("coord %d: %s", resp.StatusCode, string(respBody))
+}
+
 // writeBotCredentials writes a credentials.json with 0600 mode
 // at the bot's manifest path. Mirrors saveCredentialsAt's wire
 // format (Coordinator/Username/Name/Token) so the bot daemon —
@@ -299,34 +406,49 @@ func writeBotCredentials(path, coordinator, username, name, token string) error 
 	return nil
 }
 
-// cmdBotRun launches the bot daemon — the long-running loop
-// that polls the coord for tasks assigned to this bot, hands
-// each prompt to the LLM, and submits the result.
+// cmdBotRun launches the bot daemon: a long-running loop that
+// finds tasks assigned to this bot, runs them through the bot's
+// Handler (Claude CLI by default, but pluggable per manifest),
+// and submits results.
 //
-// One process = one bot = one project. Run multiple `enju bot
-// run` processes (different --bot, different cwd) for fleets.
+// Architectural note: the daemon is a peer consumer of
+// service.FatClient — same shape as `enju ui` — so all five
+// task actions (answer / contribute / compute / review / vote)
+// just work. The daemon adds no orchestration of its own beyond
+// "find → claim → handler → submit." Pre-Phase-7 code
+// reimplemented a tiny subset of fat-client functionality and
+// could only handle 2/5 actions; that code was thrown out and
+// rewritten on top of the same FatClient the web UI uses.
 //
-// Walking-skeleton scope: action=review + action=vote only.
-// Anything else surfaces an error from the runner; operators
-// should leave non-supported tasks for humans (or wait for
-// the workspace-aware daemon path that adds git/commit
-// support).
+// One process = one bot. ProjectID > 0 scopes to a single
+// project; ProjectID == 0 polls every project the bot is a
+// member of. Multi-bot fleets run multiple processes (one per
+// manifest entry) — the supervisor MCP tools (enju_bot_start
+// / start_all) are the recommended way to orchestrate.
 func cmdBotRun(args []string) {
 	fs := flag.NewFlagSet("bot run", flag.ExitOnError)
 	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
 	botName := fs.String("bot", "", "Bot name from enju/bots.yaml (required)")
 	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
-	projectID := fs.Int64("project-id", 0, "Optional project id to scope task discovery (0 = across every project the bot is a member of)")
+	projectID := fs.Int64("project-id", 0, "Project id to scope task discovery (0 = every project the bot is a member of)")
+	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
 	pollInterval := fs.Duration("poll-interval", 1*time.Second, "Floor sleep between empty polls (doubles up to --backoff-max)")
 	backoffMax := fs.Duration("backoff-max", 30*time.Second, "Max sleep between empty polls — caps the exponential backoff")
-	allowTools := fs.String("allow-tools", "", "Comma-separated MCP tool allowlist forwarded to any MCP host the daemon spawns. Defaults to the manifest's mcp_tools.allow when empty. Today's review/vote actions don't spawn an MCP host (text-in / text-out), so the allowlist is declarative-only — it'll be pinned at process boundary once action=contribute ships and the daemon spawns claude code with MCP.")
+	// --allow-tools is accepted for parity with the supervisor's
+	// argv (which always passes it). The daemon doesn't act on
+	// it directly; the manifest's mcp_tools.allow is the
+	// authoritative allowlist consumed by the Handler at
+	// construction time.
+	_ = fs.String("allow-tools", "", "Reserved — manifest mcp_tools.allow is authoritative")
 	fs.Parse(args)
 
 	if *botName == "" {
 		fmt.Fprintln(os.Stderr, "--bot=<name> is required (must match a bot in enju/bots.yaml)")
 		os.Exit(1)
 	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	absProject, err := filepath.Abs(*projectDir)
 	if err != nil {
@@ -348,37 +470,36 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	// Load the bot's credentials. The setup step (enju bot setup)
-	// already wrote them at bot.Credentials; if they're missing
-	// the operator skipped setup or moved the file — surface
-	// loudly with the recovery hint.
 	creds := loadCredentialsAt(*coordinator, bot.Credentials)
 	if creds == nil || creds.Token == "" {
-		fmt.Fprintf(os.Stderr, "no credentials for bot %q at %s — run `enju bot setup` first (or check the manifest's credentials path matches your coord URL)\n", bot.Name, bot.Credentials)
+		fmt.Fprintf(os.Stderr, "no credentials for bot %q at %s — run `enju bot setup` first\n", bot.Name, bot.Credentials)
 		os.Exit(1)
 	}
 
-	// Read the bot's system prompt from the manifest path.
-	// Optional — an empty system prompt is unusual but legal,
-	// and we don't want a missing file to crash the loop on
-	// startup. Just log + proceed with no system prompt.
-	systemPrompt, err := os.ReadFile(filepath.Join(absProject, bot.SystemPrompt))
+	// Read the bot's system prompt. Empty is legal (some handler
+	// types don't use one); a missing file is a soft warning so
+	// a typo'd path doesn't crash the daemon at startup.
+	var systemPrompt string
+	if bot.SystemPrompt != "" {
+		data, err := os.ReadFile(filepath.Join(absProject, bot.SystemPrompt))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: couldn't read system prompt at %s: %v — continuing with empty system prompt\n", bot.SystemPrompt, err)
+		} else {
+			systemPrompt = string(data)
+		}
+	}
+
+	handler, err := bots.NewHandler(bot)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: couldn't read system prompt at %s: %v — continuing with empty system prompt\n", bot.SystemPrompt, err)
-		systemPrompt = nil
-	}
-
-	// Pre-flight: confirm the LLM CLI is on PATH. Without
-	// this check, the first task invocation would fail
-	// mid-iteration with an exec lookup error AFTER claiming
-	// the task — operator would have to release the claim
-	// manually. Cheap to check upfront; saves a debug round.
-	if _, err := exec.LookPath("claude"); err != nil {
-		fmt.Fprintln(os.Stderr, "claude CLI not found on PATH — install Claude Code first (https://claude.com/claude-code), or pass --allow-tools=... to skip if you've configured a different LLM backend (not yet supported, but the LookPath check would be moved at that point).")
+		fmt.Fprintf(os.Stderr, "build handler: %v\n", err)
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ws, err := workspace.NewWorkspace(*workspaceDir, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build workspace: %v\n", err)
+		os.Exit(1)
+	}
 	coordClient := coord.New(coord.Config{
 		BaseURL:     *coordinator,
 		Username:    creds.Username,
@@ -386,101 +507,57 @@ func cmdBotRun(args []string) {
 		AuthToken:   creds.Token,
 		Logger:      logger,
 	})
-	runner := &bots.Runner{
+	fc := service.New(service.Config{
+		Coord:           coordClient,
+		Workspace:       ws,
+		ModelName:       bot.Model,
+		Logger:          logger,
+		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
+	})
+
+	daemon, err := bots.New(bots.Config{
+		FC:           fc,
+		Handler:      handler,
 		Bot:          bot,
+		SystemPrompt: systemPrompt,
 		ProjectID:    *projectID,
-		Coord:        &bots.HTTPCoordClient{C: coordClient},
-		LLM:          &bots.ClaudeBackend{}, // TODO(phase2.4): pluggable backend per manifest
-		Logger:       logger,
-		PollInterval: *pollInterval,
+		PollFloor:    *pollInterval,
 		BackoffMax:   *backoffMax,
-		SystemPrompt: string(systemPrompt),
+		Logger:       logger,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build daemon: %v\n", err)
+		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "Bot %q running against %s (model=%s, project_id=%d)\n",
-		bot.Name, *coordinator, bot.Model, *projectID)
-	// Resolve the tool allowlist: --allow-tools flag wins;
-	// otherwise the manifest's mcp_tools.allow. Recording it
-	// loudly so operators see the trust-model wiring even
-	// though today's actions don't currently spawn an MCP
-	// host for the LLM (review/vote are text-only). Once
-	// action=contribute ships the daemon will spawn `enju mcp
-	// --allow-tools=...` for claude code's MCP toolbox; this
-	// resolution path already feeds the right list.
-	allowList := splitAllowTools(*allowTools)
-	if len(allowList) == 0 && bot.MCPTools != nil {
-		allowList = bot.MCPTools.Allow
-	}
-	if len(allowList) > 0 {
-		fmt.Fprintf(os.Stderr, "Tool allowlist (declarative for v1 review/vote; pinned in MCP host for action=contribute): %v\n", allowList)
-	}
-	fmt.Fprintln(os.Stderr, "Walking-skeleton scope: action=review and action=vote only. Tasks with {{task.X.content}} upstream-content references will see literal placeholders (no git resolution yet — that lands with the workspace-aware daemon path).")
-	if *once {
-		fmt.Fprintln(os.Stderr, "Single-iteration mode (--once): will exit after one claim+submit cycle (or no-work).")
-	}
+	fmt.Fprintf(os.Stderr, "Bot %q running against %s (model=%s, project_id=%d, handler=%s)\n",
+		bot.Name, *coordinator, bot.Model, *projectID, bot.Handler)
 
-	// Signal handling + stdin-EOF: two ways the daemon's
-	// owner can request a graceful shutdown.
-	//
-	//  - SIGINT/SIGTERM: standard Unix; covers operator Ctrl-C
-	//    and `kill PID`. Windows handles SIGINT but NOT SIGTERM
-	//    (no symbolic equivalent), so signal.NotifyContext
-	//    falls back to os.Interrupt-only there.
-	//  - stdin-EOF: the supervisor (Phase 4 fatclient MCP tool)
-	//    closes the daemon's stdin pipe; the daemon notices
-	//    EOF and triggers the same shutdown path. Cross-platform
-	//    via stdlib only — no signal-tree gymnastics.
-	//
-	// Both feed the same context cancel so the runner's defer
-	// ReleaseActiveClaim fires uniformly across exit paths.
+	// Two graceful-shutdown triggers feeding the same cancel:
+	//   - SIGINT/SIGTERM (operator Ctrl-C, `kill PID`)
+	//   - stdin-EOF (supervisor closed our stdin pipe)
+	// Both fire the daemon's deferred ReleaseActiveClaim so a
+	// shutdown mid-iteration doesn't leak the claim.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Pre-flight: warn loudly if stdin is /dev/null or a
-	// regular file. Both EOF immediately and would shut the
-	// daemon down before it does any work — a confusing
-	// silent-no-op for operators who try `nohup enju bot run
-	// &` (which redirects stdin to /dev/null by default). The
-	// warning tells them to use a long-lived stdin (pipe from
-	// supervisor, interactive terminal, or `< /dev/zero` as
-	// an escape hatch for service managers without a pipe).
 	if st, err := os.Stdin.Stat(); err == nil {
 		mode := st.Mode()
-		// Heuristic: a regular file or /dev/null shows up as
-		// "regular" (mode.IsRegular()) or with the 0 size +
-		// no terminal/pipe bits. We flag both — false
-		// positives (rare custom setups) just see a warning.
 		if mode.IsRegular() || (mode&os.ModeCharDevice == 0 && mode&os.ModeNamedPipe == 0 && mode&os.ModeSocket == 0) {
-			fmt.Fprintln(os.Stderr, "WARNING: stdin is not a TTY/pipe/socket — the daemon may shut down immediately on EOF. To run detached, pass `< /dev/zero` or use a supervisor that pipes stdin (Phase 4 fatclient supervisor handles this; nohup alone redirects stdin to /dev/null and triggers immediate shutdown).")
+			fmt.Fprintln(os.Stderr, "WARNING: stdin is not a TTY/pipe/socket — the daemon may shut down immediately on EOF. To run detached, pass `< /dev/zero` or use a supervisor that pipes stdin.")
 		}
 	}
-
 	go watchStdinEOF(os.Stdin, cancel)
 
 	if *once {
-		// --once skips Run() (and thus its deferred release).
-		// Do the same release pass here so a Ctrl-C or LLM
-		// failure during a single iteration doesn't leak the
-		// claim for the reaper to clean up later.
-		defer runner.ReleaseActiveClaim()
-		err := runner.RunOnce(ctx)
-		switch {
-		case err == nil:
-			// Claimed and submitted — exit 0.
-		case errors.Is(err, bots.ErrNoWork):
-			// Distinct from success so CI / scripted callers
-			// can branch on it (e.g. systemd timer skips a
-			// nudge if there's nothing pending).
-			fmt.Fprintln(os.Stderr, "no work available; exiting (--once)")
-			os.Exit(3)
-		default:
+		_, err := daemon.RunOnce(ctx)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "iteration error: %v\n", err)
 			os.Exit(2)
 		}
 		return
 	}
-
-	if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := daemon.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "bot daemon exited: %v\n", err)
 		os.Exit(2)
 	}

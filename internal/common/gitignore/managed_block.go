@@ -1,4 +1,4 @@
-package workspace
+package gitignore
 
 // .gitignore managed-block helpers. The untracked-artifacts
 // feature declares per-task paths whose content must NOT land
@@ -37,7 +37,7 @@ const (
 	gitignoreBlockEnd   = "# END enju-untracked"
 )
 
-// UpdateGitignoreManagedBlock returns a new .gitignore body
+// UpdateManagedBlock returns a new .gitignore body
 // that contains the union of (existing managed-block entries,
 // additional untracked paths). Everything outside the managed
 // block is preserved verbatim.
@@ -57,7 +57,7 @@ const (
 // Returns (nil, false) when addPaths adds nothing new — lets
 // callers cheaply short-circuit the commit-a-.gitignore step
 // in the common "all declared paths already listed" case.
-func UpdateGitignoreManagedBlock(existing []byte, addPaths []string) ([]byte, bool) {
+func UpdateManagedBlock(existing []byte, addPaths []string) ([]byte, bool) {
 	// Filter + dedupe incoming paths. Empty strings (can creep
 	// in from unguarded for_each expansions) stay out of the
 	// block so we don't emit a blank ignore line.

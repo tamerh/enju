@@ -203,6 +203,14 @@ type TaskMeta struct {
 	// DependsOn contains entry A's task id, A's submission
 	// will cascade-modify B's state before B can submit.
 	DependsOn string
+	// ClaimedBy is the username of the citizen currently
+	// holding an open claim on this task, when state=claimed.
+	// Empty in any other state (or when no claim is open).
+	// Used by UI surfaces (and any caller that needs to
+	// distinguish "I hold the claim" from "someone else does"
+	// — e.g. a bot holding the claim while a human views the
+	// task page).
+	ClaimedBy string
 }
 
 // FetchTaskMeta reads a task's metadata from the coordinator. Used
@@ -351,6 +359,9 @@ func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta
 	}
 	if v, ok := raw["depends_on"].(string); ok {
 		meta.DependsOn = v
+	}
+	if v, ok := raw["claimed_by"].(string); ok {
+		meta.ClaimedBy = v
 	}
 	if v, ok := raw["prompt"].(string); ok {
 		meta.Prompt = v

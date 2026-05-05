@@ -13,24 +13,16 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// errorFromResponse decodes a JSON body and returns the value of
-// its "error" field, or "" if absent. Used by list-style handlers
-// that decode into typed structs and would otherwise silently
-// mask auth failures (the auth middleware returns 401 with
-// {"error": "..."} which is structurally compatible with most
-// list response shapes).
+// errorFromResponse forwards to coord.ExtractError. Kept as a
+// package-local name because every call site already uses the
+// short form; the implementation lives in coord so service-layer
+// code shares the same envelope-extraction logic.
 func errorFromResponse(data []byte) string {
-	var probe map[string]interface{}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return ""
-	}
-	if msg, ok := probe["error"].(string); ok {
-		return msg
-	}
-	return ""
+	return coord.ExtractError(data)
 }
 
 func (c *apiClient) handleRegisterBot(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

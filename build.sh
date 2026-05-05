@@ -140,6 +140,28 @@ cmd_check_imports() {
         fail=1
     fi
 
+    # Rule 6: bots is the second peer consumer of FatClient — bot
+    # daemon, manifest, supervisor, Handler interface. Same shape
+    # as Rule 5: bots may DIRECTLY import common/* and
+    # internal/fatclient/service only. Transitive deps via
+    # service are fine. Locks in the Phase 7 "bots are first-class
+    # fatclient consumers, not parallel infrastructure" architecture
+    # — without this, nothing prevents bots from sneaking into
+    # coordinator/* or workspace/* on a future patch.
+    local bots_offenders
+    bots_offenders=$(direct_imports_of './internal/bots/...' \
+        | awk '{ print $2 }' \
+        | grep -vE '^github\.com/enju-ai/enju/internal/(common|fatclient/service)(/|$)' \
+        | sort -u \
+        || true)
+    if [ -n "$bots_offenders" ]; then
+        echo "❌ Rule 6 violated: internal/bots/* directly imports outside the allowed surface"
+        echo "$bots_offenders" | sed 's/^/   /'
+        echo "   bots may import only internal/common/* and internal/fatclient/service."
+        echo "   Reach through service.FatClient — raise a gap if a method is missing."
+        fail=1
+    fi
+
     if [ "$fail" -eq 0 ]; then
         echo "✅ import direction OK"
         return 0

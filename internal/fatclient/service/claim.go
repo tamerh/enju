@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/types"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -206,6 +207,20 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Coord returns 4xx error envelopes as `{"error": "..."}`
+	// bodies; the coord client doesn't check HTTP status, so a
+	// claim refusal (not a member, terminated run, role
+	// mismatch, ...) lands here as `data` with no transport
+	// error. Without this check we'd happily wrap the envelope
+	// as a successful ClaimResult, set the bot's activeClaim
+	// to a task it never actually got, and only notice the
+	// failure on the next read — by which point the daemon has
+	// burned a poll cycle and (worse) every subsequent iteration
+	// would build a phantom orphaned claim coord-side.
+	if msg := coord.ExtractError(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	result := &ClaimResult{Data: data}

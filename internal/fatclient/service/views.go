@@ -25,6 +25,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/format"
 	"github.com/enju-ai/enju/internal/common/wire"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 )
 
 // ProjectDetail extends a project with the membership list. One
@@ -114,6 +115,9 @@ func (s *FatClient) ListProjects(ctx context.Context) ([]wire.Project, error) {
 	if err != nil {
 		return nil, err
 	}
+	if msg := coord.ExtractError(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
 	var out []wire.Project
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("decode projects: %w", err)
@@ -158,6 +162,9 @@ func (s *FatClient) ListRuns(ctx context.Context, projectID int64) ([]wire.Run, 
 	data, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
 	if err != nil {
 		return nil, err
+	}
+	if msg := coord.ExtractError(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var out []wire.Run
 	if err := json.Unmarshal(data, &out); err != nil {

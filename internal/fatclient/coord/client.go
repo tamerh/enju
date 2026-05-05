@@ -106,6 +106,42 @@ func New(cfg Config) *Client {
 // BaseURL returns the configured coordinator base URL.
 func (c *Client) BaseURL() string { return c.baseURL }
 
+// ExtractError decodes a coord response body and returns the
+// value of its "error" field, or "" if absent / not JSON / not
+// an object. The coord's writeError helper emits non-2xx
+// responses as `{"error": "..."}`; the auth middleware does the
+// same for 401/403. Get/Post/etc. don't check status codes —
+// they return the body unchanged so callers can extract typed
+// payloads — so callers that decode into a typed struct must
+// run this check first or risk JSON-decode errors that mask
+// the real "403 not a member" / "401 stale token" cause.
+//
+// Free function (not a method) so it composes cleanly:
+//
+//	data, err := c.Get(...)
+//	if err != nil { return err }
+//	if msg := coord.ExtractError(data); msg != "" {
+//	    return errors.New(msg)
+//	}
+//	json.Unmarshal(data, &out)
+//
+// Used by both internal/fatclient/mcphandlers and
+// internal/fatclient/service. Pure bytes — no network, no
+// state.
+func ExtractError(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var probe map[string]interface{}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ""
+	}
+	if msg, ok := probe["error"].(string); ok {
+		return msg
+	}
+	return ""
+}
+
 // Username returns the current citizen username. Safe for
 // concurrent use; reflects auto-reregister rotations.
 func (c *Client) Username() string {

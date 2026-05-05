@@ -6,6 +6,18 @@
 // API; supervisor errors surface as MCP tool errors with the
 // coord-style "✗ <reason>" prefix the LLM is trained to
 // recognize.
+//
+// Layering note: the supervisor manages OS processes only —
+// it spawns `enju bot run --bot=<name> ...`, captures the
+// PID, tails the log, and signals on shutdown. The daemon's
+// internals (FatClient consumer, Handler interface, all the
+// Phase 7 architecture) are opaque to the supervisor; from
+// here the daemon is just a binary that takes argv and
+// streams stdout/stderr. That separation is intentional —
+// the supervisor doesn't import internal/bots beyond the
+// manifest reader and the shared Supervisor type, and it
+// would still work if the daemon were re-implemented in a
+// completely different shape.
 
 package mcphandlers
 
@@ -16,7 +28,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/enju-ai/enju/internal/fatclient/bots"
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 

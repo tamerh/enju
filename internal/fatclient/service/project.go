@@ -30,6 +30,31 @@ func (s *FatClient) FetchProjectMetaFull(ctx context.Context, projectID int64) (
 	return
 }
 
+// ResolveProjectWorkspace returns the absolute path to the
+// project's local clone, materializing it (clone or init) if
+// not yet present. Used by per-process consumers (bot daemon)
+// that need to point subprocesses at the right cwd — without
+// this, a Handler that spawns `claude -p` (or any subprocess)
+// inherits the daemon's cwd, leaking the operator's filesystem
+// to the LLM AND letting the bot accidentally write into the
+// wrong tree.
+//
+// Thin wrapper over OpenProject that returns just the
+// (path, error) shape the daemon needs, so the bots package
+// doesn't have to import workspace just to read WorkDir().
+// Path is absolute and stable for the life of the project on
+// this machine.
+func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64) (string, error) {
+	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	if proj == nil {
+		return "", fmt.Errorf("no workspace project for project_id=%d", projectID)
+	}
+	return proj.WorkDir(), nil
+}
+
 // OpenProject fetches project metadata, opens the workspace
 // clone, AND wires the project's default_branch into the
 // Project so Pull/Push fallback paths target the right ref.

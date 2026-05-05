@@ -332,6 +332,152 @@ func TestListEvents_NoOptsNoQueryString(t *testing.T) {
 	}
 }
 
+func TestListReadyTasks_ScopedToRun(t *testing.T) {
+	// Pin the wire shape: with runID > 0 the daemon's bot loop
+	// expects /api/v1/tasks/ready?project_id=7&run_id=10 and a
+	// flat array back. Drift on either side breaks the bot
+	// daemon silently — this test fails loudly first.
+	srv := fakeCoord(t, map[string]any{
+		"/api/v1/tasks/ready": []map[string]any{
+			{
+				"id":         "7:10:review-design",
+				"action":     "review",
+				"assign_to":  []any{"reviewer-bot"},
+				"seq":        float64(1),
+				"claimed_by": "",
+			},
+			{
+				"id":        "7:10:answer-q1",
+				"action":    "answer",
+				"assign_to": []any{},
+				"seq":       float64(2),
+			},
+		},
+	})
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	got, err := fc.ListReadyTasks(context.Background(), 7, 10)
+	if err != nil {
+		t.Fatalf("ListReadyTasks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 tasks, got %d: %+v", len(got), got)
+	}
+	if id, _ := got[0]["id"].(string); id != "7:10:review-design" {
+		t.Errorf("first task id: got %q", id)
+	}
+	if act, _ := got[1]["action"].(string); act != "answer" {
+		t.Errorf("second task action: got %q", act)
+	}
+}
+
+func TestListReadyTasks_RunIDZeroOmitsRunIDQuery(t *testing.T) {
+	// runID == 0 should query without &run_id=, fetching every
+	// run's ready tasks. The fakeCoord matches by exact path,
+	// so the test asserts the path shape via the Server seeing
+	// the request — we capture it via the handler.
+	var sawPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	if _, err := fc.ListReadyTasks(context.Background(), 7, 0); err != nil {
+		t.Fatalf("ListReadyTasks: %v", err)
+	}
+	want := "/api/v1/tasks/ready?project_id=7"
+	if sawPath != want {
+		t.Errorf("path: got %q, want %q (no run_id when runID==0)", sawPath, want)
+	}
+}
+
+func TestListReadyTasks_DecodeError(t *testing.T) {
+	// Server returns non-array JSON without an "error" field.
+	// Method should surface the decode error, not panic.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"oops": "not an array"}`))
+	}))
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	_, err := fc.ListReadyTasks(context.Background(), 7, 10)
+	if err == nil {
+		t.Fatal("expected decode error on non-array response")
+	}
+	if !strings.Contains(err.Error(), "decoding") {
+		t.Errorf("error message: got %q, want substring \"decoding\"", err.Error())
+	}
+}
+
+// Pin the bug-fix from the membership story: when the coord
+// returns a 4xx with `{"error": "not a member of this project"}`,
+// the view method must surface the coord's message verbatim
+// rather than the misleading JSON-decode error that came from
+// trying to unmarshal the envelope into the typed slice. This
+// is what produced the "decode runs: cannot unmarshal object
+// into Go value of type []wire.Run" mystery in production.
+func TestListRuns_SurfacesCoordErrorEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error": "not a member of this project"}`))
+	}))
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	_, err := fc.ListRuns(context.Background(), 7)
+	if err == nil {
+		t.Fatal("expected error from 403 response")
+	}
+	if !strings.Contains(err.Error(), "not a member") {
+		t.Errorf("error should carry coord message verbatim, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "decode") {
+		t.Errorf("error should NOT mention JSON decode (that's the bug being fixed): %v", err)
+	}
+}
+
+func TestListProjects_SurfacesCoordErrorEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error": "stale token"}`))
+	}))
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	_, err := fc.ListProjects(context.Background())
+	if err == nil {
+		t.Fatal("expected error from 401 response")
+	}
+	if !strings.Contains(err.Error(), "stale token") {
+		t.Errorf("error should carry coord message: %v", err)
+	}
+}
+
+func TestListReadyTasks_SurfacesCoordErrorEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error": "not a member of this project"}`))
+	}))
+	defer srv.Close()
+
+	fc := newViewClient(t, srv.URL)
+	_, err := fc.ListReadyTasks(context.Background(), 7, 10)
+	if err == nil {
+		t.Fatal("expected error from 403 response")
+	}
+	if !strings.Contains(err.Error(), "not a member") {
+		t.Errorf("error should carry coord message: %v", err)
+	}
+}
+
 func TestListMaterializedProjects(t *testing.T) {
 	root := t.TempDir()
 	// Workspace.projectDir produces "<id>-<slug>" — replicate

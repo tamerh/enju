@@ -82,17 +82,63 @@ type FatClient struct {
 // New constructs a FatClient. Logger defaults to slog.Default() when
 // the caller didn't supply one — service helpers always have
 // somewhere to log without a nil check at every call site.
+//
+// Adopted-project bridge: when both ProjectRegistry and Workspace
+// are configured, every registry entry whose LocalPath still
+// exists on disk is registered with the workspace as an external
+// dir. Without this, projects adopted via `enju_init` /
+// `enju_create_project --path` (which write to
+// `~/.enju/projects.json` but only call workspace.RegisterExternalDir
+// in the SAME process) become invisible to OpenExisting after
+// process restart — the in-memory `externalDirs` map starts
+// empty in every fresh fatclient, so OpenExisting falls through
+// to filesystem scanning of `~/.enju/workspaces/...` and returns
+// ErrCloneNotFound for adopted dirs that live outside that root.
+//
+// The bridge fires once at construction so OpenExisting stays
+// fast (no per-call registry I/O) and so all consumers in this
+// process — webui, MCP handlers, bot daemon — see the same
+// authoritative answer.
 func New(cfg Config) *FatClient {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &FatClient{
+	fc := &FatClient{
 		coord:      cfg.Coord,
 		workspace:  cfg.Workspace,
 		modelName:  cfg.ModelName,
 		logger:     logger,
 		projectRegistry: cfg.ProjectRegistry,
+	}
+	fc.hydrateExternalDirsFromRegistry()
+	return fc
+}
+
+// hydrateExternalDirsFromRegistry walks the project registry and
+// registers each entry's LocalPath with the workspace as an
+// external dir. No-op when either side is unconfigured (tests
+// that build a service without a registry, or a registry that
+// fails to load).
+//
+// `Registry.List` already filters entries whose LocalPath has
+// disappeared, so we don't double-stat here.
+func (s *FatClient) hydrateExternalDirsFromRegistry() {
+	if s.projectRegistry == nil || s.workspace == nil {
+		return
+	}
+	entries, err := s.projectRegistry.List()
+	if err != nil {
+		s.logger.Warn("project registry list failed during fatclient construction; adopted projects may be invisible until next coord touch",
+			"error", err)
+		return
+	}
+	for _, e := range entries {
+		s.workspace.RegisterExternalDir(e.ID, e.LocalPath)
+	}
+	if len(entries) > 0 {
+		s.logger.Debug("registered adopted projects from registry",
+			"count", len(entries))
 	}
 }
 

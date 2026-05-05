@@ -19,6 +19,68 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
+// ArtifactResponse is one artifact index row's wire shape,
+// mirroring the coord-side ArtifactResponse field-for-field
+// (JSON tags load-bearing). Webui consumes this directly via
+// Session.ListArtifacts; MCP handlers parse the same shape
+// from the byte stream.
+type ArtifactResponse struct {
+	Path       string `json:"path"`
+	LastWriter string `json:"last_writer,omitempty"`
+	LastTaskID string `json:"last_task_id,omitempty"`
+	LastRunID  int64  `json:"last_run_id,omitempty"`
+	CommitSHA  string `json:"commit_sha,omitempty"`
+	// Tracked is *bool so the false case round-trips through
+	// JSON without omitempty dropping it. Empty-pointer means
+	// "not specified by coord," which today implies tracked=true.
+	Tracked   *bool  `json:"tracked,omitempty"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// ListArtifactsOpts mirrors the coord query string for
+// /api/v1/projects/{pid}/artifacts. Empty Branch falls back to
+// the project's default; empty Prefix returns every artifact.
+type ListArtifactsOpts struct {
+	Branch string
+	Prefix string
+}
+
+// ListArtifacts returns the project's artifact index rows.
+// Membership-gated server-side. Pure HTTP pass-through —
+// content + history live elsewhere (GetArtifactContent /
+// GetArtifactHistory).
+func (s *FatClient) ListArtifacts(ctx context.Context, projectID int64, opts ListArtifactsOpts) ([]ArtifactResponse, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("project_id is required")
+	}
+	q := ""
+	if opts.Branch != "" {
+		q += "branch=" + opts.Branch
+	}
+	if opts.Prefix != "" {
+		if q != "" {
+			q += "&"
+		}
+		q += "prefix=" + opts.Prefix
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID)
+	if q != "" {
+		path += "?" + q
+	}
+	data, err := s.coord.Get(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if msg := errorMsg(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	var out []ArtifactResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decode artifacts: %w", err)
+	}
+	return out, nil
+}
+
 // commitTaskSubjectRe matches the first line of commit messages
 // the enju client writes, so artifact-history annotations can
 // enrich each entry with the submitting task_id and owner.

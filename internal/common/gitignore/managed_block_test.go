@@ -1,4 +1,4 @@
-package workspace
+package gitignore
 
 import (
 	"strings"
@@ -9,7 +9,7 @@ import (
 // starting state: the helper must synthesize the block on its
 // own and return non-nil bytes so the caller stages the file.
 func TestGitignoreBlockFreshFile(t *testing.T) {
-	out, changed := UpdateGitignoreManagedBlock(nil, []string{"out/aligned.bam"})
+	out, changed := UpdateManagedBlock(nil, []string{"out/aligned.bam"})
 	if !changed {
 		t.Fatal("expected changed=true for fresh file")
 	}
@@ -32,7 +32,7 @@ func TestGitignoreBlockPreservesUserContent(t *testing.T) {
 .DS_Store
 node_modules/
 `)
-	out, changed := UpdateGitignoreManagedBlock(existing, []string{"out/x.bam"})
+	out, changed := UpdateManagedBlock(existing, []string{"out/x.bam"})
 	if !changed {
 		t.Fatal("expected changed=true — first time adding block")
 	}
@@ -62,7 +62,7 @@ func TestGitignoreBlockMergesIntoExistingBlock(t *testing.T) {
 	existing := []byte(gitignoreBlockBegin + "\n" +
 		"out/existing.bam\n" +
 		gitignoreBlockEnd + "\n")
-	out, changed := UpdateGitignoreManagedBlock(existing, []string{"out/new.bam"})
+	out, changed := UpdateManagedBlock(existing, []string{"out/new.bam"})
 	if !changed {
 		t.Fatal("expected changed=true for new path")
 	}
@@ -89,7 +89,7 @@ func TestGitignoreBlockIdempotentNoChange(t *testing.T) {
 	existing := []byte(gitignoreBlockBegin + "\n" +
 		"out/aligned.bam\n" +
 		gitignoreBlockEnd + "\n")
-	out, changed := UpdateGitignoreManagedBlock(existing, []string{"out/aligned.bam"})
+	out, changed := UpdateManagedBlock(existing, []string{"out/aligned.bam"})
 	if changed {
 		t.Errorf("expected changed=false (path already present), got changed=true, out=%q", out)
 	}
@@ -102,7 +102,7 @@ func TestGitignoreBlockIdempotentNoChange(t *testing.T) {
 // pass the same path multiple times (sloppy for_each expansion).
 // The block stays clean.
 func TestGitignoreBlockDedupesDuplicateRequests(t *testing.T) {
-	out, _ := UpdateGitignoreManagedBlock(nil, []string{"out/a.bam", "out/a.bam", "out/b.bam"})
+	out, _ := UpdateManagedBlock(nil, []string{"out/a.bam", "out/a.bam", "out/b.bam"})
 	s := string(out)
 	if strings.Count(s, "out/a.bam") != 1 {
 		t.Errorf("duplicates not deduped: %s", s)
@@ -113,7 +113,7 @@ func TestGitignoreBlockDedupesDuplicateRequests(t *testing.T) {
 // land in the block (would make git ignore literally nothing
 // with a warning).
 func TestGitignoreBlockEmptyPathsNoop(t *testing.T) {
-	out, changed := UpdateGitignoreManagedBlock(nil, []string{""})
+	out, changed := UpdateManagedBlock(nil, []string{""})
 	if changed {
 		t.Errorf("expected changed=false for empty-only input, got %q", out)
 	}
@@ -129,7 +129,7 @@ func TestGitignoreBlockUserContentAfterBlock(t *testing.T) {
 		gitignoreBlockEnd + "\n" +
 		"# bottom rule\n" +
 		"vendor/\n")
-	out, _ := UpdateGitignoreManagedBlock(existing, []string{"out/y"})
+	out, _ := UpdateManagedBlock(existing, []string{"out/y"})
 	s := string(out)
 	topIdx := strings.Index(s, "# top")
 	blockIdx := strings.Index(s, gitignoreBlockBegin)
@@ -151,7 +151,7 @@ func TestGitignoreBlockCorruptedBeginNoEnd(t *testing.T) {
 	existing := []byte("# my rules\n" +
 		gitignoreBlockBegin + "\n" +
 		"out/stale\n")
-	out, changed := UpdateGitignoreManagedBlock(existing, []string{"out/new"})
+	out, changed := UpdateManagedBlock(existing, []string{"out/new"})
 	if !changed {
 		t.Fatal("expected changed=true for corrupted recovery")
 	}

@@ -493,6 +493,32 @@ func ListReadyTasks(s store.CoordinatorStore, caller *store.CitizenRecord, p Rea
 	if err != nil {
 		return nil, err
 	}
+	// Project-scoped: when the caller passes ProjectID > 0 we
+	// MUST keep the result inside that project, even if the
+	// run lookup missed (RunSeq omitted, RunSeq invalid, run
+	// doesn't exist yet) and runGlobalID stayed 0. Without
+	// this filter the s.ListReadyTasks(0) above returns every
+	// ready task across the coord, and a buggy client passing
+	// the wrong run_id (e.g. global int64 instead of per-
+	// project seq) silently escapes its scope and sees tasks
+	// from projects it isn't a member of. This was the bot
+	// daemon's symptom: scoped to project 3, it received
+	// task 1:1:draft from project 1 because the daemon
+	// passed wire.Run.ID instead of wire.Run.Seq. Belt-and-
+	// braces: fix on both sides.
+	if p.ProjectID > 0 && runGlobalID == 0 {
+		filtered := tasks[:0]
+		for _, t := range tasks {
+			run, _ := s.GetRun(t.RunID)
+			if run == nil {
+				continue
+			}
+			if run.ProjectID == p.ProjectID {
+				filtered = append(filtered, t)
+			}
+		}
+		tasks = filtered
+	}
 	// Cross-project: filter to tasks whose run's project the
 	// caller can see. Single-project case was already gated by
 	// CanReadProject above.

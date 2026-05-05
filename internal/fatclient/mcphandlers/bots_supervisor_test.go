@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/bots"
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
