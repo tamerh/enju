@@ -697,3 +697,286 @@ func TestOpenExisting_HydratesRemoteURLForLazyFetch(t *testing.T) {
 		t.Errorf("content mismatch: got %q", body)
 	}
 }
+
+// TestReviewIter2_ForksFromUpstreamIter2_NotSeed pins the
+// reported regression: when an upstream task is rejected on its
+// review's iter-1 verdict and re-submits as iter-2, the
+// reviewer's own iter-2 topic branch must fork from the
+// upstream's iter-2 topic — NOT from the run base / seed.
+//
+// Production symptom: review_domain/iter-2 contained only the
+// seed commit + initial commit. The upstream developer's iter-2
+// content wasn't in the review's ancestry, so reviewer-bot
+// looked at an empty tree and rejected ("never delivered").
+//
+// This test threads the full sequence through SubmitTaskResult
+// at the project layer:
+//
+//   alice iter-1:  develop_domain/iter-1   (commit D1)
+//   bob iter-1:    review_domain/iter-1    forked from D1 (R1's parent chain → D1)
+//   alice iter-2:  develop_domain/iter-2   (commit D2 — independent topic)
+//   bob iter-2:    review_domain/iter-2    forked from D2 (R2's parent chain → D2)
+//
+// Verifies that R2's commit ancestry contains D2. If the bug
+// reproduces here, R2's parent chain reaches seed without
+// touching D2.
+func TestReviewIter2_ForksFromUpstreamIter2_NotSeed(t *testing.T) {
+	alice, bob, bare := openTwoBotClones(t)
+	_ = bare
+
+	// === iter-1 ===
+	alice.Lock()
+	d1Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:   "7:1:develop_domain",
+		Username: "alice",
+		Branch:   "1-build/develop_domain/iter-1",
+		Files:    []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 1\n")}},
+	})
+	alice.Unlock()
+	if err != nil {
+		t.Fatalf("alice iter-1 submit: %v", err)
+	}
+	d1SHA := d1Res.CommitSHA
+
+	// Bob fetches so he can fork from alice's topic.
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch before review iter-1: %v", err)
+	}
+
+	bob.Lock()
+	r1Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:     "7:1:review_domain",
+		Username:   "bob",
+		Branch:     "1-build/review_domain/iter-1",
+		BaseBranch: "1-build/develop_domain/iter-1",
+		Files:      []FileWrite{{RepoRelPath: "src/domain/review.md", Content: []byte("iter-1 reject\n")}},
+	})
+	bob.Unlock()
+	if err != nil {
+		t.Fatalf("bob iter-1 submit: %v", err)
+	}
+	r1SHA := r1Res.CommitSHA
+
+	// Sanity: R1's ancestry must include D1.
+	if !ancestryContains(t, bob, r1SHA, d1SHA) {
+		t.Fatalf("review iter-1: R1 (%s) ancestry does not contain D1 (%s) — fork-from-upstream broken at iter-1 too", r1SHA, d1SHA)
+	}
+
+	// === iter-2 ===
+	// Alice re-submits develop_domain after the cascade: a NEW
+	// topic branch with iter-2 in the name, with new content.
+	alice.Lock()
+	d2Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:   "7:1:develop_domain",
+		Username: "alice",
+		Branch:   "1-build/develop_domain/iter-2",
+		Files:    []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 2\n// iter-2 content\n")}},
+	})
+	alice.Unlock()
+	if err != nil {
+		t.Fatalf("alice iter-2 submit: %v", err)
+	}
+	d2SHA := d2Res.CommitSHA
+
+	// Bob refetches so develop_domain/iter-2 is reachable.
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch before review iter-2: %v", err)
+	}
+
+	// THIS is the bug-reproducing call. Pre-fix this would create
+	// review_domain/iter-2 forked from seed instead of from D2.
+	bob.Lock()
+	r2Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:     "7:1:review_domain",
+		Username:   "bob",
+		Branch:     "1-build/review_domain/iter-2",
+		BaseBranch: "1-build/develop_domain/iter-2",
+		Files:      []FileWrite{{RepoRelPath: "src/domain/review.md", Content: []byte("iter-2 approve\n")}},
+	})
+	bob.Unlock()
+	if err != nil {
+		t.Fatalf("bob iter-2 submit: %v", err)
+	}
+	r2SHA := r2Res.CommitSHA
+
+	// THE pin: R2's ancestry must include D2.
+	if !ancestryContains(t, bob, r2SHA, d2SHA) {
+		t.Fatalf("review iter-2 forked from seed (or D1), not D2 — production bug reproduced.\n"+
+			"  R2 = %s\n  D2 = %s (expected ancestor, missing)\n  D1 = %s\n"+
+			"  R2 ancestry: %s",
+			r2SHA, d2SHA, d1SHA, ancestryDump(t, bob, r2SHA))
+	}
+}
+
+// TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRef stresses
+// the same surface but pre-creates a stale local ref pointing at
+// the seed for the would-be review iter-2 branch. This is the
+// shape that bypasses CheckoutBranchFrom's BaseBranch logic via
+// the "branch already exists" short-circuit at client.go:1855
+// — the candidate root cause for the production reproduction.
+//
+// If this test fails, it confirms the short-circuit is the
+// culprit and the fix is to validate the existing ref's
+// ancestry against BaseBranch before honoring it.
+func TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRef(t *testing.T) {
+	alice, bob, _ := openTwoBotClones(t)
+
+	// alice iter-1
+	alice.Lock()
+	_, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:   "7:1:develop_domain",
+		Username: "alice",
+		Branch:   "1-build/develop_domain/iter-1",
+		Files:    []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("v1\n")}},
+	})
+	alice.Unlock()
+	if err != nil {
+		t.Fatalf("alice iter-1: %v", err)
+	}
+
+	// Stash bob's seed (root) commit so we can plant a stale ref.
+	bobHead, err := bob.repo.Head()
+	if err != nil {
+		t.Fatalf("bob head: %v", err)
+	}
+	seedHash := bobHead.Hash()
+
+	// alice iter-2
+	alice.Lock()
+	d2Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:   "7:1:develop_domain",
+		Username: "alice",
+		Branch:   "1-build/develop_domain/iter-2",
+		Files:    []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("v2\n")}},
+	})
+	alice.Unlock()
+	if err != nil {
+		t.Fatalf("alice iter-2: %v", err)
+	}
+	d2SHA := d2Res.CommitSHA
+
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch: %v", err)
+	}
+
+	// The stale-ref injection: pre-create review_domain/iter-2 at
+	// seed BEFORE bob's submit attempts to fork it. This is what
+	// the production clone would look like if a previous run / a
+	// fetched stale tracking ref planted the same branch name.
+	staleRefName := "refs/heads/1-build/review_domain/iter-2"
+	if err := bob.repo.Storer.SetReference(
+		plumbing.NewHashReference(plumbing.ReferenceName(staleRefName), seedHash),
+	); err != nil {
+		t.Fatalf("planting stale ref: %v", err)
+	}
+
+	// Now bob submits review iter-2.
+	bob.Lock()
+	r2Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:     "7:1:review_domain",
+		Username:   "bob",
+		Branch:     "1-build/review_domain/iter-2",
+		BaseBranch: "1-build/develop_domain/iter-2",
+		Files:      []FileWrite{{RepoRelPath: "review.md", Content: []byte("approve\n")}},
+	})
+	bob.Unlock()
+	if err != nil {
+		t.Fatalf("bob iter-2 submit: %v", err)
+	}
+
+	// Verify R2's ancestry includes D2 — i.e. CheckoutBranchFrom
+	// did NOT short-circuit on the stale ref.
+	if !ancestryContains(t, bob, r2Res.CommitSHA, d2SHA) {
+		t.Fatalf("REPRO: stale local ref short-circuited fork-from-base.\n"+
+			"  R2 = %s\n  D2 = %s (expected ancestor, missing)\n"+
+			"  R2 ancestry: %s\n"+
+			"  CheckoutBranchFrom skipped BaseBranch resolution because the branch ref already existed (pointing at seed).\n"+
+			"  Fix: validate the existing ref's ancestry against BaseBranch before honoring the short-circuit.",
+			r2Res.CommitSHA, d2SHA, ancestryDump(t, bob, r2Res.CommitSHA))
+	}
+}
+
+// ancestryContains walks back from `head` via parents and
+// returns whether `target` is reached. Used to assert one
+// commit is an ancestor of another without exhausting commits
+// — bounded at 50 hops which is plenty for these tests.
+func ancestryContains(t *testing.T, p *Clone, head, target string) bool {
+	t.Helper()
+	if head == target {
+		return true
+	}
+	visited := map[string]bool{}
+	frontier := []string{head}
+	for hops := 0; hops < 50 && len(frontier) > 0; hops++ {
+		next := []string{}
+		for _, sha := range frontier {
+			if visited[sha] {
+				continue
+			}
+			visited[sha] = true
+			if sha == target {
+				return true
+			}
+			c, err := p.repo.CommitObject(plumbing.NewHash(sha))
+			if err != nil {
+				continue
+			}
+			for _, parent := range c.ParentHashes {
+				next = append(next, parent.String())
+			}
+		}
+		frontier = next
+	}
+	return false
+}
+
+func ancestryDump(t *testing.T, p *Clone, head string) string {
+	t.Helper()
+	out := []string{}
+	frontier := []string{head}
+	visited := map[string]bool{}
+	for hops := 0; hops < 20 && len(frontier) > 0; hops++ {
+		next := []string{}
+		for _, sha := range frontier {
+			if visited[sha] {
+				continue
+			}
+			visited[sha] = true
+			c, err := p.repo.CommitObject(plumbing.NewHash(sha))
+			if err != nil {
+				out = append(out, sha+" (missing)")
+				continue
+			}
+			subj := c.Message
+			if i := indexNewline(subj); i >= 0 {
+				subj = subj[:i]
+			}
+			out = append(out, sha[:8]+" "+subj)
+			for _, parent := range c.ParentHashes {
+				next = append(next, parent.String())
+			}
+		}
+		frontier = next
+	}
+	return joinLines(out)
+}
+
+func indexNewline(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			return i
+		}
+	}
+	return -1
+}
+
+func joinLines(xs []string) string {
+	out := ""
+	for _, x := range xs {
+		if out != "" {
+			out += "\n    "
+		}
+		out += x
+	}
+	return out
+}

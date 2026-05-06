@@ -1853,9 +1853,45 @@ func (p *Clone) CheckoutBranchFrom(branch, baseBranch string) error {
 		return nil
 	}
 	// Does the branch exist locally (or track a known remote)?
-	// Simple checkout, no fork-from dance.
-	if _, err := p.repo.Reference(refName, true); err == nil {
-		return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+	// Simple checkout, no fork-from dance — UNLESS the existing
+	// ref disagrees with the requested baseBranch.
+	//
+	// Stale-ref guard: a previous attempt at this iteration may
+	// have created refs/heads/<branch> at the wrong base (e.g.
+	// it tried to fork from baseBranch before that branch was
+	// fetchable on this clone, fell through to origin/main, then
+	// crashed before committing). Honoring the stale ref blindly
+	// is the production bug behind review_domain/iter-2 forking
+	// from seed instead of develop_domain/iter-2. When baseBranch
+	// is non-empty AND its tip is NOT an ancestor of the existing
+	// ref, the ref is stale by definition (a topic branch is
+	// supposed to fork from baseBranch); reset it to baseBranch's
+	// tip and continue down the create path. The bot's legitimate-
+	// retry case still works because that ref's tip would have
+	// baseBranch as an ancestor.
+	if existing, err := p.repo.Reference(refName, true); err == nil {
+		if baseBranch == "" {
+			return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+		}
+		if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
+			if p.commitHasAncestor(existing.Hash(), h) {
+				return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+			}
+			// Stale: reset and fall through to recreate at baseBranch.
+			if p.logger != nil {
+				p.logger.Warn("stale topic-branch ref detected; resetting to baseBranch tip",
+					"branch", target, "stale_hash", existing.Hash().String(),
+					"base_branch", baseBranch, "base_hash", h.String())
+			}
+			if err := p.repo.Storer.RemoveReference(refName); err != nil {
+				return fmt.Errorf("removing stale ref %s: %w", target, err)
+			}
+		} else {
+			// baseBranch given but unresolvable — keep prior
+			// behavior (honor existing ref) so we don't make
+			// things worse on a transient lookup miss.
+			return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+		}
 	}
 	// Branch doesn't exist yet. Fork it from the project's
 	// BASE — not from workspace HEAD. Forking from HEAD silently
@@ -2021,6 +2057,44 @@ func (p *Clone) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
 		return ref.Hash(), true
 	}
 	return plumbing.ZeroHash, false
+}
+
+// commitHasAncestor returns true when `ancestor` is reachable
+// from `head` by walking parents. Bounded at 200 hops to avoid
+// runaway scans on pathological histories — topic branches in
+// our model are short (one or two commits over baseBranch), so
+// hitting 200 means something is wrong and we should fall
+// through to the stale-ref handling.
+//
+// head == ancestor returns true (a commit is its own ancestor
+// in this predicate's reflexive form). Used by CheckoutBranchFrom's
+// stale-ref guard: an existing topic-branch ref is considered
+// fresh if and only if it has baseBranch's tip in its ancestry.
+func (p *Clone) commitHasAncestor(head, ancestor plumbing.Hash) bool {
+	if head == ancestor {
+		return true
+	}
+	visited := map[plumbing.Hash]bool{}
+	frontier := []plumbing.Hash{head}
+	for hops := 0; hops < 200 && len(frontier) > 0; hops++ {
+		next := []plumbing.Hash{}
+		for _, h := range frontier {
+			if visited[h] {
+				continue
+			}
+			visited[h] = true
+			if h == ancestor {
+				return true
+			}
+			c, err := p.repo.CommitObject(h)
+			if err != nil {
+				continue
+			}
+			next = append(next, c.ParentHashes...)
+		}
+		frontier = next
+	}
+	return false
 }
 
 // MergeAuthor identifies the citizen whose ACCEPT triggered an
