@@ -1416,6 +1416,102 @@ func (p *Clone) ResetBranchToHash(hash string) error {
 	return nil
 }
 
+// ResetWorktreeToCleanState wipes any worktree residue —
+// staged changes, unstaged changes to tracked files, and
+// untracked files — leaving the working tree byte-identical
+// to whatever HEAD currently points at. Used by the bot
+// daemon between task iterations: a previous task's
+// `claude -p` may have left uncommitted edits or scratch
+// files behind, and the next iteration's CheckoutBranchFrom
+// can fail when those leftovers collide with the new topic
+// branch's index. The "no user state to preserve" property
+// of bot clones (system-managed, at <project>/enju/.clone/)
+// makes the wipe safe; operator-side clones MUST NOT call
+// this method — the operator's working tree may carry
+// intentional uncommitted WIP.
+//
+// Implementation:
+//   - HardReset to HEAD drops staged + unstaged changes to
+//     tracked files. The index resyncs to HEAD's tree, so a
+//     "staged deletion" left over from a previous bad
+//     checkout disappears here.
+//   - A second walk removes untracked files. We can't use
+//     gogit's CheckoutOptions.Force (it nukes untracked
+//     across the whole tree but doesn't preserve `.git/`
+//     itself reliably across go-git versions); a manual walk
+//     skipping infra dirs is more conservative.
+//
+// Caller MUST hold the project lock.
+func (p *Clone) ResetWorktreeToCleanState() error {
+	wt, err := p.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("worktree: %w", err)
+	}
+	head, err := p.repo.Head()
+	if err != nil {
+		return fmt.Errorf("HEAD: %w", err)
+	}
+	if err := wt.Reset(&gogit.ResetOptions{
+		Mode:   gogit.HardReset,
+		Commit: head.Hash(),
+	}); err != nil {
+		return fmt.Errorf("hard reset to HEAD: %w", err)
+	}
+
+	// Build the tracked-paths set so we can identify untracked
+	// entries during the walk. The set covers everything in
+	// the post-reset index, which equals HEAD's tree.
+	idx, err := p.repo.Storer.Index()
+	if err != nil {
+		return fmt.Errorf("reading index: %w", err)
+	}
+	tracked := make(map[string]struct{}, len(idx.Entries))
+	for _, e := range idx.Entries {
+		tracked[e.Name] = struct{}{}
+	}
+
+	return filepath.Walk(p.workDir, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if path == p.workDir {
+			return nil
+		}
+		// Skip infrastructure dirs at any depth: `.git/` (this
+		// repo's own state), `.bare.git/` and `.clone/` (when
+		// we're walking a parent that happens to host them),
+		// and any in-progress preserve dir from a crashed
+		// checkout (recovered separately via openOrClone).
+		base := filepath.Base(path)
+		if info.IsDir() {
+			if base == ".git" || base == ".bare.git" || base == ".clone" ||
+				strings.HasSuffix(base, preserveDirSuffix) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Files only past this point.
+		relOS, rerr := filepath.Rel(p.workDir, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel := filepath.ToSlash(relOS)
+		if _, ok := tracked[rel]; ok {
+			return nil
+		}
+		// Untracked file — remove. Best-effort; a removal
+		// failure (permission denied on a symlink we can't
+		// resolve, etc.) doesn't fail the whole reset since
+		// the residual file may not actually collide with the
+		// next checkout. Log via the project's logger if set.
+		if rmErr := os.Remove(path); rmErr != nil && p.logger != nil {
+			p.logger.Warn("clone reset: couldn't remove untracked file",
+				"path", rel, "error", rmErr)
+		}
+		return nil
+	})
+}
+
 // CommitSHAsByTaskID walks HEAD backward for up to maxWalk
 // commits, matching each commit's Enju-Task-Id trailer
 // against the supplied task ids. Returns a map of taskID →

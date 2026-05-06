@@ -314,3 +314,39 @@ func (s *FatClient) FetchProjectMetaExpanded(ctx context.Context, projectID int6
 	}
 	return remoteURL, name, defaultBranch, nil
 }
+
+// ResetBotCloneToCleanState wipes the bot clone's worktree
+// residue between iterations: drops staged + unstaged changes
+// to tracked files (hard reset to HEAD) and removes untracked
+// files. After ClaimTask's pre-claim pull, HEAD points at the
+// run branch tip the next task should fork from, so this
+// effectively syncs the clone to the latest run-branch state
+// while clearing the previous task's leftovers.
+//
+// **Bot-only.** The operator's `enju mcp` working tree is
+// the user's actual development directory and may legitimately
+// carry uncommitted WIP, scratch notes, or unrelated branches
+// — reset would clobber that. The daemon's clone at
+// <project>/enju/.clone/ is system-managed: anything not in
+// HEAD is residue.
+//
+// Why between iterations: a previous task's `claude -p` may
+// have left scratch files behind, or made unstaged tweaks to
+// a tracked file (go.mod, package.json) that didn't end up
+// in the commit. The next task's CheckoutBranchFrom can
+// produce a "staged-deletion + untracked" desync when the
+// new topic branch's tree disagrees with the residue. Clearing
+// the worktree first eliminates the desync class entirely.
+//
+// Idempotent — calling this on an already-clean clone is a
+// no-op (HardReset matches HEAD's tree, no untracked files
+// to remove).
+func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int64) error {
+	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	proj.Lock()
+	defer proj.Unlock()
+	return proj.ResetWorktreeToCleanState()
+}

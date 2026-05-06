@@ -52,6 +52,14 @@ type fakeFC struct {
 	// explicitly.
 	workspacePath string
 	workspaceErr  error
+
+	// resetCalls counts ResetBotCloneToCleanState invocations
+	// keyed by projectID. Tests assert on this to pin "the
+	// daemon resets the clone between iterations." resetErr,
+	// when non-nil, is returned from every call — daemon
+	// should log + continue rather than abort.
+	resetCalls map[int64]int
+	resetErr   error
 }
 
 func (f *fakeFC) Username() string { return f.username }
@@ -97,6 +105,19 @@ func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.Tas
 		return m, nil
 	}
 	return nil, errors.New("no meta for " + taskID)
+}
+
+// resetCalls counts ResetBotCloneToCleanState invocations
+// per (caller-supplied) projectID. Tests that pin the
+// "between iterations" call site assert against this.
+func (f *fakeFC) ResetBotCloneToCleanState(ctx context.Context, projectID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resetCalls == nil {
+		f.resetCalls = map[int64]int{}
+	}
+	f.resetCalls[projectID]++
+	return f.resetErr
 }
 
 func (f *fakeFC) ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error) {
@@ -381,6 +402,163 @@ func TestDaemon_RunOnce_PopulatesArtifactsFromWritesArtifacts(t *testing.T) {
 	}
 	if len(got.UntrackedArtifacts) != 1 || got.UntrackedArtifacts[0] != "big.bam" {
 		t.Errorf("UntrackedArtifacts = %v, want [big.bam]", got.UntrackedArtifacts)
+	}
+}
+
+// TestDaemon_RunOnce_ResetsBotCloneBeforeHandler pins the
+// fix for the cross-iteration residue bug: the daemon must
+// call ResetBotCloneToCleanState between ClaimTask and the
+// handler invocation, so leftover untracked files / dirty
+// tracked-file edits from a previous task can't trip the
+// next task's CheckoutBranchFrom. The single-iteration
+// failure mode this guards against is task N's residue
+// disturbing task N+1; per-iteration the call shows up as
+// exactly one reset on the project's id.
+func TestDaemon_RunOnce_ResetsBotCloneBeforeHandler(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	stub := &StubHandler{Response: "done"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := fc.resetCalls[1]; got != 1 {
+		t.Errorf("expected exactly one reset for project 1; got %d", got)
+	}
+}
+
+// TestDaemon_RunOnce_ContinuesWhenResetFails pins the
+// best-effort policy: a reset failure logs but doesn't
+// abort the iteration. The handler still runs (against
+// possibly-dirty state) and any actual collision surfaces
+// at submit time where it's already handled.
+func TestDaemon_RunOnce_ContinuesWhenResetFails(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.resetErr = errors.New("disk full")
+	stub := &StubHandler{Response: "done"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	worked, err := d.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce should swallow reset errors: %v", err)
+	}
+	if !worked {
+		t.Error("worked should be true — handler still ran despite reset failure")
+	}
+	if len(fc.submits) != 1 {
+		t.Errorf("submit should still happen: got %d", len(fc.submits))
+	}
+}
+
+// Pin pattern expansion: when the manifest declares
+// `src/api/` (directory) and the bot writes 3 files inside,
+// all 3 should land in params.Artifacts as tracked content.
+// Bots that decompose a "build the api package" task into
+// many free-form filenames need this — without directory
+// declarations every output filename has to be predicted up
+// front.
+func TestDaemon_RunOnce_DirectoryDeclarationCoversAllFilesInside(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, "src", "api"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"server.go", "middleware.go", "handlers/users.go"} {
+		full := filepath.Join(ws, "src", "api", name)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("// "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.workspacePath = ws
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		{Path: "src/api/", Track: true},
+	}
+
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	worked, err := d.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if !worked {
+		t.Fatal("expected worked=true")
+	}
+	got := fc.submits[0].Artifacts
+	want := map[string]string{
+		"src/api/server.go":          "// server.go",
+		"src/api/middleware.go":      "// middleware.go",
+		"src/api/handlers/users.go":  "// handlers/users.go",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Artifacts size: got %d, want %d (%v)", len(got), len(want), got)
+	}
+	for k, wantV := range want {
+		if got[k] != wantV {
+			t.Errorf("Artifacts[%q] = %q, want %q", k, got[k], wantV)
+		}
+	}
+}
+
+// Pin glob expansion: `src/*.go` covers every shallow .go file
+// the bot writes. Combined with TestDaemon_RunOnce_DirectoryDecl
+// this exercises both pattern forms at the daemon level.
+func TestDaemon_RunOnce_GlobDeclarationCoversMatchingFiles(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.go", "b.go", "c.go", "notes.md"} {
+		if err := os.WriteFile(filepath.Join(ws, "src", name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.workspacePath = ws
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		{Path: "src/*.go", Track: true},
+	}
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	got := fc.submits[0].Artifacts
+	if _, ok := got["src/a.go"]; !ok {
+		t.Errorf("src/a.go missing from Artifacts: %v", got)
+	}
+	if _, ok := got["src/notes.md"]; ok {
+		t.Errorf("src/notes.md should NOT match *.go glob: %v", got)
+	}
+}
+
+// Pin optional behavior: a declared optional path that the bot
+// didn't write doesn't fail the iteration. The submit goes
+// through with whatever WAS written.
+func TestDaemon_RunOnce_OptionalMissingArtifactSucceeds(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "out.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.workspacePath = ws
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		{Path: "out.txt", Track: true},
+		{Path: "go.sum", Track: true, Optional: true},
+	}
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce should not fail with optional missing: %v", err)
+	}
+	if len(fc.submits) != 1 {
+		t.Fatalf("expected 1 submit, got %d", len(fc.submits))
+	}
+	if _, ok := fc.submits[0].Artifacts["go.sum"]; ok {
+		t.Error("optional missing path should not appear in Artifacts")
+	}
+	if _, ok := fc.submits[0].Artifacts["out.txt"]; !ok {
+		t.Error("required existing path should appear in Artifacts")
 	}
 }
 

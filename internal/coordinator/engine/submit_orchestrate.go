@@ -37,23 +37,27 @@ func (e *Engine) ValidateSubmitRequest(
 	req *SubmitRequest,
 ) (resultPath, decision, voteChoice string, submitterID int64, err error) {
 	// Artifact path validation. WritesArtifacts column stores
-	// either legacy []string or current [{path,track}] JSON;
-	// yaml.WriteArtifacts.UnmarshalJSON handles both.
+	// either legacy []string or current [{path,track,optional}]
+	// JSON; yaml.WriteArtifacts.UnmarshalJSON handles both.
+	//
+	// Submitted paths are LITERAL (the concrete files the
+	// citizen wrote); declared patterns may be literal, glob
+	// (`*.go`), or directory (`src/api/`). Each submitted path
+	// must (a) pass the strict literal-path validator, and (b)
+	// match at least one declared pattern. The coord never
+	// touches the FS — pattern matching is pure string work
+	// (yaml.MatchesAnyPattern).
 	if len(req.ArtifactsWritten) > 0 {
 		var decl enjuYaml.WriteArtifacts
 		if task.WritesArtifacts != "" {
 			_ = json.Unmarshal([]byte(task.WritesArtifacts), &decl)
 		}
-		allowed := make(map[string]bool, len(decl))
-		for _, p := range decl.Paths() {
-			allowed[p] = true
-		}
 		for _, path := range req.ArtifactsWritten {
 			if err := ValidateArtifactPath(path); err != nil {
 				return "", "", "", 0, fmt.Errorf("invalid artifact path %q: %v", path, err)
 			}
-			if !allowed[path] {
-				return "", "", "", 0, fmt.Errorf("artifact %q not in writes_artifacts for this task", path)
+			if !decl.MatchesAnyPattern(path) {
+				return "", "", "", 0, fmt.Errorf("artifact %q not covered by writes_artifacts for this task", path)
 			}
 		}
 	}

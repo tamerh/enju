@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/common/gitignore"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -75,35 +76,40 @@ type Spec struct {
 	// `script:` in the YAML, not the absolute resolved path.
 	ScriptLabel string `json:"script_label"`
 
-	// Paths the script is expected to write under the
-	// project's artifact namespace AND commit into git. Wrapper
-	// reads each after the script exits; missing ones land in
-	// Result.MissingArtifacts as soft warnings.
+	// WritesArtifacts is the full declaration the task carries —
+	// tracked AND untracked, literal AND patterned. The wrapper
+	// expands each entry against the working tree AFTER the
+	// script exits (the script is what creates the files; we
+	// can't enumerate before it runs). The expanded set is then
+	// split:
 	//
-	// Historically this carried every declared artifact. Since
-	// the untracked-artifacts feature (track:false) this list
-	// narrows to the *tracked* subset; UntrackedArtifacts below
-	// carries the complement. Old wrapper specs (pre-untracked)
-	// set only this field — all declarations were tracked by
-	// definition, so they keep working without migration.
-	WritesArtifacts []string `json:"writes_artifacts,omitempty"`
-
-	// UntrackedArtifacts lists paths the script may produce but
-	// the wrapper must NOT commit. Rationale: large/scratch
-	// output files (BAMs, FASTQs, reference genomes) blow past
-	// git's practical size limit. Declaring track:false in YAML
-	// keeps these files on disk and in the coordinator's
-	// artifact index (as metadata-only entries with empty
-	// commit_sha) without inflating the repo.
+	//   - Tracked literal/glob/dir entries → read into the
+	//     commit and reported via Enju-Artifacts trailer.
+	//   - Untracked entries → stat-only; not committed (managed
+	//     .gitignore block keeps them out); listed in
+	//     Result.ArtifactsWritten so the coordinator records a
+	//     tracked=false index row.
 	//
-	// Like WritesArtifacts, missing entries here are soft warnings,
-	// not failures — a script may conditionally skip writing. Unlike
-	// WritesArtifacts, present entries do NOT appear in the commit
-	// (the managed .gitignore block added in a later phase also
-	// prevents accidental inclusion). They DO appear in
-	// Result.ArtifactsWritten so the coordinator's post-submit
-	// path can upsert an index row with tracked=false.
-	UntrackedArtifacts []string `json:"untracked_artifacts,omitempty"`
+	// Missing required entries fail the iteration loudly via
+	// Result.MissingArtifacts; missing optional entries are
+	// silent no-ops.
+	//
+	// JSON shape: yaml.WriteArtifacts.UnmarshalJSON accepts the
+	// object form (`[{"path":"a","track":true,"optional":false}]`)
+	// and a bare-string list (`["path/a", "path/b"]`) which
+	// decodes as all-tracked — the bare form is what the
+	// coordinator's writes_artifacts column held before the
+	// track flag landed, so DB rows from that era still parse.
+	//
+	// Spec carries no separate `untracked_artifacts` field —
+	// untracked entries live inside this list with `track:false`.
+	// A spec file written by an out-of-tree tool that uses the
+	// older split-fields shape would have its untracked entries
+	// dropped (encoding/json silently ignores unknown keys). The
+	// edge is "wrapper subprocess in flight while binary upgrades
+	// from a pre-track-flag version" — recoverable by re-running
+	// the task; not worth a back-compat shim.
+	WritesArtifacts enjuYaml.WriteArtifacts `json:"writes_artifacts,omitempty"`
 
 	// Commit identity.
 	AuthorName  string `json:"author_name"`
@@ -244,21 +250,32 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	workDir := proj.WorkDir()
 
 	// Pre-exec: materialize shared-root symlinks for every
-	// declared untracked path. When ENJU_SHARED_ROOT is set,
-	// this swaps the workspace path for a symlink pointing at
-	// shared storage BEFORE the script runs — the script then
-	// writes THROUGH the symlink and the bytes land on the
+	// declared untracked LITERAL path. When ENJU_SHARED_ROOT is
+	// set, this swaps the workspace path for a symlink pointing
+	// at shared storage BEFORE the script runs — the script
+	// then writes THROUGH the symlink and the bytes land on the
 	// shared mount where downstream citizens with the same
-	// mount can see them. When ENJU_SHARED_ROOT is unset,
-	// the helper is a noop and untracked writes stay local.
-	for _, rel := range spec.UntrackedArtifacts {
-		if rel == "" {
+	// mount can see them. When ENJU_SHARED_ROOT is unset, the
+	// helper is a noop and untracked writes stay local.
+	//
+	// Pattern entries (globs, directories) skip this step
+	// because we don't yet know what filenames the script will
+	// produce. The shared-root layer is purely a literal-path
+	// optimization; pattern-declared untracked outputs land
+	// locally. Operators who need shared storage for pattern
+	// outputs should pre-create the directory as a symlink
+	// themselves, or declare each expected literal path.
+	for _, decl := range spec.WritesArtifacts {
+		if decl.Track {
 			continue
 		}
-		if err := project.EnsureSharedSymlink(project.ArtifactPath(rel), workDir,
-			spec.ProjectID, spec.ProjectName, spec.Branch, rel); err != nil {
+		if decl.Path == "" || enjuYaml.IsGlob(decl.Path) || enjuYaml.IsDir(decl.Path) {
+			continue
+		}
+		if err := project.EnsureSharedSymlink(project.ArtifactPath(decl.Path), workDir,
+			spec.ProjectID, spec.ProjectName, spec.Branch, decl.Path); err != nil {
 			logger.Warn("shared-root symlink setup failed",
-				"path", rel, "error", err)
+				"path", decl.Path, "error", err)
 			// Don't fail the whole task — if the mount is
 			// unavailable, the script can still write the
 			// local path and downstream consumers on the
@@ -358,70 +375,81 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		Content:     metaBytes,
 	})
 
-	// Pick up declared artifacts. Missing ones are soft warnings,
-	// not hard failures — scripts may legitimately skip writing
-	// conditionally.
+	// Pick up declared artifacts. The expansion step walks the
+	// working tree and resolves every declared pattern (literal,
+	// glob, directory) to concrete files; required-but-missing
+	// entries land in `missing` so we surface them loudly, while
+	// optional missing entries fold silently.
 	//
-	// Two flavors of declaration, handled differently:
-	//   - Tracked (WritesArtifacts): read the file, include it in
-	//     the commit, report the path to the coordinator.
-	//   - Untracked (UntrackedArtifacts): stat the file so we know
-	//     it was produced; report the path; do NOT stage it. The
-	//     file stays on disk (and is kept out of the commit by the
-	//     managed .gitignore block written in Phase D). Coordinator
-	//     upserts an index row with tracked=false + empty
-	//     commit_sha, which downstream tasks use to verify
+	// Two flavors of expanded entries, handled differently:
+	//   - Tracked: read the file, include it in the commit,
+	//     report the path to the coordinator.
+	//   - Untracked: stat-only (already done by ExpandAgainstWorkdir);
+	//     report the path; do NOT stage it. The file stays on disk
+	//     (kept out of git by the managed .gitignore block) and
+	//     the coordinator upserts an index row with tracked=false +
+	//     empty commit_sha, which downstream tasks use to verify
 	//     presence at claim time.
-	// committedPaths are the tracked artifacts that actually landed
-	// in the commit (exist on disk + readable). ArtifactPaths on the
-	// submit request carries this list so the commit message body
-	// and the Enju-Artifacts trailer accurately reflect "what's in
-	// this commit" — untracked paths are never mentioned at the
-	// git layer.
-	var committedPaths []string
-	for _, rel := range spec.WritesArtifacts {
-		if rel == "" {
-			continue
-		}
-		full := filepath.Join(workDir, project.ArtifactPath(rel))
-		body, rerr := os.ReadFile(full)
-		if rerr != nil {
-			res.MissingArtifacts = append(res.MissingArtifacts, rel)
-			continue
-		}
-		files = append(files, project.FileWrite{
-			RepoRelPath: project.ArtifactPath(rel),
-			Content:     body,
-		})
-		committedPaths = append(committedPaths, rel)
-		res.ArtifactsWritten = append(res.ArtifactsWritten, rel)
+	//
+	// committedPaths is the tracked subset that actually landed
+	// in the commit. ArtifactPaths on the submit request carries
+	// this list so the commit message body and the Enju-Artifacts
+	// trailer accurately reflect "what's in this commit" —
+	// untracked paths are never mentioned at the git layer.
+	expanded, missing, expandErr := spec.WritesArtifacts.ExpandAgainstWorkdir(workDir)
+	if expandErr != nil {
+		res.Error = fmt.Sprintf("expanding writes_artifacts: %v", expandErr)
+		return res
 	}
-	for _, rel := range spec.UntrackedArtifacts {
-		if rel == "" {
+	res.MissingArtifacts = append(res.MissingArtifacts, missing...)
+
+	var committedPaths []string
+	for _, e := range expanded {
+		if e.Track {
+			full := filepath.Join(workDir, project.ArtifactPath(e.Path))
+			body, rerr := os.ReadFile(full)
+			if rerr != nil {
+				// Expansion already stat'd this file moments
+				// ago, so a read failure here is a transient
+				// IO problem (or a script that deleted the
+				// file between expand and read). Surface as
+				// missing for consistency with the legacy
+				// "soft warning" semantics.
+				res.MissingArtifacts = append(res.MissingArtifacts, e.Path)
+				continue
+			}
+			files = append(files, project.FileWrite{
+				RepoRelPath: project.ArtifactPath(e.Path),
+				Content:     body,
+			})
+			committedPaths = append(committedPaths, e.Path)
+			res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
 			continue
 		}
-		full := filepath.Join(workDir, project.ArtifactPath(rel))
-		if _, err := os.Stat(full); err != nil {
-			res.MissingArtifacts = append(res.MissingArtifacts, rel)
-			continue
-		}
-		// Intentionally NOT appending to `files` — untracked
-		// artifacts are kept out of git. The path still goes in
-		// res.ArtifactsWritten so /tasks/:id/result records a
-		// tracked=false row in the artifact index.
-		res.ArtifactsWritten = append(res.ArtifactsWritten, rel)
+		// Untracked: don't stage; just report the path.
+		res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
 	}
 
 	// Maintain the Enju-managed .gitignore block so untracked
 	// paths can never slip into a future commit via some
-	// unrelated `git add`/`stash` path. The helper is a no-op
-	// when the block already contains every declared path, so
-	// re-running the same task doesn't churn .gitignore with
-	// no-op commits.
-	if len(spec.UntrackedArtifacts) > 0 {
+	// unrelated `git add`/`stash` path. We write the ORIGINAL
+	// declarations (patterns and all) to gitignore — gitignore
+	// understands globs and directory prefixes natively, so the
+	// pattern strings work as-is and a `out/*.bam` declaration
+	// covers any future bam in that directory automatically. The
+	// helper is a no-op when the block already contains every
+	// declared pattern, so re-running the same task doesn't
+	// churn .gitignore with no-op commits.
+	var untrackedDecls []string
+	for _, decl := range spec.WritesArtifacts {
+		if !decl.Track && decl.Path != "" {
+			untrackedDecls = append(untrackedDecls, decl.Path)
+		}
+	}
+	if len(untrackedDecls) > 0 {
 		gitignorePath := filepath.Join(workDir, ".gitignore")
 		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
-		updated, changed := gitignore.UpdateManagedBlock(existing, spec.UntrackedArtifacts)
+		updated, changed := gitignore.UpdateManagedBlock(existing, untrackedDecls)
 		if changed {
 			files = append(files, project.FileWrite{
 				RepoRelPath: ".gitignore",

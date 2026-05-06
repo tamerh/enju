@@ -378,7 +378,9 @@ func starListValues(raw interface{}) ([]string, bool) {
 // expandStarRefsInWrites is the WriteArtifacts analogue of
 // expandStarRefsInSlice — one input entry with `{{param[*]}}`
 // in its Path becomes N entries, each carrying the same
-// Track flag. Track is a literal bool, never a param ref.
+// Track and Optional flags. Track and Optional are literal
+// bools — never param refs — so the per-expansion entry
+// inherits them verbatim from the source declaration.
 func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, scope string) (WriteArtifacts, error) {
 	if len(ws) == 0 {
 		return ws, nil
@@ -390,7 +392,11 @@ func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, sc
 			return nil, err
 		}
 		for _, p := range paths {
-			out = append(out, WriteArtifact{Path: p, Track: w.Track})
+			out = append(out, WriteArtifact{
+				Path:     p,
+				Track:    w.Track,
+				Optional: w.Optional,
+			})
 		}
 	}
 	return out, nil
@@ -431,8 +437,9 @@ func ResolveWriteArtifacts(ws WriteArtifacts, strMap map[string]string) WriteArt
 	out := make(WriteArtifacts, len(ws))
 	for i, e := range ws {
 		out[i] = WriteArtifact{
-			Path:  template.ResolveParams(e.Path, strMap),
-			Track: e.Track,
+			Path:     template.ResolveParams(e.Path, strMap),
+			Track:    e.Track,
+			Optional: e.Optional,
 		}
 	}
 	return out

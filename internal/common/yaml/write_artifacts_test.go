@@ -238,3 +238,82 @@ func TestWriteArtifactsHelpers(t *testing.T) {
 		t.Error("empty slice helpers should return nil")
 	}
 }
+
+// TestWriteArtifactsYAMLPatternForms confirms the YAML parser
+// preserves directory and glob path syntax verbatim — they
+// reach the WriteArtifact.Path field as-is, ready for the
+// expand step at submit time. Pre-pattern YAML callers that
+// still write literals get unchanged behavior.
+func TestWriteArtifactsYAMLPatternForms(t *testing.T) {
+	src := `writes_artifacts:
+  - src/api/
+  - src/handlers/*.go
+  - cmd/*/main.go
+  - go.mod`
+	var td TaskDef
+	if err := yamlv3.Unmarshal([]byte(src), &td); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"src/api/", "src/handlers/*.go", "cmd/*/main.go", "go.mod"}
+	if len(td.WritesArtifacts) != len(want) {
+		t.Fatalf("entry count: got %d, want %d", len(td.WritesArtifacts), len(want))
+	}
+	for i, w := range want {
+		if td.WritesArtifacts[i].Path != w {
+			t.Errorf("entry %d: path = %q, want %q", i, td.WritesArtifacts[i].Path, w)
+		}
+		if !td.WritesArtifacts[i].Track {
+			t.Errorf("entry %d: shorthand should default Track=true; got %+v", i, td.WritesArtifacts[i])
+		}
+	}
+}
+
+// TestWriteArtifactsYAMLOptionalRoundTrip pins both YAML
+// shapes for the optional flag: object-form with `optional:
+// true` parses as Optional=true; absent key parses as
+// Optional=false. The shorthand bare-string form has no
+// way to express optional — that's by design (bare paths
+// declare required outputs).
+func TestWriteArtifactsYAMLOptionalRoundTrip(t *testing.T) {
+	src := `writes_artifacts:
+  - path: src/server.go
+  - path: src/go.sum
+    optional: true
+  - path: out/big.bam
+    track: false
+    optional: true`
+	var td TaskDef
+	if err := yamlv3.Unmarshal([]byte(src), &td); err != nil {
+		t.Fatal(err)
+	}
+	if len(td.WritesArtifacts) != 3 {
+		t.Fatalf("entries: got %d, want 3", len(td.WritesArtifacts))
+	}
+	if td.WritesArtifacts[0].Optional {
+		t.Errorf("absent optional: should be false, got %+v", td.WritesArtifacts[0])
+	}
+	if !td.WritesArtifacts[1].Optional || !td.WritesArtifacts[1].Track {
+		t.Errorf("optional+default-track: %+v", td.WritesArtifacts[1])
+	}
+	if !td.WritesArtifacts[2].Optional || td.WritesArtifacts[2].Track {
+		t.Errorf("optional+track:false: %+v", td.WritesArtifacts[2])
+	}
+
+	// Round-trip via JSON (the wire format the wrapper subprocess sees).
+	encoded, err := json.Marshal(td.WritesArtifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back WriteArtifacts
+	if err := json.Unmarshal(encoded, &back); err != nil {
+		t.Fatal(err)
+	}
+	for i, e := range back {
+		if e.Path != td.WritesArtifacts[i].Path ||
+			e.Track != td.WritesArtifacts[i].Track ||
+			e.Optional != td.WritesArtifacts[i].Optional {
+			t.Errorf("round-trip lost data at %d: got %+v, want %+v",
+				i, e, td.WritesArtifacts[i])
+		}
+	}
+}

@@ -91,6 +91,14 @@ type fatClient interface {
 	// Same projectID, two clones — see service.ResolveBotWorkspace
 	// for the full rationale.
 	ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error)
+
+	// ResetBotCloneToCleanState wipes the bot clone's worktree
+	// residue between iterations: drops staged + unstaged
+	// changes and removes untracked files, leaving the clone
+	// synced to whatever HEAD currently is (the run branch
+	// tip post-pull). Daemon calls it after ClaimTask and
+	// before the handler runs.
+	ResetBotCloneToCleanState(ctx context.Context, projectID int64) error
 }
 
 // Config bundles every dependency the Daemon needs at construction.
@@ -471,6 +479,26 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	// see it. See runOnce's comment for why pre-warming is
 	// load-bearing.
 
+	// Reset the bot clone to a clean state before the handler
+	// runs. ClaimTask's pre-claim pull already advanced HEAD
+	// to the run branch tip; the reset drops any leftover
+	// uncommitted edits and untracked files from the previous
+	// iteration so the handler starts on the same canvas
+	// every time. Without this, residue accumulates across
+	// tasks and the next CheckoutBranchFrom can produce a
+	// staged-deletion-plus-untracked desync when the new
+	// topic branch's tree disagrees with the leftovers.
+	//
+	// Best-effort: a reset failure logs but doesn't abort the
+	// iteration — the handler may still succeed if the residue
+	// happens not to collide with this task's outputs. Hard
+	// errors surface on the subsequent submit instead, where
+	// they're already handled.
+	if rerr := d.fc.ResetBotCloneToCleanState(ctx, meta.ProjectID); rerr != nil {
+		d.logger.Warn("bot clone reset failed; continuing with possibly-dirty worktree",
+			"task_id", taskID, "project_id", meta.ProjectID, "error", rerr)
+	}
+
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
 		TaskID:       meta.ID,
 		Action:       meta.Action,
@@ -491,41 +519,56 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		AuthorEmail: authorEmail,
 	}
 
-	// Honor the task's writes_artifacts declaration: read each
-	// declared tracked path off disk (the bot's handler wrote it
-	// via Write tool / shell / etc. inside the workspace) and
-	// stage it into params.Artifacts so prepareFatSubmit packs it
-	// into the commit. Untracked paths are stat-only — they ride
-	// params.UntrackedArtifacts so the coordinator records a
-	// tracked=false index row but the file stays out of git.
+	// Honor the task's writes_artifacts declaration. Expand the
+	// declared patterns (literal / glob / directory) against the
+	// working tree the bot just wrote into; required-but-missing
+	// declarations fail the iteration loudly (silent acceptance
+	// was the data-loss bug fixed earlier this session). Optional
+	// declarations that produced nothing fold silently.
 	//
-	// Missing files are a hard fail: the bot reported success but
-	// didn't produce a declared output, so the iteration must NOT
-	// land — the task stays claimable for a retry. Silent
-	// acceptance was the data-loss bug this guards against.
-	tracked := meta.WritesArtifacts.TrackedPaths()
-	untracked := meta.WritesArtifacts.UntrackedPaths()
-	if len(tracked) > 0 || len(untracked) > 0 {
-		var missing []string
-		artifactContents := make(map[string]string, len(tracked))
-		for _, rel := range tracked {
-			body, rerr := os.ReadFile(filepath.Join(workspacePath, rel))
-			if rerr != nil {
-				missing = append(missing, rel)
-				continue
-			}
-			artifactContents[rel] = string(body)
-		}
-		for _, rel := range untracked {
-			if _, statErr := os.Stat(filepath.Join(workspacePath, rel)); statErr != nil {
-				missing = append(missing, rel)
-			}
+	// The expanded set is split:
+	//   - Tracked entries → read content into params.Artifacts so
+	//     prepareFatSubmit packs them into the commit.
+	//   - Untracked entries → paths only into
+	//     params.UntrackedArtifacts so the coord records a
+	//     tracked=false index row but the file stays out of git.
+	if len(meta.WritesArtifacts) > 0 {
+		expanded, missing, err := meta.WritesArtifacts.ExpandAgainstWorkdir(workspacePath)
+		if err != nil {
+			return fmt.Errorf("expanding writes_artifacts: %w", err)
 		}
 		if len(missing) > 0 {
-			return fmt.Errorf("declared writes_artifacts missing on disk: %s", strings.Join(missing, ", "))
+			// Only required (non-optional) entries land in missing —
+			// the expander folds optional misses silently. Naming
+			// the path AND noting it was required helps the operator
+			// triage at a glance: was the bot supposed to write
+			// this, or did the manifest forget `optional: true`?
+			return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", strings.Join(missing, ", "))
 		}
-		params.Artifacts = artifactContents
-		params.UntrackedArtifacts = untracked
+		artifactContents := make(map[string]string)
+		var untrackedPaths []string
+		for _, e := range expanded {
+			if e.Track {
+				body, rerr := os.ReadFile(filepath.Join(workspacePath, e.Path))
+				if rerr != nil {
+					// Expansion stat'd this path moments ago, so
+					// a read failure here is transient IO. Surface
+					// the same message format expansion would so
+					// the operator can't tell the two apart and
+					// retry resolves both.
+					return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", e.Path)
+				}
+				artifactContents[e.Path] = string(body)
+				continue
+			}
+			untrackedPaths = append(untrackedPaths, e.Path)
+		}
+		if len(artifactContents) > 0 {
+			params.Artifacts = artifactContents
+		}
+		if len(untrackedPaths) > 0 {
+			params.UntrackedArtifacts = untrackedPaths
+		}
 	}
 	// Action-specific shape resolution. The Handler can either:
 	//

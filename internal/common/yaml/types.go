@@ -217,18 +217,82 @@ func (o *OutputSpec) UnmarshalYAML(value *yamlv3.Node) error {
 //     exists on whatever workspace produced it (or on shared
 //     storage if $ENJU_SHARED_ROOT is configured).
 //
+// The path field accepts three forms, distinguished by syntax —
+// no separate kind field, no parser ambiguity. Form is detected
+// by IsGlob / IsDir from this package:
+//
+//   - Literal — `src/server.go`. The exact file must exist after
+//     the task runs (unless Optional is true). A literal path
+//     must NOT contain `*`, `?`, or `[` — those characters mark
+//     the entry as a glob. Filenames that legitimately include
+//     those characters can't be declared as literals; declare
+//     the parent directory instead, or rename the file.
+//   - Glob — `src/api/*.go`, `cmd/*/main.go`. Any path containing
+//     `*`, `?`, or `[` is a glob; matched files at submit time
+//     are committed. Zero matches is an error unless Optional.
+//     Globs match files only — matched directories are silently
+//     skipped (use the directory form for recursive coverage).
+//     Globs are non-recursive; `**` is not supported.
+//   - Directory — `src/api/` (trailing `/`). Recursively walks
+//     the directory at submit time and commits every regular
+//     file inside. Zero files is an error unless Optional.
+//
 // The shorthand form — a bare path string — always expands to
-// `{Path: <string>, Track: true}`. Object form is only needed
-// when overriding Track.
+// `{Path: <string>, Track: true, Optional: false}`. The object
+// form is only needed when overriding Track or Optional.
+//
+// Optional flag — when true, missing/empty expansions are silent
+// no-ops instead of iteration-killing errors. Used for
+// auto-generated files that may or may not exist (`go.sum`
+// only when external deps are pulled, `requirements.lock`
+// only when pip locks were regenerated).
 type WriteArtifact struct {
-	Path  string `yaml:"path" json:"path"`
-	Track bool   `yaml:"track" json:"track"`
+	Path     string `yaml:"path" json:"path"`
+	Track    bool   `yaml:"track" json:"track"`
+	Optional bool   `yaml:"optional,omitempty" json:"optional,omitempty"`
+}
+
+// UnmarshalJSON mirrors UnmarshalYAML for the single-struct
+// decode case. Any code path that does
+// `json.Unmarshal(data, &writeArtifact)` on `{"path":"x"}`
+// would otherwise leave Track at Go's bool zero value (false),
+// silently turning a tracked declaration into an untracked
+// one. The slice unmarshaler (WriteArtifacts.UnmarshalJSON)
+// handles its own pre-set, so this method only matters for
+// direct struct decodes — but adding it removes the asymmetry
+// and keeps "object-form without `track:` means tracked"
+// truthful at every entry point.
+//
+// Bare-string JSON (`"path/x"`) is also accepted here for
+// symmetry with the YAML scalar form.
+func (w *WriteArtifact) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		w.Path = s
+		w.Track = true
+		return nil
+	}
+	type alias WriteArtifact
+	a := alias{Track: true}
+	if err := json.Unmarshal(trimmed, &a); err != nil {
+		return err
+	}
+	*w = WriteArtifact(a)
+	return nil
 }
 
 // UnmarshalYAML accepts either a scalar (path string, track
-// defaults to true) or a mapping (path + optional track). Any
-// other shape is a schema error — caught by the generic yaml.v3
-// decoder when we fall through to struct decode.
+// defaults to true, optional false) or a mapping (path + any
+// of track/optional). Any other shape is a schema error —
+// caught by the generic yaml.v3 decoder when we fall through
+// to struct decode.
 func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
 	if value.Kind == yamlv3.ScalarNode {
 		w.Path = value.Value
@@ -241,7 +305,9 @@ func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
 	// Decode via an alias to avoid recursing into our custom
 	// unmarshaller. Pre-set Track=true so an omitted `track:`
 	// key stays true — yaml.v3 doesn't overwrite fields
-	// absent from the YAML.
+	// absent from the YAML. Optional is false by default which
+	// matches the "must produce" contract — Go's zero value
+	// happens to be the right default here.
 	type alias WriteArtifact
 	a := alias{Track: true}
 	if err := value.Decode(&a); err != nil {

@@ -24,7 +24,7 @@ func (e *Engine) ValidateRunCreation(parsed *enjuYaml.ParsedRun) error {
 				}
 			}
 			for _, entry := range ti.WritesArtifacts {
-				if err := ValidateArtifactPath(entry.Path); err != nil {
+				if err := ValidateArtifactDeclaration(entry.Path); err != nil {
 					return fmt.Errorf("task %q: invalid writes_artifacts path %q: %v", ti.ID, entry.Path, err)
 				}
 			}
@@ -42,11 +42,45 @@ func (e *Engine) ValidateRunCreation(parsed *enjuYaml.ParsedRun) error {
 	return nil
 }
 
-// ValidateArtifactPath checks that an artifact path is
-// well-formed (non-empty, no leading slash, no path
-// traversal). Exported so both engine and router can
-// call it.
+// ValidateArtifactPath checks that a CONCRETE artifact path is
+// well-formed (non-empty, no leading slash, no path traversal,
+// no reserved-dir collisions). Used for:
+//
+//   - reads_artifacts entries (must be literal — declared deps
+//     reference concrete commit-resolvable paths).
+//   - artifacts_written entries on submit (the post-expansion
+//     literal paths the citizen actually wrote).
+//
+// For the broader writes_artifacts declaration shape (literal
+// + glob + directory + optional), use ValidateArtifactDeclaration
+// instead — it enforces the same safety rules but allows the
+// pattern-syntax markers (`*`, `?`, `[`, trailing `/`).
+//
+// Exported so both engine and router can call it.
 func ValidateArtifactPath(p string) error {
+	return validateArtifactPathCore(p, false)
+}
+
+// ValidateArtifactDeclaration is the writes_artifacts variant
+// of ValidateArtifactPath: same safety guarantees (no leading
+// `/`, no `..`, no `.git/`, no `enju/`), but tolerates the
+// declaration-only syntax markers — globs (`*`, `?`, `[`) and
+// trailing-slash directory form. The expansion step at submit
+// time is responsible for ensuring the concrete matches all
+// pass the strict ValidateArtifactPath check, so this gate
+// just rejects malformed declarations.
+//
+// Implementation note: declarations are stripped of trailing
+// `/` before re-running the core checks because path-traversal
+// rules don't change based on whether the user meant directory
+// or file. Glob characters are passed through — they neither
+// trigger nor bypass the safety rules; what matters is the
+// prefix path (no `..`, no `.git/`, no `enju/`).
+func ValidateArtifactDeclaration(p string) error {
+	return validateArtifactPathCore(p, true)
+}
+
+func validateArtifactPathCore(p string, allowPatterns bool) error {
 	if p == "" {
 		return fmt.Errorf("empty path")
 	}
@@ -56,13 +90,27 @@ func ValidateArtifactPath(p string) error {
 	if strings.Contains(p, "..") {
 		return fmt.Errorf("must not contain '..'")
 	}
+	// Strip the directory marker before running reserved-dir
+	// checks. `enju/foo/` is rejected by the same rule that
+	// rejects `enju/foo`; the trailing slash is purely a
+	// classification hint at the syntactic level.
+	check := p
+	if allowPatterns && strings.HasSuffix(check, "/") {
+		check = strings.TrimSuffix(check, "/")
+		if check == "" {
+			return fmt.Errorf("path is just a slash")
+		}
+	}
+	if !allowPatterns && strings.ContainsAny(check, "*?[") {
+		return fmt.Errorf("must not contain glob metacharacters (this path must be literal)")
+	}
 	// Block reserved directories — artifacts live at natural repo
 	// paths so we must prevent writing into Enju's own state dirs
 	// or git internals.
-	if p == ResultDirRoot || strings.HasPrefix(p, ResultDirRoot+"/") || strings.HasPrefix(p, ResultDirRoot+`\`) {
+	if check == ResultDirRoot || strings.HasPrefix(check, ResultDirRoot+"/") || strings.HasPrefix(check, ResultDirRoot+`\`) {
 		return fmt.Errorf("must not write into %s/ (reserved for Enju state)", ResultDirRoot)
 	}
-	if strings.HasPrefix(p, ".git/") || strings.HasPrefix(p, ".git\\") || p == ".git" {
+	if strings.HasPrefix(check, ".git/") || strings.HasPrefix(check, ".git\\") || check == ".git" {
 		return fmt.Errorf("must not write into .git/")
 	}
 	// enju/templates/ is covered by the ResultDirRoot check above;
