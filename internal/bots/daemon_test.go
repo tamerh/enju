@@ -3,6 +3,7 @@ package bots
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -95,7 +96,7 @@ func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.Tas
 	return nil, errors.New("no meta for " + taskID)
 }
 
-func (f *fakeFC) ResolveProjectWorkspace(ctx context.Context, projectID int64) (string, error) {
+func (f *fakeFC) ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error) {
 	if f.workspaceErr != nil {
 		return "", f.workspaceErr
 	}
@@ -246,6 +247,44 @@ func TestDaemon_RunOnce_FailsWhenWorkspaceUnresolvable(t *testing.T) {
 	}
 	if len(fc.submits) != 0 {
 		t.Errorf("submit should not fire on workspace failure, got %d", len(fc.submits))
+	}
+}
+
+// TestDaemon_Run_ExitsOnPermanentConfigError pins the
+// permanent-vs-transient error split: if ResolveBotWorkspace
+// returns service.ErrNoCloneSource (project has no remote_url
+// AND no registered adopted path), the Run loop must surface
+// the error and exit, not retry forever. Without this, a
+// misconfigured project would spam log lines every poll cycle
+// indefinitely. Transient errors still get the retry-with-
+// backoff treatment — that's covered by other tests.
+func TestDaemon_Run_ExitsOnPermanentConfigError(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	// Wrap the sentinel exactly like service.ResolveBotWorkspace
+	// does, so errors.Is in Run matches end-to-end.
+	fc.workspaceErr = fmt.Errorf("%w: project 1", service.ErrNoCloneSource)
+	stub := &StubHandler{Response: "ok"}
+	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1, PollFloor: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 100ms ceiling — Run should exit immediately on the first
+	// permanent-error iteration. If the loop keeps retrying,
+	// this test hangs and fails the timeout, which is the right
+	// signal.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runErr := d.Run(ctx)
+	if runErr == nil {
+		t.Fatal("Run should return an error on permanent config failure")
+	}
+	if !errors.Is(runErr, service.ErrNoCloneSource) {
+		t.Errorf("Run should propagate ErrNoCloneSource so the operator sees the cause; got %v", runErr)
+	}
+	if ctx.Err() != nil {
+		t.Errorf("Run should have exited BEFORE the context deadline (it kept retrying instead of bailing)")
 	}
 }
 

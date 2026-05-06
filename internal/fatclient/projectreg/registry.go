@@ -215,6 +215,27 @@ func (r *Registry) Touch(id int64) error {
 
 // Remove drops the entry by ID. No-op if the entry doesn't
 // exist (idempotent — leave_project should be safely re-runnable).
+// Get returns the entry for projectID, or (nil, nil) if absent.
+// Stale entries (LocalPath no longer on disk) are filtered the
+// same way List does. Used by callers that need a single
+// entry's path without scanning the full list.
+func (r *Registry) Get(id int64) (*Entry, error) {
+	idx, err := r.Load()
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range idx.Projects {
+		if e.ID != id {
+			continue
+		}
+		if _, err := os.Stat(e.LocalPath); err != nil {
+			return nil, nil
+		}
+		return &e, nil
+	}
+	return nil, nil
+}
+
 func (r *Registry) Remove(id int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

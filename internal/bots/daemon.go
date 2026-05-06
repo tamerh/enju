@@ -73,16 +73,22 @@ type fatClient interface {
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
-	// ResolveProjectWorkspace returns the abs path to the
-	// project's local clone, materializing it if needed. Threaded
-	// to the Handler as cwd so claude -p (and any future
-	// subprocess handler) operates on the bot's clone, not the
-	// daemon's inherited cwd. Without this the LLM:
-	//   1) sees whatever filesystem the daemon was started in,
-	//   2) writes into that tree on edits, conflicting with the
-	//      operator if they're working there.
-	// See ISSUE-005 follow-up for the production symptom.
-	ResolveProjectWorkspace(ctx context.Context, projectID int64) (string, error)
+	// ResolveBotWorkspace returns the abs path to a MANAGED
+	// clone (`~/.enju/workspaces/<slug>-<id>/`), distinct from
+	// any operator-adopted path the same projectID may be
+	// registered with. Threaded to the Handler as cwd so
+	// claude -p operates in the bot's clone — not the operator's
+	// tree, where bot branch switches would collide with the
+	// operator's working state and bot writes would pollute
+	// the operator's `git status`.
+	//
+	// Why this is bot-specific (not the same call humans use):
+	// the human `enju mcp` flow WANTS to operate directly on
+	// their adopted dir, otherwise their edits aren't visible
+	// to the MCP-driven flow. Bot flows MUST clone separately.
+	// Same projectID, two clones — see service.ResolveBotWorkspace
+	// for the full rationale.
+	ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error)
 }
 
 // Config bundles every dependency the Daemon needs at construction.
@@ -216,6 +222,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		worked, err := d.runOnce(ctx)
 		if err != nil {
+			// Permanent deployment-config errors short-circuit
+			// the loop. Without this, a misconfigured project
+			// (no remote_url AND no registered adopted path)
+			// would loop forever logging the same workspace-
+			// resolve failure every poll cycle. Surface the
+			// error and exit so the operator sees the cause
+			// once and can fix it; restarting with the same
+			// config would only reproduce the spam.
+			if errors.Is(err, service.ErrNoCloneSource) {
+				d.logger.Error("permanent config error — exiting daemon",
+					"error", err,
+					"hint", "set remote_url with enju_set_project_remote, or run enju_init --path= to register an adopted tree")
+				return err
+			}
 			// Log and keep going — a one-off failure on iter
 			// N shouldn't kill the daemon. Real "this whole
 			// daemon is broken" cases (no FC, panicked
@@ -265,12 +285,42 @@ func (d *Daemon) RunOnce(ctx context.Context) (bool, error) {
 // and RunOnce share the implementation without duplicating the
 // "release on failure" defer ordering.
 func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
-	taskID, err := d.findWork(ctx)
+	taskID, projectID, err := d.findWork(ctx)
 	if err != nil {
 		return false, fmt.Errorf("find work: %w", err)
 	}
 	if taskID == "" {
 		return false, nil
+	}
+
+	// Pre-warm the bot's managed clone for this project BEFORE
+	// the claim. ClaimTask's pre-claim reconcile internally
+	// calls FatClient.OpenProject, which goes through
+	// workspace.ForProject — and ForProject's externalDirs
+	// short-circuit would otherwise resolve to the operator's
+	// adopted dir AND poison the workspace's per-project cache
+	// (`ws.clients[projectID]`) with that handle. Subsequent
+	// SubmitTaskResult and HandlerInput.Workspace calls would
+	// then keep returning the operator's tree even though the
+	// bot explicitly asked for a managed clone.
+	//
+	// By calling ResolveBotWorkspace first we force
+	// ForceManagedClone to populate the cache with the
+	// `~/.enju/workspaces/<slug>-<id>/` Project. ForProject's
+	// cache check sees that and returns it; externalDirs is
+	// never consulted for this projectID in this process.
+	//
+	// Production symptom this fixes (ISSUE-007 follow-up): bot
+	// daemon claimed work, claude -p ran in the operator's
+	// tree, bot's git checkout switched the operator's tree to
+	// the topic branch, multi-task runs jammed at the second
+	// branch switch on residue from the first task's commit.
+	workspacePath, err := d.fc.ResolveBotWorkspace(ctx, projectID)
+	if err != nil {
+		return false, fmt.Errorf("resolve workspace for project %d: %w", projectID, err)
+	}
+	if workspacePath == "" {
+		return false, fmt.Errorf("workspace path empty for project %d", projectID)
 	}
 
 	claim, err := d.fc.ClaimTask(ctx, service.ClaimParams{
@@ -291,7 +341,7 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	}
 	d.activeClaim = taskID
 
-	if err := d.processAndSubmit(ctx, taskID, claim); err != nil {
+	if err := d.processAndSubmit(ctx, taskID, claim, workspacePath); err != nil {
 		// Don't auto-release on submit failure — the claim is
 		// ours, the work either succeeded or didn't. A retry
 		// pass on the same task can be valuable. The deferred
@@ -320,7 +370,7 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 // returns one flat list per request. Tracked as a coord-side
 // follow-up; would also benefit other surfaces (UI's
 // "what's waiting for me" view).
-func (d *Daemon) findWork(ctx context.Context) (string, error) {
+func (d *Daemon) findWork(ctx context.Context) (taskID string, projectID int64, err error) {
 	username := d.fc.Username()
 
 	// Resolve the project list. ProjectID > 0 narrows to a
@@ -331,9 +381,9 @@ func (d *Daemon) findWork(ctx context.Context) (string, error) {
 	if d.projectID > 0 {
 		projectIDs = []int64{d.projectID}
 	} else {
-		projects, err := d.fc.ListProjects(ctx)
-		if err != nil {
-			return "", fmt.Errorf("list projects: %w", err)
+		projects, perr := d.fc.ListProjects(ctx)
+		if perr != nil {
+			return "", 0, fmt.Errorf("list projects: %w", perr)
 		}
 		for _, p := range projects {
 			projectIDs = append(projectIDs, p.ID)
@@ -368,12 +418,16 @@ func (d *Daemon) findWork(ctx context.Context) (string, error) {
 					continue
 				}
 				if id, _ := t["id"].(string); id != "" {
-					return id, nil
+					// Return the (taskID, projectID) pair so
+					// runOnce can pre-warm the bot's managed
+					// clone for this project before the claim
+					// fires (see runOnce comment).
+					return id, pid, nil
 				}
 			}
 		}
 	}
-	return "", nil
+	return "", 0, nil
 }
 
 // processAndSubmit hands a claimed task to the handler and
@@ -391,7 +445,7 @@ func (d *Daemon) findWork(ctx context.Context) (string, error) {
 // state behind. The fix is a heartbeat goroutine that probes
 // claim status and cancels the handler ctx on flip; deferred
 // until the cost shows up against a real LLM workload.
-func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *service.ClaimResult) error {
+func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *service.ClaimResult, workspacePath string) error {
 	meta, err := d.fc.FetchTaskMeta(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("fetch meta: %w", err)
@@ -410,27 +464,11 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		prompt = meta.Prompt
 	}
 
-	// Resolve the project's local clone so the handler gets a
-	// real working directory. Without this `claude -p` (or any
-	// subprocess handler) inherits the daemon's cwd — the
-	// operator's checkout, typically — and:
-	//   1) the LLM's Read/Grep/Glob tools can walk paths the
-	//      operator never authorized (the manifest's
-	//      mcp_tools.allow gates which TOOLS exist, not which
-	//      PATHS they touch);
-	//   2) any Write/Edit lands in the operator's tree,
-	//      conflicting with whatever the operator is doing.
-	//
-	// We hard-fail rather than silently letting the handler
-	// inherit cwd: a missing workspace is a deployment error,
-	// not a recoverable runtime state.
-	workspacePath, err := d.fc.ResolveProjectWorkspace(ctx, meta.ProjectID)
-	if err != nil {
-		return fmt.Errorf("resolve workspace for project %d: %w", meta.ProjectID, err)
-	}
-	if workspacePath == "" {
-		return fmt.Errorf("workspace path empty for project %d (project missing remote_url? bot setup incomplete?)", meta.ProjectID)
-	}
+	// workspacePath was resolved by runOnce BEFORE ClaimTask
+	// so the managed clone is cached in ws.clients[projectID]
+	// and ClaimTask's pre-claim reconcile + this submit both
+	// see it. See runOnce's comment for why pre-warming is
+	// load-bearing.
 
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
 		TaskID:       meta.ID,

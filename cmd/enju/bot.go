@@ -265,6 +265,22 @@ func cmdBotSetup(args []string) {
 		}
 	}
 
+	// Ensure the project has a non-working-tree push target
+	// (a managed bare at ~/.enju/repos/{id}.git/). Without
+	// this, a bot daemon pushing a topic branch into the
+	// operator's adopted folder hits "branch is currently
+	// checked out" or races against the operator's working-
+	// tree state. We do this AFTER membership is set up so
+	// the operator's "I just opted into bots" act is the same
+	// moment the push infrastructure appears — human-only
+	// flows never see a bare under ~/.enju/repos/.
+	//
+	// Real-remote projects (github / gitlab) skip this
+	// silently — github already plays the bare role.
+	if !*dryRun && effectiveProjectID > 0 {
+		ensureBotPushTarget(ctx, *coordinator, owner, effectiveProjectID)
+	}
+
 	fmt.Printf("\n%d registered, %d skipped, %d failed\n", registered, skipped, failed)
 	if failed > 0 {
 		os.Exit(2)
@@ -363,6 +379,68 @@ func addBotToProject(ctx context.Context, coordURL, ownerToken string, projectID
 		return nil
 	}
 	return fmt.Errorf("coord %d: %s", resp.StatusCode, string(respBody))
+}
+
+// ensureBotPushTarget calls service.FatClient.EnsureBotPushTarget
+// for the project so the moment bots are wired up, the project
+// has a non-working-tree push destination (a managed bare at
+// ~/.enju/repos/{id}.git/). Idempotent — re-running setup just
+// re-confirms the bare exists and origin points at it.
+//
+// The setup CLI is a one-shot, so we build a minimal FatClient
+// here (workspace + projectRegistry + coord) and discard it on
+// return. We don't reuse the daemon's FatClient because setup
+// runs before any bot is launched and the operator's owner
+// token (not a bot token) authorizes the coord PUT — `enju bot
+// run` would use a bot's token, which lacks the project-write
+// permission needed for /api/v1/projects/{id}/remote.
+func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credentials, projectID int64) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	wsRoot, err := defaultWorkspaceRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ! couldn't resolve workspace root for bot push-target setup: %v\n", err)
+		return
+	}
+	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ! couldn't open workspace for bot push-target setup: %v\n", err)
+		return
+	}
+	coordClient := coord.New(coord.Config{
+		BaseURL:     coordinator,
+		Username:    owner.Username,
+		CitizenName: owner.Name,
+		AuthToken:   owner.Token,
+		Logger:      logger,
+	})
+	fc := service.New(service.Config{
+		Coord:           coordClient,
+		Workspace:       ws,
+		Logger:          logger,
+		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
+	})
+	bareURL, created, err := fc.EnsureBotPushTarget(ctx, projectID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ! bot push target not ready for project #%d: %v\n", projectID, err)
+		return
+	}
+	if created {
+		fmt.Printf("  + created bot push target for project #%d at %s\n", projectID, bareURL)
+	} else {
+		fmt.Printf("  ✓ bot push target for project #%d ready at %s\n", projectID, bareURL)
+	}
+}
+
+// defaultWorkspaceRoot is the same path `enju bot run` uses for
+// its --workspace-dir default, kept identical so the bare-clone
+// resolution + the daemon's clone resolution agree on the
+// managed-clone root.
+func defaultWorkspaceRoot() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".enju", "workspaces"), nil
 }
 
 // writeBotCredentials writes a credentials.json with 0600 mode

@@ -217,6 +217,108 @@ func (ws *Workspace) findProjectDir(projectID int64) string {
 	return numericMatch
 }
 
+// ForceManagedClone is like ForProject but **always** uses the
+// managed-clone path under the workspace root, never the
+// externalDirs short-circuit and never the local-working-tree
+// short-circuit. Bots call this so their working directory is
+// distinct from any operator-adopted path that the same
+// projectID happens to be registered with.
+//
+// Why this is a separate entry point from ForProject: the human
+// `enju mcp` flow WANTS to operate directly on the operator's
+// adopted dir (otherwise their edits aren't visible to the
+// MCP-driven flow). The bot flow MUST operate on a separate
+// clone (otherwise the bot's branch switches collide with the
+// operator's working state, the bot's writes pollute the
+// operator's status, and the operator's uncommitted changes
+// jam the bot's checkout). Same projectID, two clones — the
+// bot one lives at `~/.enju/workspaces/{slug}-{id}/`, the
+// operator one is wherever they pointed `enju_init`.
+//
+// Caching: the returned Project is cached in ws.clients[id]
+// like ForProject. Subsequent calls for the same id return the
+// same handle. A single Workspace shouldn't mix ForProject and
+// ForceManagedClone for the same id — pick one resolution
+// strategy per process. In practice the bot daemon process
+// ONLY calls ForceManagedClone; the MCP / webui processes ONLY
+// call ForProject.
+//
+// remoteURL is required (empty errors). Local-path remotes are
+// CLONED, not opened in place — `git clone /op/tree
+// ~/.enju/workspaces/...` produces a clone with the local path
+// as `origin`, suitable for pull/push via the local protocol.
+// projectName is the slug source for the on-disk dir name.
+func (ws *Workspace) ForceManagedClone(projectID int64, remoteURL string, projectName ...string) (*Project, error) {
+	if projectID == 0 {
+		return nil, fmt.Errorf("projectID is required")
+	}
+	if remoteURL == "" {
+		return nil, fmt.Errorf("ForceManagedClone requires remoteURL (project %d)", projectID)
+	}
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	name := ""
+	if len(projectName) > 0 {
+		name = projectName[0]
+	}
+	expectedWorkDir := ws.projectDir(projectID, name)
+
+	// Cache check is STRICT: only return the cached entry if
+	// its WorkDir is the managed-clone path we expect.
+	// Otherwise the cached Project came from a different
+	// resolution path (ForProject's externalDirs short-circuit,
+	// or the IsLocalWorkingTree direct-open) and points at the
+	// operator's adopted dir. Returning that would defeat the
+	// whole point of ForceManagedClone — bots would silently
+	// share the operator's tree even though they explicitly
+	// asked for isolation.
+	//
+	// On mismatch we evict the cache entry and clone fresh.
+	// The evicted Project's Lock/Unlock is owned by whoever was
+	// holding it, but we don't free their handle — they keep
+	// their pointer, we just stop returning it. Next call to
+	// any ws.* method for this id consults the cache again and
+	// sees the fresh managed-clone entry. In practice this
+	// fires once per daemon process at startup if some early
+	// flow (ClaimTask's pre-claim reconcile) already opened
+	// the project via ForProject; thereafter the cache stays
+	// hot with the managed clone.
+	if p, ok := ws.clients[projectID]; ok {
+		if p.workDir == expectedWorkDir {
+			return p, nil
+		}
+		ws.logger.Info(
+			"ForceManagedClone: evicting non-managed cached project (replacing with managed clone)",
+			"project_id", projectID,
+			"cached_workdir", p.workDir,
+			"managed_workdir", expectedWorkDir,
+		)
+		delete(ws.clients, projectID)
+		// Also drop any externalDirs registration so a future
+		// ForProject call doesn't re-bind to the operator's
+		// tree. The daemon never wants externalDirs in its
+		// process; the bridge that populates it is correct
+		// for webui but wrong for bots, and there's no good
+		// way for the workspace layer to know which process
+		// it's in. Dropping on first-use is the simplest
+		// idempotent answer.
+		delete(ws.externalDirs, projectID)
+	}
+
+	workDir := expectedWorkDir
+	p, err := openOrClone(workDir, remoteURL, ws.logger)
+	if err != nil {
+		return nil, err
+	}
+	p.projectID = projectID
+	lockPath := filepath.Join(ws.rootDir, fmt.Sprintf("project-%d.lock", projectID))
+	p.fileLock = flock.New(lockPath)
+	ws.clients[projectID] = p
+	return p, nil
+}
+
 // RegisterExternalDir tells the workspace that a given project's
 // working directory is an external folder (from enju_init), not a
 // clone under the workspace root. ForProject will open the external
@@ -362,6 +464,17 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
+	// LOAD-BEARING cache hit: bot daemons rely on this returning
+	// the managed-clone Project that ForceManagedClone seeded
+	// during the pre-warm step in bots/daemon.go runOnce. If this
+	// branch ever stops returning the cached entry (e.g.
+	// "validate before return", "always re-resolve when remoteURL
+	// looks remote"), the bot's downstream OpenProject calls fall
+	// through to the externalDirs short-circuit below and silently
+	// route to the operator's adopted tree. The pre-warm dance
+	// only works because cache-hit-wins. See bots/daemon.go
+	// runOnce comment ("Pre-warm the bot's managed clone...") for
+	// the inverse half of this contract.
 	if p, ok := ws.clients[projectID]; ok {
 		return p, nil
 	}
