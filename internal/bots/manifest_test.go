@@ -369,11 +369,13 @@ func TestEnsureGitignored_FreshProject(t *testing.T) {
 		t.Error("expected changed=true on fresh project")
 	}
 	body, _ := os.ReadFile(filepath.Join(root, ".gitignore"))
-	// All three machine-managed dirs must land in the managed
-	// block so a stray `git add enju/` doesn't accidentally
-	// commit bot worktrees, the bare push target, or the bot's
-	// managed clone.
-	for _, want := range []string{"enju/bots/", "enju/.bare.git/", "enju/.clone/"} {
+	// Both machine-managed dirs must land in the managed block
+	// so a stray `git add enju/` doesn't accidentally commit
+	// bot worktrees or the bare push target. Per-bot clones
+	// nest under enju/bots/<botname>/clone/ so the enju/bots/
+	// rule covers them transitively — no separate clone entry
+	// needed.
+	for _, want := range []string{"enju/bots/", "enju/.bare.git/"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("expected %q in .gitignore, got:\n%s", want, body)
 		}

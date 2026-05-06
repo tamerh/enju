@@ -219,7 +219,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 		ProjectRegistry: projectreg.Open(regPath),
 	})
 
-	got, err := fc.ResolveBotWorkspace(context.Background(), 42)
+	got, err := fc.ResolveBotWorkspace(context.Background(), 42, "test-bot")
 	if err != nil {
 		t.Fatalf("ResolveBotWorkspace: %v", err)
 	}
@@ -227,8 +227,8 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	if got == homeTree {
 		t.Fatalf("bot workspace must be distinct from operator's home tree; both got %q", got)
 	}
-	// Bot clone lives at <home>/enju/.clone/.
-	wantClone := filepath.Join(homeTree, "enju", ".clone")
+	// Bot clone lives at <home>/enju/bots/<botname>/clone/.
+	wantClone := filepath.Join(homeTree, "enju", "bots", "test-bot", "clone")
 	if got != wantClone {
 		t.Errorf("bot clone path: got %q, want %q", got, wantClone)
 	}
@@ -262,7 +262,7 @@ func TestResolveBotWorkspace_NoRemoteAndNoAdoptedPath_Errors(t *testing.T) {
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "x", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, Workspace: ws, Logger: logger}) // no ProjectRegistry
 
-	_, err := fc.ResolveBotWorkspace(context.Background(), 99)
+	_, err := fc.ResolveBotWorkspace(context.Background(), 99, "test-bot")
 	if err == nil {
 		t.Fatal("expected error when neither remote_url nor adopted path is available")
 	}

@@ -39,6 +39,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/common/wire"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
@@ -75,22 +76,29 @@ type fatClient interface {
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
-	// ResolveBotWorkspace returns the abs path to a MANAGED
-	// clone (`~/.enju/workspaces/<slug>-<id>/`), distinct from
-	// any operator-adopted path the same projectID may be
-	// registered with. Threaded to the Handler as cwd so
-	// claude -p operates in the bot's clone — not the operator's
-	// tree, where bot branch switches would collide with the
-	// operator's working state and bot writes would pollute
-	// the operator's `git status`.
+	// ResolveBotWorkspace returns the abs path to this bot's
+	// per-bot per-project managed clone at
+	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
+	// the operator's working tree AND from any other bot's
+	// clone on the same machine. Threaded to the Handler as
+	// cwd so claude -p operates in the bot's own clone —
+	// without per-bot isolation, two daemons on the same
+	// project share a working tree and trip over each other's
+	// branch switches and in-flight writes.
+	//
+	// botUsername scopes the clone to the citizen identity.
+	// One daemon = one citizen, so callers pass d.fc.Username()
+	// (the coord-assigned name, which may differ from the
+	// manifest's requested name when collision auto-suffix
+	// fired during registration). The coord username is what
+	// shows up in the audit log and is path-safe by validation.
 	//
 	// Why this is bot-specific (not the same call humans use):
-	// the human `enju mcp` flow WANTS to operate directly on
-	// their adopted dir, otherwise their edits aren't visible
-	// to the MCP-driven flow. Bot flows MUST clone separately.
-	// Same projectID, two clones — see service.ResolveBotWorkspace
-	// for the full rationale.
-	ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error)
+	// the operator's `enju mcp` flow operates directly on
+	// their adopted dir; their working tree IS the project.
+	// Bot flows must clone separately, one per bot, so multi-
+	// bot fleets work in parallel.
+	ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error)
 
 	// ResetBotCloneToCleanState wipes the bot clone's worktree
 	// residue between iterations: drops staged + unstaged
@@ -99,6 +107,29 @@ type fatClient interface {
 	// tip post-pull). Daemon calls it after ClaimTask and
 	// before the handler runs.
 	ResetBotCloneToCleanState(ctx context.Context, projectID int64) error
+
+	// CheckoutTopicBranchTip switches HEAD to the named topic
+	// branch. Used on iter > 1 re-claim (after request_changes)
+	// so the LLM starts on iter-1's tree, not on the run-branch
+	// tip the pre-claim pull leaves behind. Caller invokes this
+	// BEFORE ResetBotCloneToCleanState so the reset's
+	// HardReset-to-HEAD lands on topic-branch state.
+	CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error
+
+	// WipeDeclaredWrites removes literal-path entries from
+	// `writes` from the worktree. Used on iter > 1 to give the
+	// LLM a clean canvas in its declared output paths, so
+	// iter-2's commit doesn't union with iter-1's files when
+	// the LLM picks different filenames. Glob/dir/templated
+	// paths are skipped — literal-path scope only.
+	WipeDeclaredWrites(ctx context.Context, projectID int64, writes enjuYaml.WriteArtifacts) error
+
+	// FetchAllRefsForBot syncs the bot clone with every remote
+	// branch's refs + objects. Daemon calls it pre-claim so
+	// claude-p sees freshly-pushed topic branches from other
+	// citizens. Without this step, per-bot clones drift apart
+	// and reading bots see stale empty topic branches.
+	FetchAllRefsForBot(ctx context.Context, projectID int64) error
 }
 
 // Config bundles every dependency the Daemon needs at construction.
@@ -324,12 +355,26 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	// tree, bot's git checkout switched the operator's tree to
 	// the topic branch, multi-task runs jammed at the second
 	// branch switch on residue from the first task's commit.
-	workspacePath, err := d.fc.ResolveBotWorkspace(ctx, projectID)
+	workspacePath, err := d.fc.ResolveBotWorkspace(ctx, projectID, d.fc.Username())
 	if err != nil {
 		return false, fmt.Errorf("resolve workspace for project %d: %w", projectID, err)
 	}
 	if workspacePath == "" {
 		return false, fmt.Errorf("workspace path empty for project %d", projectID)
+	}
+
+	// Sync the bot's clone with everything other citizens have
+	// pushed since the last poll. With per-bot clones, each
+	// bot's local object DB only carries what THIS bot has
+	// fetched — without an explicit fetch, reviewer-bot reading
+	// developer-bot's freshly-pushed topic branch sees an empty
+	// branch and emits a bogus request_changes (production saw
+	// this as the develop_config rejection loop). Best-effort:
+	// a fetch failure is logged but doesn't block the claim;
+	// ReadFileAtCommit's lazy-fetch fallback picks up the slack.
+	if ferr := d.fc.FetchAllRefsForBot(ctx, projectID); ferr != nil {
+		d.logger.Warn("pre-claim fetch failed; will rely on read-time lazy fetch",
+			"project_id", projectID, "error", ferr)
 	}
 
 	claim, err := d.fc.ClaimTask(ctx, service.ClaimParams{
@@ -479,15 +524,33 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	// see it. See runOnce's comment for why pre-warming is
 	// load-bearing.
 
+	// Revision branch state: on iter > 1 (re-claim after a
+	// reviewer's request_changes verdict), the existing topic
+	// branch already carries iter-1's commit. The pre-claim
+	// pull leaves HEAD on the run branch — exactly the wrong
+	// place for a revision, since the LLM should start from
+	// iter-1's tree (where the reviewer's feedback applies),
+	// not from the run-branch tip. Switch to the topic branch
+	// FIRST so the subsequent ResetBotCloneToCleanState lands
+	// the worktree on iter-1's state. Without this, the LLM
+	// runs against the wrong base, writes new files (often with
+	// non-deterministic filenames), and the submit-time
+	// CheckoutBranchFrom blows up with "worktree contains
+	// unstaged changes" because index ↔ worktree don't match.
+	if meta.IterSeq > 1 && meta.IterationBranch != "" {
+		if cerr := d.fc.CheckoutTopicBranchTip(ctx, meta.ProjectID, meta.IterationBranch); cerr != nil {
+			return fmt.Errorf("checkout topic branch %q for revision: %w", meta.IterationBranch, cerr)
+		}
+	}
+
 	// Reset the bot clone to a clean state before the handler
-	// runs. ClaimTask's pre-claim pull already advanced HEAD
-	// to the run branch tip; the reset drops any leftover
-	// uncommitted edits and untracked files from the previous
-	// iteration so the handler starts on the same canvas
-	// every time. Without this, residue accumulates across
-	// tasks and the next CheckoutBranchFrom can produce a
-	// staged-deletion-plus-untracked desync when the new
-	// topic branch's tree disagrees with the leftovers.
+	// runs. ClaimTask's pre-claim pull (or the iter > 1 topic
+	// checkout above) advanced HEAD to the right tip; the reset
+	// drops any leftover uncommitted edits and untracked files
+	// from the previous iteration so the handler starts on the
+	// same canvas every time. Without this, residue accumulates
+	// across tasks and the next CheckoutBranchFrom can produce
+	// a staged-deletion-plus-untracked desync.
 	//
 	// Best-effort: a reset failure logs but doesn't abort the
 	// iteration — the handler may still succeed if the residue
@@ -499,12 +562,41 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 			"task_id", taskID, "project_id", meta.ProjectID, "error", rerr)
 	}
 
+	// On iter > 1, wipe the prior iteration's declared writes
+	// so the LLM starts with a clean canvas in those paths and
+	// iter-2's commit carries iter-2's content only — not a
+	// union of both iterations' files (LLM non-determinism on
+	// filenames would otherwise produce that union and confuse
+	// reviewers). Iter-1's files remain reachable in iter-1's
+	// commit history; the topic branch stacks-on-top so both
+	// SHAs stay queryable.
+	if meta.IterSeq > 1 && len(meta.WritesArtifacts) > 0 {
+		if werr := d.fc.WipeDeclaredWrites(ctx, meta.ProjectID, meta.WritesArtifacts); werr != nil {
+			return fmt.Errorf("wiping prior iteration's writes: %w", werr)
+		}
+	}
+
+	// Prepend reviewer feedback to the prompt on a revision so
+	// the LLM understands what the reviewer asked to change.
+	// Without this, iter-2's prompt is identical to iter-1's
+	// and the LLM's "revision" is just stochastic-sampling
+	// noise on the same brief.
+	if len(claim.ReviewFeedback) > 0 {
+		var b strings.Builder
+		b.WriteString("# Reviewer feedback from previous iteration\n\n")
+		b.Write(claim.ReviewFeedback)
+		b.WriteString("\n\n# Original task\n\n")
+		b.WriteString(prompt)
+		prompt = b.String()
+	}
+
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
-		TaskID:       meta.ID,
-		Action:       meta.Action,
-		Prompt:       prompt,
-		SystemPrompt: d.systemPrompt,
-		Workspace:    workspacePath,
+		TaskID:         meta.ID,
+		Action:         meta.Action,
+		Prompt:         prompt,
+		SystemPrompt:   d.systemPrompt,
+		Workspace:      workspacePath,
+		ReviewFeedback: string(claim.ReviewFeedback),
 	})
 	if err != nil {
 		return fmt.Errorf("handler: %w", err)

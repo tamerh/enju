@@ -78,6 +78,16 @@ type HandlerInput struct {
 	// tools see project-relative paths) read this; pure-text
 	// handlers can ignore it.
 	Workspace string
+
+	// ReviewFeedback is the reviewer's prose from the previous
+	// iteration's request_changes verdict (empty on iter-1 or
+	// when the prior outcome wasn't request_changes). Daemons
+	// fold this into the prompt so the LLM understands what the
+	// reviewer asked to change. Surfaced as a separate field so
+	// non-LLM handlers (rule-based, shell) can choose to ignore
+	// it — for the Claude handler the daemon already prepends
+	// it to the user-facing prompt.
+	ReviewFeedback string
 }
 
 // HandlerOutput is what the handler returns to the daemon. The

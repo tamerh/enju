@@ -34,12 +34,20 @@ import (
 
 // validActions is the set of supported action values. Declared
 // at package scope so it's not rebuilt every call.
+//
+// merge_resolve is a system-spawned action — coord auto-spawns
+// these tasks when a non-FF auto-merge hits a content conflict
+// (parallel-merge phase 3). YAML authors don't write
+// `action: merge_resolve` directly, but the parser must accept
+// it on already-loaded run state so a re-parse of a project
+// with spawned merge_resolve tasks doesn't fail.
 var validActions = map[string]bool{
-	"answer":     true,
-	"contribute": true,
-	"compute":    true,
-	"review":     true,
-	"vote":       true,
+	"answer":        true,
+	"contribute":    true,
+	"compute":       true,
+	"review":        true,
+	"vote":          true,
+	"merge_resolve": true,
 }
 
 // validate orchestrates every parse-time check on the decoded
@@ -73,6 +81,9 @@ func validate(p *Run) ([]string, error) {
 	}
 	reviewWarnings := injectReviewGating(p)
 	injectVoteActivation(p)
+	if err := validateNoParallelSiblingWrites(p); err != nil {
+		return nil, err
+	}
 	if err := validateTemplateReferences(p, ids); err != nil {
 		return nil, err
 	}
@@ -482,6 +493,21 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		}
 		ids[t.ID] = true
 
+		// merge_resolve is system-only. coord auto-spawns these
+		// tasks when a non-FF auto-merge hits a content
+		// conflict (parallel-merge phase 3); the validator
+		// accepts the action so re-parses of state with spawned
+		// tasks don't fail, but a user-authored YAML with
+		// `action: merge_resolve` is almost certainly a typo or
+		// copy-paste and should be rejected loudly. spawn.go
+		// bypasses this validator, so the system path stays
+		// open.
+		if t.Action == "merge_resolve" {
+			return nil, false, fmt.Errorf(
+				"task %q: action: merge_resolve is system-only — coord auto-spawns these on a non-FF merge conflict, "+
+					"YAML authors don't write them by hand. Did you mean answer or contribute?",
+				t.ID)
+		}
 		if !validActions[t.Action] {
 			return nil, false, fmt.Errorf("task %q: invalid action %q (must be answer, contribute, compute, review, or vote)", t.ID, t.Action)
 		}
@@ -759,6 +785,224 @@ func validateNoDuplicateReviewTargets(p *Run) error {
 		firstReviewer[t.Reviews] = t.ID
 	}
 	return nil
+}
+
+// validateNoParallelSiblingWrites flags task pairs with no
+// transitive dep edge between them whose declared
+// writes_artifacts paths overlap on a literal-path match.
+// Parallel-merge phase 4.
+//
+// Why this matters: under parallel execution two siblings'
+// commits both target the same run branch. If two siblings
+// declare the SAME literal output path, their commits will
+// conflict at auto-merge time, which spawns a merge_resolve
+// task and pulls a human into the loop. Catching the overlap
+// at parse time gives the YAML author a clear rewrite path
+// (add a dep edge or change one path) before any work runs.
+//
+// Glob ("*.md"), directory ("out/"), and template ("{{x}}")
+// patterns are skipped here — literal-path overlap catches
+// the common case; pattern-aware lint is a follow-up.
+//
+// Runs through after dep injection (review gating, vote
+// activation, reviews-target auto-append) so the reachability
+// walk sees the final dep graph. The walk also adds IMPLICIT
+// dep edges for artifact reads/writes — `{{artifact:p}}` in a
+// prompt or an explicit `reads_artifacts: [p]` makes the
+// reading task transitively depend on writers of `p`. Without
+// that, a producer→consumer pair (bootstrap writes p, refactor
+// reads p, both write p again) would false-positive even though
+// wireArtifactDeps will serialize them at materialization time.
+//
+// Known gap: `for_each` is processed at materialization time,
+// not parse time, so a single TaskDef inside a `for_each` loop
+// counts as ONE entry here. If that task declares a literal
+// `writes_artifacts` path — same string for every iteration —
+// the lint can't detect the N-way overlap that surfaces at
+// runtime. Templated paths (`out/{{instance}}.md`) avoid the
+// hazard naturally; literal paths inside for_each that
+// actually overlap across iterations would slip through. Worth
+// re-running on the materialized instance list in
+// `engine.ValidateRunCreation` if this becomes a real
+// authoring footgun.
+func validateNoParallelSiblingWrites(p *Run) error {
+	direct := make(map[string][]string, len(p.Tasks))
+	for _, t := range p.Tasks {
+		direct[t.ID] = append([]string(nil), t.DependsOn...)
+	}
+	// Augment with implicit artifact-read → writer edges so
+	// the reachability walk matches what wireArtifactDeps will
+	// inject post-materialization. Build a path → writers map
+	// from declared writes_artifacts (literal paths only).
+	writersByPath := make(map[string][]string)
+	for _, t := range p.Tasks {
+		for _, w := range t.WritesArtifacts {
+			if w.Path == "" || strings.Contains(w.Path, "{{") {
+				continue
+			}
+			writersByPath[w.Path] = append(writersByPath[w.Path], t.ID)
+		}
+	}
+	for _, t := range p.Tasks {
+		// Collect literal paths the task reads, from explicit
+		// reads_artifacts and from `{{artifact:<path>}}` refs in
+		// prompt / user_prompt / script.
+		readPaths := map[string]struct{}{}
+		for _, r := range t.ReadsArtifacts {
+			if r == "" || strings.Contains(r, "{{") {
+				continue
+			}
+			readPaths[r] = struct{}{}
+		}
+		for _, p := range artifactRefPaths(t.Prompt) {
+			readPaths[p] = struct{}{}
+		}
+		for _, p := range artifactRefPaths(t.UserPrompt) {
+			readPaths[p] = struct{}{}
+		}
+		for _, p := range artifactRefPaths(t.Script) {
+			readPaths[p] = struct{}{}
+		}
+		for path := range readPaths {
+			for _, writer := range writersByPath[path] {
+				if writer == t.ID {
+					continue
+				}
+				// Implicit edge: this task depends on `writer`.
+				if !stringSliceContains(direct[t.ID], writer) {
+					direct[t.ID] = append(direct[t.ID], writer)
+				}
+			}
+		}
+	}
+	// Cache per-task transitive deps so each pair-check is a
+	// constant-time map lookup. O(N * E) precompute, where E is
+	// the total dep-edge count, then O(N²) pair scan with O(1)
+	// lookups inside.
+	transitive := make(map[string]map[string]struct{}, len(p.Tasks))
+	for _, t := range p.Tasks {
+		seen := make(map[string]struct{})
+		stack := append([]string{}, direct[t.ID]...)
+		for len(stack) > 0 {
+			n := len(stack) - 1
+			cur := stack[n]
+			stack = stack[:n]
+			if _, ok := seen[cur]; ok {
+				continue
+			}
+			seen[cur] = struct{}{}
+			stack = append(stack, direct[cur]...)
+		}
+		transitive[t.ID] = seen
+	}
+	for i := 0; i < len(p.Tasks); i++ {
+		a := &p.Tasks[i]
+		if len(a.WritesArtifacts) == 0 {
+			continue
+		}
+		aLits := literalWritePaths(a.WritesArtifacts)
+		if len(aLits) == 0 {
+			continue
+		}
+		for j := i + 1; j < len(p.Tasks); j++ {
+			b := &p.Tasks[j]
+			if len(b.WritesArtifacts) == 0 {
+				continue
+			}
+			// Connected via the dep DAG in either direction?
+			// Then they aren't parallel — git's serialization
+			// + linear FF handle the merge.
+			if _, ok := transitive[a.ID][b.ID]; ok {
+				continue
+			}
+			if _, ok := transitive[b.ID][a.ID]; ok {
+				continue
+			}
+			bLits := literalWritePaths(b.WritesArtifacts)
+			for path := range aLits {
+				if _, overlap := bLits[path]; overlap {
+					return fmt.Errorf(
+						"tasks %q and %q both write %q but have no dep edge between them — "+
+							"under parallel execution their commits will conflict at auto-merge time. "+
+							"Add a dep edge (e.g. one task `depends_on: [%s]`) or change one path so the writes are disjoint",
+						a.ID, b.ID, path, a.ID)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// artifactRefPaths extracts every literal path referenced by
+// `{{artifact:<path>}}` in `text`. Used by the parallel-sibling
+// lint to recognize implicit reads that wireArtifactDeps will
+// turn into dep edges at materialization. Templated payloads
+// (`{{artifact:{{x}}/foo}}`) are skipped — only fully literal
+// paths are matched, mirroring the literal-path scope of the
+// overlap check.
+func artifactRefPaths(text string) []string {
+	if text == "" {
+		return nil
+	}
+	const tag = "{{artifact:"
+	var out []string
+	for {
+		i := strings.Index(text, tag)
+		if i < 0 {
+			break
+		}
+		rest := text[i+len(tag):]
+		end := strings.Index(rest, "}}")
+		if end < 0 {
+			break
+		}
+		path := rest[:end]
+		if path != "" && !strings.Contains(path, "{{") {
+			out = append(out, path)
+		}
+		text = rest[end+2:]
+	}
+	return out
+}
+
+// stringSliceContains is a tiny membership helper used by the
+// parallel-sibling lint when augmenting the dep graph with
+// implicit artifact-read edges. Local-named to avoid collision
+// with the package-test `contains(string, string)` helper.
+func stringSliceContains(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// literalWritePaths returns the subset of declared writes whose
+// `path` field is a fully literal string (no template var, no
+// glob). Used by the parallel-sibling overlap lint to skip
+// patterns it can't safely compare.
+func literalWritePaths(w WriteArtifacts) map[string]struct{} {
+	out := make(map[string]struct{}, len(w))
+	for _, e := range w {
+		if e.Path == "" {
+			continue
+		}
+		if strings.Contains(e.Path, "{{") {
+			continue
+		}
+		if strings.ContainsAny(e.Path, "*?[") {
+			continue
+		}
+		// Directory-form ("out/") is a containment scope, not
+		// a single file — skip for now. The "literal path"
+		// lint targets file-level collisions only.
+		if strings.HasSuffix(e.Path, "/") {
+			continue
+		}
+		out[e.Path] = struct{}{}
+	}
+	return out
 }
 
 // validateReviewTarget enforces the "reviews:" field contract:

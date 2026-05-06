@@ -171,6 +171,14 @@ func generateIterationBranch(taskAction, taskDefID, instanceKey, runSlug string,
 	if taskAction == "vote" {
 		return ""
 	}
+	// merge_resolve is the operator's "I resolved the conflict
+	// by hand" submission. The merge already happened directly
+	// on the run branch in their workspace; the task's commit
+	// is just a record on top, with no separate topic to FF
+	// back. Skip the topic-branch flow same as vote.
+	if taskAction == "merge_resolve" {
+		return ""
+	}
 	// Multi-citizen tasks (parallel reviewers, parallel
 	// answerers) keep the legacy "commit directly to the run
 	// branch" behavior. Each citizen writes their own per-

@@ -30,11 +30,17 @@ type RunStatusRun struct {
 // RunStatusTask is the task-shape format.RunStatus and
 // format.RunStatusMermaid consume. Minimal fields the
 // formatters actually read.
+//
+// Action is surfaced so the formatter can render system-spawned
+// resolution tasks (`merge_resolve`) in their own attention-
+// grabbing block — they're the parallel-merge phase 3 escape
+// hatch that pulls a human into the loop on a content conflict.
 type RunStatusTask struct {
 	ID          string `json:"id"`
 	TaskDefID   string `json:"task_def_id"`
 	InstanceKey string `json:"instance_key,omitempty"`
 	State       string `json:"state"`
+	Action      string `json:"action,omitempty"`
 	ClaimedBy   string `json:"claimed_by,omitempty"`
 	DependsOn   string `json:"depends_on,omitempty"`
 	FailReason  string `json:"fail_reason,omitempty"`
@@ -95,6 +101,7 @@ func GetRunStatus(s store.CoordinatorStore, caller *store.CitizenRecord, project
 			TaskDefID:   t.TaskDefID,
 			InstanceKey: t.InstanceKey,
 			State:       string(t.State),
+			Action:      t.Action,
 			ClaimedBy:   CitizenUsername(s, t.ClaimedBy),
 			DependsOn:   strings.TrimSpace(t.DependsOn),
 			FailReason:  t.FailReason,

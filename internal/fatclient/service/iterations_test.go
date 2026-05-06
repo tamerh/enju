@@ -17,6 +17,11 @@ import (
 	"testing"
 	"time"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
@@ -191,3 +196,181 @@ func TestReadResultAtCommit_EmptyArgs(t *testing.T) {
 // fields reference it transitively (the iteration test above
 // reads .ClaimedAt as a time.Time).
 var _ = time.Time{}
+
+// TestReadResultAtCommit_LazyClonesWhenMissing pins the webui-
+// blind-spot fix: a project's clone may not exist in the
+// reader's workspace (e.g. webui process for a bot-only project,
+// where the operator never ran `enju mcp` to seed a workspace
+// clone). When OpenExisting returns ErrCloneNotFound, the read
+// path should fall back to ForProject(remoteURL) so the bare's
+// objects become reachable, then return the file content.
+func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1) Bare remote, seeded with one initial commit so the
+	// writer's ForProject can branch from refs/heads/main.
+	bare := t.TempDir()
+	if _, err := gogit.PlainInitWithOptions(bare, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
+		Bare:        true,
+	}); err != nil {
+		t.Fatalf("init bare: %v", err)
+	}
+	seedBareWithInitialCommit(t, bare)
+	// Seed the bare via a writer workspace: ForProject(7, bare)
+	// gives a clone wired with origin=bare; CommitFiles +
+	// implicit push lands the commit on the bare.
+	writerRoot := t.TempDir()
+	writerWS, err := project.NewOpener(writerRoot, logger)
+	if err != nil {
+		t.Fatalf("writer Opener: %v", err)
+	}
+	writerProj, err := writerWS.ForProject(7, bare)
+	if err != nil {
+		t.Fatalf("writer ForProject: %v", err)
+	}
+	resultDir := "enju/runs/1-draft/draft"
+	writerProj.Lock()
+	commitRes, err := writerProj.CommitFiles(project.CommitFilesRequest{
+		Files: []project.FileWrite{
+			{RepoRelPath: resultDir + "/result.md", Content: []byte("LAZY-CLONE-CONTENT")},
+		},
+		CommitMsg:   "seed",
+		AuthorName:  "Writer",
+		AuthorEmail: "writer@example.com",
+		Branch:      "main",
+	})
+	writerProj.Unlock()
+	if err != nil {
+		t.Fatalf("CommitFiles: %v", err)
+	}
+	if commitRes == nil || commitRes.CommitSHA == "" {
+		t.Fatal("empty commit SHA")
+	}
+
+	// 2) Coord stub returns the bare path as remote_url.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":             7,
+			"name":           "lazy-test",
+			"remote_url":     bare,
+			"default_branch": "main",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 3) Reader FatClient on a *fresh* workspace — no clone for
+	// project 7 exists yet. OpenExisting will return
+	// ErrCloneNotFound; the lazy-clone fallback should then
+	// materialize the clone from the bare and read at commit.
+	readerRoot := t.TempDir()
+	readerWS, err := project.NewOpener(readerRoot, logger)
+	if err != nil {
+		t.Fatalf("reader Opener: %v", err)
+	}
+	fc := New(Config{
+		Coord: coord.New(coord.Config{
+			BaseURL:   srv.URL,
+			Username:  "reader",
+			AuthToken: "tok",
+			Logger:    logger,
+		}),
+		Workspace: readerWS,
+		Logger:    logger,
+	})
+
+	got, found, err := fc.ReadResultAtCommit(context.Background(), 7, commitRes.CommitSHA, resultDir)
+	if err != nil {
+		t.Fatalf("ReadResultAtCommit (lazy): %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true after lazy clone")
+	}
+	if got != "LAZY-CLONE-CONTENT" {
+		t.Errorf("content mismatch after lazy clone: got %q", got)
+	}
+}
+
+// TestReadResultAtCommit_NoCloneNoRemoteIsQuiet covers the
+// other arm: a project has no clone AND no remote_url (path-
+// only project the reader has never been attached to). Lazy
+// clone has no source to pull from; the read should return
+// (false, nil) — same UX as "no submission yet".
+func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":             7,
+			"name":           "no-remote",
+			"remote_url":     "",
+			"default_branch": "main",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ws, err := project.NewOpener(t.TempDir(), logger)
+	if err != nil {
+		t.Fatalf("Opener: %v", err)
+	}
+	fc := New(Config{
+		Coord: coord.New(coord.Config{
+			BaseURL:   srv.URL,
+			Username:  "reader",
+			AuthToken: "tok",
+			Logger:    logger,
+		}),
+		Workspace: ws,
+		Logger:    logger,
+	})
+
+	_, found, err := fc.ReadResultAtCommit(context.Background(), 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "enju/runs/1-x/x")
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if found {
+		t.Error("expected found=false when no clone and no remote_url")
+	}
+}
+
+// seedBareWithInitialCommit pushes one README.md commit on
+// refs/heads/main into the given bare so ForProject's clone
+// has a branch to fork from. Mirrors the project package's
+// internal helper of the same name (kept inline here to avoid
+// cross-package test plumbing).
+func seedBareWithInitialCommit(t *testing.T, bareDir string) {
+	t.Helper()
+	seedDir := t.TempDir()
+	repo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
+	})
+	if err != nil {
+		t.Fatalf("init seed: %v", err)
+	}
+	if _, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{bareDir}}); err != nil {
+		t.Fatalf("create remote: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(seedDir, "README.md"), []byte("# seed\n"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+	if _, err := wt.Add("README.md"); err != nil {
+		t.Fatalf("add readme: %v", err)
+	}
+	sig := &object.Signature{Name: "Test", Email: "test@localhost", When: time.Unix(1700000000, 0)}
+	if _, err := wt.Commit("seed", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	if err := repo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
+		t.Fatalf("push seed: %v", err)
+	}
+}

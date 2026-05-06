@@ -154,6 +154,21 @@ func (s *Server) Router() http.Handler {
 		// best-effort like every other event); duplicate POSTs
 		// produce duplicate events but no state corruption.
 		r.Post("/projects/{projectID}/runs/{runSeq}/merges", s.handleReportMerge)
+		// Sibling of /merges for the parallel-merge non-FF
+		// path: when the auto-merge of an ACCEPTED topic onto
+		// the run branch hits a content conflict, the fat-
+		// client reports it here. The accept already stood;
+		// this signals "merge needs human resolution." Phase
+		// 3 of the parallel-merge work converts this into a
+		// merge_resolve task spawn.
+		r.Post("/projects/{projectID}/runs/{runSeq}/merges/conflicts", s.handleReportMergeConflict)
+		// Audit hook for the verify-after-push fix: fat-client
+		// posts here when its post-push verify catches a
+		// silent-success state (push reported success but the
+		// remote ref doesn't equal the local commit). Surfaces
+		// the failure in run_status / event log so the bug is
+		// visible without tailing daemon log files.
+		r.Post("/projects/{projectID}/runs/{runSeq}/push-verify-failed", s.handleReportPushVerifyFailed)
 		r.Get("/projects/{projectID}/events", s.handleShowEvents)
 
 		// Issues — project-level structured artifacts

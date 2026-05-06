@@ -262,10 +262,11 @@ func (ws *Opener) findProjectDir(projectID int64) string {
 // OpenBotCloneAt opens (or clones) the bot's managed clone at an
 // explicit caller-supplied path, sourcing from the supplied URL.
 // Used by service.ResolveBotWorkspace, where the clone lives at
-// `<projectHome>/enju/.clone/` and sources from the per-project
-// bare at `<projectHome>/enju/.bare.git/` (or a real github
-// remote). Bot-flow only — operator-side reads go through
-// ForProject.
+// `<projectHome>/enju/bots/<botUsername>/clone/` (per-bot, so
+// parallel bots on the same project don't collide on working-tree
+// state) and sources from the per-project bare at
+// `<projectHome>/enju/.bare.git/` (or a real github remote).
+// Bot-flow only — operator-side reads go through ForProject.
 //
 // clonePath and sourceURL are both required. The clone is opened
 // in-place if it already exists (and origin matches sourceURL),
@@ -590,6 +591,17 @@ func (ws *Opener) OpenExisting(projectID int64) (*Clone, error) {
 		workDir:   workDir,
 		repo:      repo,
 		logger:    ws.logger,
+	}
+	// Hydrate remoteURL from the on-disk origin so lazy-fetch
+	// paths (ReadFileAtCommit on commit-not-found) can self-heal.
+	// Without this, the cross-citizen read gap silently re-opens
+	// for every OpenExisting'd clone — the bug that left the
+	// webui showing "(content unavailable — commit unreachable
+	// from this clone)" even though the bare had the commit.
+	if rem, err := repo.Remote("origin"); err == nil {
+		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 {
+			p.remoteURL = cfg.URLs[0]
+		}
 	}
 	lockPath := filepath.Join(ws.rootDir, fmt.Sprintf("project-%d.lock", projectID))
 	p.fileLock = flock.New(lockPath)
@@ -922,6 +934,43 @@ func (p *Clone) Pull() error {
 	return p.PullBranch("")
 }
 
+// FetchAllRefs runs `git fetch origin` to bring every remote
+// branch's refs and objects into this clone's object DB. Used
+// by the bot daemon's pre-claim path so reviewer-bot (or any
+// other reader bot) can resolve topic-branch SHAs that
+// developer-bot just pushed — without this, per-bot clones
+// drift apart and downstream citizens see stale "no such
+// commit" errors when reading upstream content.
+//
+// Forces the full-branches refspec (`+refs/heads/*:refs/remotes/origin/*`)
+// because go-git's PlainClone configures origin with a narrow
+// refspec by default — passing FetchOptions without RefSpecs
+// uses that narrow config and skips other branches' objects.
+// Topic branches pushed by other citizens are exactly the
+// "other branches" we need.
+//
+// No-op when there's no remote configured (operator-no-remote
+// mode). Network failure is non-fatal: returns the error so the
+// caller can decide, but the lazy-fetch in ReadFileAtCommit
+// will retry on first miss.
+//
+// Cheap when up-to-date: go-git's Fetch returns
+// NoErrAlreadyUpToDate which we swallow.
+func (p *Clone) FetchAllRefs() error {
+	if p.remoteURL == "" {
+		return nil
+	}
+	err := p.repo.Fetch(&gogit.FetchOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
+		Auth:       sshAuthMethod(p.remoteURL),
+	})
+	if err != nil && err != gogit.NoErrAlreadyUpToDate {
+		return friendlyGitError("fetch", p.remoteURL, err)
+	}
+	return nil
+}
+
 // PullBranch is the branch-aware variant of Pull. Pass "" to
 // use the project's configured default branch.
 //
@@ -1052,11 +1101,42 @@ func (p *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 // Used by the template resolver when the caller wants the exact
 // version associated with an upstream task's submitted commit SHA,
 // rather than whatever happens to be in the working tree today.
+//
+// Lazy fetch: with per-bot clones, the local object DB only has
+// what THIS clone has fetched. When another citizen (developer-
+// bot) pushes a topic branch to the bare and a different citizen
+// (reviewer-bot, webui, operator) tries to read the SHA, the
+// local clone hasn't seen it. Production saw this as the
+// "object not found" warning + reviewer-bot reading an empty
+// topic branch from its stale clone. Fix: on commit-not-found,
+// fetch from origin and retry. Cheap when the commit is already
+// local (no network traffic) and self-healing when it isn't.
 func (p *Clone) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
 	hash := plumbing.NewHash(commitSHA)
 	commit, err := p.repo.CommitObject(hash)
 	if err != nil {
-		return nil, false, fmt.Errorf("loading commit %s: %w", commitSHA, err)
+		// Commit not in local object DB. If we have a remote,
+		// try fetching once and retrying — this is the cross-
+		// citizen sync gap (bot-A pushes, bot-B reads without
+		// having fetched).
+		if p.remoteURL != "" {
+			// Force full-branches refspec — go-git's clone
+			// default is narrow, so omitting RefSpecs here
+			// would silently miss branches written by other
+			// citizens (the production fail mode).
+			if fetchErr := p.repo.Fetch(&gogit.FetchOptions{
+				RemoteName: "origin",
+				RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
+				Auth:       sshAuthMethod(p.remoteURL),
+			}); fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
+				return nil, false, fmt.Errorf("loading commit %s (fetch failed: %w): %w",
+					commitSHA, fetchErr, err)
+			}
+			commit, err = p.repo.CommitObject(hash)
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("loading commit %s: %w", commitSHA, err)
+		}
 	}
 	tree, err := commit.Tree()
 	if err != nil {
@@ -1943,23 +2023,73 @@ func (p *Clone) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
 	return plumbing.ZeroHash, false
 }
 
-// FastForwardBranchToCommit advances `branch` to `commitSHA`
-// locally and on origin, refusing if the move isn't a fast-
-// forward. Used by the living-workflow phase 6b foundational
-// auto-merge: after a topic-branch commit lands and the
-// coordinator marks the task ACCEPTED, the fat-client FF-pushes
-// the topic SHA onto the run branch so all downstream readers
-// see the canonical state on the run branch.
+// MergeAuthor identifies the citizen whose ACCEPT triggered an
+// auto-merge. Their identity authors the merge commit when the
+// non-FF fallback fires (the trailers Enju-Merge: auto and
+// Enju-Triggered-By make the mechanical nature explicit).
+// TaskID feeds the Enju-Triggered-By trailer; format is up to
+// the caller (typically a stable task identifier).
+type MergeAuthor struct {
+	Name   string
+	Email  string
+	TaskID string
+}
+
+// ErrMergeConflict is returned by MergeBranchToCommit when the
+// non-FF merge fallback hits a content conflict. The merge has
+// been aborted and the run branch ref is unchanged; the caller
+// is expected to spawn a merge_resolve task with the listed
+// files so a human (or future merge-resolver bot) can resolve
+// in their own clone.
+type ErrMergeConflict struct {
+	Branch        string
+	TopicBranch   string
+	TopicCommit   string
+	RunTipCommit  string
+	ConflictFiles []string
+}
+
+func (e *ErrMergeConflict) Error() string {
+	files := strings.Join(e.ConflictFiles, ", ")
+	if files == "" {
+		files = "<unknown>"
+	}
+	return fmt.Sprintf(
+		"merge conflict on %q: topic %s and run-tip %s do not merge cleanly (conflicts in %s)",
+		e.Branch, shortSHA(e.TopicCommit), shortSHA(e.RunTipCommit), files)
+}
+
+func shortSHA(s string) string {
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	return s
+}
+
+// MergeBranchToCommit advances `branch` to `commitSHA` locally
+// and on origin, preferring fast-forward when possible and
+// falling back to a real merge commit (parents = [run-tip,
+// topic-tip]) when the move isn't a fast-forward. Used by the
+// living-workflow phase 6b foundational auto-merge: after a
+// topic-branch commit lands and the coordinator marks the task
+// ACCEPTED, the fat-client lands the topic SHA onto the run
+// branch so all downstream readers see the canonical state.
 //
-// FF-only is the v1 contract — under linear progression
-// (depends_on must be merged before downstream starts) a
-// non-FF here means a parallel iteration ran without proper
-// gating, which is a workflow bug we want to surface loudly
-// rather than silently rewrite history. v2 will introduce
-// rebase / spawn-resolve_conflict on this path.
+// Sequential (non-parallel) runs always take the FF fast path
+// and produce identical history to the pre-parallel-merge era.
+// Parallel siblings whose topics fork from the same run-branch
+// base can land in either order; the second one's merge becomes
+// a real merge commit. On a content conflict, the merge is
+// aborted cleanly (run branch unchanged) and ErrMergeConflict
+// is returned so the caller can spawn a merge_resolve task.
+//
+// topicBranch is the source topic branch's short name (used for
+// trailer text only — the merge target is `commitSHA`, not the
+// branch). author identifies the accepter; their identity goes
+// on the merge commit when the fallback fires.
 //
 // Caller MUST hold the project lock.
-func (p *Clone) FastForwardBranchToCommit(branch, commitSHA string) error {
+func (p *Clone) MergeBranchToCommit(branch, commitSHA, topicBranch string, author MergeAuthor) error {
 	if branch == "" {
 		return fmt.Errorf("branch is required")
 	}
@@ -1971,11 +2101,6 @@ func (p *Clone) FastForwardBranchToCommit(branch, commitSHA string) error {
 		return fmt.Errorf("invalid commit SHA %q", commitSHA)
 	}
 
-	// Verify FF locally first: the current branch ref (or its
-	// origin-tracking ref, if the local ref doesn't exist yet)
-	// must be an ancestor of the target commit. Refuses with a
-	// clear message rather than letting the remote reject in a
-	// less-readable form.
 	refName := plumbing.NewBranchReferenceName(branch)
 	var currentHash plumbing.Hash
 	if ref, err := p.repo.Reference(refName, true); err == nil {
@@ -1983,39 +2108,42 @@ func (p *Clone) FastForwardBranchToCommit(branch, commitSHA string) error {
 	} else if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true); err == nil {
 		currentHash = ref.Hash()
 	}
-	if !currentHash.IsZero() && currentHash != hash {
-		isAncestor, ancErr := p.commitIsAncestor(currentHash, hash)
-		if ancErr != nil {
-			return fmt.Errorf("verifying fast-forward of %q: %w", branch, ancErr)
-		}
-		if !isAncestor {
-			return fmt.Errorf(
-				"refusing non-fast-forward update of %q from %s to %s — "+
-					"the run branch has diverged from the topic branch, which under "+
-					"linear progression should never happen. Investigate parallel "+
-					"iterations or manual ref edits before retrying",
-				branch, currentHash.String()[:8], hash.String()[:8])
-		}
+
+	// FF fast path: branch absent, branch already at target, or
+	// run-tip is an ancestor of topic-tip. No worktree touch,
+	// just a ref move + push (identical to pre-parallel-merge
+	// behavior).
+	if currentHash.IsZero() || currentHash == hash {
+		return p.ffSetAndPushBranch(branch, hash)
+	}
+	isAncestor, err := p.commitIsAncestor(currentHash, hash)
+	if err != nil {
+		return fmt.Errorf("verifying fast-forward of %q: %w", branch, err)
+	}
+	if isAncestor {
+		return p.ffSetAndPushBranch(branch, hash)
 	}
 
-	// Update the local ref so subsequent reads see the merged
-	// state. Idempotent when already at target.
-	if currentHash != hash {
-		if err := p.repo.Storer.SetReference(plumbing.NewHashReference(refName, hash)); err != nil {
-			return fmt.Errorf("updating local %q to %s: %w", branch, hash, err)
+	// Non-FF: real merge commit. The run branch advanced past
+	// the topic's fork point (a sibling already merged), so we
+	// build a two-parent commit on top of run-tip.
+	return p.mergeCommitFallback(branch, hash, currentHash, topicBranch, author)
+}
+
+// ffSetAndPushBranch sets `branch` to `targetHash` locally and
+// pushes the same hash to origin. Idempotent on the local side.
+// Internal helper for the FF fast path of MergeBranchToCommit.
+func (p *Clone) ffSetAndPushBranch(branch string, targetHash plumbing.Hash) error {
+	refName := plumbing.NewBranchReferenceName(branch)
+	if ref, err := p.repo.Reference(refName, true); err != nil || ref.Hash() != targetHash {
+		if err := p.repo.Storer.SetReference(plumbing.NewHashReference(refName, targetHash)); err != nil {
+			return fmt.Errorf("updating local %q to %s: %w", branch, targetHash, err)
 		}
 	}
-
-	// Push the same SHA to the remote branch ref. Using the
-	// non-force form means the remote will reject any non-FF
-	// update — a defense-in-depth check on top of the local
-	// ancestry verify. The remote rejection message is less
-	// readable than ours, so we treat the remote-side reject as
-	// a separate hard error class.
 	if p.remoteURL == "" {
 		return nil
 	}
-	refSpec := fmt.Sprintf("%s:refs/heads/%s", hash.String(), branch)
+	refSpec := fmt.Sprintf("%s:refs/heads/%s", targetHash.String(), branch)
 	pushErr := p.repo.Push(&gogit.PushOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
@@ -2030,10 +2158,137 @@ func (p *Clone) FastForwardBranchToCommit(branch, commitSHA string) error {
 	return nil
 }
 
+// mergeCommitFallback performs `git merge --no-ff` of topicHash
+// onto branch (whose tip is runTipHash) by shelling out to the
+// system git binary. go-git's merge support is incomplete (no
+// proper conflict-file reporting), so we use git itself the
+// same way `rebaseOnRemote` does for the rebase path.
+//
+// On conflict: aborts the merge, parses unmerged files from
+// `git status --porcelain`, returns ErrMergeConflict. The run
+// branch ref is unchanged in this case.
+//
+// On success: pushes the new run-branch tip to origin.
+func (p *Clone) mergeCommitFallback(branch string, topicHash, runTipHash plumbing.Hash, topicBranch string, author MergeAuthor) error {
+	refName := plumbing.NewBranchReferenceName(branch)
+	if err := p.repo.Storer.SetReference(plumbing.NewHashReference(refName, runTipHash)); err != nil {
+		return fmt.Errorf("setting local %q to %s before merge: %w", branch, runTipHash, err)
+	}
+
+	checkoutCmd := exec.Command("git", "-C", p.workDir, "checkout", branch)
+	checkoutCmd.Env = os.Environ()
+	if out, err := checkoutCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git checkout %s before merge: %s (%w)",
+			branch, strings.TrimSpace(string(out)), err)
+	}
+
+	msg := fmt.Sprintf("Auto-merge topic %s into %s\n\nEnju-Merge: auto\nEnju-Merged-Topic: %s\nEnju-Merged-Run: %s",
+		topicBranch, branch, topicBranch, branch)
+	if author.TaskID != "" {
+		msg += "\nEnju-Triggered-By: " + author.TaskID
+	}
+	name := author.Name
+	if name == "" {
+		name = "Enju Client"
+	}
+	email := author.Email
+	if email == "" {
+		email = "enju-client@localhost"
+	}
+	mergeCmd := exec.Command("git", "-C", p.workDir,
+		"merge", "--no-ff", "--no-edit", "-m", msg, topicHash.String())
+	mergeCmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME="+name,
+		"GIT_AUTHOR_EMAIL="+email,
+		"GIT_COMMITTER_NAME="+name,
+		"GIT_COMMITTER_EMAIL="+email,
+	)
+	mergeOut, mergeErr := mergeCmd.CombinedOutput()
+	if mergeErr != nil {
+		conflictFiles := readUnmergedFiles(p.workDir)
+		abortCmd := exec.Command("git", "-C", p.workDir, "merge", "--abort")
+		abortCmd.Env = os.Environ()
+		_ = abortCmd.Run()
+		// Restore the local branch ref to runTipHash in case
+		// `git merge` (or `--abort`) somehow left it
+		// elsewhere. Defense-in-depth: callers rely on the run
+		// branch staying put when a conflict is reported.
+		_ = p.repo.Storer.SetReference(plumbing.NewHashReference(refName, runTipHash))
+		if len(conflictFiles) > 0 {
+			return &ErrMergeConflict{
+				Branch:        branch,
+				TopicBranch:   topicBranch,
+				TopicCommit:   topicHash.String(),
+				RunTipCommit:  runTipHash.String(),
+				ConflictFiles: conflictFiles,
+			}
+		}
+		return fmt.Errorf("git merge --no-ff %s onto %s: %s (%w)",
+			topicHash.String()[:8], branch, strings.TrimSpace(string(mergeOut)), mergeErr)
+	}
+
+	newRef, err := p.repo.Reference(refName, true)
+	if err != nil {
+		return fmt.Errorf("reading %q after merge: %w", branch, err)
+	}
+	newTip := newRef.Hash()
+
+	if p.remoteURL == "" {
+		return nil
+	}
+	refSpec := fmt.Sprintf("%s:refs/heads/%s", newTip, branch)
+	pushErr := p.repo.Push(&gogit.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
+		Auth:       sshAuthMethod(p.remoteURL),
+	})
+	p.lastPushAt = time.Now()
+	if pushErr != nil && pushErr != gogit.NoErrAlreadyUpToDate {
+		p.lastPushError = pushErr.Error()
+		return friendlyGitError("merge-push", p.remoteURL, pushErr)
+	}
+	p.lastPushError = ""
+	return nil
+}
+
+// readUnmergedFiles parses `git status --porcelain` for entries
+// in conflict states (UU/AA/DD/AU/UA/DU/UD), returning the
+// affected paths. Used to populate ErrMergeConflict.ConflictFiles
+// after a non-FF merge fails. Best-effort: a status-read failure
+// returns nil rather than masking the underlying merge error.
+//
+// Format dependency: relies on `git status --porcelain` v1
+// shape (`XY <path>`, two-char status field starting at column
+// 0). v2 / future formats would need parser updates; we pin
+// implicitly by not passing --porcelain=v2. A locale-shifted
+// or future-version git that changes the format silently
+// returns no files and the caller falls through to the generic
+// merge error — losing the conflict-files detail but never
+// corrupting the merge.
+func readUnmergedFiles(workDir string) []string {
+	cmd := exec.Command("git", "-C", workDir, "status", "--porcelain")
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		switch line[:2] {
+		case "UU", "AA", "DD", "AU", "UA", "DU", "UD":
+			files = append(files, strings.TrimSpace(line[3:]))
+		}
+	}
+	return files
+}
+
 // commitIsAncestor reports whether `ancestor` is reachable
 // from `descendant` via parent links — the standard "is X a
-// fast-forward of Y" check. Used by FastForwardBranchToCommit
-// before any ref update.
+// fast-forward of Y" check. Used by MergeBranchToCommit before
+// any ref update.
 func (p *Clone) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, error) {
 	if ancestor == descendant {
 		return true, nil
@@ -2134,6 +2389,16 @@ func (p *Clone) branchBaseHash() (plumbing.Hash, error) {
 // pushBranchInternal is the branch-aware equivalent of
 // pushInternal. It pushes only the named branch to origin.
 // Empty `branch` resolves to the project default.
+//
+// Post-push verify: after go-git's Push returns success (or the
+// "already up to date" no-op), this function lists the remote
+// ref and confirms it equals the local branch tip. If they
+// diverge, returns *ErrPushVerifyFailed — surfaces silent-
+// success bugs (transport quirks, NoErrAlreadyUpToDate firing
+// when there ARE new local commits, etc.) the production
+// "commit-reported-but-not-in-bare" symptom traced to. The
+// verify is a no-op when remoteURL is empty (legitimate local-
+// only operator mode — there's nothing to verify against).
 func (p *Clone) pushBranchInternal(branch string, force bool) error {
 	if p.remoteURL == "" {
 		return nil
@@ -2152,7 +2417,106 @@ func (p *Clone) pushBranchInternal(branch string, force bool) error {
 		return friendlyGitError("push", p.remoteURL, err)
 	}
 	p.lastPushError = ""
+
+	// Verify the remote ref now matches our local tip. Catches
+	// the silent-success class of bugs without trusting go-git's
+	// return value alone.
+	localRef, refErr := p.repo.Reference(plumbing.NewBranchReferenceName(b), true)
+	if refErr != nil {
+		// No local ref to verify against — likely a no-commits
+		// path or pre-init state. Push semantically already
+		// did nothing meaningful; let the caller continue.
+		return nil
+	}
+	if vErr := p.verifyRemoteRefMatches(b, localRef.Hash()); vErr != nil {
+		return vErr
+	}
 	return nil
+}
+
+// ErrPushVerifyFailed is returned by pushBranchInternal when the
+// push call returned success (or a NoErrAlreadyUpToDate no-op)
+// but the remote ref doesn't actually equal the local branch
+// tip. Production-fix work this typed error so the fat-client's
+// submit pipeline can surface a push_verify_failed event to
+// coord (and a clear error to the operator) instead of
+// reporting a phantom SHA that nothing else can read.
+type ErrPushVerifyFailed struct {
+	Branch     string
+	LocalSHA   string
+	RemoteSHA  string // empty when the remote ref is missing entirely
+	RemoteURL  string
+	UnderlyingErr error // optional — set when the verify itself failed (network, etc.)
+}
+
+func (e *ErrPushVerifyFailed) Error() string {
+	remoteDesc := e.RemoteSHA
+	if remoteDesc == "" {
+		remoteDesc = "<missing>"
+	}
+	msg := fmt.Sprintf(
+		"push of %q to %s reported success but verify shows the remote ref is at %s, "+
+			"not the expected local tip %s — the commit didn't land",
+		e.Branch, e.RemoteURL, remoteDesc, e.LocalSHA)
+	if e.UnderlyingErr != nil {
+		msg += " (verify error: " + e.UnderlyingErr.Error() + ")"
+	}
+	return msg
+}
+
+func (e *ErrPushVerifyFailed) Unwrap() error { return e.UnderlyingErr }
+
+// verifyRemoteRefMatches asks the remote for its current
+// `refs/heads/<branch>` value and compares it to the expected
+// local SHA. Returns nil when they match, *ErrPushVerifyFailed
+// otherwise. Used by pushBranchInternal as a post-push check.
+//
+// "Matches" is strict equality — for the simple branch-push case
+// the local tip and remote tip should be byte-identical after
+// a successful push. Merge-commit and rebase paths happen in
+// other helpers (mergeCommitFallback, rebaseOnRemote) that don't
+// route through this verify.
+func (p *Clone) verifyRemoteRefMatches(branch string, expected plumbing.Hash) error {
+	rem, err := p.repo.Remote("origin")
+	if err != nil {
+		return &ErrPushVerifyFailed{
+			Branch:        branch,
+			LocalSHA:      expected.String(),
+			RemoteURL:     p.remoteURL,
+			UnderlyingErr: fmt.Errorf("opening origin: %w", err),
+		}
+	}
+	refs, err := rem.List(&gogit.ListOptions{
+		Auth: sshAuthMethod(p.remoteURL),
+	})
+	if err != nil {
+		return &ErrPushVerifyFailed{
+			Branch:        branch,
+			LocalSHA:      expected.String(),
+			RemoteURL:     p.remoteURL,
+			UnderlyingErr: fmt.Errorf("listing remote refs: %w", err),
+		}
+	}
+	wanted := plumbing.NewBranchReferenceName(branch)
+	for _, r := range refs {
+		if r.Name() == wanted {
+			if r.Hash() == expected {
+				return nil
+			}
+			return &ErrPushVerifyFailed{
+				Branch:    branch,
+				LocalSHA:  expected.String(),
+				RemoteSHA: r.Hash().String(),
+				RemoteURL: p.remoteURL,
+			}
+		}
+	}
+	return &ErrPushVerifyFailed{
+		Branch:    branch,
+		LocalSHA:  expected.String(),
+		RemoteSHA: "",
+		RemoteURL: p.remoteURL,
+	}
 }
 
 // rebaseOnRemote runs `git pull --rebase --autostash` via the

@@ -2453,3 +2453,145 @@ tasks:
 		t.Fatalf("expected nil AutoTriage, got %+v", parsed.Run.AutoTriage)
 	}
 }
+
+// TestParseRejectsAuthorWrittenMergeResolve pins the parallel-
+// merge phase 3 contract that `action: merge_resolve` cannot
+// appear in user-authored YAML — it's auto-spawned by coord on
+// non-FF merge conflicts. Without this gate a typo'd or copy-
+// pasted manifest would parse, then spawn weirdly because
+// generateIterationBranch skips topic-branch flow assuming the
+// operator has already done the merge externally.
+func TestParseRejectsAuthorWrittenMergeResolve(t *testing.T) {
+	yamlData := []byte(`
+name: "Hand-written merge_resolve"
+version: 1
+tasks:
+  - id: bogus
+    action: merge_resolve
+    prompt: "shouldn't be here"
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting hand-written action: merge_resolve")
+	}
+	for _, want := range []string{"merge_resolve", "system-only", "bogus"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message missing %q: %s", want, err.Error())
+		}
+	}
+}
+
+// TestParseRejectsParallelSiblingsWithOverlappingWrites pins the
+// parallel-merge phase 4 lint: two tasks with no transitive dep
+// edge that both declare the SAME literal writes_artifacts path
+// are flagged at parse time. Under parallel execution their
+// commits would conflict at auto-merge time, spawning a
+// merge_resolve task — surfacing the issue at parse time gives
+// the YAML author a clean rewrite path instead.
+func TestParseRejectsParallelSiblingsWithOverlappingWrites(t *testing.T) {
+	yamlData := []byte(`
+name: "Overlapping siblings"
+version: 1
+tasks:
+  - id: alpha
+    action: answer
+    prompt: "alpha"
+    writes_artifacts:
+      - path: shared/notes.md
+  - id: beta
+    action: answer
+    prompt: "beta"
+    writes_artifacts:
+      - path: shared/notes.md
+`)
+	_, err := Parse(yamlData)
+	if err == nil {
+		t.Fatal("expected error rejecting parallel siblings with overlapping writes")
+	}
+	for _, want := range []string{"alpha", "beta", "shared/notes.md", "no dep edge"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message missing %q: %s", want, err.Error())
+		}
+	}
+}
+
+// TestParseAcceptsSerialOverlappingWrites confirms the lint only
+// fires on PARALLEL siblings — when one task depends on the
+// other (transitively or directly), they're serialized by the
+// DAG and the second commit naturally lands on top of the first.
+// Same path on both is fine because it's just an overwrite, not
+// a merge conflict.
+func TestParseAcceptsSerialOverlappingWrites(t *testing.T) {
+	yamlData := []byte(`
+name: "Serial overlap"
+version: 1
+tasks:
+  - id: alpha
+    action: answer
+    prompt: "alpha"
+    writes_artifacts:
+      - path: shared/notes.md
+  - id: beta
+    action: answer
+    prompt: "beta"
+    depends_on: [alpha]
+    writes_artifacts:
+      - path: shared/notes.md
+`)
+	if _, err := Parse(yamlData); err != nil {
+		t.Fatalf("serial overlap should parse: %v", err)
+	}
+}
+
+// TestParseAcceptsParallelDisjointWrites covers the happy
+// parallel case: two siblings with no dep edge but DIFFERENT
+// paths. No conflict possible at merge time; lint stays quiet.
+func TestParseAcceptsParallelDisjointWrites(t *testing.T) {
+	yamlData := []byte(`
+name: "Parallel disjoint"
+version: 1
+tasks:
+  - id: alpha
+    action: answer
+    prompt: "alpha"
+    writes_artifacts:
+      - path: out/alpha.md
+  - id: beta
+    action: answer
+    prompt: "beta"
+    writes_artifacts:
+      - path: out/beta.md
+`)
+	if _, err := Parse(yamlData); err != nil {
+		t.Fatalf("parallel disjoint writes should parse: %v", err)
+	}
+}
+
+// TestParseAcceptsParallelSiblingsWithTemplatedOverlap pins the
+// scope limitation: the lint is literal-path only, so siblings
+// that both write to "out/{{instance}}.md" pass parse-time
+// (different instance keys produce disjoint paths at
+// materialization). Glob/template-aware overlap detection is a
+// follow-up; today's lint shouldn't false-positive on these.
+func TestParseAcceptsParallelSiblingsWithTemplatedOverlap(t *testing.T) {
+	yamlData := []byte(`
+name: "Templated overlap"
+version: 1
+for_each:
+  case: [a, b]
+tasks:
+  - id: alpha
+    action: answer
+    prompt: "alpha {{case}}"
+    writes_artifacts:
+      - path: "out/{{case}}/alpha.md"
+  - id: beta
+    action: answer
+    prompt: "beta {{case}}"
+    writes_artifacts:
+      - path: "out/{{case}}/beta.md"
+`)
+	if _, err := Parse(yamlData); err != nil {
+		t.Fatalf("templated paths should parse: %v", err)
+	}
+}

@@ -74,12 +74,38 @@ const BotsRuntimeDir = "enju/bots"
 // a bare belongs in the project's git history.
 const BotPushTargetDir = "enju/.bare.git"
 
-// BotCloneDir is the per-project managed clone the bot daemon
-// operates in. Distinct from the operator's working tree so
-// branch switches and dirty state can't collide. Sourced from
-// BotPushTargetDir, populated lazily on first claim. Always
-// gitignored.
-const BotCloneDir = "enju/.clone"
+// BotCloneDirFor returns the per-bot per-project managed clone
+// directory. Each bot citizen running on a given machine gets
+// its own clone so multiple daemons can work in parallel
+// without stepping on each other's working tree (claude -p
+// writes scratch files, branch switches, in-flight commits —
+// all isolated per bot).
+//
+// Layout: <project>/enju/bots/<botUsername>/clone/
+//
+// Sits under BotsRuntimeDir so the existing `enju/bots/`
+// gitignore rule covers every bot's clone in one go and
+// `ls enju/bots/` advertises the local fleet to the operator.
+//
+// botUsername is the coord-assigned username (the canonical
+// citizen identity). Coord-side ValidateUsername already
+// restricts the character set, but this helper rejects
+// path-hostile input as defense in depth — empty strings,
+// path separators, and `..` traversals all get refused so a
+// future un-validated caller can't escape into the project
+// tree.
+func BotCloneDirFor(botUsername string) (string, error) {
+	if botUsername == "" {
+		return "", fmt.Errorf("bot username is required")
+	}
+	if strings.ContainsAny(botUsername, `/\`) {
+		return "", fmt.Errorf("bot username %q contains path separator", botUsername)
+	}
+	if botUsername == "." || botUsername == ".." || strings.Contains(botUsername, "..") {
+		return "", fmt.Errorf("bot username %q contains path traversal", botUsername)
+	}
+	return filepath.Join(BotsRuntimeDir, botUsername, "clone"), nil
+}
 
 // BotPromptsDir is the conventional location bot system prompts
 // live in. Convention only — the manifest's `system_prompt:`

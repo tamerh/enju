@@ -53,6 +53,13 @@ type fakeFC struct {
 	workspacePath string
 	workspaceErr  error
 
+	// lastResolveBotUsername captures the username arg the
+	// daemon passed on its most recent ResolveBotWorkspace
+	// call. Tests asserting "the daemon passes its own
+	// citizen identity to the workspace resolver" check this
+	// directly rather than reaching for log strings.
+	lastResolveBotUsername string
+
 	// resetCalls counts ResetBotCloneToCleanState invocations
 	// keyed by projectID. Tests assert on this to pin "the
 	// daemon resets the clone between iterations." resetErr,
@@ -60,6 +67,41 @@ type fakeFC struct {
 	// should log + continue rather than abort.
 	resetCalls map[int64]int
 	resetErr   error
+
+	// checkoutTopicCalls captures the (projectID, branch) pairs
+	// the daemon asked CheckoutTopicBranchTip for. Tests pin
+	// the iter-2-revision flow by asserting this fires only on
+	// re-claim.
+	checkoutTopicCalls []checkoutTopicCall
+	checkoutTopicErr   error
+
+	// wipeWritesCalls captures the (projectID, paths) pairs the
+	// daemon asked WipeDeclaredWrites for. Tests pin the
+	// "iter-2 starts from a clean canvas in declared output
+	// paths" contract by asserting this fires only on re-claim.
+	wipeWritesCalls []wipeWritesCall
+	wipeWritesErr   error
+
+	// reviewFeedback, when set, is returned in
+	// ClaimResult.ReviewFeedback. Tests pinning the iter-2
+	// feedback-into-prompt contract set this.
+	reviewFeedback []byte
+
+	// fetchAllRefsCalls records FetchAllRefsForBot invocations
+	// keyed by projectID. Tests pin the "daemon fetches before
+	// claim" contract by asserting this fires every iteration.
+	fetchAllRefsCalls []int64
+	fetchAllRefsErr   error
+}
+
+type checkoutTopicCall struct {
+	projectID int64
+	branch    string
+}
+
+type wipeWritesCall struct {
+	projectID int64
+	paths     []string
 }
 
 func (f *fakeFC) Username() string { return f.username }
@@ -90,7 +132,10 @@ func (f *fakeFC) ClaimTask(ctx context.Context, p service.ClaimParams) (*service
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
-	return &service.ClaimResult{Inputs: f.claimInputs[p.TaskID]}, nil
+	return &service.ClaimResult{
+		Inputs:         f.claimInputs[p.TaskID],
+		ReviewFeedback: f.reviewFeedback,
+	}, nil
 }
 
 func (f *fakeFC) ReleaseTask(ctx context.Context, taskID string) error {
@@ -120,16 +165,45 @@ func (f *fakeFC) ResetBotCloneToCleanState(ctx context.Context, projectID int64)
 	return f.resetErr
 }
 
-func (f *fakeFC) ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error) {
+func (f *fakeFC) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkoutTopicCalls = append(f.checkoutTopicCalls, checkoutTopicCall{projectID, branch})
+	return f.checkoutTopicErr
+}
+
+func (f *fakeFC) FetchAllRefsForBot(ctx context.Context, projectID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchAllRefsCalls = append(f.fetchAllRefsCalls, projectID)
+	return f.fetchAllRefsErr
+}
+
+func (f *fakeFC) WipeDeclaredWrites(ctx context.Context, projectID int64, writes enjuYaml.WriteArtifacts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	paths := make([]string, 0, len(writes))
+	for _, w := range writes {
+		paths = append(paths, w.Path)
+	}
+	f.wipeWritesCalls = append(f.wipeWritesCalls, wipeWritesCall{projectID, paths})
+	return f.wipeWritesErr
+}
+
+func (f *fakeFC) ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error) {
+	f.mu.Lock()
+	f.lastResolveBotUsername = botUsername
+	f.mu.Unlock()
 	if f.workspaceErr != nil {
 		return "", f.workspaceErr
 	}
 	if f.workspacePath != "" {
 		return f.workspacePath, nil
 	}
-	// Default to a synthetic path; tests that care about the
-	// concrete value populate workspacePath explicitly.
-	return "/tmp/fake-workspace/project-" + itoa(projectID), nil
+	// Default to a synthetic path that includes the bot
+	// username so tests asserting per-bot isolation can spot
+	// distinct resolves at a glance.
+	return "/tmp/fake-workspace/project-" + itoa(projectID) + "-bot-" + botUsername, nil
 }
 
 func (f *fakeFC) SubmitTaskResult(ctx context.Context, p service.SubmitParams) *service.SubmitResult {
@@ -233,7 +307,7 @@ func TestDaemon_FindWork_PassesRunSeqNotGlobalID(t *testing.T) {
 // there.
 func TestDaemon_ResolvesAndThreadsWorkspaceToHandler(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = "/home/test/projects/myproject/enju/.clone"
+	fc.workspacePath = "/home/test/projects/myproject/enju/bots/bot1/clone"
 	stub := &StubHandler{Response: "ok"}
 	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
 	if _, err := d.RunOnce(context.Background()); err != nil {
@@ -242,8 +316,28 @@ func TestDaemon_ResolvesAndThreadsWorkspaceToHandler(t *testing.T) {
 	if len(stub.Inputs) != 1 {
 		t.Fatalf("expected 1 handler invocation, got %d", len(stub.Inputs))
 	}
-	if got := stub.Inputs[0].Workspace; got != "/home/test/projects/myproject/enju/.clone" {
+	if got := stub.Inputs[0].Workspace; got != "/home/test/projects/myproject/enju/bots/bot1/clone" {
 		t.Errorf("Workspace not threaded to handler: got %q (claude -p would inherit daemon cwd)", got)
+	}
+}
+
+// TestDaemon_RunOnce_PassesBotUsernameToWorkspaceResolver pins
+// the per-bot-clone contract: the daemon must thread its own
+// citizen identity (Username from the FatClient) into
+// ResolveBotWorkspace so the resolver can scope the clone to
+// `<project>/enju/bots/<botUsername>/clone/`. Pre-fix the call
+// took only projectID, all bots collided on a single shared
+// clone, and two daemons on the same project on the same
+// machine couldn't run in parallel.
+func TestDaemon_RunOnce_PassesBotUsernameToWorkspaceResolver(t *testing.T) {
+	fc := newFCWithTask("alice-bot", "answer", "")
+	stub := &StubHandler{Response: "ok"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fc.lastResolveBotUsername; got != "alice-bot" {
+		t.Errorf("daemon should pass its own citizen username to ResolveBotWorkspace; got %q, want %q", got, "alice-bot")
 	}
 }
 
@@ -1156,6 +1250,127 @@ func newFCWithTask(username, action, content string) *fakeFC {
 		metaByID: map[string]*service.TaskMeta{
 			"1:1:t": {ID: "1:1:t", Action: action, Prompt: content, ProjectID: 1, RunSeq: 1},
 		},
+	}
+}
+
+// TestDaemon_Iter1_NoTopicCheckoutOrWipe pins the iter-1
+// (first claim) contract: topic-branch checkout and writes-wipe
+// must NOT fire on a fresh task. The pre-claim pull leaves HEAD
+// on the run branch, the existing reset cleans residue, and the
+// handler runs against a clean run-branch tree. Pre-fix had no
+// distinction between iter-1 and iter-2; this test guards
+// against accidentally always-firing the revision-only steps.
+func TestDaemon_Iter1_NoTopicCheckoutOrWipe(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "do work")
+	// IterSeq=1 (default zero is 0; daemon treats > 1 as
+	// revision, so 0/1 both mean first claim — set explicitly
+	// for readability).
+	fc.metaByID["1:1:t"].IterSeq = 1
+	fc.metaByID["1:1:t"].IterationBranch = "run-1/t/iter-1"
+
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "ok"}, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fc.checkoutTopicCalls) != 0 {
+		t.Errorf("iter-1: CheckoutTopicBranchTip should NOT fire (got %d calls: %+v)",
+			len(fc.checkoutTopicCalls), fc.checkoutTopicCalls)
+	}
+	if len(fc.wipeWritesCalls) != 0 {
+		t.Errorf("iter-1: WipeDeclaredWrites should NOT fire (got %d calls: %+v)",
+			len(fc.wipeWritesCalls), fc.wipeWritesCalls)
+	}
+}
+
+// TestDaemon_Iter2_ChecksOutTopicWipesAndPrependsFeedback pins
+// the revision-loop fix: on a re-claim after request_changes
+// (IterSeq > 1, topic branch present, ReviewFeedback non-empty),
+// the daemon must:
+//
+//  1. Check out the topic branch tip BEFORE the handler so the
+//     LLM starts on iter-1's tree (where reviewer feedback
+//     applies), not on the run-branch tip.
+//  2. Wipe declared writes_artifacts paths so iter-2's commit
+//     carries iter-2's content only — not a union of both
+//     iterations' files when LLM non-determinism produces
+//     different filenames.
+//  3. Prepend the reviewer feedback to the prompt so the LLM
+//     understands what to change. Without this, iter-2's prompt
+//     equals iter-1's and the "revision" is just stochastic
+//     sampling on identical input.
+//
+// Pre-fix all three were missing. The production symptom was
+// iter-2's submit blowing up with "worktree contains unstaged
+// changes" because of the state desync, AND silent revision
+// noise because the LLM never saw the reviewer's feedback.
+func TestDaemon_Iter2_ChecksOutTopicWipesAndPrependsFeedback(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "Implement the foo module.")
+	fc.metaByID["1:1:t"].IterSeq = 2
+	fc.metaByID["1:1:t"].IterationBranch = "run-1/t/iter-1"
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		// Optional: true — the stub handler doesn't actually
+		// write these files; we're only pinning the daemon's
+		// pre-handler steps (checkout/wipe/prompt-prepend), not
+		// the post-handler submission contract.
+		{Path: "src/foo/entities.go", Track: true, Optional: true},
+		{Path: "src/foo/errors.go", Track: true, Optional: true},
+	}
+	// claimInputs is keyed by task id (the daemon uses task id
+	// as the lookup key in ClaimTask). The resolved_prompt is
+	// what extractResolvedPrompt pulls out for the handler.
+	fc.claimInputs = map[string][]byte{
+		"1:1:t": []byte(`{"resolved_prompt":"Implement the foo module."}`),
+	}
+	// reviewFeedback is what the fakeFC's ClaimTask returns in
+	// ClaimResult.ReviewFeedback; the daemon prepends it to the
+	// prompt on iter > 1.
+	fc.reviewFeedback = []byte("Please rename entities.go to entity.go (singular).")
+
+	stub := &StubHandler{Response: "ok"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Topic checkout fired with the right branch.
+	if len(fc.checkoutTopicCalls) != 1 {
+		t.Fatalf("iter-2: expected 1 CheckoutTopicBranchTip call, got %d: %+v",
+			len(fc.checkoutTopicCalls), fc.checkoutTopicCalls)
+	}
+	if got := fc.checkoutTopicCalls[0].branch; got != "run-1/t/iter-1" {
+		t.Errorf("checkout branch = %q, want run-1/t/iter-1", got)
+	}
+
+	// Wipe fired with the declared writes_artifacts paths.
+	if len(fc.wipeWritesCalls) != 1 {
+		t.Fatalf("iter-2: expected 1 WipeDeclaredWrites call, got %d: %+v",
+			len(fc.wipeWritesCalls), fc.wipeWritesCalls)
+	}
+	gotPaths := fc.wipeWritesCalls[0].paths
+	if len(gotPaths) != 2 || gotPaths[0] != "src/foo/entities.go" || gotPaths[1] != "src/foo/errors.go" {
+		t.Errorf("wipe paths = %v, want [src/foo/entities.go src/foo/errors.go]", gotPaths)
+	}
+
+	// Handler received the feedback both as a separate field AND
+	// prepended in the prompt — the prompt prepend is what the
+	// LLM actually sees for free; the field is for handlers that
+	// want structured access.
+	if len(stub.Inputs) != 1 {
+		t.Fatalf("expected 1 handler invocation, got %d", len(stub.Inputs))
+	}
+	in := stub.Inputs[0]
+	if in.ReviewFeedback != "Please rename entities.go to entity.go (singular)." {
+		t.Errorf("HandlerInput.ReviewFeedback = %q, want the reviewer's note", in.ReviewFeedback)
+	}
+	if !strings.Contains(in.Prompt, "Reviewer feedback from previous iteration") {
+		t.Errorf("prompt missing reviewer feedback header:\n%s", in.Prompt)
+	}
+	if !strings.Contains(in.Prompt, "rename entities.go") {
+		t.Errorf("prompt missing reviewer feedback content:\n%s", in.Prompt)
+	}
+	if !strings.Contains(in.Prompt, "Implement the foo module.") {
+		t.Errorf("prompt missing original task brief:\n%s", in.Prompt)
 	}
 }
 

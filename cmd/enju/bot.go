@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -566,6 +567,15 @@ func cmdBotRun(args []string) {
 
 	if *botName == "" {
 		fmt.Fprintln(os.Stderr, "--bot=<name> is required (must match a bot in enju/bots.yaml)")
+		os.Exit(1)
+	}
+
+	// Hard dependency: enju shells out to system `git` for
+	// rebase-on-non-FF and merge-commit-on-conflict paths.
+	// Catch a missing binary at startup rather than mid-submit
+	// where the error is buried in a hook log.
+	if _, err := exec.LookPath("git"); err != nil {
+		fmt.Fprintln(os.Stderr, "`git` not found on PATH — install git (https://git-scm.com/downloads) before running enju bots.")
 		os.Exit(1)
 	}
 

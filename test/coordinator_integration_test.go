@@ -48,6 +48,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
+	"github.com/enju-ai/enju/internal/common/format"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -2291,6 +2292,262 @@ func TestEvent_BranchMergedEmission(t *testing.T) {
 	}
 	if meta["merge_sha"] != "deadbeef0000000000000000000000000000beef" {
 		t.Errorf("merge_sha not preserved: got %v", meta["merge_sha"])
+	}
+}
+
+// TestEvent_MergeConflictDetectedEmission pins the parallel-merge
+// conflict reporting path: a fat-client whose post-accept auto-
+// merge hit a content conflict POSTs /merges/conflicts and the
+// coordinator emits merge_conflict_detected with the right
+// metadata AND spawns a merge_resolve task for the operator to
+// claim and finish the merge by hand.
+func TestEvent_MergeConflictDetectedEmission(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/conflicts", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch":   "run-1/task_b/iter-1",
+			"run_branch":     "main",
+			"topic_commit":   "cafef00d0000000000000000000000000000beef",
+			"run_tip_commit": "deadbeef0000000000000000000000000000beef",
+			"conflict_files": []string{"shared/notes.md", "src/util.go"},
+			"task_id":        fmt.Sprintf("%d:1:task_b", projectID),
+		})
+	if status, _ := resp["status"].(string); status != "recorded" {
+		t.Fatalf("expected status=recorded, got %+v", resp)
+	}
+
+	ev := s.findEvent(projectID, "merge_conflict_detected")
+	if ev == nil {
+		t.Fatal("merge_conflict_detected event not emitted after /merges/conflicts report")
+	}
+	meta, _ := ev["metadata"].(map[string]interface{})
+	if meta == nil {
+		if metaStr, ok := ev["metadata"].(string); ok {
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+		}
+	}
+	if meta == nil {
+		t.Fatalf("event metadata missing or unparseable: %+v", ev)
+	}
+	for _, key := range []string{"topic_branch", "run_branch", "topic_commit", "run_tip_commit", "conflict_files", "run_seq"} {
+		if _, ok := meta[key]; !ok {
+			t.Errorf("merge_conflict_detected metadata missing %q (got %+v)", key, meta)
+		}
+	}
+	files, _ := meta["conflict_files"].([]interface{})
+	if len(files) != 2 {
+		t.Errorf("conflict_files should have 2 entries, got %v", files)
+	}
+
+	// Phase 3: the conflict report should also have spawned a
+	// merge_resolve task. The response surfaces the spawned
+	// task ID; verify the task exists and has the right shape.
+	spawnedID, _ := resp["merge_resolve_task_id"].(string)
+	if spawnedID == "" {
+		t.Fatalf("expected merge_resolve_task_id in response, got %+v", resp)
+	}
+	taskResp := s.get(fmt.Sprintf("/api/v1/tasks/%s", spawnedID))
+	if action, _ := taskResp["action"].(string); action != "merge_resolve" {
+		t.Errorf("spawned task action = %q, want merge_resolve", action)
+	}
+	defID, _ := taskResp["task_def_id"].(string)
+	if !strings.Contains(defID, "merge_resolve") {
+		t.Errorf("spawned task_def_id = %q, want substring 'merge_resolve'", defID)
+	}
+	prompt, _ := taskResp["prompt"].(string)
+	for _, want := range []string{"shared/notes.md", "src/util.go", "main", "run-1/task_b/iter-1"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("spawned prompt missing %q\nfull prompt:\n%s", want, prompt)
+		}
+	}
+	// Spawned task should depend on the task whose accept
+	// drove the conflict, so downstream of B reaches the
+	// merge_resolve task in dep walks. depends_on serializes
+	// as a comma-joined string today.
+	deps, _ := taskResp["depends_on"].(string)
+	wantDep := fmt.Sprintf("%d:1:task_b", projectID)
+	if !strings.Contains(deps, wantDep) {
+		t.Errorf("spawned task should depend on %s, got deps %q", wantDep, deps)
+	}
+}
+
+// TestEvent_PushVerifyFailedEmission pins the
+// verify-after-push surface: when the fat-client's post-push
+// verify catches a silent-success state (push reported OK but
+// remote ref doesn't match the local commit), it POSTs to
+// /push-verify-failed and the coord emits push_verify_failed
+// with the local SHA, remote SHA, and branch in the metadata.
+// This is the operator-visible audit trail that surfaces
+// "object not found" / "commit reported but not in bare"
+// failures in the event log instead of leaving them buried in
+// daemon-only stderr.
+func TestEvent_PushVerifyFailedEmission(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+	resp := s.post(
+		fmt.Sprintf("/api/v1/projects/%d/runs/%s/push-verify-failed", projectID, runSeq),
+		map[string]interface{}{
+			"branch":     "run-1/task_a/iter-1",
+			"local_sha":  "cafef00d0000000000000000000000000000beef",
+			"remote_sha": "deadbeef0000000000000000000000000000beef",
+			"remote_url": "/home/test/proj/enju/.bare.git",
+			"task_id":    fmt.Sprintf("%d:1:task_a", projectID),
+		})
+	if status, _ := resp["status"].(string); status != "recorded" {
+		t.Fatalf("expected status=recorded, got %+v", resp)
+	}
+	ev := s.findEvent(projectID, "push_verify_failed")
+	if ev == nil {
+		t.Fatal("push_verify_failed event not emitted after /push-verify-failed report")
+	}
+	meta, _ := ev["metadata"].(map[string]interface{})
+	if meta == nil {
+		if metaStr, ok := ev["metadata"].(string); ok {
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+		}
+	}
+	if meta == nil {
+		t.Fatalf("event metadata missing: %+v", ev)
+	}
+	for _, key := range []string{"branch", "local_sha", "remote_sha", "remote_url", "run_seq"} {
+		if _, ok := meta[key]; !ok {
+			t.Errorf("push_verify_failed metadata missing %q (got %+v)", key, meta)
+		}
+	}
+	if meta["local_sha"] != "cafef00d0000000000000000000000000000beef" {
+		t.Errorf("local_sha not preserved: got %v", meta["local_sha"])
+	}
+	if meta["remote_sha"] != "deadbeef0000000000000000000000000000beef" {
+		t.Errorf("remote_sha not preserved: got %v", meta["remote_sha"])
+	}
+}
+
+// TestReportMergeConflict_RejectsEmptyTaskID pins the
+// parallel-merge phase 3 contract that an empty task_id is
+// rejected outright (rather than silently spawning an orphan
+// merge_resolve with no dep edge). Without this gate the
+// spawned task would be ready immediately and visible before
+// the conflict actually happened.
+func TestReportMergeConflict_RejectsEmptyTaskID(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+	resp := s.post(
+		fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/conflicts", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch":   "run-1/task_b/iter-1",
+			"run_branch":     "main",
+			"topic_commit":   "cafef00d0000000000000000000000000000beef",
+			"run_tip_commit": "deadbeef0000000000000000000000000000beef",
+			"conflict_files": []string{"shared/notes.md"},
+			// task_id intentionally omitted.
+		})
+	errMsg, _ := resp["error"].(string)
+	if errMsg == "" {
+		t.Fatalf("expected error in response for empty task_id, got %+v", resp)
+	}
+	if !strings.Contains(errMsg, "task_id") {
+		t.Errorf("error should mention task_id, got %q", errMsg)
+	}
+	// And no spawned task should leak through.
+	if id, _ := resp["merge_resolve_task_id"].(string); id != "" {
+		t.Errorf("rejected request must not spawn a task; got merge_resolve_task_id=%q", id)
+	}
+}
+
+// TestParallelMerge_E2E_ConflictSpawnsTaskAndRendersInStatus is
+// the connecting integration test for the parallel-merge work
+// (phases 2 + 3 + 5). One conflict report drives:
+//   - Phase 2: merge_conflict_detected event recorded.
+//   - Phase 3: merge_resolve task spawned with deps + prompt.
+//   - Phase 5: enju_run_status renders the "Merge resolutions
+//     awaiting human" block via the same JSON the real fat-
+//     client formatter consumes.
+//
+// Phases 1 (git layer + ErrMergeConflict) and 4 (parse-time
+// overlap lint) are covered by their own narrower tests in
+// internal/fatclient/project/merge_branch_test.go and
+// internal/common/yaml/parser_test.go respectively. This test
+// pins the seam: the wire from a real fat-client conflict report
+// through the coord-side spawn into the operator-facing
+// run_status render.
+func TestParallelMerge_E2E_ConflictSpawnsTaskAndRendersInStatus(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+
+	// Step 1: post the conflict report. The fat-client would
+	// fire this from applyAcceptedMerges on *.ErrMergeConflict.
+	conflictResp := s.post(
+		fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/conflicts", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch":   "run-1/task_b/iter-1",
+			"run_branch":     "main",
+			"topic_commit":   "cafef00d0000000000000000000000000000beef",
+			"run_tip_commit": "deadbeef0000000000000000000000000000beef",
+			"conflict_files": []string{"shared/notes.md"},
+			"task_id":        fmt.Sprintf("%d:1:task_b", projectID),
+		})
+	spawnedID, _ := conflictResp["merge_resolve_task_id"].(string)
+	if spawnedID == "" {
+		t.Fatalf("phase 3: expected merge_resolve_task_id in response, got %+v", conflictResp)
+	}
+
+	// Step 2: fetch the run + tasks payloads exactly the way
+	// the fat-client mcphandler does for enju_run_status, then
+	// feed them to format.RunStatus and verify the
+	// merge-resolutions block appears.
+	runJSON, err := json.Marshal(s.get(fmt.Sprintf("/api/v1/projects/%d/runs/%s", projectID, runSeq)))
+	if err != nil {
+		t.Fatalf("marshal run: %v", err)
+	}
+	tasksJSON, err := json.Marshal(s.getList(fmt.Sprintf("/api/v1/projects/%d/runs/%s/tasks", projectID, runSeq)))
+	if err != nil {
+		t.Fatalf("marshal tasks: %v", err)
+	}
+	rendered := format.RunStatus(runJSON, tasksJSON)
+	if !strings.Contains(rendered, "Merge resolutions awaiting human") {
+		t.Errorf("phase 5: run_status render missing merge-resolutions block:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, spawnedID) {
+		t.Errorf("phase 5: run_status render missing spawned task id %q:\n%s", spawnedID, rendered)
+	}
+
+	// Step 3: also sanity-check the spawned task itself reflects
+	// the right shape (action + dep + prompt with conflict
+	// file). This duplicates parts of
+	// TestEvent_MergeConflictDetectedEmission but anchors the
+	// E2E story end-to-end in one place.
+	taskResp := s.get("/api/v1/tasks/" + spawnedID)
+	if action, _ := taskResp["action"].(string); action != "merge_resolve" {
+		t.Errorf("spawned task action = %q, want merge_resolve", action)
+	}
+	if prompt, _ := taskResp["prompt"].(string); !strings.Contains(prompt, "shared/notes.md") {
+		t.Errorf("spawned prompt missing conflict file:\n%s", prompt)
 	}
 }
 

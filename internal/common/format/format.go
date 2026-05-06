@@ -1570,6 +1570,35 @@ func RunStatus(runData []byte, tasksData []byte, viewer ...string) string {
 		b.WriteString("\n")
 	}
 
+	// Pending merge resolutions — system-spawned merge_resolve
+	// tasks (parallel-merge phase 3) flag a non-FF auto-merge
+	// that hit a content conflict and needs a human (or future
+	// merge-resolver bot) to finish the merge by hand. Render
+	// in their own block so non-assignees scanning run_status
+	// see the attention signal regardless of who owns the task.
+	var mergeResolveTasks []map[string]interface{}
+	for _, t := range tasks {
+		if a, _ := t["action"].(string); a == "merge_resolve" {
+			if s, _ := t["state"].(string); s != "accepted" && s != "skipped" && s != "failed" {
+				mergeResolveTasks = append(mergeResolveTasks, t)
+			}
+		}
+	}
+	if len(mergeResolveTasks) > 0 {
+		b.WriteString(fmt.Sprintf("  ⚠ Merge resolutions awaiting human (%d):\n", len(mergeResolveTasks)))
+		for _, t := range mergeResolveTasks {
+			tid, _ := t["id"].(string)
+			tstate, _ := t["state"].(string)
+			claimedBy, _ := t["claimed_by"].(string)
+			line := fmt.Sprintf("    %s [%s]", tid, tstate)
+			if claimedBy != "" {
+				line += " — claimed by " + claimedBy
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
 	// Template-level summary: group by task_def_id, show
 	// counts per state. Readable regardless of DAG size.
 	b.WriteString(RenderTemplateSummary(tasks))

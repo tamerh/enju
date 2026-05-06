@@ -355,10 +355,12 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	if st, statErr := os.Stat(gitignorePath); statErr == nil {
 		mode = st.Mode().Perm()
 	}
+	// BotsRuntimeDir already covers each bot's per-bot clone at
+	// <project>/enju/bots/<botname>/clone/, so no separate clone
+	// entry is needed.
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
 		corelayout.BotsRuntimeDir + "/",
 		corelayout.BotPushTargetDir + "/",
-		corelayout.BotCloneDir + "/",
 	})
 	if !changed {
 		return false, nil

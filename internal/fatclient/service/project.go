@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -93,9 +94,12 @@ func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64
 // is registered with an explicit path at create_project + init
 // time (both require `path=`), so the lookup is unambiguous —
 // no remote_url-as-path fallback, no filesystem walk.
-func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error) {
+func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error) {
 	if s.project == nil {
 		return "", fmt.Errorf("no workspace configured")
+	}
+	if botUsername == "" {
+		return "", fmt.Errorf("bot username is required")
 	}
 	remoteURL, _, _, err := s.FetchProjectMetaExpanded(ctx, projectID)
 	if err != nil {
@@ -122,8 +126,17 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 			ErrNoCloneSource, projectID)
 	}
 
-	// Compute the bot's clone path and resolve the source URL.
-	clonePath := filepath.Join(home, corelayout.BotCloneDir)
+	// Compute this bot's clone path. Per-bot per-project so two
+	// bots running on the same machine for the same project have
+	// their own working trees and don't collide on branch
+	// switches or in-flight scratch files. The path safety
+	// guards inside BotCloneDirFor reject malformed usernames so
+	// a hostile manifest can't escape into the project tree.
+	relClone, cerr := corelayout.BotCloneDirFor(botUsername)
+	if cerr != nil {
+		return "", fmt.Errorf("invalid bot username %q: %w", botUsername, cerr)
+	}
+	clonePath := filepath.Join(home, relClone)
 
 	// Source: real remote wins (push/pull travels the network),
 	// else the per-project bare from `enju bot setup`.
@@ -147,6 +160,21 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 	if err != nil {
 		return "", err
 	}
+
+	// Stash the resolved clone keyed by projectID so subsequent
+	// OpenProject calls inside this FatClient (claim, submit,
+	// reset) route to the bot clone instead of the operator-side
+	// ForProject lookup. One FatClient = one citizen, so a
+	// project-keyed map is sufficient — there's no scenario in
+	// which the same FatClient resolves multiple bot identities
+	// for the same project.
+	s.botClonesMu.Lock()
+	if s.botClones == nil {
+		s.botClones = make(map[int64]*project.Clone)
+	}
+	s.botClones[projectID] = proj
+	s.botClonesMu.Unlock()
+
 	return proj.WorkDir(), nil
 }
 
@@ -279,6 +307,22 @@ func (s *FatClient) OpenProject(ctx context.Context, projectID int64) (proj *pro
 	if err != nil {
 		return nil, "", "", "", err
 	}
+
+	// Bot path: if ResolveBotWorkspace stashed a per-bot clone
+	// for this project, use it. Routes claim / submit / reset to
+	// the bot's own working tree at <project>/enju/bots/<bot>/clone/
+	// instead of the operator's adopted dir. Without this lookup,
+	// a daemon's submit would fall through to ForProject and
+	// land on the operator's tree — the legacy "shared bot
+	// clone" failure mode.
+	s.botClonesMu.Lock()
+	cached := s.botClones[projectID]
+	s.botClonesMu.Unlock()
+	if cached != nil {
+		cached.SetDefaultBranch(defaultBranch)
+		return cached, remoteURL, projName, defaultBranch, nil
+	}
+
 	proj, err = s.project.ForProject(projectID, remoteURL, projName)
 	if err != nil {
 		return nil, remoteURL, projName, defaultBranch, err
@@ -342,6 +386,16 @@ func (s *FatClient) FetchProjectMetaExpanded(ctx context.Context, projectID int6
 // no-op (HardReset matches HEAD's tree, no untracked files
 // to remove).
 func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int64) error {
+	// OpenProject routes through the FatClient's bot-clone stash
+	// when present (populated by ResolveBotWorkspace), so this
+	// call resolves to the bot's own working tree at
+	// <project>/enju/bots/<bot>/clone/ rather than the operator's
+	// adopted dir. The contract "this method only touches bot
+	// clones" is enforced by the pre-warm requirement: a daemon
+	// MUST call ResolveBotWorkspace before ResetBotCloneToCleanState
+	// so the stash is populated; the existing daemon flow
+	// (runOnce → ResolveBotWorkspace → ClaimTask → reset) honors
+	// that ordering.
 	proj, _, _, _, err := s.OpenProject(ctx, projectID)
 	if err != nil {
 		return err
@@ -349,4 +403,130 @@ func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int
 	proj.Lock()
 	defer proj.Unlock()
 	return proj.ResetWorktreeToCleanState()
+}
+
+// FetchAllRefsForBot brings every remote branch's refs +
+// objects into the bot's clone. Used by the daemon's pre-claim
+// path so claude-p sees fresh topic branches pushed by other
+// bots since this daemon last fetched. Without this step, per-
+// bot clones drift apart: developer-bot pushes its iter-1
+// commit, reviewer-bot's clone has no record of it, claude-p
+// reads an empty topic branch and emits a bogus
+// request_changes.
+//
+// Best-effort: a fetch failure (network blip, transient
+// unreachable) is logged by the caller but doesn't block the
+// claim — the lazy-fetch in ReadFileAtCommit picks up the
+// commit on first read miss as a fallback.
+func (s *FatClient) FetchAllRefsForBot(ctx context.Context, projectID int64) error {
+	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	proj.Lock()
+	defer proj.Unlock()
+	return proj.FetchAllRefs()
+}
+
+// CheckoutTopicBranchTip switches the bot clone's HEAD to the
+// named topic branch. Used by the bot daemon on iter-2+ re-claim
+// after a request_changes verdict so the LLM starts on the prior
+// iteration's tree (where the reviewer's feedback applies),
+// rather than on the run-branch tip the pre-claim pull leaves
+// HEAD at.
+//
+// The branch is expected to already exist locally — iter-1's
+// successful submit created it. We don't fetch from origin here
+// (the same bot just pushed the topic on iter-1, so the local
+// ref is current); a future multi-bot revision flow would need
+// fetch + force-update.
+//
+// Caller-side: call this BEFORE ResetBotCloneToCleanState so the
+// reset's HardReset-to-HEAD lands the worktree on topic-branch
+// state, not run-branch state.
+func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error {
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	proj.Lock()
+	defer proj.Unlock()
+	// CheckoutBranchFrom with empty baseBranch hits the "branch
+	// exists locally → simple checkout" path, which is what we
+	// want here: just switch HEAD onto the existing topic. The
+	// fork-from logic only fires when the branch doesn't exist,
+	// so reusing this method keeps the fork-creation path
+	// centralized in CheckoutBranchFrom.
+	return proj.CheckoutBranchFrom(branch, "")
+}
+
+// WipeDeclaredWrites removes every file matching the task's
+// declared `writes` from the bot clone's worktree. Used by the
+// bot daemon on iter-2+ re-claim to give the LLM a clean canvas
+// in its declared output paths — without this, iter-2's
+// potentially different filenames (LLM non-determinism) end up
+// unioned with iter-1's tracked files in the topic-branch tree.
+//
+// All four declaration shapes are handled by delegating to
+// `WriteArtifacts.ExpandAgainstWorkdir`, which the post-handler
+// validation already uses for the symmetric "what did the LLM
+// actually write" check:
+//
+//   - Literal path ("src/foo.go"): matches that one file if
+//     present.
+//   - Glob ("src/*.go"): expands to every matching file.
+//   - Directory ("src/foo/"): walks the dir, every file under it.
+//   - Templated ("out/{{instance}}.md"): pre-resolved at
+//     materialization to a literal — no special handling needed.
+//
+// A declaration that matches nothing (the prior iteration didn't
+// write that path) is silently skipped — there's nothing to
+// wipe. Required-vs-optional doesn't matter here; we only care
+// about what's actually on disk.
+//
+// Idempotent: a missing file is fine. A removal failure
+// (permission denied on a symlink, etc.) returns an error so the
+// daemon fails the iteration loudly rather than handing the LLM
+// a half-clean tree.
+//
+// Caller-side: call AFTER CheckoutTopicBranchTip + the existing
+// ResetBotCloneToCleanState (so worktree reflects iter-1's tree
+// and ExpandAgainstWorkdir finds the right files), and BEFORE
+// the handler runs.
+func (s *FatClient) WipeDeclaredWrites(ctx context.Context, projectID int64, writes enjuYaml.WriteArtifacts) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	return wipeDeclaredWritesInDir(proj.WorkDir(), writes)
+}
+
+// wipeDeclaredWritesInDir is the pure-function core of
+// WipeDeclaredWrites: given a working directory and a set of
+// `writes_artifacts` declarations, expand the declarations
+// against what's on disk and delete every match. Extracted out
+// of the FatClient method so the all-shapes contract (literal +
+// glob + directory + pre-resolved template) can be tested with
+// just a TempDir, no fat-client / coord / clone scaffolding.
+func wipeDeclaredWritesInDir(workDir string, writes enjuYaml.WriteArtifacts) error {
+	expanded, _, eerr := writes.ExpandAgainstWorkdir(workDir)
+	if eerr != nil {
+		return fmt.Errorf("expanding writes_artifacts for wipe: %w", eerr)
+	}
+	for _, e := range expanded {
+		if e.Path == "" {
+			continue
+		}
+		full := filepath.Join(workDir, e.Path)
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing prior iteration's declared write %q: %w", e.Path, err)
+		}
+	}
+	return nil
 }

@@ -14,6 +14,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -176,6 +177,27 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	})
 	prep.Project.Unlock()
 	if err != nil {
+		// Verify-after-push catches the production "commit
+		// reported but never landed in bare" failure mode.
+		// Before bubbling up to the caller, post a
+		// push_verify_failed audit event so the failure is
+		// visible in run_status / event log instead of buried
+		// in a daemon-only stderr.
+		var verifyErr *project.ErrPushVerifyFailed
+		if errors.As(err, &verifyErr) {
+			runSeq := int64(0)
+			if prep.Meta != nil {
+				runSeq = int64(prep.Meta.RunSeq)
+			}
+			if prep.Meta != nil && prep.Meta.ProjectID > 0 && runSeq > 0 {
+				s.reportPushVerifyFailed(ctx, prep.Meta.ProjectID, runSeq, prep.TaskID,
+					verifyErr.Branch, verifyErr.LocalSHA, verifyErr.RemoteSHA, verifyErr.RemoteURL)
+			} else {
+				s.logger.Warn("push verify failed but no project_id/run_seq context to report",
+					"task", prep.TaskID, "branch", verifyErr.Branch,
+					"local_sha", verifyErr.LocalSHA, "remote_sha", verifyErr.RemoteSHA)
+			}
+		}
 		return &SubmitResult{ErrorMessage: "writing commit to local clone: " + err.Error()}
 	}
 
@@ -571,6 +593,54 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	}, nil
 }
 
+// reportPushVerifyFailed POSTs a push_verify_failed audit
+// event so the silent-push class of bugs (push reported
+// success but commit didn't land in bare) surfaces in
+// run_status / event log instead of being buried in a daemon-
+// only log. Best-effort: a transport failure on this report
+// is logged but doesn't override the underlying submit error
+// the caller already sees.
+func (s *FatClient) reportPushVerifyFailed(ctx context.Context, projectID, runSeq int64, taskID, branch, localSHA, remoteSHA, remoteURL string) {
+	body := map[string]interface{}{
+		"branch":     branch,
+		"local_sha":  localSHA,
+		"remote_sha": remoteSHA,
+		"remote_url": remoteURL,
+	}
+	if taskID != "" {
+		body["task_id"] = taskID
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/push-verify-failed", projectID, runSeq)
+	if _, err := s.coord.Post(ctx, path, body); err != nil {
+		s.logger.Warn("posting push_verify_failed event failed",
+			"task", taskID, "branch", branch, "error", err)
+	}
+}
+
+// reportMergeConflict POSTs a merge_conflict_detected report
+// to the coordinator. Best-effort: a network blip drops the
+// report but the underlying accept stood — the run branch is
+// just left at its pre-merge tip until the report eventually
+// lands (or an operator manually resolves and reports the
+// merge).
+func (s *FatClient) reportMergeConflict(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, topicCommit, runTipCommit string, conflictFiles []string) {
+	body := map[string]interface{}{
+		"topic_branch":   topicBranch,
+		"run_branch":     runBranch,
+		"topic_commit":   topicCommit,
+		"run_tip_commit": runTipCommit,
+		"conflict_files": conflictFiles,
+	}
+	if taskID != "" {
+		body["task_id"] = taskID
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/merges/conflicts", projectID, runSeq)
+	if _, err := s.coord.Post(ctx, path, body); err != nil {
+		// Soft-log; never bubble up. Mirrors reportMerge.
+		_ = err
+	}
+}
+
 // reportMerge POSTs a branch_merged report to the coordinator.
 // fires after each successful FF push from
 // applyAcceptedMerges. Best-effort: on transport / coordinator
@@ -593,19 +663,28 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 	}
 }
 
-// applyAcceptedMerges drives the post-submit FF-merge of any
+// applyAcceptedMerges drives the post-submit auto-merge of any
 // topic branches the coordinator marked ACCEPTED. The submit
 // response carries an `accepted_merges` array; each entry is
 // (task_id, topic_branch, run_branch, commit_sha) and the fat-
-// client FF-pushes the topic SHA onto the run branch's ref
-// (locally + on origin). Hard-fail on non-FF — under linear
-// progression that should never fire in normal use.
+// client merges the topic SHA onto the run branch (locally +
+// on origin). FF when possible, real merge commit when a sibling
+// already advanced the run branch past the topic's fork point.
 //
 // Empty / missing array is a no-op (older coordinators, vote/
 // review submits without an accepted target). The merge step
 // is idempotent: a re-submit that resurfaces the same merge
 // targets just performs a same-SHA push, which workspace treats
 // as already-up-to-date.
+//
+// On *project.ErrMergeConflict the merge is left aborted (run
+// branch unchanged) and we POST a merge_conflict_detected
+// report to the coordinator instead of failing the whole
+// submit. The accept stood; the audit timeline carries the
+// signal. Phase 3 of the parallel-merge work hooks that
+// coord-side report into a merge_resolve task spawn so
+// downstream is unblocked once a human (or future merge-
+// resolver bot) finishes the merge by hand.
 func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone, responseBody []byte) error {
 	if proj == nil || len(responseBody) == 0 {
 		return nil
@@ -649,10 +728,47 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone
 		if runBranch == "" || commitSHA == "" {
 			continue
 		}
-		if err := proj.FastForwardBranchToCommit(runBranch, commitSHA); err != nil {
+		mergeAuthor := project.MergeAuthor{
+			Name:   s.coord.CitizenName(),
+			Email:  s.coord.CitizenEmail(),
+			TaskID: taskID,
+		}
+		mergeErr := proj.MergeBranchToCommit(runBranch, commitSHA, topicBranch, mergeAuthor)
+		if mergeErr != nil {
+			// Conflict: the accept stood, but the post-accept
+			// merge can't reconcile two parallel siblings.
+			// Report to coord (so the audit timeline has the
+			// signal) and keep going on remaining merges
+			// rather than failing the whole submit.
+			var conflict *project.ErrMergeConflict
+			if errors.As(mergeErr, &conflict) {
+				if reportProjectID > 0 && reportRunSeq > 0 {
+					s.reportMergeConflict(ctx, reportProjectID, reportRunSeq,
+						taskID, conflict.TopicBranch, conflict.Branch,
+						conflict.TopicCommit, conflict.RunTipCommit,
+						conflict.ConflictFiles)
+				} else {
+					// No way to address the report — older
+					// coordinators that don't surface
+					// project_id/run_seq in the submit response,
+					// or test harnesses that bypass the run
+					// envelope. Without the project/run pair we
+					// can't POST anywhere meaningful, so the
+					// audit timeline silently loses the signal
+					// and no merge_resolve task spawns. Log
+					// loudly so the gap is at least debuggable.
+					s.logger.Warn("dropped merge_conflict report: project_id/run_seq missing from submit response",
+						"task", taskID,
+						"topic_branch", conflict.TopicBranch,
+						"run_branch", conflict.Branch,
+						"conflict_files", conflict.ConflictFiles)
+				}
+				lastRunBranch = runBranch
+				continue
+			}
 			return fmt.Errorf(
-				"task %s: ff-merging topic %q onto run branch %q at %s: %w",
-				taskID, topicBranch, runBranch, commitSHA, err)
+				"task %s: merging topic %q onto run branch %q at %s: %w",
+				taskID, topicBranch, runBranch, commitSHA, mergeErr)
 		}
 		reports = append(reports, mergeReport{
 			taskID: taskID, topicBranch: topicBranch,

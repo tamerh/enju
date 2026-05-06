@@ -89,10 +89,32 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	// subsequent lookups.
 	proj, perr := s.project.OpenExisting(projectID)
 	if perr != nil {
-		if errors.Is(perr, project.ErrCloneNotFound) {
+		if !errors.Is(perr, project.ErrCloneNotFound) {
+			return "", true, fmt.Errorf("open project clone: %w", perr)
+		}
+		// Lazy-clone fallback for read-only surfaces (web UI).
+		// With per-bot clones bots write to <project>/enju/bots/<bot>/clone/
+		// and don't materialize a clone in the operator's
+		// workspace; if the operator never ran `enju mcp` for
+		// this project, OpenExisting returns ErrCloneNotFound
+		// even though the bare repo and commits exist. Fetch
+		// the project's remote_url and clone on demand so the
+		// UI can render submitted content. Skipped silently when
+		// remote_url is unset (path-only projects with no
+		// workspace clone aren't readable from this surface).
+		remoteURL, projName, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
+		if ferr != nil {
+			s.logger.Warn("ReadResultAtCommit: fetch project meta failed; treating as not-found",
+				"project_id", projectID, "error", ferr)
 			return "", false, nil
 		}
-		return "", true, fmt.Errorf("open project clone: %w", perr)
+		if remoteURL == "" {
+			return "", false, nil
+		}
+		proj, perr = s.project.ForProject(projectID, remoteURL, projName)
+		if perr != nil {
+			return "", true, fmt.Errorf("lazy-clone project: %w", perr)
+		}
 	}
 	repoPath := resultDir + "/result.md"
 	data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)

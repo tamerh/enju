@@ -77,6 +77,19 @@ type FatClient struct {
 	profileName  string
 	profileEmail string
 	profileKind  string
+
+	// botClones holds bot-resolved clones keyed by projectID.
+	// Populated by ResolveBotWorkspace; consulted by OpenProject
+	// so subsequent submit / claim / reset calls within the bot
+	// daemon route to its own clone instead of falling through
+	// to the operator-side ForProject lookup. One FatClient =
+	// one citizen identity, so a single map covers every project
+	// the daemon polls without bleeding across bot identities.
+	//
+	// Operator-side FatClients leave this nil and OpenProject
+	// flows to the operator's working tree as before.
+	botClonesMu sync.Mutex
+	botClones   map[int64]*project.Clone
 }
 
 // New constructs a FatClient. Logger defaults to slog.Default() when

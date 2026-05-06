@@ -405,6 +405,110 @@ type reportMergeRequest struct {
 	TaskID   string `json:"task_id,omitempty"` // optional — task whose ACCEPTED state drove this merge
 }
 
+// reportMergeConflictRequest is the body shape for
+// POST /projects/{p}/runs/{r}/merges/conflicts. Fat-clients
+// post this when their auto-merge of an ACCEPTED topic onto
+// the run branch hits a content conflict — the accept stood,
+// but the merge couldn't land cleanly. Phase 3 of the parallel-
+// merge work will turn this into a merge_resolve task spawn;
+// Phase 2 just records the audit event.
+type reportMergeConflictRequest struct {
+	TopicBranch   string   `json:"topic_branch"`
+	RunBranch     string   `json:"run_branch"`
+	TopicCommit   string   `json:"topic_commit"`
+	RunTipCommit  string   `json:"run_tip_commit"`
+	ConflictFiles []string `json:"conflict_files"`
+	TaskID        string   `json:"task_id,omitempty"`
+}
+
+// handleReportMergeConflict — endpoint. Emits
+// merge_conflict_detected with the topic/run/conflict-files
+// payload. Body-of-truth in service.
+func (s *Server) handleReportMergeConflict(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	var req reportMergeConflictRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	caller := citizenFromRequest(r)
+	resp, err := service.ReportMergeConflict(s.store, caller, projectID, runSeq, service.ReportMergeConflictParams{
+		TopicBranch:   req.TopicBranch,
+		RunBranch:     req.RunBranch,
+		TopicCommit:   req.TopicCommit,
+		RunTipCommit:  req.RunTipCommit,
+		ConflictFiles: req.ConflictFiles,
+		TaskID:        req.TaskID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrNotMember):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// reportPushVerifyFailedRequest is the body shape for
+// POST /projects/{p}/runs/{r}/push-verify-failed. Fat-clients
+// post this when their post-push verify catches a silent-
+// success state — push helper returned no error but the
+// remote ref doesn't equal the local commit. Production
+// trace: bot's SubmitTaskResult returned a SHA, coord stored
+// it, but bare's branch ref stayed at the seed and downstream
+// readers got "object not found".
+type reportPushVerifyFailedRequest struct {
+	Branch    string `json:"branch"`
+	LocalSHA  string `json:"local_sha"`
+	RemoteSHA string `json:"remote_sha,omitempty"`
+	RemoteURL string `json:"remote_url,omitempty"`
+	TaskID    string `json:"task_id,omitempty"`
+}
+
+// handleReportPushVerifyFailed — endpoint. Emits
+// push_verify_failed so the silent-push class of bugs surfaces
+// in run_status / event log instead of being buried in a
+// daemon-only log file.
+func (s *Server) handleReportPushVerifyFailed(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	var req reportPushVerifyFailedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	caller := citizenFromRequest(r)
+	resp, err := service.ReportPushVerifyFailed(s.store, caller, projectID, runSeq, service.ReportPushVerifyFailedParams{
+		Branch:    req.Branch,
+		LocalSHA:  req.LocalSHA,
+		RemoteSHA: req.RemoteSHA,
+		RemoteURL: req.RemoteURL,
+		TaskID:    req.TaskID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrNotMember):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleReportMerge — endpoint. Emits branch_merged with
 // topic + run_branch + merge_sha. Body-of-truth in service.
 func (s *Server) handleReportMerge(w http.ResponseWriter, r *http.Request) {
