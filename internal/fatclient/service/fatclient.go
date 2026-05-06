@@ -27,7 +27,7 @@ import (
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // Config is the constructor input for New. Coord and Workspace are
@@ -35,7 +35,7 @@ import (
 // process-scoped attribution / diagnostics.
 type Config struct {
 	Coord     *coord.Client
-	Workspace *workspace.Workspace
+	Workspace *project.Opener
 	ModelName string
 	Logger    *slog.Logger
 
@@ -63,7 +63,7 @@ type Config struct {
 // sync.Once.
 type FatClient struct {
 	coord       *coord.Client
-	workspace   *workspace.Workspace
+	project     *project.Opener
 	modelName   string
 	logger      *slog.Logger
 	projectRegistry  *projectreg.Registry
@@ -83,22 +83,14 @@ type FatClient struct {
 // the caller didn't supply one — service helpers always have
 // somewhere to log without a nil check at every call site.
 //
-// Adopted-project bridge: when both ProjectRegistry and Workspace
-// are configured, every registry entry whose LocalPath still
-// exists on disk is registered with the workspace as an external
-// dir. Without this, projects adopted via `enju_init` /
-// `enju_create_project --path` (which write to
-// `~/.enju/projects.json` but only call workspace.RegisterExternalDir
-// in the SAME process) become invisible to OpenExisting after
-// process restart — the in-memory `externalDirs` map starts
-// empty in every fresh fatclient, so OpenExisting falls through
-// to filesystem scanning of `~/.enju/workspaces/...` and returns
-// ErrCloneNotFound for adopted dirs that live outside that root.
-//
-// The bridge fires once at construction so OpenExisting stays
-// fast (no per-call registry I/O) and so all consumers in this
-// process — webui, MCP handlers, bot daemon — see the same
-// authoritative answer.
+// When both Workspace and ProjectRegistry are configured, the
+// registry is attached to the workspace at construction so that
+// ForProject / ProjectDir / OpenExisting can resolve project
+// paths directly. The registry is the durable per-machine
+// "project N → home path" record; the workspace consults it
+// each call rather than maintaining its own mirror.
+// AttachRegistry is a nil-safe no-op when either side is
+// unconfigured (test fixtures, embeddings without a registry).
 func New(cfg Config) *FatClient {
 	logger := cfg.Logger
 	if logger == nil {
@@ -106,18 +98,11 @@ func New(cfg Config) *FatClient {
 	}
 	fc := &FatClient{
 		coord:      cfg.Coord,
-		workspace:  cfg.Workspace,
+		project:    cfg.Workspace,
 		modelName:  cfg.ModelName,
 		logger:     logger,
 		projectRegistry: cfg.ProjectRegistry,
 	}
-	// Attach the registry to the workspace so ForProject /
-	// ProjectDir / OpenExisting can resolve project paths
-	// directly. Pre-Phase-F this was a "hydrate externalDirs at
-	// startup" bridge; the registry-as-source-of-truth model
-	// makes the bridge unnecessary — Workspace just queries the
-	// registry on each call. AttachRegistry is a nil-safe no-op
-	// when either side is unconfigured.
 	if cfg.Workspace != nil && cfg.ProjectRegistry != nil {
 		cfg.Workspace.AttachRegistry(cfg.ProjectRegistry)
 	}
@@ -182,10 +167,10 @@ func (s *FatClient) UnregisterProject(id int64) {
 // FatClient method.
 func (s *FatClient) Coord() *coord.Client { return s.coord }
 
-// Workspace returns the underlying workspace. Exposed for callers
+// Workspace returns the underlying project. Exposed for callers
 // that need direct access to workspace primitives (project resolve,
 // scan, etc.).
-func (s *FatClient) Workspace() *workspace.Workspace { return s.workspace }
+func (s *FatClient) Workspace() *project.Opener { return s.project }
 
 // Username delegates to the coord client so callers see live values
 // across auto-reregister rotations.

@@ -32,7 +32,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func testCtx(t *testing.T) context.Context {
@@ -59,10 +59,10 @@ func writeFile(dir, name, content string) error {
 // changed — it still looks up each path's Track flag from
 // the task's writes_artifacts declaration.
 func TestBuildReconcileBodyUnionsTrackedAndUntracked(t *testing.T) {
-	trailers := []workspace.CommitTrailer{
+	trailers := []project.CommitTrailer{
 		{
 			CommitSHA: "abcd1234",
-			Trailers: workspace.EnjuTrailers{
+			Trailers: project.EnjuTrailers{
 				TaskID:             "3:1:align",
 				ExitCode:           0,
 				ExitSet:            true,
@@ -94,10 +94,10 @@ func TestBuildReconcileBodyUnionsTrackedAndUntracked(t *testing.T) {
 // TestBuildReconcileBodyOmitsEmptyArtifacts — a commit with
 // no artifact trailers at all shouldn't emit the key.
 func TestBuildReconcileBodyOmitsEmptyArtifacts(t *testing.T) {
-	trailers := []workspace.CommitTrailer{
+	trailers := []project.CommitTrailer{
 		{
 			CommitSHA: "deadbeef",
-			Trailers: workspace.EnjuTrailers{
+			Trailers: project.EnjuTrailers{
 				TaskID:  "3:1:t",
 				ExitSet: true,
 			},
@@ -142,15 +142,15 @@ func TestWrapperResultSyncAsyncParity(t *testing.T) {
 	syncArtifacts := append([]string(nil), allPaths...)
 
 	// --- Async path: render trailer, parse back, build reconcile body ---
-	rendered := workspace.RenderEnjuTrailers(workspace.EnjuTrailers{
+	rendered := project.RenderEnjuTrailers(project.EnjuTrailers{
 		TaskID:             "3:1:align",
 		ExitCode:           0,
 		ExitSet:            true,
 		Artifacts:          trackedPaths,
 		UntrackedArtifacts: untrackedPaths,
 	})
-	parsed := workspace.ParseEnjuTrailers("Task 3:1:align by @alice: ok\n\n" + rendered)
-	body := buildReconcileBody([]workspace.CommitTrailer{
+	parsed := project.ParseEnjuTrailers("Task 3:1:align by @alice: ok\n\n" + rendered)
+	body := buildReconcileBody([]project.CommitTrailer{
 		{CommitSHA: "abc", Trailers: parsed},
 	})
 	tasks, _ := body["tasks"].([]map[string]interface{})
@@ -181,7 +181,7 @@ func TestWrapperResultSyncAsyncParity(t *testing.T) {
 // async wrapper commit actually takes, end-to-end through
 // the scanner's eyes.
 func TestReconcileBodyFromRenderedCommit(t *testing.T) {
-	rendered := workspace.RenderEnjuTrailers(workspace.EnjuTrailers{
+	rendered := project.RenderEnjuTrailers(project.EnjuTrailers{
 		TaskID:             "3:1:align",
 		ExitCode:           0,
 		ExitSet:            true,
@@ -191,9 +191,9 @@ func TestReconcileBodyFromRenderedCommit(t *testing.T) {
 	})
 	// Simulate a real commit message (subject + body + trailers).
 	fullMsg := "Task 3:1:align by @alice: ran\n\n" + rendered
-	parsed := workspace.ParseEnjuTrailers(fullMsg)
+	parsed := project.ParseEnjuTrailers(fullMsg)
 
-	body := buildReconcileBody([]workspace.CommitTrailer{
+	body := buildReconcileBody([]project.CommitTrailer{
 		{CommitSHA: "sha-xyz", Trailers: parsed},
 	})
 	tasks, _ := body["tasks"].([]map[string]interface{})
@@ -210,10 +210,10 @@ func TestReconcileBodyFromRenderedCommit(t *testing.T) {
 // reads/*.fq outputs, all untracked, none surviving
 // reconcile pre-fix.
 func TestBuildReconcileBodyUntrackedOnly(t *testing.T) {
-	trailers := []workspace.CommitTrailer{
+	trailers := []project.CommitTrailer{
 		{
 			CommitSHA: "cafebabe",
-			Trailers: workspace.EnjuTrailers{
+			Trailers: project.EnjuTrailers{
 				TaskID:             "3:1:fetch",
 				ExitCode:           0,
 				ExitSet:            true,
@@ -285,7 +285,7 @@ func TestPullBranchWithReconcileReleasesLockAcrossPost(t *testing.T) {
 	// --- Fat-client workspace rooted in a temp dir. ---
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	wsRoot := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestPullBranchWithReconcileReleasesLockAcrossPost(t *testing.T) {
 		t.Fatalf("baseline scan: %v", err)
 	}
 	stateDir := filepath.Join(wsRoot, ".state")
-	cursors := workspace.NewCursors(stateDir, projectID)
+	cursors := project.NewCursors(stateDir, projectID)
 	cursors.Set("main", baselineTip)
 	if err := cursors.Save(); err != nil {
 		t.Fatalf("seed cursor: %v", err)

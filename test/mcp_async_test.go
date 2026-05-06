@@ -1007,7 +1007,7 @@ func waitForTaskState(h *mcpHarness, taskID, want string, timeout time.Duration)
 // async-compute tests can poll wrapper output without reaching
 // into harness internals.
 func (h *mcpHarness) workspaceDirForProject(projectID int64) string {
-	proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+	proj, err := h.project.ForProject(projectID, h.remoteFor(projectID))
 	if err != nil {
 		h.t.Fatalf("opening project %d workspace: %v", projectID, err)
 	}

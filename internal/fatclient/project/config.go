@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"fmt"
@@ -42,7 +42,7 @@ type ProjectConfig struct {
 // filesystem) keeps template discovery consistent regardless of
 // which run branch the workspace happens to be checked out on.
 // See templates.go for the full rationale.
-func (p *Project) LoadProjectConfig() (*ProjectConfig, error) {
+func (p *Clone) LoadProjectConfig() (*ProjectConfig, error) {
 	tree, err := p.defaultBranchTree()
 	if err != nil {
 		return nil, err
@@ -86,7 +86,7 @@ func (p *Project) LoadProjectConfig() (*ProjectConfig, error) {
 // `templates:` list if present; otherwise falls back to the
 // built-in default. Always returns at least one entry so
 // downstream scans don't need a special-case "no roots" path.
-func (p *Project) templateRoots() ([]string, error) {
+func (p *Clone) templateRoots() ([]string, error) {
 	cfg, err := p.LoadProjectConfig()
 	if err != nil {
 		return nil, err

@@ -18,7 +18,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -34,7 +34,7 @@ type Config struct {
 	// local clone here and reports commit SHAs back to the
 	// coordinator, bypassing the legacy content-over-wire path.
 	// When nil, only the legacy path is used.
-	Workspace *workspace.Workspace
+	Workspace *project.Opener
 	// SaveCredentials is called after a successful auto re-register
 	// so the new server-side identity is persisted to disk. The
 	// username passed back may be the same (DB wipe case) or new
@@ -114,7 +114,7 @@ type NotifyOptions struct {
 const agentInstructions = `Enju is a human-AI collaborative task orchestration system. Work is structured as DAGs of tasks within runs within projects.
 
 Core model:
-- A claimed task is YOUR workspace. Iterate with the human freely — discuss, draft, refine. Only the final submission is committed to git. Internal back-and-forth doesn't need tracking.
+- A claimed task is YOUR project. Iterate with the human freely — discuss, draft, refine. Only the final submission is committed to git. Internal back-and-forth doesn't need tracking.
 - Reviews are quality gates — you're deciding whether an upstream result is ready to feed into downstream tasks, not doing a line-by-line code review. Decisions: approve (ship it), request_changes (revise, target → READY), reject (fail cascade, target → FAILED terminal), or comment (non-blocking).
 - Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
 - Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.

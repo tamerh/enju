@@ -91,7 +91,7 @@ type ExecuteRunResult struct {
 // modes share the same per-task ExecuteComputeTask path so a
 // single fix to the worker propagates to both.
 func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*ExecuteRunResult, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_execute_run requires a local workspace")
 	}
 

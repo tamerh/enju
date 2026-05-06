@@ -408,7 +408,7 @@ func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta
 // the local workspace, recoverable and intact, just not synced
 // anywhere.
 func (s *FatClient) UseFatClient(meta *TaskMeta) bool {
-	if s.workspace == nil || meta == nil {
+	if s.project == nil || meta == nil {
 		return false
 	}
 	return true

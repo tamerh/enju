@@ -18,7 +18,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // RunBranchFromData pulls the `branch` field out of a run JSON
@@ -58,8 +58,8 @@ func RunSlugFromData(runData []byte) string {
 // the opened project + loaded bundle so the post-create snapshot
 // commit doesn't have to re-load anything.
 type RunTemplatePrep struct {
-	Project        *workspace.Project
-	LoadedTemplate *workspace.LoadedTemplate
+	Project        *project.Clone
+	LoadedTemplate *project.LoadedTemplate
 	YAMLContent    string
 	SourceCommit   string
 }
@@ -75,7 +75,7 @@ type RunTemplatePrep struct {
 // caller passes to CommitRunTemplateSnapshot after the
 // coordinator assigns the run's seq.
 func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, authorName, authorEmail string) (*RunTemplatePrep, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_create_run with 'path' requires a local workspace (MCP client mode)")
 	}
 	proj, _, _, _, err := s.OpenProject(ctx, projectID)
@@ -167,7 +167,7 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 		return ""
 	}
 	prep.Project.Lock()
-	_, cerr := prep.Project.CommitFiles(workspace.CommitFilesRequest{
+	_, cerr := prep.Project.CommitFiles(project.CommitFilesRequest{
 		Files:       files,
 		CommitMsg:   fmt.Sprintf("Snapshot template %s into run %d", prep.LoadedTemplate.BundleDir, seq),
 		AuthorName:  authorName,
@@ -197,7 +197,7 @@ type ExportFileResult struct {
 // Returns the rendered Mermaid body so handlers can both report
 // the commit and inline the diagram in the response.
 func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (body string, res *ExportFileResult, err error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return "", nil, fmt.Errorf("enju_export_diagram requires a local workspace (MCP client mode)")
 	}
 	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
@@ -226,8 +226,8 @@ func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runI
 	repoPath := filepath.Join(corelayout.RunDir(runID, RunSlugFromData(runData)), "graph", fmt.Sprintf("%s.mmd", phase))
 
 	proj.Lock()
-	cres, err := proj.CommitFiles(workspace.CommitFilesRequest{
-		Files: []workspace.FileWrite{{
+	cres, err := proj.CommitFiles(project.CommitFilesRequest{
+		Files: []project.FileWrite{{
 			RepoRelPath: repoPath,
 			Content:     []byte(body),
 		}},
@@ -253,7 +253,7 @@ func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runI
 // enju/runs/{seq}-{slug}/events/{phase}.jsonl. Returns the
 // decoded event slice so handlers can render an inline preview.
 func (s *FatClient) ExportRunEventsFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (events []map[string]interface{}, res *ExportFileResult, err error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, nil, fmt.Errorf("enju_export_run_events requires a local workspace (MCP client mode)")
 	}
 	// Fetch the run record first so the events commit lands on
@@ -293,8 +293,8 @@ func (s *FatClient) ExportRunEventsFile(ctx context.Context, projectID int64, ru
 	repoPath := filepath.Join(corelayout.RunDir(runID, runSlug), "events", fmt.Sprintf("%s.jsonl", phase))
 
 	proj.Lock()
-	cres, err := proj.CommitFiles(workspace.CommitFilesRequest{
-		Files: []workspace.FileWrite{{
+	cres, err := proj.CommitFiles(project.CommitFilesRequest{
+		Files: []project.FileWrite{{
 			RepoRelPath: repoPath,
 			Content:     body.Bytes(),
 		}},
@@ -338,7 +338,7 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 	json.Unmarshal(tasksData, &tasks)
 
 	var remoteURL, projName string
-	if s.workspace != nil {
+	if s.project != nil {
 		if u, n, err := s.FetchProjectMetaFull(ctx, projectID); err == nil {
 			remoteURL = u
 			projName = n
@@ -373,8 +373,8 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 		// output is what matters. Show the prompt only as
 		// context below the result.
 		resultShown := false
-		if tstate == "accepted" && commitSHA != "" && s.workspace != nil && remoteURL != "" {
-			if proj, err := s.workspace.ForProject(projectID, remoteURL, projName); err == nil {
+		if tstate == "accepted" && commitSHA != "" && s.project != nil && remoteURL != "" {
+			if proj, err := s.project.ForProject(projectID, remoteURL, projName); err == nil {
 				resultFile := resultPath + "/result.md"
 				if defID != "" && resultPath != "" {
 					content, found, rerr := proj.ReadFileAtCommit(commitSHA, resultFile)

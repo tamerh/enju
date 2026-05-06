@@ -15,13 +15,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/enju-ai/enju/internal/common/types"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // SubmitParams is the input shape for FatClient.SubmitTaskResult.
@@ -33,17 +34,30 @@ import (
 // passed in pre-resolved — the service layer doesn't carry the
 // profile cache.
 type SubmitParams struct {
-	TaskID        string
-	Meta          *TaskMeta
-	Content       string
-	Outputs       map[string]string
-	OutputLists   map[string][]string
-	Artifacts     map[string]string
-	Decision      string
-	Option        string
-	ModelOverride string
-	AuthorName    string
-	AuthorEmail   string
+	TaskID      string
+	Meta        *TaskMeta
+	Content     string
+	Outputs     map[string]string
+	OutputLists map[string][]string
+	// Artifacts holds path → content for tracked artifact writes.
+	// Entries land in the commit at their declared repo-relative
+	// path. Bot/citizen submitters populate this from the working
+	// tree per the task's writes_artifacts(track:true) declaration.
+	Artifacts map[string]string
+	// UntrackedArtifacts lists the path-only set of artifact writes
+	// declared with track:false. These files are NOT committed (the
+	// .gitignore managed block keeps them out) but ARE reported to
+	// the coordinator so it records a tracked=false index row that
+	// downstream tasks can verify by stat. Caller is responsible for
+	// having stat'd that the files exist on disk before passing
+	// them in — prepareFatSubmit re-validates and fails loudly on
+	// any missing entry.
+	UntrackedArtifacts []string
+	Decision           string
+	Option             string
+	ModelOverride      string
+	AuthorName         string
+	AuthorEmail        string
 }
 
 // SubmitResult bundles the data the formatter and downstream
@@ -141,7 +155,7 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 		verdict = prep.Option
 	}
 	prep.Project.Lock()
-	submitRes, err := prep.Project.SubmitTaskResult(workspace.SubmitRequest{
+	submitRes, err := prep.Project.SubmitTaskResult(project.SubmitRequest{
 		TaskID:        prep.TaskID,
 		Username:      s.Username(),
 		AuthorName:    prep.AuthorName,
@@ -153,10 +167,11 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 		BaseBranch:    baseBranch,
 		ProjectID:     prep.Meta.ProjectID,
 		StateDir:      s.StateDir(),
-		Trailers: workspace.EnjuTrailers{
-			TaskID:  prep.TaskID,
-			Verdict: verdict,
-			IterSeq: prep.Meta.IterSeq,
+		Trailers: project.EnjuTrailers{
+			TaskID:             prep.TaskID,
+			Verdict:            verdict,
+			IterSeq:            prep.Meta.IterSeq,
+			UntrackedArtifacts: prep.UntrackedArtifactPaths,
 		},
 	})
 	prep.Project.Unlock()
@@ -191,14 +206,20 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 // go through SubmitTaskResult which composes prepare +
 // push + report into one call.
 type preparedFatSubmit struct {
-	TaskID        string
-	Meta          *TaskMeta
-	Project       *workspace.Project
-	Files         []workspace.FileWrite
-	ArtifactPaths []string
-	ResultDir     string
-	AuthorName    string
-	AuthorEmail   string
+	TaskID    string
+	Meta      *TaskMeta
+	Project   *project.Clone
+	Files     []project.FileWrite
+	// ArtifactPaths is the tracked-artifact subset of Files (paths
+	// only) — feeds the commit message body and the Enju-Artifacts
+	// trailer. Untracked paths are NOT here; they ride
+	// UntrackedArtifactPaths into the Enju-Untracked-Artifacts
+	// trailer so the async reconcile path can still see them.
+	ArtifactPaths          []string
+	UntrackedArtifactPaths []string
+	ResultDir              string
+	AuthorName             string
+	AuthorEmail            string
 	// ReportBody is the POST payload for /tasks/{id}/result.
 	// commit_sha + resolved SHA are filled in by the caller
 	// after the push completes (the prep step doesn't know
@@ -375,11 +396,11 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		}
 	}
 
-	files := []workspace.FileWrite{}
+	files := []project.FileWrite{}
 
 	// Single-file result path: `content` is a string blob.
 	if content != "" {
-		files = append(files, workspace.FileWrite{
+		files = append(files, project.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
 			Content:     []byte(content),
 		})
@@ -409,7 +430,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	// as a single result.json blob (legacy-compatible default).
 	if outputs != nil {
 		metadata["named_outputs"] = true
-		schema := workspace.ParseNamedOutputSchema(meta.OutputsSchemaJSON)
+		schema := project.ParseNamedOutputSchema(meta.OutputsSchemaJSON)
 		hasFileSpec := false
 		for _, sp := range schema {
 			if sp.File != "" {
@@ -418,7 +439,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 			}
 		}
 		if hasFileSpec {
-			outFiles, fileIndex := workspace.BuildNamedOutputFiles(resultDir, schema, outputs)
+			outFiles, fileIndex := project.BuildNamedOutputFiles(resultDir, schema, outputs)
 			files = append(files, outFiles...)
 			metadata["output_files"] = fileIndex
 		} else {
@@ -426,7 +447,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 			if err != nil {
 				return nil, fmt.Errorf("encoding outputs: %w", err)
 			}
-			files = append(files, workspace.FileWrite{
+			files = append(files, project.FileWrite{
 				RepoRelPath: filepath.Join(resultDir, "result.json"),
 				Content:     outputsBytes,
 			})
@@ -437,7 +458,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	if err != nil {
 		return nil, fmt.Errorf("encoding metadata: %w", err)
 	}
-	files = append(files, workspace.FileWrite{
+	files = append(files, project.FileWrite{
 		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -452,10 +473,31 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		}
 		sort.Strings(artifactPaths)
 		for _, p := range artifactPaths {
-			files = append(files, workspace.FileWrite{
-				RepoRelPath: workspace.ArtifactPath(p),
+			files = append(files, project.FileWrite{
+				RepoRelPath: project.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
+		}
+	}
+
+	// Untracked artifact paths: stat-only verification — we never
+	// commit them (the .gitignore managed block keeps them out)
+	// but we DO require they exist on disk before claiming the
+	// task succeeded. Silent acceptance of "I declared X but
+	// didn't write it" was the data-loss bug fixed here. Sorted
+	// for deterministic ordering across reportBody, the trailer,
+	// and any retry that re-prepares the same submit.
+	untrackedPaths := append([]string(nil), params.UntrackedArtifacts...)
+	sort.Strings(untrackedPaths)
+	if len(untrackedPaths) > 0 {
+		var missing []string
+		for _, p := range untrackedPaths {
+			if _, statErr := os.Stat(filepath.Join(proj.WorkDir(), project.ArtifactPath(p))); statErr != nil {
+				missing = append(missing, p)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("declared untracked artifact(s) missing on disk: %s", strings.Join(missing, ", "))
 		}
 	}
 
@@ -464,10 +506,21 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	// push may rewrite the SHA, and the batch path especially
 	// needs to defer this assignment until after the single
 	// coalesced push + CommitSHAsByTaskID remap).
+	// artifacts_written carries BOTH tracked and untracked paths.
+	// The coordinator looks up each entry against the task's
+	// declared writes_artifacts to recover the track flag (see
+	// engine/submit_orchestrate.go). Tracked paths are also in
+	// the commit; untracked ones are not — but the coord still
+	// records a tracked=false index row so downstream tasks can
+	// verify their presence by stat at claim time.
+	allArtifactPaths := append([]string(nil), artifactPaths...)
+	allArtifactPaths = append(allArtifactPaths, untrackedPaths...)
+	sort.Strings(allArtifactPaths)
+
 	reportBody := map[string]interface{}{
 		"commit_sha":        "", // filled in post-push
 		"result_path":       resultDir,
-		"artifacts_written": artifactPaths,
+		"artifacts_written": allArtifactPaths,
 		"tokens_used":       0,
 		"model":             effectiveModel,
 		// Username identifies the submitting citizen for
@@ -502,18 +555,19 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		reportBody["option"] = option
 	}
 	return &preparedFatSubmit{
-		TaskID:         taskID,
-		Meta:           meta,
-		Project:        proj,
-		Files:          files,
-		ArtifactPaths:  artifactPaths,
-		ResultDir:      resultDir,
-		AuthorName:     params.AuthorName,
-		AuthorEmail:    params.AuthorEmail,
-		ReportBody:     reportBody,
-		EffectiveModel: effectiveModel,
-		Decision:       decision,
-		Option:         option,
+		TaskID:                 taskID,
+		Meta:                   meta,
+		Project:                proj,
+		Files:                  files,
+		ArtifactPaths:          artifactPaths,
+		UntrackedArtifactPaths: untrackedPaths,
+		ResultDir:              resultDir,
+		AuthorName:             params.AuthorName,
+		AuthorEmail:            params.AuthorEmail,
+		ReportBody:             reportBody,
+		EffectiveModel:         effectiveModel,
+		Decision:               decision,
+		Option:                 option,
 	}, nil
 }
 
@@ -552,7 +606,7 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 // is idempotent: a re-submit that resurfaces the same merge
 // targets just performs a same-SHA push, which workspace treats
 // as already-up-to-date.
-func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *workspace.Project, responseBody []byte) error {
+func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone, responseBody []byte) error {
 	if proj == nil || len(responseBody) == 0 {
 		return nil
 	}

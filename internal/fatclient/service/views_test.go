@@ -477,9 +477,9 @@ func TestListReadyTasks_SurfacesCoordErrorEnvelope(t *testing.T) {
 }
 
 func TestListMaterializedProjects(t *testing.T) {
-	// Post-Phase-A every project home is registered explicitly,
-	// so this just round-trips through the registry. Two
-	// projects in, two projects out.
+	// Every project home is registered explicitly at create_project
+	// + init time, so this just round-trips through the registry.
+	// Two projects in, two projects out.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	dir7 := t.TempDir()
@@ -520,12 +520,11 @@ func TestListMaterializedProjects_NoRegistry(t *testing.T) {
 }
 
 func TestListMaterializedProjects_FromRegistry(t *testing.T) {
-	// Post-Phase-A every project has an explicit registry entry
-	// (path is required at create_project + init time), so the
-	// registry is the only source ListMaterializedProjects
-	// consults. Pre-refactor this test also exercised a
-	// filesystem-walk fallback (deleted in Phase D once the
-	// "managed workspace dir" concept went away).
+	// Every project has an explicit registry entry (path is
+	// required at create_project + init time), so the registry
+	// is the only source ListMaterializedProjects consults.
+	// (A legacy filesystem-walk fallback existed earlier; it
+	// went away with the "managed workspace dir" concept.)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	externalDir := t.TempDir()
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
@@ -577,6 +576,6 @@ func TestRegisterAndList_RoundTrip(t *testing.T) {
 	}
 }
 
-// (TestParseProjectIDFromDir removed in Phase D — the helper
+// (Removed: TestParseProjectIDFromDir. The helper it covered
 // only existed to parse "<id>-<slug>" workspace-managed dir
-// names, which the layout refactor eliminated.)
+// names — a concept the project-home layout eliminated.)

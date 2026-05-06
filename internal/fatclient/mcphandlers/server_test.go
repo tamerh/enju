@@ -19,7 +19,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/go-git/go-git/v5/config"
@@ -309,7 +309,7 @@ func toolResultText(res interface{}) string {
 //
 // Setup: a bare git repo seeded with a draft result.md at a known
 // commit SHA, an httptest coordinator that serves a fake /inputs
-// descriptor pointing at that commit, and a real workspace.Workspace
+// descriptor pointing at that commit, and a real project.Opener
 // that clones the bare on first access. The test asserts the
 // resolved inputs JSON contains a "reviewing" key with the target
 // content, the target task def id, and the claimer's username.
@@ -407,7 +407,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	})
 	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
 		// openProject fetches the project record to wire
-		// default_branch into the workspace. Minimal response
+		// default_branch into the project. Minimal response
 		// matching the fields fetchProjectMetaExpanded reads.
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -422,7 +422,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 
 	// 3. Real Workspace. Clones the bare on first ForProject.
 	wsDir := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -469,11 +469,11 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	}
 }
 
-// TestCreateProjectPathRequired pins Phase A's contract: omitting
-// `path` is a hard error. Pre-Phase-A the handler accepted no-path
-// and silently routed to a managed `~/.enju/workspaces/` dir; that
-// fork was the source of the "two LocalPath shapes in projectreg"
-// confusion. After Phase A, callers MUST pick a path explicitly.
+// TestCreateProjectPathRequired pins the contract: omitting
+// `path` is a hard error. Earlier the handler accepted no-path
+// and silently routed to a managed `~/.enju/workspaces/` dir;
+// that fork was the source of the "two LocalPath shapes in
+// projectreg" confusion. Callers MUST pick a path explicitly.
 func TestCreateProjectPathRequired(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
@@ -484,7 +484,7 @@ func TestCreateProjectPathRequired(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -513,9 +513,9 @@ func TestCreateProjectPathRequired(t *testing.T) {
 // caller-supplied absolute path (registered as an external dir),
 // the eager-init produces a seeded git repo (README + scaffold),
 // and no shadow bare is created at the legacy
-// `~/.enju/repos/{id}.git/` path. With Phase A, path is the only
-// way to create a project; the legacy "managed workspace dir"
-// branch is gone.
+// `~/.enju/repos/{id}.git/` path. `path` is the only way to
+// create a project — the legacy "managed workspace dir" branch
+// is gone.
 func TestCreateProjectCustomPathFresh(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
@@ -539,7 +539,7 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -586,9 +586,9 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 		}
 	}
 
-	// No shadow bare under ~/.enju/repos/. (Layout refactor
-	// kept this assertion alive — the legacy path is gone but
-	// regressions would re-introduce it.)
+	// No shadow bare under ~/.enju/repos/ — the legacy path is
+	// gone, but a regression to the auto-bare flow would
+	// re-introduce it.
 	legacyBare := filepath.Join(tmpHome, ".enju", "repos", "1.git")
 	if _, err := os.Stat(legacyBare); err == nil {
 		t.Errorf("unexpected shadow bare at %s — local-only create should not create one", legacyBare)
@@ -694,7 +694,7 @@ func TestCreateProjectCustomPathCreatesNonExistentParents(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -929,7 +929,7 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1051,7 +1051,7 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# My Paper"), 0644)
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1137,7 +1137,7 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "test@test", When: time.Now()},
 	})
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1211,7 +1211,7 @@ func TestInitIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "data.csv"), []byte("a,b,c"), 0644)
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1296,7 +1296,7 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
 	})
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1391,7 +1391,7 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 		URLs: []string{preExistingOrigin},
 	})
 
-	ws, _ := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1501,23 +1501,23 @@ func TestIsLocalWorkingTree(t *testing.T) {
 			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
 		},
 	})
-	if !workspace.IsLocalWorkingTree(wtDir) {
+	if !project.IsLocalWorkingTree(wtDir) {
 		t.Error("expected working tree detected")
 	}
 
 	// Case 2: plain folder → false.
 	plainDir := t.TempDir()
-	if workspace.IsLocalWorkingTree(plainDir) {
+	if project.IsLocalWorkingTree(plainDir) {
 		t.Error("plain dir should not be detected as working tree")
 	}
 
 	// Case 3: non-existent path → false.
-	if workspace.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
+	if project.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
 		t.Error("non-existent path should not be detected")
 	}
 
 	// Case 4: SSH URL → false.
-	if workspace.IsLocalWorkingTree("git@github.com:org/repo.git") {
+	if project.IsLocalWorkingTree("git@github.com:org/repo.git") {
 		t.Error("SSH URL should not be detected as working tree")
 	}
 }
@@ -1536,7 +1536,7 @@ func TestIsSSHURL(t *testing.T) {
 		{"/home/tamer/projects/myproject/enju/.bare.git", false},
 	}
 	for _, tc := range cases {
-		if got := workspace.IsSSHURL(tc.url); got != tc.want {
+		if got := project.IsSSHURL(tc.url); got != tc.want {
 			t.Errorf("IsSSHURL(%q) = %v, want %v", tc.url, got, tc.want)
 		}
 	}
@@ -1824,12 +1824,11 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	runCommitHash, _ := wt.Commit("Task 2:1:work by @t: result\n\nEnju-Task-Complete: 2:1:work\n",
 		&gogit.CommitOptions{Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()}})
 
-	// Wire the workspace + project. Post-Phase-F path
-	// resolution comes from a projectreg.Registry attached to
-	// the workspace, not the legacy `RegisterExternalDir`
-	// in-memory map.
+	// Wire the opener + project. Path resolution comes from a
+	// projectreg.Registry attached to the opener (the durable
+	// per-machine "project N → home path" record).
 	wsRoot := t.TempDir()
-	ws, _ := workspace.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := project.NewOpener(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	if err := reg.Upsert(projectreg.Entry{ID: 2, LocalPath: workDir}); err != nil {
 		t.Fatalf("registry upsert: %v", err)
@@ -1841,7 +1840,7 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 
 	// Fresh empty bare for the new remote.
 	bareDir := filepath.Join(t.TempDir(), "bare.git")
-	if err := workspace.InitBareEmpty(bareDir); err != nil {
+	if err := project.InitBareEmpty(bareDir); err != nil {
 		t.Fatalf("init bare: %v", err)
 	}
 
@@ -1885,13 +1884,13 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// local branch — main and run-1. Without this, the next
 	// scan would baseline tip and miss the historical trailer
 	// commit on run-1.
-	cursors, err := workspace.LoadCursors(c.stateDir(), 2)
+	cursors, err := project.LoadCursors(c.stateDir(), 2)
 	if err != nil {
 		t.Fatalf("loading cursors: %v", err)
 	}
 	for _, b := range []string{"main", "run-1"} {
-		if got := cursors.Get(b); got != workspace.RescanSentinelSHA {
-			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, workspace.RescanSentinelSHA)
+		if got := cursors.Get(b); got != project.RescanSentinelSHA {
+			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, project.RescanSentinelSHA)
 		}
 	}
 }

@@ -11,7 +11,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func newAPIClient(baseURL string) *apiClient {
@@ -193,7 +193,7 @@ func TestFetchTaskMetaMalformedJSON(t *testing.T) {
 // workspace + a service.FatClient that wraps it, so the useFatClient
 // forwarder has somewhere to dispatch to. Tests below use this in
 // place of the bare `newClient(nil, ws, nil)` literal.
-func newAPIClientWithWorkspace(ws *workspace.Workspace) *apiClient {
+func newAPIClientWithWorkspace(ws *project.Opener) *apiClient {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return newClient(nil, ws, logger)
 }
@@ -208,7 +208,7 @@ func TestUseFatClientNoWorkspaceReturnsFalse(t *testing.T) {
 }
 
 func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
-	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
 }
 
 func TestUseFatClientWithRemoteURL(t *testing.T) {
-	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,15 +231,15 @@ func TestUseFatClientWithRemoteURL(t *testing.T) {
 }
 
 func TestUseFatClientWithExternalDir(t *testing.T) {
-	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	extDir := t.TempDir()
-	// Post-Phase-F: project paths come from the registry, not
-	// an in-memory externalDirs map. Register via projectreg
-	// + AttachRegistry; ForProject (and HasExternalDir) will
-	// find the path the same way they do in production.
+	// Project paths come from the registry. Register via
+	// projectreg + AttachRegistry; ForProject (and
+	// HasExternalDir) will find the path the same way they do
+	// in production.
 	regPath := filepath.Join(t.TempDir(), "projects.json")
 	reg := projectreg.Open(regPath)
 	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: extDir}); err != nil {
@@ -264,7 +264,7 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 // state=accepted with empty commit_sha and no on-disk directory.
 // Only compute tasks worked because they bypass useFatClient.
 func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
-	ws, err := workspace.NewWorkspace(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

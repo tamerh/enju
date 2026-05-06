@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"fmt"
@@ -88,7 +88,7 @@ type ParamSummary struct {
 // (canonical after pull) and falls back to refs/remotes/origin
 // so a just-cloned workspace can discover templates before its
 // first explicit pull.
-func (p *Project) defaultBranchTree() (*object.Tree, error) {
+func (p *Clone) defaultBranchTree() (*object.Tree, error) {
 	b := p.defaultBranchOr()
 	var hash plumbing.Hash
 	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(b), true); err == nil {
@@ -167,7 +167,7 @@ func treeReadBlob(tree *object.Tree, path string) ([]byte, bool, error) {
 // discovered. If any are found, they're surfaced as a single
 // migration-hint entry in the result so the author knows to
 // move them.
-func (p *Project) ListTemplates() ([]TemplateSummary, error) {
+func (p *Clone) ListTemplates() ([]TemplateSummary, error) {
 	roots, err := p.templateRoots()
 	if err != nil {
 		return nil, err
@@ -201,7 +201,7 @@ func (p *Project) ListTemplates() ([]TemplateSummary, error) {
 // scanTemplateRoot walks one template root in the default-branch
 // tree and returns the bundles it finds. Split out so
 // ListTemplates can fan over multiple configured roots.
-func (p *Project) scanTemplateRoot(tree *object.Tree, root string) ([]TemplateSummary, error) {
+func (p *Clone) scanTemplateRoot(tree *object.Tree, root string) ([]TemplateSummary, error) {
 	rootTree, ok, err := treeSubTree(tree, root)
 	if err != nil {
 		return nil, fmt.Errorf("reading templates directory %s: %w", root, err)
@@ -253,7 +253,7 @@ func (p *Project) scanTemplateRoot(tree *object.Tree, root string) ([]TemplateSu
 // templateSummaryFromTree reads one template manifest from the
 // default-branch tree and returns its compressed view. Used by
 // ListTemplates and as a building block for LoadTemplate.
-func (p *Project) templateSummaryFromTree(tree *object.Tree, repoRelPath string) (*TemplateSummary, error) {
+func (p *Clone) templateSummaryFromTree(tree *object.Tree, repoRelPath string) (*TemplateSummary, error) {
 	data, ok, err := treeReadBlob(tree, repoRelPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading template %s: %w", repoRelPath, err)
@@ -318,7 +318,7 @@ type LoadedTemplate struct {
 // Size guard: if the bundle exceeds 10 MB total, return an
 // error — templates aren't the place for large data blobs, and
 // a runaway snapshot would bloat every subsequent run commit.
-func (p *Project) ReadBundleFiles(bundleDir, targetDir string) ([]FileWrite, error) {
+func (p *Clone) ReadBundleFiles(bundleDir, targetDir string) ([]FileWrite, error) {
 	tree, err := p.defaultBranchTree()
 	if err != nil {
 		return nil, err
@@ -424,7 +424,7 @@ func readFullFromBlob(r interface{ Read([]byte) (int, error) }, buf []byte) (int
 // BundleDir carries the surrounding directory so callers doing
 // snapshot-on-instantiate can enumerate all the files in the
 // bundle.
-func (p *Project) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
+func (p *Clone) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	// Block path escapes — user-controlled input even though
 	// it's read from the local workspace, and a `../` could
 	// let a caller pull files from outside the configured
@@ -479,7 +479,7 @@ func (p *Project) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 // validate existence — but it keeps the error message
 // consistent ("must live under <configured roots>") when a
 // caller types a typo'd path.
-func (p *Project) assertUnderTemplatesRoot(repoRelPath string) error {
+func (p *Clone) assertUnderTemplatesRoot(repoRelPath string) error {
 	roots, err := p.templateRoots()
 	if err != nil {
 		return err
@@ -509,7 +509,7 @@ type resolvedBundle struct {
 // EnsureBundleOnDefault commits the bundle before the run
 // actually branches off. Without the fallback, that flow would
 // break because the tree wouldn't have the template yet.
-func (p *Project) resolveAndReadBundle(tree *object.Tree, repoRelPath string) (*resolvedBundle, error) {
+func (p *Clone) resolveAndReadBundle(tree *object.Tree, repoRelPath string) (*resolvedBundle, error) {
 	bundleDir, manifestPath, err := p.resolveBundlePathShape(repoRelPath)
 	if err != nil {
 		return nil, err
@@ -537,7 +537,7 @@ func (p *Project) resolveAndReadBundle(tree *object.Tree, repoRelPath string) (*
 // or filesystem check. Lets both tree-read and
 // filesystem-fallback loaders share the same classification
 // logic.
-func (p *Project) resolveBundlePathShape(repoRelPath string) (bundleDir, manifestPath string, err error) {
+func (p *Clone) resolveBundlePathShape(repoRelPath string) (bundleDir, manifestPath string, err error) {
 	pth := strings.TrimSuffix(repoRelPath, "/")
 	// Manifest form: ends in /<BundleManifestName>.
 	if strings.HasSuffix(pth, "/"+corelayout.BundleManifestName) {
@@ -574,7 +574,7 @@ func (p *Project) resolveBundlePathShape(repoRelPath string) (bundleDir, manifes
 // ParseWithParams (missing required params, type mismatches,
 // unknown param names) bubble up with their natural-language
 // phrasing so the LLM can forward them to the user.
-func (p *Project) InstantiateTemplate(repoRelPath string, params map[string]interface{}) (*enjuYaml.ParsedRun, []byte, error) {
+func (p *Clone) InstantiateTemplate(repoRelPath string, params map[string]interface{}) (*enjuYaml.ParsedRun, []byte, error) {
 	loaded, err := p.LoadTemplate(repoRelPath)
 	if err != nil {
 		return nil, nil, err
@@ -591,7 +591,7 @@ func (p *Project) InstantiateTemplate(repoRelPath string, params map[string]inte
 // before the user commits to submission. Returns nil if the
 // param set is valid; returns the natural-language error
 // otherwise.
-func (p *Project) ValidateTemplateParams(repoRelPath string, params map[string]interface{}) error {
+func (p *Clone) ValidateTemplateParams(repoRelPath string, params map[string]interface{}) error {
 	_, _, err := p.InstantiateTemplate(repoRelPath, params)
 	return err
 }

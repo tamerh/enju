@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Rename-based preservation of non-tracked files across a
 // Force checkout. Workspaces for bio/ML workflows routinely

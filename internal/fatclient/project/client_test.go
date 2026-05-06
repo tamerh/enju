@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"io"
@@ -149,7 +149,7 @@ func TestWorkspaceCloneAndSubmit(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(43, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -273,14 +273,14 @@ func TestSubmitRetryOnConcurrentPush(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	// Client A will submit first.
-	wsA, _ := NewWorkspace(t.TempDir(), nullLogger())
+	wsA, _ := NewOpener(t.TempDir(), nullLogger())
 	projA, err := wsA.ForProject(44, bare)
 	if err != nil {
 		t.Fatalf("clone A: %v", err)
 	}
 
 	// Client B clones and is ready to submit.
-	wsB, _ := NewWorkspace(t.TempDir(), nullLogger())
+	wsB, _ := NewOpener(t.TempDir(), nullLogger())
 	projB, err := wsB.ForProject(44, bare)
 	if err != nil {
 		t.Fatalf("clone B: %v", err)
@@ -340,7 +340,7 @@ func TestReopenExistingClone(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	wsDir := t.TempDir()
-	ws1, _ := NewWorkspace(wsDir, nullLogger())
+	ws1, _ := NewOpener(wsDir, nullLogger())
 	proj1, err := ws1.ForProject(45, bare)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
@@ -348,7 +348,7 @@ func TestReopenExistingClone(t *testing.T) {
 	projDir := proj1.WorkDir()
 
 	// Re-create the workspace — simulating a process restart.
-	ws2, _ := NewWorkspace(wsDir, nullLogger())
+	ws2, _ := NewOpener(wsDir, nullLogger())
 	proj2, err := ws2.ForProject(45, "") // note: no URL passed
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -368,7 +368,7 @@ func TestResolveFanIn(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(46, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -472,7 +472,7 @@ func TestResolveSingletonUpstream(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(47, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -524,7 +524,7 @@ func TestResolveWinningOption(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(90, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -581,7 +581,7 @@ func TestResolveForEachParams(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(48, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -608,7 +608,7 @@ func TestResolveArtifactRead(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(49, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -666,7 +666,7 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(51, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -748,12 +748,13 @@ func TestSubmitCommitAuthorAttribution(t *testing.T) {
 		t.Errorf("AI commit should have Co-Authored-By trailer, got: %s", c2.Message)
 	}
 }
+
 // artifact the task declared can't be found at the given commit.
 func TestResolveMissingArtifact(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(50, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -788,7 +789,7 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	// Client A writes and pushes normally to bare.
-	wsA, _ := NewWorkspace(t.TempDir(), nullLogger())
+	wsA, _ := NewOpener(t.TempDir(), nullLogger())
 	projA, err := wsA.ForProject(60, bare)
 	if err != nil {
 		t.Fatalf("clone A: %v", err)
@@ -809,7 +810,7 @@ func TestPushForceOverwritesDivergedRemote(t *testing.T) {
 	// history). Write + commit locally so HEAD is a real commit.
 	bareB := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bareB)
-	wsB, _ := NewWorkspace(t.TempDir(), nullLogger())
+	wsB, _ := NewOpener(t.TempDir(), nullLogger())
 	projB, err := wsB.ForProject(60, bareB)
 	if err != nil {
 		t.Fatalf("clone B: %v", err)
@@ -874,7 +875,7 @@ func TestSubmitFailsClearlyAgainstUnreachableRemote(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(61, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -983,13 +984,13 @@ func TestCrossWorkspaceFlockSerialization(t *testing.T) {
 
 	sharedRoot := t.TempDir()
 
-	wsA, _ := NewWorkspace(sharedRoot, nullLogger())
+	wsA, _ := NewOpener(sharedRoot, nullLogger())
 	projA, err := wsA.ForProject(80, bare)
 	if err != nil {
 		t.Fatalf("wsA ForProject: %v", err)
 	}
 
-	wsB, _ := NewWorkspace(sharedRoot, nullLogger())
+	wsB, _ := NewOpener(sharedRoot, nullLogger())
 	projB, err := wsB.ForProject(80, bare)
 	if err != nil {
 		t.Fatalf("wsB ForProject: %v", err)
@@ -1043,7 +1044,7 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	wsDir := t.TempDir()
-	ws, _ := NewWorkspace(wsDir, nullLogger())
+	ws, _ := NewOpener(wsDir, nullLogger())
 	proj, err := ws.ForProject(70, bare)
 	if err != nil {
 		t.Fatalf("first clone: %v", err)
@@ -1089,7 +1090,7 @@ func TestSlugifyProjectDir(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	wsDir := t.TempDir()
-	ws, _ := NewWorkspace(wsDir, nullLogger())
+	ws, _ := NewOpener(wsDir, nullLogger())
 
 	// Case 1: passing a project name creates a slug-based dir.
 	proj, err := ws.ForProject(7, bare, "Battle Test Alpha")
@@ -1106,7 +1107,7 @@ func TestSlugifyProjectDir(t *testing.T) {
 
 	// Case 2: legacy numeric dir gets auto-migrated.
 	// Create a numeric-only clone, then call ForProject with a name.
-	ws2, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws2, _ := NewOpener(t.TempDir(), nullLogger())
 	projOld, err := ws2.ForProject(8, bare) // no name → numeric dir
 	if err != nil {
 		t.Fatalf("clone without name: %v", err)
@@ -1166,7 +1167,7 @@ func (e *stringErr) Error() string { return e.msg }
 // exercise ListTemplates/LoadTemplate/LoadProjectConfig have to
 // commit their fixtures rather than leaving them as worktree
 // files.
-func commitToDefault(t *testing.T, proj *Project, files map[string][]byte) {
+func commitToDefault(t *testing.T, proj *Clone, files map[string][]byte) {
 	t.Helper()
 	writes := make([]FileWrite, 0, len(files))
 	for path, body := range files {

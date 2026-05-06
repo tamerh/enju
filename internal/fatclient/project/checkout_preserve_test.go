@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // CheckoutBranch's interaction with untracked worktree files.
 // The code comment on CheckoutBranch claims "Untracked files
@@ -17,6 +17,7 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,7 +32,7 @@ func TestCheckoutBranchPreservesUntrackedFiles(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestCheckoutBranchRemovesTrackedFilesFromPriorBranch(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestCheckoutBranchMultiBranchCleanSwitches(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	// Commit file-a on branch-a.
@@ -237,7 +238,7 @@ func TestCheckoutBranchPriorBranchFilesNotOnMainAfterEnsureBundle(t *testing.T) 
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	// Simulate create_run(bundle-a, branch=run-a):
@@ -349,7 +350,7 @@ func TestCheckoutBranchPreservesUntrackedRoot(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(2, bare)
 
 	workDir := proj.WorkDir()
@@ -382,7 +383,7 @@ func TestCheckoutBranchPreservesGitignoredFiles(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -466,7 +467,7 @@ func TestCheckoutBranchRenamePreserveLargeFileConstantMemory(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -600,7 +601,7 @@ func TestCheckoutBranchSubtreeRenameIsWholeDir(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -657,7 +658,7 @@ func TestCrashRecoveryOfLeftoverPreserveDir(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	rootDir := t.TempDir()
-	ws, _ := NewWorkspace(rootDir, nullLogger())
+	ws, _ := NewOpener(rootDir, nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("first clone: %v", err)
@@ -688,7 +689,7 @@ func TestCrashRecoveryOfLeftoverPreserveDir(t *testing.T) {
 	// through openOrClone again (which invokes recovery).
 	proj.Lock()
 	proj.Unlock()
-	ws.clients = map[int64]*Project{}
+	ws.clients = map[int64]*Clone{}
 
 	// Re-open: recovery should run.
 	_, err = ws.ForProject(1, bare)
@@ -749,5 +750,138 @@ func TestCountConflictFilesDescendsIntoDirs(t *testing.T) {
 	want := 4 // 3 files under data/ + note.md
 	if got != want {
 		t.Errorf("countConflictFiles: got %d, want %d (dir-entry conflict should count descendants)", got, want)
+	}
+}
+
+// TestCheckoutBranchDrainsLeftoverPreserveDir pins the
+// in-process recovery: a preserve dir from a prior failed
+// checkout (still on disk because the cached *Clone never
+// re-runs openOrClone's recovery hook) gets drained at the
+// top of the next CheckoutBranchFrom — without the drain,
+// movePreserveNonTracked would rename fresh paths INTO the
+// dirty dir and produce undefined state.
+func TestCheckoutBranchDrainsLeftoverPreserveDir(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
+	proj, _ := ws.ForProject(1, bare)
+	preserveDir := proj.workDir + preserveDirSuffix
+
+	// Plant a preserve dir as if a prior crashed checkout
+	// left it behind. The file inside doesn't conflict with
+	// anything on the current branch.
+	if err := os.MkdirAll(preserveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	preservedContent := []byte("recovered from prior crash\n")
+	if err := os.WriteFile(filepath.Join(preserveDir, "leftover.md"), preservedContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger a checkout. The drain should restore leftover.md
+	// into the workdir before the new preserve cycle begins.
+	proj.Lock()
+	err := proj.CheckoutBranch("feature-x")
+	proj.Unlock()
+	if err != nil {
+		t.Fatalf("CheckoutBranch: %v", err)
+	}
+
+	// File restored into work dir.
+	got, err := os.ReadFile(filepath.Join(proj.workDir, "leftover.md"))
+	if err != nil {
+		t.Fatalf("leftover.md not restored: %v", err)
+	}
+	if string(got) != string(preservedContent) {
+		t.Errorf("restored content mismatch: got %q, want %q", got, preservedContent)
+	}
+	// Preserve dir cleaned up.
+	if _, err := os.Stat(preserveDir); err == nil {
+		t.Error("preserve dir should have been removed after successful drain")
+	}
+}
+
+// TestCheckoutBranchRefusesWhenLeftoverPreserveConflicts pins
+// the safety guard: when the leftover preserve dir contains
+// a file the current branch ALSO tracks, drain leaves it for
+// manual review and the new checkout refuses to proceed —
+// fresh preservation must never write into a dirty dir.
+func TestCheckoutBranchRefusesWhenLeftoverPreserveConflicts(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
+	proj, _ := ws.ForProject(1, bare)
+	preserveDir := proj.workDir + preserveDirSuffix
+
+	// Plant a preserve dir whose content collides with a
+	// path the current branch tracks (README.md is in the
+	// seeded initial commit).
+	if err := os.MkdirAll(preserveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(preserveDir, "README.md"), []byte("conflicting"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	proj.Lock()
+	err := proj.CheckoutBranch("feature-y")
+	proj.Unlock()
+	if err == nil {
+		t.Fatal("expected error refusing checkout, got nil")
+	}
+	if !strings.Contains(err.Error(), "leftover preserve dir") {
+		t.Errorf("error should mention leftover preserve dir; got %q", err.Error())
+	}
+	// Preserve dir's conflicting file untouched — operator
+	// can review and remove it manually.
+	if _, err := os.Stat(filepath.Join(preserveDir, "README.md")); err != nil {
+		t.Errorf("conflicting preserve file should still be present for review: %v", err)
+	}
+}
+
+// TestOpenExistingDrainsLeftoverPreserveDir mirrors the
+// openOrClone recovery hook for the read-only path. Webui /
+// inbox callers go through OpenExisting; without recovery
+// here, a preserve dir from a crashed checkout would survive
+// across daemon restarts that happen to open via this path.
+func TestOpenExistingDrainsLeftoverPreserveDir(t *testing.T) {
+	bare := initBareRemote(t)
+	seedRemoteWithInitialCommit(t, bare)
+
+	rootDir := t.TempDir()
+	ws, _ := NewOpener(rootDir, nullLogger())
+	// Materialize the clone via ForProject first so the
+	// on-disk shape matches what OpenExisting expects.
+	if _, err := ws.ForProject(1, bare); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the cache so the next ForProject/OpenExisting
+	// call goes through the real open path.
+	delete(ws.clients, 1)
+
+	// Locate the workdir and plant a preserve dir.
+	workDir := ws.findProjectDir(1)
+	if workDir == "" {
+		t.Fatal("could not find clone dir")
+	}
+	preserveDir := workDir + preserveDirSuffix
+	if err := os.MkdirAll(preserveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(preserveDir, "scratch.md"), []byte("crashed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// OpenExisting should drain the preserve dir.
+	if _, err := ws.OpenExisting(1); err != nil {
+		t.Fatalf("OpenExisting: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "scratch.md")); err != nil {
+		t.Errorf("scratch.md should have been restored to workDir: %v", err)
+	}
+	if _, err := os.Stat(preserveDir); err == nil {
+		t.Error("preserve dir should be cleaned up after OpenExisting")
 	}
 }

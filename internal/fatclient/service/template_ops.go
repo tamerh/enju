@@ -14,7 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // Type aliases re-export the workspace template shapes through
@@ -22,17 +22,17 @@ import (
 // service.TemplateSummary without importing workspace —
 // keeps the published FatClient API self-contained at the
 // fatclient/service boundary.
-type TemplateSummary = workspace.TemplateSummary
-type ParamSummary = workspace.ParamSummary
-type LoadedTemplate = workspace.LoadedTemplate
+type TemplateSummary = project.TemplateSummary
+type ParamSummary = project.ParamSummary
+type LoadedTemplate = project.LoadedTemplate
 
 // ListTemplates opens the project clone, best-effort pulls,
 // and returns the list of template entries. A failed pull is
 // logged at Debug and the scan proceeds against whatever's on
 // disk — the user still gets a menu, and the error surfaces
 // on the next branch-touching tool call if it's load-bearing.
-func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]workspace.TemplateSummary, error) {
-	if s.workspace == nil {
+func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]project.TemplateSummary, error) {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_list_templates requires a local workspace (MCP client mode)")
 	}
 	proj, _, _, _, err := s.OpenProject(ctx, projectID)
@@ -49,8 +49,8 @@ func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]works
 
 // DescribeTemplate opens the project clone, best-effort pulls,
 // and loads one template by path.
-func (s *FatClient) DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*workspace.LoadedTemplate, error) {
-	if s.workspace == nil {
+func (s *FatClient) DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*project.LoadedTemplate, error) {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_describe_template requires a local workspace (MCP client mode)")
 	}
 	proj, _, _, _, err := s.OpenProject(ctx, projectID)

@@ -154,7 +154,7 @@ func (s *FatClient) ClaimReadyMatching(ctx context.Context, params ClaimMatching
 	// branch. If a future relaxation allows cross-run
 	// selectors, this optimization has to move inside the
 	// per-entry loop.
-	if s.workspace != nil {
+	if s.project != nil {
 		if firstMeta, err := s.FetchTaskMeta(ctx, pool[0].taskID); err == nil && firstMeta != nil && s.UseFatClient(firstMeta) {
 			if proj, _, _, _, perr := s.OpenProject(ctx, firstMeta.ProjectID); perr == nil && proj != nil {
 				_ = s.PullBranchWithReconcile(ctx, proj, firstMeta.ProjectID, firstMeta.Branch)

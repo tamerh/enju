@@ -12,7 +12,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // ClaimParams is the input shape for FatClient.ClaimTask. Mirrors
@@ -77,7 +77,7 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	if commitSHA == "" || resultDir == "" {
 		return "", false, nil
 	}
-	if s.workspace == nil {
+	if s.project == nil {
 		return "", true, fmt.Errorf("no workspace configured")
 	}
 	// Read-only: resolve the existing on-disk clone via
@@ -87,9 +87,9 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	// clone on disk, silently creating an orphan empty repo
 	// at "{rootDir}/{id}" that outranks the real clone in
 	// subsequent lookups.
-	proj, perr := s.workspace.OpenExisting(projectID)
+	proj, perr := s.project.OpenExisting(projectID)
 	if perr != nil {
-		if errors.Is(perr, workspace.ErrCloneNotFound) {
+		if errors.Is(perr, project.ErrCloneNotFound) {
 			return "", false, nil
 		}
 		return "", true, fmt.Errorf("open project clone: %w", perr)
@@ -269,9 +269,9 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	// THAT commit's tree directly via ReadFileAtCommit; fall
 	// back to the worktree ReadFile for legacy paths (no
 	// iteration branch involved, prior commit unknown).
-	if result.ReviewFeedback != nil && meta != nil && s.workspace != nil {
+	if result.ReviewFeedback != nil && meta != nil && s.project != nil {
 		remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-		if proj, perr := s.workspace.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
+		if proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
 			contentPath := filepath.Join(meta.ResultDir, "result.md")
 			var content []byte
 			if meta.PreviousIterationCommit != "" {
@@ -314,11 +314,11 @@ func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []b
 	// both the result.md and metadata.json are still on disk.
 	// We read metadata.json to recover the decision and
 	// reviewer identity.
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil
 	}
 	remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-	proj, perr := s.workspace.ForProject(meta.ProjectID, remoteURL, projName)
+	proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName)
 	if perr != nil {
 		return nil
 	}
@@ -409,7 +409,7 @@ func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []b
 // checkUntrackedReadsPresence verifies that every upstream
 // artifact this task reads is either tracked (in which case git
 // resolution handles it) or, if untracked, actually exists on
-// the local workspace. Returns a user-facing error when an
+// the local project. Returns a user-facing error when an
 // untracked upstream is missing — the caller surfaces it as a
 // tool-result-error so the task stays claimable by another
 // citizen who does have the file.
@@ -456,7 +456,7 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		}
 	}
 	remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-	proj, perr := s.workspace.ForProject(meta.ProjectID, remoteURL, projName)
+	proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName)
 	if perr != nil {
 		s.logger.Warn("opening project for presence check", "project_id", meta.ProjectID, "error", perr)
 		return nil
@@ -476,11 +476,11 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		// stat succeeds. EnsureSharedSymlink is a noop when
 		// the env var is unset, so this call is free in
 		// local-only setups.
-		if err := workspace.EnsureSharedSymlink(workspace.ArtifactPath(p), workDir,
+		if err := project.EnsureSharedSymlink(project.ArtifactPath(p), workDir,
 			meta.ProjectID, meta.ProjectName, meta.Branch, p); err != nil {
 			s.logger.Warn("shared-root symlink setup", "path", p, "error", err)
 		}
-		full := filepath.Join(workDir, workspace.ArtifactPath(p))
+		full := filepath.Join(workDir, project.ArtifactPath(p))
 		if _, err := os.Stat(full); err != nil {
 			missing = append(missing, p)
 		}
@@ -506,7 +506,7 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 // FetchAndResolveLocally is the fat-client claim-time resolver:
 // ask the coordinator for a dependency descriptor, open/pull
 // the local clone, read upstream results and artifacts locally,
-// render the resolved prompt via workspace. Returns a JSON blob
+// render the resolved prompt via project. Returns a JSON blob
 // that looks like the legacy /inputs response so formatters
 // don't need to know which path produced it.
 //
@@ -549,14 +549,14 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 	proj.Lock()
 	defer proj.Unlock()
 
-	input := workspace.ResolveInput{
+	input := project.ResolveInput{
 		TaskID:       meta.ID,
 		PromptTemplate:   desc.PromptTemplate,
 		UserPromptTemplate: desc.UserPromptTemplate,
 		ForEachParams:   desc.ForEachParams,
 	}
 	for _, d := range desc.Dependencies {
-		ref := workspace.DependencyRef{
+		ref := project.DependencyRef{
 			TaskDefID:   d.TaskDefID,
 			InstanceKey:  d.InstanceKey,
 			InstanceParams: d.InstanceParams,
@@ -570,7 +570,7 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 			if pathUser == "" {
 				pathUser = r.Username
 			}
-			ref.Responses = append(ref.Responses, workspace.CitizenResponseRef{
+			ref.Responses = append(ref.Responses, project.CitizenResponseRef{
 				Username:   r.Username,
 				PathUsername: pathUser,
 				Option:    r.Option,
@@ -580,7 +580,7 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 		input.Dependencies = append(input.Dependencies, ref)
 	}
 	for _, a := range desc.ArtifactReads {
-		input.ArtifactReads = append(input.ArtifactReads, workspace.ArtifactRef{
+		input.ArtifactReads = append(input.ArtifactReads, project.ArtifactRef{
 			Path:   a.Path,
 			CommitSHA: a.CommitSHA,
 		})

@@ -14,12 +14,12 @@ import (
 	"strconv"
 
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func cmdInbox(args []string) {
 	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL (only used to look up identity from credentials.json — inbox itself reads only local files)")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json; only used to look up identity, inbox reads local files)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running for a non-default citizen.")
 	workspaceRoot := fs.String("workspace", "", "Workspace root (default ~/.enju/workspaces/). The project clone is expected at <workspace>/{slug}-{id}/.")
 	fs.Usage = func() {
@@ -63,7 +63,7 @@ Flags:`)
 		home, _ := os.UserHomeDir()
 		wsRoot = filepath.Join(home, ".enju", "workspaces")
 	}
-	ws, err := workspace.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := project.NewOpener(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "opening workspace %s: %v\n", wsRoot, err)
 		os.Exit(1)
@@ -89,11 +89,11 @@ Flags:`)
 	fmt.Println(inbox.FormatInbox(rows))
 }
 
-// cliInboxDeps adapts workspace.Project to inbox.Deps. The shared
+// cliInboxDeps adapts project.Clone to inbox.Deps. The shared
 // inbox core needs only a single method — git read at commit —
 // so this is intentionally tiny.
 type cliInboxDeps struct {
-	proj *workspace.Project
+	proj *project.Clone
 }
 
 func (d *cliInboxDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {

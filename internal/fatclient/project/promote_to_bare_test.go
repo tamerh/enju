@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Tests for PromoteWorkingTreeToBare — the primitive that
 // `enju bot setup` calls to give an adopted-folder project a

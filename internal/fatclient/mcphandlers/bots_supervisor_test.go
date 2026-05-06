@@ -178,6 +178,77 @@ func TestHandleBotStart_OmittedManifestAllowlistMeansAllTools(t *testing.T) {
 	}
 }
 
+// TestHandleBotStart_AutoDiscoversWhenSingleBotInManifest pins
+// the UX win: omitting `bot` succeeds when the manifest has
+// exactly one entry. Cuts redundant typing for the dominant
+// solo-project case.
+func TestHandleBotStart_AutoDiscoversWhenSingleBotInManifest(t *testing.T) {
+	fakeBin := writeFakeBinary(t)
+	pidDir := t.TempDir()
+	logDir := t.TempDir()
+	c := newClientWithSupervisor(t, fakeBin, pidDir, logDir)
+	defer c.supervisor.StopAll(context.Background())
+
+	projectDir := writeManifestForBot(t, "lonely-bot", nil)
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_bot_start",
+			Arguments: map[string]any{
+				"project": projectDir, // no `bot` field
+			},
+		},
+	}
+	res, err := c.handleBotStart(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("handleBotStart: err=%v res=%s", err, textOf(res))
+	}
+	if !strings.Contains(textOf(res), "lonely-bot") {
+		t.Errorf("expected response to mention auto-discovered bot lonely-bot, got %s", textOf(res))
+	}
+}
+
+// TestHandleBotStart_RefusesAmbiguousAutoDiscover pins the
+// safety: when the manifest has two or more bots, omitting
+// `bot` errors with a list of names so the operator can pick.
+// Without this guard the supervisor would silently start the
+// first bot — surprising and impossible to reason about.
+func TestHandleBotStart_RefusesAmbiguousAutoDiscover(t *testing.T) {
+	fakeBin := writeFakeBinary(t)
+	pidDir := t.TempDir()
+	logDir := t.TempDir()
+	c := newClientWithSupervisor(t, fakeBin, pidDir, logDir)
+	defer c.supervisor.StopAll(context.Background())
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "enju"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	body := "version: 1\nbots:\n  - name: alice\n    model: claude-sonnet-4-6\n  - name: bob\n    model: claude-sonnet-4-6\n"
+	if err := os.WriteFile(filepath.Join(dir, "enju", "bots.yaml"), []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_bot_start",
+			Arguments: map[string]any{
+				"project": dir,
+			},
+		},
+	}
+	res, err := c.handleBotStart(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleBotStart: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected error result on ambiguous auto-discover; got success: %s", textOf(res))
+	}
+	msg := textOf(res)
+	if !strings.Contains(msg, "alice") || !strings.Contains(msg, "bob") {
+		t.Errorf("error must list both candidate names; got %s", msg)
+	}
+}
+
 // textOf extracts the first text content from a CallToolResult
 // for error messages. Matches the inlined helper in mcp-go's
 // own tests.

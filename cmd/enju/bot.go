@@ -21,7 +21,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // cmdBot is the parent dispatcher for `enju bot <subcommand>`.
@@ -101,7 +101,7 @@ Run 'enju bot <command> -h' for command-specific help.`)
 // register-or-rollback is out of scope for Phase 1.
 func cmdBotSetup(args []string) {
 	fs := flag.NewFlagSet("bot setup", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	credsPath := fs.String("credentials", "", "Path to OWNER credentials.json (default ~/.enju/credentials.json). Used only to authenticate the registration calls — bot tokens land at each bot's manifest-declared path.")
 	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
 	projectIDFlag := fs.Int64("project-id", 0, "Project id to add bots to as members (overrides manifest's project_id). 0 = no auto-add; operator must call enju_add_project_member manually.")
@@ -173,80 +173,36 @@ func cmdBotSetup(args []string) {
 
 	for i := range manifest.Bots {
 		b := &manifest.Bots[i]
-		// Idempotency: a credentials file at the declared path
-		// means setup has already run for this bot. We don't
-		// validate its contents — the daemon will surface a
-		// clearer error if the token is bad than we would here.
-		//
-		// We still run the membership add for already-registered
-		// bots when --project-id is set: the bot might have been
-		// registered before the auto-add path existed, or the
-		// previous setup ran without a project id. Membership is
-		// idempotent on the coord side, so re-running is safe and
-		// fixes the legacy "registered but not a project member"
-		// state.
-		if _, err := os.Stat(b.Credentials); err == nil {
-			fmt.Printf("  %-20s ✓ already set up — credentials at %s\n", b.Name, b.Credentials)
-			skipped++
-			if effectiveProjectID > 0 && !*dryRun {
-				existing := loadCredentialsAt(*coordinator, b.Credentials)
-				if existing != nil && existing.Username != "" {
-					if err := addBotToProject(ctx, *coordinator, owner.Token, effectiveProjectID, existing.Username); err != nil {
-						fmt.Fprintf(os.Stderr, "  %-20s ⚠ couldn't add to project %d: %v\n   add manually: enju_add_project_member project_id=%d username=%s\n",
-							b.Name, effectiveProjectID, err, effectiveProjectID, existing.Username)
-					} else {
-						fmt.Printf("  %-20s ✓ ensured member of project #%d\n", b.Name, effectiveProjectID)
-					}
-				}
+		if *dryRun {
+			if _, err := os.Stat(b.Credentials); err == nil {
+				fmt.Printf("  %-20s ✓ already set up — credentials at %s\n", b.Name, b.Credentials)
+				skipped++
+			} else {
+				fmt.Printf("  %-20s [dry-run] would register and stash at %s\n", b.Name, b.Credentials)
+				registered++
 			}
 			continue
 		}
-		if *dryRun {
-			fmt.Printf("  %-20s [dry-run] would register and stash at %s\n", b.Name, b.Credentials)
-			registered++
-			continue
-		}
-
-		token, username, err := registerBot(ctx, *coordinator, owner.Token, b)
+		res, err := setupBotIfNeeded(ctx, *coordinator, owner, b, effectiveProjectID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  %-20s ✗ register failed: %v\n", b.Name, err)
+			fmt.Fprintf(os.Stderr, "  %-20s ✗ %v\n", b.Name, err)
 			failed++
 			continue
 		}
-
-		// Stash the bot's credentials in the same shape the
-		// human's credentials.json uses, so the bot daemon can
-		// reuse the existing fatclient identity-loading path
-		// without a parallel format. The username field carries
-		// whatever username the coord assigned (the manifest
-		// requested b.Name; the coord may auto-suffix on
-		// collision via generateUniqueUsername).
-		if err := writeBotCredentials(b.Credentials, *coordinator, username, b.Name, token); err != nil {
-			fmt.Fprintf(os.Stderr, "  %-20s ✗ token written but credentials file save failed: %v\n   IMPORTANT: stash this token NOW or the bot is unrecoverable: %s\n", b.Name, err, token)
-			failed++
-			continue
+		switch res.Status {
+		case "registered":
+			fmt.Printf("  %-20s ✓ registered as %s, credentials at %s\n", b.Name, res.Username, b.Credentials)
+			registered++
+		case "already-set-up":
+			fmt.Printf("  %-20s ✓ already set up — credentials at %s\n", b.Name, b.Credentials)
+			skipped++
 		}
-		fmt.Printf("  %-20s ✓ registered as %s, credentials at %s\n", b.Name, username, b.Credentials)
-		registered++
-
-		// Auto-add to project membership when configured. Without
-		// this, the freshly-registered bot is a citizen but has no
-		// access to its project's runs — `enju bot run` would
-		// poll, get 403s on /projects/{id}/runs, and never claim
-		// anything. The owner's token authorizes the add (operator
-		// who ran `enju bot setup` must be a project member; the
-		// coord enforces that on the POST).
-		//
-		// "already a member" is treated as success — the operator
-		// re-running setup after a partial registration shouldn't
-		// see a failure when the membership step succeeded the
-		// first time around.
-		if effectiveProjectID > 0 {
-			if err := addBotToProject(ctx, *coordinator, owner.Token, effectiveProjectID, username); err != nil {
-				fmt.Fprintf(os.Stderr, "  %-20s ⚠ registered but couldn't add to project %d: %v\n   add manually: enju_add_project_member project_id=%d username=%s\n",
-					b.Name, effectiveProjectID, err, effectiveProjectID, username)
+		if effectiveProjectID > 0 && res.Username != "" {
+			if res.AddedToPr {
+				fmt.Printf("  %-20s ✓ ensured member of project #%d\n", b.Name, effectiveProjectID)
 			} else {
-				fmt.Printf("  %-20s ✓ added to project #%d as member\n", b.Name, effectiveProjectID)
+				fmt.Fprintf(os.Stderr, "  %-20s ⚠ couldn't add to project %d (manual: enju_add_project_member project_id=%d username=%s)\n",
+					b.Name, effectiveProjectID, effectiveProjectID, res.Username)
 			}
 		}
 	}
@@ -285,6 +241,68 @@ func cmdBotSetup(args []string) {
 	if failed > 0 {
 		os.Exit(2)
 	}
+}
+
+// botSetupResult summarizes setupBotIfNeeded's outcome so callers
+// can render a one-line status without re-running the existence
+// check. Status mirrors the cmdBotSetup tally vocabulary so
+// `enju bot run`'s self-heal output stays visually consistent
+// with `enju bot setup`.
+type botSetupResult struct {
+	Status    string // "registered", "already-set-up", or empty on no-op
+	Username  string // coord-assigned username (may differ from b.Name on collision)
+	AddedToPr bool   // true when project membership was newly added (vs already-member)
+}
+
+// setupBotIfNeeded performs the per-bot work `enju bot setup`
+// does — register against the coord if no credentials file
+// exists at b.Credentials, write the credentials file, and
+// optionally add the bot to a project. Idempotent: a present
+// credentials file short-circuits to "already-set-up" without
+// touching the coord. Used by both `enju bot setup` (looped
+// over every manifest entry) and `enju bot run` (lazy self-
+// heal for the one bot the operator named).
+//
+// owner.Token authenticates the registration. effectiveProjectID
+// = 0 means "skip the membership step" — the operator can add
+// later via enju_add_project_member.
+func setupBotIfNeeded(ctx context.Context, coordinator string, owner *credentials, b *bots.Bot, effectiveProjectID int64) (botSetupResult, error) {
+	if _, err := os.Stat(b.Credentials); err == nil {
+		// Idempotent path: existing credentials file means setup
+		// already happened. We don't probe the coord — if the
+		// token's stale the daemon's first auth attempt surfaces
+		// a clearer error than a setup-time liveness check.
+		res := botSetupResult{Status: "already-set-up"}
+		existing := loadCredentialsAt(coordinator, b.Credentials)
+		if existing != nil {
+			res.Username = existing.Username
+		}
+		// Re-run membership add only when explicitly scoped to a
+		// project — fixes the legacy "registered before auto-add
+		// existed" state without mutating coord state on every
+		// bot run.
+		if effectiveProjectID > 0 && res.Username != "" {
+			if err := addBotToProject(ctx, coordinator, owner.Token, effectiveProjectID, res.Username); err == nil {
+				res.AddedToPr = true
+			}
+		}
+		return res, nil
+	}
+
+	token, username, err := registerBot(ctx, coordinator, owner.Token, b)
+	if err != nil {
+		return botSetupResult{}, fmt.Errorf("register: %w", err)
+	}
+	if err := writeBotCredentials(b.Credentials, coordinator, username, b.Name, token); err != nil {
+		return botSetupResult{}, fmt.Errorf("token issued by coord but couldn't be written to %s: %w (token: %s — stash this NOW or the bot is unrecoverable)", b.Credentials, err, token)
+	}
+	res := botSetupResult{Status: "registered", Username: username}
+	if effectiveProjectID > 0 {
+		if err := addBotToProject(ctx, coordinator, owner.Token, effectiveProjectID, username); err == nil {
+			res.AddedToPr = true
+		}
+	}
+	return res, nil
 }
 
 // registerBot POSTs to /api/v1/citizens/me/bots and returns the
@@ -333,6 +351,31 @@ func registerBot(ctx context.Context, coordURL, ownerToken string, b *bots.Bot) 
 		return "", "", fmt.Errorf("coord returned empty token")
 	}
 	return out.Token, out.Username, nil
+}
+
+// ensureBotMembership best-effort adds botUsername to projectID
+// using owner's token. Called on every `enju bot run` startup —
+// not just on first registration — because a previously-set-up
+// bot may be starting against a different project than setup
+// ran for, or the manifest's project_id may have been 0 at
+// setup time. addBotToProject is idempotent (treats already-
+// a-member as success), so re-running is free.
+//
+// Failures don't abort startup: the daemon will surface a
+// clearer "not a member" error on its first poll, and we'd
+// rather see a bot try and fail loudly than block its launch
+// over a transient coord blip. The stderr line gives the
+// operator the bot+project pair so they know which manual
+// add to run if the auto-step keeps failing.
+//
+// `stderr` is parameterized for testability — production passes
+// os.Stderr; tests capture into a bytes.Buffer to assert the
+// failure-message shape.
+func ensureBotMembership(ctx context.Context, coord, ownerToken string, projectID int64, botUsername string, stderr io.Writer) {
+	if err := addBotToProject(ctx, coord, ownerToken, projectID, botUsername); err != nil {
+		fmt.Fprintf(stderr, "self-heal: couldn't ensure bot %q is a member of project %d: %v\n   the daemon will surface the failure on its first poll if this isn't resolved\n",
+			botUsername, projectID, err)
+	}
 }
 
 // addBotToProject POSTs to /api/v1/projects/{id}/members to add
@@ -401,7 +444,7 @@ func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credent
 		fmt.Fprintf(os.Stderr, "  ! couldn't resolve workspace root for bot push-target setup: %v\n", err)
 		return
 	}
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ! couldn't open workspace for bot push-target setup: %v\n", err)
 		return
@@ -505,7 +548,7 @@ func writeBotCredentials(path, coordinator, username, name, token string) error 
 // / start_all) are the recommended way to orchestrate.
 func cmdBotRun(args []string) {
 	fs := flag.NewFlagSet("bot run", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	botName := fs.String("bot", "", "Bot name from enju/bots.yaml (required)")
 	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
 	projectID := fs.Int64("project-id", 0, "Project id to scope task discovery (0 = every project the bot is a member of)")
@@ -548,10 +591,109 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
+	// Self-heal: if the bot has no credentials file yet, register
+	// it on the spot using the operator's owner credentials. Saves
+	// the operator one explicit `enju bot setup` round-trip — for
+	// solo projects with one operator + a few bots that's the
+	// dominant case. Owner credentials default to
+	// ~/.enju/credentials.json; an explicit --owner-credentials
+	// flag overrides for hosts running multiple operator
+	// identities.
 	creds := loadCredentialsAt(*coordinator, bot.Credentials)
 	if creds == nil || creds.Token == "" {
-		fmt.Fprintf(os.Stderr, "no credentials for bot %q at %s — run `enju bot setup` first\n", bot.Name, bot.Credentials)
-		os.Exit(1)
+		setupCtx, setupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		owner := loadCredentialsAt(*coordinator, resolveCredentialsPath(""))
+		if owner == nil || owner.Token == "" {
+			setupCancel()
+			fmt.Fprintf(os.Stderr, "no credentials for bot %q at %s, and no owner credentials at %s for %s either.\n",
+				bot.Name, bot.Credentials, resolveCredentialsPath(""), *coordinator)
+			fmt.Fprintln(os.Stderr, "Register your own identity first by running `enju mcp` once, then re-run `enju bot run --bot=...`.")
+			os.Exit(1)
+		}
+		// Membership: prefer the run's --project-id flag (operator
+		// asked to scope to one project anyway), else fall back
+		// to the manifest's project_id. Same precedence
+		// `cmdBotSetup` uses.
+		effectiveProjectID := *projectID
+		if effectiveProjectID == 0 {
+			effectiveProjectID = manifest.ProjectID
+		}
+		fmt.Fprintf(os.Stderr, "self-heal: registering bot %q against %s (owner=%s)\n", bot.Name, *coordinator, owner.Username)
+		res, setupErr := setupBotIfNeeded(setupCtx, *coordinator, owner, bot, effectiveProjectID)
+		setupCancel()
+		if setupErr != nil {
+			fmt.Fprintf(os.Stderr, "self-heal failed: %v\n", setupErr)
+			os.Exit(1)
+		}
+		switch res.Status {
+		case "registered":
+			fmt.Fprintf(os.Stderr, "self-heal: registered as %s, credentials at %s\n", res.Username, bot.Credentials)
+			if effectiveProjectID > 0 && res.AddedToPr {
+				fmt.Fprintf(os.Stderr, "self-heal: added to project #%d as member\n", effectiveProjectID)
+			}
+		case "already-set-up":
+			// Defensive: setupBotIfNeeded saw a creds file even
+			// though loadCredentialsAt above didn't — schema
+			// mismatch (wrong coordinator URL?) or a race where
+			// another process landed creds between our checks.
+			fmt.Fprintf(os.Stderr, "self-heal: credentials file appeared at %s — re-loading\n", bot.Credentials)
+		}
+		creds = loadCredentialsAt(*coordinator, bot.Credentials)
+		if creds == nil || creds.Token == "" {
+			fmt.Fprintf(os.Stderr, "self-heal succeeded but credentials still unloadable at %s — coordinator URL mismatch?\n", bot.Credentials)
+			os.Exit(1)
+		}
+	}
+
+	// Always ensure the project's push target exists AND that
+	// this bot is a member of the project. Both calls are
+	// idempotent — a bare already in place is a no-op, and
+	// addBotToProject treats "already a member" as success —
+	// so the run path can fire them on every start without
+	// coord chatter or filesystem churn.
+	//
+	// The membership step matters even when bot creds already
+	// exist: a bot may have been registered against project A
+	// (where setup ran) and is now starting against project B,
+	// or the manifest's project_id was 0 at setup time (so
+	// membership was skipped) and is set now. The user-reported
+	// failure mode was the daemon polling for tasks, hitting
+	// "not a member of this project" indefinitely, with the
+	// operator forced to call enju_add_project_member by hand
+	// for every bot in the manifest.
+	if *projectID > 0 || manifest.ProjectID > 0 {
+		// Use owner credentials for both calls: only the
+		// operator's identity is allowed to write into the
+		// project's enju/.bare.git/ scaffolding (the bot's
+		// project membership doesn't grant filesystem rights),
+		// and project membership additions require an existing
+		// member with permission to add (typically the project
+		// owner).
+		owner := loadCredentialsAt(*coordinator, resolveCredentialsPath(""))
+		if owner != nil && owner.Token != "" {
+			pid := *projectID
+			if pid == 0 {
+				pid = manifest.ProjectID
+			}
+			ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ensureBotPushTarget(ensureCtx, *coordinator, owner, pid)
+			ensureBotMembership(ensureCtx, *coordinator, owner.Token, pid, creds.Username, os.Stderr)
+			ensureCancel()
+		}
+		// No owner creds → skip silently. The daemon either
+		// works against an existing bare + pre-set membership
+		// (real-remote project) or the operator will see the
+		// push failure / "not a member" loop and run
+		// `enju mcp` to register an owner identity.
+	}
+
+	// Maintain the managed gitignore block so a re-run of `enju
+	// bot run` after a fresh manifest-edit doesn't leave bot
+	// worktrees showing in `git status`. Same idempotency story
+	// as ensureBotPushTarget — silent no-op when the block
+	// already covers everything.
+	if changed, err := bots.EnsureGitignored(absProject); err == nil && changed {
+		fmt.Fprintln(os.Stderr, "self-heal: .gitignore updated to ignore enju/bots/, enju/.bare.git/, enju/.clone/")
 	}
 
 	// Read the bot's system prompt. Empty is legal (some handler
@@ -573,7 +715,7 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	ws, err := workspace.NewWorkspace(*workspaceDir, logger)
+	ws, err := project.NewOpener(*workspaceDir, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build workspace: %v\n", err)
 		os.Exit(1)

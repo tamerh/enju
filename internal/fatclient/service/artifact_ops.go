@@ -16,7 +16,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // ArtifactResponse is one artifact index row's wire shape,
@@ -84,7 +84,7 @@ func (s *FatClient) ListArtifacts(ctx context.Context, projectID int64, opts Lis
 // commitTaskSubjectRe matches the first line of commit messages
 // the enju client writes, so artifact-history annotations can
 // enrich each entry with the submitting task_id and owner.
-// Kept in sync with workspace.buildCommitMessage's format.
+// Kept in sync with project.buildCommitMessage's format.
 // A non-match means the commit wasn't produced by a task
 // submission (project init, rollback, manual commit), in which
 // case the entry's task_id / owner fields stay empty.
@@ -122,7 +122,7 @@ func indexOfNewline(s string) int {
 // tree as a fallback. Returns the marshaled JSON ready for
 // format.ArtifactDetail.
 func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("get_artifact requires a local workspace (MCP client mode)")
 	}
 	metaRaw, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path))
@@ -147,7 +147,7 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 	proj.Unlock()
 
 	commitSHA, _ := meta["commit_sha"].(string)
-	repoPath := workspace.ArtifactPath(path)
+	repoPath := project.ArtifactPath(path)
 	var content []byte
 	if commitSHA != "" {
 		data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)
@@ -174,7 +174,7 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 // artifact index and the task state machine. Returns the
 // marshaled JSON ready for format.ArtifactHistory.
 func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("get_artifact_history requires a local workspace (MCP client mode)")
 	}
 	proj, _, _, _, err := s.OpenProject(ctx, projectID)
@@ -185,7 +185,7 @@ func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, pat
 	_ = proj.Pull()
 	proj.Unlock()
 
-	history, err := proj.LogFile(workspace.ArtifactPath(path))
+	history, err := proj.LogFile(project.ArtifactPath(path))
 	if err != nil {
 		return nil, fmt.Errorf("reading git history: %w", err)
 	}
@@ -309,7 +309,7 @@ type UntrackedArtifactReport struct {
 // fix downstream "untracked artifact missing" claim errors
 // in-place when shared storage is available.
 func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64, branch string) (*UntrackedArtifactReport, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_list_untracked_artifacts requires a local workspace (MCP client mode)")
 	}
 	// Resolve project metadata once — default_branch is load-
@@ -338,7 +338,7 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 	// still report what the index says; the local visibility
 	// column says "(workspace unavailable)".
 	var workDir string
-	if proj, perr := s.workspace.ForProject(projectID, remoteURL, projName); perr == nil {
+	if proj, perr := s.project.ForProject(projectID, remoteURL, projName); perr == nil {
 		workDir = proj.WorkDir()
 	}
 
@@ -360,9 +360,9 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 			out = append(out, ur)
 			continue
 		}
-		_ = workspace.EnsureSharedSymlink(workspace.ArtifactPath(path), workDir,
+		_ = project.EnsureSharedSymlink(project.ArtifactPath(path), workDir,
 			projectID, projName, branch, path)
-		full := filepath.Join(workDir, workspace.ArtifactPath(path))
+		full := filepath.Join(workDir, project.ArtifactPath(path))
 		fi, serr := os.Lstat(full)
 		if os.IsNotExist(serr) {
 			ur.LocalState = "missing"
@@ -382,7 +382,7 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 	return &UntrackedArtifactReport{
 		Rows:           out,
 		ResolvedBranch: branch,
-		SharedRoot:     workspace.SharedRoot(),
+		SharedRoot:     project.SharedRoot(),
 	}, nil
 }
 

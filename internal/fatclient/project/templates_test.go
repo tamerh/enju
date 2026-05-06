@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"strings"
@@ -12,7 +12,7 @@ import (
 func TestListTemplatesEmpty(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestListTemplatesEmpty(t *testing.T) {
 func TestListAndLoadTemplate(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -122,7 +122,7 @@ tasks:
 func TestInstantiateTemplateMissingRequired(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	commitToDefault(t, proj, map[string][]byte{
@@ -160,7 +160,7 @@ tasks:
 func TestListTemplatesLegacyFileShape(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	commitToDefault(t, proj, map[string][]byte{
@@ -189,7 +189,7 @@ func TestListTemplatesLegacyFileShape(t *testing.T) {
 func TestLoadTemplateRejectsPathEscape(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	_, err := proj.LoadTemplate("enju/templates/../.git/config")
@@ -208,7 +208,7 @@ func TestLoadTemplateRejectsPathEscape(t *testing.T) {
 func TestLoadTemplateRejectsOutsideTemplatesDir(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	_, err := proj.LoadTemplate("runs/1/result.md")
@@ -230,7 +230,7 @@ func TestLoadTemplateRejectsOutsideTemplatesDir(t *testing.T) {
 func TestListTemplatesVisibleFromNonDefaultBranch(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)

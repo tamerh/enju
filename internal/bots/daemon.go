@@ -32,6 +32,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -487,6 +489,43 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		Content:     out.Response,
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
+	}
+
+	// Honor the task's writes_artifacts declaration: read each
+	// declared tracked path off disk (the bot's handler wrote it
+	// via Write tool / shell / etc. inside the workspace) and
+	// stage it into params.Artifacts so prepareFatSubmit packs it
+	// into the commit. Untracked paths are stat-only — they ride
+	// params.UntrackedArtifacts so the coordinator records a
+	// tracked=false index row but the file stays out of git.
+	//
+	// Missing files are a hard fail: the bot reported success but
+	// didn't produce a declared output, so the iteration must NOT
+	// land — the task stays claimable for a retry. Silent
+	// acceptance was the data-loss bug this guards against.
+	tracked := meta.WritesArtifacts.TrackedPaths()
+	untracked := meta.WritesArtifacts.UntrackedPaths()
+	if len(tracked) > 0 || len(untracked) > 0 {
+		var missing []string
+		artifactContents := make(map[string]string, len(tracked))
+		for _, rel := range tracked {
+			body, rerr := os.ReadFile(filepath.Join(workspacePath, rel))
+			if rerr != nil {
+				missing = append(missing, rel)
+				continue
+			}
+			artifactContents[rel] = string(body)
+		}
+		for _, rel := range untracked {
+			if _, statErr := os.Stat(filepath.Join(workspacePath, rel)); statErr != nil {
+				missing = append(missing, rel)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("declared writes_artifacts missing on disk: %s", strings.Join(missing, ", "))
+		}
+		params.Artifacts = artifactContents
+		params.UntrackedArtifacts = untracked
 	}
 	// Action-specific shape resolution. The Handler can either:
 	//

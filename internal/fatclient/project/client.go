@@ -34,16 +34,16 @@
 //   - Commit messages follow the format iteration 3.1's walker
 //     expects:
 //
-//         Task {taskID} by @{username}: result
-//         Task {taskID} by @{username}: result + N artifact(s)
+//     Task {taskID} by @{username}: result
+//     Task {taskID} by @{username}: result + N artifact(s)
 //
-//         Artifacts: path1, path2, ...
+//     Artifacts: path1, path2, ...
 //
 //     (Subject line matches `commitTaskSubjectRe` in the coordinator's
 //     legacy rollback code; future iterations will replace the walker
 //     with DB-only invalidation and drop this constraint, but for
 //     the coexistence period the format stays stable.)
-package workspace
+package project
 
 import (
 	"bytes"
@@ -69,23 +69,24 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
-// Workspace manages a directory that holds one local clone per
-// project. Callers create a Workspace once at MCP client startup and
-// re-use it for the lifetime of the process.
+// Opener manages local clones of projects. Callers create one at
+// MCP client startup and re-use it for the lifetime of the
+// process — it holds the open *Clone cache and the cross-process
+// flock, both of which need a single owner per fat-client.
 //
 // Project paths come from the projectreg.Registry when one is
 // attached via AttachRegistry. The registry is the single source
 // of truth for "where does project N live on disk?" — every
-// project home is registered explicitly at create_project /
-// init time (Phase A made `path=` required), so there's no
+// project home is registered explicitly at `enju_create_project`
+// + `enju_init` time (both require `path=`), so there's no
 // in-memory cache to keep in sync.
-type Workspace struct {
+type Opener struct {
 	rootDir  string
 	logger   *slog.Logger
 	registry *projectreg.Registry
 
 	mu      sync.Mutex
-	clients map[int64]*Project // projectID → open project clone
+	clients map[int64]*Clone // projectID → open project clone
 }
 
 // NewWorkspace creates (or reuses) a workspace rooted at the given
@@ -97,7 +98,7 @@ type Workspace struct {
 // the IsLocalWorkingTree(remoteURL) and clone-from-remote paths —
 // fine for the bot daemon which uses OpenBotCloneAt, but operator-
 // side flows (MCP / webui) need the registry attached at startup.
-func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
+func NewOpener(rootDir string, logger *slog.Logger) (*Opener, error) {
 	if rootDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -108,10 +109,10 @@ func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating workspace root: %w", err)
 	}
-	return &Workspace{
+	return &Opener{
 		rootDir: rootDir,
 		logger:  logger,
-		clients: make(map[int64]*Project),
+		clients: make(map[int64]*Clone),
 	}, nil
 }
 
@@ -122,7 +123,7 @@ func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 //
 // Called from service.New() once at construction; the bot daemon's
 // Workspace doesn't need it (OpenBotCloneAt takes paths explicitly).
-func (ws *Workspace) AttachRegistry(reg *projectreg.Registry) {
+func (ws *Opener) AttachRegistry(reg *projectreg.Registry) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	ws.registry = reg
@@ -131,7 +132,7 @@ func (ws *Workspace) AttachRegistry(reg *projectreg.Registry) {
 // projectHome looks up the project's working-tree path from the
 // attached registry. Returns "" when no registry is attached or
 // the project isn't registered. Caller must hold ws.mu.
-func (ws *Workspace) projectHome(projectID int64) string {
+func (ws *Opener) projectHome(projectID int64) string {
 	if ws.registry == nil {
 		return ""
 	}
@@ -143,7 +144,7 @@ func (ws *Workspace) projectHome(projectID int64) string {
 }
 
 // RootDir returns the directory that holds per-project clones.
-func (ws *Workspace) RootDir() string { return ws.rootDir }
+func (ws *Opener) RootDir() string { return ws.rootDir }
 
 // projectDir returns the on-disk path for one project's local clone.
 // When projectName is non-empty, the directory is named "{slug}-{id}"
@@ -152,7 +153,7 @@ func (ws *Workspace) RootDir() string { return ws.rootDir }
 //
 // If a legacy numeric-only directory exists and a name is now known,
 // projectDir renames it to the slug form so existing clones survive.
-func (ws *Workspace) projectDir(projectID int64, projectName string) string {
+func (ws *Opener) projectDir(projectID int64, projectName string) string {
 	numericDir := filepath.Join(ws.rootDir, fmt.Sprintf("%d", projectID))
 	if projectName == "" {
 		return numericDir
@@ -191,23 +192,23 @@ func slugify(name string) string {
 }
 
 // HasLocalClone returns true if a clone for the given project
-// already exists on disk in this workspace. Used by list-style
+// already exists on disk in this project. Used by list-style
 // callers (enju_list_projects) that want to decorate their output
 // with local state WITHOUT triggering a fresh clone as a side
 // effect of the listing call.
-func (ws *Workspace) HasLocalClone(projectID int64) bool {
+func (ws *Opener) HasLocalClone(projectID int64) bool {
 	dir := ws.findProjectDir(projectID)
 	return dir != ""
 }
 
 // ProjectDir returns the on-disk working directory for a project.
-// Registry wins (the post-Phase-A authoritative source); falls
-// back to a slug/numeric scan of the workspace root for legacy
-// clones not yet migrated AND for integration tests that build
-// a project via the coord directly without going through the
-// handler's EagerInitProjectClone (which writes to the
-// registry). Read-only — does not trigger a clone.
-func (ws *Workspace) ProjectDir(projectID int64) string {
+// Registry wins (the authoritative source for "where N lives");
+// falls back to a slug/numeric scan of the opener root for
+// integration tests that build a project via the coord directly
+// without going through the handler's EagerInitProjectClone
+// (which writes to the registry). Read-only — does not trigger
+// a clone.
+func (ws *Opener) ProjectDir(projectID int64) string {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	if home := ws.projectHome(projectID); home != "" {
@@ -227,7 +228,7 @@ func (ws *Workspace) ProjectDir(projectID int64) string {
 // "{rootDir}/{id}" stub). Alphabetical os.ReadDir order would
 // otherwise return the numeric stub before the real slug clone.
 // Two-pass: collect both candidates, return slug if present.
-func (ws *Workspace) findProjectDir(projectID int64) string {
+func (ws *Opener) findProjectDir(projectID int64) string {
 	suffix := fmt.Sprintf("-%d", projectID)
 	numericName := fmt.Sprintf("%d", projectID)
 	entries, err := os.ReadDir(ws.rootDir)
@@ -273,14 +274,14 @@ func (ws *Workspace) findProjectDir(projectID int64) string {
 // `<filepath.Dir(clonePath)>/.bot-clone.lock` — local to the
 // project, doesn't depend on ws.rootDir at all.
 //
-// Cache: the workspace's `clients[id]` map is keyed by projectID.
+// Cache: the opener's `clients[id]` map is keyed by projectID.
 // A bot daemon process that started by calling ForProject (e.g.
 // some legacy startup path) might have populated the cache with
 // the operator's tree handle; if we see a stale entry at a
 // different workDir, evict it before opening the bot's clone.
-// In practice the daemon never calls ForProject post-Phase-C, so
-// this branch only fires defensively.
-func (ws *Workspace) OpenBotCloneAt(projectID int64, clonePath, sourceURL string) (*Project, error) {
+// In practice the daemon never calls ForProject, so this branch
+// only fires defensively.
+func (ws *Opener) OpenBotCloneAt(projectID int64, clonePath, sourceURL string) (*Clone, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
 	}
@@ -389,7 +390,7 @@ func IsLocalWorkingTree(path string) bool {
 // registered home path (from enju_init or enju_create_project).
 // Wraps the registry lookup; named for backward compatibility
 // with tests that pre-date the registry-bridge unification.
-func (ws *Workspace) HasExternalDir(projectID int64) bool {
+func (ws *Opener) HasExternalDir(projectID int64) bool {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.projectHome(projectID) != ""
@@ -404,7 +405,7 @@ func (ws *Workspace) HasExternalDir(projectID int64) bool {
 // Use cases: reclaiming disk space for a project the citizen is
 // done with, or recovering from a corrupted local clone. The remote
 // is untouched; this is purely a local cache wipe.
-func (ws *Workspace) LeaveProject(projectID int64) error {
+func (ws *Opener) LeaveProject(projectID int64) error {
 	if projectID == 0 {
 		return fmt.Errorf("projectID is required")
 	}
@@ -448,7 +449,7 @@ func (ws *Workspace) LeaveProject(projectID int64) error {
 // silently create an orphan stub when remoteURL=="" and the
 // computed numeric path doesn't match the actual slug-form
 // clone on disk; OpenExisting refuses to materialize state.
-func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName ...string) (*Project, error) {
+func (ws *Opener) ForProject(projectID int64, remoteURL string, projectName ...string) (*Clone, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
 	}
@@ -543,7 +544,7 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 // the actual slug-form clone on disk, ForProject would
 // PlainInit a fresh empty repo at "{rootDir}/{id}", outranking
 // the real clone in subsequent findProjectDir scans.
-func (ws *Workspace) OpenExisting(projectID int64) (*Project, error) {
+func (ws *Opener) OpenExisting(projectID int64) (*Clone, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
 	}
@@ -574,7 +575,17 @@ func (ws *Workspace) OpenExisting(projectID int64) (*Project, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open existing clone at %s: %w", workDir, err)
 	}
-	p := &Project{
+	// Drain a leftover preserve dir from a prior process's
+	// crashed checkout. Mirrors openOrClone's recovery hook
+	// so read-only callers (inbox, UI, ReadResultAtCommit)
+	// also clean up — without this rung, a preserve dir from
+	// a webui-side crash sat around forever because the next
+	// open went through OpenExisting, not openOrClone.
+	if err := recoverLeftoverPreserve(workDir, ws.logger); err != nil && ws.logger != nil {
+		ws.logger.Warn("preserve-dir recovery failed during OpenExisting; leaving for manual inspection",
+			"error", err, "path", workDir+preserveDirSuffix)
+	}
+	p := &Clone{
 		projectID: projectID,
 		workDir:   workDir,
 		repo:      repo,
@@ -605,7 +616,7 @@ var ErrCloneNotFound = fmt.Errorf("workspace: no clone exists for project")
 //     process that points at the same workspace root. Without the
 //     flock, two processes can race on .git/index.lock and
 //     corrupt the clone.
-type Project struct {
+type Clone struct {
 	projectID int64
 	workDir   string
 	remoteURL string
@@ -638,7 +649,7 @@ type Project struct {
 // otherwise. Keeps the "no branch configured yet" case producing
 // the historical main-branch behavior so callers that pre-date
 // the branch model still work unchanged.
-func (p *Project) defaultBranchOr() string {
+func (p *Clone) defaultBranchOr() string {
 	if p.defaultBranch == "" {
 		return "main"
 	}
@@ -649,7 +660,7 @@ func (p *Project) defaultBranchOr() string {
 // explicit override when non-empty, falling back to the
 // project's default. Central point so every call site stays
 // consistent.
-func (p *Project) resolveBranch(override string) string {
+func (p *Clone) resolveBranch(override string) string {
 	if override != "" {
 		return override
 	}
@@ -662,7 +673,7 @@ func (p *Project) resolveBranch(override string) string {
 // the coordinator's project record. Idempotent; no-op on empty
 // input so callers that don't know the branch yet can leave it
 // untouched.
-func (p *Project) SetDefaultBranch(branch string) {
+func (p *Clone) SetDefaultBranch(branch string) {
 	if branch == "" {
 		return
 	}
@@ -671,27 +682,27 @@ func (p *Project) SetDefaultBranch(branch string) {
 
 // DefaultBranch returns the currently configured default
 // branch, or "main" if none was set.
-func (p *Project) DefaultBranch() string {
+func (p *Clone) DefaultBranch() string {
 	return p.defaultBranchOr()
 }
 
 // ProjectID returns the coordinator-assigned project ID this clone
 // belongs to.
-func (p *Project) ProjectID() int64 { return p.projectID }
+func (p *Clone) ProjectID() int64 { return p.projectID }
 
 // WorkDir returns the local working-tree path.
-func (p *Project) WorkDir() string { return p.workDir }
+func (p *Clone) WorkDir() string { return p.workDir }
 
 // RemoteURL returns the configured origin URL, or an empty string
 // for local-only clones.
-func (p *Project) RemoteURL() string { return p.remoteURL }
+func (p *Clone) RemoteURL() string { return p.remoteURL }
 
 // GitOriginURL returns the URL of the "origin" remote from the git
 // config, or empty if no origin is configured. For init'd projects,
 // this is the actual push target (e.g. git@github.com:org/repo.git),
 // which may differ from RemoteURL() (the local folder path stored
 // on the coordinator).
-func (p *Project) GitOriginURL() string {
+func (p *Clone) GitOriginURL() string {
 	rem, err := p.repo.Remote("origin")
 	if err != nil {
 		return ""
@@ -719,7 +730,7 @@ func (p *Project) GitOriginURL() string {
 // became unwritable. This is intentional: silently falling back
 // to intra-process-only locking would reintroduce the corruption
 // risk the flock exists to prevent.
-func (p *Project) Lock() {
+func (p *Clone) Lock() {
 	p.mu.Lock()
 	if p.fileLock != nil {
 		if err := p.fileLock.Lock(); err != nil {
@@ -733,7 +744,7 @@ func (p *Project) Lock() {
 // Unlock releases the flock first, then the in-process mutex. The
 // reverse order of Lock, mirroring a standard stacked-lock
 // release.
-func (p *Project) Unlock() {
+func (p *Clone) Unlock() {
 	if p.fileLock != nil {
 		_ = p.fileLock.Unlock()
 	}
@@ -745,7 +756,7 @@ func (p *Project) Unlock() {
 // repo, it's opened in place. If it doesn't exist, it's cloned from
 // remoteURL. If workDir exists but isn't a repo (or the clone is
 // corrupted), it's removed and re-cloned.
-func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, error) {
+func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Clone, error) {
 	// Recover from a previous crash that left non-tracked files
 	// staged in <workDir>.preserve-in-progress. Best-effort: a
 	// failure here logs but doesn't block workspace open — the
@@ -779,7 +790,7 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Project, erro
 				goto clone
 			}
 		}
-		p := &Project{
+		p := &Clone{
 			workDir: workDir,
 			repo:    repo,
 			logger:  logger,
@@ -821,7 +832,7 @@ clone:
 			return nil, fmt.Errorf("seeding local-only repo: %w", err)
 		}
 		logger.Info("initialized local-only repo", "path", workDir)
-		return &Project{
+		return &Clone{
 			workDir: workDir,
 			repo:    repo,
 			logger:  logger,
@@ -879,7 +890,7 @@ clone:
 				return nil, fmt.Errorf("configuring origin for empty remote: %w", err)
 			}
 			logger.Info("bootstrapped empty remote", "url", remoteURL, "path", workDir)
-			return &Project{
+			return &Clone{
 				workDir:   workDir,
 				remoteURL: remoteURL,
 				repo:      repo2,
@@ -889,7 +900,7 @@ clone:
 		return nil, friendlyGitError("clone", remoteURL, err)
 	}
 	logger.Info("cloned project", "url", remoteURL, "path", workDir)
-	return &Project{
+	return &Clone{
 		workDir:   workDir,
 		remoteURL: remoteURL,
 		repo:      repo,
@@ -907,7 +918,7 @@ clone:
 // To pull a specific branch (typically the branch of a specific
 // run), use PullBranch(branch) — this shorthand uses the
 // project-level default.
-func (p *Project) Pull() error {
+func (p *Clone) Pull() error {
 	return p.PullBranch("")
 }
 
@@ -920,7 +931,7 @@ func (p *Project) Pull() error {
 // the very first claim on e.g. branch="run-2" before any
 // commits exist on the remote. The caller's next push creates
 // the remote ref naturally.
-func (p *Project) PullBranch(branch string) error {
+func (p *Clone) PullBranch(branch string) error {
 	if p.remoteURL == "" {
 		return nil // local-only, nothing to pull
 	}
@@ -963,7 +974,7 @@ func (p *Project) PullBranch(branch string) error {
 }
 
 // HeadHash returns the SHA of the current local HEAD.
-func (p *Project) HeadHash() (string, error) {
+func (p *Clone) HeadHash() (string, error) {
 	ref, err := p.repo.Head()
 	if err != nil {
 		return "", fmt.Errorf("reading HEAD: %w", err)
@@ -981,7 +992,7 @@ func (p *Project) HeadHash() (string, error) {
 // different branch after the user switches runs in the same
 // session. Empty `branch` resolves through the project's
 // configured default.
-func (p *Project) LocalBranchHash(branch string) (string, error) {
+func (p *Clone) LocalBranchHash(branch string) (string, error) {
 	b := p.resolveBranch(branch)
 	localRef := plumbing.NewBranchReferenceName(b)
 	if ref, err := p.repo.Reference(localRef, true); err == nil {
@@ -999,14 +1010,14 @@ func (p *Project) LocalBranchHash(branch string) (string, error) {
 // string if the remote has no such ref. Used by CompareToRemote
 // to compare local HEAD against the authoritative remote state
 // without a full fetch.
-func (p *Project) RemoteHeadHash() (string, error) {
+func (p *Clone) RemoteHeadHash() (string, error) {
 	return p.RemoteBranchHash("")
 }
 
 // RemoteBranchHash is the branch-aware variant of
 // RemoteHeadHash. Pass "" to use the project's configured
 // default.
-func (p *Project) RemoteBranchHash(branch string) (string, error) {
+func (p *Clone) RemoteBranchHash(branch string) (string, error) {
 	if p.remoteURL == "" {
 		return "", fmt.Errorf("no remote configured")
 	}
@@ -1032,7 +1043,7 @@ func (p *Project) RemoteBranchHash(branch string) (string, error) {
 // ReadFile reads a file from the working tree at a repo-relative path.
 // Used by the client-side template resolver to read upstream task
 // results and artifact contents.
-func (p *Project) ReadFile(repoRelPath string) ([]byte, error) {
+func (p *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 	full := filepath.Join(p.workDir, repoRelPath)
 	return os.ReadFile(full)
 }
@@ -1041,7 +1052,7 @@ func (p *Project) ReadFile(repoRelPath string) ([]byte, error) {
 // Used by the template resolver when the caller wants the exact
 // version associated with an upstream task's submitted commit SHA,
 // rather than whatever happens to be in the working tree today.
-func (p *Project) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
+func (p *Clone) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
 	hash := plumbing.NewHash(commitSHA)
 	commit, err := p.repo.CommitObject(hash)
 	if err != nil {
@@ -1218,7 +1229,7 @@ type SubmitResult struct {
 //   - If we hit MaxRetries without succeeding, the most recent
 //     push error is returned. The caller should surface this so
 //     the citizen knows their submit didn't land.
-func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
+func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	// Single-submit thin wrapper: the post-push HEAD is this
 	// submit's commit (possibly rewritten by a rebase
 	// retry). Batch callers prepare N commits then call
@@ -1255,7 +1266,7 @@ func (p *Project) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 // Single-submit callers can still use SubmitTaskResult, which
 // composes PrepareCommit + PushPendingCommits internally and
 // returns the post-push SHA directly.
-func (p *Project) PrepareCommit(req SubmitRequest) (string, error) {
+func (p *Clone) PrepareCommit(req SubmitRequest) (string, error) {
 	if len(req.Files) == 0 {
 		return "", fmt.Errorf("no files to write")
 	}
@@ -1338,7 +1349,7 @@ func (p *Project) PrepareCommit(req SubmitRequest) (string, error) {
 //
 // maxRetries <= 0 defaults to 3. Caller must hold the
 // project lock.
-func (p *Project) PushPendingCommits(branch string, maxRetries int) (int, string, error) {
+func (p *Clone) PushPendingCommits(branch string, maxRetries int) (int, string, error) {
 	if maxRetries <= 0 {
 		maxRetries = 3
 	}
@@ -1388,7 +1399,7 @@ func (p *Project) PushPendingCommits(branch string, maxRetries int) (int, string
 // with duplicate Enju-Task-Complete trailers per task.
 //
 // Caller must hold the project lock.
-func (p *Project) ResetBranchToHash(hash string) error {
+func (p *Clone) ResetBranchToHash(hash string) error {
 	if hash == "" {
 		return fmt.Errorf("empty hash")
 	}
@@ -1421,7 +1432,7 @@ func (p *Project) ResetBranchToHash(hash string) error {
 // Missing task ids (no commit found with that trailer
 // within the walk window) are simply absent from the map;
 // the caller decides whether that's an error.
-func (p *Project) CommitSHAsByTaskID(taskIDs []string, maxWalk int) (map[string]string, error) {
+func (p *Clone) CommitSHAsByTaskID(taskIDs []string, maxWalk int) (map[string]string, error) {
 	if len(taskIDs) == 0 {
 		return nil, nil
 	}
@@ -1532,7 +1543,7 @@ type CommitFilesResult struct {
 // Returned CommitSHA is the SHA that actually landed on the
 // remote (rebase may rewrite it between the local commit and
 // the eventual push).
-func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) {
+func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) {
 	if len(req.Files) == 0 {
 		return nil, fmt.Errorf("no files to write")
 	}
@@ -1635,7 +1646,7 @@ func (p *Project) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error
 //
 // Idempotent — a no-op when HEAD is already on `branch`. The
 // caller MUST hold the project lock.
-func (p *Project) CheckoutBranch(branch string) error {
+func (p *Clone) CheckoutBranch(branch string) error {
 	return p.CheckoutBranchFrom(branch, "")
 }
 
@@ -1654,7 +1665,7 @@ func (p *Project) CheckoutBranch(branch string) error {
 // origin/<remote HEAD>, then root) is used as the fork point.
 //
 // Caller MUST hold the project lock.
-func (p *Project) CheckoutBranchFrom(branch, baseBranch string) error {
+func (p *Clone) CheckoutBranchFrom(branch, baseBranch string) error {
 	target := p.resolveBranch(branch)
 	wt, err := p.repo.Worktree()
 	if err != nil {
@@ -1730,6 +1741,52 @@ func (p *Project) CheckoutBranchFrom(branch, baseBranch string) error {
 	// proj.Lock(), so the preserve dir can't collide with
 	// another CheckoutBranch on the same project.
 	preserveDir := p.workDir + preserveDirSuffix
+
+	// Drain any leftover preserve dir BEFORE renaming fresh
+	// content into it. Two motivating scenarios:
+	//
+	//   - In-process: a prior CheckoutBranchFrom in this same
+	//     daemon failed mid-restore (rename collision, FS
+	//     error). The preserve dir stayed on disk; the cached
+	//     *Clone never re-runs openOrClone, so its recovery
+	//     hook never fires. Without this drain the next
+	//     checkout's movePreserveNonTracked would rename fresh
+	//     paths INTO the same dir, mixing two unrelated
+	//     preservations — and `os.Rename` over an existing
+	//     non-empty dir errors out unpredictably across OSes.
+	//
+	//   - Cross-process: the user reported preserve dirs
+	//     surviving across daemon restarts when the next open
+	//     went through OpenExisting (read-only path) rather
+	//     than openOrClone. Belt-and-braces — OpenExisting now
+	//     also drains, but the lock-held checkout path is the
+	//     one that absolutely cannot proceed with a dirty
+	//     preserve dir.
+	//
+	// Recovery is best-effort: it restores anything that
+	// doesn't collide with current branch content. Files that
+	// collide stay in the preserve dir — the new checkout
+	// then fails fast (next block) rather than writing more
+	// state into a dirty dir.
+	if _, statErr := os.Stat(preserveDir); statErr == nil {
+		if recErr := recoverLeftoverPreserve(p.workDir, p.logger); recErr != nil {
+			return fmt.Errorf(
+				"leftover preserve dir at %s couldn't be drained: %w — review files there and remove (or move aside) before retrying checkout",
+				preserveDir, recErr,
+			)
+		}
+		// recoverLeftoverPreserve cleans up empty dirs but
+		// leaves files that collide with current branch
+		// content. If anything remains, fail loud rather than
+		// risk merging unrelated preservations.
+		if _, statErr := os.Stat(preserveDir); statErr == nil {
+			return fmt.Errorf(
+				"leftover preserve dir at %s holds files that conflict with the current branch — review and remove (or move aside) before retrying checkout",
+				preserveDir,
+			)
+		}
+	}
+
 	manifest, err := movePreserveNonTracked(p.repo, p.workDir, preserveDir)
 	if err != nil {
 		// Refuse the checkout on partial-preserve failure.
@@ -1780,7 +1837,7 @@ func (p *Project) CheckoutBranchFrom(branch, baseBranch string) error {
 // branch. Returns (hash, true) on success; (zero, false) when
 // neither ref exists, letting the caller fall back to the
 // default base resolution.
-func (p *Project) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
+func (p *Clone) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
 	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true); err == nil {
 		return ref.Hash(), true
 	}
@@ -1806,7 +1863,7 @@ func (p *Project) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool)
 // rebase / spawn-resolve_conflict on this path.
 //
 // Caller MUST hold the project lock.
-func (p *Project) FastForwardBranchToCommit(branch, commitSHA string) error {
+func (p *Clone) FastForwardBranchToCommit(branch, commitSHA string) error {
 	if branch == "" {
 		return fmt.Errorf("branch is required")
 	}
@@ -1842,7 +1899,7 @@ func (p *Project) FastForwardBranchToCommit(branch, commitSHA string) error {
 					"linear progression should never happen. Investigate parallel "+
 					"iterations or manual ref edits before retrying",
 				branch, currentHash.String()[:8], hash.String()[:8])
-			}
+		}
 	}
 
 	// Update the local ref so subsequent reads see the merged
@@ -1881,7 +1938,7 @@ func (p *Project) FastForwardBranchToCommit(branch, commitSHA string) error {
 // from `descendant` via parent links — the standard "is X a
 // fast-forward of Y" check. Used by FastForwardBranchToCommit
 // before any ref update.
-func (p *Project) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, error) {
+func (p *Clone) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, error) {
 	if ancestor == descendant {
 		return true, nil
 	}
@@ -1904,22 +1961,42 @@ func (p *Project) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, er
 // from when the caller asks for a branch that doesn't exist
 // yet. Preference order:
 //
-//  1. origin/main — the conventional project seed.
-//  2. origin/<remote HEAD symbolic ref> — when a repo was
-//     init'd with a non-main default (e.g. git init
+//  1. refs/heads/<default> locally — the project's actual default
+//     branch tip. Local-first matters for solo projects (no
+//     remote post-Option-B) where origin/* refs simply don't
+//     exist; without this rung the fallback walked back to the
+//     root commit and run branches forked from the very first
+//     commit on the timeline, requiring manual `git merge main`
+//     to recover. Also matters when a fresh local commit hasn't
+//     been pushed yet — origin/* would be stale.
+//  2. origin/<default> — for projects with a remote, the canonical
+//     seed when the local ref is somehow absent (fresh clone with
+//     no checkout yet).
+//  3. origin/<remote HEAD symbolic ref> — when a repo was
+//     init'd with a non-default-named default (e.g. git init
 //     --initial-branch=trunk).
-//  3. The repo's root commit — last-ditch fallback that
+//  4. The repo's root commit — last-ditch fallback that
 //     always yields a valid hash.
 //
 // Deliberately does NOT fall back to the caller's current HEAD,
 // which would reintroduce the "silent inheritance" bug.
-func (p *Project) branchBaseHash() (plumbing.Hash, error) {
-	// Try origin/main first.
-	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", "main"), true); err == nil {
+func (p *Clone) branchBaseHash() (plumbing.Hash, error) {
+	defaultBranch := p.defaultBranchOr()
+	// Local default branch first — covers solo projects (no
+	// remote) AND the "haven't pushed the latest commit yet"
+	// case where origin/* would be behind HEAD.
+	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(defaultBranch), true); err == nil {
+		return ref.Hash(), nil
+	}
+	// Then origin/<default> — fresh clone where the local ref
+	// hasn't been instantiated yet but the remote-tracking ref
+	// is already populated by the initial fetch.
+	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", defaultBranch), true); err == nil {
 		return ref.Hash(), nil
 	}
 	// Try the remote's HEAD symref — covers repos whose
-	// default isn't main (trunk, master, etc.).
+	// default isn't named the same as p.defaultBranch (trunk,
+	// master, etc.) and the project record hasn't caught up.
 	if ref, err := p.repo.Reference(plumbing.NewRemoteHEADReferenceName("origin"), true); err == nil {
 		return ref.Hash(), nil
 	}
@@ -1961,7 +2038,7 @@ func (p *Project) branchBaseHash() (plumbing.Hash, error) {
 // pushBranchInternal is the branch-aware equivalent of
 // pushInternal. It pushes only the named branch to origin.
 // Empty `branch` resolves to the project default.
-func (p *Project) pushBranchInternal(branch string, force bool) error {
+func (p *Clone) pushBranchInternal(branch string, force bool) error {
 	if p.remoteURL == "" {
 		return nil
 	}
@@ -1997,7 +2074,7 @@ func (p *Project) pushBranchInternal(branch string, force bool) error {
 // Pulls the specific branch the caller was pushing to — passing
 // "" resolves to the project's configured default. No-op for
 // local-only projects (no remoteURL).
-func (p *Project) rebaseOnRemote(branch string) error {
+func (p *Clone) rebaseOnRemote(branch string) error {
 	if p.remoteURL == "" {
 		return nil
 	}
@@ -2043,7 +2120,7 @@ func isNonFastForwardError(err error) bool {
 // an auto-commit actually fired.
 //
 // The caller MUST hold the project lock.
-func (p *Project) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, modelName string) (string, error) {
+func (p *Clone) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, modelName string) (string, error) {
 	if err := p.CheckoutBranch(""); err != nil {
 		return "", fmt.Errorf("switching to default branch: %w", err)
 	}
@@ -2154,7 +2231,7 @@ func (p *Project) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mode
 // relying on that anymore, but the fall-through exists so a
 // future caller that genuinely wants a sweep-everything
 // commit can opt in by passing nil.
-func (p *Project) commit(message string, paths []string, authorName, authorEmail string) (string, error) {
+func (p *Clone) commit(message string, paths []string, authorName, authorEmail string) (string, error) {
 	wt, err := p.repo.Worktree()
 	if err != nil {
 		return "", fmt.Errorf("getting worktree: %w", err)
@@ -2207,7 +2284,7 @@ func (p *Project) commit(message string, paths []string, authorName, authorEmail
 // semantics. Uses ambient credentials via go-git's default AuthMethod
 // (SSH agent for SSH URLs, credential helpers for HTTPS). Returns nil
 // for local-only projects. Private helper used by SubmitTaskResult.
-func (p *Project) push() error {
+func (p *Clone) push() error {
 	return p.pushInternal(false)
 }
 
@@ -2215,7 +2292,7 @@ func (p *Project) push() error {
 // in the local repository. Used when we need to enumerate
 // branches without a coordinator round-trip — e.g. resetting
 // scan cursors after a project's remote URL changes.
-func (p *Project) LocalBranches() ([]string, error) {
+func (p *Clone) LocalBranches() ([]string, error) {
 	iter, err := p.repo.Branches()
 	if err != nil {
 		return nil, fmt.Errorf("listing branches: %w", err)
@@ -2242,7 +2319,7 @@ func (p *Project) LocalBranches() ([]string, error) {
 // branches without configured upstream.
 //
 // Caller MUST hold the project lock.
-func (p *Project) PushAllLocalBranches() error {
+func (p *Clone) PushAllLocalBranches() error {
 	if p.remoteURL == "" {
 		return fmt.Errorf("no remote configured")
 	}
@@ -2265,13 +2342,13 @@ func (p *Project) PushAllLocalBranches() error {
 // local HEAD to origin with go-git's default (non-force) semantics,
 // so a non-fast-forward state is rejected by the remote. The caller
 // MUST hold the project lock.
-func (p *Project) Push() error { return p.pushInternal(false) }
+func (p *Clone) Push() error { return p.pushInternal(false) }
 
 // PushForce is the destructive counterpart to Push: overwrites the
 // remote branch even when histories have diverged. Only called from
 // the explicit force-sync path, never from the normal submit flow.
 // The caller MUST hold the project lock.
-func (p *Project) PushForce() error { return p.pushInternal(true) }
+func (p *Clone) PushForce() error { return p.pushInternal(true) }
 
 // pushInternal is the shared implementation behind Push / PushForce /
 // the private submit-time push. Returns nil for local-only projects
@@ -2284,7 +2361,7 @@ func (p *Project) PushForce() error { return p.pushInternal(true) }
 // push would silently leave run-branch work behind on
 // enju_project_sync. Submit / CommitFiles paths that want to
 // target a single specific branch use pushBranchInternal instead.
-func (p *Project) pushInternal(force bool) error {
+func (p *Clone) pushInternal(force bool) error {
 	if p.remoteURL == "" {
 		return nil
 	}
@@ -2316,7 +2393,7 @@ func (p *Project) pushInternal(force bool) error {
 //
 // Returns the zero value only if there's no session push AND no
 // HEAD commit (fresh empty-remote bootstrap case).
-func (p *Project) LastPushAt() time.Time {
+func (p *Clone) LastPushAt() time.Time {
 	if !p.lastPushAt.IsZero() {
 		return p.lastPushAt
 	}
@@ -2333,7 +2410,7 @@ func (p *Project) LastPushAt() time.Time {
 
 // LastPushError returns the error message from the most recent
 // push attempt, or the empty string if the last push succeeded.
-func (p *Project) LastPushError() string { return p.lastPushError }
+func (p *Clone) LastPushError() string { return p.lastPushError }
 
 // --- Remote comparison (ported from internal/git iteration 4) ---
 
@@ -2384,7 +2461,7 @@ type RemoteComparison struct {
 // `git.Writer.CompareToRemote`, then moved to the client side
 // during the iteration A orchestrator rewrite so the coordinator
 // stops touching git entirely.
-func (p *Project) CompareToRemote() (*RemoteComparison, error) {
+func (p *Clone) CompareToRemote() (*RemoteComparison, error) {
 	r := &RemoteComparison{}
 
 	if p.remoteURL == "" {
@@ -2531,7 +2608,7 @@ type CommitInfo struct {
 // local clone, newest-first. Used by the MCP client's
 // enju_get_artifact_history tool to render per-file provenance
 // without any coordinator round-trip.
-func (p *Project) LogFile(relPath string) ([]CommitInfo, error) {
+func (p *Clone) LogFile(relPath string) ([]CommitInfo, error) {
 	iter, err := p.repo.Log(&gogit.LogOptions{FileName: &relPath})
 	if err != nil {
 		return nil, fmt.Errorf("opening log for %s: %w", relPath, err)
@@ -2563,7 +2640,7 @@ func (p *Project) LogFile(relPath string) ([]CommitInfo, error) {
 //
 // Passing an empty string removes origin, turning the clone into
 // a local-only project. The caller MUST hold the project lock.
-func (p *Project) SetRemote(url string) error {
+func (p *Clone) SetRemote(url string) error {
 	existing, err := p.repo.Remote("origin")
 	if url == "" {
 		if err != nil {

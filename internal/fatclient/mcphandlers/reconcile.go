@@ -12,13 +12,13 @@ import (
 	"context"
 
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // buildReconcileBody forwards to the service layer. Kept as a
 // package-local function so existing call sites + tests don't
 // need to import service to construct reconcile bodies.
-func buildReconcileBody(trailers []workspace.CommitTrailer) map[string]interface{} {
+func buildReconcileBody(trailers []project.CommitTrailer) map[string]interface{} {
 	return service.BuildReconcileBody(trailers)
 }
 
@@ -28,6 +28,6 @@ func (c *apiClient) stateDir() string {
 }
 
 // pullBranchWithReconcile forwards to the service layer.
-func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *workspace.Project, projectID int64, branch string) error {
+func (c *apiClient) pullBranchWithReconcile(ctx context.Context, proj *project.Clone, projectID int64, branch string) error {
 	return c.fc.PullBranchWithReconcile(ctx, proj, projectID, branch)
 }

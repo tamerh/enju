@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"strings"
@@ -11,7 +11,7 @@ import (
 func TestLoadProjectConfigMissingFile(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -31,7 +31,7 @@ func TestLoadProjectConfigMissingFile(t *testing.T) {
 func TestLoadProjectConfigWithTemplates(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	confBody := []byte(`templates:
@@ -72,7 +72,7 @@ func TestLoadProjectConfigRejectsAbsoluteOrEscape(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			bare := initBareRemote(t)
 			seedRemoteWithInitialCommit(t, bare)
-			ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+			ws, _ := NewOpener(t.TempDir(), nullLogger())
 			proj, _ := ws.ForProject(1, bare)
 
 			commitToDefault(t, proj, map[string][]byte{
@@ -93,7 +93,7 @@ func TestLoadProjectConfigRejectsAbsoluteOrEscape(t *testing.T) {
 func TestLoadProjectConfigMalformedYAML(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	commitToDefault(t, proj, map[string][]byte{
@@ -116,7 +116,7 @@ func TestLoadProjectConfigMalformedYAML(t *testing.T) {
 func TestListTemplatesUsesConfiguredRoots(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	// Drop a bundle under a custom path.

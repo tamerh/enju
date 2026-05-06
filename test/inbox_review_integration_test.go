@@ -73,10 +73,10 @@ tasks:
 	// Materialize the project clone + seed live.jsonl with
 	// task_ready events for ALL three tasks (the inbox handler
 	// will filter via coordinator state).
-	if _, err := h.workspace.ForProject(projectID, h.remoteFor(projectID), "inbox-test"); err != nil {
+	if _, err := h.project.ForProject(projectID, h.remoteFor(projectID), "inbox-test"); err != nil {
 		t.Fatalf("workspace.ForProject: %v", err)
 	}
-	projectDir := h.workspace.ProjectDir(projectID)
+	projectDir := h.project.ProjectDir(projectID)
 	// Seed task_ready events for all three. The candidate scan
 	// only fires on assign_to=h.username events, so theirs/open
 	// won't even be candidates. Including them here would no-op;
@@ -113,7 +113,7 @@ tasks:
 func TestInboxToolEmpty(t *testing.T) {
 	h := newMCPHarness(t, "EmptyInbox")
 	projectID := h.createTestProject()
-	if _, err := h.workspace.ForProject(projectID, h.remoteFor(projectID), "empty-inbox"); err != nil {
+	if _, err := h.project.ForProject(projectID, h.remoteFor(projectID), "empty-inbox"); err != nil {
 		t.Fatalf("workspace.ForProject: %v", err)
 	}
 
@@ -145,10 +145,10 @@ tasks:
 `, h.username)
 	h.mcpCreateRunInline(t, projectID, yaml)
 
-	if _, err := h.workspace.ForProject(projectID, h.remoteFor(projectID), "claimed-test"); err != nil {
+	if _, err := h.project.ForProject(projectID, h.remoteFor(projectID), "claimed-test"); err != nil {
 		t.Fatalf("workspace.ForProject: %v", err)
 	}
-	projectDir := h.workspace.ProjectDir(projectID)
+	projectDir := h.project.ProjectDir(projectID)
 
 	// Seed events for two tasks: one that's still ready, one that
 	// was ready then claimed. The newer claim event hides the

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
@@ -331,6 +334,81 @@ func TestDaemon_RunOnce_AnswerAction(t *testing.T) {
 	}
 	if got.Decision != "" || got.Option != "" {
 		t.Errorf("answer should not set Decision/Option: %+v", got)
+	}
+}
+
+// Pin the data-loss fix: when the task declares writes_artifacts,
+// the daemon must read each tracked path off disk and stage it
+// into params.Artifacts, and stat each untracked path into
+// params.UntrackedArtifacts. Without the read step, the bot
+// reports success but the file silently drops out of the commit.
+func TestDaemon_RunOnce_PopulatesArtifactsFromWritesArtifacts(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, "out"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "out", "tracked.md"), []byte("tracked body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "big.bam"), []byte("untracked body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.workspacePath = ws
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		{Path: "out/tracked.md", Track: true},
+		{Path: "big.bam", Track: false},
+	}
+
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	worked, err := d.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if !worked {
+		t.Fatal("expected worked=true")
+	}
+	if len(fc.submits) != 1 {
+		t.Fatalf("expected 1 submit, got %d", len(fc.submits))
+	}
+	got := fc.submits[0]
+	if got.Artifacts["out/tracked.md"] != "tracked body" {
+		t.Errorf("Artifacts[out/tracked.md] = %q, want %q", got.Artifacts["out/tracked.md"], "tracked body")
+	}
+	if _, ok := got.Artifacts["big.bam"]; ok {
+		t.Errorf("untracked path big.bam must NOT appear in Artifacts (would be committed): got %+v", got.Artifacts)
+	}
+	if len(got.UntrackedArtifacts) != 1 || got.UntrackedArtifacts[0] != "big.bam" {
+		t.Errorf("UntrackedArtifacts = %v, want [big.bam]", got.UntrackedArtifacts)
+	}
+}
+
+// Pin the fail-loud contract: a declared artifact missing on disk
+// fails the iteration so the bot's "I'm done" doesn't silently
+// land. Pre-fix this scenario submitted result.md only and the
+// task transitioned to ACCEPTED with the missing file unrecorded.
+func TestDaemon_RunOnce_FailsWhenDeclaredArtifactMissing(t *testing.T) {
+	ws := t.TempDir() // intentionally empty — no out/missing.md
+
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.workspacePath = ws
+	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
+		{Path: "out/missing.md", Track: true},
+	}
+
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	_, err := d.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected error from missing artifact, got nil")
+	}
+	if !strings.Contains(err.Error(), "out/missing.md") {
+		t.Errorf("error should name the missing path; got %q", err.Error())
+	}
+	// The submit MUST NOT happen — if it did, the bug would be back:
+	// task accepted with phantom artifact_written list, file gone.
+	if len(fc.submits) != 0 {
+		t.Errorf("submit must NOT be called when artifacts are missing; got %d submits", len(fc.submits))
 	}
 }
 

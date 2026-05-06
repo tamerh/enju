@@ -10,7 +10,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/webui"
 )
 
@@ -64,7 +64,7 @@ import (
 //     with a real auth story; v1 doesn't try to be that.
 func cmdUI(args []string) {
 	fs := flag.NewFlagSet("ui", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
@@ -113,7 +113,7 @@ func cmdUI(args []string) {
 		token = creds.Token
 	}
 
-	ws, err := workspace.NewWorkspace(*workspaceDir, logger)
+	ws, err := project.NewOpener(*workspaceDir, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create workspace: %v\n", err)
 		os.Exit(1)

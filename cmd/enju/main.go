@@ -18,7 +18,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/scheduler"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -283,7 +283,7 @@ func warnRestartOnly[T comparable](logger *slog.Logger, key string, old, new T) 
 
 func cmdMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	localMode := fs.Bool("local", false, "Run in local-only mode: embed the coordinator in this process (no separate enju serve needed)")
 	localDB := fs.String("db", "", "SQLite path for local mode (default ~/.enju/local.db)")
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
@@ -414,13 +414,13 @@ func cmdMCP(args []string) {
 		token = creds.Token
 	}
 
-	// Build a client-side git workspace. Used for iteration A.2's
+	// Build a client-side git project. Used for iteration A.2's
 	// fat-client write path when the project has a remote_url.
 	// Self-hosted projects without a remote fall back to the
 	// legacy coordinator-writes path; this workspace stays unused
 	// for them but the creation itself is cheap and safe.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ws, err := workspace.NewWorkspace(*workspaceDir, logger)
+	ws, err := project.NewOpener(*workspaceDir, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create MCP workspace: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Hint: the workspace directory (default ~/.enju/workspaces) must be writable and have free disk space. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
@@ -496,6 +496,32 @@ type credentials struct {
 func credentialsPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".enju", "credentials.json")
+}
+
+// defaultCoordinatorURL returns the coordinator URL stashed in
+// ~/.enju/credentials.json when present, falling back to the
+// hardcoded localhost default. Used as the --coordinator flag's
+// default so an operator who already registered against, say,
+// http://localhost:8333 doesn't have to re-pass that URL on
+// every CLI invocation. The flag still overrides; this only
+// kicks in when the operator omits --coordinator entirely.
+const fallbackCoordinatorURL = "http://localhost:8000"
+
+func defaultCoordinatorURL() string {
+	data, err := os.ReadFile(credentialsPath())
+	if err != nil {
+		return fallbackCoordinatorURL
+	}
+	var creds struct {
+		Coordinator string `json:"coordinator"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return fallbackCoordinatorURL
+	}
+	if creds.Coordinator == "" {
+		return fallbackCoordinatorURL
+	}
+	return creds.Coordinator
 }
 
 // deriveEventsDBPath turns a state-DB path like "/var/enju/state.db"

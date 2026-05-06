@@ -2,7 +2,7 @@ package service
 
 // Fetch-path reconciliation: turns scanner-spotted commits into
 // coordinator state transitions. Wires the three primitives from
-// internal/fatclient/workspace (FetchBranch + ScanBranchSince +
+// internal/fatclient/project (FetchBranch + ScanBranchSince +
 // Cursors) together with the coordinator's /tasks/reconcile
 // endpoint, plus an async-wrapper failure reaper that catches
 // non-zero exits the trailer scanner can't see.
@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/fatclient/compute"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // BuildReconcileBody turns scanner results into the batch shape
@@ -38,7 +38,7 @@ import (
 // the bug that blocked async downstream tasks reading
 // track:false outputs: sync path POSTs via /tasks/:id/result
 // with the full union; async path had to rely on the trailer.
-func BuildReconcileBody(trailers []workspace.CommitTrailer) map[string]interface{} {
+func BuildReconcileBody(trailers []project.CommitTrailer) map[string]interface{} {
 	entries := make([]map[string]interface{}, 0, len(trailers))
 	for _, t := range trailers {
 		entry := map[string]interface{}{
@@ -73,8 +73,8 @@ func BuildReconcileBody(trailers []workspace.CommitTrailer) map[string]interface
 // Falls back to ~/.enju/state/ only when no workspace is
 // configured (local-only / legacy callers).
 func (s *FatClient) StateDir() string {
-	if s.workspace != nil {
-		return filepath.Join(s.workspace.RootDir(), ".state")
+	if s.project != nil {
+		return filepath.Join(s.project.RootDir(), ".state")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -109,7 +109,7 @@ func (s *FatClient) StateDir() string {
 // across this call (it would deadlock); subsequent operations
 // that need the lock (resolver reads, commit writes) re-acquire
 // after this returns.
-func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *workspace.Project, projectID int64, branch string) error {
+func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *project.Clone, projectID int64, branch string) error {
 	if proj == nil {
 		return nil
 	}
@@ -160,13 +160,13 @@ func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *workspace
 		// a stale / missing origin ref.
 		_ = proj.FetchBranch(branch)
 	}
-	var trailers []workspace.CommitTrailer
+	var trailers []project.CommitTrailer
 	var newTip string
 	var preCursor string
 	if branch != "" {
-		cursorMu := workspace.CursorMutexFor(s.StateDir(), projectID)
+		cursorMu := project.CursorMutexFor(s.StateDir(), projectID)
 		cursorMu.Lock()
-		cursors, _ := workspace.LoadCursors(s.StateDir(), projectID)
+		cursors, _ := project.LoadCursors(s.StateDir(), projectID)
 		preCursor = cursors.Get(branch)
 		// Cursor baseline seeding: without this, a freshly-
 		// forked run branch (no origin/<branch> yet when the
@@ -225,9 +225,9 @@ func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *workspace
 	// Fresh load to absorb any parallel advanceCursorPastCommit
 	// that might have run while we were posting.
 	if newTip != "" && newTip != preCursor {
-		cursorMu := workspace.CursorMutexFor(s.StateDir(), projectID)
+		cursorMu := project.CursorMutexFor(s.StateDir(), projectID)
 		cursorMu.Lock()
-		latest, _ := workspace.LoadCursors(s.StateDir(), projectID)
+		latest, _ := project.LoadCursors(s.StateDir(), projectID)
 		latest.Set(branch, newTip)
 		_ = latest.Save()
 		cursorMu.Unlock()
@@ -250,7 +250,7 @@ func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *workspace
 // scan / post errors are logged at Debug and the call returns
 // without surfacing them.
 func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, runData []byte) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return
 	}
 	branch := RunBranchFromData(runData)
@@ -266,13 +266,13 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 	// on the HTTP round-trip.
 	proj.Lock()
 	ferr := proj.FetchBranch(branch)
-	var trailers []workspace.CommitTrailer
+	var trailers []project.CommitTrailer
 	var newTip, preCursor string
 	if ferr == nil {
 		stateDir := s.StateDir()
-		cursorMu := workspace.CursorMutexFor(stateDir, projectID)
+		cursorMu := project.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		cursors, _ := workspace.LoadCursors(stateDir, projectID)
+		cursors, _ := project.LoadCursors(stateDir, projectID)
 		preCursor = cursors.Get(branch)
 		// Persist-on-first-touch so a brand-new run branch
 		// doesn't fall back to the first-scan baseline (or
@@ -305,9 +305,9 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 	}
 	if newTip != "" && newTip != preCursor {
 		stateDir := s.StateDir()
-		cursorMu := workspace.CursorMutexFor(stateDir, projectID)
+		cursorMu := project.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		latest, _ := workspace.LoadCursors(stateDir, projectID)
+		latest, _ := project.LoadCursors(stateDir, projectID)
 		latest.Set(branch, newTip)
 		_ = latest.Save()
 		cursorMu.Unlock()
@@ -336,7 +336,7 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 // (matching the sync path) doesn't commit on exit != 0 so a
 // failed async task has no scanner-visible signal — the reaper
 // fills that gap when the submitter comes back online.
-func (s *FatClient) ReapWrapperFailures(ctx context.Context, proj *workspace.Project, projectID int64) {
+func (s *FatClient) ReapWrapperFailures(ctx context.Context, proj *project.Clone, projectID int64) {
 	if proj == nil {
 		return
 	}

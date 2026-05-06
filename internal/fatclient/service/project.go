@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // ErrNoCloneSource indicates a project has neither a remote_url
@@ -78,8 +78,8 @@ func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64
 //     operator's tree, Edit/Write tools would touch files the
 //     operator may also be editing.
 //
-// Layout (post-Phase-C): the clone lives at
-// `<projectHome>/enju/.clone/`. Source for the clone:
+// Layout: the clone lives at `<projectHome>/enju/.clone/`.
+// Source for the clone:
 //
 //   - **Real remote (https/git/ssh):** clone directly from the
 //     coord's remote_url. The bot pushes back to the same
@@ -89,11 +89,12 @@ func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64
 //     `enju bot setup` (see EnsureBotPushTarget). If it doesn't
 //     exist, surface a clear "run setup first" error.
 //
-// Project home comes from the projectreg registry — Phase A
-// guarantees every project has an explicit, registered home.
-// No remote_url, no fallback shenanigans.
+// Project home comes from the projectreg registry. Every project
+// is registered with an explicit path at create_project + init
+// time (both require `path=`), so the lookup is unambiguous —
+// no remote_url-as-path fallback, no filesystem walk.
 func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (string, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return "", fmt.Errorf("no workspace configured")
 	}
 	remoteURL, _, _, err := s.FetchProjectMetaExpanded(ctx, projectID)
@@ -101,11 +102,11 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 		return "", err
 	}
 
-	// Determine the project home: registry is authoritative
-	// (Phase A made `path=` required for both create_project and
-	// init, both of which register the home). The coord's
-	// remote_url is for the SHARED remote (github/gitlab) and
-	// no longer doubles as a local path.
+	// Determine the project home: registry is authoritative.
+	// Both create_project and init require `path=`, so every
+	// project ends up with an entry. The coord's remote_url is
+	// reserved for the SHARED remote (github/gitlab) — it does
+	// not double as a local path.
 	var home string
 	if s.projectRegistry != nil {
 		entry, gerr := s.projectRegistry.Get(projectID)
@@ -127,7 +128,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 	// Source: real remote wins (push/pull travels the network),
 	// else the per-project bare from `enju bot setup`.
 	var source string
-	if remoteURL != "" && !workspace.IsLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && !project.IsLocalWorkingTree(remoteURL) {
 		// Network URL (https://, git@, ssh://). Clone direct.
 		source = remoteURL
 	} else {
@@ -142,7 +143,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 		source = barePath
 	}
 
-	proj, err := s.workspace.OpenBotCloneAt(projectID, clonePath, source)
+	proj, err := s.project.OpenBotCloneAt(projectID, clonePath, source)
 	if err != nil {
 		return "", err
 	}
@@ -169,7 +170,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 //     remote unchanged. The bot pushes there directly via the
 //     project's `origin`.
 //   - **Local path (project home):** call
-//     workspace.PromoteWorkingTreeToBare to bare-clone the home
+//     project.PromoteWorkingTreeToBare to bare-clone the home
 //     into `<home>/enju/.bare.git/`, rewire the home's `origin`
 //     to that bare. Returns the bare path.
 //   - **Empty:** fall back to the projectRegistry's home path
@@ -202,7 +203,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64) (s
 // opts into bots, exactly when it starts earning its
 // keep.
 func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (bareURL string, created bool, err error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return "", false, fmt.Errorf("no workspace configured")
 	}
 	remoteURL, _, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
@@ -216,7 +217,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 	// (network URLs, missing paths) returns false here too, so
 	// we narrow to "non-empty AND local working tree" before
 	// promoting.
-	if remoteURL != "" && !workspace.IsLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && !project.IsLocalWorkingTree(remoteURL) {
 		return remoteURL, false, nil
 	}
 
@@ -237,7 +238,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 				"with `enju_init --path=` / `enju_create_project path=`",
 			ErrNoCloneSource, projectID)
 	}
-	if !workspace.IsLocalWorkingTree(source) {
+	if !project.IsLocalWorkingTree(source) {
 		return "", false, fmt.Errorf(
 			"clone source %q for project %d is not a git working tree; "+
 				"cannot promote to a bare",
@@ -259,7 +260,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 		wasFresh = false
 	}
 
-	if err := workspace.PromoteWorkingTreeToBare(source, barePath); err != nil {
+	if err := project.PromoteWorkingTreeToBare(source, barePath); err != nil {
 		return "", false, fmt.Errorf("promoting %q to bare at %q: %w", source, barePath, err)
 	}
 	return barePath, wasFresh, nil
@@ -269,16 +270,16 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 // clone, AND wires the project's default_branch into the
 // Project so Pull/Push fallback paths target the right ref.
 // Every call site that pairs FetchProjectMetaFull +
-// workspace.ForProject should use this helper instead.
-func (s *FatClient) OpenProject(ctx context.Context, projectID int64) (proj *workspace.Project, remoteURL, projName, defaultBranch string, err error) {
-	if s.workspace == nil {
+// project.ForProject should use this helper instead.
+func (s *FatClient) OpenProject(ctx context.Context, projectID int64) (proj *project.Clone, remoteURL, projName, defaultBranch string, err error) {
+	if s.project == nil {
 		return nil, "", "", "", fmt.Errorf("no workspace configured")
 	}
 	remoteURL, projName, defaultBranch, err = s.FetchProjectMetaExpanded(ctx, projectID)
 	if err != nil {
 		return nil, "", "", "", err
 	}
-	proj, err = s.workspace.ForProject(projectID, remoteURL, projName)
+	proj, err = s.project.ForProject(projectID, remoteURL, projName)
 	if err != nil {
 		return nil, remoteURL, projName, defaultBranch, err
 	}

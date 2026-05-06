@@ -24,7 +24,7 @@ import (
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -39,7 +39,7 @@ import (
 // workspace is unset, the body doesn't unmarshal, or no
 // decoration applied.
 func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
-	if s.workspace == nil {
+	if s.project == nil {
 		return data
 	}
 	var projects []map[string]interface{}
@@ -59,11 +59,11 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 		if projectID == 0 {
 			continue
 		}
-		if !s.workspace.HasLocalClone(projectID) {
+		if !s.project.HasLocalClone(projectID) {
 			continue
 		}
 		pName, _ := p["name"].(string)
-		proj, err := s.workspace.ForProject(projectID, remoteURL, pName)
+		proj, err := s.project.ForProject(projectID, remoteURL, pName)
 		if err != nil {
 			continue
 		}
@@ -161,7 +161,7 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 	if idF, ok := result["id"].(float64); ok {
 		pid = int64(idF)
 	}
-	if pid > 0 && s.workspace != nil {
+	if pid > 0 && s.project != nil {
 		if ierr := s.EagerInitProjectClone(ctx, pid, params.Path); ierr != nil {
 			s.logger.Warn("eager workspace init failed (will retry on first task)",
 				"project_id", pid, "path", params.Path, "error", ierr)
@@ -225,22 +225,22 @@ func validateCreateProjectPath(path string) error {
 // project record is registered; the next tool call will retry
 // the init).
 func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, path string) error {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil
 	}
 	if path == "" {
 		return fmt.Errorf("EagerInitProjectClone: path is required (programming error: handler should reject empty path)")
 	}
 	// Register in projectreg FIRST so the subsequent ForProject
-	// call's registry lookup resolves to `path`. Post-Phase-F
-	// the workspace consults the registry directly; without
-	// this ordering ForProject would fall through to the
+	// call's registry lookup resolves to `path`. ForProject
+	// consults the registry directly for path resolution;
+	// without this ordering it would fall through to the
 	// "clone-from-remote" branch with empty remoteURL.
 	s.RegisterProject(projectreg.Entry{
 		ID:        projectID,
 		LocalPath: path,
 	})
-	_, err := s.workspace.ForProject(projectID, "")
+	_, err := s.project.ForProject(projectID, "")
 	return err
 }
 
@@ -388,7 +388,7 @@ func (s *FatClient) InitDirAsProject(dirPath string) (adoptedBranch string, err 
 // ForProject (which queries the registry) to verify the clone
 // works.
 func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil
 	}
 	// Registry write FIRST — ForProject's path lookup consults
@@ -398,7 +398,7 @@ func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 		ID:        projectID,
 		LocalPath: dirPath,
 	})
-	_, err := s.workspace.ForProject(projectID, "")
+	_, err := s.project.ForProject(projectID, "")
 	return err
 }
 
@@ -409,7 +409,7 @@ func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 // optional last_push_*, optional remote_error). Returns the
 // no-remote payload directly when the project has no remote URL.
 func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("remote status is only available in MCP client mode")
 	}
 	proj, remoteURL, _, _, err := s.OpenProject(ctx, projectID)
@@ -421,7 +421,7 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 		"remote_url": remoteURL,
 	}
 	if remoteURL == "" {
-		resp["status"] = string(workspace.RemoteNoRemote)
+		resp["status"] = string(project.RemoteNoRemote)
 		return resp, nil
 	}
 	cmp, err := proj.CompareToRemote()
@@ -456,7 +456,7 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 // CompareToRemote (refuse diverged state without force), push.
 // Returns the response payload the formatter renders.
 func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("project sync is only available in MCP client mode")
 	}
 	proj, remoteURL, _, _, err := s.OpenProject(ctx, projectID)
@@ -484,15 +484,15 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		resp["behind_by"] = cmp.BehindBy
 
 		switch cmp.Status {
-		case workspace.RemoteInSync:
+		case project.RemoteInSync:
 			resp["result"] = "noop"
 			resp["message"] = "already in sync"
 			return resp, nil
-		case workspace.RemoteBehind:
+		case project.RemoteBehind:
 			resp["result"] = "noop"
 			resp["message"] = fmt.Sprintf("local is behind remote by %d commit(s); nothing to push — fetch+merge to catch up", cmp.BehindBy)
 			return resp, nil
-		case workspace.RemoteDiverged, workspace.RemoteUnrelated:
+		case project.RemoteDiverged, project.RemoteUnrelated:
 			if !force {
 				resp["result"] = "refused"
 				resp["message"] = fmt.Sprintf(
@@ -540,10 +540,10 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 // Returns a warning message when push fails (non-fatal — remote
 // is set, but seeding failed). Empty workspace is a no-op.
 func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) string {
-	if s.workspace == nil {
+	if s.project == nil {
 		return ""
 	}
-	proj, err := s.workspace.ForProject(projectID, remoteURL)
+	proj, err := s.project.ForProject(projectID, remoteURL)
 	if err != nil {
 		return ""
 	}
@@ -567,11 +567,11 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 	// place for the next attempt).
 	if branches, lerr := proj.LocalBranches(); lerr == nil {
 		stateDir := s.StateDir()
-		cursorMu := workspace.CursorMutexFor(stateDir, projectID)
+		cursorMu := project.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		cursors, _ := workspace.LoadCursors(stateDir, projectID)
+		cursors, _ := project.LoadCursors(stateDir, projectID)
 		for _, b := range branches {
-			cursors.Set(b, workspace.RescanSentinelSHA)
+			cursors.Set(b, project.RescanSentinelSHA)
 		}
 		if serr := cursors.Save(); serr != nil {
 			s.logger.Warn("set_project_remote: cursor reset save failed",
@@ -586,11 +586,11 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 // and reports whether one existed beforehand. Caller decides
 // what to do with the membership row on the coordinator side.
 func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return false, nil
 	}
-	hadClone = s.workspace.HasLocalClone(projectID)
-	if err := s.workspace.LeaveProject(projectID); err != nil {
+	hadClone = s.project.HasLocalClone(projectID)
+	if err := s.project.LeaveProject(projectID); err != nil {
 		return hadClone, fmt.Errorf("removing local clone: %w", err)
 	}
 	s.UnregisterProject(projectID)

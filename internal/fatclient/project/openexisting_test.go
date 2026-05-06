@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Tests for OpenExisting + the slug-form preference in
 // findProjectDir. The bug these fix is documented in
@@ -19,10 +19,10 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
-func newWS(t *testing.T) *Workspace {
+func newWS(t *testing.T) *Opener {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ws, err := NewWorkspace(t.TempDir(), logger)
+	ws, err := NewOpener(t.TempDir(), logger)
 	if err != nil {
 		t.Fatal(err)
 	}

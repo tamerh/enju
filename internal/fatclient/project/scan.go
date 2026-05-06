@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Fetch-path scanner for Enju task-completion trailers.
 //
@@ -124,7 +124,7 @@ type CommitTrailer struct {
 // database operation on git objects. The scanner uses Fetch so
 // it never races with in-flight writes and never rewrites the
 // worktree.
-func (p *Project) FetchBranch(branch string) error {
+func (p *Clone) FetchBranch(branch string) error {
 	if p.remoteURL == "" {
 		return nil // local-only, nothing to fetch
 	}
@@ -200,7 +200,7 @@ func (p *Project) FetchBranch(branch string) error {
 // A commit without Enju-Task-Complete is silently skipped. An
 // unreachable `since` hash returns an error rather than a bogus
 // walk.
-func (p *Project) ScanBranchSince(branch, since string) (newTip string, found []CommitTrailer, err error) {
+func (p *Clone) ScanBranchSince(branch, since string) (newTip string, found []CommitTrailer, err error) {
 	b := p.resolveBranch(branch)
 	remoteRef := plumbing.NewRemoteReferenceName("origin", b)
 	ref, err := p.repo.Reference(remoteRef, true)

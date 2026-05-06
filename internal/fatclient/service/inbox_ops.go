@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // InboxResult bundles the inbox rows with the project-clone
@@ -33,10 +33,10 @@ type InboxResult struct {
 // materialized yet — handler surfaces a friendly message
 // rather than treating it as an error.
 func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username string) (*InboxResult, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("workspace not configured")
 	}
-	projectDir := s.workspace.ProjectDir(projectID)
+	projectDir := s.project.ProjectDir(projectID)
 	if projectDir == "" {
 		return &InboxResult{ProjectClonePresent: false}, nil
 	}
@@ -50,9 +50,9 @@ func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username st
 	// clone with a different slug suffix. The inbox
 	// projection only reads (live.jsonl + git tree at
 	// committed SHAs) — it has no business creating clones.
-	proj, err := s.workspace.OpenExisting(projectID)
+	proj, err := s.project.OpenExisting(projectID)
 	if err != nil {
-		if errors.Is(err, workspace.ErrCloneNotFound) {
+		if errors.Is(err, project.ErrCloneNotFound) {
 			return &InboxResult{ProjectClonePresent: false}, nil
 		}
 		return nil, fmt.Errorf("opening project clone: %w", err)
@@ -70,7 +70,7 @@ func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username st
 // Deps surface today is just one method (git read at commit) —
 // the projection is otherwise self-contained over live.jsonl.
 type inboxGitDeps struct {
-	proj *workspace.Project
+	proj *project.Clone
 }
 
 func (d *inboxGitDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {

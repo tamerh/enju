@@ -51,9 +51,6 @@ func resolveProjectDir(arg string) (string, error) {
 
 func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	botName := req.GetString("bot", "")
-	if botName == "" {
-		return mcp.NewToolResultError("bot is required"), nil
-	}
 	projectDir, err := resolveProjectDir(req.GetString("project", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("resolve project: %v", err)), nil
@@ -83,11 +80,39 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(fmt.Sprintf("loading manifest: %v", err)), nil
 	}
 	if manifest == nil {
-		return mcp.NewToolResultError(fmt.Sprintf("no enju/bots.yaml found at %s — run `enju bot setup` first", projectDir)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("no enju/bots.yaml found at %s", projectDir)), nil
+	}
+	// Auto-discover when the operator didn't name a bot AND
+	// the manifest has exactly one. Cuts redundant typing for
+	// the dominant solo-project case (one bot, one project)
+	// without breaking the multi-bot path — there the operator
+	// must still disambiguate by name.
+	if botName == "" {
+		switch len(manifest.Bots) {
+		case 0:
+			return mcp.NewToolResultError(fmt.Sprintf("no bots declared in %s/enju/bots.yaml", projectDir)), nil
+		case 1:
+			botName = manifest.Bots[0].Name
+		default:
+			names := make([]string, 0, len(manifest.Bots))
+			for i := range manifest.Bots {
+				names = append(names, manifest.Bots[i].Name)
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("manifest has %d bots — pick one: %v", len(manifest.Bots), names)), nil
+		}
 	}
 	bot := manifest.ByName(botName)
 	if bot == nil {
 		return mcp.NewToolResultError(fmt.Sprintf("bot %q not found in %s/enju/bots.yaml", botName, projectDir)), nil
+	}
+	// Fall back to the manifest's project_id when the caller
+	// didn't supply one. Mirrors `enju bot setup`'s precedence
+	// rule (caller > manifest > 0). 0 is still valid — the
+	// daemon treats it as "poll every project the bot is a
+	// member of" — but solo projects with a single coord
+	// shouldn't have to repeat the id on every start call.
+	if projectID == 0 && manifest.ProjectID > 0 {
+		projectID = manifest.ProjectID
 	}
 	var allowTools []string
 	if bot.MCPTools != nil {

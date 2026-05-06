@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Enju commit trailers. Every task-submit commit produced by the
 // fat client carries a structured trailer section identifying the
@@ -23,11 +23,11 @@ import (
 // agree on the exact strings. Changing any of these is a
 // cross-component protocol bump.
 const (
-	TrailerTaskComplete    = "Enju-Task-Complete"
-	TrailerExit        = "Enju-Exit"
-	TrailerArtifacts      = "Enju-Artifacts"
+	TrailerTaskComplete       = "Enju-Task-Complete"
+	TrailerExit               = "Enju-Exit"
+	TrailerArtifacts          = "Enju-Artifacts"
 	TrailerUntrackedArtifacts = "Enju-Untracked-Artifacts"
-	TrailerDurationSeconds   = "Enju-Duration-Seconds"
+	TrailerDurationSeconds    = "Enju-Duration-Seconds"
 	// verdict + iter-seq trailers carry per-
 	// submission semantics into the commit message itself,
 	// so a forensic `git log` over a project's history can
@@ -54,7 +54,7 @@ type EnjuTrailers struct {
 	// ExitCode — compute tasks only. Absent ⇒ ExitSet == false.
 	// Encoded as `Enju-Exit: 0` / `Enju-Exit: 137`.
 	ExitCode int
-	ExitSet bool
+	ExitSet  bool
 
 	// Artifacts — tracked artifact paths actually written
 	// by the task AND included in this commit. Comma-
@@ -227,4 +227,3 @@ func ParseEnjuTrailers(msg string) EnjuTrailers {
 	}
 	return t
 }
-

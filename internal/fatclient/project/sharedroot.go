@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Shared-root helpers for the untracked-artifacts feature.
 // When a citizen configures ENJU_SHARED_ROOT, untracked

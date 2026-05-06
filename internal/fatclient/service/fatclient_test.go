@@ -1,7 +1,7 @@
 package service
 
 // Tests for FatClient construction. Particularly the
-// adopted-project bridge: registry → workspace.externalDirs at
+// adopted-project bridge: registry → project.externalDirs at
 // New() time, so a fatclient process restarted after `enju_init
 // --path=/external/dir` can still resolve that project to its
 // adopted location.
@@ -27,7 +27,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // initRealClone plants a usable git clone at dir + commits one
@@ -96,7 +96,7 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
-	ws, err := workspace.NewWorkspace(tmp, logger)
+	ws, err := project.NewOpener(tmp, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	// Nothing was registered → OpenExisting on an arbitrary id
 	// returns ErrCloneNotFound, exactly as without the bridge.
 	_, err = ws.OpenExisting(99)
-	if !errors.Is(err, workspace.ErrCloneNotFound) {
+	if !errors.Is(err, project.ErrCloneNotFound) {
 		t.Errorf("expected ErrCloneNotFound, got %v", err)
 	}
 }
@@ -166,13 +166,13 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	homeTree := filepath.Join(tmp, "op-tree")
 	initRealCloneWithAuthor(t, homeTree)
 
-	// Phase B: a bot push target lives at <home>/enju/.bare.git/.
+	// The bot push target lives at <home>/enju/.bare.git/.
 	// `enju bot setup` would have created this; in the test we
 	// promote directly. Without it, ResolveBotWorkspace fails
 	// loudly with a "run enju bot setup" hint — that's the
 	// design (no silent fall-back to the operator's tree).
 	barePath := filepath.Join(homeTree, "enju", ".bare.git")
-	if err := workspace.PromoteWorkingTreeToBare(homeTree, barePath); err != nil {
+	if err := project.PromoteWorkingTreeToBare(homeTree, barePath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,7 +202,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	if got == homeTree {
 		t.Fatalf("bot workspace must be distinct from operator's home tree; both got %q", got)
 	}
-	// Phase C: clone lives at <home>/enju/.clone/.
+	// Bot clone lives at <home>/enju/.clone/.
 	wantClone := filepath.Join(homeTree, "enju", ".clone")
 	if got != wantClone {
 		t.Errorf("bot clone path: got %q, want %q", got, wantClone)
@@ -258,7 +258,7 @@ func TestResolveBotWorkspace_NoRemoteAndNoAdoptedPath_Errors(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
+	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "x", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, Workspace: ws, Logger: logger}) // no ProjectRegistry
 
@@ -293,14 +293,14 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = New(Config{Workspace: ws, ProjectRegistry: projectreg.Open(regPath), Logger: logger})
 
 	_, err = ws.OpenExisting(77)
-	if !errors.Is(err, workspace.ErrCloneNotFound) {
+	if !errors.Is(err, project.ErrCloneNotFound) {
 		t.Errorf("stale entry should be filtered; OpenExisting got: %v", err)
 	}
 }
@@ -334,14 +334,11 @@ func initRealCloneWithAuthor(t *testing.T, dir string) {
 	}
 }
 
-// (Removed in layout refactor — Phase A made `enju_create_project`
-// require an explicit path, so the registry can no longer hold a
-// workspace-internal path. Phase C dropped the
-// isManagedWorkspaceClone discriminator from ResolveBotWorkspace
-// (as it had become unreachable). Both the
-// EnsureBotPushTarget and ResolveBotWorkspace variants of this
-// test are gone — the cases they guarded against are
-// structurally impossible.)
+// (Removed: tests for the isManagedWorkspaceClone discriminator
+// that filtered registry entries pointing inside the workspace
+// root. With `enju_create_project path=` required, the registry
+// can no longer hold a workspace-internal path, so the
+// discriminator and its tests are unreachable.)
 
 // pushTargetCoordStub stands in for the coord during
 // EnsureBotPushTarget tests. It serves GET /projects/{id} with a
@@ -381,12 +378,12 @@ func newPushTargetCoord(t *testing.T, initialRemote string) (*httptest.Server, *
 	return srv, s
 }
 
-// TestEnsureBotPushTarget_LocalTreePromotes pins the happy path
-// after Phase B: project's remote_url is empty, registry has
-// the project's home path. EnsureBotPushTarget must
+// TestEnsureBotPushTarget_LocalTreePromotes pins the happy path:
+// project's remote_url is empty, registry has the project's
+// home path. EnsureBotPushTarget must
 //
 //	(a) promote the home tree to a bare INSIDE the project at
-//	    `<home>/enju/.bare.git/` — not under ~/.enju/repos/,
+//	    `<home>/enju/.bare.git/`,
 //	(b) NOT PUT to the coord (the bare is local-per-machine),
 //	(c) return created=true.
 //
@@ -418,7 +415,7 @@ func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
+	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, Workspace: ws, Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
 
@@ -437,7 +434,7 @@ func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 		t.Errorf("bare not materialized at %q: %v", wantBare, err)
 	}
 	if stub.putCount != 0 {
-		t.Errorf("Phase B: must NOT PUT to coord — bare is purely local; got %d PUTs", stub.putCount)
+		t.Errorf("must NOT PUT to coord — bare is purely local; got %d PUTs", stub.putCount)
 	}
 
 	// Second call must be idempotent — no re-clone, created=false.
@@ -464,7 +461,7 @@ func TestEnsureBotPushTarget_RealRemoteIsNoOp(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
+	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, Workspace: ws, Logger: logger})
 
@@ -501,7 +498,7 @@ func TestEnsureBotPushTarget_NoSourceErrors(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
+	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, Workspace: ws, Logger: logger}) // no projectRegistry
 

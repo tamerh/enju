@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func TestListTaskIterations(t *testing.T) {
@@ -97,14 +97,14 @@ func TestReadResultAtCommit(t *testing.T) {
 	// read returns the file contents at that commit.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	wsRoot := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsRoot, logger)
+	ws, err := project.NewOpener(wsRoot, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Adopt a directory as project 7's local clone. The
 	// InitDirAsProject helper does the git init + first commit
-	// and wires it through the workspace.
+	// and wires it through the project.
 	clone := t.TempDir()
 	resultDir := "enju/runs/1-draft/draft"
 	resultPath := filepath.Join(clone, resultDir, "result.md")
@@ -128,8 +128,8 @@ func TestReadResultAtCommit(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("ForProject: %v", perr)
 	}
-	commitRes, err := proj.CommitFiles(workspace.CommitFilesRequest{
-		Files: []workspace.FileWrite{
+	commitRes, err := proj.CommitFiles(project.CommitFilesRequest{
+		Files: []project.FileWrite{
 			{RepoRelPath: resultDir + "/result.md", Content: []byte("VERSION-1-CONTENT")},
 		},
 		CommitMsg:   "seed",

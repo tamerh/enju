@@ -1,4 +1,4 @@
-package workspace
+package project
 
 import (
 	"encoding/json"
@@ -158,7 +158,7 @@ type ResolvedPrompt struct {
 //     fan-in aggregation when multiple upstreams share a TaskDefID
 //  3. artifact content (`{{artifact:path}}`) — inlined from the
 //     version at the index's commit SHA
-func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
+func (p *Clone) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 	// 1. Group dependencies by task def id so fan-in cases get one
 	// aggregated entry. Deterministic ordering (sorted by instance
 	// key) so the rendered block is stable.
@@ -326,7 +326,7 @@ func (p *Project) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 // template resolver consumes. Mirrors the coordinator's legacy
 // `readResultForTemplate` but reads from the local clone instead of
 // the coordinator's working tree.
-func (p *Project) readResultForTemplate(dep DependencyRef) (map[string]interface{}, error) {
+func (p *Clone) readResultForTemplate(dep DependencyRef) (map[string]interface{}, error) {
 	result := map[string]interface{}{
 		"task_id": dep.TaskDefID,
 	}
@@ -469,7 +469,7 @@ func (p *Project) readResultForTemplate(dep DependencyRef) (map[string]interface
 // If the commit SHA is empty, it falls back to reading from the
 // working tree — useful for tests and for cases where the caller
 // doesn't care which version it gets.
-func (p *Project) readAt(commitSHA, repoRelPath string) ([]byte, bool, error) {
+func (p *Clone) readAt(commitSHA, repoRelPath string) ([]byte, bool, error) {
 	if commitSHA == "" {
 		data, err := p.ReadFile(repoRelPath)
 		if err != nil {
@@ -482,7 +482,7 @@ func (p *Project) readAt(commitSHA, repoRelPath string) ([]byte, bool, error) {
 
 // readArtifactVersion reads an artifact file at a specific commit
 // (or the working tree if commitSHA is empty).
-func (p *Project) readArtifactVersion(commitSHA, repoRelPath string) (string, bool, error) {
+func (p *Clone) readArtifactVersion(commitSHA, repoRelPath string) (string, bool, error) {
 	data, ok, err := p.readAt(commitSHA, repoRelPath)
 	if err != nil || !ok {
 		return "", false, err

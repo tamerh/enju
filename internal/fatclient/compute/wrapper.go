@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/common/gitignore"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // GitSubmitFailedPrefix is the leading text of the wrapper's
@@ -230,7 +230,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// so the cross-process flock is honored — the MCP handler and
 	// this wrapper run in distinct processes and MUST NOT race on
 	// .git/index.lock.
-	ws, err := workspace.NewWorkspace(spec.WorkspaceRoot, logger)
+	ws, err := project.NewOpener(spec.WorkspaceRoot, logger)
 	if err != nil {
 		res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
 		return res
@@ -255,7 +255,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		if err := workspace.EnsureSharedSymlink(workspace.ArtifactPath(rel), workDir,
+		if err := project.EnsureSharedSymlink(project.ArtifactPath(rel), workDir,
 			spec.ProjectID, spec.ProjectName, spec.Branch, rel); err != nil {
 			logger.Warn("shared-root symlink setup failed",
 				"path", rel, "error", err)
@@ -320,7 +320,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 	res.Content = content
 
-	files := []workspace.FileWrite{
+	files := []project.FileWrite{
 		{
 			RepoRelPath: filepath.Join(spec.ResultDir, "result.md"),
 			Content:     []byte(content),
@@ -332,13 +332,13 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// the commit alone.
 	contextPath := filepath.Join(workDir, spec.ResultDir, "context.json")
 	if ctxBytes, cerr := os.ReadFile(contextPath); cerr == nil {
-		files = append(files, workspace.FileWrite{
+		files = append(files, project.FileWrite{
 			RepoRelPath: filepath.Join(spec.ResultDir, "context.json"),
 			Content:     ctxBytes,
 		})
 	}
 	// script.log — full stdout+stderr transcript on success.
-	files = append(files, workspace.FileWrite{
+	files = append(files, project.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "script.log"),
 		Content:     scriptLog.Bytes(),
 	})
@@ -353,7 +353,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		"timestamp":   time.Now().Format(time.RFC3339),
 	}
 	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, workspace.FileWrite{
+	files = append(files, project.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -383,14 +383,14 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		full := filepath.Join(workDir, workspace.ArtifactPath(rel))
+		full := filepath.Join(workDir, project.ArtifactPath(rel))
 		body, rerr := os.ReadFile(full)
 		if rerr != nil {
 			res.MissingArtifacts = append(res.MissingArtifacts, rel)
 			continue
 		}
-		files = append(files, workspace.FileWrite{
-			RepoRelPath: workspace.ArtifactPath(rel),
+		files = append(files, project.FileWrite{
+			RepoRelPath: project.ArtifactPath(rel),
 			Content:     body,
 		})
 		committedPaths = append(committedPaths, rel)
@@ -400,7 +400,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if rel == "" {
 			continue
 		}
-		full := filepath.Join(workDir, workspace.ArtifactPath(rel))
+		full := filepath.Join(workDir, project.ArtifactPath(rel))
 		if _, err := os.Stat(full); err != nil {
 			res.MissingArtifacts = append(res.MissingArtifacts, rel)
 			continue
@@ -423,7 +423,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
 		updated, changed := gitignore.UpdateManagedBlock(existing, spec.UntrackedArtifacts)
 		if changed {
-			files = append(files, workspace.FileWrite{
+			files = append(files, project.FileWrite{
 				RepoRelPath: ".gitignore",
 				Content:     updated,
 			})
@@ -465,7 +465,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 
 	proj.Lock()
-	submitRes, err := proj.SubmitTaskResult(workspace.SubmitRequest{
+	submitRes, err := proj.SubmitTaskResult(project.SubmitRequest{
 		TaskID:        spec.TaskID,
 		Username:      spec.Username,
 		AuthorName:    spec.AuthorName,
@@ -479,7 +479,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		// async reconcile path can see them too.
 		ArtifactPaths: committedPaths,
 		Branch:        spec.Branch,
-		Trailers: workspace.EnjuTrailers{
+		Trailers: project.EnjuTrailers{
 			TaskID:             spec.TaskID,
 			ExitCode:           0,
 			ExitSet:            true,

@@ -19,7 +19,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // TestClientConfig is the test-only construction shape for
@@ -29,7 +29,7 @@ import (
 // Register() boot sequence.
 type TestClientConfig struct {
 	Coord           *coord.Client
-	Workspace       *workspace.Workspace
+	Workspace       *project.Opener
 	ModelName       string
 	Logger          *slog.Logger
 	ProjectRegistry *projectreg.Registry
@@ -42,12 +42,11 @@ type TestClientConfig struct {
 //
 // Defaults:
 //   - Logger → slog.Default() when unset.
-//   - ProjectRegistry → a fresh temp-file registry when a
-//     workspace is provided but no registry. Post-Phase-F
-//     ForProject's path resolution consults the registry, so
-//     tests that exercise workspace-touching handlers need one
-//     attached. The temp file is cleaned up by Go's tempdir on
-//     test exit.
+//   - ProjectRegistry → a fresh temp-file registry when an
+//     opener is provided but no registry. ForProject's path
+//     resolution consults the registry, so tests that exercise
+//     workspace-touching handlers need one attached. The temp
+//     file is cleaned up by Go's tempdir on test exit.
 func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 	logger := cfg.Logger
 	if logger == nil {
@@ -78,8 +77,8 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 // newClient is the shorter test fixture form. Tests construct
 // `c := newClient(coord.New(...), ws, logger)` instead of
 // hand-rolling `&apiClient{...}` with the right fields. ws may
-// be nil for tests that don't touch the workspace.
-func newClient(coordCli *coord.Client, ws *workspace.Workspace, logger *slog.Logger) *apiClient {
+// be nil for tests that don't touch the project.
+func newClient(coordCli *coord.Client, ws *project.Opener, logger *slog.Logger) *apiClient {
 	return newAPIClientForTest(TestClientConfig{
 		Coord:     coordCli,
 		Workspace: ws,

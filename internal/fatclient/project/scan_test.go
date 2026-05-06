@@ -1,4 +1,4 @@
-package workspace
+package project
 
 // Fetch-path scanner tests. The scanner is how phase 4's async
 // compute completion gets from "commit landed on origin" to
@@ -31,7 +31,7 @@ import (
 // project's local clone and pushes it to the bare remote.
 // Returns the commit SHA. Mirrors what the production wrapper
 // does, just with canned content.
-func submitOnBranch(t *testing.T, proj *Project, branch, taskID, username string, exitCode int) string {
+func submitOnBranch(t *testing.T, proj *Clone, branch, taskID, username string, exitCode int) string {
 	t.Helper()
 	resultDir := ResultDir(1, "", taskID)
 	proj.Lock()
@@ -67,7 +67,7 @@ func TestFetchBranchPureFetchNoWorktreeChange(t *testing.T) {
 	seedRemoteWithInitialCommit(t, bare)
 
 	// Reader side: separate clone that will FetchBranch.
-	readerWS, err := NewWorkspace(t.TempDir(), nullLogger())
+	readerWS, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("reader workspace: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestFetchBranchPureFetchNoWorktreeChange(t *testing.T) {
 
 	// Writer side: land a commit on main via a different
 	// workspace, so the reader's fetch has something new to see.
-	writerWS, err := NewWorkspace(t.TempDir(), nullLogger())
+	writerWS, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("writer workspace: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestFetchBranchNonexistentRemoteBranchIsNoOp(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -136,12 +136,12 @@ func TestScanBranchSinceBaseline(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	writerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	writerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	writer, _ := writerWS.ForProject(1, bare)
 	submitOnBranch(t, writer, "main", "1:1:t1", "alice", 0)
 	submitOnBranch(t, writer, "main", "1:1:t2", "alice", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	readerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	reader, _ := readerWS.ForProject(1, bare)
 	if err := reader.FetchBranch("main"); err != nil {
 		t.Fatalf("fetch: %v", err)
@@ -166,11 +166,11 @@ func TestScanBranchSinceIncremental(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	writerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	writerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	writer, _ := writerWS.ForProject(1, bare)
 	submitOnBranch(t, writer, "main", "1:1:pre", "alice", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	readerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	reader, _ := readerWS.ForProject(1, bare)
 	reader.FetchBranch("main")
 	baseline, _, _ := reader.ScanBranchSince("main", "")
@@ -211,11 +211,11 @@ func TestScanBranchSinceNoNewCommits(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	writerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	writerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	writer, _ := writerWS.ForProject(1, bare)
 	submitOnBranch(t, writer, "main", "1:1:t1", "alice", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	readerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	reader, _ := readerWS.ForProject(1, bare)
 	reader.FetchBranch("main")
 	baseline, _, _ := reader.ScanBranchSince("main", "")
@@ -241,7 +241,7 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	writerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	writerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	writer, _ := writerWS.ForProject(1, bare)
 
 	// Mix: task commit, human commit, task commit.
@@ -263,7 +263,7 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 	writer.Unlock()
 	sha3 := submitOnBranch(t, writer, "main", "1:1:auto2", "alice", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), nullLogger())
+	readerWS, _ := NewOpener(t.TempDir(), nullLogger())
 	reader, _ := readerWS.ForProject(1, bare)
 	reader.FetchBranch("main")
 	baseline, _, _ := reader.ScanBranchSince("main", "")
@@ -301,7 +301,7 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 // findSeedSHA walks origin/main's history back to its root and
 // returns the root SHA. Used to make incremental-scan tests
 // start from "before anything the test created."
-func findSeedSHA(t *testing.T, proj *Project) string {
+func findSeedSHA(t *testing.T, proj *Clone) string {
 	t.Helper()
 	tip, _, err := proj.ScanBranchSince("main", "")
 	if err != nil {
@@ -507,7 +507,7 @@ func TestSubmitTaskResultAutoAdvancesCursor(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, err := NewWorkspace(t.TempDir(), nullLogger())
+	ws, err := NewOpener(t.TempDir(), nullLogger())
 	if err != nil {
 		t.Fatalf("workspace: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestSubmitTaskResultSkipsCursorAdvanceWithoutConfig(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
-	ws, _ := NewWorkspace(t.TempDir(), nullLogger())
+	ws, _ := NewOpener(t.TempDir(), nullLogger())
 	proj, _ := ws.ForProject(1, bare)
 
 	stateDir := t.TempDir()
@@ -645,7 +645,7 @@ func TestScanBranchSinceFallsBackToLocalHeads(t *testing.T) {
 	// origin is configured, so the scanner's fast path
 	// (refs/remotes/origin/main) misses and the fallback
 	// kicks in.
-	proj := &Project{
+	proj := &Clone{
 		workDir: workDir,
 		repo:    repo,
 		logger:  nullLogger(),
@@ -684,7 +684,7 @@ func TestScanBranchSinceUnknownBranchReturnsEmpty(t *testing.T) {
 		t.Fatalf("init repo: %v", err)
 	}
 
-	proj := &Project{
+	proj := &Clone{
 		workDir: workDir,
 		repo:    repo,
 		logger:  nullLogger(),

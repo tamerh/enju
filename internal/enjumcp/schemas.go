@@ -1203,10 +1203,11 @@ func BotStart() mcp.Tool {
 
 One daemon per (machine, bot) for v1. Calling start on an already-running bot returns an error — call enju_bot_stop first if you want to restart.
 
-Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. Walking-skeleton scope: action=review and action=vote only. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.`),
+Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. Walking-skeleton scope: action=review and action=vote only. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.
+
+When the manifest declares exactly one bot, the 'bot' argument may be omitted — the supervisor uses that single entry. project_id may also be omitted to fall back to the manifest's project_id.`),
 		mcp.WithString("bot",
-			mcp.Required(),
-			mcp.Description("Bot name from enju/bots.yaml"),
+			mcp.Description("Bot name from enju/bots.yaml. Optional when the manifest has exactly one bot."),
 		),
 		mcp.WithString("project",
 			mcp.Description("Project directory containing enju/bots.yaml. Defaults to the fatclient's current working directory."),

@@ -111,7 +111,7 @@ func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 		CitizenEmail:   citizen.Email,
 		AuthToken:      citizen.Token,
 		ModelName:      "test-model",
-		Workspace:      ts.workspace,
+		Workspace:      ts.project,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return &mcpHarness{
@@ -214,7 +214,7 @@ func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcphandle
 		CitizenEmail:   citizen.Email,
 		AuthToken:      citizen.Token,
 		ModelName:      "test-model",
-		Workspace:      h.workspace,
+		Workspace:      h.project,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return mcphandlers.NewTestClient(cfg)
@@ -512,7 +512,7 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 		CitizenName:    "Notify Bot",
 		AuthToken:      botToken,
 		ModelName:      "test-model",
-		Workspace:      h.workspace,
+		Workspace:      h.project,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
@@ -3020,7 +3020,7 @@ tasks:
 		// Pre-submit HEAD on the run's branch. h.remoteFor returns
 		// "" in no-remote mode; ForProject's local-only fallback
 		// (Option B) opens the workspace clone regardless.
-		proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+		proj, err := h.project.ForProject(projectID, h.remoteFor(projectID))
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
@@ -3093,7 +3093,7 @@ tasks:
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 		h.mcpClaimOK(t, "i01:pick")
-		proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+		proj, err := h.project.ForProject(projectID, h.remoteFor(projectID))
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
@@ -3136,7 +3136,7 @@ tasks:
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 		h.mcpClaimOK(t, "pick")
-		proj, _ := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+		proj, _ := h.project.ForProject(projectID, h.remoteFor(projectID))
 		preHead, _ := proj.HeadHash()
 
 		// Submit option only — no content prose.
@@ -3180,7 +3180,7 @@ tasks:
 `
 		h.mcpCreateRunInline(t, projectID, yaml)
 
-		proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+		proj, err := h.project.ForProject(projectID, h.remoteFor(projectID))
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
@@ -3256,7 +3256,7 @@ tasks:
 		// Open the workspace clone — note the empty remote URL,
 		// which exercises Option B's local-only fallback in
 		// Workspace.ForProject.
-		proj, err := h.workspace.ForProject(projectID, "")
+		proj, err := h.project.ForProject(projectID, "")
 		if err != nil {
 			t.Fatalf("open workspace clone (no-remote project): %v", err)
 		}
@@ -5093,7 +5093,7 @@ tasks:
 		// run's branch. Every assertion downstream compares
 		// against this hash — if rollback silently fails, one of
 		// the orphan commits would be HEAD instead.
-		proj, err := h.workspace.ForProject(projectID, h.remoteFor(projectID))
+		proj, err := h.project.ForProject(projectID, h.remoteFor(projectID))
 		if err != nil {
 			t.Fatalf("open project workspace: %v", err)
 		}

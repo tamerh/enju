@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
+	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // SubmitBatchEntry is one entry in the batch submission input.
@@ -25,14 +25,15 @@ import (
 // rarely has to learn new shapes — it's the same per-task dict,
 // just list-wrapped.
 type SubmitBatchEntry struct {
-	TaskID        string
-	Content       string
-	Decision      string
-	Option        string
-	Outputs       map[string]string
-	OutputLists   map[string][]string
-	Artifacts     map[string]string
-	Model         string // per-entry model override
+	TaskID             string
+	Content            string
+	Decision           string
+	Option             string
+	Outputs            map[string]string
+	OutputLists        map[string][]string
+	Artifacts          map[string]string
+	UntrackedArtifacts []string
+	Model              string // per-entry model override
 }
 
 // SubmitBatchParams is the input shape for
@@ -118,17 +119,18 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 			continue
 		}
 		prep, prepErr := s.prepareFatSubmit(ctx, SubmitParams{
-			TaskID:        e.TaskID,
-			Meta:          bc.meta,
-			Content:       e.Content,
-			Outputs:       e.Outputs,
-			OutputLists:   e.OutputLists,
-			Artifacts:     e.Artifacts,
-			Decision:      e.Decision,
-			Option:        e.Option,
-			ModelOverride: e.Model,
-			AuthorName:    params.AuthorName,
-			AuthorEmail:   params.AuthorEmail,
+			TaskID:             e.TaskID,
+			Meta:               bc.meta,
+			Content:            e.Content,
+			Outputs:            e.Outputs,
+			OutputLists:        e.OutputLists,
+			Artifacts:          e.Artifacts,
+			UntrackedArtifacts: e.UntrackedArtifacts,
+			Decision:           e.Decision,
+			Option:             e.Option,
+			ModelOverride:      e.Model,
+			AuthorName:         params.AuthorName,
+			AuthorEmail:        params.AuthorEmail,
 		})
 		if prepErr != nil {
 			results[i] = SubmitBatchEntryResult{TaskID: e.TaskID, Status: "error", Message: prepErr.Error()}
@@ -173,7 +175,7 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 		commitErr := ""
 		taskIDs := make([]string, 0, len(prepared))
 		for _, prep := range prepared {
-			if _, err := proj.PrepareCommit(workspace.SubmitRequest{
+			if _, err := proj.PrepareCommit(project.SubmitRequest{
 				TaskID:        prep.TaskID,
 				Username:      s.Username(),
 				AuthorName:    prep.AuthorName,
@@ -182,6 +184,14 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 				Files:         prep.Files,
 				ArtifactPaths: prep.ArtifactPaths,
 				Branch:        branch,
+				Trailers: project.EnjuTrailers{
+					// Untracked-artifact trailer keeps the async
+					// reconcile path on the consumer side aware
+					// of declared-but-not-committed paths — same
+					// shape as the single-submit and compute
+					// paths.
+					UntrackedArtifacts: prep.UntrackedArtifactPaths,
+				},
 			}); err != nil {
 				commitErr = fmt.Sprintf("writing commit for %s to local clone: %v", prep.TaskID, err)
 				break
@@ -287,17 +297,18 @@ func (s *FatClient) submitOneForBatch(ctx context.Context, e SubmitBatchEntry, m
 		return SubmitBatchEntryResult{TaskID: e.TaskID, Status: "error", Message: "submit requires a local workspace; run via `enju mcp`"}
 	}
 	res := s.SubmitTaskResult(ctx, SubmitParams{
-		TaskID:        e.TaskID,
-		Meta:          meta,
-		Content:       e.Content,
-		Outputs:       e.Outputs,
-		OutputLists:   e.OutputLists,
-		Artifacts:     e.Artifacts,
-		Decision:      e.Decision,
-		Option:        e.Option,
-		ModelOverride: e.Model,
-		AuthorName:    authorName,
-		AuthorEmail:   authorEmail,
+		TaskID:             e.TaskID,
+		Meta:               meta,
+		Content:            e.Content,
+		Outputs:            e.Outputs,
+		OutputLists:        e.OutputLists,
+		Artifacts:          e.Artifacts,
+		UntrackedArtifacts: e.UntrackedArtifacts,
+		Decision:           e.Decision,
+		Option:             e.Option,
+		ModelOverride:      e.Model,
+		AuthorName:         authorName,
+		AuthorEmail:        authorEmail,
 	})
 	if res == nil {
 		return SubmitBatchEntryResult{TaskID: e.TaskID, Status: "error", Message: "submit returned nil result"}
@@ -316,7 +327,7 @@ func (s *FatClient) advanceScanCursor(projectID int64, branch, sha string) {
 	if sha == "" {
 		return
 	}
-	workspace.AdvanceScanCursor(projectID, s.StateDir(), branch, sha)
+	project.AdvanceScanCursor(projectID, s.StateDir(), branch, sha)
 }
 
 // IntraBatchDependencyConflict reports whether any entry's task

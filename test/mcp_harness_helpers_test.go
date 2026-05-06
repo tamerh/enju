@@ -563,21 +563,25 @@ func (h *mcpHarness) mcpInstancesOf(t *testing.T, defID string) []string {
 // Administrative / direct-store setup (no MCP handler for these)
 // ===========================================================================
 
-// mcpExpectProseRejection is the "soft error" counterpart to
-// callExpectError: it asserts a NON-error CallToolResult whose
-// formatted prose contains a failure marker ("✗ Failed" or the
-// given substring). Many MCP handlers (claim, create_project,
-// ...) surface coordinator-level rejections as formatted prose
-// inside a success result, rather than flipping IsError on. The
-// distinction is deliberate — the handler-formatter renders the
-// full server error so users see it in-line — but it means tests
-// need a specific assertion shape for these paths.
+// mcpExpectProseRejection asserts the call was rejected — either
+// as a tool-level error (`IsError=true`) OR as a "soft" non-error
+// CallToolResult whose formatted prose contains a failure marker
+// ("✗ Failed"). MCP handlers surface coordinator-level rejections
+// in either shape depending on the path: legacy handlers wrap the
+// server error in a success result with formatted prose; newer
+// handlers (post coord-side hardening for access-control + multi-
+// citizen vote claims) flip `IsError=true` directly. Both are
+// "the call was rejected" semantically — the helper accepts
+// either and substring-checks the resulting text.
 func (h *mcpHarness) mcpExpectProseRejection(t *testing.T, client *mcphandlers.TestClient, toolName string, args map[string]any, substrs ...string) string {
 	t.Helper()
-	res := h.mcpCallOKVia(t, client, toolName, args)
+	res := h.mcpCallVia(t, client, toolName, args)
 	text := mcpText(res)
-	if !strings.Contains(text, "✗") && !strings.Contains(strings.ToLower(text), "failed") {
-		t.Fatalf("call %s expected a formatted rejection (✗/Failed prefix), got: %s", toolName, text)
+	if !res.IsError {
+		// Soft-error shape: success result + "✗"/"failed" prose.
+		if !strings.Contains(text, "✗") && !strings.Contains(strings.ToLower(text), "failed") {
+			t.Fatalf("call %s expected a rejection (IsError=true OR ✗/Failed prose), got success: %s", toolName, text)
+		}
 	}
 	for _, s := range substrs {
 		if !strings.Contains(text, s) {

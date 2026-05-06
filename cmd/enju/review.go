@@ -33,7 +33,7 @@ var validReviewDecisions = []string{"approve", "request_changes", "reject", "com
 
 func cmdReview(args []string) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
-	coordinator := fs.String("coordinator", "http://localhost:8000", "Coordinator URL")
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json)")
 	decision := fs.String("decision", "", `Review decision: "approve", "request_changes", "reject", or "comment". Prompted interactively if omitted.`)
 	contentFlag := fs.String("content", "", "Review prose. If omitted, $EDITOR opens for you to write it.")

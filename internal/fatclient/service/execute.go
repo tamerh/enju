@@ -85,7 +85,7 @@ func ResolvedMode(meta *TaskMeta) string {
 // record it and stop the cascade gracefully without unwinding
 // as a generic failure.
 func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*ExecuteOutcome, error) {
-	if s.workspace == nil {
+	if s.project == nil {
 		return nil, fmt.Errorf("enju_execute_task requires a local workspace")
 	}
 
@@ -193,7 +193,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		TaskID:             taskID,
 		ProjectID:          meta.ProjectID,
 		RemoteURL:          remoteURL,
-		WorkspaceRoot:      s.workspace.RootDir(),
+		WorkspaceRoot:      s.project.RootDir(),
 		ProjectName:        projName,
 		Branch:             meta.Branch,
 		ResultDir:          resultDir,
