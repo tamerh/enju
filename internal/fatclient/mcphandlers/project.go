@@ -44,20 +44,23 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	description := req.GetString("description", "")
 	remoteURL := req.GetString("remote_url", "")
 	defaultBranch := req.GetString("default_branch", "")
-	customPath := req.GetString("path", "")
+	customPath, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError("path is required — pass an absolute path where the project's working tree will live (must be empty or not yet exist). To adopt a populated folder, use enju_init instead."), nil
+	}
 
-	// Validate optional `path`: must be absolute, must be empty
-	// or non-existent. The "fresh" guarantee on this tool means
-	// callers can trust we won't overwrite anything — populated
-	// directories must go through enju_init instead.
-	if customPath != "" {
+	// Validate the required path: must be absolute, must be
+	// empty or non-existent. The "fresh" guarantee on this tool
+	// means callers can trust we won't overwrite anything —
+	// populated directories must go through enju_init instead.
+	{
 		// path + remote_url combined would be ambiguous: the
-		// custom-path code path seeds a fresh local working tree
+		// path code path seeds a fresh local working tree
 		// rather than cloning, so the project record would persist
 		// a remote_url it never actually cloned from. Refuse loudly
 		// rather than create that drift silently.
 		if remoteURL != "" {
-			return mcp.NewToolResultError("path and remote_url are mutually exclusive — enju_create_project with path= seeds a fresh local working tree, it does not clone. To use a remote, either omit path= (workspace lands at ~/.enju/workspaces/) or git-clone the remote yourself and run enju_init on the resulting directory."), nil
+			return mcp.NewToolResultError("path and remote_url are mutually exclusive — enju_create_project seeds a fresh local working tree at path, it does not clone. To use a remote, git-clone it yourself first and run enju_init on the resulting directory."), nil
 		}
 		if !filepath.IsAbs(customPath) {
 			return mcp.NewToolResultError(fmt.Sprintf("path must be absolute, got %q", customPath)), nil

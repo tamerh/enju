@@ -1114,6 +1114,7 @@ func TestMCPDefaultBranchOnCreateProject(t *testing.T) {
 		projectName := fmt.Sprintf("branch-default-%d", nowNano())
 		res, err := h.client.Call(context.Background(), "enju_create_project", map[string]any{
 			"name":           projectName,
+			"path":           t.TempDir(),
 			"default_branch": "enju/work",
 		})
 		if err != nil || res.IsError {

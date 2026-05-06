@@ -318,19 +318,27 @@ func (m *Manifest) ByName(name string) *Bot {
 }
 
 // EnsureGitignored ensures the project's .gitignore lists the
-// per-bot worktree directory (corelayout.BotsRuntimeDir) inside
-// the existing enju-managed block. Called by `enju bot setup`
-// so the operator doesn't have to remember the gitignore step
-// manually.
+// machine-managed bot directories inside the existing enju-managed
+// block. Called by `enju bot setup` so the operator doesn't have
+// to remember the gitignore step manually. Three entries land in
+// the block:
+//
+//   - enju/bots/      — per-bot worktrees (transient runtime)
+//   - enju/.bare.git/ — bot push target bare (per-machine local)
+//   - enju/.clone/    — bot's managed clone (per-machine local)
+//
+// All three are local-only state, never something to commit. The
+// bare and clone are dot-prefixed so they don't clutter `ls enju/`
+// alongside the human-curated templates and bots.yaml.
 //
 // Returns (changed=true, nil) when the file was updated; (false,
-// nil) when the path was already present. Errors only on real I/O
-// failure.
+// nil) when all paths were already present. Errors only on real
+// I/O failure.
 //
-// Implementation note: the worktree path needs a trailing slash
-// so .gitignore matches a directory rather than (also) a sibling
-// file named "bots". Without the slash, an accidentally-created
-// file at enju/bots would also be ignored, masking a typo bug.
+// Implementation note: directory paths get a trailing slash so
+// .gitignore matches the directory specifically rather than (also)
+// a sibling file with the same name — a typo'd plain file at
+// `enju/bots` should NOT be silently ignored.
 func EnsureGitignored(projectRoot string) (bool, error) {
 	gitignorePath := filepath.Join(projectRoot, ".gitignore")
 	existing, err := os.ReadFile(gitignorePath)
@@ -347,7 +355,11 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	if st, statErr := os.Stat(gitignorePath); statErr == nil {
 		mode = st.Mode().Perm()
 	}
-	updated, changed := gitignore.UpdateManagedBlock(existing, []string{corelayout.BotsRuntimeDir + "/"})
+	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
+		corelayout.BotsRuntimeDir + "/",
+		corelayout.BotPushTargetDir + "/",
+		corelayout.BotCloneDir + "/",
+	})
 	if !changed {
 		return false, nil
 	}

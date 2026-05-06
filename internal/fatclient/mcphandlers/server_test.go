@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 	gogit "github.com/go-git/go-git/v5"
@@ -468,115 +469,62 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	}
 }
 
-// TestEagerCloneOnCreateProject verifies that handleCreateProject
-// clones the workspace directory immediately, so it exists before
-// any task is claimed.
-func TestEagerCloneOnCreateProject(t *testing.T) {
-	// 1. Seed a bare repo to act as the project's remote.
-	bareDir := t.TempDir()
-	workspace.InitBareWithSeed(bareDir)
-
-	// 2. Fake coordinator: POST /projects returns id=1,
-	//    GET /projects/1 returns remote_url + name.
+// TestCreateProjectPathRequired pins Phase A's contract: omitting
+// `path` is a hard error. Pre-Phase-A the handler accepted no-path
+// and silently routed to a managed `~/.enju/workspaces/` dir; that
+// fork was the source of the "two LocalPath shapes in projectreg"
+// confusion. After Phase A, callers MUST pick a path explicitly.
+func TestCreateProjectPathRequired(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"name":"my-cool-project"}`))
-	})
-	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"name":"my-cool-project","remote_url":"` + bareDir + `"}`))
-	})
-	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"username":"tester"}`))
+		t.Error("POST /projects must NOT fire when path is missing — handler should reject before calling coord")
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	// 3. Real workspace.
 	wsDir := t.TempDir()
 	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
-			BaseURL:  ts.URL,
-			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
+	c := newClient(coord.New(coord.Config{BaseURL: ts.URL, Username: "tester", Logger: logger}), ws, logger)
 
-	// Before: no clone exists.
-	if ws.HasLocalClone(1) {
-		t.Fatal("expected no clone before create")
-	}
-
-	// Call handleCreateProject via the MCP tool handler.
-	// Pass remote_url explicitly so the autoLocal path is
-	// skipped — this test is about eager-clone-given-a-remote,
-	// not bare-creation. The autoLocal path is covered by
-	// TestAutoLocalBareRepoOnCreateProject.
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_create_project",
-			Arguments: map[string]interface{}{
-				"name":       "my-cool-project",
-				"remote_url": bareDir,
-			},
+			Name:      "enju_create_project",
+			Arguments: map[string]interface{}{"name": "demo"},
 		},
 	})
 	if err != nil {
-		t.Fatalf("handleCreateProject: %v", err)
+		t.Fatalf("handleCreateProject (transport-level error, not expected): %v", err)
 	}
-	if result == nil {
-		t.Fatal("nil result from handleCreateProject")
+	if result == nil || !result.IsError {
+		t.Fatalf("expected IsError=true result, got %+v", result)
 	}
-
-	// After: clone should exist with the slug-named directory.
-	if !ws.HasLocalClone(1) {
-		t.Fatal("expected clone to exist immediately after create")
-	}
-	// Verify slug naming.
-	entries, _ := os.ReadDir(wsDir)
-	found := false
-	for _, e := range entries {
-		if e.IsDir() && strings.Contains(e.Name(), "my-cool-project") {
-			found = true
-		}
-	}
-	if !found {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Fatalf("expected slug-named dir containing 'my-cool-project', got: %v", names)
+	if !strings.Contains(mcpResultText(t, result), "path is required") {
+		t.Errorf("error should explain path is required, got: %s", mcpResultText(t, result))
 	}
 }
 
-// TestCreateProjectLocalOnlyWorkingTree verifies that
-// enju_create_project with no remote_url produces a single
-// local working tree — no shadow bare under
-// $HOME/.enju/repos/{id}.git, no PUT /remote dance. The
-// scanner's refs/heads fallback (ScanBranchSince) is what makes
-// this work without async tasks stalling. Project ends up with
-// remote_url="" on the coordinator; user can later upgrade to
-// a real remote via enju_set_project_remote.
-//
-// Replaces the legacy TestAutoLocalBareRepoOnCreateProject —
-// the auto-bare workaround was needed when the scanner only
-// walked refs/remotes/origin; with the fallback shipped, the
-// shadow becomes vestigial.
-func TestCreateProjectLocalOnlyWorkingTree(t *testing.T) {
+// TestCreateProjectCustomPathFresh verifies the path= parameter
+// on enju_create_project: the working tree lands at the
+// caller-supplied absolute path (registered as an external dir),
+// the eager-init produces a seeded git repo (README + scaffold),
+// and no shadow bare is created at the legacy
+// `~/.enju/repos/{id}.git/` path. With Phase A, path is the only
+// way to create a project; the legacy "managed workspace dir"
+// branch is gone.
+func TestCreateProjectCustomPathFresh(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects/1/remote", func(w http.ResponseWriter, r *http.Request) {
-		// Should NEVER be called for local-only create. If
-		// this fires, the autoLocal regression came back.
-		t.Errorf("unexpected PUT /projects/1/remote — local-only create should not call it (autoLocal regression)")
+		// Should NEVER fire — local-only create has no remote
+		// to PUT. Catches autoLocal regressions if they came back.
+		t.Errorf("unexpected PUT /projects/1/remote on local-only create")
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
@@ -598,87 +546,10 @@ func TestCreateProjectLocalOnlyWorkingTree(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
-			BaseURL:  ts.URL,
-			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
-
-	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name:      "enju_create_project",
-			Arguments: map[string]interface{}{"name": "demo"},
-		},
-	})
-	if err != nil || result == nil || result.IsError {
-		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
-	}
-
-	// No shadow bare must exist at the legacy autoLocal path.
-	legacyBare := filepath.Join(tmpHome, ".enju", "repos", "1.git")
-	if _, err := os.Stat(legacyBare); err == nil {
-		t.Errorf("unexpected shadow bare at %s — local-only mode should not create one", legacyBare)
-	}
-
-	// The eager-init produced a working tree. Without this,
-	// the user would later hit "reference not found" on first
-	// submit because branchBaseHash needs at least one commit
-	// to fork from.
-	if !ws.HasLocalClone(1) {
-		t.Fatal("expected local clone after create_project")
-	}
-
-	// The clone must carry the seeded initial commit so
-	// branch-off-of-HEAD works on first submit.
-	proj, err := ws.ForProject(1, "", "demo")
-	if err != nil {
-		t.Fatalf("ForProject post-create: %v", err)
-	}
-	if _, err := proj.HeadHash(); err != nil {
-		t.Fatalf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
-	}
-
-	// The seed should have produced README + the templates
-	// scaffold, so the user-visible layout matches what
-	// remote-backed projects ship with.
-	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
-		full := filepath.Join(proj.WorkDir(), rel)
-		if _, err := os.Stat(full); err != nil {
-			t.Errorf("expected seeded file %s after local-only create, got: %v", rel, err)
-		}
-	}
-}
-
-// TestCreateProjectCustomPathFresh verifies the optional path=
-// parameter on enju_create_project: the workspace lands at the
-// caller-supplied absolute path (registered as an external dir),
-// not under ~/.enju/workspaces/<slug>-<id>/.
-func TestCreateProjectCustomPathFresh(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"name":"demo","remote_url":""}`))
-	})
-	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":1,"name":"demo"}`))
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	wsDir := t.TempDir()
-	ws, err := workspace.NewWorkspace(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("new workspace: %v", err)
-	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
-			BaseURL:  ts.URL,
-			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
+		BaseURL:  ts.URL,
+		Username: "tester",
+		Logger:   logger,
+	}), ws, logger)
 
 	customPath := filepath.Join(t.TempDir(), "my-project")
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
@@ -694,14 +565,33 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
 	}
 
-	// Workspace should resolve to the custom path, not the
-	// default ~/.enju/workspaces/ location.
+	// Workspace resolves to the custom path.
 	proj, err := ws.ForProject(1, "")
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
 	}
 	if proj.WorkDir() != customPath {
 		t.Errorf("WorkDir = %q, want %q", proj.WorkDir(), customPath)
+	}
+
+	// Eager-init seeded the repo so first-submit's
+	// branchBaseHash has something to fork from.
+	if _, err := proj.HeadHash(); err != nil {
+		t.Errorf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
+	}
+	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
+		full := filepath.Join(proj.WorkDir(), rel)
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("expected seeded file %s after create, got: %v", rel, err)
+		}
+	}
+
+	// No shadow bare under ~/.enju/repos/. (Layout refactor
+	// kept this assertion alive — the legacy path is gone but
+	// regressions would re-introduce it.)
+	legacyBare := filepath.Join(tmpHome, ".enju", "repos", "1.git")
+	if _, err := os.Stat(legacyBare); err == nil {
+		t.Errorf("unexpected shadow bare at %s — local-only create should not create one", legacyBare)
 	}
 }
 
@@ -1134,9 +1024,10 @@ func TestInitDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 // folder (no .git) initializes git, writes the scaffold, and
 // registers the external dir so ForProject opens it directly.
 func TestInitFolderWithoutGit(t *testing.T) {
-	// Isolate $HOME — handleInit's auto-bare path writes under
-	// ~/.enju/repos/, which would collide with the developer's
-	// real project state if we let tests share $HOME.
+	// Isolate $HOME — defensive against any stray code path
+	// that might still consult $HOME for state. Post-layout-
+	// refactor, init no longer writes anywhere outside the
+	// adopted dir, but the override is cheap insurance.
 	t.Setenv("HOME", t.TempDir())
 	// Fake coordinator.
 	var createdProjectID int64 = 1
@@ -1356,15 +1247,17 @@ func TestInitIdempotent(t *testing.T) {
 	}
 }
 
-// TestInitOriginlessFolderStaysOriginless verifies the new
-// solo-mode behavior: enju_init on a folder with no `origin`
-// must NOT create a shadow bare at ~/.enju/repos/{id}.git
-// or configure origin in the working tree. Async tasks still
-// work because ScanBranchSince falls back to refs/heads when
-// no origin tracking ref exists. Replaces the legacy
-// TestInitAutoCreatesBareForOriginlessFolder — the auto-bare
-// workaround was a complement to an origin-only scanner;
-// with the scanner fallback the shadow becomes vestigial.
+// TestInitOriginlessFolderStaysOriginless verifies solo-mode
+// behavior: enju_init on a folder with no `origin` must NOT
+// create any bare or configure origin in the working tree.
+// Async tasks still work because ScanBranchSince falls back
+// to refs/heads when no origin tracking ref exists.
+//
+// The bare push target only appears later, when the operator
+// runs `enju bot setup` — it lands at <project>/enju/.bare.git/
+// (gitignored, per-machine). Pre-layout-refactor a "shadow
+// bare" lived at ~/.enju/repos/{id}.git/; that path no longer
+// exists.
 func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -1640,7 +1533,7 @@ func TestIsSSHURL(t *testing.T) {
 		{"/tmp/my-folder", false},
 		{"https://github.com/org/repo.git", false},
 		{"", false},
-		{"/home/tamer/.enju/repos/1.git", false},
+		{"/home/tamer/projects/myproject/enju/.bare.git", false},
 	}
 	for _, tc := range cases {
 		if got := workspace.IsSSHURL(tc.url); got != tc.want {
@@ -1931,10 +1824,17 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	runCommitHash, _ := wt.Commit("Task 2:1:work by @t: result\n\nEnju-Task-Complete: 2:1:work\n",
 		&gogit.CommitOptions{Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()}})
 
-	// Wire the workspace + project.
+	// Wire the workspace + project. Post-Phase-F path
+	// resolution comes from a projectreg.Registry attached to
+	// the workspace, not the legacy `RegisterExternalDir`
+	// in-memory map.
 	wsRoot := t.TempDir()
 	ws, _ := workspace.NewWorkspace(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ws.RegisterExternalDir(2, workDir)
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	if err := reg.Upsert(projectreg.Entry{ID: 2, LocalPath: workDir}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws.AttachRegistry(reg)
 	if _, err := ws.ForProject(2, ""); err != nil {
 		t.Fatalf("ForProject: %v", err)
 	}

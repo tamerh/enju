@@ -157,24 +157,38 @@ func TestNew_NoRegistry_NoBridge(t *testing.T) {
 func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
+	t.Setenv("GIT_AUTHOR_NAME", "test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+	t.Setenv("GIT_COMMITTER_NAME", "test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
 
-	// Operator's adopted tree: a real git clone at /op/tree.
-	adoptedDir := filepath.Join(tmp, "op-tree")
-	initRealClone(t, adoptedDir)
+	// Operator's project home: a real git clone at /op/tree.
+	homeTree := filepath.Join(tmp, "op-tree")
+	initRealCloneWithAuthor(t, homeTree)
+
+	// Phase B: a bot push target lives at <home>/enju/.bare.git/.
+	// `enju bot setup` would have created this; in the test we
+	// promote directly. Without it, ResolveBotWorkspace fails
+	// loudly with a "run enju bot setup" hint — that's the
+	// design (no silent fall-back to the operator's tree).
+	barePath := filepath.Join(homeTree, "enju", ".bare.git")
+	if err := workspace.PromoteWorkingTreeToBare(homeTree, barePath); err != nil {
+		t.Fatal(err)
+	}
 
 	// Persist the registry entry — what `enju_init --path=` does.
 	regPath := filepath.Join(tmp, "projects.json")
 	reg := projectreg.Open(regPath)
 	if err := reg.Upsert(projectreg.Entry{
 		ID:        42,
-		LocalPath: adoptedDir,
+		LocalPath: homeTree,
 		Name:      "demo-project",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Coord stub returning empty remote_url (the operator's
-	// project has no real remote — just the adopted local tree).
+	// Coord stub returning empty remote_url (project has no
+	// real github/etc. remote — just the local home tree).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -209,13 +223,14 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveBotWorkspace: %v", err)
 	}
-	// Critical assertion: bot's workspace is NOT the operator's tree.
-	if got == adoptedDir {
-		t.Fatalf("bot workspace must be distinct from operator's adopted dir; both got %q", got)
+	// Critical assertion: bot's clone is NOT the operator's tree.
+	if got == homeTree {
+		t.Fatalf("bot workspace must be distinct from operator's home tree; both got %q", got)
 	}
-	// And it must live under the workspace root.
-	if !strings.HasPrefix(got, wsRoot) {
-		t.Errorf("bot workspace should live under %q, got %q", wsRoot, got)
+	// Phase C: clone lives at <home>/enju/.clone/.
+	wantClone := filepath.Join(homeTree, "enju", ".clone")
+	if got != wantClone {
+		t.Errorf("bot clone path: got %q, want %q", got, wantClone)
 	}
 	// And it must be a real git clone.
 	if _, statErr := os.Stat(filepath.Join(got, ".git")); statErr != nil {
@@ -319,106 +334,14 @@ func initRealCloneWithAuthor(t *testing.T, dir string) {
 	}
 }
 
-// TestResolveBotWorkspace_RejectsManagedWorkspacePathAsSource
-// pins the bug from the create_project-no-path scenario:
-// EagerInitProjectClone registers the workspace path itself
-// (under ws.RootDir()) as the project's LocalPath. Pre-fix the
-// daemon's ResolveBotWorkspace blindly used that as a clone
-// source and ForceManagedClone tried to clone a path into
-// itself, eventually hitting openOrClone's bootstrap-empty-
-// remote path which set origin = the workspace path (self-
-// reference). The bot then couldn't push anywhere sensible.
-//
-// Post-fix: registry entries pointing inside the workspace
-// root are filtered out, ResolveBotWorkspace returns
-// ErrNoCloneSource, the daemon exits cleanly with operator
-// guidance.
-func TestResolveBotWorkspace_RejectsManagedWorkspacePathAsSource(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tmp := t.TempDir()
-
-	wsRoot := filepath.Join(tmp, "workspaces")
-	_ = os.MkdirAll(wsRoot, 0o755)
-	// Plant the "workspace clone" dir EagerInit would have
-	// created. Doesn't need to be a valid repo for the check —
-	// the filter fires before any clone op.
-	managedClone := filepath.Join(wsRoot, "demo-7")
-	_ = os.MkdirAll(managedClone, 0o755)
-
-	regPath := filepath.Join(tmp, "projects.json")
-	reg := projectreg.Open(regPath)
-	if err := reg.Upsert(projectreg.Entry{ID: 7, LocalPath: managedClone, Name: "demo"}); err != nil {
-		t.Fatal(err)
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":             7,
-			"name":           "demo",
-			"remote_url":     "",
-			"default_branch": "main",
-		})
-	}))
-	defer srv.Close()
-
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
-	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
-
-	_, err := fc.ResolveBotWorkspace(context.Background(), 7)
-	if err == nil {
-		t.Fatal("expected ErrNoCloneSource for create_project-no-path projects (registry path is the workspace clone itself)")
-	}
-	if !errors.Is(err, ErrNoCloneSource) {
-		t.Errorf("expected ErrNoCloneSource so the daemon exits cleanly; got %v", err)
-	}
-}
-
-// TestEnsureBotPushTarget_RejectsManagedWorkspacePathAsSource
-// covers the symmetric case for `enju bot setup`: when the
-// only registered LocalPath is the workspace clone, refuse to
-// promote (promoting would create a bare that the bot's clone
-// would still land on top of, since both bot and operator's
-// clone resolve to the same ws.projectDir path). Operator must
-// pick a different shape.
-func TestEnsureBotPushTarget_RejectsManagedWorkspacePathAsSource(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	wsRoot := filepath.Join(tmp, "workspaces")
-	_ = os.MkdirAll(wsRoot, 0o755)
-	managedClone := filepath.Join(wsRoot, "demo-7")
-	_ = os.MkdirAll(managedClone, 0o755)
-
-	regPath := filepath.Join(tmp, "projects.json")
-	reg := projectreg.Open(regPath)
-	if err := reg.Upsert(projectreg.Entry{ID: 7, LocalPath: managedClone, Name: "demo"}); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, stub := newPushTargetCoord(t, "")
-	defer srv.Close()
-
-	ws, _ := workspace.NewWorkspace(wsRoot, logger)
-	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
-
-	_, _, err := fc.EnsureBotPushTarget(context.Background(), 7)
-	if err == nil {
-		t.Fatal("expected ErrNoCloneSource — workspace-internal path must not be promoted to a bare")
-	}
-	if !errors.Is(err, ErrNoCloneSource) {
-		t.Errorf("expected ErrNoCloneSource, got %v", err)
-	}
-	if stub.putCount != 0 {
-		t.Errorf("must NOT PUT to coord when no valid source exists, got %d PUTs", stub.putCount)
-	}
-	if _, statErr := os.Stat(filepath.Join(tmp, ".enju", "repos")); statErr == nil {
-		t.Errorf("must NOT create a bare under ~/.enju/repos/ when source is invalid")
-	}
-}
+// (Removed in layout refactor — Phase A made `enju_create_project`
+// require an explicit path, so the registry can no longer hold a
+// workspace-internal path. Phase C dropped the
+// isManagedWorkspaceClone discriminator from ResolveBotWorkspace
+// (as it had become unreachable). Both the
+// EnsureBotPushTarget and ResolveBotWorkspace variants of this
+// test are gone — the cases they guarded against are
+// structurally impossible.)
 
 // pushTargetCoordStub stands in for the coord during
 // EnsureBotPushTarget tests. It serves GET /projects/{id} with a
@@ -458,36 +381,35 @@ func newPushTargetCoord(t *testing.T, initialRemote string) (*httptest.Server, *
 	return srv, s
 }
 
-// TestEnsureBotPushTarget_LocalTreePromotes pins the happy
-// path: project's remote_url is empty, the operator has an
-// adopted tree registered. EnsureBotPushTarget must
-// (a) promote the adopted tree to a bare under
+// TestEnsureBotPushTarget_LocalTreePromotes pins the happy path
+// after Phase B: project's remote_url is empty, registry has
+// the project's home path. EnsureBotPushTarget must
 //
-//	$HOME/.enju/repos/{id}.git/, (b) PUT the new bare path to
+//	(a) promote the home tree to a bare INSIDE the project at
+//	    `<home>/enju/.bare.git/` — not under ~/.enju/repos/,
+//	(b) NOT PUT to the coord (the bare is local-per-machine),
+//	(c) return created=true.
 //
-// the coord, (c) return created=true.
+// Idempotency: a second call sees the existing bare and returns
+// created=false without re-cloning.
 func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
-	// HOME override redirects $HOME so os.UserHomeDir lands the
-	// bare under tmp/.enju/repos/ instead of the real home dir.
-	// Pin GIT_AUTHOR_* + GIT_COMMITTER_* explicitly because the
-	// override also masks the real ~/.gitconfig — without these,
-	// initRealClone's wt.Commit fails with "author field is
-	// required" since go-git would otherwise have read .gitconfig
-	// for the user.name/user.email defaults.
-	t.Setenv("HOME", tmp)
+	// Pin GIT_AUTHOR_* + GIT_COMMITTER_* — initRealCloneWithAuthor
+	// supplies them via an explicit signature, but go-git's
+	// CommitOptions.All path still consults the env in some go-git
+	// versions. Keeps the test deterministic across versions.
 	t.Setenv("GIT_AUTHOR_NAME", "test")
 	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
 	t.Setenv("GIT_COMMITTER_NAME", "test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
 
-	adoptedDir := filepath.Join(tmp, "op-tree")
-	initRealCloneWithAuthor(t, adoptedDir)
+	homeTree := filepath.Join(tmp, "op-tree")
+	initRealCloneWithAuthor(t, homeTree)
 
 	regPath := filepath.Join(tmp, "projects.json")
 	reg := projectreg.Open(regPath)
-	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: adoptedDir, Name: "demo"}); err != nil {
+	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: homeTree, Name: "demo"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -507,18 +429,15 @@ func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 	if !created {
 		t.Errorf("first call should report created=true")
 	}
-	wantBare := filepath.Join(tmp, ".enju", "repos", "42.git")
+	wantBare := filepath.Join(homeTree, "enju", ".bare.git")
 	if bareURL != wantBare {
 		t.Errorf("bareURL: got %q, want %q", bareURL, wantBare)
 	}
 	if _, err := os.Stat(filepath.Join(wantBare, "HEAD")); err != nil {
 		t.Errorf("bare not materialized at %q: %v", wantBare, err)
 	}
-	if stub.putCount != 1 {
-		t.Errorf("expected 1 PUT to coord, got %d", stub.putCount)
-	}
-	if stub.gotPutBody["remote_url"] != wantBare {
-		t.Errorf("PUT remote_url: got %q, want %q", stub.gotPutBody["remote_url"], wantBare)
+	if stub.putCount != 0 {
+		t.Errorf("Phase B: must NOT PUT to coord — bare is purely local; got %d PUTs", stub.putCount)
 	}
 
 	// Second call must be idempotent — no re-clone, created=false.

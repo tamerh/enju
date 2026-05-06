@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
@@ -234,7 +236,16 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	extDir := t.TempDir()
-	ws.RegisterExternalDir(42, extDir)
+	// Post-Phase-F: project paths come from the registry, not
+	// an in-memory externalDirs map. Register via projectreg
+	// + AttachRegistry; ForProject (and HasExternalDir) will
+	// find the path the same way they do in production.
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg := projectreg.Open(regPath)
+	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: extDir}); err != nil {
+		t.Fatal(err)
+	}
+	ws.AttachRegistry(reg)
 
 	c := newAPIClientWithWorkspace(ws)
 	meta := &taskMeta{ProjectID: 42} // no remote URL

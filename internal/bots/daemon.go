@@ -305,10 +305,9 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	// bot explicitly asked for a managed clone.
 	//
 	// By calling ResolveBotWorkspace first we force
-	// ForceManagedClone to populate the cache with the
-	// `~/.enju/workspaces/<slug>-<id>/` Project. ForProject's
-	// cache check sees that and returns it; externalDirs is
-	// never consulted for this projectID in this process.
+	// OpenBotCloneAt to populate the cache with the bot clone
+	// at `<projectHome>/enju/.clone/`. ForProject's cache check
+	// sees that and returns it.
 	//
 	// Production symptom this fixes (ISSUE-007 follow-up): bot
 	// daemon claimed work, claude -p ran in the operator's

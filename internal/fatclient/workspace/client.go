@@ -65,23 +65,38 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/gofrs/flock"
+
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // Workspace manages a directory that holds one local clone per
 // project. Callers create a Workspace once at MCP client startup and
 // re-use it for the lifetime of the process.
+//
+// Project paths come from the projectreg.Registry when one is
+// attached via AttachRegistry. The registry is the single source
+// of truth for "where does project N live on disk?" — every
+// project home is registered explicitly at create_project /
+// init time (Phase A made `path=` required), so there's no
+// in-memory cache to keep in sync.
 type Workspace struct {
-	rootDir string
-	logger  *slog.Logger
+	rootDir  string
+	logger   *slog.Logger
+	registry *projectreg.Registry
 
-	mu           sync.Mutex
-	clients      map[int64]*Project // projectID → open project clone
-	externalDirs map[int64]string   // projectID → external folder path (from enju_init)
+	mu      sync.Mutex
+	clients map[int64]*Project // projectID → open project clone
 }
 
 // NewWorkspace creates (or reuses) a workspace rooted at the given
 // directory. The directory is created with 0755 perms if missing.
 // Pass an empty string to default to `$HOME/.enju/workspaces`.
+//
+// Attach a projectreg.Registry via AttachRegistry to enable path
+// resolution for `ForProject`. Without it, ForProject only handles
+// the IsLocalWorkingTree(remoteURL) and clone-from-remote paths —
+// fine for the bot daemon which uses OpenBotCloneAt, but operator-
+// side flows (MCP / webui) need the registry attached at startup.
 func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 	if rootDir == "" {
 		home, err := os.UserHomeDir()
@@ -94,11 +109,37 @@ func NewWorkspace(rootDir string, logger *slog.Logger) (*Workspace, error) {
 		return nil, fmt.Errorf("creating workspace root: %w", err)
 	}
 	return &Workspace{
-		rootDir:      rootDir,
-		logger:       logger,
-		clients:      make(map[int64]*Project),
-		externalDirs: make(map[int64]string),
+		rootDir: rootDir,
+		logger:  logger,
+		clients: make(map[int64]*Project),
 	}, nil
+}
+
+// AttachRegistry wires the projectreg.Registry that ForProject and
+// ProjectDir consult for path resolution. Replaces the previous
+// `RegisterExternalDir` + `externalDirs` map model — the registry
+// is the durable record, no need for an in-memory shadow.
+//
+// Called from service.New() once at construction; the bot daemon's
+// Workspace doesn't need it (OpenBotCloneAt takes paths explicitly).
+func (ws *Workspace) AttachRegistry(reg *projectreg.Registry) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.registry = reg
+}
+
+// projectHome looks up the project's working-tree path from the
+// attached registry. Returns "" when no registry is attached or
+// the project isn't registered. Caller must hold ws.mu.
+func (ws *Workspace) projectHome(projectID int64) string {
+	if ws.registry == nil {
+		return ""
+	}
+	entry, err := ws.registry.Get(projectID)
+	if err != nil || entry == nil {
+		return ""
+	}
+	return entry.LocalPath
 }
 
 // RootDir returns the directory that holds per-project clones.
@@ -159,19 +200,19 @@ func (ws *Workspace) HasLocalClone(projectID int64) bool {
 	return dir != ""
 }
 
-// ProjectDir returns the on-disk working directory for a project,
-// resolving externally-registered paths (from enju_init) before
-// the workspace's standard slug/numeric clone layout. Returns
-// empty when no clone exists. Read-only — does not trigger a
-// clone. Used by the notify subsystem to derive paths for
-// project-scoped state files (cursor, live event log).
+// ProjectDir returns the on-disk working directory for a project.
+// Registry wins (the post-Phase-A authoritative source); falls
+// back to a slug/numeric scan of the workspace root for legacy
+// clones not yet migrated AND for integration tests that build
+// a project via the coord directly without going through the
+// handler's EagerInitProjectClone (which writes to the
+// registry). Read-only — does not trigger a clone.
 func (ws *Workspace) ProjectDir(projectID int64) string {
 	ws.mu.Lock()
-	if dir, ok := ws.externalDirs[projectID]; ok {
-		ws.mu.Unlock()
-		return dir
+	defer ws.mu.Unlock()
+	if home := ws.projectHome(projectID); home != "" {
+		return home
 	}
-	ws.mu.Unlock()
 	return ws.findProjectDir(projectID)
 }
 
@@ -217,116 +258,66 @@ func (ws *Workspace) findProjectDir(projectID int64) string {
 	return numericMatch
 }
 
-// ForceManagedClone is like ForProject but **always** uses the
-// managed-clone path under the workspace root, never the
-// externalDirs short-circuit and never the local-working-tree
-// short-circuit. Bots call this so their working directory is
-// distinct from any operator-adopted path that the same
-// projectID happens to be registered with.
+// OpenBotCloneAt opens (or clones) the bot's managed clone at an
+// explicit caller-supplied path, sourcing from the supplied URL.
+// Used by service.ResolveBotWorkspace, where the clone lives at
+// `<projectHome>/enju/.clone/` and sources from the per-project
+// bare at `<projectHome>/enju/.bare.git/` (or a real github
+// remote). Bot-flow only — operator-side reads go through
+// ForProject.
 //
-// Why this is a separate entry point from ForProject: the human
-// `enju mcp` flow WANTS to operate directly on the operator's
-// adopted dir (otherwise their edits aren't visible to the
-// MCP-driven flow). The bot flow MUST operate on a separate
-// clone (otherwise the bot's branch switches collide with the
-// operator's working state, the bot's writes pollute the
-// operator's status, and the operator's uncommitted changes
-// jam the bot's checkout). Same projectID, two clones — the
-// bot one lives at `~/.enju/workspaces/{slug}-{id}/`, the
-// operator one is wherever they pointed `enju_init`.
+// clonePath and sourceURL are both required. The clone is opened
+// in-place if it already exists (and origin matches sourceURL),
+// otherwise PlainClone'd from sourceURL. Cross-process operations
+// against the same projectID coordinate via a flock at
+// `<filepath.Dir(clonePath)>/.bot-clone.lock` — local to the
+// project, doesn't depend on ws.rootDir at all.
 //
-// Caching: the returned Project is cached in ws.clients[id]
-// like ForProject. Subsequent calls for the same id return the
-// same handle. A single Workspace shouldn't mix ForProject and
-// ForceManagedClone for the same id — pick one resolution
-// strategy per process. In practice the bot daemon process
-// ONLY calls ForceManagedClone; the MCP / webui processes ONLY
-// call ForProject.
-//
-// remoteURL is required (empty errors). Local-path remotes are
-// CLONED, not opened in place — `git clone /op/tree
-// ~/.enju/workspaces/...` produces a clone with the local path
-// as `origin`, suitable for pull/push via the local protocol.
-// projectName is the slug source for the on-disk dir name.
-func (ws *Workspace) ForceManagedClone(projectID int64, remoteURL string, projectName ...string) (*Project, error) {
+// Cache: the workspace's `clients[id]` map is keyed by projectID.
+// A bot daemon process that started by calling ForProject (e.g.
+// some legacy startup path) might have populated the cache with
+// the operator's tree handle; if we see a stale entry at a
+// different workDir, evict it before opening the bot's clone.
+// In practice the daemon never calls ForProject post-Phase-C, so
+// this branch only fires defensively.
+func (ws *Workspace) OpenBotCloneAt(projectID int64, clonePath, sourceURL string) (*Project, error) {
 	if projectID == 0 {
 		return nil, fmt.Errorf("projectID is required")
 	}
-	if remoteURL == "" {
-		return nil, fmt.Errorf("ForceManagedClone requires remoteURL (project %d)", projectID)
+	if clonePath == "" {
+		return nil, fmt.Errorf("OpenBotCloneAt requires clonePath (project %d)", projectID)
+	}
+	if sourceURL == "" {
+		return nil, fmt.Errorf("OpenBotCloneAt requires sourceURL (project %d)", projectID)
 	}
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	name := ""
-	if len(projectName) > 0 {
-		name = projectName[0]
-	}
-	expectedWorkDir := ws.projectDir(projectID, name)
-
-	// Cache check is STRICT: only return the cached entry if
-	// its WorkDir is the managed-clone path we expect.
-	// Otherwise the cached Project came from a different
-	// resolution path (ForProject's externalDirs short-circuit,
-	// or the IsLocalWorkingTree direct-open) and points at the
-	// operator's adopted dir. Returning that would defeat the
-	// whole point of ForceManagedClone — bots would silently
-	// share the operator's tree even though they explicitly
-	// asked for isolation.
-	//
-	// On mismatch we evict the cache entry and clone fresh.
-	// The evicted Project's Lock/Unlock is owned by whoever was
-	// holding it, but we don't free their handle — they keep
-	// their pointer, we just stop returning it. Next call to
-	// any ws.* method for this id consults the cache again and
-	// sees the fresh managed-clone entry. In practice this
-	// fires once per daemon process at startup if some early
-	// flow (ClaimTask's pre-claim reconcile) already opened
-	// the project via ForProject; thereafter the cache stays
-	// hot with the managed clone.
 	if p, ok := ws.clients[projectID]; ok {
-		if p.workDir == expectedWorkDir {
+		if p.workDir == clonePath {
 			return p, nil
 		}
 		ws.logger.Info(
-			"ForceManagedClone: evicting non-managed cached project (replacing with managed clone)",
+			"OpenBotCloneAt: evicting cached project at different path",
 			"project_id", projectID,
 			"cached_workdir", p.workDir,
-			"managed_workdir", expectedWorkDir,
+			"requested_workdir", clonePath,
 		)
 		delete(ws.clients, projectID)
-		// Also drop any externalDirs registration so a future
-		// ForProject call doesn't re-bind to the operator's
-		// tree. The daemon never wants externalDirs in its
-		// process; the bridge that populates it is correct
-		// for webui but wrong for bots, and there's no good
-		// way for the workspace layer to know which process
-		// it's in. Dropping on first-use is the simplest
-		// idempotent answer.
-		delete(ws.externalDirs, projectID)
 	}
 
-	workDir := expectedWorkDir
-	p, err := openOrClone(workDir, remoteURL, ws.logger)
+	p, err := openOrClone(clonePath, sourceURL, ws.logger)
 	if err != nil {
 		return nil, err
 	}
 	p.projectID = projectID
-	lockPath := filepath.Join(ws.rootDir, fmt.Sprintf("project-%d.lock", projectID))
+	// Lock lives next to the clone, inside the project's enju/
+	// dir. Per-project, doesn't collide with anything else.
+	lockPath := filepath.Join(filepath.Dir(clonePath), ".bot-clone.lock")
 	p.fileLock = flock.New(lockPath)
 	ws.clients[projectID] = p
 	return p, nil
-}
-
-// RegisterExternalDir tells the workspace that a given project's
-// working directory is an external folder (from enju_init), not a
-// clone under the workspace root. ForProject will open the external
-// folder directly instead of cloning from a remote.
-func (ws *Workspace) RegisterExternalDir(projectID int64, dir string) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	ws.externalDirs[projectID] = dir
 }
 
 // sshAuthMethod returns an SSH auth method for the given remote URL.
@@ -394,13 +385,14 @@ func IsLocalWorkingTree(path string) bool {
 	return err == nil && gitInfo.IsDir()
 }
 
-// HasExternalDir returns true if the given project has been
-// registered as an external directory (from enju_init).
+// HasExternalDir returns true if the given project has a
+// registered home path (from enju_init or enju_create_project).
+// Wraps the registry lookup; named for backward compatibility
+// with tests that pre-date the registry-bridge unification.
 func (ws *Workspace) HasExternalDir(projectID int64) bool {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	_, ok := ws.externalDirs[projectID]
-	return ok
+	return ws.projectHome(projectID) != ""
 }
 
 // LeaveProject forgets the cached Project handle (if any) and
@@ -465,13 +457,13 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 	defer ws.mu.Unlock()
 
 	// LOAD-BEARING cache hit: bot daemons rely on this returning
-	// the managed-clone Project that ForceManagedClone seeded
-	// during the pre-warm step in bots/daemon.go runOnce. If this
-	// branch ever stops returning the cached entry (e.g.
-	// "validate before return", "always re-resolve when remoteURL
-	// looks remote"), the bot's downstream OpenProject calls fall
-	// through to the externalDirs short-circuit below and silently
-	// route to the operator's adopted tree. The pre-warm dance
+	// the bot-clone Project that OpenBotCloneAt seeded during the
+	// pre-warm step in bots/daemon.go runOnce. If this branch
+	// ever stops returning the cached entry (e.g. "validate
+	// before return", "always re-resolve when remoteURL looks
+	// remote"), the bot's downstream OpenProject calls fall
+	// through to the externalDirs short-circuit below and
+	// silently route to the operator's tree. The pre-warm dance
 	// only works because cache-hit-wins. See bots/daemon.go
 	// runOnce comment ("Pre-warm the bot's managed clone...") for
 	// the inverse half of this contract.
@@ -479,9 +471,12 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 		return p, nil
 	}
 
-	// Check for external directory (from enju_init, in-memory).
-	if extDir, ok := ws.externalDirs[projectID]; ok {
-		p, err := openOrClone(extDir, "", ws.logger)
+	// Registry path resolution: the projectreg.Registry holds
+	// the durable "project N lives at /path" mapping. When a
+	// registry is attached (operator-side flows always do this
+	// at New()), the project's working tree lives at that path.
+	if home := ws.projectHome(projectID); home != "" {
+		p, err := openOrClone(home, "", ws.logger)
 		if err != nil {
 			return nil, err
 		}
@@ -492,10 +487,10 @@ func (ws *Workspace) ForProject(projectID int64, remoteURL string, projectName .
 
 	// Detect local working tree: if remoteURL is a local path
 	// with a .git dir (not bare), open it directly instead of
-	// cloning. This handles enju_init'd projects that persist
-	// their path as remote_url across restarts.
+	// cloning. Defensive — covers callers with no registry
+	// attached but a local-path remoteURL (rare; bot daemon's
+	// resolveBare flow doesn't use this entry point).
 	if remoteURL != "" && IsLocalWorkingTree(remoteURL) {
-		ws.externalDirs[projectID] = remoteURL
 		p, err := openOrClone(remoteURL, "", ws.logger)
 		if err != nil {
 			return nil, err
@@ -560,12 +555,12 @@ func (ws *Workspace) OpenExisting(projectID int64) (*Project, error) {
 		return p, nil
 	}
 
-	// Resolve the on-disk path: external dir wins, then
-	// findProjectDir (slug-form preferred, numeric fallback).
-	var workDir string
-	if extDir, ok := ws.externalDirs[projectID]; ok {
-		workDir = extDir
-	} else {
+	// Resolve the on-disk path: registry wins, fallback to
+	// findProjectDir's slug/numeric scan for legacy clones not
+	// yet registered (rare; tests that build a Workspace
+	// directly without a registry attached).
+	workDir := ws.projectHome(projectID)
+	if workDir == "" {
 		workDir = ws.findProjectDir(projectID)
 	}
 	if workDir == "" {

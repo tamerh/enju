@@ -209,7 +209,7 @@ func TestDaemon_FindWork_PassesRunSeqNotGlobalID(t *testing.T) {
 // there.
 func TestDaemon_ResolvesAndThreadsWorkspaceToHandler(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = "/home/test/.enju/workspaces/3-myproject"
+	fc.workspacePath = "/home/test/projects/myproject/enju/.clone"
 	stub := &StubHandler{Response: "ok"}
 	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
 	if _, err := d.RunOnce(context.Background()); err != nil {
@@ -218,7 +218,7 @@ func TestDaemon_ResolvesAndThreadsWorkspaceToHandler(t *testing.T) {
 	if len(stub.Inputs) != 1 {
 		t.Fatalf("expected 1 handler invocation, got %d", len(stub.Inputs))
 	}
-	if got := stub.Inputs[0].Workspace; got != "/home/test/.enju/workspaces/3-myproject" {
+	if got := stub.Inputs[0].Workspace; got != "/home/test/projects/myproject/enju/.clone" {
 		t.Errorf("Workspace not threaded to handler: got %q (claude -p would inherit daemon cwd)", got)
 	}
 }

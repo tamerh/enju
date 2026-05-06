@@ -212,45 +212,35 @@ func validateCreateProjectPath(path string) error {
 	return nil
 }
 
-// EagerInitProjectClone materializes the local workspace clone for
-// a freshly-created project. Two paths:
+// EagerInitProjectClone materializes the local working tree for
+// a freshly-created project at the operator's chosen path. The
+// project's working tree IS that directory: register it as
+// external, then ForProject opens it (git-init's if needed).
 //
-//   - customPath set: the project's working tree IS the user's
-//     chosen directory. Register it as external, then ForProject
-//     opens it (git-init's if needed). Skips the default
-//     ~/.enju/workspaces/ slug + the remote-clone path.
-//   - customPath empty: pulls the coordinator's remote_url + name
-//     and either clones (when a remote is set) or seeds a fresh
-//     local working tree under ~/.enju/workspaces/<slug>-<id>/.
+// path is required — `enju_create_project` validates this at the
+// MCP handler boundary, so a zero-value here is a programming
+// error.
 //
 // Errors are returned but treated as warnings by callers (the
-// project record is registered; the next tool call will retry the
-// init/clone).
-func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, customPath string) error {
+// project record is registered; the next tool call will retry
+// the init).
+func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, path string) error {
 	if s.workspace == nil {
 		return nil
 	}
-	if customPath != "" {
-		s.workspace.RegisterExternalDir(projectID, customPath)
-		_, err := s.workspace.ForProject(projectID, "")
-		s.RegisterProject(projectreg.Entry{
-			ID:        projectID,
-			LocalPath: customPath,
-		})
-		return err
+	if path == "" {
+		return fmt.Errorf("EagerInitProjectClone: path is required (programming error: handler should reject empty path)")
 	}
-	remote, projName, defaultBranch, err := s.FetchProjectMetaExpanded(ctx, projectID)
-	if err != nil {
-		return err
-	}
-	_, err = s.workspace.ForProject(projectID, remote, projName)
+	// Register in projectreg FIRST so the subsequent ForProject
+	// call's registry lookup resolves to `path`. Post-Phase-F
+	// the workspace consults the registry directly; without
+	// this ordering ForProject would fall through to the
+	// "clone-from-remote" branch with empty remoteURL.
 	s.RegisterProject(projectreg.Entry{
-		ID:            projectID,
-		LocalPath:     s.workspace.ProjectDir(projectID),
-		Name:          projName,
-		RemoteURL:     remote,
-		DefaultBranch: defaultBranch,
+		ID:        projectID,
+		LocalPath: path,
 	})
+	_, err := s.workspace.ForProject(projectID, "")
 	return err
 }
 
@@ -393,22 +383,22 @@ func (s *FatClient) InitDirAsProject(dirPath string) (adoptedBranch string, err 
 
 // RegisterAdoptedDir wires an existing on-disk directory into
 // the workspace as the project's working tree. Used by enju_init
-// after the coordinator has registered the project: marks the
-// directory as external (so ForProject opens it directly instead
-// of cloning), then opens it once to verify it works.
+// after the coordinator has registered the project: writes the
+// path to projectreg (durable), then opens it once via
+// ForProject (which queries the registry) to verify the clone
+// works.
 func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 	if s.workspace == nil {
 		return nil
 	}
-	s.workspace.RegisterExternalDir(projectID, dirPath)
-	_, err := s.workspace.ForProject(projectID, "")
-	// External dirs aren't discoverable from the workspace
-	// root; the registry is the only durable record. Without
-	// this, restarting `enju mcp` loses the adoption.
+	// Registry write FIRST — ForProject's path lookup consults
+	// the registry, so the adoption must be durable before the
+	// open call.
 	s.RegisterProject(projectreg.Entry{
 		ID:        projectID,
 		LocalPath: dirPath,
 	})
+	_, err := s.workspace.ForProject(projectID, "")
 	return err
 }
 

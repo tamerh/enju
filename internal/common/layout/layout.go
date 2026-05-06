@@ -64,6 +64,23 @@ const BotManifestPath = "enju/bots.yaml"
 // trip through `git add` even if the ignore is missing.
 const BotsRuntimeDir = "enju/bots"
 
+// BotPushTargetDir is the per-project bare repo the bot daemon
+// pushes its topic branches to. Created by `enju bot setup` (see
+// service.EnsureBotPushTarget); operator's working tree's `origin`
+// is rewired to point at this path so async submits land here too.
+// The dot prefix on the directory name keeps it out of normal
+// `ls`-ing while matching the visible/hidden split convention
+// elsewhere in enju/. Always gitignored — no scenario where
+// a bare belongs in the project's git history.
+const BotPushTargetDir = "enju/.bare.git"
+
+// BotCloneDir is the per-project managed clone the bot daemon
+// operates in. Distinct from the operator's working tree so
+// branch switches and dirty state can't collide. Sourced from
+// BotPushTargetDir, populated lazily on first claim. Always
+// gitignored.
+const BotCloneDir = "enju/.clone"
+
 // BotPromptsDir is the conventional location bot system prompts
 // live in. Convention only — the manifest's `system_prompt:`
 // field can point anywhere repo-relative; this constant just

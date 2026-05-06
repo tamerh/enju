@@ -111,35 +111,17 @@ func New(cfg Config) *FatClient {
 		logger:     logger,
 		projectRegistry: cfg.ProjectRegistry,
 	}
-	fc.hydrateExternalDirsFromRegistry()
+	// Attach the registry to the workspace so ForProject /
+	// ProjectDir / OpenExisting can resolve project paths
+	// directly. Pre-Phase-F this was a "hydrate externalDirs at
+	// startup" bridge; the registry-as-source-of-truth model
+	// makes the bridge unnecessary — Workspace just queries the
+	// registry on each call. AttachRegistry is a nil-safe no-op
+	// when either side is unconfigured.
+	if cfg.Workspace != nil && cfg.ProjectRegistry != nil {
+		cfg.Workspace.AttachRegistry(cfg.ProjectRegistry)
+	}
 	return fc
-}
-
-// hydrateExternalDirsFromRegistry walks the project registry and
-// registers each entry's LocalPath with the workspace as an
-// external dir. No-op when either side is unconfigured (tests
-// that build a service without a registry, or a registry that
-// fails to load).
-//
-// `Registry.List` already filters entries whose LocalPath has
-// disappeared, so we don't double-stat here.
-func (s *FatClient) hydrateExternalDirsFromRegistry() {
-	if s.projectRegistry == nil || s.workspace == nil {
-		return
-	}
-	entries, err := s.projectRegistry.List()
-	if err != nil {
-		s.logger.Warn("project registry list failed during fatclient construction; adopted projects may be invisible until next coord touch",
-			"error", err)
-		return
-	}
-	for _, e := range entries {
-		s.workspace.RegisterExternalDir(e.ID, e.LocalPath)
-	}
-	if len(entries) > 0 {
-		s.logger.Debug("registered adopted projects from registry",
-			"count", len(entries))
-	}
 }
 
 // ProjectRegistry returns the per-machine registry the FatClient

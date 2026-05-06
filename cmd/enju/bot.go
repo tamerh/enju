@@ -383,17 +383,17 @@ func addBotToProject(ctx context.Context, coordURL, ownerToken string, projectID
 
 // ensureBotPushTarget calls service.FatClient.EnsureBotPushTarget
 // for the project so the moment bots are wired up, the project
-// has a non-working-tree push destination (a managed bare at
-// ~/.enju/repos/{id}.git/). Idempotent — re-running setup just
-// re-confirms the bare exists and origin points at it.
+// has a non-working-tree push destination (a managed bare inside
+// the project at <project>/enju/.bare.git/). Idempotent —
+// re-running setup just re-confirms the bare exists and origin
+// points at it.
 //
 // The setup CLI is a one-shot, so we build a minimal FatClient
 // here (workspace + projectRegistry + coord) and discard it on
-// return. We don't reuse the daemon's FatClient because setup
-// runs before any bot is launched and the operator's owner
-// token (not a bot token) authorizes the coord PUT — `enju bot
-// run` would use a bot's token, which lacks the project-write
-// permission needed for /api/v1/projects/{id}/remote.
+// return. The bare lives inside the project home (gitignored,
+// per-machine), so no coord write is needed; this helper builds a
+// FatClient just for FetchProjectMetaExpanded and the registry
+// lookup.
 func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credentials, projectID int64) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	wsRoot, err := defaultWorkspaceRoot()

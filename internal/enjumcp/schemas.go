@@ -487,11 +487,9 @@ func ListProjects() mcp.Tool {
 
 func CreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription(`Create a brand-new Enju project from scratch. Always creates a fresh workspace — guaranteed not to overwrite anything in an existing populated directory.
+		mcp.WithDescription(`Create a brand-new Enju project from scratch at an absolute path you provide. Always creates a fresh workspace — guaranteed not to overwrite anything in an existing populated directory.
 
-Workspace location:
-  - Default: ~/.enju/workspaces/<slug>-<id>/ — Enju picks the location, no cwd magic.
-  - With path=: the absolute path you provide. Must be empty or not yet exist; populated paths are refused with a pointer to enju_init.
+Path is required. Must be absolute, and must be empty or not yet exist. Populated paths are refused with a pointer to enju_init.
 
 Use this when the user wants to start fresh. If they have an existing folder, paper draft, or code repo to add Enju on top of, use enju_init instead.`),
 		mcp.WithString("name",
@@ -499,7 +497,8 @@ Use this when the user wants to start fresh. If they have an existing folder, pa
 			mcp.Description("Unique project name"),
 		),
 		mcp.WithString("path",
-			mcp.Description(`Optional absolute path for the workspace. Empty or non-existent only — populated paths are refused (use enju_init for those). Mutually exclusive with remote_url: path= seeds a fresh local working tree, it does not clone. Default: ~/.enju/workspaces/<slug>-<id>/.`),
+			mcp.Required(),
+			mcp.Description(`Absolute path for the project's working tree. Empty or non-existent only — populated paths are refused (use enju_init for those). The folder will hold all of Enju's per-project state under enju/ (templates, runs, events, bot state). Mutually exclusive with remote_url: path= seeds a fresh local working tree, it does not clone.`),
 		),
 		mcp.WithString("description",
 			mcp.Description("Optional project description"),

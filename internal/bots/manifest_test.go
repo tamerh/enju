@@ -369,8 +369,14 @@ func TestEnsureGitignored_FreshProject(t *testing.T) {
 		t.Error("expected changed=true on fresh project")
 	}
 	body, _ := os.ReadFile(filepath.Join(root, ".gitignore"))
-	if !strings.Contains(string(body), "enju/bots/") {
-		t.Errorf("expected enju/bots/ in .gitignore, got:\n%s", body)
+	// All three machine-managed dirs must land in the managed
+	// block so a stray `git add enju/` doesn't accidentally
+	// commit bot worktrees, the bare push target, or the bot's
+	// managed clone.
+	for _, want := range []string{"enju/bots/", "enju/.bare.git/", "enju/.clone/"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("expected %q in .gitignore, got:\n%s", want, body)
+		}
 	}
 	if !strings.Contains(string(body), "enju-untracked") {
 		t.Error(".gitignore should contain the managed block markers")

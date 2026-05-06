@@ -587,6 +587,7 @@ func TestMCPRecentEvents(t *testing.T) {
 	// Create a project so we have an authorized scope.
 	createRes := h.callOK(t, "enju_create_project", map[string]any{
 		"name": "recent-events-test",
+		"path": t.TempDir(),
 	})
 	createText := mcpText(createRes)
 	// Extract the project ID via the testServer rather than parsing the
@@ -1910,6 +1911,7 @@ func TestMCPCreateProject(t *testing.T) {
 
 		res := h.callOK(t, "enju_create_project", map[string]any{
 			"name":        "Drug Target Discovery",
+			"path":        t.TempDir(),
 			"description": "Long-lived project for drug target analyses",
 		})
 		if text := mcpText(res); !strings.Contains(text, "Drug Target Discovery") {
@@ -1924,6 +1926,7 @@ func TestMCPCreateProject(t *testing.T) {
 		// match the handler's actual behavior.
 		dupRes := h.callOK(t, "enju_create_project", map[string]any{
 			"name": "Drug Target Discovery",
+			"path": t.TempDir(),
 		})
 		dupText := mcpText(dupRes)
 		if !strings.Contains(dupText, "Failed to create") {
@@ -1950,6 +1953,7 @@ func TestMCPRunInProject(t *testing.T) {
 
 		h.callOK(t, "enju_create_project", map[string]any{
 			"name": "Bioinformatics Research",
+			"path": t.TempDir(),
 		})
 		projects := h.getList("/api/v1/projects")
 		var projectID int64

@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,7 +22,6 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/workspace"
 )
 
 // fakeCoord builds a httptest server that returns canned
@@ -479,25 +477,21 @@ func TestListReadyTasks_SurfacesCoordErrorEnvelope(t *testing.T) {
 }
 
 func TestListMaterializedProjects(t *testing.T) {
-	root := t.TempDir()
-	// Workspace.projectDir produces "<id>-<slug>" — replicate
-	// that shape so the discovery rule round-trips.
-	for _, name := range []string{"7-alpha", "11-beta-project", "not-a-project", "garbage"} {
-		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	// Post-Phase-A every project home is registered explicitly,
+	// so this just round-trips through the registry. Two
+	// projects in, two projects out.
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	dir7 := t.TempDir()
+	dir11 := t.TempDir()
+	if err := reg.Upsert(projectreg.Entry{ID: 7, LocalPath: dir7, Name: "alpha"}); err != nil {
+		t.Fatal(err)
 	}
-	// And one file (not a dir) — should be skipped.
-	if err := os.WriteFile(filepath.Join(root, "99-file"), []byte("x"), 0o644); err != nil {
+	if err := reg.Upsert(projectreg.Entry{ID: 11, LocalPath: dir11, Name: "beta-project"}); err != nil {
 		t.Fatal(err)
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ws, err := workspace.NewWorkspace(root, logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fc := New(Config{Workspace: ws, Logger: logger})
+	fc := New(Config{Logger: logger, ProjectRegistry: reg})
 	got, err := fc.ListMaterializedProjects()
 	if err != nil {
 		t.Fatalf("ListMaterializedProjects: %v", err)
@@ -514,7 +508,7 @@ func TestListMaterializedProjects(t *testing.T) {
 	}
 }
 
-func TestListMaterializedProjects_NoWorkspace(t *testing.T) {
+func TestListMaterializedProjects_NoRegistry(t *testing.T) {
 	fc := New(Config{})
 	got, err := fc.ListMaterializedProjects()
 	if err != nil {
@@ -525,25 +519,14 @@ func TestListMaterializedProjects_NoWorkspace(t *testing.T) {
 	}
 }
 
-func TestListMaterializedProjects_RegistryWins(t *testing.T) {
-	// When the registry has entries, they take priority over the
-	// filesystem walk — captures externally adopted dirs that
-	// don't live under the workspace root.
+func TestListMaterializedProjects_FromRegistry(t *testing.T) {
+	// Post-Phase-A every project has an explicit registry entry
+	// (path is required at create_project + init time), so the
+	// registry is the only source ListMaterializedProjects
+	// consults. Pre-refactor this test also exercised a
+	// filesystem-walk fallback (deleted in Phase D once the
+	// "managed workspace dir" concept went away).
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	root := t.TempDir()
-	ws, err := workspace.NewWorkspace(root, logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Filesystem has one standard clone (id=7) under root.
-	if err := os.MkdirAll(filepath.Join(root, "7-alpha"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Registry has a different project (id=99) at an external
-	// location. If the filesystem walk runs, we'd see id=7. If
-	// the registry wins, we see id=99.
 	externalDir := t.TempDir()
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	if err := reg.Upsert(projectreg.Entry{
@@ -554,38 +537,13 @@ func TestListMaterializedProjects_RegistryWins(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fc := New(Config{Workspace: ws, Logger: logger, ProjectRegistry: reg})
+	fc := New(Config{Logger: logger, ProjectRegistry: reg})
 	got, err := fc.ListMaterializedProjects()
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if len(got) != 1 || got[0].ProjectID != 99 {
-		t.Errorf("expected registry to win with id=99, got %+v", got)
-	}
-}
-
-func TestListMaterializedProjects_FilesystemFallback(t *testing.T) {
-	// Empty registry → falls back to filesystem walk. Smooths
-	// the migration path for users on older code who have
-	// standard clones but no registry yet.
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	root := t.TempDir()
-	ws, err := workspace.NewWorkspace(root, logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, "7-alpha"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	emptyReg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
-	fc := New(Config{Workspace: ws, Logger: logger, ProjectRegistry: emptyReg})
-	got, err := fc.ListMaterializedProjects()
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if len(got) != 1 || got[0].ProjectID != 7 {
-		t.Errorf("expected filesystem fallback to find id=7, got %+v", got)
+	if len(got) != 1 || got[0].ProjectID != 99 || got[0].Path != externalDir {
+		t.Errorf("expected single registry entry id=99 path=%q, got %+v", externalDir, got)
 	}
 }
 
@@ -619,22 +577,6 @@ func TestRegisterAndList_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseProjectIDFromDir(t *testing.T) {
-	cases := []struct {
-		name string
-		want int64
-	}{
-		{"7-alpha", 7},
-		{"11-beta-bot", 11},
-		{"7", 7},
-		{"7abc", 0}, // looks-like-int-but-isn't, no dash to strip
-		{"abc-7", 0},
-		{"-7", 0},
-		{"", 0},
-	}
-	for _, tc := range cases {
-		if got := parseProjectIDFromDir(tc.name); got != tc.want {
-			t.Errorf("parseProjectIDFromDir(%q) = %d, want %d", tc.name, got, tc.want)
-		}
-	}
-}
+// (TestParseProjectIDFromDir removed in Phase D — the helper
+// only existed to parse "<id>-<slug>" workspace-managed dir
+// names, which the layout refactor eliminated.)

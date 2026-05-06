@@ -17,8 +17,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -273,71 +271,21 @@ func (s *FatClient) ListEvents(ctx context.Context, projectID int64, opts ListEv
 // projects, then GetProject per ID for richer metadata that
 // isn't cached in the registry.
 func (s *FatClient) ListMaterializedProjects() ([]MaterializedProject, error) {
-	if s.projectRegistry != nil {
-		entries, err := s.projectRegistry.List()
-		if err != nil {
-			s.logger.Warn("project registry list failed, falling back to filesystem",
-				"error", err)
-		} else if len(entries) > 0 {
-			out := make([]MaterializedProject, 0, len(entries))
-			for _, e := range entries {
-				out = append(out, MaterializedProject{
-					ProjectID: e.ID,
-					Path:      e.LocalPath,
-				})
-			}
-			return out, nil
-		}
-	}
-	return s.listMaterializedFromWorkspace()
-}
-
-// listMaterializedFromWorkspace walks the workspace root and
-// reports projects with a local clone. Used as the fallback
-// path when no registry has been populated yet.
-func (s *FatClient) listMaterializedFromWorkspace() ([]MaterializedProject, error) {
-	if s.workspace == nil {
+	if s.projectRegistry == nil {
 		return nil, nil
 	}
-	root := s.workspace.RootDir()
-	entries, err := os.ReadDir(root)
+	entries, err := s.projectRegistry.List()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read workspace root: %w", err)
+		return nil, fmt.Errorf("project registry list: %w", err)
 	}
-	out := []MaterializedProject{}
+	out := make([]MaterializedProject, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		id := parseProjectIDFromDir(e.Name())
-		if id <= 0 {
-			continue
-		}
 		out = append(out, MaterializedProject{
-			ProjectID: id,
-			Path:      filepath.Join(root, e.Name()),
+			ProjectID: e.ID,
+			Path:      e.LocalPath,
 		})
 	}
 	return out, nil
-}
-
-// parseProjectIDFromDir returns the int prefix of "<id>-<slug>"
-// directory names, or 0 if the name doesn't match the
-// convention.
-func parseProjectIDFromDir(name string) int64 {
-	dash := strings.IndexByte(name, '-')
-	head := name
-	if dash >= 0 {
-		head = name[:dash]
-	}
-	n, err := strconv.ParseInt(head, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 // === local wire types ===

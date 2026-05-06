@@ -29,6 +29,7 @@ func mcpCreateProjectAs(t *testing.T, h *mcpHarness, client *mcphandlers.TestCli
 	t.Helper()
 	res, err := client.Call(context.Background(), "enju_create_project", map[string]any{
 		"name": name,
+		"path": t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create_project: %v", err)
