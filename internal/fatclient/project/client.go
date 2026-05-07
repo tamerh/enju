@@ -1005,16 +1005,7 @@ func (p *Clone) HeadHash() (string, error) {
 // session. Empty `branch` resolves through the project's
 // configured default.
 func (p *Clone) LocalBranchHash(branch string) (string, error) {
-	b := p.resolveBranch(branch)
-	localRef := plumbing.NewBranchReferenceName(b)
-	if ref, err := p.repo.Reference(localRef, true); err == nil {
-		return ref.Hash().String(), nil
-	}
-	remoteRef := plumbing.NewRemoteReferenceName("origin", b)
-	if ref, err := p.repo.Reference(remoteRef, true); err == nil {
-		return ref.Hash().String(), nil
-	}
-	return "", nil
+	return p.gitClone.LocalBranchHash(p.resolveBranch(branch))
 }
 
 // RemoteHeadHash contacts the remote via ls-remote and returns
@@ -1030,26 +1021,7 @@ func (p *Clone) RemoteHeadHash() (string, error) {
 // RemoteHeadHash. Pass "" to use the project's configured
 // default.
 func (p *Clone) RemoteBranchHash(branch string) (string, error) {
-	if p.remoteURL == "" {
-		return "", fmt.Errorf("no remote configured")
-	}
-	rem, err := p.repo.Remote("origin")
-	if err != nil {
-		return "", fmt.Errorf("no origin remote: %w", err)
-	}
-	refs, err := rem.List(&gogit.ListOptions{
-		Auth: sshAuthMethod(p.remoteURL),
-	})
-	if err != nil {
-		return "", friendlyGitError("check remote status", p.remoteURL, err)
-	}
-	target := plumbing.NewBranchReferenceName(p.resolveBranch(branch))
-	for _, r := range refs {
-		if r.Name() == target {
-			return r.Hash().String(), nil
-		}
-	}
-	return "", nil
+	return p.gitClone.RemoteBranchHash(p.resolveBranch(branch))
 }
 
 // ReadFile reads a file from the working tree at a repo-relative path.
