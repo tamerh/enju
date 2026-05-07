@@ -472,7 +472,7 @@ func (p *Clone) readResultForTemplate(dep DependencyRef) (map[string]interface{}
 // doesn't care which version it gets.
 func (p *Clone) readAt(commitSHA, repoRelPath string) ([]byte, bool, error) {
 	if commitSHA == "" {
-		data, err := p.ReadFile(repoRelPath)
+		data, err := p.gitClone.ReadFile(repoRelPath)
 		if err != nil {
 			return nil, false, nil
 		}

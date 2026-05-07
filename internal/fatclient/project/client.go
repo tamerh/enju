@@ -836,14 +836,6 @@ func cloneFromGit(gc *enjugit.SharedClone, logger *slog.Logger) *Clone {
 	}
 }
 
-// ReadFile reads a file from the working tree at a repo-relative path.
-// Used by the client-side template resolver to read upstream task
-// results and artifact contents.
-func (p *Clone) ReadFile(repoRelPath string) ([]byte, error) {
-	full := filepath.Join(p.workDir, repoRelPath)
-	return os.ReadFile(full)
-}
-
 // FileWrite describes one file to write into the working tree as part
 // of a single atomic commit. Used by SubmitTaskResult to pack together
 // a task's result file(s), metadata, and any artifact writes.
