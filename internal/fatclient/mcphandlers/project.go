@@ -120,7 +120,7 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	// claim. Failures are non-fatal at this point: the project
 	// record is registered, and the next tool call will retry
 	// the init/clone.
-	if c.fc.Workspace() != nil {
+	if c.fc.Enjugit() != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
@@ -202,7 +202,7 @@ func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	if c.fc.Workspace() != nil {
+	if c.fc.Enjugit() != nil {
 		var result map[string]interface{}
 		if json.Unmarshal(data, &result) == nil {
 			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
@@ -260,7 +260,7 @@ func (c *apiClient) handleLeaveProject(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
 	keepMembership := req.GetBool("keep_membership", false)
-	if c.fc.Workspace() == nil {
+	if c.fc.Enjugit() == nil {
 		return mcp.NewToolResultError("leave project is only available in MCP client mode"), nil
 	}
 	// Existence check.

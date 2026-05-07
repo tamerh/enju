@@ -42,7 +42,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError("run_id is required"), nil
 	}
-	if c.fc.Workspace() == nil {
+	if c.fc.Enjugit() == nil {
 		return mcp.NewToolResultError("enju_execute_run requires a local workspace"), nil
 	}
 	maxTasks := req.GetInt("max_tasks", defaultExecuteRunLimit)

@@ -39,7 +39,7 @@ import (
 // workspace is unset, the body doesn't unmarshal, or no
 // decoration applied.
 func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return data
 	}
 	var projects []map[string]interface{}
@@ -63,20 +63,19 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 			continue
 		}
 		pName, _ := p["name"].(string)
-		proj, err := s.project.ForProject(projectID, remoteURL, pName)
+		wf, err := s.enjugit.ForProject(projectID, remoteURL, pName)
 		if err != nil {
 			continue
 		}
-		gc := proj.GitClone()
-		t := gc.LastPushAt()
+		t := wf.LastPushAt()
 		if t.IsZero() {
-			t = gc.HeadCommitTime()
+			t = wf.HeadCommitTime()
 		}
 		if !t.IsZero() {
 			p["last_push_at"] = t.Format(time.RFC3339)
 			changed = true
 		}
-		if e := gc.LastPushError(); e != "" {
+		if e := wf.LastPushError(); e != "" {
 			p["last_push_error"] = e
 			changed = true
 		}
@@ -245,7 +244,7 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 		ID:        projectID,
 		LocalPath: path,
 	})
-	_, err := s.project.ForProject(projectID, "")
+	_, err := s.enjugit.ForProject(projectID, "")
 	return err
 }
 
@@ -403,7 +402,7 @@ func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 		ID:        projectID,
 		LocalPath: dirPath,
 	})
-	_, err := s.project.ForProject(projectID, "")
+	_, err := s.enjugit.ForProject(projectID, "")
 	return err
 }
 

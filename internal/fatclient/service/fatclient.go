@@ -217,8 +217,15 @@ func (s *FatClient) Coord() *coord.Client { return s.coord }
 
 // Workspace returns the underlying project. Exposed for callers
 // that need direct access to workspace primitives (project resolve,
-// scan, etc.).
+// scan, etc.). Goes away with the project package — new callers
+// should use Enjugit() instead.
 func (s *FatClient) Workspace() *project.Opener { return s.project }
+
+// Enjugit returns the underlying enjugit Workspace, the
+// post-migration replacement for Workspace(). Mode-check guard for
+// "MCP client mode" — nil means no on-disk workspace configured
+// (test fixtures with coord-only setup).
+func (s *FatClient) Enjugit() *enjugit.Workspace { return s.enjugit }
 
 // Username delegates to the coord client so callers see live values
 // across auto-reregister rotations.
