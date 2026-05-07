@@ -35,7 +35,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 
-	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // NamedOutputSpec describes one named output's file layout. Mirrors
@@ -111,7 +111,7 @@ func ParseNamedOutputSchema(schemaJSON string) map[string]NamedOutputSpec {
 // the `output_files` key before writing it.
 //
 // Ported from the legacy coordinator-side writeMultiFileResult.
-func BuildNamedOutputFiles(resultDir string, schema map[string]NamedOutputSpec, values map[string]string) (files []project.FileWrite, fileIndex map[string]string) {
+func BuildNamedOutputFiles(resultDir string, schema map[string]NamedOutputSpec, values map[string]string) (files []enjugit.FileWrite, fileIndex map[string]string) {
 	fileIndex = make(map[string]string, len(values))
 	for name, value := range values {
 		spec, hasSpec := schema[name]
@@ -125,7 +125,7 @@ func BuildNamedOutputFiles(resultDir string, schema map[string]NamedOutputSpec, 
 			}
 			fileName = name + "." + format
 		}
-		files = append(files, project.FileWrite{
+		files = append(files, enjugit.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, fileName),
 			Content:     []byte(value),
 		})

@@ -825,7 +825,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 		resultDir = filepath.Join(baseResultDir, "citizen-"+voterUser)
 	}
-	files := []project.FileWrite{}
+	files := []enjugit.FileWrite{}
 	metadata := map[string]interface{}{
 		"task_id":     fullTaskID,
 		"model":       "test",
@@ -856,7 +856,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 	}
 	if content != "" {
-		files = append(files, project.FileWrite{
+		files = append(files, enjugit.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
 			Content:     []byte(content),
 		})
@@ -882,7 +882,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			metadata["output_files"] = fileIndex
 		} else {
 			outBytes, _ := json.MarshalIndent(outputs, "", "  ")
-			files = append(files, project.FileWrite{
+			files = append(files, enjugit.FileWrite{
 				RepoRelPath: filepath.Join(resultDir, "result.json"),
 				Content:     outBytes,
 			})
@@ -892,7 +892,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		s.t.Fatalf("submit with no content, outputs, or artifacts")
 	}
 	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, project.FileWrite{
+	files = append(files, enjugit.FileWrite{
 		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -908,7 +908,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			}
 		}
 		for _, p := range artifactPaths {
-			files = append(files, project.FileWrite{
+			files = append(files, enjugit.FileWrite{
 				RepoRelPath: enjugit.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})

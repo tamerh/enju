@@ -338,7 +338,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 	res.Content = content
 
-	files := []project.FileWrite{
+	files := []enjugit.FileWrite{
 		{
 			RepoRelPath: filepath.Join(spec.ResultDir, "result.md"),
 			Content:     []byte(content),
@@ -350,13 +350,13 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// the commit alone.
 	contextPath := filepath.Join(workDir, spec.ResultDir, "context.json")
 	if ctxBytes, cerr := os.ReadFile(contextPath); cerr == nil {
-		files = append(files, project.FileWrite{
+		files = append(files, enjugit.FileWrite{
 			RepoRelPath: filepath.Join(spec.ResultDir, "context.json"),
 			Content:     ctxBytes,
 		})
 	}
 	// script.log — full stdout+stderr transcript on success.
-	files = append(files, project.FileWrite{
+	files = append(files, enjugit.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "script.log"),
 		Content:     scriptLog.Bytes(),
 	})
@@ -371,7 +371,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		"timestamp":   time.Now().Format(time.RFC3339),
 	}
 	metaBytes, _ := json.MarshalIndent(metadata, "", "  ")
-	files = append(files, project.FileWrite{
+	files = append(files, enjugit.FileWrite{
 		RepoRelPath: filepath.Join(spec.ResultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -419,7 +419,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 				res.MissingArtifacts = append(res.MissingArtifacts, e.Path)
 				continue
 			}
-			files = append(files, project.FileWrite{
+			files = append(files, enjugit.FileWrite{
 				RepoRelPath: enjugit.ArtifactPath(e.Path),
 				Content:     body,
 			})
@@ -452,7 +452,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
 		updated, changed := gitignore.UpdateManagedBlock(existing, untrackedDecls)
 		if changed {
-			files = append(files, project.FileWrite{
+			files = append(files, enjugit.FileWrite{
 				RepoRelPath: ".gitignore",
 				Content:     updated,
 			})
@@ -501,14 +501,6 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// flow through CustomTrailers — Workflow doesn't model them as
 	// first-class request fields.
 	wf := enjugit.WorkflowFromShared(proj.GitClone(), spec.ProjectID, spec.Branch, logger)
-	enjuFiles := make([]enjugit.FileWrite, len(files))
-	for i, f := range files {
-		enjuFiles[i] = enjugit.FileWrite{
-			RepoRelPath: f.RepoRelPath,
-			Content:     f.Content,
-			Mode:        f.Mode,
-		}
-	}
 	customTrailers := map[string]string{
 		enjugit.TrailerExit: "0",
 	}
@@ -523,7 +515,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	submitRes, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
 		TaskID:         spec.TaskID,
 		BranchOverride: spec.Branch,
-		Files:          enjuFiles,
+		Files:          files,
 		// ArtifactPaths feeds the commit message + Enju-Artifacts
 		// trailer — these describe what's *in* this commit, so only
 		// tracked artifacts belong. Untracked paths go via

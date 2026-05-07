@@ -691,27 +691,3 @@ func cloneFromGit(gc *enjugit.SharedClone, logger *slog.Logger) *Clone {
 	}
 }
 
-// FileWrite describes one file to write into the working tree as part
-// of a single atomic commit. Used by SubmitTaskResult to pack together
-// a task's result file(s), metadata, and any artifact writes.
-type FileWrite struct {
-	// RepoRelPath is the file's path relative to the repo root
-	// (e.g., "runs/1/foo/result.md", "artifacts/notes/intro.md").
-	RepoRelPath string
-	// Content is the raw bytes to write.
-	Content []byte
-	// Mode is the file permission bits to write with. When
-	// zero, the caller doesn't care and we default to 0644.
-	// Callers that need executable scripts (template-bundle
-	// snapshots, in particular — see ReadBundleFiles) must
-	// set this to 0755 so go-git's Worktree.Add picks up the
-	// exec bit when building the tree entry, and downstream
-	// `git pull` on a fresh clone restores it.
-	//
-	// Without this, committing a shell script as a 0644 blob
-	// means the executor on the other side hits "permission
-	// denied" when trying to run it from the snapshot — the
-	// exact regression the 2026-04-18 template-bundle pass
-	// introduced.
-	Mode os.FileMode
-}
