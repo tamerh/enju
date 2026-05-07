@@ -489,13 +489,11 @@ func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int
 // claim — the lazy-fetch in ReadFileAtCommit picks up the
 // commit on first read miss as a fallback.
 func (s *FatClient) FetchAllRefsForBot(ctx context.Context, projectID int64) error {
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return err
 	}
-	proj.Lock()
-	defer proj.Unlock()
-	return proj.FetchAllRefs()
+	return wf.FetchAllRefs()
 }
 
 // CheckoutTopicBranchTip switches the bot clone's HEAD to the

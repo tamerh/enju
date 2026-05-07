@@ -897,36 +897,6 @@ func (p *Clone) Pull() error {
 	return p.PullBranch("")
 }
 
-// FetchAllRefs runs `git fetch origin` to bring every remote
-// branch's refs and objects into this clone's object DB. Used
-// by the bot daemon's pre-claim path so reviewer-bot (or any
-// other reader bot) can resolve topic-branch SHAs that
-// developer-bot just pushed — without this, per-bot clones
-// drift apart and downstream citizens see stale "no such
-// commit" errors when reading upstream content.
-//
-// Forces the full-branches refspec (`+refs/heads/*:refs/remotes/origin/*`)
-// because go-git's PlainClone configures origin with a narrow
-// refspec by default — passing FetchOptions without RefSpecs
-// uses that narrow config and skips other branches' objects.
-// Topic branches pushed by other citizens are exactly the
-// "other branches" we need.
-//
-// No-op when there's no remote configured (operator-no-remote
-// mode). Network failure is non-fatal: returns the error so the
-// caller can decide, but the lazy-fetch in ReadFileAtCommit
-// will retry on first miss.
-//
-// Cheap when up-to-date: go-git's Fetch returns
-// NoErrAlreadyUpToDate which we swallow.
-func (p *Clone) FetchAllRefs() error {
-	err := p.gitClone.Fetch()
-	if errors.Is(err, enjugit.ErrSharedNoRemote) {
-		return nil
-	}
-	return err
-}
-
 // PullBranch is the branch-aware variant of Pull. Pass "" to
 // use the project's configured default branch.
 //
