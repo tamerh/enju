@@ -14,6 +14,25 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
+// WorkflowFromShared builds a *Workflow over an already-opened
+// *SharedClone, using the production Conventions. Used by the
+// compute wrapper subprocess so it can route SubmitTaskResult
+// through Workflow without spinning up a sibling Workspace —
+// keeps the *git.Clone shared with the project.Opener path that
+// computed the workspace, avoiding the #381 dual-handle bug.
+//
+// Goes away with the project package.
+func WorkflowFromShared(gc *SharedClone, projID int64, defaultBranch string, logger *slog.Logger) *Workflow {
+	wf := &Workflow{
+		git:    gc,
+		convs:  NewProductionConventions(),
+		projID: projID,
+		logger: logger,
+	}
+	wf.SetDefaultBranch(defaultBranch)
+	return wf
+}
+
 // SharedSSHAuth returns an SSH auth method for the given remote URL,
 // trying the SSH agent first and falling back to common key-file
 // paths. Re-exported for project.Clone.CompareToRemote during the

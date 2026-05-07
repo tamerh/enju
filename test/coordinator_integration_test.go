@@ -915,14 +915,22 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 	}
 
+	wf := enjugit.WorkflowFromShared(proj.GitClone(), projectID, proj.DefaultBranch(), nil)
+	enjuFiles := make([]enjugit.FileWrite, len(files))
+	for i, f := range files {
+		enjuFiles[i] = enjugit.FileWrite{
+			RepoRelPath: f.RepoRelPath,
+			Content:     f.Content,
+			Mode:        f.Mode,
+		}
+	}
 	proj.Lock()
-	res, err := proj.SubmitTaskResult(project.SubmitRequest{
-		TaskID:        fullTaskID,
-		Username:      "test",
-		AuthorName:    "Test Citizen",
-		AuthorEmail:   "test@enju.local",
-		Files:         files,
-		ArtifactPaths: artifactPaths,
+	res, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
+		TaskID:         fullTaskID,
+		BranchOverride: proj.DefaultBranch(),
+		Files:          enjuFiles,
+		ArtifactPaths:  artifactPaths,
+		Citizen:        enjugit.Identity{Name: "Test Citizen", Email: "test@enju.local"},
 	})
 	proj.Unlock()
 	if err != nil {

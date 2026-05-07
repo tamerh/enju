@@ -493,28 +493,46 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		}
 	}
 
+	// Build a Workflow over project.Clone's *git.Clone (same handle
+	// → no #381 dual-handle drift). The compute task commits
+	// directly to the run branch, so BranchOverride bypasses
+	// topic-branch composition. Compute-specific trailers
+	// (Enju-Exit, Enju-Duration-Seconds, Enju-Untracked-Artifacts)
+	// flow through CustomTrailers — Workflow doesn't model them as
+	// first-class request fields.
+	wf := enjugit.WorkflowFromShared(proj.GitClone(), spec.ProjectID, spec.Branch, logger)
+	enjuFiles := make([]enjugit.FileWrite, len(files))
+	for i, f := range files {
+		enjuFiles[i] = enjugit.FileWrite{
+			RepoRelPath: f.RepoRelPath,
+			Content:     f.Content,
+			Mode:        f.Mode,
+		}
+	}
+	customTrailers := map[string]string{
+		enjugit.TrailerExit: "0",
+	}
+	if durSec := int(elapsed.Round(time.Second) / time.Second); durSec > 0 {
+		customTrailers[enjugit.TrailerDurationSeconds] = fmt.Sprintf("%d", durSec)
+	}
+	if len(untrackedProduced) > 0 {
+		customTrailers[enjugit.TrailerUntrackedArtifacts] = strings.Join(untrackedProduced, ", ")
+	}
+
 	proj.Lock()
-	submitRes, err := proj.SubmitTaskResult(project.SubmitRequest{
-		TaskID:        spec.TaskID,
-		Username:      spec.Username,
-		AuthorName:    spec.AuthorName,
-		AuthorEmail:   spec.AuthorEmail,
-		ModelName:     spec.Model,
-		Files: files,
+	submitRes, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
+		TaskID:         spec.TaskID,
+		BranchOverride: spec.Branch,
+		Files:          enjuFiles,
 		// ArtifactPaths feeds the commit message + Enju-Artifacts
 		// trailer — these describe what's *in* this commit, so only
-		// tracked artifacts belong. Untracked paths go in the
-		// Enju-Untracked-Artifacts trailer (see below) so the
-		// async reconcile path can see them too.
-		ArtifactPaths: committedPaths,
-		Branch:        spec.Branch,
-		Trailers: enjugit.EnjuTrailers{
-			TaskID:             spec.TaskID,
-			ExitCode:           0,
-			ExitSet:            true,
-			DurationSeconds:    int(elapsed.Round(time.Second) / time.Second),
-			UntrackedArtifacts: untrackedProduced,
-		},
+		// tracked artifacts belong. Untracked paths go via
+		// CustomTrailers["Enju-Untracked-Artifacts"] so the async
+		// reconcile path can see them too.
+		ArtifactPaths:  committedPaths,
+		Citizen:        enjugit.Identity{Name: spec.AuthorName, Email: spec.AuthorEmail},
+		ModelName:      spec.Model,
+		CustomTrailers: customTrailers,
 	})
 	proj.Unlock()
 	if err != nil {
