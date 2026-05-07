@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -223,7 +224,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 				Content:     []byte("done"),
 			},
 			{
-				RepoRelPath: ArtifactPath("notes/intro.md"),
+				RepoRelPath: enjugit.ArtifactPath("notes/intro.md"),
 				Content:     []byte("# Intro\n"),
 			},
 		},
@@ -255,7 +256,7 @@ func TestSubmitWithArtifacts(t *testing.T) {
 	}
 
 	// Verify the artifact file is on disk at the expected path.
-	data, err := os.ReadFile(filepath.Join(verifyDir, ArtifactPath("notes/intro.md")))
+	data, err := os.ReadFile(filepath.Join(verifyDir, enjugit.ArtifactPath("notes/intro.md")))
 	if err != nil {
 		t.Fatalf("read artifact: %v", err)
 	}
@@ -625,7 +626,7 @@ func TestResolveArtifactRead(t *testing.T) {
 				Content:     []byte("done"),
 			},
 			{
-				RepoRelPath: ArtifactPath("notes/intro.md"),
+				RepoRelPath: enjugit.ArtifactPath("notes/intro.md"),
 				Content:     []byte("# Intro\n\nThe intro content."),
 			},
 		},

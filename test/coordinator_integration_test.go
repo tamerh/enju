@@ -45,6 +45,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -907,7 +908,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 		for _, p := range artifactPaths {
 			files = append(files, project.FileWrite{
-				RepoRelPath: project.ArtifactPath(p),
+				RepoRelPath: enjugit.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
 		}
@@ -979,7 +980,7 @@ func (s *testServer) readArtifactFile(projectID int64, path string) (string, boo
 	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
 		return "", false
 	}
-	data, err := os.ReadFile(filepath.Join(cloneDir, project.ArtifactPath(path)))
+	data, err := os.ReadFile(filepath.Join(cloneDir, enjugit.ArtifactPath(path)))
 	if err != nil {
 		return "", false
 	}

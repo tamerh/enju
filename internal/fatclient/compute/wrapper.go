@@ -273,7 +273,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		if decl.Path == "" || enjuYaml.IsGlob(decl.Path) || enjuYaml.IsDir(decl.Path) {
 			continue
 		}
-		if err := project.EnsureSharedSymlink(project.ArtifactPath(decl.Path), workDir,
+		if err := enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(decl.Path), workDir,
 			spec.ProjectID, spec.ProjectName, spec.Branch, decl.Path); err != nil {
 			logger.Warn("shared-root symlink setup failed",
 				"path", decl.Path, "error", err)
@@ -407,7 +407,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	var committedPaths []string
 	for _, e := range expanded {
 		if e.Track {
-			full := filepath.Join(workDir, project.ArtifactPath(e.Path))
+			full := filepath.Join(workDir, enjugit.ArtifactPath(e.Path))
 			body, rerr := os.ReadFile(full)
 			if rerr != nil {
 				// Expansion already stat'd this file moments
@@ -420,7 +420,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 				continue
 			}
 			files = append(files, project.FileWrite{
-				RepoRelPath: project.ArtifactPath(e.Path),
+				RepoRelPath: enjugit.ArtifactPath(e.Path),
 				Content:     body,
 			})
 			committedPaths = append(committedPaths, e.Path)

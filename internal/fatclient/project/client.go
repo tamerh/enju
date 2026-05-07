@@ -2651,15 +2651,6 @@ func aiCoAuthor(modelName string) string {
 // key=value segments) — see docs/storage.md for the new
 // shape.
 
-// ArtifactPath returns the repo-relative path for a user-facing
-// artifact. Artifacts live at their natural path in the repo root
-// (no prefix), so `writes_artifacts: [figures/fig1.png]` writes
-// directly to `figures/fig1.png`. Validation (no ../, no .git/,
-// no enju/) is the caller's responsibility.
-func ArtifactPath(userPath string) string {
-	return userPath
-}
-
 // --- Named outputs with file specs ---
 //
 // Tasks may declare an `outputs:` schema in their YAML:

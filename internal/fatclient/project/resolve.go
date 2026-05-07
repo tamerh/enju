@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/template"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // ResolveInput is the structured dependency descriptor a client
@@ -300,7 +301,7 @@ func (p *Clone) Resolve(input ResolveInput) (*ResolvedPrompt, error) {
 		// their files at the legacy location even though the
 		// DB index now reports their path in the unprefixed
 		// user-facing form.
-		repoPath := ArtifactPath(ref.Path)
+		repoPath := enjugit.ArtifactPath(ref.Path)
 		content, ok, err := p.readArtifactVersion(ref.CommitSHA, repoPath)
 		if err != nil || !ok {
 			missing = append(missing, ref.Path)
