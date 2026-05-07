@@ -57,6 +57,32 @@ type Ops interface {
 	// docstring for context.
 	EnsureOrigin(url string) error
 
+	// Per-branch fetch + pull (reconcile / claim path). FetchBranch
+	// updates only refs/remotes/origin/<branch>; PullBranch fetches
+	// and merges into the local branch. Both no-op when no remote
+	// is configured.
+	FetchBranch(branch string) error
+	PullBranch(branch string) error
+
+	// LocalBranchHash returns the SHA of refs/heads/<branch>,
+	// falling back to refs/remotes/origin/<branch>. Empty string
+	// when neither resolves.
+	LocalBranchHash(branch string) (string, error)
+
+	// ScanBranchSince walks commits on origin/<branch> (or
+	// refs/heads/<branch>) newer than `since`, calling visit for
+	// each in chronological order. Returns the new tip SHA.
+	// See git.Clone.ScanBranchSince for the cursor semantics.
+	ScanBranchSince(branch, since string, visit func(sha, message string)) (newTip string, err error)
+
+	// ReadFile reads a worktree file at a repo-relative path.
+	ReadFile(repoRelPath string) ([]byte, error)
+
+	// CheckoutBranch is a no-op when branch is "" (matches
+	// project.PullBranchWithReconcile's "skip switch when empty"
+	// semantics), else equivalent to Checkout.
+	CheckoutBranch(branch string) error
+
 	// Merge — acquire the lock.
 	MergeFFOrFail(target, source string) (newTipSHA string, err error)
 	MergeWithCommit(target, source, message, authorName, authorEmail string) (newTipSHA string, err error)

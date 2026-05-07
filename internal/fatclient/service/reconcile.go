@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -235,6 +236,133 @@ func (s *FatClient) PullBranchWithReconcile(ctx context.Context, proj *project.C
 
 	s.ReapWrapperFailures(ctx, proj, projectID)
 	return pullErr
+}
+
+// PullBranchWithReconcileWF is the enjugit-Workflow flavored
+// counterpart to PullBranchWithReconcile. Same semantics:
+// checkout + pull + fetch + scan + reconcile-post + cursor
+// advance, plus wrapper-failure reap. Used by claim.go's
+// fat-client paths after the port to enjugit.
+//
+// Mirrors PullBranchWithReconcile step-for-step but on a
+// *enjugit.Workflow handle, using enjugit's CursorMutexFor /
+// LoadCursors and the Workflow's PullBranch / FetchBranch /
+// ScanBranchSince / LocalBranchHash.
+//
+// Errors: same contract as the project version. Pull error is
+// the only thing surfaced; scanner / reconcile-post / reaper
+// failures are logged at Debug.
+func (s *FatClient) PullBranchWithReconcileWF(ctx context.Context, wf *enjugit.Workflow, projectID int64, branch string) error {
+	if wf == nil {
+		return nil
+	}
+	if branch != "" {
+		if err := wf.CheckoutBranch(branch); err != nil {
+			return fmt.Errorf("switching workspace to branch %q: %w", branch, err)
+		}
+	}
+	pullErr := wf.PullBranch(branch)
+	if branch != "" {
+		_ = wf.FetchBranch(branch)
+	}
+	var trailers []enjugit.CommitTrailer
+	var newTip string
+	var preCursor string
+	if branch != "" {
+		stateDir := s.StateDir()
+		cursorMu := enjugit.CursorMutexFor(stateDir, projectID)
+		cursorMu.Lock()
+		cursors, _ := enjugit.LoadCursors(stateDir, projectID)
+		preCursor = cursors.Get(branch)
+		// Persist-on-first-touch — same baseline-seeding rationale
+		// as the project-flavored version. See its comment block.
+		if preCursor == "" {
+			if h, herr := wf.LocalBranchHash(branch); herr == nil && h != "" {
+				preCursor = h
+				cursors.Set(branch, h)
+				_ = cursors.Save()
+			}
+		}
+		cursorMu.Unlock()
+		tip, found, serr := wf.ScanBranchSince(branch, preCursor)
+		if serr != nil {
+			s.logger.Debug("reconcile scan", "project", projectID, "branch", branch, "error", serr)
+		} else {
+			newTip = tip
+			trailers = found
+		}
+	}
+
+	// Network phase: POST /tasks/reconcile.
+	if len(trailers) > 0 {
+		body := buildReconcileBodyWF(trailers)
+		if _, perr := s.coord.Post(ctx, "/api/v1/tasks/reconcile", body); perr != nil {
+			s.logger.Debug("reconcile post", "project", projectID, "branch", branch, "error", perr)
+			s.ReapWrapperFailuresWF(ctx, wf)
+			return pullErr
+		}
+	}
+
+	// Cursor-save phase.
+	if newTip != "" && newTip != preCursor {
+		stateDir := s.StateDir()
+		cursorMu := enjugit.CursorMutexFor(stateDir, projectID)
+		cursorMu.Lock()
+		latest, _ := enjugit.LoadCursors(stateDir, projectID)
+		latest.Set(branch, newTip)
+		_ = latest.Save()
+		cursorMu.Unlock()
+	}
+
+	s.ReapWrapperFailuresWF(ctx, wf)
+	return pullErr
+}
+
+// buildReconcileBodyWF mirrors BuildReconcileBody but on
+// enjugit.CommitTrailer (vs project.CommitTrailer). Same
+// payload shape — keep in sync if either side changes.
+func buildReconcileBodyWF(trailers []enjugit.CommitTrailer) map[string]interface{} {
+	entries := make([]map[string]interface{}, 0, len(trailers))
+	for _, t := range trailers {
+		entry := map[string]interface{}{
+			"task_id":    t.Trailers.TaskID,
+			"commit_sha": t.CommitSHA,
+		}
+		if t.Trailers.ExitSet {
+			entry["exit_code"] = t.Trailers.ExitCode
+		}
+		combined := append([]string(nil), t.Trailers.Artifacts...)
+		combined = append(combined, t.Trailers.UntrackedArtifacts...)
+		if len(combined) > 0 {
+			entry["artifacts_written"] = combined
+		}
+		entries = append(entries, entry)
+	}
+	return map[string]interface{}{"tasks": entries}
+}
+
+// ReapWrapperFailuresWF is the enjugit-Workflow flavored
+// counterpart to ReapWrapperFailures — walks the workflow's
+// worktree for .wrap-result.json files and posts /tasks/:id/fail
+// for non-zero exits.
+func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workflow) {
+	if wf == nil {
+		return
+	}
+	root := filepath.Join(wf.WorkDir(), "enju", "runs")
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != ".wrap-result.json" {
+			return nil
+		}
+		s.handleOneWrapperResult(ctx, path)
+		return nil
+	})
 }
 
 // ReconcileRunBranch is the read-only reconcile path used by

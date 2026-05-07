@@ -155,17 +155,25 @@ func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
 }
 
 // openOrClone opens an existing clone at dir, or clones from
-// remoteURL if missing. Caller holds w.mu.
+// remoteURL if missing, or initializes an empty local-only repo
+// when remoteURL is empty (no-remote / solo project mode).
+// Caller holds w.mu.
 func (w *Workspace) openOrClone(id int64, dir, remoteURL string) (*git.Clone, error) {
 	lockPath := w.lockPathFor(id)
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		return git.OpenClone(dir, lockPath, w.logger)
 	}
-	if remoteURL == "" {
-		return nil, fmt.Errorf("%w: id=%d dir=%s", ErrNoCloneSource, id, dir)
-	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return nil, fmt.Errorf("enjugit: mkdir parent %s: %w", dir, err)
+	}
+	if remoteURL == "" {
+		// Local-only init: no remote configured. Mirrors the
+		// project package's openOrClone fallback so no-remote
+		// projects (enju_init solo mode, fresh-create) get a
+		// usable workspace dir without requiring a bare/clone
+		// source. Subsequent operations work against the local
+		// branches; SetRemote can wire origin later.
+		return git.InitLocal(dir, lockPath, w.logger)
 	}
 	return git.CloneOrInit(dir, remoteURL, lockPath, w.logger)
 }

@@ -585,13 +585,3 @@ func (p *Clone) InstantiateTemplate(repoRelPath string, params map[string]interf
 	}
 	return parsed, loaded.Raw, nil
 }
-
-// ValidateTemplateParams runs the ParseWithParams path without
-// producing a run — useful as a dry-run from the LLM side
-// before the user commits to submission. Returns nil if the
-// param set is valid; returns the natural-language error
-// otherwise.
-func (p *Clone) ValidateTemplateParams(repoRelPath string, params map[string]interface{}) error {
-	_, _, err := p.InstantiateTemplate(repoRelPath, params)
-	return err
-}

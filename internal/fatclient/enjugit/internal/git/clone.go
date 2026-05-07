@@ -11,6 +11,7 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/gofrs/flock"
 )
 
@@ -144,6 +145,93 @@ func CloneOrInit(workDir, remoteURL, lockPath string, logger *slog.Logger) (*Clo
 		c.fileLock = flock.New(lockPath)
 	}
 	return c, nil
+}
+
+// InitLocal creates a fresh local-only repo at workDir with no
+// remote configured AND a seed initial commit so refs/heads/main
+// has a SHA. Used for solo / no-remote projects where the
+// operator wants to commit locally and (optionally) wire a
+// remote later via SetRemote.
+//
+// Seed contents (README + enju/templates/.gitkeep) match the
+// project package's seedLocalWorkspace so the layout users see
+// is identical regardless of whether they came in via project
+// or enjugit. Without the seed, refs/heads/main has no SHA and
+// downstream ops (fork-from-default during submit) fail with
+// "default branch main not found" — same failure mode as a
+// truly empty repo.
+//
+// Returns a *Clone whose remoteURL is "" (no origin in config).
+// All push/fetch ops on this clone short-circuit via ErrNoRemote
+// until SetRemote is called.
+func InitLocal(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, fmt.Errorf("git: mkdir %s: %w", workDir, err)
+	}
+	repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("git: init local %s: %w", workDir, err)
+	}
+	if err := seedInitialCommit(repo, workDir); err != nil {
+		return nil, fmt.Errorf("git: seed local init %s: %w", workDir, err)
+	}
+	c := &Clone{
+		workDir: workDir,
+		repo:    repo,
+		logger:  logger,
+	}
+	if lockPath != "" {
+		c.fileLock = flock.New(lockPath)
+	}
+	return c, nil
+}
+
+// seedInitialCommit writes README.md + enju/templates/.gitkeep
+// and commits them so refs/heads/main has a SHA. Mirrors the
+// project package's seedLocalWorkspace shape so layouts agree.
+func seedInitialCommit(repo *gogit.Repository, workDir string) error {
+	readme := filepath.Join(workDir, "README.md")
+	readmeBody := "# Enju project\n"
+	if err := os.WriteFile(readme, []byte(readmeBody), 0o644); err != nil {
+		return fmt.Errorf("write README: %w", err)
+	}
+	templatesDir := filepath.Join(workDir, "enju", "templates")
+	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+		return fmt.Errorf("create templates dir: %w", err)
+	}
+	gitkeepRel := "enju/templates/.gitkeep"
+	if err := os.WriteFile(filepath.Join(workDir, gitkeepRel), []byte(""), 0o644); err != nil {
+		return fmt.Errorf("write .gitkeep: %w", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("worktree: %w", err)
+	}
+	if _, err := wt.Add("README.md"); err != nil {
+		return fmt.Errorf("add README: %w", err)
+	}
+	if _, err := wt.Add(gitkeepRel); err != nil {
+		return fmt.Errorf("add .gitkeep: %w", err)
+	}
+	sig := &object.Signature{
+		Name:  "Enju",
+		Email: "enju@localhost",
+		When:  time.Now(),
+	}
+	if _, err := wt.Commit("initial commit", &gogit.CommitOptions{
+		Author:    sig,
+		Committer: sig,
+	}); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 // WorkDir returns the absolute path to this clone's worktree.

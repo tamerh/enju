@@ -94,11 +94,21 @@ func TestForProject_FreshClone(t *testing.T) {
 	}
 }
 
-func TestForProject_NoSource(t *testing.T) {
+func TestForProject_NoSource_InitsLocal(t *testing.T) {
+	// Empty remoteURL is the "solo / no-remote" project mode.
+	// ForProject inits a local-only clone (with seed) so the
+	// workflow is usable without an upstream. Callers can wire
+	// origin later via SetRemote.
 	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
-	_, err := ws.ForProject(7, "")
-	if !errors.Is(err, ErrNoCloneSource) {
-		t.Errorf("expected ErrNoCloneSource, got %v", err)
+	wf, err := ws.ForProject(7, "")
+	if err != nil {
+		t.Fatalf("ForProject with empty remoteURL: expected local-init, got %v", err)
+	}
+	if wf == nil {
+		t.Fatal("ForProject returned nil workflow")
+	}
+	if !ws.HasLocalClone(7) {
+		t.Error("HasLocalClone should be true after local-init")
 	}
 }
 

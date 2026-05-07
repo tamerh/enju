@@ -12,7 +12,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
-	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // ClaimParams is the input shape for FatClient.ClaimTask. Mirrors
@@ -77,7 +77,7 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	if commitSHA == "" || resultDir == "" {
 		return "", false, nil
 	}
-	if s.project == nil {
+	if s.enjugit == nil {
 		return "", true, fmt.Errorf("no workspace configured")
 	}
 	// Read-only: resolve the existing on-disk clone via
@@ -87,22 +87,18 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	// clone on disk, silently creating an orphan empty repo
 	// at "{rootDir}/{id}" that outranks the real clone in
 	// subsequent lookups.
-	proj, perr := s.project.OpenExisting(projectID)
-	if perr != nil {
-		if !errors.Is(perr, project.ErrCloneNotFound) {
-			return "", true, fmt.Errorf("open project clone: %w", perr)
+	// Try OpenView first — read-only path that doesn't materialize
+	// a clone if one doesn't exist (the per-bot-clone case).
+	view, verr := s.enjugit.OpenView(projectID)
+	if verr != nil {
+		if !errors.Is(verr, enjugit.ErrCloneNotFound) {
+			return "", true, fmt.Errorf("open project clone: %w", verr)
 		}
-		// Lazy-clone fallback for read-only surfaces (web UI).
-		// With per-bot clones bots write to <project>/enju/bots/<bot>/clone/
-		// and don't materialize a clone in the operator's
-		// workspace; if the operator never ran `enju mcp` for
-		// this project, OpenExisting returns ErrCloneNotFound
-		// even though the bare repo and commits exist. Fetch
-		// the project's remote_url and clone on demand so the
-		// UI can render submitted content. Skipped silently when
-		// remote_url is unset (path-only projects with no
-		// workspace clone aren't readable from this surface).
-		remoteURL, projName, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
+		// Lazy-clone fallback for read-only surfaces (web UI):
+		// fetch remote_url and clone on demand. Skipped silently
+		// when remote_url is unset (path-only projects with no
+		// workspace clone).
+		remoteURL, _, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
 		if ferr != nil {
 			s.logger.Warn("ReadResultAtCommit: fetch project meta failed; treating as not-found",
 				"project_id", projectID, "error", ferr)
@@ -111,13 +107,14 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 		if remoteURL == "" {
 			return "", false, nil
 		}
-		proj, perr = s.project.ForProject(projectID, remoteURL, projName)
-		if perr != nil {
-			return "", true, fmt.Errorf("lazy-clone project: %w", perr)
+		view2, verr2 := s.enjugit.OpenOrLazyClone(projectID, remoteURL)
+		if verr2 != nil {
+			return "", true, fmt.Errorf("lazy-clone project: %w", verr2)
 		}
+		view = view2
 	}
 	repoPath := resultDir + "/result.md"
-	data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)
+	data, ok, rerr := view.ReadFileAtCommit(commitSHA, repoPath)
 	if rerr != nil {
 		return "", true, fmt.Errorf("read at commit: %w", rerr)
 	}
@@ -205,8 +202,8 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	// claimable for other reasons.
 	preMeta, preMetaErr := s.FetchTaskMeta(ctx, params.TaskID)
 	if preMetaErr == nil && preMeta != nil && s.UseFatClient(preMeta) {
-		if proj, _, _, _, perr := s.OpenProject(ctx, preMeta.ProjectID); perr == nil && proj != nil {
-			_ = s.PullBranchWithReconcile(ctx, proj, preMeta.ProjectID, preMeta.Branch)
+		if wf, _, _, _, perr := s.OpenWorkflow(ctx, preMeta.ProjectID); perr == nil && wf != nil {
+			_ = s.PullBranchWithReconcileWF(ctx, wf, preMeta.ProjectID, preMeta.Branch)
 		}
 	}
 
@@ -291,18 +288,18 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	// THAT commit's tree directly via ReadFileAtCommit; fall
 	// back to the worktree ReadFile for legacy paths (no
 	// iteration branch involved, prior commit unknown).
-	if result.ReviewFeedback != nil && meta != nil && s.project != nil {
-		remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-		if proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName); perr == nil {
+	if result.ReviewFeedback != nil && meta != nil && s.enjugit != nil {
+		remoteURL, _, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
+		if wf, werr := s.enjugit.ForProject(meta.ProjectID, remoteURL); werr == nil {
 			contentPath := filepath.Join(meta.ResultDir, "result.md")
 			var content []byte
 			if meta.PreviousIterationCommit != "" {
-				if b, ok, _ := proj.ReadFileAtCommit(meta.PreviousIterationCommit, contentPath); ok && len(b) > 0 {
+				if b, ok, _ := wf.ReadFileAtCommit(meta.PreviousIterationCommit, contentPath); ok && len(b) > 0 {
 					content = b
 				}
 			}
 			if len(content) == 0 {
-				if b, rerr := proj.ReadFile(contentPath); rerr == nil && len(b) > 0 {
+				if b, rerr := wf.ReadFile(contentPath); rerr == nil && len(b) > 0 {
 					content = b
 				}
 			}
@@ -336,12 +333,12 @@ func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []b
 	// both the result.md and metadata.json are still on disk.
 	// We read metadata.json to recover the decision and
 	// reviewer identity.
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil
 	}
-	remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-	proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName)
-	if perr != nil {
+	remoteURL, _, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
+	wf, werr := s.enjugit.ForProject(meta.ProjectID, remoteURL)
+	if werr != nil {
 		return nil
 	}
 
@@ -382,12 +379,12 @@ func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []b
 		var metaBytes []byte
 		var merr error
 		if latestCommit != "" {
-			if b, ok, _ := proj.ReadFileAtCommit(latestCommit, metaPath); ok && len(b) > 0 {
+			if b, ok, _ := wf.ReadFileAtCommit(latestCommit, metaPath); ok && len(b) > 0 {
 				metaBytes = b
 			}
 		}
 		if len(metaBytes) == 0 {
-			metaBytes, merr = proj.ReadFile(metaPath)
+			metaBytes, merr = wf.ReadFile(metaPath)
 		}
 		if merr != nil || len(metaBytes) == 0 {
 			continue
@@ -404,12 +401,12 @@ func (s *FatClient) fetchReviewFeedback(ctx context.Context, meta *TaskMeta) []b
 		contentPath := filepath.Join(reviewResultDir, "result.md")
 		var content []byte
 		if latestCommit != "" {
-			if b, ok, _ := proj.ReadFileAtCommit(latestCommit, contentPath); ok && len(b) > 0 {
+			if b, ok, _ := wf.ReadFileAtCommit(latestCommit, contentPath); ok && len(b) > 0 {
 				content = b
 			}
 		}
 		if len(content) == 0 {
-			b, rerr := proj.ReadFile(contentPath)
+			b, rerr := wf.ReadFile(contentPath)
 			if rerr != nil {
 				continue
 			}
@@ -477,13 +474,13 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 			writerByPath[p] = t
 		}
 	}
-	remoteURL, projName, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
-	proj, perr := s.project.ForProject(meta.ProjectID, remoteURL, projName)
-	if perr != nil {
-		s.logger.Warn("opening project for presence check", "project_id", meta.ProjectID, "error", perr)
+	remoteURL, _, _ := s.FetchProjectMetaFull(ctx, meta.ProjectID)
+	wf, werr := s.enjugit.ForProject(meta.ProjectID, remoteURL)
+	if werr != nil {
+		s.logger.Warn("opening workflow for presence check", "project_id", meta.ProjectID, "error", werr)
 		return nil
 	}
-	workDir := proj.WorkDir()
+	workDir := wf.WorkDir()
 
 	var missing []string
 	for _, p := range meta.ReadsArtifacts {
@@ -498,11 +495,11 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		// stat succeeds. EnsureSharedSymlink is a noop when
 		// the env var is unset, so this call is free in
 		// local-only setups.
-		if err := project.EnsureSharedSymlink(project.ArtifactPath(p), workDir,
+		if err := enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(p), workDir,
 			meta.ProjectID, meta.ProjectName, meta.Branch, p); err != nil {
 			s.logger.Warn("shared-root symlink setup", "path", p, "error", err)
 		}
-		full := filepath.Join(workDir, project.ArtifactPath(p))
+		full := filepath.Join(workDir, enjugit.ArtifactPath(p))
 		if _, err := os.Stat(full); err != nil {
 			missing = append(missing, p)
 		}
@@ -557,58 +554,55 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	proj, _, _, _, err := s.OpenProject(ctx, meta.ProjectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, meta.ProjectID)
 	if err != nil {
 		return nil, err
 	}
-	// Pull + opportunistic reconcile: picks up async
-	// completions (scanner) + reaps failed detached wrappers
-	// (reaper). Lock-managed internally so we can re-acquire
-	// below for the resolver's git reads.
-	if err := s.PullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch); err != nil {
+	// Pull + opportunistic reconcile via the WF-flavored helper.
+	// Workflow's verbs handle locking internally — no caller-side
+	// Lock/Unlock needed (matches other ported sites).
+	if err := s.PullBranchWithReconcileWF(ctx, wf, meta.ProjectID, meta.Branch); err != nil {
 		return nil, fmt.Errorf("refreshing local clone before resolving task %s: %w", meta.ID, err)
 	}
-	proj.Lock()
-	defer proj.Unlock()
 
-	input := project.ResolveInput{
-		TaskID:       meta.ID,
-		PromptTemplate:   desc.PromptTemplate,
+	input := enjugit.ResolveInput{
+		TaskID:             meta.ID,
+		PromptTemplate:     desc.PromptTemplate,
 		UserPromptTemplate: desc.UserPromptTemplate,
-		ForEachParams:   desc.ForEachParams,
+		ForEachParams:      desc.ForEachParams,
 	}
 	for _, d := range desc.Dependencies {
-		ref := project.DependencyRef{
-			TaskDefID:   d.TaskDefID,
-			InstanceKey:  d.InstanceKey,
+		ref := enjugit.DependencyRef{
+			TaskDefID:      d.TaskDefID,
+			InstanceKey:    d.InstanceKey,
 			InstanceParams: d.InstanceParams,
-			CommitSHA:   d.CommitSHA,
-			ResultPath:  d.ResultPath,
-			State:     d.State,
-			VoteChoice:  d.VoteChoice,
+			CommitSHA:      d.CommitSHA,
+			ResultPath:     d.ResultPath,
+			State:          d.State,
+			VoteChoice:     d.VoteChoice,
 		}
 		for _, r := range d.Responses {
 			pathUser := r.RealUsername
 			if pathUser == "" {
 				pathUser = r.Username
 			}
-			ref.Responses = append(ref.Responses, project.CitizenResponseRef{
-				Username:   r.Username,
+			ref.Responses = append(ref.Responses, enjugit.CitizenResponseRef{
+				Username:     r.Username,
 				PathUsername: pathUser,
-				Option:    r.Option,
-				CommitSHA:  r.CommitSHA,
+				Option:       r.Option,
+				CommitSHA:    r.CommitSHA,
 			})
 		}
 		input.Dependencies = append(input.Dependencies, ref)
 	}
 	for _, a := range desc.ArtifactReads {
-		input.ArtifactReads = append(input.ArtifactReads, project.ArtifactRef{
-			Path:   a.Path,
+		input.ArtifactReads = append(input.ArtifactReads, enjugit.ArtifactRef{
+			Path:      a.Path,
 			CommitSHA: a.CommitSHA,
 		})
 	}
 
-	resolved, err := proj.Resolve(input)
+	resolved, err := wf.Resolve(input)
 	if err != nil {
 		return nil, err
 	}
@@ -642,7 +636,7 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 				continue
 			}
 			contentPath := filepath.Join(d.ResultPath, "result.md")
-			data, ok, rerr := proj.ReadFileAtCommit(d.CommitSHA, contentPath)
+			data, ok, rerr := wf.ReadFileAtCommit(d.CommitSHA, contentPath)
 			if rerr != nil || !ok {
 				s.logger.Warn("reading reviewed target content",
 					"review_task", meta.ID,

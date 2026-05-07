@@ -338,6 +338,57 @@ func (f *fakeOps) EnsureOrigin(url string) error {
 	return f.checkErr("EnsureOrigin")
 }
 
+func (f *fakeOps) FetchBranch(branch string) error {
+	f.record("FetchBranch", branch)
+	return f.checkErr("FetchBranch")
+}
+
+func (f *fakeOps) PullBranch(branch string) error {
+	f.record("PullBranch", branch)
+	return f.checkErr("PullBranch")
+}
+
+func (f *fakeOps) LocalBranchHash(branch string) (string, error) {
+	f.record("LocalBranchHash", branch)
+	if err := f.checkErr("LocalBranchHash"); err != nil {
+		return "", err
+	}
+	if sha, ok := f.resolveMap["refs/heads/"+branch]; ok {
+		return sha, nil
+	}
+	if sha, ok := f.resolveMap["refs/remotes/origin/"+branch]; ok {
+		return sha, nil
+	}
+	return "", nil
+}
+
+func (f *fakeOps) ScanBranchSince(branch, since string, visit func(sha, message string)) (string, error) {
+	f.record("ScanBranchSince", branch, since)
+	if err := f.checkErr("ScanBranchSince"); err != nil {
+		return since, err
+	}
+	for _, c := range f.recentCommits {
+		visit(c.SHA, c.Message)
+	}
+	if len(f.recentCommits) > 0 {
+		return f.recentCommits[0].SHA, nil
+	}
+	return since, nil
+}
+
+func (f *fakeOps) ReadFile(path string) ([]byte, error) {
+	f.record("ReadFile", path)
+	return nil, f.checkErr("ReadFile")
+}
+
+func (f *fakeOps) CheckoutBranch(branch string) error {
+	f.record("CheckoutBranch", branch)
+	if branch == "" {
+		return nil
+	}
+	return f.Checkout(branch)
+}
+
 func (f *fakeOps) MergeFFOrFail(target, source string) (string, error) {
 	f.record("MergeFFOrFail", target, source)
 	if err := f.checkErr("MergeFFOrFail"); err != nil {

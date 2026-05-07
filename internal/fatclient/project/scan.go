@@ -68,29 +68,6 @@ func CursorMutexFor(stateDir string, projectID int64) *sync.Mutex {
 	actual, _ := cursorMutexes.LoadOrStore(key, fresh)
 	return actual.(*sync.Mutex)
 }
-
-// advanceCursorIfConfigured is the SubmitTaskResult / CommitFiles
-// hook that marks a just-landed commit as "already processed" in
-// the fat-client's scan cursor, so the next trailer scan doesn't
-// replay it as a new event. Called INSIDE SubmitTaskResult so
-// every caller — production MCP handlers, tests, future shell
-// wrappers, anyone — benefits without having to remember a
-// post-commit cursor update call.
-//
-// No-op when (projectID, stateDir) isn't configured: that's
-// the "caller doesn't maintain a scanner cursor" case
-// (coordinator-side code, store unit tests, the raw workspace
-// helpers in tests). Runs under CursorMutexFor so a
-// concurrent scanner save can't race-overwrite the advance.
-// AdvanceScanCursor is the exported variant of
-// advanceCursorIfConfigured. Same behavior (no-op on empty
-// stateDir / zero projectID / empty branch-or-sha), suitable
-// for batch submit's post-push cursor advance where the
-// SubmitTaskResult path isn't used.
-func AdvanceScanCursor(projectID int64, stateDir, branch, sha string) {
-	advanceCursorIfConfigured(projectID, stateDir, branch, sha)
-}
-
 func advanceCursorIfConfigured(projectID int64, stateDir, branch, sha string) {
 	if projectID == 0 || stateDir == "" || branch == "" || sha == "" {
 		return
