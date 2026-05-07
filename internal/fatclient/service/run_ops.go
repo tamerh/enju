@@ -337,11 +337,10 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 	var tasks []map[string]interface{}
 	json.Unmarshal(tasksData, &tasks)
 
-	var remoteURL, projName string
+	var remoteURL string
 	if s.project != nil {
-		if u, n, err := s.FetchProjectMetaFull(ctx, projectID); err == nil {
+		if u, _, err := s.FetchProjectMetaFull(ctx, projectID); err == nil {
 			remoteURL = u
-			projName = n
 		}
 	}
 
@@ -373,11 +372,11 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 		// output is what matters. Show the prompt only as
 		// context below the result.
 		resultShown := false
-		if tstate == "accepted" && commitSHA != "" && s.project != nil && remoteURL != "" {
-			if proj, err := s.project.ForProject(projectID, remoteURL, projName); err == nil {
+		if tstate == "accepted" && commitSHA != "" && s.enjugit != nil && remoteURL != "" {
+			if wf, err := s.enjugit.ForProject(projectID, remoteURL); err == nil {
 				resultFile := resultPath + "/result.md"
 				if defID != "" && resultPath != "" {
-					content, found, rerr := proj.ReadFileAtCommit(commitSHA, resultFile)
+					content, found, rerr := wf.ReadFileAtCommit(commitSHA, resultFile)
 					if rerr == nil && found && len(content) > 0 {
 						b.WriteString(string(content) + "\n\n")
 						resultShown = true

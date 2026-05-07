@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func cmdInbox(args []string) {
@@ -63,25 +63,21 @@ Flags:`)
 		home, _ := os.UserHomeDir()
 		wsRoot = filepath.Join(home, ".enju", "workspaces")
 	}
-	ws, err := project.NewOpener(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "opening workspace %s: %v\n", wsRoot, err)
 		os.Exit(1)
 	}
 	projectDir := ws.ProjectDir(projectID)
-	if projectDir == "" {
+	view, err := ws.OpenView(projectID)
+	if err != nil || projectDir == "" {
 		fmt.Fprintf(os.Stderr, "project %d has no local clone at %s — run `enju mcp` once with this credentials file to materialize the clone.\n", projectID, wsRoot)
 		os.Exit(1)
 	}
 
-	proj, err := ws.ForProject(projectID, "", "")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "opening project clone: %v\n", err)
-		os.Exit(1)
-	}
-
 	livePath := filepath.Join(projectDir, "enju", "events", "live.jsonl")
-	rows, err := inbox.BuildInbox(livePath, creds.Username, &cliInboxDeps{proj: proj})
+	rows, err := inbox.BuildInbox(livePath, creds.Username, &cliInboxDeps{view: view})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -89,13 +85,13 @@ Flags:`)
 	fmt.Println(inbox.FormatInbox(rows))
 }
 
-// cliInboxDeps adapts project.Clone to inbox.Deps. The shared
+// cliInboxDeps adapts enjugit.View to inbox.Deps. The shared
 // inbox core needs only a single method — git read at commit —
 // so this is intentionally tiny.
 type cliInboxDeps struct {
-	proj *project.Clone
+	view *enjugit.View
 }
 
 func (d *cliInboxDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
-	return d.proj.ReadFileAtCommit(commitSHA, repoRelPath)
+	return d.view.ReadFileAtCommit(commitSHA, repoRelPath)
 }

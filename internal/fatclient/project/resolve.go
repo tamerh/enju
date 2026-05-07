@@ -477,7 +477,7 @@ func (p *Clone) readAt(commitSHA, repoRelPath string) ([]byte, bool, error) {
 		}
 		return data, true, nil
 	}
-	return p.ReadFileAtCommit(commitSHA, repoRelPath)
+	return p.gitClone.ReadFileAtCommit(commitSHA, repoRelPath)
 }
 
 // readArtifactVersion reads an artifact file at a specific commit

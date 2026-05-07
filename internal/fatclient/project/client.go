@@ -954,24 +954,6 @@ func (p *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 	return os.ReadFile(full)
 }
 
-// ReadFileAtCommit reads a file's contents as of a specific commit.
-// Used by the template resolver when the caller wants the exact
-// version associated with an upstream task's submitted commit SHA,
-// rather than whatever happens to be in the working tree today.
-//
-// Lazy fetch: with per-bot clones, the local object DB only has
-// what THIS clone has fetched. When another citizen (developer-
-// bot) pushes a topic branch to the bare and a different citizen
-// (reviewer-bot, webui, operator) tries to read the SHA, the
-// local clone hasn't seen it. Production saw this as the
-// "object not found" warning + reviewer-bot reading an empty
-// topic branch from its stale clone. Fix: on commit-not-found,
-// fetch from origin and retry. Cheap when the commit is already
-// local (no network traffic) and self-healing when it isn't.
-func (p *Clone) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
-	return p.gitClone.ReadFileAtCommit(commitSHA, repoRelPath)
-}
-
 // FileWrite describes one file to write into the working tree as part
 // of a single atomic commit. Used by SubmitTaskResult to pack together
 // a task's result file(s), metadata, and any artifact writes.
