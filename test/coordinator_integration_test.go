@@ -47,6 +47,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/enju-ai/enju/internal/common/format"
@@ -867,7 +868,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		// each output to its own file per the schema. Otherwise
 		// serialize the outputs map as a single result.json.
 		schemaJSON, _ := task["outputs"].(string)
-		schema := project.ParseNamedOutputSchema(schemaJSON)
+		schema := service.ParseNamedOutputSchema(schemaJSON)
 		hasFileSpec := false
 		for _, sp := range schema {
 			if sp.File != "" {
@@ -876,7 +877,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			}
 		}
 		if hasFileSpec {
-			outFiles, fileIndex := project.BuildNamedOutputFiles(resultDir, schema, outputs)
+			outFiles, fileIndex := service.BuildNamedOutputFiles(resultDir, schema, outputs)
 			files = append(files, outFiles...)
 			metadata["output_files"] = fileIndex
 		} else {

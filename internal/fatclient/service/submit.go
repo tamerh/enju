@@ -24,7 +24,6 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // SubmitParams is the input shape for FatClient.SubmitTaskResult.
@@ -466,7 +465,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	// as a single result.json blob (legacy-compatible default).
 	if outputs != nil {
 		metadata["named_outputs"] = true
-		schema := project.ParseNamedOutputSchema(meta.OutputsSchemaJSON)
+		schema := ParseNamedOutputSchema(meta.OutputsSchemaJSON)
 		hasFileSpec := false
 		for _, sp := range schema {
 			if sp.File != "" {
@@ -475,11 +474,9 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 			}
 		}
 		if hasFileSpec {
-			// BuildNamedOutputFiles still lives in project pkg
-			// (named-output schema sub-area, deferred port).
 			// Convert at the boundary so the rest of the submit
 			// flow stays on enjugit.FileWrite.
-			outFiles, fileIndex := project.BuildNamedOutputFiles(resultDir, schema, outputs)
+			outFiles, fileIndex := BuildNamedOutputFiles(resultDir, schema, outputs)
 			for _, f := range outFiles {
 				files = append(files, enjugit.FileWrite{
 					RepoRelPath: f.RepoRelPath,
