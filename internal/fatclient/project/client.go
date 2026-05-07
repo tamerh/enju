@@ -900,12 +900,6 @@ func cloneFromGit(gc *enjugit.SharedClone, logger *slog.Logger) *Clone {
 	}
 }
 
-// HeadHash returns the SHA of the current local HEAD.
-func (p *Clone) HeadHash() (string, error) {
-	sha, _, err := p.gitClone.Head()
-	return sha, err
-}
-
 // ReadFile reads a file from the working tree at a repo-relative path.
 // Used by the client-side template resolver to read upstream task
 // results and artifact contents.
@@ -2407,7 +2401,7 @@ func (p *Clone) CompareToRemote() (*RemoteComparison, error) {
 		return r, nil
 	}
 
-	localHash, _ := p.HeadHash()
+	localHash, _, _ := p.gitClone.Head()
 	r.LocalHead = localHash
 
 	remoteHash, err := p.gitClone.RemoteBranchHash(p.resolveBranch(""))

@@ -3024,7 +3024,7 @@ tasks:
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
-		preHead, err := proj.HeadHash()
+		preHead, _, err := proj.GitClone().Head()
 		if err != nil {
 			t.Fatalf("pre-submit HEAD: %v", err)
 		}
@@ -3038,7 +3038,7 @@ tasks:
 
 		// Post-submit HEAD must be different — the submit must have
 		// committed.
-		postHead, err := proj.HeadHash()
+		postHead, _, err := proj.GitClone().Head()
 		if err != nil {
 			t.Fatalf("post-submit HEAD: %v", err)
 		}
@@ -3097,11 +3097,11 @@ tasks:
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
-		preHead, _ := proj.HeadHash()
+		preHead, _, _ := proj.GitClone().Head()
 
 		h.mcpSubmitVote(t, "i01:pick", "approve for i01", "approve")
 
-		postHead, _ := proj.HeadHash()
+		postHead, _, _ := proj.GitClone().Head()
 		if postHead == preHead {
 			t.Fatalf("HEAD unchanged after for_each vote submit on i01 — no commit landed; this is the tester-reported gap")
 		}
@@ -3137,7 +3137,7 @@ tasks:
 		h.mcpCreateRunInline(t, projectID, yaml)
 		h.mcpClaimOK(t, "pick")
 		proj, _ := h.project.ForProject(projectID, h.remoteFor(projectID))
-		preHead, _ := proj.HeadHash()
+		preHead, _, _ := proj.GitClone().Head()
 
 		// Submit option only — no content prose.
 		h.callOK(t, "enju_submit_result", map[string]any{
@@ -3145,7 +3145,7 @@ tasks:
 			"option":  "a",
 		})
 
-		postHead, _ := proj.HeadHash()
+		postHead, _, _ := proj.GitClone().Head()
 		if postHead == preHead {
 			t.Fatalf("HEAD unchanged after option-only vote submit — content gates the commit but the metadata.json should land regardless")
 		}
@@ -3184,7 +3184,7 @@ tasks:
 		if err != nil {
 			t.Fatalf("open workspace: %v", err)
 		}
-		preHead, _ := proj.HeadHash()
+		preHead, _, _ := proj.GitClone().Head()
 
 		// Submit i01 with one model.
 		h.mcpClaimOK(t, "i01:vote")
@@ -3202,7 +3202,7 @@ tasks:
 			"model":   "gpt-5-1",
 		})
 
-		postHead, _ := proj.HeadHash()
+		postHead, _, _ := proj.GitClone().Head()
 		if postHead == preHead {
 			t.Fatal("HEAD unchanged after both vote submits — neither committed")
 		}
@@ -3260,13 +3260,13 @@ tasks:
 		if err != nil {
 			t.Fatalf("open workspace clone (no-remote project): %v", err)
 		}
-		preHead, _ := proj.HeadHash()
+		preHead, _, _ := proj.GitClone().Head()
 
 		h.mcpClaimOK(t, "pick")
 		h.mcpSubmitVote(t, "pick", "going with a", "a")
 
 		// HEAD must advance — the load-bearing assertion.
-		postHead, _ := proj.HeadHash()
+		postHead, _, _ := proj.GitClone().Head()
 		if postHead == preHead {
 			t.Fatal("HEAD unchanged after vote submit on no-remote project — useFatClient regression: submits silently went to the legacy no-commit path")
 		}
@@ -5097,7 +5097,7 @@ tasks:
 		if err != nil {
 			t.Fatalf("open project workspace: %v", err)
 		}
-		preBatchHead, err := proj.HeadHash()
+		preBatchHead, _, err := proj.GitClone().Head()
 		if err != nil {
 			t.Fatalf("snapshot HEAD: %v", err)
 		}
@@ -5140,7 +5140,7 @@ tasks:
 		// snapshot. Orphan commits from task_a's successful
 		// PrepareCommit would have advanced HEAD; rollback put
 		// it back.
-		postBatchHead, err := proj.HeadHash()
+		postBatchHead, _, err := proj.GitClone().Head()
 		if err != nil {
 			t.Fatalf("read HEAD after failed batch: %v", err)
 		}

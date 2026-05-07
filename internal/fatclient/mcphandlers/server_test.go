@@ -577,7 +577,7 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 
 	// Eager-init seeded the repo so first-submit's
 	// branchBaseHash has something to fork from.
-	if _, err := proj.HeadHash(); err != nil {
+	if _, _, err := proj.GitClone().Head(); err != nil {
 		t.Errorf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
 	}
 	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
