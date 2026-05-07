@@ -60,7 +60,7 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 		if projectID == 0 {
 			continue
 		}
-		if !s.project.HasLocalClone(projectID) {
+		if !s.enjugit.HasLocalClone(projectID) {
 			continue
 		}
 		pName, _ := p["name"].(string)
@@ -597,7 +597,7 @@ func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error
 	if s.project == nil {
 		return false, nil
 	}
-	hadClone = s.project.HasLocalClone(projectID)
+	hadClone = s.enjugit.HasLocalClone(projectID)
 	if err := s.project.LeaveProject(projectID); err != nil {
 		return hadClone, fmt.Errorf("removing local clone: %w", err)
 	}

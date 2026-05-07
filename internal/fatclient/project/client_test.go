@@ -1054,8 +1054,8 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 	if _, err := os.Stat(workDir); err != nil {
 		t.Fatalf("expected clone dir to exist: %v", err)
 	}
-	if !ws.HasLocalClone(70) {
-		t.Fatal("expected HasLocalClone to report true before leave")
+	if ws.findProjectDir(70) == "" {
+		t.Fatal("expected clone dir to exist before leave")
 	}
 
 	if err := ws.LeaveProject(70); err != nil {
@@ -1064,8 +1064,8 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
 		t.Errorf("expected clone dir to be gone, stat err: %v", err)
 	}
-	if ws.HasLocalClone(70) {
-		t.Error("expected HasLocalClone to report false after leave")
+	if ws.findProjectDir(70) != "" {
+		t.Error("expected clone dir to be gone after leave")
 	}
 
 	// Leaving a project that was never opened should be a no-op, not an error.
@@ -1102,8 +1102,8 @@ func TestSlugifyProjectDir(t *testing.T) {
 	if proj.WorkDir() != expected {
 		t.Errorf("expected workdir %s, got %s", expected, proj.WorkDir())
 	}
-	if !ws.HasLocalClone(7) {
-		t.Error("HasLocalClone should find slug-named dir")
+	if ws.findProjectDir(7) == "" {
+		t.Error("findProjectDir should find slug-named dir")
 	}
 
 	// Case 2: legacy numeric dir gets auto-migrated.

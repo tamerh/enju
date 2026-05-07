@@ -200,16 +200,6 @@ func slugify(name string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// HasLocalClone returns true if a clone for the given project
-// already exists on disk in this project. Used by list-style
-// callers (enju_list_projects) that want to decorate their output
-// with local state WITHOUT triggering a fresh clone as a side
-// effect of the listing call.
-func (ws *Opener) HasLocalClone(projectID int64) bool {
-	dir := ws.findProjectDir(projectID)
-	return dir != ""
-}
-
 // ProjectDir returns the on-disk working directory for a project.
 // Registry wins (the authoritative source for "where N lives");
 // falls back to a slug/numeric scan of the opener root for
