@@ -906,36 +906,6 @@ func (p *Clone) HeadHash() (string, error) {
 	return sha, err
 }
 
-// LocalBranchHash returns the SHA of the named local branch ref,
-// falling back to refs/remotes/origin/<branch> when the local
-// ref doesn't exist, and finally to empty string when neither
-// exists. Used by the fetch-path reconcile hook to seed the
-// scanner cursor for a freshly-created run branch (local ref
-// exists at the base hash, no origin ref yet) without relying
-// on the worktree's current HEAD — HEAD can point at a
-// different branch after the user switches runs in the same
-// session. Empty `branch` resolves through the project's
-// configured default.
-func (p *Clone) LocalBranchHash(branch string) (string, error) {
-	return p.gitClone.LocalBranchHash(p.resolveBranch(branch))
-}
-
-// RemoteHeadHash contacts the remote via ls-remote and returns
-// the SHA of the project's configured default branch, or empty
-// string if the remote has no such ref. Used by CompareToRemote
-// to compare local HEAD against the authoritative remote state
-// without a full fetch.
-func (p *Clone) RemoteHeadHash() (string, error) {
-	return p.RemoteBranchHash("")
-}
-
-// RemoteBranchHash is the branch-aware variant of
-// RemoteHeadHash. Pass "" to use the project's configured
-// default.
-func (p *Clone) RemoteBranchHash(branch string) (string, error) {
-	return p.gitClone.RemoteBranchHash(p.resolveBranch(branch))
-}
-
 // ReadFile reads a file from the working tree at a repo-relative path.
 // Used by the client-side template resolver to read upstream task
 // results and artifact contents.
@@ -2440,7 +2410,7 @@ func (p *Clone) CompareToRemote() (*RemoteComparison, error) {
 	localHash, _ := p.HeadHash()
 	r.LocalHead = localHash
 
-	remoteHash, err := p.RemoteHeadHash()
+	remoteHash, err := p.gitClone.RemoteBranchHash(p.resolveBranch(""))
 	if err != nil {
 		r.Status = RemoteUnreachable
 		r.Unreachable = err.Error()
