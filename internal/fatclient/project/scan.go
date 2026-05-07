@@ -29,7 +29,6 @@ import (
 	"sync"
 
 	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/storer"
@@ -102,42 +101,7 @@ type CommitTrailer struct {
 // it never races with in-flight writes and never rewrites the
 // worktree.
 func (p *Clone) FetchBranch(branch string) error {
-	if p.remoteURL == "" {
-		return nil // local-only, nothing to fetch
-	}
-	// Mirror PullBranch's solo-init guard: a project whose
-	// coordinator-stored remote_url is the working-tree path
-	// (enju_init solo mode) has no `origin` configured in the
-	// local repo, so a fetch attempt would error on the
-	// missing remote. Treating "no git origin" the same as
-	// "no remote_url" keeps the scanner's local-heads
-	// fallback path clean.
-	if p.GitOriginURL() == "" {
-		return nil
-	}
-	b := p.resolveBranch(branch)
-	// ls-remote first so a non-existent remote branch is a
-	// no-op rather than a fetch error. Matches the PullBranch
-	// convention used elsewhere.
-	remoteSHA, err := p.RemoteBranchHash(b)
-	if err != nil {
-		return err
-	}
-	if remoteSHA == "" {
-		return nil
-	}
-	refName := plumbing.NewBranchReferenceName(b)
-	remoteRefName := plumbing.NewRemoteReferenceName("origin", b)
-	refSpec := config.RefSpec(fmt.Sprintf("+%s:%s", refName, remoteRefName))
-	err = p.repo.Fetch(&gogit.FetchOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{refSpec},
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		return friendlyGitError("fetch", p.remoteURL, err)
-	}
-	return nil
+	return p.gitClone.FetchBranch(p.resolveBranch(branch))
 }
 
 // ScanBranchSince walks commits on `refs/remotes/origin/<branch>`
