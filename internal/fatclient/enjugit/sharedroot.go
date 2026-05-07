@@ -52,6 +52,78 @@ func IsLocalWorkingTree(path string) bool {
 	return err == nil && gitInfo.IsDir()
 }
 
+// FriendlyGitError wraps a raw go-git error with an actionable hint
+// based on the operation being performed (clone/push/pull/fetch/
+// ls-remote) and a best-effort classification of the underlying cause
+// (auth, network, unknown host, non-fast-forward). The original error
+// is wrapped with %w so callers can still errors.Is/As against it.
+//
+// op is a short verb phrase like "clone", "push", "fetch origin" that
+// appears at the start of the message. remoteURL is optional; when
+// set it's included so the user sees which remote failed.
+func FriendlyGitError(op, remoteURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	var hint string
+	switch {
+	case strings.Contains(msg, "ssh:") ||
+		strings.Contains(msg, "handshake failed") ||
+		strings.Contains(msg, "publickey") ||
+		strings.Contains(msg, "unable to authenticate"):
+		hint = "check that your SSH agent has the right key loaded (`ssh-add -l`) and that the key is authorized on the remote"
+	case strings.Contains(msg, "authentication required") ||
+		strings.Contains(msg, "authorization failed") ||
+		strings.Contains(msg, "401") ||
+		strings.Contains(msg, "403"):
+		hint = "check your git credential helper or ~/.netrc — HTTPS remotes need a valid token/password"
+	case strings.Contains(msg, "non-fast-forward") ||
+		strings.Contains(msg, "fetch first") ||
+		strings.Contains(msg, "rejected"):
+		hint = "remote has advanced — run enju_project_sync to refresh, or retry the submit"
+	case strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "network is unreachable"):
+		hint = "network/DNS issue — check connectivity to the git host"
+	case strings.Contains(msg, "repository not found") ||
+		strings.Contains(msg, "does not exist"):
+		if isLocalGitPath(remoteURL) {
+			hint = "verify the path exists and points to a valid bare repository"
+		} else {
+			hint = "verify the remote URL and that your account has access"
+		}
+	}
+	where := ""
+	if remoteURL != "" {
+		where = " " + remoteURL
+	}
+	if hint == "" {
+		return fmt.Errorf("%s%s: %w", op, where, err)
+	}
+	return fmt.Errorf("%s%s: %w (hint: %s)", op, where, err, hint)
+}
+
+// isLocalGitPath returns true if remoteURL looks like a local
+// filesystem path rather than a network URL. Used by FriendlyGitError
+// to pick the right "not found" hint.
+func isLocalGitPath(remoteURL string) bool {
+	if remoteURL == "" {
+		return false
+	}
+	if strings.Contains(remoteURL, "://") {
+		return false
+	}
+	if i := strings.Index(remoteURL, ":"); i > 0 {
+		if strings.Contains(remoteURL[:i], "@") {
+			return false
+		}
+	}
+	return true
+}
+
 // ArtifactPath returns the repo-relative path for a user-facing
 // artifact. Artifacts live at their natural path in the repo root
 // (no prefix), so `writes_artifacts: [figures/fig1.png]` writes

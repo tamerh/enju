@@ -773,7 +773,7 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Clone, error)
 			logger.Info("bootstrapped empty remote", "url", remoteURL, "path", workDir)
 			return cloneFromGit(gc, logger), nil
 		}
-		return nil, friendlyGitError("clone", remoteURL, err)
+		return nil, enjugit.FriendlyGitError("clone", remoteURL, err)
 	}
 	logger.Info("cloned project", "url", remoteURL, "path", workDir)
 	return cloneFromGit(gc, logger), nil
@@ -1496,84 +1496,3 @@ func aiCoAuthor(modelName string) string {
 // key=value segments) — see docs/storage.md for the new
 // shape.
 
-// friendlyGitError wraps a raw go-git error with an actionable hint
-// based on the operation being performed (clone/push/pull/fetch/
-// ls-remote) and a best-effort classification of the underlying cause
-// (auth, network, unknown host, non-fast-forward). The original error
-// is wrapped with %w so callers can still errors.Is/As against it.
-//
-// op is a short verb phrase like "clone", "push", "fetch origin" that
-// appears at the start of the message. remoteURL is optional; when
-// set it's included so the user sees which remote failed.
-func friendlyGitError(op, remoteURL string, err error) error {
-	if err == nil {
-		return nil
-	}
-	msg := strings.ToLower(err.Error())
-	var hint string
-	switch {
-	case strings.Contains(msg, "ssh:") ||
-		strings.Contains(msg, "handshake failed") ||
-		strings.Contains(msg, "publickey") ||
-		strings.Contains(msg, "unable to authenticate"):
-		hint = "check that your SSH agent has the right key loaded (`ssh-add -l`) and that the key is authorized on the remote"
-	case strings.Contains(msg, "authentication required") ||
-		strings.Contains(msg, "authorization failed") ||
-		strings.Contains(msg, "401") ||
-		strings.Contains(msg, "403"):
-		hint = "check your git credential helper or ~/.netrc — HTTPS remotes need a valid token/password"
-	case strings.Contains(msg, "non-fast-forward") ||
-		strings.Contains(msg, "fetch first") ||
-		strings.Contains(msg, "rejected"):
-		hint = "remote has advanced — run enju_project_sync to refresh, or retry the submit"
-	case strings.Contains(msg, "no such host") ||
-		strings.Contains(msg, "dial tcp") ||
-		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "i/o timeout") ||
-		strings.Contains(msg, "network is unreachable"):
-		hint = "network/DNS issue — check connectivity to the git host"
-	case strings.Contains(msg, "repository not found") ||
-		strings.Contains(msg, "does not exist"):
-		if isLocalGitPath(remoteURL) {
-			hint = "verify the path exists and points to a valid bare repository"
-		} else {
-			hint = "verify the remote URL and that your account has access"
-		}
-	}
-	where := ""
-	if remoteURL != "" {
-		where = " " + remoteURL
-	}
-	if hint == "" {
-		return fmt.Errorf("%s%s: %w", op, where, err)
-	}
-	return fmt.Errorf("%s%s: %w (hint: %s)", op, where, err, hint)
-}
-
-// isLocalGitPath returns true if remoteURL looks like a local
-// filesystem path rather than a network URL. Used to pick the
-// right "not found" hint: network URLs want a credentials/URL
-// hint, local paths want a "does the path exist" hint.
-func isLocalGitPath(remoteURL string) bool {
-	if remoteURL == "" {
-		return false
-	}
-	// Network URL schemes: https://, git://, ssh://, file:// (which
-	// is technically local but conventionally accessed by URL).
-	if strings.Contains(remoteURL, "://") {
-		return false
-	}
-	// SCP-style SSH remote: user@host:path. The ":" is the
-	// distinguishing marker — local paths with ":" are vanishingly
-	// rare on Unix (and a windows "C:\" path won't match since the
-	// leading char is alpha-colon-backslash, not alpha-colon-alpha).
-	if i := strings.Index(remoteURL, ":"); i > 0 {
-		// Make sure the pre-colon part doesn't start with "/" or
-		// "." (which would mean it's an absolute or relative
-		// path, not user@host). user@host form requires an `@`.
-		if strings.Contains(remoteURL[:i], "@") {
-			return false
-		}
-	}
-	return true
-}

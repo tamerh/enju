@@ -941,7 +941,7 @@ func TestFriendlyGitErrorHints(t *testing.T) {
 	}
 	// Local path variant — same underlying error, different hint.
 	t.Run("local path not found", func(t *testing.T) {
-		got := friendlyGitError("clone", "/tmp/does-not-exist.git", errStr("repository not found"))
+		got := enjugit.FriendlyGitError("clone", "/tmp/does-not-exist.git", errStr("repository not found"))
 		if got == nil {
 			t.Fatal("nil error")
 		}
@@ -954,7 +954,7 @@ func TestFriendlyGitErrorHints(t *testing.T) {
 	})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := friendlyGitError("push", "git@example:foo.git", tc.err)
+			got := enjugit.FriendlyGitError("push", "git@example:foo.git", tc.err)
 			if got == nil {
 				t.Fatalf("nil error")
 			}
@@ -968,7 +968,7 @@ func TestFriendlyGitErrorHints(t *testing.T) {
 	}
 
 	// Unclassified errors pass through without a hint suffix.
-	plain := friendlyGitError("clone", "", errStr("some random non-matching failure"))
+	plain := enjugit.FriendlyGitError("clone", "", errStr("some random non-matching failure"))
 	if strings.Contains(plain.Error(), "hint:") {
 		t.Errorf("unclassified error should not carry a hint, got: %q", plain.Error())
 	}
