@@ -46,7 +46,6 @@
 package project
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -55,7 +54,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -1018,41 +1016,38 @@ func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
-	// Overlay the new files on top of current HEAD. Any local
-	// commits the user made (e.g. a manual edit to a script
-	// between submits) stay where they are — we do NOT reset
-	// HEAD to origin/<default> any more. That reset was the
-	// root cause of the "fat-client clobbers user commits" bug.
-	for _, f := range req.Files {
-		full := filepath.Join(p.workDir, f.RepoRelPath)
-		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
-		}
-		mode := f.Mode
-		if mode == 0 {
-			mode = 0644
-		}
-		if err := os.WriteFile(full, f.Content, mode); err != nil {
-			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
-		}
-		// WriteFile respects umask on creation but existing
-		// files keep their prior mode. Explicit chmod so the
-		// requested mode actually sticks across overwrite-in-
-		// place cases (re-submit, re-snapshot).
-		if err := os.Chmod(full, mode); err != nil {
-			return nil, fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
-		}
-	}
-
 	// One commit per submit, on top of whatever was there.
-	// Stage ONLY the paths the caller explicitly wrote —
-	// AddGlob(".") would sweep any other pending untracked
-	// edits (e.g. a co-authored template) into the commit.
+	// gitClone.CommitFiles writes Files to disk (with the
+	// requested mode), stages exactly StagePaths (no AddGlob),
+	// and commits with the supplied author. Local commits the
+	// user made (e.g. a manual edit between submits) stay
+	// where they are — overlay-on-HEAD, never reset. That
+	// reset was the root cause of the "fat-client clobbers
+	// user commits" bug.
+	files := make([]enjugit.SharedFileWrite, 0, len(req.Files))
 	stagePaths := make([]string, 0, len(req.Files))
 	for _, f := range req.Files {
+		files = append(files, enjugit.SharedFileWrite{
+			RepoRelPath: f.RepoRelPath,
+			Content:     f.Content,
+			Mode:        f.Mode,
+		})
 		stagePaths = append(stagePaths, f.RepoRelPath)
 	}
-	if _, err := p.commit(commitMsg, stagePaths, req.AuthorName, req.AuthorEmail); err != nil {
+	authorName, authorEmail := req.AuthorName, req.AuthorEmail
+	if authorName == "" {
+		authorName = "Enju Client"
+	}
+	if authorEmail == "" {
+		authorEmail = "enju-client@localhost"
+	}
+	if _, err := p.gitClone.CommitFiles(enjugit.SharedCommitRequest{
+		Files:       files,
+		StagePaths:  stagePaths,
+		Message:     commitMsg,
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+	}); err != nil {
 		return nil, fmt.Errorf("creating commit: %w", err)
 	}
 
@@ -1190,27 +1185,6 @@ func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) 
 		maxRetries = 3
 	}
 
-	// No-op check: read each target path's current content (if
-	// any) and bail if every requested write matches. Done
-	// before any on-disk mutation so a skipped export leaves
-	// the working tree byte-identical.
-	allMatch := true
-	for _, f := range req.Files {
-		full := filepath.Join(p.workDir, f.RepoRelPath)
-		existing, err := os.ReadFile(full)
-		if err != nil || !bytes.Equal(existing, f.Content) {
-			allMatch = false
-			break
-		}
-	}
-	if allMatch {
-		sha := ""
-		if head, herr := p.repo.Head(); herr == nil {
-			sha = head.Hash().String()
-		}
-		return &CommitFilesResult{CommitSHA: sha, Attempts: 0, NoOp: true}, nil
-	}
-
 	// Commit message — optionally append the AI-Model trailer
 	// so `git log --format='%(trailers)'` can distinguish AI
 	// vs human contributions, same convention as SubmitTaskResult.
@@ -1224,33 +1198,39 @@ func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) 
 		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
-	// Overlay files onto current HEAD (no reset — see
-	// SubmitTaskResult godoc for the rationale).
-	for _, f := range req.Files {
-		full := filepath.Join(p.workDir, f.RepoRelPath)
-		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
-		}
-		mode := f.Mode
-		if mode == 0 {
-			mode = 0644
-		}
-		if err := os.WriteFile(full, f.Content, mode); err != nil {
-			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
-		}
-		if err := os.Chmod(full, mode); err != nil {
-			return nil, fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
-		}
-	}
-
+	// Delegate write + no-op detection + stage + commit to the
+	// git layer. NoOp result short-circuits the push retry loop.
+	files := make([]enjugit.SharedFileWrite, 0, len(req.Files))
 	stagePaths := make([]string, 0, len(req.Files))
 	for _, f := range req.Files {
+		files = append(files, enjugit.SharedFileWrite{
+			RepoRelPath: f.RepoRelPath,
+			Content:     f.Content,
+			Mode:        f.Mode,
+		})
 		stagePaths = append(stagePaths, f.RepoRelPath)
 	}
-	sha, err := p.commit(msg, stagePaths, req.AuthorName, req.AuthorEmail)
+	authorName, authorEmail := req.AuthorName, req.AuthorEmail
+	if authorName == "" {
+		authorName = "Enju Client"
+	}
+	if authorEmail == "" {
+		authorEmail = "enju-client@localhost"
+	}
+	commitRes, err := p.gitClone.CommitFiles(enjugit.SharedCommitRequest{
+		Files:       files,
+		StagePaths:  stagePaths,
+		Message:     msg,
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("creating commit: %w", err)
 	}
+	if commitRes.NoOp {
+		return &CommitFilesResult{CommitSHA: commitRes.SHA, Attempts: 0, NoOp: true}, nil
+	}
+	sha := commitRes.SHA
 
 	branch := p.resolveBranch(req.Branch)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -1313,79 +1293,6 @@ func readUnmergedFiles(workDir string) []string {
 }
 
 
-
-// commit stages everything in the working tree and creates a
-// commit with the given message and author identity. If authorName
-// or authorEmail is empty, a generic `Enju Client` placeholder is
-// used — this is only the case for unit tests that don't care
-// about author attribution. Production callers (the MCP server's
-// submit handler) always pass the citizen's real name and email so
-// pushes to the user's own git host attribute correctly on
-// contributor graphs, blame, and CODEOWNERS.
-// commit builds a git commit with the given message + author
-// signature, staging ONLY the explicit paths the caller passes.
-// An earlier version used wt.AddGlob(".") which incidentally
-// swept every untracked file in the worktree into the commit —
-// that was the template-scatter bug, where co-authored
-// untracked templates (tmpl-b sitting next to tmpl-a being
-// instantiated) silently landed on the run's branch and
-// vanished from main. Scoped staging fixes both that bug and
-// the general principle that a commit helper should only
-// touch paths the caller asked for.
-//
-// An empty `paths` argument keeps the old "stage everything
-// under worktree root" semantics — we don't have any callers
-// relying on that anymore, but the fall-through exists so a
-// future caller that genuinely wants a sweep-everything
-// commit can opt in by passing nil.
-func (p *Clone) commit(message string, paths []string, authorName, authorEmail string) (string, error) {
-	wt, err := p.repo.Worktree()
-	if err != nil {
-		return "", fmt.Errorf("getting worktree: %w", err)
-	}
-	if paths == nil {
-		if err := wt.AddGlob("."); err != nil {
-			return "", fmt.Errorf("staging: %w", err)
-		}
-	} else {
-		for _, rel := range paths {
-			if rel == "" {
-				continue
-			}
-			// wt.Add handles New, Modified, and Deleted
-			// file states for the given path. Errors
-			// propagate (typically unknown-path, which
-			// means the caller's bookkeeping is off).
-			if _, err := wt.Add(rel); err != nil {
-				return "", fmt.Errorf("staging %s: %w", rel, err)
-			}
-		}
-	}
-	status, err := wt.Status()
-	if err != nil {
-		return "", fmt.Errorf("status: %w", err)
-	}
-	if status.IsClean() {
-		return "", fmt.Errorf("nothing to commit")
-	}
-	if authorName == "" {
-		authorName = "Enju Client"
-	}
-	if authorEmail == "" {
-		authorEmail = "enju-client@localhost"
-	}
-	hash, err := wt.Commit(message, &gogit.CommitOptions{
-		Author: &object.Signature{
-			Name:  authorName,
-			Email: authorEmail,
-			When:  time.Now(),
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("committing: %w", err)
-	}
-	return hash.String(), nil
-}
 
 // --- Remote comparison (ported from internal/git iteration 4) ---
 

@@ -56,6 +56,16 @@ func InitLocalShared(workDir, lockPath string, logger *slog.Logger) (*SharedClon
 // Goes away with the project package.
 var ErrSharedPushNonFF = git.ErrPushNonFF
 
+// SharedCommitRequest / SharedCommitResult / SharedFileWrite are the
+// migration-shim aliases for the git layer's commit primitive types.
+// Used by project.Clone's SubmitTaskResult / CommitFiles after they
+// were refactored to delegate write+stage+commit to gitClone.CommitFiles
+// (which handles file writes, mode + chmod, idempotent no-op, staging,
+// and committing in one call). Goes away with the project package.
+type SharedCommitRequest = git.CommitRequest
+type SharedCommitResult = git.CommitResult
+type SharedFileWrite = git.FileWrite
+
 // ErrSharedNoRemote is the migration-shim alias for git.ErrNoRemote.
 // project methods that delegate to gitClone.Fetch / Push (which
 // surface ErrNoRemote when there's no origin) check via
