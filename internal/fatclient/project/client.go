@@ -58,7 +58,6 @@ import (
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
@@ -1066,17 +1065,25 @@ func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	if maxRetries <= 0 {
 		maxRetries = 3
 	}
+	branch := p.resolveBranch(req.Branch)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		pushErr := p.pushBranchInternal(req.Branch, false)
-		if pushErr == nil {
-			finalSHA := ""
-			if head, herr := p.repo.Head(); herr == nil {
-				finalSHA = head.Hash().String()
-			}
-			advanceCursorIfConfigured(req.ProjectID, req.StateDir, p.resolveBranch(req.Branch), finalSHA)
-			return &SubmitResult{CommitSHA: finalSHA, Attempts: attempt}, nil
+		// Read the local tip so PushWithVerify can confirm
+		// the remote ref actually advanced to that SHA after
+		// the push call returns success — catches the silent-
+		// success class of bugs (transport quirks, server hooks
+		// that drop the push but don't error). Empty remoteURL
+		// short-circuits to nil inside the gitClone push path,
+		// matching the "local-only operator mode" semantics.
+		expectedSHA := ""
+		if head, herr := p.repo.Head(); herr == nil {
+			expectedSHA = head.Hash().String()
 		}
-		if !isNonFastForwardError(pushErr) {
+		pushErr := p.gitClone.PushWithVerify(branch, expectedSHA)
+		if pushErr == nil || errors.Is(pushErr, enjugit.ErrSharedNoRemote) {
+			advanceCursorIfConfigured(req.ProjectID, req.StateDir, branch, expectedSHA)
+			return &SubmitResult{CommitSHA: expectedSHA, Attempts: attempt}, nil
+		}
+		if !errors.Is(pushErr, enjugit.ErrSharedPushNonFF) {
 			return nil, fmt.Errorf("push failed: %w", pushErr)
 		}
 		// Non-FF: the remote moved while we were working.
@@ -1086,7 +1093,7 @@ func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		// go-git's rebase support doesn't cover the cases we
 		// need (especially divergent-history with
 		// user-authored commits).
-		if rebaseErr := p.rebaseOnRemote(req.Branch); rebaseErr != nil {
+		if rebaseErr := p.gitClone.RebaseOnRemote(branch); rebaseErr != nil {
 			return nil, fmt.Errorf(
 				"submit push rejected and rebase failed — your submit likely touches a file another client also changed. Local work is still in git reflog. Details: %w",
 				rebaseErr)
@@ -1245,18 +1252,20 @@ func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) 
 		return nil, fmt.Errorf("creating commit: %w", err)
 	}
 
+	branch := p.resolveBranch(req.Branch)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		pushErr := p.pushBranchInternal(req.Branch, false)
-		if pushErr == nil {
-			if head, herr := p.repo.Head(); herr == nil {
-				sha = head.Hash().String()
-			}
-			return &CommitFilesResult{CommitSHA: sha, Attempts: attempt}, nil
+		expectedSHA := sha
+		if head, herr := p.repo.Head(); herr == nil {
+			expectedSHA = head.Hash().String()
 		}
-		if !isNonFastForwardError(pushErr) {
+		pushErr := p.gitClone.PushWithVerify(branch, expectedSHA)
+		if pushErr == nil || errors.Is(pushErr, enjugit.ErrSharedNoRemote) {
+			return &CommitFilesResult{CommitSHA: expectedSHA, Attempts: attempt}, nil
+		}
+		if !errors.Is(pushErr, enjugit.ErrSharedPushNonFF) {
 			return nil, fmt.Errorf("push failed: %w", pushErr)
 		}
-		if rebaseErr := p.rebaseOnRemote(req.Branch); rebaseErr != nil {
+		if rebaseErr := p.gitClone.RebaseOnRemote(branch); rebaseErr != nil {
 			return nil, fmt.Errorf(
 				"push rejected and rebase failed — local work is still in git reflog. Details: %w",
 				rebaseErr)
@@ -1304,184 +1313,6 @@ func readUnmergedFiles(workDir string) []string {
 }
 
 
-// pushBranchInternal is the branch-aware equivalent of
-// pushInternal. It pushes only the named branch to origin.
-// Empty `branch` resolves to the project default.
-//
-// Post-push verify: after go-git's Push returns success (or the
-// "already up to date" no-op), this function lists the remote
-// ref and confirms it equals the local branch tip. If they
-// diverge, returns *ErrPushVerifyFailed — surfaces silent-
-// success bugs (transport quirks, NoErrAlreadyUpToDate firing
-// when there ARE new local commits, etc.) the production
-// "commit-reported-but-not-in-bare" symptom traced to. The
-// verify is a no-op when remoteURL is empty (legitimate local-
-// only operator mode — there's nothing to verify against).
-func (p *Clone) pushBranchInternal(branch string, force bool) error {
-	if p.remoteURL == "" {
-		return nil
-	}
-	b := p.resolveBranch(branch)
-	refSpec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", b, b)
-	err := p.repo.Push(&gogit.PushOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
-		Force:      force,
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
-	now := time.Now()
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		p.gitClone.RecordPush(now, err.Error())
-		return friendlyGitError("push", p.remoteURL, err)
-	}
-	p.gitClone.RecordPush(now, "")
-
-	// Verify the remote ref now matches our local tip. Catches
-	// the silent-success class of bugs without trusting go-git's
-	// return value alone.
-	localRef, refErr := p.repo.Reference(plumbing.NewBranchReferenceName(b), true)
-	if refErr != nil {
-		// No local ref to verify against — likely a no-commits
-		// path or pre-init state. Push semantically already
-		// did nothing meaningful; let the caller continue.
-		return nil
-	}
-	if vErr := p.verifyRemoteRefMatches(b, localRef.Hash()); vErr != nil {
-		return vErr
-	}
-	return nil
-}
-
-// ErrPushVerifyFailed is returned by pushBranchInternal when the
-// push call returned success (or a NoErrAlreadyUpToDate no-op)
-// but the remote ref doesn't actually equal the local branch
-// tip. Production-fix work this typed error so the fat-client's
-// submit pipeline can surface a push_verify_failed event to
-// coord (and a clear error to the operator) instead of
-// reporting a phantom SHA that nothing else can read.
-type ErrPushVerifyFailed struct {
-	Branch     string
-	LocalSHA   string
-	RemoteSHA  string // empty when the remote ref is missing entirely
-	RemoteURL  string
-	UnderlyingErr error // optional — set when the verify itself failed (network, etc.)
-}
-
-func (e *ErrPushVerifyFailed) Error() string {
-	remoteDesc := e.RemoteSHA
-	if remoteDesc == "" {
-		remoteDesc = "<missing>"
-	}
-	msg := fmt.Sprintf(
-		"push of %q to %s reported success but verify shows the remote ref is at %s, "+
-			"not the expected local tip %s — the commit didn't land",
-		e.Branch, e.RemoteURL, remoteDesc, e.LocalSHA)
-	if e.UnderlyingErr != nil {
-		msg += " (verify error: " + e.UnderlyingErr.Error() + ")"
-	}
-	return msg
-}
-
-func (e *ErrPushVerifyFailed) Unwrap() error { return e.UnderlyingErr }
-
-// verifyRemoteRefMatches asks the remote for its current
-// `refs/heads/<branch>` value and compares it to the expected
-// local SHA. Returns nil when they match, *ErrPushVerifyFailed
-// otherwise. Used by pushBranchInternal as a post-push check.
-//
-// "Matches" is strict equality — for the simple branch-push case
-// the local tip and remote tip should be byte-identical after
-// a successful push. Merge-commit and rebase paths happen in
-// other helpers (mergeCommitFallback, rebaseOnRemote) that don't
-// route through this verify.
-func (p *Clone) verifyRemoteRefMatches(branch string, expected plumbing.Hash) error {
-	rem, err := p.repo.Remote("origin")
-	if err != nil {
-		return &ErrPushVerifyFailed{
-			Branch:        branch,
-			LocalSHA:      expected.String(),
-			RemoteURL:     p.remoteURL,
-			UnderlyingErr: fmt.Errorf("opening origin: %w", err),
-		}
-	}
-	refs, err := rem.List(&gogit.ListOptions{
-		Auth: sshAuthMethod(p.remoteURL),
-	})
-	if err != nil {
-		return &ErrPushVerifyFailed{
-			Branch:        branch,
-			LocalSHA:      expected.String(),
-			RemoteURL:     p.remoteURL,
-			UnderlyingErr: fmt.Errorf("listing remote refs: %w", err),
-		}
-	}
-	wanted := plumbing.NewBranchReferenceName(branch)
-	for _, r := range refs {
-		if r.Name() == wanted {
-			if r.Hash() == expected {
-				return nil
-			}
-			return &ErrPushVerifyFailed{
-				Branch:    branch,
-				LocalSHA:  expected.String(),
-				RemoteSHA: r.Hash().String(),
-				RemoteURL: p.remoteURL,
-			}
-		}
-	}
-	return &ErrPushVerifyFailed{
-		Branch:    branch,
-		LocalSHA:  expected.String(),
-		RemoteSHA: "",
-		RemoteURL: p.remoteURL,
-	}
-}
-
-// rebaseOnRemote runs `git pull --rebase --autostash` via the
-// system git binary so divergent histories are merged without
-// discarding local commits. go-git's rebase support is too
-// limited for this case — it doesn't handle arbitrary
-// divergent-history replays, which is exactly what we need
-// when the user has committed between submits.
-//
-// --autostash protects against an edge case where the caller
-// left uncommitted changes in the working tree; they get
-// stashed + reapplied around the rebase so we never surprise
-// the user with a dirty-tree rejection.
-//
-// Pulls the specific branch the caller was pushing to — passing
-// "" resolves to the project's configured default. No-op for
-// local-only projects (no remoteURL).
-func (p *Clone) rebaseOnRemote(branch string) error {
-	if p.remoteURL == "" {
-		return nil
-	}
-	b := p.resolveBranch(branch)
-	cmd := exec.Command("git", "-C", p.workDir, "pull", "--rebase", "--autostash", "origin", b)
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git pull --rebase origin %s: %s (%w)", b, strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
-// isNonFastForwardError tells whether a push error is the
-// "someone else pushed first" case (recoverable via rebase) vs
-// a real network / auth / config failure (not recoverable,
-// surface to the user). go-git surfaces non-FF via a few
-// different phrasings depending on the transport; check them
-// all.
-func isNonFastForwardError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "non-fast-forward") ||
-		strings.Contains(s, "fetch first") ||
-		strings.Contains(s, "rejected") ||
-		strings.Contains(s, "stale info")
-}
 
 // commit stages everything in the working tree and creates a
 // commit with the given message and author identity. If authorName

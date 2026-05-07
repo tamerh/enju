@@ -328,6 +328,11 @@ func (f *fakeOps) CheckoutBranchFrom(branch, baseBranch, defaultBranch string) e
 	return f.checkErr("CheckoutBranchFrom")
 }
 
+func (f *fakeOps) RebaseOnRemote(branch string) error {
+	f.record("RebaseOnRemote")
+	return f.checkErr("RebaseOnRemote")
+}
+
 func (f *fakeOps) PushAllRefs(force bool) error {
 	f.record("PushAllRefs")
 	return f.checkErr("PushAllRefs")

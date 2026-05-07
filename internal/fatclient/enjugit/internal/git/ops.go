@@ -55,6 +55,7 @@ type Ops interface {
 	Push(branch string) error
 	PushAllRefs(force bool) error
 	PushWithVerify(branch, expectedSHA string) error
+	RebaseOnRemote(branch string) error
 	Fetch() error
 
 	// EnsureOrigin self-heals the on-disk .git/config when the

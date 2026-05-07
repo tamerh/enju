@@ -49,6 +49,13 @@ func InitLocalShared(workDir, lockPath string, logger *slog.Logger) (*SharedClon
 	return git.InitLocal(workDir, lockPath, logger)
 }
 
+// ErrSharedPushNonFF is the migration-shim alias for git.ErrPushNonFF —
+// returned when a push is rejected as non-fast-forward. Callers that
+// retry on non-FF (project.SubmitTaskResult / CommitFiles) check
+// errors.Is(err, enjugit.ErrSharedPushNonFF) before driving a rebase.
+// Goes away with the project package.
+var ErrSharedPushNonFF = git.ErrPushNonFF
+
 // ErrSharedNoRemote is the migration-shim alias for git.ErrNoRemote.
 // project methods that delegate to gitClone.Fetch / Push (which
 // surface ErrNoRemote when there's no origin) check via
