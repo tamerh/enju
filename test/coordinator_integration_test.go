@@ -1160,7 +1160,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 	_ = proj.GitClone().PullBranch(proj.DefaultBranch())
 	proj.Unlock()
 
-	input := project.ResolveInput{
+	input := enjugit.ResolveInput{
 		PromptTemplate:     d.PromptTemplate,
 		UserPromptTemplate: d.UserPromptTemplate,
 		ForEachParams:      d.ForEachParams,
@@ -1173,7 +1173,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 				params[k] = sv
 			}
 		}
-		ref := project.DependencyRef{
+		ref := enjugit.DependencyRef{
 			TaskDefID:      asString(dep["task_def_id"]),
 			InstanceKey:    asString(dep["instance_key"]),
 			InstanceParams: params,
@@ -1181,10 +1181,6 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 			ResultPath:     asString(dep["result_path"]),
 			VoteChoice:     asString(dep["vote_choice"]),
 		}
-		// Phase E.2 session 2b — multi-citizen upstream
-		// responses. The coordinator populates a per-citizen
-		// list on the descriptor; the resolver reads each
-		// citizen's result.md from the local clone.
 		if respsRaw, ok := dep["responses"].([]interface{}); ok {
 			for _, r := range respsRaw {
 				rm, _ := r.(map[string]interface{})
@@ -1192,7 +1188,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 				if pathUser == "" {
 					pathUser = asString(rm["username"])
 				}
-				ref.Responses = append(ref.Responses, project.CitizenResponseRef{
+				ref.Responses = append(ref.Responses, enjugit.CitizenResponseRef{
 					Username:     asString(rm["username"]),
 					PathUsername: pathUser,
 					Option:       asString(rm["option"]),
@@ -1203,13 +1199,14 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		input.Dependencies = append(input.Dependencies, ref)
 	}
 	for _, a := range d.ArtifactReads {
-		input.ArtifactReads = append(input.ArtifactReads, project.ArtifactRef{
+		input.ArtifactReads = append(input.ArtifactReads, enjugit.ArtifactRef{
 			Path:      asString(a["path"]),
 			CommitSHA: asString(a["commit_sha"]),
 		})
 	}
 
-	resolved, err := proj.Resolve(input)
+	wf := enjugit.WorkflowFromShared(proj.GitClone(), projectID, proj.DefaultBranch(), nil)
+	resolved, err := wf.Resolve(input)
 	if err != nil {
 		s.t.Fatalf("resolve: %v", err)
 	}
