@@ -942,11 +942,8 @@ func (p *Clone) PullBranch(branch string) error {
 
 // HeadHash returns the SHA of the current local HEAD.
 func (p *Clone) HeadHash() (string, error) {
-	ref, err := p.repo.Head()
-	if err != nil {
-		return "", fmt.Errorf("reading HEAD: %w", err)
-	}
-	return ref.Hash().String(), nil
+	sha, _, err := p.gitClone.Head()
+	return sha, err
 }
 
 // LocalBranchHash returns the SHA of the named local branch ref,
@@ -2748,9 +2745,11 @@ func (p *Clone) LogFile(relPath string) ([]CommitInfo, error) {
 // Passing an empty string removes origin, turning the clone into
 // a local-only project. The caller MUST hold the project lock.
 func (p *Clone) SetRemote(url string) error {
-	existing, err := p.repo.Remote("origin")
 	if url == "" {
-		if err != nil {
+		// Empty URL → remove origin entirely. EnsureOrigin only
+		// adds/replaces; deletion stays here (and is a no-op when
+		// origin is already absent).
+		if _, err := p.repo.Remote("origin"); err != nil {
 			return nil
 		}
 		if err := p.repo.DeleteRemote("origin"); err != nil {
@@ -2759,20 +2758,8 @@ func (p *Clone) SetRemote(url string) error {
 		p.remoteURL = ""
 		return nil
 	}
-	if err == nil {
-		if cfg := existing.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] == url {
-			p.remoteURL = url
-			return nil
-		}
-		if err := p.repo.DeleteRemote("origin"); err != nil {
-			return fmt.Errorf("replacing origin: %w", err)
-		}
-	}
-	if _, err := p.repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{url},
-	}); err != nil {
-		return fmt.Errorf("creating remote: %w", err)
+	if err := p.gitClone.EnsureOrigin(url); err != nil {
+		return err
 	}
 	p.remoteURL = url
 	return nil
