@@ -427,10 +427,14 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 		"remote_url": remoteURL,
 	}
 	if remoteURL == "" {
-		resp["status"] = string(project.RemoteNoRemote)
+		resp["status"] = string(enjugit.AggregateNoRemote)
 		return resp, nil
 	}
-	cmp, err := proj.CompareToRemote()
+	wf, _, _, _, werr := s.OpenWorkflow(ctx, projectID)
+	if werr != nil {
+		return nil, fmt.Errorf("opening workflow: %w", werr)
+	}
+	cmp, err := wf.CompareDefaultBranch("")
 	if err != nil {
 		return nil, fmt.Errorf("comparing to remote: %w", err)
 	}
@@ -486,7 +490,11 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		"force":      force,
 	}
 
-	cmp, cmpErr := proj.CompareToRemote()
+	wf, _, _, _, werr := s.OpenWorkflow(ctx, projectID)
+	if werr != nil {
+		return nil, fmt.Errorf("opening workflow: %w", werr)
+	}
+	cmp, cmpErr := wf.CompareDefaultBranch("")
 	if cmpErr == nil && cmp != nil {
 		resp["status"] = string(cmp.Status)
 		resp["local_head"] = cmp.LocalHead
@@ -495,15 +503,15 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		resp["behind_by"] = cmp.BehindBy
 
 		switch cmp.Status {
-		case project.RemoteInSync:
+		case enjugit.AggregateInSync:
 			resp["result"] = "noop"
 			resp["message"] = "already in sync"
 			return resp, nil
-		case project.RemoteBehind:
+		case enjugit.AggregateBehind:
 			resp["result"] = "noop"
 			resp["message"] = fmt.Sprintf("local is behind remote by %d commit(s); nothing to push — fetch+merge to catch up", cmp.BehindBy)
 			return resp, nil
-		case project.RemoteDiverged, project.RemoteUnrelated:
+		case enjugit.AggregateDiverged, enjugit.AggregateUnrelated:
 			if !force {
 				resp["result"] = "refused"
 				resp["message"] = fmt.Sprintf(
