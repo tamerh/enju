@@ -23,6 +23,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -128,24 +129,30 @@ func TestReadResultAtCommit(t *testing.T) {
 		t.Fatalf("RegisterAdoptedDir: %v", err)
 	}
 
-	// Stage + commit the result file via the workspace's git.
-	proj, perr := ws.ForProject(7, "")
-	if perr != nil {
-		t.Fatalf("ForProject: %v", perr)
+	// Stage + commit the result file via a sibling enjugit
+	// workspace pointing at the same root (avoids the coord-stub
+	// dependency OpenWorkflow has via FetchProjectMetaExpanded).
+	enjuWS, eerr := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	if eerr != nil {
+		t.Fatalf("enjugit Workspace: %v", eerr)
 	}
-	commitRes, err := proj.CommitFiles(project.CommitFilesRequest{
-		Files: []project.FileWrite{
+	wf, ferr := enjuWS.ForProject(7, "")
+	if ferr != nil {
+		t.Fatalf("enjugit ForProject: %v", ferr)
+	}
+	commitRes, err := wf.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+		Files: []enjugit.FileWrite{
 			{RepoRelPath: resultDir + "/result.md", Content: []byte("VERSION-1-CONTENT")},
 		},
-		CommitMsg:   "seed",
+		Subject:     "seed",
 		AuthorName:  "Test",
 		AuthorEmail: "test@example.com",
 	})
 	if err != nil {
-		t.Fatalf("CommitFiles: %v", err)
+		t.Fatalf("CommitArbitraryFiles: %v", err)
 	}
 	if commitRes == nil || commitRes.CommitSHA == "" {
-		t.Fatal("CommitFiles returned empty SHA")
+		t.Fatal("CommitArbitraryFiles returned empty SHA")
 	}
 	commitSHA := commitRes.CommitSHA
 
@@ -217,32 +224,32 @@ func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
 		t.Fatalf("init bare: %v", err)
 	}
 	seedBareWithInitialCommit(t, bare)
-	// Seed the bare via a writer workspace: ForProject(7, bare)
-	// gives a clone wired with origin=bare; CommitFiles +
-	// implicit push lands the commit on the bare.
+	// Seed the bare via a writer enjugit workspace: ForProject(7, bare)
+	// gives a Workflow whose clone is wired with origin=bare;
+	// CommitArbitraryFiles + implicit push lands the commit there.
 	writerRoot := t.TempDir()
-	writerWS, err := project.NewOpener(writerRoot, logger)
-	if err != nil {
-		t.Fatalf("writer Opener: %v", err)
+	writerEnjugit, eerr := enjugit.NewWorkspace(writerRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	if eerr != nil {
+		t.Fatalf("writer enjugit: %v", eerr)
 	}
-	writerProj, err := writerWS.ForProject(7, bare)
+	writerWF, err := writerEnjugit.ForProject(7, bare)
 	if err != nil {
-		t.Fatalf("writer ForProject: %v", err)
+		t.Fatalf("writer enjugit.ForProject: %v", err)
 	}
 	resultDir := "enju/runs/1-draft/draft"
-	writerProj.Lock()
-	commitRes, err := writerProj.CommitFiles(project.CommitFilesRequest{
-		Files: []project.FileWrite{
+	// CommitArbitraryFiles takes WithLock internally via the
+	// enjugit git layer; no project-level Lock needed.
+	commitRes, err := writerWF.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+		Files: []enjugit.FileWrite{
 			{RepoRelPath: resultDir + "/result.md", Content: []byte("LAZY-CLONE-CONTENT")},
 		},
-		CommitMsg:   "seed",
+		Subject:     "seed",
 		AuthorName:  "Writer",
 		AuthorEmail: "writer@example.com",
 		Branch:      "main",
 	})
-	writerProj.Unlock()
 	if err != nil {
-		t.Fatalf("CommitFiles: %v", err)
+		t.Fatalf("CommitArbitraryFiles: %v", err)
 	}
 	if commitRes == nil || commitRes.CommitSHA == "" {
 		t.Fatal("empty commit SHA")
