@@ -1148,7 +1148,7 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		s.t.Fatalf("open project: %v", err)
 	}
 	proj.Lock()
-	_ = proj.Pull()
+	_ = proj.GitClone().PullBranch(proj.DefaultBranch())
 	proj.Unlock()
 
 	input := project.ResolveInput{

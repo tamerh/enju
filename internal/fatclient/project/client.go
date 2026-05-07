@@ -724,6 +724,14 @@ func (p *Clone) ProjectID() int64 { return p.projectID }
 // WorkDir returns the local working-tree path.
 func (p *Clone) WorkDir() string { return p.workDir }
 
+// GitClone returns the underlying enjugit git handle. Exposed so
+// callers can drive enjugit-side verbs (PullBranch, etc.) against
+// the SAME *git.Clone the project.Clone wraps — avoiding the
+// dual-handle staleness bug where two independent git.Clone
+// instances over the same .git see each other's pack files only
+// after re-open.
+func (p *Clone) GitClone() *enjugit.SharedClone { return p.gitClone }
+
 // RemoteURL returns the configured origin URL, or an empty string
 // for local-only clones.
 func (p *Clone) RemoteURL() string { return p.remoteURL }
@@ -890,33 +898,6 @@ func cloneFromGit(gc *enjugit.SharedClone, logger *slog.Logger) *Clone {
 		logger:    logger,
 		gitClone:  gc,
 	}
-}
-
-// Pull fetches the latest state of the project's configured
-// default branch and fast-forwards the local branch to match.
-// If the working tree has uncommitted local changes (shouldn't
-// happen in normal flow — clients should always commit what
-// they wrote before yielding), Pull returns an error. The
-// caller MUST hold the project lock.
-//
-// To pull a specific branch (typically the branch of a specific
-// run), use PullBranch(branch) — this shorthand uses the
-// project-level default.
-func (p *Clone) Pull() error {
-	return p.PullBranch("")
-}
-
-// PullBranch is the branch-aware variant of Pull. Pass "" to
-// use the project's configured default branch.
-//
-// First-submit on a new branch: if origin has no
-// refs/heads/<branch> yet, we return nil. go-git's Pull raises
-// a "reference not found" error in that case, which would wedge
-// the very first claim on e.g. branch="run-2" before any
-// commits exist on the remote. The caller's next push creates
-// the remote ref naturally.
-func (p *Clone) PullBranch(branch string) error {
-	return p.gitClone.PullBranch(p.resolveBranch(branch))
 }
 
 // HeadHash returns the SHA of the current local HEAD.
@@ -2147,7 +2128,7 @@ func (p *Clone) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, modelN
 	if err := p.CheckoutBranch(""); err != nil {
 		return "", fmt.Errorf("switching to default branch: %w", err)
 	}
-	if err := p.PullBranch(""); err != nil {
+	if err := p.gitClone.PullBranch(p.resolveBranch("")); err != nil {
 		return "", fmt.Errorf("pulling default branch: %w", err)
 	}
 	wt, err := p.repo.Worktree()
