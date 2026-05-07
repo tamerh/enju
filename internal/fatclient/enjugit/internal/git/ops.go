@@ -45,6 +45,11 @@ type Ops interface {
 	ResetClean() error
 	RemoveFiles(paths []string) error
 
+	// CheckoutBranchFrom is the meaty branch-checkout: stale-ref
+	// guard, fork-from-baseBranch, Force checkout with non-tracked
+	// preservation. See checkout_branch_from.go.
+	CheckoutBranchFrom(branch, baseBranch, defaultBranch string) error
+
 	// Commit / push / fetch — acquire the lock.
 	CommitFiles(req CommitRequest) (CommitResult, error)
 	Push(branch string) error

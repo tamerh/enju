@@ -145,11 +145,11 @@ func (c *Clone) checkoutRef(branchRef plumbing.ReferenceName, detachedHash plumb
 	if err != nil {
 		return fmt.Errorf("git: worktree handle: %w", err)
 	}
-	preserveDir := c.workDir + preserveDirSuffix
+	preserveDir := c.workDir + PreserveDirSuffix
 
 	// Drain leftover preserve dir if it exists.
 	if _, statErr := os.Stat(preserveDir); statErr == nil {
-		if recErr := recoverLeftoverPreserve(c.workDir, c.logger); recErr != nil {
+		if recErr := RecoverLeftoverPreserve(c.workDir, c.logger); recErr != nil {
 			return fmt.Errorf("%w: %v", ErrPreserveDirCollision, recErr)
 		}
 		if _, statErr := os.Stat(preserveDir); statErr == nil {
@@ -241,8 +241,8 @@ func (c *Clone) ResetClean() error {
 			if base == ".git" || base == ".bare.git" || base == ".clone" {
 				return filepath.SkipDir
 			}
-			if len(base) > len(preserveDirSuffix) &&
-				base[len(base)-len(preserveDirSuffix):] == preserveDirSuffix {
+			if len(base) > len(PreserveDirSuffix) &&
+				base[len(base)-len(PreserveDirSuffix):] == PreserveDirSuffix {
 				return filepath.SkipDir
 			}
 			return nil

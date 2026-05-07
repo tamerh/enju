@@ -532,7 +532,7 @@ func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64,
 	// pass meta.Branch (run branch) so brand-new topics land on
 	// the run-branch tip; existing-topic checkouts ignore
 	// baseBranch (the existing-ref short-circuit fires first).
-	return proj.CheckoutBranchFrom(branch, baseBranch)
+	return proj.GitClone().CheckoutBranchFrom(branch, baseBranch, proj.DefaultBranch())
 }
 
 // WipeDeclaredWrites removes every file matching the task's

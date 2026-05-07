@@ -185,7 +185,7 @@ func (c *Clone) LocalBranches() ([]string, error) {
 //
 // Read-only: does not acquire the project lock.
 func (c *Clone) State() WorktreeState {
-	if _, err := os.Stat(c.workDir + preserveDirSuffix); err == nil {
+	if _, err := os.Stat(c.workDir + PreserveDirSuffix); err == nil {
 		return StateMidCheckout
 	}
 	if head, err := c.repo.Head(); err == nil && !head.Name().IsBranch() {
@@ -487,4 +487,4 @@ func isHexSHA(s string) bool {
 	return true
 }
 
-// preserveDirSuffix is declared in preserve.go.
+// PreserveDirSuffix is declared in preserve.go.

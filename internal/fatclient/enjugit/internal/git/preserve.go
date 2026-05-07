@@ -73,12 +73,12 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 )
 
-// preserveDirSuffix is the name of the sibling directory we
+// PreserveDirSuffix is the name of the sibling directory we
 // rename non-tracked workDir entries into during a Force
 // checkout. Kept verbose ("-in-progress") so a human finding
 // one in the filesystem immediately understands it's a
 // transient state, not a backup.
-const preserveDirSuffix = ".preserve-in-progress"
+const PreserveDirSuffix = ".preserve-in-progress"
 
 // preservedEntry records one rename we performed during
 // preservation. Restore iterates this manifest to rename each
@@ -247,7 +247,7 @@ func countConflictFiles(preserveDir string, conflicts []preservedEntry) int {
 	return total
 }
 
-// recoverLeftoverPreserve drains a preserve dir left behind by
+// RecoverLeftoverPreserve drains a preserve dir left behind by
 // a previous process's crash. Called once on workspace open.
 // Uses the same rename-if-no-conflict logic as restoreFromPreserve,
 // but without a manifest — walks the preserve dir and mirrors
@@ -275,8 +275,8 @@ func countConflictFiles(preserveDir string, conflicts []preservedEntry) int {
 //
 // All three cases are handled by "walk preserve dir, for each
 // entry: rename back if target missing, leave otherwise."
-func recoverLeftoverPreserve(workDir string, logger *slog.Logger) error {
-	preserveDir := workDir + preserveDirSuffix
+func RecoverLeftoverPreserve(workDir string, logger *slog.Logger) error {
+	preserveDir := workDir + PreserveDirSuffix
 	info, err := os.Stat(preserveDir)
 	if os.IsNotExist(err) {
 		return nil

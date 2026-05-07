@@ -12,6 +12,19 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
+// SharedPreserveDirSuffix is the suffix used for the sibling
+// preserve dir during a Force checkout. Re-exported for project
+// package's openOrClone / OpenExisting drain paths during the
+// migration; goes away with the project package.
+const SharedPreserveDirSuffix = git.PreserveDirSuffix
+
+// RecoverLeftoverSharedPreserve drains a leftover preserve dir
+// from a previous crash. Re-exported for project's workspace-open
+// paths; goes away with the project package.
+func RecoverLeftoverSharedPreserve(workDir string, logger *slog.Logger) error {
+	return git.RecoverLeftoverPreserve(workDir, logger)
+}
+
 // SharedClone is the migration-shim alias for *git.Clone. Project
 // package holds one of these in project.Clone.gitClone so its
 // repo pointer matches whatever an enjugit Workflow opened on the

@@ -323,6 +323,11 @@ func (f *fakeOps) Push(branch string) error {
 	return f.checkErr("Push")
 }
 
+func (f *fakeOps) CheckoutBranchFrom(branch, baseBranch, defaultBranch string) error {
+	f.record("CheckoutBranchFrom")
+	return f.checkErr("CheckoutBranchFrom")
+}
+
 func (f *fakeOps) PushAllRefs(force bool) error {
 	f.record("PushAllRefs")
 	return f.checkErr("PushAllRefs")

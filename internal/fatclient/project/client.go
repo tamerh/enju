@@ -554,9 +554,9 @@ func (ws *Opener) OpenExisting(projectID int64) (*Clone, error) {
 	// also clean up — without this rung, a preserve dir from
 	// a webui-side crash sat around forever because the next
 	// open went through OpenExisting, not openOrClone.
-	if err := recoverLeftoverPreserve(workDir, ws.logger); err != nil && ws.logger != nil {
+	if err := enjugit.RecoverLeftoverSharedPreserve(workDir, ws.logger); err != nil && ws.logger != nil {
 		ws.logger.Warn("preserve-dir recovery failed during OpenExisting; leaving for manual inspection",
-			"error", err, "path", workDir+preserveDirSuffix)
+			"error", err, "path", workDir+enjugit.SharedPreserveDirSuffix)
 	}
 	p := &Clone{
 		projectID: projectID,
@@ -738,9 +738,9 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Clone, error)
 	// preserve dir will stay on disk for manual inspection, and
 	// subsequent operations still work on whatever's already in
 	// workDir. See preserve.go for the recovery logic.
-	if err := recoverLeftoverPreserve(workDir, logger); err != nil && logger != nil {
+	if err := enjugit.RecoverLeftoverSharedPreserve(workDir, logger); err != nil && logger != nil {
 		logger.Warn("preserve-dir recovery failed; leaving for manual inspection",
-			"error", err, "path", workDir+preserveDirSuffix)
+			"error", err, "path", workDir+enjugit.SharedPreserveDirSuffix)
 	}
 
 	// Existing clone path: open via the shared enjugit/internal/git
@@ -1015,7 +1015,7 @@ func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	// right branch. When the caller passed BaseBranch (topic-
 	// branch flow), use it as the fork point so a per-iteration
 	// topic branch lands on top of the run branch's tip.
-	if err := p.CheckoutBranchFrom(req.Branch, req.BaseBranch); err != nil {
+	if err := p.gitClone.CheckoutBranchFrom(p.resolveBranch(req.Branch), req.BaseBranch, p.defaultBranchOr()); err != nil {
 		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
@@ -1213,7 +1213,7 @@ func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) 
 	}
 
 	// Ensure the commit lands on the right branch.
-	if err := p.CheckoutBranch(req.Branch); err != nil {
+	if err := p.gitClone.CheckoutBranchFrom(p.resolveBranch(req.Branch), "", p.defaultBranchOr()); err != nil {
 		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
@@ -1265,345 +1265,10 @@ func (p *Clone) CommitFiles(req CommitFilesRequest) (*CommitFilesResult, error) 
 	return nil, fmt.Errorf("commit failed after %d push attempts", maxRetries)
 }
 
-// CheckoutBranch switches the working tree to `branch`, creating
-// it locally if it doesn't exist. The creation path bases the
-// new branch on whatever's currently checked out (typically the
-// project's default branch), so an unseen `run-2` branches off
-// from the tip of `main` — matching the "branches as isolated
-// run workspaces" mental model.
-//
-// Idempotent — a no-op when HEAD is already on `branch`. The
-// caller MUST hold the project lock.
-func (p *Clone) CheckoutBranch(branch string) error {
-	return p.CheckoutBranchFrom(branch, "")
-}
 
-// CheckoutBranchFrom is the base-branch-aware variant of
-// CheckoutBranch. When `baseBranch` is non-empty AND `branch`
-// doesn't yet exist locally or as a remote-tracking ref, the new
-// branch is forked from the tip of `baseBranch` (resolved via
-// origin/<baseBranch>, then the local refs/heads/<baseBranch>).
-// Used by the living-workflow phase 6b.1 topic-branch flow:
-// per-iteration topic branches fork from the run branch tip,
-// not from origin/main, so iter-1's commits land on top of the
-// run branch's current state.
-//
-// When `baseBranch` is empty, behavior is identical to
-// CheckoutBranch — the project's default base (origin/main, then
-// origin/<remote HEAD>, then root) is used as the fork point.
-//
-// Caller MUST hold the project lock.
-func (p *Clone) CheckoutBranchFrom(branch, baseBranch string) error {
-	target := p.resolveBranch(branch)
-	wt, err := p.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("getting worktree: %w", err)
-	}
-	refName := plumbing.NewBranchReferenceName(target)
-	// Already on this branch? No-op.
-	if head, err := p.repo.Head(); err == nil && head.Name() == refName {
-		return nil
-	}
-	// Does the branch exist locally (or track a known remote)?
-	// Simple checkout, no fork-from dance — UNLESS the existing
-	// ref disagrees with the requested baseBranch.
-	//
-	// Stale-ref guard: a previous attempt at this iteration may
-	// have created refs/heads/<branch> at the wrong base (e.g.
-	// it tried to fork from baseBranch before that branch was
-	// fetchable on this clone, fell through to origin/main, then
-	// crashed before committing). Honoring the stale ref blindly
-	// is the production bug behind review_domain/iter-2 forking
-	// from seed instead of develop_domain/iter-2. When baseBranch
-	// is non-empty AND its tip is NOT an ancestor of the existing
-	// ref, the ref is stale by definition (a topic branch is
-	// supposed to fork from baseBranch); reset it to baseBranch's
-	// tip and continue down the create path. The bot's legitimate-
-	// retry case still works because that ref's tip would have
-	// baseBranch as an ancestor.
-	if existing, err := p.repo.Reference(refName, true); err == nil {
-		if baseBranch == "" {
-			// Upstream-tracking semantics (caller wants the
-			// local ref to mirror origin/<target>). If origin
-			// has a different hash, the local ref is stale
-			// (e.g. a previous broken fix planted it at the
-			// wrong commit) and a simple wt.Checkout would
-			// land the worktree on the stale tree. Reset by
-			// removing the local ref; the fall-through
-			// create-new path then re-creates it at origin's
-			// tip and Force-checkouts the proper tree.
-			if h, ok := p.resolveOriginRefHash(target); ok && h != existing.Hash() {
-				if p.logger != nil {
-					p.logger.Warn("upstream-tracking ref disagrees with origin; resetting",
-						"branch", target,
-						"stale_hash", existing.Hash().String(),
-						"origin_hash", h.String())
-				}
-				if err := p.repo.Storer.RemoveReference(refName); err != nil {
-					return fmt.Errorf("removing stale upstream-tracking ref %s: %w", target, err)
-				}
-				// Fall through to create-new path.
-			} else {
-				return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
-			}
-		} else {
-			if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
-				if p.commitHasAncestor(existing.Hash(), h) {
-					return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
-				}
-				// Stale: reset and fall through to recreate at baseBranch.
-				if p.logger != nil {
-					p.logger.Warn("stale topic-branch ref detected; resetting to baseBranch tip",
-						"branch", target, "stale_hash", existing.Hash().String(),
-						"base_branch", baseBranch, "base_hash", h.String())
-				}
-				if err := p.repo.Storer.RemoveReference(refName); err != nil {
-					return fmt.Errorf("removing stale ref %s: %w", target, err)
-				}
-			} else {
-				// baseBranch given but unresolvable — keep prior
-				// behavior (honor existing ref) so we don't make
-				// things worse on a transient lookup miss.
-				return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
-			}
-		}
-	}
-	// Branch doesn't exist yet. Fork it from the project's
-	// BASE — not from workspace HEAD. Forking from HEAD silently
-	// inherits whatever branch was checked out last, which was
-	// the tester-reported "enju/work got created from run-1's
-	// tip instead of main" bug. "Project base" here = origin/main
-	// when available (the conventional seed), falling back to
-	// origin/<HEAD>, then the repo's root commit. This gives
-	// every new branch a clean, predictable ancestor.
-	//
-	// When the caller passed an explicit baseBranch (phase 6b.1
-	// topic-branch flow), prefer that as the fork point so a
-	// per-iteration branch lands on top of the run branch's
-	// current tip. Falls back to the default base resolution
-	// when baseBranch is empty or its tip can't be resolved.
-	var baseHash plumbing.Hash
-	// Cross-citizen "follow the upstream" path: when the local
-	// branch doesn't exist but a remote-tracking ref does, the
-	// caller is asking to materialize that branch's content (e.g.
-	// reviewer-bot wants to read developer-bot's pushed topic).
-	// Create the local at origin/<target>'s tip so the worktree
-	// post-checkout reflects the upstream's tree, not seed.
-	// Without this, a reviewer fetches the developer's commits
-	// (refs reachable in object DB) but the working tree never
-	// updates to show them — claude -p reads from disk, not from
-	// refs, and falsely reports "no source delivered."
-	//
-	// Skipped when an explicit baseBranch was passed: that means
-	// the caller is forking a NEW branch off baseBranch (the
-	// topic-branch creation path), so origin/<target> existing
-	// would be a stale leftover, not authoritative.
-	if baseBranch == "" {
-		if h, ok := p.resolveOriginRefHash(target); ok {
-			baseHash = h
-		}
-	}
-	if baseHash.IsZero() && baseBranch != "" {
-		if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
-			baseHash = h
-		}
-	}
-	if baseHash.IsZero() {
-		h, err := p.branchBaseHash()
-		if err != nil {
-			return fmt.Errorf("resolving base for new branch %q: %w", target, err)
-		}
-		baseHash = h
-	}
-	// Create the branch ref at the base hash, then point HEAD
-	// at it. go-git's Worktree.Checkout with Create=true uses
-	// current HEAD as the starting point; doing the ref dance
-	// manually lets us fork from a different commit.
-	branchRef := plumbing.NewHashReference(refName, baseHash)
-	if err := p.repo.Storer.SetReference(branchRef); err != nil {
-		return fmt.Errorf("creating branch ref %s: %w", target, err)
-	}
-	// Checkout the new branch's tree with Force so files
-	// tracked on the PREVIOUS branch but not on the new one
-	// get removed from the worktree. Without Force, go-git
-	// bails on "unstaged changes" (the prior branch's tracked
-	// files look like unstaged removals from the new branch's
-	// POV), OR with Keep:true silently carries those files
-	// into the next submit — which was the tester-reported
-	// "lane-b inherits lane-a's commits" leak.
-	//
-	// Force:true in go-git ALSO wipes untracked files (different
-	// from `git checkout --force` CLI, which only overwrites
-	// conflicting paths) — an earlier version of this code lost
-	// a tester's in-progress template directory to exactly that
-	// behavior. To get Force's branch-isolation AND preserve
-	// user-authored scratch / gitignored artifacts, we rename
-	// non-tracked paths out of workDir before the checkout and
-	// rename them back after. The move is a metadata-only
-	// inode-table update, so a 50 GB untracked BAM file (common
-	// in bio workflows) moves in microseconds — no memory blow-
-	// up, no data copy. See preserve.go for the full rationale.
-	//
-	// Concurrency: this operation runs under the caller's
-	// proj.Lock(), so the preserve dir can't collide with
-	// another CheckoutBranch on the same project.
-	preserveDir := p.workDir + preserveDirSuffix
 
-	// Drain any leftover preserve dir BEFORE renaming fresh
-	// content into it. Two motivating scenarios:
-	//
-	//   - In-process: a prior CheckoutBranchFrom in this same
-	//     daemon failed mid-restore (rename collision, FS
-	//     error). The preserve dir stayed on disk; the cached
-	//     *Clone never re-runs openOrClone, so its recovery
-	//     hook never fires. Without this drain the next
-	//     checkout's movePreserveNonTracked would rename fresh
-	//     paths INTO the same dir, mixing two unrelated
-	//     preservations — and `os.Rename` over an existing
-	//     non-empty dir errors out unpredictably across OSes.
-	//
-	//   - Cross-process: the user reported preserve dirs
-	//     surviving across daemon restarts when the next open
-	//     went through OpenExisting (read-only path) rather
-	//     than openOrClone. Belt-and-braces — OpenExisting now
-	//     also drains, but the lock-held checkout path is the
-	//     one that absolutely cannot proceed with a dirty
-	//     preserve dir.
-	//
-	// Recovery is best-effort: it restores anything that
-	// doesn't collide with current branch content. Files that
-	// collide stay in the preserve dir — the new checkout
-	// then fails fast (next block) rather than writing more
-	// state into a dirty dir.
-	if _, statErr := os.Stat(preserveDir); statErr == nil {
-		if recErr := recoverLeftoverPreserve(p.workDir, p.logger); recErr != nil {
-			return fmt.Errorf(
-				"leftover preserve dir at %s couldn't be drained: %w — review files there and remove (or move aside) before retrying checkout",
-				preserveDir, recErr,
-			)
-		}
-		// recoverLeftoverPreserve cleans up empty dirs but
-		// leaves files that collide with current branch
-		// content. If anything remains, fail loud rather than
-		// risk merging unrelated preservations.
-		if _, statErr := os.Stat(preserveDir); statErr == nil {
-			return fmt.Errorf(
-				"leftover preserve dir at %s holds files that conflict with the current branch — review and remove (or move aside) before retrying checkout",
-				preserveDir,
-			)
-		}
-	}
 
-	manifest, err := movePreserveNonTracked(p.repo, p.workDir, preserveDir)
-	if err != nil {
-		// Refuse the checkout on partial-preserve failure.
-		// The preserve dir remains on disk for manual
-		// inspection / next-session crash recovery. This is
-		// the "don't touch git state if preservation is half-
-		// done" safety default — rollback has its own failure
-		// modes (rename-back might fail for the same reason
-		// the forward rename did).
-		return fmt.Errorf(
-			"preserving non-tracked files before checkout failed: %w — partial state at %q; next workspace open will attempt recovery",
-			err, preserveDir,
-		)
-	}
-	if err := wt.Checkout(&gogit.CheckoutOptions{
-		Branch: refName,
-		Force:  true,
-	}); err != nil {
-		// Checkout failed — restore what we moved so the
-		// workspace is usable again.
-		_, _ = restoreFromPreserve(p.workDir, preserveDir, manifest)
-		return err
-	}
-	conflicts, restoreErr := restoreFromPreserve(p.workDir, preserveDir, manifest)
-	if restoreErr != nil {
-		return fmt.Errorf("restoring non-tracked files after checkout: %w", restoreErr)
-	}
-	if len(conflicts) > 0 && p.logger != nil {
-		p.logger.Warn(
-			"branch switch preserved non-tracked paths, but some now conflict with tracked paths on the new branch; preserved copies remain in the preserve dir for manual review",
-			"preserve_dir", preserveDir,
-			"conflict_entries", len(conflicts),
-			"conflict_files", countConflictFiles(preserveDir, conflicts),
-		)
-	}
-	return nil
-}
 
-// resolveBaseBranchHash looks up the tip commit of a named base
-// branch for the topic-branch flow. Prefers the LOCAL ref
-// refs/heads/<baseBranch> over the origin-tracking ref because
-// recent local commits (template auto-commits on first
-// create_run, batch submits not yet pushed) live on the local
-// branch BEFORE origin learns about them — and forking the
-// topic from a stale origin/<baseBranch> would produce a
-// branch whose history misses those commits, breaking the FF
-// invariant when we later merge topic back onto the local run
-// branch. Returns (hash, true) on success; (zero, false) when
-// neither ref exists, letting the caller fall back to the
-// default base resolution.
-func (p *Clone) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
-	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true); err == nil {
-		return ref.Hash(), true
-	}
-	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", baseBranch), true); err == nil {
-		return ref.Hash(), true
-	}
-	return plumbing.ZeroHash, false
-}
-
-// resolveOriginRefHash returns the hash of refs/remotes/origin/<branch>
-// when present, or (zero, false) when the remote-tracking ref
-// doesn't exist. Used by CheckoutBranchFrom's "follow upstream"
-// path so a reviewer's clone that has fetched the developer's
-// topic ref can materialize that topic's content into its
-// worktree without explicit baseBranch plumbing.
-func (p *Clone) resolveOriginRefHash(branch string) (plumbing.Hash, bool) {
-	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true); err == nil {
-		return ref.Hash(), true
-	}
-	return plumbing.ZeroHash, false
-}
-
-// commitHasAncestor returns true when `ancestor` is reachable
-// from `head` by walking parents. Bounded at 200 hops to avoid
-// runaway scans on pathological histories — topic branches in
-// our model are short (one or two commits over baseBranch), so
-// hitting 200 means something is wrong and we should fall
-// through to the stale-ref handling.
-//
-// head == ancestor returns true (a commit is its own ancestor
-// in this predicate's reflexive form). Used by CheckoutBranchFrom's
-// stale-ref guard: an existing topic-branch ref is considered
-// fresh if and only if it has baseBranch's tip in its ancestry.
-func (p *Clone) commitHasAncestor(head, ancestor plumbing.Hash) bool {
-	if head == ancestor {
-		return true
-	}
-	visited := map[plumbing.Hash]bool{}
-	frontier := []plumbing.Hash{head}
-	for hops := 0; hops < 200 && len(frontier) > 0; hops++ {
-		next := []plumbing.Hash{}
-		for _, h := range frontier {
-			if visited[h] {
-				continue
-			}
-			visited[h] = true
-			if h == ancestor {
-				return true
-			}
-			c, err := p.repo.CommitObject(h)
-			if err != nil {
-				continue
-			}
-			next = append(next, c.ParentHashes...)
-		}
-		frontier = next
-	}
-	return false
-}
 // readUnmergedFiles parses `git status --porcelain` for entries
 // in conflict states (UU/AA/DD/AU/UA/DU/UD), returning the
 // affected paths. Used to populate ErrMergeConflict.ConflictFiles
@@ -1638,106 +1303,6 @@ func readUnmergedFiles(workDir string) []string {
 	return files
 }
 
-// commitIsAncestor reports whether `ancestor` is reachable
-// from `descendant` via parent links — the standard "is X a
-// fast-forward of Y" check. Used by MergeBranchToCommit before
-// any ref update.
-func (p *Clone) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, error) {
-	if ancestor == descendant {
-		return true, nil
-	}
-	descCommit, err := p.repo.CommitObject(descendant)
-	if err != nil {
-		return false, fmt.Errorf("loading descendant commit %s: %w", descendant, err)
-	}
-	ancCommit, err := p.repo.CommitObject(ancestor)
-	if err != nil {
-		return false, fmt.Errorf("loading ancestor commit %s: %w", ancestor, err)
-	}
-	// go-git semantics: X.IsAncestor(Y) reports whether X is
-	// reachable from Y by walking parent links — i.e. "is X an
-	// ancestor of Y." So to ask "is ancestor an ancestor of
-	// descendant" we call ancCommit.IsAncestor(descCommit).
-	return ancCommit.IsAncestor(descCommit)
-}
-
-// branchBaseHash picks the commit a fresh branch should fork
-// from when the caller asks for a branch that doesn't exist
-// yet. Preference order:
-//
-//  1. refs/heads/<default> locally — the project's actual default
-//     branch tip. Local-first matters for solo projects (no
-//     remote post-Option-B) where origin/* refs simply don't
-//     exist; without this rung the fallback walked back to the
-//     root commit and run branches forked from the very first
-//     commit on the timeline, requiring manual `git merge main`
-//     to recover. Also matters when a fresh local commit hasn't
-//     been pushed yet — origin/* would be stale.
-//  2. origin/<default> — for projects with a remote, the canonical
-//     seed when the local ref is somehow absent (fresh clone with
-//     no checkout yet).
-//  3. origin/<remote HEAD symbolic ref> — when a repo was
-//     init'd with a non-default-named default (e.g. git init
-//     --initial-branch=trunk).
-//  4. The repo's root commit — last-ditch fallback that
-//     always yields a valid hash.
-//
-// Deliberately does NOT fall back to the caller's current HEAD,
-// which would reintroduce the "silent inheritance" bug.
-func (p *Clone) branchBaseHash() (plumbing.Hash, error) {
-	defaultBranch := p.defaultBranchOr()
-	// Local default branch first — covers solo projects (no
-	// remote) AND the "haven't pushed the latest commit yet"
-	// case where origin/* would be behind HEAD.
-	if ref, err := p.repo.Reference(plumbing.NewBranchReferenceName(defaultBranch), true); err == nil {
-		return ref.Hash(), nil
-	}
-	// Then origin/<default> — fresh clone where the local ref
-	// hasn't been instantiated yet but the remote-tracking ref
-	// is already populated by the initial fetch.
-	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", defaultBranch), true); err == nil {
-		return ref.Hash(), nil
-	}
-	// Try the remote's HEAD symref — covers repos whose
-	// default isn't named the same as p.defaultBranch (trunk,
-	// master, etc.) and the project record hasn't caught up.
-	if ref, err := p.repo.Reference(plumbing.NewRemoteHEADReferenceName("origin"), true); err == nil {
-		return ref.Hash(), nil
-	}
-	// Root commit fallback: walk to the very first commit
-	// reachable from any branch. The project always has a
-	// seed commit, so this succeeds except for the empty-repo
-	// edge case — which is exactly the "auto-local bare was
-	// not seeded" regression path. Surface the workspace +
-	// remote paths so the user can inspect what went wrong
-	// instead of chasing "log: reference not found" in isolation.
-	iter, err := p.repo.Log(&gogit.LogOptions{})
-	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf(
-			"local clone at %s has no refs to branch from (remote %q is empty or unseeded). "+
-				"This typically means enju_create_project's auto-local bare init failed silently. "+
-				"Check the coordinator's remote_url via enju_project_remote_status, or re-create the project",
-			p.workDir, p.remoteURL)
-	}
-	defer iter.Close()
-	var root plumbing.Hash
-	for {
-		c, err := iter.Next()
-		if err != nil {
-			break
-		}
-		root = c.Hash
-	}
-	if root.IsZero() {
-		return plumbing.ZeroHash, fmt.Errorf(
-			"local clone at %s has no commits to branch from (remote %q is empty). "+
-				"enju_create_project is supposed to seed the bare repo with an initial commit — "+
-				"this usually means that step failed silently. Re-create the project or set a "+
-				"valid remote via enju_set_project_remote",
-			p.workDir, p.remoteURL)
-	}
-	return root, nil
-}
 
 // pushBranchInternal is the branch-aware equivalent of
 // pushInternal. It pushes only the named branch to origin.
