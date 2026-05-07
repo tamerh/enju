@@ -327,7 +327,7 @@ func (ws *Opener) OpenBotCloneAt(projectID int64, clonePath, sourceURL string) (
 // for non-SSH URLs (http/https/local paths) — go-git handles those
 // without explicit auth.
 func sshAuthMethod(remoteURL string) transport.AuthMethod {
-	if !IsSSHURL(remoteURL) {
+	if !enjugit.IsSSHURL(remoteURL) {
 		return nil
 	}
 	// Try SSH agent first.
@@ -357,33 +357,6 @@ func sshAuthMethod(remoteURL string) transport.AuthMethod {
 		return auth
 	}
 	return nil
-}
-
-// isSSHURL returns true if the URL looks like an SSH remote
-// (git@host:..., ssh://...).
-func IsSSHURL(url string) bool {
-	if strings.HasPrefix(url, "ssh://") {
-		return true
-	}
-	// git@github.com:org/repo.git pattern
-	if strings.Contains(url, "@") && strings.Contains(url, ":") && !strings.Contains(url, "://") {
-		return true
-	}
-	return false
-}
-
-// isLocalWorkingTree returns true if the path is a local directory
-// with a .git subdirectory (a git working tree, not a bare repo).
-// Used to detect enju_init'd projects whose path is stored as
-// remote_url on the coordinator.
-func IsLocalWorkingTree(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil || !info.IsDir() {
-		return false
-	}
-	gitDir := filepath.Join(path, ".git")
-	gitInfo, err := os.Stat(gitDir)
-	return err == nil && gitInfo.IsDir()
 }
 
 // HasExternalDir returns true if the given project has a
@@ -491,7 +464,7 @@ func (ws *Opener) ForProject(projectID int64, remoteURL string, projectName ...s
 	// cloning. Defensive — covers callers with no registry
 	// attached but a local-path remoteURL (rare; bot daemon's
 	// resolveBare flow doesn't use this entry point).
-	if remoteURL != "" && IsLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && enjugit.IsLocalWorkingTree(remoteURL) {
 		p, err := openOrClone(remoteURL, "", ws.logger)
 		if err != nil {
 			return nil, err

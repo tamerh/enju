@@ -1502,23 +1502,23 @@ func TestIsLocalWorkingTree(t *testing.T) {
 			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
 		},
 	})
-	if !project.IsLocalWorkingTree(wtDir) {
+	if !enjugit.IsLocalWorkingTree(wtDir) {
 		t.Error("expected working tree detected")
 	}
 
 	// Case 2: plain folder → false.
 	plainDir := t.TempDir()
-	if project.IsLocalWorkingTree(plainDir) {
+	if enjugit.IsLocalWorkingTree(plainDir) {
 		t.Error("plain dir should not be detected as working tree")
 	}
 
 	// Case 3: non-existent path → false.
-	if project.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
+	if enjugit.IsLocalWorkingTree("/tmp/nonexistent-enju-test-path") {
 		t.Error("non-existent path should not be detected")
 	}
 
 	// Case 4: SSH URL → false.
-	if project.IsLocalWorkingTree("git@github.com:org/repo.git") {
+	if enjugit.IsLocalWorkingTree("git@github.com:org/repo.git") {
 		t.Error("SSH URL should not be detected as working tree")
 	}
 }
@@ -1537,7 +1537,7 @@ func TestIsSSHURL(t *testing.T) {
 		{"/home/tamer/projects/myproject/enju/.bare.git", false},
 	}
 	for _, tc := range cases {
-		if got := project.IsSSHURL(tc.url); got != tc.want {
+		if got := enjugit.IsSSHURL(tc.url); got != tc.want {
 			t.Errorf("IsSSHURL(%q) = %v, want %v", tc.url, got, tc.want)
 		}
 	}

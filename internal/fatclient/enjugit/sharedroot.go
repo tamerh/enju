@@ -19,7 +19,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// IsSSHURL returns true when the URL looks like an SSH git remote
+// (`git@host:org/repo.git` or `ssh://...`). Pure string classifier,
+// no network. Used by callers that need to choose between SSH and
+// HTTPS auth before constructing a clone or checking remote state.
+func IsSSHURL(url string) bool {
+	if strings.HasPrefix(url, "ssh://") {
+		return true
+	}
+	// git@github.com:org/repo.git pattern: contains @ and :, but not ://
+	if strings.Contains(url, "@") && strings.Contains(url, ":") && !strings.Contains(url, "://") {
+		return true
+	}
+	return false
+}
 
 // IsLocalWorkingTree returns true when path is a directory
 // containing a `.git` subdirectory — i.e. a real on-disk git

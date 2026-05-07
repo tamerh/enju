@@ -142,7 +142,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 	// Source: real remote wins (push/pull travels the network),
 	// else the per-project bare from `enju bot setup`.
 	var source string
-	if remoteURL != "" && !project.IsLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && !enjugit.IsLocalWorkingTree(remoteURL) {
 		// Network URL (https://, git@, ssh://). Clone direct.
 		source = remoteURL
 	} else {
@@ -261,7 +261,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 	// (network URLs, missing paths) returns false here too, so
 	// we narrow to "non-empty AND local working tree" before
 	// promoting.
-	if remoteURL != "" && !project.IsLocalWorkingTree(remoteURL) {
+	if remoteURL != "" && !enjugit.IsLocalWorkingTree(remoteURL) {
 		return remoteURL, false, nil
 	}
 
@@ -282,7 +282,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 				"with `enju_init --path=` / `enju_create_project path=`",
 			ErrNoCloneSource, projectID)
 	}
-	if !project.IsLocalWorkingTree(source) {
+	if !enjugit.IsLocalWorkingTree(source) {
 		return "", false, fmt.Errorf(
 			"clone source %q for project %d is not a git working tree; "+
 				"cannot promote to a bare",
