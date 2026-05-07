@@ -1871,26 +1871,49 @@ func (p *Clone) CheckoutBranchFrom(branch, baseBranch string) error {
 	// baseBranch as an ancestor.
 	if existing, err := p.repo.Reference(refName, true); err == nil {
 		if baseBranch == "" {
-			return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
-		}
-		if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
-			if p.commitHasAncestor(existing.Hash(), h) {
+			// Upstream-tracking semantics (caller wants the
+			// local ref to mirror origin/<target>). If origin
+			// has a different hash, the local ref is stale
+			// (e.g. a previous broken fix planted it at the
+			// wrong commit) and a simple wt.Checkout would
+			// land the worktree on the stale tree. Reset by
+			// removing the local ref; the fall-through
+			// create-new path then re-creates it at origin's
+			// tip and Force-checkouts the proper tree.
+			if h, ok := p.resolveOriginRefHash(target); ok && h != existing.Hash() {
+				if p.logger != nil {
+					p.logger.Warn("upstream-tracking ref disagrees with origin; resetting",
+						"branch", target,
+						"stale_hash", existing.Hash().String(),
+						"origin_hash", h.String())
+				}
+				if err := p.repo.Storer.RemoveReference(refName); err != nil {
+					return fmt.Errorf("removing stale upstream-tracking ref %s: %w", target, err)
+				}
+				// Fall through to create-new path.
+			} else {
 				return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
 			}
-			// Stale: reset and fall through to recreate at baseBranch.
-			if p.logger != nil {
-				p.logger.Warn("stale topic-branch ref detected; resetting to baseBranch tip",
-					"branch", target, "stale_hash", existing.Hash().String(),
-					"base_branch", baseBranch, "base_hash", h.String())
-			}
-			if err := p.repo.Storer.RemoveReference(refName); err != nil {
-				return fmt.Errorf("removing stale ref %s: %w", target, err)
-			}
 		} else {
-			// baseBranch given but unresolvable — keep prior
-			// behavior (honor existing ref) so we don't make
-			// things worse on a transient lookup miss.
-			return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+			if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
+				if p.commitHasAncestor(existing.Hash(), h) {
+					return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+				}
+				// Stale: reset and fall through to recreate at baseBranch.
+				if p.logger != nil {
+					p.logger.Warn("stale topic-branch ref detected; resetting to baseBranch tip",
+						"branch", target, "stale_hash", existing.Hash().String(),
+						"base_branch", baseBranch, "base_hash", h.String())
+				}
+				if err := p.repo.Storer.RemoveReference(refName); err != nil {
+					return fmt.Errorf("removing stale ref %s: %w", target, err)
+				}
+			} else {
+				// baseBranch given but unresolvable — keep prior
+				// behavior (honor existing ref) so we don't make
+				// things worse on a transient lookup miss.
+				return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
+			}
 		}
 	}
 	// Branch doesn't exist yet. Fork it from the project's
@@ -1908,7 +1931,27 @@ func (p *Clone) CheckoutBranchFrom(branch, baseBranch string) error {
 	// current tip. Falls back to the default base resolution
 	// when baseBranch is empty or its tip can't be resolved.
 	var baseHash plumbing.Hash
-	if baseBranch != "" {
+	// Cross-citizen "follow the upstream" path: when the local
+	// branch doesn't exist but a remote-tracking ref does, the
+	// caller is asking to materialize that branch's content (e.g.
+	// reviewer-bot wants to read developer-bot's pushed topic).
+	// Create the local at origin/<target>'s tip so the worktree
+	// post-checkout reflects the upstream's tree, not seed.
+	// Without this, a reviewer fetches the developer's commits
+	// (refs reachable in object DB) but the working tree never
+	// updates to show them — claude -p reads from disk, not from
+	// refs, and falsely reports "no source delivered."
+	//
+	// Skipped when an explicit baseBranch was passed: that means
+	// the caller is forking a NEW branch off baseBranch (the
+	// topic-branch creation path), so origin/<target> existing
+	// would be a stale leftover, not authoritative.
+	if baseBranch == "" {
+		if h, ok := p.resolveOriginRefHash(target); ok {
+			baseHash = h
+		}
+	}
+	if baseHash.IsZero() && baseBranch != "" {
 		if h, ok := p.resolveBaseBranchHash(baseBranch); ok {
 			baseHash = h
 		}
@@ -2054,6 +2097,19 @@ func (p *Clone) resolveBaseBranchHash(baseBranch string) (plumbing.Hash, bool) {
 		return ref.Hash(), true
 	}
 	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", baseBranch), true); err == nil {
+		return ref.Hash(), true
+	}
+	return plumbing.ZeroHash, false
+}
+
+// resolveOriginRefHash returns the hash of refs/remotes/origin/<branch>
+// when present, or (zero, false) when the remote-tracking ref
+// doesn't exist. Used by CheckoutBranchFrom's "follow upstream"
+// path so a reviewer's clone that has fetched the developer's
+// topic ref can materialize that topic's content into its
+// worktree without explicit baseBranch plumbing.
+func (p *Clone) resolveOriginRefHash(branch string) (plumbing.Hash, bool) {
+	if ref, err := p.repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true); err == nil {
 		return ref.Hash(), true
 	}
 	return plumbing.ZeroHash, false

@@ -114,7 +114,7 @@ type fatClient interface {
 	// tip the pre-claim pull leaves behind. Caller invokes this
 	// BEFORE ResetBotCloneToCleanState so the reset's
 	// HardReset-to-HEAD lands on topic-branch state.
-	CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error
+	CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch, baseBranch string) error
 
 	// WipeDeclaredWrites removes literal-path entries from
 	// `writes` from the worktree. Used on iter > 1 to give the
@@ -538,7 +538,18 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	// CheckoutBranchFrom blows up with "worktree contains
 	// unstaged changes" because index ↔ worktree don't match.
 	if meta.IterSeq > 1 && meta.IterationBranch != "" {
-		if cerr := d.fc.CheckoutTopicBranchTip(ctx, meta.ProjectID, meta.IterationBranch); cerr != nil {
+		// For review tasks, the new iter-N topic must fork from
+		// the upstream's topic (which carries the developer's
+		// content) — NOT from run-branch. Otherwise claude -p
+		// reads an empty worktree and rejects forever, the
+		// reporter's loop-forever bug across smoke runs and
+		// build runs. For non-review tasks, run-branch is the
+		// right fork base (fresh start after invalidate).
+		baseForkBranch := meta.Branch
+		if meta.Action == "review" && meta.UpstreamIterationBranch != "" {
+			baseForkBranch = meta.UpstreamIterationBranch
+		}
+		if cerr := d.fc.CheckoutTopicBranchTip(ctx, meta.ProjectID, meta.IterationBranch, baseForkBranch); cerr != nil {
 			return fmt.Errorf("checkout topic branch %q for revision: %w", meta.IterationBranch, cerr)
 		}
 	}
@@ -573,6 +584,34 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	if meta.IterSeq > 1 && len(meta.WritesArtifacts) > 0 {
 		if werr := d.fc.WipeDeclaredWrites(ctx, meta.ProjectID, meta.WritesArtifacts); werr != nil {
 			return fmt.Errorf("wiping prior iteration's writes: %w", werr)
+		}
+	}
+
+	// Review tasks: materialize the upstream's topic-branch content
+	// in the worktree BEFORE the handler runs. claude -p reads from
+	// disk, not from refs — without this checkout the reviewer's
+	// worktree carries whatever was last on it (typically the run
+	// branch / main, with no developer commits visible) and the
+	// LLM correctly reports "no source delivered" against an empty
+	// tree.
+	//
+	// Skipped on iter > 1 because CheckoutTopicBranchTip(meta.IterationBranch)
+	// above already lands the reviewer on its own topic, which was
+	// originally forked from the upstream's topic and therefore
+	// carries upstream's tree. The fetch-and-fork-from-origin
+	// machinery in CheckoutBranchFrom handles a brand-new local
+	// branch creation when origin/<upstream> exists.
+	if meta.Action == "review" && meta.IterSeq == 1 && meta.UpstreamIterationBranch != "" {
+		// Pass empty baseBranch: we want the LOCAL upstream ref
+		// to track origin/<upstreamTopic>'s actual tip (which
+		// has the developer's content). Passing meta.Branch
+		// (run branch) here would make CheckoutBranchFrom fork
+		// the new local upstream ref from run-branch tip — the
+		// reporter's bug where review_a/iter-N's worktree has
+		// no smoke/a.md because it's rooted at the run base
+		// instead of at develop_a's commit.
+		if cerr := d.fc.CheckoutTopicBranchTip(ctx, meta.ProjectID, meta.UpstreamIterationBranch, ""); cerr != nil {
+			return fmt.Errorf("checkout upstream topic %q for review: %w", meta.UpstreamIterationBranch, cerr)
 		}
 	}
 

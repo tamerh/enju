@@ -444,7 +444,7 @@ func (s *FatClient) FetchAllRefsForBot(ctx context.Context, projectID int64) err
 // Caller-side: call this BEFORE ResetBotCloneToCleanState so the
 // reset's HardReset-to-HEAD lands the worktree on topic-branch
 // state, not run-branch state.
-func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error {
+func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch, baseBranch string) error {
 	if branch == "" {
 		return fmt.Errorf("branch is required")
 	}
@@ -454,13 +454,17 @@ func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64,
 	}
 	proj.Lock()
 	defer proj.Unlock()
-	// CheckoutBranchFrom with empty baseBranch hits the "branch
-	// exists locally → simple checkout" path, which is what we
-	// want here: just switch HEAD onto the existing topic. The
-	// fork-from logic only fires when the branch doesn't exist,
-	// so reusing this method keeps the fork-creation path
-	// centralized in CheckoutBranchFrom.
-	return proj.CheckoutBranchFrom(branch, "")
+	// baseBranch matters for the create-new path: when the topic
+	// doesn't yet exist locally (iter-N bumped after a terminal
+	// reject/invalidate), CheckoutBranchFrom needs a fork base
+	// or it falls through to branchBaseHash() = origin/main
+	// (seed). That orphans iter-N from any prior run-branch
+	// content, the production "iter-2 forked from seed instead
+	// of build-1" bug. Callers in the topic-branch flow should
+	// pass meta.Branch (run branch) so brand-new topics land on
+	// the run-branch tip; existing-topic checkouts ignore
+	// baseBranch (the existing-ref short-circuit fires first).
+	return proj.CheckoutBranchFrom(branch, baseBranch)
 }
 
 // WipeDeclaredWrites removes every file matching the task's

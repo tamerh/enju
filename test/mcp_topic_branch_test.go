@@ -10,6 +10,7 @@ package test
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -638,6 +639,77 @@ tasks:
 		// iter-2's commit must exist as a brand-new ref.
 		if sha := bareRefSHA(t, remoteURL, iter2Topic); sha == "" {
 			t.Errorf("iter-2 topic %q missing from bare after reclaim", iter2Topic)
+		}
+	})
+}
+
+// TestMCPReporterScenario_RequestChangesShouldNotBumpIterSeq is
+// a reproduction of the reporter's day-of-development claim:
+//
+//   "iter_seq: bumped from 1 → 2 → 3 (NOT staying at 1 as
+//    phase 6c docs suggest)"
+//
+// Phase 6c contract: request_changes verdicts on a downstream
+// review keep the upstream's claim row OPEN. Same-citizen
+// re-claim REUSES the row, iter_seq stays. Distinct iter-N
+// topic branches only appear after a TERMINAL outcome
+// (invalidate / reject / abandon).
+//
+// This test exercises three rounds of request_changes on the
+// same upstream by the same dev citizen and asserts:
+//   - Only ONE iteration row exists across all rounds.
+//   - Branch list contains exactly one entry, ending in /iter-1.
+//   - iter-2 / iter-3 do NOT appear.
+//
+// If this fails, we've found a real iter_seq-bumping regression
+// matching the reporter's data. If it passes, the reporter's
+// production verdicts must have actually been `reject` (terminal),
+// not `request_changes` — and the iter_seq bumping was
+// per-design.
+func TestMCPReporterScenario_RequestChangesShouldNotBumpIterSeq(t *testing.T) {
+	eachRemoteMode(t, "RequestChangesNoIterBump", func(t *testing.T, h *mcpHarness) {
+		reviewer := h.newMCPClientAs(t, "RcBumpReviewer")
+		projectID := h.createTestProject()
+
+		yaml := `name: "request_changes no bump"
+version: 1
+tasks:
+  - id: develop_domain
+    action: answer
+    prompt: "Do work."
+  - id: review_domain
+    action: review
+    reviews: develop_domain
+    prompt: "Review."
+`
+		h.mcpCreateRunInline(t, projectID, yaml)
+
+		// Three rounds of request_changes on the SAME develop_domain.
+		for round := 1; round <= 3; round++ {
+			h.mcpClaimOK(t, "develop_domain")
+			h.mcpSubmitText(t, "develop_domain", fmt.Sprintf("attempt %d", round))
+			h.mcpClaimAs(t, reviewer, "review_domain")
+			// On the final round, approve so the run can finish.
+			verdict := "request_changes"
+			if round == 3 {
+				verdict = "approve"
+			}
+			h.mcpSubmitReviewAs(t, reviewer, "review_domain", fmt.Sprintf("round %d feedback", round), verdict)
+		}
+
+		// After three rounds with request_changes (rounds 1 and
+		// 2) and a final approve (round 3), develop_domain
+		// should have exactly ONE iteration. iter-2 / iter-3
+		// MUST NOT appear.
+		out := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+			"task_id": h.taskID("develop_domain"),
+		}))
+		if strings.Contains(out, "iter-2") || strings.Contains(out, "iter-3") {
+			t.Errorf("REPRO: request_changes bumped iter_seq (reporter's bug).\n"+
+				"Expected only iter-1; got:\n%s", out)
+		}
+		if !strings.Contains(out, "[completed]") {
+			t.Errorf("expected iter-1 [completed] after final approve, got:\n%s", out)
 		}
 	})
 }

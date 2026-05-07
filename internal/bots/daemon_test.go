@@ -165,10 +165,11 @@ func (f *fakeFC) ResetBotCloneToCleanState(ctx context.Context, projectID int64)
 	return f.resetErr
 }
 
-func (f *fakeFC) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch string) error {
+func (f *fakeFC) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch, baseBranch string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkoutTopicCalls = append(f.checkoutTopicCalls, checkoutTopicCall{projectID, branch})
+	_ = baseBranch
 	return f.checkoutTopicErr
 }
 
