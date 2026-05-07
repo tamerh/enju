@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/fatclient/project"
@@ -1884,13 +1885,13 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// local branch — main and run-1. Without this, the next
 	// scan would baseline tip and miss the historical trailer
 	// commit on run-1.
-	cursors, err := project.LoadCursors(c.stateDir(), 2)
+	cursors, err := project.LoadCursors(c.fc.StateDir(), 2)
 	if err != nil {
 		t.Fatalf("loading cursors: %v", err)
 	}
 	for _, b := range []string{"main", "run-1"} {
-		if got := cursors.Get(b); got != project.RescanSentinelSHA {
-			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, project.RescanSentinelSHA)
+		if got := cursors.Get(b); got != enjugit.RescanSentinelSHA {
+			t.Errorf("cursor for %s: got %q, want sentinel %q", b, got, enjugit.RescanSentinelSHA)
 		}
 	}
 }

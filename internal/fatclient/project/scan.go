@@ -150,27 +150,6 @@ func (p *Clone) ScanBranchSince(branch, since string) (newTip string, found []Co
 	return tip, found, gerr
 }
 
-// RescanSentinelSHA is the cursor value that forces
-// ScanBranchSince to walk a branch's full history from tip on
-// the next scan. The 40-zero string is non-empty (so it
-// doesn't trigger the first-scan baseline early return) and
-// guaranteed not to resolve to any real commit (so
-// stopOnSince=false in the walk path, the iter goes back to
-// the root). The coordinator's reconcile endpoint is
-// idempotent, so re-emitting already-seen trailers is safe —
-// the cursor advances to the actual tip after the first full
-// walk and subsequent scans return to incremental behavior.
-//
-// Used by enju_set_project_remote to recover from the
-// late-remote-add case: a project that ran async compute with
-// no origin configured has commits stranded on local
-// refs/heads/* that the scanner never saw. Setting a remote
-// + pushing makes refs/remotes/origin/* exist for the first
-// time, but cursor entries (if any) baselined empty. Setting
-// each branch's cursor to this sentinel forces a one-shot
-// retroactive scan that picks up the historical trailers.
-const RescanSentinelSHA = "0000000000000000000000000000000000000000"
-
 // Cursors tracks per-branch scan position for one project. On-
 // disk form: `~/.enju/state/project-<id>-cursors.json`. Readers
 // load, scan, and atomically save via Cursors.Save().
