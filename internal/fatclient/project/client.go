@@ -2424,20 +2424,7 @@ func (p *Clone) push() error {
 // branches without a coordinator round-trip — e.g. resetting
 // scan cursors after a project's remote URL changes.
 func (p *Clone) LocalBranches() ([]string, error) {
-	iter, err := p.repo.Branches()
-	if err != nil {
-		return nil, fmt.Errorf("listing branches: %w", err)
-	}
-	defer iter.Close()
-	var names []string
-	err = iter.ForEach(func(ref *plumbing.Reference) error {
-		names = append(names, ref.Name().Short())
-		return nil
-	})
-	if err != nil {
-		return names, fmt.Errorf("iterating branches: %w", err)
-	}
-	return names, nil
+	return p.gitClone.LocalBranches()
 }
 
 // PushAllLocalBranches pushes every refs/heads/* to origin in a
@@ -2740,24 +2727,13 @@ type CommitInfo struct {
 // enju_get_artifact_history tool to render per-file provenance
 // without any coordinator round-trip.
 func (p *Clone) LogFile(relPath string) ([]CommitInfo, error) {
-	iter, err := p.repo.Log(&gogit.LogOptions{FileName: &relPath})
+	raw, err := p.gitClone.LogFile(relPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening log for %s: %w", relPath, err)
+		return nil, err
 	}
-	defer iter.Close()
-
-	var out []CommitInfo
-	err = iter.ForEach(func(c *object.Commit) error {
-		out = append(out, CommitInfo{
-			Hash:    c.Hash.String(),
-			Message: c.Message,
-			Author:  c.Author.Name,
-			Time:    c.Author.When,
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("iterating log: %w", err)
+	out := make([]CommitInfo, len(raw))
+	for i, c := range raw {
+		out[i] = CommitInfo{Hash: c.Hash, Message: c.Message, Author: c.Author, Time: c.Time}
 	}
 	return out, nil
 }
