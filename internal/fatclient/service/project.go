@@ -378,7 +378,7 @@ func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enju
 		return cached, remoteURL, projName, defaultBranch, nil
 	}
 
-	wf, err = s.enjugit.ForProject(projectID, remoteURL)
+	wf, err = s.enjugit.ForProject(projectID, remoteURL, projName)
 	if err != nil {
 		return nil, remoteURL, projName, defaultBranch, err
 	}

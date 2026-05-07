@@ -157,6 +157,15 @@ func (ws *Opener) RootDir() string { return ws.rootDir }
 func (ws *Opener) projectDir(projectID int64, projectName string) string {
 	numericDir := filepath.Join(ws.rootDir, fmt.Sprintf("%d", projectID))
 	if projectName == "" {
+		// Caller didn't tell us the name, but a previous open
+		// (e.g. via a different code path with the name) may have
+		// already created a slug-id dir on disk. Use that if it
+		// exists so we don't fork a parallel numeric dir for the
+		// same project — the path-divergence class of bugs the
+		// project↔enjugit migration keeps surfacing.
+		if existing := ws.findProjectDir(projectID); existing != "" {
+			return existing
+		}
 		return numericDir
 	}
 	slug := slugify(projectName)

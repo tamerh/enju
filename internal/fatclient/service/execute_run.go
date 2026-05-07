@@ -140,8 +140,8 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 		// concluding the run is idle.
 		if !coldReconcileTried && len(entries) == 0 && len(ready) == 0 && runBranch != "" {
 			coldReconcileTried = true
-			if proj, _, _, _, perr := s.OpenProject(ctx, int64(p.ProjectID)); perr == nil && proj != nil {
-				_ = s.PullBranchWithReconcile(ctx, proj, int64(p.ProjectID), runBranch)
+			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(p.ProjectID)); perr == nil && wf != nil {
+				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(p.ProjectID), runBranch)
 				ready, err = s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunID)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{
@@ -589,8 +589,8 @@ func (s *FatClient) runCascadeParallel(
 
 		if !coldReconcileTried && inFlight == 0 && len(entries) == 0 && len(ready) == 0 && runBranch != "" {
 			coldReconcileTried = true
-			if proj, _, _, _, perr := s.OpenProject(ctx, int64(projectID)); perr == nil && proj != nil {
-				_ = s.PullBranchWithReconcile(ctx, proj, int64(projectID), runBranch)
+			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(projectID)); perr == nil && wf != nil {
+				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(projectID), runBranch)
 				ready, err = s.fetchReadyTasksForRun(ctx, projectID, runID)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{

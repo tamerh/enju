@@ -85,7 +85,7 @@ func ResolvedMode(meta *TaskMeta) string {
 // record it and stop the cascade gracefully without unwinding
 // as a generic failure.
 func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*ExecuteOutcome, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("enju_execute_task requires a local workspace")
 	}
 
@@ -100,7 +100,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("task %q has no script field declared", taskID)
 	}
 
-	proj, remoteURL, projName, _, err := s.OpenProject(ctx, meta.ProjectID)
+	wf, remoteURL, projName, _, err := s.OpenWorkflow(ctx, meta.ProjectID)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// otherwise orphans downstream tasks because the coordinator
 	// hasn't yet seen the upstream completion commit. Best-effort;
 	// a reconcile failure here just means slightly stale state.
-	_ = s.PullBranchWithReconcile(ctx, proj, meta.ProjectID, meta.Branch)
+	_ = s.PullBranchWithReconcileWF(ctx, wf, meta.ProjectID, meta.Branch)
 
 	// Re-fetch so the claim decision sees the post-reconcile
 	// state (esp. for chained async tasks that just transitioned
@@ -138,7 +138,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		)
 	}
 
-	workDir := proj.WorkDir()
+	workDir := wf.WorkDir()
 	resultDir := meta.ResultDir
 
 	// Script resolution: template runs pin scripts to the per-run
@@ -193,7 +193,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		TaskID:             taskID,
 		ProjectID:          meta.ProjectID,
 		RemoteURL:          remoteURL,
-		WorkspaceRoot:      s.project.RootDir(),
+		WorkspaceRoot:      s.enjugit.RootDir(),
 		ProjectName:        projName,
 		Branch:             meta.Branch,
 		ResultDir:          resultDir,

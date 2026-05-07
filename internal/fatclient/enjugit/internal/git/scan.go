@@ -241,14 +241,46 @@ func (c *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 	return os.ReadFile(full)
 }
 
-// CheckoutBranch is a convenience for the reconcile path: when
-// branch == "" it's a no-op, else it Checkouts the branch.
-// project.PullBranchWithReconcile only switches branches when
-// branch is set; this preserves that semantics so reconcile-
-// path callers don't have to special-case.
+// CheckoutBranch is the reconcile-path entry point: switches
+// the worktree to the named branch. When branch == "" it's a
+// no-op (matches project.PullBranchWithReconcile semantics so
+// callers don't special-case).
+//
+// Distinct from Checkout: this is a SOFT checkout (no Force,
+// no preserve dance). go-git refuses if the worktree has
+// uncommitted changes — which is the right behavior for
+// reconcile, where dirty trees indicate concurrent work the
+// caller should handle, not a stale branch to wipe. State-prep
+// flows (iter-N branch creation, post-iteration cleanup) still
+// use the force-flavored Checkout directly.
+//
+// TODO(post-project-retirement): rename for clarity. Current
+// `Checkout` (force) vs `CheckoutBranch` (soft) doesn't
+// telegraph the difference — a reader can't tell which is
+// destructive from the name. Plan: rename Checkout →
+// ForceCheckout, and rename this to Checkout (the safe default).
+// Deferred to avoid churning ~10 callsites in state_prep.go /
+// producing.go mid-migration.
+//
+// Why soft: tests + ad-hoc operator workflow chmod files in the
+// worktree (e.g. setting +x on committed scripts that git
+// stores at 0644). A force checkout resets those mode bits;
+// the next exec gets "permission denied". Project's
+// PullBranchWithReconcile.CheckoutBranch was non-force and
+// silently no-op'd on dirty trees — preserving the chmod as a
+// side effect. We mirror that here.
 func (c *Clone) CheckoutBranch(branch string) error {
+	defer c.lock()()
 	if branch == "" {
 		return nil
 	}
-	return c.Checkout(branch)
+	refName := plumbing.NewBranchReferenceName(branch)
+	if _, err := c.repo.Reference(refName, true); err != nil {
+		return fmt.Errorf("%w: %s", ErrRefNotFound, branch)
+	}
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("git: worktree handle: %w", err)
+	}
+	return wt.Checkout(&gogit.CheckoutOptions{Branch: refName})
 }

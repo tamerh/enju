@@ -20,13 +20,29 @@ import (
 //
 // Returns the same Workflow on subsequent calls (cached by
 // projectID).
-func (w *Workspace) ForProject(id int64, remoteURL string) (*Workflow, error) {
+func (w *Workspace) ForProject(id int64, remoteURL string, projectName ...string) (*Workflow, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if wf, ok := w.workflows[id]; ok {
 		return wf, nil
 	}
+	name := ""
+	if len(projectName) > 0 {
+		name = projectName[0]
+	}
 	dir := w.projectDirLocked(id)
+	// If no existing dir was found and we know the project name,
+	// prefer the slug-id form. Mirrors project.Opener.projectDir's
+	// choice so a wf-first ForProject creates the same path
+	// project pkg would have. Without this, wf creates `<root>/<id>/`
+	// while a later project.ForProject(...,name) creates
+	// `<root>/<slug>-<id>/` — divergent dirs for the same project,
+	// the failure mode behind the dual-handle test breakage.
+	if name != "" {
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			dir = w.projectDirForName(id, name)
+		}
+	}
 	clone, err := w.openOrClone(id, dir, remoteURL)
 	if err != nil {
 		return nil, err
