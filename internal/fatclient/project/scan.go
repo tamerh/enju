@@ -28,10 +28,6 @@ import (
 	"sort"
 	"sync"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/storer"
 )
 
 // cursorsFormatVersion tracks the on-disk schema for cursor files.
@@ -142,83 +138,16 @@ func (p *Clone) FetchBranch(branch string) error {
 // unreachable `since` hash returns an error rather than a bogus
 // walk.
 func (p *Clone) ScanBranchSince(branch, since string) (newTip string, found []CommitTrailer, err error) {
-	b := p.resolveBranch(branch)
-	remoteRef := plumbing.NewRemoteReferenceName("origin", b)
-	ref, err := p.repo.Reference(remoteRef, true)
-	if err != nil {
-		// Origin tracking ref absent. Two scenarios resolve to
-		// the same fallback:
-		//
-		//   - Local-only project (no remote configured at all).
-		//     Wrappers commit directly to refs/heads/<branch>;
-		//     there's no push step. Without a fallback the
-		//     scanner finds nothing forever and async tasks
-		//     silently stall (TP53 Bug 1's failure mode).
-		//
-		//   - Branch present locally but origin not yet fetched
-		//     (transient state right after creating a fresh
-		//     run branch). The local head is the authoritative
-		//     state; treating it as the scan target is correct.
-		//
-		// Walk refs/heads/<branch> in both cases. When a remote
-		// IS configured and reachable, this fallback is bypassed
-		// — origin's tracking ref exists post-fetch, and the
-		// fast path above takes over.
-		localRef := plumbing.NewBranchReferenceName(b)
-		ref, err = p.repo.Reference(localRef, true)
-		if err != nil {
-			// Neither ref exists — branch genuinely unknown.
-			return since, nil, nil
-		}
-	}
-	tip := ref.Hash().String()
-	if since == "" {
-		// First-time baseline: record tip, no scan.
-		return tip, nil, nil
-	}
-	if since == tip {
-		return tip, nil, nil
-	}
-
-	// If `since` doesn't resolve to a commit we have, fall back
-	// to walking from tip without a stop condition. Scanner
-	// will re-emit everything; the coordinator no-ops duplicates.
-	_, sinceErr := p.repo.CommitObject(plumbing.NewHash(since))
-	stopOnSince := sinceErr == nil
-
-	iter, err := p.repo.Log(&gogit.LogOptions{From: ref.Hash()})
-	if err != nil {
-		return since, nil, fmt.Errorf("opening log for %s: %w", b, err)
-	}
-	defer iter.Close()
-
-	// Walk in reverse chronological order (newest first). We
-	// reverse at the end so callers see commits in
-	// ancestor→tip order — matches what a human reader
-	// following `git log --reverse` would see, and lets the
-	// coordinator process upstream completions before
-	// downstream ones when both land in one scan window.
-	err = iter.ForEach(func(c *object.Commit) error {
-		if stopOnSince && c.Hash.String() == since {
-			return storer.ErrStop
-		}
-		t := ParseEnjuTrailers(c.Message)
+	tip, gerr := p.gitClone.ScanBranchSince(p.resolveBranch(branch), since, func(sha, message string) {
+		t := ParseEnjuTrailers(message)
 		if t.TaskID != "" {
 			found = append(found, CommitTrailer{
-				CommitSHA: c.Hash.String(),
+				CommitSHA: sha,
 				Trailers:  t,
 			})
 		}
-		return nil
 	})
-	if err != nil && err != storer.ErrStop {
-		return since, nil, fmt.Errorf("walking log: %w", err)
-	}
-	// Reverse to chronological order.
-	for i, j := 0, len(found)-1; i < j; i, j = i+1, j-1 {
-		found[i], found[j] = found[j], found[i]
-	}
-	return tip, found, nil
+	return tip, found, gerr
 }
 
 // RescanSentinelSHA is the cursor value that forces
