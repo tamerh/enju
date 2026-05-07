@@ -1302,73 +1302,7 @@ func (p *Clone) PushPendingCommits(branch string, maxRetries int) (int, string, 
 //
 // Caller MUST hold the project lock.
 func (p *Clone) ResetWorktreeToCleanState() error {
-	wt, err := p.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("worktree: %w", err)
-	}
-	head, err := p.repo.Head()
-	if err != nil {
-		return fmt.Errorf("HEAD: %w", err)
-	}
-	if err := wt.Reset(&gogit.ResetOptions{
-		Mode:   gogit.HardReset,
-		Commit: head.Hash(),
-	}); err != nil {
-		return fmt.Errorf("hard reset to HEAD: %w", err)
-	}
-
-	// Build the tracked-paths set so we can identify untracked
-	// entries during the walk. The set covers everything in
-	// the post-reset index, which equals HEAD's tree.
-	idx, err := p.repo.Storer.Index()
-	if err != nil {
-		return fmt.Errorf("reading index: %w", err)
-	}
-	tracked := make(map[string]struct{}, len(idx.Entries))
-	for _, e := range idx.Entries {
-		tracked[e.Name] = struct{}{}
-	}
-
-	return filepath.Walk(p.workDir, func(path string, info os.FileInfo, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if path == p.workDir {
-			return nil
-		}
-		// Skip infrastructure dirs at any depth: `.git/` (this
-		// repo's own state), `.bare.git/` and `.clone/` (when
-		// we're walking a parent that happens to host them),
-		// and any in-progress preserve dir from a crashed
-		// checkout (recovered separately via openOrClone).
-		base := filepath.Base(path)
-		if info.IsDir() {
-			if base == ".git" || base == ".bare.git" || base == ".clone" ||
-				strings.HasSuffix(base, preserveDirSuffix) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		// Files only past this point.
-		relOS, rerr := filepath.Rel(p.workDir, path)
-		if rerr != nil {
-			return rerr
-		}
-		rel := filepath.ToSlash(relOS)
-		if _, ok := tracked[rel]; ok {
-			return nil
-		}
-		// Untracked file — remove. Best-effort; a removal
-		// failure (permission denied on a symlink we can't
-		// resolve, etc.) doesn't fail the whole reset since
-		// the residual file may not actually collide with the
-		// next checkout. Log via the project's logger if set.
-		if rmErr := os.Remove(path); rmErr != nil && p.logger != nil {
-			p.logger.Warn("clone reset: couldn't remove untracked file",
-				"path", rel, "error", rmErr)
-		}
-		return nil
-	})
+	return p.gitClone.ResetClean()
 }
 // extractTaskIDTrailer reads the `Enju-Task-Complete:` trailer
 // out of a commit message, or returns "" if the commit isn't a
@@ -2680,14 +2614,8 @@ func countCommitsBetween(from *object.Commit, until string) int {
 // a local-only project. The caller MUST hold the project lock.
 func (p *Clone) SetRemote(url string) error {
 	if url == "" {
-		// Empty URL → remove origin entirely. EnsureOrigin only
-		// adds/replaces; deletion stays here (and is a no-op when
-		// origin is already absent).
-		if _, err := p.repo.Remote("origin"); err != nil {
-			return nil
-		}
-		if err := p.repo.DeleteRemote("origin"); err != nil {
-			return fmt.Errorf("removing origin: %w", err)
+		if err := p.gitClone.RemoveOrigin(); err != nil {
+			return err
 		}
 		p.remoteURL = ""
 		return nil

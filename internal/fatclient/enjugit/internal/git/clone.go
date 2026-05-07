@@ -300,6 +300,23 @@ func (c *Clone) EnsureOrigin(url string) error {
 	return nil
 }
 
+// RemoveOrigin deletes the origin remote when present.
+// Idempotent: returns nil when origin doesn't exist. Used by
+// callers that want to turn a remote-backed clone into a
+// local-only one (project.Clone.SetRemote("") delegates here).
+func (c *Clone) RemoveOrigin() error {
+	defer c.lock()()
+	if _, err := c.repo.Remote("origin"); err != nil {
+		// origin already absent — no-op.
+		return nil
+	}
+	if err := c.repo.DeleteRemote("origin"); err != nil {
+		return fmt.Errorf("git: remove-origin: delete: %w", err)
+	}
+	c.remoteURL = ""
+	return nil
+}
+
 // LastPushAt returns the timestamp of the most recent successful
 // push. Zero value when no push has happened in this process.
 func (c *Clone) LastPushAt() time.Time { return c.lastPushAt }
