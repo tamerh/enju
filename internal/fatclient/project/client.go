@@ -66,6 +66,7 @@ import (
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/gofrs/flock"
 
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
@@ -635,6 +636,15 @@ type Clone struct {
 	repo      *gogit.Repository
 	logger    *slog.Logger
 
+	// gitClone is the shared enjugit/internal/git handle backing
+	// this project.Clone. p.repo is set to gitClone.Repo() so
+	// reads/writes through either package land in identical
+	// in-memory state — kills the dual-handle drift class of
+	// bugs (#381) without requiring every method to migrate at
+	// once. Nil only for synthetic test clones built without
+	// going through openOrClone (rare).
+	gitClone *enjugit.SharedClone
+
 	mu       sync.Mutex   // in-process serialization
 	fileLock *flock.Flock // cross-process serialization (optional)
 
@@ -780,80 +790,46 @@ func openOrClone(workDir, remoteURL string, logger *slog.Logger) (*Clone, error)
 			"error", err, "path", workDir+preserveDirSuffix)
 	}
 
-	if repo, err := gogit.PlainOpen(workDir); err == nil {
-		// Clone exists — verify the remote URL matches.
-		// After a DB wipe, the same workspace dir (keyed by
-		// project int ID) may hold a clone from a previous
-		// project that used the same numeric ID. If the
-		// origin URL doesn't match, wipe and re-clone so
-		// the citizen doesn't work against stale content.
-		if remoteURL != "" {
-			mismatch := true
-			if rem, err := repo.Remote("origin"); err == nil {
-				if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] == remoteURL {
-					mismatch = false
-				}
-			}
-			if mismatch {
-				logger.Warn("stale workspace — remote URL mismatch, re-cloning",
-					"path", workDir, "expected", remoteURL)
-				os.RemoveAll(workDir)
-				// Fall through to the clone path below.
-				goto clone
-			}
+	// Existing clone path: open via the shared enjugit/internal/git
+	// layer so project.Clone and any enjugit.Workflow opened on the
+	// same dir end up holding the SAME *gogit.Repository pointer.
+	// Eliminates dual-handle drift (#381) — both packages now read
+	// the same in-memory ref state instead of stale-reading after
+	// the other's writes.
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); err == nil {
+		gc, err := enjugit.OpenSharedClone(workDir, "", logger)
+		if err != nil {
+			return nil, fmt.Errorf("opening existing clone at %s: %w", workDir, err)
 		}
-		p := &Clone{
-			workDir: workDir,
-			repo:    repo,
-			logger:  logger,
+		// Stale-clone detection: numeric workspace dirs can be
+		// reused across DB wipes. If the on-disk origin doesn't
+		// match the requested remoteURL, wipe and re-clone so the
+		// citizen doesn't work against unrelated content.
+		if remoteURL != "" && gc.RemoteURL() != remoteURL {
+			logger.Warn("stale workspace — remote URL mismatch, re-cloning",
+				"path", workDir, "expected", remoteURL, "found", gc.RemoteURL())
+			os.RemoveAll(workDir)
+			// Fall through to the fresh-clone path below.
+		} else {
+			return cloneFromGit(gc, logger), nil
 		}
-		if remoteURL == "" {
-			if rem, err := repo.Remote("origin"); err == nil {
-				if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 {
-					remoteURL = cfg.URLs[0]
-				}
-			}
-		}
-		p.remoteURL = remoteURL
-		return p, nil
 	}
-clone:
 
-	// Clone doesn't exist — either clone from remote or init empty.
+	// Fresh-clone path: no existing checkout. Use the enjugit/git
+	// helpers so the resulting *gogit.Repository is identical to
+	// what enjugit would open on the same dir.
 	if remoteURL == "" {
-		// Local-only mode: init the working tree and seed it
-		// with one commit so subsequent operations
-		// (branchBaseHash, template scans, submit's first
-		// parent lookup) have something to work against.
-		// Mirrors what InitBareWithSeed produces inside a bare;
-		// the contents (README + enju/templates/.gitkeep) match
-		// so the layout users see is the same regardless of
-		// whether a remote was configured at create time.
-		if err := os.MkdirAll(workDir, 0755); err != nil {
-			return nil, fmt.Errorf("creating work dir: %w", err)
-		}
-		repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
-			InitOptions: gogit.InitOptions{
-				DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-			},
-		})
+		// Local-only mode.
+		gc, err := enjugit.InitLocalShared(workDir, "", logger)
 		if err != nil {
 			return nil, fmt.Errorf("initializing local-only repo: %w", err)
 		}
-		if err := seedLocalWorkspace(repo, workDir); err != nil {
-			return nil, fmt.Errorf("seeding local-only repo: %w", err)
-		}
 		logger.Info("initialized local-only repo", "path", workDir)
-		return &Clone{
-			workDir: workDir,
-			repo:    repo,
-			logger:  logger,
-		}, nil
+		return cloneFromGit(gc, logger), nil
 	}
 
-	// Clone from remote. If the parent dir exists but is empty or
-	// stale, remove it first so go-git's PlainClone can write into
-	// a fresh path.
+	// Clean stale non-repo dir before clone so PlainClone writes
+	// into a fresh path.
 	if stat, err := os.Stat(workDir); err == nil && stat.IsDir() {
 		entries, _ := os.ReadDir(workDir)
 		if len(entries) > 0 {
@@ -863,61 +839,48 @@ clone:
 			}
 		}
 	}
-	repo, err := gogit.PlainClone(workDir, false, &gogit.CloneOptions{
-		URL:           remoteURL,
-		ReferenceName: plumbing.ReferenceName("refs/heads/main"),
-		SingleBranch:  true,
-		Auth:          sshAuthMethod(remoteURL),
-	})
+	gc, err := enjugit.CloneOrInitShared(workDir, remoteURL, "", logger)
 	if err != nil {
-		// Empty-remote bootstrap path (A.5 fix). Fresh repos on
-		// GitHub/GitLab with no initial commit return
-		// `transport.ErrEmptyRemoteRepository` from PlainClone —
-		// this is the most common first-time user scenario
-		// ("create a fresh repo, point enju at it, start
-		// submitting tasks"). Initialize an empty local clone
-		// configured with origin, and let the first submit push
-		// the initial commit which populates the remote.
+		// Empty-remote bootstrap path (A.5 fix). Fresh remotes
+		// with no initial commit surface as
+		// transport.ErrEmptyRemoteRepository — the common
+		// first-time scenario ("create a fresh repo, point enju
+		// at it, start submitting tasks"). Init an empty local
+		// clone with origin configured and let the first submit
+		// push the bootstrap commit.
 		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
-			// Clean up anything PlainClone may have left behind
-			// before re-initializing in the same path.
 			if stat, statErr := os.Stat(workDir); statErr == nil && stat.IsDir() {
 				_ = os.RemoveAll(workDir)
 			}
-			if err := os.MkdirAll(workDir, 0755); err != nil {
-				return nil, fmt.Errorf("creating work dir for empty remote: %w", err)
+			gc, ierr := enjugit.InitLocalShared(workDir, "", logger)
+			if ierr != nil {
+				return nil, fmt.Errorf("initializing empty-remote clone: %w", ierr)
 			}
-			repo2, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
-				InitOptions: gogit.InitOptions{
-					DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-				},
-			})
-			if err != nil {
-				return nil, fmt.Errorf("initializing empty-remote clone: %w", err)
-			}
-			if _, err := repo2.CreateRemote(&config.RemoteConfig{
-				Name: "origin",
-				URLs: []string{remoteURL},
-			}); err != nil {
-				return nil, fmt.Errorf("configuring origin for empty remote: %w", err)
+			if eerr := gc.EnsureOrigin(remoteURL); eerr != nil {
+				return nil, fmt.Errorf("configuring origin for empty remote: %w", eerr)
 			}
 			logger.Info("bootstrapped empty remote", "url", remoteURL, "path", workDir)
-			return &Clone{
-				workDir:   workDir,
-				remoteURL: remoteURL,
-				repo:      repo2,
-				logger:    logger,
-			}, nil
+			return cloneFromGit(gc, logger), nil
 		}
 		return nil, friendlyGitError("clone", remoteURL, err)
 	}
 	logger.Info("cloned project", "url", remoteURL, "path", workDir)
+	return cloneFromGit(gc, logger), nil
+}
+
+// cloneFromGit builds a project.Clone façade over an enjugit/git
+// Clone. Single construction site so every Clone created via
+// openOrClone holds the same field-population pattern. Caller
+// fills projectID + fileLock after, since those are bound to the
+// Opener's policy, not the underlying git layer.
+func cloneFromGit(gc *enjugit.SharedClone, logger *slog.Logger) *Clone {
 	return &Clone{
-		workDir:   workDir,
-		remoteURL: remoteURL,
-		repo:      repo,
+		workDir:   gc.WorkDir(),
+		remoteURL: gc.RemoteURL(),
+		repo:      gc.Repo(),
 		logger:    logger,
-	}, nil
+		gitClone:  gc,
+	}
 }
 
 // Pull fetches the latest state of the project's configured

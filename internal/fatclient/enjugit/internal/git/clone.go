@@ -243,6 +243,16 @@ func (c *Clone) WorkDir() string { return c.workDir }
 // clone has no remote (solo / path-only projects).
 func (c *Clone) RemoteURL() string { return c.remoteURL }
 
+// Repo returns the underlying go-git repository handle.
+//
+// Exposed so the project package can wrap *git.Clone while the
+// enjugit migration is in flight: project.Clone stores the same
+// *gogit.Repository pointer that this Clone holds, ensuring
+// reads/writes through either package land in identical in-
+// memory state. Once the project package retires (Phase 11),
+// drop this accessor — the Ops interface is the public surface.
+func (c *Clone) Repo() *gogit.Repository { return c.repo }
+
 // EnsureOrigin makes the on-disk .git/config carry an origin
 // remote pointing at url. Idempotent: no-op when origin already
 // matches; re-adds when missing; replaces when mismatched.
