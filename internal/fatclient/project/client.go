@@ -990,56 +990,16 @@ type SubmitResult struct {
 //     push error is returned. The caller should surface this so
 //     the citizen knows their submit didn't land.
 func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
-	// Single-submit thin wrapper: the post-push HEAD is this
-	// submit's commit (possibly rewritten by a rebase
-	// retry). Batch callers prepare N commits then call
-	// PushPendingCommits + CommitSHAsByTaskID directly so
-	// each entry's post-rebase SHA can be recovered.
-	if _, err := p.PrepareCommit(req); err != nil {
-		return nil, err
-	}
-	attempts, finalSHA, err := p.PushPendingCommits(req.Branch, req.MaxRetries)
-	if err != nil {
-		return nil, err
-	}
-	advanceCursorIfConfigured(req.ProjectID, req.StateDir, p.resolveBranch(req.Branch), finalSHA)
-	return &SubmitResult{CommitSHA: finalSHA, Attempts: attempts}, nil
-}
-
-// PrepareCommit overlays a submit request's files onto the
-// working tree and creates a local commit, WITHOUT pushing.
-// Used by the batch submit path — N PrepareCommit calls
-// accumulate commits on the branch, then a single
-// PushPendingCommits flushes them in one network round-trip.
-//
-// The caller MUST hold the project lock for the duration AND
-// across the subsequent PushPendingCommits. Rebase rewriting
-// commits concurrently with an un-pushed local chain would
-// produce commits that aren't connected to the post-rebase
-// tip.
-//
-// Returns the pre-push commit SHA. If PushPendingCommits
-// triggers a rebase, the SHA will change — use
-// CommitSHAsByTaskID after the push to recover the final SHA
-// by matching the Enju-Task-Id trailer.
-//
-// Single-submit callers can still use SubmitTaskResult, which
-// composes PrepareCommit + PushPendingCommits internally and
-// returns the post-push SHA directly.
-func (p *Clone) PrepareCommit(req SubmitRequest) (string, error) {
 	if len(req.Files) == 0 {
-		return "", fmt.Errorf("no files to write")
+		return nil, fmt.Errorf("no files to write")
 	}
 	if req.TaskID == "" || req.Username == "" {
-		return "", fmt.Errorf("TaskID and Username are required")
+		return nil, fmt.Errorf("TaskID and Username are required")
 	}
 
 	// Default trailers carry at minimum the task id so the
 	// fetch-path scanner can pick any task-submit commit up
-	// without the caller having to opt in. The Enju-Task-Id
-	// trailer is also the batch path's hook for mapping
-	// post-rebase SHAs back to the originating submit
-	// entry — see CommitSHAsByTaskID.
+	// without the caller having to opt in.
 	trailers := req.Trailers
 	if trailers.TaskID == "" {
 		trailers.TaskID = req.TaskID
@@ -1056,7 +1016,7 @@ func (p *Clone) PrepareCommit(req SubmitRequest) (string, error) {
 	// branch flow), use it as the fork point so a per-iteration
 	// topic branch lands on top of the run branch's tip.
 	if err := p.CheckoutBranchFrom(req.Branch, req.BaseBranch); err != nil {
-		return "", fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
+		return nil, fmt.Errorf("switching to branch %q: %w", p.resolveBranch(req.Branch), err)
 	}
 
 	// Overlay the new files on top of current HEAD. Any local
@@ -1067,21 +1027,21 @@ func (p *Clone) PrepareCommit(req SubmitRequest) (string, error) {
 	for _, f := range req.Files {
 		full := filepath.Join(p.workDir, f.RepoRelPath)
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			return "", fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
+			return nil, fmt.Errorf("creating dir for %s: %w", f.RepoRelPath, err)
 		}
 		mode := f.Mode
 		if mode == 0 {
 			mode = 0644
 		}
 		if err := os.WriteFile(full, f.Content, mode); err != nil {
-			return "", fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
+			return nil, fmt.Errorf("writing %s: %w", f.RepoRelPath, err)
 		}
 		// WriteFile respects umask on creation but existing
 		// files keep their prior mode. Explicit chmod so the
 		// requested mode actually sticks across overwrite-in-
 		// place cases (re-submit, re-snapshot).
 		if err := os.Chmod(full, mode); err != nil {
-			return "", fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
+			return nil, fmt.Errorf("chmod %s: %w", f.RepoRelPath, err)
 		}
 	}
 
@@ -1093,45 +1053,31 @@ func (p *Clone) PrepareCommit(req SubmitRequest) (string, error) {
 	for _, f := range req.Files {
 		stagePaths = append(stagePaths, f.RepoRelPath)
 	}
-	sha, err := p.commit(commitMsg, stagePaths, req.AuthorName, req.AuthorEmail)
-	if err != nil {
-		return "", fmt.Errorf("creating commit: %w", err)
+	if _, err := p.commit(commitMsg, stagePaths, req.AuthorName, req.AuthorEmail); err != nil {
+		return nil, fmt.Errorf("creating commit: %w", err)
 	}
-	return sha, nil
-}
 
-// PushPendingCommits pushes the current local branch tip to
-// origin with retry-on-non-fast-forward. Returns (attempts,
-// final HEAD SHA, error). The final SHA is whatever HEAD
-// resolves to after a successful push — for a single-entry
-// submit that's the task's commit; for a batch of N it's the
-// latest entry's post-rebase commit.
-//
-// maxRetries <= 0 defaults to 3. Caller must hold the
-// project lock.
-func (p *Clone) PushPendingCommits(branch string, maxRetries int) (int, string, error) {
-	if maxRetries <= 0 {
-		maxRetries = 3
-	}
 	// Push with retry. On non-FF rejection, rebase our chain
 	// onto the new remote tip and try again. Every attempt
 	// preserves local history — only a real path conflict can
 	// stop the rebase, and we surface that as an error rather
-	// than discard work. Batch callers piggyback on this:
-	// multiple local commits rebase together in one go, so
-	// the rebase cost is paid once no matter how many tasks
-	// are in the batch.
+	// than discard work.
+	maxRetries := req.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		pushErr := p.pushBranchInternal(branch, false)
+		pushErr := p.pushBranchInternal(req.Branch, false)
 		if pushErr == nil {
-			sha := ""
+			finalSHA := ""
 			if head, herr := p.repo.Head(); herr == nil {
-				sha = head.Hash().String()
+				finalSHA = head.Hash().String()
 			}
-			return attempt, sha, nil
+			advanceCursorIfConfigured(req.ProjectID, req.StateDir, p.resolveBranch(req.Branch), finalSHA)
+			return &SubmitResult{CommitSHA: finalSHA, Attempts: attempt}, nil
 		}
 		if !isNonFastForwardError(pushErr) {
-			return attempt, "", fmt.Errorf("push failed: %w", pushErr)
+			return nil, fmt.Errorf("push failed: %w", pushErr)
 		}
 		// Non-FF: the remote moved while we were working.
 		// `git pull --rebase --autostash` fetches the new
@@ -1140,13 +1086,13 @@ func (p *Clone) PushPendingCommits(branch string, maxRetries int) (int, string, 
 		// go-git's rebase support doesn't cover the cases we
 		// need (especially divergent-history with
 		// user-authored commits).
-		if rebaseErr := p.rebaseOnRemote(branch); rebaseErr != nil {
-			return attempt, "", fmt.Errorf(
+		if rebaseErr := p.rebaseOnRemote(req.Branch); rebaseErr != nil {
+			return nil, fmt.Errorf(
 				"submit push rejected and rebase failed — your submit likely touches a file another client also changed. Local work is still in git reflog. Details: %w",
 				rebaseErr)
 		}
 	}
-	return maxRetries, "", fmt.Errorf("submit failed after %d push attempts", maxRetries)
+	return nil, fmt.Errorf("submit failed after %d push attempts", maxRetries)
 }
 // extractTaskIDTrailer reads the `Enju-Task-Complete:` trailer
 // out of a commit message, or returns "" if the commit isn't a
