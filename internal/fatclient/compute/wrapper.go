@@ -31,7 +31,6 @@ import (
 	"github.com/enju-ai/enju/internal/common/gitignore"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // GitSubmitFailedPrefix is the leading text of the wrapper's
@@ -233,22 +232,25 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		return res
 	}
 
-	// Open the project clone via the fat-client workspace layer
-	// so the cross-process flock is honored — the MCP handler and
-	// this wrapper run in distinct processes and MUST NOT race on
-	// .git/index.lock.
-	ws, err := project.NewOpener(spec.WorkspaceRoot, logger)
+	// Open the project clone via enjugit so the cross-process
+	// flock (lockPathFor) is honored — the MCP handler and this
+	// wrapper run in distinct processes and MUST NOT race on
+	// .git/index.lock. ForProject returns a *Workflow whose
+	// SubmitTaskResult wraps git ops in WithLock internally.
+	ws, err := enjugit.NewWorkspace(spec.WorkspaceRoot,
+		enjugit.NewProductionConventions(),
+		enjugit.WithLogger(logger))
 	if err != nil {
 		res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
 		return res
 	}
-	proj, err := ws.ForProject(spec.ProjectID, spec.RemoteURL, spec.ProjectName)
+	wf, err := ws.ForProject(spec.ProjectID, spec.RemoteURL, spec.ProjectName)
 	if err != nil {
 		res.Error = fmt.Sprintf("opening project: %v", err)
 		return res
 	}
 
-	workDir := proj.WorkDir()
+	workDir := wf.WorkDir()
 
 	// Pre-exec: materialize shared-root symlinks for every
 	// declared untracked LITERAL path. When ENJU_SHARED_ROOT is
@@ -493,14 +495,11 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		}
 	}
 
-	// Build a Workflow over project.Clone's *git.Clone (same handle
-	// → no #381 dual-handle drift). The compute task commits
-	// directly to the run branch, so BranchOverride bypasses
-	// topic-branch composition. Compute-specific trailers
-	// (Enju-Exit, Enju-Duration-Seconds, Enju-Untracked-Artifacts)
-	// flow through CustomTrailers — Workflow doesn't model them as
-	// first-class request fields.
-	wf := enjugit.WorkflowFromShared(proj.GitClone(), spec.ProjectID, spec.Branch, logger)
+	// The compute task commits directly to the run branch, so
+	// BranchOverride bypasses topic-branch composition. Compute-
+	// specific trailers (Enju-Exit, Enju-Duration-Seconds,
+	// Enju-Untracked-Artifacts) flow through CustomTrailers —
+	// Workflow doesn't model them as first-class request fields.
 	customTrailers := map[string]string{
 		enjugit.TrailerExit: "0",
 	}
@@ -511,7 +510,6 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		customTrailers[enjugit.TrailerUntrackedArtifacts] = strings.Join(untrackedProduced, ", ")
 	}
 
-	proj.Lock()
 	submitRes, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
 		TaskID:         spec.TaskID,
 		BranchOverride: spec.Branch,
@@ -526,7 +524,6 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		ModelName:      spec.Model,
 		CustomTrailers: customTrailers,
 	})
-	proj.Unlock()
 	if err != nil {
 		// Script ran fine; the failure is at the git layer
 		// (commit retry exhausted, push rejected, rebase
