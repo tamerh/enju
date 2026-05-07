@@ -2182,61 +2182,6 @@ func (p *Clone) commit(message string, paths []string, authorName, authorEmail s
 	return hash.String(), nil
 }
 
-// push pushes the local main branch to origin with safe (non-force)
-// semantics. Uses ambient credentials via go-git's default AuthMethod
-// (SSH agent for SSH URLs, credential helpers for HTTPS). Returns nil
-// for local-only projects. Private helper used by SubmitTaskResult.
-func (p *Clone) push() error {
-	return p.pushInternal(false)
-}
-
-// Push is the public safe-push entry point for the MCP tool handler
-// that performs on-demand sync (enju_project_sync). It pushes the
-// local HEAD to origin with go-git's default (non-force) semantics,
-// so a non-fast-forward state is rejected by the remote. The caller
-// MUST hold the project lock.
-func (p *Clone) Push() error { return p.pushInternal(false) }
-
-// PushForce is the destructive counterpart to Push: overwrites the
-// remote branch even when histories have diverged. Only called from
-// the explicit force-sync path, never from the normal submit flow.
-// The caller MUST hold the project lock.
-func (p *Clone) PushForce() error { return p.pushInternal(true) }
-
-// pushInternal is the shared implementation behind Push / PushForce /
-// the private submit-time push. Returns nil for local-only projects
-// so callers can uniformly call it regardless of whether a remote is
-// configured.
-//
-// No RefSpecs — pushes every matching local branch to origin. In a
-// branch-per-run world a project can have many branches with local
-// commits that haven't shipped yet; a narrow default-branch-only
-// push would silently leave run-branch work behind on
-// enju_project_sync. Submit / CommitFiles paths that want to
-// target a single specific branch use pushBranchInternal instead.
-func (p *Clone) pushInternal(force bool) error {
-	if p.remoteURL == "" {
-		return nil
-	}
-	err := p.repo.Push(&gogit.PushOptions{
-		RemoteName: "origin",
-		Force:      force,
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
-	// Record the outcome on the gitClone bridge so service-side
-	// LastPushAt/LastPushError reads via GitClone() see this push.
-	// project.pushInternal still drives the underlying go-git Push
-	// directly; the explicit RecordPush keeps gitClone's cache in
-	// step until pushInternal itself is ported to enjugit verbs.
-	now := time.Now()
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		p.gitClone.RecordPush(now, err.Error())
-		return friendlyGitError("push", p.remoteURL, err)
-	}
-	p.gitClone.RecordPush(now, "")
-	return nil
-}
-
 // --- Remote comparison (ported from internal/git iteration 4) ---
 
 // RemoteComparisonStatus enumerates the possible relationships

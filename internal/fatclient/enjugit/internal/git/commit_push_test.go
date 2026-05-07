@@ -169,7 +169,7 @@ func TestPushAllRefs_PropagatesAllBranches(t *testing.T) {
 	}
 
 	// PushAllRefs ships everything in one call.
-	if err := c.PushAllRefs(); err != nil {
+	if err := c.PushAllRefs(false); err != nil {
 		t.Fatalf("PushAllRefs: %v", err)
 	}
 
@@ -202,10 +202,10 @@ func TestPushAllRefs_NoOpIdempotent(t *testing.T) {
 	seedBareWithInitialCommit(t, bare)
 	c := freshClone(t, bare)
 
-	if err := c.PushAllRefs(); err != nil {
+	if err := c.PushAllRefs(false); err != nil {
 		t.Fatalf("first PushAllRefs: %v", err)
 	}
-	if err := c.PushAllRefs(); err != nil {
+	if err := c.PushAllRefs(false); err != nil {
 		t.Errorf("second PushAllRefs (no-op) should succeed, got: %v", err)
 	}
 }

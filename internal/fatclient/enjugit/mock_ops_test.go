@@ -323,7 +323,7 @@ func (f *fakeOps) Push(branch string) error {
 	return f.checkErr("Push")
 }
 
-func (f *fakeOps) PushAllRefs() error {
+func (f *fakeOps) PushAllRefs(force bool) error {
 	f.record("PushAllRefs")
 	return f.checkErr("PushAllRefs")
 }

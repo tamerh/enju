@@ -98,7 +98,7 @@ func (c *Clone) Fetch() error {
 // Errors:
 //   - ErrNoRemote: clone has no origin configured.
 //   - any other: wrapped as "git: push-all: ...".
-func (c *Clone) PushAllRefs() error {
+func (c *Clone) PushAllRefs(force bool) error {
 	defer c.lock()()
 	if c.remoteURL == "" {
 		return ErrNoRemote
@@ -106,6 +106,7 @@ func (c *Clone) PushAllRefs() error {
 	err := c.repo.Push(&gogit.PushOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{config.RefSpec("refs/heads/*:refs/heads/*")},
+		Force:      force,
 		Auth:       sshAuthMethod(c.remoteURL),
 	})
 	c.lastPushAt = time.Now()

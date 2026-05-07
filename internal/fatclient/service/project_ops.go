@@ -515,12 +515,7 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		}
 	}
 
-	var pushErr error
-	if force {
-		pushErr = proj.PushForce()
-	} else {
-		pushErr = proj.Push()
-	}
+	pushErr := proj.GitClone().PushAllRefs(force)
 	if pushErr != nil {
 		resp["result"] = "failed"
 		resp["error"] = pushErr.Error()
@@ -561,7 +556,7 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 	_ = wf.SetRemote(remoteURL)
 
 	var warning string
-	if pushErr := wf.PushAllRefs(); pushErr != nil {
+	if pushErr := wf.PushAllRefs(false); pushErr != nil {
 		warning = fmt.Sprintf("\n⚠ Pushing local branches to new remote failed: %v", pushErr)
 		s.logger.Warn("set_project_remote: push to new remote failed",
 			"project_id", projectID, "remote", remoteURL, "error", pushErr)

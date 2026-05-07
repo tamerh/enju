@@ -48,7 +48,7 @@ type Ops interface {
 	// Commit / push / fetch — acquire the lock.
 	CommitFiles(req CommitRequest) (CommitResult, error)
 	Push(branch string) error
-	PushAllRefs() error
+	PushAllRefs(force bool) error
 	PushWithVerify(branch, expectedSHA string) error
 	Fetch() error
 

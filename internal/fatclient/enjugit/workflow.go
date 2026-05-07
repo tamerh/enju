@@ -143,6 +143,6 @@ func (w *Workflow) LocalBranches() ([]string, error) {
 // round-trip via `refs/heads/*:refs/heads/*`. Used by
 // enju_set_project_remote to seed a freshly-pointed bare with the
 // project's full branch state. Idempotent.
-func (w *Workflow) PushAllRefs() error {
-	return translateGitError("push all refs", w.git.PushAllRefs())
+func (w *Workflow) PushAllRefs(force bool) error {
+	return translateGitError("push all refs", w.git.PushAllRefs(force))
 }
