@@ -68,11 +68,16 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 		if err != nil {
 			continue
 		}
-		if t := proj.LastPushAt(); !t.IsZero() {
+		gc := proj.GitClone()
+		t := gc.LastPushAt()
+		if t.IsZero() {
+			t = gc.HeadCommitTime()
+		}
+		if !t.IsZero() {
 			p["last_push_at"] = t.Format(time.RFC3339)
 			changed = true
 		}
-		if e := proj.LastPushError(); e != "" {
+		if e := gc.LastPushError(); e != "" {
 			p["last_push_error"] = e
 			changed = true
 		}
@@ -443,10 +448,15 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 	if cmp.Unreachable != "" {
 		resp["remote_error"] = cmp.Unreachable
 	}
-	if t := proj.LastPushAt(); !t.IsZero() {
+	gc := proj.GitClone()
+	t := gc.LastPushAt()
+	if t.IsZero() {
+		t = gc.HeadCommitTime()
+	}
+	if !t.IsZero() {
 		resp["last_push_at"] = t.Format(time.RFC3339)
 	}
-	if e := proj.LastPushError(); e != "" {
+	if e := gc.LastPushError(); e != "" {
 		resp["last_push_error"] = e
 	}
 	return resp, nil

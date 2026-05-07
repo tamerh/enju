@@ -665,15 +665,6 @@ type Clone struct {
 	// "main" so bare-repo initialization and pre-branch-model
 	// tests keep working.
 	defaultBranch string
-
-	// Push status bookkeeping — in-memory only, per process
-	// lifetime. Updated by pushInternal on both success and
-	// failure so the project_remote_status tool can report
-	// "last push at / last push error". Resets on MCP client
-	// restart, which is fine because the information is purely
-	// diagnostic.
-	lastPushAt    time.Time
-	lastPushError string
 }
 
 // defaultBranchOr returns p.defaultBranch when set, "main"
@@ -1873,12 +1864,12 @@ func (p *Clone) pushBranchInternal(branch string, force bool) error {
 		Force:      force,
 		Auth:       sshAuthMethod(p.remoteURL),
 	})
-	p.lastPushAt = time.Now()
+	now := time.Now()
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		p.lastPushError = err.Error()
+		p.gitClone.RecordPush(now, err.Error())
 		return friendlyGitError("push", p.remoteURL, err)
 	}
-	p.lastPushError = ""
+	p.gitClone.RecordPush(now, "")
 
 	// Verify the remote ref now matches our local tip. Catches
 	// the silent-success class of bugs without trusting go-git's
@@ -2243,47 +2234,19 @@ func (p *Clone) pushInternal(force bool) error {
 		Force:      force,
 		Auth:       sshAuthMethod(p.remoteURL),
 	})
-	// Record the outcome for the project_remote_status diagnostic,
-	// regardless of whether this was a success or a failure.
-	p.lastPushAt = time.Now()
+	// Record the outcome on the gitClone bridge so service-side
+	// LastPushAt/LastPushError reads via GitClone() see this push.
+	// project.pushInternal still drives the underlying go-git Push
+	// directly; the explicit RecordPush keeps gitClone's cache in
+	// step until pushInternal itself is ported to enjugit verbs.
+	now := time.Now()
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		p.lastPushError = err.Error()
+		p.gitClone.RecordPush(now, err.Error())
 		return friendlyGitError("push", p.remoteURL, err)
 	}
-	p.lastPushError = ""
+	p.gitClone.RecordPush(now, "")
 	return nil
 }
-
-// LastPushAt returns the timestamp of the most recent push attempt
-// (success or failure). When no push has happened during the
-// current MCP client process lifetime — which includes fresh
-// sessions where the user runs `enju_project_remote_status`
-// before submitting anything — it falls back to the HEAD commit's
-// timestamp as a proxy for "last known successful push." The HEAD
-// commit time is a conservative lower bound: any push since the
-// last local commit advanced origin/main to HEAD, so the HEAD
-// time is at or before the actual push time.
-//
-// Returns the zero value only if there's no session push AND no
-// HEAD commit (fresh empty-remote bootstrap case).
-func (p *Clone) LastPushAt() time.Time {
-	if !p.lastPushAt.IsZero() {
-		return p.lastPushAt
-	}
-	ref, err := p.repo.Head()
-	if err != nil {
-		return time.Time{}
-	}
-	commit, err := p.repo.CommitObject(ref.Hash())
-	if err != nil {
-		return time.Time{}
-	}
-	return commit.Author.When
-}
-
-// LastPushError returns the error message from the most recent
-// push attempt, or the empty string if the last push succeeded.
-func (p *Clone) LastPushError() string { return p.lastPushError }
 
 // --- Remote comparison (ported from internal/git iteration 4) ---
 

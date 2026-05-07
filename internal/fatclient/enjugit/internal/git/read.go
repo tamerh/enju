@@ -127,6 +127,27 @@ func (c *Clone) Head() (sha, branch string, err error) {
 	return head.Hash().String(), branch, nil
 }
 
+// HeadCommitTime returns the author timestamp of HEAD's commit,
+// or the zero Time when HEAD or the commit object can't be read
+// (empty repo, detached state pointing at no object). Used by
+// callers that need a "last activity" proxy when no explicit
+// timestamp is recorded — e.g. surfacing LastPushAt with a
+// HEAD-time fallback for projects that haven't pushed in this
+// process.
+//
+// Read-only: does not acquire the project lock.
+func (c *Clone) HeadCommitTime() time.Time {
+	ref, err := c.repo.Head()
+	if err != nil {
+		return time.Time{}
+	}
+	commit, err := c.repo.CommitObject(ref.Hash())
+	if err != nil {
+		return time.Time{}
+	}
+	return commit.Author.When
+}
+
 // LocalBranches returns the names (short form) of every local
 // branch ref. Order is iteration-order from the ref store; not
 // stable across calls.

@@ -325,6 +325,18 @@ func (c *Clone) LastPushAt() time.Time { return c.lastPushAt }
 // "" when the most recent push succeeded.
 func (c *Clone) LastPushError() string { return c.lastPushError }
 
+// RecordPush sets the cached LastPushAt/LastPushError fields
+// without performing a push. Bridge for callers that drive the
+// underlying go-git Repository's Push directly (project.Clone's
+// own pushInternal predates the enjugit port and still updates a
+// duplicate copy on its own struct). Once those callers move to
+// enjugit's Push verbs, this entry point can go away.
+func (c *Clone) RecordPush(t time.Time, errMsg string) {
+	defer c.lock()()
+	c.lastPushAt = t
+	c.lastPushError = errMsg
+}
+
 // lock acquires both mu and (when configured) the flock. No-op
 // when reentrant is set. Returns a function the caller must call
 // to release. Use as: defer c.lock()()
