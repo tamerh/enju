@@ -327,39 +327,23 @@ func (ws *Opener) HasExternalDir(projectID int64) bool {
 	return ws.projectHome(projectID) != ""
 }
 
-// LeaveProject forgets the cached Project handle (if any) and
-// removes the on-disk clone directory. The next ForProject call for
-// this project will re-clone from the remote. Safe to call even if
-// the project was never opened in this process — a missing clone
-// directory is not an error.
-//
-// Use cases: reclaiming disk space for a project the citizen is
-// done with, or recovering from a corrupted local clone. The remote
-// is untouched; this is purely a local cache wipe.
-func (ws *Opener) LeaveProject(projectID int64) error {
+// EvictProjectCache drops the cached *Clone for projectID (if any),
+// briefly holding the project lock to barrier in-flight submits.
+// On-disk removal lives on the enjugit Workspace; service-level
+// LeaveProject orchestration calls this for project-side cache
+// eviction, then enjugit.Workspace.LeaveProject for the dir wipe.
+// Goes away with the project package.
+func (ws *Opener) EvictProjectCache(projectID int64) {
 	if projectID == 0 {
-		return fmt.Errorf("projectID is required")
+		return
 	}
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	if p, ok := ws.clients[projectID]; ok {
-		// Hold the project lock briefly to make sure no in-flight
-		// submit is mid-write. Once we have it, drop the map entry
-		// and release — nobody else can acquire this handle since
-		// we're also holding the workspace lock.
 		p.mu.Lock()
 		p.mu.Unlock() //nolint:staticcheck // barrier against in-flight writers
 		delete(ws.clients, projectID)
 	}
-	// Find whichever directory format exists (slug or numeric).
-	workDir := ws.findProjectDir(projectID)
-	if workDir == "" {
-		return nil // nothing to remove
-	}
-	if err := os.RemoveAll(workDir); err != nil {
-		return fmt.Errorf("removing clone at %s: %w", workDir, err)
-	}
-	return nil
 }
 
 // ForProject returns a handle to the local clone of the given project,

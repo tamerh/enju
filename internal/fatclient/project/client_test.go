@@ -1037,10 +1037,11 @@ func TestCrossWorkspaceFlockSerialization(t *testing.T) {
 	projB.Unlock()
 }
 
-// TestLeaveProjectRemovesClone verifies that LeaveProject drops the
-// cached handle and wipes the on-disk clone, and that a subsequent
-// ForProject call re-clones from the remote cleanly.
-func TestLeaveProjectRemovesClone(t *testing.T) {
+// TestEvictProjectCacheDropsHandle verifies that EvictProjectCache
+// drops the cached *Clone (so ForProject re-resolves from disk on
+// the next call). On-disk removal lives on enjugit.Workspace; this
+// test only covers project's cache-eviction half.
+func TestEvictProjectCacheDropsHandle(t *testing.T) {
 	bare := initBareRemote(t)
 	seedRemoteWithInitialCommit(t, bare)
 
@@ -1050,36 +1051,30 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first clone: %v", err)
 	}
-	workDir := proj.WorkDir()
-	if _, err := os.Stat(workDir); err != nil {
-		t.Fatalf("expected clone dir to exist: %v", err)
-	}
-	if ws.findProjectDir(70) == "" {
-		t.Fatal("expected clone dir to exist before leave")
-	}
 
-	if err := ws.LeaveProject(70); err != nil {
-		t.Fatalf("LeaveProject: %v", err)
-	}
-	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
-		t.Errorf("expected clone dir to be gone, stat err: %v", err)
-	}
-	if ws.findProjectDir(70) != "" {
-		t.Error("expected clone dir to be gone after leave")
-	}
-
-	// Leaving a project that was never opened should be a no-op, not an error.
-	if err := ws.LeaveProject(999); err != nil {
-		t.Errorf("LeaveProject on unknown project: %v", err)
-	}
-
-	// Next ForProject should re-clone successfully.
-	proj2, err := ws.ForProject(70, bare)
+	// Cache hit before evict: same pointer.
+	again, err := ws.ForProject(70, bare)
 	if err != nil {
-		t.Fatalf("reclone after leave: %v", err)
+		t.Fatalf("second ForProject before evict: %v", err)
 	}
-	if proj2.WorkDir() != workDir {
-		t.Errorf("expected same work dir after reclone, got %s vs %s", proj2.WorkDir(), workDir)
+	if again != proj {
+		t.Errorf("expected cache-hit identity before evict")
+	}
+
+	// Evict + safe on unknown projectID.
+	ws.EvictProjectCache(70)
+	ws.EvictProjectCache(999)
+
+	// After evict: ForProject re-opens — different pointer, same workDir.
+	reopened, err := ws.ForProject(70, bare)
+	if err != nil {
+		t.Fatalf("reopen after evict: %v", err)
+	}
+	if reopened == proj {
+		t.Errorf("expected fresh handle after evict")
+	}
+	if reopened.WorkDir() != proj.WorkDir() {
+		t.Errorf("expected same work dir, got %s vs %s", reopened.WorkDir(), proj.WorkDir())
 	}
 }
 

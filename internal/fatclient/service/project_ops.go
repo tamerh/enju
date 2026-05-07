@@ -593,7 +593,8 @@ func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error
 		return false, nil
 	}
 	hadClone = s.enjugit.HasLocalClone(projectID)
-	if err := s.project.LeaveProject(projectID); err != nil {
+	s.project.EvictProjectCache(projectID)
+	if err := s.enjugit.LeaveProject(projectID); err != nil {
 		return hadClone, fmt.Errorf("removing local clone: %w", err)
 	}
 	s.UnregisterProject(projectID)

@@ -168,6 +168,53 @@ func TestProductionDiskLayout(t *testing.T) {
 	}
 }
 
+// TestLeaveProjectRemovesClone mirrors the project-side test that
+// moved here when service.LocalLeaveProject started routing the
+// disk-wipe through enjugit. ForProject → LeaveProject → ForProject
+// should clone, wipe, and re-clone the same dir.
+func TestLeaveProjectRemovesClone(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf, err := ws.ForProject(70, bare)
+	if err != nil {
+		t.Fatalf("first clone: %v", err)
+	}
+	workDir := wf.WorkDir()
+	if _, err := os.Stat(workDir); err != nil {
+		t.Fatalf("expected clone dir to exist: %v", err)
+	}
+	if !ws.HasLocalClone(70) {
+		t.Fatal("HasLocalClone should be true before leave")
+	}
+
+	if err := ws.LeaveProject(70); err != nil {
+		t.Fatalf("LeaveProject: %v", err)
+	}
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("expected clone dir to be gone, stat err: %v", err)
+	}
+	if ws.HasLocalClone(70) {
+		t.Error("HasLocalClone should be false after leave")
+	}
+
+	// Leaving a project that was never opened is a no-op.
+	if err := ws.LeaveProject(999); err != nil {
+		t.Errorf("LeaveProject on unknown project: %v", err)
+	}
+
+	// Next ForProject re-clones into the same dir.
+	wf2, err := ws.ForProject(70, bare)
+	if err != nil {
+		t.Fatalf("reclone after leave: %v", err)
+	}
+	if wf2.WorkDir() != workDir {
+		t.Errorf("expected same work dir after reclone, got %s vs %s", wf2.WorkDir(), workDir)
+	}
+}
+
 func TestSlugify(t *testing.T) {
 	cases := map[string]string{
 		"hello":          "hello",
