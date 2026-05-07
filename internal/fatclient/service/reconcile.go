@@ -378,69 +378,61 @@ func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workf
 // scan / post errors are logged at Debug and the call returns
 // without surfacing them.
 func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, runData []byte) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return
 	}
 	branch := RunBranchFromData(runData)
 	if branch == "" {
 		return
 	}
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
-	if err != nil || proj == nil {
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
 		return
 	}
-	// Git phase: fetch + scan under proj.Lock. Release BEFORE
-	// posting to the coordinator so concurrent ops don't block
-	// on the HTTP round-trip.
-	proj.Lock()
-	ferr := proj.FetchBranch(branch)
-	var trailers []project.CommitTrailer
+	ferr := wf.FetchBranch(branch)
+	var trailers []enjugit.CommitTrailer
 	var newTip, preCursor string
 	if ferr == nil {
 		stateDir := s.StateDir()
-		cursorMu := project.CursorMutexFor(stateDir, projectID)
+		cursorMu := enjugit.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		cursors, _ := project.LoadCursors(stateDir, projectID)
+		cursors, _ := enjugit.LoadCursors(stateDir, projectID)
 		preCursor = cursors.Get(branch)
-		// Persist-on-first-touch so a brand-new run branch
-		// doesn't fall back to the first-scan baseline (or
-		// race with the wrapper's own local-ref advance) and
-		// orphan a task. See PullBranchWithReconcile's
-		// identical block for the full rationale.
+		// Persist-on-first-touch — same rationale as
+		// PullBranchWithReconcileWF's identical block.
 		if preCursor == "" {
-			if h, herr := proj.LocalBranchHash(branch); herr == nil && h != "" {
+			if h, herr := wf.LocalBranchHash(branch); herr == nil && h != "" {
 				preCursor = h
 				cursors.Set(branch, h)
 				_ = cursors.Save()
 			}
 		}
 		cursorMu.Unlock()
-		if tip, found, serr := proj.ScanBranchSince(branch, preCursor); serr == nil {
+		if tip, found, serr := wf.ScanBranchSince(branch, preCursor); serr == nil {
 			newTip = tip
 			trailers = found
 		} else {
 			s.logger.Debug("reconcile scan", "project", projectID, "branch", branch, "error", serr)
 		}
 	}
-	proj.Unlock()
 
 	if len(trailers) > 0 {
-		if _, perr := s.coord.Post(ctx, "/api/v1/tasks/reconcile", BuildReconcileBody(trailers)); perr != nil {
+		if _, perr := s.coord.Post(ctx, "/api/v1/tasks/reconcile", buildReconcileBodyWF(trailers)); perr != nil {
 			s.logger.Debug("reconcile post", "project", projectID, "branch", branch, "error", perr)
-			s.ReapWrapperFailures(ctx, proj, projectID)
+			s.ReapWrapperFailuresWF(ctx, wf)
 			return
 		}
 	}
 	if newTip != "" && newTip != preCursor {
 		stateDir := s.StateDir()
-		cursorMu := project.CursorMutexFor(stateDir, projectID)
+		cursorMu := enjugit.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		latest, _ := project.LoadCursors(stateDir, projectID)
+		latest, _ := enjugit.LoadCursors(stateDir, projectID)
 		latest.Set(branch, newTip)
 		_ = latest.Save()
 		cursorMu.Unlock()
 	}
-	s.ReapWrapperFailures(ctx, proj, projectID)
+	s.ReapWrapperFailuresWF(ctx, wf)
 }
 
 // ReapWrapperFailures walks the project's enju/runs tree
