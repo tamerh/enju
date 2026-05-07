@@ -155,6 +155,53 @@ func (c *Clone) WorkDir() string { return c.workDir }
 // clone has no remote (solo / path-only projects).
 func (c *Clone) RemoteURL() string { return c.remoteURL }
 
+// EnsureOrigin makes the on-disk .git/config carry an origin
+// remote pointing at url. Idempotent: no-op when origin already
+// matches; re-adds when missing; replaces when mismatched.
+//
+// Why this exists (band-aid for #381 dual-handle bug):
+// While both project.Clone and enjugit.Workflow are in active
+// use against the same on-disk dir, some code path inside the
+// project package wipes the [remote "origin"] section from
+// .git/config between operations (observed: between an
+// export_diagram commit and a downstream submit's prepare-branch
+// fetch). The cached enjugit Workflow's in-memory remoteURL
+// stays correct, but go-git's repo.Fetch reads .git/config on
+// every call and fails with "remote not found" once the section
+// is gone. Calling EnsureOrigin before any fetch/push self-heals
+// the on-disk state without us having to identify the exact
+// wipe site (which proved hard to pin down — it's somewhere in
+// the project package's claim/pull paths).
+//
+// Once the project package is fully retired (Phase 11), this
+// method becomes redundant and can be deleted along with its
+// callers.
+func (c *Clone) EnsureOrigin(url string) error {
+	defer c.lock()()
+	if url == "" {
+		return nil
+	}
+	if rem, err := c.repo.Remote("origin"); err == nil {
+		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] == url {
+			return nil
+		}
+		// Mismatched origin — replace so we don't fight a writer
+		// that intentionally repointed it.
+		if derr := c.repo.DeleteRemote("origin"); derr != nil {
+			return fmt.Errorf("git: ensure-origin: delete stale: %w", derr)
+		}
+	}
+	if _, err := c.repo.CreateRemote(&config.RemoteConfig{
+		Name:  "origin",
+		URLs:  []string{url},
+		Fetch: []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
+	}); err != nil {
+		return fmt.Errorf("git: ensure-origin: create: %w", err)
+	}
+	c.remoteURL = url
+	return nil
+}
+
 // LastPushAt returns the timestamp of the most recent successful
 // push. Zero value when no push has happened in this process.
 func (c *Clone) LastPushAt() time.Time { return c.lastPushAt }

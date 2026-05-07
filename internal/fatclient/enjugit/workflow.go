@@ -108,3 +108,14 @@ func (w *Workflow) ProjectID() int64 { return w.projID }
 // with. Useful for diagnostic surfaces that want to render the
 // same names workflow uses.
 func (w *Workflow) Conventions() Conventions { return w.convs }
+
+// EnsureOrigin self-heals the on-disk origin remote when something
+// (the project package's claim/pull paths) wipes the
+// [remote "origin"] section from .git/config. Idempotent.
+//
+// Band-aid for the dual-handle bug (#381) — see git.Clone.EnsureOrigin
+// for the full context. Service callers invoke this after every
+// OpenWorkflow so subsequent fetch/push find origin on disk.
+func (w *Workflow) EnsureOrigin(url string) error {
+	return translateGitError("ensure origin", w.git.EnsureOrigin(url))
+}

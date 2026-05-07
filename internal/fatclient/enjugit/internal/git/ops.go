@@ -51,6 +51,12 @@ type Ops interface {
 	PushWithVerify(branch, expectedSHA string) error
 	Fetch() error
 
+	// EnsureOrigin self-heals the on-disk .git/config when the
+	// origin remote section is missing or mismatched. Band-aid
+	// for the dual-handle bug (#381); see Clone.EnsureOrigin
+	// docstring for context.
+	EnsureOrigin(url string) error
+
 	// Merge — acquire the lock.
 	MergeFFOrFail(target, source string) (newTipSHA string, err error)
 	MergeWithCommit(target, source, message, authorName, authorEmail string) (newTipSHA string, err error)

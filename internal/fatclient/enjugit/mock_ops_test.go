@@ -333,6 +333,11 @@ func (f *fakeOps) Fetch() error {
 	return f.checkErr("Fetch")
 }
 
+func (f *fakeOps) EnsureOrigin(url string) error {
+	f.record("EnsureOrigin", url)
+	return f.checkErr("EnsureOrigin")
+}
+
 func (f *fakeOps) MergeFFOrFail(target, source string) (string, error) {
 	f.record("MergeFFOrFail", target, source)
 	if err := f.checkErr("MergeFFOrFail"); err != nil {
