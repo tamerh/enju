@@ -27,6 +27,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -172,7 +173,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	// loudly with a "run enju bot setup" hint — that's the
 	// design (no silent fall-back to the operator's tree).
 	barePath := filepath.Join(homeTree, "enju", ".bare.git")
-	if err := project.PromoteWorkingTreeToBare(homeTree, barePath); err != nil {
+	if err := enjugit.PromoteWorkingTreeToBare(homeTree, barePath); err != nil {
 		t.Fatal(err)
 	}
 

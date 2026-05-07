@@ -1841,7 +1841,7 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 
 	// Fresh empty bare for the new remote.
 	bareDir := filepath.Join(t.TempDir(), "bare.git")
-	if err := project.InitBareEmpty(bareDir); err != nil {
+	if err := enjugit.InitBareEmpty(bareDir); err != nil {
 		t.Fatalf("init bare: %v", err)
 	}
 

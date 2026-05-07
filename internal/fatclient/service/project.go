@@ -304,7 +304,7 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 		wasFresh = false
 	}
 
-	if err := project.PromoteWorkingTreeToBare(source, barePath); err != nil {
+	if err := enjugit.PromoteWorkingTreeToBare(source, barePath); err != nil {
 		return "", false, fmt.Errorf("promoting %q to bare at %q: %w", source, barePath, err)
 	}
 	return barePath, wasFresh, nil
