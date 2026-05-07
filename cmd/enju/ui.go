@@ -10,7 +10,6 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/webui"
 )
 
@@ -113,7 +112,7 @@ func cmdUI(args []string) {
 		token = creds.Token
 	}
 
-	ws, err := project.NewOpener(*workspaceDir, logger)
+	wsRoot, err := resolveWorkspaceRoot(*workspaceDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create workspace: %v\n", err)
 		os.Exit(1)
@@ -132,7 +131,7 @@ func cmdUI(args []string) {
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		WorkspaceRoot:   ws.RootDir(),
+		WorkspaceRoot:   wsRoot,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})

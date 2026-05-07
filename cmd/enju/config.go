@@ -184,6 +184,26 @@ func expandPath(p string) string {
 	return p
 }
 
+// resolveWorkspaceRoot canonicalizes the -workspace-dir flag value
+// the same way the legacy project.NewOpener used to: empty falls
+// back to ~/.enju/workspaces, and the directory is created with
+// 0755 if it doesn't exist. Returns the absolute path the boot
+// path should hand to service.Config.WorkspaceRoot /
+// mcphandlers.Config.WorkspaceRoot.
+func resolveWorkspaceRoot(rootDir string) (string, error) {
+	if rootDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolving home dir: %w", err)
+		}
+		rootDir = filepath.Join(home, ".enju", "workspaces")
+	}
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating workspace root: %w", err)
+	}
+	return rootDir, nil
+}
+
 // defaultConfigPath returns the conventional location for the server
 // config. Used as the default value of -config; absence is fine.
 func defaultConfigPath() string {

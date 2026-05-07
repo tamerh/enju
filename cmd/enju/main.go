@@ -18,7 +18,6 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/scheduler"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -420,7 +419,7 @@ func cmdMCP(args []string) {
 	// legacy coordinator-writes path; this workspace stays unused
 	// for them but the creation itself is cheap and safe.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ws, err := project.NewOpener(*workspaceDir, logger)
+	wsRoot, err := resolveWorkspaceRoot(*workspaceDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create MCP workspace: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Hint: the workspace directory (default ~/.enju/workspaces) must be writable and have free disk space. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
@@ -444,7 +443,7 @@ func cmdMCP(args []string) {
 		CitizenEmail:  *email,
 		ModelName:   *model,
 		AuthToken:   token,
-		WorkspaceRoot: ws.RootDir(),
+		WorkspaceRoot: wsRoot,
 		Logger:     logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)

@@ -22,7 +22,6 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // cmdBot is the parent dispatcher for `enju bot <subcommand>`.
@@ -445,7 +444,7 @@ func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credent
 		fmt.Fprintf(os.Stderr, "  ! couldn't resolve workspace root for bot push-target setup: %v\n", err)
 		return
 	}
-	ws, err := project.NewOpener(wsRoot, logger)
+	wsRoot, err = resolveWorkspaceRoot(wsRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ! couldn't open workspace for bot push-target setup: %v\n", err)
 		return
@@ -459,7 +458,7 @@ func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credent
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		WorkspaceRoot:   ws.RootDir(),
+		WorkspaceRoot:   wsRoot,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
@@ -725,7 +724,7 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	ws, err := project.NewOpener(*workspaceDir, logger)
+	wsRoot, err := resolveWorkspaceRoot(*workspaceDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build workspace: %v\n", err)
 		os.Exit(1)
@@ -739,7 +738,7 @@ func cmdBotRun(args []string) {
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		WorkspaceRoot:   ws.RootDir(),
+		WorkspaceRoot:   wsRoot,
 		ModelName:       bot.Model,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
