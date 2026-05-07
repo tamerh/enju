@@ -2311,42 +2311,6 @@ func (p *Clone) push() error {
 	return p.pushInternal(false)
 }
 
-// LocalBranches returns the short names of every refs/heads/*
-// in the local repository. Used when we need to enumerate
-// branches without a coordinator round-trip — e.g. resetting
-// scan cursors after a project's remote URL changes.
-func (p *Clone) LocalBranches() ([]string, error) {
-	return p.gitClone.LocalBranches()
-}
-
-// PushAllLocalBranches pushes every refs/heads/* to origin in a
-// single push, with explicit refspec so it doesn't depend on
-// per-branch upstream tracking config. Used when a freshly
-// configured (or freshly changed) origin needs to be seeded
-// with the workspace's existing branch state — e.g. a late-add
-// of an origin to a project that already has run-branch
-// commits, where the regular Push() default refspec might miss
-// branches without configured upstream.
-//
-// Caller MUST hold the project lock.
-func (p *Clone) PushAllLocalBranches() error {
-	if p.remoteURL == "" {
-		return fmt.Errorf("no remote configured")
-	}
-	err := p.repo.Push(&gogit.PushOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{"refs/heads/*:refs/heads/*"},
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
-	p.lastPushAt = time.Now()
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		p.lastPushError = err.Error()
-		return friendlyGitError("push", p.remoteURL, err)
-	}
-	p.lastPushError = ""
-	return nil
-}
-
 // Push is the public safe-push entry point for the MCP tool handler
 // that performs on-demand sync (enju_project_sync). It pushes the
 // local HEAD to origin with go-git's default (non-force) semantics,
@@ -2601,30 +2565,6 @@ func countCommitsBetween(from *object.Commit, until string) int {
 		current = parent
 	}
 	return count
-}
-
-// SetRemote reconfigures the origin remote of the local clone to
-// point at a new URL. Used when the coordinator's project record
-// has a remote_url that differs from (or fills in) the local
-// clone's origin — e.g., on first access to a project the client
-// had cloned from somewhere else, or when the coordinator updates
-// a project's remote_url post-hoc.
-//
-// Passing an empty string removes origin, turning the clone into
-// a local-only project. The caller MUST hold the project lock.
-func (p *Clone) SetRemote(url string) error {
-	if url == "" {
-		if err := p.gitClone.RemoveOrigin(); err != nil {
-			return err
-		}
-		p.remoteURL = ""
-		return nil
-	}
-	if err := p.gitClone.EnsureOrigin(url); err != nil {
-		return err
-	}
-	p.remoteURL = url
-	return nil
 }
 
 // --- commit message format ---

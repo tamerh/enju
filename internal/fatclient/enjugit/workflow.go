@@ -119,3 +119,30 @@ func (w *Workflow) Conventions() Conventions { return w.convs }
 func (w *Workflow) EnsureOrigin(url string) error {
 	return translateGitError("ensure origin", w.git.EnsureOrigin(url))
 }
+
+// SetRemote points the clone at a new origin URL. Empty URL means
+// "remove origin entirely" (turning a remote-backed clone into a
+// local-only one); a non-empty URL adds or replaces the existing
+// origin. Idempotent on both paths.
+func (w *Workflow) SetRemote(url string) error {
+	if url == "" {
+		return translateGitError("remove origin", w.git.RemoveOrigin())
+	}
+	return translateGitError("set remote", w.git.EnsureOrigin(url))
+}
+
+// LocalBranches returns the names of every refs/heads/<name> on
+// disk. Used by callers that need to enumerate branches for
+// per-branch operations (cursor reset, batch reconcile, etc).
+func (w *Workflow) LocalBranches() ([]string, error) {
+	branches, err := w.git.LocalBranches()
+	return branches, translateGitError("local branches", err)
+}
+
+// PushAllRefs ships every local branch to origin in one network
+// round-trip via `refs/heads/*:refs/heads/*`. Used by
+// enju_set_project_remote to seed a freshly-pointed bare with the
+// project's full branch state. Idempotent.
+func (w *Workflow) PushAllRefs() error {
+	return translateGitError("push all refs", w.git.PushAllRefs())
+}

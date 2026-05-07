@@ -48,6 +48,7 @@ type Ops interface {
 	// Commit / push / fetch — acquire the lock.
 	CommitFiles(req CommitRequest) (CommitResult, error)
 	Push(branch string) error
+	PushAllRefs() error
 	PushWithVerify(branch, expectedSHA string) error
 	Fetch() error
 
@@ -56,6 +57,10 @@ type Ops interface {
 	// for the dual-handle bug (#381); see Clone.EnsureOrigin
 	// docstring for context.
 	EnsureOrigin(url string) error
+	// RemoveOrigin deletes the origin remote when present;
+	// idempotent no-op when absent. Used by SetRemote("")
+	// to turn a remote-backed clone local-only.
+	RemoveOrigin() error
 
 	// Per-branch fetch + pull (reconcile / claim path). FetchBranch
 	// updates only refs/remotes/origin/<branch>; PullBranch fetches

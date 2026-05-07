@@ -82,6 +82,41 @@ func (c *Clone) Fetch() error {
 	return nil
 }
 
+// PushAllRefs pushes every local branch to origin via the
+// `refs/heads/*:refs/heads/*` wildcard refspec. Used to seed a
+// freshly-pointed remote (enju_set_project_remote) with the
+// project's full branch state, including run / topic branches
+// that don't yet exist on origin.
+//
+// Idempotent on no-op (NoErrAlreadyUpToDate). lastPushAt /
+// lastPushError state is updated regardless of success or failure
+// — the project_remote_status diagnostic reads it.
+//
+// Git operations performed:
+//   1. repo.Push(refspec="refs/heads/*:refs/heads/*", auth).
+//
+// Errors:
+//   - ErrNoRemote: clone has no origin configured.
+//   - any other: wrapped as "git: push-all: ...".
+func (c *Clone) PushAllRefs() error {
+	defer c.lock()()
+	if c.remoteURL == "" {
+		return ErrNoRemote
+	}
+	err := c.repo.Push(&gogit.PushOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec("refs/heads/*:refs/heads/*")},
+		Auth:       sshAuthMethod(c.remoteURL),
+	})
+	c.lastPushAt = time.Now()
+	if err == nil || errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		c.lastPushError = ""
+		return nil
+	}
+	c.lastPushError = err.Error()
+	return fmt.Errorf("git: push-all: %w", err)
+}
+
 // pushInternal does the actual push. Caller already holds the lock.
 // force is hardcoded false in current callers; reserved for a
 // future force-push verb if needed.

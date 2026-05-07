@@ -541,20 +541,17 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 // Returns a warning message when push fails (non-fatal — remote
 // is set, but seeding failed). Empty workspace is a no-op.
 func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) string {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return ""
 	}
-	proj, err := s.project.ForProject(projectID, remoteURL)
+	wf, err := s.enjugit.ForProject(projectID, remoteURL)
 	if err != nil {
 		return ""
 	}
-	proj.Lock()
-	defer proj.Unlock()
-
-	_ = proj.SetRemote(remoteURL)
+	_ = wf.SetRemote(remoteURL)
 
 	var warning string
-	if pushErr := proj.PushAllLocalBranches(); pushErr != nil {
+	if pushErr := wf.PushAllRefs(); pushErr != nil {
 		warning = fmt.Sprintf("\n⚠ Pushing local branches to new remote failed: %v", pushErr)
 		s.logger.Warn("set_project_remote: push to new remote failed",
 			"project_id", projectID, "remote", remoteURL, "error", pushErr)
@@ -566,7 +563,7 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 	// don't yet exist is harmless (the scanner returns empty
 	// when the remote ref is missing, leaving the sentinel in
 	// place for the next attempt).
-	if branches, lerr := proj.LocalBranches(); lerr == nil {
+	if branches, lerr := wf.LocalBranches(); lerr == nil {
 		stateDir := s.StateDir()
 		cursorMu := project.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 func TestCommitFiles_HappyPath(t *testing.T) {
@@ -137,6 +139,75 @@ func TestPush_NoRemote(t *testing.T) {
 	// a real source. The contract is exercised in higher-level
 	// tests where solo projects exist.
 	t.Skip("no-remote path tested via solo-project integration tests")
+}
+
+// TestPushAllRefs_PropagatesAllBranches — the load-bearing case
+// for enju_set_project_remote: a clone holds N local branches
+// (main + topics), and pointing it at a fresh bare must push all
+// N up so the new remote is a complete mirror, not just origin/main.
+func TestPushAllRefs_PropagatesAllBranches(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	// Land a commit on main.
+	res, err := c.CommitFiles(CommitRequest{
+		Files:   []FileWrite{{RepoRelPath: "main.txt", Content: []byte("m")}},
+		Message: "main commit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSHA := res.SHA
+
+	// Create two topic branches at main's tip.
+	if err := c.CreateBranchAt("topic-a", mainSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CreateBranchAt("topic-b", mainSHA); err != nil {
+		t.Fatal(err)
+	}
+
+	// PushAllRefs ships everything in one call.
+	if err := c.PushAllRefs(); err != nil {
+		t.Fatalf("PushAllRefs: %v", err)
+	}
+
+	// Verify by re-fetching from a fresh clone — all three branches
+	// must be reachable.
+	other := freshClone(t, bare)
+	for _, br := range []string{"main", "topic-a", "topic-b"} {
+		ref, err := other.repo.Reference(plumbing.NewRemoteReferenceName("origin", br), true)
+		if err != nil {
+			t.Errorf("origin/%s missing on fresh clone: %v", br, err)
+			continue
+		}
+		if ref.Hash().String() != mainSHA {
+			t.Errorf("origin/%s = %s, want %s", br, ref.Hash().String(), mainSHA)
+		}
+	}
+	// State bookkeeping must update on success.
+	if c.lastPushAt.IsZero() {
+		t.Errorf("lastPushAt should be set after successful PushAllRefs")
+	}
+	if c.lastPushError != "" {
+		t.Errorf("lastPushError should be empty after success, got %q", c.lastPushError)
+	}
+}
+
+// TestPushAllRefs_NoOpIdempotent — second call is a no-op (already
+// up to date) and must not error.
+func TestPushAllRefs_NoOpIdempotent(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	if err := c.PushAllRefs(); err != nil {
+		t.Fatalf("first PushAllRefs: %v", err)
+	}
+	if err := c.PushAllRefs(); err != nil {
+		t.Errorf("second PushAllRefs (no-op) should succeed, got: %v", err)
+	}
 }
 
 func TestPushWithVerify_OK(t *testing.T) {

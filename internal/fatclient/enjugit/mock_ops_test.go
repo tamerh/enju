@@ -323,6 +323,11 @@ func (f *fakeOps) Push(branch string) error {
 	return f.checkErr("Push")
 }
 
+func (f *fakeOps) PushAllRefs() error {
+	f.record("PushAllRefs")
+	return f.checkErr("PushAllRefs")
+}
+
 func (f *fakeOps) PushWithVerify(branch, expected string) error {
 	f.record("PushWithVerify", branch, expected)
 	return f.checkErr("PushWithVerify")
@@ -336,6 +341,11 @@ func (f *fakeOps) Fetch() error {
 func (f *fakeOps) EnsureOrigin(url string) error {
 	f.record("EnsureOrigin", url)
 	return f.checkErr("EnsureOrigin")
+}
+
+func (f *fakeOps) RemoveOrigin() error {
+	f.record("RemoveOrigin")
+	return f.checkErr("RemoveOrigin")
 }
 
 func (f *fakeOps) FetchBranch(branch string) error {
