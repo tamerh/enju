@@ -40,8 +40,8 @@ import (
 // Falls back to ~/.enju/state/ only when no workspace is
 // configured (local-only / legacy callers).
 func (s *FatClient) StateDir() string {
-	if s.project != nil {
-		return filepath.Join(s.project.RootDir(), ".state")
+	if s.enjugit != nil {
+		return filepath.Join(s.enjugit.RootDir(), ".state")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
