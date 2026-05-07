@@ -28,6 +28,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // cursorsFormatVersion tracks the on-disk schema for cursor files.
@@ -83,7 +84,7 @@ func advanceCursorIfConfigured(projectID int64, stateDir, branch, sha string) {
 // an `Enju-Task-Complete` trailer; commits without it are skipped.
 type CommitTrailer struct {
 	CommitSHA string
-	Trailers  EnjuTrailers
+	Trailers  enjugit.EnjuTrailers
 }
 
 // FetchBranch updates `refs/remotes/origin/<branch>` from the
@@ -139,7 +140,7 @@ func (p *Clone) FetchBranch(branch string) error {
 // walk.
 func (p *Clone) ScanBranchSince(branch, since string) (newTip string, found []CommitTrailer, err error) {
 	tip, gerr := p.gitClone.ScanBranchSince(p.resolveBranch(branch), since, func(sha, message string) {
-		t := ParseEnjuTrailers(message)
+		t := enjugit.ParseEnjuTrailers(message)
 		if t.TaskID != "" {
 			found = append(found, CommitTrailer{
 				CommitSHA: sha,

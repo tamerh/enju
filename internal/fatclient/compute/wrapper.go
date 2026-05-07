@@ -30,6 +30,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/gitignore"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -507,7 +508,7 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		// async reconcile path can see them too.
 		ArtifactPaths: committedPaths,
 		Branch:        spec.Branch,
-		Trailers: project.EnjuTrailers{
+		Trailers: enjugit.EnjuTrailers{
 			TaskID:             spec.TaskID,
 			ExitCode:           0,
 			ExitSet:            true,

@@ -1050,7 +1050,7 @@ type SubmitRequest struct {
 	// Compute tasks populate Trailers.ExitSet/ExitCode/
 	// DurationSeconds; answer/review/vote submits leave those
 	// zero and just get the task-complete trailer.
-	Trailers EnjuTrailers
+	Trailers enjugit.EnjuTrailers
 
 	// ProjectID, if nonzero, pairs with StateDir to auto-
 	// advance the fat-client's scan cursor past the commit
@@ -1313,7 +1313,7 @@ func (p *Clone) ResetWorktreeToCleanState() error {
 // stable key for mapping post-rebase SHAs back to the
 // originating submit entry.
 func extractTaskIDTrailer(msg string) string {
-	prefix := TrailerTaskComplete + ":"
+	prefix := enjugit.TrailerTaskComplete + ":"
 	for _, line := range strings.Split(msg, "\n") {
 		// HasPrefix on the trimmed line so the match is a
 		// real trailer, not a body mention. A commit whose
@@ -2581,7 +2581,7 @@ func countCommitsBetween(from *object.Commit, until string) int {
 //	Task {taskID} by @{username}: result + N artifact(s)
 //
 //	Artifacts: path1, path2, ...
-func buildCommitMessage(taskID, username string, artifactPaths []string, modelName string, trailers EnjuTrailers) string {
+func buildCommitMessage(taskID, username string, artifactPaths []string, modelName string, trailers enjugit.EnjuTrailers) string {
 	var subject string
 	if len(artifactPaths) == 0 {
 		subject = fmt.Sprintf("Task %s by @%s: result", taskID, username)
@@ -2601,7 +2601,7 @@ func buildCommitMessage(taskID, username string, artifactPaths []string, modelNa
 		trailerLines = append(trailerLines, aiCoAuthor(modelName))
 		trailerLines = append(trailerLines, "AI-Model: "+modelName)
 	}
-	if rendered := RenderEnjuTrailers(trailers); rendered != "" {
+	if rendered := enjugit.RenderEnjuTrailers(trailers); rendered != "" {
 		trailerLines = append(trailerLines, rendered)
 	}
 	if len(trailerLines) > 0 {
