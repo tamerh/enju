@@ -17,7 +17,6 @@ import (
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // ErrNoCloneSource indicates a project has neither a remote_url
@@ -157,41 +156,27 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 		source = barePath
 	}
 
-	proj, err := s.project.OpenBotCloneAt(projectID, clonePath, source)
+	if s.enjugit == nil {
+		return "", fmt.Errorf("no workspace configured")
+	}
+	wf, err := s.enjugit.OpenBotCloneAt(projectID, clonePath, source)
 	if err != nil {
 		return "", err
 	}
 
-	// Stash the resolved clone keyed by projectID so subsequent
-	// OpenProject calls inside this FatClient (claim, submit,
+	// Stash the resolved Workflow keyed by projectID so subsequent
+	// OpenWorkflow calls inside this FatClient (claim, submit,
 	// reset) route to the bot clone instead of the operator-side
 	// ForProject lookup. One FatClient = one citizen, so a
-	// project-keyed map is sufficient — there's no scenario in
-	// which the same FatClient resolves multiple bot identities
-	// for the same project.
+	// project-keyed map is sufficient.
 	s.botClonesMu.Lock()
-	if s.botClones == nil {
-		s.botClones = make(map[int64]*project.Clone)
+	if s.botWorkflows == nil {
+		s.botWorkflows = make(map[int64]*enjugit.Workflow)
 	}
-	s.botClones[projectID] = proj
-	// Mirror into the enjugit stash so OpenWorkflow routes to the
-	// same per-bot tree. Falls back silently if enjugit isn't
-	// configured (test fixtures with project-only setup).
-	if s.enjugit != nil {
-		wf, werr := s.enjugit.OpenBotCloneAt(projectID, clonePath, source)
-		if werr == nil {
-			if s.botWorkflows == nil {
-				s.botWorkflows = make(map[int64]*enjugit.Workflow)
-			}
-			s.botWorkflows[projectID] = wf
-		} else {
-			s.logger.Warn("enjugit bot clone open failed; new-API call sites for this project unavailable",
-				"project_id", projectID, "error", werr)
-		}
-	}
+	s.botWorkflows[projectID] = wf
 	s.botClonesMu.Unlock()
 
-	return proj.WorkDir(), nil
+	return wf.WorkDir(), nil
 }
 
 // EnsureBotPushTarget makes sure the project has a non-working-
@@ -310,54 +295,16 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 	return barePath, wasFresh, nil
 }
 
-// OpenProject fetches project metadata, opens the workspace
-// clone, AND wires the project's default_branch into the
-// Project so Pull/Push fallback paths target the right ref.
-// Every call site that pairs FetchProjectMetaFull +
-// project.ForProject should use this helper instead.
-func (s *FatClient) OpenProject(ctx context.Context, projectID int64) (proj *project.Clone, remoteURL, projName, defaultBranch string, err error) {
-	if s.project == nil {
-		return nil, "", "", "", fmt.Errorf("no workspace configured")
-	}
-	remoteURL, projName, defaultBranch, err = s.FetchProjectMetaExpanded(ctx, projectID)
-	if err != nil {
-		return nil, "", "", "", err
-	}
-
-	// Bot path: if ResolveBotWorkspace stashed a per-bot clone
-	// for this project, use it. Routes claim / submit / reset to
-	// the bot's own working tree at <project>/enju/bots/<bot>/clone/
-	// instead of the operator's adopted dir. Without this lookup,
-	// a daemon's submit would fall through to ForProject and
-	// land on the operator's tree — the legacy "shared bot
-	// clone" failure mode.
-	s.botClonesMu.Lock()
-	cached := s.botClones[projectID]
-	s.botClonesMu.Unlock()
-	if cached != nil {
-		cached.SetDefaultBranch(defaultBranch)
-		return cached, remoteURL, projName, defaultBranch, nil
-	}
-
-	proj, err = s.project.ForProject(projectID, remoteURL, projName)
-	if err != nil {
-		return nil, remoteURL, projName, defaultBranch, err
-	}
-	proj.SetDefaultBranch(defaultBranch)
-	return proj, remoteURL, projName, defaultBranch, nil
-}
-
-// OpenWorkflow is the enjugit-side analog of OpenProject:
-// fetches project metadata, opens (or reuses the bot stash for)
-// the workspace clone, and pre-configures the Workflow with
-// the project's default branch so subsequent template / submit
+// OpenWorkflow fetches project metadata, opens (or reuses the bot
+// stash for) the workspace clone, and pre-configures the Workflow
+// with the project's default branch so subsequent template / submit
 // verbs target the right ref. Every call site that pairs
 // FetchProjectMetaExpanded + enjugit.ForProject should use this
 // helper instead.
 //
-// Returns ErrNoWorkspace when no enjugit workspace is configured
-// (test fixture without local fs). Errors from the underlying
-// open propagate as-is.
+// Returns an error when no enjugit workspace is configured (test
+// fixtures without a local fs). Errors from the underlying open
+// propagate as-is.
 func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enjugit.Workflow, remoteURL, projName, defaultBranch string, err error) {
 	if s.enjugit == nil {
 		return nil, "", "", "", fmt.Errorf("no workspace configured")
@@ -368,8 +315,10 @@ func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enju
 	}
 
 	// Bot path: ResolveBotWorkspace stashed a per-bot Workflow
-	// for this project — route to it. Mirrors OpenProject's
-	// botClones lookup.
+	// for this project — route to it. Without this lookup, a
+	// daemon's claim/submit would fall through to enjugit.ForProject
+	// and land on the operator's tree (the legacy "shared bot
+	// clone" failure mode).
 	s.botClonesMu.Lock()
 	cached := s.botWorkflows[projectID]
 	s.botClonesMu.Unlock()

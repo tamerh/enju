@@ -87,25 +87,17 @@ type FatClient struct {
 	profileEmail string
 	profileKind  string
 
-	// botClones holds bot-resolved clones keyed by projectID.
-	// Populated by ResolveBotWorkspace; consulted by OpenProject
+	// botWorkflows holds bot-resolved Workflows keyed by projectID.
+	// Populated by ResolveBotWorkspace; consulted by OpenWorkflow
 	// so subsequent submit / claim / reset calls within the bot
-	// daemon route to its own clone instead of falling through
-	// to the operator-side ForProject lookup. One FatClient =
-	// one citizen identity, so a single map covers every project
-	// the daemon polls without bleeding across bot identities.
+	// daemon route to its own clone instead of falling through to
+	// the operator-side ForProject lookup. One FatClient = one
+	// citizen identity, so a single map covers every project the
+	// daemon polls without bleeding across bot identities.
 	//
-	// Operator-side FatClients leave this nil and OpenProject
+	// Operator-side FatClients leave this nil and OpenWorkflow
 	// flows to the operator's working tree as before.
-	botClonesMu sync.Mutex
-	botClones   map[int64]*project.Clone
-
-	// botWorkflows mirrors botClones for the new enjugit-based
-	// path. Populated by ResolveBotWorkspace alongside botClones
-	// so OpenWorkflow (the enjugit-side analog of OpenProject)
-	// routes to the same per-bot clone that the project path
-	// uses. Two maps until the project package is fully retired;
-	// at that point this collapses to one.
+	botClonesMu  sync.Mutex
 	botWorkflows map[int64]*enjugit.Workflow
 }
 
