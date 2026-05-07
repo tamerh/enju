@@ -431,7 +431,7 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 	}
 	// For init'd projects, surface both the workspace path and
 	// the actual git origin URL when they differ.
-	if gitOrigin := proj.GitOriginURL(); gitOrigin != "" && gitOrigin != remoteURL {
+	if gitOrigin := proj.GitClone().RemoteURL(); gitOrigin != "" && gitOrigin != remoteURL {
 		resp["workspace"] = remoteURL
 		resp["remote_url"] = gitOrigin
 	}

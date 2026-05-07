@@ -736,23 +736,6 @@ func (p *Clone) GitClone() *enjugit.SharedClone { return p.gitClone }
 // for local-only clones.
 func (p *Clone) RemoteURL() string { return p.remoteURL }
 
-// GitOriginURL returns the URL of the "origin" remote from the git
-// config, or empty if no origin is configured. For init'd projects,
-// this is the actual push target (e.g. git@github.com:org/repo.git),
-// which may differ from RemoteURL() (the local folder path stored
-// on the coordinator).
-func (p *Clone) GitOriginURL() string {
-	rem, err := p.repo.Remote("origin")
-	if err != nil {
-		return ""
-	}
-	cfg := rem.Config()
-	if cfg == nil || len(cfg.URLs) == 0 {
-		return ""
-	}
-	return cfg.URLs[0]
-}
-
 // Lock acquires the per-project write mutex AND the on-disk
 // flock. Callers performing a sequence of WriteFile + Commit +
 // Push operations must hold this across the whole sequence so
@@ -2367,7 +2350,7 @@ func (p *Clone) CompareToRemote() (*RemoteComparison, error) {
 	// confusing UX for a healthy local-only project. Report
 	// RemoteNoRemote instead so the user-facing answer matches
 	// the actual git state.
-	if p.GitOriginURL() == "" {
+	if p.gitClone.RemoteURL() == "" {
 		r.Status = RemoteNoRemote
 		return r, nil
 	}
