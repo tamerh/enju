@@ -414,10 +414,10 @@ func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
 // optional last_push_*, optional remote_error). Returns the
 // no-remote payload directly when the project has no remote URL.
 func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("remote status is only available in MCP client mode")
 	}
-	proj, remoteURL, _, _, err := s.OpenProject(ctx, projectID)
+	wf, remoteURL, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -429,17 +429,13 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 		resp["status"] = string(enjugit.AggregateNoRemote)
 		return resp, nil
 	}
-	wf, _, _, _, werr := s.OpenWorkflow(ctx, projectID)
-	if werr != nil {
-		return nil, fmt.Errorf("opening workflow: %w", werr)
-	}
 	cmp, err := wf.CompareDefaultBranch("")
 	if err != nil {
 		return nil, fmt.Errorf("comparing to remote: %w", err)
 	}
 	// For init'd projects, surface both the workspace path and
 	// the actual git origin URL when they differ.
-	if gitOrigin := proj.GitClone().RemoteURL(); gitOrigin != "" && gitOrigin != remoteURL {
+	if gitOrigin := wf.RemoteURL(); gitOrigin != "" && gitOrigin != remoteURL {
 		resp["workspace"] = remoteURL
 		resp["remote_url"] = gitOrigin
 	}
@@ -451,15 +447,14 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 	if cmp.Unreachable != "" {
 		resp["remote_error"] = cmp.Unreachable
 	}
-	gc := proj.GitClone()
-	t := gc.LastPushAt()
+	t := wf.LastPushAt()
 	if t.IsZero() {
-		t = gc.HeadCommitTime()
+		t = wf.HeadCommitTime()
 	}
 	if !t.IsZero() {
 		resp["last_push_at"] = t.Format(time.RFC3339)
 	}
-	if e := gc.LastPushError(); e != "" {
+	if e := wf.LastPushError(); e != "" {
 		resp["last_push_error"] = e
 	}
 	return resp, nil
@@ -470,18 +465,16 @@ func (s *FatClient) RemoteStatusReport(ctx context.Context, projectID int64) (ma
 // CompareToRemote (refuse diverged state without force), push.
 // Returns the response payload the formatter renders.
 func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("project sync is only available in MCP client mode")
 	}
-	proj, remoteURL, _, _, err := s.OpenProject(ctx, projectID)
+	wf, remoteURL, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	if remoteURL == "" {
 		return nil, fmt.Errorf("project has no remote configured")
 	}
-	proj.Lock()
-	defer proj.Unlock()
 
 	resp := map[string]interface{}{
 		"project_id": projectID,
@@ -489,10 +482,6 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		"force":      force,
 	}
 
-	wf, _, _, _, werr := s.OpenWorkflow(ctx, projectID)
-	if werr != nil {
-		return nil, fmt.Errorf("opening workflow: %w", werr)
-	}
 	cmp, cmpErr := wf.CompareDefaultBranch("")
 	if cmpErr == nil && cmp != nil {
 		resp["status"] = string(cmp.Status)
@@ -522,7 +511,7 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 		}
 	}
 
-	pushErr := proj.GitClone().PushAllRefs(force)
+	pushErr := wf.PushAllRefs(force)
 	if pushErr != nil {
 		resp["result"] = "failed"
 		resp["error"] = pushErr.Error()

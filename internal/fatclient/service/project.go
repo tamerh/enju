@@ -53,14 +53,14 @@ func (s *FatClient) FetchProjectMetaFull(ctx context.Context, projectID int64) (
 // webui directly. Bot flows MUST NOT use this — see
 // ResolveBotWorkspace below.
 func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64) (string, error) {
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return "", err
 	}
-	if proj == nil {
+	if wf == nil {
 		return "", fmt.Errorf("no workspace project for project_id=%d", projectID)
 	}
-	return proj.WorkDir(), nil
+	return wf.WorkDir(), nil
 }
 
 // ResolveBotWorkspace returns the absolute path to the bot's
@@ -466,13 +466,11 @@ func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int
 	// so the stash is populated; the existing daemon flow
 	// (runOnce → ResolveBotWorkspace → ClaimTask → reset) honors
 	// that ordering.
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return err
 	}
-	proj.Lock()
-	defer proj.Unlock()
-	return proj.GitClone().ResetClean()
+	return wf.ResetCleanWorktree()
 }
 
 // FetchAllRefsForBot brings every remote branch's refs +
@@ -516,12 +514,10 @@ func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64,
 	if branch == "" {
 		return fmt.Errorf("branch is required")
 	}
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return err
 	}
-	proj.Lock()
-	defer proj.Unlock()
 	// baseBranch matters for the create-new path: when the topic
 	// doesn't yet exist locally (iter-N bumped after a terminal
 	// reject/invalidate), CheckoutBranchFrom needs a fork base
@@ -532,7 +528,7 @@ func (s *FatClient) CheckoutTopicBranchTip(ctx context.Context, projectID int64,
 	// pass meta.Branch (run branch) so brand-new topics land on
 	// the run-branch tip; existing-topic checkouts ignore
 	// baseBranch (the existing-ref short-circuit fires first).
-	return proj.GitClone().CheckoutBranchFrom(branch, baseBranch, proj.DefaultBranch())
+	return wf.CheckoutBranchFrom(branch, baseBranch)
 }
 
 // WipeDeclaredWrites removes every file matching the task's
@@ -572,11 +568,11 @@ func (s *FatClient) WipeDeclaredWrites(ctx context.Context, projectID int64, wri
 	if len(writes) == 0 {
 		return nil
 	}
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return err
 	}
-	return wipeDeclaredWritesInDir(proj.WorkDir(), writes)
+	return wipeDeclaredWritesInDir(wf.WorkDir(), writes)
 }
 
 // wipeDeclaredWritesInDir is the pure-function core of

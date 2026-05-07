@@ -2,6 +2,7 @@ package enjugit
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
@@ -103,6 +104,47 @@ func (w *Workflow) WorkDir() string {
 // ProjectID returns the project ID this Workflow operates on.
 // Used by service callers that need to log alongside coord ops.
 func (w *Workflow) ProjectID() int64 { return w.projID }
+
+// RemoteURL returns the on-disk origin URL ("" if no origin
+// configured). Used by sync-status surfaces that want to render the
+// real git remote alongside the coord-tracked workspace path.
+// Returns "" when the underlying git.Ops doesn't expose a clone
+// (test fakes).
+func (w *Workflow) RemoteURL() string {
+	if c, ok := w.git.(*git.Clone); ok {
+		return c.RemoteURL()
+	}
+	return ""
+}
+
+// LastPushAt returns the timestamp of the most recent successful
+// push from this clone, or zero if none yet. Used by remote-status
+// UX. Returns zero when the underlying git.Ops isn't a *git.Clone.
+func (w *Workflow) LastPushAt() time.Time {
+	if c, ok := w.git.(*git.Clone); ok {
+		return c.LastPushAt()
+	}
+	return time.Time{}
+}
+
+// LastPushError returns the most recent push error string ("" if
+// the last push succeeded or none yet). Used by remote-status UX.
+func (w *Workflow) LastPushError() string {
+	if c, ok := w.git.(*git.Clone); ok {
+		return c.LastPushError()
+	}
+	return ""
+}
+
+// HeadCommitTime returns the author timestamp of HEAD's commit,
+// or zero if HEAD is unset / unreadable. Used as a fallback for
+// "when was this clone last touched" when no push has happened.
+func (w *Workflow) HeadCommitTime() time.Time {
+	if c, ok := w.git.(*git.Clone); ok {
+		return c.HeadCommitTime()
+	}
+	return time.Time{}
+}
 
 // Conventions returns the conventions this workflow was built
 // with. Useful for diagnostic surfaces that want to render the
