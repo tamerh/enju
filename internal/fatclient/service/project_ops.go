@@ -24,7 +24,6 @@ import (
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -578,9 +577,9 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 	// place for the next attempt).
 	if branches, lerr := wf.LocalBranches(); lerr == nil {
 		stateDir := s.StateDir()
-		cursorMu := project.CursorMutexFor(stateDir, projectID)
+		cursorMu := enjugit.CursorMutexFor(stateDir, projectID)
 		cursorMu.Lock()
-		cursors, _ := project.LoadCursors(stateDir, projectID)
+		cursors, _ := enjugit.LoadCursors(stateDir, projectID)
 		for _, b := range branches {
 			cursors.Set(b, enjugit.RescanSentinelSHA)
 		}

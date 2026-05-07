@@ -1885,7 +1885,7 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// local branch — main and run-1. Without this, the next
 	// scan would baseline tip and miss the historical trailer
 	// commit on run-1.
-	cursors, err := project.LoadCursors(c.fc.StateDir(), 2)
+	cursors, err := enjugit.LoadCursors(c.fc.StateDir(), 2)
 	if err != nil {
 		t.Fatalf("loading cursors: %v", err)
 	}
