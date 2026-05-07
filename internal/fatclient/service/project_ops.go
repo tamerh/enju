@@ -23,8 +23,9 @@ import (
 	"time"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/projectreg"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -571,7 +572,7 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 		cursorMu.Lock()
 		cursors, _ := project.LoadCursors(stateDir, projectID)
 		for _, b := range branches {
-			cursors.Set(b, project.RescanSentinelSHA)
+			cursors.Set(b, enjugit.RescanSentinelSHA)
 		}
 		if serr := cursors.Save(); serr != nil {
 			s.logger.Warn("set_project_remote: cursor reset save failed",
