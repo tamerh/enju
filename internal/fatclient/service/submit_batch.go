@@ -9,14 +9,18 @@ package service
 //
 // Lives next to submit.go because every helper here either
 // composes prepareFatSubmit or mirrors SubmitTaskResult's
-// post-prepare flow with the push step coalesced.
+// post-prepare flow with the push step coalesced. The actual
+// git work is delegated to enjugit.Workflow.SubmitBatch which
+// owns the lock / loop-commit / coalesced-push / trailer-scan
+// sequence under one structured-diagnostics trace.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // SubmitBatchEntry is one entry in the batch submission input.
@@ -65,20 +69,35 @@ type SubmitBatchResult struct {
 	AnySuccess bool
 }
 
-// SubmitResultsBatch is the bulk-submit composition. Validates
-// each entry, then loops prepareFatSubmit → loops PrepareCommit
-// under one lock → single PushPendingCommits → CommitSHAsByTaskID
-// to remap post-rebase SHAs → per-entry coordinator report.
-// Legacy coordinator-writes projects (no remote_url) fall back
-// to per-entry submit calls in the same loop — they have no
-// local git step to coalesce.
+// SubmitResultsBatch is the bulk-submit composition. Per entry:
+// validate + prepareFatSubmit. Then one Workflow.SubmitBatch
+// covers loop-commit + per-branch push (with verify) + per-
+// branch trailer scan under one lock. Then a per-entry
+// coordinator POST loop. Legacy coordinator-writes projects
+// (no remote_url) fall back to per-entry submit calls in the
+// same loop — they have no local git step to coalesce.
 //
-// Failure semantics: best-effort within the batch. A mid-loop
-// PrepareCommit failure triggers a hard reset of the branch
-// back to the pre-batch HEAD so orphan commits don't accumulate
-// on retry. A push failure surfaces for every entry. A
-// coordinator-POST failure on a single entry leaves that entry
-// in error while subsequent entries still attempt.
+// Behavioural parity with single-submit (SubmitTaskResult):
+//   - PushWithVerify catches the silent "commit reported but
+//     never landed in bare" failure (TP53 Bug 1).
+//   - ErrSubmitVerify is unpacked and reported as a
+//     push_verify_failed audit event so it shows in run_status
+//     and the event log.
+//   - TouchProject ticks the project's last-write timestamp
+//     after any successful entry so projectreg cache
+//     invalidation matches single-submit.
+//
+// Failure semantics: best-effort within the batch.
+//   - prepareFatSubmit failure on one entry leaves it in error
+//     and continues with the rest.
+//   - Mid-loop commit failure inside SubmitBatch hard-resets
+//     the branch back to pre-batch HEAD; the failed entry
+//     surfaces a *WorkflowOpError with step trace; later
+//     entries surface a generic "rolled back" message.
+//   - Push failure inside SubmitBatch flags every committed
+//     entry with the same push error; commits stay local.
+//   - Coordinator-POST failure on a single entry leaves that
+//     entry in error while subsequent entries still attempt.
 //
 // All structural validation (cross-project, cross-run, intra-
 // batch dependency conflicts, action-specific field presence)
@@ -108,6 +127,7 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 	results := make([]SubmitBatchEntryResult, len(loaded))
 	var prepared []*preparedFatSubmit
 	preparedIdx := make([]int, 0, len(loaded))
+	var submitReqs []enjugit.SubmitRequest
 	for i, bc := range loaded {
 		e := bc.entry
 		// Legacy coordinator-writes path (no fat client) has
@@ -145,132 +165,94 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 		}
 		prepared = append(prepared, prep)
 		preparedIdx = append(preparedIdx, i)
+		submitReqs = append(submitReqs, buildBatchSubmitRequest(prep, e))
 	}
 
 	if len(prepared) > 0 {
-		// Every prepared entry shares the same project (scope
-		// check enforced by the handler) and branch (same
-		// run). Grab from the first.
-		proj := prepared[0].Project
-		branch := prepared[0].Meta.Branch
+		// All prepared entries share one project (handler
+		// enforces single-project scope), but may target
+		// different branches — answer/develop tasks each have
+		// their own per-iteration topic, vote/review tasks
+		// land on the run branch directly. enjugit.SubmitBatch
+		// groups by effective branch internally and processes
+		// one group at a time inside the lock.
+		wf := prepared[0].Workflow
+		batchRes, batchErr := wf.SubmitBatch(submitReqs)
 
-		proj.Lock()
-		// Snapshot the pre-batch HEAD so a mid-loop
-		// PrepareCommit failure can roll back the K already-
-		// committed entries. Without this rollback the local
-		// branch carries K unpushed commits; a retry appends
-		// another K' with the same Enju-Task-Complete
-		// trailers, leaving the history with duplicate
-		// task-id trailers that CommitSHAsByTaskID then
-		// papers over (newest wins). The orphan commits stay
-		// on the branch and show up in `git log`, which is
-		// confusing even though it's not corrupting.
-		preBatchHead, headErr := proj.HeadHash()
-		if headErr != nil {
-			// Workspace has no HEAD yet (fresh clone, before
-			// any commit). Leave preBatchHead empty; the
-			// reset path below is a no-op in that case.
-			preBatchHead = ""
-		}
-		commitErr := ""
-		taskIDs := make([]string, 0, len(prepared))
-		for _, prep := range prepared {
-			if _, err := proj.PrepareCommit(project.SubmitRequest{
-				TaskID:        prep.TaskID,
-				Username:      s.Username(),
-				AuthorName:    prep.AuthorName,
-				AuthorEmail:   prep.AuthorEmail,
-				ModelName:     prep.EffectiveModel,
-				Files:         prep.Files,
-				ArtifactPaths: prep.ArtifactPaths,
-				Branch:        branch,
-				Trailers: project.EnjuTrailers{
-					// Untracked-artifact trailer keeps the async
-					// reconcile path on the consumer side aware
-					// of declared-but-not-committed paths — same
-					// shape as the single-submit and compute
-					// paths.
-					UntrackedArtifacts: prep.UntrackedArtifactPaths,
-				},
-			}); err != nil {
-				commitErr = fmt.Sprintf("writing commit for %s to local clone: %v", prep.TaskID, err)
-				break
+		// Build a quick lookup branch → final HEAD SHA so the
+		// per-entry coord-report fallback (when trailer scan
+		// missed an entry) and the scan-cursor advance can use
+		// it without re-walking the Branches slice.
+		branchHeads := map[string]string{}
+		if batchRes != nil {
+			for _, b := range batchRes.Branches {
+				branchHeads[b.Name] = b.FinalHeadSHA
 			}
-			taskIDs = append(taskIDs, prep.TaskID)
 		}
 
-		// If a prepare failed mid-loop, roll the branch back
-		// to the pre-batch HEAD so the partial commit chain
-		// doesn't persist as orphan commits. A subsequent
-		// retry re-prepares from a clean state; no duplicate
-		// Enju-Task-Complete trailers in `git log`.
-		if commitErr != "" {
-			if preBatchHead != "" && len(taskIDs) > 0 {
-				if rerr := proj.ResetBranchToHash(preBatchHead); rerr != nil {
-					s.logger.Warn("batch rollback: hard-reset after prepare failure",
-						"error", rerr, "head", preBatchHead, "failed_at", commitErr)
-				}
-			}
-			proj.Unlock()
+		switch {
+		case batchErr != nil && batchRes == nil:
+			// Hard pre-flight failure (empty reqs, validation,
+			// etc.). Mark every prepared entry with the error.
 			for _, idx := range preparedIdx {
-				if results[idx].Status == "" {
-					results[idx] = SubmitBatchEntryResult{TaskID: loaded[idx].entry.TaskID, Status: "error", Message: commitErr}
+				results[idx] = SubmitBatchEntryResult{
+					TaskID:  loaded[idx].entry.TaskID,
+					Status:  "error",
+					Message: "batch failed: " + batchErr.Error(),
 				}
 			}
-		} else {
-			_, finalHeadSHA, pushErr := proj.PushPendingCommits(branch, 3)
-			var shaByTask map[string]string
-			if pushErr == nil {
-				shaByTask, _ = proj.CommitSHAsByTaskID(taskIDs, len(taskIDs)*2+16)
+		case batchErr != nil:
+			// Mid-loop commit failure (rollback fired) OR push
+			// failure. Per-entry Err is set on every Attempted
+			// entry that was rolled back, on the failed entry
+			// itself, and on the failed branch's entries on
+			// push fail. Entries on already-pushed branches
+			// (multi-branch batch + later push fail) keep Err
+			// nil and are still successes — render those as
+			// "accepted" with the post-push report.
+			for k, prep := range prepared {
+				idx := preparedIdx[k]
+				e := batchRes.Entries[k]
+				// Push-verify failure on this entry's branch:
+				// post the same audit event single-submit does
+				// so the run_status / event log can see it.
+				// Match single-submit's nil-checks: project_id +
+				// run_seq must be present to route the event.
+				var verifyErr *enjugit.ErrSubmitVerify
+				if e.Err != nil && errors.As(e.Err, &verifyErr) && prep.Meta != nil && prep.Meta.ProjectID > 0 && prep.Meta.RunSeq > 0 {
+					s.reportPushVerifyFailed(ctx, prep.Meta.ProjectID, int64(prep.Meta.RunSeq),
+						prep.TaskID, verifyErr.Branch, verifyErr.LocalSHA, verifyErr.RemoteSHA, "")
+				}
+				switch {
+				case e.Err != nil:
+					results[idx] = SubmitBatchEntryResult{
+						TaskID: prep.TaskID, Status: "error",
+						Message: e.Err.Error(),
+					}
+				case !e.Attempted:
+					results[idx] = SubmitBatchEntryResult{
+						TaskID: prep.TaskID, Status: "error",
+						Message: "rolled back due to earlier batch failure",
+					}
+				default:
+					// Committed AND its branch pushed (a sibling
+					// branch failed later). Report this entry to
+					// coord as a success.
+					results[idx] = s.reportBatchEntryToCoord(ctx, prep, e, branchHeads)
+				}
 			}
-			proj.Unlock()
-
-			// If the push failed, every entry in the batch
-			// reports that same error — none reached the
-			// coordinator. Local commits stay in the reflog
-			// for a manual retry.
-			if pushErr != nil {
-				for k, prep := range prepared {
-					results[preparedIdx[k]] = SubmitBatchEntryResult{
-						TaskID:  prep.TaskID,
-						Status:  "error",
-						Message: "pushing coalesced batch commits: " + pushErr.Error(),
-					}
+		default:
+			// Success path: every branch landed. Advance scan
+			// cursor per branch, then per-entry coord report
+			// (which also drives accept-cascade auto-merges).
+			for _, b := range batchRes.Branches {
+				if b.FinalHeadSHA != "" {
+					enjugit.AdvanceScanCursor(prepared[0].Meta.ProjectID, s.StateDir(), b.Name, b.FinalHeadSHA)
 				}
-			} else {
-				// Advance the scan cursor once to the final
-				// HEAD — covers all N commits we just pushed.
-				s.advanceScanCursor(prepared[0].Meta.ProjectID, branch, finalHeadSHA)
-				// Report each entry to the coordinator with
-				// its post-rebase SHA (same as local if no
-				// rebase happened).
-				for k, prep := range prepared {
-					sha := shaByTask[prep.TaskID]
-					if sha == "" {
-						// Fallback — shouldn't happen because
-						// every commit carries the Enju-Task-
-						// Complete trailer, but be defensive:
-						// report HEAD so the coordinator gets
-						// *some* valid SHA rather than an
-						// empty one it rejects.
-						sha = finalHeadSHA
-					}
-					prep.ReportBody["commit_sha"] = sha
-					data, err := s.coord.Post(ctx, "/api/v1/tasks/"+prep.TaskID+"/result", prep.ReportBody)
-					if err != nil {
-						results[preparedIdx[k]] = SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: "reporting commit: " + err.Error()}
-						continue
-					}
-					if errMsg := extractErrorString(data); errMsg != "" {
-						results[preparedIdx[k]] = SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: DecorateCoordinatorRejection(errMsg)}
-						continue
-					}
-					// Stash the response body in Message so
-					// the formatter can render the per-entry
-					// detail; the per-entry formatter uses
-					// format.SubmitResult on this string.
-					results[preparedIdx[k]] = SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "accepted", Message: string(data)}
-				}
+			}
+			for k, prep := range prepared {
+				idx := preparedIdx[k]
+				results[idx] = s.reportBatchEntryToCoord(ctx, prep, batchRes.Entries[k], branchHeads)
 			}
 		}
 	}
@@ -282,7 +264,107 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 			break
 		}
 	}
+	// TouchProject ticks the projectreg's last-write timestamp
+	// for cache invalidation. Mirrors the single-submit path's
+	// post-success TouchProject call. Handler contract
+	// guarantees single-project scope, so one tick covers the
+	// whole batch — read it from the first prepared entry's
+	// meta (the legacy fallback path operates on the same
+	// project too).
+	if anySuccess && len(prepared) > 0 && prepared[0].Meta != nil && prepared[0].Meta.ProjectID > 0 {
+		s.TouchProject(prepared[0].Meta.ProjectID)
+	}
 	return &SubmitBatchResult{Entries: results, AnySuccess: anySuccess}, nil
+}
+
+// reportBatchEntryToCoord posts one batch entry's result to the
+// coordinator and drives any accept-cascade auto-merges the
+// coordinator returns. Factored out so both the success path
+// and the partial-success path (multi-branch batch where one
+// branch pushed while another failed) share the exact same
+// coord transport + auto-merge + error-rendering shape — a
+// future change to the coord-report contract touches one site,
+// not two.
+//
+// The auto-merge step matters for review-task batches: when a
+// review ACCEPTs, the coordinator's response carries an
+// `accepted_merges` array naming the topic branches to FF-merge
+// into the run branch. Without this call, the topic stays
+// stranded and the review's commit never reaches the run
+// branch — which the integration tests catch by walking the
+// bare remote's HEAD for trailer-bearing commits.
+func (s *FatClient) reportBatchEntryToCoord(ctx context.Context, prep *preparedFatSubmit, e enjugit.BatchEntryResult, branchHeads map[string]string) SubmitBatchEntryResult {
+	sha := e.CommitSHA
+	if sha == "" {
+		sha = branchHeads[e.BranchName]
+	}
+	prep.ReportBody["commit_sha"] = sha
+	data, err := s.coord.Post(ctx, "/api/v1/tasks/"+prep.TaskID+"/result", prep.ReportBody)
+	if err != nil {
+		return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: "reporting commit: " + err.Error()}
+	}
+	if errMsg := extractErrorString(data); errMsg != "" {
+		return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: DecorateCoordinatorRejection(errMsg)}
+	}
+	if mergeErr := s.applyAcceptedMerges(ctx, prep.Workflow, data); mergeErr != nil {
+		return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: "auto-merging accepted topic branch: " + mergeErr.Error()}
+	}
+	return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "accepted", Message: string(data)}
+}
+
+// buildBatchSubmitRequest composes the per-entry enjugit
+// SubmitRequest from a preparedFatSubmit + its raw entry.
+// Mirrors the request shape used by the single-submit path
+// (see submit.go's SubmitTaskResult call site) so batch and
+// single-submit produce structurally identical commits AND
+// land on the same branch (per-iteration topic branch when
+// IterationBranch is set, else the run branch). enjugit's
+// SubmitBatch supports multi-branch batches by grouping reqs
+// by effective branch internally — the service just hands it
+// the heterogeneous list.
+func buildBatchSubmitRequest(prep *preparedFatSubmit, e SubmitBatchEntry) enjugit.SubmitRequest {
+	commitBranch := prep.Meta.Branch
+	baseBranch := ""
+	if prep.Meta.IterationBranch != "" {
+		commitBranch = prep.Meta.IterationBranch
+		baseBranch = prep.Meta.Branch
+		if prep.Meta.Action == "review" && prep.Meta.UpstreamIterationBranch != "" {
+			baseBranch = prep.Meta.UpstreamIterationBranch
+		}
+	}
+	verdict := prep.Decision
+	if verdict == "" {
+		verdict = prep.Option
+	}
+	customTrailers := map[string]string{}
+	if len(prep.UntrackedArtifactPaths) > 0 {
+		customTrailers["Enju-Untracked-Artifacts"] = strings.Join(prep.UntrackedArtifactPaths, ", ")
+	}
+	return enjugit.SubmitRequest{
+		TaskID:         prep.TaskID,
+		IterSeq:        prep.Meta.IterSeq,
+		RunSeq:         prep.Meta.RunSeq,
+		RunSlug:        prep.Meta.RunSlug,
+		TaskDef:        prep.Meta.TaskDefID,
+		InstanceKey:    prep.Meta.InstanceKey,
+		RunBranch:      baseBranch,
+		BranchOverride: commitBranch,
+		Files:          prep.Files,
+		ArtifactPaths:  prep.ArtifactPaths,
+		Citizen:        enjugit.Identity{Name: prep.AuthorName, Email: prep.AuthorEmail},
+		ModelName:      prep.EffectiveModel,
+		Verdict:        verdict,
+		CustomTrailers: customTrailers,
+	}
+}
+
+// shortBatchSHA truncates a SHA for human-readable error
+// messages.
+func shortBatchSHA(sha string) string {
+	if len(sha) >= 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // submitOneForBatch executes a single batch entry through the
@@ -317,17 +399,6 @@ func (s *FatClient) submitOneForBatch(ctx context.Context, e SubmitBatchEntry, m
 		return SubmitBatchEntryResult{TaskID: e.TaskID, Status: "error", Message: res.ErrorMessage}
 	}
 	return SubmitBatchEntryResult{TaskID: e.TaskID, Status: "accepted", Message: string(res.ResponseBody)}
-}
-
-// advanceScanCursor advances the fat-client's scan cursor past
-// a pushed commit. Encapsulates the (project id, state dir,
-// branch, sha) wiring so single + batch submit share the same
-// call shape.
-func (s *FatClient) advanceScanCursor(projectID int64, branch, sha string) {
-	if sha == "" {
-		return
-	}
-	project.AdvanceScanCursor(projectID, s.StateDir(), branch, sha)
 }
 
 // IntraBatchDependencyConflict reports whether any entry's task
@@ -403,4 +474,3 @@ func CoherentBatchScope(metas []*TaskMeta) (projectID int64, runSeq int, badInde
 	}
 	return projectID, runSeq, -1, true
 }
-

@@ -16,6 +16,7 @@ import (
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -173,6 +174,21 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 		s.botClones = make(map[int64]*project.Clone)
 	}
 	s.botClones[projectID] = proj
+	// Mirror into the enjugit stash so OpenWorkflow routes to the
+	// same per-bot tree. Falls back silently if enjugit isn't
+	// configured (test fixtures with project-only setup).
+	if s.enjugit != nil {
+		wf, werr := s.enjugit.OpenBotCloneAt(projectID, clonePath, source)
+		if werr == nil {
+			if s.botWorkflows == nil {
+				s.botWorkflows = make(map[int64]*enjugit.Workflow)
+			}
+			s.botWorkflows[projectID] = wf
+		} else {
+			s.logger.Warn("enjugit bot clone open failed; new-API call sites for this project unavailable",
+				"project_id", projectID, "error", werr)
+		}
+	}
 	s.botClonesMu.Unlock()
 
 	return proj.WorkDir(), nil
@@ -329,6 +345,45 @@ func (s *FatClient) OpenProject(ctx context.Context, projectID int64) (proj *pro
 	}
 	proj.SetDefaultBranch(defaultBranch)
 	return proj, remoteURL, projName, defaultBranch, nil
+}
+
+// OpenWorkflow is the enjugit-side analog of OpenProject:
+// fetches project metadata, opens (or reuses the bot stash for)
+// the workspace clone, and pre-configures the Workflow with
+// the project's default branch so subsequent template / submit
+// verbs target the right ref. Every call site that pairs
+// FetchProjectMetaExpanded + enjugit.ForProject should use this
+// helper instead.
+//
+// Returns ErrNoWorkspace when no enjugit workspace is configured
+// (test fixture without local fs). Errors from the underlying
+// open propagate as-is.
+func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enjugit.Workflow, remoteURL, projName, defaultBranch string, err error) {
+	if s.enjugit == nil {
+		return nil, "", "", "", fmt.Errorf("no workspace configured")
+	}
+	remoteURL, projName, defaultBranch, err = s.FetchProjectMetaExpanded(ctx, projectID)
+	if err != nil {
+		return nil, "", "", "", err
+	}
+
+	// Bot path: ResolveBotWorkspace stashed a per-bot Workflow
+	// for this project — route to it. Mirrors OpenProject's
+	// botClones lookup.
+	s.botClonesMu.Lock()
+	cached := s.botWorkflows[projectID]
+	s.botClonesMu.Unlock()
+	if cached != nil {
+		cached.SetDefaultBranch(defaultBranch)
+		return cached, remoteURL, projName, defaultBranch, nil
+	}
+
+	wf, err = s.enjugit.ForProject(projectID, remoteURL)
+	if err != nil {
+		return nil, remoteURL, projName, defaultBranch, err
+	}
+	wf.SetDefaultBranch(defaultBranch)
+	return wf, remoteURL, projName, defaultBranch, nil
 }
 
 // FetchProjectMetaExpanded returns remote_url + name +

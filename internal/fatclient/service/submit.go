@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/common/types"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
@@ -155,35 +156,48 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	if verdict == "" {
 		verdict = prep.Option
 	}
-	prep.Project.Lock()
-	submitRes, err := prep.Project.SubmitTaskResult(project.SubmitRequest{
-		TaskID:        prep.TaskID,
-		Username:      s.Username(),
-		AuthorName:    prep.AuthorName,
-		AuthorEmail:   prep.AuthorEmail,
-		ModelName:     prep.EffectiveModel,
-		Files:         prep.Files,
-		ArtifactPaths: prep.ArtifactPaths,
-		Branch:        commitBranch,
-		BaseBranch:    baseBranch,
-		ProjectID:     prep.Meta.ProjectID,
-		StateDir:      s.StateDir(),
-		Trailers: project.EnjuTrailers{
-			TaskID:             prep.TaskID,
-			Verdict:            verdict,
-			IterSeq:            prep.Meta.IterSeq,
-			UntrackedArtifacts: prep.UntrackedArtifactPaths,
-		},
+	// Untracked-artifact paths flow into commits via the
+	// Enju-Untracked-Artifacts trailer (the scanner reads it to
+	// reconcile artifacts that were declared track:false and
+	// thus not committed in the tree).
+	customTrailers := map[string]string{}
+	if len(prep.UntrackedArtifactPaths) > 0 {
+		customTrailers["Enju-Untracked-Artifacts"] = strings.Join(prep.UntrackedArtifactPaths, ", ")
+	}
+	// Branch resolution: enjugit's Conventions.BranchName composes
+	// the topic branch from RunSeq/RunSlug/TaskDef/InstanceKey/
+	// IterSeq, so we pass those fields and the workflow re-derives.
+	// commitBranch is informational only here.
+	_ = commitBranch
+	// commitBranch is the branch the commit lands on. For
+	// answer/develop topic-branch flow it's the per-iteration
+	// topic; for vote/review/legacy paths it's the run branch
+	// directly. Pass it as BranchOverride so Workflow uses it
+	// verbatim instead of re-deriving via Conventions.
+	submitRes, err := prep.Workflow.SubmitTaskResult(enjugit.SubmitRequest{
+		TaskID:         prep.TaskID,
+		IterSeq:        prep.Meta.IterSeq,
+		RunSeq:         prep.Meta.RunSeq,
+		RunSlug:        prep.Meta.RunSlug,
+		TaskDef:        prep.Meta.TaskDefID,
+		InstanceKey:    prep.Meta.InstanceKey,
+		RunBranch:      baseBranch,
+		BranchOverride: commitBranch,
+		Files:          prep.Files,
+		ArtifactPaths:  prep.ArtifactPaths,
+		Citizen:        enjugit.Identity{Name: prep.AuthorName, Email: prep.AuthorEmail},
+		ModelName:      prep.EffectiveModel,
+		Verdict:        verdict,
+		CustomTrailers: customTrailers,
 	})
-	prep.Project.Unlock()
 	if err != nil {
 		// Verify-after-push catches the production "commit
 		// reported but never landed in bare" failure mode.
-		// Before bubbling up to the caller, post a
-		// push_verify_failed audit event so the failure is
-		// visible in run_status / event log instead of buried
-		// in a daemon-only stderr.
-		var verifyErr *project.ErrPushVerifyFailed
+		// Post a push_verify_failed audit event so the failure
+		// is visible in run_status / event log instead of buried
+		// in a daemon-only stderr. errors.As against the typed
+		// *enjugit.ErrSubmitVerify gives Branch/LocalSHA/RemoteSHA.
+		var verifyErr *enjugit.ErrSubmitVerify
 		if errors.As(err, &verifyErr) {
 			runSeq := int64(0)
 			if prep.Meta != nil {
@@ -191,7 +205,7 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 			}
 			if prep.Meta != nil && prep.Meta.ProjectID > 0 && runSeq > 0 {
 				s.reportPushVerifyFailed(ctx, prep.Meta.ProjectID, runSeq, prep.TaskID,
-					verifyErr.Branch, verifyErr.LocalSHA, verifyErr.RemoteSHA, verifyErr.RemoteURL)
+					verifyErr.Branch, verifyErr.LocalSHA, verifyErr.RemoteSHA, "")
 			} else {
 				s.logger.Warn("push verify failed but no project_id/run_seq context to report",
 					"task", prep.TaskID, "branch", verifyErr.Branch,
@@ -209,7 +223,7 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	if errMsg := extractErrorString(data); errMsg != "" {
 		return &SubmitResult{ErrorMessage: DecorateCoordinatorRejection(errMsg)}
 	}
-	if err := s.applyAcceptedMerges(ctx, prep.Project, data); err != nil {
+	if err := s.applyAcceptedMerges(ctx, prep.Workflow, data); err != nil {
 		return &SubmitResult{ErrorMessage: "auto-merging accepted topic branch: " + err.Error()}
 	}
 	if prep.Meta != nil && prep.Meta.ProjectID > 0 {
@@ -228,10 +242,10 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 // go through SubmitTaskResult which composes prepare +
 // push + report into one call.
 type preparedFatSubmit struct {
-	TaskID    string
-	Meta      *TaskMeta
-	Project   *project.Clone
-	Files     []project.FileWrite
+	TaskID   string
+	Meta     *TaskMeta
+	Workflow *enjugit.Workflow
+	Files    []enjugit.FileWrite
 	// ArtifactPaths is the tracked-artifact subset of Files (paths
 	// only) — feeds the commit message body and the Enju-Artifacts
 	// trailer. Untracked paths are NOT here; they ride
@@ -350,7 +364,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		}
 	}
 
-	proj, _, _, _, err := s.OpenProject(ctx, meta.ProjectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, meta.ProjectID)
 	if err != nil {
 		return nil, err
 	}
@@ -418,11 +432,11 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		}
 	}
 
-	files := []project.FileWrite{}
+	files := []enjugit.FileWrite{}
 
 	// Single-file result path: `content` is a string blob.
 	if content != "" {
-		files = append(files, project.FileWrite{
+		files = append(files, enjugit.FileWrite{
 			RepoRelPath: filepath.Join(resultDir, "result.md"),
 			Content:     []byte(content),
 		})
@@ -461,15 +475,25 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 			}
 		}
 		if hasFileSpec {
+			// BuildNamedOutputFiles still lives in project pkg
+			// (named-output schema sub-area, deferred port).
+			// Convert at the boundary so the rest of the submit
+			// flow stays on enjugit.FileWrite.
 			outFiles, fileIndex := project.BuildNamedOutputFiles(resultDir, schema, outputs)
-			files = append(files, outFiles...)
+			for _, f := range outFiles {
+				files = append(files, enjugit.FileWrite{
+					RepoRelPath: f.RepoRelPath,
+					Content:     f.Content,
+					Mode:        f.Mode,
+				})
+			}
 			metadata["output_files"] = fileIndex
 		} else {
 			outputsBytes, err := json.MarshalIndent(outputs, "", "  ")
 			if err != nil {
 				return nil, fmt.Errorf("encoding outputs: %w", err)
 			}
-			files = append(files, project.FileWrite{
+			files = append(files, enjugit.FileWrite{
 				RepoRelPath: filepath.Join(resultDir, "result.json"),
 				Content:     outputsBytes,
 			})
@@ -480,7 +504,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	if err != nil {
 		return nil, fmt.Errorf("encoding metadata: %w", err)
 	}
-	files = append(files, project.FileWrite{
+	files = append(files, enjugit.FileWrite{
 		RepoRelPath: filepath.Join(resultDir, "metadata.json"),
 		Content:     metaBytes,
 	})
@@ -495,8 +519,8 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		}
 		sort.Strings(artifactPaths)
 		for _, p := range artifactPaths {
-			files = append(files, project.FileWrite{
-				RepoRelPath: project.ArtifactPath(p),
+			files = append(files, enjugit.FileWrite{
+				RepoRelPath: enjugit.ArtifactPath(p),
 				Content:     []byte(artifacts[p]),
 			})
 		}
@@ -514,7 +538,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	if len(untrackedPaths) > 0 {
 		var missing []string
 		for _, p := range untrackedPaths {
-			if _, statErr := os.Stat(filepath.Join(proj.WorkDir(), project.ArtifactPath(p))); statErr != nil {
+			if _, statErr := os.Stat(filepath.Join(wf.WorkDir(), enjugit.ArtifactPath(p))); statErr != nil {
 				missing = append(missing, p)
 			}
 		}
@@ -579,7 +603,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	return &preparedFatSubmit{
 		TaskID:                 taskID,
 		Meta:                   meta,
-		Project:                proj,
+		Workflow:               wf,
 		Files:                  files,
 		ArtifactPaths:          artifactPaths,
 		UntrackedArtifactPaths: untrackedPaths,
@@ -677,16 +701,16 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 // targets just performs a same-SHA push, which workspace treats
 // as already-up-to-date.
 //
-// On *project.ErrMergeConflict the merge is left aborted (run
-// branch unchanged) and we POST a merge_conflict_detected
-// report to the coordinator instead of failing the whole
-// submit. The accept stood; the audit timeline carries the
-// signal. Phase 3 of the parallel-merge work hooks that
-// coord-side report into a merge_resolve task spawn so
-// downstream is unblocked once a human (or future merge-
-// resolver bot) finishes the merge by hand.
-func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone, responseBody []byte) error {
-	if proj == nil || len(responseBody) == 0 {
+// On *enjugit.ErrConflict the merge is left aborted (run branch
+// unchanged) and we POST a merge_conflict_detected report to
+// the coordinator instead of failing the whole submit. The
+// accept stood; the audit timeline carries the signal. Phase 3
+// of the parallel-merge work hooks that coord-side report into
+// a merge_resolve task spawn so downstream is unblocked once a
+// human (or future merge-resolver bot) finishes the merge by
+// hand.
+func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflow, responseBody []byte) error {
+	if wf == nil || len(responseBody) == 0 {
 		return nil
 	}
 	var raw map[string]interface{}
@@ -709,13 +733,10 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone
 	if v, ok := raw["run_seq"].(float64); ok {
 		reportRunSeq = int64(v)
 	}
-	proj.Lock()
-	defer proj.Unlock()
 	type mergeReport struct {
 		taskID, topicBranch, runBranch, mergeSHA string
 	}
 	var reports []mergeReport
-	var lastRunBranch string
 	for _, m := range merges {
 		entry, ok := m.(map[string]interface{})
 		if !ok {
@@ -728,42 +749,37 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone
 		if runBranch == "" || commitSHA == "" {
 			continue
 		}
-		mergeAuthor := project.MergeAuthor{
-			Name:   s.coord.CitizenName(),
-			Email:  s.coord.CitizenEmail(),
-			TaskID: taskID,
+		mergeAuthor := enjugit.MergeAuthor{
+			Citizen:      enjugit.Identity{Name: s.coord.CitizenName(), Email: s.coord.CitizenEmail()},
+			TaskID:       taskID,
+			AutoOrManual: "auto",
 		}
-		mergeErr := proj.MergeBranchToCommit(runBranch, commitSHA, topicBranch, mergeAuthor)
+		// AutoMergeAcceptedTopic checks out the target branch
+		// internally so HEAD ends up on the run branch after
+		// the merge — no explicit checkout-back needed in
+		// service. See enjugit/producing.go's checkout-target
+		// step (added to fix the lost-commit regression).
+		_, mergeErr := wf.AutoMergeAcceptedTopic(topicBranch, runBranch, mergeAuthor)
 		if mergeErr != nil {
 			// Conflict: the accept stood, but the post-accept
 			// merge can't reconcile two parallel siblings.
 			// Report to coord (so the audit timeline has the
 			// signal) and keep going on remaining merges
 			// rather than failing the whole submit.
-			var conflict *project.ErrMergeConflict
+			var conflict *enjugit.ErrConflict
 			if errors.As(mergeErr, &conflict) {
 				if reportProjectID > 0 && reportRunSeq > 0 {
 					s.reportMergeConflict(ctx, reportProjectID, reportRunSeq,
 						taskID, conflict.TopicBranch, conflict.Branch,
 						conflict.TopicCommit, conflict.RunTipCommit,
-						conflict.ConflictFiles)
+						conflict.Paths)
 				} else {
-					// No way to address the report — older
-					// coordinators that don't surface
-					// project_id/run_seq in the submit response,
-					// or test harnesses that bypass the run
-					// envelope. Without the project/run pair we
-					// can't POST anywhere meaningful, so the
-					// audit timeline silently loses the signal
-					// and no merge_resolve task spawns. Log
-					// loudly so the gap is at least debuggable.
 					s.logger.Warn("dropped merge_conflict report: project_id/run_seq missing from submit response",
 						"task", taskID,
 						"topic_branch", conflict.TopicBranch,
 						"run_branch", conflict.Branch,
-						"conflict_files", conflict.ConflictFiles)
+						"conflict_files", conflict.Paths)
 				}
-				lastRunBranch = runBranch
 				continue
 			}
 			return fmt.Errorf(
@@ -774,7 +790,6 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone
 			taskID: taskID, topicBranch: topicBranch,
 			runBranch: runBranch, mergeSHA: commitSHA,
 		})
-		lastRunBranch = runBranch
 	}
 	// Report each successful merge to the coordinator so the
 	// audit timeline gets a branch_merged event. Fire after
@@ -785,19 +800,6 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, proj *project.Clone
 		for _, rep := range reports {
 			s.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
 				rep.topicBranch, rep.runBranch, rep.mergeSHA)
-		}
-	}
-	// Switch the workspace HEAD back to the run branch after a
-	// successful merge so the next operation in this session
-	// (a manual git commit, a sibling submit, the user
-	// inspecting the workspace) sees the authoritative merged
-	// state rather than the now-stale topic branch we were
-	// on coming out of SubmitTaskResult. Without this the
-	// workspace stays on the topic and any later manual commit
-	// lands on a branch the next claim won't fork from.
-	if lastRunBranch != "" {
-		if err := proj.CheckoutBranch(lastRunBranch); err != nil {
-			return fmt.Errorf("returning workspace to run branch %q after merge: %w", lastRunBranch, err)
 		}
 	}
 	return nil

@@ -26,6 +26,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/project"
 )
@@ -64,6 +65,14 @@ type Config struct {
 type FatClient struct {
 	coord       *coord.Client
 	project     *project.Opener
+	// enjugit is the new workspace handle, opened in parallel to
+	// `project` during the project→enjugit migration. Both point
+	// at the same on-disk root, but reach it through different
+	// abstractions. Each call site is ported one at a time:
+	// pre-port sites still go through `project`; post-port sites
+	// open Workflow / View handles via `enjugit`. After the last
+	// site flips, the old `project` field gets removed.
+	enjugit *enjugit.Workspace
 	modelName   string
 	logger      *slog.Logger
 	projectRegistry  *projectreg.Registry
@@ -90,6 +99,14 @@ type FatClient struct {
 	// flows to the operator's working tree as before.
 	botClonesMu sync.Mutex
 	botClones   map[int64]*project.Clone
+
+	// botWorkflows mirrors botClones for the new enjugit-based
+	// path. Populated by ResolveBotWorkspace alongside botClones
+	// so OpenWorkflow (the enjugit-side analog of OpenProject)
+	// routes to the same per-bot clone that the project path
+	// uses. Two maps until the project package is fully retired;
+	// at that point this collapses to one.
+	botWorkflows map[int64]*enjugit.Workflow
 }
 
 // New constructs a FatClient. Logger defaults to slog.Default() when
@@ -118,6 +135,24 @@ func New(cfg Config) *FatClient {
 	}
 	if cfg.Workspace != nil && cfg.ProjectRegistry != nil {
 		cfg.Workspace.AttachRegistry(cfg.ProjectRegistry)
+	}
+	// Open the parallel enjugit workspace at the same root. Logs
+	// (but doesn't fail) when construction errors — pre-port call
+	// sites still work via `s.project`; only post-port sites need
+	// the enjugit handle.
+	if cfg.Workspace != nil {
+		opts := []enjugit.Option{enjugit.WithLogger(logger)}
+		if cfg.ProjectRegistry != nil {
+			opts = append(opts, enjugit.WithRegistry(cfg.ProjectRegistry))
+		}
+		ws, err := enjugit.NewWorkspace(cfg.Workspace.RootDir(),
+			enjugit.NewProductionConventions(), opts...)
+		if err != nil {
+			logger.Warn("enjugit workspace init failed; new-API call sites will be unavailable",
+				"root", cfg.Workspace.RootDir(), "error", err)
+		} else {
+			fc.enjugit = ws
+		}
 	}
 	return fc
 }

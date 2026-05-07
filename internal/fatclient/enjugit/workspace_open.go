@@ -1,0 +1,171 @@
+package enjugit
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
+)
+
+// ForProject returns a Workflow handle for the given project. If
+// no on-disk clone exists yet, clones from remoteURL into the
+// canonical slug-id directory under rootDir. If a clone already
+// exists (or registry points at an adopted dir), opens it.
+//
+// remoteURL may be empty for path-only projects only when an
+// adopted dir is registered. Otherwise returns ErrNoCloneSource.
+//
+// Returns the same Workflow on subsequent calls (cached by
+// projectID).
+func (w *Workspace) ForProject(id int64, remoteURL string) (*Workflow, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if wf, ok := w.workflows[id]; ok {
+		return wf, nil
+	}
+	dir := w.projectDirLocked(id)
+	clone, err := w.openOrClone(id, dir, remoteURL)
+	if err != nil {
+		return nil, err
+	}
+	wf := w.newWorkflowFromClone(id, clone)
+	w.workflows[id] = wf
+	return wf, nil
+}
+
+// AdoptExisting registers an existing on-disk working tree as
+// project id and returns a Workflow handle for it. Used by
+// enju_init to adopt the operator's current directory as a
+// solo project (no remote URL upfront — possibly added later
+// via SetRemote).
+//
+// path must be a directory containing a .git. Returns
+// ErrCloneNotFound if not. Updates the registry (when one is
+// attached) so subsequent ProjectDir lookups find this path.
+func (w *Workspace) AdoptExisting(id int64, path string) (*Workflow, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrCloneNotFound, path)
+		}
+		return nil, fmt.Errorf("enjugit: stat %s: %w", path, err)
+	}
+	clone, err := git.OpenClone(path, w.lockPathFor(id), w.logger)
+	if err != nil {
+		return nil, fmt.Errorf("enjugit: open adopted dir %s: %w", path, err)
+	}
+	if w.registry != nil {
+		if err := w.registry.Upsert(projectreg.Entry{
+			ID:        id,
+			LocalPath: path,
+		}); err != nil {
+			w.logger.Warn("enjugit: registry upsert failed", "id", id, "path", path, "error", err)
+		}
+	}
+	wf := w.newWorkflowFromClone(id, clone)
+	w.workflows[id] = wf
+	return wf, nil
+}
+
+// OpenBotCloneAt opens a bot-specific clone at an explicit path
+// (typically <project>/enju/bots/<bot>/clone/). Pre-warms the
+// per-bot clone path override so ProjectDir(id) returns this
+// path for subsequent calls.
+//
+// Different bots on the same project on the same machine each
+// get their own clone via this entry point. Service constructs
+// a Workspace per bot identity at startup.
+func (w *Workspace) OpenBotCloneAt(id int64, path, sourceURL string) (*Workflow, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.botCloneAt[id] = path
+	clone, err := w.openOrClone(id, path, sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	wf := w.newWorkflowFromClone(id, clone)
+	w.workflows[id] = wf
+	return wf, nil
+}
+
+// OpenView returns a read-only View for project id. Errors with
+// ErrCloneNotFound when no clone exists on disk — does NOT
+// silently lazy-clone (use OpenOrLazyClone for that semantics).
+func (w *Workspace) OpenView(id int64) (*View, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if v, ok := w.views[id]; ok {
+		return v, nil
+	}
+	dir := w.projectDirLocked(id)
+	if dir == "" {
+		return nil, ErrCloneNotFound
+	}
+	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	if err != nil {
+		if errors.Is(err, git.ErrCloneNotFound) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: open view %s: %w", dir, err)
+	}
+	v := w.newViewFromClone(id, clone)
+	w.views[id] = v
+	return v, nil
+}
+
+// OpenOrLazyClone returns a read-only View for project id. When
+// no clone exists on disk, clones from remoteURL first. Used by
+// webui's read path so projects the user has never explicitly
+// attached to still render content.
+//
+// Returns ErrNoCloneSource when no clone exists AND remoteURL is
+// empty (path-only project the webui process has never seen).
+func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if v, ok := w.views[id]; ok {
+		return v, nil
+	}
+	dir := w.projectDirLocked(id)
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		// Clone exists; use it.
+		clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+		if err != nil {
+			return nil, fmt.Errorf("enjugit: open existing %s: %w", dir, err)
+		}
+		v := w.newViewFromClone(id, clone)
+		w.views[id] = v
+		return v, nil
+	}
+	// No clone; lazy-clone if we have a source.
+	if remoteURL == "" {
+		return nil, ErrNoCloneSource
+	}
+	clone, err := git.CloneOrInit(dir, remoteURL, w.lockPathFor(id), w.logger)
+	if err != nil {
+		return nil, fmt.Errorf("enjugit: lazy-clone for view %s: %w", dir, err)
+	}
+	v := w.newViewFromClone(id, clone)
+	w.views[id] = v
+	return v, nil
+}
+
+// openOrClone opens an existing clone at dir, or clones from
+// remoteURL if missing. Caller holds w.mu.
+func (w *Workspace) openOrClone(id int64, dir, remoteURL string) (*git.Clone, error) {
+	lockPath := w.lockPathFor(id)
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		return git.OpenClone(dir, lockPath, w.logger)
+	}
+	if remoteURL == "" {
+		return nil, fmt.Errorf("%w: id=%d dir=%s", ErrNoCloneSource, id, dir)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return nil, fmt.Errorf("enjugit: mkdir parent %s: %w", dir, err)
+	}
+	return git.CloneOrInit(dir, remoteURL, lockPath, w.logger)
+}

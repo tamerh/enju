@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // InboxResult bundles the inbox rows with the project-clone
@@ -33,46 +33,40 @@ type InboxResult struct {
 // materialized yet — handler surfaces a friendly message
 // rather than treating it as an error.
 func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username string) (*InboxResult, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("workspace not configured")
 	}
-	projectDir := s.project.ProjectDir(projectID)
+	projectDir := s.enjugit.ProjectDir(projectID)
 	if projectDir == "" {
 		return &InboxResult{ProjectClonePresent: false}, nil
 	}
 
-	// Read-only: use OpenExisting to resolve the on-disk
-	// clone via findProjectDir's slug-then-numeric lookup.
-	// Avoids the latent ForProject bug where a coord-side
-	// project rename would have ForProject(id, newName)
-	// compute a fresh slug path that doesn't exist, fall into
-	// the clone-from-remote branch, and create a second
-	// clone with a different slug suffix. The inbox
-	// projection only reads (live.jsonl + git tree at
+	// Read-only path uses OpenView so we never lazy-clone.
+	// The inbox projection only reads (live.jsonl + git tree at
 	// committed SHAs) — it has no business creating clones.
-	proj, err := s.project.OpenExisting(projectID)
+	view, err := s.enjugit.OpenView(projectID)
 	if err != nil {
-		if errors.Is(err, project.ErrCloneNotFound) {
+		if errors.Is(err, enjugit.ErrCloneNotFound) {
 			return &InboxResult{ProjectClonePresent: false}, nil
 		}
 		return nil, fmt.Errorf("opening project clone: %w", err)
 	}
 
 	livePath := filepath.Join(projectDir, "enju", "events", "live.jsonl")
-	rows, err := inbox.BuildInbox(livePath, username, &inboxGitDeps{proj: proj})
+	rows, err := inbox.BuildInbox(livePath, username, &inboxGitDeps{view: view})
 	if err != nil {
 		return nil, err
 	}
 	return &InboxResult{Rows: rows, ProjectClonePresent: true}, nil
 }
 
-// inboxGitDeps adapts a project clone to inbox.Deps. The full
+// inboxGitDeps adapts an enjugit View to inbox.Deps. The full
 // Deps surface today is just one method (git read at commit) —
 // the projection is otherwise self-contained over live.jsonl.
 type inboxGitDeps struct {
-	proj *project.Clone
+	view *enjugit.View
 }
 
 func (d *inboxGitDeps) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
-	return d.proj.ReadFileAtCommit(commitSHA, repoRelPath)
+	return d.view.ReadFileAtCommit(commitSHA, repoRelPath)
 }

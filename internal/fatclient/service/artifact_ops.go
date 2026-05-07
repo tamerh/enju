@@ -16,7 +16,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // ArtifactResponse is one artifact index row's wire shape,
@@ -84,7 +84,8 @@ func (s *FatClient) ListArtifacts(ctx context.Context, projectID int64, opts Lis
 // commitTaskSubjectRe matches the first line of commit messages
 // the enju client writes, so artifact-history annotations can
 // enrich each entry with the submitting task_id and owner.
-// Kept in sync with project.buildCommitMessage's format.
+// Kept in sync with enjugit's commit-subject format
+// (see enjugit/producing.go: "Task %s by @%s: %s").
 // A non-match means the commit wasn't produced by a task
 // submission (project init, rollback, manual commit), in which
 // case the entry's task_id / owner fields stay empty.
@@ -121,8 +122,14 @@ func indexOfNewline(s string) int {
 // content matches what the index points at, or from the working
 // tree as a fallback. Returns the marshaled JSON ready for
 // format.ArtifactDetail.
+//
+// SHA-based reads use the workflow's lazy-fetch — if the local
+// clone doesn't have the commit, the git layer fetches once and
+// retries. So no explicit pre-pull is needed for the common
+// case. The worktree-fallback path (commit_sha empty) reads
+// whatever the on-disk clone currently shows.
 func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("get_artifact requires a local workspace (MCP client mode)")
 	}
 	metaRaw, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path))
@@ -138,25 +145,22 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
-	proj.Lock()
-	_ = proj.Pull()
-	proj.Unlock()
-
 	commitSHA, _ := meta["commit_sha"].(string)
-	repoPath := project.ArtifactPath(path)
+	repoPath := enjugit.ArtifactPath(path)
 	var content []byte
 	if commitSHA != "" {
-		data, ok, rerr := proj.ReadFileAtCommit(commitSHA, repoPath)
+		data, ok, rerr := wf.ReadFileAtCommit(commitSHA, repoPath)
 		if rerr != nil || !ok {
 			return nil, fmt.Errorf("artifact %q not found at commit %s", path, commitSHA)
 		}
 		content = data
 	} else {
-		data, rerr := proj.ReadFile(repoPath)
+		// Worktree fallback (rare — coord usually supplies a SHA).
+		data, rerr := os.ReadFile(filepath.Join(wf.WorkDir(), repoPath))
 		if rerr != nil {
 			return nil, fmt.Errorf("reading artifact from working tree: not found")
 		}
@@ -174,18 +178,19 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 // artifact index and the task state machine. Returns the
 // marshaled JSON ready for format.ArtifactHistory.
 func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("get_artifact_history requires a local workspace (MCP client mode)")
 	}
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
-	proj.Lock()
-	_ = proj.Pull()
-	proj.Unlock()
+	// Best-effort fetch so the log walk sees commits another
+	// citizen pushed since our last sync. A network blip leaves
+	// us with whatever local state we have — still useful.
+	_ = wf.FetchAllRefs()
 
-	history, err := proj.LogFile(project.ArtifactPath(path))
+	history, err := wf.LogFile(enjugit.ArtifactPath(path))
 	if err != nil {
 		return nil, fmt.Errorf("reading git history: %w", err)
 	}
@@ -309,7 +314,7 @@ type UntrackedArtifactReport struct {
 // fix downstream "untracked artifact missing" claim errors
 // in-place when shared storage is available.
 func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64, branch string) (*UntrackedArtifactReport, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("enju_list_untracked_artifacts requires a local workspace (MCP client mode)")
 	}
 	// Resolve project metadata once — default_branch is load-
@@ -333,13 +338,13 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 		return nil, fmt.Errorf("unable to parse artifact index")
 	}
 
-	// Open project workspace so we can stat paths + run the
-	// symlink materializer. Non-fatal: if the open fails, we
-	// still report what the index says; the local visibility
-	// column says "(workspace unavailable)".
+	// Open the workflow so we can stat paths + run the symlink
+	// materializer. Non-fatal: if the open fails, we still
+	// report what the index says; the local visibility column
+	// says "(workspace unavailable)".
 	var workDir string
-	if proj, perr := s.project.ForProject(projectID, remoteURL, projName); perr == nil {
-		workDir = proj.WorkDir()
+	if wf, werr := s.enjugit.ForProject(projectID, remoteURL); werr == nil {
+		workDir = wf.WorkDir()
 	}
 
 	var out []UntrackedArtifactRow
@@ -360,9 +365,9 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 			out = append(out, ur)
 			continue
 		}
-		_ = project.EnsureSharedSymlink(project.ArtifactPath(path), workDir,
+		_ = enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(path), workDir,
 			projectID, projName, branch, path)
-		full := filepath.Join(workDir, project.ArtifactPath(path))
+		full := filepath.Join(workDir, enjugit.ArtifactPath(path))
 		fi, serr := os.Lstat(full)
 		if os.IsNotExist(serr) {
 			ur.LocalState = "missing"
@@ -382,7 +387,7 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 	return &UntrackedArtifactReport{
 		Rows:           out,
 		ResolvedBranch: branch,
-		SharedRoot:     project.SharedRoot(),
+		SharedRoot:     enjugit.SharedRoot(),
 	}, nil
 }
 
