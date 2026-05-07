@@ -584,6 +584,23 @@ tasks:
 // in-flight siblings still finish. The cascade summary shows
 // stop_reason=compute_failed and includes both the failed task
 // and any siblings that completed before the drain.
+//
+// KNOWN FAILING (regression at commit fae79fa, deferred):
+// boom's claim hits coord-side `auto-register model "test-model":
+// username "test-model" is already taken`. Three parallel
+// goroutines call /tasks/.../claim simultaneously; the first
+// auto-registers the model citizen, the others race on the
+// unique-username constraint. The race ALWAYS existed in coord
+// — project's PullBranchWithReconcile (now retired from the
+// execute path) used a coarse proj.Lock that serialized the
+// reconciles, so by the time goroutine N reached claim,
+// goroutine N-1 had already auto-registered. WF's fine-grained
+// locking removed that accidental serialization. Proper fix is
+// in coord: make model auto-register idempotent (INSERT OR
+// IGNORE on the username unique key, or look-up-then-create
+// inside a transaction). Don't paper over with a workflow
+// mutex — that re-introduces the serialization we just paid
+// to remove.
 func TestMCPExecuteRunParallelStopsOnFailure(t *testing.T) {
 	eachRemoteMode(t, "ExecRunParallelFail", func(t *testing.T, h *mcpHarness) {
 		requireRemote(t, h)
