@@ -1220,35 +1220,6 @@ func (p *Clone) PushPendingCommits(branch string, maxRetries int) (int, string, 
 	}
 	return maxRetries, "", fmt.Errorf("submit failed after %d push attempts", maxRetries)
 }
-// ResetWorktreeToCleanState wipes any worktree residue —
-// staged changes, unstaged changes to tracked files, and
-// untracked files — leaving the working tree byte-identical
-// to whatever HEAD currently points at. Used by the bot
-// daemon between task iterations: a previous task's
-// `claude -p` may have left uncommitted edits or scratch
-// files behind, and the next iteration's CheckoutBranchFrom
-// can fail when those leftovers collide with the new topic
-// branch's index. The "no user state to preserve" property
-// of bot clones (system-managed, at <project>/enju/.clone/)
-// makes the wipe safe; operator-side clones MUST NOT call
-// this method — the operator's working tree may carry
-// intentional uncommitted WIP.
-//
-// Implementation:
-//   - HardReset to HEAD drops staged + unstaged changes to
-//     tracked files. The index resyncs to HEAD's tree, so a
-//     "staged deletion" left over from a previous bad
-//     checkout disappears here.
-//   - A second walk removes untracked files. We can't use
-//     gogit's CheckoutOptions.Force (it nukes untracked
-//     across the whole tree but doesn't preserve `.git/`
-//     itself reliably across go-git versions); a manual walk
-//     skipping infra dirs is more conservative.
-//
-// Caller MUST hold the project lock.
-func (p *Clone) ResetWorktreeToCleanState() error {
-	return p.gitClone.ResetClean()
-}
 // extractTaskIDTrailer reads the `Enju-Task-Complete:` trailer
 // out of a commit message, or returns "" if the commit isn't a
 // task submission. The trailer key matches

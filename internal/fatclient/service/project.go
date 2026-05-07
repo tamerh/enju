@@ -472,7 +472,7 @@ func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int
 	}
 	proj.Lock()
 	defer proj.Unlock()
-	return proj.ResetWorktreeToCleanState()
+	return proj.GitClone().ResetClean()
 }
 
 // FetchAllRefsForBot brings every remote branch's refs +
