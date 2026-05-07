@@ -2708,33 +2708,6 @@ func countCommitsBetween(from *object.Commit, until string) int {
 	return count
 }
 
-// --- Artifact history (git log per file) ---
-
-// CommitInfo describes a single commit for history-walking purposes.
-// Returned by LogFile in reverse-chronological order (newest first).
-type CommitInfo struct {
-	Hash    string
-	Message string
-	Author  string
-	Time    time.Time
-}
-
-// LogFile returns the commits that touched a specific file in the
-// local clone, newest-first. Used by the MCP client's
-// enju_get_artifact_history tool to render per-file provenance
-// without any coordinator round-trip.
-func (p *Clone) LogFile(relPath string) ([]CommitInfo, error) {
-	raw, err := p.gitClone.LogFile(relPath)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]CommitInfo, len(raw))
-	for i, c := range raw {
-		out[i] = CommitInfo{Hash: c.Hash, Message: c.Message, Author: c.Author, Time: c.Time}
-	}
-	return out, nil
-}
-
 // SetRemote reconfigures the origin remote of the local clone to
 // point at a new URL. Used when the coordinator's project record
 // has a remote_url that differs from (or fills in) the local
