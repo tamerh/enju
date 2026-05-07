@@ -1002,48 +1002,7 @@ func (p *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 // fetch from origin and retry. Cheap when the commit is already
 // local (no network traffic) and self-healing when it isn't.
 func (p *Clone) ReadFileAtCommit(commitSHA, repoRelPath string) ([]byte, bool, error) {
-	hash := plumbing.NewHash(commitSHA)
-	commit, err := p.repo.CommitObject(hash)
-	if err != nil {
-		// Commit not in local object DB. If we have a remote,
-		// try fetching once and retrying — this is the cross-
-		// citizen sync gap (bot-A pushes, bot-B reads without
-		// having fetched).
-		if p.remoteURL != "" {
-			// Force full-branches refspec — go-git's clone
-			// default is narrow, so omitting RefSpecs here
-			// would silently miss branches written by other
-			// citizens (the production fail mode).
-			if fetchErr := p.repo.Fetch(&gogit.FetchOptions{
-				RemoteName: "origin",
-				RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
-				Auth:       sshAuthMethod(p.remoteURL),
-			}); fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
-				return nil, false, fmt.Errorf("loading commit %s (fetch failed: %w): %w",
-					commitSHA, fetchErr, err)
-			}
-			commit, err = p.repo.CommitObject(hash)
-		}
-		if err != nil {
-			return nil, false, fmt.Errorf("loading commit %s: %w", commitSHA, err)
-		}
-	}
-	tree, err := commit.Tree()
-	if err != nil {
-		return nil, false, fmt.Errorf("loading tree: %w", err)
-	}
-	file, err := tree.File(repoRelPath)
-	if err == object.ErrFileNotFound {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, fmt.Errorf("looking up file: %w", err)
-	}
-	content, err := file.Contents()
-	if err != nil {
-		return nil, false, fmt.Errorf("reading contents: %w", err)
-	}
-	return []byte(content), true, nil
+	return p.gitClone.ReadFileAtCommit(commitSHA, repoRelPath)
 }
 
 // FileWrite describes one file to write into the working tree as part
