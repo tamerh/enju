@@ -132,7 +132,7 @@ func cmdUI(args []string) {
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		Workspace:       ws,
+		WorkspaceRoot:   ws.RootDir(),
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})

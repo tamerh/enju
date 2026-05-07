@@ -64,9 +64,13 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 			reg = projectreg.Open(filepath.Join(dir, "projects.json"))
 		}
 	}
+	wsRoot := ""
+	if cfg.Workspace != nil {
+		wsRoot = cfg.Workspace.RootDir()
+	}
 	fc := service.New(service.Config{
 		Coord:           cfg.Coord,
-		Workspace:       cfg.Workspace,
+		WorkspaceRoot:   wsRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
 		ProjectRegistry: reg,

@@ -459,7 +459,7 @@ func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credent
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		Workspace:       ws,
+		WorkspaceRoot:   ws.RootDir(),
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
@@ -739,7 +739,7 @@ func cmdBotRun(args []string) {
 	})
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		Workspace:       ws,
+		WorkspaceRoot:   ws.RootDir(),
 		ModelName:       bot.Model,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),

@@ -28,17 +28,19 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
-// Config is the constructor input for New. Coord and Workspace are
-// the load-bearing dependencies; ModelName + Logger are
-// process-scoped attribution / diagnostics.
+// Config is the constructor input for New. Coord and WorkspaceRoot
+// are the load-bearing dependencies; ModelName + Logger are
+// process-scoped attribution / diagnostics. WorkspaceRoot is the
+// directory under which per-project clones live (default
+// `~/.enju/workspaces` for `enju mcp`); empty disables on-disk
+// workspace flows entirely (test fixtures with coord-only setup).
 type Config struct {
-	Coord     *coord.Client
-	Workspace *project.Opener
-	ModelName string
-	Logger    *slog.Logger
+	Coord         *coord.Client
+	WorkspaceRoot string
+	ModelName     string
+	Logger        *slog.Logger
 
 	// ProjectRegistry tracks the projects this fat-client knows
 	// about (standard clones + externally adopted dirs). Optional
@@ -63,18 +65,10 @@ type Config struct {
 // themselves goroutine-safe; the profile-cache load is gated by
 // sync.Once.
 type FatClient struct {
-	coord       *coord.Client
-	project     *project.Opener
-	// enjugit is the new workspace handle, opened in parallel to
-	// `project` during the project→enjugit migration. Both point
-	// at the same on-disk root, but reach it through different
-	// abstractions. Each call site is ported one at a time:
-	// pre-port sites still go through `project`; post-port sites
-	// open Workflow / View handles via `enjugit`. After the last
-	// site flips, the old `project` field gets removed.
-	enjugit *enjugit.Workspace
-	modelName   string
-	logger      *slog.Logger
+	coord     *coord.Client
+	enjugit   *enjugit.Workspace
+	modelName string
+	logger    *slog.Logger
 	projectRegistry  *projectreg.Registry
 
 	// Cached citizen profile (name + email + kind) used to
@@ -119,29 +113,24 @@ func New(cfg Config) *FatClient {
 		logger = slog.Default()
 	}
 	fc := &FatClient{
-		coord:      cfg.Coord,
-		project:    cfg.Workspace,
-		modelName:  cfg.ModelName,
-		logger:     logger,
+		coord:           cfg.Coord,
+		modelName:       cfg.ModelName,
+		logger:          logger,
 		projectRegistry: cfg.ProjectRegistry,
 	}
-	if cfg.Workspace != nil && cfg.ProjectRegistry != nil {
-		cfg.Workspace.AttachRegistry(cfg.ProjectRegistry)
-	}
-	// Open the parallel enjugit workspace at the same root. Logs
-	// (but doesn't fail) when construction errors — pre-port call
-	// sites still work via `s.project`; only post-port sites need
-	// the enjugit handle.
-	if cfg.Workspace != nil {
+	// Open the enjugit workspace at the configured root. Logs (but
+	// doesn't fail) when construction errors — fat-client flows
+	// that don't touch git stay usable.
+	if cfg.WorkspaceRoot != "" {
 		opts := []enjugit.Option{enjugit.WithLogger(logger)}
 		if cfg.ProjectRegistry != nil {
 			opts = append(opts, enjugit.WithRegistry(cfg.ProjectRegistry))
 		}
-		ws, err := enjugit.NewWorkspace(cfg.Workspace.RootDir(),
+		ws, err := enjugit.NewWorkspace(cfg.WorkspaceRoot,
 			enjugit.NewProductionConventions(), opts...)
 		if err != nil {
 			logger.Warn("enjugit workspace init failed; new-API call sites will be unavailable",
-				"root", cfg.Workspace.RootDir(), "error", err)
+				"root", cfg.WorkspaceRoot, "error", err)
 		} else {
 			fc.enjugit = ws
 		}
@@ -207,16 +196,9 @@ func (s *FatClient) UnregisterProject(id int64) {
 // FatClient method.
 func (s *FatClient) Coord() *coord.Client { return s.coord }
 
-// Workspace returns the underlying project. Exposed for callers
-// that need direct access to workspace primitives (project resolve,
-// scan, etc.). Goes away with the project package — new callers
-// should use Enjugit() instead.
-func (s *FatClient) Workspace() *project.Opener { return s.project }
-
-// Enjugit returns the underlying enjugit Workspace, the
-// post-migration replacement for Workspace(). Mode-check guard for
-// "MCP client mode" — nil means no on-disk workspace configured
-// (test fixtures with coord-only setup).
+// Enjugit returns the underlying enjugit Workspace. Mode-check
+// guard for "MCP client mode" — nil means no on-disk workspace
+// configured (test fixtures with coord-only setup).
 func (s *FatClient) Enjugit() *enjugit.Workspace { return s.enjugit }
 
 // Username delegates to the coord client so callers see live values

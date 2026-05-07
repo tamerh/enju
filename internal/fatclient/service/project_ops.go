@@ -165,7 +165,7 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 	if idF, ok := result["id"].(float64); ok {
 		pid = int64(idF)
 	}
-	if pid > 0 && s.project != nil {
+	if pid > 0 && s.enjugit != nil {
 		if ierr := s.EagerInitProjectClone(ctx, pid, params.Path); ierr != nil {
 			s.logger.Warn("eager workspace init failed (will retry on first task)",
 				"project_id", pid, "path", params.Path, "error", ierr)
@@ -229,7 +229,7 @@ func validateCreateProjectPath(path string) error {
 // project record is registered; the next tool call will retry
 // the init).
 func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, path string) error {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil
 	}
 	if path == "" {
@@ -392,7 +392,7 @@ func (s *FatClient) InitDirAsProject(dirPath string) (adoptedBranch string, err 
 // ForProject (which queries the registry) to verify the clone
 // works.
 func (s *FatClient) RegisterAdoptedDir(projectID int64, dirPath string) error {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil
 	}
 	// Registry write FIRST — ForProject's path lookup consults
@@ -584,11 +584,10 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) stri
 // and reports whether one existed beforehand. Caller decides
 // what to do with the membership row on the coordinator side.
 func (s *FatClient) LocalLeaveProject(projectID int64) (hadClone bool, err error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return false, nil
 	}
 	hadClone = s.enjugit.HasLocalClone(projectID)
-	s.project.EvictProjectCache(projectID)
 	if err := s.enjugit.LeaveProject(projectID); err != nil {
 		return hadClone, fmt.Errorf("removing local clone: %w", err)
 	}

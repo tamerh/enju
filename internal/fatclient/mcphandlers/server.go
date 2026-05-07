@@ -184,9 +184,13 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:         logger,
 	})
+	wsRoot := ""
+	if cfg.Workspace != nil {
+		wsRoot = cfg.Workspace.RootDir()
+	}
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		Workspace:       cfg.Workspace,
+		WorkspaceRoot:   wsRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
@@ -209,7 +213,7 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 			CoordinatorURL: cfg.CoordinatorURL,
 			TokenFn:        client.Token, // live read — picks up auto-reregister rotations
 			Username:       cfg.Username,
-			Workspace:      cfg.Workspace,
+			Workspace:      fc.Enjugit(),
 			ParentCtx:      cfg.Notify.ParentCtx,
 			Logger:         logger,
 		})

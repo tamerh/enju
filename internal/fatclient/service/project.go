@@ -95,7 +95,7 @@ func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64
 // time (both require `path=`), so the lookup is unambiguous —
 // no remote_url-as-path fallback, no filesystem walk.
 func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return "", fmt.Errorf("no workspace configured")
 	}
 	if botUsername == "" {
@@ -156,9 +156,6 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 		source = barePath
 	}
 
-	if s.enjugit == nil {
-		return "", fmt.Errorf("no workspace configured")
-	}
 	wf, err := s.enjugit.OpenBotCloneAt(projectID, clonePath, source)
 	if err != nil {
 		return "", err
@@ -232,7 +229,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 // opts into bots, exactly when it starts earning its
 // keep.
 func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (bareURL string, created bool, err error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return "", false, fmt.Errorf("no workspace configured")
 	}
 	remoteURL, _, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
