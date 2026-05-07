@@ -18,7 +18,6 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -28,13 +27,14 @@ type Config struct {
 	Username       string // citizen's username (stable handle)
 	CitizenName    string // display name, for greetings
 	CitizenEmail   string // email used when re-registering after a DB wipe, optional
-	// Workspace is the per-client git workspace used by the
-	// iteration A.2 fat-client path. When non-nil and a project
-	// has a remote_url, the MCP client writes task results to a
-	// local clone here and reports commit SHAs back to the
-	// coordinator, bypassing the legacy content-over-wire path.
-	// When nil, only the legacy path is used.
-	Workspace *project.Opener
+	// WorkspaceRoot is the root directory under which per-project
+	// clones live. The fat-client iteration A.2 path resolves
+	// each project's working tree as a subdirectory of this root
+	// (typically `~/.enju/workspaces/`). Empty disables on-disk
+	// workspace flows entirely (test fixtures with coord-only
+	// setup); non-empty constructs an enjugit.Workspace at this
+	// root for production callers.
+	WorkspaceRoot string
 	// SaveCredentials is called after a successful auto re-register
 	// so the new server-side identity is persisted to disk. The
 	// username passed back may be the same (DB wipe case) or new
@@ -184,13 +184,9 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:         logger,
 	})
-	wsRoot := ""
-	if cfg.Workspace != nil {
-		wsRoot = cfg.Workspace.RootDir()
-	}
 	fc := service.New(service.Config{
 		Coord:           coordClient,
-		WorkspaceRoot:   wsRoot,
+		WorkspaceRoot:   cfg.WorkspaceRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),

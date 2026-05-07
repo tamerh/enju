@@ -289,7 +289,7 @@ func newE2EClient(url, username, token string) *apiClient {
 		AuthToken: token,
 		Logger:    logger,
 	})
-	return newClient(coordClient, nil, logger)
+	return newClient(coordClient, "", logger)
 }
 
 // mcpResultText extracts the text content from an MCP tool result.

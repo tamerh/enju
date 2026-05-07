@@ -111,7 +111,7 @@ func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 		CitizenEmail:   citizen.Email,
 		AuthToken:      citizen.Token,
 		ModelName:      "test-model",
-		Workspace:      ts.project,
+		WorkspaceRoot:  ts.project.RootDir(),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return &mcpHarness{
@@ -214,7 +214,7 @@ func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcphandle
 		CitizenEmail:   citizen.Email,
 		AuthToken:      citizen.Token,
 		ModelName:      "test-model",
-		Workspace:      h.project,
+		WorkspaceRoot:  h.project.RootDir(),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return mcphandlers.NewTestClient(cfg)
@@ -512,7 +512,7 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 		CitizenName:    "Notify Bot",
 		AuthToken:      botToken,
 		ModelName:      "test-model",
-		Workspace:      h.project,
+		WorkspaceRoot:  h.project.RootDir(),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 

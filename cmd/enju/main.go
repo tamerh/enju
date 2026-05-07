@@ -444,7 +444,7 @@ func cmdMCP(args []string) {
 		CitizenEmail:  *email,
 		ModelName:   *model,
 		AuthToken:   token,
-		Workspace:   ws,
+		WorkspaceRoot: ws.RootDir(),
 		Logger:     logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)

@@ -48,13 +48,9 @@ func NewTestClient(cfg Config) *TestClient {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:          logger,
 	})
-	wsRoot := ""
-	if cfg.Workspace != nil {
-		wsRoot = cfg.Workspace.RootDir()
-	}
 	fc := service.New(service.Config{
 		Coord:         coordClient,
-		WorkspaceRoot: wsRoot,
+		WorkspaceRoot: cfg.WorkspaceRoot,
 		ModelName:     cfg.ModelName,
 		Logger:        logger,
 	})

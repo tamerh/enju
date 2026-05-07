@@ -19,17 +19,16 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // TestClientConfig is the test-only construction shape for
 // apiClient. Mirrors the production Config but exposes the
-// pre-built coord client + workspace + logger so tests can
+// pre-built coord client + workspace root + logger so tests can
 // inject httptest stubs without going through the full
 // Register() boot sequence.
 type TestClientConfig struct {
 	Coord           *coord.Client
-	Workspace       *project.Opener
+	WorkspaceRoot   string
 	ModelName       string
 	Logger          *slog.Logger
 	ProjectRegistry *projectreg.Registry
@@ -53,7 +52,7 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 		logger = slog.Default()
 	}
 	reg := cfg.ProjectRegistry
-	if reg == nil && cfg.Workspace != nil {
+	if reg == nil && cfg.WorkspaceRoot != "" {
 		// Test-only: synthesize a registry at a unique temp
 		// path so handlers that EagerInitProjectClone can
 		// register paths without colliding with the real user's
@@ -64,13 +63,9 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 			reg = projectreg.Open(filepath.Join(dir, "projects.json"))
 		}
 	}
-	wsRoot := ""
-	if cfg.Workspace != nil {
-		wsRoot = cfg.Workspace.RootDir()
-	}
 	fc := service.New(service.Config{
 		Coord:           cfg.Coord,
-		WorkspaceRoot:   wsRoot,
+		WorkspaceRoot:   cfg.WorkspaceRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
 		ProjectRegistry: reg,
@@ -79,13 +74,13 @@ func newAPIClientForTest(cfg TestClientConfig) *apiClient {
 }
 
 // newClient is the shorter test fixture form. Tests construct
-// `c := newClient(coord.New(...), ws, logger)` instead of
-// hand-rolling `&apiClient{...}` with the right fields. ws may
-// be nil for tests that don't touch the project.
-func newClient(coordCli *coord.Client, ws *project.Opener, logger *slog.Logger) *apiClient {
+// `c := newClient(coord.New(...), wsRoot, logger)` instead of
+// hand-rolling `&apiClient{...}` with the right fields. wsRoot
+// may be empty for tests that don't touch the project.
+func newClient(coordCli *coord.Client, wsRoot string, logger *slog.Logger) *apiClient {
 	return newAPIClientForTest(TestClientConfig{
-		Coord:     coordCli,
-		Workspace: ws,
-		Logger:    logger,
+		Coord:         coordCli,
+		WorkspaceRoot: wsRoot,
+		Logger:        logger,
 	})
 }
