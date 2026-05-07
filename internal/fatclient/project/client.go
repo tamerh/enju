@@ -920,18 +920,11 @@ func (p *Clone) Pull() error {
 // Cheap when up-to-date: go-git's Fetch returns
 // NoErrAlreadyUpToDate which we swallow.
 func (p *Clone) FetchAllRefs() error {
-	if p.remoteURL == "" {
+	err := p.gitClone.Fetch()
+	if errors.Is(err, enjugit.ErrSharedNoRemote) {
 		return nil
 	}
-	err := p.repo.Fetch(&gogit.FetchOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
-		Auth:       sshAuthMethod(p.remoteURL),
-	})
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		return friendlyGitError("fetch", p.remoteURL, err)
-	}
-	return nil
+	return err
 }
 
 // PullBranch is the branch-aware variant of Pull. Pass "" to

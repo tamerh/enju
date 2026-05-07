@@ -35,3 +35,11 @@ func CloneOrInitShared(workDir, remoteURL, lockPath string, logger *slog.Logger)
 func InitLocalShared(workDir, lockPath string, logger *slog.Logger) (*SharedClone, error) {
 	return git.InitLocal(workDir, lockPath, logger)
 }
+
+// ErrSharedNoRemote is the migration-shim alias for git.ErrNoRemote.
+// project methods that delegate to gitClone.Fetch / Push (which
+// surface ErrNoRemote when there's no origin) check via
+// errors.Is(err, enjugit.ErrSharedNoRemote) to swallow the
+// no-remote case the way project's old methods used to (return
+// nil, no-op).
+var ErrSharedNoRemote = git.ErrNoRemote
