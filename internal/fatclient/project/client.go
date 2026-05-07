@@ -937,45 +937,7 @@ func (p *Clone) FetchAllRefs() error {
 // commits exist on the remote. The caller's next push creates
 // the remote ref naturally.
 func (p *Clone) PullBranch(branch string) error {
-	if p.remoteURL == "" {
-		return nil // local-only, nothing to pull
-	}
-	// Solo enju_init projects store the working-tree path as
-	// remote_url on the coordinator (not an external bare),
-	// so p.remoteURL is non-empty even though the local repo
-	// has no `origin` configured. Treat that as local-only too
-	// — without this guard, RemoteBranchHash below errors
-	// with "no origin remote" and the failure cascades up to
-	// the caller as a spurious remote-error message.
-	if p.GitOriginURL() == "" {
-		return nil
-	}
-	b := p.resolveBranch(branch)
-	// Cheap ls-remote check so a brand-new branch doesn't
-	// propagate a reference-not-found error. Any network /
-	// auth failure here is passed through — we only swallow
-	// the specific "branch doesn't exist yet" case.
-	remoteSHA, err := p.RemoteBranchHash(b)
-	if err != nil {
-		return err
-	}
-	if remoteSHA == "" {
-		return nil
-	}
-	wt, err := p.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("getting worktree: %w", err)
-	}
-	refName := plumbing.NewBranchReferenceName(b)
-	err = wt.Pull(&gogit.PullOptions{
-		RemoteName:    "origin",
-		ReferenceName: refName,
-		SingleBranch:  true,
-	})
-	if err != nil && err != gogit.NoErrAlreadyUpToDate {
-		return friendlyGitError("pull", p.remoteURL, err)
-	}
-	return nil
+	return p.gitClone.PullBranch(p.resolveBranch(branch))
 }
 
 // HeadHash returns the SHA of the current local HEAD.
