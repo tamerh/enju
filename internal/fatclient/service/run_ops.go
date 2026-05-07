@@ -18,7 +18,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
-	"github.com/enju-ai/enju/internal/fatclient/project"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // RunBranchFromData pulls the `branch` field out of a run JSON
@@ -55,11 +55,11 @@ func RunSlugFromData(runData []byte) string {
 
 // RunTemplatePrep is the state FatClient.PrepareRunTemplate
 // returns and FatClient.CommitRunTemplateSnapshot consumes. Holds
-// the opened project + loaded bundle so the post-create snapshot
+// the opened workflow + loaded bundle so the post-create snapshot
 // commit doesn't have to re-load anything.
 type RunTemplatePrep struct {
-	Project        *project.Clone
-	LoadedTemplate *project.LoadedTemplate
+	Workflow       *enjugit.Workflow
+	LoadedTemplate *enjugit.LoadedTemplate
 	YAMLContent    string
 	SourceCommit   string
 }
@@ -75,10 +75,10 @@ type RunTemplatePrep struct {
 // caller passes to CommitRunTemplateSnapshot after the
 // coordinator assigns the run's seq.
 func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, authorName, authorEmail string) (*RunTemplatePrep, error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, fmt.Errorf("enju_create_run with 'path' requires a local workspace (MCP client mode)")
 	}
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +86,9 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 	// diverged, fall through and scan whatever's on disk — the
 	// loader will surface a clear "template not found" if the
 	// file truly isn't there yet.
-	proj.Lock()
-	_ = proj.Pull()
-	proj.Unlock()
+	_ = wf.PullBranch("")
 
-	loaded, err := proj.LoadTemplate(templatePath)
+	loaded, err := wf.LoadTemplate(templatePath)
 	if err != nil {
 		return nil, err
 	}
@@ -102,21 +100,19 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 	// flow would sweep untracked template files onto the run's
 	// branch only, leaving the template unreachable on the
 	// default branch.
-	proj.Lock()
-	committedSHA, bundleErr := proj.EnsureBundleOnDefault(loaded.BundleDir, authorName, authorEmail, s.modelName)
-	proj.Unlock()
+	committedSHA, bundleErr := wf.EnsureBundleOnDefault(loaded.BundleDir, authorName, authorEmail, s.modelName)
 	if bundleErr != nil {
 		return nil, fmt.Errorf("pinning template to default branch: %w", bundleErr)
 	}
 
 	prep := &RunTemplatePrep{
-		Project:        proj,
+		Workflow:       wf,
 		LoadedTemplate: loaded,
 		YAMLContent:    string(loaded.Raw),
 	}
 	if committedSHA != "" {
 		prep.SourceCommit = committedSHA
-	} else if head, herr := proj.HeadHash(); herr == nil {
+	} else if head, herr := wf.LocalBranchHash(""); herr == nil {
 		prep.SourceCommit = head
 	}
 	return prep, nil
@@ -132,7 +128,7 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 // already exists on the coordinator side; only the snapshot
 // commit is in question. Empty string means success or no-op.
 func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []byte, templatePath, authorName, authorEmail string) string {
-	if prep == nil || prep.Project == nil || prep.LoadedTemplate == nil {
+	if prep == nil || prep.Workflow == nil || prep.LoadedTemplate == nil {
 		return ""
 	}
 	var created map[string]interface{}
@@ -145,7 +141,7 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 	}
 	seq := int(seqF)
 
-	// The run's branch — pass to CommitFiles so the template
+	// The run's branch — pass to CommitArbitraryFiles so the
 	// snapshot lands on THIS run's branch (not whatever branch
 	// the worktree is currently on).
 	runBranch, _ := created["branch"].(string)
@@ -159,23 +155,21 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 		runSlug = corelayout.ComputeRunSlug(templatePath, "")
 	}
 	snapshotTarget := corelayout.RunTemplateSnapshotDir(seq, runSlug)
-	files, ferr := prep.Project.ReadBundleFiles(prep.LoadedTemplate.BundleDir, snapshotTarget)
+	files, ferr := prep.Workflow.ReadBundleFiles(prep.LoadedTemplate.BundleDir, snapshotTarget)
 	if ferr != nil {
 		return fmt.Sprintf("snapshot skipped: %v", ferr)
 	}
 	if len(files) == 0 {
 		return ""
 	}
-	prep.Project.Lock()
-	_, cerr := prep.Project.CommitFiles(project.CommitFilesRequest{
+	_, cerr := prep.Workflow.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
 		Files:       files,
-		CommitMsg:   fmt.Sprintf("Snapshot template %s into run %d", prep.LoadedTemplate.BundleDir, seq),
+		Branch:      runBranch,
+		Subject:     fmt.Sprintf("Snapshot template %s into run %d", prep.LoadedTemplate.BundleDir, seq),
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
 		ModelName:   s.modelName,
-		Branch:      runBranch,
 	})
-	prep.Project.Unlock()
 	if cerr != nil {
 		return fmt.Sprintf("snapshot commit failed: %v", cerr)
 	}
@@ -197,7 +191,7 @@ type ExportFileResult struct {
 // Returns the rendered Mermaid body so handlers can both report
 // the commit and inline the diagram in the response.
 func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (body string, res *ExportFileResult, err error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return "", nil, fmt.Errorf("enju_export_diagram requires a local workspace (MCP client mode)")
 	}
 	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
@@ -219,25 +213,23 @@ func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runI
 	}
 
 	runBranch := RunBranchFromData(runData)
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return body, nil, err
 	}
 	repoPath := filepath.Join(corelayout.RunDir(runID, RunSlugFromData(runData)), "graph", fmt.Sprintf("%s.mmd", phase))
 
-	proj.Lock()
-	cres, err := proj.CommitFiles(project.CommitFilesRequest{
-		Files: []project.FileWrite{{
+	cres, err := wf.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+		Files: []enjugit.FileWrite{{
 			RepoRelPath: repoPath,
 			Content:     []byte(body),
 		}},
-		CommitMsg:   fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase),
+		Branch:      runBranch,
+		Subject:     fmt.Sprintf("Export diagram: run %d:%d phase %s", projectID, runID, phase),
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
 		ModelName:   s.modelName,
-		Branch:      runBranch,
 	})
-	proj.Unlock()
 	if err != nil {
 		return body, nil, fmt.Errorf("writing diagram to clone: %w", err)
 	}
@@ -253,7 +245,7 @@ func (s *FatClient) ExportDiagramFile(ctx context.Context, projectID int64, runI
 // enju/runs/{seq}-{slug}/events/{phase}.jsonl. Returns the
 // decoded event slice so handlers can render an inline preview.
 func (s *FatClient) ExportRunEventsFile(ctx context.Context, projectID int64, runID int, phase, authorName, authorEmail string) (events []map[string]interface{}, res *ExportFileResult, err error) {
-	if s.project == nil {
+	if s.enjugit == nil {
 		return nil, nil, fmt.Errorf("enju_export_run_events requires a local workspace (MCP client mode)")
 	}
 	// Fetch the run record first so the events commit lands on
@@ -286,25 +278,23 @@ func (s *FatClient) ExportRunEventsFile(ctx context.Context, projectID int64, ru
 		body.WriteByte('\n')
 	}
 
-	proj, _, _, _, err := s.OpenProject(ctx, projectID)
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return events, nil, err
 	}
 	repoPath := filepath.Join(corelayout.RunDir(runID, runSlug), "events", fmt.Sprintf("%s.jsonl", phase))
 
-	proj.Lock()
-	cres, err := proj.CommitFiles(project.CommitFilesRequest{
-		Files: []project.FileWrite{{
+	cres, err := wf.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+		Files: []enjugit.FileWrite{{
 			RepoRelPath: repoPath,
 			Content:     body.Bytes(),
 		}},
-		CommitMsg:   fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events)),
+		Branch:      runBranch,
+		Subject:     fmt.Sprintf("Export run events: run %d:%d phase %s (%d events)", projectID, runID, phase, len(events)),
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
 		ModelName:   s.modelName,
-		Branch:      runBranch,
 	})
-	proj.Unlock()
 	if err != nil {
 		return events, nil, fmt.Errorf("writing events to clone: %w", err)
 	}
@@ -338,7 +328,7 @@ func (s *FatClient) ExportRunMarkdown(ctx context.Context, projectID int64, runS
 	json.Unmarshal(tasksData, &tasks)
 
 	var remoteURL string
-	if s.project != nil {
+	if s.enjugit != nil {
 		if u, _, err := s.FetchProjectMetaFull(ctx, projectID); err == nil {
 			remoteURL = u
 		}

@@ -90,14 +90,14 @@ func (c *Clone) CommitFiles(req CommitRequest) (CommitResult, error) {
 		}
 	}
 
-	// No-op detection: if nothing changed AND the worktree
-	// already matches HEAD, return without commit.
-	if !anyChanged {
-		head, err := c.repo.Head()
-		if err == nil {
-			return CommitResult{SHA: head.Hash().String(), NoOp: true}, nil
-		}
-	}
+	// Note: we previously short-circuited to NoOp here when the
+	// loop above wrote nothing — but matching bytes-on-disk does
+	// not imply the index already has the file. Untracked files
+	// with already-correct content still need wt.Add + commit to
+	// be tracked. The wt.Commit call below returns ErrEmptyCommit
+	// when staging genuinely produces no change, and we map that
+	// to NoOp (see line ~129).
+	_ = anyChanged
 
 	wt, err := c.repo.Worktree()
 	if err != nil {
