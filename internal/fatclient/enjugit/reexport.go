@@ -9,8 +9,18 @@ package enjugit
 import (
 	"log/slog"
 
+	"github.com/go-git/go-git/v5/plumbing/transport"
+
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
+
+// SharedSSHAuth returns an SSH auth method for the given remote URL,
+// trying the SSH agent first and falling back to common key-file
+// paths. Re-exported for project.Clone.CompareToRemote during the
+// migration; goes away with the project package.
+func SharedSSHAuth(remoteURL string) transport.AuthMethod {
+	return git.SSHAuthMethod(remoteURL)
+}
 
 // SharedPreserveDirSuffix is the suffix used for the sibling
 // preserve dir during a Force checkout. Re-exported for project

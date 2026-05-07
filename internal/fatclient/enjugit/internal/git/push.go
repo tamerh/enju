@@ -74,7 +74,7 @@ func (c *Clone) Fetch() error {
 		RefSpecs: []config.RefSpec{
 			config.RefSpec("+refs/heads/*:refs/remotes/origin/*"),
 		},
-		Auth: sshAuthMethod(c.remoteURL),
+		Auth: SSHAuthMethod(c.remoteURL),
 	})
 	if err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
 		return fmt.Errorf("git: fetch: %w", err)
@@ -107,7 +107,7 @@ func (c *Clone) PushAllRefs(force bool) error {
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{config.RefSpec("refs/heads/*:refs/heads/*")},
 		Force:      force,
-		Auth:       sshAuthMethod(c.remoteURL),
+		Auth:       SSHAuthMethod(c.remoteURL),
 	})
 	c.lastPushAt = time.Now()
 	if err == nil || errors.Is(err, gogit.NoErrAlreadyUpToDate) {
@@ -137,7 +137,7 @@ func (c *Clone) pushInternal(branch string, force bool) error {
 	err := c.repo.Push(&gogit.PushOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{config.RefSpec(refspec)},
-		Auth:       sshAuthMethod(c.remoteURL),
+		Auth:       SSHAuthMethod(c.remoteURL),
 	})
 	if err == nil || errors.Is(err, gogit.NoErrAlreadyUpToDate) {
 		c.lastPushAt = time.Now()
@@ -164,7 +164,7 @@ func (c *Clone) verifyRemoteMatches(branch, expectedSHA string) error {
 		return fmt.Errorf("git: lookup origin: %w", err)
 	}
 	refs, err := rem.List(&gogit.ListOptions{
-		Auth: sshAuthMethod(c.remoteURL),
+		Auth: SSHAuthMethod(c.remoteURL),
 	})
 	if err != nil {
 		return fmt.Errorf("git: ls-remote: %w", err)

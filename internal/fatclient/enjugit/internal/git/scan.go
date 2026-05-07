@@ -64,7 +64,7 @@ func (c *Clone) FetchBranch(branch string) error {
 	err = c.repo.Fetch(&gogit.FetchOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{refSpec},
-		Auth:       sshAuthMethod(c.remoteURL),
+		Auth:       SSHAuthMethod(c.remoteURL),
 	})
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
 		return fmt.Errorf("git: fetch branch %s: %w", branch, err)
@@ -107,7 +107,7 @@ func (c *Clone) PullBranch(branch string) error {
 		RemoteName:    "origin",
 		ReferenceName: refName,
 		SingleBranch:  true,
-		Auth:          sshAuthMethod(c.remoteURL),
+		Auth:          SSHAuthMethod(c.remoteURL),
 	})
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
 		return fmt.Errorf("git: pull branch %s: %w", branch, err)
@@ -134,7 +134,7 @@ func (c *Clone) remoteBranchHashLocked(branch string) (string, error) {
 		return "", fmt.Errorf("git: remote-branch-hash: %w", err)
 	}
 	refs, err := rem.List(&gogit.ListOptions{
-		Auth: sshAuthMethod(c.remoteURL),
+		Auth: SSHAuthMethod(c.remoteURL),
 	})
 	if err != nil {
 		return "", fmt.Errorf("git: ls-remote: %w", err)

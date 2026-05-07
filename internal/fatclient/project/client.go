@@ -59,7 +59,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
-	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/gofrs/flock"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
@@ -316,44 +315,6 @@ func (ws *Opener) OpenBotCloneAt(projectID int64, clonePath, sourceURL string) (
 	p.fileLock = flock.New(lockPath)
 	ws.clients[projectID] = p
 	return p, nil
-}
-
-// sshAuthMethod returns an SSH auth method for the given remote URL.
-// Tries SSH agent first (via SSH_AUTH_SOCK), then falls back to
-// common private key files (~/.ssh/id_ed25519, id_rsa). Returns nil
-// for non-SSH URLs (http/https/local paths) — go-git handles those
-// without explicit auth.
-func sshAuthMethod(remoteURL string) transport.AuthMethod {
-	if !enjugit.IsSSHURL(remoteURL) {
-		return nil
-	}
-	// Try SSH agent first.
-	if os.Getenv("SSH_AUTH_SOCK") != "" {
-		if auth, err := gitssh.NewSSHAgentAuth("git"); err == nil {
-			return auth
-		}
-	}
-	// Fall back to key files.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-	keyFiles := []string{
-		filepath.Join(home, ".ssh", "id_ed25519"),
-		filepath.Join(home, ".ssh", "id_rsa"),
-		filepath.Join(home, ".ssh", "id_ecdsa"),
-	}
-	for _, kf := range keyFiles {
-		if _, err := os.Stat(kf); err != nil {
-			continue
-		}
-		auth, err := gitssh.NewPublicKeysFromFile("git", kf, "")
-		if err != nil {
-			continue // passphrase-protected, skip
-		}
-		return auth
-	}
-	return nil
 }
 
 // HasExternalDir returns true if the given project has a
@@ -1096,30 +1057,6 @@ func (p *Clone) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	}
 	return nil, fmt.Errorf("submit failed after %d push attempts", maxRetries)
 }
-// extractTaskIDTrailer reads the `Enju-Task-Complete:` trailer
-// out of a commit message, or returns "" if the commit isn't a
-// task submission. The trailer key matches
-// TrailerTaskComplete in trailers.go — the one every
-// buildCommitMessage commit emits. A rebase rewrites commit
-// hashes but preserves message bodies, so this stays the
-// stable key for mapping post-rebase SHAs back to the
-// originating submit entry.
-func extractTaskIDTrailer(msg string) string {
-	prefix := enjugit.TrailerTaskComplete + ":"
-	for _, line := range strings.Split(msg, "\n") {
-		// HasPrefix on the trimmed line so the match is a
-		// real trailer, not a body mention. A commit whose
-		// description happens to contain the phrase
-		// "Enju-Task-Complete: foo" in prose shouldn't be
-		// misread as the task's own commit.
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, prefix) {
-			return strings.TrimSpace(trimmed[len(prefix):])
-		}
-	}
-	return ""
-}
-
 // CommitFilesRequest packages inputs for a generic file-commit
 // that isn't tied to a task submission (the existing
 // SubmitTaskResult is task-shaped — TaskID, ArtifactPaths,
@@ -1408,7 +1345,7 @@ func (p *Clone) CompareToRemote() (*RemoteComparison, error) {
 	if err != nil {
 		if fetchErr := p.repo.Fetch(&gogit.FetchOptions{
 			RemoteName: "origin",
-			Auth:       sshAuthMethod(p.remoteURL),
+			Auth:       enjugit.SharedSSHAuth(p.remoteURL),
 		}); fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
 			// Can't fetch — report diverged conservatively so the
 			// user doesn't assume they're safe to fast-forward.

@@ -43,7 +43,7 @@ func (c *Clone) ReadFileAtCommit(sha, path string) ([]byte, bool, error) {
 				RefSpecs: []config.RefSpec{
 					config.RefSpec("+refs/heads/*:refs/remotes/origin/*"),
 				},
-				Auth: sshAuthMethod(c.remoteURL),
+				Auth: SSHAuthMethod(c.remoteURL),
 			}); fetchErr != nil && !errors.Is(fetchErr, gogit.NoErrAlreadyUpToDate) {
 				return nil, false, fmt.Errorf("%w (fetch failed: %v)", ErrCommitNotFound, fetchErr)
 			}
@@ -402,7 +402,7 @@ func (c *Clone) treeAtCommit(sha string) (*object.Tree, error) {
 				RefSpecs: []config.RefSpec{
 					config.RefSpec("+refs/heads/*:refs/remotes/origin/*"),
 				},
-				Auth: sshAuthMethod(c.remoteURL),
+				Auth: SSHAuthMethod(c.remoteURL),
 			}); fetchErr != nil && !errors.Is(fetchErr, gogit.NoErrAlreadyUpToDate) {
 				return nil, fmt.Errorf("%w (fetch failed: %v)", ErrCommitNotFound, fetchErr)
 			}

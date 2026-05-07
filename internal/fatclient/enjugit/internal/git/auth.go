@@ -9,11 +9,15 @@ import (
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 )
 
-// sshAuthMethod returns an SSH auth method for the given remote
+// SSHAuthMethod returns an SSH auth method for the given remote
 // URL. Tries the SSH agent first (SSH_AUTH_SOCK), falls back to
 // common key file paths. Returns nil for non-SSH URLs (http/https,
 // local paths) — go-git handles those without explicit auth.
-func sshAuthMethod(remoteURL string) transport.AuthMethod {
+//
+// Exported so the enjugit package can re-export it during the
+// project-package migration; once project retires this can fold
+// back to lowercase.
+func SSHAuthMethod(remoteURL string) transport.AuthMethod {
 	if !IsSSHURL(remoteURL) {
 		return nil
 	}
