@@ -2,6 +2,7 @@ package enjugit
 
 import (
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
@@ -19,12 +20,17 @@ import (
 //
 // Concrete verbs live in:
 //
-//   - state_prep.go   — EnsureRunBranch, ResetCleanWorktree
-//                       (+ unexported iteration-branch lifecycle)
-//   - producing.go    — SubmitTaskResult, MergeAcceptedTopic
+//   - state_prep.go      — EnsureRunBranch, ResetCleanWorktree
+//                          (+ unexported iteration-branch lifecycle)
+//   - branch_prep.go     — prepareBranchForCommit (shared by submit
+//                          and arbitrary-files commit paths)
+//   - producing.go       — SubmitTaskResult, MergeAcceptedTopic,
+//                          CommitArbitraryFiles
 //   - producing_batch.go — SubmitBatch (multi-task atomic submit)
-//   - sync_read.go    — FetchAllRefs, ReadFileAtCommit
-//   - lifecycle.go    — EnsureOrigin, SetRemote
+//   - scan.go            — FetchBranch, PullBranch, LocalBranchHash,
+//                          CheckoutBranch(From), ReadFile, ScanBranchSince
+//   - workflow.go        — origin/remote management (EnsureOrigin,
+//                          SetRemote, PushAllRefs) + metadata accessors
 //
 // Single vs batch submit:
 //
@@ -53,6 +59,13 @@ type Workflow struct {
 	// Used in log lines and (in future) per-project metrics.
 	projID int64
 
+	// mu guards defaultBranch. Workflow is shared across goroutines
+	// (Workspace caches one per project), and SetDefaultBranch can
+	// fire concurrently with verbs that read DefaultBranch. The
+	// other fields (git, convs, projID, logger) are set at
+	// construction and never mutated.
+	mu sync.RWMutex
+
 	// defaultBranch is the project's default branch (typically
 	// "main"). Templates are read from this branch's tree, and
 	// templates / submits fork run branches from its tip. Service
@@ -71,16 +84,22 @@ type Workflow struct {
 // is a no-op so callers don't have to special-case
 // uninitialized state.
 func (w *Workflow) SetDefaultBranch(branch string) {
-	if branch != "" {
-		w.defaultBranch = branch
+	if branch == "" {
+		return
 	}
+	w.mu.Lock()
+	w.defaultBranch = branch
+	w.mu.Unlock()
 }
 
 // DefaultBranch returns the configured default branch, or
 // the convs-supplied default when none was set explicitly.
 func (w *Workflow) DefaultBranch() string {
-	if w.defaultBranch != "" {
-		return w.defaultBranch
+	w.mu.RLock()
+	cached := w.defaultBranch
+	w.mu.RUnlock()
+	if cached != "" {
+		return cached
 	}
 	return w.convs.DefaultRunBranch
 }

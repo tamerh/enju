@@ -15,7 +15,7 @@ import (
 // upstreamBranch is the name of the upstream task's topic branch
 // (e.g. "1-build/develop_a/iter-1"). Resolved via origin's tip.
 //
-// Git operations performed:
+// Git operations performed (under one WithLock):
 //   1. Fetch origin (so origin/<upstreamBranch> is current).
 //   2. ResolveRef(<upstreamBranch>) — finds origin/<upstreamBranch>'s SHA.
 //   3. CheckoutCommit(SHA) — detached HEAD on that commit.
@@ -33,39 +33,42 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 	trace := startTrace("materializeUpstreamForReview")
 	trace.ctx("upstream_branch", upstreamBranch)
 
-	// Step 1: fetch (best-effort).
-	if err := w.git.Fetch(); err != nil {
-		if errors.Is(err, git.ErrNoRemote) {
-			trace.skipped("fetch-origin", "no remote configured")
+	werr := w.git.WithLock(func(g git.Ops) error {
+		// Step 1: fetch (best-effort).
+		if err := g.Fetch(); err != nil {
+			if errors.Is(err, git.ErrNoRemote) {
+				trace.skipped("fetch-origin", "no remote configured")
+			} else {
+				trace.steps = append(trace.steps, Step{
+					Name: "fetch-origin", Status: "failed",
+					Detail: err.Error(),
+				})
+				w.logger.Warn("enjugit: pre-materialize fetch failed; continuing with cached refs",
+					"branch", upstreamBranch, "error", err)
+			}
 		} else {
-			trace.steps = append(trace.steps, Step{
-				Name: "fetch-origin", Status: "failed",
-				Detail: err.Error(),
-			})
-			w.logger.Warn("enjugit: pre-materialize fetch failed; continuing with cached refs",
-				"branch", upstreamBranch, "error", err)
+			trace.ok("fetch-origin")
 		}
-	} else {
-		trace.ok("fetch-origin")
-	}
 
-	// Step 2: resolve upstream tip.
-	sha, err := w.git.ResolveRef(upstreamBranch)
-	if err != nil {
-		if errors.Is(err, git.ErrRefNotFound) {
-			return trace.fail("resolve-upstream",
-				fmt.Errorf("%w: %s", ErrUpstreamNotFound, upstreamBranch))
+		// Step 2: resolve upstream tip.
+		sha, err := g.ResolveRef(upstreamBranch)
+		if err != nil {
+			if errors.Is(err, git.ErrRefNotFound) {
+				return trace.fail("resolve-upstream",
+					fmt.Errorf("%w: %s", ErrUpstreamNotFound, upstreamBranch))
+			}
+			return trace.fail("resolve-upstream", translateGitError("resolve upstream", err))
 		}
-		return trace.fail("resolve-upstream", translateGitError("resolve upstream", err))
-	}
-	trace.okDetail("resolve-upstream", shortSHA(sha))
+		trace.okDetail("resolve-upstream", shortSHA(sha))
 
-	// Step 3: detached checkout onto upstream's tree.
-	if err := w.git.CheckoutCommit(sha); err != nil {
-		return trace.fail("checkout-detached", translateGitError("checkout upstream commit", err))
-	}
-	trace.ok("checkout-detached")
-	return nil
+		// Step 3: detached checkout onto upstream's tree.
+		if err := g.CheckoutCommit(sha); err != nil {
+			return trace.fail("checkout-detached", translateGitError("checkout upstream commit", err))
+		}
+		trace.ok("checkout-detached")
+		return nil
+	})
+	return werr
 }
 
 // startIterationBranch creates a fresh iter-N topic branch

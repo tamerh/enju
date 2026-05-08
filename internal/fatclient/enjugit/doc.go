@@ -11,7 +11,7 @@
 //     Enju-Iter-Seq, Enju-Task-ID, AI-Model, Co-Authored-By)
 //   - Author identity per verb (citizen vs system)
 //   - Per-project disk layout (<project>/enju/.bare.git/,
-//     <project>/enju/bots/<name>/clone/)
+//     <project>/enju/.clone/, <project>/enju/bots/<name>/clone/)
 //   - Iteration semantics (iter_seq → branch name)
 //   - Template snapshots, scanner, refs, sharedroot — all the
 //     Enju-specific concepts that operate on git
@@ -46,6 +46,7 @@
 // Workflow tests pass a fake git.Ops that records calls and
 // returns canned responses. Each verb's contract becomes
 // "right git ops invoked, in right order, with right author and
-// trailers." Property tests assert pre/post worktree state and
-// documented errors fire when expected.
+// trailers." Integration tests under cross_bot_read_integration_test.go
+// + producing_*_integration_test.go pin behavior against a real
+// on-disk repo for the paths fakes can't faithfully reproduce.
 package enjugit

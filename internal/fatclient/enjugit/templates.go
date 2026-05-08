@@ -73,12 +73,11 @@ type resolvedBundle struct {
 // would bloat every subsequent run commit.
 const maxTemplateBundleBytes = 10 * 1024 * 1024
 
-// ListTemplates scans every configured template root on the
-// default branch and returns one summary per directory bundle.
-// Roots and default branch are read from workflow state (set
-// by service via SetDefaultBranch / SetTemplateRoots). Empty
-// configuration falls back to corelayout's
-// DefaultTemplatesDir + convs.DefaultRunBranch.
+// ListTemplates scans the default template root on the default
+// branch and returns one summary per directory bundle. The root
+// is corelayout.DefaultTemplatesDir; the branch is the workflow's
+// default (set via SetDefaultBranch, falling back to
+// convs.DefaultRunBranch).
 //
 // Directories without an enju.yaml are skipped silently. A
 // bundle whose enju.yaml fails to parse appears with ParseError

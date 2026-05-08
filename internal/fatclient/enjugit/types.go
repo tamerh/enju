@@ -1,9 +1,6 @@
 package enjugit
 
-import (
-	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
-)
+import "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 
 // ForkPoint names where a new iteration branch should fork from.
 // Replaces the previous "magic baseBranch parameter" overload
@@ -170,8 +167,3 @@ type MergeAuthor struct {
 	// Goes into the Enju-Merge trailer.
 	AutoOrManual string
 }
-
-// WriteArtifacts is re-exported from common/yaml so service
-// callers can pass the parsed declarations through to
-// Workflow.WipeIterationWrites without importing yaml directly.
-type WriteArtifacts = enjuYaml.WriteArtifacts

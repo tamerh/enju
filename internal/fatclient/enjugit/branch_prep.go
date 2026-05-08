@@ -140,7 +140,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 	}
 	trace.skipped("checkout-local", "no local refs/heads/"+branch)
 
-	// Step 3: track-origin. Branch missing locally — see if
+	// Step 4: track-origin. Branch missing locally — see if
 	// origin has it.
 	originSHA, rerr := g.ResolveRef("refs/remotes/origin/" + branch)
 	switch {
@@ -159,7 +159,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 		return trace.fail("track-origin", rerr)
 	}
 
-	// Step 4: fork-from-preferred-base. When the caller
+	// Step 5: fork-from-preferred-base. When the caller
 	// supplied a preferred fork ref (e.g. a review submit
 	// passes the upstream's iteration branch so the review's
 	// topic forks from the upstream's content), use that.
@@ -185,7 +185,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 		trace.skipped("fork-from-preferred-base", "no preferred base supplied")
 	}
 
-	// Step 5: fork-from-default. Last resort — fork from the
+	// Step 6: fork-from-default. Last resort — fork from the
 	// project's default branch. Try local default first, then
 	// origin/default.
 	defaultSHA, defErr := w.resolveBranchTip(g, defaultBranch)

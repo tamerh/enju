@@ -259,8 +259,8 @@ func (c *Clone) ResetClean() error {
 }
 
 // RemoveFiles deletes the given paths from the worktree. Used by
-// enjugit's WipeIterationWrites to clear a prior iteration's
-// declared output files before the next iteration's handler runs.
+// service.WipeDeclaredWrites to clear a prior iteration's declared
+// output files before the next iteration's handler runs.
 //
 // Idempotent: a path that doesn't exist is silently skipped.
 // Paths are relative to workDir.
