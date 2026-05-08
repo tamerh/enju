@@ -407,29 +407,6 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 	return &result, nil
 }
 
-// CommitTemplateBundle snapshots a directory of template files
-// onto the project's default branch. System-authored, idempotent
-// (no-op when bundle contents match what's already on the branch).
-//
-// Used during run materialization to persist the template bundle
-// the run was created from, so the run can later re-execute even
-// if the template's source moved.
-//
-// Git operations performed (under one WithLock):
-//   1. Switch to default branch (create from current HEAD if needed).
-//   2. Walk bundleDir, build FileWrites under "enju/templates/<bundle>/".
-//   3. CommitFiles with system author + Enju-Template-Snapshot trailer.
-//   4. Push the default branch.
-//
-// Returns the commit SHA. NoOp result when nothing changed
-// (existing snapshot identical to bundle).
-func (w *Workflow) CommitTemplateBundle(bundleName, bundleDir string, runSeq int) (string, error) {
-	// This is a thin verb that mostly delegates to a helper that
-	// will live in templates.go (Phase 9). For now: stub so the
-	// shape compiles and callers can reference it.
-	return "", fmt.Errorf("enjugit: CommitTemplateBundle not yet implemented (Phase 9)")
-}
-
 // FetchAllRefs is a passthrough for git.Fetch. Wraps with
 // Enju-typed errors. Used by daemon's pre-claim pull so
 // cross-citizen refs are visible.

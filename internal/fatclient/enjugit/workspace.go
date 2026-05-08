@@ -86,10 +86,6 @@ func NewWorkspace(rootDir string, convs Conventions, opts ...Option) (*Workspace
 // (default: ~/.enju/workspaces).
 func (w *Workspace) RootDir() string { return w.rootDir }
 
-// Conventions returns the conventions this Workspace was
-// constructed with. Useful for tests + diagnostic surfaces that
-// want to render the same names workflow uses.
-func (w *Workspace) Conventions() Conventions { return w.convs }
 
 // ProjectDir returns the on-disk path for a project's clone root.
 // Resolves via:

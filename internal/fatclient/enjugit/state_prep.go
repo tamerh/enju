@@ -275,39 +275,6 @@ func (w *Workflow) ResumeIterationBranch(
 	return branchName, nil
 }
 
-// WipeIterationWrites removes files matching the task's declared
-// writes_artifacts patterns. Run between iterations so iter-N's
-// commit carries iter-N's content only — no union of prior
-// iterations' files (the LLM-non-determinism-in-filenames bug).
-//
-// All four declaration shapes (literal, glob, dir, templated)
-// are handled by delegating to WriteArtifacts.ExpandAgainstWorkdir
-// (the same expander used by post-handler validation).
-//
-// Git operations performed:
-//   1. Expand writes against the worktree → list of paths.
-//   2. RemoveFiles(paths).
-//
-// Worktree state: Pre StateClean → Post StateClean (paths gone).
-// Idempotent: missing paths are silently skipped.
-func (w *Workflow) WipeIterationWrites(writes WriteArtifacts) error {
-	if len(writes) == 0 {
-		return nil
-	}
-	expanded, _, err := writes.ExpandAgainstWorkdir(w.workDir())
-	if err != nil {
-		return fmt.Errorf("enjugit: expand writes: %w", err)
-	}
-	paths := make([]string, 0, len(expanded))
-	for _, e := range expanded {
-		paths = append(paths, e.Path)
-	}
-	if len(paths) == 0 {
-		return nil
-	}
-	return translateGitError("remove iter writes", w.git.RemoveFiles(paths))
-}
-
 // ResetCleanWorktree drops uncommitted modifications + untracked
 // files. After this, State() == StateClean.
 //

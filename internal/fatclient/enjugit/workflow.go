@@ -48,13 +48,6 @@ type Workflow struct {
 	// call. Empty falls back to convs.DefaultRunBranch.
 	defaultBranch string
 
-	// templateRoots are the configured templates directories,
-	// resolved from enju/conf.yaml's `templates:` list (or just
-	// `enju/templates/` when no conf). Set by service after
-	// Workflow construction. Empty defaults to corelayout's
-	// DefaultTemplatesDir.
-	templateRoots []string
-
 	logger *slog.Logger
 }
 
@@ -76,21 +69,6 @@ func (w *Workflow) DefaultBranch() string {
 		return w.defaultBranch
 	}
 	return w.convs.DefaultRunBranch
-}
-
-// SetTemplateRoots updates the configured template roots.
-// Empty / nil resets to default.
-func (w *Workflow) SetTemplateRoots(roots []string) {
-	w.templateRoots = roots
-}
-
-// TemplateRoots returns the configured roots, falling back
-// to the corelayout default when none were set.
-func (w *Workflow) TemplateRoots() []string {
-	if len(w.templateRoots) > 0 {
-		return w.templateRoots
-	}
-	return nil // ListTemplates fills in DefaultTemplatesDir
 }
 
 // WorkDir returns the worktree path for this workflow's clone,

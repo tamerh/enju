@@ -86,10 +86,7 @@ const maxTemplateBundleBytes = 10 * 1024 * 1024
 // root produce a migration-hint entry so the author isn't left
 // with an empty menu.
 func (w *Workflow) ListTemplates() ([]TemplateSummary, error) {
-	roots := w.templateRoots
-	if len(roots) == 0 {
-		roots = []string{corelayout.DefaultTemplatesDir}
-	}
+	roots := []string{corelayout.DefaultTemplatesDir}
 	sha, err := w.resolveDefaultBranchSHA(w.DefaultBranch())
 	if err != nil {
 		return nil, err
@@ -205,14 +202,12 @@ func paramSummaries(ps []enjuYaml.ParamDef) []ParamSummary {
 // UX — a user writes enju.yaml into the worktree without
 // committing, then create_run's EnsureBundleOnDefault auto-commits.
 //
-// Configured roots, default branch, and workdir are read from
-// workflow state — set them via SetDefaultBranch /
-// SetTemplateRoots after Workflow construction.
+// Default branch and workdir are read from workflow state —
+// set the default branch via SetDefaultBranch after Workflow
+// construction. Templates always live under
+// corelayout.DefaultTemplatesDir on the default branch.
 func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
-	roots := w.templateRoots
-	if len(roots) == 0 {
-		roots = []string{corelayout.DefaultTemplatesDir}
-	}
+	roots := []string{corelayout.DefaultTemplatesDir}
 	clean := filepath.ToSlash(filepath.Clean(repoRelPath))
 	if strings.Contains(clean, "../") || clean != repoRelPath {
 		return nil, fmt.Errorf("template path %q contains disallowed path components", repoRelPath)
@@ -419,28 +414,6 @@ func (w *Workflow) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mod
 		return sha, nil
 	}
 	return res.CommitSHA, nil
-}
-
-// InstantiateTemplate loads a template, substitutes params, and
-// returns the resolved ParsedRun ready for the submit path.
-func (w *Workflow) InstantiateTemplate(repoRelPath string, params map[string]interface{}) (*enjuYaml.ParsedRun, []byte, error) {
-	loaded, err := w.LoadTemplate(repoRelPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	parsed, err := enjuYaml.ParseWithParams(loaded.Raw, params)
-	if err != nil {
-		return nil, nil, err
-	}
-	return parsed, loaded.Raw, nil
-}
-
-// ValidateTemplateParams runs ParseWithParams without producing
-// a run — useful as a dry-run from the LLM side before the user
-// commits to submission.
-func (w *Workflow) ValidateTemplateParams(repoRelPath string, params map[string]interface{}) error {
-	_, _, err := w.InstantiateTemplate(repoRelPath, params)
-	return err
 }
 
 // resolveDefaultBranchSHA returns the SHA of the default branch

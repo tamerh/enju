@@ -20,7 +20,6 @@ func makeWorkflow(t *testing.T) (*Workflow, *fakeOps) {
 		convs:         NewProductionConventions(),
 		projID:        7,
 		defaultBranch: "main",
-		templateRoots: []string{"enju/templates"},
 		logger:        nullLogger(),
 	}
 	return wf, fake
@@ -277,7 +276,6 @@ func TestResumeIterationBranch_TraceShowsAutoHeal(t *testing.T) {
 		convs:         NewProductionConventions(),
 		projID:        7,
 		defaultBranch: "main",
-		templateRoots: []string{"enju/templates"},
 		logger:        nullLogger(),
 	}
 	_, err = wf2.ResumeIterationBranch("7:1:dev_a", 1,
