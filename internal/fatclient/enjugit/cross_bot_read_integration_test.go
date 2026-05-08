@@ -590,6 +590,90 @@ func TestCrossBotRead_OperatorAndBot_ParallelPushesEachReadsOtherIntegration(t *
 	}
 }
 
+// TestOpenView_HydratesRemoteURLForLazyFetchIntegration pins the
+// regression where webui's clone (always opened via OpenView)
+// had remoteURL="" even though origin was configured on disk,
+// dead-locking the lazy-fetch in ReadFileAtCommit. Production
+// symptom: webui showed "(content unavailable — commit
+// unreachable from this clone)" for a commit that existed in the
+// bare and was reachable via origin, just not yet in the local
+// object DB.
+//
+// In enjugit, OpenView calls git.OpenClone, which hydrates
+// Clone.remoteURL from the on-disk origin remote (clone.go's
+// OpenClone reads origin's URL into c.remoteURL). This test
+// exercises the cross-citizen read through that path: writer
+// pushes via ForProject, reader opens fresh via OpenView, lazy
+// fetch must succeed.
+//
+// Originally project's TestOpenExisting_HydratesRemoteURLForLazyFetch.
+func TestOpenView_HydratesRemoteURLForLazyFetchIntegration(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+
+	// Writer pushes a commit to the bare (the "bot" side).
+	writerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	writer, err := writerWS.ForProject(7, bare)
+	if err != nil {
+		t.Fatalf("writer ForProject: %v", err)
+	}
+	res, err := writer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:dev",
+		BranchOverride: "topic-x",
+		Citizen:        Identity{Name: "writer", Email: "w@example.com"},
+		Files:          []FileWrite{{RepoRelPath: "out.md", Content: []byte("payload\n")}},
+	})
+	if err != nil {
+		t.Fatalf("writer submit: %v", err)
+	}
+	writerSHA := res.CommitSHA
+
+	// Reader workspace: clone first via ForProject so the on-disk
+	// clone exists with origin configured. Then drop the in-memory
+	// caches (workflows + views) and call OpenView — mirrors the
+	// webui path where each request opens fresh against a
+	// pre-existing clone.
+	readerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	if _, err := readerWS.ForProject(7, bare); err != nil {
+		t.Fatalf("reader initial ForProject: %v", err)
+	}
+	// Force OpenView to do its own work (not return cached).
+	readerWS.mu.Lock()
+	delete(readerWS.workflows, 7)
+	delete(readerWS.views, 7)
+	readerWS.mu.Unlock()
+
+	view, err := readerWS.OpenView(7)
+	if err != nil {
+		t.Fatalf("OpenView: %v", err)
+	}
+
+	// Assert the underlying *git.Clone hydrated remoteURL from
+	// on-disk origin. git.View doesn't expose RemoteURL, so we
+	// type-assert to *git.Clone (the concrete type that satisfies
+	// git.View).
+	clone, ok := view.git.(*git.Clone)
+	if !ok {
+		t.Fatalf("expected *git.Clone under view, got %T", view.git)
+	}
+	if clone.RemoteURL() == "" {
+		t.Fatal("OpenView did not hydrate remoteURL from on-disk origin — lazy-fetch dead")
+	}
+
+	// Cross-citizen read: writerSHA isn't in reader's local
+	// object DB yet. ReadFileAtCommit should self-heal via the
+	// lazy fetch (which now has a remote to fetch from).
+	body, found, rerr := view.ReadFileAtCommit(writerSHA, "out.md")
+	if rerr != nil {
+		t.Fatalf("ReadFileAtCommit on cross-citizen commit: %v", rerr)
+	}
+	if !found {
+		t.Fatal("expected found=true after lazy fetch; pre-fix production failure mode")
+	}
+	if string(body) != "payload\n" {
+		t.Errorf("content mismatch: got %q", body)
+	}
+}
+
 // TestCrossBotRead_ProductionRequestChangesShapeIntegration
 // reproduces the exact production failure shape: developer-bot
 // pushes its iter-1 deliverable on the topic branch produced by
