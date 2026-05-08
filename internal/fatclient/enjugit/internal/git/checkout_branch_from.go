@@ -261,6 +261,24 @@ func (c *Clone) resolveOriginRefHash(branch string) (plumbing.Hash, bool) {
 	return plumbing.ZeroHash, false
 }
 
+// IsAncestor reports whether `ancestor` is reachable from
+// `descendant` via parents. Public counterpart to
+// commitHasAncestor (which takes plumbing.Hash) — accepts SHA
+// strings so callers via the Ops interface don't need to import
+// go-git plumbing.
+//
+// Returns false (no error) when either SHA is invalid / unknown
+// to the local object DB; ancestry queries on missing commits
+// are not "errors" in the verb sense — the caller's stale-ref
+// guard treats them as "not an ancestor" (i.e. the local ref is
+// stale enough that we can't reason about it, reseat).
+func (c *Clone) IsAncestor(ancestor, descendant string) (bool, error) {
+	defer c.lock()()
+	a := plumbing.NewHash(ancestor)
+	d := plumbing.NewHash(descendant)
+	return c.commitHasAncestor(d, a), nil
+}
+
 // commitHasAncestor returns true when `ancestor` is reachable
 // from `head` by walking parents. Bounded at 200 hops to avoid
 // runaway scans on pathological histories — topic branches in

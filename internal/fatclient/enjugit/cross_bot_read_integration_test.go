@@ -22,10 +22,14 @@ package enjugit
 //   Phase 7: Theme D-disk  — worktree-on-disk content (4 tests)
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
@@ -59,6 +63,69 @@ func openTwoBotWorkflowsForRead(t *testing.T) (alice, bob *Workflow, bare string
 		t.Fatalf("bob clone: %v", err)
 	}
 	return alice, bob, bare
+}
+
+// workflowRepo returns the underlying go-git *Repository for a
+// Workflow. Used by tests that need direct access to refs /
+// log walking — the same pattern as producing_edge_integration
+// and merge_integration. Tests, not production, get to peek
+// behind the abstraction.
+func workflowRepo(t *testing.T, wf *Workflow) *gogit.Repository {
+	t.Helper()
+	clone, ok := wf.git.(*git.Clone)
+	if !ok {
+		t.Fatalf("expected *git.Clone under workflow, got %T", wf.git)
+	}
+	return clone.Repo()
+}
+
+// ancestryContains returns true when target is reachable from
+// head via the parent chain in wf's local clone. Used to verify
+// that a review-iter-N commit's ancestry threads through the
+// upstream's iter-N (the load-bearing fork-from-upstream
+// invariant).
+func ancestryContains(t *testing.T, wf *Workflow, head, target string) bool {
+	t.Helper()
+	repo := workflowRepo(t, wf)
+	headHash := plumbing.NewHash(head)
+	targetHash := plumbing.NewHash(target)
+	iter, err := repo.Log(&gogit.LogOptions{From: headHash})
+	if err != nil {
+		t.Fatalf("log from %s: %v", head, err)
+	}
+	defer iter.Close()
+	for {
+		c, err := iter.Next()
+		if err != nil {
+			break
+		}
+		if c.Hash == targetHash {
+			return true
+		}
+	}
+	return false
+}
+
+// ancestryDump returns a short text dump of head's ancestor
+// SHAs. Used in failure messages to make "the ancestry doesn't
+// match" diagnosable instead of opaque.
+func ancestryDump(t *testing.T, wf *Workflow, head string) string {
+	t.Helper()
+	repo := workflowRepo(t, wf)
+	iter, err := repo.Log(&gogit.LogOptions{From: plumbing.NewHash(head)})
+	if err != nil {
+		return fmt.Sprintf("(log error: %v)", err)
+	}
+	defer iter.Close()
+	var lines []string
+	for i := 0; i < 10; i++ {
+		c, err := iter.Next()
+		if err != nil {
+			break
+		}
+		lines = append(lines, c.Hash.String()[:8])
+	}
+	return strings.Join(lines, " → ")
 }
 
 // hasCommit returns true if wf's underlying clone has the given
@@ -723,5 +790,318 @@ func TestCrossBotRead_ProductionRequestChangesShapeIntegration(t *testing.T) {
 		if len(body) == 0 {
 			t.Errorf("reviewer got empty bytes for %s", path)
 		}
+	}
+}
+
+// TestReviewIter2_ForksFromUpstreamIter2_NotSeedIntegration pins
+// the reported regression: when an upstream task is rejected on
+// its review's iter-1 verdict and re-submits as iter-2, the
+// reviewer's own iter-2 topic branch must fork from the upstream's
+// iter-2 topic — NOT from the run base / seed.
+//
+// Production symptom: review_domain/iter-2 contained only the
+// seed commit + initial commit. The upstream developer's iter-2
+// content wasn't in the review's ancestry, so reviewer-bot looked
+// at an empty tree and rejected ("never delivered").
+//
+// Threads the full sequence through SubmitTaskResult at the
+// Workflow layer:
+//
+//	alice iter-1:  develop_domain/iter-1   (commit D1)
+//	bob iter-1:    review_domain/iter-1    forked from D1
+//	alice iter-2:  develop_domain/iter-2   (commit D2)
+//	bob iter-2:    review_domain/iter-2    forked from D2
+//
+// Verifies R2's commit ancestry contains D2. If the bug
+// reproduces, R2's parent chain reaches seed without touching D2.
+//
+// Maps project's BaseBranch field to enjugit's RunBranch field:
+// SubmitTaskResult uses RunBranch as the preferred fork base
+// when the topic doesn't yet exist (producing.go:88-91).
+func TestReviewIter2_ForksFromUpstreamIter2_NotSeedIntegration(t *testing.T) {
+	alice, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// === iter-1 ===
+	d1Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "1-build/develop_domain/iter-1",
+		Citizen:        Identity{Name: "alice", Email: "alice@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 1\n")}},
+	})
+	if err != nil {
+		t.Fatalf("alice iter-1 submit: %v", err)
+	}
+	d1SHA := d1Res.CommitSHA
+
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch before review iter-1: %v", err)
+	}
+
+	r1Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:review_domain",
+		BranchOverride: "1-build/review_domain/iter-1",
+		RunBranch:      "1-build/develop_domain/iter-1", // fork base when topic doesn't yet exist
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/review.md", Content: []byte("iter-1 reject\n")}},
+	})
+	if err != nil {
+		t.Fatalf("bob iter-1 submit: %v", err)
+	}
+	r1SHA := r1Res.CommitSHA
+
+	if !ancestryContains(t, bob, r1SHA, d1SHA) {
+		t.Fatalf("review iter-1: R1 (%s) ancestry does not contain D1 (%s) — fork-from-upstream broken at iter-1", r1SHA, d1SHA)
+	}
+
+	// === iter-2 ===
+	d2Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "1-build/develop_domain/iter-2",
+		Citizen:        Identity{Name: "alice", Email: "alice@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 2\n// iter-2 content\n")}},
+	})
+	if err != nil {
+		t.Fatalf("alice iter-2 submit: %v", err)
+	}
+	d2SHA := d2Res.CommitSHA
+
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch before review iter-2: %v", err)
+	}
+
+	// THE bug-reproducing call. Pre-fix this would create
+	// review_domain/iter-2 forked from seed instead of from D2.
+	r2Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:review_domain",
+		BranchOverride: "1-build/review_domain/iter-2",
+		RunBranch:      "1-build/develop_domain/iter-2", // upstream iter-2 as fork base
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/review.md", Content: []byte("iter-2 approve\n")}},
+	})
+	if err != nil {
+		t.Fatalf("bob iter-2 submit: %v", err)
+	}
+	r2SHA := r2Res.CommitSHA
+
+	// THE pin: R2's ancestry must include D2.
+	if !ancestryContains(t, bob, r2SHA, d2SHA) {
+		t.Fatalf("review iter-2 forked from seed (or D1), not D2 — production bug reproduced.\n"+
+			"  R2 = %s\n  D2 = %s (expected ancestor, missing)\n  D1 = %s\n"+
+			"  R2 ancestry: %s",
+			r2SHA, d2SHA, d1SHA, ancestryDump(t, bob, r2SHA))
+	}
+}
+
+// TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRefIntegration
+// stresses the same surface but pre-creates a stale local ref
+// pointing at the seed for the would-be review iter-2 branch.
+// This is the shape that bypasses the BaseBranch logic via the
+// "branch already exists" short-circuit — the candidate root cause
+// for the production reproduction. The stale-ref guard must
+// validate the existing ref's ancestry against RunBranch before
+// honoring it.
+func TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRefIntegration(t *testing.T) {
+	alice, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// alice iter-1
+	if _, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "1-build/develop_domain/iter-1",
+		Citizen:        Identity{Name: "alice", Email: "alice@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("v1\n")}},
+	}); err != nil {
+		t.Fatalf("alice iter-1: %v", err)
+	}
+
+	// Stash bob's seed (root) commit so we can plant a stale ref.
+	bobRepo := workflowRepo(t, bob)
+	bobHead, err := bobRepo.Head()
+	if err != nil {
+		t.Fatalf("bob head: %v", err)
+	}
+	seedHash := bobHead.Hash()
+
+	// alice iter-2
+	d2Res, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "1-build/develop_domain/iter-2",
+		Citizen:        Identity{Name: "alice", Email: "alice@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("v2\n")}},
+	})
+	if err != nil {
+		t.Fatalf("alice iter-2: %v", err)
+	}
+	d2SHA := d2Res.CommitSHA
+
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch: %v", err)
+	}
+
+	// The stale-ref injection: pre-create review_domain/iter-2 at
+	// seed BEFORE bob's submit. This is what the production clone
+	// would look like if a previous run / a fetched stale tracking
+	// ref planted the same branch name.
+	staleRefName := "refs/heads/1-build/review_domain/iter-2"
+	if err := bobRepo.Storer.SetReference(
+		plumbing.NewHashReference(plumbing.ReferenceName(staleRefName), seedHash),
+	); err != nil {
+		t.Fatalf("planting stale ref: %v", err)
+	}
+
+	r2Res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:review_domain",
+		BranchOverride: "1-build/review_domain/iter-2",
+		RunBranch:      "1-build/develop_domain/iter-2",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "review.md", Content: []byte("approve\n")}},
+	})
+	if err != nil {
+		t.Fatalf("bob iter-2 submit: %v", err)
+	}
+
+	// Verify R2's ancestry includes D2 — the stale-ref guard must
+	// have detected the existing ref's seed-only ancestry and
+	// reseated it on D2 before commit.
+	if !ancestryContains(t, bob, r2Res.CommitSHA, d2SHA) {
+		t.Fatalf("REPRO: stale local ref short-circuited fork-from-base.\n"+
+			"  R2 = %s\n  D2 = %s (expected ancestor, missing)\n"+
+			"  R2 ancestry: %s\n"+
+			"  prepareBranchForCommit honored the stale ref instead of reseating on RunBranch.",
+			r2Res.CommitSHA, d2SHA, ancestryDump(t, bob, r2Res.CommitSHA))
+	}
+}
+
+// TestReviewerCheckoutUpstreamTopic_ForksFromOriginNotRunBranchIntegration
+// pins the reviewer pre-handler checkout: when the daemon needs
+// to materialize the upstream's pushed content into the worktree
+// (so claude -p can read files), CheckoutBranchFrom with empty
+// baseBranch must resolve origin/<upstream-topic> — landing the
+// new local ref at the developer's actual tip — NOT at run-branch.
+//
+// Production symptom: reviewer-bot saw an empty src/ on disk
+// because the local upstream ref pointed at run-branch's tip
+// instead of the developer's commit.
+func TestReviewerCheckoutUpstreamTopic_ForksFromOriginNotRunBranchIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Run-branch baseline: a commit unrelated to develop_a's content
+	// (analog of the template-snapshot commit).
+	if _, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:setup",
+		BranchOverride: "iter-smoke",
+		Citizen:        Identity{Name: "developer", Email: "dev@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "templates/seed.md", Content: []byte("template scaffold\n")}},
+	}); err != nil {
+		t.Fatalf("setup commit: %v", err)
+	}
+
+	// Developer pushes the topic carrying the file the reviewer
+	// needs to evaluate.
+	devRes, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_a",
+		BranchOverride: "iter-smoke-runs/develop_a/iter-1",
+		RunBranch:      "iter-smoke",
+		Citizen:        Identity{Name: "developer", Email: "dev@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "smoke/a.md", Content: []byte("magic word: enju\n")}},
+	})
+	if err != nil {
+		t.Fatalf("develop_a iter-1 submit: %v", err)
+	}
+	devTopicSHA := devRes.CommitSHA
+
+	if err := reviewer.FetchAllRefs(); err != nil {
+		t.Fatalf("reviewer fetch: %v", err)
+	}
+
+	// Daemon passes EMPTY baseBranch for the review's pre-handler
+	// upstream checkout. CheckoutBranchFrom resolves
+	// origin/<upstream-topic>, landing the new local ref at the
+	// developer's actual tip.
+	if err := reviewer.CheckoutBranchFrom(
+		"iter-smoke-runs/develop_a/iter-1", // target = upstream topic
+		"",                                  // empty: track origin/<upstream>
+	); err != nil {
+		t.Fatalf("CheckoutBranchFrom: %v", err)
+	}
+
+	// Verify: reviewer's local ref must point at the developer's
+	// actual commit, NOT at run-branch's tip.
+	repo := workflowRepo(t, reviewer)
+	ref, err := repo.Reference(plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1"), true)
+	if err != nil {
+		t.Fatalf("upstream ref lookup: %v", err)
+	}
+	if ref.Hash().String() != devTopicSHA {
+		t.Fatalf("REPRO: reviewer's local upstream ref points at the WRONG commit.\n"+
+			"  got:  %s (run-branch tip — has no smoke/a.md)\n"+
+			"  want: %s (developer's actual topic commit)",
+			ref.Hash(), devTopicSHA)
+	}
+
+	// Verify: smoke/a.md is on disk (the actual symptom).
+	smokePath := filepath.Join(reviewer.WorkDir(), "smoke", "a.md")
+	if _, err := os.Stat(smokePath); err != nil {
+		t.Errorf("smoke/a.md missing from reviewer worktree: %v", err)
+	}
+}
+
+// TestReviewerIterN_ForksFromRunBranchNotUpstreamIntegration is
+// the reporter's loop-forever bug nailed at the right call site.
+// For iter > 1 of a REVIEW task, the daemon calls
+// CheckoutBranchFrom(review_a/iter-N, upstream-topic) — passing
+// upstream-topic as baseBranch so the new review-iter-N forks
+// from the upstream's content (which carries the developer's
+// files claude -p must evaluate), NOT from run-branch (which
+// has no upstream content).
+//
+// Pre-fix the daemon passed run-branch as baseBranch; review iter-N
+// forked from run-branch tip; worktree had no smoke/a.md; claude -p
+// rejected forever in a loop.
+func TestReviewerIterN_ForksFromRunBranchNotUpstreamIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Run-branch baseline (analog of template snapshot).
+	if _, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:setup",
+		BranchOverride: "iter-smoke",
+		Citizen:        Identity{Name: "developer", Email: "dev@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "templates/seed.md", Content: []byte("scaffold\n")}},
+	}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Developer pushes upstream topic with smoke/a.md.
+	if _, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_a",
+		BranchOverride: "iter-smoke-runs/develop_a/iter-1",
+		RunBranch:      "iter-smoke",
+		Citizen:        Identity{Name: "developer", Email: "dev@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "smoke/a.md", Content: []byte("magic word: enju\n")}},
+	}); err != nil {
+		t.Fatalf("develop_a iter-1 submit: %v", err)
+	}
+
+	if err := reviewer.FetchAllRefs(); err != nil {
+		t.Fatalf("reviewer fetch: %v", err)
+	}
+
+	// Post-fix: daemon passes UpstreamIterationBranch (not run-branch)
+	// as baseBranch when the action is review. review_a/iter-2 forks
+	// from upstream-topic which carries the developer's content.
+	if err := reviewer.CheckoutBranchFrom(
+		"iter-smoke-runs/review_a/iter-2",  // target = reviewer's own iter-N
+		"iter-smoke-runs/develop_a/iter-1", // baseBranch = upstream's topic
+	); err != nil {
+		t.Fatalf("CheckoutBranchFrom: %v", err)
+	}
+
+	smokePath := filepath.Join(reviewer.WorkDir(), "smoke", "a.md")
+	if _, err := os.Stat(smokePath); err != nil {
+		t.Fatalf("REPRO: review iter-N forked from run-branch (no smoke/a.md).\n"+
+			"  os.Stat smoke/a.md: %v\n"+
+			"This is the loop-forever bug: review iter-2+ creates a topic\n"+
+			"branch forked from run-branch instead of upstream-topic, so\n"+
+			"the developer's commit content isn't on disk; claude -p reads\n"+
+			"empty → request_changes → iter_seq bumps → repeat.", err)
 	}
 }

@@ -19,18 +19,26 @@ import (
 //  1. **fetch-origin** — best-effort fetch so origin tracking
 //     refs reflect the latest server state. Skipped silently
 //     when no remote is configured.
-//  2. **checkout-local** — if `refs/heads/<branch>` exists
+//  2. **validate-stale-ref** — when local `refs/heads/<branch>`
+//     exists AND `preferredBase` is supplied, confirm the local
+//     ref's history actually contains preferredBase's tip. If
+//     not, the ref is stale from a prior bad fork and we reseat
+//     it to preferredBase's tip BEFORE the next step takes it at
+//     face value. Skipped when no preferredBase, or when the
+//     ref doesn't exist yet, or when preferredBase can't be
+//     resolved.
+//  3. **checkout-local** — if `refs/heads/<branch>` exists
 //     locally, check it out. Done. (Common steady state.)
-//  3. **track-origin** — if `refs/remotes/origin/<branch>`
+//  4. **track-origin** — if `refs/remotes/origin/<branch>`
 //     exists, create local from origin's tip + checkout. Done.
 //     (First-time use of a branch the remote already knows.)
-//  4. **fork-from-preferred-base** — neither local nor origin
+//  5. **fork-from-preferred-base** — neither local nor origin
 //     has `<branch>`. When `preferredBase` is non-empty, fork
 //     from its tip (used by review submits to fork the review
 //     topic from the upstream developer's topic, so the review's
 //     commit lands on top of the upstream content). Otherwise
-//     falls through to step 5.
-//  5. **fork-from-default** — neither local nor origin has
+//     falls through to step 6.
+//  6. **fork-from-default** — neither local nor origin has
 //     `<branch>`, and no preferred base was supplied. Create
 //     from `defaultBranch` tip + checkout. (New run branch on
 //     a project where main has commits.)
@@ -70,9 +78,58 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 		trace.ok("fetch-origin")
 	}
 
-	// Step 2: checkout-local. Try local first — fastest path,
+	// Step 2: validate-stale-ref. When the local topic ref ALREADY
+	// exists AND the caller supplied a preferredBase (review-iter
+	// submit case), confirm the existing ref's history actually
+	// contains preferredBase's tip. If not, the ref is stale (a
+	// previous bad fork left it pointing at seed instead of
+	// upstream's iter-N) and we reseat it to preferredBase's tip
+	// before the next step takes it at face value.
+	//
+	// Skipped when no preferredBase is set, or the local ref
+	// doesn't exist yet (the fork-from-* steps below will create
+	// it correctly), or preferredBase can't be resolved (transient
+	// — defer to the existing ref to avoid making things worse on
+	// a lookup miss).
+	//
+	// This step is the "is the assumption I'm about to act on
+	// still true?" check that prevents the silent-success class of
+	// failure where checkout-local would happily switch to a stale
+	// ref and the trace would say "ok" while the worktree ended up
+	// at the wrong commit.
+	if preferredBase != "" {
+		localSHA, lerr := g.ResolveRef("refs/heads/" + branch)
+		if lerr == nil {
+			preferredSHA, perr := w.resolveBranchTip(g, preferredBase)
+			if perr != nil {
+				trace.skipped("validate-stale-ref",
+					"preferred base "+preferredBase+" not yet resolvable")
+			} else if isAnc, _ := g.IsAncestor(preferredSHA, localSHA); isAnc {
+				trace.ok("validate-stale-ref")
+			} else {
+				if rerr := g.SetBranchTo(branch, preferredSHA); rerr != nil {
+					return trace.fail("validate-stale-ref",
+						translateGitError("reseat stale ref", rerr))
+				}
+				trace.okDetail("validate-stale-ref",
+					"reseated "+shortSHA(localSHA)+" → "+
+						preferredBase+"@"+shortSHA(preferredSHA))
+			}
+		} else if errors.Is(lerr, git.ErrRefNotFound) {
+			trace.skipped("validate-stale-ref",
+				"local refs/heads/"+branch+" doesn't exist yet")
+		} else {
+			return trace.fail("validate-stale-ref",
+				translateGitError("resolve local ref", lerr))
+		}
+	} else {
+		trace.skipped("validate-stale-ref", "no preferred base supplied")
+	}
+
+	// Step 3: checkout-local. Try local first — fastest path,
 	// and the steady state for any branch the workspace has
-	// already touched.
+	// already touched. (After validate-stale-ref above, the local
+	// ref is either correct as-is or has been reseated.)
 	if cerr := g.Checkout(branch); cerr == nil {
 		trace.ok("checkout-local")
 		return nil

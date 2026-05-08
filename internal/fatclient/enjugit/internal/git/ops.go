@@ -39,6 +39,14 @@ type Ops interface {
 	DeleteBranch(name string) error
 	SetBranchTo(name, sha string) error
 
+	// IsAncestor reports whether `ancestor` is reachable from
+	// `descendant` by walking parents. Used by branch-prep's
+	// stale-ref validation: when a local topic ref exists and the
+	// caller supplied a preferred fork base, we check whether the
+	// base's tip is in the topic's ancestry; if not, the ref is
+	// stale and gets reseated. Both arguments are SHA strings.
+	IsAncestor(ancestor, descendant string) (bool, error)
+
 	// Worktree — acquire the lock.
 	Checkout(branch string) error
 	CheckoutCommit(sha string) error

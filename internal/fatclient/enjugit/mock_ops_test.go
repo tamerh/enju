@@ -66,6 +66,14 @@ type fakeOps struct {
 	// repo.
 	checkoutMissingUntilCreated string
 	checkoutCreatedBranches     map[string]bool
+
+	// IsAncestor canned response. ancestorReturnSet=false (zero
+	// value) means "default to true" — the happy path for
+	// prepareBranchForCommit's validate-stale-ref step. Tests that
+	// want to drive the reseat branch flip ancestorReturnSet=true
+	// + ancestorReturn=false.
+	ancestorReturnSet bool
+	ancestorReturn    bool
 }
 
 // WorkDir returns the configured test workdir or "". Workflow
@@ -256,6 +264,22 @@ func (f *fakeOps) SetBranchTo(name, sha string) error {
 	}
 	f.resolveMap["refs/heads/"+name] = sha
 	return nil
+}
+
+// IsAncestor stub: defaults to true (the common case — a stale-
+// ref test that wants to assert the reseat path runs explicitly
+// flips ancestorReturn to false). Tests that don't care about
+// ancestry get the no-op-reseat behavior the production happy
+// path takes.
+func (f *fakeOps) IsAncestor(ancestor, descendant string) (bool, error) {
+	f.record("IsAncestor", ancestor, descendant)
+	if err := f.checkErr("IsAncestor"); err != nil {
+		return false, err
+	}
+	if f.ancestorReturnSet {
+		return f.ancestorReturn, nil
+	}
+	return true, nil
 }
 
 func (f *fakeOps) Checkout(branch string) error {
