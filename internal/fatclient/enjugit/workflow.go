@@ -25,6 +25,21 @@ import (
 //   - producing_batch.go — SubmitBatch (multi-task atomic submit)
 //   - sync_read.go    — FetchAllRefs, ReadFileAtCommit
 //   - lifecycle.go    — EnsureOrigin, SetRemote
+//
+// Single vs batch submit:
+//
+//   - SubmitTaskResult: one task → one commit → one push. Use this
+//     for the normal claim/submit flow where a citizen finishes a
+//     task and lands the result.
+//
+//   - SubmitBatch: N tasks → N commits → coalesced push (one
+//     network round-trip). Use this when the service has multiple
+//     tasks ready to submit at once (e.g. enju_execute_run finishing
+//     a parallel batch). Atomic: if any commit fails, none of the
+//     batch's commits are pushed; partial-batch state is reverted
+//     by reseating local branch refs to their pre-batch tips.
+//     Single-submit's PushAttempts/MaxRetries semantics don't apply
+//     — batch is push-once or fail.
 type Workflow struct {
 	// git is the plumbing layer. Workflow holds the interface,
 	// not the concrete *git.Clone, so tests can pass a fake.
