@@ -64,13 +64,18 @@ func aiCoAuthorTrailer(modelName string) string {
 		return ""
 	}
 	// Map the model name to a canonical Co-Authored-By string.
-	// We use the same shape Anthropic suggests for Claude commits.
-	// Other providers fall back to "<modelName> <noreply@<provider>>".
+	// We use the same shape Anthropic suggests for Claude commits,
+	// preserving the model identity in parens — without it,
+	// every Claude variant collapses to a single "Claude" line in
+	// contributor graphs and audit timelines, losing per-model
+	// attribution that downstream review tooling relies on.
+	// Other providers follow the same "Vendor (model) <addr>"
+	// pattern so the trailer reads consistently across vendors.
 	switch {
 	case strings.HasPrefix(modelName, "claude"):
-		return "Claude <noreply@anthropic.com>"
+		return "Claude (" + modelName + ") <noreply@anthropic.com>"
 	case strings.HasPrefix(modelName, "gpt"):
-		return "OpenAI " + modelName + " <noreply@openai.com>"
+		return "OpenAI (" + modelName + ") <noreply@openai.com>"
 	default:
 		return modelName + " <noreply@unknown>"
 	}

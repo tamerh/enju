@@ -76,7 +76,7 @@ func TestSubmitTaskResult_ComposesTrailers(t *testing.T) {
 		"Enju-Iter-Seq: 2",
 		"Enju-Verdict: approve",
 		"AI-Model: claude-3.5-sonnet",
-		"Co-Authored-By: Claude <noreply@anthropic.com>",
+		"Co-Authored-By: Claude (claude-3.5-sonnet) <noreply@anthropic.com>",
 	} {
 		if !strings.Contains(msg, expected) {
 			t.Errorf("commit message missing %q\n%s", expected, msg)
