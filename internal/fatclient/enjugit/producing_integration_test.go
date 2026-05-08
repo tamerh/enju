@@ -11,11 +11,6 @@ package enjugit
 // branch composition — these tests pin the submit primitive's
 // behavior, not the topic-branch lifecycle (which has its own
 // coverage in claim/submit integration paths).
-//
-// Originally these tests lived in internal/fatclient/project
-// as part of client_test.go. They were never project-internal
-// — they exercise enjugit.Workflow's contract over a real
-// clone — so they belong here.
 
 import (
 	"os"

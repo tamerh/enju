@@ -7,19 +7,17 @@ package enjugit
 // reading bot-A's pushed commit gets "object not found" and falls
 // back to a stale worktree read.
 //
-// The pre-fix project test suite tested write-isolation
-// (TestTwoBots_*) but never cross-bot reads. These tests pin the
-// READ direction. Originally lived in internal/fatclient/project
-// as cross_bot_read_test.go.
+// The earlier write-isolation tests (TestTwoBots_*) didn't cover
+// cross-bot reads. These tests pin the READ direction.
 //
-// PHASING (matches project file's structure 1:1, ported in 7 phases):
-//   Phase 1 (this commit): Theme A — lazy/eager fetch (4 tests)
-//   Phase 2: Theme B-bot   — multi-clone after merge (3 tests)
-//   Phase 3: Theme B-op    — operator+bot variants (3 tests)
-//   Phase 4: Theme C       — OpenView remoteURL hydration (1 test)
-//   Phase 5: Theme D-fork  — reviewer iter-N fork base (4 tests)
-//   Phase 6: Theme D-iter  — iter-N + dirty worktree (3 tests)
-//   Phase 7: Theme D-disk  — worktree-on-disk content (4 tests)
+// THEMES:
+//   Theme A — lazy/eager fetch (4 tests)
+//   Theme B-bot   — multi-clone after merge (3 tests)
+//   Theme B-op    — operator+bot variants (3 tests)
+//   Theme C       — OpenView remoteURL hydration (1 test)
+//   Theme D-fork  — reviewer iter-N fork base (4 tests)
+//   Theme D-iter  — iter-N + dirty worktree (3 tests)
+//   Theme D-disk  — worktree-on-disk content (4 tests)
 
 import (
 	"fmt"
@@ -672,8 +670,6 @@ func TestCrossBotRead_OperatorAndBot_ParallelPushesEachReadsOtherIntegration(t *
 // exercises the cross-citizen read through that path: writer
 // pushes via ForProject, reader opens fresh via OpenView, lazy
 // fetch must succeed.
-//
-// Originally project's TestOpenExisting_HydratesRemoteURLForLazyFetch.
 func TestOpenView_HydratesRemoteURLForLazyFetchIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
@@ -1123,8 +1119,6 @@ func TestReviewerIterN_ForksFromRunBranchNotUpstreamIntegration(t *testing.T) {
 //
 // If req.Files faithfully carries claude's output, the commit
 // must contain it regardless of any worktree wipe during step 4.
-//
-// Originally project's TestStaleRefReset_PreservesClaudeOutput.
 func TestStaleRefReset_PreservesClaudeOutputIntegration(t *testing.T) {
 	alice, bob, _ := openTwoBotWorkflowsForRead(t)
 

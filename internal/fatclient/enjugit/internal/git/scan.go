@@ -7,17 +7,10 @@ package git
 // helpers reconcile needs (RemoteBranchHash, LocalBranchHash,
 // ReadFile, GitOriginURL).
 //
-// Ported from internal/fatclient/project/scan.go +
-// internal/fatclient/project/client.go. Same go-git APIs;
-// receiver is *Clone (this package's), error wrapping uses our
-// typed sentinels where applicable.
-//
-// NOTE on trailer parsing: the project package owned a
-// CommitTrailer + EnjuTrailers shape with parsed-out fields.
-// Enjugit's parsed_trailers.go already re-implements that;
-// ScanBranchSince here returns *raw commit messages* via a
-// callback so callers can plug their own ParseEnjuTrailers
-// (the higher-level Workflow.ScanBranchSince composes the two).
+// Trailer parsing is intentionally kept out of this layer:
+// ScanBranchSince returns *raw commit messages* via a callback so
+// callers can plug their own ParseEnjuTrailers. The higher-level
+// Workflow.ScanBranchSince composes the two.
 
 import (
 	"errors"

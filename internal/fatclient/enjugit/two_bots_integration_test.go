@@ -12,9 +12,6 @@ package enjugit
 // daemon corrupted the other's working tree mid-branch-switch),
 // and the lockfile was a single per-project lock that
 // bottlenecked any "parallel" work to serial commits.
-//
-// Originally lived in internal/fatclient/project as
-// two_bots_test.go.
 
 import (
 	"path/filepath"

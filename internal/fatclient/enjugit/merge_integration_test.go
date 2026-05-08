@@ -7,9 +7,6 @@ package enjugit
 // merge with a real go-git operation against a real bare, the
 // merge commit lands on the bare with the right parents + trailers,
 // and both topics' files are reachable from the merge tip.
-//
-// Originally lived in internal/fatclient/project as
-// merge_branch_test.go (TestMergeBranchToCommit_NonFFDisjointWrites).
 
 import (
 	"strings"

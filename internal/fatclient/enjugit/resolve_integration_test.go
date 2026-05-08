@@ -6,11 +6,6 @@ package enjugit
 // The unit-level coverage in resolve_test.go uses fake ops; this
 // file covers the end-to-end shape of "commit lands → Resolve
 // reads it back via CommitSHA."
-//
-// Originally these tests lived in internal/fatclient/project as
-// part of client_test.go. They were never project-internal —
-// they exercise enjugit.Workflow's contract over a real clone —
-// so they belong here.
 
 import (
 	"path/filepath"

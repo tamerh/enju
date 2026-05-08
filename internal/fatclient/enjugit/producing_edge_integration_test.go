@@ -6,10 +6,6 @@ package enjugit
 // SubmitTaskResult through the same go-git path production hits,
 // covering scenarios the fake-ops unit tests in producing_test.go
 // can't reach (real network/ref behavior).
-//
-// Originally lived in internal/fatclient/project as part of
-// client_test.go; ported into enjugit alongside the other
-// _integration_test.go files.
 
 import (
 	"os"

@@ -5,9 +5,6 @@ package enjugit
 // directory naming. Both reach into the on-disk side of
 // enjugit.Workspace + git.Clone in ways the fake-ops unit
 // tests can't.
-//
-// Originally lived in internal/fatclient/project as part of
-// client_test.go.
 
 import (
 	"os"

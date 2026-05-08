@@ -185,8 +185,7 @@ func TestEnsureSharedSymlinkCreatesSharedParent(t *testing.T) {
 // pattern-match: SSH/credential/non-FF/network/not-found errors get
 // distinguishable hints, the local-path "not found" carries a
 // different hint than the remote-URL one, and unclassified errors
-// pass through unchanged. Originally lived in project/client_test.go;
-// moved here when the implementation moved to enjugit.
+// pass through unchanged.
 func TestFriendlyGitErrorHints(t *testing.T) {
 	cases := []struct {
 		name     string

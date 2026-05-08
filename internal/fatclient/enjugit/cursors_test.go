@@ -110,8 +110,7 @@ func writeFile(t *testing.T, path, contents string) error {
 
 // TestCursorsVersionMismatchTreatedAsEmpty: a cursor file from a
 // future schema version is treated as empty, so an older client
-// won't act on data it can't interpret. Originally project's
-// TestCursorsVersionMismatch.
+// won't act on data it can't interpret.
 func TestCursorsVersionMismatchTreatedAsEmpty(t *testing.T) {
 	stateDir := t.TempDir()
 	path := cursorsPath(stateDir, 8)
@@ -130,7 +129,7 @@ func TestCursorsVersionMismatchTreatedAsEmpty(t *testing.T) {
 // TestCursorsSaveAtomicallyOverwrites: a second Save replaces the
 // first cleanly via the temp-file + rename pattern. The reload
 // must observe the second state, not a partial mix or the first
-// state. Originally project's TestCursorsAtomicSaveSurvivesPartialWrite.
+// state.
 func TestCursorsSaveAtomicallyOverwrites(t *testing.T) {
 	stateDir := t.TempDir()
 	c := NewCursors(stateDir, 5)
@@ -149,9 +148,8 @@ func TestCursorsSaveAtomicallyOverwrites(t *testing.T) {
 	}
 }
 
-// TestAdvanceScanCursor_SerializesConcurrentCallers covers the
-// last-writer-wins race the project test originally flagged.
-// Before CursorMutexFor, two callers could each do
+// TestAdvanceScanCursor_SerializesConcurrentCallers covers a
+// last-writer-wins race. Before CursorMutexFor, two callers could each do
 // LoadCursors → Set → Save concurrently; the later writer's save
 // carried its own older snapshot and silently overwrote the
 // earlier writer's advance. Atomic-rename keeps the file from
@@ -162,7 +160,6 @@ func TestCursorsSaveAtomicallyOverwrites(t *testing.T) {
 // Test: N goroutines each advance a unique commit SHA on the
 // same branch. After all finish, the saved cursor MUST be one
 // of the N SHAs (never empty, never the seed, never corrupt).
-// Originally project's TestAdvanceCursorIfConfiguredSerializesConcurrentCallers.
 func TestAdvanceScanCursor_SerializesConcurrentCallers(t *testing.T) {
 	stateDir := t.TempDir()
 	const projectID int64 = 42

@@ -5,11 +5,6 @@ package enjugit
 // can't see actual go-git fetch/scan behavior; these tests pin
 // the end-to-end shape against a live bare so production
 // reconcile semantics stay protected.
-//
-// Originally lived in internal/fatclient/project as scan_test.go
-// (the integration-shaped subset). The cursor read/write tests
-// already had unit coverage in cursors_test.go; the gap was
-// "do we actually fetch + scan trailer commits correctly?"
 
 import (
 	"path/filepath"

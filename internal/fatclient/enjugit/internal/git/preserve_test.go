@@ -2,10 +2,10 @@ package git
 
 // Tests for the rename-based preserve mechanism around Force
 // checkouts. See preserve.go for the design rationale + invariants.
-// TestCheckout_PreservesUntracked in branch_test.go already pins
-// the basic untracked-survives case; this file covers the
-// load-bearing edge cases originally tested in
-// internal/fatclient/project/checkout_preserve_test.go.
+// TestCheckout_PreservesUntracked in branch_test.go pins the basic
+// untracked-survives case; this file covers the load-bearing edges:
+// gitignored files, subtree rename, leftover-dir recovery,
+// conflict accounting, large-file constant memory.
 
 import (
 	"errors"
@@ -23,8 +23,6 @@ import (
 // snapshot used go-git's Status, which filters ignored paths out
 // of the Untracked set. Fix: the rename walk treats anything not
 // in the index as preservable, including gitignored paths.
-//
-// Originally project's TestCheckoutBranchPreservesGitignoredFiles.
 func TestCheckout_PreservesGitignoredFiles(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
@@ -81,8 +79,7 @@ func TestCheckout_PreservesGitignoredFiles(t *testing.T) {
 // for restoreFromPreserve's conflict branch: when the post-checkout
 // workDir already has a file at the target path (the new branch
 // tracks it), the preserved copy must stay in the preserve dir
-// rather than overwrite branch content. Originally project's
-// TestRestoreFromPreserveLeavesConflictingCopy.
+// rather than overwrite branch content.
 func TestRestoreFromPreserve_LeavesConflictingCopy(t *testing.T) {
 	workDir := t.TempDir()
 	preserveDir := workDir + PreserveDirSuffix
@@ -125,8 +122,6 @@ func TestRestoreFromPreserve_LeavesConflictingCopy(t *testing.T) {
 // tracked descendants, the whole subtree (including empty
 // subdirs) is renamed in one syscall and restored intact. A
 // per-file snapshot would silently drop empty leaf dirs.
-//
-// Originally project's TestCheckoutBranchSubtreeRenameIsWholeDir.
 func TestCheckout_PreservesEmptyDirsViaSubtreeRename(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
@@ -172,8 +167,6 @@ func TestCheckout_PreservesEmptyDirsViaSubtreeRename(t *testing.T) {
 // beside workDir with mixed content. RecoverLeftoverPreserve
 // must drain non-conflicting entries back into workDir and leave
 // conflicting entries in the preserve dir for manual review.
-//
-// Originally project's TestCrashRecoveryOfLeftoverPreserveDir.
 func TestRecoverLeftoverPreserve_RestoresAndLeavesConflicts(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
@@ -222,8 +215,6 @@ func TestRecoverLeftoverPreserve_RestoresAndLeavesConflicts(t *testing.T) {
 // conflict must report every file it strands, not just "1 entry."
 // A gitignored data/ dir holding 50 files stranded by a branch
 // that tracks data/ should log "conflict_count: 50" not 1.
-//
-// Originally project's TestCountConflictFilesDescendsIntoDirs.
 func TestCountConflictFilesDescendsIntoDirs(t *testing.T) {
 	preserveDir := t.TempDir()
 	for _, rel := range []string{"data/a.txt", "data/b.txt", "data/nested/c.txt"} {
@@ -255,8 +246,6 @@ func TestCountConflictFilesDescendsIntoDirs(t *testing.T) {
 // of the next Checkout. Without the drain,
 // movePreserveNonTracked would rename fresh paths INTO the dirty
 // dir and produce undefined state.
-//
-// Originally project's TestCheckoutBranchDrainsLeftoverPreserveDir.
 func TestCheckout_DrainsLeftoverPreserveDir(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
@@ -294,8 +283,6 @@ func TestCheckout_DrainsLeftoverPreserveDir(t *testing.T) {
 // branch ALSO tracks, drain leaves it for manual review and the
 // new checkout returns ErrPreserveDirCollision rather than
 // proceeding. Fresh preservation must never write into a dirty dir.
-//
-// Originally project's TestCheckoutBranchRefusesWhenLeftoverPreserveConflicts.
 func TestCheckout_RefusesWhenLeftoverConflicts(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
@@ -333,8 +320,6 @@ func TestCheckout_RefusesWhenLeftoverConflicts(t *testing.T) {
 // well under 500 ms — infeasible if the preserve logic were
 // reading bytes. Rename-based preservation runs in O(1) syscalls
 // independent of file size.
-//
-// Originally project's TestCheckoutBranchRenamePreserveLargeFileConstantMemory.
 func TestCheckout_PreservesLargeFileConstantMemory(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)

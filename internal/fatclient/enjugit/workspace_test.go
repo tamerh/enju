@@ -122,13 +122,12 @@ func TestOpenView_CloneNotFound(t *testing.T) {
 
 // TestOpenView_DoesNotInitOnMissing pins the read-side contract:
 // when no clone exists, OpenView must REFUSE to silently init a
-// stub at <rootDir>/<id>. Originally a project-package regression
-// guard — the buggy build's ForProject(id, "") could PlainInit a
-// numeric-form stub that findProjectDir would then return as if
-// it were the real clone. enjugit's OpenView only reads, so the
-// invariant is enforced by code structure; this test pins it so
-// any future "open-or-init" convenience accidentally added to the
-// read path fails loudly.
+// stub at <rootDir>/<id>. A buggy build's ForProject(id, "") could
+// PlainInit a numeric-form stub that findProjectDir would then
+// return as if it were the real clone. enjugit's OpenView only
+// reads, so the invariant is enforced by code structure; this test
+// pins it so any future "open-or-init" convenience accidentally
+// added to the read path fails loudly.
 func TestOpenView_DoesNotInitOnMissing(t *testing.T) {
 	root := t.TempDir()
 	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
@@ -148,8 +147,7 @@ func TestOpenView_DoesNotInitOnMissing(t *testing.T) {
 // "webui-toy-1") and numeric ("1") directories live under rootDir,
 // the slug-form wins. Without this rule, alphabetical os.ReadDir
 // returns "1" before "webui-toy-1" and a buggy build's leftover
-// numeric stub would shadow the real clone. Originally project's
-// TestFindProjectDir_PrefersSlugOverNumeric.
+// numeric stub would shadow the real clone.
 func TestProjectDirLocked_PrefersSlugOverNumeric(t *testing.T) {
 	root := t.TempDir()
 	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))

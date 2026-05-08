@@ -98,8 +98,7 @@ func TestPromoteWorkingTreeToBare(t *testing.T) {
 // wouldn't catch a regression where the bare ends up with HEAD-only
 // (gogit's PlainClone(bare=true) default). Bots fork topic branches
 // off main → if the bare is missing the operator's other branches,
-// pushes from those branches break. Originally lived in project
-// package as TestPromoteWorkingTreeToBare_HappyPath.
+// pushes from those branches break.
 func TestPromoteWorkingTreeToBare_TransfersAllBranches(t *testing.T) {
 	tmp := t.TempDir()
 	wt := filepath.Join(tmp, "op-tree")
@@ -200,7 +199,7 @@ func TestPromoteWorkingTreeToBare_ReplacesExistingOrigin(t *testing.T) {
 // TestPromoteWorkingTreeToBare_RejectsNonGitDir verifies the input
 // validation: pointing the promote at a directory that isn't a git
 // working tree must return an error rather than silently corrupting
-// the destination bare. Originally a separate test in project package.
+// the destination bare.
 func TestPromoteWorkingTreeToBare_RejectsNonGitDir(t *testing.T) {
 	tmp := t.TempDir()
 	notARepo := filepath.Join(tmp, "plain-dir")
