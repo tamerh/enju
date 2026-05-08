@@ -59,6 +59,36 @@ func (s *FatClient) EnsureRunBranch(ctx context.Context, projectID int64, runDat
 	return ""
 }
 
+// EnsureProjectDefaultBranch materializes the project's new
+// default branch in the local workspace + on origin. Called from
+// handleSetProjectDefaultBranch after the coord-side update
+// lands, so the git side doesn't drift from the coord setting.
+//
+// Idempotent — see Workflow.EnsureRunBranch for the case-by-case
+// semantics. Errors are returned as a non-empty warning string
+// (the coord already updated; only the workspace side is in
+// question), matching the run-branch path's "soft-fail" pattern.
+//
+// oldDefault is consulted only when the new branch is brand-new.
+// Falls back to "main" when oldDefault is empty (project meta
+// fetch failed); that's the same fallback the coordinator uses.
+func (s *FatClient) EnsureProjectDefaultBranch(ctx context.Context, projectID int64, newBranch, oldDefault string) string {
+	if s.enjugit == nil || newBranch == "" {
+		return ""
+	}
+	if oldDefault == "" {
+		oldDefault = "main"
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return fmt.Sprintf("ensure default branch skipped: %v", err)
+	}
+	if err := wf.EnsureRunBranch(newBranch, oldDefault); err != nil {
+		return fmt.Sprintf("ensure default branch %q failed: %v", newBranch, err)
+	}
+	return ""
+}
+
 // RunBranchFromData pulls the `branch` field out of a run JSON
 // payload as returned by GET /runs/{seq} or POST /runs. Empty
 // when the payload is malformed or missing — callers pass the

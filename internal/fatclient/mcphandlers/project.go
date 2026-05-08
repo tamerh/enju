@@ -425,8 +425,12 @@ func (c *apiClient) setMemberRole(ctx context.Context, req mcp.CallToolRequest, 
 }
 
 // handleSetProjectDefaultBranch changes a project's default
-// branch. Thin REST pass-through; the coordinator enforces
-// owner-only + branch shape validation.
+// branch. The coordinator enforces owner-only + branch shape
+// validation; on success, the fat-client materializes the new
+// default in git so the workspace doesn't drift from the coord
+// setting (subsequent runs default-branch the new name —
+// PrepareBranchForCommit + EnsureRunBranch resolve `branch` from
+// origin/local refs, so the ref must actually exist).
 func (c *apiClient) handleSetProjectDefaultBranch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
@@ -436,6 +440,12 @@ func (c *apiClient) handleSetProjectDefaultBranch(ctx context.Context, req mcp.C
 	if err != nil {
 		return mcp.NewToolResultError("branch is required"), nil
 	}
+	// Capture the OLD default before the coord update so a
+	// brand-new branch can fork from the prior default. If
+	// fetch fails (project gone, network), EnsureRunBranch
+	// gracefully no-ops with a warning instead of a hard fail.
+	_, _, oldDefault, _ := c.fc.FetchProjectMetaExpanded(ctx, int64(projectID))
+
 	data, err := c.put(ctx, fmt.Sprintf("/api/v1/projects/%d/default_branch", projectID), map[string]string{
 		"branch": branch,
 	})
@@ -448,7 +458,19 @@ func (c *apiClient) handleSetProjectDefaultBranch(ctx context.Context, req mcp.C
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Project #%d default branch set to %q", projectID, branch)), nil
+
+	// Materialize the new default in git so subsequent runs
+	// can fork from it. Same idempotent verb used at create_run:
+	// existing branch (local OR origin) is no-op'd; brand-new
+	// branch forks from oldDefault and pushes. Errors are
+	// non-fatal — coord update already landed.
+	ensureWarning := c.fc.EnsureProjectDefaultBranch(ctx, int64(projectID), branch, oldDefault)
+
+	text := fmt.Sprintf("✓ Project #%d default branch set to %q", projectID, branch)
+	if ensureWarning != "" {
+		text += fmt.Sprintf("\n⚠ %s", ensureWarning)
+	}
+	return mcp.NewToolResultText(text), nil
 }
 
 // handleSetProjectRemote updates a project's remote URL in the
