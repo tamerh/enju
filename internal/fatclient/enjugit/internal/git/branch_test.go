@@ -218,6 +218,50 @@ func TestResetClean_DropsUnstagedAndUntracked(t *testing.T) {
 	}
 }
 
+// TestResetClean_Idempotent — daemons call ResetClean every
+// iteration between tasks, even when there's nothing to clean.
+// Verify that consecutive calls on an already-clean clone are
+// no-ops: the worktree contents don't churn (same set of entries
+// before and after) and StateClean is preserved.
+func TestResetClean_Idempotent(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+	commitOneFile(t, c, "tracked.txt", []byte("v1"))
+
+	snapshot := func() map[string]bool {
+		entries, err := os.ReadDir(c.workDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := map[string]bool{}
+		for _, e := range entries {
+			names[e.Name()] = true
+		}
+		return names
+	}
+	before := snapshot()
+
+	for i := 0; i < 3; i++ {
+		if err := c.ResetClean(); err != nil {
+			t.Fatalf("call #%d: %v", i, err)
+		}
+		if c.State() != StateClean {
+			t.Errorf("call #%d: expected StateClean, got %s", i, c.State())
+		}
+	}
+
+	after := snapshot()
+	if len(before) != len(after) {
+		t.Errorf("entry count drifted: before=%v after=%v", before, after)
+	}
+	for k := range before {
+		if !after[k] {
+			t.Errorf("entry %q vanished after idempotent resets", k)
+		}
+	}
+}
+
 func TestRemoveFiles(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
