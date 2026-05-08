@@ -179,9 +179,9 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 //   - ErrMergeConflict (carries paths via *ErrConflict): real file conflict.
 //     Caller (service) spawns a merge_resolve task in response.
 //   - ErrCannotAutoMerge: anything else that prevents the merge.
-func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) (string, error) {
+func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) (*MergeResult, error) {
 	if topic == "" || target == "" {
-		return "", fmt.Errorf("enjugit: MergeAcceptedTopic: topic and target required")
+		return nil, fmt.Errorf("enjugit: MergeAcceptedTopic: topic and target required")
 	}
 	authorName, authorEmail := w.mergeAuthorIdentity(author)
 	trailers := buildMergeTrailers(author)
@@ -198,7 +198,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 	// so a conflict's ErrConflict carries them for the audit
 	// pipeline to spawn merge_resolve with full context.
 	var topicSHA, targetSHA string
-	var newTip string
+	result := &MergeResult{}
 	werr := w.git.WithLock(func(g git.Ops) error {
 		// Pre-merge: capture branch tips for conflict-context.
 		// Best-effort — a missing ref leaves SHAs empty and the
@@ -235,7 +235,8 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		// to target's OLD state and the subsequent FF (which
 		// is ref-only) wouldn't refresh it.
 		if tip, err := g.MergeFFOrFail(target, topic); err == nil {
-			newTip = tip
+			result.NewTip = tip
+			result.FastForwarded = true
 			trace.okDetail("merge-ff", shortSHA(tip))
 			// Step 3a: checkout target so HEAD + worktree
 			// land on target's new tip. Without this, HEAD
@@ -252,6 +253,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			if perr := g.Push(target); perr != nil {
 				if errors.Is(perr, git.ErrNoRemote) {
 					trace.skipped("push", "no remote configured")
+					result.PushSkipped = true
 					return nil
 				}
 				return trace.fail("push", translateGitError("push", perr))
@@ -282,7 +284,8 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			}
 			return trace.fail("merge-commit", translated)
 		}
-		newTip = tip
+		result.NewTip = tip
+		result.FastForwarded = false
 		trace.okDetail("merge-commit", shortSHA(tip))
 
 		// Step 4b: checkout target so HEAD + worktree land on
@@ -298,6 +301,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		if perr := g.Push(target); perr != nil {
 			if errors.Is(perr, git.ErrNoRemote) {
 				trace.skipped("push", "no remote configured")
+				result.PushSkipped = true
 				return nil
 			}
 			return trace.fail("push", translateGitError("push", perr))
@@ -306,9 +310,9 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		return nil
 	})
 	if werr != nil {
-		return "", werr
+		return nil, werr
 	}
-	return newTip, nil
+	return result, nil
 }
 
 // CommitArbitraryFiles commits a set of files to a target
@@ -321,19 +325,23 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 // default branch. Empty author falls back to SystemAuthor.
 //
 // Git operations performed (under one WithLock):
-//  1. Resolve target branch + Checkout (creating from default
-//     when missing).
-//  2. Compose message + trailers.
-//  3. CommitFiles → returns local SHA.
-//  4. Push (best-effort: returns the local SHA on push failure
-//     so callers see the in-memory commit even when offline).
+//  1. prepare-branch: resolve target + checkout (full multi-step
+//     fallback via prepareBranchForCommit, no preferred base).
+//  2. commit: stage + commit the files.
+//  3. push: best-effort. Push failure is non-fatal (the local
+//     commit is the source of truth; offline retry is the
+//     caller's policy) — surfaced in the trace as a
+//     non-blocking failed step.
 //
 // Worktree state: Pre any → Post StateClean.
 //
-// Errors:
+// Errors (returned as *WorkflowOpError carrying the trace):
 //   - ErrCannotForkBranch: branch missing AND no default branch.
-//   - ErrPushNonFF / underlying push errors: branch advanced
-//     between local commit and push.
+//   - any commit-time git error translated via translateGitError.
+//
+// Push errors do NOT fail the verb (returned commit reflects the
+// local landing); they appear in the trace as a "push: failed"
+// step for the operator's audit pipeline.
 func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*CommitArbitraryFilesResult, error) {
 	if len(req.Files) == 0 {
 		return nil, fmt.Errorf("enjugit: CommitArbitraryFiles: Files required")
@@ -372,15 +380,21 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 		stagePaths[i] = f.RepoRelPath
 	}
 
+	trace := startTrace("CommitArbitraryFiles")
+	trace.ctx("branch", branch)
+	trace.ctx("subject", subject)
+
 	var result CommitArbitraryFilesResult
 	werr := w.git.WithLock(func(g git.Ops) error {
-		// Branch prep: full multi-step fallback with structured
-		// per-step diagnostics. CommitArbitraryFiles is for
-		// non-task commits (diagram exports, etc.) and has no
-		// preferred fork base — fall through to default-branch.
+		// Step 1: prepare-branch — same multi-step fallback
+		// SubmitTaskResult uses, no preferred fork base (this
+		// verb is for export-class commits, not review topics).
 		if err := w.prepareBranchForCommit(g, branch, ""); err != nil {
-			return err
+			return trace.fail("prepare-branch", err)
 		}
+		trace.ok("prepare-branch")
+
+		// Step 2: commit.
 		commitRes, err := g.CommitFiles(git.CommitRequest{
 			Files:       req.Files,
 			StagePaths:  stagePaths,
@@ -389,15 +403,33 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 			AuthorEmail: authorEmail,
 		})
 		if err != nil {
-			return translateGitError("commit", err)
+			return trace.fail("commit", translateGitError("commit", err))
 		}
 		result.CommitSHA = commitRes.SHA
 		result.NoOp = commitRes.NoOp
-		// Best-effort push: a no-remote project still produces
-		// a valid local commit. Non-fatal log on push failure.
-		if perr := g.Push(branch); perr != nil && !errors.Is(perr, git.ErrNoRemote) {
-			w.logger.Warn("enjugit: arbitrary-files push failed; commit landed locally only",
-				"branch", branch, "error", perr)
+		if commitRes.NoOp {
+			trace.okDetail("commit", "no-op (worktree already matched)")
+		} else {
+			trace.okDetail("commit", shortSHA(commitRes.SHA))
+		}
+
+		// Step 3: push (best-effort). A no-remote project still
+		// produces a valid local commit; offline blips are
+		// caller-policy to retry. Trace records the failure
+		// without aborting the verb.
+		if perr := g.Push(branch); perr != nil {
+			if errors.Is(perr, git.ErrNoRemote) {
+				trace.skipped("push", "no remote configured")
+			} else {
+				trace.steps = append(trace.steps, Step{
+					Name: "push", Status: "failed",
+					Detail: perr.Error(),
+				})
+				w.logger.Warn("enjugit: arbitrary-files push failed; commit landed locally only",
+					"branch", branch, "error", perr)
+			}
+		} else {
+			trace.ok("push")
 		}
 		return nil
 	})
@@ -431,20 +463,26 @@ func (w *Workflow) Head() (sha, branch string, err error) {
 }
 
 // LogFile returns commits that touched relPath in the local clone,
-// newest-first. Passthrough so service callers can render
-// per-file history without reaching into git.
-//
-// CommitInfo is re-exported as enjugit.CommitInfo via type alias
-// so callers don't need to import the internal git package.
+// newest-first. Native enjugit.CommitInfo (not a type alias) so the
+// service-layer view of "commit history" doesn't depend on
+// internal/git's struct shape — internal git changes can't ripple
+// out without an explicit translation step here.
 func (w *Workflow) LogFile(relPath string) ([]CommitInfo, error) {
 	out, err := w.git.LogFile(relPath)
-	return out, translateGitError("log file", err)
+	if err != nil {
+		return nil, translateGitError("log file", err)
+	}
+	res := make([]CommitInfo, len(out))
+	for i, c := range out {
+		res[i] = CommitInfo{
+			Hash:    c.Hash,
+			Message: c.Message,
+			Author:  c.Author,
+			Time:    c.Time,
+		}
+	}
+	return res, nil
 }
-
-// CommitInfo is re-exported from the internal git package so
-// service callers consuming Workflow.LogFile don't need to import
-// git directly. Same shape, same semantics.
-type CommitInfo = git.CommitInfo
 
 // mergeAuthorIdentity picks (name, email) for an auto-merge
 // commit per spec: system for "auto", citizen for "manual".

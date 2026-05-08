@@ -253,13 +253,16 @@ func TestAutoMergeAcceptedTopic_TraceNarrates(t *testing.T) {
 func TestAutoMergeAcceptedTopic_FastForward(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 
-	tip, err := wf.MergeAcceptedTopic("topic", "main",
+	res, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
 	if err != nil {
 		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
-	if tip != "ffsha" {
-		t.Errorf("expected FF tip, got %q", tip)
+	if res.NewTip != "ffsha" {
+		t.Errorf("expected FF tip, got %q", res.NewTip)
+	}
+	if !res.FastForwarded {
+		t.Errorf("expected FastForwarded=true on FF path")
 	}
 	// FF path used MergeFFOrFail then Push, no MergeWithCommit.
 	if fake.callCount("MergeFFOrFail") != 1 {
@@ -277,13 +280,16 @@ func TestAutoMergeAcceptedTopic_NonFFFallsBackToMergeCommit(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)
 
-	tip, err := wf.MergeAcceptedTopic("topic", "main",
+	res, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
 	if err != nil {
 		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
-	if tip != "mergesha" {
-		t.Errorf("expected merge-commit tip, got %q", tip)
+	if res.NewTip != "mergesha" {
+		t.Errorf("expected merge-commit tip, got %q", res.NewTip)
+	}
+	if res.FastForwarded {
+		t.Errorf("expected FastForwarded=false on non-FF path")
 	}
 	if fake.callCount("MergeWithCommit") != 1 {
 		t.Errorf("expected 1 MergeWithCommit on non-FF, got %d", fake.callCount("MergeWithCommit"))

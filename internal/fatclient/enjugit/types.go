@@ -1,6 +1,22 @@
 package enjugit
 
-import "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+import (
+	"time"
+
+	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+)
+
+// CommitInfo describes a single commit for history-walking
+// purposes. Returned by Workflow.LogFile in reverse-chronological
+// order (newest first). Native to enjugit so service-layer
+// callers don't transitively depend on internal/git's struct
+// shape — keeps the layer boundary load-bearing.
+type CommitInfo struct {
+	Hash    string
+	Message string
+	Author  string
+	Time    time.Time
+}
 
 // ForkPoint names where a new iteration branch should fork from.
 // Replaces the previous "magic baseBranch parameter" overload
@@ -147,6 +163,31 @@ type CommitArbitraryFilesRequest struct {
 type CommitArbitraryFilesResult struct {
 	CommitSHA string
 	NoOp      bool
+}
+
+// MergeResult is what Workflow.MergeAcceptedTopic returns.
+// Same XxxResult shape as SubmitResult / BatchResult / ScanResult
+// — every multi-output verb returns a typed result struct so
+// callers don't have to read positional return values to decode
+// what happened.
+type MergeResult struct {
+	// NewTip is the post-merge SHA of the target branch. Whether
+	// it's a fast-forward to the topic's tip or a brand-new merge
+	// commit depends on FastForwarded.
+	NewTip string
+
+	// FastForwarded is true when the merge succeeded as a pure
+	// ref move (target had no commits ahead of the topic's fork
+	// point). False when a merge commit had to be authored to
+	// reconcile diverged history. Surface for telemetry / commit-
+	// message rendering — service distinguishes "FF merge" from
+	// "merge commit" in the branch_merged event metadata.
+	FastForwarded bool
+
+	// PushSkipped is true when no remote was configured (solo
+	// project) so the new tip lives locally only. False when the
+	// push completed successfully.
+	PushSkipped bool
 }
 
 // MergeAuthor identifies the actor whose ACCEPT triggered an
