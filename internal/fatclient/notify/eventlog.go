@@ -11,11 +11,13 @@ package notify
 // metadata), so a `cat live.jsonl | jq` view matches a `curl
 // /events` view.
 //
-// Concurrency: O_APPEND makes single-line writes atomic on POSIX
-// for sizes < PIPE_BUF (4096 bytes). Notification events are
-// always small. No locking needed even if multiple writers (a
-// future "merge two coordinators' streams" tool, etc.) point at
-// the same file.
+// Concurrency: writers are within a single process today (the
+// notify supervisor's in-process dispatch). The *os.File handle
+// + Go's runtime serialize concurrent goroutine writes; no
+// further locking needed. If notify ever grows multi-process
+// writers (e.g. bot daemons writing into the operator's stream
+// directly), this needs revisiting — Windows in particular
+// doesn't guarantee O_APPEND atomicity across processes.
 //
 // Rotation: not in v1. The file grows. When it gets large,
 // rotate by `mv live.jsonl archive-{seqlo}-{seqhi}.jsonl &&

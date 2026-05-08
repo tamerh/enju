@@ -78,6 +78,18 @@ type DiskLayout struct {
 	BarePath          func(projectDir string) string
 	BotClonePath      func(projectDir, botName string) string
 	OperatorClonePath func(projectDir string) string
+
+	// ProjectRoot reverses the clone-suffix conventions: given a
+	// workDir (operator clone, bot clone, or autoLocal repo
+	// root), returns the user-facing project root. Used to route
+	// per-project trace logs to a single location regardless of
+	// which clone is doing the writing.
+	//
+	// Production rule:
+	//   - <root>/enju/.clone           → <root>
+	//   - <root>/enju/bots/<x>/clone   → <root>
+	//   - any other path               → workDir (autoLocal/unknown)
+	ProjectRoot func(workDir string) string
 }
 
 // NewProductionConventions returns the canonical Enju policy.
@@ -99,8 +111,46 @@ func NewProductionConventions() Conventions {
 			OperatorClonePath: func(projectDir string) string {
 				return filepath.Join(projectDir, "enju", ".clone")
 			},
+			ProjectRoot: productionProjectRootFromWorkDir,
 		},
 	}
+}
+
+// productionProjectRootFromWorkDir reverses the clone-suffix
+// conventions. Recognized suffixes (in priority order):
+//
+//   - .../enju/.clone            → strip the trailing 2 segments
+//   - .../enju/bots/<x>/clone    → strip the trailing 4 segments
+//   - else                       → workDir is already the root
+//
+// Path-pattern based, but the patterns ARE the convention — every
+// other constructor (BarePath, BotClonePath, OperatorClonePath)
+// produces strings that match these. If the convention changes,
+// this function changes alongside.
+func productionProjectRootFromWorkDir(workDir string) string {
+	if workDir == "" {
+		return ""
+	}
+	clean := filepath.Clean(workDir)
+	parent := filepath.Dir(clean)
+	parentBase := filepath.Base(parent)
+	leaf := filepath.Base(clean)
+
+	// Operator clone: <root>/enju/.clone
+	if leaf == ".clone" && parentBase == "enju" {
+		return filepath.Dir(parent)
+	}
+
+	// Bot clone: <root>/enju/bots/<botName>/clone
+	if leaf == "clone" && parentBase != "" {
+		grand := filepath.Dir(parent)
+		if filepath.Base(grand) == "bots" && filepath.Base(filepath.Dir(grand)) == "enju" {
+			return filepath.Dir(filepath.Dir(grand))
+		}
+	}
+
+	// autoLocal or unknown — workDir is already the project root.
+	return clean
 }
 
 // ProductionTrailerOrder is the canonical order Enju trailers

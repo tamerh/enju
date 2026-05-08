@@ -232,6 +232,24 @@ func TestProductionDiskLayout(t *testing.T) {
 	if got := convs.DiskLayout.OperatorClonePath("/proj"); got != "/proj/enju/.clone" {
 		t.Errorf("OperatorClonePath: got %q", got)
 	}
+
+	// ProjectRoot reverses the clone-suffix conventions so the
+	// per-project trace log can be a single file across operator
+	// + bots. Three input shapes; each must round-trip back to
+	// the project root the other constructors started from.
+	cases := []struct{ in, want string }{
+		{"/proj/enju/.clone", "/proj"},
+		{"/proj/enju/bots/alice/clone", "/proj"},
+		{"/proj/enju/bots/reviewer-bot-1/clone", "/proj"},
+		{"/proj", "/proj"}, // autoLocal — workDir is already root
+		{"/some/random/path", "/some/random/path"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := convs.DiskLayout.ProjectRoot(c.in); got != c.want {
+			t.Errorf("ProjectRoot(%q): got %q, want %q", c.in, got, c.want)
+		}
+	}
 }
 
 // TestLeaveProjectRemovesClone mirrors the project-side test that

@@ -10,9 +10,15 @@ import (
 
 // Emit writes a one-line structured summary of the trace to the
 // parent logger AND, when traceFile is non-nil, appends the same
-// information to the per-project log file. Callers should
-// `defer trace.Emit(logger, file)` right after Start so every
-// invocation — success OR failure — leaves a queryable record.
+// information to it. The file is per-process (see
+// ProcessTraceFilename) so within-process goroutines write
+// safely (slog and *os.File both have internal mutexes); no
+// cross-process coordination needed because each process owns
+// its own file.
+//
+// Callers should `defer trace.Emit(logger, traceFile)` right
+// after Start so every invocation — success OR failure — leaves
+// a queryable record.
 //
 // Without persistent emission, traces on the success path are
 // thrown away, leaving "verb returned nil but didn't actually do
@@ -76,8 +82,8 @@ func (t *Trace) Emit(logger *slog.Logger, traceFile *os.File) {
 		}
 		line.WriteString("\n")
 		// Best-effort write. A failure here (file rotated or
-		// removed under us) shouldn't crash the verb path —
-		// the slog logger remains as backup.
+		// removed) shouldn't crash the verb path — slog stays
+		// as the backup destination.
 		_, _ = traceFile.WriteString(line.String())
 	}
 }

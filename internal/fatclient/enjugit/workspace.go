@@ -29,6 +29,12 @@ type Workspace struct {
 	registry *projectreg.Registry
 	logger   *slog.Logger
 
+	// logName picks the trace log filename: "<logName>.log".
+	// Empty falls back to trace-<pid>.log. Set via WithLogName
+	// at construction — typically "operator" for the MCP server
+	// and "bot-<name>" for each bot daemon.
+	logName string
+
 	mu         sync.Mutex
 	workflows  map[int64]*Workflow // cached by projectID
 	views      map[int64]*View     // cached by projectID
@@ -49,6 +55,15 @@ func WithRegistry(reg *projectreg.Registry) Option {
 // Defaults to slog.Default() when not provided.
 func WithLogger(logger *slog.Logger) Option {
 	return func(w *Workspace) { w.logger = logger }
+}
+
+// WithLogName sets the role label used for the per-project trace
+// log filename. The trace log lives at
+// <projectRoot>/enju/logs/<logName>.log. Typical values:
+// "operator" for the MCP server, "bot-<botName>" for each bot
+// daemon. Empty (default) falls back to trace-<pid>.log.
+func WithLogName(name string) Option {
+	return func(w *Workspace) { w.logName = name }
 }
 
 // NewWorkspace constructs a Workspace rooted at rootDir.
@@ -279,11 +294,24 @@ func (w *Workspace) newWorkflowFromClone(id int64, clone *git.Clone) *Workflow {
 		projID: id,
 		logger: w.logger,
 	}
+	// Trace log lives at <projectRoot>/enju/logs/trace-<pid>.log
+	// — per-process file (PID-suffixed) so operator MCP, each bot
+	// daemon, and any autoLocal driver each own their own file
+	// without cross-process append coordination. Convention-
+	// supplied ProjectRoot reverses the clone-suffix patterns
+	// (.clone / bots/<x>/clone) so all writers under one project
+	// land their logs in the same directory regardless of which
+	// clone they're driving.
 	if workDir := clone.WorkDir(); workDir != "" {
-		f, err := oplog.OpenProjectLogFile(workDir, filepath.Join("enju", "logs"), "trace.log")
+		projectRoot := workDir
+		if w.convs.DiskLayout.ProjectRoot != nil {
+			projectRoot = w.convs.DiskLayout.ProjectRoot(workDir)
+		}
+		f, err := oplog.OpenProjectLogFile(projectRoot,
+			filepath.Join("enju", "logs"), oplog.TraceFilename(w.logName))
 		if err != nil {
 			w.logger.Warn("enjugit: open trace log failed; verb traces go to slog only",
-				"project_id", id, "work_dir", workDir, "error", err)
+				"project_id", id, "project_root", projectRoot, "error", err)
 		} else {
 			wf.traceFile = f
 		}

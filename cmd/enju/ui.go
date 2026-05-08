@@ -133,6 +133,7 @@ func cmdUI(args []string) {
 		Coord:           coordClient,
 		WorkspaceRoot:   wsRoot,
 		Logger:          logger,
+		LogName:         "webui",
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
 

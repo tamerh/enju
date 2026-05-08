@@ -6,27 +6,33 @@ import (
 	"path/filepath"
 )
 
-// OpenProjectLogFile opens (creating if needed) an append-only log
-// file at <workDir>/<subdir>/<filename>. Side effects on first
-// use:
+// OpenProjectLogFile opens (creating if needed) an append-only
+// log file at <workDir>/<subdir>/<filename>. Side effects on
+// first use:
 //
 //   - mkdir -p <workDir>/<subdir>/
 //   - drop a self-installing `.gitignore` containing "*\n" so the
-//     directory's contents (including the .gitignore itself) never
-//     end up in git. Same pattern internal/fatclient/notify uses
-//     for enju/events/.
+//     directory's contents (including the .gitignore itself)
+//     never end up in git. Same pattern internal/fatclient/notify
+//     uses for enju/events/.
 //
-// The returned file is opened O_APPEND|O_CREATE|O_WRONLY so
-// concurrent processes (operator MCP + multiple bot daemons,
-// notify supervisor + writer goroutines) can each append safely
-// on Linux without coordination.
+// Concurrency model: each PROCESS picks a unique filename
+// (typically with PID suffix — see ProcessTraceFilename) and
+// writes to its own file. No cross-process append coordination
+// needed. Within-process callers use the returned *os.File via
+// slog.NewTextHandler or similar — slog handlers serialize
+// writes internally, so multiple goroutines in the same process
+// share the file safely without further locking.
 //
-// Empty workDir is a programming error and returns an error.
-// Other setup failures (permission denied, disk full at mkdir)
-// are returned to the caller, who decides whether they're fatal
-// (notify treats them as fatal — events would be lost) or
-// degradation-acceptable (oplog treats them as fall-through to
-// the slog logger).
+// This avoids the POSIX-only O_APPEND atomicity assumption AND
+// the complexity of cross-process flocking. The "single
+// aggregated file across processes" view is built downstream:
+// `tail -f <dir>/*.log` or a bot-side merger if richer queries
+// are needed.
+//
+// Empty workDir or filename is a programming error and returns
+// an error. Other setup failures (permission denied, disk full
+// at mkdir) are returned to the caller.
 func OpenProjectLogFile(workDir, subdir, filename string) (*os.File, error) {
 	if workDir == "" {
 		return nil, fmt.Errorf("oplog: OpenProjectLogFile: workDir is empty")
@@ -46,6 +52,28 @@ func OpenProjectLogFile(workDir, subdir, filename string) (*os.File, error) {
 	}
 	return os.OpenFile(filepath.Join(dir, filename),
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+}
+
+// TraceFilename returns the per-process trace log filename for
+// a given role. Format: `<role>-<pid>.log`. Role gives a human-
+// readable handle ("operator", "bot-alice", "webui"); PID makes
+// it unique across concurrent sessions or restarts of the same
+// role. Empty role falls back to `trace-<pid>.log` so ad-hoc /
+// test wirings still get a file.
+//
+// Discovery flow: `tail -f <projectRoot>/enju/logs/*.log` for a
+// live aggregate view; `cat operator-*.log` for every operator
+// session's history; `ls -lt` to find the most recent.
+//
+// Each process owns its own file, so no cross-process write
+// coordination is needed — within-process goroutines serialize
+// via *os.File's runtime mutex, which is what slog handlers
+// rely on too.
+func TraceFilename(roleName string) string {
+	if roleName == "" {
+		return fmt.Sprintf("trace-%d.log", os.Getpid())
+	}
+	return fmt.Sprintf("%s-%d.log", roleName, os.Getpid())
 }
 
 // ensureSelfIgnoringGitignore writes a `.gitignore` containing

@@ -42,6 +42,13 @@ type Config struct {
 	ModelName     string
 	Logger        *slog.Logger
 
+	// LogName picks the trace log filename. The trace log lives at
+	// <projectRoot>/enju/logs/<LogName>.log; one file per role.
+	// `enju mcp` passes "operator", `enju bot run` passes
+	// "bot-<botName>". Empty falls back to trace-<pid>.log so
+	// ad-hoc / test wirings still get a unique file.
+	LogName string
+
 	// ProjectRegistry tracks the projects this fat-client knows
 	// about (standard clones + externally adopted dirs). Optional
 	// — when nil, ListMaterializedProjects falls back to walking
@@ -125,6 +132,9 @@ func New(cfg Config) *FatClient {
 		opts := []enjugit.Option{enjugit.WithLogger(logger)}
 		if cfg.ProjectRegistry != nil {
 			opts = append(opts, enjugit.WithRegistry(cfg.ProjectRegistry))
+		}
+		if cfg.LogName != "" {
+			opts = append(opts, enjugit.WithLogName(cfg.LogName))
 		}
 		ws, err := enjugit.NewWorkspace(cfg.WorkspaceRoot,
 			enjugit.NewProductionConventions(), opts...)

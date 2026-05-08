@@ -189,6 +189,7 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		WorkspaceRoot:   cfg.WorkspaceRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
+		LogName:         "operator",
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
 	client := &apiClient{fc: fc}

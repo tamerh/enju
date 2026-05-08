@@ -741,6 +741,7 @@ func cmdBotRun(args []string) {
 		WorkspaceRoot:   wsRoot,
 		ModelName:       bot.Model,
 		Logger:          logger,
+		LogName:         "bot-" + creds.Username,
 		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
 	})
 
