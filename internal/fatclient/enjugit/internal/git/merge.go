@@ -26,7 +26,7 @@ import (
 // Worktree state: unchanged (this is a ref-only operation).
 func (c *Clone) MergeFFOrFail(target, source string) (string, error) {
 	defer c.lock()()
-	targetSHA, err := c.resolveLocalRef(target)
+	targetSHA, err := c.resolveLocalOrPlantFromOrigin(target)
 	if err != nil {
 		return "", fmt.Errorf("%w: target %s", ErrRefNotFound, target)
 	}
@@ -82,7 +82,7 @@ func (c *Clone) MergeFFOrFail(target, source string) (string, error) {
 //   - any: shell-out failure wrapped.
 func (c *Clone) MergeWithCommit(target, source, message, authorName, authorEmail string) (string, error) {
 	defer c.lock()()
-	targetSHA, err := c.resolveLocalRef(target)
+	targetSHA, err := c.resolveLocalOrPlantFromOrigin(target)
 	if err != nil {
 		return "", fmt.Errorf("%w: target %s", ErrRefNotFound, target)
 	}
@@ -152,6 +152,35 @@ func (c *Clone) resolveLocalRef(name string) (plumbing.Hash, error) {
 		return plumbing.ZeroHash, err
 	}
 	return ref.Hash(), nil
+}
+
+// resolveLocalOrPlantFromOrigin resolves a branch name to a hash:
+// returns the local SHA if refs/heads/<name> exists, otherwise
+// PLANTS refs/heads/<name> from refs/remotes/origin/<name> (when
+// the origin tracking ref exists) and returns that SHA.
+//
+// Why plant from origin: a fresh clone (e.g. a bot's per-bot
+// clone) sees the run branch as origin/<name> after fetch but
+// never has a local ref unless someone explicitly creates one.
+// Merge ops need a local ref to advance — without this fallback,
+// MergeFFOrFail / MergeWithCommit fail with a misleading "ref
+// not found" against a branch that DOES exist on origin.
+//
+// Returns ErrRefNotFound when neither local nor origin tracking
+// has the branch (genuinely unknown).
+func (c *Clone) resolveLocalOrPlantFromOrigin(name string) (plumbing.Hash, error) {
+	if hash, err := c.resolveLocalRef(name); err == nil {
+		return hash, nil
+	}
+	remoteRef, rerr := c.repo.Reference(plumbing.NewRemoteReferenceName("origin", name), true)
+	if rerr != nil {
+		return plumbing.ZeroHash, rerr
+	}
+	localRef := plumbing.NewBranchReferenceName(name)
+	if err := c.repo.Storer.SetReference(plumbing.NewHashReference(localRef, remoteRef.Hash())); err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("planting local ref %s from origin: %w", name, err)
+	}
+	return remoteRef.Hash(), nil
 }
 
 // resolveAnyRef resolves a ref name to a hash, accepting:

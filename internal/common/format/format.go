@@ -137,16 +137,14 @@ func ProjectRemoteStatus(data []byte) string {
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Project #%s remote status\n", projectID))
-	if remote == "" {
-		b.WriteString("  (no remote configured)\n")
-		return b.String()
-	}
-	// For init'd projects, show workspace path + actual git remote separately.
+	// For path-mode projects (adopted folder + managed bare under
+	// <project>/enju/.bare.git/), RemoteStatusReport surfaces the
+	// project home as `workspace` and the bare path as `remote_url`.
+	// Show them on separate lines so the user understands the
+	// "your tree → managed bare" routing.
 	if workspace, ok := r["workspace"].(string); ok && workspace != "" {
 		b.WriteString("  workspace: " + workspace + " (adopted folder)\n")
 		b.WriteString("  git remote: " + remote + "\n")
-	} else if strings.HasPrefix(remote, "/") && !strings.HasSuffix(remote, ".git") {
-		b.WriteString("  workspace: " + remote + " (local, no git remote)\n")
 	} else {
 		b.WriteString("  remote:    " + remote + "\n")
 	}
@@ -250,8 +248,6 @@ func HumanRemoteStatus(code string, ahead, behind int) string {
 		return "local has no HEAD yet"
 	case "unreachable":
 		return "unreachable — ls-remote failed"
-	case "no_remote":
-		return "no remote configured"
 	default:
 		return code
 	}

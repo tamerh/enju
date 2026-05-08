@@ -607,22 +607,40 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	}
 }
 
-// TestCreateProjectCustomPathRefusesPopulated pins the safety
-// guarantee on enju_create_project: a path with existing content
-// is refused with a curative error pointing to enju_init.
-func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
+// TestCreateProjectCustomPathRefusesPopulatedGitRepo pins the
+// safety guarantee on enju_create_project: a path that already
+// contains a git repo with commits but no Enju metadata is
+// refused unless force=true. Catches the LLM-typoed-path footgun
+// (running in /repo/A but passing /repo/B that turns out to be
+// /repo/A again).
+func TestCreateProjectCustomPathRefusesPopulatedGitRepo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	customPath := t.TempDir()
+	// Make it a populated git repo with no Enju marker.
+	repo, err := gogit.PlainInitWithOptions(customPath, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{
+			DefaultBranch: "refs/heads/main",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlainInit: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(customPath, "existing.txt"), []byte("user data"), 0644); err != nil {
 		t.Fatal(err)
+	}
+	wt, _ := repo.Worktree()
+	_ = wt.AddGlob(".")
+	sig := &object.Signature{Name: "u", Email: "u@u", When: time.Now()}
+	if _, err := wt.Commit("initial", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
-			Username: "tester",
-			Logger:  logger,
-		}), "", logger)
+		Username: "tester",
+		Logger:   logger,
+	}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -637,14 +655,13 @@ func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
 		t.Fatalf("expected curative error result, got err=%v result=%+v", err, result)
 	}
 	if !result.IsError {
-		t.Fatal("expected IsError=true for populated path")
+		t.Fatal("expected IsError=true for populated git repo without Enju marker")
 	}
-	// The error must point the user at enju_init, not just refuse.
 	gotText := mcpResultText(t, result)
-	if !strings.Contains(gotText, "enju_init") {
-		t.Errorf("error message should route to enju_init, got: %s", gotText)
+	if !strings.Contains(gotText, "force=true") {
+		t.Errorf("error message should mention force=true escape hatch, got: %s", gotText)
 	}
-	// Also: existing file must remain untouched.
+	// Existing file must remain untouched.
 	if _, err := os.Stat(filepath.Join(customPath, "existing.txt")); err != nil {
 		t.Errorf("existing file disturbed: %v", err)
 	}
@@ -848,13 +865,14 @@ func TestCreateProjectCustomPathRefusesRelative(t *testing.T) {
 	}
 }
 
-// TestInitRefusesPopulatedUnrelatedRepo pins the safety contract:
-// enju_init refuses to adopt a git repo that has commits AND no
-// Enju marker. The footgun this catches is the calling LLM
-// running inside /repo/A and typo'ing path=/repo/B → /repo/A,
-// which would otherwise silently scaffold + commit Enju into the
-// caller's source repo.
-func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
+// TestCreateProjectRefusesPopulatedUnrelatedRepoAdoption pins the
+// safety contract: enju_create_project (smart-detect adoption)
+// refuses to adopt a git repo that has commits AND no Enju marker.
+// The footgun this catches is the calling LLM running inside
+// /repo/A and typo'ing path=/repo/B → /repo/A, which would
+// otherwise silently scaffold + commit Enju into the caller's
+// source repo.
+func TestCreateProjectRefusesPopulatedUnrelatedRepoAdoption(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
@@ -883,9 +901,9 @@ func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
 			Logger:  logger,
 		}), "", logger)
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_init",
+			Name: "enju_create_project",
 			Arguments: map[string]interface{}{
 				"name": "demo",
 				"path": dir,
@@ -911,9 +929,10 @@ func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
 	}
 }
 
-// TestInitForceAdoptsPopulatedRepo pins the cure: with force=true,
-// enju_init adopts the repo, scaffolds it, and proceeds normally.
-func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
+// TestCreateProjectForceAdoptsPopulatedRepo pins the cure: with
+// force=true, enju_create_project (smart-detect adoption) adopts
+// the repo, scaffolds it, and proceeds normally.
+func TestCreateProjectForceAdoptsPopulatedRepo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
@@ -949,9 +968,9 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 			Logger:  logger,
 		}), ws.RootDir(), logger)
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_init",
+			Name: "enju_create_project",
 			Arguments: map[string]interface{}{
 				"name":  "demo",
 				"path":  dir,
@@ -960,7 +979,7 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 		},
 	})
 	if err != nil || result == nil || result.IsError {
-		t.Fatalf("handleInit with force=true: err=%v result=%+v text=%s",
+		t.Fatalf("handleCreateProject with force=true: err=%v result=%+v text=%s",
 			err, result, mcpResultText(t, result))
 	}
 	// Scaffold must exist now.
@@ -969,11 +988,11 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 	}
 }
 
-// TestInitAcceptsAlreadyAdoptedRepo pins idempotency: re-running
-// enju_init on a repo that was previously adopted (carries enju/
-// scaffold) passes through without force, even though it has
-// commits.
-func TestInitAcceptsAlreadyAdoptedRepo(t *testing.T) {
+// TestCreateProjectAcceptsAlreadyAdoptedRepo pins idempotency:
+// re-running enju_create_project (smart-detect adoption) on a repo
+// that was previously adopted (carries enju/ scaffold) passes
+// through without force, even though it has commits.
+func TestCreateProjectAcceptsAlreadyAdoptedRepo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
@@ -998,15 +1017,16 @@ func TestInitAcceptsAlreadyAdoptedRepo(t *testing.T) {
 	}
 }
 
-// TestInitDetectsEnjuBinaryNotMistakenForScaffold pins the
-// IsDir discrimination on the safety check. The enju repo
+// TestCreateProjectDetectsEnjuBinaryNotMistakenForScaffold pins
+// the IsDir discrimination on the safety check used by
+// enju_create_project (smart-detect adoption). The enju repo
 // itself is a populated git repo whose root contains the
 // compiled `enju` binary as a regular file. Without the IsDir
 // check, an os.Stat-only marker test would treat the binary
 // as an "enju/" scaffold marker and skip refusal — defeating
 // the safety gate exactly in the scenario it's there to catch
 // (calling LLM adopting the enju source repo).
-func TestInitDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
+func TestCreateProjectDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
@@ -1032,10 +1052,11 @@ func TestInitDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 	}
 }
 
-// TestInitFolderWithoutGit verifies that enju_init on a plain
-// folder (no .git) initializes git, writes the scaffold, and
-// registers the external dir so ForProject opens it directly.
-func TestInitFolderWithoutGit(t *testing.T) {
+// TestCreateProjectFolderWithoutGit verifies that
+// enju_create_project (smart-detect adoption) on a plain folder
+// (no .git) initializes git, writes the scaffold, and registers
+// the external dir so ForProject opens it directly.
+func TestCreateProjectFolderWithoutGit(t *testing.T) {
 	// Isolate $HOME — defensive against any stray code path
 	// that might still consult $HOME for state. Post-layout-
 	// refactor, init no longer writes anywhere outside the
@@ -1078,14 +1099,14 @@ func TestInitFolderWithoutGit(t *testing.T) {
 		ProjectRegistry: reg,
 	})
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "enju_init",
+			Name:      "enju_create_project",
 			Arguments: map[string]interface{}{"name": "test-init", "path": dir},
 		},
 	})
 	if err != nil {
-		t.Fatalf("handleInit: %v", err)
+		t.Fatalf("handleCreateProject: %v", err)
 	}
 	if result == nil || result.IsError {
 		t.Fatalf("expected success, got: %+v", result)
@@ -1118,10 +1139,13 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	}
 }
 
-// TestInitFolderWithExistingGit verifies that enju_init on a
-// folder that already has git preserves existing history and
-// adds the scaffold on top.
-func TestInitFolderWithExistingGit(t *testing.T) {
+// TestCreateProjectFolderWithExistingGit verifies that
+// enju_create_project (smart-detect adoption) on a folder that
+// already has git preserves existing history. Unlike the
+// no-.git or empty-folder branches, the existing-.git branch
+// does NOT add a scaffold commit — the existing repo is
+// adopted as-is and only origin is wired (managed bare).
+func TestCreateProjectFolderWithExistingGit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects", func(w http.ResponseWriter, r *http.Request) {
@@ -1161,24 +1185,26 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 			Logger:  logger,
 		}), ws.RootDir(), logger)
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_init",
+			Name: "enju_create_project",
 			Arguments: map[string]interface{}{
 				"name": "existing-git", "path": dir, "force": true,
 			},
 		},
 	})
 	if err != nil || result.IsError {
-		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
 	}
 
-	// Should have 2 commits: the pre-existing one + scaffold.
+	// Pre-existing commit preserved — existing-.git branch
+	// does NOT add a scaffold commit (that's reserved for the
+	// no-.git branches).
 	iter, _ := repo.Log(&gogit.LogOptions{})
 	count := 0
 	iter.ForEach(func(c *object.Commit) error { count++; return nil })
-	if count != 2 {
-		t.Errorf("expected 2 commits (pre-existing + scaffold), got %d", count)
+	if count != 1 {
+		t.Errorf("expected 1 commit (pre-existing), got %d — existing-.git branch should not add commits on top", count)
 	}
 
 	// Pre-existing file preserved.
@@ -1187,15 +1213,18 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 		t.Errorf("existing.txt clobbered: %s", data)
 	}
 
-	// Scaffold added.
-	if _, err := os.Stat(filepath.Join(dir, "enju", "templates", ".gitkeep")); err != nil {
-		t.Error("expected enju/templates/.gitkeep after init on existing git repo")
+	// Managed bare wired (the existing-.git+no-origin branch
+	// always promotes a managed bare so origin is non-empty).
+	managedBare := filepath.Join(dir, "enju", ".bare.git")
+	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err != nil {
+		t.Errorf("managed bare missing at %s: %v", managedBare, err)
 	}
 }
 
-// TestInitIdempotent verifies that running enju_init twice on the
-// same folder doesn't clobber anything or fail.
-func TestInitIdempotent(t *testing.T) {
+// TestCreateProjectIdempotent verifies that running
+// enju_create_project (smart-detect adoption) twice on the same
+// folder doesn't clobber anything or fail.
+func TestCreateProjectIdempotent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	mux := http.NewServeMux()
 	callCount := 0
@@ -1238,22 +1267,22 @@ func TestInitIdempotent(t *testing.T) {
 	makeReq := func() mcp.CallToolRequest {
 		return mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
-				Name:      "enju_init",
+				Name:      "enju_create_project",
 				Arguments: map[string]interface{}{"name": "idempotent", "path": dir},
 			},
 		}
 	}
 
-	// First init.
-	r1, err := c.handleInit(context.Background(), makeReq())
+	// First create_project.
+	r1, err := c.handleCreateProject(context.Background(), makeReq())
 	if err != nil || r1.IsError {
-		t.Fatalf("first init: err=%v result=%+v", err, r1)
+		t.Fatalf("first create_project: err=%v result=%+v", err, r1)
 	}
 
-	// Second init — should not fail, scaffold already exists.
-	r2, err := c.handleInit(context.Background(), makeReq())
+	// Second create_project — should not fail, scaffold already exists.
+	r2, err := c.handleCreateProject(context.Background(), makeReq())
 	if err != nil || r2.IsError {
-		t.Fatalf("second init: err=%v result=%+v", err, r2)
+		t.Fatalf("second create_project: err=%v result=%+v", err, r2)
 	}
 
 	// Data file still intact.
@@ -1263,18 +1292,22 @@ func TestInitIdempotent(t *testing.T) {
 	}
 }
 
-// TestInitOriginlessFolderStaysOriginless verifies solo-mode
-// behavior: enju_init on a folder with no `origin` must NOT
-// create any bare or configure origin in the working tree.
-// Async tasks still work because ScanBranchSince falls back
-// to refs/heads when no origin tracking ref exists.
+// TestCreateProjectOriginlessFolderGetsManagedBare verifies the
+// "every project has origin" precondition (Phase 1 of the
+// no-remote collapse): enju_create_project (smart-detect
+// adoption) on a folder with no `origin` MUST create a managed
+// bare at <project>/enju/.bare.git/ and wire origin to it. This
+// eliminates the no-remote state class so verbs downstream don't
+// need to handle "what if there's no push target" branches.
 //
-// The bare push target only appears later, when the operator
-// runs `enju bot setup` — it lands at <project>/enju/.bare.git/
-// (gitignored, per-machine). Pre-layout-refactor a "shadow
-// bare" lived at ~/.enju/repos/{id}.git/; that path no longer
-// exists.
-func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
+// The legacy ~/.enju/repos/{id}.git/ shadow bare must NOT
+// appear — that path is removed by the layout refactor;
+// the new bare lives sibling-to the operator's working tree.
+//
+// Coord must NOT receive a PUT /remote — the origin is local
+// to the operator's machine and coord-side state stays
+// remote_url="" (path-mode project).
+func TestCreateProjectOriginlessFolderGetsManagedBare(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	mux := http.NewServeMux()
@@ -1285,7 +1318,7 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 	mux.HandleFunc("/api/v1/projects/42/remote", func(w http.ResponseWriter, r *http.Request) {
 		// Should NEVER fire for solo-mode init. If this hits,
 		// the auto-bare regression came back.
-		t.Error("unexpected PUT /projects/42/remote — solo-mode enju_init should not call it")
+		t.Error("unexpected PUT /projects/42/remote — solo-mode enju_create_project should not call it")
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/api/v1/citizens", func(w http.ResponseWriter, r *http.Request) {
@@ -1327,30 +1360,40 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 		ProjectRegistry: reg,
 	})
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_init",
+			Name: "enju_create_project",
 			Arguments: map[string]interface{}{
 				"name": "tp53", "path": dir, "force": true,
 			},
 		},
 	})
 	if err != nil || result.IsError {
-		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
 	}
 
-	// No shadow bare must exist.
+	// Legacy ~/.enju/repos/{id}.git/ shadow bare must NOT
+	// exist — that path was removed by the layout refactor.
 	legacyBare := filepath.Join(os.Getenv("HOME"), ".enju", "repos", "42.git")
 	if _, err := os.Stat(legacyBare); err == nil {
-		t.Errorf("unexpected shadow bare at %s — solo-mode init should leave the folder alone", legacyBare)
+		t.Errorf("unexpected legacy shadow bare at %s", legacyBare)
 	}
 
-	// Working tree must NOT have origin configured (the input
-	// state was originless; we don't auto-add one anymore).
-	if rem, err := repo.Remote("origin"); err == nil {
-		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 && cfg.URLs[0] != "" {
-			t.Errorf("origin was unexpectedly configured: %v", cfg.URLs)
-		}
+	// The managed bare MUST exist at <dir>/enju/.bare.git/ —
+	// every project gets a push target at creation time.
+	managedBare := filepath.Join(dir, "enju", ".bare.git")
+	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err != nil {
+		t.Errorf("managed bare missing at %s: %v", managedBare, err)
+	}
+
+	// Working tree's origin MUST point at the managed bare —
+	// `git push` lands there; no more silent push-skip.
+	rem, err := repo.Remote("origin")
+	if err != nil {
+		t.Fatalf("origin not configured after init: %v", err)
+	}
+	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != managedBare {
+		t.Errorf("origin URL: got %v, want [%s]", cfg.URLs, managedBare)
 	}
 
 	// Workspace's external dir registration succeeded — ForProject
@@ -1364,12 +1407,12 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 	}
 }
 
-// TestInitPreservesExistingOrigin verifies the github-clone
-// case: when the adopted folder already has an origin (e.g.
-// from a prior `git clone`), enju_init must NOT overwrite it
-// with a managed bare. The user's existing push target stays
-// intact.
-func TestInitPreservesExistingOrigin(t *testing.T) {
+// TestCreateProjectPreservesExistingOrigin verifies the
+// github-clone case: when the adopted folder already has an
+// origin (e.g. from a prior `git clone`), enju_create_project
+// (smart-detect adoption) must NOT overwrite it with a managed
+// bare. The user's existing push target stays intact.
+func TestCreateProjectPreservesExistingOrigin(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	mux := http.NewServeMux()
@@ -1419,16 +1462,16 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 			Logger:  logger,
 		}), ws.RootDir(), logger)
 
-	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
+	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_init",
+			Name: "enju_create_project",
 			Arguments: map[string]interface{}{
 				"name": "with-origin", "path": dir, "force": true,
 			},
 		},
 	})
 	if err != nil || result.IsError {
-		t.Fatalf("handleInit: err=%v result=%+v", err, result)
+		t.Fatalf("handleCreateProject: err=%v result=%+v", err, result)
 	}
 
 	// Origin must be untouched.

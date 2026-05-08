@@ -487,50 +487,35 @@ func ListProjects() mcp.Tool {
 
 func CreateProject() mcp.Tool {
 	return mcp.NewTool("enju_create_project",
-		mcp.WithDescription(`Create a brand-new Enju project from scratch at an absolute path you provide. Always creates a fresh workspace — guaranteed not to overwrite anything in an existing populated directory.
+		mcp.WithDescription(`Create or adopt an Enju project at an absolute path you provide. The folder IS the project's working tree — Enju writes its scaffold (enju/templates/) into it and runs git init if needed. Smart-detects what's at the path and dispatches:
 
-Path is required. Must be absolute, and must be empty or not yet exist. Populated paths are refused with a pointer to enju_init.
+  - Empty or non-existent folder: git init + seed + managed bare remote.
+  - Populated folder, no .git: git init + commit existing files + managed bare. Refuses populated git repos with no Enju marker (the LLM-typoed-path footgun); pass force=true to override.
+  - Folder with .git, no origin: leaves the existing repo alone, wires a managed bare so commits have somewhere to land.
+  - Folder with .git + origin: registers as-is. Your remote stays the push target.
 
-Use this when the user wants to start fresh. If they have an existing folder, paper draft, or code repo to add Enju on top of, use enju_init instead.`),
+Path is required and must be explicit: pass the absolute path to the folder. There is no cwd default — the calling LLM may be running inside a different project's directory than the one being adopted (very common when running Claude in /repo/A while creating an Enju project for /repo/B), and silently adopting cwd would be a footgun. If the user says "this folder" or "the current directory," confirm what cwd is and pass it explicitly.
+
+To migrate from a managed bare to a real GitHub/GitLab remote later, use enju_set_project_remote.`),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Unique project name"),
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description(`Absolute path for the project's working tree. Empty or non-existent only — populated paths are refused (use enju_init for those). The folder will hold all of Enju's per-project state under enju/ (templates, runs, events, bot state). Mutually exclusive with remote_url: path= seeds a fresh local working tree, it does not clone.`),
+			mcp.Description(`Absolute path for the project's working tree. Folder may be empty, populated, or already a git repo — see tool description for what each state triggers. The folder will hold all of Enju's per-project state under enju/ (templates, runs, events, bot state). Mutually exclusive with remote_url.`),
 		),
 		mcp.WithString("description",
 			mcp.Description("Optional project description"),
 		),
 		mcp.WithString("remote_url",
-			mcp.Description("Optional external git remote URL (e.g., git@github.com:org/repo.git). When set, the coordinator pushes every task result commit to this remote. Auth follows the host's SSH/credential configuration."),
+			mcp.Description("Optional external git remote URL (e.g., git@github.com:org/repo.git) to clone into the default workspace location. Mutually exclusive with path. Auth follows the host's SSH/credential configuration."),
 		),
 		mcp.WithString("default_branch",
-			mcp.Description(`Optional git branch new runs land on by default. Defaults to "main". Orgs that want Enju activity to stay off their repo's main branch set this to e.g. "enju/work" — runs will commit to that branch unless an explicit branch= is passed at create_run time.`),
-		),
-	)
-}
-
-func Init() mcp.Tool {
-	return mcp.NewTool("enju_init",
-		mcp.WithDescription(`Adopt an existing folder as an Enju project. The folder IS the workspace — Enju writes its scaffold (enju/, enju/templates/) into it, respects all existing files, and runs git init if there isn't one already. Use this when the user has a directory, paper draft, or code repo they want to add Enju orchestration on top of.
-
-Path is required and must be explicit: pass the absolute path to the folder. There is no cwd default — the calling LLM may be running inside a different project's directory than the one being adopted (very common when running Claude in /repo/A while creating an Enju project for /repo/B), and silently adopting cwd would be a footgun. If the user says "this folder" or "the current directory," confirm what cwd is and pass it explicitly.
-
-Safety gate: enju_init refuses to adopt a populated git repo that has no Enju metadata — that pattern is almost always a typo'd path pointing at the wrong repo. The error message names the cure: re-invoke with force=true to adopt anyway, or pick a different path. Fresh "git init" with no commits, empty directories, and previously-adopted Enju projects pass through without force.
-
-If the user wants to start fresh with no existing files, use enju_create_project instead.`),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Project name"),
-		),
-		mcp.WithString("path",
-			mcp.Required(),
-			mcp.Description("Absolute path to the existing folder to adopt. Pass explicitly — no cwd default."),
+			mcp.Description(`Optional git branch new runs land on by default. When adopting an existing repo, auto-detected from HEAD; otherwise defaults to "main". Set explicitly to e.g. "enju/work" if you want Enju activity off your main branch.`),
 		),
 		mcp.WithBoolean("force",
-			mcp.Description("Override the populated-git-repo safety gate. Default false. Set true only when the user has explicitly confirmed they want to add Enju orchestration on top of an existing populated git repository."),
+			mcp.Description("Override the populated-git-repo safety gate. Default false. Set true only when the user has explicitly confirmed they want to add Enju orchestration on top of an existing populated git repository with no Enju marker."),
 		),
 	)
 }
@@ -929,7 +914,7 @@ func SetProjectDefaultBranch() mcp.Tool {
 
 func SetProjectRemote() mcp.Tool {
 	return mcp.NewTool("enju_set_project_remote",
-		mcp.WithDescription("Set the external git remote URL for a project, or migrate from one remote to another. Subsequent task result commits push to this remote. Pass the new URL directly to migrate; use enju_leave_project to stop using the project on this machine. Empty strings are rejected — clearing a remote on a multi-machine project would silently fork the team."),
+		mcp.WithDescription("Set the external git remote URL for a project. Use this to graduate a path-mode project (currently using its local managed bare under <project>/enju/.bare.git/) to a real GitHub/GitLab/Gitea/self-hosted remote, or to migrate from one external remote to another. The fat-client pushes every local branch to the new remote and resets scan cursors so the artifact index catches up to the migrated history. Pass the new URL directly to migrate; use enju_leave_project to stop using the project on this machine. Empty strings are rejected — clearing a remote on a multi-machine project would silently fork the team."),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose remote to update"),

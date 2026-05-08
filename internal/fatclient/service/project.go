@@ -45,9 +45,10 @@ func (s *FatClient) FetchProjectMetaFull(ctx context.Context, projectID int64) (
 
 // ResolveProjectWorkspace returns the absolute path to the
 // project's local clone, materializing it (clone or init) if
-// not yet present. Honors externalDirs (an `enju_init`'d
-// adopted dir wins over the managed `~/.enju/workspaces/`
-// path), which is the right call for HUMAN flows: the
+// not yet present. Honors externalDirs (a folder adopted via
+// `enju_create_project path=`) over the managed `~/.enju/
+// workspaces/` path, which is the right call for HUMAN flows:
+// the
 // operator's edits in their adopted tree are visible to MCP /
 // webui directly. Bot flows MUST NOT use this — see
 // ResolveBotWorkspace below.
@@ -121,8 +122,7 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 	if home == "" {
 		return "", fmt.Errorf(
 			"%w: project %d — no registered home path. Register "+
-				"the project with `enju_init --path=` or "+
-				"`enju_create_project path=`",
+				"the project with `enju_create_project path=`",
 			ErrNoCloneSource, projectID)
 	}
 
@@ -139,10 +139,12 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 	clonePath := filepath.Join(home, relClone)
 
 	// Source: real remote wins (push/pull travels the network),
-	// else the per-project bare from `enju bot setup`.
+	// else the per-project managed bare under <home>/enju/.bare.git.
+	// coord stores remote_url as either "" (path-mode) or a real
+	// network URL — never a local path — so no disambiguation
+	// needed.
 	var source string
-	if remoteURL != "" && !enjugit.IsLocalWorkingTree(remoteURL) {
-		// Network URL (https://, git@, ssh://). Clone direct.
+	if remoteURL != "" {
 		source = remoteURL
 	} else {
 		barePath := filepath.Join(home, corelayout.BotPushTargetDir)
@@ -195,26 +197,26 @@ func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, bo
 //     / etc. is already a bare. No-op. Returns the existing
 //     remote unchanged. The bot pushes there directly via the
 //     project's `origin`.
-//   - **Local path (project home):** call
-//     project.PromoteWorkingTreeToBare to bare-clone the home
-//     into `<home>/enju/.bare.git/`, rewire the home's `origin`
-//     to that bare. Returns the bare path.
-//   - **Empty:** fall back to the projectRegistry's home path
-//     as the source. Same promote flow.
-//   - **No source:** error.
+//   - **Empty (path-mode):** fall back to the projectRegistry's
+//     home path. Call PromoteWorkingTreeToBare to bare-clone
+//     the home into `<home>/enju/.bare.git/`, rewire the home's
+//     `origin` to that bare. Returns the bare path.
+//   - **No registry entry:** error pointing at enju_create_project.
 //
 // No coord PUT: the bare path is local-per-machine and
 // derivable from the project home anyway. Other fatclient
 // processes on the same machine compute the same path; the
 // coord doesn't need to know.
 //
-// Why this lives at "bot setup" time rather than at
-// `enju_init`: Option B (commit d8e97b6) removed auto-bare
-// from `enju_init` because once the scanner gained a
+// Historical note: Option B (commit d8e97b6) removed auto-bare
+// from project creation because once the scanner gained a
 // `refs/heads/<branch>` fallback (when no
 // `refs/remotes/origin/<branch>` exists), the bare became
-// redundant for single-citizen flows. In solo mode nobody
-// pushes — submit wrappers commit straight to the working
+// redundant for single-citizen flows. Phase 1 of the no-remote
+// collapse re-introduced ensureManagedBare at create time
+// because every project needs an origin push target. In solo
+// mode nobody pushes — submit wrappers commit straight to the
+// working
 // tree's local heads, the scanner reads local heads, done.
 //
 // Bots break that property: the daemon runs in a SEPARATE
@@ -238,20 +240,18 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 	}
 
 	// Real remote (https/git/ssh) — github plays the bare role.
-	// IsLocalWorkingTree returns true only for filesystem paths
-	// pointing at a real git working tree; everything else
-	// (network URLs, missing paths) returns false here too, so
-	// we narrow to "non-empty AND local working tree" before
-	// promoting.
-	if remoteURL != "" && !enjugit.IsLocalWorkingTree(remoteURL) {
+	// coord-side remote_url is now always either "" (path-mode)
+	// or a real network URL, so non-empty == real remote, no-op.
+	if remoteURL != "" {
 		return remoteURL, false, nil
 	}
 
-	// Source for the bare-clone is the project's home path:
-	// prefer remote_url (when it points at a local working
-	// tree), else fall back to the registry's home path.
-	source := remoteURL
-	if source == "" && s.projectRegistry != nil {
+	// Path-mode: the project's home in the registry is the source
+	// to bare-clone from. Validate it's actually a working tree
+	// before promoting (defensive — a corrupted registry entry
+	// shouldn't silently produce an empty bare).
+	var source string
+	if s.projectRegistry != nil {
 		entry, gerr := s.projectRegistry.Get(projectID)
 		if gerr == nil && entry != nil {
 			source = entry.LocalPath
@@ -261,12 +261,12 @@ func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (b
 		return "", false, fmt.Errorf(
 			"%w: project %d — set a real remote with "+
 				"`enju_set_project_remote`, or register a project home "+
-				"with `enju_init --path=` / `enju_create_project path=`",
+				"with `enju_create_project path=`",
 			ErrNoCloneSource, projectID)
 	}
 	if !enjugit.IsLocalWorkingTree(source) {
 		return "", false, fmt.Errorf(
-			"clone source %q for project %d is not a git working tree; "+
+			"registered project home %q for project %d is not a git working tree; "+
 				"cannot promote to a bare",
 			source, projectID)
 	}

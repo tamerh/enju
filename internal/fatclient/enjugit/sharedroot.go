@@ -40,7 +40,7 @@ func IsSSHURL(url string) bool {
 // IsLocalWorkingTree returns true when path is a directory
 // containing a `.git` subdirectory — i.e. a real on-disk git
 // working tree (not a bare, not a worktree-link, not nothing).
-// Used to detect enju_init'd projects whose path is stored as
+// Used to detect enju_create_project-adopted projects whose path is stored as
 // remote_url on the coordinator.
 func IsLocalWorkingTree(path string) bool {
 	info, err := os.Stat(path)

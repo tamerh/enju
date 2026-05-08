@@ -74,14 +74,13 @@ type Ops interface {
 	// docstring for context.
 	EnsureOrigin(url string) error
 	// RemoveOrigin deletes the origin remote when present;
-	// idempotent no-op when absent. Used by SetRemote("")
-	// to turn a remote-backed clone local-only.
+	// idempotent no-op when absent.
 	RemoveOrigin() error
 
 	// Per-branch fetch + pull (reconcile / claim path). FetchBranch
 	// updates only refs/remotes/origin/<branch>; PullBranch fetches
-	// and merges into the local branch. Both no-op when no remote
-	// is configured.
+	// and merges into the local branch. Both no-op when the named
+	// branch doesn't exist on origin.
 	FetchBranch(branch string) error
 	PullBranch(branch string) error
 

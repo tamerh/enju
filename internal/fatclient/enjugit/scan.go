@@ -29,18 +29,18 @@ type ScanResult struct {
 }
 
 // FetchBranch refreshes refs/remotes/origin/<branch> from the
-// remote without touching the worktree. No-op when no remote.
-// Empty branch resolves to the workflow's default branch
-// (mirroring project.resolveBranch) so callers without a
-// specific branch context fall back to the project default
-// rather than silently skipping the fetch.
+// remote without touching the worktree. No-op when the named
+// branch doesn't exist on origin yet. Empty branch resolves to
+// the workflow's default branch so callers without a specific
+// branch context fall back to the project default rather than
+// silently skipping the fetch.
 func (w *Workflow) FetchBranch(branch string) error {
 	return translateGitError("fetch branch", w.git.FetchBranch(w.resolveBranch(branch)))
 }
 
 // PullBranch fetches + fast-forwards the local branch. No-op
-// when no remote is configured. Empty branch → default branch,
-// same rationale as FetchBranch.
+// when the named branch doesn't exist on origin yet. Empty
+// branch → default branch, same rationale as FetchBranch.
 func (w *Workflow) PullBranch(branch string) error {
 	return translateGitError("pull branch", w.git.PullBranch(w.resolveBranch(branch)))
 }

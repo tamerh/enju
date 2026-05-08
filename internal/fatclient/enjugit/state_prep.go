@@ -37,16 +37,12 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 	werr := w.git.WithLock(func(g git.Ops) error {
 		// Step 1: fetch (best-effort).
 		if err := g.Fetch(); err != nil {
-			if errors.Is(err, git.ErrNoRemote) {
-				trace.skipped("fetch-origin", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "fetch-origin", Status: "failed",
-					Detail: err.Error(),
-				})
-				w.logger.Warn("enjugit: pre-materialize fetch failed; continuing with cached refs",
-					"branch", upstreamBranch, "error", err)
-			}
+			trace.appendStep(Step{
+				Name: "fetch-origin", Status: "failed",
+				Detail: err.Error(),
+			})
+			w.logger.Warn("enjugit: pre-materialize fetch failed; continuing with cached refs",
+				"branch", upstreamBranch, "error", err)
 		} else {
 			trace.ok("fetch-origin")
 		}
@@ -142,16 +138,12 @@ func (w *Workflow) startIterationBranch(
 
 		// Step 2: fetch (best-effort) so cross-citizen refs are visible.
 		if ferr := g.Fetch(); ferr != nil {
-			if errors.Is(ferr, git.ErrNoRemote) {
-				trace.skipped("fetch-origin", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "fetch-origin", Status: "failed",
-					Detail: ferr.Error(),
-				})
-				w.logger.Warn("enjugit: pre-fork fetch failed; continuing",
-					"task_id", taskID, "fork_ref", forkRef, "error", ferr)
-			}
+			trace.appendStep(Step{
+				Name: "fetch-origin", Status: "failed",
+				Detail: ferr.Error(),
+			})
+			w.logger.Warn("enjugit: pre-fork fetch failed; continuing",
+				"task_id", taskID, "fork_ref", forkRef, "error", ferr)
 		} else {
 			trace.ok("fetch-origin")
 		}
@@ -232,16 +224,12 @@ func (w *Workflow) resumeIterationBranch(
 
 		// Step 2: fetch (best-effort) so we can compare with origin.
 		if ferr := g.Fetch(); ferr != nil {
-			if errors.Is(ferr, git.ErrNoRemote) {
-				trace.skipped("fetch-origin", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "fetch-origin", Status: "failed",
-					Detail: ferr.Error(),
-				})
-				w.logger.Warn("enjugit: pre-resume fetch failed; continuing",
-					"task_id", taskID, "branch", branchName, "error", ferr)
-			}
+			trace.appendStep(Step{
+				Name: "fetch-origin", Status: "failed",
+				Detail: ferr.Error(),
+			})
+			w.logger.Warn("enjugit: pre-resume fetch failed; continuing",
+				"task_id", taskID, "branch", branchName, "error", ferr)
 		} else {
 			trace.ok("fetch-origin")
 		}
@@ -304,7 +292,7 @@ func (w *Workflow) ResetCleanWorktree() error {
 //  2. branch exists only on origin (another machine pushed it first)
 //     → create local tracking ref pointing at origin's tip.
 //  3. branch exists nowhere → fork from defaultBranch, push to
-//     origin (best-effort on no-remote projects).
+//     origin.
 //
 // Inputs:
 //   - branch: the run branch name (e.g. "run-on-auto-branch-1").
@@ -321,7 +309,7 @@ func (w *Workflow) ResetCleanWorktree() error {
 //     (only when both local and origin missed).
 //  5. CreateBranchAt(branch, baseSHA) — points the local ref.
 //  6. Push(branch) — establishes the ref on origin
-//     (only in case 3; skipped on no-remote).
+//     (only in case 3).
 //
 // Worktree state: unchanged (this is a ref-only operation).
 //
@@ -344,16 +332,12 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 		// Step 1: refresh origin refs so the local-vs-origin
 		// distinction below reflects current reality.
 		if err := g.Fetch(); err != nil {
-			if errors.Is(err, git.ErrNoRemote) {
-				trace.skipped("fetch-origin", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "fetch-origin", Status: "failed",
-					Detail: err.Error(),
-				})
-				w.logger.Warn("enjugit: pre-ensure fetch failed; continuing",
-					"branch", branch, "error", err)
-			}
+			trace.appendStep(Step{
+				Name: "fetch-origin", Status: "failed",
+				Detail: err.Error(),
+			})
+			w.logger.Warn("enjugit: pre-ensure fetch failed; continuing",
+				"branch", branch, "error", err)
 		} else {
 			trace.ok("fetch-origin")
 		}
@@ -405,10 +389,6 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 		// this, follow-up verbs on a different machine couldn't
 		// see the branch and would either err or duplicate-create.
 		if err := g.Push(branch); err != nil {
-			if errors.Is(err, git.ErrNoRemote) {
-				trace.skipped("push", "no remote configured")
-				return nil
-			}
 			return trace.fail("push",
 				translateGitError("push run branch", err))
 		}

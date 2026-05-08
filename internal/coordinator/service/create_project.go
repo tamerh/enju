@@ -153,7 +153,17 @@ func SetProjectRemoteURL(s store.CoordinatorStore, caller *store.CitizenRecord, 
 }
 
 // SetRemoteURLResponse is the wire shape for set_project_remote.
+//
+// Contract on `remote_url`: the fat-client always sends either
+// the empty string (path-mode projects, where the managed bare
+// at <project>/enju/.bare.git/ is the push target — coord
+// doesn't need to know the local path) or an external git URL
+// (https/git/ssh/scp-like). Local working-tree paths are never
+// written here. Coord doesn't validate this at the API layer
+// because we trust our single authenticated fat-client; the
+// upstream invariant lives in service.CreateProject + the smart-
+// detect dispatch.
 type SetRemoteURLResponse struct {
-	ProjectID int64 `json:"project_id"`
+	ProjectID int64  `json:"project_id"`
 	RemoteURL string `json:"remote_url"`
 }

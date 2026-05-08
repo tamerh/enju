@@ -107,9 +107,10 @@ func TestReadResultAtCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Adopt a directory as project 7's local clone. The
-	// InitDirAsProject helper does the git init + first commit
-	// and wires it through the project.
+	// Adopt a directory as project 7's local clone via the
+	// post-Phase-A entry point: inspect the populated folder,
+	// then EagerInitProjectClone runs git init + commit + wires
+	// the managed bare.
 	clone := t.TempDir()
 	resultDir := "enju/runs/1-draft/draft"
 	resultPath := filepath.Join(clone, resultDir, "result.md")
@@ -120,12 +121,13 @@ func TestReadResultAtCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fc := New(Config{WorkspaceRoot:   ws.RootDir(), Logger: logger})
-	if _, err := fc.InitDirAsProject(clone); err != nil {
-		t.Fatalf("InitDirAsProject: %v", err)
+	fc := New(Config{WorkspaceRoot: ws.RootDir(), Logger: logger})
+	target, terr := validateAndInspectPath(clone, false)
+	if terr != nil {
+		t.Fatalf("inspect: %v", terr)
 	}
-	if err := fc.RegisterAdoptedDir(7, clone); err != nil {
-		t.Fatalf("RegisterAdoptedDir: %v", err)
+	if err := fc.EagerInitProjectClone(context.Background(), 7, clone, target); err != nil {
+		t.Fatalf("EagerInitProjectClone: %v", err)
 	}
 
 	// Stage + commit the result file via a sibling enjugit

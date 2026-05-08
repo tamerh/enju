@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
 // Tests for Workflow.prepareBranchForCommit. Each test exercises
@@ -113,19 +111,6 @@ func TestPrepareBranch_DefaultMissingErrorIsStructured(t *testing.T) {
 	}
 	if stepStatuses["fork-from-default"] != "failed" {
 		t.Errorf("fork-from-default should be failed, got %q", stepStatuses["fork-from-default"])
-	}
-}
-
-func TestPrepareBranch_NoRemoteFetchSkipsCleanly(t *testing.T) {
-	wf, fake := makeWorkflow(t)
-	// No remote configured → Fetch returns ErrNoRemote. Should
-	// NOT fail the whole verb; just record skipped.
-	fake.inject("Fetch", git.ErrNoRemote)
-	fake.resolveMap["refs/heads/topic"] = "localsha"
-
-	err := callPrepare(wf, fake, "topic")
-	if err != nil {
-		t.Fatalf("expected success despite no-remote fetch, got %v", err)
 	}
 }
 

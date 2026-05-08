@@ -2,6 +2,7 @@ package enjugit
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
@@ -43,6 +44,7 @@ var (
 
 	// Read
 	ErrCommitNotFound = errors.New("enjugit: commit not found")
+	ErrRefNotFound    = errors.New("enjugit: ref not found")
 )
 
 // ErrConflict carries everything the audit pipeline needs to
@@ -135,10 +137,16 @@ func translateGitError(op string, err error) error {
 	case errors.Is(err, git.ErrCloneNotFound):
 		return ErrCloneNotFound
 	case errors.Is(err, git.ErrRefNotFound):
-		// Generic ref-not-found from git is upstream-not-found
-		// from enjugit's POV when the caller asked for an upstream.
-		// Caller wraps further if needed.
-		return ErrUpstreamNotFound
+		// Generic ref-not-found from git surfaces as enjugit's
+		// own ErrRefNotFound. Callers that mean "upstream not
+		// found on origin" specifically (e.g. state_prep's
+		// resolve-upstream step) wrap with ErrUpstreamNotFound
+		// at the call site — see materializeUpstreamForReview.
+		// Don't blanket-translate to ErrUpstreamNotFound here:
+		// MergeFFOrFail's target-not-found case isn't an
+		// "upstream" question and the resulting message lies
+		// about which branch is missing where.
+		return fmt.Errorf("%w: %s", ErrRefNotFound, err.Error())
 	default:
 		return err
 	}

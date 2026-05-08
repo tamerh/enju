@@ -128,8 +128,6 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleListRuns(ctx, req)
 	case "enju_create_project":
 		return t.c.handleCreateProject(ctx, req)
-	case "enju_init":
-		return t.c.handleInit(ctx, req)
 	case "enju_release_task":
 		return t.c.handleReleaseTask(ctx, req)
 	case "enju_invalidate_task":

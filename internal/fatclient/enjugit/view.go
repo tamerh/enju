@@ -52,8 +52,9 @@ func (v *View) CompareToRemote(branches []string) (*git.RemoteComparison, error)
 }
 
 // ResolveRef resolves a ref name (or SHA) to a commit SHA.
-// Returns ErrUpstreamNotFound when the name doesn't resolve —
-// the View-side translation of git.ErrRefNotFound.
+// Returns ErrRefNotFound when the name doesn't resolve. Callers
+// that want an upstream-specific error (e.g. "this run branch
+// must already be on origin") wrap explicitly.
 func (v *View) ResolveRef(name string) (string, error) {
 	sha, err := v.git.ResolveRef(name)
 	if err != nil {

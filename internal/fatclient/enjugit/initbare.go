@@ -28,7 +28,7 @@ import (
 // mirrors the operator's working tree at workTreePath, and
 // rewires the working tree's `origin` remote to point at the
 // new bare. Used by `enju bot setup` when the project lacks a
-// real remote (created via enju_init or enju_create_project
+// real remote (created via enju_create_project
 // --path) — bots need a non-working-tree push target, and this
 // promotion produces one without disturbing the operator's
 // existing folder layout.
@@ -131,10 +131,10 @@ func setOrReplaceOrigin(workTreePath, bareURL string) error {
 // — a separate seed would create a divergent root that can't
 // merge with what's already there.
 //
-// Production callers used to be enju_init's auto-bare path;
-// after Option B (solo-mode default), no production path
-// creates bares anymore — kept for test fixtures that need to
-// construct fake remotes.
+// Production no longer calls this directly — Phase 1 of the
+// no-remote collapse routes through PromoteWorkingTreeToBare for
+// projects that have a working tree to seed from. Kept for test
+// fixtures that need to construct fake remotes.
 func InitBareEmpty(bareDir string) error {
 	if err := os.MkdirAll(bareDir, 0755); err != nil {
 		return fmt.Errorf("creating bare dir: %w", err)

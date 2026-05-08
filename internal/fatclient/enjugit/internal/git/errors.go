@@ -55,11 +55,6 @@ var (
 	// already exists. Distinct from "branch missing" so the caller
 	// can decide whether to delete-and-recreate or reuse.
 	ErrBranchExists = errors.New("git: branch already exists")
-
-	// ErrNoRemote — operation requires a remote (push, fetch) but
-	// the clone has no origin configured. Returned by Push,
-	// PushWithVerify, Fetch.
-	ErrNoRemote = errors.New("git: no remote configured")
 )
 
 // ErrConflict carries the paths that conflicted during a merge.

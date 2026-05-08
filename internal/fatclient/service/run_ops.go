@@ -32,9 +32,9 @@ import (
 // workspace side is in question), matching the snapshot-commit
 // path's "soft-fail with surface-to-user" pattern.
 //
-// Returns "" on success or no-op (no remote configured, branch
-// already present, etc.); non-empty when the operator should
-// know something didn't quite land.
+// Returns "" on success or no-op (branch already present, etc.);
+// non-empty when the operator should know something didn't
+// quite land.
 func (s *FatClient) EnsureRunBranch(ctx context.Context, projectID int64, runData []byte) string {
 	if s.enjugit == nil {
 		return ""

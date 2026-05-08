@@ -1,6 +1,7 @@
 package enjugit
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -156,13 +157,14 @@ func (w *Workflow) EnsureOrigin(url string) error {
 	return translateGitError("ensure origin", w.git.EnsureOrigin(url))
 }
 
-// SetRemote points the clone at a new origin URL. Empty URL means
-// "remove origin entirely" (turning a remote-backed clone into a
-// local-only one); a non-empty URL adds or replaces the existing
-// origin. Idempotent on both paths.
+// SetRemote points the clone at a new origin URL, adding or
+// replacing the existing origin. Idempotent. The url must be
+// non-empty — every project has an origin (managed bare for
+// path-mode, real remote otherwise), and the coord-side handler
+// rejects empty URLs upstream.
 func (w *Workflow) SetRemote(url string) error {
 	if url == "" {
-		return translateGitError("remove origin", w.git.RemoveOrigin())
+		return fmt.Errorf("enjugit: SetRemote: url is required")
 	}
 	return translateGitError("set remote", w.git.EnsureOrigin(url))
 }

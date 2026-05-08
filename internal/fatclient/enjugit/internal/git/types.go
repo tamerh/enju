@@ -117,10 +117,6 @@ const (
 	// Push would non-FF.
 	RemoteDiverged
 
-	// RemoteNoRemote — branch exists locally but not on remote.
-	// Push would create the remote ref.
-	RemoteNoRemote
-
 	// RemoteUnrelated — local and remote share no common ancestor
 	// (e.g., bare was rewritten or two unrelated repos pushed to
 	// the same name).
@@ -142,8 +138,6 @@ func (r RemoteState) String() string {
 		return "ahead"
 	case RemoteDiverged:
 		return "diverged"
-	case RemoteNoRemote:
-		return "no-remote"
 	case RemoteUnrelated:
 		return "unrelated"
 	case RemoteUnreachable:

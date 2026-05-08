@@ -43,14 +43,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/format"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/coordinator/api"
+	"github.com/enju-ai/enju/internal/coordinator/engine"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/coordinator/engine"
-	"github.com/enju-ai/enju/internal/coordinator/store"
-	"github.com/enju-ai/enju/internal/common/format"
-	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -123,9 +123,9 @@ type testServer struct {
 	// attaches the default citizen's token on every unqualified
 	// post/get. Tests that act as a specific citizen use the
 	// postAs/getAs variants.
-	muAuth         sync.Mutex
-	tokens         map[string]string // username → token
-	defaultUser    string            // first-registered citizen, used when no explicit actor specified
+	muAuth      sync.Mutex
+	tokens      map[string]string // username → token
+	defaultUser string            // first-registered citizen, used when no explicit actor specified
 }
 
 // bareRemotePath returns the on-disk path of the bare repo acting
@@ -541,34 +541,6 @@ func (s *testServer) createTestProject() int64 {
 	}
 	projectID := int64(id)
 	s.rememberRemote(projectID, barePath)
-	s.wipeProjectMembers(projectID)
-	return projectID
-}
-
-// createTestProjectNoRemote creates a project WITHOUT a remote URL
-// — the post-Option-B "I just want to start working, no GitHub yet"
-// shape that real users hit via enju_create_project without
-// remote_url=. Used by regression tests for code paths that must
-// work without a configured remote (e.g. fat-client commits should
-// still land in the local clone for vote/review/answer submits;
-// previously they silently went to the legacy POST path because
-// useFatClient gated on remote URL presence).
-//
-// Returns the project ID. No bare repo is created — the workspace
-// clone is created on demand by Workspace.ForProject(remoteURL="")
-// via Option B's local-only fallback.
-func (s *testServer) createTestProjectNoRemote() int64 {
-	s.t.Helper()
-	s.ensureDefaultCitizen()
-	name := fmt.Sprintf("test-noremote-%d", time.Now().UnixNano())
-	resp := s.post("/api/v1/projects", map[string]string{
-		"name": name,
-	})
-	id, _ := resp["id"].(float64)
-	if id == 0 {
-		s.t.Fatalf("failed to create no-remote test project: %v", resp)
-	}
-	projectID := int64(id)
 	s.wipeProjectMembers(projectID)
 	return projectID
 }
@@ -1356,10 +1328,6 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-
-
-
-
 // ===================================================================
 // Error Case Tests
 // ===================================================================
@@ -1443,7 +1411,6 @@ func TestEmptyYAMLRejected(t *testing.T) {
 	}
 }
 
-
 func TestTaskTimeout(t *testing.T) {
 	s := newTestServer(t)
 	alice := s.register("alice")
@@ -1489,7 +1456,6 @@ func TestTaskTimeout(t *testing.T) {
 	}
 }
 
-
 func TestTaskSeqNumbers(t *testing.T) {
 	s := newTestServer(t)
 
@@ -1529,8 +1495,6 @@ func TestRunAutoIncrementID(t *testing.T) {
 	}
 }
 
-
-
 func TestFreshDBHasNoProjects(t *testing.T) {
 	s := newTestServer(t)
 
@@ -1539,7 +1503,6 @@ func TestFreshDBHasNoProjects(t *testing.T) {
 		t.Fatalf("expected 0 projects on fresh DB, got %d", len(projects))
 	}
 }
-
 
 func TestRunRequiresProject(t *testing.T) {
 	s := newTestServer(t)
@@ -1551,7 +1514,6 @@ func TestRunRequiresProject(t *testing.T) {
 		t.Fatal("expected error when submitting to non-existent project")
 	}
 }
-
 
 func TestPerProjectRunNumbering(t *testing.T) {
 	s := newTestServer(t)
@@ -1584,8 +1546,6 @@ func TestPerProjectRunNumbering(t *testing.T) {
 		t.Fatalf("expected seq 1 in new project B, got %d", int(seq3))
 	}
 }
-
-
 
 func TestCitizenRegistrationWithEmail(t *testing.T) {
 	s := newTestServer(t)
@@ -1633,7 +1593,6 @@ func TestRegisterWithoutEmailAllowed(t *testing.T) {
 	}
 }
 
-
 func TestUpdateProfileDuplicateEmail(t *testing.T) {
 	s := newTestServer(t)
 
@@ -1648,8 +1607,6 @@ func TestUpdateProfileDuplicateEmail(t *testing.T) {
 }
 
 // --- Phase C: Artifacts ---
-
-
 
 // TestArtifactWriteRejectedForTraversal confirms path validation.
 func TestArtifactWriteRejectedForTraversal(t *testing.T) {
@@ -1666,9 +1623,6 @@ func TestArtifactWriteRejectedForTraversal(t *testing.T) {
 		t.Fatalf("expected error for path traversal, got %v", resp)
 	}
 }
-
-
-
 
 // --- Iteration 2: username model ---
 
@@ -1851,26 +1805,9 @@ tasks:
 
 // --- Iteration 1: assign_to + require_role ---
 
-
-
-
-
 // --- Iteration 3: cascade invalidation ---
 
-
-
-
-
-
-
-
-
 // --- Iteration 1: assign_to + require_role (historical section) ---
-
-
-
-
-
 
 // cleanYAML strips common LLM output issues: markdown fences, leading text, trailing text.
 func cleanYAML(raw string) string {
@@ -1898,26 +1835,6 @@ func cleanYAML(raw string) string {
 	return strings.TrimSpace(s)
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // TestCoordinatorRejectsMalformedCommitSHA verifies the REST
 // submit path rejects commit_sha values that aren't shaped like
 // git SHAs (40 or 64 hex chars). Trust-the-client doesn't mean
@@ -1938,9 +1855,9 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 		"abc123",                // too short
 		strings.Repeat("z", 40), // correct length, wrong chars
 		"ABCDEF1234567890abcdef1234567890abcdef12", // uppercase rejected (git uses lowercase)
-		strings.Repeat("0", 40), // empty-SHA sentinel — go-git uses this as nil-ref
-		strings.Repeat("f", 40), // common test-garbage phantom
-		strings.Repeat("a", 64), // SHA-256 length but all-same-char
+		strings.Repeat("0", 40),                    // empty-SHA sentinel — go-git uses this as nil-ref
+		strings.Repeat("f", 40),                    // common test-garbage phantom
+		strings.Repeat("a", 64),                    // SHA-256 length but all-same-char
 	}
 	for _, bad := range malformed {
 		t.Run(bad, func(t *testing.T) {
@@ -2005,19 +1922,6 @@ func TestReviewCommitShaOptional(t *testing.T) {
 		t.Fatalf("expected accepted, got %v", resp["status"])
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // TestTokenAuthRejectsInvalidToken — a request with a
 // fake Bearer token should get 401.
@@ -2166,13 +2070,13 @@ func TestEventsStatusEndpoint(t *testing.T) {
 // endpoint. Three properties:
 //
 //  1. ?wait=0 (or absent) returns immediately with whatever's
-//   matched right now — preserves the legacy synchronous shape.
+//     matched right now — preserves the legacy synchronous shape.
 //  2. ?wait=Ns with no matching events blocks for at most N
-//   seconds, then returns an empty array. Doesn't return early
-//   on unrelated activity.
+//     seconds, then returns an empty array. Doesn't return early
+//     on unrelated activity.
 //  3. ?wait=Ns wakes up promptly when a matching event lands —
-//   the broadcast pathway from EventStore.broadcastNotify is
-//   what makes this faster than dumb polling.
+//     the broadcast pathway from EventStore.broadcastNotify is
+//     what makes this faster than dumb polling.
 //
 // All three together are the substrate for the notification
 // subsystem (docs/notifications.md). Without this, every

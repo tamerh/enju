@@ -1,7 +1,7 @@
 package mcphandlers
 
 // Project-lifecycle handlers. Creating (from scratch or by
-// adopting an existing folder via enju_init), listing, reading
+// adopting an existing folder via path=), listing, reading
 // remote status + sync state, setting a remote URL, and
 // leaving a project (deleting its local clone). Workspace-heavy
 // orchestration (git scaffold, compare-to-remote, push +
@@ -14,8 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
@@ -41,183 +39,28 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	if err != nil {
 		return mcp.NewToolResultError("name is required"), nil
 	}
-	description := req.GetString("description", "")
-	remoteURL := req.GetString("remote_url", "")
-	defaultBranch := req.GetString("default_branch", "")
 	customPath, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("path is required — pass an absolute path where the project's working tree will live (must be empty or not yet exist). To adopt a populated folder, use enju_init instead."), nil
+		return mcp.NewToolResultError("path is required — pass an absolute path to the folder you want to use as the project's working tree. The folder may be empty, populated (we'll git-init and commit your files), or already a git repo (we'll adopt it)."), nil
 	}
-
-	// Validate the required path: must be absolute, must be
-	// empty or non-existent. The "fresh" guarantee on this tool
-	// means callers can trust we won't overwrite anything —
-	// populated directories must go through enju_init instead.
-	{
-		// path + remote_url combined would be ambiguous: the
-		// path code path seeds a fresh local working tree
-		// rather than cloning, so the project record would persist
-		// a remote_url it never actually cloned from. Refuse loudly
-		// rather than create that drift silently.
-		if remoteURL != "" {
-			return mcp.NewToolResultError("path and remote_url are mutually exclusive — enju_create_project seeds a fresh local working tree at path, it does not clone. To use a remote, git-clone it yourself first and run enju_init on the resulting directory."), nil
-		}
-		if !filepath.IsAbs(customPath) {
-			return mcp.NewToolResultError(fmt.Sprintf("path must be absolute, got %q", customPath)), nil
-		}
-		// Lstat (not Stat) so symlinks surface as symlinks rather
-		// than being silently followed. Following symlinks would
-		// be a footgun: a user passing path=/home/me/proj where
-		// proj is a symlink to a populated repo would either get
-		// "refused, not empty" (confusing — they thought proj was
-		// fresh) or, worse if the target is empty, end up with
-		// the project's working tree dual-rooted via the symlink.
-		info, lstatErr := os.Lstat(customPath)
-		switch {
-		case lstatErr == nil:
-			if info.Mode()&os.ModeSymlink != 0 {
-				return mcp.NewToolResultError(fmt.Sprintf("path %q is a symlink — pass a real directory path. If you intended the link target, resolve it with `readlink -f` and pass that instead.", customPath)), nil
-			}
-			if !info.IsDir() {
-				return mcp.NewToolResultError(fmt.Sprintf("path %q exists but is not a directory", customPath)), nil
-			}
-			entries, readErr := os.ReadDir(customPath)
-			if readErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("reading %q: %v", customPath, readErr)), nil
-			}
-			if len(entries) > 0 {
-				return mcp.NewToolResultError(fmt.Sprintf(
-					"path %q exists and is not empty — enju_create_project requires an empty or non-existent directory. To adopt a populated folder, use enju_init with the same path.",
-					customPath,
-				)), nil
-			}
-		case os.IsNotExist(lstatErr):
-			// Doesn't exist — fall through to MkdirAll, which
-			// handles non-existent parent chains too.
-		default:
-			return mcp.NewToolResultError(fmt.Sprintf("checking path %q: %v", customPath, lstatErr)), nil
-		}
-		if mkErr := os.MkdirAll(customPath, 0755); mkErr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("creating %q: %v", customPath, mkErr)), nil
-		}
+	params := service.CreateProjectParams{
+		Name:          name,
+		Description:   req.GetString("description", ""),
+		DefaultBranch: req.GetString("default_branch", ""),
+		Path:          customPath,
+		RemoteURL:     req.GetString("remote_url", ""),
+		Force:         req.GetBool("force", false),
 	}
-
-	body := map[string]string{
-		"name":        name,
-		"description": description,
-		"remote_url":  remoteURL,
-	}
-	if defaultBranch != "" {
-		body["default_branch"] = defaultBranch
-	}
-	data, err := c.post(ctx, "/api/v1/projects", body)
+	res, err := c.fc.CreateProject(ctx, params)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-
-	// Eagerly initialize the workspace so the project directory
-	// exists immediately after creation — not lazily on first
-	// claim. Failures are non-fatal at this point: the project
-	// record is registered, and the next tool call will retry
-	// the init/clone.
-	if c.fc.Enjugit() != nil {
-		var result map[string]interface{}
-		if json.Unmarshal(data, &result) == nil {
-			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
-				if ierr := c.fc.EagerInitProjectClone(ctx, projectID, customPath); ierr != nil {
-					c.fc.Logger().Warn("eager workspace init failed (will retry on first task)",
-						"project_id", projectID, "path", customPath, "error", ierr)
-				}
-				// Auto-subscribe notifications to the just-created
-				// project. Nil supervisor (notify-disabled session)
-				// no-ops cleanly.
-				c.notifySess.Switch(projectID)
-			}
-		}
+	if res.ProjectID > 0 {
+		// Auto-subscribe notifications to the just-created project.
+		// Nil supervisor (notify-disabled session) no-ops cleanly.
+		c.notifySess.Switch(res.ProjectID)
 	}
-
-	return mcp.NewToolResultText(format.CreateProjectResult(data)), nil
-}
-
-// handleInit adopts an existing folder as an Enju project. It:
-// 1. Validates the path exists and refuses populated unrelated repos.
-// 2. Hands off to service.FatClient.InitDirAsProject for git init +
-//    scaffold + commit (returns the adopted branch name).
-// 3. Registers the project with the coordinator, passing the
-//    adopted branch as default_branch.
-// 4. Calls service.FatClient.RegisterAdoptedDir to wire the folder
-//    into the workspace as external, then opens it once to verify.
-func (c *apiClient) handleInit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	name, err := req.RequireString("name")
-	if err != nil {
-		return mcp.NewToolResultError("name is required"), nil
-	}
-	dirPath, err := req.RequireString("path")
-	if err != nil {
-		return mcp.NewToolResultError("path is required"), nil
-	}
-	force := req.GetBool("force", false)
-
-	stat, err := os.Stat(dirPath)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("path %q does not exist: %v", dirPath, err)), nil
-	}
-	if !stat.IsDir() {
-		return mcp.NewToolResultError(fmt.Sprintf("path %q is not a directory", dirPath)), nil
-	}
-
-	// Safety check: refuse populated unrelated git repos unless
-	// force=true. The footgun this catches: a calling LLM running
-	// inside /repo/A passes path=/repo/B but typos to /repo/A —
-	// without this gate, Enju silently writes its scaffold + a
-	// commit into the wrong repo.
-	if !force {
-		if reason := service.DetectPopulatedUnrelatedRepo(dirPath); reason != "" {
-			return mcp.NewToolResultError(fmt.Sprintf(
-				"%s. To adopt this directory anyway, re-invoke enju_init with force=true. To initialize a fresh project elsewhere, pass a different path or use enju_create_project.",
-				reason,
-			)), nil
-		}
-	}
-
-	adoptedBranch, err := c.fc.InitDirAsProject(dirPath)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	// Register project with coordinator. The working-tree path
-	// goes in remote_url so the local fat-client opens it
-	// directly via RegisterExternalDir below. If the folder
-	// already has an origin (github clone case), pushes still
-	// route to that origin via the working tree's git config.
-	body := map[string]string{
-		"name":       name,
-		"remote_url": dirPath,
-	}
-	if adoptedBranch != "" {
-		body["default_branch"] = adoptedBranch
-	}
-	data, err := c.post(ctx, "/api/v1/projects", body)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	if c.fc.Enjugit() != nil {
-		var result map[string]interface{}
-		if json.Unmarshal(data, &result) == nil {
-			if projectID := int64(format.JsonFloat(result["id"])); projectID > 0 {
-				if rerr := c.fc.RegisterAdoptedDir(projectID, dirPath); rerr != nil {
-					c.fc.Logger().Warn("opening init'd folder", "error", rerr)
-				}
-				// Auto-subscribe notifications. Same rationale as
-				// create_project — init signals "I'm working here
-				// now" so the cross-restart record updates.
-				c.notifySess.Switch(projectID)
-			}
-		}
-	}
-
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Initialized Enju in %s\n  Project registered as: %s", dirPath, name)), nil
+	return mcp.NewToolResultText(format.CreateProjectResult(res.CoordResponse)), nil
 }
 
 func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -516,8 +359,12 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 
 	// Mirror the remote change into the existing local clone
 	// (origin URL update + push every local branch to seed the
-	// new bare + cursor reset to force full-history rescan).
-	pushWarning := c.fc.MirrorRemoteAfterSet(int64(projectID), remoteURL)
+	// new bare + cursor reset to force full-history rescan). The
+	// migrationNote tells the operator when their project is
+	// graduating from a managed local bare to a real remote so the
+	// "all your local branches are being mirrored" effect isn't
+	// silent.
+	migrationNote, pushWarning := c.fc.MirrorRemoteAfterSet(int64(projectID), remoteURL)
 
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s", projectID, remoteURL, pushWarning)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s%s", projectID, remoteURL, migrationNote, pushWarning)), nil
 }

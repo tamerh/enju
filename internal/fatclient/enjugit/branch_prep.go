@@ -17,8 +17,8 @@ import (
 // Resolution order (top wins):
 //
 //  1. **fetch-origin** — best-effort fetch so origin tracking
-//     refs reflect the latest server state. Skipped silently
-//     when no remote is configured.
+//     refs reflect the latest server state. Network blips are
+//     recorded as a failed step but do not abort the verb.
 //  2. **validate-stale-ref** — when local `refs/heads/<branch>`
 //     exists AND `preferredBase` is supplied, confirm the local
 //     ref's history actually contains preferredBase's tip. If
@@ -63,18 +63,14 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 		trace.ctx("preferred_base", preferredBase)
 	}
 
-	// Step 1: fetch-origin (best-effort).
+	// Step 1: fetch-origin (best-effort). Don't fail the whole
+	// verb — offline / network blips are recoverable. Failure
+	// recorded for debug.
 	if ferr := g.Fetch(); ferr != nil {
-		if errors.Is(ferr, git.ErrNoRemote) {
-			trace.skipped("fetch-origin", "no remote configured")
-		} else {
-			// Don't fail the whole verb — offline / network
-			// blips are recoverable. Recorded for debug.
-			trace.appendStep(Step{
-				Name: "fetch-origin", Status: "failed",
-				Detail: ferr.Error(),
-			})
-		}
+		trace.appendStep(Step{
+			Name: "fetch-origin", Status: "failed",
+			Detail: ferr.Error(),
+		})
 	} else {
 		trace.ok("fetch-origin")
 	}

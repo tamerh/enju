@@ -427,7 +427,7 @@ func cmdMCP(args []string) {
 	}
 
 	// Tier 1 notification session — stays dormant at boot. When
-	// the user calls enju_create_project or enju_init, mcpserver
+	// the user calls enju_create_project, mcpserver
 	// fires notifySession.Switch and the polling loop activates
 	// for that project. All notify state (cursor, event log,
 	// rules) lives under the project's enju/ directory; nothing

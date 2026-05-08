@@ -22,8 +22,7 @@ import (
 //
 // Without persistent emission, traces on the success path are
 // thrown away, leaving "verb returned nil but didn't actually do
-// the work" cases (silent skipped-push, no-remote fallback)
-// impossible to diagnose post-hoc.
+// the work" cases impossible to diagnose post-hoc.
 //
 // Severity rule: info when every step ran cleanly (ok/skipped),
 // warn when any step failed (so log filters surface the bad runs

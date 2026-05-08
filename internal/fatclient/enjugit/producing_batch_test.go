@@ -3,13 +3,11 @@ package enjugit
 import (
 	"errors"
 	"testing"
-
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
 // Tests for Workflow.SubmitBatch. Each test exercises one slice
 // of the contract — happy path, mid-loop rollback, push-failure
-// handling, no-remote graceful skip, single-branch enforcement.
+// handling, single-branch enforcement.
 
 func TestSubmitBatch_HappyPath_ResolvesSHAsFromTrailers(t *testing.T) {
 	wf, fake := makeWorkflow(t)
@@ -63,32 +61,6 @@ func TestSubmitBatch_HappyPath_ResolvesSHAsFromTrailers(t *testing.T) {
 	// Push called exactly once (the coalesced push).
 	if got, want := fake.callCount("PushWithVerify"), 1; got != want {
 		t.Errorf("Push count: got %d, want %d (single coalesced push)", got, want)
-	}
-}
-
-func TestSubmitBatch_NoRemote_SkipsPushGracefully(t *testing.T) {
-	wf, fake := makeWorkflow(t)
-	branch := "1-probe/vote/iter-1"
-	fake.resolveMap["refs/heads/"+branch] = "preheadsha000000"
-	fake.headSHA = "preheadsha000000"
-	fake.inject("PushWithVerify", git.ErrNoRemote)
-	fake.recentCommits = []struct{ SHA, Message string }{
-		{SHA: "shaB", Message: "Task t-b\n\nEnju-Task-Complete: t-b"},
-		{SHA: "shaA", Message: "Task t-a\n\nEnju-Task-Complete: t-a"},
-	}
-
-	reqs := []SubmitRequest{
-		newBatchReq("t-a", branch),
-		newBatchReq("t-b", branch),
-	}
-	res, err := wf.SubmitBatch(reqs)
-	if err != nil {
-		t.Fatalf("expected success despite no-remote, got %v", err)
-	}
-	for i, e := range res.Entries {
-		if e.Err != nil {
-			t.Errorf("entry[%d] Err on no-remote: got %v, want nil", i, e.Err)
-		}
 	}
 }
 

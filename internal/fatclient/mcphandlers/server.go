@@ -59,7 +59,7 @@ type Config struct {
 	// Notify, when set, enables the auto-subscribe-on-touch
 	// notification supervisor. The MCP server activates a notify
 	// poller for the project named in any successful
-	// enju_create_project / enju_init call, persists the active
+	// enju_create_project call, persists the active
 	// project to disk, and switches when the user moves to a
 	// different project. Nil = no notification subsystem.
 	//
@@ -121,7 +121,7 @@ Core model:
 - Templates are reproducible bundles. enju_create_run(path=enju/templates/foo) snapshots the full bundle (enju.yaml + scripts + data) into enju/runs/{seq}/template-snapshot/ at creation. The run is pinned to that frozen copy — later live-template edits don't affect in-flight runs. Compute scripts resolve from the snapshot.
 - Compute scripts get both env vars (ENJU_TASK_ID, ENJU_PROJECT_DIR, ENJU_RUN_DIR, ENJU_TEMPLATE_DIR, ENJU_PARAM_<name> for each param + iteration var) and a structured $ENJU_RUN_DIR/context.json with typed params/iteration/artifact declarations. Use env vars for shell, context.json for anything richer.
 
-Starting: If the user wants to start fresh, use enju_create_project — workspace lands at ~/.enju/workspaces/<slug>-<id>/, no risk of adopting your cwd. If they have an existing folder or repo, use enju_init and pass path= explicitly (your cwd may be a different project than the one being adopted — very common when running inside one repo while creating an Enju project for another). When unclear, ask.
+Starting: enju_create_project takes path=<absolute folder> and smart-detects what to do: empty/nonexistent → init + seed + managed bare; populated, no git → init + commit existing files; existing repo → adopt as-is. Pass path explicitly (your cwd may be a different project than the one being adopted — very common when running inside one repo while creating an Enju project for another). When unclear, ask.
 
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 
@@ -342,8 +342,6 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleCreateProject, true
 	case "enju_create_run":
 		return c.handleCreateRun, true
-	case "enju_init":
-		return c.handleInit, true
 	case "enju_set_project_remote":
 		return c.handleSetProjectRemote, true
 	case "enju_set_project_default_branch":

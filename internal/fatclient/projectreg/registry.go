@@ -7,8 +7,8 @@
 // Why a registry, vs walking the filesystem:
 //   - Standard clones at `~/.enju/workspaces/<id>-<slug>/` are
 //     discoverable from the filesystem alone, but
-//   - Externally adopted dirs (via enju_init path=...) live
-//     anywhere on disk and have no convention. Without this
+//   - Externally adopted dirs (via enju_create_project path=...)
+//     live anywhere on disk and have no convention. Without this
 //     file, they're invisible to anything that didn't observe
 //     the original adoption — including the UI on a fresh
 //     process start.

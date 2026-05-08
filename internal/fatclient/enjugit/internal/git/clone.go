@@ -29,7 +29,7 @@ import (
 type Clone struct {
 	workDir   string
 	repo      *gogit.Repository
-	remoteURL string // hydrated from origin on open; "" when no remote
+	remoteURL string // hydrated from origin on open; "" between InitLocal and the followup EnsureOrigin call
 	logger    *slog.Logger
 
 	// In-process serialization. Acquired by every mutating method
@@ -100,8 +100,8 @@ func OpenClone(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 // behaves like OpenClone. If not, performs `git clone` from
 // remoteURL into workDir. When remoteURL is empty AND workDir is
 // missing, returns an error — this layer does NOT silently init
-// orphan empty repos. Enjugit handles "no remote, init empty"
-// explicitly via a separate path.
+// orphan empty repos. The path-mode bootstrap path uses InitLocal
+// directly (followed by EnsureOrigin onto the managed bare).
 func CloneOrInit(workDir, remoteURL, lockPath string, logger *slog.Logger) (*Clone, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -148,22 +148,18 @@ func CloneOrInit(workDir, remoteURL, lockPath string, logger *slog.Logger) (*Clo
 }
 
 // InitLocal creates a fresh local-only repo at workDir with no
-// remote configured AND a seed initial commit so refs/heads/main
-// has a SHA. Used for solo / no-remote projects where the
-// operator wants to commit locally and (optionally) wire a
-// remote later via SetRemote.
+// origin configured AND a seed initial commit so refs/heads/main
+// has a SHA. The bootstrap step for path-mode projects: callers
+// follow up with EnsureOrigin to point at the managed bare under
+// <project>/enju/.bare.git/ before any push/fetch fires.
 //
-// Seed contents (README + enju/templates/.gitkeep) match the
-// project package's seedLocalWorkspace so the layout users see
-// is identical regardless of whether they came in via project
-// or enjugit. Without the seed, refs/heads/main has no SHA and
-// downstream ops (fork-from-default during submit) fail with
-// "default branch main not found" — same failure mode as a
-// truly empty repo.
+// Seed contents (README + enju/templates/.gitkeep) ensure
+// refs/heads/main has a SHA so downstream ops (fork-from-default
+// during submit) don't fail with "default branch main not found".
 //
 // Returns a *Clone whose remoteURL is "" (no origin in config).
-// All push/fetch ops on this clone short-circuit via ErrNoRemote
-// until SetRemote is called.
+// Push/fetch on this clone will fail at the gogit layer until
+// EnsureOrigin runs.
 func InitLocal(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -239,8 +235,9 @@ func seedInitialCommit(repo *gogit.Repository, workDir string) error {
 // (compute scripts, audit log readers).
 func (c *Clone) WorkDir() string { return c.workDir }
 
-// RemoteURL returns the configured origin URL, or "" when the
-// clone has no remote (solo / path-only projects).
+// RemoteURL returns the configured origin URL. Empty only between
+// InitLocal and the followup EnsureOrigin call during path-mode
+// bootstrap — every healthy project has origin set.
 func (c *Clone) RemoteURL() string { return c.remoteURL }
 
 // Repo returns the underlying go-git repository handle.

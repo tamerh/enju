@@ -11,8 +11,8 @@ import (
 // TestSmokeReviewCycleFullPipeline is the cross-layer end-to-end
 // smoke test for the canonical review-revision-approve cycle:
 //
-//   create_run → claim → submit V1 → review request_changes
-//             → resubmit V2 → review approve → terminal
+//	create_run → claim → submit V1 → review request_changes
+//	          → resubmit V2 → review approve → terminal
 //
 // Existing tests cover slices of this flow:
 //   - TestMCPRequestChangesKeepsClaimOpenForRevision — iter_seq stability
@@ -337,4 +337,3 @@ func hasEventForTask(t *testing.T, h *mcpHarness, projectID int64, eventType, ta
 	}
 	return false
 }
-

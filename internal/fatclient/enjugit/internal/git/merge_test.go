@@ -27,6 +27,71 @@ func TestMergeFFOrFail_FastForward(t *testing.T) {
 	}
 }
 
+// TestMergeFFOrFail_TargetOnlyOnOrigin pins the bot-clone fix:
+// when the target branch exists as origin/<name> in the merge
+// clone but NOT as a local refs/heads/<name>, MergeFFOrFail must
+// auto-plant the local ref from origin tracking and proceed.
+//
+// Repro flow:
+//  1. Bare has main + run-branch "smoke-1" (created upstream).
+//  2. Bot's per-bot clone fetches → has refs/remotes/origin/smoke-1
+//     but no refs/heads/smoke-1 (never explicitly tracked locally).
+//  3. Bot creates topic, commits, pushes.
+//  4. Topic accepted → MergeAcceptedTopic asks to merge topic
+//     into smoke-1. Without the fix, MergeFFOrFail returns
+//     ErrRefNotFound mapped to "upstream branch not found on
+//     origin" — even though origin DOES have it.
+//  5. With the fix, the local smoke-1 is planted from
+//     origin/smoke-1 automatically and the merge proceeds.
+func TestMergeFFOrFail_TargetOnlyOnOrigin(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	// Step 1: prepare the run branch on the bare. Use the same
+	// clone to push smoke-1, then DELETE the local ref so the
+	// post-state matches a fresh clone that only sees origin/smoke-1.
+	rootSHA, _, _ := c.Head()
+	c.CreateBranchAt("smoke-1", rootSHA)
+	c.Checkout("smoke-1")
+	smoke1SHA := commitOneFile(t, c, "run-marker.txt", []byte("run"))
+	if err := c.Push("smoke-1"); err != nil {
+		t.Fatalf("seed push smoke-1: %v", err)
+	}
+
+	// Now produce the "bot's clone" pre-state: fresh clone from
+	// the bare. After fresh clone + Fetch, smoke-1 lives at
+	// refs/remotes/origin/smoke-1 only — no local ref.
+	bot := freshClone(t, bare)
+	if err := bot.Fetch(); err != nil {
+		t.Fatalf("bot fetch: %v", err)
+	}
+	if _, err := bot.resolveLocalRef("smoke-1"); err == nil {
+		t.Fatal("precondition failure: bot clone unexpectedly has local smoke-1; reproducer is invalid")
+	}
+
+	// Step 2: bot creates topic from smoke-1 and commits.
+	bot.CreateBranchAt("topic-a", smoke1SHA)
+	bot.Checkout("topic-a")
+	topicSHA := commitOneFile(t, bot, "topic.txt", []byte("topic"))
+
+	// Step 3: the test — merge topic into smoke-1. Pre-fix this
+	// returns ErrRefNotFound; post-fix it auto-plants local
+	// smoke-1 from origin/smoke-1 and FFs cleanly.
+	newTip, err := bot.MergeFFOrFail("smoke-1", "topic-a")
+	if err != nil {
+		t.Fatalf("MergeFFOrFail with target on origin only: %v", err)
+	}
+	if newTip != topicSHA {
+		t.Errorf("FF tip: got %s, want %s", newTip, topicSHA)
+	}
+
+	// Verify: refs/heads/smoke-1 now exists in the bot clone.
+	if _, err := bot.resolveLocalRef("smoke-1"); err != nil {
+		t.Errorf("expected local smoke-1 ref planted post-merge, got %v", err)
+	}
+}
+
 func TestMergeFFOrFail_NotFastForward(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)

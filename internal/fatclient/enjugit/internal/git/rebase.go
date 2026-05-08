@@ -22,15 +22,9 @@ import (
 // not resolve to default here — callers at Workflow level pre-
 // resolve via Conventions).
 //
-// No-op when remoteURL is empty (local-only project — there's
-// nothing to rebase against).
-//
 // Caller MUST hold the project lock.
 func (c *Clone) RebaseOnRemote(branch string) error {
 	defer c.lock()()
-	if c.remoteURL == "" {
-		return nil
-	}
 	if branch == "" {
 		return fmt.Errorf("git: rebase-on-remote: branch is required")
 	}

@@ -20,10 +20,14 @@ import (
 //   2. repo.Push(refspec="refs/heads/<branch>:refs/heads/<branch>", auth).
 //
 // Errors:
-//   - ErrNoRemote: clone has no origin configured.
 //   - ErrRefNotFound: branch doesn't exist locally.
 //   - ErrPushNonFF: remote ref isn't an ancestor of local tip.
 //   - any other: wrapped as "git: push <branch>: ..."
+//
+// Origin is assumed configured — every project gets one at
+// creation (managed bare for path-mode, real URL for remote-mode).
+// A genuinely missing origin (manual `git remote rm origin`,
+// corrupt restore) surfaces as the underlying gogit error.
 func (c *Clone) Push(branch string) error {
 	defer c.lock()()
 	return c.pushInternal(branch, false)
@@ -62,13 +66,11 @@ func (c *Clone) PushWithVerify(branch, expectedSHA string) error {
 //   1. repo.Fetch(refspec="+refs/heads/*:refs/remotes/origin/*", auth).
 //
 // Errors:
-//   - ErrNoRemote: clone has no origin.
-//   - any other: wrapped.
+//   - underlying gogit error wrapped (e.g. "remote not found"
+//     when origin is genuinely missing — should not happen for
+//     healthy projects after Phase 1's auto-bare).
 func (c *Clone) Fetch() error {
 	defer c.lock()()
-	if c.remoteURL == "" {
-		return ErrNoRemote
-	}
 	err := c.repo.Fetch(&gogit.FetchOptions{
 		RemoteName: "origin",
 		RefSpecs: []config.RefSpec{
@@ -96,13 +98,9 @@ func (c *Clone) Fetch() error {
 //   1. repo.Push(refspec="refs/heads/*:refs/heads/*", auth).
 //
 // Errors:
-//   - ErrNoRemote: clone has no origin configured.
-//   - any other: wrapped as "git: push-all: ...".
+//   - underlying gogit error wrapped as "git: push-all: ...".
 func (c *Clone) PushAllRefs(force bool) error {
 	defer c.lock()()
-	if c.remoteURL == "" {
-		return ErrNoRemote
-	}
 	err := c.repo.Push(&gogit.PushOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{config.RefSpec("refs/heads/*:refs/heads/*")},
@@ -122,9 +120,6 @@ func (c *Clone) PushAllRefs(force bool) error {
 // force is hardcoded false in current callers; reserved for a
 // future force-push verb if needed.
 func (c *Clone) pushInternal(branch string, force bool) error {
-	if c.remoteURL == "" {
-		return ErrNoRemote
-	}
 	refName := plumbing.NewBranchReferenceName(branch)
 	if _, err := c.repo.Reference(refName, false); err != nil {
 		return fmt.Errorf("%w: %s", ErrRefNotFound, branch)
@@ -156,9 +151,6 @@ func (c *Clone) pushInternal(branch string, force bool) error {
 // points at expectedSHA. Returns ErrPushVerifyFailed when the
 // remote ref's SHA doesn't match.
 func (c *Clone) verifyRemoteMatches(branch, expectedSHA string) error {
-	if c.remoteURL == "" {
-		return ErrNoRemote
-	}
 	rem, err := c.repo.Remote("origin")
 	if err != nil {
 		return fmt.Errorf("git: lookup origin: %w", err)

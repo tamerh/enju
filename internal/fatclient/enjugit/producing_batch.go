@@ -1,7 +1,6 @@
 package enjugit
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
@@ -40,15 +39,11 @@ type BatchBranchResult struct {
 	// fresh inside this batch.
 	PreBatchHead string
 
-	// FinalHeadSHA is the post-push tip. Empty when push was
-	// skipped (no remote) — in that case the local tip is
-	// still authoritative; caller can read it from any
-	// resolved entry's CommitSHA.
+	// FinalHeadSHA is the post-push tip. Empty when push failed.
 	FinalHeadSHA string
 
-	// Pushed is true when an actual network push completed (or
-	// would have, but was gracefully skipped on no-remote).
-	// False when push was attempted and failed.
+	// Pushed is true when the push completed successfully. False
+	// when push was attempted and failed.
 	Pushed bool
 }
 
@@ -247,15 +242,6 @@ func (w *Workflow) SubmitBatch(reqs []SubmitRequest) (*BatchResult, error) {
 		for _, grp := range groups {
 			expectedSHA := result.Entries[grp.entryIdxs[len(grp.entryIdxs)-1]].CommitSHA
 			if perr := g.PushWithVerify(grp.branch, expectedSHA); perr != nil {
-				if errors.Is(perr, git.ErrNoRemote) {
-					trace.skipped("push:"+grp.branch, "no remote configured (solo project)")
-					result.Branches = append(result.Branches, BatchBranchResult{
-						Name:         grp.branch,
-						PreBatchHead: lookupPreHead(touched, grp.branch),
-						Pushed:       true, // local-only is the source of truth here
-					})
-					continue
-				}
 				wErr := trace.fail("push:"+grp.branch, translateGitError("push verify", perr))
 				// Flag every entry in THIS branch's group with
 				// the push error. Entries in already-pushed

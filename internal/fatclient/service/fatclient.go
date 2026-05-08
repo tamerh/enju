@@ -155,11 +155,10 @@ func New(cfg Config) *FatClient {
 func (s *FatClient) ProjectRegistry() *projectreg.Registry { return s.projectRegistry }
 
 // RegisterProject upserts a registry entry. Called from the
-// project-creation paths (EagerInitProjectClone for standard
-// clones, RegisterAdoptedDir for externally adopted dirs) so
-// the UI's cross-project landing finds the project on next
-// render, including external dirs that aren't discoverable from
-// the workspace root.
+// project-creation path (EagerInitProjectClone) so the UI's
+// cross-project landing finds the project on next render,
+// including external dirs that aren't discoverable from the
+// workspace root.
 //
 // No-op when no registry is configured.
 func (s *FatClient) RegisterProject(e projectreg.Entry) {

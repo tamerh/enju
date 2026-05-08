@@ -73,9 +73,7 @@ type SubmitBatchResult struct {
 // validate + prepareFatSubmit. Then one Workflow.SubmitBatch
 // covers loop-commit + per-branch push (with verify) + per-
 // branch trailer scan under one lock. Then a per-entry
-// coordinator POST loop. Legacy coordinator-writes projects
-// (no remote_url) fall back to per-entry submit calls in the
-// same loop — they have no local git step to coalesce.
+// coordinator POST loop.
 //
 // Behavioural parity with single-submit (SubmitTaskResult):
 //   - PushWithVerify catches the silent "commit reported but

@@ -2,9 +2,9 @@ package service
 
 // Tests for FatClient construction. Particularly the
 // adopted-project bridge: registry → project.externalDirs at
-// New() time, so a fatclient process restarted after `enju_init
-// --path=/external/dir` can still resolve that project to its
-// adopted location.
+// New() time, so a fatclient process restarted after
+// `enju_create_project path=/external/dir` can still resolve
+// that project to its adopted location.
 
 import (
 	"context"
@@ -57,7 +57,7 @@ func initRealClone(t *testing.T, dir string) {
 }
 
 // TestNew_BridgesRegistryToExternalDirs pins the cross-process
-// adopted-project bug: pre-fix, after `enju_init --path=/dir`
+// adopted-project bug: pre-fix, after `enju_create_project path=/dir`
 // the fatclient that ran the init had externalDirs[id] = /dir
 // in memory, but a fresh fatclient process (e.g. `enju ui`
 // started later) had an empty externalDirs and OpenExisting
@@ -78,7 +78,7 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	initRealClone(t, adoptedDir)
 
 	// Persist the entry to a real on-disk registry — what
-	// `enju_init` would have done in a previous fatclient
+	// `enju_create_project path=` would have done in a previous fatclient
 	// process.
 	regPath := filepath.Join(tmp, "projects.json")
 	reg := projectreg.Open(regPath)
@@ -139,7 +139,7 @@ func TestNew_NoRegistry_NoBridge(t *testing.T) {
 
 // TestResolveBotWorkspace_DistinctFromAdoptedDir pins the
 // production symptom from ISSUE-007: when a project is
-// registered as adopted (operator did `enju_init --path=`),
+// registered as adopted (operator did `enju_create_project path=`),
 // the bot's working directory must be a SEPARATE managed
 // clone, not the operator's adopted tree.
 //
@@ -177,7 +177,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Persist the registry entry — what `enju_init --path=` does.
+	// Persist the registry entry — what `enju_create_project path=` does.
 	regPath := filepath.Join(tmp, "projects.json")
 	reg := projectreg.Open(regPath)
 	if err := reg.Upsert(projectreg.Entry{

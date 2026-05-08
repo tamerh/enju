@@ -274,7 +274,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if errors.Is(err, service.ErrNoCloneSource) {
 				d.logger.Error("permanent config error — exiting daemon",
 					"error", err,
-					"hint", "set remote_url with enju_set_project_remote, or run enju_init --path= to register an adopted tree")
+					"hint", "set remote_url with enju_set_project_remote, or register a project home with enju_create_project path=")
 				return err
 			}
 			// Log and keep going — a one-off failure on iter

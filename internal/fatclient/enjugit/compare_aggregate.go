@@ -18,7 +18,7 @@ import (
 //
 // Distinct from git.BranchState (the per-branch shape on
 // View.CompareToRemote) — this aggregate compares one branch and
-// adds counts + a no-remote / unreachable signal.
+// adds counts + an unreachable signal when ls-remote fails.
 type AggregateRemoteStatus string
 
 const (
@@ -29,7 +29,6 @@ const (
 	AggregateUnrelated   AggregateRemoteStatus = "unrelated"
 	AggregateRemoteEmpty AggregateRemoteStatus = "remote_empty"
 	AggregateLocalEmpty  AggregateRemoteStatus = "local_empty"
-	AggregateNoRemote    AggregateRemoteStatus = "no_remote"
 	AggregateUnreachable AggregateRemoteStatus = "unreachable"
 )
 
@@ -56,8 +55,9 @@ type AggregateComparison struct {
 // branch is the branch name to compare (typically the project's
 // default). Empty falls back to the workflow's default branch.
 //
-// On no-origin or empty remoteURL, returns AggregateNoRemote with no
-// error — callers can render "no remote" in UIs without special-casing.
+// Origin is assumed configured — every project gets one at
+// creation. A genuinely missing origin (corrupt project state)
+// surfaces as AggregateUnreachable with the underlying error.
 func (w *Workflow) CompareDefaultBranch(branch string) (*AggregateComparison, error) {
 	r := &AggregateComparison{}
 	if branch == "" {
@@ -68,10 +68,6 @@ func (w *Workflow) CompareDefaultBranch(branch string) (*AggregateComparison, er
 	clone, ok := w.git.(*git.Clone)
 	if !ok {
 		return nil, fmt.Errorf("enjugit: CompareDefaultBranch requires concrete *git.Clone, got %T", w.git)
-	}
-	if clone.RemoteURL() == "" {
-		r.Status = AggregateNoRemote
-		return r, nil
 	}
 
 	localHash, _, _ := clone.Head()

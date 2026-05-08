@@ -400,13 +400,10 @@ func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta
 // (compute.Run → Project.SubmitTaskResult) that bypasses
 // UseFatClient entirely.
 //
-// New behavior: workspace configured = always use the fat-client
-// path. Workspace.ForProject creates a local clone on demand
-// (Option B's local-only fallback) regardless of remote URL.
-// Local commits land in that clone; push happens only when there's
-// a remote. Projects with no remote keep their commit history in
-// the local workspace, recoverable and intact, just not synced
-// anywhere.
+// Current behavior: workspace configured = always use the fat-
+// client path. Every project has origin (real remote or managed
+// bare under <project>/enju/.bare.git/), so commits land locally
+// and push always has a target.
 func (s *FatClient) UseFatClient(meta *TaskMeta) bool {
 	if s.enjugit == nil || meta == nil {
 		return false

@@ -34,13 +34,8 @@ import (
 // Distinct from Fetch (which does a full refspec fetch): this
 // only refreshes ONE branch's tracking ref. Used by the scan
 // path so it picks up the latest tip without a wide fetch.
-//
-// No-op when remoteURL is empty (local-only project).
 func (c *Clone) FetchBranch(branch string) error {
 	defer c.lock()()
-	if c.remoteURL == "" {
-		return nil
-	}
 	if branch == "" {
 		return fmt.Errorf("git: FetchBranch: branch required (caller should resolve to default)")
 	}
@@ -70,13 +65,10 @@ func (c *Clone) FetchBranch(branch string) error {
 // FetchBranch (which only updates origin tracking) — Pull
 // updates the LOCAL branch and the worktree.
 //
-// No-op when remoteURL is empty or remote doesn't yet have
-// this branch (matches the legacy project.PullBranch contract).
+// No-op when remote doesn't yet have this branch (brand-new
+// branch yet to be pushed).
 func (c *Clone) PullBranch(branch string) error {
 	defer c.lock()()
-	if c.remoteURL == "" {
-		return nil
-	}
 	if branch == "" {
 		// Empty branch is a caller bug — Workflow.PullBranch
 		// resolves "" to the default before calling. If we got
@@ -110,7 +102,7 @@ func (c *Clone) PullBranch(branch string) error {
 
 // RemoteBranchHash queries origin via ls-remote and returns the
 // SHA of the named branch, or empty string when the remote
-// doesn't carry it. Empty remoteURL returns ErrNoRemote.
+// doesn't carry it.
 func (c *Clone) RemoteBranchHash(branch string) (string, error) {
 	defer c.lock()()
 	return c.remoteBranchHashLocked(branch)
@@ -119,9 +111,6 @@ func (c *Clone) RemoteBranchHash(branch string) (string, error) {
 // remoteBranchHashLocked is the lock-free variant for callers
 // that already hold c.lock (FetchBranch / PullBranch).
 func (c *Clone) remoteBranchHashLocked(branch string) (string, error) {
-	if c.remoteURL == "" {
-		return "", ErrNoRemote
-	}
 	rem, err := c.repo.Remote("origin")
 	if err != nil {
 		return "", fmt.Errorf("git: remote-branch-hash: %w", err)

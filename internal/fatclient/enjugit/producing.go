@@ -120,20 +120,12 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 
 		// Step 3: push-verify. The verify step catches the
 		// "commit reported but never landed" failure mode
-		// (TP53 Bug 1 reproducer). For solo projects with no
-		// remote, push-verify is a skip — the commit lives
-		// locally only, and there's no remote ref to verify
-		// against. Service treats local-only commits as valid
-		// (the scanner reads refs/heads/<branch> directly).
+		// (TP53 Bug 1 reproducer). Origin always exists (managed
+		// bare for path-mode projects, real remote otherwise).
 		if perr := g.PushWithVerify(branchName, commitRes.SHA); perr != nil {
-			if errors.Is(perr, git.ErrNoRemote) {
-				trace.skipped("push-verify", "no remote configured (solo project)")
-			} else {
-				return trace.fail("push-verify", translateGitError("push verify", perr))
-			}
-		} else {
-			trace.ok("push-verify")
+			return trace.fail("push-verify", translateGitError("push verify", perr))
 		}
+		trace.ok("push-verify")
 		return nil
 	})
 	if werr != nil {
@@ -212,18 +204,15 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		if sha, err := g.ResolveRef(target); err == nil {
 			targetSHA = sha
 		}
-		// Step 1: pre-merge fetch (best-effort).
+		// Step 1: pre-merge fetch (best-effort). Offline blips
+		// are recoverable; record without aborting.
 		if err := g.Fetch(); err != nil {
-			if errors.Is(err, git.ErrNoRemote) {
-				trace.skipped("fetch-origin", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "fetch-origin", Status: "failed",
-					Detail: err.Error(),
-				})
-				w.logger.Warn("enjugit: pre-merge fetch failed; continuing",
-					"topic", topic, "target", target, "error", err)
-			}
+			trace.appendStep(Step{
+				Name: "fetch-origin", Status: "failed",
+				Detail: err.Error(),
+			})
+			w.logger.Warn("enjugit: pre-merge fetch failed; continuing",
+				"topic", topic, "target", target, "error", err)
 		} else {
 			trace.ok("fetch-origin")
 		}
@@ -250,14 +239,8 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 				return trace.fail("checkout-target", translateGitError("checkout merge target", cerr))
 			}
 			trace.ok("checkout-target")
-			// Step 4a: push the FF'd target. Skip on no-remote
-			// (solo project — local commit is the source of truth).
+			// Step 4a: push the FF'd target.
 			if perr := g.Push(target); perr != nil {
-				if errors.Is(perr, git.ErrNoRemote) {
-					trace.skipped("push", "no remote configured")
-					result.PushSkipped = true
-					return nil
-				}
 				return trace.fail("push", translateGitError("push", perr))
 			}
 			trace.ok("push")
@@ -299,13 +282,8 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		}
 		trace.ok("checkout-target")
 
-		// Step 5: push the new target tip. Skip on no-remote.
+		// Step 5: push the new target tip.
 		if perr := g.Push(target); perr != nil {
-			if errors.Is(perr, git.ErrNoRemote) {
-				trace.skipped("push", "no remote configured")
-				result.PushSkipped = true
-				return nil
-			}
 			return trace.fail("push", translateGitError("push", perr))
 		}
 		trace.ok("push")
@@ -416,21 +394,16 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 			trace.okDetail("commit", shortSHA(commitRes.SHA))
 		}
 
-		// Step 3: push (best-effort). A no-remote project still
-		// produces a valid local commit; offline blips are
-		// caller-policy to retry. Trace records the failure
-		// without aborting the verb.
+		// Step 3: push (best-effort). Offline blips are caller-
+		// policy to retry; trace records the failure without
+		// aborting the verb.
 		if perr := g.Push(branch); perr != nil {
-			if errors.Is(perr, git.ErrNoRemote) {
-				trace.skipped("push", "no remote configured")
-			} else {
-				trace.appendStep(Step{
-					Name: "push", Status: "failed",
-					Detail: perr.Error(),
-				})
-				w.logger.Warn("enjugit: arbitrary-files push failed; commit landed locally only",
-					"branch", branch, "error", perr)
-			}
+			trace.appendStep(Step{
+				Name: "push", Status: "failed",
+				Detail: perr.Error(),
+			})
+			w.logger.Warn("enjugit: arbitrary-files push failed; commit landed locally only",
+				"branch", branch, "error", perr)
 		} else {
 			trace.ok("push")
 		}

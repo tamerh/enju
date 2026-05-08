@@ -85,7 +85,6 @@ var Registry = []mcp.Tool{
 	Inbox(),
 	Review(),
 	CreateProject(),
-	Init(),
 	SetProjectRemote(),
 	ProjectRemoteStatus(),
 	ProjectSync(),

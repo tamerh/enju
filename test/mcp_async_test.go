@@ -26,12 +26,11 @@ import (
 // run_status — which triggers the fetch-path scanner, which
 // POSTs /tasks/reconcile, which flips the task to accepted.
 func TestMCPAsyncComputeEndToEnd(t *testing.T) {
-	eachRemoteMode(t, "AsyncCompute", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncCompute")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/async-ok/enju.yaml": {body: `name: "async ok"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/async-ok/enju.yaml": {body: `name: "async ok"
 version: 1
 tasks:
   - id: run
@@ -39,64 +38,64 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/async-ok/scripts/run.sh": {body: `#!/bin/bash
+		"enju/templates/async-ok/scripts/run.sh": {body: `#!/bin/bash
 echo "hello from async"
 `, mode: 0o755},
-		}, "seed async template")
+	}, "seed async template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/async-ok",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
-
-		// Execute must return immediately (not block until the
-		// script finishes) and its response must say "background."
-		execStart := time.Now()
-		res := h.call(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("run"),
-		})
-		elapsed := time.Since(execStart)
-		if res.IsError {
-			t.Fatalf("execute: %s", mcpText(res))
-		}
-		text := mcpText(res)
-		if !strings.Contains(text, "background") {
-			t.Errorf("async execute text missing 'background' marker; got:\n%s", text)
-		}
-		// Sanity: async kickoff should be fast (fork + metadata
-		// write, no waiting on script). A >5s elapsed here would
-		// mean the handler accidentally took the sync path.
-		if elapsed > 5*time.Second {
-			t.Errorf("async execute took %v — expected fast fork-and-return", elapsed)
-		}
-
-		// Poll until the wrapper's .wrap-result.json exists in the
-		// project clone. Its presence signals the detached
-		// subprocess has written its result and (for exit 0)
-		// committed + pushed. We poll the workspace the harness
-		// uses to issue MCP calls — the same clone the MCP server
-		// and wrapper share for this project.
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrapper result file did not appear: %v", err)
-		}
-
-		// run_status triggers reconcileRunBranch: fetch origin,
-		// scan for Enju-Task-Complete trailers since the cursor,
-		// POST /tasks/reconcile, advance cursor.
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-
-		// The run_status call above already fired reconcile via
-		// reconcileRunBranch. Poll briefly — if the HTTP round-
-		// trip is mid-flight when we check state, give it a beat.
-		if err := waitForTaskState(h, h.taskID("run"), "accepted", 5*time.Second); err != nil {
-			t.Fatalf("task did not reach accepted: %v", err)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/async-ok",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	// Execute must return immediately (not block until the
+	// script finishes) and its response must say "background."
+	execStart := time.Now()
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	elapsed := time.Since(execStart)
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+	text := mcpText(res)
+	if !strings.Contains(text, "background") {
+		t.Errorf("async execute text missing 'background' marker; got:\n%s", text)
+	}
+	// Sanity: async kickoff should be fast (fork + metadata
+	// write, no waiting on script). A >5s elapsed here would
+	// mean the handler accidentally took the sync path.
+	if elapsed > 5*time.Second {
+		t.Errorf("async execute took %v — expected fast fork-and-return", elapsed)
+	}
+
+	// Poll until the wrapper's .wrap-result.json exists in the
+	// project clone. Its presence signals the detached
+	// subprocess has written its result and (for exit 0)
+	// committed + pushed. We poll the workspace the harness
+	// uses to issue MCP calls — the same clone the MCP server
+	// and wrapper share for this project.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrapper result file did not appear: %v", err)
+	}
+
+	// run_status triggers reconcileRunBranch: fetch origin,
+	// scan for Enju-Task-Complete trailers since the cursor,
+	// POST /tasks/reconcile, advance cursor.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+
+	// The run_status call above already fired reconcile via
+	// reconcileRunBranch. Poll briefly — if the HTTP round-
+	// trip is mid-flight when we check state, give it a beat.
+	if err := waitForTaskState(h, h.taskID("run"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach accepted: %v", err)
+	}
+
 }
 
 // TestMCPAsyncCursorAdvanceDoesNotStarveScanner is the direct
@@ -125,12 +124,11 @@ echo "hello from async"
 // If the wrapper auto-advanced the cursor in step 3, step 4
 // would see no new commits and the task would be stuck.
 func TestMCPAsyncCursorAdvanceDoesNotStarveScanner(t *testing.T) {
-	eachRemoteMode(t, "AsyncCursorStarve", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncCursorStarve")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/async-starve/enju.yaml": {body: `name: "async starve"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/async-starve/enju.yaml": {body: `name: "async starve"
 version: 1
 tasks:
   - id: job
@@ -138,43 +136,43 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
+		"enju/templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
 echo "async payload"
 `, mode: 0o755},
-		}, "seed async starve template")
+	}, "seed async starve template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/async-starve",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
-
-		// Launch async. Handler's pullBranchWithReconcile fires
-		// at this point (cursor saves to pre-wrapper tip).
-		res := h.call(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("job"),
-		})
-		if res.IsError {
-			t.Fatalf("execute_task: %s", mcpText(res))
-		}
-
-		// Wait for wrapper to land its .wrap-result.json.
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrap-result.json did not appear: %v", err)
-		}
-
-		// run_status triggers reconcileRunBranch. If the wrapper
-		// had auto-advanced the cursor, scanner would find no
-		// new commits and never post — task state stays claimed.
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
-			t.Fatalf("task did not reach accepted — cursor likely advanced past wrapper commit: %v", err)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/async-starve",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
+
+	// Launch async. Handler's pullBranchWithReconcile fires
+	// at this point (cursor saves to pre-wrapper tip).
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("job"),
+	})
+	if res.IsError {
+		t.Fatalf("execute_task: %s", mcpText(res))
+	}
+
+	// Wait for wrapper to land its .wrap-result.json.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// run_status triggers reconcileRunBranch. If the wrapper
+	// had auto-advanced the cursor, scanner would find no
+	// new commits and never post — task state stays claimed.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach accepted — cursor likely advanced past wrapper commit: %v", err)
+	}
+
 }
 
 // TestMCPAsyncCursorRaceOnNamedBranch replicates the tester's
@@ -186,12 +184,11 @@ echo "async payload"
 // default branch, so any branch-specific regression would
 // slip through.
 func TestMCPAsyncCursorRaceOnNamedBranch(t *testing.T) {
-	eachRemoteMode(t, "AsyncNamedBranch", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncNamedBranch")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/simple-async/enju.yaml": {body: `name: "simple-async"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/simple-async/enju.yaml": {body: `name: "simple-async"
 version: 1
 tasks:
   - id: job
@@ -199,39 +196,39 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
+		"enju/templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
 echo "async payload on named branch"
 `, mode: 0o755},
-		}, "seed simple-async template")
+	}, "seed simple-async template")
 
-		// branch:"auto" → allocates slug-N (e.g. simple-async-1).
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/simple-async",
-			"branch":     "auto",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
-
-		res := h.call(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("job"),
-		})
-		if res.IsError {
-			t.Fatalf("execute_task: %s", mcpText(res))
-		}
-
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrap-result.json did not appear: %v", err)
-		}
-
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
-			t.Fatalf("task did not reach accepted on named branch: %v", err)
-		}
+	// branch:"auto" → allocates slug-N (e.g. simple-async-1).
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/simple-async",
+		"branch":     "auto",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:job", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("job"),
+	})
+	if res.IsError {
+		t.Fatalf("execute_task: %s", mcpText(res))
+	}
+
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "job/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("job"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach accepted on named branch: %v", err)
+	}
+
 }
 
 // TestMCPAsyncChainStage2ClaimRaceOrphan reproduces the
@@ -254,12 +251,11 @@ echo "async payload on named branch"
 // successfully claimed. Either way: after execute_task on
 // stage2, the task must reach ACCEPTED — not orphan.
 func TestMCPAsyncChainStage2ClaimRaceOrphan(t *testing.T) {
-	eachRemoteMode(t, "AsyncChainRace", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncChainRace")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/chain3/enju.yaml": {body: `name: "chain3"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/chain3/enju.yaml": {body: `name: "chain3"
 version: 1
 tasks:
   - id: stage1
@@ -272,66 +268,66 @@ tasks:
     script: scripts/s.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/chain3/scripts/s.sh": {body: `#!/bin/bash
+		"enju/templates/chain3/scripts/s.sh": {body: `#!/bin/bash
 sleep 0.05
 echo "out-$(date +%s%N)"
 `, mode: 0o755},
-		}, "seed chain3 template")
+	}, "seed chain3 template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/chain3",
-		})
-		stage1ID := fmt.Sprintf("%d:1:stage1", projectID)
-		stage2ID := fmt.Sprintf("%d:1:stage2", projectID)
-		h.rememberRunFromTaskID(t, stage1ID)
-
-		// Run stage1 async.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": stage1ID})
-		s1Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage1/.wrap-result.json"))
-		if err := waitForFile(s1Result, 20*time.Second); err != nil {
-			t.Fatalf("stage1 wrap-result: %v", err)
-		}
-
-		// Call execute_task on stage2 DIRECTLY without an
-		// intervening run_status/claim/list_ready — the tester's
-		// exact repro. At this moment, stage1's completion
-		// commit exists on origin but the coordinator's state
-		// for stage1 is still "claimed" (no reconcile has
-		// fired), so stage2 is still "pending" (blocked on
-		// stage1). handleExecuteTask runs reconcile *inside*
-		// its pullBranchWithReconcile hook, which promotes
-		// stage2 → ready — but by then the claim check has
-		// already been skipped.
-		res := h.call(t, "enju_execute_task", map[string]any{"task_id": stage2ID})
-		if res.IsError {
-			// Acceptable per the tester's suggested fix: refuse
-			// to launch with a clear error instead of leaking a
-			// wrapper. Don't assert on a specific error wording.
-			t.Logf("execute_task(stage2) refused: %s (acceptable outcome)", mcpText(res))
-			return
-		}
-
-		// If execute_task returned success, the task MUST
-		// eventually reach accepted — otherwise we've leaked a
-		// wrapper whose commit will never advance state.
-		s2Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage2/.wrap-result.json"))
-		if err := waitForFile(s2Result, 20*time.Second); err != nil {
-			t.Fatalf("stage2 wrap-result never appeared — wrapper may have failed: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, stage2ID, "accepted", 5*time.Second); err != nil {
-			got, _ := h.store.GetTask(stage2ID)
-			state := "<nil>"
-			if got != nil {
-				state = string(got.State)
-			}
-			t.Fatalf("stage2 stuck at state=%q after async chain — wrapper launched without successful claim, commit orphaned", state)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/chain3",
 	})
+	stage1ID := fmt.Sprintf("%d:1:stage1", projectID)
+	stage2ID := fmt.Sprintf("%d:1:stage2", projectID)
+	h.rememberRunFromTaskID(t, stage1ID)
+
+	// Run stage1 async.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": stage1ID})
+	s1Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage1/.wrap-result.json"))
+	if err := waitForFile(s1Result, 20*time.Second); err != nil {
+		t.Fatalf("stage1 wrap-result: %v", err)
+	}
+
+	// Call execute_task on stage2 DIRECTLY without an
+	// intervening run_status/claim/list_ready — the tester's
+	// exact repro. At this moment, stage1's completion
+	// commit exists on origin but the coordinator's state
+	// for stage1 is still "claimed" (no reconcile has
+	// fired), so stage2 is still "pending" (blocked on
+	// stage1). handleExecuteTask runs reconcile *inside*
+	// its pullBranchWithReconcile hook, which promotes
+	// stage2 → ready — but by then the claim check has
+	// already been skipped.
+	res := h.call(t, "enju_execute_task", map[string]any{"task_id": stage2ID})
+	if res.IsError {
+		// Acceptable per the tester's suggested fix: refuse
+		// to launch with a clear error instead of leaking a
+		// wrapper. Don't assert on a specific error wording.
+		t.Logf("execute_task(stage2) refused: %s (acceptable outcome)", mcpText(res))
+		return
+	}
+
+	// If execute_task returned success, the task MUST
+	// eventually reach accepted — otherwise we've leaked a
+	// wrapper whose commit will never advance state.
+	s2Result := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "stage2/.wrap-result.json"))
+	if err := waitForFile(s2Result, 20*time.Second); err != nil {
+		t.Fatalf("stage2 wrap-result never appeared — wrapper may have failed: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, stage2ID, "accepted", 5*time.Second); err != nil {
+		got, _ := h.store.GetTask(stage2ID)
+		state := "<nil>"
+		if got != nil {
+			state = string(got.State)
+		}
+		t.Fatalf("stage2 stuck at state=%q after async chain — wrapper launched without successful claim, commit orphaned", state)
+	}
+
 }
 
 // TestMCPAsyncClaimTriggersReconcile is the regression guard
@@ -343,12 +339,11 @@ echo "out-$(date +%s%N)"
 // state hasn't flipped yet) and rejects. The fix: reconcile
 // first, then attempt the claim.
 func TestMCPAsyncClaimTriggersReconcile(t *testing.T) {
-	eachRemoteMode(t, "AsyncClaimReconcile", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncClaimReconcile")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/chain2/enju.yaml": {body: `name: "chain2"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/chain2/enju.yaml": {body: `name: "chain2"
 version: 1
 tasks:
   - id: produce
@@ -360,44 +355,44 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-			"enju/templates/chain2/scripts/p.sh": {body: `#!/bin/bash
+		"enju/templates/chain2/scripts/p.sh": {body: `#!/bin/bash
 echo "payload-v1"
 `, mode: 0o755},
-		}, "seed chain2 template")
+	}, "seed chain2 template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/chain2",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
-
-		res := h.call(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("produce"),
-		})
-		if res.IsError {
-			t.Fatalf("execute: %s", mcpText(res))
-		}
-
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrap-result.json did not appear: %v", err)
-		}
-
-		// DELIBERATELY skip run_status. Go straight to claiming
-		// the downstream — handleClaimTask's reconcile hook must
-		// promote the upstream to accepted before the claim
-		// attempt reaches the coordinator's blocked-check gate.
-		claimRes := h.call(t, "enju_claim_task", map[string]any{
-			"task_id": h.taskID("consume"),
-		})
-		if claimRes.IsError {
-			t.Fatalf("claim on downstream failed — reconcile hook not running before claim POST: %s", mcpText(claimRes))
-		}
-		text := mcpText(claimRes)
-		if strings.Contains(text, "blocked") || strings.Contains(text, "pending") {
-			t.Fatalf("claim returned blocked/pending — reconcile hook not promoting upstream before claim:\n%s", text)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/chain2",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// DELIBERATELY skip run_status. Go straight to claiming
+	// the downstream — handleClaimTask's reconcile hook must
+	// promote the upstream to accepted before the claim
+	// attempt reaches the coordinator's blocked-check gate.
+	claimRes := h.call(t, "enju_claim_task", map[string]any{
+		"task_id": h.taskID("consume"),
+	})
+	if claimRes.IsError {
+		t.Fatalf("claim on downstream failed — reconcile hook not running before claim POST: %s", mcpText(claimRes))
+	}
+	text := mcpText(claimRes)
+	if strings.Contains(text, "blocked") || strings.Contains(text, "pending") {
+		t.Fatalf("claim returned blocked/pending — reconcile hook not promoting upstream before claim:\n%s", text)
+	}
+
 }
 
 // TestMCPAsyncReExecuteUpdatesUpstreamCommit is the regression
@@ -408,14 +403,13 @@ echo "payload-v1"
 // reconcile doesn't update it, the review sees stale
 // content pinned to the invalidated commit.
 func TestMCPAsyncReExecuteUpdatesUpstreamCommit(t *testing.T) {
-	eachRemoteMode(t, "AsyncReExecute", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncReExecute")
+	projectID := h.createTestProject()
 
-		// Script embeds a sequence marker so we can distinguish
-		// run1 vs run2 outputs.
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/rerun/enju.yaml": {body: `name: "rerun"
+	// Script embeds a sequence marker so we can distinguish
+	// run1 vs run2 outputs.
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/rerun/enju.yaml": {body: `name: "rerun"
 version: 1
 tasks:
   - id: gen
@@ -423,7 +417,7 @@ tasks:
     script: scripts/g.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/rerun/scripts/g.sh": {body: `#!/bin/bash
+		"enju/templates/rerun/scripts/g.sh": {body: `#!/bin/bash
 # 50ms sleep + nanosecond timestamp guarantees run2's output
 # differs from run1's even on fast systems. Without this the
 # commit can return "nothing to commit" when content is
@@ -433,68 +427,68 @@ tasks:
 sleep 0.05
 echo "run-$(date +%s%N)"
 `, mode: 0o755},
-		}, "seed rerun template")
+	}, "seed rerun template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/rerun",
-		})
-		taskID := fmt.Sprintf("%d:1:gen", projectID)
-		h.rememberRunFromTaskID(t, taskID)
-
-		// First execute.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run1 wrap-result.json: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run1 accept: %v", err)
-		}
-		task1, _ := h.store.GetTask(taskID)
-		sha1 := task1.CommitSHA
-		if sha1 == "" {
-			t.Fatalf("run1 accepted but commit_sha is empty")
-		}
-
-		// Invalidate to force re-execution.
-		h.callOK(t, "enju_invalidate_task", map[string]any{
-			"task_id": taskID,
-			"reason":  "want fresher data",
-		})
-
-		// Remove the old wrap-result so waitForFile can tell
-		// run2's apart.
-		_ = os.Remove(resultPath)
-		_ = os.Remove(resultPath + ".done.json") // reaper may have renamed it
-
-		// Re-execute. SEQ env changes output content so the new
-		// commit's tree differs from the first.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run2 wrap-result.json: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run2 accept: %v", err)
-		}
-
-		task2, _ := h.store.GetTask(taskID)
-		sha2 := task2.CommitSHA
-		if sha2 == "" {
-			t.Fatalf("run2 accepted but commit_sha is empty")
-		}
-		if sha2 == sha1 {
-			t.Fatalf("task.CommitSHA still points at run1 %s after re-execute — reconcile didn't update on rerun", sha1)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/rerun",
 	})
+	taskID := fmt.Sprintf("%d:1:gen", projectID)
+	h.rememberRunFromTaskID(t, taskID)
+
+	// First execute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1 wrap-result.json: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+	task1, _ := h.store.GetTask(taskID)
+	sha1 := task1.CommitSHA
+	if sha1 == "" {
+		t.Fatalf("run1 accepted but commit_sha is empty")
+	}
+
+	// Invalidate to force re-execution.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": taskID,
+		"reason":  "want fresher data",
+	})
+
+	// Remove the old wrap-result so waitForFile can tell
+	// run2's apart.
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json") // reaper may have renamed it
+
+	// Re-execute. SEQ env changes output content so the new
+	// commit's tree differs from the first.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": taskID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2 wrap-result.json: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, taskID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+
+	task2, _ := h.store.GetTask(taskID)
+	sha2 := task2.CommitSHA
+	if sha2 == "" {
+		t.Fatalf("run2 accepted but commit_sha is empty")
+	}
+	if sha2 == sha1 {
+		t.Fatalf("task.CommitSHA still points at run1 %s after re-execute — reconcile didn't update on rerun", sha1)
+	}
+
 }
 
 // TestMCPAsyncReviewSeesLatestUpstreamAfterRerun is Bug 2's
@@ -507,19 +501,18 @@ echo "run-$(date +%s%N)"
 // {{upstream.content}} from the upstream task's current
 // task.CommitSHA.
 func TestMCPAsyncReviewSeesLatestUpstreamAfterRerun(t *testing.T) {
-	eachRemoteMode(t, "AsyncReviewRerun", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncReviewRerun")
+	projectID := h.createTestProject()
 
-		// Script uses SEQ env to distinguish run1 vs run2 output
-		// so the review's rendered upstream content is
-		// diagnosable. SEQ defaults to "v1"; we invalidate + pass
-		// nothing different and rely on the timestamp commit in
-		// metadata to differ. Simpler: script reads an env the
-		// caller can set via task env: block (not needed for
-		// this test — just record-anything).
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/gate/enju.yaml": {body: `name: "gate"
+	// Script uses SEQ env to distinguish run1 vs run2 output
+	// so the review's rendered upstream content is
+	// diagnosable. SEQ defaults to "v1"; we invalidate + pass
+	// nothing different and rely on the timestamp commit in
+	// metadata to differ. Simpler: script reads an env the
+	// caller can set via task env: block (not needed for
+	// this test — just record-anything).
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/gate/enju.yaml": {body: `name: "gate"
 version: 1
 tasks:
   - id: gen
@@ -531,90 +524,90 @@ tasks:
     reviews: gen
     prompt: "Review {{gen.content}}"
 `, mode: 0o644},
-			"enju/templates/gate/scripts/g.sh": {body: `#!/bin/bash
+		"enju/templates/gate/scripts/g.sh": {body: `#!/bin/bash
 echo "content-at-$(date +%s%N)"
 `, mode: 0o755},
-		}, "seed gate template")
+	}, "seed gate template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/gate",
-		})
-		genID := fmt.Sprintf("%d:1:gen", projectID)
-		gateID := fmt.Sprintf("%d:1:gate", projectID)
-		h.rememberRunFromTaskID(t, genID)
-
-		// Run1 async compute.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run1: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run1 accept: %v", err)
-		}
-
-		// Invalidate (models request_changes on the compute).
-		// A direct invalidate exercises the same state transition
-		// and sidesteps the review-submit plumbing.
-		h.callOK(t, "enju_invalidate_task", map[string]any{
-			"task_id": genID,
-			"reason":  "want rerun",
-		})
-
-		// Clean up run1's wrap-result so the next waitForFile
-		// detects run2's.
-		_ = os.Remove(resultPath)
-		_ = os.Remove(resultPath + ".done.json")
-
-		// Run2 async compute.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run2: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run2 accept: %v", err)
-		}
-
-		// Gen's commit should now be run2's.
-		gen2, _ := h.store.GetTask(genID)
-		run2SHA := gen2.CommitSHA
-
-		// Claim the review. The rendered prompt carries the
-		// upstream's content — which should be run2's, not
-		// run1's. Bug 2 surfaces as the review seeing run1's
-		// content despite run2 being the accepted commit.
-		claim := h.callOK(t, "enju_claim_task", map[string]any{
-			"task_id": gateID,
-		})
-		claimText := mcpText(claim)
-
-		// The rendered prompt should embed run2's content. The
-		// script echoes a nanosecond timestamp, so run1 and run2
-		// produce DIFFERENT outputs.
-		if !strings.Contains(claimText, "content-at-") {
-			t.Fatalf("claim text missing content-at marker; got:\n%s", claimText)
-		}
-		// Read gen's result.md at run2's commit to know what we
-		// expect. Then assert the review claim text contains it.
-		remoteURL := h.remoteFor(projectID)
-		run2Result := readCommitFile(t, remoteURL, run2SHA, filepath.Join(h.runDir(1), "gen/result.md"))
-		run2Content := strings.TrimSpace(string(run2Result))
-		if run2Content == "" {
-			t.Fatalf("run2 result.md missing at %s", run2SHA)
-		}
-		if !strings.Contains(claimText, run2Content) {
-			t.Fatalf("review claim shows stale run1 content, not run2's (%s). Claim text:\n%s", run2Content, claimText)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/gate",
 	})
+	genID := fmt.Sprintf("%d:1:gen", projectID)
+	gateID := fmt.Sprintf("%d:1:gate", projectID)
+	h.rememberRunFromTaskID(t, genID)
+
+	// Run1 async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "gen/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+
+	// Invalidate (models request_changes on the compute).
+	// A direct invalidate exercises the same state transition
+	// and sidesteps the review-submit plumbing.
+	h.callOK(t, "enju_invalidate_task", map[string]any{
+		"task_id": genID,
+		"reason":  "want rerun",
+	})
+
+	// Clean up run1's wrap-result so the next waitForFile
+	// detects run2's.
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json")
+
+	// Run2 async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": genID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+
+	// Gen's commit should now be run2's.
+	gen2, _ := h.store.GetTask(genID)
+	run2SHA := gen2.CommitSHA
+
+	// Claim the review. The rendered prompt carries the
+	// upstream's content — which should be run2's, not
+	// run1's. Bug 2 surfaces as the review seeing run1's
+	// content despite run2 being the accepted commit.
+	claim := h.callOK(t, "enju_claim_task", map[string]any{
+		"task_id": gateID,
+	})
+	claimText := mcpText(claim)
+
+	// The rendered prompt should embed run2's content. The
+	// script echoes a nanosecond timestamp, so run1 and run2
+	// produce DIFFERENT outputs.
+	if !strings.Contains(claimText, "content-at-") {
+		t.Fatalf("claim text missing content-at marker; got:\n%s", claimText)
+	}
+	// Read gen's result.md at run2's commit to know what we
+	// expect. Then assert the review claim text contains it.
+	remoteURL := h.remoteFor(projectID)
+	run2Result := readCommitFile(t, remoteURL, run2SHA, filepath.Join(h.runDir(1), "gen/result.md"))
+	run2Content := strings.TrimSpace(string(run2Result))
+	if run2Content == "" {
+		t.Fatalf("run2 result.md missing at %s", run2SHA)
+	}
+	if !strings.Contains(claimText, run2Content) {
+		t.Fatalf("review claim shows stale run1 content, not run2's (%s). Claim text:\n%s", run2Content, claimText)
+	}
+
 }
 
 // readCommitFile reads a file from a specific commit in a bare
@@ -683,12 +676,11 @@ func readCommitFile(t *testing.T, remoteURL, commitSHA, repoRelPath string) []by
 // pullBranchWithReconcile so origin-tracking is current
 // before the scan.
 func TestMCPAsyncRequestChangesRerunArtifactIndex(t *testing.T) {
-	eachRemoteMode(t, "AsyncRerunArtifact", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncRerunArtifact")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/bug2/enju.yaml": {body: `name: "bug2"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/bug2/enju.yaml": {body: `name: "bug2"
 version: 1
 tasks:
   - id: compute_data
@@ -702,7 +694,7 @@ tasks:
     reviews: compute_data
     prompt: "Review"
 `, mode: 0o644},
-			"enju/templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
+		"enju/templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 # 50ms sleep guarantees the timestamp differs from any previous
 # run's output even on fast systems — nanosecond resolution is
@@ -712,112 +704,112 @@ mkdir -p "$ENJU_PROJECT_DIR/out"
 sleep 0.05
 echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 `, mode: 0o755},
-		}, "seed bug2 template")
+	}, "seed bug2 template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/bug2",
-			"branch":     "auto",
-		})
-		computeID := fmt.Sprintf("%d:1:compute_data", projectID)
-		reviewID := fmt.Sprintf("%d:1:review_data", projectID)
-		h.rememberRunFromTaskID(t, computeID)
-
-		// Run1: async compute.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "compute_data/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run1 wrap-result: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run1 accept: %v", err)
-		}
-		compute1, _ := h.store.GetTask(computeID)
-		shaA := compute1.CommitSHA
-
-		// Review run1: request_changes.
-		h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
-		h.callOK(t, "enju_submit_result", map[string]any{
-			"task_id":  reviewID,
-			"decision": "request_changes",
-			"content":  "rework please",
-		})
-
-		// Compute should now be READY again, CommitSHA cleared.
-		computeAfterInvalidate, _ := h.store.GetTask(computeID)
-		if computeAfterInvalidate.State != "ready" {
-			t.Fatalf("compute not bounced to ready after request_changes: state=%s", computeAfterInvalidate.State)
-		}
-
-		_ = os.Remove(resultPath)
-		_ = os.Remove(resultPath + ".done.json")
-
-		// Run2: re-execute. Timestamp in the content will differ,
-		// so sha_A ≠ sha_B.
-		h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("run2 wrap-result: %v", err)
-		}
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
-			t.Fatalf("run2 accept: %v", err)
-		}
-		compute2, _ := h.store.GetTask(computeID)
-		shaB := compute2.CommitSHA
-		if shaB == "" || shaB == shaA {
-			t.Fatalf("compute.CommitSHA did not update after re-run reconcile: shaA=%s shaB=%s — scanner is re-posting old trailers, rejecting the new one via the terminal-state guard", shaA, shaB)
-		}
-
-		// Re-claim the review. After invalidation it's READY.
-		claim := h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
-		claimText := mcpText(claim)
-
-		// Bug 2 manifestation: claim should show shaB's content,
-		// not shaA's. If the review's target-preview reads from
-		// a stale workspace state OR from an out-of-date
-		// task.CommitSHA, we'd see shaA's content here.
-		remoteURL := h.remoteFor(projectID)
-		newArtifact := readCommitFile(t, remoteURL, shaB, "out/data.txt")
-		newContent := strings.TrimSpace(string(newArtifact))
-		if newContent == "" {
-			t.Fatalf("shaB has no out/data.txt artifact")
-		}
-		oldArtifact := readCommitFile(t, remoteURL, shaA, "out/data.txt")
-		oldContent := strings.TrimSpace(string(oldArtifact))
-		if oldContent == newContent {
-			t.Fatalf("test setup: shaA and shaB have same content, timestamps should differ")
-		}
-
-		// Assert the new content appears somewhere in the claim
-		// display (result.md preview or similar). The OLD content
-		// must NOT appear — that's the stale-display bug.
-		if strings.Contains(claimText, oldContent) {
-			t.Errorf("review claim shows STALE run1 content %q — artifact index / target preview is stale after re-run reconcile.\nClaim:\n%s", oldContent, claimText)
-		}
-
-		// Also verify the artifact index on the coordinator side
-		// points at shaB, not shaA. This is the specific field
-		// the tester flagged as broken. Branch comes from the
-		// run's record; compute_data was created on auto-branch.
-		runs, _ := h.store.ListRunsByProject(projectID)
-		if len(runs) == 0 {
-			t.Fatal("no runs found")
-		}
-		artifact, err := h.store.GetArtifact(projectID, runs[0].Branch, "out/data.txt")
-		if err != nil || artifact == nil {
-			t.Fatalf("artifact index missing out/data.txt entry on %q: %v", runs[0].Branch, err)
-		}
-		if artifact.CommitSHA != shaB {
-			t.Errorf("artifact index for out/data.txt points at %s, want shaB %s (shaA %s)", artifact.CommitSHA, shaB, shaA)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/bug2",
+		"branch":     "auto",
 	})
+	computeID := fmt.Sprintf("%d:1:compute_data", projectID)
+	reviewID := fmt.Sprintf("%d:1:review_data", projectID)
+	h.rememberRunFromTaskID(t, computeID)
+
+	// Run1: async compute.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "compute_data/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run1 wrap-result: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run1 accept: %v", err)
+	}
+	compute1, _ := h.store.GetTask(computeID)
+	shaA := compute1.CommitSHA
+
+	// Review run1: request_changes.
+	h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
+	h.callOK(t, "enju_submit_result", map[string]any{
+		"task_id":  reviewID,
+		"decision": "request_changes",
+		"content":  "rework please",
+	})
+
+	// Compute should now be READY again, CommitSHA cleared.
+	computeAfterInvalidate, _ := h.store.GetTask(computeID)
+	if computeAfterInvalidate.State != "ready" {
+		t.Fatalf("compute not bounced to ready after request_changes: state=%s", computeAfterInvalidate.State)
+	}
+
+	_ = os.Remove(resultPath)
+	_ = os.Remove(resultPath + ".done.json")
+
+	// Run2: re-execute. Timestamp in the content will differ,
+	// so sha_A ≠ sha_B.
+	h.callOK(t, "enju_execute_task", map[string]any{"task_id": computeID})
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("run2 wrap-result: %v", err)
+	}
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+		t.Fatalf("run2 accept: %v", err)
+	}
+	compute2, _ := h.store.GetTask(computeID)
+	shaB := compute2.CommitSHA
+	if shaB == "" || shaB == shaA {
+		t.Fatalf("compute.CommitSHA did not update after re-run reconcile: shaA=%s shaB=%s — scanner is re-posting old trailers, rejecting the new one via the terminal-state guard", shaA, shaB)
+	}
+
+	// Re-claim the review. After invalidation it's READY.
+	claim := h.callOK(t, "enju_claim_task", map[string]any{"task_id": reviewID})
+	claimText := mcpText(claim)
+
+	// Bug 2 manifestation: claim should show shaB's content,
+	// not shaA's. If the review's target-preview reads from
+	// a stale workspace state OR from an out-of-date
+	// task.CommitSHA, we'd see shaA's content here.
+	remoteURL := h.remoteFor(projectID)
+	newArtifact := readCommitFile(t, remoteURL, shaB, "out/data.txt")
+	newContent := strings.TrimSpace(string(newArtifact))
+	if newContent == "" {
+		t.Fatalf("shaB has no out/data.txt artifact")
+	}
+	oldArtifact := readCommitFile(t, remoteURL, shaA, "out/data.txt")
+	oldContent := strings.TrimSpace(string(oldArtifact))
+	if oldContent == newContent {
+		t.Fatalf("test setup: shaA and shaB have same content, timestamps should differ")
+	}
+
+	// Assert the new content appears somewhere in the claim
+	// display (result.md preview or similar). The OLD content
+	// must NOT appear — that's the stale-display bug.
+	if strings.Contains(claimText, oldContent) {
+		t.Errorf("review claim shows STALE run1 content %q — artifact index / target preview is stale after re-run reconcile.\nClaim:\n%s", oldContent, claimText)
+	}
+
+	// Also verify the artifact index on the coordinator side
+	// points at shaB, not shaA. This is the specific field
+	// the tester flagged as broken. Branch comes from the
+	// run's record; compute_data was created on auto-branch.
+	runs, _ := h.store.ListRunsByProject(projectID)
+	if len(runs) == 0 {
+		t.Fatal("no runs found")
+	}
+	artifact, err := h.store.GetArtifact(projectID, runs[0].Branch, "out/data.txt")
+	if err != nil || artifact == nil {
+		t.Fatalf("artifact index missing out/data.txt entry on %q: %v", runs[0].Branch, err)
+	}
+	if artifact.CommitSHA != shaB {
+		t.Errorf("artifact index for out/data.txt points at %s, want shaB %s (shaA %s)", artifact.CommitSHA, shaB, shaA)
+	}
+
 }
 
 // TestMCPAsyncReconcileUnblocksDownstream is the direct
@@ -835,12 +827,11 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 // task depending on it. Execute the compute, wait for
 // reconcile, assert the downstream becomes claimable.
 func TestMCPAsyncReconcileUnblocksDownstream(t *testing.T) {
-	eachRemoteMode(t, "AsyncDownstream", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncDownstream")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/chain/enju.yaml": {body: `name: "chain"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/chain/enju.yaml": {body: `name: "chain"
 version: 1
 tasks:
   - id: produce
@@ -852,48 +843,48 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-			"enju/templates/chain/scripts/p.sh": {body: `#!/bin/bash
+		"enju/templates/chain/scripts/p.sh": {body: `#!/bin/bash
 echo "payload"
 `, mode: 0o755},
-		}, "seed chain template")
+	}, "seed chain template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/chain",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
-
-		// Launch async upstream.
-		res := h.call(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("produce"),
-		})
-		if res.IsError {
-			t.Fatalf("execute: %s", mcpText(res))
-		}
-
-		// Wait for wrapper to commit.
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrap-result.json did not appear: %v", err)
-		}
-
-		// run_status triggers reconcile. Upstream flips to accepted.
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, h.taskID("produce"), "accepted", 5*time.Second); err != nil {
-			t.Fatalf("produce did not reach accepted: %v", err)
-		}
-
-		// Downstream MUST now be ready — the reconcile path has to
-		// run the same ready-sweep the sync submit handler does.
-		// Before the fix, it stays in "pending" and the claim
-		// returns a blocked error.
-		if err := waitForTaskState(h, h.taskID("consume"), "ready", 5*time.Second); err != nil {
-			t.Fatalf("consume not promoted to ready after upstream reconcile — ready-sweep missing from reconcile path: %v", err)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/chain",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:produce", projectID))
+
+	// Launch async upstream.
+	res := h.call(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("produce"),
+	})
+	if res.IsError {
+		t.Fatalf("execute: %s", mcpText(res))
+	}
+
+	// Wait for wrapper to commit.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "produce/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// run_status triggers reconcile. Upstream flips to accepted.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("produce"), "accepted", 5*time.Second); err != nil {
+		t.Fatalf("produce did not reach accepted: %v", err)
+	}
+
+	// Downstream MUST now be ready — the reconcile path has to
+	// run the same ready-sweep the sync submit handler does.
+	// Before the fix, it stays in "pending" and the claim
+	// returns a blocked error.
+	if err := waitForTaskState(h, h.taskID("consume"), "ready", 5*time.Second); err != nil {
+		t.Fatalf("consume not promoted to ready after upstream reconcile — ready-sweep missing from reconcile path: %v", err)
+	}
+
 }
 
 // TestMCPAsyncComputeFailurePropagatesViaReaper verifies the
@@ -904,12 +895,11 @@ echo "payload"
 // which reads the result file and posts /tasks/:id/fail,
 // flipping the coordinator's view to failed.
 func TestMCPAsyncComputeFailurePropagatesViaReaper(t *testing.T) {
-	eachRemoteMode(t, "AsyncFail", func(t *testing.T, h *mcpHarness) {
-		requireRemote(t, h)
-		projectID := h.createTestProject()
+	h := newMCPHarness(t, "AsyncFail")
+	projectID := h.createTestProject()
 
-		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/async-fail/enju.yaml": {body: `name: "async fail"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/async-fail/enju.yaml": {body: `name: "async fail"
 version: 1
 tasks:
   - id: run
@@ -917,51 +907,51 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-			"enju/templates/async-fail/scripts/run.sh": {body: `#!/bin/bash
+		"enju/templates/async-fail/scripts/run.sh": {body: `#!/bin/bash
 echo "something went wrong" >&2
 exit 7
 `, mode: 0o755},
-		}, "seed async fail template")
+	}, "seed async fail template")
 
-		h.callOK(t, "enju_create_run", map[string]any{
-			"project_id": float64(projectID),
-			"path":       "enju/templates/async-fail",
-		})
-		h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
-
-		// Launch async task. Returns immediately.
-		res := h.callOK(t, "enju_execute_task", map[string]any{
-			"task_id": h.taskID("run"),
-		})
-		if !strings.Contains(mcpText(res), "background") {
-			t.Fatalf("expected background kickoff, got:\n%s", mcpText(res))
-		}
-
-		// Wait for the wrapper to finish (.wrap-result.json written
-		// with exit_code=7). Before the reaper runs, coordinator
-		// still sees claimed.
-		resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
-		if err := waitForFile(resultPath, 20*time.Second); err != nil {
-			t.Fatalf("wrap-result.json did not appear: %v", err)
-		}
-
-		// Trigger reaper via run_status. The handler's reconcile
-		// hook walks the tree and posts /tasks/:id/fail for the
-		// exit!=0 entry.
-		h.callOK(t, "enju_run_status", map[string]any{
-			"project_id": float64(projectID),
-			"run_id":     float64(1),
-		})
-		if err := waitForTaskState(h, h.taskID("run"), "failed", 5*time.Second); err != nil {
-			t.Fatalf("task did not reach failed via reaper: %v", err)
-		}
-
-		// Reaper should have moved the result file aside so a
-		// second call doesn't double-process it.
-		if _, statErr := os.Stat(resultPath); statErr == nil {
-			t.Errorf("expected reaper to rename %s away; still present", resultPath)
-		}
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/async-fail",
 	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	// Launch async task. Returns immediately.
+	res := h.callOK(t, "enju_execute_task", map[string]any{
+		"task_id": h.taskID("run"),
+	})
+	if !strings.Contains(mcpText(res), "background") {
+		t.Fatalf("expected background kickoff, got:\n%s", mcpText(res))
+	}
+
+	// Wait for the wrapper to finish (.wrap-result.json written
+	// with exit_code=7). Before the reaper runs, coordinator
+	// still sees claimed.
+	resultPath := filepath.Join(h.workspaceDirForProject(projectID), filepath.Join(h.runDir(1), "run/.wrap-result.json"))
+	if err := waitForFile(resultPath, 20*time.Second); err != nil {
+		t.Fatalf("wrap-result.json did not appear: %v", err)
+	}
+
+	// Trigger reaper via run_status. The handler's reconcile
+	// hook walks the tree and posts /tasks/:id/fail for the
+	// exit!=0 entry.
+	h.callOK(t, "enju_run_status", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(1),
+	})
+	if err := waitForTaskState(h, h.taskID("run"), "failed", 5*time.Second); err != nil {
+		t.Fatalf("task did not reach failed via reaper: %v", err)
+	}
+
+	// Reaper should have moved the result file aside so a
+	// second call doesn't double-process it.
+	if _, statErr := os.Stat(resultPath); statErr == nil {
+		t.Errorf("expected reaper to rename %s away; still present", resultPath)
+	}
+
 }
 
 // waitForFile polls a filesystem path until it exists or the

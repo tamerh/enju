@@ -2,8 +2,6 @@ package git
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -124,21 +122,6 @@ func TestPush_RefNotFound(t *testing.T) {
 	if !errors.Is(err, ErrRefNotFound) {
 		t.Errorf("expected ErrRefNotFound, got %v", err)
 	}
-}
-
-func TestPush_NoRemote(t *testing.T) {
-	// Init a local repo with no origin.
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("s"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	c, err := CloneOrInit(dir, "https://example.invalid/x.git", "", nullLogger())
-	_ = c
-	_ = err
-	// Skip the no-remote case for now — CloneOrInit requires
-	// a real source. The contract is exercised in higher-level
-	// tests where solo projects exist.
-	t.Skip("no-remote path tested via solo-project integration tests")
 }
 
 // TestPushAllRefs_PropagatesAllBranches — the load-bearing case

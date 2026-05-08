@@ -183,11 +183,6 @@ type MergeResult struct {
 	// message rendering — service distinguishes "FF merge" from
 	// "merge commit" in the branch_merged event metadata.
 	FastForwarded bool
-
-	// PushSkipped is true when no remote was configured (solo
-	// project) so the new tip lives locally only. False when the
-	// push completed successfully.
-	PushSkipped bool
 }
 
 // MergeAuthor identifies the actor whose ACCEPT triggered an
