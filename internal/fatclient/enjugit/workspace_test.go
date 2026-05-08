@@ -120,6 +120,74 @@ func TestOpenView_CloneNotFound(t *testing.T) {
 	}
 }
 
+// TestOpenView_DoesNotInitOnMissing pins the read-side contract:
+// when no clone exists, OpenView must REFUSE to silently init a
+// stub at <rootDir>/<id>. Originally a project-package regression
+// guard — the buggy build's ForProject(id, "") could PlainInit a
+// numeric-form stub that findProjectDir would then return as if
+// it were the real clone. enjugit's OpenView only reads, so the
+// invariant is enforced by code structure; this test pins it so
+// any future "open-or-init" convenience accidentally added to the
+// read path fails loudly.
+func TestOpenView_DoesNotInitOnMissing(t *testing.T) {
+	root := t.TempDir()
+	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
+	if _, err := ws.OpenView(42); !errors.Is(err, ErrCloneNotFound) {
+		t.Fatalf("expected ErrCloneNotFound, got %v", err)
+	}
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if e.Name() == "42" || e.Name() == "0" {
+			t.Errorf("OpenView created stub directory %q — must never init", e.Name())
+		}
+	}
+}
+
+// TestProjectDirLocked_PrefersSlugOverNumeric covers the tie-break
+// in projectDirLocked's scan path: when both slug-form (e.g.
+// "webui-toy-1") and numeric ("1") directories live under rootDir,
+// the slug-form wins. Without this rule, alphabetical os.ReadDir
+// returns "1" before "webui-toy-1" and a buggy build's leftover
+// numeric stub would shadow the real clone. Originally project's
+// TestFindProjectDir_PrefersSlugOverNumeric.
+func TestProjectDirLocked_PrefersSlugOverNumeric(t *testing.T) {
+	root := t.TempDir()
+	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
+
+	// Plant the slug-form clone (with .git so projectDirLocked's
+	// IsDir check would accept it; though scan only looks at name
+	// suffix, we keep .git for parity with project package's setup).
+	wantSlug := filepath.Join(root, "webui-toy-1")
+	if err := os.MkdirAll(filepath.Join(wantSlug, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a numeric-form orphan stub.
+	stub := filepath.Join(root, "1")
+	if err := os.MkdirAll(filepath.Join(stub, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ws.ProjectDir(1); got != wantSlug {
+		t.Errorf("tie-break failed: got %q, want %q (slug-form should beat numeric)", got, wantSlug)
+	}
+}
+
+// TestProjectDirLocked_NumericFallback verifies the legacy-compat
+// fallback: when ONLY the numeric form exists (no slug-id sibling),
+// projectDirLocked returns it. Otherwise pre-slug-rename projects
+// would silently lose their on-disk clone.
+func TestProjectDirLocked_NumericFallback(t *testing.T) {
+	root := t.TempDir()
+	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
+	dir := filepath.Join(root, "1")
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := ws.ProjectDir(1); got != dir {
+		t.Errorf("numeric fallback broke: got %q, want %q", got, dir)
+	}
+}
+
 func TestOpenOrLazyClone_LazyClonesWhenMissing(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
