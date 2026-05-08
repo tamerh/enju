@@ -23,7 +23,7 @@ func newClientNoWorkspace() *apiClient {
 			BaseURL:  "http://unused",
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 }
 
 func callTool(fn func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), args map[string]any) (*mcp.CallToolResult, error) {

@@ -21,7 +21,7 @@ func newAPIClient(baseURL string) *apiClient {
 		Username: "tester",
 		Logger:  logger,
 	})
-	return newClient(coordClient, nil, logger)
+	return newClient(coordClient, "", logger)
 }
 
 // TestFetchTaskMetaFullPayload verifies every field on taskMeta gets
@@ -192,15 +192,15 @@ func TestFetchTaskMetaMalformedJSON(t *testing.T) {
 // newAPIClientWithWorkspace builds an apiClient bound to a real
 // workspace + a service.FatClient that wraps it, so the useFatClient
 // forwarder has somewhere to dispatch to. Tests below use this in
-// place of the bare `newClient(nil, ws, nil)` literal.
-func newAPIClientWithWorkspace(ws *project.Opener) *apiClient {
+// place of the bare `newClient(nil, wsRoot, nil)` literal.
+func newAPIClientWithWorkspace(wsRoot string) *apiClient {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newClient(nil, ws, logger)
+	return newClient(nil, wsRoot, logger)
 }
 
 func TestUseFatClientNoWorkspaceReturnsFalse(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(nil, nil, logger)
+	c := newClient(nil, "", logger)
 	meta := &taskMeta{ProjectID: 1, ProjectRemoteURL: "git@x.com:p.git"}
 	if c.fc.UseFatClient(meta) {
 		t.Fatal("expected false when workspace is nil")
@@ -212,7 +212,7 @@ func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newAPIClientWithWorkspace(ws)
+	c := newAPIClientWithWorkspace(ws.RootDir())
 	if c.fc.UseFatClient(nil) {
 		t.Fatal("expected false on nil meta")
 	}
@@ -223,7 +223,7 @@ func TestUseFatClientWithRemoteURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newAPIClientWithWorkspace(ws)
+	c := newAPIClientWithWorkspace(ws.RootDir())
 	meta := &taskMeta{ProjectID: 1, ProjectRemoteURL: "git@x.com:p.git"}
 	if !c.fc.UseFatClient(meta) {
 		t.Fatal("expected true when remote URL present")
@@ -247,7 +247,7 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 	}
 	ws.AttachRegistry(reg)
 
-	c := newAPIClientWithWorkspace(ws)
+	c := newAPIClientWithWorkspace(ws.RootDir())
 	meta := &taskMeta{ProjectID: 42} // no remote URL
 	if !c.fc.UseFatClient(meta) {
 		t.Fatal("expected true when external dir registered")
@@ -268,7 +268,7 @@ func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newAPIClientWithWorkspace(ws)
+	c := newAPIClientWithWorkspace(ws.RootDir())
 	meta := &taskMeta{ProjectID: 99} // no remote, not registered
 	if !c.fc.UseFatClient(meta) {
 		t.Fatal("expected true: workspace exists, fat-client path commits to local clone even without a remote")

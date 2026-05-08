@@ -87,7 +87,7 @@ func TestAutoReregisterOnStaleCitizen(t *testing.T) {
 				savedEmail = e
 				saveCalls.Add(1)
 			},
-		}), nil, logger)
+		}), "", logger)
 
 	data, err := c.get(context.Background(), "/api/v1/citizens/by-username/alice")
 	if err != nil {
@@ -130,7 +130,7 @@ func TestStaleCitizenWithoutNameGivesUp(t *testing.T) {
 			Username: "alice",
 			// CitizenName intentionally empty
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 	data, err := c.get(context.Background(), "/api/v1/citizens/by-username/alice")
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -198,7 +198,7 @@ func TestSubmitReviewPreValidationBlocksGit(t *testing.T) {
 			BaseURL:  "http://unused.invalid",
 			Username: "tamer",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 	reviewMeta := &taskMeta{
 		ID:            "1:1:check",
 		ProjectID:     1,
@@ -433,7 +433,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "bob",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 	meta := &taskMeta{
 		ID:               reviewID,
 		ProjectID:        projectID,
@@ -490,7 +490,7 @@ func TestCreateProjectPathRequired(t *testing.T) {
 		t.Fatalf("new workspace: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{BaseURL: ts.URL, Username: "tester", Logger: logger}), ws, logger)
+	c := newClient(coord.New(coord.Config{BaseURL: ts.URL, Username: "tester", Logger: logger}), ws.RootDir(), logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -544,13 +544,25 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
+	// Shared registry so the apiClient's enjugit.Workspace and
+	// the test's project.Opener see the same project→path
+	// bindings. handleCreateProject upserts via the apiClient's
+	// registry; the test asserts via ws.ForProject which consults
+	// this same registry.
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	ws.AttachRegistry(reg)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
-		BaseURL:  ts.URL,
-		Username: "tester",
-		Logger:   logger,
-	}), ws, logger)
+	c := newAPIClientForTest(TestClientConfig{
+		Coord: coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:   logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		Logger:          logger,
+		ProjectRegistry: reg,
+	})
 
 	customPath := filepath.Join(t.TempDir(), "my-project")
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
@@ -611,7 +623,7 @@ func TestCreateProjectCustomPathRefusesPopulated(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -651,7 +663,7 @@ func TestCreateProjectCustomPathRejectsWithRemoteURL(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -705,7 +717,7 @@ func TestCreateProjectCustomPathCreatesNonExistentParents(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 
 	deepPath := filepath.Join(t.TempDir(), "missing", "parent", "chain", "project")
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
@@ -748,7 +760,7 @@ func TestCreateProjectCustomPathRefusesSymlink(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -786,7 +798,7 @@ func TestCreateProjectCustomPathRefusesRegularFile(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -818,7 +830,7 @@ func TestCreateProjectCustomPathRefusesRelative(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleCreateProject(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -870,7 +882,7 @@ func TestInitRefusesPopulatedUnrelatedRepo(t *testing.T) {
 	c := newClient(coord.New(coord.Config{
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -936,7 +948,7 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1053,12 +1065,19 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# My Paper"), 0644)
 
 	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	ws.AttachRegistry(reg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
+	c := newAPIClientForTest(TestClientConfig{
+		Coord: coord.New(coord.Config{
 			BaseURL:  ts.URL,
 			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
+			Logger:   logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		Logger:          logger,
+		ProjectRegistry: reg,
+	})
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1144,7 +1163,7 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1218,7 +1237,7 @@ func TestInitIdempotent(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 
 	makeReq := func() mcp.CallToolRequest {
 		return mcp.CallToolRequest{
@@ -1298,12 +1317,19 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 	})
 
 	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	ws.AttachRegistry(reg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
+	c := newAPIClientForTest(TestClientConfig{
+		Coord: coord.New(coord.Config{
 			BaseURL:  ts.URL,
 			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
+			Logger:   logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		Logger:          logger,
+		ProjectRegistry: reg,
+	})
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1398,7 +1424,7 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), ws, logger)
+		}), ws.RootDir(), logger)
 
 	result, err := c.handleInit(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1846,11 +1872,16 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := newClient(coord.New(coord.Config{
+	c := newAPIClientForTest(TestClientConfig{
+		Coord: coord.New(coord.Config{
 			BaseURL:  ts.URL,
 			Username: "tester",
-			Logger:  logger,
-		}), ws, logger)
+			Logger:   logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		Logger:          logger,
+		ProjectRegistry: reg,
+	})
 
 	result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1922,7 +1953,7 @@ func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
 			BaseURL:  ts.URL,
 			Username: "tester",
 			Logger:  logger,
-		}), nil, logger)
+		}), "", logger)
 
 	for _, badURL := range []string{"", "   ", "\t\n"} {
 		result, err := c.handleSetProjectRemote(context.Background(), mcp.CallToolRequest{
