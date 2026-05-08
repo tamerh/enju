@@ -56,7 +56,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 	}
 	defaultBranch := w.DefaultBranch()
 	trace := startTrace("PrepareBranchForCommit")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("branch", branch)
 	trace.ctx("default_branch", defaultBranch)
 	if preferredBase != "" {
@@ -70,7 +70,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 		} else {
 			// Don't fail the whole verb — offline / network
 			// blips are recoverable. Recorded for debug.
-			trace.steps = append(trace.steps, Step{
+			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: ferr.Error(),
 			})
@@ -193,7 +193,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 	if defErr != nil {
 		// Record the failure WITH the typed cause so
 		// errors.Is(err, ErrCannotForkBranch) routes correctly.
-		trace.steps = append(trace.steps, Step{
+		trace.appendStep(Step{
 			Name: "fork-from-default", Status: "failed",
 			Detail: "default branch " + defaultBranch +
 				" not found locally or on origin",

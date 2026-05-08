@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/enju-ai/enju/internal/common/oplog"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
@@ -266,13 +267,28 @@ func (w *Workspace) lockPathFor(id int64) string {
 
 // newWorkflowFromClone wraps a *git.Clone in a Workflow with the
 // Workspace's conventions. Used by ForProject and friends.
+//
+// Opens the per-clone trace log at <workDir>/enju/logs/trace.log
+// so every verb's deferred Emit lands a one-liner there. Failures
+// to open (permission denied, disk full) are logged once and the
+// Workflow runs without the file — slog stays as the fallback.
 func (w *Workspace) newWorkflowFromClone(id int64, clone *git.Clone) *Workflow {
-	return &Workflow{
+	wf := &Workflow{
 		git:    clone,
 		convs:  w.convs,
 		projID: id,
 		logger: w.logger,
 	}
+	if workDir := clone.WorkDir(); workDir != "" {
+		f, err := oplog.OpenProjectLogFile(workDir, filepath.Join("enju", "logs"), "trace.log")
+		if err != nil {
+			w.logger.Warn("enjugit: open trace log failed; verb traces go to slog only",
+				"project_id", id, "work_dir", workDir, "error", err)
+		} else {
+			wf.traceFile = f
+		}
+	}
+	return wf
 }
 
 // newViewFromClone wraps a *git.Clone in a read-only View.

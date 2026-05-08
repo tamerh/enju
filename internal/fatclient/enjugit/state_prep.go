@@ -31,7 +31,7 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 		return fmt.Errorf("enjugit: materializeUpstreamForReview: upstreamBranch is required")
 	}
 	trace := startTrace("materializeUpstreamForReview")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("upstream_branch", upstreamBranch)
 
 	werr := w.git.WithLock(func(g git.Ops) error {
@@ -40,7 +40,7 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 			if errors.Is(err, git.ErrNoRemote) {
 				trace.skipped("fetch-origin", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "fetch-origin", Status: "failed",
 					Detail: err.Error(),
 				})
@@ -110,7 +110,7 @@ func (w *Workflow) startIterationBranch(
 	}
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
 	trace := startTrace("startIterationBranch")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("fork_point", fork.String())
@@ -145,7 +145,7 @@ func (w *Workflow) startIterationBranch(
 			if errors.Is(ferr, git.ErrNoRemote) {
 				trace.skipped("fetch-origin", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "fetch-origin", Status: "failed",
 					Detail: ferr.Error(),
 				})
@@ -215,7 +215,7 @@ func (w *Workflow) resumeIterationBranch(
 ) (string, error) {
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
 	trace := startTrace("resumeIterationBranch")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", iterSeq))
@@ -235,7 +235,7 @@ func (w *Workflow) resumeIterationBranch(
 			if errors.Is(ferr, git.ErrNoRemote) {
 				trace.skipped("fetch-origin", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "fetch-origin", Status: "failed",
 					Detail: ferr.Error(),
 				})
@@ -336,7 +336,7 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 		return fmt.Errorf("enjugit: EnsureRunBranch: branch is required")
 	}
 	trace := startTrace("EnsureRunBranch")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("branch", branch)
 	trace.ctx("default_branch", defaultBranch)
 
@@ -347,7 +347,7 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 			if errors.Is(err, git.ErrNoRemote) {
 				trace.skipped("fetch-origin", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "fetch-origin", Status: "failed",
 					Detail: err.Error(),
 				})

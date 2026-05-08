@@ -183,7 +183,7 @@ func (w *Workflow) SubmitBatch(reqs []SubmitRequest) (*BatchResult, error) {
 	}
 
 	trace := startTrace("SubmitBatch")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("entries", fmt.Sprintf("%d", len(reqs)))
 	trace.ctx("branches", fmt.Sprintf("%d", len(groups)))
 
@@ -374,7 +374,7 @@ func commitOneBatchEntry(g git.Ops, convs Conventions, req SubmitRequest) (git.C
 // cases. Branches with empty preHead (created fresh inside the
 // batch) get a skipped step rather than an attempted reset.
 func rollbackBatchMulti(g git.Ops, trace *stepTrace, touched []struct{ name, preHead string }, failStep string, cause error, result *BatchResult, failedIdx int) error {
-	trace.steps = append(trace.steps, Step{
+	trace.appendStep(Step{
 		Name: failStep, Status: "failed",
 		Detail: cause.Error(),
 	})
@@ -390,7 +390,7 @@ func rollbackBatchMulti(g git.Ops, trace *stepTrace, touched []struct{ name, pre
 			continue
 		}
 		if rerr := g.SetBranchTo(t.name, t.preHead); rerr != nil {
-			trace.steps = append(trace.steps, Step{
+			trace.appendStep(Step{
 				Name: "rollback:" + t.name, Status: "failed",
 				Detail: fmt.Sprintf("set-branch-to %s: %v", shortSHA(t.preHead), rerr),
 			})

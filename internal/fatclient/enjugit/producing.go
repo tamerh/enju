@@ -75,7 +75,7 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	}
 
 	trace := startTrace("SubmitTaskResult")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("task_id", req.TaskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", req.IterSeq))
@@ -190,7 +190,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 	message := composeCommitMessage(w.convs, subject, "", trailers)
 
 	trace := startTrace("MergeAcceptedTopic")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("topic", topic)
 	trace.ctx("target", target)
 	trace.ctx("trigger_task", author.TaskID)
@@ -217,7 +217,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			if errors.Is(err, git.ErrNoRemote) {
 				trace.skipped("fetch-origin", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "fetch-origin", Status: "failed",
 					Detail: err.Error(),
 				})
@@ -383,7 +383,7 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 	}
 
 	trace := startTrace("CommitArbitraryFiles")
-	defer trace.emit(w.logger)
+	defer trace.emit(w.logger, w.traceFile)
 	trace.ctx("branch", branch)
 	trace.ctx("subject", subject)
 
@@ -424,7 +424,7 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 			if errors.Is(perr, git.ErrNoRemote) {
 				trace.skipped("push", "no remote configured")
 			} else {
-				trace.steps = append(trace.steps, Step{
+				trace.appendStep(Step{
 					Name: "push", Status: "failed",
 					Detail: perr.Error(),
 				})

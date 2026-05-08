@@ -2,6 +2,7 @@ package enjugit
 
 import (
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -76,6 +77,14 @@ type Workflow struct {
 	defaultBranch string
 
 	logger *slog.Logger
+
+	// traceFile is the per-clone append-only log opened at
+	// <workDir>/enju/logs/trace.log. Verbs `defer trace.emit(
+	// w.logger, w.traceFile)` so every invocation lands a
+	// structured one-liner here regardless of success/failure.
+	// Nil when Workspace failed to open it (mkdir denied,
+	// disk full); emit silently degrades to slog only.
+	traceFile *os.File
 }
 
 // SetDefaultBranch updates the cached default-branch name.

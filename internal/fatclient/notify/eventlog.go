@@ -21,12 +21,18 @@ package notify
 // rotate by `mv live.jsonl archive-{seqlo}-{seqhi}.jsonl &&
 // touch live.jsonl`. Bots tracking by seq cross the boundary
 // cleanly because seq is monotone.
+//
+// File-sink mechanics (mkdir + self-installing .gitignore +
+// O_APPEND open) live in internal/common/oplog. enjugit's
+// trace.log uses the same primitive so the project layout's
+// conventions for "untracked append-only logs" are encoded once.
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
+
+	"github.com/enju-ai/enju/internal/common/oplog"
 )
 
 // appendEventToLog appends one event as a JSON line to the
@@ -34,26 +40,25 @@ import (
 // configured (tests that don't set ProjectDir).
 //
 // Best-effort: write failures are logged by the caller and the
-// notify loop continues. Missing parent dir is created lazily,
-// along with a self-installing .gitignore so the events dir's
-// contents (live.jsonl, cursor.json, future archives) never
-// land in git.
+// notify loop continues. The file's parent dir is created lazily
+// (with self-installing .gitignore via oplog.OpenProjectLogFile)
+// so the events dir's contents never land in git.
 func appendEventToLog(path string, ev Event) error {
 	if path == "" {
 		return nil
 	}
+	// Split path into <workDir>/<subdir>/<filename> for the
+	// oplog primitive. notify configures `path` as
+	// "<projectDir>/enju/events/live.jsonl"; we hand each part
+	// in separately so oplog can mkdir the right places and
+	// drop a .gitignore in <projectDir>/enju/events/.
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create events dir: %w", err)
-	}
-	if err := ensureGitignore(dir); err != nil {
-		// Non-fatal — log path is the priority. Caller logs
-		// the warning if it cares.
-		return fmt.Errorf("ensure gitignore in %s: %w", dir, err)
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	parent := filepath.Dir(dir)
+	subdir := filepath.Base(dir)
+	filename := filepath.Base(path)
+	f, err := oplog.OpenProjectLogFile(parent, subdir, filename)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
+		return fmt.Errorf("open events log %s: %w", path, err)
 	}
 	defer f.Close()
 	line, err := json.Marshal(ev)
@@ -65,20 +70,4 @@ func appendEventToLog(path string, ev Event) error {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
-}
-
-// ensureGitignore writes a self-installing `.gitignore` in the
-// events dir if missing. Content is "*\n" — ignores everything
-// in the directory including the .gitignore itself, so git never
-// commits anything from this tree. Each clone independently
-// creates its own .gitignore on first notify write; nothing
-// crosses repo boundaries.
-//
-// Idempotent — does nothing if the file already exists.
-func ensureGitignore(dir string) error {
-	path := filepath.Join(dir, ".gitignore")
-	if _, err := os.Stat(path); err == nil {
-		return nil // already there
-	}
-	return os.WriteFile(path, []byte("*\n"), 0o644)
 }
