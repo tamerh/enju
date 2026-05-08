@@ -245,6 +245,54 @@ func TestPushWithVerify_WrongExpected(t *testing.T) {
 	}
 }
 
+// TestVerifyRemoteMatches_MissingRef pins the "remote ref doesn't
+// exist at all" path inside verifyRemoteMatches — distinct from
+// TestPushWithVerify_WrongExpected, which exercises the SHA-mismatch
+// branch. Production saw silent-success failures where push reported
+// ok but the branch never appeared on the bare; this test confirms
+// verify catches that shape and returns an *ErrVerifyFailed with
+// RemoteSHA="" so callers can distinguish "wrong content" from
+// "ref vanished."
+func TestVerifyRemoteMatches_MissingRef(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	// Make a local commit so we have a real SHA to verify, but
+	// don't push the branch — the bare won't have it. This is
+	// equivalent to the production "push went into the void"
+	// shape.
+	res, err := c.CommitFiles(CommitRequest{
+		Files:   []FileWrite{{RepoRelPath: "x.txt", Content: []byte("x")}},
+		Message: "add x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.CreateBranchAt("topic-vanish", res.SHA)
+
+	vErr := c.verifyRemoteMatches("topic-vanish", res.SHA)
+	if vErr == nil {
+		t.Fatal("expected ErrVerifyFailed when remote ref is missing; got nil")
+	}
+	if !errors.Is(vErr, ErrPushVerifyFailed) {
+		t.Errorf("expected ErrPushVerifyFailed in chain, got %v", vErr)
+	}
+	var typed *ErrVerifyFailed
+	if !errors.As(vErr, &typed) {
+		t.Fatalf("expected *ErrVerifyFailed, got %T: %v", vErr, vErr)
+	}
+	if typed.RemoteSHA != "" {
+		t.Errorf("RemoteSHA = %q, want empty (missing) for a vanished ref", typed.RemoteSHA)
+	}
+	if typed.LocalSHA != res.SHA {
+		t.Errorf("LocalSHA = %s, want %s", typed.LocalSHA, res.SHA)
+	}
+	if typed.Branch != "topic-vanish" {
+		t.Errorf("Branch = %q, want topic-vanish", typed.Branch)
+	}
+}
+
 func TestFetch_BringsDownNewBranches(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
