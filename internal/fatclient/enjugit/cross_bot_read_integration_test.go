@@ -1349,3 +1349,307 @@ func TestIter2_DirtyWorktreeFromIter1_DoesNotBlockBranchSwitchIntegration(t *tes
 		t.Errorf("HEAD on wrong ref after checkout: got %s, want %s", got, want)
 	}
 }
+
+// TestReviewerWorktreeHasUpstreamContent_BeforeHandlerRunsIntegration
+// pins the daemon's pre-handler checkout: before claude -p runs on
+// a review task, the upstream developer's source files MUST be
+// visible on disk at the worktree root. The upstream commit's tree
+// being reachable via origin/<topic> is not enough — claude -p
+// reads files from the filesystem, not from git refs.
+//
+// Production symptom: developer pushes src/config/config.go;
+// reviewer-bot fetches and the remote-tracking ref appears, but
+// `ls src/config/` returns "No such file or directory" because no
+// checkout fired. claude -p reports "no src/ directory exists" and
+// rejects forever.
+func TestReviewerWorktreeHasUpstreamContent_BeforeHandlerRunsIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Developer pushes a topic branch carrying real source files.
+	if _, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_config",
+		BranchOverride: "1-build/develop_config/iter-1",
+		Citizen:        Identity{Name: "developer", Email: "d@x.com"},
+		Files: []FileWrite{
+			{RepoRelPath: "src/config/config.go", Content: []byte("package config\n\ntype Config struct{ Port int }\n")},
+			{RepoRelPath: "src/go.mod", Content: []byte("module example.com/cfg\n")},
+		},
+	}); err != nil {
+		t.Fatalf("developer submit: %v", err)
+	}
+
+	if err := reviewer.FetchAllRefs(); err != nil {
+		t.Fatalf("reviewer fetch: %v", err)
+	}
+
+	// Sanity: the ref exists in reviewer's clone (object DB).
+	reviewerRepo := workflowRepo(t, reviewer)
+	if _, err := reviewerRepo.Reference(plumbing.NewRemoteReferenceName("origin", "1-build/develop_config/iter-1"), true); err != nil {
+		t.Fatalf("reviewer fetch didn't bring upstream topic ref: %v", err)
+	}
+
+	// THE FIX: checkout the upstream topic branch tip so its content
+	// materializes in the worktree before claude -p runs.
+	if err := reviewer.CheckoutBranchFrom("1-build/develop_config/iter-1", ""); err != nil {
+		t.Fatalf("reviewer checkout upstream topic: %v", err)
+	}
+
+	// Post-checkout: the upstream's source files are now on disk.
+	srcPath := filepath.Join(reviewer.WorkDir(), "src", "config", "config.go")
+	body, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("after checkout, src/config/config.go still not visible: %v\n"+
+			"This is the production bug — claude -p reads from disk, refs alone aren't enough.", err)
+	}
+	if !strings.Contains(string(body), "type Config struct") {
+		t.Errorf("on-disk content doesn't match upstream commit: got %q", body)
+	}
+	gomod, err := os.ReadFile(filepath.Join(reviewer.WorkDir(), "src", "go.mod"))
+	if err != nil {
+		t.Errorf("src/go.mod missing on disk after checkout: %v", err)
+	} else if !strings.Contains(string(gomod), "module example.com/cfg") {
+		t.Errorf("go.mod content mismatch: got %q", gomod)
+	}
+}
+
+// TestReviewerWorktreeMissingContent_LocalRefMatchesOriginIntegration
+// pins the persistent reporter scenario: the local upstream ref
+// already EXISTS and points at the CORRECT commit (matches origin).
+// HEAD is on a different branch (the run branch). When
+// CheckoutBranchFrom switches HEAD to the upstream topic, the
+// worktree must be updated to match — otherwise claude -p reads
+// the previous branch's tree from disk and rejects forever.
+//
+// Without a Force-shaped checkout, go-git's non-Force wt.Checkout
+// could leave the worktree on the previous branch's tree even
+// after HEAD moves. enjugit's CheckoutBranchFrom uses Force +
+// preserve dance, which materializes the new branch's tree.
+func TestReviewerWorktreeMissingContent_LocalRefMatchesOriginIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Developer pushes content.
+	devRes, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_a",
+		BranchOverride: "iter-smoke-runs/develop_a/iter-1",
+		Citizen:        Identity{Name: "developer", Email: "d@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "smoke/a.md", Content: []byte("magic word: enju\n")}},
+	})
+	if err != nil {
+		t.Fatalf("developer submit: %v", err)
+	}
+	devSHA := devRes.CommitSHA
+
+	if err := reviewer.FetchAllRefs(); err != nil {
+		t.Fatalf("reviewer fetch: %v", err)
+	}
+
+	// Establish the production state precisely: local upstream ref
+	// EXISTS and matches origin's tip. (This is what a previous
+	// successful review iteration of the same upstream would have
+	// left behind.)
+	reviewerRepo := workflowRepo(t, reviewer)
+	upstreamRef := plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1")
+	if err := reviewerRepo.Storer.SetReference(
+		plumbing.NewHashReference(upstreamRef, plumbing.NewHash(devSHA)),
+	); err != nil {
+		t.Fatalf("planting matching local ref: %v", err)
+	}
+
+	// Sanity: HEAD must be on a DIFFERENT branch (not the upstream
+	// topic) so we exercise the worktree-update path.
+	head, _ := reviewerRepo.Head()
+	if head.Name() == upstreamRef {
+		t.Fatal("test setup invalid: HEAD already on upstream topic; can't exercise the switch")
+	}
+
+	// Production call.
+	if err := reviewer.CheckoutBranchFrom("iter-smoke-runs/develop_a/iter-1", ""); err != nil {
+		t.Fatalf("CheckoutBranchFrom: %v", err)
+	}
+
+	// THE PRODUCTION SYMPTOM. After the checkout, smoke/a.md must
+	// be on disk. If the checkout failed to materialize the new
+	// branch's tree, this test fails exactly as production did.
+	smokePath := filepath.Join(reviewer.WorkDir(), "smoke", "a.md")
+	body, err := os.ReadFile(smokePath)
+	if err != nil {
+		t.Fatalf("REPRO: smoke/a.md missing from worktree.\n"+
+			"  os.ReadFile: %v\n"+
+			"  HEAD post-checkout: %s\n"+
+			"non-Force wt.Checkout did not write the new branch's tree to disk.\n"+
+			"claude -p reads empty worktree → request_changes loop.",
+			err, headRefName(t, reviewer))
+	}
+	if string(body) != "magic word: enju\n" {
+		t.Errorf("content mismatch: got %q", body)
+	}
+}
+
+// TestReviewerWorktreeMissingContent_DespiteCorrectRefIntegration
+// pins the new reporter scenario after the prior fixes landed:
+// branch ref appears correct on inspection (R2 forks from D2),
+// but the worktree doesn't have the upstream's tree on disk.
+// Hypothesized cause: a stale local refs/heads/<upstream-topic>
+// from a prior bot invocation pointing at the wrong commit
+// (run-branch tip instead of developer's actual tip). The new
+// checkout call must reseat the local ref AND materialize the
+// correct tree on disk.
+func TestReviewerWorktreeMissingContent_DespiteCorrectRefIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Developer pushes a topic branch carrying smoke/a.md.
+	devRes, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_a",
+		BranchOverride: "iter-smoke-runs/develop_a/iter-1",
+		Citizen:        Identity{Name: "developer", Email: "d@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "smoke/a.md", Content: []byte("hello from a\n")}},
+	})
+	if err != nil {
+		t.Fatalf("developer submit: %v", err)
+	}
+	devActualSHA := devRes.CommitSHA
+
+	if err := reviewer.FetchAllRefs(); err != nil {
+		t.Fatalf("reviewer fetch: %v", err)
+	}
+
+	// Plant the stale-ref shape: the local refs/heads/<upstream>
+	// exists from a prior bot invocation pointing at the WRONG
+	// commit (e.g. seed/run-branch tip — what the broken version
+	// of the fix produced). origin/<upstream> still points at the
+	// developer's actual commit.
+	reviewerRepo := workflowRepo(t, reviewer)
+	bobHead, _ := reviewerRepo.Head()
+	staleHash := bobHead.Hash()
+	if staleHash == plumbing.NewHash(devActualSHA) {
+		t.Fatal("test setup invalid: HEAD coincides with developer's commit")
+	}
+	staleRef := plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1")
+	if err := reviewerRepo.Storer.SetReference(plumbing.NewHashReference(staleRef, staleHash)); err != nil {
+		t.Fatalf("planting stale ref: %v", err)
+	}
+
+	// Production flow: daemon calls CheckoutBranchFrom(upstream, "")
+	// — empty baseBranch so the verb resolves origin/<upstream> as
+	// the authoritative tip and reseats the local ref.
+	if err := reviewer.CheckoutBranchFrom("iter-smoke-runs/develop_a/iter-1", ""); err != nil {
+		t.Fatalf("CheckoutBranchFrom: %v", err)
+	}
+
+	// Verify the local ref now points at the developer's actual
+	// commit (not the stale hash).
+	ref, err := reviewerRepo.Reference(staleRef, true)
+	if err != nil {
+		t.Fatalf("ref lookup post-checkout: %v", err)
+	}
+	if ref.Hash().String() != devActualSHA {
+		t.Errorf("REPRO: local upstream ref still stale.\n"+
+			"  got:  %s (the planted stale hash)\n"+
+			"  want: %s (origin's actual upstream tip)",
+			ref.Hash(), devActualSHA)
+	}
+
+	// THE PRODUCTION SYMPTOM: smoke/a.md must be on disk after the
+	// checkout. If it isn't, claude -p reads empty src/ and rejects
+	// forever.
+	smokePath := filepath.Join(reviewer.WorkDir(), "smoke", "a.md")
+	body, err := os.ReadFile(smokePath)
+	if err != nil {
+		t.Fatalf("REPRO: smoke/a.md missing from reviewer worktree post-checkout: %v\n"+
+			"This is the reporter's bug: branch ref appears correct but the\n"+
+			"worktree on disk doesn't reflect the upstream's tree. claude -p\n"+
+			"reads disk → no file → request_changes forever.", err)
+	}
+	if string(body) != "hello from a\n" {
+		t.Errorf("smoke/a.md content mismatch: got %q", body)
+	}
+}
+
+// TestRequestChanges_RevisionOnSameBranch_DirtyWorktreeIntegration
+// pins the request_changes flow at iter-1: after a reviewer-bot
+// asks for changes, the developer re-claims the SAME iteration
+// (iter_seq stays at 1, topic branch name unchanged). claude -p
+// writes revised content to the worktree (often modifying tracked
+// files). Submit then calls SubmitTaskResult with the same branch
+// name — the existing-ref short-circuit must not fail on unstaged
+// modifications. Pre-fix the non-Force wt.Checkout returned
+// ErrUnstagedChanges; with the Force-shaped path, the revision
+// commit lands cleanly.
+func TestRequestChanges_RevisionOnSameBranch_DirtyWorktreeIntegration(t *testing.T) {
+	_, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// Establish the run branch (analog of the operator's initial
+	// create_run + first commit). Iter-1's topic forks from this.
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:setup",
+		BranchOverride: "mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "README.md", Content: []byte("# project\n")}},
+	}); err != nil {
+		t.Fatalf("setup commit: %v", err)
+	}
+
+	// Bob submits iter-1 on its topic branch (forked from mainline).
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "topics/develop_domain/iter-1",
+		RunBranch:      "mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 1\n")}},
+	}); err != nil {
+		t.Fatalf("iter-1 submit: %v", err)
+	}
+
+	// CRITICAL: simulate the pre-claim pull moving HEAD off the
+	// topic branch and back onto the run branch (so the early-
+	// return-when-already-on-branch short-circuit doesn't fire on
+	// the subsequent submit).
+	if err := bob.CheckoutBranchFrom("mainline", ""); err != nil {
+		t.Fatalf("simulating pre-claim pull (move HEAD to run branch): %v", err)
+	}
+
+	// Now claude -p iter-2 writes a file. From run-branch's POV
+	// this file is NEW (untracked). From iter-1's POV the path
+	// already exists tracked. When CheckoutBranchFrom switches
+	// from run-branch to iter-1 it must overwrite this untracked
+	// file with iter-1's tracked version, then SubmitTaskResult
+	// writes the revised content from req.Files.
+	if err := os.MkdirAll(filepath.Join(bob.WorkDir(), "src/domain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(bob.WorkDir(), "src/domain/foo.go"),
+		[]byte("package domain\n\nvar V = 2 // revised per reviewer\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// iter-2 submits to the SAME branch (request_changes flow,
+	// iter_seq still = 1). SubmitTaskResult internally calls into
+	// prepareBranchForCommit which checks out the topic branch.
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "topics/develop_domain/iter-1", // SAME branch — revision
+		RunBranch:      "mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 2 // revised per reviewer\n")}},
+	}); err != nil {
+		t.Fatalf("REPRO: revision submit on same branch failed with dirty worktree: %v\n"+
+			"This is the request_changes-flow bug — non-Force checkout fails on\n"+
+			"unstaged modifications.", err)
+	}
+}
+
+// headRefName returns the wf's current HEAD ref name as a string,
+// or "(error)". Helper for diagnostic failure messages — keeps
+// the test bodies focused.
+func headRefName(t *testing.T, wf *Workflow) string {
+	t.Helper()
+	repo := workflowRepo(t, wf)
+	h, err := repo.Head()
+	if err != nil {
+		return "(error)"
+	}
+	return h.Name().String()
+}
