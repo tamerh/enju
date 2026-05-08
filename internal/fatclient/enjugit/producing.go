@@ -75,6 +75,7 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	}
 
 	trace := startTrace("SubmitTaskResult")
+	defer trace.emit(w.logger)
 	trace.ctx("task_id", req.TaskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", req.IterSeq))
@@ -189,6 +190,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 	message := composeCommitMessage(w.convs, subject, "", trailers)
 
 	trace := startTrace("MergeAcceptedTopic")
+	defer trace.emit(w.logger)
 	trace.ctx("topic", topic)
 	trace.ctx("target", target)
 	trace.ctx("trigger_task", author.TaskID)
@@ -381,6 +383,7 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 	}
 
 	trace := startTrace("CommitArbitraryFiles")
+	defer trace.emit(w.logger)
 	trace.ctx("branch", branch)
 	trace.ctx("subject", subject)
 

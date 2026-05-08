@@ -1,6 +1,7 @@
 package enjugit
 
 import (
+	"log/slog"
 	"sort"
 	"strings"
 )
@@ -200,5 +201,60 @@ func (t *stepTrace) wrapTerminal(cause error) error {
 		Cause:   cause,
 		Steps:   t.steps,
 		Context: t.context,
+	}
+}
+
+// emit writes a one-line structured summary of the trace to
+// logger. Verbs `defer trace.emit(w.logger)` right after
+// startTrace so every invocation — success OR failure — leaves a
+// queryable record. Without this, traces on the success path
+// were thrown away, making "verb returned nil but didn't actually
+// do the work" cases (silent skipped-push, no-remote fallback)
+// impossible to diagnose post-hoc.
+//
+// Severity rule: info when every step ran cleanly (ok/skipped),
+// warn when any step failed (so log filters surface the bad
+// runs without manual scanning). Caller-supplied logger may be
+// nil — emit no-ops then.
+//
+// Structured fields:
+//   - op: verb name
+//   - steps: "name1=status1,name2=status2,..." compact line
+//   - one field per ctx() entry (branch, task_id, etc.)
+//   - fail_detail: the last failed step's error text, when present
+func (t *stepTrace) emit(logger *slog.Logger) {
+	if logger == nil || t == nil {
+		return
+	}
+	var stepsBuf strings.Builder
+	for i, s := range t.steps {
+		if i > 0 {
+			stepsBuf.WriteString(",")
+		}
+		stepsBuf.WriteString(s.Name)
+		stepsBuf.WriteString("=")
+		stepsBuf.WriteString(s.Status)
+	}
+	var failDetail string
+	for i := len(t.steps) - 1; i >= 0; i-- {
+		if t.steps[i].Status == "failed" {
+			failDetail = t.steps[i].Detail
+			break
+		}
+	}
+	attrs := []any{"op", t.op, "steps", stepsBuf.String()}
+	keys := make([]string, 0, len(t.context))
+	for k := range t.context {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		attrs = append(attrs, k, t.context[k])
+	}
+	if failDetail != "" {
+		attrs = append(attrs, "fail_detail", failDetail)
+		logger.Warn("enjugit verb completed", attrs...)
+	} else {
+		logger.Info("enjugit verb completed", attrs...)
 	}
 }

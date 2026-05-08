@@ -31,6 +31,7 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 		return fmt.Errorf("enjugit: materializeUpstreamForReview: upstreamBranch is required")
 	}
 	trace := startTrace("materializeUpstreamForReview")
+	defer trace.emit(w.logger)
 	trace.ctx("upstream_branch", upstreamBranch)
 
 	werr := w.git.WithLock(func(g git.Ops) error {
@@ -109,6 +110,7 @@ func (w *Workflow) startIterationBranch(
 	}
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
 	trace := startTrace("startIterationBranch")
+	defer trace.emit(w.logger)
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("fork_point", fork.String())
@@ -213,6 +215,7 @@ func (w *Workflow) resumeIterationBranch(
 ) (string, error) {
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
 	trace := startTrace("resumeIterationBranch")
+	defer trace.emit(w.logger)
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", iterSeq))
@@ -333,6 +336,7 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 		return fmt.Errorf("enjugit: EnsureRunBranch: branch is required")
 	}
 	trace := startTrace("EnsureRunBranch")
+	defer trace.emit(w.logger)
 	trace.ctx("branch", branch)
 	trace.ctx("default_branch", defaultBranch)
 

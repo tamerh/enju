@@ -183,6 +183,7 @@ func (w *Workflow) SubmitBatch(reqs []SubmitRequest) (*BatchResult, error) {
 	}
 
 	trace := startTrace("SubmitBatch")
+	defer trace.emit(w.logger)
 	trace.ctx("entries", fmt.Sprintf("%d", len(reqs)))
 	trace.ctx("branches", fmt.Sprintf("%d", len(groups)))
 

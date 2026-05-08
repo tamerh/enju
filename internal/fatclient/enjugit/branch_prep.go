@@ -56,6 +56,7 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 	}
 	defaultBranch := w.DefaultBranch()
 	trace := startTrace("PrepareBranchForCommit")
+	defer trace.emit(w.logger)
 	trace.ctx("branch", branch)
 	trace.ctx("default_branch", defaultBranch)
 	if preferredBase != "" {
