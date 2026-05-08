@@ -267,7 +267,19 @@ func (w *Workspace) projectDirForName(id int64, projectName string) string {
 
 // lockPathFor returns the cross-process flock file for one
 // project. Lives next to the project dir, suffixed with .lock.
+//
+// When a per-bot-clone override is registered for this id (via
+// OpenBotCloneAt), the lock follows the bot's clone path so each
+// bot daemon gets its own flock. Without this branch, two bots
+// on the same project share one lock and serialize even though
+// their clones are independent on disk — defeats the per-bot-
+// clone parallelism the bot architecture relies on.
+//
+// Mirrors the same override rule already in ProjectDir(id).
 func (w *Workspace) lockPathFor(id int64) string {
+	if path, ok := w.botCloneAt[id]; ok {
+		return path + ".lock"
+	}
 	return filepath.Join(w.rootDir, fmt.Sprintf("project-%d.lock", id))
 }
 
