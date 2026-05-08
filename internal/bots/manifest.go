@@ -119,6 +119,29 @@ type Bot struct {
 	// Validate rejects unknown values so a typo'd handler type
 	// surfaces before the daemon starts.
 	Handler string `yaml:"handler,omitempty"`
+
+	// Replicas requests N independently-running copies of this
+	// bot — useful when you want parallel work from multiple
+	// instances of the same role (three developer bots picking
+	// from the same READY queue, fastest claim wins). Optional;
+	// absent or 1 means a single bot with the entry's name.
+	//
+	// On parse, replicas >= 2 expand into N synthetic Bot
+	// entries with names suffixed -1, -2, ..., -N. All other
+	// fields copy verbatim per replica EXCEPT credentials, which
+	// resolve per replica name (one cred file per identity), and
+	// the default system prompt, which resolves from the BASE
+	// name so all replicas share the same prompt (they're
+	// supposed to be identical bots).
+	//
+	// Capped at 32 to prevent typo'd configs from spawning
+	// runaway citizen registrations.
+	//
+	// Downstream code (Resolve, Validate, Load callers) only
+	// sees the expanded Bot entries; the Replicas field is
+	// cleared after expansion so this knob can't leak into
+	// runtime decisions.
+	Replicas int `yaml:"replicas,omitempty"`
 }
 
 // MCPTools holds the per-bot tool allowlist the runner pins on
@@ -172,6 +195,9 @@ func Load(projectRoot string) (*Manifest, error) {
 	if err := yamlv3.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", corelayout.BotManifestPath, err)
 	}
+	if err := m.expandReplicas(); err != nil {
+		return nil, err
+	}
 	if err := m.Resolve(); err != nil {
 		return nil, err
 	}
@@ -179,6 +205,70 @@ func Load(projectRoot string) (*Manifest, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// botReplicasCap bounds the number of synthetic entries a single
+// `replicas: N` field can spawn. The cap exists to make typo'd
+// configs (replicas: 1000 from a fat finger or a unit confusion)
+// fail loudly before they land 1000 citizens on the coord.
+const botReplicasCap = 32
+
+// expandReplicas processes the `replicas` field on each manifest
+// entry: entries with replicas >= 2 expand into N synthetic Bot
+// entries with names suffixed `-1` through `-N`, copying all
+// other fields verbatim. Entries with replicas absent or 1 stay
+// unchanged. The Replicas field is cleared on every entry post-
+// expansion so downstream code never sees it.
+//
+// Run before Resolve so per-replica defaults (credentials path
+// based on the suffixed name) get filled in correctly. The
+// system_prompt default is set inline here (against the BASE
+// name) so all replicas share one prompt file — the typical
+// case for "three developer bots all reading prompts/dev-bot.md."
+func (m *Manifest) expandReplicas() error {
+	expanded := make([]Bot, 0, len(m.Bots))
+	for i, b := range m.Bots {
+		switch {
+		case b.Replicas < 0:
+			return fmt.Errorf("bots[%d] %q: replicas must be >= 1 (got %d); omit the field for a single bot", i, b.Name, b.Replicas)
+		case b.Replicas > botReplicasCap:
+			return fmt.Errorf("bots[%d] %q: replicas %d exceeds cap of %d (cap exists to catch typo'd configs before they register runaway citizens)", i, b.Name, b.Replicas, botReplicasCap)
+		}
+		// 0 (absent) or 1 → single entry; clear Replicas so
+		// downstream sees a normal Bot.
+		if b.Replicas < 2 {
+			b.Replicas = 0
+			expanded = append(expanded, b)
+			continue
+		}
+		base := b.Name
+		// Pre-resolve the shared system_prompt default once for
+		// the whole replica family. If the user authored an
+		// explicit path, it carries through to every replica;
+		// if they left it empty, all replicas share the
+		// base-name prompt rather than each looking for its own
+		// suffixed file.
+		sharedPrompt := b.SystemPrompt
+		if sharedPrompt == "" && base != "" {
+			sharedPrompt = filepath.ToSlash(filepath.Join(corelayout.BotPromptsDir, base+".md"))
+		}
+		for n := 1; n <= b.Replicas; n++ {
+			rep := b
+			rep.Replicas = 0
+			rep.Name = fmt.Sprintf("%s-%d", base, n)
+			rep.SystemPrompt = sharedPrompt
+			// Credentials default left empty so Resolve fills
+			// per replica name; an explicit user-supplied path
+			// is unusual for a replicas: N entry but if present,
+			// every replica shares the same credentials file —
+			// almost certainly wrong. We leave that as the
+			// user's choice; Validate doesn't have a rule against
+			// it.
+			expanded = append(expanded, rep)
+		}
+	}
+	m.Bots = expanded
+	return nil
 }
 
 // Resolve fills in the conventional defaults for fields the

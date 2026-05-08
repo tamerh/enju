@@ -417,6 +417,170 @@ func TestEnsureGitignored_PreservesUserContent(t *testing.T) {
 	}
 }
 
+// TestExpandReplicas covers the full replicas matrix: backward-
+// compat (absent + 1 stay single), expansion (>=2 produces N
+// suffixed entries with shared fields), validation (negative,
+// over-cap), and the per-replica defaults Resolve fills in
+// after expansion (credentials per replica, prompt shared).
+func TestExpandReplicas(t *testing.T) {
+	t.Run("absent: single entry unchanged", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: only-bot
+    model: claude-sonnet-4-6
+`)
+		m, err := Load(root)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(m.Bots) != 1 || m.Bots[0].Name != "only-bot" {
+			t.Errorf("expected 1 entry named only-bot, got %+v", m.Bots)
+		}
+	})
+
+	t.Run("replicas: 1 stays single (sentinel for explicit single)", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: solo-dev
+    model: claude-sonnet-4-6
+    replicas: 1
+`)
+		m, err := Load(root)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(m.Bots) != 1 {
+			t.Fatalf("replicas:1 should produce 1 entry, got %d", len(m.Bots))
+		}
+		if m.Bots[0].Name != "solo-dev" {
+			t.Errorf("expected name unchanged, got %q", m.Bots[0].Name)
+		}
+		if m.Bots[0].Replicas != 0 {
+			t.Errorf("Replicas should be cleared post-expansion, got %d", m.Bots[0].Replicas)
+		}
+	})
+
+	t.Run("replicas: 3 expands to 3 suffixed entries", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: dev-bot
+    model: claude-sonnet-4-6
+    replicas: 3
+`)
+		m, err := Load(root)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(m.Bots) != 3 {
+			t.Fatalf("replicas:3 should produce 3 entries, got %d", len(m.Bots))
+		}
+		wantNames := []string{"dev-bot-1", "dev-bot-2", "dev-bot-3"}
+		for i, want := range wantNames {
+			if m.Bots[i].Name != want {
+				t.Errorf("Bots[%d].Name: got %q, want %q", i, m.Bots[i].Name, want)
+			}
+			if m.Bots[i].Model != "claude-sonnet-4-6" {
+				t.Errorf("Bots[%d].Model not copied: %q", i, m.Bots[i].Model)
+			}
+			if m.Bots[i].Replicas != 0 {
+				t.Errorf("Bots[%d].Replicas should be cleared post-expansion, got %d", i, m.Bots[i].Replicas)
+			}
+		}
+	})
+
+	t.Run("replicas share BASE prompt, separate credentials", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: dev-bot
+    model: claude-sonnet-4-6
+    replicas: 3
+`)
+		m, err := Load(root)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		// All replicas point at the same prompt file (the BASE
+		// name, not the suffixed name) — three identical bots.
+		for i, b := range m.Bots {
+			if !strings.HasSuffix(b.SystemPrompt, "/dev-bot.md") {
+				t.Errorf("Bots[%d].SystemPrompt: got %q, want suffix /dev-bot.md (shared)", i, b.SystemPrompt)
+			}
+		}
+		// But each replica has its own credentials file (distinct
+		// identity = distinct token = distinct on-disk file).
+		seenCreds := make(map[string]bool)
+		for i, b := range m.Bots {
+			if seenCreds[b.Credentials] {
+				t.Errorf("Bots[%d] credentials duplicate: %q", i, b.Credentials)
+			}
+			seenCreds[b.Credentials] = true
+			wantSuffix := "credentials/" + b.Name + ".json"
+			if !strings.HasSuffix(b.Credentials, wantSuffix) {
+				t.Errorf("Bots[%d].Credentials: got %q, want suffix %q", i, b.Credentials, wantSuffix)
+			}
+		}
+	})
+
+	t.Run("replicas: -1 rejected", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: dev-bot
+    model: claude-sonnet-4-6
+    replicas: -1
+`)
+		_, err := Load(root)
+		if err == nil {
+			t.Fatal("expected error on negative replicas")
+		}
+		if !strings.Contains(err.Error(), "replicas must be >= 1") {
+			t.Errorf("error should explain the rule, got: %v", err)
+		}
+	})
+
+	t.Run("replicas exceeding cap rejected", func(t *testing.T) {
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: dev-bot
+    model: claude-sonnet-4-6
+    replicas: 100
+`)
+		_, err := Load(root)
+		if err == nil {
+			t.Fatal("expected error on over-cap replicas")
+		}
+		if !strings.Contains(err.Error(), "exceeds cap") {
+			t.Errorf("error should mention the cap, got: %v", err)
+		}
+	})
+
+	t.Run("name collision between replica and explicit entry rejected", func(t *testing.T) {
+		// dev-bot replicas:2 expands to dev-bot-1 + dev-bot-2;
+		// the explicit dev-bot-1 below collides.
+		root := writeManifest(t, `
+version: 1
+bots:
+  - name: dev-bot
+    model: claude-sonnet-4-6
+    replicas: 2
+  - name: dev-bot-1
+    model: claude-sonnet-4-6
+`)
+		_, err := Load(root)
+		if err == nil {
+			t.Fatal("expected duplicate-name error post-expansion")
+		}
+		if !strings.Contains(err.Error(), "duplicate name") {
+			t.Errorf("error should mention duplicate name, got: %v", err)
+		}
+	})
+}
+
 func TestByName(t *testing.T) {
 	m := &Manifest{Bots: []Bot{
 		{Name: "a", Model: "m1"},
