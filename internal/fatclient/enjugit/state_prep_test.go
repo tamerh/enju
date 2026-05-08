@@ -29,8 +29,8 @@ func TestMaterializeUpstreamForReview_HappyPath(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.resolveMap["1-build/develop_a/iter-1"] = "abcdef0123456789abcdef0123456789abcdef01"
 
-	if err := wf.MaterializeUpstreamForReview("1-build/develop_a/iter-1"); err != nil {
-		t.Fatalf("MaterializeUpstreamForReview: %v", err)
+	if err := wf.materializeUpstreamForReview("1-build/develop_a/iter-1"); err != nil {
+		t.Fatalf("materializeUpstreamForReview: %v", err)
 	}
 	// Must call Fetch (so origin is current) then ResolveRef
 	// then CheckoutCommit.
@@ -51,7 +51,7 @@ func TestMaterializeUpstreamForReview_UpstreamMissing(t *testing.T) {
 	// resolveMap empty → ResolveRef returns ErrRefNotFound.
 	_ = fake
 
-	err := wf.MaterializeUpstreamForReview("nonexistent/topic")
+	err := wf.materializeUpstreamForReview("nonexistent/topic")
 	if !errors.Is(err, ErrUpstreamNotFound) {
 		t.Errorf("expected ErrUpstreamNotFound, got %v", err)
 	}
@@ -59,7 +59,7 @@ func TestMaterializeUpstreamForReview_UpstreamMissing(t *testing.T) {
 
 func TestMaterializeUpstreamForReview_EmptyBranch(t *testing.T) {
 	wf, _ := makeWorkflow(t)
-	if err := wf.MaterializeUpstreamForReview(""); err == nil {
+	if err := wf.materializeUpstreamForReview(""); err == nil {
 		t.Error("expected error for empty upstreamBranch")
 	}
 }
@@ -68,7 +68,7 @@ func TestStartIterationBranch_FromRunBranch(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.resolveMap["main"] = "runbranch00000000000000000000000000000000"
 
-	branchName, err := wf.StartIterationBranch(
+	branchName, err := wf.startIterationBranch(
 		"7:1:dev_a", 2,
 		ForkFromRunBranch,
 		"dev_a", "",
@@ -76,7 +76,7 @@ func TestStartIterationBranch_FromRunBranch(t *testing.T) {
 		"main", "",
 	)
 	if err != nil {
-		t.Fatalf("StartIterationBranch: %v", err)
+		t.Fatalf("startIterationBranch: %v", err)
 	}
 	if branchName != "1-build/dev_a/iter-2" {
 		t.Errorf("branch name: got %q, want 1-build/dev_a/iter-2", branchName)
@@ -101,7 +101,7 @@ func TestStartIterationBranch_FromUpstreamTopic(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.resolveMap["1-build/develop_a/iter-1"] = "upstreamtopic000000000000000000000000000"
 
-	branchName, err := wf.StartIterationBranch(
+	branchName, err := wf.startIterationBranch(
 		"7:1:review_a", 1,
 		ForkFromUpstreamTopic,
 		"review_a", "",
@@ -109,7 +109,7 @@ func TestStartIterationBranch_FromUpstreamTopic(t *testing.T) {
 		"main", "1-build/develop_a/iter-1",
 	)
 	if err != nil {
-		t.Fatalf("StartIterationBranch: %v", err)
+		t.Fatalf("startIterationBranch: %v", err)
 	}
 	if branchName != "1-build/review_a/iter-1" {
 		t.Errorf("branch name: got %q", branchName)
@@ -122,7 +122,7 @@ func TestStartIterationBranch_FromUpstreamTopic(t *testing.T) {
 
 func TestStartIterationBranch_UnknownForkPoint(t *testing.T) {
 	wf, _ := makeWorkflow(t)
-	_, err := wf.StartIterationBranch("7:1:x", 1, ForkUnknown,
+	_, err := wf.startIterationBranch("7:1:x", 1, ForkUnknown,
 		"x", "", 1, "build", "main", "")
 	if !errors.Is(err, ErrInvalidForkPoint) {
 		t.Errorf("expected ErrInvalidForkPoint, got %v", err)
@@ -132,7 +132,7 @@ func TestStartIterationBranch_UnknownForkPoint(t *testing.T) {
 func TestStartIterationBranch_ForkBaseMissing(t *testing.T) {
 	wf, _ := makeWorkflow(t)
 	// resolveMap empty → ResolveRef("main") returns ErrRefNotFound.
-	_, err := wf.StartIterationBranch("7:1:x", 1, ForkFromRunBranch,
+	_, err := wf.startIterationBranch("7:1:x", 1, ForkFromRunBranch,
 		"x", "", 1, "build", "main", "")
 	if !errors.Is(err, ErrForkBaseNotFound) {
 		t.Errorf("expected ErrForkBaseNotFound, got %v", err)
@@ -145,7 +145,7 @@ func TestStartIterationBranch_ExistingBranchErrors(t *testing.T) {
 	// Pre-existing branch.
 	fake.resolveMap["refs/heads/1-build/dev_a/iter-2"] = "oldsha"
 
-	_, err := wf.StartIterationBranch("7:1:dev_a", 2, ForkFromRunBranch,
+	_, err := wf.startIterationBranch("7:1:dev_a", 2, ForkFromRunBranch,
 		"dev_a", "", 1, "build", "main", "")
 	if !errors.Is(err, ErrIterationBranchExists) {
 		t.Errorf("expected ErrIterationBranchExists, got %v", err)
@@ -157,10 +157,10 @@ func TestResumeIterationBranch_HappyPath(t *testing.T) {
 	fake.resolveMap["refs/heads/1-build/dev_a/iter-1"] = "matchingsha0000000000000000000000000000"
 	fake.resolveMap["refs/remotes/origin/1-build/dev_a/iter-1"] = "matchingsha0000000000000000000000000000"
 
-	branchName, err := wf.ResumeIterationBranch("7:1:dev_a", 1,
+	branchName, err := wf.resumeIterationBranch("7:1:dev_a", 1,
 		"dev_a", "", 1, "build")
 	if err != nil {
-		t.Fatalf("ResumeIterationBranch: %v", err)
+		t.Fatalf("resumeIterationBranch: %v", err)
 	}
 	if branchName != "1-build/dev_a/iter-1" {
 		t.Errorf("branch name: got %q", branchName)
@@ -179,9 +179,9 @@ func TestResumeIterationBranch_AutoHealsStaleLocal(t *testing.T) {
 	fake.resolveMap["refs/heads/1-build/dev_a/iter-1"] = "stalelocal0000000000000000000000000000"
 	fake.resolveMap["refs/remotes/origin/1-build/dev_a/iter-1"] = "originfresh000000000000000000000000000"
 
-	if _, err := wf.ResumeIterationBranch("7:1:dev_a", 1,
+	if _, err := wf.resumeIterationBranch("7:1:dev_a", 1,
 		"dev_a", "", 1, "build"); err != nil {
-		t.Fatalf("ResumeIterationBranch: %v", err)
+		t.Fatalf("resumeIterationBranch: %v", err)
 	}
 	// Auto-heal: local disagreed with origin → SetBranchTo
 	// resets local to origin's hash.
@@ -196,7 +196,7 @@ func TestResumeIterationBranch_AutoHealsStaleLocal(t *testing.T) {
 
 func TestResumeIterationBranch_BranchMissing(t *testing.T) {
 	wf, _ := makeWorkflow(t)
-	_, err := wf.ResumeIterationBranch("7:1:dev_a", 1,
+	_, err := wf.resumeIterationBranch("7:1:dev_a", 1,
 		"dev_a", "", 1, "build")
 	if !errors.Is(err, ErrIterationBranchMissing) {
 		t.Errorf("expected ErrIterationBranchMissing, got %v", err)
@@ -221,7 +221,7 @@ func TestResetCleanWorktree(t *testing.T) {
 func TestStartIterationBranch_TraceNarrates(t *testing.T) {
 	wf, _ := makeWorkflow(t)
 	// resolveMap is empty → ResolveRef("main") fails.
-	_, err := wf.StartIterationBranch("7:1:x", 1, ForkFromRunBranch,
+	_, err := wf.startIterationBranch("7:1:x", 1, ForkFromRunBranch,
 		"x", "", 1, "build", "main", "")
 	if err == nil {
 		t.Fatal("expected error when fork base missing")
@@ -230,7 +230,7 @@ func TestStartIterationBranch_TraceNarrates(t *testing.T) {
 	if !errors.As(err, &opErr) {
 		t.Fatalf("expected *WorkflowOpError, got %T: %v", err, err)
 	}
-	if opErr.Op != "StartIterationBranch" {
+	if opErr.Op != "startIterationBranch" {
 		t.Errorf("Op: got %q", opErr.Op)
 	}
 	stepStatus := map[string]string{}
@@ -259,10 +259,10 @@ func TestResumeIterationBranch_TraceShowsAutoHeal(t *testing.T) {
 	fake.resolveMap["refs/heads/1-build/dev_a/iter-1"] = "stalelocal0000000000000000000000000000"
 	fake.resolveMap["refs/remotes/origin/1-build/dev_a/iter-1"] = "originfresh000000000000000000000000000"
 
-	_, err := wf.ResumeIterationBranch("7:1:dev_a", 1,
+	_, err := wf.resumeIterationBranch("7:1:dev_a", 1,
 		"dev_a", "", 1, "build")
 	if err != nil {
-		t.Fatalf("ResumeIterationBranch: %v", err)
+		t.Fatalf("resumeIterationBranch: %v", err)
 	}
 	// Success — no error to inspect, but the test value of the
 	// trace is in the failure case. Inject a Checkout failure to
@@ -278,7 +278,7 @@ func TestResumeIterationBranch_TraceShowsAutoHeal(t *testing.T) {
 		defaultBranch: "main",
 		logger:        nullLogger(),
 	}
-	_, err = wf2.ResumeIterationBranch("7:1:dev_a", 1,
+	_, err = wf2.resumeIterationBranch("7:1:dev_a", 1,
 		"dev_a", "", 1, "build")
 	if err == nil {
 		t.Fatal("expected checkout failure")
@@ -307,11 +307,11 @@ func TestStartIterationBranch_PriorIterationFork(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.resolveMap["1-build/dev_a/iter-1"] = "prior_iter_sha000000000000000000000000"
 
-	branchName, err := wf.StartIterationBranch("7:1:dev_a", 2,
+	branchName, err := wf.startIterationBranch("7:1:dev_a", 2,
 		ForkFromPriorIteration,
 		"dev_a", "", 1, "build", "main", "")
 	if err != nil {
-		t.Fatalf("StartIterationBranch: %v", err)
+		t.Fatalf("startIterationBranch: %v", err)
 	}
 	if branchName != "1-build/dev_a/iter-2" {
 		t.Errorf("branch name: got %q", branchName)

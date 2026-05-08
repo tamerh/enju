@@ -16,8 +16,8 @@ import (
 // buildSubmitTrailers.
 //
 // PRECONDITION: the daemon has already prepared the worktree by
-// calling StartIterationBranch / ResumeIterationBranch /
-// MaterializeUpstreamForReview as appropriate. SubmitTaskResult
+// calling startIterationBranch / resumeIterationBranch /
+// materializeUpstreamForReview as appropriate. SubmitTaskResult
 // switches to the composed branch (creating it if missing); if
 // creation is required AND the daemon didn't pre-prepare,
 // SubmitTaskResult forks from the run branch (the safe default).

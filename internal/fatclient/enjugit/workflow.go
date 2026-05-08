@@ -19,8 +19,8 @@ import (
 //
 // Concrete verbs live in:
 //
-//   - state_prep.go   — MaterializeUpstreamForReview, StartIterationBranch,
-//                       ResumeIterationBranch, WipeIterationWrites,
+//   - state_prep.go   — materializeUpstreamForReview, startIterationBranch,
+//                       resumeIterationBranch, WipeIterationWrites,
 //                       ResetCleanWorktree
 //   - producing.go    — SubmitTaskResult, AutoMergeAcceptedTopic,
 //                       CommitTemplateBundle
@@ -123,11 +123,6 @@ func (w *Workflow) HeadCommitTime() time.Time {
 	}
 	return time.Time{}
 }
-
-// Conventions returns the conventions this workflow was built
-// with. Useful for diagnostic surfaces that want to render the
-// same names workflow uses.
-func (w *Workflow) Conventions() Conventions { return w.convs }
 
 // EnsureOrigin self-heals the on-disk origin remote when something
 // (the project package's claim/pull paths) wipes the

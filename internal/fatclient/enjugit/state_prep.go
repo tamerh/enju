@@ -7,7 +7,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
-// MaterializeUpstreamForReview puts the upstream task's tip on
+// materializeUpstreamForReview puts the upstream task's tip on
 // disk in detached HEAD state. NO local branch ref is created or
 // modified. Used by review tasks before claude -p reads the
 // developer's content.
@@ -26,11 +26,11 @@ import (
 // Errors:
 //   - ErrUpstreamNotFound: upstreamBranch doesn't exist on origin.
 //   - any git error translated via translateGitError.
-func (w *Workflow) MaterializeUpstreamForReview(upstreamBranch string) error {
+func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 	if upstreamBranch == "" {
-		return fmt.Errorf("enjugit: MaterializeUpstreamForReview: upstreamBranch is required")
+		return fmt.Errorf("enjugit: materializeUpstreamForReview: upstreamBranch is required")
 	}
-	trace := startTrace("MaterializeUpstreamForReview")
+	trace := startTrace("materializeUpstreamForReview")
 	trace.ctx("upstream_branch", upstreamBranch)
 
 	// Step 1: fetch (best-effort).
@@ -68,7 +68,7 @@ func (w *Workflow) MaterializeUpstreamForReview(upstreamBranch string) error {
 	return nil
 }
 
-// StartIterationBranch creates a fresh iter-N topic branch
+// startIterationBranch creates a fresh iter-N topic branch
 // according to ForkPoint policy. Branch name composed from
 // Conventions.BranchName.
 //
@@ -93,7 +93,7 @@ func (w *Workflow) MaterializeUpstreamForReview(upstreamBranch string) error {
 //   - ErrIterationBranchExists: branch already exists locally.
 //   - ErrForkBaseNotFound: fork-base ref couldn't be resolved.
 //   - any git error translated.
-func (w *Workflow) StartIterationBranch(
+func (w *Workflow) startIterationBranch(
 	taskID string,
 	iterSeq int,
 	fork ForkPoint,
@@ -105,7 +105,7 @@ func (w *Workflow) StartIterationBranch(
 		return "", fmt.Errorf("%w: caller must specify ForkPoint", ErrInvalidForkPoint)
 	}
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
-	trace := startTrace("StartIterationBranch")
+	trace := startTrace("startIterationBranch")
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("fork_point", fork.String())
@@ -182,7 +182,7 @@ func (w *Workflow) StartIterationBranch(
 	return branchName, nil
 }
 
-// ResumeIterationBranch switches to an existing iter-N topic
+// resumeIterationBranch switches to an existing iter-N topic
 // branch (request_changes revision case where iter_seq stays the
 // same). Errors if the branch doesn't exist locally.
 //
@@ -201,7 +201,7 @@ func (w *Workflow) StartIterationBranch(
 //
 // Errors:
 //   - ErrIterationBranchMissing: no local ref for the iter branch.
-func (w *Workflow) ResumeIterationBranch(
+func (w *Workflow) resumeIterationBranch(
 	taskID string,
 	iterSeq int,
 	taskDef, instanceKey string,
@@ -209,7 +209,7 @@ func (w *Workflow) ResumeIterationBranch(
 	runSlug string,
 ) (string, error) {
 	branchName := w.convs.BranchName(runSeq, runSlug, taskDef, instanceKey, iterSeq)
-	trace := startTrace("ResumeIterationBranch")
+	trace := startTrace("resumeIterationBranch")
 	trace.ctx("task_id", taskID)
 	trace.ctx("branch", branchName)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", iterSeq))

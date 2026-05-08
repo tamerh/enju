@@ -10,7 +10,7 @@ import (
 
 func TestSubmitTaskResult_HappyPath(t *testing.T) {
 	wf, fake := makeWorkflow(t)
-	// Pre-stage: branch exists locally (daemon called StartIterationBranch).
+	// Pre-stage: branch exists locally (daemon called startIterationBranch).
 	fake.resolveMap["refs/heads/1-build/dev_a/iter-1"] = "currenttip"
 
 	req := SubmitRequest{
