@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
@@ -88,6 +89,126 @@ func TestPromoteWorkingTreeToBare(t *testing.T) {
 	}
 	if origin.URLs[0] != bare {
 		t.Errorf("origin URL: got %q, want %q", origin.URLs[0], bare)
+	}
+}
+
+// TestPromoteWorkingTreeToBare_TransfersAllBranches exercises the
+// mirror-refspec path inside PromoteWorkingTreeToBare. The basic
+// TestPromoteWorkingTreeToBare above only seeds main, so it
+// wouldn't catch a regression where the bare ends up with HEAD-only
+// (gogit's PlainClone(bare=true) default). Bots fork topic branches
+// off main → if the bare is missing the operator's other branches,
+// pushes from those branches break. Originally lived in project
+// package as TestPromoteWorkingTreeToBare_HappyPath.
+func TestPromoteWorkingTreeToBare_TransfersAllBranches(t *testing.T) {
+	tmp := t.TempDir()
+	wt := filepath.Join(tmp, "op-tree")
+	bare := filepath.Join(tmp, "repos", "demo.git")
+
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := gogit.PlainInitWithOptions(wt, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _ := repo.Worktree()
+	if err := os.WriteFile(filepath.Join(wt, "README.md"), []byte("# op\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.Add("README.md")
+	w.Commit("seed", &gogit.CommitOptions{All: true})
+	headRef, _ := repo.Head()
+	for _, name := range []string{"smoke-1", "smoke-2"} {
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(name), headRef.Hash())
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := PromoteWorkingTreeToBare(wt, bare); err != nil {
+		t.Fatalf("PromoteWorkingTreeToBare: %v", err)
+	}
+
+	bareRepo, err := gogit.PlainOpen(bare)
+	if err != nil {
+		t.Fatalf("open bare: %v", err)
+	}
+	cfg, _ := bareRepo.Config()
+	if !cfg.Core.IsBare {
+		t.Errorf("expected bare repo, got non-bare")
+	}
+	wantBranches := map[string]bool{"main": false, "smoke-1": false, "smoke-2": false}
+	iter, _ := bareRepo.Branches()
+	_ = iter.ForEach(func(ref *plumbing.Reference) error {
+		if _, ok := wantBranches[ref.Name().Short()]; ok {
+			wantBranches[ref.Name().Short()] = true
+		}
+		return nil
+	})
+	for name, found := range wantBranches {
+		if !found {
+			t.Errorf("bare missing branch %q", name)
+		}
+	}
+}
+
+// TestPromoteWorkingTreeToBare_ReplacesExistingOrigin pins the
+// defensive contract: an operator's adopted folder may already
+// have an `origin` pointing at an old GitHub URL they're
+// abandoning. Promoting must replace it, not silently leave the
+// stale origin in place — otherwise future pushes route to the
+// wrong remote.
+func TestPromoteWorkingTreeToBare_ReplacesExistingOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	wt := filepath.Join(tmp, "op-tree")
+	bare := filepath.Join(tmp, "repos", "demo.git")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := gogit.PlainInitWithOptions(wt, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _ := repo.Worktree()
+	os.WriteFile(filepath.Join(wt, "README.md"), []byte("# op\n"), 0o644)
+	w.Add("README.md")
+	w.Commit("seed", &gogit.CommitOptions{All: true})
+
+	if _, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{"https://example.com/old-remote.git"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PromoteWorkingTreeToBare(wt, bare); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, _ = gogit.PlainOpen(wt)
+	cfg, _ := repo.Config()
+	if got := cfg.Remotes["origin"].URLs[0]; got != bare {
+		t.Errorf("expected origin replaced with %q, got %v", bare, got)
+	}
+}
+
+// TestPromoteWorkingTreeToBare_RejectsNonGitDir verifies the input
+// validation: pointing the promote at a directory that isn't a git
+// working tree must return an error rather than silently corrupting
+// the destination bare. Originally a separate test in project package.
+func TestPromoteWorkingTreeToBare_RejectsNonGitDir(t *testing.T) {
+	tmp := t.TempDir()
+	notARepo := filepath.Join(tmp, "plain-dir")
+	_ = os.MkdirAll(notARepo, 0o755)
+	bare := filepath.Join(tmp, "repos", "demo.git")
+
+	if err := PromoteWorkingTreeToBare(notARepo, bare); err == nil {
+		t.Fatal("expected error when source is not a git working tree")
 	}
 }
 
