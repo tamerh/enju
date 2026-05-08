@@ -155,7 +155,7 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	return &result, nil
 }
 
-// AutoMergeAcceptedTopic merges a topic branch into a target
+// MergeAcceptedTopic merges a topic branch into a target
 // branch. Tries fast-forward first; falls back to a no-FF merge
 // commit when the target has advanced past the topic's fork point.
 //
@@ -179,16 +179,16 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 //   - ErrMergeConflict (carries paths via *ErrConflict): real file conflict.
 //     Caller (service) spawns a merge_resolve task in response.
 //   - ErrCannotAutoMerge: anything else that prevents the merge.
-func (w *Workflow) AutoMergeAcceptedTopic(topic, target string, author MergeAuthor) (string, error) {
+func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) (string, error) {
 	if topic == "" || target == "" {
-		return "", fmt.Errorf("enjugit: AutoMergeAcceptedTopic: topic and target required")
+		return "", fmt.Errorf("enjugit: MergeAcceptedTopic: topic and target required")
 	}
 	authorName, authorEmail := w.mergeAuthorIdentity(author)
 	trailers := buildMergeTrailers(author)
 	subject := fmt.Sprintf("Merge %s into %s", topic, target)
 	message := composeCommitMessage(w.convs, subject, "", trailers)
 
-	trace := startTrace("AutoMergeAcceptedTopic")
+	trace := startTrace("MergeAcceptedTopic")
 	trace.ctx("topic", topic)
 	trace.ctx("target", target)
 	trace.ctx("trigger_task", author.TaskID)

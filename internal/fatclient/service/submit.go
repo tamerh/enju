@@ -751,12 +751,12 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 			TaskID:       taskID,
 			AutoOrManual: "auto",
 		}
-		// AutoMergeAcceptedTopic checks out the target branch
+		// MergeAcceptedTopic checks out the target branch
 		// internally so HEAD ends up on the run branch after
 		// the merge — no explicit checkout-back needed in
 		// service. See enjugit/producing.go's checkout-target
 		// step (added to fix the lost-commit regression).
-		_, mergeErr := wf.AutoMergeAcceptedTopic(topicBranch, runBranch, mergeAuthor)
+		_, mergeErr := wf.MergeAcceptedTopic(topicBranch, runBranch, mergeAuthor)
 		if mergeErr != nil {
 			// Conflict: the accept stood, but the post-accept
 			// merge can't reconcile two parallel siblings.

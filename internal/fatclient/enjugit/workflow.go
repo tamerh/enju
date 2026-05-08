@@ -19,13 +19,12 @@ import (
 //
 // Concrete verbs live in:
 //
-//   - state_prep.go   — materializeUpstreamForReview, startIterationBranch,
-//                       resumeIterationBranch, WipeIterationWrites,
-//                       ResetCleanWorktree
-//   - producing.go    — SubmitTaskResult, AutoMergeAcceptedTopic,
-//                       CommitTemplateBundle
+//   - state_prep.go   — EnsureRunBranch, ResetCleanWorktree
+//                       (+ unexported iteration-branch lifecycle)
+//   - producing.go    — SubmitTaskResult, MergeAcceptedTopic
+//   - producing_batch.go — SubmitBatch (multi-task atomic submit)
 //   - sync_read.go    — FetchAllRefs, ReadFileAtCommit
-//   - lifecycle.go    — EnsureBareRemote, SetRemote
+//   - lifecycle.go    — EnsureOrigin, SetRemote
 type Workflow struct {
 	// git is the plumbing layer. Workflow holds the interface,
 	// not the concrete *git.Clone, so tests can pass a fake.

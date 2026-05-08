@@ -157,7 +157,7 @@ type CommitArbitraryFilesResult struct {
 type MergeAuthor struct {
 	// Citizen is the actor whose acceptance triggered this merge.
 	// Empty Citizen means "system" (auto-merge during reconcile).
-	// Workflow.AutoMergeAcceptedTopic uses this to choose between
+	// Workflow.MergeAcceptedTopic uses this to choose between
 	// system author and citizen author per spec.
 	Citizen Identity
 

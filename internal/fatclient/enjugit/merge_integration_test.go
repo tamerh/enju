@@ -1,6 +1,6 @@
 package enjugit
 
-// Real-bare integration test for Workflow.AutoMergeAcceptedTopic.
+// Real-bare integration test for Workflow.MergeAcceptedTopic.
 // The fake-ops unit tests in producing_test.go already cover the
 // FF path, non-FF fallback, conflict translation, and trace shape.
 // This file pins the end-to-end shape: parallel siblings actually
@@ -84,7 +84,7 @@ func TestAutoMergeAcceptedTopic_NonFFDisjointWritesIntegration(t *testing.T) {
 	}
 
 	// First merge: topic-a → main. Same fork point → FF path.
-	if _, err := wf.AutoMergeAcceptedTopic("topic-a", "main",
+	if _, err := wf.MergeAcceptedTopic("topic-a", "main",
 		MergeAuthor{
 			TaskID:       "task-a",
 			AutoOrManual: "auto",
@@ -95,7 +95,7 @@ func TestAutoMergeAcceptedTopic_NonFFDisjointWritesIntegration(t *testing.T) {
 
 	// Second merge: topic-b → main. Main has advanced; non-FF
 	// path triggers a real merge commit.
-	if _, err := wf.AutoMergeAcceptedTopic("topic-b", "main",
+	if _, err := wf.MergeAcceptedTopic("topic-b", "main",
 		MergeAuthor{
 			TaskID:       "task-b",
 			AutoOrManual: "auto",

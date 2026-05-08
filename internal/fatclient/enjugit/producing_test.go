@@ -195,10 +195,10 @@ func TestSubmitTaskResult_TraceNarratesSteps(t *testing.T) {
 // caller no longer cares about.
 func TestAutoMergeAcceptedTopic_LeavesHeadOnTarget(t *testing.T) {
 	wf, fake := makeWorkflow(t)
-	_, err := wf.AutoMergeAcceptedTopic("topic", "main",
+	_, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "x", AutoOrManual: "auto"})
 	if err != nil {
-		t.Fatalf("AutoMergeAcceptedTopic: %v", err)
+		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
 	// The trace must show checkout-target executed BEFORE
 	// merge-ff. Without that ordering, HEAD would stay on the
@@ -223,7 +223,7 @@ func TestAutoMergeAcceptedTopic_TraceNarrates(t *testing.T) {
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)
 	fake.inject("MergeWithCommit", &git.ErrConflict{Paths: []string{"a.go"}})
 
-	_, err := wf.AutoMergeAcceptedTopic("topic", "main",
+	_, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "x", AutoOrManual: "auto"})
 	if err == nil {
 		t.Fatal("expected error from injected conflict")
@@ -253,10 +253,10 @@ func TestAutoMergeAcceptedTopic_TraceNarrates(t *testing.T) {
 func TestAutoMergeAcceptedTopic_FastForward(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 
-	tip, err := wf.AutoMergeAcceptedTopic("topic", "main",
+	tip, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
 	if err != nil {
-		t.Fatalf("AutoMergeAcceptedTopic: %v", err)
+		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
 	if tip != "ffsha" {
 		t.Errorf("expected FF tip, got %q", tip)
@@ -277,10 +277,10 @@ func TestAutoMergeAcceptedTopic_NonFFFallsBackToMergeCommit(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)
 
-	tip, err := wf.AutoMergeAcceptedTopic("topic", "main",
+	tip, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
 	if err != nil {
-		t.Fatalf("AutoMergeAcceptedTopic: %v", err)
+		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
 	if tip != "mergesha" {
 		t.Errorf("expected merge-commit tip, got %q", tip)
@@ -297,7 +297,7 @@ func TestAutoMergeAcceptedTopic_ConflictTranslated(t *testing.T) {
 		Paths: []string{"src/foo.go", "src/bar.go"},
 	})
 
-	_, err := wf.AutoMergeAcceptedTopic("topic", "main",
+	_, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
 	if !errors.Is(err, ErrMergeConflict) {
 		t.Fatalf("expected ErrMergeConflict, got %v", err)
@@ -315,7 +315,7 @@ func TestAutoMergeAcceptedTopic_AutoUsesSystemAuthor(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)
 
-	wf.AutoMergeAcceptedTopic("topic", "main",
+	wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "x", AutoOrManual: "auto"})
 
 	mc := fake.lastCall("MergeWithCommit")
@@ -328,7 +328,7 @@ func TestAutoMergeAcceptedTopic_ManualUsesCitizen(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)
 
-	wf.AutoMergeAcceptedTopic("topic", "main",
+	wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{
 			TaskID:       "x",
 			AutoOrManual: "manual",

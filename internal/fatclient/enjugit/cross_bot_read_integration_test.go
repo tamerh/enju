@@ -390,7 +390,7 @@ func TestCrossBotRead_ParallelWrites_ReaderSeesBothIntegration(t *testing.T) {
 // since the merge.
 //
 // Maps project's MergeBranchToCommit to enjugit's
-// AutoMergeAcceptedTopic (the higher-level Workflow merge verb).
+// MergeAcceptedTopic (the higher-level Workflow merge verb).
 func TestCrossBotRead_AfterAutoMerge_ReaderSeesMainIntegration(t *testing.T) {
 	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
 
@@ -408,7 +408,7 @@ func TestCrossBotRead_AfterAutoMerge_ReaderSeesMainIntegration(t *testing.T) {
 
 	// Auto-merge the topic onto main (FF case — main hasn't
 	// advanced since topic forked from it).
-	if _, err := developer.AutoMergeAcceptedTopic("topic-merged", "main",
+	if _, err := developer.MergeAcceptedTopic("topic-merged", "main",
 		MergeAuthor{
 			TaskID:       "7:1:dev",
 			AutoOrManual: "auto",
@@ -467,7 +467,7 @@ func TestCrossBotRead_SequentialMerges_ReaderTracksMainIntegration(t *testing.T)
 		}
 		iters[i].sha = res.CommitSHA
 		// FF-merge each iteration onto main before the next.
-		if _, err := developer.AutoMergeAcceptedTopic(iters[i].topic, "main",
+		if _, err := developer.MergeAcceptedTopic(iters[i].topic, "main",
 			MergeAuthor{
 				TaskID:       "7:1:dev",
 				AutoOrManual: "auto",
