@@ -46,7 +46,6 @@ import (
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -107,7 +106,7 @@ type testServer struct {
 	url           string
 	bareBaseDir   string // base directory containing per-project bare remotes
 	workspaceDir  string // base directory for fat-client working clones
-	project       *project.Opener
+	enjugit       *enjugit.Workspace
 	store         *store.Store // direct store access for testing reaper/internals
 	lastRunID     string       // "projectID:runSeq" of last submitted run
 	lastProjectID int64
@@ -208,7 +207,9 @@ func newTestServer(t *testing.T) *testServer {
 	t.Cleanup(func() { es.Close() })
 	st.AttachEventStore(es)
 
-	ws, err := project.NewOpener(workspaceDir, logger)
+	ws, err := enjugit.NewWorkspace(workspaceDir,
+		enjugit.NewProductionConventions(),
+		enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +224,7 @@ func newTestServer(t *testing.T) *testServer {
 		url:          ts.URL,
 		bareBaseDir:  bareBaseDir,
 		workspaceDir: workspaceDir,
-		project:      ws,
+		enjugit:      ws,
 		store:        st,
 		remotes:      make(map[int64]string),
 		tokens:       make(map[string]string),
@@ -796,7 +797,7 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		s.t.Fatalf("project %d has no remote_url configured", projectID)
 	}
 
-	proj, err := s.project.ForProject(projectID, remoteURL)
+	wf, err := s.enjugit.ForProject(projectID, remoteURL)
 	if err != nil {
 		s.t.Fatalf("open project %d: %v", projectID, err)
 	}
@@ -915,7 +916,6 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 		}
 	}
 
-	wf := enjugit.WorkflowFromShared(proj.GitClone(), projectID, proj.DefaultBranch(), nil)
 	enjuFiles := make([]enjugit.FileWrite, len(files))
 	for i, f := range files {
 		enjuFiles[i] = enjugit.FileWrite{
@@ -924,15 +924,13 @@ func (s *testServer) fatClientSubmitWithDecisionAs(taskIDShort, asUser, content 
 			Mode:        f.Mode,
 		}
 	}
-	proj.Lock()
 	res, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
 		TaskID:         fullTaskID,
-		BranchOverride: proj.DefaultBranch(),
+		BranchOverride: wf.DefaultBranch(),
 		Files:          enjuFiles,
 		ArtifactPaths:  artifactPaths,
 		Citizen:        enjugit.Identity{Name: "Test Citizen", Email: "test@enju.local"},
 	})
-	proj.Unlock()
 	if err != nil {
 		// Surface client-side submit failures (path
 		// traversal rejected by wt.Add, malformed files,
@@ -1152,13 +1150,11 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		// on this path will surface the issue loudly.
 		return desc
 	}
-	proj, err := s.project.ForProject(projectID, remoteURL)
+	wf, err := s.enjugit.ForProject(projectID, remoteURL)
 	if err != nil {
 		s.t.Fatalf("open project: %v", err)
 	}
-	proj.Lock()
-	_ = proj.GitClone().PullBranch(proj.DefaultBranch())
-	proj.Unlock()
+	_ = wf.PullBranch(wf.DefaultBranch())
 
 	input := enjugit.ResolveInput{
 		PromptTemplate:     d.PromptTemplate,
@@ -1205,7 +1201,6 @@ func (s *testServer) taskInputs(taskID string) map[string]interface{} {
 		})
 	}
 
-	wf := enjugit.WorkflowFromShared(proj.GitClone(), projectID, proj.DefaultBranch(), nil)
 	resolved, err := wf.Resolve(input)
 	if err != nil {
 		s.t.Fatalf("resolve: %v", err)

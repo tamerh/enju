@@ -296,7 +296,7 @@ func newTestClientFor(t *testing.T, h *mcpHarness, username, displayName string)
 		CitizenEmail:   cz.Email,
 		AuthToken:      cz.Token,
 		ModelName:      "test-model",
-		WorkspaceRoot:  h.project.RootDir(),
+		WorkspaceRoot:  h.enjugit.RootDir(),
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return mcphandlers.NewTestClient(cfg)
