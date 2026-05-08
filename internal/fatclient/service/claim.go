@@ -203,7 +203,17 @@ func (s *FatClient) ClaimTask(ctx context.Context, params ClaimParams) (*ClaimRe
 	preMeta, preMetaErr := s.FetchTaskMeta(ctx, params.TaskID)
 	if preMetaErr == nil && preMeta != nil && s.UseFatClient(preMeta) {
 		if wf, _, _, _, perr := s.OpenWorkflow(ctx, preMeta.ProjectID); perr == nil && wf != nil {
-			_ = s.PullBranchWithReconcileWF(ctx, wf, preMeta.ProjectID, preMeta.Branch)
+			// Pre-claim reconcile must succeed — without it, the
+			// worktree may sit on a stale branch (or the initial
+			// commit on a brand-new bot clone), causing the
+			// handler to run with no upstream context and produce
+			// nothing useful. Failing here is preferable to the
+			// silent-skip-then-empty-output footgun: the operator
+			// sees a clear "couldn't refresh local clone" instead
+			// of a successful-but-empty submission.
+			if err := s.PullBranchWithReconcileWF(ctx, wf, preMeta.ProjectID, preMeta.Branch); err != nil {
+				return nil, fmt.Errorf("pre-claim reconcile for task %s on branch %q: %w", preMeta.ID, preMeta.Branch, err)
+			}
 		}
 	}
 

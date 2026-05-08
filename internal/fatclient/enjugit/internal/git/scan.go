@@ -256,9 +256,27 @@ func (c *Clone) CheckoutBranch(branch string) error {
 	if branch == "" {
 		return nil
 	}
-	refName := plumbing.NewBranchReferenceName(branch)
-	if _, err := c.repo.Reference(refName, true); err != nil {
+	// Auto-track-from-origin: a fresh per-bot clone has
+	// refs/remotes/origin/<branch> after fetch but no local
+	// refs/heads/<branch> until something explicitly creates one.
+	// Plant the local ref from origin tracking before checking
+	// out, so first-claim flows on a brand-new bot clone don't
+	// fail with "ref not found" against a branch that origin
+	// clearly has. Same pattern as MergeFFOrFail's target
+	// resolution. Returns ErrRefNotFound only when neither
+	// local nor origin tracking has the branch — the genuinely-
+	// unknown case.
+	if _, err := c.resolveLocalOrPlantFromOrigin(branch); err != nil {
 		return fmt.Errorf("%w: %s", ErrRefNotFound, branch)
+	}
+	refName := plumbing.NewBranchReferenceName(branch)
+	// Same-branch fast path: HEAD already on the target. wt.Checkout
+	// would refuse on a dirty tree, but a same-branch transition is
+	// a no-op in real terms — nothing to update. Skip the call so
+	// dirty trees (chmod-edited scripts, in-progress edits) don't
+	// fail pre-claim reconcile.
+	if head, err := c.repo.Head(); err == nil && head.Name() == refName {
+		return nil
 	}
 	wt, err := c.repo.Worktree()
 	if err != nil {

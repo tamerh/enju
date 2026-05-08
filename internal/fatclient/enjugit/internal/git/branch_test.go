@@ -155,6 +155,76 @@ func TestCheckout_RefNotFound(t *testing.T) {
 	}
 }
 
+// TestCheckoutBranch_TargetOnlyOnOrigin pins the bot-clone fix:
+// when a brand-new clone has refs/remotes/origin/<branch> but
+// no local refs/heads/<branch> (no explicit tracking yet),
+// CheckoutBranch must auto-plant the local ref from origin
+// tracking and proceed. Without the fix, first-claim flows on
+// a freshly-registered bot's clone fail with "ref not found"
+// against a branch that origin clearly has — the daemon then
+// either errors (good) or silently falls through and runs the
+// LLM in a stale state (bad, observed in the wild).
+//
+// Mirrors TestMergeFFOrFail_TargetOnlyOnOrigin (same fix shape,
+// different surface).
+func TestCheckoutBranch_TargetOnlyOnOrigin(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	// Push a run branch "build-1" to the bare via the seed
+	// clone. Then produce the bot-clone pre-state by fresh-
+	// cloning + fetching: the new clone sees only
+	// refs/remotes/origin/build-1, no local refs/heads/build-1.
+	rootSHA, _, _ := c.Head()
+	c.CreateBranchAt("build-1", rootSHA)
+	c.Checkout("build-1")
+	commitOneFile(t, c, "run-marker.txt", []byte("run"))
+	if err := c.Push("build-1"); err != nil {
+		t.Fatalf("seed push build-1: %v", err)
+	}
+
+	bot := freshClone(t, bare)
+	if err := bot.Fetch(); err != nil {
+		t.Fatalf("bot fetch: %v", err)
+	}
+	if _, err := bot.resolveLocalRef("build-1"); err == nil {
+		t.Fatal("precondition failure: bot clone unexpectedly has local build-1; reproducer is invalid")
+	}
+
+	// CheckoutBranch should auto-plant local build-1 from
+	// origin/build-1 and succeed.
+	if err := bot.CheckoutBranch("build-1"); err != nil {
+		t.Fatalf("CheckoutBranch on origin-only branch: %v", err)
+	}
+
+	// Verify: refs/heads/build-1 exists post-checkout.
+	if _, err := bot.resolveLocalRef("build-1"); err != nil {
+		t.Errorf("expected local build-1 ref planted post-checkout, got %v", err)
+	}
+
+	// Verify: HEAD is on build-1 + worktree carries the
+	// branch's content (run-marker.txt from the upstream commit).
+	if _, err := os.Stat(filepath.Join(bot.workDir, "run-marker.txt")); err != nil {
+		t.Errorf("worktree should carry build-1's content post-checkout: %v", err)
+	}
+}
+
+// TestCheckoutBranch_GenuinelyMissing covers the other side: a
+// branch that origin doesn't have either should still surface
+// ErrRefNotFound. The auto-track fallback only fires when the
+// origin tracking ref exists.
+func TestCheckoutBranch_GenuinelyMissing(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	err := c.CheckoutBranch("nonexistent")
+	if !errors.Is(err, ErrRefNotFound) {
+		t.Errorf("expected ErrRefNotFound for branch that's not local AND not on origin, got %v", err)
+	}
+}
+
 func TestCheckoutCommit_DetachedHEAD(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
