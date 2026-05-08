@@ -215,6 +215,220 @@ func TestCrossBotRead_LazyFetchPropagatesAllBranchesIntegration(t *testing.T) {
 	}
 }
 
+// openThreeBotWorkflowsForRead extends openTwoBotWorkflowsForRead
+// for tests that need a third reader (e.g. reviewer-bot watching
+// alice + bob produce in parallel). Same projectID, three
+// distinct on-disk clones, one shared bare.
+func openThreeBotWorkflowsForRead(t *testing.T) (alice, bob, carol *Workflow, bare string) {
+	t.Helper()
+	bare = initBareForWorkspaceTest(t)
+
+	projectHome := t.TempDir()
+	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+
+	for _, e := range []struct {
+		name    string
+		out     **Workflow
+	}{
+		{"alice", &alice},
+		{"bob", &bob},
+		{"carol", &carol},
+	} {
+		path := filepath.Join(projectHome, "enju", "bots", e.name, "clone")
+		c, err := ws.OpenBotCloneAt(7, path, bare)
+		if err != nil {
+			t.Fatalf("%s clone: %v", e.name, err)
+		}
+		*e.out = c
+	}
+	return alice, bob, carol, bare
+}
+
+// TestCrossBotRead_ParallelWrites_ReaderSeesBothIntegration pins
+// the parallel-bot scenario: two developer bots push different
+// topic branches concurrently, a reviewer reads both. Without the
+// reader-side fetch, reviewer would see one branch's content (or
+// none) depending on which one happens to be in its local object
+// DB. With the lazy fetch, both reads succeed.
+//
+// This is the multi-developer pattern (dev_a + dev_b in parallel,
+// reviewer judges combined output) the parallel-merge work was
+// supposed to enable end-to-end. The push side already worked;
+// this test pins that the read side does too.
+func TestCrossBotRead_ParallelWrites_ReaderSeesBothIntegration(t *testing.T) {
+	alice, bob, carol, _ := openThreeBotWorkflowsForRead(t)
+
+	// Alice + bob push concurrently to disjoint topic branches.
+	type result struct {
+		sha string
+		err error
+	}
+	results := make([]result, 2)
+	done := make(chan struct{}, 2)
+	go func() {
+		res, err := alice.SubmitTaskResult(SubmitRequest{
+			TaskID:         "7:1:dev_a",
+			BranchOverride: "topic-a",
+			Citizen:        Identity{Name: "alice", Email: "alice@example.com"},
+			Files:          []FileWrite{{RepoRelPath: "out/a.md", Content: []byte("alice work\n")}},
+		})
+		if err != nil {
+			results[0] = result{err: err}
+		} else {
+			results[0] = result{sha: res.CommitSHA}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		res, err := bob.SubmitTaskResult(SubmitRequest{
+			TaskID:         "7:1:dev_b",
+			BranchOverride: "topic-b",
+			Citizen:        Identity{Name: "bob", Email: "bob@example.com"},
+			Files:          []FileWrite{{RepoRelPath: "out/b.md", Content: []byte("bob work\n")}},
+		})
+		if err != nil {
+			results[1] = result{err: err}
+		} else {
+			results[1] = result{sha: res.CommitSHA}
+		}
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("parallel push %d: %v", i, r.err)
+		}
+	}
+	aliceSHA, bobSHA := results[0].sha, results[1].sha
+
+	// Carol (reviewer-bot) reads both. First read triggers a
+	// fetch that brings in BOTH topic branches; the second is a
+	// pure local lookup.
+	body, found, rerr := carol.ReadFileAtCommit(aliceSHA, "out/a.md")
+	if rerr != nil || !found || string(body) != "alice work\n" {
+		t.Errorf("carol read alice: body=%q found=%v err=%v", body, found, rerr)
+	}
+	body, found, rerr = carol.ReadFileAtCommit(bobSHA, "out/b.md")
+	if rerr != nil || !found || string(body) != "bob work\n" {
+		t.Errorf("carol read bob: body=%q found=%v err=%v", body, found, rerr)
+	}
+}
+
+// TestCrossBotRead_AfterAutoMerge_ReaderSeesMainIntegration pins
+// the FF auto-merge path: developer pushes a topic, auto-merges
+// it onto the run branch (main), reviewer reads main from their
+// own clone. This is the standard answer→review flow with two
+// citizens; pre-fix reviewer's clone might not have fetched main
+// since the merge.
+//
+// Maps project's MergeBranchToCommit to enjugit's
+// AutoMergeAcceptedTopic (the higher-level Workflow merge verb).
+func TestCrossBotRead_AfterAutoMerge_ReaderSeesMainIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	// Developer pushes a topic branch with content.
+	res, err := developer.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:dev",
+		BranchOverride: "topic-merged",
+		Citizen:        Identity{Name: "developer", Email: "d@example.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/feature.go", Content: []byte("// feature\n")}},
+	})
+	if err != nil {
+		t.Fatalf("developer submit: %v", err)
+	}
+	devSHA := res.CommitSHA
+
+	// Auto-merge the topic onto main (FF case — main hasn't
+	// advanced since topic forked from it).
+	if _, err := developer.AutoMergeAcceptedTopic("topic-merged", "main",
+		MergeAuthor{
+			TaskID:       "7:1:dev",
+			AutoOrManual: "auto",
+			Citizen:      Identity{Name: "Developer", Email: "d@example.com"},
+		}); err != nil {
+		t.Fatalf("auto-merge: %v", err)
+	}
+
+	// Reviewer reads main via the merged commit SHA. Reviewer's
+	// clone has not seen this commit yet — the lazy fetch in
+	// ReadFileAtCommit must rescue.
+	body, found, rerr := reviewer.ReadFileAtCommit(devSHA, "src/feature.go")
+	if rerr != nil {
+		t.Fatalf("reviewer read after auto-merge: %v", rerr)
+	}
+	if !found || string(body) != "// feature\n" {
+		t.Errorf("reviewer post-merge: body=%q found=%v", body, found)
+	}
+}
+
+// TestCrossBotRead_SequentialMerges_ReaderTracksMainIntegration
+// pins the review-of-iterating-developer scenario: developer
+// pushes + auto-merges several iterations sequentially; reviewer
+// reads each iteration's commit independently. Earlier reads must
+// not "stick" the reviewer's clone to one revision — every fresh
+// read sees the right SHA's content.
+//
+// Tests across-iterations cross-bot reads, complementing the
+// single-iteration AfterAutoMerge test above. Non-FF merge-commit
+// fallback isn't exercised here (covered by the merge integration
+// suite); this focuses on whether the cross-bot lazy-fetch keeps
+// up with multiple advances on main.
+func TestCrossBotRead_SequentialMerges_ReaderTracksMainIntegration(t *testing.T) {
+	developer, reviewer, _ := openTwoBotWorkflowsForRead(t)
+
+	type iter struct {
+		topic string
+		path  string
+		body  string
+		sha   string
+	}
+	iters := []iter{
+		{topic: "topic-iter1", path: "v1.md", body: "iter1\n"},
+		{topic: "topic-iter2", path: "v2.md", body: "iter2\n"},
+		{topic: "topic-iter3", path: "v3.md", body: "iter3\n"},
+	}
+	for i := range iters {
+		res, err := developer.SubmitTaskResult(SubmitRequest{
+			TaskID:         "7:1:dev",
+			BranchOverride: iters[i].topic,
+			Citizen:        Identity{Name: "developer", Email: "d@x.com"},
+			Files:          []FileWrite{{RepoRelPath: iters[i].path, Content: []byte(iters[i].body)}},
+		})
+		if err != nil {
+			t.Fatalf("dev submit %s: %v", iters[i].topic, err)
+		}
+		iters[i].sha = res.CommitSHA
+		// FF-merge each iteration onto main before the next.
+		if _, err := developer.AutoMergeAcceptedTopic(iters[i].topic, "main",
+			MergeAuthor{
+				TaskID:       "7:1:dev",
+				AutoOrManual: "auto",
+				Citizen:      Identity{Name: "Developer", Email: "d@x.com"},
+			}); err != nil {
+			t.Fatalf("dev merge %s: %v", iters[i].topic, err)
+		}
+	}
+
+	// Reviewer reads each iteration's commit. Reads are
+	// independent — earlier iterations' content shouldn't shadow
+	// later ones, and vice versa.
+	for _, it := range iters {
+		body, found, rerr := reviewer.ReadFileAtCommit(it.sha, it.path)
+		if rerr != nil {
+			t.Errorf("reviewer read %s: %v", it.topic, rerr)
+			continue
+		}
+		if !found {
+			t.Errorf("reviewer found nothing for %s at %s", it.path, it.topic)
+			continue
+		}
+		if string(body) != it.body {
+			t.Errorf("reviewer %s: body=%q want %q", it.topic, body, it.body)
+		}
+	}
+}
+
 // TestCrossBotRead_ProductionRequestChangesShapeIntegration
 // reproduces the exact production failure shape: developer-bot
 // pushes its iter-1 deliverable on the topic branch produced by
