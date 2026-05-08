@@ -21,6 +21,44 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
+// EnsureRunBranch materializes the run branch in the local
+// workspace + on origin so subsequent claim/submit verbs can rely
+// on the run branch being a real git ref instead of just a
+// coordinator-side string.
+//
+// Idempotent — see Workflow.EnsureRunBranch for the case-by-case
+// semantics. Errors are returned as a non-empty warning string
+// (the run already exists on the coordinator side; only the
+// workspace side is in question), matching the snapshot-commit
+// path's "soft-fail with surface-to-user" pattern.
+//
+// Returns "" on success or no-op (no remote configured, branch
+// already present, etc.); non-empty when the operator should
+// know something didn't quite land.
+func (s *FatClient) EnsureRunBranch(ctx context.Context, projectID int64, runData []byte) string {
+	if s.enjugit == nil {
+		return ""
+	}
+	var run map[string]interface{}
+	if err := json.Unmarshal(runData, &run); err != nil {
+		return ""
+	}
+	branch, _ := run["branch"].(string)
+	if branch == "" {
+		return ""
+	}
+	defaultBranch, _ := run["default_branch"].(string)
+
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return fmt.Sprintf("ensure run branch skipped: %v", err)
+	}
+	if err := wf.EnsureRunBranch(branch, defaultBranch); err != nil {
+		return fmt.Sprintf("ensure run branch %q failed: %v", branch, err)
+	}
+	return ""
+}
+
 // RunBranchFromData pulls the `branch` field out of a run JSON
 // payload as returned by GET /runs/{seq} or POST /runs. Empty
 // when the payload is malformed or missing — callers pass the

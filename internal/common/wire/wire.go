@@ -73,6 +73,11 @@ type Run struct {
 	State           string    `json:"state"`
 	TaskCount       int       `json:"task_count"`
 	Branch          string    `json:"branch,omitempty"`
+	// DefaultBranch is the project's default branch at the time
+	// the run was created — fat-clients use it as the fork-base
+	// when EnsureRunBranch needs to materialize a brand-new run
+	// branch. Sent on create/get; empty on older coordinators.
+	DefaultBranch   string    `json:"default_branch,omitempty"`
 	Slug            string    `json:"slug,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	SourcePath      string    `json:"source_path,omitempty"`

@@ -221,6 +221,7 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 		State:      string(store.RunActive),
 		TaskCount:    taskCount,
 		Branch:     branch,
+		DefaultBranch:  proj.DefaultBranch,
 		Slug:      runSlug,
 		CreatedAt:    now,
 		SourcePath:   params.SourcePath,

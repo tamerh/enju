@@ -553,6 +553,15 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	// Materialize the run branch in the local workspace + on
+	// origin BEFORE the snapshot commit (which lands on it) and
+	// before any claim/submit verb tries to fork from it.
+	// Idempotent: existing run branches are no-op'd. Errors are
+	// non-fatal — the run exists on the coord side; surface as
+	// a warning so the operator knows the workspace state isn't
+	// fully synced.
+	ensureBranchWarning := c.fc.EnsureRunBranch(ctx, int64(projectID), data)
+
 	// Template mode: after the coordinator assigns a run seq,
 	// commit a frozen copy of the bundle into
 	// enju/runs/{seq}-{slug}/template-snapshot/. Errors here
@@ -568,6 +577,9 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	c.fc.TouchProject(int64(projectID))
 
 	text := format.CreateRun(data)
+	if ensureBranchWarning != "" {
+		text += fmt.Sprintf("\n⚠ %s\n", ensureBranchWarning)
+	}
 	if snapshotWarning != "" {
 		text += fmt.Sprintf("\n⚠ Template %s\n", snapshotWarning)
 	}

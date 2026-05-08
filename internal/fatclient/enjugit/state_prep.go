@@ -318,6 +318,132 @@ func (w *Workflow) ResetCleanWorktree() error {
 	return translateGitError("reset clean", w.git.ResetClean())
 }
 
+// EnsureRunBranch makes the run branch exist locally and on origin.
+// Idempotent: a branch that already exists at either location is
+// left alone. Called from the create_run path so subsequent
+// claim/submit verbs can rely on the run branch being a real ref
+// (not a coordinator-only string), which lets MergeFFOrFail stay
+// strict instead of special-casing missing targets.
+//
+// Three cases:
+//
+//  1. branch already exists locally → no-op (covers `branch=<existing>`).
+//  2. branch exists only on origin (another machine pushed it first)
+//     → create local tracking ref pointing at origin's tip.
+//  3. branch exists nowhere → fork from defaultBranch, push to
+//     origin (best-effort on no-remote projects).
+//
+// Inputs:
+//   - branch: the run branch name (e.g. "run-on-auto-branch-1").
+//   - defaultBranch: where to fork a brand-new branch from
+//     (e.g. "main"). Only consulted in case 3.
+//
+// Git operations performed (under one WithLock):
+//
+//  1. Fetch (best-effort — pulls remote refs into refs/remotes/origin/*).
+//  2. ResolveRef("refs/heads/<branch>") — local check.
+//  3. ResolveRef("refs/remotes/origin/<branch>") — origin check
+//     (only when local missed).
+//  4. ResolveRef(defaultBranch) — fork-base lookup
+//     (only when both local and origin missed).
+//  5. CreateBranchAt(branch, baseSHA) — points the local ref.
+//  6. Push(branch) — establishes the ref on origin
+//     (only in case 3; skipped on no-remote).
+//
+// Worktree state: unchanged (this is a ref-only operation).
+//
+// Errors:
+//   - ErrForkBaseNotFound: defaultBranch can't be resolved when
+//     branch is brand-new. Caller's project has no commits yet —
+//     should seed (`enju_create_project` does this) before
+//     creating runs.
+//   - any git error translated.
+func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
+	if branch == "" {
+		return fmt.Errorf("enjugit: EnsureRunBranch: branch is required")
+	}
+	trace := startTrace("EnsureRunBranch")
+	trace.ctx("branch", branch)
+	trace.ctx("default_branch", defaultBranch)
+
+	werr := w.git.WithLock(func(g git.Ops) error {
+		// Step 1: refresh origin refs so the local-vs-origin
+		// distinction below reflects current reality.
+		if err := g.Fetch(); err != nil {
+			if errors.Is(err, git.ErrNoRemote) {
+				trace.skipped("fetch-origin", "no remote configured")
+			} else {
+				trace.steps = append(trace.steps, Step{
+					Name: "fetch-origin", Status: "failed",
+					Detail: err.Error(),
+				})
+				w.logger.Warn("enjugit: pre-ensure fetch failed; continuing",
+					"branch", branch, "error", err)
+			}
+		} else {
+			trace.ok("fetch-origin")
+		}
+
+		// Step 2: local check. Pass the full ref path so
+		// ResolveRef does an exact lookup instead of falling
+		// through to origin's tracking ref.
+		if sha, err := g.ResolveRef("refs/heads/" + branch); err == nil {
+			trace.okDetail("exists-local", shortSHA(sha))
+			return nil
+		}
+		trace.skipped("exists-local", "branch not present locally")
+
+		// Step 3: origin check. When another machine has pushed
+		// the branch but our clone hasn't materialized it as a
+		// local ref yet, planting the local ref keeps subsequent
+		// fork/checkout verbs strict.
+		if sha, err := g.ResolveRef("refs/remotes/origin/" + branch); err == nil {
+			trace.okDetail("exists-origin", shortSHA(sha))
+			if err := g.CreateBranchAt(branch, sha); err != nil {
+				return trace.fail("create-from-origin",
+					translateGitError("create local from origin tip", err))
+			}
+			trace.ok("create-from-origin")
+			return nil
+		}
+		trace.skipped("exists-origin", "branch not present on origin")
+
+		// Step 4: brand-new branch — fork from defaultBranch.
+		if defaultBranch == "" {
+			return trace.fail("pick-fork-base",
+				fmt.Errorf("%w: defaultBranch required for brand-new run branch", ErrForkBaseNotFound))
+		}
+		forkSHA, err := g.ResolveRef(defaultBranch)
+		if err != nil {
+			return trace.fail("resolve-default-branch",
+				fmt.Errorf("%w: %s: %v", ErrForkBaseNotFound, defaultBranch, err))
+		}
+		trace.okDetail("resolve-default-branch", shortSHA(forkSHA))
+
+		// Step 5: create the local ref at the fork point.
+		if err := g.CreateBranchAt(branch, forkSHA); err != nil {
+			return trace.fail("create-branch",
+				translateGitError("create run branch", err))
+		}
+		trace.ok("create-branch")
+
+		// Step 6: push so the ref exists on origin too. Without
+		// this, follow-up verbs on a different machine couldn't
+		// see the branch and would either err or duplicate-create.
+		if err := g.Push(branch); err != nil {
+			if errors.Is(err, git.ErrNoRemote) {
+				trace.skipped("push", "no remote configured")
+				return nil
+			}
+			return trace.fail("push",
+				translateGitError("push run branch", err))
+		}
+		trace.ok("push")
+		return nil
+	})
+	return werr
+}
+
 // workDir is a small helper so workflow methods can resolve the
 // worktree directory without depending on *git.Clone directly
 // (that would defeat the Ops-interface mocking story). We add a
