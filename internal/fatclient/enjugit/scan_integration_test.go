@@ -81,12 +81,12 @@ func TestFetchBranchPureFetchNoWorktreeChange(t *testing.T) {
 		t.Errorf("HEAD must not move on fetch; pre=%s post=%s", preHead, postHead)
 	}
 	// origin/main has the new commit — scanning from "" returns it as tip.
-	tip, _, err := reader.ScanBranchSince("main", "")
+	res, err := reader.ScanBranchSince("main", "")
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if tip != sha {
-		t.Errorf("origin/main after fetch: got %s, want %s", tip, sha)
+	if res.NewTip != sha {
+		t.Errorf("origin/main after fetch: got %s, want %s", res.NewTip, sha)
 	}
 }
 
@@ -131,28 +131,29 @@ func TestScanBranchSinceBaselineAndIncremental(t *testing.T) {
 	}
 
 	// Baseline scan: tip set, no trailers returned.
-	baseline, found, err := reader.ScanBranchSince("main", "")
+	baselineRes, err := reader.ScanBranchSince("main", "")
 	if err != nil {
 		t.Fatalf("baseline scan: %v", err)
 	}
+	baseline := baselineRes.NewTip
 	if baseline == "" {
 		t.Fatal("expected non-empty baseline tip")
 	}
-	if len(found) != 0 {
-		t.Errorf("baseline scan must not replay history, got %d trailers", len(found))
+	if len(baselineRes.Trailers) != 0 {
+		t.Errorf("baseline scan must not replay history, got %d trailers", len(baselineRes.Trailers))
 	}
 
 	// Re-scan with the baseline cursor before any new commits:
 	// idempotent no-op.
-	tipNoOp, foundNoOp, err := reader.ScanBranchSince("main", baseline)
+	noopRes, err := reader.ScanBranchSince("main", baseline)
 	if err != nil {
 		t.Fatalf("noop scan: %v", err)
 	}
-	if tipNoOp != baseline {
-		t.Errorf("noop scan should return same tip; got %s want %s", tipNoOp, baseline)
+	if noopRes.NewTip != baseline {
+		t.Errorf("noop scan should return same tip; got %s want %s", noopRes.NewTip, baseline)
 	}
-	if len(foundNoOp) != 0 {
-		t.Errorf("noop scan should return no trailers, got %d", len(foundNoOp))
+	if len(noopRes.Trailers) != 0 {
+		t.Errorf("noop scan should return no trailers, got %d", len(noopRes.Trailers))
 	}
 
 	// Two new commits land.
@@ -162,13 +163,14 @@ func TestScanBranchSinceBaselineAndIncremental(t *testing.T) {
 	if err := reader.FetchBranch("main"); err != nil {
 		t.Fatalf("re-fetch: %v", err)
 	}
-	tip, found, err := reader.ScanBranchSince("main", baseline)
+	incRes, err := reader.ScanBranchSince("main", baseline)
 	if err != nil {
 		t.Fatalf("incremental scan: %v", err)
 	}
-	if tip != sha2 {
-		t.Errorf("incremental tip: got %s, want %s", tip, sha2)
+	if incRes.NewTip != sha2 {
+		t.Errorf("incremental tip: got %s, want %s", incRes.NewTip, sha2)
 	}
+	found := incRes.Trailers
 	if len(found) != 2 {
 		t.Fatalf("expected 2 trailers since baseline, got %d: %+v", len(found), found)
 	}
@@ -225,13 +227,14 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 	// three commits are in scope. resolveSeedRoot walks the bare's
 	// log to find the parentless commit.
 	seedSHA := resolveSeedRoot(t, bare)
-	tip, found, err := reader.ScanBranchSince("main", seedSHA)
+	res, err := reader.ScanBranchSince("main", seedSHA)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if tip != taskB {
-		t.Errorf("expected tip=%s, got %s", taskB, tip)
+	if res.NewTip != taskB {
+		t.Errorf("expected tip=%s, got %s", taskB, res.NewTip)
 	}
+	found := res.Trailers
 	if len(found) != 2 {
 		t.Fatalf("expected 2 task trailers (human commit skipped), got %d: %+v", len(found), found)
 	}
@@ -287,13 +290,14 @@ func TestScanBranchSinceFallsBackToLocalHeads(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	tip, found, err := wf.ScanBranchSince("main", baseline)
+	scanRes, err := wf.ScanBranchSince("main", baseline)
 	if err != nil {
 		t.Fatalf("ScanBranchSince: %v", err)
 	}
-	if tip != res.CommitSHA {
-		t.Errorf("tip: got %s, want %s", tip, res.CommitSHA)
+	if scanRes.NewTip != res.CommitSHA {
+		t.Errorf("tip: got %s, want %s", scanRes.NewTip, res.CommitSHA)
 	}
+	found := scanRes.Trailers
 	if len(found) != 1 {
 		t.Fatalf("expected 1 trailer commit, got %d: %+v", len(found), found)
 	}
@@ -315,15 +319,15 @@ func TestScanBranchSinceUnknownBranchReturnsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tip, found, err := wf.ScanBranchSince("does-not-exist", "abc123")
+	res, err := wf.ScanBranchSince("does-not-exist", "abc123")
 	if err != nil {
 		t.Fatalf("ScanBranchSince on unknown branch: %v", err)
 	}
-	if tip != "abc123" {
-		t.Errorf("tip should be unchanged when branch unknown; got %s, want abc123", tip)
+	if res.NewTip != "abc123" {
+		t.Errorf("tip should be unchanged when branch unknown; got %s, want abc123", res.NewTip)
 	}
-	if len(found) != 0 {
-		t.Errorf("expected no trailers from unknown branch, got %d", len(found))
+	if len(res.Trailers) != 0 {
+		t.Errorf("expected no trailers from unknown branch, got %d", len(res.Trailers))
 	}
 }
 

@@ -16,6 +16,18 @@ type CommitTrailer struct {
 	Trailers  EnjuTrailers
 }
 
+// ScanResult bundles ScanBranchSince's outputs. NewTip is the
+// branch's tip SHA after the scan (the value the caller persists
+// as the next cursor). Trailers are the per-commit Enju trailers
+// for commits since the input cursor, in chronological order.
+//
+// Same shape as SubmitResult / batch results — keeps the verb
+// surface uniform: every multi-output verb returns (*XxxResult, error).
+type ScanResult struct {
+	NewTip   string
+	Trailers []CommitTrailer
+}
+
 // FetchBranch refreshes refs/remotes/origin/<branch> from the
 // remote without touching the worktree. No-op when no remote.
 // Empty branch resolves to the workflow's default branch
@@ -89,14 +101,15 @@ func (w *Workflow) ReadFile(repoRelPath string) ([]byte, error) {
 
 // ScanBranchSince walks origin/<branch> (or refs/heads/<branch>)
 // commits newer than `since`, parses the Enju trailers from each
-// commit message, and returns the new tip SHA + per-commit
-// trailers in chronological order. Cursor semantics: see
-// git.Clone.ScanBranchSince.
+// commit message, and returns a ScanResult with the new tip SHA
+// + per-commit trailers in chronological order. Cursor semantics:
+// see git.Clone.ScanBranchSince.
 //
 // Workflow-level wrapper combines the raw git walk with
 // ParseEnjuTrailers so service callers don't have to thread the
 // commit message themselves.
-func (w *Workflow) ScanBranchSince(branch, since string) (newTip string, found []CommitTrailer, err error) {
+func (w *Workflow) ScanBranchSince(branch, since string) (*ScanResult, error) {
+	var found []CommitTrailer
 	tip, gerr := w.git.ScanBranchSince(branch, since, func(sha, message string) {
 		t := ParseEnjuTrailers(message)
 		if t.TaskID != "" {
@@ -106,5 +119,8 @@ func (w *Workflow) ScanBranchSince(branch, since string) (newTip string, found [
 			})
 		}
 	})
-	return tip, found, translateGitError("scan branch since", gerr)
+	if gerr != nil {
+		return nil, translateGitError("scan branch since", gerr)
+	}
+	return &ScanResult{NewTip: tip, Trailers: found}, nil
 }

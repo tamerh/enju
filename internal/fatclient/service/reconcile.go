@@ -96,12 +96,12 @@ func (s *FatClient) PullBranchWithReconcileWF(ctx context.Context, wf *enjugit.W
 			}
 		}
 		cursorMu.Unlock()
-		tip, found, serr := wf.ScanBranchSince(branch, preCursor)
+		res, serr := wf.ScanBranchSince(branch, preCursor)
 		if serr != nil {
 			s.logger.Debug("reconcile scan", "project", projectID, "branch", branch, "error", serr)
 		} else {
-			newTip = tip
-			trailers = found
+			newTip = res.NewTip
+			trailers = res.Trailers
 		}
 	}
 
@@ -220,9 +220,9 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 			}
 		}
 		cursorMu.Unlock()
-		if tip, found, serr := wf.ScanBranchSince(branch, preCursor); serr == nil {
-			newTip = tip
-			trailers = found
+		if res, serr := wf.ScanBranchSince(branch, preCursor); serr == nil {
+			newTip = res.NewTip
+			trailers = res.Trailers
 		} else {
 			s.logger.Debug("reconcile scan", "project", projectID, "branch", branch, "error", serr)
 		}
