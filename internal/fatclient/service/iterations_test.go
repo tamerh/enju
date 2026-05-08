@@ -121,7 +121,7 @@ func TestReadResultAtCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fc := New(Config{Workspace: ws, Logger: logger})
+	fc := New(Config{WorkspaceRoot:   ws.RootDir(), Logger: logger})
 	if _, err := fc.InitDirAsProject(clone); err != nil {
 		t.Fatalf("InitDirAsProject: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
 			AuthToken: "tok",
 			Logger:    logger,
 		}),
-		Workspace: readerWS,
+		WorkspaceRoot:   readerWS.RootDir(),
 		Logger:    logger,
 	})
 
@@ -333,7 +333,7 @@ func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
 			AuthToken: "tok",
 			Logger:    logger,
 		}),
-		Workspace: ws,
+		WorkspaceRoot:   ws.RootDir(),
 		Logger:    logger,
 	})
 

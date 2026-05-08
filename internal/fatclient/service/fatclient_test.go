@@ -105,10 +105,11 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	// Open a SECOND registry handle pointing at the same file —
 	// what production does. (Each process opens its own handle.)
 	reg2 := projectreg.Open(regPath)
-	_ = New(Config{Workspace: ws, ProjectRegistry: reg2, Logger: logger})
+	ws.AttachRegistry(reg2)
+	_ = New(Config{WorkspaceRoot: ws.RootDir(), ProjectRegistry: reg2, Logger: logger})
 
-	// The bridge should have registered project 42 with the
-	// adopted dir. OpenExisting must now resolve it.
+	// With the registry attached to the opener, OpenExisting
+	// resolves project 42 to its registered adopted dir.
 	proj, err := ws.OpenExisting(42)
 	if err != nil {
 		t.Fatalf("OpenExisting(42) after fresh fatclient + registry-bridge: %v", err)
@@ -128,7 +129,7 @@ func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = New(Config{Workspace: ws, Logger: logger}) // no ProjectRegistry
+	_ = New(Config{WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no ProjectRegistry
 	// Nothing was registered → OpenExisting on an arbitrary id
 	// returns ErrCloneNotFound, exactly as without the bridge.
 	_, err = ws.OpenExisting(99)
@@ -215,7 +216,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	})
 	fc := New(Config{
 		Coord:           c,
-		Workspace:       ws,
+		WorkspaceRoot:   ws.RootDir(),
 		Logger:          logger,
 		ProjectRegistry: projectreg.Open(regPath),
 	})
@@ -261,7 +262,7 @@ func TestResolveBotWorkspace_NoRemoteAndNoAdoptedPath_Errors(t *testing.T) {
 	_ = os.MkdirAll(wsRoot, 0o755)
 	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "x", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger}) // no ProjectRegistry
+	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no ProjectRegistry
 
 	_, err := fc.ResolveBotWorkspace(context.Background(), 99, "test-bot")
 	if err == nil {
@@ -298,7 +299,7 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = New(Config{Workspace: ws, ProjectRegistry: projectreg.Open(regPath), Logger: logger})
+	_ = New(Config{WorkspaceRoot:   ws.RootDir(), ProjectRegistry: projectreg.Open(regPath), Logger: logger})
 
 	_, err = ws.OpenExisting(77)
 	if !errors.Is(err, project.ErrCloneNotFound) {
@@ -418,7 +419,7 @@ func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 	_ = os.MkdirAll(wsRoot, 0o755)
 	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
+	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
 
 	bareURL, created, err := fc.EnsureBotPushTarget(context.Background(), 42)
 	if err != nil {
@@ -464,7 +465,7 @@ func TestEnsureBotPushTarget_RealRemoteIsNoOp(t *testing.T) {
 	_ = os.MkdirAll(wsRoot, 0o755)
 	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger})
+	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger})
 
 	url, created, err := fc.EnsureBotPushTarget(context.Background(), 42)
 	if err != nil {
@@ -501,7 +502,7 @@ func TestEnsureBotPushTarget_NoSourceErrors(t *testing.T) {
 	_ = os.MkdirAll(wsRoot, 0o755)
 	ws, _ := project.NewOpener(wsRoot, logger)
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, Workspace: ws, Logger: logger}) // no projectRegistry
+	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no projectRegistry
 
 	_, _, err := fc.EnsureBotPushTarget(context.Background(), 42)
 	if err == nil {
