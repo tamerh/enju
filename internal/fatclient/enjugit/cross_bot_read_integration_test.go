@@ -1105,3 +1105,247 @@ func TestReviewerIterN_ForksFromRunBranchNotUpstreamIntegration(t *testing.T) {
 			"empty → request_changes → iter_seq bumps → repeat.", err)
 	}
 }
+
+// TestStaleRefReset_PreservesClaudeOutputIntegration pins the
+// load-bearing contract: when validate-stale-ref reseats a stale
+// local topic ref to RunBranch's tip, any handler output the
+// caller passed in `req.Files` must NOT be lost. The daemon-side
+// flow is:
+//
+//  1. handler (claude -p) writes src/foo.go to the worktree
+//  2. daemon scans worktree, reads file content into req.Files
+//  3. daemon calls SubmitTaskResult with req.Files populated
+//  4. SubmitTaskResult.prepareBranchForCommit fires validate-stale-ref
+//     (stale local topic at seed → reseats to RunBranch tip)
+//  5. SubmitTaskResult writes req.Files back from the in-memory
+//     copies it received
+//  6. commit + push
+//
+// If req.Files faithfully carries claude's output, the commit
+// must contain it regardless of any worktree wipe during step 4.
+//
+// Originally project's TestStaleRefReset_PreservesClaudeOutput.
+func TestStaleRefReset_PreservesClaudeOutputIntegration(t *testing.T) {
+	alice, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// Alice publishes the run-branch tip we'll fork from.
+	if _, err := alice.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:setup",
+		BranchOverride: "run-base",
+		Citizen:        Identity{Name: "alice", Email: "alice@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "README.md", Content: []byte("# project\n")}},
+	}); err != nil {
+		t.Fatalf("alice setup: %v", err)
+	}
+
+	if err := bob.FetchAllRefs(); err != nil {
+		t.Fatalf("bob fetch: %v", err)
+	}
+
+	// Plant the stale-ref shape: develop_config/iter-2 already
+	// exists locally pointing at seed (the production bug shape).
+	bobRepoH := workflowRepo(t, bob)
+	bobHead, _ := bobRepoH.Head()
+	seedHash := bobHead.Hash()
+	staleRef := plumbing.ReferenceName("refs/heads/run-1/develop_config/iter-2")
+	if err := bobRepoH.Storer.SetReference(plumbing.NewHashReference(staleRef, seedHash)); err != nil {
+		t.Fatalf("planting stale ref: %v", err)
+	}
+
+	// Simulate "claude -p just wrote files to the worktree" —
+	// these are untracked files in bob's working tree at this
+	// moment. The daemon would scan them and hand them to
+	// SubmitTaskResult as req.Files. We mimic that exactly: write
+	// files to disk, then build the Files slice from in-memory
+	// copies (matching the daemon's `ReadFile + Files = ...` shape).
+	claudeOutput := []FileWrite{
+		{RepoRelPath: "src/config/config.go", Content: []byte("package config\n\nvar Default = \"v1\"\n")},
+		{RepoRelPath: "src/go.mod", Content: []byte("module example.com/cfg\n\ngo 1.22\n")},
+		{RepoRelPath: "result.md", Content: []byte("Implemented config package.\n")},
+	}
+	for _, f := range claudeOutput {
+		full := filepath.Join(bob.WorkDir(), f.RepoRelPath)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, f.Content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Bob submits. The validate-stale-ref step MUST fire (ref points
+	// at seed, not in run-base's ancestry) and reseat the local ref
+	// to run-base's tip BEFORE the commit lands.
+	res, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_config",
+		BranchOverride: "run-1/develop_config/iter-2",
+		RunBranch:      "run-base",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          claudeOutput,
+	})
+	if err != nil {
+		t.Fatalf("bob submit: %v", err)
+	}
+
+	// Verify the commit's tree has all of claude's output. The
+	// reseat must NOT have wiped req.Files mid-flight.
+	commit, err := bobRepoH.CommitObject(plumbing.NewHash(res.CommitSHA))
+	if err != nil {
+		t.Fatalf("commit lookup: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("tree lookup: %v", err)
+	}
+	for _, f := range claudeOutput {
+		entry, err := tree.File(f.RepoRelPath)
+		if err != nil {
+			t.Errorf("commit tree missing %s: %v — stale-ref reseat corrupted submit pipeline", f.RepoRelPath, err)
+			continue
+		}
+		body, err := entry.Contents()
+		if err != nil {
+			t.Errorf("read %s: %v", f.RepoRelPath, err)
+			continue
+		}
+		if body != string(f.Content) {
+			t.Errorf("content mismatch for %s: got %q, want %q", f.RepoRelPath, body, string(f.Content))
+		}
+	}
+}
+
+// TestIterN_NewBranchForksFromRunBranchNotSeedIntegration pins the
+// production fork-base bug. When the daemon detects iter > 1 and
+// the topic branch has bumped (e.g. develop_domain/iter-2 after
+// review verdict triggered iter_seq increment), it calls
+// CheckoutBranchFrom(topic, run-branch) so the new topic forks
+// from the run-branch's TIP (which has prior task content), NOT
+// from seed.
+//
+// Production symptom: develop_domain/iter-2 forked from seed
+// instead of build-1 tip; iter-2 was orphaned from prior task
+// content; switching between worktrees of build-1 vs iter-2
+// failed with "worktree contains unstaged changes" because the
+// trees diverged wildly.
+func TestIterN_NewBranchForksFromRunBranchNotSeedIntegration(t *testing.T) {
+	_, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// Build the run branch with two commits — seed + a run-branch
+	// advance (analog of develop_config landing on build-1 before
+	// develop_domain runs).
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:setup",
+		BranchOverride: "build-mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "README.md", Content: []byte("# project\n")}},
+	}); err != nil {
+		t.Fatalf("setup commit: %v", err)
+	}
+	advanceRes, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_config",
+		BranchOverride: "build-mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/config/config.go", Content: []byte("package config\n")}},
+	})
+	if err != nil {
+		t.Fatalf("run-branch advance: %v", err)
+	}
+	runBranchTip := advanceRes.CommitSHA
+
+	// iter-1 of develop_domain — committed on its topic, forked
+	// from build-mainline (which now contains src/config/).
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "topics/develop_domain/iter-1",
+		RunBranch:      "build-mainline",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 1\n")}},
+	}); err != nil {
+		t.Fatalf("iter-1 submit: %v", err)
+	}
+
+	// Simulate the daemon's iter > 1 branch step. With the fix,
+	// the daemon now passes meta.Branch (run branch = build-mainline)
+	// as baseBranch so the new topic forks from the run-branch tip
+	// — which carries prior task content.
+	if err := bob.CheckoutBranchFrom("topics/develop_domain/iter-2", "build-mainline"); err != nil {
+		t.Fatalf("CheckoutBranchFrom for iter-2: %v", err)
+	}
+
+	// Verify iter-2's branch ref forks from the RUN BRANCH TIP,
+	// not from seed. This is the core production failure.
+	bobRepoH := workflowRepo(t, bob)
+	iter2Ref, err := bobRepoH.Reference(plumbing.ReferenceName("refs/heads/topics/develop_domain/iter-2"), true)
+	if err != nil {
+		t.Fatalf("iter-2 ref lookup: %v", err)
+	}
+	if got := iter2Ref.Hash().String(); got != runBranchTip {
+		t.Fatalf("REPRO: iter-2 forked from wrong base.\n"+
+			"  iter-2 commit: %s\n"+
+			"  run-branch tip: %s (expected — has prior task content)\n"+
+			"  This matches the production failure where iter-2/iter-3 forked\n"+
+			"  from seed (origin/main) instead of build-1 tip, leaving them\n"+
+			"  orphaned from prior task content.",
+			got, runBranchTip)
+	}
+}
+
+// TestIter2_DirtyWorktreeFromIter1_DoesNotBlockBranchSwitchIntegration
+// pins the iteration-boundary bug: the daemon calls
+// CheckoutBranchFrom for iter-2 BEFORE running ResetCleanWorktree.
+// The bot's worktree still carries iter-1's tree + any untracked /
+// modified residue from claude -p. The Force-checkout + preserve
+// dance must handle that dirty state — without it, the production
+// failure was "git refuses: worktree contains unstaged changes."
+func TestIter2_DirtyWorktreeFromIter1_DoesNotBlockBranchSwitchIntegration(t *testing.T) {
+	_, bob, _ := openTwoBotWorkflowsForRead(t)
+
+	// Bob commits iter-1 on its own topic branch.
+	if _, err := bob.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:develop_domain",
+		BranchOverride: "1-build/develop_domain/iter-1",
+		Citizen:        Identity{Name: "bob", Email: "bob@x.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/domain/foo.go", Content: []byte("package domain\n\nvar V = 1\n")}},
+	}); err != nil {
+		t.Fatalf("iter-1 submit: %v", err)
+	}
+
+	// Simulate claude -p iter-1's residue: an untracked scratch
+	// file AND a modification to the just-committed tracked file.
+	// Both are common shapes — claude often writes scratch notes
+	// it never declares, and sometimes patches tracked files
+	// outside writes_artifacts after the commit landed.
+	if err := os.WriteFile(
+		filepath.Join(bob.WorkDir(), "scratch.notes"),
+		[]byte("untracked claude scratch\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(bob.WorkDir(), "src/domain/foo.go"),
+		[]byte("package domain\n\nvar V = 1\n// post-commit edit by claude\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the iter-2 invalidate-bump case: cascade marked iter-1
+	// rejected, daemon re-claims with iter_seq=2 and a fresh branch
+	// name. This is the call the daemon makes BEFORE any reset.
+	if err := bob.CheckoutBranchFrom("1-build/develop_domain/iter-2", ""); err != nil {
+		t.Fatalf("REPRO: CheckoutBranchFrom for iter-2 failed on dirty iter-1 worktree: %v\n"+
+			"This is the iteration-boundary bug — the daemon calls this BEFORE\n"+
+			"resetting the clone, so iter-1's residue blocks the switch.", err)
+	}
+
+	// Verify HEAD landed on iter-2 (not stuck on iter-1).
+	bobRepoH := workflowRepo(t, bob)
+	head, err := bobRepoH.Head()
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if got, want := head.Name().String(), "refs/heads/1-build/develop_domain/iter-2"; got != want {
+		t.Errorf("HEAD on wrong ref after checkout: got %s, want %s", got, want)
+	}
+}
