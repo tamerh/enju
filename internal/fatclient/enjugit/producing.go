@@ -140,6 +140,18 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 	}
 	result.BranchName = branchName
 	result.PushAttempts = 1 // single attempt; no rebase loop in v1
+	// TODO(enjugit-retry-loop): the project package's old
+	// SubmitTaskResult had a fetch+reset+re-apply+re-push retry
+	// loop here that recovered from concurrent-push non-FF
+	// rejections. Dropping it was a deliberate v1 simplification,
+	// but it shifts the "race recovery" responsibility onto
+	// callers (or leaves clients to lose work on naive retries).
+	// Revisit: either honor SubmitRequest.MaxRetries here with a
+	// proper rebase loop, OR document that the service layer
+	// MUST handle non-FF + retry and audit all callers. Either
+	// way, restore the scenario covered by
+	// TestSubmitTaskResult_ConcurrentPushSurfacesNonFFIntegration
+	// (which currently asserts the post-drop behavior).
 	return &result, nil
 }
 
