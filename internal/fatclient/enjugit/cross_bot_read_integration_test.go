@@ -429,6 +429,167 @@ func TestCrossBotRead_SequentialMerges_ReaderTracksMainIntegration(t *testing.T)
 	}
 }
 
+// openOperatorAndBotWorkflows sets up a realistic operator + bot
+// pair: operator uses ForProject (the same path the human's
+// `enju mcp` session uses, sourced through the workspace opener),
+// bot uses OpenBotCloneAt (per-bot managed clone). Both clone
+// from the same shared bare. Returns separate Workspaces so the
+// cache-collision behavior between the two modes mirrors
+// production (different processes, different in-memory state)
+// instead of the single-Workspace cases above.
+func openOperatorAndBotWorkflows(t *testing.T) (operator, bot *Workflow, bare string) {
+	t.Helper()
+	bare = initBareForWorkspaceTest(t)
+
+	// Operator side: uses ForProject (adopted-dir / workspace
+	// path). The Workspace's rootDir hosts the operator's clone.
+	opWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	var err error
+	operator, err = opWS.ForProject(7, bare)
+	if err != nil {
+		t.Fatalf("operator ForProject: %v", err)
+	}
+
+	// Bot side: uses OpenBotCloneAt (per-bot managed clone at an
+	// explicit path). Separate Workspace so both clones are fully
+	// independent — that's the production split between the
+	// operator's `enju mcp` process and a `enju bot run` daemon
+	// process.
+	botWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	botPath := filepath.Join(t.TempDir(), "enju", "bots", "developer-bot", "clone")
+	bot, err = botWS.OpenBotCloneAt(7, botPath, bare)
+	if err != nil {
+		t.Fatalf("bot clone: %v", err)
+	}
+	return operator, bot, bare
+}
+
+// TestCrossBotRead_OperatorWritesBotReadsIntegration pins the
+// case where the operator commits something (e.g. a manual seed
+// file, a task result the human filled in directly) and a bot
+// downstream needs to read it as upstream context. Bot's clone
+// has never seen the commit; lazy fetch must rescue.
+func TestCrossBotRead_OperatorWritesBotReadsIntegration(t *testing.T) {
+	operator, bot, _ := openOperatorAndBotWorkflows(t)
+
+	res, err := operator.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:human_seed",
+		BranchOverride: "topic-human-seed",
+		Citizen:        Identity{Name: "tamer", Email: "tamer@example.com"},
+		Files:          []FileWrite{{RepoRelPath: "design/brief.md", Content: []byte("human-authored brief\n")}},
+	})
+	if err != nil {
+		t.Fatalf("operator submit: %v", err)
+	}
+
+	// Bot reads at the operator's commit SHA. Bot's clone has no
+	// record of this commit yet — lazy fetch fixes it.
+	body, found, rerr := bot.ReadFileAtCommit(res.CommitSHA, "design/brief.md")
+	if rerr != nil {
+		t.Fatalf("bot read of operator commit: %v", rerr)
+	}
+	if !found || string(body) != "human-authored brief\n" {
+		t.Errorf("bot read: body=%q found=%v", body, found)
+	}
+}
+
+// TestCrossBotRead_BotWritesOperatorReadsIntegration pins the
+// symmetric case: bot pushes (typical autonomous-developer flow),
+// then the operator's MCP session reads the same SHA via inbox /
+// run_status / iteration history. Operator's clone hasn't fetched
+// since the bot's push; lazy fetch must rescue. Same shape as the
+// production webui "iteration content unavailable" symptom.
+func TestCrossBotRead_BotWritesOperatorReadsIntegration(t *testing.T) {
+	operator, bot, _ := openOperatorAndBotWorkflows(t)
+
+	res, err := bot.SubmitTaskResult(SubmitRequest{
+		TaskID:         "7:1:dev",
+		BranchOverride: "topic-dev-iter1",
+		Citizen:        Identity{Name: "developer-bot", Email: "dev@example.com"},
+		Files:          []FileWrite{{RepoRelPath: "src/feature.go", Content: []byte("// developed\n")}},
+	})
+	if err != nil {
+		t.Fatalf("bot submit: %v", err)
+	}
+
+	// Operator's MCP renders run_status / inbox / web UI by
+	// reading at the bot's commit SHA. Pre-fix this is where the
+	// "object not found" warning fires; post-fix lazy fetch
+	// self-heals.
+	body, found, rerr := operator.ReadFileAtCommit(res.CommitSHA, "src/feature.go")
+	if rerr != nil {
+		t.Fatalf("operator read of bot commit: %v", rerr)
+	}
+	if !found || string(body) != "// developed\n" {
+		t.Errorf("operator read: body=%q found=%v", body, found)
+	}
+}
+
+// TestCrossBotRead_OperatorAndBot_ParallelPushesEachReadsOtherIntegration
+// pins the bidirectional case: operator and bot each push
+// concurrently to disjoint topic branches, then each reads the
+// other's commit. This is the shape you get when a human is
+// working interactively while a bot daemon runs autonomously in
+// the background — both citizens advance the project at the same
+// time.
+func TestCrossBotRead_OperatorAndBot_ParallelPushesEachReadsOtherIntegration(t *testing.T) {
+	operator, bot, _ := openOperatorAndBotWorkflows(t)
+
+	type pushResult struct {
+		sha string
+		err error
+	}
+	results := make([]pushResult, 2)
+	done := make(chan struct{}, 2)
+	go func() {
+		res, err := operator.SubmitTaskResult(SubmitRequest{
+			TaskID:         "7:1:human",
+			BranchOverride: "topic-human",
+			Citizen:        Identity{Name: "tamer", Email: "tamer@example.com"},
+			Files:          []FileWrite{{RepoRelPath: "human.md", Content: []byte("from human\n")}},
+		})
+		if err != nil {
+			results[0] = pushResult{err: err}
+		} else {
+			results[0] = pushResult{sha: res.CommitSHA}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		res, err := bot.SubmitTaskResult(SubmitRequest{
+			TaskID:         "7:1:bot",
+			BranchOverride: "topic-bot",
+			Citizen:        Identity{Name: "developer-bot", Email: "dev@example.com"},
+			Files:          []FileWrite{{RepoRelPath: "bot.md", Content: []byte("from bot\n")}},
+		})
+		if err != nil {
+			results[1] = pushResult{err: err}
+		} else {
+			results[1] = pushResult{sha: res.CommitSHA}
+		}
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("parallel push %d: %v", i, r.err)
+		}
+	}
+	humanSHA, botSHA := results[0].sha, results[1].sha
+
+	// Operator reads bot's commit.
+	body, found, rerr := operator.ReadFileAtCommit(botSHA, "bot.md")
+	if rerr != nil || !found || string(body) != "from bot\n" {
+		t.Errorf("operator read bot: body=%q found=%v err=%v", body, found, rerr)
+	}
+	// Bot reads operator's commit.
+	body, found, rerr = bot.ReadFileAtCommit(humanSHA, "human.md")
+	if rerr != nil || !found || string(body) != "from human\n" {
+		t.Errorf("bot read operator: body=%q found=%v err=%v", body, found, rerr)
+	}
+}
+
 // TestCrossBotRead_ProductionRequestChangesShapeIntegration
 // reproduces the exact production failure shape: developer-bot
 // pushes its iter-1 deliverable on the topic branch produced by
