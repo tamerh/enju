@@ -1,6 +1,7 @@
 package enjugit
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -107,6 +108,66 @@ func (w *Workspace) ProjectDir(id int64) string {
 		return path
 	}
 	return w.projectDirLocked(id)
+}
+
+// AttachRegistry wires the projectreg.Registry post-construction.
+// Equivalent to passing WithRegistry to NewWorkspace, but useful
+// when the registry is created after the Workspace (e.g. tests
+// that build both, then bridge them).
+//
+// Nil-safe: passing nil clears the registry.
+func (w *Workspace) AttachRegistry(reg *projectreg.Registry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.registry = reg
+}
+
+// HasExternalDir reports whether a registry entry exists for id.
+// Equivalent to "has the project been registered (via enju_init or
+// enju_create_project) so ProjectDir resolves to an explicit path?"
+// Returns false when no registry is attached.
+func (w *Workspace) HasExternalDir(id int64) bool {
+	w.mu.Lock()
+	reg := w.registry
+	w.mu.Unlock()
+	if reg == nil {
+		return false
+	}
+	entry, err := reg.Get(id)
+	return err == nil && entry != nil && entry.LocalPath != ""
+}
+
+// OpenExisting opens the existing clone for id and returns a
+// Workflow. Errors with ErrCloneNotFound when no clone exists on
+// disk — does NOT clone or init. Used by callers that want to
+// fail loudly when the on-disk state is missing rather than
+// silently materialize.
+func (w *Workspace) OpenExisting(id int64) (*Workflow, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if wf, ok := w.workflows[id]; ok {
+		return wf, nil
+	}
+	dir := w.projectDirLocked(id)
+	if dir == "" {
+		return nil, ErrCloneNotFound
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: stat %s: %w", dir, err)
+	}
+	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	if err != nil {
+		if errors.Is(err, git.ErrCloneNotFound) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: open existing %s: %w", dir, err)
+	}
+	wf := w.newWorkflowFromClone(id, clone)
+	w.workflows[id] = wf
+	return wf, nil
 }
 
 // HasLocalClone reports whether a clone exists on disk for id.

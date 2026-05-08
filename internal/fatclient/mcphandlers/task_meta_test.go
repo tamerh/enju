@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func newAPIClient(baseURL string) *apiClient {
@@ -208,7 +208,7 @@ func TestUseFatClientNoWorkspaceReturnsFalse(t *testing.T) {
 }
 
 func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
-	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestUseFatClientNilMetaReturnsFalse(t *testing.T) {
 }
 
 func TestUseFatClientWithRemoteURL(t *testing.T) {
-	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestUseFatClientWithRemoteURL(t *testing.T) {
 }
 
 func TestUseFatClientWithExternalDir(t *testing.T) {
-	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 // state=accepted with empty commit_sha and no on-disk directory.
 // Only compute tasks worked because they bypass useFatClient.
 func TestUseFatClientWithoutRemoteOrExternal(t *testing.T) {
-	ws, err := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -24,7 +24,6 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 func TestListTaskIterations(t *testing.T) {
@@ -103,7 +102,7 @@ func TestReadResultAtCommit(t *testing.T) {
 	// read returns the file contents at that commit.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	wsRoot := t.TempDir()
-	ws, err := project.NewOpener(wsRoot, logger)
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +273,7 @@ func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
 	// ErrCloneNotFound; the lazy-clone fallback should then
 	// materialize the clone from the bare and read at commit.
 	readerRoot := t.TempDir()
-	readerWS, err := project.NewOpener(readerRoot, logger)
+	readerWS, err := enjugit.NewWorkspace(readerRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatalf("reader Opener: %v", err)
 	}
@@ -322,7 +321,7 @@ func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	ws, err := project.NewOpener(t.TempDir(), logger)
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatalf("Opener: %v", err)
 	}

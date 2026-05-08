@@ -20,7 +20,6 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/go-git/go-git/v5/config"
@@ -423,7 +422,7 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 
 	// 3. Real Workspace. Clones the bare on first ForProject.
 	wsDir := t.TempDir()
-	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(wsDir, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -485,7 +484,7 @@ func TestCreateProjectPathRequired(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(wsDir, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -540,7 +539,7 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(wsDir, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -589,7 +588,7 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 
 	// Eager-init seeded the repo so first-submit's
 	// branchBaseHash has something to fork from.
-	if _, _, err := proj.GitClone().Head(); err != nil {
+	if _, _, err := proj.Head(); err != nil {
 		t.Errorf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
 	}
 	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
@@ -707,7 +706,7 @@ func TestCreateProjectCustomPathCreatesNonExistentParents(t *testing.T) {
 	defer ts.Close()
 
 	wsDir := t.TempDir()
-	ws, err := project.NewOpener(wsDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, err := enjugit.NewWorkspace(wsDir, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatalf("new workspace: %v", err)
 	}
@@ -942,7 +941,7 @@ func TestInitForceAdoptsPopulatedRepo(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1064,7 +1063,7 @@ func TestInitFolderWithoutGit(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# My Paper"), 0644)
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	ws.AttachRegistry(reg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -1157,7 +1156,7 @@ func TestInitFolderWithExistingGit(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "test@test", When: time.Now()},
 	})
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1231,7 +1230,7 @@ func TestInitIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "data.csv"), []byte("a,b,c"), 0644)
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1316,7 +1315,7 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
 	})
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	ws.AttachRegistry(reg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -1418,7 +1417,7 @@ func TestInitPreservesExistingOrigin(t *testing.T) {
 		URLs: []string{preExistingOrigin},
 	})
 
-	ws, _ := project.NewOpener(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
 			BaseURL:  ts.URL,
@@ -1855,7 +1854,7 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// projectreg.Registry attached to the opener (the durable
 	// per-machine "project N → home path" record).
 	wsRoot := t.TempDir()
-	ws, _ := project.NewOpener(wsRoot, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
 	if err := reg.Upsert(projectreg.Entry{ID: 2, LocalPath: workDir}); err != nil {
 		t.Fatalf("registry upsert: %v", err)

@@ -28,7 +28,6 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/project"
 )
 
 // initRealClone plants a usable git clone at dir + commits one
@@ -97,7 +96,7 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ws, err := project.NewOpener(wsRoot, logger)
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +124,7 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
-	ws, err := project.NewOpener(tmp, logger)
+	ws, err := enjugit.NewWorkspace(tmp, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +132,7 @@ func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	// Nothing was registered → OpenExisting on an arbitrary id
 	// returns ErrCloneNotFound, exactly as without the bridge.
 	_, err = ws.OpenExisting(99)
-	if !errors.Is(err, project.ErrCloneNotFound) {
+	if !errors.Is(err, enjugit.ErrCloneNotFound) {
 		t.Errorf("expected ErrCloneNotFound, got %v", err)
 	}
 }
@@ -204,7 +203,7 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, err := project.NewOpener(wsRoot, logger)
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +259,7 @@ func TestResolveBotWorkspace_NoRemoteAndNoAdoptedPath_Errors(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := project.NewOpener(wsRoot, logger)
+	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "x", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no ProjectRegistry
 
@@ -295,14 +294,14 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, err := project.NewOpener(wsRoot, logger)
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = New(Config{WorkspaceRoot:   ws.RootDir(), ProjectRegistry: projectreg.Open(regPath), Logger: logger})
 
 	_, err = ws.OpenExisting(77)
-	if !errors.Is(err, project.ErrCloneNotFound) {
+	if !errors.Is(err, enjugit.ErrCloneNotFound) {
 		t.Errorf("stale entry should be filtered; OpenExisting got: %v", err)
 	}
 }
@@ -417,7 +416,7 @@ func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := project.NewOpener(wsRoot, logger)
+	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
 
@@ -463,7 +462,7 @@ func TestEnsureBotPushTarget_RealRemoteIsNoOp(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := project.NewOpener(wsRoot, logger)
+	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger})
 
@@ -500,7 +499,7 @@ func TestEnsureBotPushTarget_NoSourceErrors(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := project.NewOpener(wsRoot, logger)
+	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
 	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no projectRegistry
 
