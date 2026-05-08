@@ -1,7 +1,10 @@
 package enjugit
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -103,4 +106,111 @@ func TestRescanSentinelSHA(t *testing.T) {
 func writeFile(t *testing.T, path, contents string) error {
 	t.Helper()
 	return writeFileImpl(path, []byte(contents))
+}
+
+// TestCursorsVersionMismatchTreatedAsEmpty: a cursor file from a
+// future schema version is treated as empty, so an older client
+// won't act on data it can't interpret. Originally project's
+// TestCursorsVersionMismatch.
+func TestCursorsVersionMismatchTreatedAsEmpty(t *testing.T) {
+	stateDir := t.TempDir()
+	path := cursorsPath(stateDir, 8)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":999,"branches":{"main":"xxx"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := LoadCursors(stateDir, 8)
+	if c.Get("main") != "" {
+		t.Errorf("future version should be treated as empty; got main=%q", c.Get("main"))
+	}
+}
+
+// TestCursorsSaveAtomicallyOverwrites: a second Save replaces the
+// first cleanly via the temp-file + rename pattern. The reload
+// must observe the second state, not a partial mix or the first
+// state. Originally project's TestCursorsAtomicSaveSurvivesPartialWrite.
+func TestCursorsSaveAtomicallyOverwrites(t *testing.T) {
+	stateDir := t.TempDir()
+	c := NewCursors(stateDir, 5)
+	c.Set("main", "first")
+	if err := c.Save(); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	c.Set("main", "second")
+	if err := c.Save(); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	reloaded, _ := LoadCursors(stateDir, 5)
+	if got := reloaded.Get("main"); got != "second" {
+		t.Errorf("expected second after overwrite, got %q", got)
+	}
+}
+
+// TestAdvanceScanCursor_SerializesConcurrentCallers covers the
+// last-writer-wins race the project test originally flagged.
+// Before CursorMutexFor, two callers could each do
+// LoadCursors → Set → Save concurrently; the later writer's save
+// carried its own older snapshot and silently overwrote the
+// earlier writer's advance. Atomic-rename keeps the file from
+// corrupting, but the cursor still goes BACKWARDS — next scan
+// walks extra history. AdvanceScanCursor now serializes via
+// CursorMutexFor so writes never trample each other.
+//
+// Test: N goroutines each advance a unique commit SHA on the
+// same branch. After all finish, the saved cursor MUST be one
+// of the N SHAs (never empty, never the seed, never corrupt).
+// Originally project's TestAdvanceCursorIfConfiguredSerializesConcurrentCallers.
+func TestAdvanceScanCursor_SerializesConcurrentCallers(t *testing.T) {
+	stateDir := t.TempDir()
+	const projectID int64 = 42
+	const N = 20
+
+	// Pre-seed with an initial cursor so the file exists before
+	// the racers start (matches production's "scanner has been
+	// running" steady state).
+	seed := NewCursors(stateDir, projectID)
+	seed.Set("main", "seed")
+	if err := seed.Save(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	shas := make([]string, N)
+	for i := 0; i < N; i++ {
+		shas[i] = fmt.Sprintf("%040x", i+1)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(sha string) {
+			defer wg.Done()
+			AdvanceScanCursor(projectID, stateDir, "main", sha)
+		}(shas[i])
+	}
+	wg.Wait()
+
+	loaded, err := LoadCursors(stateDir, projectID)
+	if err != nil {
+		t.Fatalf("load after race: %v", err)
+	}
+	final := loaded.Get("main")
+	if final == "" {
+		t.Fatalf("cursor vanished after concurrent advances")
+	}
+	if final == "seed" {
+		t.Fatalf("cursor stayed at seed — concurrent advances all lost")
+	}
+	found := false
+	for _, sha := range shas {
+		if sha == final {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("final cursor %q is not one of the advanced SHAs — concurrent save corrupted state", final)
+	}
 }
