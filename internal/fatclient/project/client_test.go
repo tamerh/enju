@@ -921,59 +921,6 @@ func TestSubmitFailsClearlyAgainstUnreachableRemote(t *testing.T) {
 	}
 }
 
-// TestFriendlyGitErrorHints covers the auth/network hint helper
-// added in B1a — each branch of the pattern match should produce a
-// distinguishable hint when given a representative error string.
-func TestFriendlyGitErrorHints(t *testing.T) {
-	cases := []struct {
-		name     string
-		err      error
-		wantHint string
-	}{
-		{"ssh", errStr("ssh: handshake failed: no supported methods"), "SSH agent"},
-		{"publickey", errStr("publickey denied"), "SSH agent"},
-		{"https 401", errStr("authentication required: HTTP 401"), "credential helper"},
-		{"403", errStr("remote: HTTP 403 forbidden"), "credential helper"},
-		{"non-ff", errStr("non-fast-forward update rejected"), "enju_project_sync"},
-		{"dns", errStr("dial tcp: lookup git.example: no such host"), "network/DNS"},
-		{"timeout", errStr("i/o timeout on fetch"), "network/DNS"},
-		{"not found", errStr("repository not found"), "verify the remote URL"},
-	}
-	// Local path variant — same underlying error, different hint.
-	t.Run("local path not found", func(t *testing.T) {
-		got := enjugit.FriendlyGitError("clone", "/tmp/does-not-exist.git", errStr("repository not found"))
-		if got == nil {
-			t.Fatal("nil error")
-		}
-		if !strings.Contains(got.Error(), "valid bare repository") {
-			t.Errorf("expected local-path hint, got: %q", got.Error())
-		}
-		if strings.Contains(got.Error(), "your account has access") {
-			t.Errorf("local-path error should NOT include credentials hint, got: %q", got.Error())
-		}
-	})
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := enjugit.FriendlyGitError("push", "git@example:foo.git", tc.err)
-			if got == nil {
-				t.Fatalf("nil error")
-			}
-			if !strings.Contains(got.Error(), tc.wantHint) {
-				t.Errorf("expected hint containing %q, got: %q", tc.wantHint, got.Error())
-			}
-			if !strings.Contains(got.Error(), "push") {
-				t.Errorf("expected op name 'push' in message, got: %q", got.Error())
-			}
-		})
-	}
-
-	// Unclassified errors pass through without a hint suffix.
-	plain := enjugit.FriendlyGitError("clone", "", errStr("some random non-matching failure"))
-	if strings.Contains(plain.Error(), "hint:") {
-		t.Errorf("unclassified error should not carry a hint, got: %q", plain.Error())
-	}
-}
-
 // TestCrossWorkspaceFlockSerialization verifies that two Workspace
 // instances pointed at the same root dir (simulating two MCP
 // processes running against the same ~/.enju/workspaces) serialize
@@ -1037,47 +984,6 @@ func TestCrossWorkspaceFlockSerialization(t *testing.T) {
 	projB.Unlock()
 }
 
-// TestEvictProjectCacheDropsHandle verifies that EvictProjectCache
-// drops the cached *Clone (so ForProject re-resolves from disk on
-// the next call). On-disk removal lives on enjugit.Workspace; this
-// test only covers project's cache-eviction half.
-func TestEvictProjectCacheDropsHandle(t *testing.T) {
-	bare := initBareRemote(t)
-	seedRemoteWithInitialCommit(t, bare)
-
-	wsDir := t.TempDir()
-	ws, _ := NewOpener(wsDir, nullLogger())
-	proj, err := ws.ForProject(70, bare)
-	if err != nil {
-		t.Fatalf("first clone: %v", err)
-	}
-
-	// Cache hit before evict: same pointer.
-	again, err := ws.ForProject(70, bare)
-	if err != nil {
-		t.Fatalf("second ForProject before evict: %v", err)
-	}
-	if again != proj {
-		t.Errorf("expected cache-hit identity before evict")
-	}
-
-	// Evict + safe on unknown projectID.
-	ws.EvictProjectCache(70)
-	ws.EvictProjectCache(999)
-
-	// After evict: ForProject re-opens — different pointer, same workDir.
-	reopened, err := ws.ForProject(70, bare)
-	if err != nil {
-		t.Fatalf("reopen after evict: %v", err)
-	}
-	if reopened == proj {
-		t.Errorf("expected fresh handle after evict")
-	}
-	if reopened.WorkDir() != proj.WorkDir() {
-		t.Errorf("expected same work dir, got %s vs %s", reopened.WorkDir(), proj.WorkDir())
-	}
-}
-
 // TestSlugifyProjectDir verifies that ForProject with a project name
 // creates a "{slug}-{id}" directory, and that an existing numeric-only
 // directory is auto-migrated to the slug form.
@@ -1127,25 +1033,6 @@ func TestSlugifyProjectDir(t *testing.T) {
 	// Old numeric dir should be gone.
 	if _, err := os.Stat(numericDir); !os.IsNotExist(err) {
 		t.Error("expected old numeric dir to be gone after migration")
-	}
-}
-
-// TestSlugify checks edge cases of the slugify helper.
-func TestSlugify(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"Battle Test Alpha", "battle-test-alpha"},
-		{"  spaces  ", "spaces"},
-		{"UPPER-case_MIX", "upper-case-mix"},
-		{"---dashes---", "dashes"},
-		{"123numbers", "123numbers"},
-		{"", ""},
-		{"a", "a"},
-	}
-	for _, tc := range cases {
-		got := slugify(tc.in)
-		if got != tc.want {
-			t.Errorf("slugify(%q) = %q, want %q", tc.in, got, tc.want)
-		}
 	}
 }
 

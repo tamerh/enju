@@ -180,3 +180,70 @@ func TestEnsureSharedSymlinkCreatesSharedParent(t *testing.T) {
 		t.Errorf("expected shared parent dir at %q, err=%v", sharedDir, err)
 	}
 }
+
+// TestFriendlyGitErrorHints covers each branch of FriendlyGitError's
+// pattern-match: SSH/credential/non-FF/network/not-found errors get
+// distinguishable hints, the local-path "not found" carries a
+// different hint than the remote-URL one, and unclassified errors
+// pass through unchanged. Originally lived in project/client_test.go;
+// moved here when the implementation moved to enjugit.
+func TestFriendlyGitErrorHints(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantHint string
+	}{
+		{"ssh", errStr("ssh: handshake failed: no supported methods"), "SSH agent"},
+		{"publickey", errStr("publickey denied"), "SSH agent"},
+		{"https 401", errStr("authentication required: HTTP 401"), "credential helper"},
+		{"403", errStr("remote: HTTP 403 forbidden"), "credential helper"},
+		{"non-ff", errStr("non-fast-forward update rejected"), "enju_project_sync"},
+		{"dns", errStr("dial tcp: lookup git.example: no such host"), "network/DNS"},
+		{"timeout", errStr("i/o timeout on fetch"), "network/DNS"},
+		{"not found", errStr("repository not found"), "verify the remote URL"},
+	}
+
+	// Local path variant — same underlying error, different hint.
+	t.Run("local path not found", func(t *testing.T) {
+		got := FriendlyGitError("clone", "/tmp/does-not-exist.git", errStr("repository not found"))
+		if got == nil {
+			t.Fatal("nil error")
+		}
+		if !strings.Contains(got.Error(), "valid bare repository") {
+			t.Errorf("expected local-path hint, got: %q", got.Error())
+		}
+		if strings.Contains(got.Error(), "your account has access") {
+			t.Errorf("local-path error should NOT include credentials hint, got: %q", got.Error())
+		}
+	})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FriendlyGitError("push", "git@example:foo.git", tc.err)
+			if got == nil {
+				t.Fatalf("nil error")
+			}
+			if !strings.Contains(got.Error(), tc.wantHint) {
+				t.Errorf("expected hint containing %q, got: %q", tc.wantHint, got.Error())
+			}
+			if !strings.Contains(got.Error(), "push") {
+				t.Errorf("expected op name 'push' in message, got: %q", got.Error())
+			}
+		})
+	}
+
+	// Unclassified errors pass through without a hint suffix.
+	plain := FriendlyGitError("clone", "", errStr("some random non-matching failure"))
+	if strings.Contains(plain.Error(), "hint:") {
+		t.Errorf("unclassified error should not carry a hint, got: %q", plain.Error())
+	}
+}
+
+// errStr builds an error from a literal string. Helper for the
+// FriendlyGitError pattern-match test above; kept here so the
+// test file stays self-contained.
+func errStr(s string) error { return &stringErr{s} }
+
+type stringErr struct{ msg string }
+
+func (e *stringErr) Error() string { return e.msg }
