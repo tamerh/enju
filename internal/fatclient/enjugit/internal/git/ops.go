@@ -1,5 +1,7 @@
 package git
 
+import "time"
+
 // Ops is the verb surface of the git layer. Workflow code in
 // enjugit depends on this interface, not on the concrete *Clone,
 // so workflow tests can pass a fake that records calls. Production
@@ -108,6 +110,16 @@ type Ops interface {
 
 	// Diagnostics — read-only.
 	CompareToRemote(branches []string) (*RemoteComparison, error)
+
+	// Clone metadata — read-only state queries with no git
+	// operations behind them. Live on Ops (not via type assertion
+	// to *Clone) so fakes can return canned values and Workflow
+	// can program against the interface uniformly.
+	WorkDir() string
+	RemoteURL() string
+	LastPushAt() time.Time
+	LastPushError() string
+	HeadCommitTime() time.Time
 
 	// WithLock holds the project lock across the closure. Inside
 	// fn, the passed Ops is the same Clone but with re-entrant

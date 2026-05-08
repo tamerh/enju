@@ -410,16 +410,3 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 	})
 	return werr
 }
-
-// workDir is a small helper so workflow methods can resolve the
-// worktree directory without depending on *git.Clone directly
-// (that would defeat the Ops-interface mocking story). We add a
-// tiny extension method on git.Ops via a type assertion when the
-// underlying impl supports it.
-func (w *Workflow) workDir() string {
-	type workDirer interface{ WorkDir() string }
-	if wd, ok := w.git.(workDirer); ok {
-		return wd.WorkDir()
-	}
-	return ""
-}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
@@ -81,6 +82,16 @@ type fakeOps struct {
 // the worktree-fallback path set fake.workDir before calling
 // the verb under test.
 func (f *fakeOps) WorkDir() string { return f.workDir }
+
+// Metadata stubs — return zero values. Tests that need specific
+// values can set the corresponding fakeOps field, but these are
+// rarely exercised in fake-ops unit tests (they're consumed by
+// service callers via Workflow's metadata accessors). Production
+// uses *git.Clone which reads them from on-disk state.
+func (f *fakeOps) RemoteURL() string       { return "" }
+func (f *fakeOps) LastPushAt() time.Time   { return time.Time{} }
+func (f *fakeOps) LastPushError() string   { return "" }
+func (f *fakeOps) HeadCommitTime() time.Time { return time.Time{} }
 
 type fakeCall struct {
 	Method string
