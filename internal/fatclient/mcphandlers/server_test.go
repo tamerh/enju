@@ -1108,10 +1108,7 @@ func TestInitFolderWithoutGit(t *testing.T) {
 		t.Errorf("paper.md clobbered: %s", data)
 	}
 
-	// External dir registered — ForProject should open it.
-	if !ws.HasExternalDir(createdProjectID) {
-		t.Error("expected external dir registered")
-	}
+	// External dir registered — ForProject resolves to the adopted folder.
 	proj, err := ws.ForProject(createdProjectID, "")
 	if err != nil {
 		t.Fatalf("ForProject on init'd dir: %v", err)
@@ -1356,11 +1353,8 @@ func TestInitOriginlessFolderStaysOriginless(t *testing.T) {
 		}
 	}
 
-	// Workspace's external dir registration succeeded — user
-	// can immediately operate on the project.
-	if !ws.HasExternalDir(42) {
-		t.Error("expected external dir registered for init'd folder")
-	}
+	// Workspace's external dir registration succeeded — ForProject
+	// resolves to the adopted folder.
 	proj, err := ws.ForProject(42, "")
 	if err != nil {
 		t.Fatalf("ForProject post-init: %v", err)

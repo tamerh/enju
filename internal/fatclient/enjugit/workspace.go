@@ -118,21 +118,6 @@ func (w *Workspace) AttachRegistry(reg *projectreg.Registry) {
 	w.registry = reg
 }
 
-// HasExternalDir reports whether a registry entry exists for id.
-// Equivalent to "has the project been registered (via enju_init or
-// enju_create_project) so ProjectDir resolves to an explicit path?"
-// Returns false when no registry is attached.
-func (w *Workspace) HasExternalDir(id int64) bool {
-	w.mu.Lock()
-	reg := w.registry
-	w.mu.Unlock()
-	if reg == nil {
-		return false
-	}
-	entry, err := reg.Get(id)
-	return err == nil && entry != nil && entry.LocalPath != ""
-}
-
 // OpenExisting opens the existing clone for id and returns a
 // Workflow. Errors with ErrCloneNotFound when no clone exists on
 // disk — does NOT clone or init. Used by callers that want to

@@ -237,9 +237,8 @@ func TestUseFatClientWithExternalDir(t *testing.T) {
 	}
 	extDir := t.TempDir()
 	// Project paths come from the registry. Register via
-	// projectreg + AttachRegistry; ForProject (and
-	// HasExternalDir) will find the path the same way they do
-	// in production.
+	// projectreg + AttachRegistry; ForProject finds the path
+	// the same way it does in production.
 	regPath := filepath.Join(t.TempDir(), "projects.json")
 	reg := projectreg.Open(regPath)
 	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: extDir}); err != nil {
