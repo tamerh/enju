@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // makeWorkflow returns a Workflow wired to a fake git.Ops with

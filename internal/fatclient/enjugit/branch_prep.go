@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // prepareBranchForCommit ensures `branch` exists locally and is

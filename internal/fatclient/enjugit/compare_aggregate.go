@@ -1,7 +1,7 @@
 package enjugit
 
 import (
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // AggregateRemoteStatus enumerates the possible relationships between

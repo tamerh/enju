@@ -27,7 +27,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // openTwoBotWorkflowsForRead is the cross-bot-read variant of

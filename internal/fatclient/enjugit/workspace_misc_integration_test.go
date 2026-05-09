@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // TestCrossWorkspaceFlockSerializationIntegration verifies that

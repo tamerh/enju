@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // makeWorkflow + fakeOps already defined in state_prep_test.go.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
 )
 
 // fakeOps is a recording mock implementing git.Ops. Workflow
