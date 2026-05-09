@@ -160,6 +160,21 @@ func (r RemoteState) String() string {
 	}
 }
 
+// CommitCompareResult is the relation between two commits in the
+// same repo, with ahead/behind counts when classifiable. Returned
+// by CompareCommits. State is one of RemoteInSync, RemoteAhead,
+// RemoteBehind, RemoteDiverged, RemoteUnrelated.
+//
+// AheadBy / BehindBy counts are populated only for Ahead / Behind
+// (single-direction count from the named SHA back to the other
+// commit) and Diverged (both counts, each measured back to the
+// merge base). Best-effort: zero on walk error.
+type CommitCompareResult struct {
+	State    RemoteState
+	AheadBy  int
+	BehindBy int
+}
+
 // WorktreeState classifies the current state of the working tree
 // relative to HEAD. Used by verb pre/post contracts.
 type WorktreeState int

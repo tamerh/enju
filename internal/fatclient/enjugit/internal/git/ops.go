@@ -126,6 +126,22 @@ type Ops interface {
 	// Diagnostics — read-only.
 	CompareToRemote(branches []string) (*RemoteComparison, error)
 
+	// RemoteBranchHash queries origin via ls-remote and returns
+	// the remote tip SHA for the named branch, or "" when the
+	// branch is absent on the remote. Errors when the remote is
+	// unreachable.
+	RemoteBranchHash(branch string) (string, error)
+
+	// CompareCommits classifies the relationship between two
+	// commits in the local object DB. Both SHAs must be non-empty;
+	// callers handle missing-side cases (empty local / empty
+	// remote) before calling. When remoteSHA is unknown to the
+	// local object DB, CompareCommits performs a single Fetch
+	// against origin and retries; if still unresolvable, it
+	// returns RemoteDiverged with zero counts (best effort, since
+	// we can't compute a merge base). Used by sync-preflight UX.
+	CompareCommits(localSHA, remoteSHA string) (CommitCompareResult, error)
+
 	// Clone metadata — read-only state queries with no git
 	// operations behind them. Live on Ops (not via type assertion
 	// to *Clone) so fakes can return canned values and Workflow

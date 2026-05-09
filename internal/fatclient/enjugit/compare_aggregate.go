@@ -1,12 +1,6 @@
 package enjugit
 
 import (
-	"fmt"
-
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 )
 
@@ -58,22 +52,21 @@ type AggregateComparison struct {
 // Origin is assumed configured — every project gets one at
 // creation. A genuinely missing origin (corrupt project state)
 // surfaces as AggregateUnreachable with the underlying error.
+//
+// Goes entirely through the git.Ops surface (RemoteBranchHash +
+// CompareCommits). No direct go-git imports — the seam stays
+// clean so the underlying backend can be swapped without
+// touching this file.
 func (w *Workflow) CompareDefaultBranch(branch string) (*AggregateComparison, error) {
 	r := &AggregateComparison{}
 	if branch == "" {
 		branch = w.DefaultBranch()
 	}
-	// Production always backs Workflow with *git.Clone; the
-	// Ops-only fakeOps test path does not exercise this verb.
-	clone, ok := w.git.(*git.Clone)
-	if !ok {
-		return nil, fmt.Errorf("enjugit: CompareDefaultBranch requires concrete *git.Clone, got %T", w.git)
-	}
 
-	localHash, _, _ := clone.Head()
+	localHash, _, _ := w.git.Head()
 	r.LocalHead = localHash
 
-	remoteHash, err := clone.RemoteBranchHash(branch)
+	remoteHash, err := w.git.RemoteBranchHash(branch)
 	if err != nil {
 		r.Status = AggregateUnreachable
 		r.Unreachable = err.Error()
@@ -96,71 +89,37 @@ func (w *Workflow) CompareDefaultBranch(branch string) (*AggregateComparison, er
 		return r, nil
 	}
 
-	repo := clone.Repo()
-	localCommit, err := repo.CommitObject(plumbing.NewHash(localHash))
+	cmp, err := w.git.CompareCommits(localHash, remoteHash)
 	if err != nil {
-		return nil, fmt.Errorf("loading local commit: %w", err)
-	}
-	// Remote commit may not be in the local object DB (we only did
-	// ls-remote). Try once; on miss, fetch and retry.
-	remoteCommit, err := repo.CommitObject(plumbing.NewHash(remoteHash))
-	if err != nil {
-		if fetchErr := repo.Fetch(&gogit.FetchOptions{
-			RemoteName: "origin",
-			Auth:       git.SSHAuthMethod(clone.RemoteURL()),
-		}); fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
-			r.Status = AggregateDiverged
-			return r, nil
-		}
-		remoteCommit, err = repo.CommitObject(plumbing.NewHash(remoteHash))
-		if err != nil {
-			r.Status = AggregateDiverged
-			return r, nil
-		}
-	}
-
-	if remoteIsAncestor, aerr := remoteCommit.IsAncestor(localCommit); aerr == nil && remoteIsAncestor {
-		r.Status = AggregateAhead
-		r.AheadBy = countCommitsBetween(localCommit, remoteHash)
+		r.Status = AggregateUnreachable
+		r.Unreachable = err.Error()
 		return r, nil
 	}
-	if localIsAncestor, aerr := localCommit.IsAncestor(remoteCommit); aerr == nil && localIsAncestor {
-		r.Status = AggregateBehind
-		r.BehindBy = countCommitsBetween(remoteCommit, localHash)
-		return r, nil
-	}
-
-	bases, err := localCommit.MergeBase(remoteCommit)
-	if err != nil || len(bases) == 0 {
-		r.Status = AggregateUnrelated
-		return r, nil
-	}
-	baseHash := bases[0].Hash.String()
-	r.Status = AggregateDiverged
-	r.AheadBy = countCommitsBetween(localCommit, baseHash)
-	r.BehindBy = countCommitsBetween(remoteCommit, baseHash)
+	r.AheadBy = cmp.AheadBy
+	r.BehindBy = cmp.BehindBy
+	r.Status = aggregateFromRemoteState(cmp.State)
 	return r, nil
 }
 
-// countCommitsBetween walks first-parent history starting at `from`
-// and returns the count of commits before reaching `until`
-// (exclusive). Diagnostic only — returns 0 on any walk error.
-func countCommitsBetween(from *object.Commit, until string) int {
-	count := 0
-	current := from
-	for current != nil {
-		if current.Hash.String() == until {
-			return count
-		}
-		count++
-		if current.NumParents() == 0 {
-			return count
-		}
-		parent, err := current.Parent(0)
-		if err != nil {
-			return count
-		}
-		current = parent
+// aggregateFromRemoteState maps git.RemoteState (the backend-level
+// enum) to AggregateRemoteStatus (the UX-level enum). Empty-side
+// cases (RemoteEmpty / LocalEmpty) are handled by the caller
+// before invoking CompareCommits, so they don't appear here.
+func aggregateFromRemoteState(s git.RemoteState) AggregateRemoteStatus {
+	switch s {
+	case git.RemoteInSync:
+		return AggregateInSync
+	case git.RemoteAhead:
+		return AggregateAhead
+	case git.RemoteBehind:
+		return AggregateBehind
+	case git.RemoteDiverged:
+		return AggregateDiverged
+	case git.RemoteUnrelated:
+		return AggregateUnrelated
+	case git.RemoteUnreachable:
+		return AggregateUnreachable
+	default:
+		return AggregateUnreachable
 	}
-	return count
 }

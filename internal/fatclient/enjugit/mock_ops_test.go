@@ -483,6 +483,16 @@ func (f *fakeOps) CompareToRemote(branches []string) (*git.RemoteComparison, err
 	return &git.RemoteComparison{}, f.checkErr("CompareToRemote")
 }
 
+func (f *fakeOps) RemoteBranchHash(branch string) (string, error) {
+	f.record("RemoteBranchHash", branch)
+	return "", f.checkErr("RemoteBranchHash")
+}
+
+func (f *fakeOps) CompareCommits(localSHA, remoteSHA string) (git.CommitCompareResult, error) {
+	f.record("CompareCommits", localSHA, remoteSHA)
+	return git.CommitCompareResult{}, f.checkErr("CompareCommits")
+}
+
 func (f *fakeOps) WithLock(fn func(git.Ops) error) error {
 	f.record("WithLock")
 	if f.insideWithLock {
