@@ -390,6 +390,34 @@ func (c *Clone) WalkRecentCommits(maxWalk int, visit func(sha, message string) b
 	return nil
 }
 
+// WalkCommitsFrom walks ancestry first-parent-first starting at
+// fromSHA, calling visit for up to maxWalk commits (<=0 = all).
+// Returns ErrCommitNotFound when fromSHA isn't in the local
+// object DB. See the Ops docstring for the contract.
+//
+// Read-only: does not acquire the project lock.
+func (c *Clone) WalkCommitsFrom(fromSHA string, maxWalk int, visit func(sha, message string) bool) error {
+	hash := plumbing.NewHash(fromSHA)
+	if _, err := c.repo.CommitObject(hash); err != nil {
+		return ErrCommitNotFound
+	}
+	iter, err := c.repo.Log(&gogit.LogOptions{From: hash})
+	if err != nil {
+		return fmt.Errorf("git: log walk from %s: %w", fromSHA, err)
+	}
+	defer iter.Close()
+	for i := 0; maxWalk <= 0 || i < maxWalk; i++ {
+		commit, err := iter.Next()
+		if err != nil {
+			break
+		}
+		if !visit(commit.Hash.String(), commit.Message) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // treeAtCommit loads the root tree for a commit, with the same
 // lazy-fetch retry as ReadFileAtCommit.
 func (c *Clone) treeAtCommit(sha string) (*object.Tree, error) {

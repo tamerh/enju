@@ -32,6 +32,15 @@ type Ops interface {
 	// trailers (rebase-stable key).
 	WalkRecentCommits(maxWalk int, visit func(sha, message string) bool) error
 
+	// WalkCommitsFrom walks ancestry first-parent-first starting at
+	// fromSHA, calling visit for up to maxWalk commits (<=0 = all).
+	// Returns ErrCommitNotFound when fromSHA isn't in the local
+	// object DB. Differs from WalkRecentCommits by accepting an
+	// arbitrary starting commit instead of HEAD — used by
+	// integration-test diagnostics to dump a commit's ancestry
+	// without dragging go-git into the test file.
+	WalkCommitsFrom(fromSHA string, maxWalk int, visit func(sha, message string) bool) error
+
 	// LogFile returns commits that touched relPath, newest-first.
 	// Used by per-file history readers (enju_get_artifact_history).
 	LogFile(relPath string) ([]CommitInfo, error)
