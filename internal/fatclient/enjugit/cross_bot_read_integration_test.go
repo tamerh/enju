@@ -20,6 +20,7 @@ package enjugit
 //   Theme D-disk  — worktree-on-disk content (4 tests)
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,8 +28,6 @@ import (
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
 )
 
 // openTwoBotWorkflowsForRead is the cross-bot-read variant of
@@ -63,79 +62,53 @@ func openTwoBotWorkflowsForRead(t *testing.T) (alice, bob *Workflow, bare string
 	return alice, bob, bare
 }
 
-// workflowRepo returns the underlying go-git *Repository for a
-// Workflow. Used by tests that need direct access to refs /
-// log walking — the same pattern as producing_edge_integration
-// and merge_integration. Tests, not production, get to peek
-// behind the abstraction.
-func workflowRepo(t *testing.T, wf *Workflow) *gogit.Repository {
-	t.Helper()
-	clone, ok := wf.git.(*git.Clone)
-	if !ok {
-		t.Fatalf("expected *git.Clone under workflow, got %T", wf.git)
-	}
-	return clone.Repo()
-}
-
 // ancestryContains returns true when target is reachable from
 // head via the parent chain in wf's local clone. Used to verify
 // that a review-iter-N commit's ancestry threads through the
 // upstream's iter-N (the load-bearing fork-from-upstream
-// invariant).
+// invariant). Goes through the Ops surface so the assertion is
+// backend-agnostic.
 func ancestryContains(t *testing.T, wf *Workflow, head, target string) bool {
 	t.Helper()
-	repo := workflowRepo(t, wf)
-	headHash := plumbing.NewHash(head)
-	targetHash := plumbing.NewHash(target)
-	iter, err := repo.Log(&gogit.LogOptions{From: headHash})
+	isAnc, err := wf.git.IsAncestor(target, head)
 	if err != nil {
-		t.Fatalf("log from %s: %v", head, err)
+		// One side missing locally — treat as "no" for the test
+		// invariant. Surface the underlying error in case the
+		// caller's failure message wants to mention it.
+		t.Logf("IsAncestor(%s, %s): %v", target, head, err)
+		return false
 	}
-	defer iter.Close()
-	for {
-		c, err := iter.Next()
-		if err != nil {
-			break
-		}
-		if c.Hash == targetHash {
-			return true
-		}
-	}
-	return false
+	return isAnc
 }
 
 // ancestryDump returns a short text dump of head's ancestor
 // SHAs. Used in failure messages to make "the ancestry doesn't
-// match" diagnosable instead of opaque.
+// match" diagnosable instead of opaque. Walks via the Ops
+// WalkCommitsFrom primitive — no go-git imports here.
 func ancestryDump(t *testing.T, wf *Workflow, head string) string {
 	t.Helper()
-	repo := workflowRepo(t, wf)
-	iter, err := repo.Log(&gogit.LogOptions{From: plumbing.NewHash(head)})
-	if err != nil {
-		return fmt.Sprintf("(log error: %v)", err)
-	}
-	defer iter.Close()
 	var lines []string
-	for i := 0; i < 10; i++ {
-		c, err := iter.Next()
-		if err != nil {
-			break
-		}
-		lines = append(lines, c.Hash.String()[:8])
+	err := wf.git.WalkCommitsFrom(head, 10, func(sha, _ string) bool {
+		lines = append(lines, sha[:8])
+		return true
+	})
+	if err != nil {
+		return fmt.Sprintf("(walk error: %v)", err)
 	}
 	return strings.Join(lines, " → ")
 }
 
 // hasCommit returns true if wf's underlying clone has the given
-// commit SHA in its local object DB. Used to assert pre-/post-
-// fetch invariants without dragging plumbing into every test.
+// commit SHA in its local object DB. Probes via WalkCommitsFrom
+// with maxWalk=1 — it short-circuits to ErrCommitNotFound when
+// the starting SHA can't be resolved, which is exactly the
+// "exists?" question.
 func hasCommit(t *testing.T, wf *Workflow, sha string) bool {
 	t.Helper()
-	clone, ok := wf.git.(*git.Clone)
-	if !ok {
-		t.Fatalf("expected *git.Clone under workflow, got %T", wf.git)
+	err := wf.git.WalkCommitsFrom(sha, 1, func(string, string) bool { return false })
+	if err != nil && !errors.Is(err, git.ErrCommitNotFound) {
+		t.Logf("hasCommit(%s) probe: %v", sha, err)
 	}
-	_, err := clone.Repo().CommitObject(plumbing.NewHash(sha))
 	return err == nil
 }
 
@@ -910,12 +883,10 @@ func TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRefIntegration(t *testing.
 	}
 
 	// Stash bob's seed (root) commit so we can plant a stale ref.
-	bobRepo := workflowRepo(t, bob)
-	bobHead, err := bobRepo.Head()
+	seedHash, _, err := bob.git.Head()
 	if err != nil {
 		t.Fatalf("bob head: %v", err)
 	}
-	seedHash := bobHead.Hash()
 
 	// alice iter-2
 	d2Res, err := alice.SubmitTaskResult(SubmitRequest{
@@ -936,11 +907,9 @@ func TestReviewIter2_ForksCorrectly_EvenWithStaleLocalRefIntegration(t *testing.
 	// The stale-ref injection: pre-create review_domain/iter-2 at
 	// seed BEFORE bob's submit. This is what the production clone
 	// would look like if a previous run / a fetched stale tracking
-	// ref planted the same branch name.
-	staleRefName := "refs/heads/1-build/review_domain/iter-2"
-	if err := bobRepo.Storer.SetReference(
-		plumbing.NewHashReference(plumbing.ReferenceName(staleRefName), seedHash),
-	); err != nil {
+	// ref planted the same branch name. SetBranchTo writes the
+	// branch ref directly via Ops — no go-git needed.
+	if err := bob.git.SetBranchTo("1-build/review_domain/iter-2", seedHash); err != nil {
 		t.Fatalf("planting stale ref: %v", err)
 	}
 
@@ -1021,17 +990,17 @@ func TestReviewerCheckoutUpstreamTopic_ForksFromOriginNotRunBranchIntegration(t 
 	}
 
 	// Verify: reviewer's local ref must point at the developer's
-	// actual commit, NOT at run-branch's tip.
-	repo := workflowRepo(t, reviewer)
-	ref, err := repo.Reference(plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1"), true)
+	// actual commit, NOT at run-branch's tip. LocalBranchHash
+	// reads refs/heads/<branch> via Ops.
+	gotSHA, err := reviewer.git.LocalBranchHash("iter-smoke-runs/develop_a/iter-1")
 	if err != nil {
 		t.Fatalf("upstream ref lookup: %v", err)
 	}
-	if ref.Hash().String() != devTopicSHA {
+	if gotSHA != devTopicSHA {
 		t.Fatalf("REPRO: reviewer's local upstream ref points at the WRONG commit.\n"+
 			"  got:  %s (run-branch tip — has no smoke/a.md)\n"+
 			"  want: %s (developer's actual topic commit)",
-			ref.Hash(), devTopicSHA)
+			gotSHA, devTopicSHA)
 	}
 
 	// Verify: smoke/a.md is on disk (the actual symptom).
@@ -1138,11 +1107,8 @@ func TestStaleRefReset_PreservesClaudeOutputIntegration(t *testing.T) {
 
 	// Plant the stale-ref shape: develop_config/iter-2 already
 	// exists locally pointing at seed (the production bug shape).
-	bobRepoH := workflowRepo(t, bob)
-	bobHead, _ := bobRepoH.Head()
-	seedHash := bobHead.Hash()
-	staleRef := plumbing.ReferenceName("refs/heads/run-1/develop_config/iter-2")
-	if err := bobRepoH.Storer.SetReference(plumbing.NewHashReference(staleRef, seedHash)); err != nil {
+	seedHash, _, _ := bob.git.Head()
+	if err := bob.git.SetBranchTo("run-1/develop_config/iter-2", seedHash); err != nil {
 		t.Fatalf("planting stale ref: %v", err)
 	}
 
@@ -1182,28 +1148,20 @@ func TestStaleRefReset_PreservesClaudeOutputIntegration(t *testing.T) {
 	}
 
 	// Verify the commit's tree has all of claude's output. The
-	// reseat must NOT have wiped req.Files mid-flight.
-	commit, err := bobRepoH.CommitObject(plumbing.NewHash(res.CommitSHA))
-	if err != nil {
-		t.Fatalf("commit lookup: %v", err)
-	}
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("tree lookup: %v", err)
-	}
+	// reseat must NOT have wiped req.Files mid-flight. ReadFileAtCommit
+	// reaches the tree through the Ops surface.
 	for _, f := range claudeOutput {
-		entry, err := tree.File(f.RepoRelPath)
+		body, found, err := bob.git.ReadFileAtCommit(res.CommitSHA, f.RepoRelPath)
 		if err != nil {
-			t.Errorf("commit tree missing %s: %v — stale-ref reseat corrupted submit pipeline", f.RepoRelPath, err)
+			t.Errorf("read %s at %s: %v — stale-ref reseat corrupted submit pipeline", f.RepoRelPath, res.CommitSHA, err)
 			continue
 		}
-		body, err := entry.Contents()
-		if err != nil {
-			t.Errorf("read %s: %v", f.RepoRelPath, err)
+		if !found {
+			t.Errorf("commit tree missing %s — stale-ref reseat corrupted submit pipeline", f.RepoRelPath)
 			continue
 		}
-		if body != string(f.Content) {
-			t.Errorf("content mismatch for %s: got %q, want %q", f.RepoRelPath, body, string(f.Content))
+		if string(body) != string(f.Content) {
+			t.Errorf("content mismatch for %s: got %q, want %q", f.RepoRelPath, string(body), string(f.Content))
 		}
 	}
 }
@@ -1268,12 +1226,14 @@ func TestIterN_NewBranchForksFromRunBranchNotSeedIntegration(t *testing.T) {
 
 	// Verify iter-2's branch ref forks from the RUN BRANCH TIP,
 	// not from seed. This is the core production failure.
-	bobRepoH := workflowRepo(t, bob)
-	iter2Ref, err := bobRepoH.Reference(plumbing.ReferenceName("refs/heads/topics/develop_domain/iter-2"), true)
+	got, err := bob.git.LocalBranchHash("topics/develop_domain/iter-2")
 	if err != nil {
 		t.Fatalf("iter-2 ref lookup: %v", err)
 	}
-	if got := iter2Ref.Hash().String(); got != runBranchTip {
+	if got == "" {
+		t.Fatalf("iter-2 ref missing locally")
+	}
+	if got != runBranchTip {
 		t.Fatalf("REPRO: iter-2 forked from wrong base.\n"+
 			"  iter-2 commit: %s\n"+
 			"  run-branch tip: %s (expected — has prior task content)\n"+
@@ -1333,13 +1293,13 @@ func TestIter2_DirtyWorktreeFromIter1_DoesNotBlockBranchSwitchIntegration(t *tes
 			"resetting the clone, so iter-1's residue blocks the switch.", err)
 	}
 
-	// Verify HEAD landed on iter-2 (not stuck on iter-1).
-	bobRepoH := workflowRepo(t, bob)
-	head, err := bobRepoH.Head()
+	// Verify HEAD landed on iter-2 (not stuck on iter-1). Ops.Head
+	// returns the short branch name (no refs/heads/ prefix).
+	_, branch, err := bob.git.Head()
 	if err != nil {
 		t.Fatalf("HEAD: %v", err)
 	}
-	if got, want := head.Name().String(), "refs/heads/1-build/develop_domain/iter-2"; got != want {
+	if got, want := branch, "1-build/develop_domain/iter-2"; got != want {
 		t.Errorf("HEAD on wrong ref after checkout: got %s, want %s", got, want)
 	}
 }
@@ -1377,9 +1337,11 @@ func TestReviewerWorktreeHasUpstreamContent_BeforeHandlerRunsIntegration(t *test
 	}
 
 	// Sanity: the ref exists in reviewer's clone (object DB).
-	reviewerRepo := workflowRepo(t, reviewer)
-	if _, err := reviewerRepo.Reference(plumbing.NewRemoteReferenceName("origin", "1-build/develop_config/iter-1"), true); err != nil {
-		t.Fatalf("reviewer fetch didn't bring upstream topic ref: %v", err)
+	// LocalBranchHash falls back to refs/remotes/origin/<branch>
+	// when the local ref isn't present, so an empty return means
+	// neither path resolved — fetch didn't bring the ref in.
+	if h, err := reviewer.git.LocalBranchHash("1-build/develop_config/iter-1"); err != nil || h == "" {
+		t.Fatalf("reviewer fetch didn't bring upstream topic ref: hash=%q err=%v", h, err)
 	}
 
 	// THE FIX: checkout the upstream topic branch tip so its content
@@ -1440,19 +1402,16 @@ func TestReviewerWorktreeMissingContent_LocalRefMatchesOriginIntegration(t *test
 	// Establish the production state precisely: local upstream ref
 	// EXISTS and matches origin's tip. (This is what a previous
 	// successful review iteration of the same upstream would have
-	// left behind.)
-	reviewerRepo := workflowRepo(t, reviewer)
-	upstreamRef := plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1")
-	if err := reviewerRepo.Storer.SetReference(
-		plumbing.NewHashReference(upstreamRef, plumbing.NewHash(devSHA)),
-	); err != nil {
+	// left behind.) SetBranchTo writes refs/heads/<branch> via Ops.
+	upstreamBranch := "iter-smoke-runs/develop_a/iter-1"
+	if err := reviewer.git.SetBranchTo(upstreamBranch, devSHA); err != nil {
 		t.Fatalf("planting matching local ref: %v", err)
 	}
 
 	// Sanity: HEAD must be on a DIFFERENT branch (not the upstream
 	// topic) so we exercise the worktree-update path.
-	head, _ := reviewerRepo.Head()
-	if head.Name() == upstreamRef {
+	_, headBranch, _ := reviewer.git.Head()
+	if headBranch == upstreamBranch {
 		t.Fatal("test setup invalid: HEAD already on upstream topic; can't exercise the switch")
 	}
 
@@ -1512,35 +1471,33 @@ func TestReviewerWorktreeMissingContent_DespiteCorrectRefIntegration(t *testing.
 	// commit (e.g. seed/run-branch tip — what the broken version
 	// of the fix produced). origin/<upstream> still points at the
 	// developer's actual commit.
-	reviewerRepo := workflowRepo(t, reviewer)
-	bobHead, _ := reviewerRepo.Head()
-	staleHash := bobHead.Hash()
-	if staleHash == plumbing.NewHash(devActualSHA) {
+	staleHash, _, _ := reviewer.git.Head()
+	if staleHash == devActualSHA {
 		t.Fatal("test setup invalid: HEAD coincides with developer's commit")
 	}
-	staleRef := plumbing.ReferenceName("refs/heads/iter-smoke-runs/develop_a/iter-1")
-	if err := reviewerRepo.Storer.SetReference(plumbing.NewHashReference(staleRef, staleHash)); err != nil {
+	upstreamBranch := "iter-smoke-runs/develop_a/iter-1"
+	if err := reviewer.git.SetBranchTo(upstreamBranch, staleHash); err != nil {
 		t.Fatalf("planting stale ref: %v", err)
 	}
 
 	// Production flow: daemon calls CheckoutBranchFrom(upstream, "")
 	// — empty baseBranch so the verb resolves origin/<upstream> as
 	// the authoritative tip and reseats the local ref.
-	if err := reviewer.CheckoutBranchFrom("iter-smoke-runs/develop_a/iter-1", ""); err != nil {
+	if err := reviewer.CheckoutBranchFrom(upstreamBranch, ""); err != nil {
 		t.Fatalf("CheckoutBranchFrom: %v", err)
 	}
 
 	// Verify the local ref now points at the developer's actual
 	// commit (not the stale hash).
-	ref, err := reviewerRepo.Reference(staleRef, true)
+	gotSHA, err := reviewer.git.LocalBranchHash(upstreamBranch)
 	if err != nil {
 		t.Fatalf("ref lookup post-checkout: %v", err)
 	}
-	if ref.Hash().String() != devActualSHA {
+	if gotSHA != devActualSHA {
 		t.Errorf("REPRO: local upstream ref still stale.\n"+
 			"  got:  %s (the planted stale hash)\n"+
 			"  want: %s (origin's actual upstream tip)",
-			ref.Hash(), devActualSHA)
+			gotSHA, devActualSHA)
 	}
 
 	// THE PRODUCTION SYMPTOM: smoke/a.md must be on disk after the
@@ -1636,14 +1593,16 @@ func TestRequestChanges_RevisionOnSameBranch_DirtyWorktreeIntegration(t *testing
 }
 
 // headRefName returns the wf's current HEAD ref name as a string,
-// or "(error)". Helper for diagnostic failure messages — keeps
-// the test bodies focused.
+// or "(error)" / "(detached)". Helper for diagnostic failure
+// messages — keeps the test bodies focused. Goes through Ops.
 func headRefName(t *testing.T, wf *Workflow) string {
 	t.Helper()
-	repo := workflowRepo(t, wf)
-	h, err := repo.Head()
+	_, branch, err := wf.git.Head()
 	if err != nil {
 		return "(error)"
 	}
-	return h.Name().String()
+	if branch == "" {
+		return "(detached)"
+	}
+	return "refs/heads/" + branch
 }
