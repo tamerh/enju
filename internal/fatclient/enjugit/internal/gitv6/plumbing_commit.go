@@ -351,8 +351,23 @@ func buildNestedTree(s storer.EncodedObjectStorer, paths map[string]plumbingTree
 				Hash: childHash,
 			})
 		}
+		// Git's canonical tree-entry sort: directories sort as if
+		// their name had a trailing "/" appended. Without this,
+		// sibling file "enju.yaml" + sibling dir "enju/" sort as
+		// "enju" < "enju.yaml" — but git wants "enju.yaml" first
+		// because '.' (0x2e) < '/' (0x2f). go-git/v6's Tree.Encode
+		// validates this order and rejects with "entries in tree
+		// are not sorted"; v5 was lenient.
 		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].Name < entries[j].Name
+			ki := entries[i].Name
+			if entries[i].Mode == filemode.Dir {
+				ki += "/"
+			}
+			kj := entries[j].Name
+			if entries[j].Mode == filemode.Dir {
+				kj += "/"
+			}
+			return ki < kj
 		})
 		tree := &object.Tree{Entries: entries}
 		treeObj := s.NewEncodedObject()

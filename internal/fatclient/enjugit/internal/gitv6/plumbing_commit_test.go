@@ -337,3 +337,39 @@ func TestPlumbingCommit_ConcurrentDistinctBranches(t *testing.T) {
 		}
 	}
 }
+
+// TestPlumbingCommit_GitCanonicalEntryOrder pins git's tree-entry
+// sort rule: directories are compared as if their name has a "/"
+// appended. So a sibling file "enju.yaml" (key "enju.yaml") must
+// sort BEFORE a sibling dir "enju/" (key "enju/") — because '.'
+// (0x2e) < '/' (0x2f). A naive sort on entry.Name puts the dir
+// first ("enju" < "enju.yaml") and v6's Tree.Encode rejects with
+// "entries in tree are not sorted".
+//
+// This is the load-tester repro for the production failure where
+// every PlumbingCommit on a topic branch failed with that error
+// (a project with both `enju.yaml` and the `enju/` directory in
+// its repo root, which is the canonical Enju layout).
+func TestPlumbingCommit_GitCanonicalEntryOrder(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+	baseSHA, _, _ := c.Head()
+
+	// Overlay both a file at "enju.yaml" and a file under "enju/".
+	// After flattenTree + Files overlay, the root tree has a sibling
+	// file "enju.yaml" + sibling subdir "enju".
+	_, err := c.PlumbingCommit(PlumbingCommitRequest{
+		BaseSHA: baseSHA,
+		Files: []FileWrite{
+			{RepoRelPath: "enju.yaml", Content: []byte("project: x\n")},
+			{RepoRelPath: "enju/runs/1/result.md", Content: []byte("ok\n")},
+		},
+		Message:     "test git canonical entry order\n",
+		AuthorName:  "Tester",
+		AuthorEmail: "tester@example.com",
+	})
+	if err != nil {
+		t.Fatalf("PlumbingCommit failed with file+dir name collision: %v", err)
+	}
+}
