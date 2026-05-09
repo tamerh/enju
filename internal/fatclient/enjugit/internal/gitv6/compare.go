@@ -5,6 +5,7 @@ import (
 
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // CompareToRemote returns local-vs-remote sync state for the
@@ -75,6 +76,89 @@ func (c *Clone) classifyState(localSHA, remoteSHA string) RemoteState {
 		return RemoteUnrelated
 	}
 	return RemoteDiverged
+}
+
+// CompareCommits classifies the relationship between two commits
+// in the local object DB and returns ahead/behind counts. See the
+// Ops docstring for the contract. localSHA and remoteSHA must be
+// non-empty.
+//
+// Tries once to load both commits; if remoteSHA is missing,
+// fetches origin (with the v6 ClientOptions auth path) and
+// retries. On any unresolved-load after that, returns
+// RemoteDiverged with zero counts.
+func (c *Clone) CompareCommits(localSHA, remoteSHA string) (CommitCompareResult, error) {
+	out := CommitCompareResult{}
+	if localSHA == remoteSHA {
+		out.State = RemoteInSync
+		return out, nil
+	}
+	localHash := plumbing.NewHash(localSHA)
+	remoteHash := plumbing.NewHash(remoteSHA)
+	localCommit, err := c.repo.CommitObject(localHash)
+	if err != nil {
+		return out, err
+	}
+	remoteCommit, err := c.repo.CommitObject(remoteHash)
+	if err != nil {
+		fetchErr := c.repo.Fetch(&gogit.FetchOptions{
+			RemoteName:    "origin",
+			ClientOptions: clientOptionsFor(c.RemoteURL()),
+		})
+		if fetchErr != nil && !errors.Is(fetchErr, gogit.NoErrAlreadyUpToDate) {
+			out.State = RemoteDiverged
+			return out, nil
+		}
+		remoteCommit, err = c.repo.CommitObject(remoteHash)
+		if err != nil {
+			out.State = RemoteDiverged
+			return out, nil
+		}
+	}
+	if anc, aerr := remoteCommit.IsAncestor(localCommit); aerr == nil && anc {
+		out.State = RemoteAhead
+		out.AheadBy = countFirstParentBetween(localCommit, remoteSHA)
+		return out, nil
+	}
+	if anc, aerr := localCommit.IsAncestor(remoteCommit); aerr == nil && anc {
+		out.State = RemoteBehind
+		out.BehindBy = countFirstParentBetween(remoteCommit, localSHA)
+		return out, nil
+	}
+	bases, err := localCommit.MergeBase(remoteCommit)
+	if err != nil || len(bases) == 0 {
+		out.State = RemoteUnrelated
+		return out, nil
+	}
+	baseHash := bases[0].Hash.String()
+	out.State = RemoteDiverged
+	out.AheadBy = countFirstParentBetween(localCommit, baseHash)
+	out.BehindBy = countFirstParentBetween(remoteCommit, baseHash)
+	return out, nil
+}
+
+// countFirstParentBetween walks first-parent history starting at
+// `from` and returns the number of commits before reaching
+// `until` (exclusive). Diagnostic only — returns 0 on any walk
+// error so a count failure never aborts the comparison.
+func countFirstParentBetween(from *object.Commit, until string) int {
+	count := 0
+	current := from
+	for current != nil {
+		if current.Hash.String() == until {
+			return count
+		}
+		count++
+		if current.NumParents() == 0 {
+			return count
+		}
+		parent, err := current.Parent(0)
+		if err != nil {
+			return count
+		}
+		current = parent
+	}
+	return count
 }
 
 // silence unused import when we don't reference gogit types in
