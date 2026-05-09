@@ -13,9 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/enjugit/internal/git"
 	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 )
 
 // TestSubmitTaskResult_ConcurrentPushSurfacesNonFFIntegration
@@ -158,31 +156,23 @@ func TestPushForceOverwritesDivergedRemoteIntegration(t *testing.T) {
 		t.Fatalf("B initial submit: %v", err)
 	}
 
-	// Repoint B's clone at A's bare. Direct go-git access via
-	// the *git.Clone underneath — Workflow doesn't expose
-	// remote-management primitives because production code
-	// doesn't need them; tests do.
-	cloneB, ok := wfB.git.(*git.Clone)
-	if !ok {
-		t.Fatalf("expected *git.Clone under workflow, got %T", wfB.git)
+	// Repoint B's clone at A's bare via the Ops surface
+	// (RemoveOrigin + EnsureOrigin). Workflow exposes those
+	// primitives so this scenario doesn't need to bypass
+	// the seam.
+	if err := wfB.git.RemoveOrigin(); err != nil {
+		t.Fatalf("remove origin: %v", err)
 	}
-	repoB := cloneB.Repo()
-	if err := repoB.DeleteRemote("origin"); err != nil {
-		t.Fatalf("delete origin: %v", err)
-	}
-	if _, err := repoB.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{bare},
-	}); err != nil {
-		t.Fatalf("recreate origin: %v", err)
+	if err := wfB.git.EnsureOrigin(bare); err != nil {
+		t.Fatalf("set origin to bare: %v", err)
 	}
 
 	// Normal push (force=false) should fail against the
 	// divergent remote. Force push wins.
-	if err := cloneB.PushAllRefs(false); err == nil {
+	if err := wfB.git.PushAllRefs(false); err == nil {
 		t.Fatal("expected normal Push to fail against diverged remote")
 	}
-	if err := cloneB.PushAllRefs(true); err != nil {
+	if err := wfB.git.PushAllRefs(true); err != nil {
 		t.Fatalf("PushAllRefs(force=true): %v", err)
 	}
 
@@ -217,20 +207,12 @@ func TestSubmitTaskResult_FailsClearlyAgainstUnreachableRemoteIntegration(t *tes
 	// Point the project at a bogus remote so push fails with
 	// "repository not found" — a hard error the retry loop
 	// cannot recover from.
-	clone, ok := wf.git.(*git.Clone)
-	if !ok {
-		t.Fatalf("expected *git.Clone under workflow, got %T", wf.git)
-	}
-	repo := clone.Repo()
-	if err := repo.DeleteRemote("origin"); err != nil {
-		t.Fatalf("delete origin: %v", err)
+	if err := wf.git.RemoveOrigin(); err != nil {
+		t.Fatalf("remove origin: %v", err)
 	}
 	bogus := filepath.Join(t.TempDir(), "nonexistent.git")
-	if _, err := repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{bogus},
-	}); err != nil {
-		t.Fatalf("recreate origin: %v", err)
+	if err := wf.git.EnsureOrigin(bogus); err != nil {
+		t.Fatalf("set origin to bogus: %v", err)
 	}
 
 	_, err = wf.SubmitTaskResult(SubmitRequest{
