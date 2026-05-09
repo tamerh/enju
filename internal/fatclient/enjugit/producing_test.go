@@ -185,31 +185,48 @@ func TestSubmitTaskResult_TraceNarratesSteps(t *testing.T) {
 	}
 }
 
-// TestAutoMergeAcceptedTopic_LeavesHeadOnTarget is the
-// regression guard for the lost-commit bug. After a merge
-// completes, HEAD must be on the target branch so any
-// subsequent worktree operation (a user's manual `git commit`,
-// the next iteration's claim) lands on the right ref. Without
-// the explicit checkout-target step, HEAD stayed on the topic
-// branch the merge was sourced from — the orphan branch the
-// caller no longer cares about.
-func TestAutoMergeAcceptedTopic_LeavesHeadOnTarget(t *testing.T) {
+// TestAutoMergeAcceptedTopic_ChecksOutTargetWhenHeadElsewhere
+// is the regression guard for the lost-commit bug — for the
+// LLM/bot path, where HEAD enters the merge sitting on the
+// topic branch. Without an explicit Checkout(target), HEAD
+// would stay on topic after the FF and the next iteration's
+// fork would miss any user commits made between submits.
+func TestAutoMergeAcceptedTopic_ChecksOutTargetWhenHeadElsewhere(t *testing.T) {
 	wf, fake := makeWorkflow(t)
+	// Simulate the LLM/bot entry shape: HEAD on the topic
+	// branch, not on the merge target.
+	fake.headBranch = "topic"
 	_, err := wf.MergeAcceptedTopic("topic", "main",
 		MergeAuthor{TaskID: "x", AutoOrManual: "auto"})
 	if err != nil {
 		t.Fatalf("MergeAcceptedTopic: %v", err)
 	}
-	// The trace must show checkout-target executed BEFORE
-	// merge-ff. Without that ordering, HEAD would stay on the
-	// topic branch and the next iteration's fork would miss
-	// any user commits made between submits.
 	checkoutCall := fake.lastCall("Checkout")
 	if checkoutCall == nil {
 		t.Fatal("Checkout(target) not called — HEAD wouldn't end up on target")
 	}
 	if checkoutCall.Args[0] != "main" {
 		t.Errorf("Checkout target: got %v, want main", checkoutCall.Args[0])
+	}
+}
+
+// TestAutoMergeAcceptedTopic_SkipsCheckoutWhenHeadAlreadyOnTarget
+// is the Phase 1.4 companion: when HEAD enters the merge already
+// on target (compute path — pre-claim CheckoutBranch left HEAD
+// on the run branch and the no-checkout PlumbingCommit didn't
+// move it), the post-FF Checkout becomes redundant AND harmful
+// (triggers preserve-restore on a worktree that holds untracked
+// script outputs). Skip it.
+func TestAutoMergeAcceptedTopic_SkipsCheckoutWhenHeadAlreadyOnTarget(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	// fake.headBranch defaults to "main" — same as our merge target.
+	_, err := wf.MergeAcceptedTopic("topic", "main",
+		MergeAuthor{TaskID: "x", AutoOrManual: "auto"})
+	if err != nil {
+		t.Fatalf("MergeAcceptedTopic: %v", err)
+	}
+	if call := fake.lastCall("Checkout"); call != nil {
+		t.Errorf("expected Checkout to be skipped when HEAD already on target, got call %+v", call)
 	}
 }
 

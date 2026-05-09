@@ -100,19 +100,33 @@ func (w *Workflow) SubmitComputeTaskResult(req SubmitRequest) (*SubmitResult, er
 	trace.ctx("run_branch", req.RunBranch)
 	trace.ctx("iter_seq", fmt.Sprintf("%d", req.IterSeq))
 
-	// Step 1: resolve base SHA = run branch's local tip. The topic
-	// commit forks from here. Note: caller is responsible for
-	// ensuring the run branch exists + is current. We don't fetch
-	// here — the cascade-pull at task claim time should have
-	// already brought run-branch up to date.
-	baseSHA, err := w.git.LocalBranchHash(req.RunBranch)
-	if err != nil {
-		return nil, trace.fail("resolve-base", fmt.Errorf("read run branch %s: %w", req.RunBranch, err))
+	// Step 1: resolve base SHA. When the topic branch already
+	// exists locally (re-iteration after request_changes — Phase
+	// 6c keeps iter_seq stable so the topic branch name doesn't
+	// change), fork the new commit from the EXISTING topic tip,
+	// not the run branch. Otherwise the new commit's parent
+	// chain has nothing in common with origin's topic ref → push
+	// rejected as non-fast-forward.
+	//
+	// First iteration: no local topic ref, fall back to the run
+	// branch as before.
+	var baseSHA string
+	var baseSource string
+	if topicSHA, terr := w.git.LocalBranchHash(branchName); terr == nil && topicSHA != "" {
+		baseSHA = topicSHA
+		baseSource = "topic"
+	} else {
+		runSHA, err := w.git.LocalBranchHash(req.RunBranch)
+		if err != nil {
+			return nil, trace.fail("resolve-base", fmt.Errorf("read run branch %s: %w", req.RunBranch, err))
+		}
+		if runSHA == "" {
+			return nil, trace.fail("resolve-base", fmt.Errorf("run branch %s has no local ref (caller must ensure run branch exists)", req.RunBranch))
+		}
+		baseSHA = runSHA
+		baseSource = "run"
 	}
-	if baseSHA == "" {
-		return nil, trace.fail("resolve-base", fmt.Errorf("run branch %s has no local ref (caller must ensure run branch exists)", req.RunBranch))
-	}
-	trace.okDetail("resolve-base", baseSHA[:8])
+	trace.okDetail("resolve-base", baseSource+":"+baseSHA[:8])
 
 	// Step 2: build commit via plumbing (no checkout, no HEAD move).
 	commitSHA, err := w.git.PlumbingCommit(git.PlumbingCommitRequest{

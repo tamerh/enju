@@ -7042,8 +7042,11 @@ tasks:
 set -e
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo '{"rows":42}' > "$ENJU_PROJECT_DIR/out/summary.json"
-# Simulate a big-on-disk scratch file the lab wouldn't want in git.
-printf 'pretend-binary-bytes' > "$ENJU_PROJECT_DIR/out/scratch.bam"
+# Simulate a big-on-disk scratch file the lab wouldn't want in git —
+# writes_artifacts(track:false) routes it to ENJU_BIGFILES instead
+# of the worktree, so git literally never sees it.
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'pretend-binary-bytes' > "$ENJU_BIGFILES/out/scratch.bam"
 echo "analyze complete"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded analyze.sh",
@@ -7097,30 +7100,20 @@ echo "analyze complete"
 	}
 
 	// The untracked file MUST still exist on disk — we only skipped
-	// committing it, we didn't erase it. Phase E's downstream
-	// consumers will stat() this exact path.
-	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "scratch.bam"))
+	// committing it, we didn't erase it. Phase 1.4 layout: the file
+	// lives at <project>/enju/bigfiles/<branch>/<path>, sibling of
+	// the worktree (.clone/). Downstream consumers stat() this path.
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "scratch.bam"))
 	if len(matches) == 0 {
-		t.Errorf("expected out/scratch.bam on disk after untracked write; workspace=%s", h.workspaceDir)
+		t.Errorf("expected scratch.bam under enju/bigfiles/<branch>/out/; workspace=%s", h.workspaceDir)
 	}
 
-	// Phase D: the managed .gitignore block must list the
-	// untracked path. Belt-and-suspenders against accidental
-	// `git add` / `stash -u` picking up the file on re-run.
-	gitignoreMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".gitignore"))
-	if len(gitignoreMatches) == 0 {
-		t.Fatalf(".gitignore not created after untracked submit; workspace=%s", h.workspaceDir)
-	}
-	gi, err := os.ReadFile(gitignoreMatches[0])
-	if err != nil {
-		t.Fatalf("reading .gitignore: %v", err)
-	}
-	gis := string(gi)
-	if !strings.Contains(gis, "out/scratch.bam") {
-		t.Errorf(".gitignore missing untracked path:\n%s", gis)
-	}
-	if !strings.Contains(gis, "BEGIN enju-untracked") || !strings.Contains(gis, "END enju-untracked") {
-		t.Errorf(".gitignore missing managed-block markers:\n%s", gis)
+	// scratch.bam must NOT be inside the worktree — that's what
+	// the bigfiles dir was created to avoid. A regression here
+	// would mean we're back to the .gitignore-trick layout.
+	worktreeMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "scratch.bam"))
+	for _, m := range worktreeMatches {
+		t.Errorf("untracked scratch.bam leaked into the worktree at %s — should live in enju/bigfiles/", m)
 	}
 
 	// The tracked file is committed, so `git log` on the workspace
@@ -7175,8 +7168,8 @@ tasks:
 
 	h.mcpClaimOK(t, "setup")
 	script := `#!/bin/bash
-mkdir -p "$ENJU_PROJECT_DIR/out"
-printf 'pretend-bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'pretend-bam-bytes' > "$ENJU_BIGFILES/out/big.bam"
 echo "produced"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
@@ -7197,10 +7190,11 @@ echo "produced"
 	// Simulate "some other citizen": nuke the untracked file
 	// from disk. Tracked artifacts (committed) would still
 	// live in git, but out/big.bam is a track:false output —
-	// once removed, this workspace has no copy.
-	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	// once removed, this workspace has no copy. Phase 1.4 layout:
+	// untracked artifacts live under enju/bigfiles/<branch>/.
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "big.bam"))
 	if len(bamMatches) == 0 {
-		t.Fatalf("expected out/big.bam on disk before removal; workspace=%s", h.workspaceDir)
+		t.Fatalf("expected big.bam under enju/bigfiles/ before removal; workspace=%s", h.workspaceDir)
 	}
 	for _, m := range bamMatches {
 		if err := os.Remove(m); err != nil {
@@ -7275,8 +7269,8 @@ tasks:
 
 	h.mcpClaimOK(t, "setup")
 	script := `#!/bin/bash
-mkdir -p "$ENJU_PROJECT_DIR/out"
-printf 'pretend-bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'pretend-bam-bytes' > "$ENJU_BIGFILES/out/big.bam"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
 		map[string]string{"scripts/produce.sh": script})
@@ -7303,30 +7297,24 @@ printf 'pretend-bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
 
 }
 
-// TestMCPSharedRootBridgesCitizens exercises Phase F: when
-// ENJU_SHARED_ROOT is configured, the producer's untracked
-// writes go through a symlink to shared storage. A downstream
-// citizen whose local workspace doesn't have the file can
-// still claim — the pre-claim check materializes the same
-// symlink on their side, pointing at the same shared bytes.
+// TestMCPSharedRootBridgesCitizens exercises the cluster
+// scenario for untracked artifacts: when ENJU_BIGFILES points
+// at a shared mount (NFS, Lustre, scratch dir), every citizen's
+// bigfiles dir resolves to the SAME location on disk. The
+// producer's untracked writes are immediately visible to the
+// downstream citizen — no symlink dance, no extra mechanism,
+// just pointing the env var.
 //
-// The test harness uses one workspace per run; we simulate
-// the "second citizen" by deleting the producer's symlink,
-// leaving only the shared-side bytes. The Phase E claim
-// guard (now with Phase F's symlink step) re-creates the
-// symlink on stat, so the claim succeeds.
-//
-// Without Phase F, the same scenario fails like
-// TestMCPClaimRefusesMissingUntrackedRead — the second
-// citizen has no path to the bytes.
+// Phase 1.4 superseded the old per-citizen-symlink mechanism:
+// the bigfiles dir IS the shared dir when ENJU_BIGFILES is set.
 func TestMCPSharedRootBridgesCitizens(t *testing.T) {
 	shared := t.TempDir()
-	t.Setenv("ENJU_SHARED_ROOT", shared)
+	t.Setenv("ENJU_BIGFILES", shared)
 
 	h := newMCPHarness(t, "SharedRootBridge")
 	projectID := h.createTestProject()
 
-	yaml := `name: "shared root bridges citizens"
+	yaml := `name: "shared bigfiles bridges citizens"
 version: 1
 tasks:
   - id: setup
@@ -7341,7 +7329,7 @@ tasks:
     writes_artifacts:
       - path: out/shared.bam
         track: false
-    prompt: "Produce via shared root"
+    prompt: "Produce via shared bigfiles"
     depends_on: [setup]
 
   - id: consume
@@ -7354,12 +7342,11 @@ tasks:
 	h.mcpCreateRunInline(t, projectID, yaml)
 
 	h.mcpClaimOK(t, "setup")
-	// Script writes via the path the wrapper handed us — which
-	// is now a symlink to $ENJU_SHARED_ROOT/<slug>-<id>/main/out/shared.bam.
-	// The write flows through the symlink; bytes land on shared.
+	// Script writes directly to $ENJU_BIGFILES. The shared mount
+	// is the same directory both producer and consumer resolve to.
 	script := `#!/bin/bash
-mkdir -p "$ENJU_PROJECT_DIR/out"
-printf 'shared-bam-bytes' > "$ENJU_PROJECT_DIR/out/shared.bam"
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'shared-bam-bytes' > "$ENJU_BIGFILES/out/shared.bam"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded produce.sh",
 		map[string]string{"scripts/produce.sh": script})
@@ -7375,56 +7362,24 @@ printf 'shared-bam-bytes' > "$ENJU_PROJECT_DIR/out/shared.bam"
 		t.Fatalf("execute produce: %s", mcpText(res))
 	}
 
-	// Bytes must have landed on the shared mount.
+	// Bytes land on the shared mount, sharded by <slug>-<id>/<branch>/.
 	sharedFiles, _ := filepath.Glob(filepath.Join(shared, "*", "main", "out", "shared.bam"))
 	if len(sharedFiles) == 0 {
-		t.Fatalf("expected shared.bam on shared root %q after produce", shared)
+		t.Fatalf("expected shared.bam on shared bigfiles %q after produce", shared)
 	}
 	data, err := os.ReadFile(sharedFiles[0])
 	if err != nil || string(data) != "shared-bam-bytes" {
 		t.Fatalf("shared bytes wrong: %q err=%v", data, err)
 	}
 
-	// Simulate "citizen B": remove the local symlink so the
-	// workspace appears to lack the file. The shared-side
-	// bytes remain untouched.
-	wsMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "shared.bam"))
-	for _, m := range wsMatches {
-		fi, err := os.Lstat(m)
-		if err != nil {
-			t.Fatalf("lstat workspace path: %v", err)
-		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			t.Errorf("expected workspace path to be a symlink (shared root configured), got mode=%v", fi.Mode())
-		}
-		if err := os.Remove(m); err != nil {
-			t.Fatalf("removing workspace symlink: %v", err)
-		}
-	}
-
-	// Claim consume — Phase E's guard re-creates the symlink
-	// via the Phase F helper, then stats it, sees the shared
-	// bytes, and allows the claim.
+	// Claim consume — the consumer's pre-claim presence check
+	// resolves to the same shared dir, finds the file, and
+	// permits the claim.
 	res = h.call(t, "enju_claim_task", map[string]any{
 		"task_id": h.taskID("consume"),
 	})
 	if res.IsError {
-		t.Fatalf("expected claim to succeed via shared root, got error:\n%s", mcpText(res))
-	}
-
-	// The workspace symlink should have been re-created by the
-	// pre-claim check. Stat it through the symlink (os.Stat
-	// follows) and confirm bytes route to shared storage.
-	wsMatches2, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "shared.bam"))
-	if len(wsMatches2) == 0 {
-		t.Fatalf("expected workspace symlink re-materialized after claim")
-	}
-	got, err := os.ReadFile(wsMatches2[0])
-	if err != nil {
-		t.Fatalf("reading re-materialized artifact: %v", err)
-	}
-	if string(got) != "shared-bam-bytes" {
-		t.Errorf("re-materialized path serves wrong bytes: %q", got)
+		t.Fatalf("expected claim to succeed via shared bigfiles, got error:\n%s", mcpText(res))
 	}
 }
 
@@ -7462,7 +7417,8 @@ tasks:
 	script := `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo '{"ok":1}' > "$ENJU_PROJECT_DIR/out/summary.json"
-printf 'bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'bam-bytes' > "$ENJU_BIGFILES/out/big.bam"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded",
 		map[string]string{"scripts/produce.sh": script})
@@ -7496,10 +7452,10 @@ printf 'bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
 		t.Errorf("expected present marker, got:\n%s", report)
 	}
 
-	// Now delete the untracked file — same "second citizen"
-	// simulation as the Phase E tests. Next listing should
-	// report missing.
-	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
+	// Now delete the untracked file from the bigfiles dir to
+	// simulate the "second citizen with no copy" case. Next
+	// listing should report missing.
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "big.bam"))
 	for _, m := range bamMatches {
 		_ = os.Remove(m)
 	}
@@ -7513,29 +7469,23 @@ printf 'bam-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
 	if !strings.Contains(report, "missing") {
 		t.Errorf("expected missing marker after delete:\n%s", report)
 	}
-	if !strings.Contains(report, "ENJU_SHARED_ROOT") {
-		t.Errorf("expected hint about ENJU_SHARED_ROOT for unconfigured case:\n%s", report)
-	}
-
 }
 
 // TestMCPListUntrackedArtifactsResolvesDefaultBranch is a
 // regression guard for a debug-tool bug: when the caller omits
 // the `branch` argument, the tool used to hardcode "main" for
-// the symlink materializer's branch segment. Projects with
+// the bigfiles dir's branch segment. Projects with
 // default_branch set to something else (e.g. "develop") would
-// then build a symlink target like $SHARED/<slug>/main/... even
-// though the producer wrote to $SHARED/<slug>/develop/..., so
-// the tool reported "missing" even when bytes existed on the
-// shared mount.
+// then look at $BIGFILES/<slug>/main/... even though the
+// producer wrote to $BIGFILES/<slug>/develop/..., so the tool
+// reported "missing" even when bytes existed.
 //
 // Fix verification: flip default_branch away from "main", run
-// the producer, delete the workspace-side symlink, and confirm
-// the list tool materializes the symlink at the correct target
-// (and the file reads back correctly through it).
+// the producer, and confirm the list tool resolves the bigfiles
+// dir at the correct target.
 func TestMCPListUntrackedArtifactsResolvesDefaultBranch(t *testing.T) {
 	shared := t.TempDir()
-	t.Setenv("ENJU_SHARED_ROOT", shared)
+	t.Setenv("ENJU_BIGFILES", shared)
 
 	h := newMCPHarness(t, "ListUntrackedNonDefaultBranch")
 	projectID := h.createTestProject()
@@ -7568,8 +7518,8 @@ tasks:
 	h.mcpCreateRunInline(t, projectID, yaml)
 	h.mcpClaimOK(t, "setup")
 	script := `#!/bin/bash
-mkdir -p "$ENJU_PROJECT_DIR/out"
-printf 'develop-branch-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
+mkdir -p "$ENJU_BIGFILES/out"
+printf 'develop-branch-bytes' > "$ENJU_BIGFILES/out/big.bam"
 `
 	h.mcpSubmitArtifacts(t, "setup", "seeded",
 		map[string]string{"scripts/produce.sh": script})
@@ -7584,26 +7534,17 @@ printf 'develop-branch-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
 		t.Fatalf("execute produce: %s", mcpText(res))
 	}
 
-	// Producer wrote through the symlink to shared. Confirm
-	// the bytes are there under the non-default branch segment.
+	// Producer wrote to bigfiles/<slug>/develop/... — confirm
+	// bytes landed under the non-default branch segment.
 	sharedFiles, _ := filepath.Glob(filepath.Join(shared, "*", "develop", "out", "big.bam"))
 	if len(sharedFiles) == 0 {
-		t.Fatalf("expected bytes under shared/<slug>/develop/... got none in %s", shared)
+		t.Fatalf("expected bytes under bigfiles/<slug>/develop/... got none in %s", shared)
 	}
 
-	// Delete the workspace symlink to simulate a second citizen
-	// without a local copy.
-	wsMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
-	for _, m := range wsMatches {
-		if err := os.Remove(m); err != nil {
-			t.Fatalf("removing workspace symlink: %v", err)
-		}
-	}
-
-	// Call the tool without an explicit branch — bug 2 was
-	// that "main" was hardcoded here instead of the project's
+	// Call the tool without an explicit branch — the bug was that
+	// "main" was hardcoded here instead of the project's
 	// default_branch ("develop"). The fix resolves via
-	// fetchProjectMetaExpanded.
+	// fetchProjectMetaExpanded so list_untracked finds the file.
 	res = h.call(t, "enju_list_untracked_artifacts", map[string]any{
 		"project_id": float64(projectID),
 	})
@@ -7612,28 +7553,7 @@ printf 'develop-branch-bytes' > "$ENJU_PROJECT_DIR/out/big.bam"
 	}
 	report := mcpText(res)
 	if !strings.Contains(report, "present") {
-		t.Errorf("expected present marker after symlink re-materialization, got:\n%s", report)
-	}
-
-	// And the workspace-side symlink must now resolve to the
-	// right shared target AND serve the producer's bytes.
-	wsMatches2, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "big.bam"))
-	if len(wsMatches2) == 0 {
-		t.Fatalf("expected workspace symlink re-materialized after list_untracked")
-	}
-	target, err := os.Readlink(wsMatches2[0])
-	if err != nil {
-		t.Fatalf("reading symlink: %v", err)
-	}
-	if !strings.Contains(target, "/develop/") {
-		t.Errorf("symlink target should include /develop/ segment (default_branch), got %q", target)
-	}
-	got, err := os.ReadFile(wsMatches2[0])
-	if err != nil {
-		t.Fatalf("reading re-materialized artifact: %v", err)
-	}
-	if string(got) != "develop-branch-bytes" {
-		t.Errorf("re-materialized path serves wrong bytes: %q", got)
+		t.Errorf("expected present marker for bigfiles-resolved artifact, got:\n%s", report)
 	}
 }
 

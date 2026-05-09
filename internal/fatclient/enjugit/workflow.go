@@ -123,6 +123,22 @@ func (w *Workflow) DefaultBranch() string {
 // they're configured with.
 func (w *Workflow) WorkDir() string { return w.git.WorkDir() }
 
+// ProjectRoot returns the user-facing project directory — the
+// parent of enju/.clone/ in the production layout. Used by
+// callers (compute wrapper, bigfiles resolver) that need to
+// address sibling dirs of the worktree rather than paths inside
+// it.
+//
+// Falls back to WorkDir when DiskLayout.ProjectRoot isn't set
+// (older tests using bare Conventions{}). Production callers
+// always have it set via NewProductionConventions.
+func (w *Workflow) ProjectRoot() string {
+	if w.convs.DiskLayout.ProjectRoot != nil {
+		return w.convs.DiskLayout.ProjectRoot(w.git.WorkDir())
+	}
+	return w.git.WorkDir()
+}
+
 // ProjectID returns the project ID this Workflow operates on.
 // Used by service callers that need to log alongside coord ops.
 func (w *Workflow) ProjectID() int64 { return w.projID }
@@ -146,17 +162,6 @@ func (w *Workflow) LastPushError() string { return w.git.LastPushError() }
 // "when was this clone last touched" when no push has happened.
 func (w *Workflow) HeadCommitTime() time.Time { return w.git.HeadCommitTime() }
 
-// EnsureOrigin self-heals the on-disk origin remote when something
-// (the project package's claim/pull paths) wipes the
-// [remote "origin"] section from .git/config. Idempotent.
-//
-// Band-aid for the dual-handle bug (#381) — see git.Clone.EnsureOrigin
-// for the full context. Service callers invoke this after every
-// OpenWorkflow so subsequent fetch/push find origin on disk.
-func (w *Workflow) EnsureOrigin(url string) error {
-	return translateGitError("ensure origin", w.git.EnsureOrigin(url))
-}
-
 // SetRemote points the clone at a new origin URL, adding or
 // replacing the existing origin. Idempotent. The url must be
 // non-empty — every project has an origin (managed bare for
@@ -175,6 +180,31 @@ func (w *Workflow) SetRemote(url string) error {
 func (w *Workflow) LocalBranches() ([]string, error) {
 	branches, err := w.git.LocalBranches()
 	return branches, translateGitError("local branches", err)
+}
+
+// wrapGitError attaches workdir + remote URL context to a git
+// error so error messages tell the operator WHICH on-disk
+// clone and WHICH remote the failure happened against — without
+// having to grep the trace log to find out. branch is empty for
+// non-branch-scoped ops (Fetch with no arg, Head, etc.).
+//
+// Sentinel checks (errors.Is, errors.As) walk through Unwrap,
+// so callers doing errors.Is(err, ErrPushNonFF) keep working.
+//
+// Use this in preference to plain translateGitError on the
+// branch/push/fetch/merge paths where the operator's first
+// question is "which clone, which remote?".
+func (w *Workflow) wrapGitError(op, branch string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &gitOpError{
+		Op:        op,
+		Branch:    branch,
+		WorkDir:   w.git.WorkDir(),
+		RemoteURL: w.git.RemoteURL(),
+		Cause:     translateGitError(op, err),
+	}
 }
 
 // PushAllRefs ships every local branch to origin in one network

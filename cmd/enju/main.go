@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -183,9 +184,44 @@ func cmdServe(args []string) {
 		"events_db", eventsPath,
 	)
 
-	if err := http.ListenAndServe(addr, srv.Router()); err != nil {
-		logger.Error("server error", "error", err)
-		os.Exit(1)
+	// Signal handler for SIGINT/SIGTERM. Without this, an
+	// uncaught SIGTERM exits the Go runtime silently — no
+	// stack trace, no log line, just a dead process and
+	// confused operators ("did it crash? did something kill
+	// it?"). With the handler we get a clear log line naming
+	// the signal, and the followup http.Server.Shutdown drains
+	// in-flight requests instead of dropping connections
+	// mid-response. The bare http.ListenAndServe path we used
+	// before couldn't do graceful drain — Shutdown needs an
+	// http.Server you control.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	httpSrv := &http.Server{Addr: addr, Handler: srv.Router()}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		err := httpSrv.ListenAndServe()
+		if !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			logger.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		logger.Info("received shutdown signal, draining HTTP server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("graceful shutdown failed", "error", err)
+		}
+		logger.Info("Enju coordinator stopped")
 	}
 }
 

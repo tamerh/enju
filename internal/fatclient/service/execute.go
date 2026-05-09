@@ -27,6 +27,7 @@ import (
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
 // ExecuteOutcome is the structured result of one compute-task
@@ -125,8 +126,17 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		// coordinator side; without a retry, the cascade aborts
 		// with stop_reason=compute_errored on what should be a
 		// recoverable hiccup.
-		if err := s.claimWithTransientRetry(ctx, taskID); err != nil {
+		//
+		// The claim response carries the post-claim TaskMeta
+		// (IterationBranch, IterSeq, refreshed state) — adopt it
+		// directly so SubmitComputeTaskResult sees the per-claim
+		// fields without a second GET round-trip.
+		postClaim, err := s.claimWithTransientRetry(ctx, taskID)
+		if err != nil {
 			return nil, err
+		}
+		if postClaim != nil {
+			meta = postClaim
 		}
 	case "claimed", "running":
 		// Already ours (e.g. retry after transient wrapper
@@ -155,7 +165,19 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
 	}
 
-	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, meta)
+	// Resolve + pre-create the bigfiles dir for this branch so
+	// the script can write track:false outputs into it without
+	// "no such file or directory". Best-effort: if MkdirAll fails
+	// (permission, full disk), let the script error path surface
+	// it — the resolver always returns a non-empty path in the
+	// production layout, so an mkdir failure here is genuine IO
+	// trouble worth seeing.
+	bigfilesDir := enjugit.ResolveBigfilesDir(wf.ProjectRoot(), meta.ProjectID, projName, meta.Branch)
+	if bigfilesDir != "" {
+		_ = os.MkdirAll(bigfilesDir, 0755)
+	}
+
+	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, meta)
 
 	// context.json — structured companion to the env vars.
 	var readsArtifacts []string
@@ -196,7 +218,15 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		WorkspaceRoot:      s.enjugit.RootDir(),
 		ProjectName:        projName,
 		Branch:             meta.Branch,
+		// IterationBranch is the per-task topic branch coord
+		// populated at claim time. compute.Run uses it as
+		// BranchOverride for SubmitComputeTaskResult so each
+		// parallel sibling commits to its own ref, isolated from
+		// the others. Coord's auto-merge then FFs the topic onto
+		// meta.Branch (the run branch) on accept.
+		IterationBranch:    meta.IterationBranch,
 		ResultDir:          resultDir,
+		BigfilesDir:        bigfilesDir,
 		ScriptPath:         scriptPath,
 		ScriptLabel:        meta.Script,
 		WritesArtifacts:    meta.WritesArtifacts,
@@ -229,7 +259,11 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}, nil
 	}
 
-	res := compute.Run(ctx, spec, env, s.logger)
+	// Pass the already-opened Workflow so compute.Run doesn't
+	// re-open one per task — concurrent goroutines share the
+	// in-process Mutex rather than falling through to the
+	// slower cross-process flock.
+	res := compute.Run(ctx, wf, spec, env, s.logger)
 	if res.Error != "" {
 		return nil, fmt.Errorf("%s", res.Error)
 	}
@@ -300,6 +334,20 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("coordinator report for %s: %w", taskID, err)
 	}
 
+	// Apply any FF auto-merges the coordinator emitted in the
+	// report response. Compute submits land on a per-task topic
+	// branch (SubmitComputeTaskResult); the run branch only
+	// catches up when the topic is FF-merged in. Server-side
+	// collectAcceptedMerges enumerates the eligible merges and
+	// returns them in the response — applyAcceptedMerges executes
+	// each one locally and reports back via report_merge so coord
+	// stamps a branch_merged event. Best-effort: a merge failure
+	// shouldn't fail the compute task itself (the work is on
+	// origin via the topic branch); operator can re-run later.
+	if mergeErr := s.applyAcceptedMerges(ctx, wf, reportData); mergeErr != nil {
+		s.logger.Warn("post-compute auto-merge failed", "task_id", taskID, "error", mergeErr)
+	}
+
 	out := &ExecuteOutcome{
 		TaskID:           taskID,
 		Script:           meta.Script,
@@ -329,13 +377,22 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 // and batch) produce byte-identical environments for the same
 // task — any divergence would show up as reproducibility drift
 // between a manual execute and a batched one.
-func buildComputeEnv(taskID, workDir, resultDir, templateDir string, meta *TaskMeta) []string {
+//
+// bigfilesDir is the absolute path the script's track:false
+// outputs go into; exposed as ENJU_BIGFILES so recipes can
+// write directly via "$ENJU_BIGFILES/<path>". Empty string
+// suppresses the export — only happens in legacy / test paths
+// that haven't resolved a project root yet.
+func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir string, meta *TaskMeta) []string {
 	env := os.Environ()
 	env = append(env,
 		"ENJU_TASK_ID="+taskID,
 		"ENJU_PROJECT_DIR="+workDir,
 		"ENJU_RUN_DIR="+filepath.Join(workDir, resultDir),
 	)
+	if bigfilesDir != "" {
+		env = append(env, enjugit.BigfilesEnv+"="+bigfilesDir)
+	}
 	if templateDir != "" {
 		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
 	}
@@ -360,7 +417,13 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir string, meta *TaskM
 // 3 attempts with 50/100/200ms backoff. Total max wait ~350ms,
 // short enough that callers don't notice the retries unless
 // the network is really down.
-func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) error {
+//
+// Returns the parsed post-claim TaskMeta so the caller has the
+// per-claim fields (IterationBranch, IterSeq, refreshed State)
+// without a second GET. Returns nil meta when the response
+// envelope doesn't carry a "task" subobject (older coord builds);
+// callers that need the meta unconditionally must FetchTaskMeta.
+func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) (*TaskMeta, error) {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -370,7 +433,7 @@ func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) 
 		})
 		if err != nil {
 			if !isTransientTransportError(err) {
-				return fmt.Errorf("claim %s: %w", taskID, err)
+				return nil, fmt.Errorf("claim %s: %w", taskID, err)
 			}
 			lastErr = fmt.Errorf("claim %s: %w", taskID, err)
 			sleepBackoff(attempt)
@@ -380,16 +443,19 @@ func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) 
 		if json.Unmarshal(claimData, &claimResp) == nil {
 			if errMsg, _ := claimResp["error"].(string); errMsg != "" {
 				if !isTransientCoordinatorError(errMsg) {
-					return fmt.Errorf("claim %s: %s", taskID, errMsg)
+					return nil, fmt.Errorf("claim %s: %s", taskID, errMsg)
 				}
 				lastErr = fmt.Errorf("claim %s: %s", taskID, errMsg)
 				sleepBackoff(attempt)
 				continue
 			}
+			if taskMap, ok := claimResp["task"].(map[string]interface{}); ok {
+				return s.parseTaskMetaFromMap(taskID, taskMap), nil
+			}
 		}
-		return nil
+		return nil, nil
 	}
-	return fmt.Errorf("after %d retries: %w", maxAttempts, lastErr)
+	return nil, fmt.Errorf("after %d retries: %w", maxAttempts, lastErr)
 }
 
 // isTransientTransportError reports whether a transport-level

@@ -329,21 +329,6 @@ func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enju
 		return nil, remoteURL, projName, defaultBranch, err
 	}
 	wf.SetDefaultBranch(defaultBranch)
-	// Band-aid for #381 dual-handle bug: while project.Clone and
-	// enjugit.Workflow both touch the same on-disk dir, some code
-	// path inside the project package (claim/pull) intermittently
-	// wipes the [remote "origin"] section from .git/config. The
-	// cached enjugit Workflow's in-memory remoteURL stays correct
-	// but go-git's Fetch reads .git/config every call and fails
-	// with "remote not found". EnsureOrigin idempotently restores
-	// the section when missing. Drop this call once Phase 11
-	// retires the project package and the wipe source goes away.
-	if remoteURL != "" {
-		if eerr := wf.EnsureOrigin(remoteURL); eerr != nil {
-			s.logger.Warn("OpenWorkflow: ensure-origin self-heal failed",
-				"project_id", projectID, "remote", remoteURL, "error", eerr)
-		}
-	}
 	return wf, remoteURL, projName, defaultBranch, nil
 }
 

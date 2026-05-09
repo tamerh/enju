@@ -437,9 +437,8 @@ func (s *FatClient) initGitWithExistingFiles(dirPath string) (string, error) {
 // a real-remote one and the bare should be skipped.
 //
 // Idempotent at every layer: PromoteWorkingTreeToBare returns
-// silently when the bare already exists; setOrReplaceOrigin is
-// a no-op when origin already points at the right place;
-// wf.EnsureOrigin is the same.
+// silently when the bare already exists; SetRemote is
+// a no-op when origin already points at the right place.
 //
 // Errors propagate so the caller can surface them as warnings.
 // Returning nil with a soft-fail on the cache refresh keeps the
@@ -470,7 +469,7 @@ func (s *FatClient) ensureManagedBare(workDir string, wf *enjugit.Workflow) erro
 	if err := enjugit.PromoteWorkingTreeToBare(workDir, barePath); err != nil {
 		return fmt.Errorf("creating managed bare for %q: %w", workDir, err)
 	}
-	if err := wf.EnsureOrigin(barePath); err != nil {
+	if err := wf.SetRemote(barePath); err != nil {
 		// Non-fatal: bare exists, on-disk origin set; cache
 		// refresh failed. Log so anomalies are visible.
 		s.logger.Warn("ensureManagedBare: cache refresh failed",

@@ -1430,6 +1430,31 @@ func (s *Store) ListActiveClaims(taskID string) ([]TaskClaimRecord, error) {
 	return scanTaskClaims(rows)
 }
 
+// ListOpenClaimsForCitizen returns every open (outcome = NULL)
+// claim row currently held by a given citizen across all tasks.
+// Used by the bot daemon's startup recovery path: when a daemon
+// restarts (operator-initiated stop+start, fatclient crash, coord
+// crash), the new process has no in-memory record of claims it
+// "had" before. Without this list, those claims sit until natural
+// reaper expiry (~30min), wasting an iteration cycle each.
+//
+// The daemon iterates the result and applies ReleaseClaim per
+// row, freeing the tasks back to READY immediately.
+func (s *Store) ListOpenClaimsForCitizen(citizenID int64) ([]TaskClaimRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT `+taskClaimColumns+`
+		 FROM task_claims
+		 WHERE citizen_id = ? AND outcome IS NULL
+		 ORDER BY claimed_at`,
+		citizenID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTaskClaims(rows)
+}
+
 // taskClaimColumns is the canonical column list for task_claims
 // reads. model_id is the current attribution column; future
 // operator/model-design columns (route, model_resolved, paid_by)

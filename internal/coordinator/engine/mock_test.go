@@ -82,6 +82,10 @@ func (m *mockStore) HasActiveClaim(taskID string, citizenID int64) (bool, error)
 	return citizens[citizenID], nil
 }
 
+func (m *mockStore) ListOpenClaimsForCitizen(citizenID int64) ([]store.TaskClaimRecord, error) {
+	return nil, nil
+}
+
 func (m *mockStore) CountActiveClaims(taskID string) (int, error) {
 	if m.claimCounts == nil {
 		return 0, nil

@@ -1,11 +1,19 @@
 package service
 
-// Fetch-path reconciliation: turns scanner-spotted commits into
-// coordinator state transitions. Wires the three primitives from
-// internal/fatclient/project (FetchBranch + ScanBranchSince +
-// Cursors) together with the coordinator's /tasks/reconcile
-// endpoint, plus an async-wrapper failure reaper that catches
-// non-zero exits the trailer scanner can't see.
+// Fetch-path reconciliation: turns wrap-task outcomes into
+// coordinator state transitions. Two parallel paths:
+//
+//   - Trailer scan: walks new commits on the run branch via
+//     enjugit's FetchBranch + ScanBranchSince + Cursors and
+//     posts /tasks/reconcile for the trailers it finds. Catches
+//     commits that landed directly on the run branch (legacy
+//     and review/vote paths).
+//   - Wrapper-result reaper: walks `.wrap-result.json` files that
+//     async wrap-task subprocesses leave behind. On success
+//     POSTs /tasks/:id/result + applies the auto-merge plan so
+//     the run branch FFs to include the topic-branch commit
+//     (the trailer scanner can't see topic-only commits on its
+//     own); on failure POSTs /tasks/:id/fail.
 //
 // Lives on FatClient because every per-tool service call that
 // touches a project's branch wants the same "freshen + sweep"
@@ -156,7 +164,19 @@ func buildReconcileBodyWF(trailers []enjugit.CommitTrailer) map[string]interface
 // ReapWrapperFailuresWF is the enjugit-Workflow flavored
 // counterpart to ReapWrapperFailures — walks the workflow's
 // worktree for .wrap-result.json files and posts /tasks/:id/fail
-// for non-zero exits.
+// for non-zero exits, /tasks/:id/result + applyAcceptedMerges
+// for successes.
+//
+// The success branch handles the parallel-compute topic-branch
+// flow: wrap-task pushed the commit to a per-task topic ref,
+// but nothing on the local clone has FF'd the run branch up to
+// it yet (sync compute does that via the /result response).
+// We re-run the same dance here from the parent: POST /result
+// with the wrap-task's commit_sha → coord returns
+// accepted_merges → applyAcceptedMerges advances the run branch
+// locally and pushes it. Without this step the trailer scanner
+// would walk the run branch and never see the topic-branch
+// commit.
 func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workflow) {
 	if wf == nil {
 		return
@@ -172,7 +192,7 @@ func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workf
 		if filepath.Base(path) != ".wrap-result.json" {
 			return nil
 		}
-		s.handleOneWrapperResult(ctx, path)
+		s.handleOneWrapperResult(ctx, path, wf)
 		return nil
 	})
 }
@@ -248,14 +268,20 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 }
 
 // handleOneWrapperResult processes one wrapper result file.
-// Reads result + corresponding spec, and when the result
-// indicates a script failure posts /tasks/:id/fail to the
-// coordinator. On success the result file is renamed to
-// .wrap-result.done.json so a later reap doesn't revisit it.
-// Idempotent — the coordinator rejects /fail on tasks already
-// in terminal state, which we treat as "already handled, move
-// on."
-func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath string) {
+// Reads result + corresponding spec; routes by outcome:
+//
+//   - Success (exit 0, no error): POST /tasks/:id/result with the
+//     wrap-task's commit_sha, then applyAcceptedMerges so the
+//     run branch FFs to include the topic-branch commit. Without
+//     this the trailer scanner walks the run branch and never
+//     sees the async commit (it's on a topic ref).
+//   - Failure: POST /tasks/:id/fail with a human-readable reason.
+//
+// On both paths the file is renamed to .wrap-result.done.json so
+// a later reap doesn't revisit it. Idempotent — the coordinator
+// rejects state changes on already-terminal tasks, which we
+// treat as "already handled, move on."
+func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath string, wf *enjugit.Workflow) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return
@@ -267,31 +293,61 @@ func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath strin
 		_ = os.Rename(resultPath, resultPath+".malformed")
 		return
 	}
+
+	// Both branches need the spec — read once.
+	specPath := filepath.Join(filepath.Dir(resultPath), ".wrap-spec.json")
+	specBytes, specErr := os.ReadFile(specPath)
+	var spec compute.Spec
+	if specErr == nil {
+		_ = json.Unmarshal(specBytes, &spec)
+	}
+
 	if res.ExitCode == 0 && res.Error == "" {
-		// Success case — the trailer scanner handles this via
-		// /tasks/reconcile. We just need to mark the file
-		// processed so the next reap walk doesn't slow down
-		// re-reading it.
+		// Success case — wrap-task already committed + pushed
+		// the topic branch. We still need to (a) tell coord the
+		// commit landed so it can advance state and emit the
+		// auto-merge plan, and (b) execute that merge plan
+		// locally so the run branch catches up.
+		if specErr != nil || spec.TaskID == "" {
+			// No spec → can't name the task. Mark done; a
+			// human can inspect after if a downstream stays
+			// stuck. The trailer-scanner fallback may still
+			// catch it on a later sweep if the run branch is
+			// somehow advanced by other means.
+			_ = os.Rename(resultPath, strings.TrimSuffix(resultPath, ".json")+".done.json")
+			return
+		}
+		reportBody := map[string]interface{}{
+			"commit_sha":  res.CommitSHA,
+			"result_path": spec.ResultDir,
+			"model":       spec.Model,
+			"username":    spec.Username,
+			"content":     res.Content,
+		}
+		if len(res.ArtifactsWritten) > 0 {
+			reportBody["artifacts_written"] = res.ArtifactsWritten
+		}
+		reportData, perr := s.coord.Post(ctx, fmt.Sprintf("/api/v1/tasks/%s/result", spec.TaskID), reportBody)
+		if perr != nil {
+			// Network blip or coord-side rejection (e.g. task
+			// already terminal — repeat reap after re-attach).
+			// Leave the file in place so the next reap retries
+			// unless the rejection is terminal.
+			if !strings.Contains(perr.Error(), "terminal") {
+				s.logger.Debug("reap post result", "task_id", spec.TaskID, "error", perr)
+				return
+			}
+		} else if mergeErr := s.applyAcceptedMerges(ctx, wf, reportData); mergeErr != nil {
+			s.logger.Warn("post-async auto-merge failed", "task_id", spec.TaskID, "error", mergeErr)
+		}
 		_ = os.Rename(resultPath, strings.TrimSuffix(resultPath, ".json")+".done.json")
 		return
 	}
 
-	// Failure path: read the companion spec file for the task
-	// id. Spec lives next to result in the wrapper's kickoff
-	// payload (see kickoffAsyncWrapTask).
-	specPath := filepath.Join(filepath.Dir(resultPath), ".wrap-spec.json")
-	specBytes, err := os.ReadFile(specPath)
-	if err != nil {
-		// No spec → can't name the task. Skip; a future
-		// wrapper version might emit task_id in the result
-		// directly to avoid this dependency.
-		return
-	}
-	var spec compute.Spec
-	if err := json.Unmarshal(specBytes, &spec); err != nil {
-		return
-	}
-	if spec.TaskID == "" {
+	if specErr != nil || spec.TaskID == "" {
+		// Failure path needs the task id; without it we can't
+		// name what to fail. Skip silently — the next reap will
+		// retry once spec arrives.
 		return
 	}
 

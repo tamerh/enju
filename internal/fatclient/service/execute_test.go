@@ -116,7 +116,7 @@ func TestClaimTransientRetryRecovers(t *testing.T) {
 		Logger: logger,
 	})
 
-	if err := sess.claimWithTransientRetry(context.Background(), "1:1:t"); err != nil {
+	if _, err := sess.claimWithTransientRetry(context.Background(), "1:1:t"); err != nil {
 		t.Fatalf("claimWithTransientRetry: %v (expected success after one transient retry)", err)
 	}
 	if got := atomic.LoadInt32(&attempts); got != 2 {
@@ -155,7 +155,7 @@ func TestClaimTransientRetrySkipsSubstantiveErrors(t *testing.T) {
 		Logger: logger,
 	})
 
-	err := sess.claimWithTransientRetry(context.Background(), "1:1:t")
+	_, err := sess.claimWithTransientRetry(context.Background(), "1:1:t")
 	if err == nil {
 		t.Fatalf("claimWithTransientRetry: expected error for non-claimable task, got nil")
 	}

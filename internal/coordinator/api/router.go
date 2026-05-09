@@ -209,6 +209,10 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/result", s.handleSubmitResult)
 		r.Post("/tasks/reconcile", s.handleReconcileTasks)
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)
+		// Bulk release for daemon startup recovery — releases
+		// every open claim held by the calling citizen across
+		// all projects. Identity from the Bearer token.
+		r.Post("/me/release-claims", s.handleReleaseAllOpenClaims)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
 		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
 		r.Post("/tasks/{taskID}/fail", s.handleFailTask)

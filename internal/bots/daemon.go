@@ -73,6 +73,7 @@ type fatClient interface {
 
 	ClaimTask(ctx context.Context, params service.ClaimParams) (*service.ClaimResult, error)
 	ReleaseTask(ctx context.Context, taskID string) error
+	ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAllMyOpenClaimsResponse, error)
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
@@ -255,6 +256,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"bot", d.bot.Name,
 		"project_id", d.projectID,
 		"username", d.fc.Username())
+
+	// Startup recovery: release any open claims held by this
+	// bot's identity from a previous daemon instance. Without
+	// this, a daemon that exited mid-iteration (operator-
+	// initiated stop, fatclient/coord crash, terminal close)
+	// leaves orphaned claims that this fresh process knows
+	// nothing about. The poll loop sees those tasks as
+	// CLAIMED-by-self and skips them — they sit until reaper
+	// deadline (~30 min), wasting an iteration cycle each.
+	//
+	// Errors don't abort startup: if the call fails, we log
+	// and continue. Worst case is the legacy 30-min wait.
+	if resp, err := d.fc.ReleaseAllMyOpenClaims(ctx); err != nil {
+		d.logger.Warn("startup orphan-release failed (proceeding)",
+			"error", err)
+	} else if resp.Count > 0 {
+		d.logger.Info("released orphaned claims from previous daemon run",
+			"count", resp.Count, "task_ids", resp.ReleasedTaskIDs)
+	}
 
 	backoff := d.pollFloor
 	for {

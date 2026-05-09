@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/enju-ai/enju/internal/common/gitignore"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
@@ -58,14 +57,51 @@ type Spec struct {
 	WorkspaceRoot string `json:"workspace_root"`
 	ProjectName   string `json:"project_name,omitempty"`
 
-	// Branch the commit MUST land on. Passed through to
-	// Project.SubmitTaskResult, which handles checkout + push.
+	// Branch is the run branch (the integration target). The
+	// commit's per-task topic branch is built FROM this base via
+	// IterationBranch — see SubmitComputeTaskResult — and the
+	// existing coord-side auto-merge integrates the topic into
+	// this run branch on accept.
 	Branch string `json:"branch"`
+
+	// IterationBranch is the per-task topic branch the commit
+	// lands on (e.g. "1-build/fetch_a/iter-1"). Composed by
+	// coord at claim time via generateIterationBranch and surfaced
+	// through TaskMeta. Required: empty value means coord didn't
+	// populate it, which would only happen on a legacy claim row;
+	// SubmitComputeTaskResult fails loudly in that case rather
+	// than silently falling back to landing on the run branch
+	// directly (which is the parallel-compute race we're fixing).
+	IterationBranch string `json:"iteration_branch"`
 
 	// Repo-relative result directory (e.g. "enju/runs/3/foo").
 	// The handler already wrote context.json here before spawn;
 	// the wrapper reads it back to include in the final commit.
 	ResultDir string `json:"result_dir"`
+
+	// BigfilesDir is the absolute path where this task's
+	// declared-untracked outputs (writes_artifacts entries with
+	// track:false) live. Resolved by the handler via
+	// enjugit.ResolveBigfilesDir — either
+	// <project>/enju/bigfiles/<branch>/ for local-only mode, or
+	// <ENJU_BIGFILES>/<slug>-<id>/<branch>/ when the citizen has
+	// set the shared-mount env var.
+	//
+	// The wrapper:
+	//   - Pre-creates this dir (mkdir -p) before exec'ing the
+	//     script, so the script can write into it without
+	//     "no such file or directory".
+	//   - Exports ENJU_BIGFILES=<this path> in the script's env
+	//     so recipes can write directly via $ENJU_BIGFILES/<path>.
+	//   - Expands writes_artifacts(track:false) entries against
+	//     this dir (instead of workDir), so the file's natural
+	//     home is outside the worktree and git literally can't
+	//     see it.
+	//
+	// Required when the task declares any track:false output —
+	// the wrapper rejects the spec rather than silently routing
+	// untracked writes back into the worktree.
+	BigfilesDir string `json:"bigfiles_dir,omitempty"`
 
 	// Absolute path to the script file the wrapper execs.
 	// Resolution rules (template snapshot vs. inline YAML) live
@@ -207,10 +243,17 @@ type Result struct {
 // environment handed to the script (OS env + ENJU_* vars + task
 // env), pre-assembled by the caller.
 //
+// wf is the project's Workflow handle. Sync callers pass the
+// already-cached one (`s.enjugit.ForProject(...)`) so concurrent
+// compute goroutines share the in-process sync.Mutex instead of
+// falling through to the slower cross-process flock. Pass nil
+// from the wrap-task subprocess (separate process), and Run will
+// construct its own from spec.WorkspaceRoot.
+//
 // ctx cancellation propagates to the script via exec.CommandContext.
 // Wrapper-level errors are returned via Result.Error; script exit
 // codes land in Result.ExitCode.
-func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Result {
+func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, logger *slog.Logger) Result {
 	res := Result{}
 
 	if spec.ScriptPath == "" {
@@ -232,22 +275,22 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		return res
 	}
 
-	// Open the project clone via enjugit so the cross-process
-	// flock (lockPathFor) is honored — the MCP handler and this
-	// wrapper run in distinct processes and MUST NOT race on
-	// .git/index.lock. ForProject returns a *Workflow whose
-	// SubmitTaskResult wraps git ops in WithLock internally.
-	ws, err := enjugit.NewWorkspace(spec.WorkspaceRoot,
-		enjugit.NewProductionConventions(),
-		enjugit.WithLogger(logger))
-	if err != nil {
-		res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
-		return res
-	}
-	wf, err := ws.ForProject(spec.ProjectID, spec.RemoteURL, spec.ProjectName)
-	if err != nil {
-		res.Error = fmt.Sprintf("opening project: %v", err)
-		return res
+	// Subprocess fallback: wrap-task is a separate process and
+	// cannot inherit the parent fat-client's Workflow. Open one
+	// from spec — flock honors cross-process serialization.
+	if wf == nil {
+		ws, err := enjugit.NewWorkspace(spec.WorkspaceRoot,
+			enjugit.NewProductionConventions(),
+			enjugit.WithLogger(logger))
+		if err != nil {
+			res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
+			return res
+		}
+		wf, err = ws.ForProject(spec.ProjectID, spec.RemoteURL, spec.ProjectName)
+		if err != nil {
+			res.Error = fmt.Sprintf("opening project: %v", err)
+			return res
+		}
 	}
 
 	workDir := wf.WorkDir()
@@ -399,66 +442,65 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	// this list so the commit message body and the Enju-Artifacts
 	// trailer accurately reflect "what's in this commit" —
 	// untracked paths are never mentioned at the git layer.
-	expanded, missing, expandErr := spec.WritesArtifacts.ExpandAgainstWorkdir(workDir)
+	// Tracked entries are walked against the worktree (where the
+	// script wrote them, and where the commit will pick them up).
+	// Untracked entries (track:false) are walked against the
+	// bigfiles dir — the per-branch sibling of the worktree where
+	// big data lives. Splitting the declaration list by Track
+	// flag and running ExpandAgainstWorkdir against the right
+	// root gives each kind its own home with no .gitignore trick.
+	trackedDecls, untrackedDecls := splitArtifactsByTrack(spec.WritesArtifacts)
+
+	tracked, missingT, expandErr := trackedDecls.ExpandAgainstWorkdir(workDir)
 	if expandErr != nil {
 		res.Error = fmt.Sprintf("expanding writes_artifacts: %v", expandErr)
 		return res
 	}
-	res.MissingArtifacts = append(res.MissingArtifacts, missing...)
+	res.MissingArtifacts = append(res.MissingArtifacts, missingT...)
+
+	// Untracked entries expand against the bigfiles dir — the
+	// per-branch sibling of the worktree. BigfilesDir is required
+	// for any task with track:false declarations; an empty value
+	// means the handler didn't populate it, which is a wiring
+	// bug, not a recipe shape we should silently tolerate.
+	if len(untrackedDecls) > 0 && spec.BigfilesDir == "" {
+		res.Error = "BigfilesDir not set on Spec but task declares track:false outputs"
+		return res
+	}
+	untracked, missingU, expandErr := untrackedDecls.ExpandAgainstWorkdir(spec.BigfilesDir)
+	if expandErr != nil {
+		res.Error = fmt.Sprintf("expanding writes_artifacts (untracked): %v", expandErr)
+		return res
+	}
+	res.MissingArtifacts = append(res.MissingArtifacts, missingU...)
 
 	var committedPaths []string
-	for _, e := range expanded {
-		if e.Track {
-			full := filepath.Join(workDir, enjugit.ArtifactPath(e.Path))
-			body, rerr := os.ReadFile(full)
-			if rerr != nil {
-				// Expansion already stat'd this file moments
-				// ago, so a read failure here is a transient
-				// IO problem (or a script that deleted the
-				// file between expand and read). Surface as
-				// missing for consistency with the legacy
-				// "soft warning" semantics.
-				res.MissingArtifacts = append(res.MissingArtifacts, e.Path)
-				continue
-			}
-			files = append(files, enjugit.FileWrite{
-				RepoRelPath: enjugit.ArtifactPath(e.Path),
-				Content:     body,
-			})
-			committedPaths = append(committedPaths, e.Path)
-			res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
+	for _, e := range tracked {
+		full := filepath.Join(workDir, enjugit.ArtifactPath(e.Path))
+		body, rerr := os.ReadFile(full)
+		if rerr != nil {
+			// Expansion already stat'd this file moments
+			// ago, so a read failure here is a transient
+			// IO problem (or a script that deleted the
+			// file between expand and read). Surface as
+			// missing for consistency with the legacy
+			// "soft warning" semantics.
+			res.MissingArtifacts = append(res.MissingArtifacts, e.Path)
 			continue
 		}
-		// Untracked: don't stage; just report the path.
+		files = append(files, enjugit.FileWrite{
+			RepoRelPath: enjugit.ArtifactPath(e.Path),
+			Content:     body,
+		})
+		committedPaths = append(committedPaths, e.Path)
 		res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
 	}
-
-	// Maintain the Enju-managed .gitignore block so untracked
-	// paths can never slip into a future commit via some
-	// unrelated `git add`/`stash` path. We write the ORIGINAL
-	// declarations (patterns and all) to gitignore — gitignore
-	// understands globs and directory prefixes natively, so the
-	// pattern strings work as-is and a `out/*.bam` declaration
-	// covers any future bam in that directory automatically. The
-	// helper is a no-op when the block already contains every
-	// declared pattern, so re-running the same task doesn't
-	// churn .gitignore with no-op commits.
-	var untrackedDecls []string
-	for _, decl := range spec.WritesArtifacts {
-		if !decl.Track && decl.Path != "" {
-			untrackedDecls = append(untrackedDecls, decl.Path)
-		}
-	}
-	if len(untrackedDecls) > 0 {
-		gitignorePath := filepath.Join(workDir, ".gitignore")
-		existing, _ := os.ReadFile(gitignorePath) // missing file → nil (fine)
-		updated, changed := gitignore.UpdateManagedBlock(existing, untrackedDecls)
-		if changed {
-			files = append(files, enjugit.FileWrite{
-				RepoRelPath: ".gitignore",
-				Content:     updated,
-			})
-		}
+	for _, e := range untracked {
+		// Untracked: don't stage; just report the path. File
+		// stays at <untrackedRoot>/<path>; coord upserts an
+		// index row with tracked=false + empty commit_sha,
+		// downstream tasks resolve via the same root.
+		res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
 	}
 
 	// Trailers carry the machine-parseable task-complete
@@ -510,9 +552,22 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 		customTrailers[enjugit.TrailerUntrackedArtifacts] = strings.Join(untrackedProduced, ", ")
 	}
 
-	submitRes, err := wf.SubmitTaskResult(enjugit.SubmitRequest{
+	// Compute submits via the no-checkout plumbing path: each
+	// parallel goroutine builds a commit on its OWN topic branch
+	// (spec.IterationBranch) without touching HEAD/.git/index/
+	// working-tree, then pushes that topic branch. Coord's
+	// existing acceptedMergeForTask + fat-client applyAcceptedMerges
+	// handles the integration: on accept, the topic branch is
+	// FF-merged into spec.Branch (the run branch), same flow LLM
+	// tasks already use.
+	//
+	// LLM/bot tasks keep using SubmitTaskResult (porcelain) —
+	// they run in their own per-bot clone and need the worktree
+	// flow for tools that exec git commands inside the script.
+	submitRes, err := wf.SubmitComputeTaskResult(enjugit.SubmitRequest{
 		TaskID:         spec.TaskID,
-		BranchOverride: spec.Branch,
+		BranchOverride: spec.IterationBranch,
+		RunBranch:      spec.Branch,
 		Files:          files,
 		// ArtifactPaths feeds the commit message + Enju-Artifacts
 		// trailer — these describe what's *in* this commit, so only
@@ -538,6 +593,25 @@ func Run(ctx context.Context, spec Spec, env []string, logger *slog.Logger) Resu
 	}
 	res.CommitSHA = submitRes.CommitSHA
 	return res
+}
+
+// splitArtifactsByTrack partitions writes_artifacts declarations
+// into the tracked / untracked subsets so each can be expanded
+// against its own filesystem root: tracked entries live in the
+// worktree (and land in the commit); untracked entries live in
+// the bigfiles dir (sibling of the worktree).
+//
+// Preserves declaration order within each subset so error
+// messages and the per-decl Optional flag stay stable.
+func splitArtifactsByTrack(decls enjuYaml.WriteArtifacts) (tracked, untracked enjuYaml.WriteArtifacts) {
+	for _, d := range decls {
+		if d.Track {
+			tracked = append(tracked, d)
+		} else {
+			untracked = append(untracked, d)
+		}
+	}
+	return tracked, untracked
 }
 
 // ReadSpec loads a Spec from a JSON file. Used by the
@@ -621,7 +695,10 @@ func WrapMain(args []string, stderr io.Writer) int {
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	res := Run(context.Background(), spec, os.Environ(), logger)
+	// Subprocess: no parent Workflow to share — Run opens its own
+	// from spec.WorkspaceRoot. Cross-process flock keeps it safe
+	// against the parent's concurrent ops.
+	res := Run(context.Background(), nil, spec, os.Environ(), logger)
 
 	if err := WriteResult(outputPath, res); err != nil {
 		fmt.Fprintln(stderr, "wrap-task: writing result:", err)

@@ -338,14 +338,15 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 		return nil, fmt.Errorf("unable to parse artifact index")
 	}
 
-	// Open the workflow so we can stat paths + run the symlink
-	// materializer. Non-fatal: if the open fails, we still
-	// report what the index says; the local visibility column
-	// says "(workspace unavailable)".
-	var workDir string
+	// Resolve the bigfiles dir for this project + branch so we
+	// can stat untracked entries. Non-fatal: if workspace open
+	// fails we still report what the index says (LocalState =
+	// "(workspace unavailable)" per row).
+	var projectRoot string
 	if wf, werr := s.enjugit.ForProject(projectID, remoteURL); werr == nil {
-		workDir = wf.WorkDir()
+		projectRoot = wf.ProjectRoot()
 	}
+	bigfilesDir := enjugit.ResolveBigfilesDir(projectRoot, projectID, projName, branch)
 
 	var out []UntrackedArtifactRow
 	for _, r := range rows {
@@ -360,14 +361,14 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 			Path:     path,
 			Producer: firstNonEmptyMapValue(r, "last_writer", "last_task_id"),
 		}
-		if workDir == "" {
+		if bigfilesDir == "" {
 			ur.LocalState = "(workspace unavailable)"
 			out = append(out, ur)
 			continue
 		}
-		_ = enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(path), workDir,
-			projectID, projName, branch, path)
-		full := filepath.Join(workDir, enjugit.ArtifactPath(path))
+		// Untracked artifacts live in bigfilesDir, never in
+		// the worktree. Layout: <project>/enju/bigfiles/<branch>/<path>.
+		full := filepath.Join(bigfilesDir, enjugit.ArtifactPath(path))
 		fi, serr := os.Lstat(full)
 		if os.IsNotExist(serr) {
 			ur.LocalState = "missing"

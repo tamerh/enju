@@ -228,6 +228,17 @@ func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta
 	if errMsg, ok := raw["error"].(string); ok {
 		return nil, fmt.Errorf("%s", errMsg)
 	}
+	return s.parseTaskMetaFromMap(taskID, raw), nil
+}
+
+// parseTaskMetaFromMap decodes a TaskResponse-shaped map into
+// TaskMeta. The same wire shape comes back from
+// GET /api/v1/tasks/:id and from POST /api/v1/tasks/:id/claim's
+// "task" subobject, so callers that already have the parsed JSON
+// (e.g. the claim path that needs post-claim IterationBranch
+// without a second round-trip) can decode in-place instead of
+// refetching.
+func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface{}) *TaskMeta {
 	meta := &TaskMeta{ID: taskID}
 	if v, ok := raw["project_id"].(float64); ok {
 		meta.ProjectID = int64(v)
@@ -380,7 +391,7 @@ func (s *FatClient) FetchTaskMeta(ctx context.Context, taskID string) (*TaskMeta
 			}
 		}
 	}
-	return meta, nil
+	return meta
 }
 
 // UseFatClient reports whether the MCP client should take the

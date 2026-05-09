@@ -62,6 +62,7 @@ type CoordinatorStore interface {
 	ListTaskIterations(taskID string) ([]IterationRecord, error)
 	GetExpiredClaims() ([]TaskClaimRecord, error)
 	GetOpenClaimIterSeq(taskID string) (int64, error)
+	ListOpenClaimsForCitizen(citizenID int64) ([]TaskClaimRecord, error)
 
 	// --- Runs ---
 	GetRun(id int64) (*RunRecord, error)

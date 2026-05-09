@@ -150,6 +150,43 @@ func (s *FatClient) ReleaseTask(ctx context.Context, taskID string) error {
 	return nil
 }
 
+// ReleaseAllMyOpenClaimsResponse is the fat-client mirror of
+// the coord's wire shape for POST /api/v1/me/release-claims.
+type ReleaseAllMyOpenClaimsResponse struct {
+	ReleasedTaskIDs []string `json:"released_task_ids"`
+	Count           int      `json:"count"`
+}
+
+// ReleaseAllMyOpenClaims releases every open claim currently
+// held by the calling citizen across all projects. Used by the
+// bot daemon's startup recovery: a fresh daemon process has no
+// in-memory record of claims its previous instance held, so
+// without this call those claims sit until reaper deadline
+// (~30min) and the daemon idles in the meantime (the orphan
+// task appears CLAIMED-by-self in the ready scan and gets
+// skipped).
+//
+// Returns the released task IDs + count. Empty list when there
+// are no orphans is a normal first-run case.
+func (s *FatClient) ReleaseAllMyOpenClaims(ctx context.Context) (*ReleaseAllMyOpenClaimsResponse, error) {
+	data, err := s.coord.Post(ctx, "/api/v1/me/release-claims",
+		map[string]string{"username": s.coord.Username()})
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) == nil {
+		if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+			return nil, fmt.Errorf("%s", errMsg)
+		}
+	}
+	var resp ReleaseAllMyOpenClaimsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode release-all response: %w", err)
+	}
+	return &resp, nil
+}
+
 // ClaimResult bundles every byte slice the format.ClaimResult
 // renderer wants. Each field can be nil — the formatter omits
 // the corresponding section. Lean-mode (IncludeContext=false)
@@ -490,7 +527,7 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		s.logger.Warn("opening workflow for presence check", "project_id", meta.ProjectID, "error", werr)
 		return nil
 	}
-	workDir := wf.WorkDir()
+	bigfilesDir := enjugit.ResolveBigfilesDir(wf.ProjectRoot(), meta.ProjectID, meta.ProjectName, meta.Branch)
 
 	var missing []string
 	for _, p := range meta.ReadsArtifacts {
@@ -498,18 +535,8 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		if !known || tracked {
 			continue
 		}
-		// Best-effort shared-root hookup: if ENJU_SHARED_ROOT
-		// is configured AND the producer wrote through it,
-		// the downstream workspace won't have a file yet —
-		// the symlink needs to be materialized before the
-		// stat succeeds. EnsureSharedSymlink is a noop when
-		// the env var is unset, so this call is free in
-		// local-only setups.
-		if err := enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(p), workDir,
-			meta.ProjectID, meta.ProjectName, meta.Branch, p); err != nil {
-			s.logger.Warn("shared-root symlink setup", "path", p, "error", err)
-		}
-		full := filepath.Join(workDir, enjugit.ArtifactPath(p))
+		// Untracked artifacts live in bigfilesDir.
+		full := filepath.Join(bigfilesDir, enjugit.ArtifactPath(p))
 		if _, err := os.Stat(full); err != nil {
 			missing = append(missing, p)
 		}
@@ -527,8 +554,8 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteString("\nUntracked artifacts live outside git — only the producer's workspace (or a shared mount via $ENJU_SHARED_ROOT) has the bytes. Options: ")
-	b.WriteString("re-run the producer task locally so it materializes the file here, or configure $ENJU_SHARED_ROOT to point at a mount the producer writes to.")
+	b.WriteString("\nUntracked artifacts live outside git, in <project>/enju/bigfiles/<branch>/. Options: ")
+	b.WriteString("re-run the producer task locally so it materializes the file here, or set $ENJU_BIGFILES to a shared mount the producer writes to.")
 	return fmt.Errorf("%s", b.String())
 }
 

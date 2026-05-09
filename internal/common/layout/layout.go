@@ -64,6 +64,37 @@ const BotManifestPath = "enju/bots.yaml"
 // trip through `git add` even if the ignore is missing.
 const BotsRuntimeDir = "enju/bots"
 
+// BigfilesDir is the per-project root where action:compute tasks
+// land their declared-untracked outputs (writes_artifacts entries
+// with track:false). Sibling to .clone/ and .bare.git/, so it
+// lives INSIDE the project tree but OUTSIDE the worktree — git
+// in .clone/ literally can't see files here, which is the whole
+// point: scripts produce multi-GB BAM/FASTQ data, the data lives
+// next to the run that produced it, and no .gitignore trickery
+// or preserve-during-checkout dance is needed.
+//
+// Per-branch subdirs (BigfilesBranchDir) keep parallel-branch
+// runs from clobbering each other's outputs at the same logical
+// path.
+const BigfilesDir = "enju/bigfiles"
+
+// BigfilesBranchDir returns the per-branch root for untracked
+// artifacts produced on `branch`. Branch is used verbatim — git's
+// own branch-name validity rules (no ".." segments, no leading
+// dashes, etc.) double as our filesystem-safety check, and slash-
+// separated branch names ("feature/foo") create useful directory
+// structure on disk.
+//
+// Empty branch collapses to "main" — same default the artifact
+// index and topic-branch composer use, so callers that haven't
+// resolved a branch name yet still produce a well-formed path.
+func BigfilesBranchDir(branch string) string {
+	if branch == "" {
+		branch = "main"
+	}
+	return filepath.Join(BigfilesDir, branch)
+}
+
 // BotPushTargetDir is the per-project bare repo the bot daemon
 // pushes its topic branches to. Created by `enju bot setup` (see
 // service.EnsureBotPushTarget); operator's working tree's `origin`

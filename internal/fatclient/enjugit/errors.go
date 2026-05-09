@@ -105,6 +105,59 @@ func (e *ErrSubmitVerify) Error() string {
 }
 func (e *ErrSubmitVerify) Is(target error) bool { return target == ErrSubmitVerifyFailed }
 
+// gitOpError wraps a translated git error with the project-level
+// context the operator needs to diagnose without a debugger:
+// which op, which branch (if branch-scoped), which on-disk
+// clone, which origin URL. Surfaces in error messages as a
+// compact `op{branch=…, workdir=…, origin=…}: <cause>` line.
+//
+// Sentinel checks (errors.Is / errors.As) walk through Unwrap,
+// so a caller doing `errors.Is(err, ErrPushNonFF)` still works
+// when the wrap is in the chain.
+//
+// Construct via Workflow.wrapGitError so the workdir + remote
+// fields are filled in consistently. Plain translateGitError
+// remains for callers that don't have a Workflow handle (low-
+// level tests + a few internal helpers).
+type gitOpError struct {
+	Op        string // verb name, e.g. "push", "fetch branch"
+	Branch    string // empty for non-branch-scoped ops
+	WorkDir   string
+	RemoteURL string
+	Cause     error
+}
+
+func (e *gitOpError) Error() string {
+	parts := make([]string, 0, 3)
+	if e.Branch != "" {
+		parts = append(parts, "branch="+e.Branch)
+	}
+	if e.WorkDir != "" {
+		parts = append(parts, "workdir="+e.WorkDir)
+	}
+	if e.RemoteURL != "" {
+		parts = append(parts, "origin="+e.RemoteURL)
+	}
+	ctx := ""
+	if len(parts) > 0 {
+		ctx = "{" + joinComma(parts) + "} "
+	}
+	return e.Op + " " + ctx + ": " + e.Cause.Error()
+}
+
+func (e *gitOpError) Unwrap() error { return e.Cause }
+
+func joinComma(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += ", "
+		}
+		out += p
+	}
+	return out
+}
+
 // translateGitError maps a git.Err* to its enjugit.Err*
 // counterpart. Used by every Workflow method that catches a git
 // error before returning. Unknown git errors are wrapped

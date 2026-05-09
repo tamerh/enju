@@ -4,8 +4,8 @@ package git
 // checkouts. See preserve.go for the design rationale + invariants.
 // TestCheckout_PreservesUntracked in branch_test.go pins the basic
 // untracked-survives case; this file covers the load-bearing edges:
-// gitignored files, subtree rename, leftover-dir recovery,
-// conflict accounting, large-file constant memory.
+// gitignored files, leftover-dir recovery, conflict handling,
+// large-file constant memory.
 
 import (
 	"errors"
@@ -104,9 +104,6 @@ func TestRestoreFromPreserve_LeavesConflictingCopy(t *testing.T) {
 	if len(conflicts) != 1 || conflicts[0].relPath != "notes.md" {
 		t.Errorf("expected notes.md in conflicts, got %+v", conflicts)
 	}
-	if n := countConflictFiles(preserveDir, conflicts); n != 1 {
-		t.Errorf("expected 1 conflicting file, got %d", n)
-	}
 	got, _ := os.ReadFile(filepath.Join(workDir, "notes.md"))
 	if string(got) != string(branchContent) {
 		t.Errorf("workDir clobbered: got %q", got)
@@ -117,12 +114,12 @@ func TestRestoreFromPreserve_LeavesConflictingCopy(t *testing.T) {
 	}
 }
 
-// TestCheckout_PreservesEmptyDirsViaSubtreeRename verifies the
-// wholesale-subtree rename optimization: when a directory has no
-// tracked descendants, the whole subtree (including empty
-// subdirs) is renamed in one syscall and restored intact. A
-// per-file snapshot would silently drop empty leaf dirs.
-func TestCheckout_PreservesEmptyDirsViaSubtreeRename(t *testing.T) {
+// TestCheckout_PreservesNestedNonTracked covers the per-file
+// preserve walk: nested untracked files survive a Force checkout,
+// each renamed individually since the wholesale-subtree shortcut
+// is gone. (Empty leaf directories are not preserved — git
+// doesn't track them.)
+func TestCheckout_PreservesNestedNonTracked(t *testing.T) {
 	bare := initBareRemote(t)
 	seedBareWithInitialCommit(t, bare)
 	c := freshClone(t, bare)
@@ -135,10 +132,6 @@ func TestCheckout_PreservesEmptyDirsViaSubtreeRename(t *testing.T) {
 		if err := os.WriteFile(full, []byte(rel), 0o644); err != nil {
 			t.Fatal(err)
 		}
-	}
-	emptyDir := filepath.Join(c.workDir, "scratch", "empty")
-	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
-		t.Fatal(err)
 	}
 
 	headSHA, _, _ := c.Head()
@@ -157,8 +150,88 @@ func TestCheckout_PreservesEmptyDirsViaSubtreeRename(t *testing.T) {
 			t.Errorf("%s content changed: got %q", rel, got)
 		}
 	}
-	if info, err := os.Stat(emptyDir); err != nil || !info.IsDir() {
-		t.Errorf("empty dir scratch/empty did not survive: %v", err)
+}
+
+// TestRestoreFromPreserve_DropsByteEqualConflict pins the
+// no-phantom-conflicts rule: when restore finds the target
+// path already on disk AND its bytes equal the preserved
+// copy's bytes, the preserved copy is silently removed
+// rather than being flagged as a conflict. This is the
+// "branch tree just rewrote what we tried to preserve"
+// case (typical right after a successful submit), where
+// the older code accumulated stale entries in the preserve
+// dir across iterations.
+func TestRestoreFromPreserve_DropsByteEqualConflict(t *testing.T) {
+	workDir := t.TempDir()
+	preserveDir := workDir + PreserveDirSuffix
+	if err := os.MkdirAll(preserveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte("identical bytes\n")
+	if err := os.WriteFile(filepath.Join(preserveDir, "src/foo.txt"), body, 0o644); err != nil {
+		// preserve subdir doesn't exist yet; create it.
+		if err := os.MkdirAll(filepath.Join(preserveDir, "src"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(preserveDir, "src/foo.txt"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(workDir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "src/foo.txt"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := []preservedEntry{{relPath: "src/foo.txt"}}
+	conflicts, err := restoreFromPreserve(workDir, preserveDir, manifest)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Errorf("expected no conflicts when bytes match, got %+v", conflicts)
+	}
+	if _, err := os.Stat(filepath.Join(preserveDir, "src/foo.txt")); err == nil {
+		t.Errorf("preserved copy should have been removed when bytes match")
+	}
+	got, _ := os.ReadFile(filepath.Join(workDir, "src/foo.txt"))
+	if string(got) != string(body) {
+		t.Errorf("workdir content changed: got %q", got)
+	}
+}
+
+// TestRestoreFromPreserve_KeepsDifferingConflict pins the
+// other half: when bytes differ, the preserved copy stays in
+// the preserve dir for manual review — that's a real divergence
+// the user needs to see (untracked work that collides with
+// branch-tracked content).
+func TestRestoreFromPreserve_KeepsDifferingConflict(t *testing.T) {
+	workDir := t.TempDir()
+	preserveDir := workDir + PreserveDirSuffix
+	if err := os.MkdirAll(preserveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(preserveDir, "notes.md"), []byte("user version"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "notes.md"), []byte("branch version"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := []preservedEntry{{relPath: "notes.md"}}
+	conflicts, err := restoreFromPreserve(workDir, preserveDir, manifest)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Errorf("expected 1 conflict on differing bytes, got %d", len(conflicts))
+	}
+	got, _ := os.ReadFile(filepath.Join(preserveDir, "notes.md"))
+	if string(got) != "user version" {
+		t.Errorf("preserved copy lost: %q", got)
 	}
 }
 
@@ -208,36 +281,6 @@ func TestRecoverLeftoverPreserve_RestoresAndLeavesConflicts(t *testing.T) {
 	got, err = os.ReadFile(filepath.Join(preserveDir, "conflict.txt"))
 	if err != nil || string(got) != "preserved version" {
 		t.Errorf("preserve copy of conflict.txt gone: got=%q err=%v", got, err)
-	}
-}
-
-// TestCountConflictFilesDescendsIntoDirs: a wholesale-dir
-// conflict must report every file it strands, not just "1 entry."
-// A gitignored data/ dir holding 50 files stranded by a branch
-// that tracks data/ should log "conflict_count: 50" not 1.
-func TestCountConflictFilesDescendsIntoDirs(t *testing.T) {
-	preserveDir := t.TempDir()
-	for _, rel := range []string{"data/a.txt", "data/b.txt", "data/nested/c.txt"} {
-		full := filepath.Join(preserveDir, rel)
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(preserveDir, "note.md"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	conflicts := []preservedEntry{
-		{relPath: "data", isDir: true},
-		{relPath: "note.md", isDir: false},
-	}
-	got := countConflictFiles(preserveDir, conflicts)
-	want := 4 // 3 files under data/ + note.md
-	if got != want {
-		t.Errorf("countConflictFiles: got %d, want %d (dir entry should count descendants)", got, want)
 	}
 }
 

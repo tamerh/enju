@@ -53,6 +53,7 @@ type Ops interface {
 	Checkout(branch string) error
 	CheckoutCommit(sha string) error
 	ResetClean() error
+	SyncIndexToHead() error
 	RemoveFiles(paths []string) error
 
 	// CheckoutBranchFrom is the meaty branch-checkout: stale-ref

@@ -219,8 +219,7 @@ func (c *Clone) CheckoutBranchFrom(branch, baseBranch, defaultBranch string) err
 		c.logger.Warn(
 			"branch switch preserved non-tracked paths, but some now conflict with tracked paths on the new branch; preserved copies remain in the preserve dir for manual review",
 			"preserve_dir", preserveDir,
-			"conflict_entries", len(conflicts),
-			"conflict_files", countConflictFiles(preserveDir, conflicts),
+			"conflict_files", len(conflicts),
 		)
 	}
 	return nil

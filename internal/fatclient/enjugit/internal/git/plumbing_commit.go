@@ -5,14 +5,20 @@ package git
 // PlumbingCommit and UpdateRef build commits + advance refs by
 // writing directly to the object store, never touching HEAD,
 // .git/index, or the working tree. This is the substrate for
-// parallel compute: N goroutines on the same *Clone can each
-// build a commit on their own topic branch concurrently because
-// no shared mutable state (HEAD, index, working dir) is touched.
+// parallel compute: N goroutines on the same *Clone each build
+// commits on their own topic branch independently — no fight
+// over HEAD/index/worktree.
 //
-// Object writes are filesystem-level concurrent-safe (each blob/
-// tree/commit is content-addressed, written as its own file under
-// .git/objects/). Ref writes go through UpdateRef which uses
-// go-git's reference storage (atomic via .lock files).
+// Locking: both methods take c.lock(). Even though loose-object
+// writes are content-addressed (distinct paths), they share the
+// same .git/objects/ tree with shellout `git` invocations from
+// other code paths (merge.go, rebase.go), and a half-written
+// loose-object temp file from go-git can trip git's internal
+// BUG() assertions during a concurrent merge → SIGABRT. The
+// lock makes those mutually exclusive. The win we actually
+// needed (no checkout, parallel topic branches, parallel script
+// execution) is preserved — only the in-process object writes
+// serialize, and a blob+tree+commit triple is microseconds.
 //
 // Compare to CommitFiles in commit.go which uses worktree.Add +
 // worktree.Commit (porcelain) — that path moves HEAD and updates
@@ -78,18 +84,20 @@ type PlumbingCommitRequest struct {
 //     ParentHashes = [BaseSHA] (or empty if BaseSHA is "").
 //  6. Store the commit, return its SHA.
 //
-// Concurrent safety: this method does NOT acquire c.lock(). The
-// underlying go-git object store is concurrent-safe for writes
-// (content-addressed, distinct paths). Multiple goroutines may
-// invoke PlumbingCommit on the same *Clone simultaneously.
-//
-// The lock IS used by UpdateRef when the caller follows up to
-// advance a branch ref — that's where serialization is required
-// (atomic ref CAS).
+// Concurrent safety: takes c.lock() for the duration. Even
+// though loose-object writes are content-addressed (distinct
+// paths), this method shares .git/objects/ with shellout `git`
+// invocations elsewhere (merge.go, rebase.go) and a half-written
+// loose-object temp file from go-git can trip git's internal
+// BUG() assertions during a concurrent merge → SIGABRT. The
+// lock makes the two mutually exclusive. Parallelism we
+// actually need (script execution + per-task topic branches +
+// independent pushes) is preserved.
 func (c *Clone) PlumbingCommit(req PlumbingCommitRequest) (string, error) {
 	if req.Message == "" {
 		return "", fmt.Errorf("git: PlumbingCommit: Message required")
 	}
+	defer c.lock()()
 	stor := c.repo.Storer
 
 	// Step 1+2: flatten base tree into path map.

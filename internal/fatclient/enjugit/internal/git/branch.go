@@ -258,6 +258,34 @@ func (c *Clone) ResetClean() error {
 	})
 }
 
+// SyncIndexToHead updates the index to match HEAD's tree without
+// touching the worktree (go-git MixedReset semantics — same as
+// `git reset --mixed`). Used after a ref-only FF merge moves the
+// branch tip to a new commit: the worktree files are already
+// (mostly) correct, but the index still reflects the pre-merge
+// tree, which makes the next checkout's preserve walk
+// misclassify newly-committed files as untracked.
+//
+// Worktree state: pre any → post unchanged.
+func (c *Clone) SyncIndexToHead() error {
+	defer c.lock()()
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("git: worktree handle: %w", err)
+	}
+	head, err := c.repo.Head()
+	if err != nil {
+		return fmt.Errorf("%w: HEAD: %v", ErrRefNotFound, err)
+	}
+	if err := wt.Reset(&gogit.ResetOptions{
+		Mode:   gogit.MixedReset,
+		Commit: head.Hash(),
+	}); err != nil {
+		return fmt.Errorf("git: mixed reset to HEAD: %w", err)
+	}
+	return nil
+}
+
 // RemoveFiles deletes the given paths from the worktree. Used by
 // service.WipeDeclaredWrites to clear a prior iteration's declared
 // output files before the next iteration's handler runs.

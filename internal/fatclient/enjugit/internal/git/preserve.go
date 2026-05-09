@@ -1,17 +1,17 @@
 package git
 
 // Rename-based preservation of non-tracked files across a
-// Force checkout. Workspaces for bio/ML workflows routinely
-// hold multi-GB untracked artifacts (BAM files, model
-// checkpoints, FASTQ data produced by writes_artifacts
-// tracked=false compute tasks). The naive approach — read
-// every non-tracked file into memory before the checkout,
-// write back after — OOMs on those workloads.
+// Force checkout. go-git's Force checkout (HardReset) walks
+// the worktree and deletes anything not in the target tree —
+// including untracked files. CLI git keeps them; go-git does
+// not. So before every Force checkout we move non-tracked
+// paths out of the way, then move them back after. The user's
+// scratch files (logs, ad-hoc edits, gitignored configs) survive
+// the branch swap.
 //
-// The rename approach moves files out of the way by updating
-// the filesystem directory entry only. Bytes never leave the
-// disk, so a 50 GB file moves in microseconds and total memory
-// stays flat regardless of workspace size.
+// The rename approach moves files via directory-entry update
+// only. Bytes never leave disk, so even a multi-GB scratch
+// file moves in microseconds and total memory stays flat.
 //
 // Invariants:
 //
@@ -19,15 +19,9 @@ package git
 //     (<workDir>.preserve-in-progress), guaranteeing same-
 //     filesystem so os.Rename works without EXDEV.
 //
-//   - For a directory with no tracked descendants (e.g. an
-//     entire gitignored data/ tree), we rename the whole
-//     subtree in one syscall. This is the big win for the
-//     bio-workload case.
-//
-//   - For a mixed directory (some tracked, some not), we
-//     recurse and rename individual non-tracked files. Tracked
-//     paths stay in place so Force checkout can do its normal
-//     tree swap.
+//   - The walk is per-file: every non-tracked path becomes
+//     its own manifest entry. Empty directories are not
+//     preserved — git ignores them and so do we.
 //
 //   - On any rename failure mid-preservation, we stop
 //     immediately and return the partial manifest + an error.
@@ -44,17 +38,15 @@ package git
 //
 //   - Crash recovery at workspace open: a leftover
 //     <workDir>.preserve-in-progress from a previous process's
-//     crash is drained back into workDir using the same
-//     rename-if-no-conflict logic as the normal restore.
+//     crash is drained back into workDir using rename-if-no-
+//     conflict logic.
 //
-// Known limitations (acceptable v1, file follow-ups if needed):
+// Known limitations:
 //
 //   - Staged-but-uncommitted changes are in the index, so
 //     we classify them as tracked → Force checkout will
-//     update/remove them as part of the branch swap. Rare
-//     in the fat-client flow (we don't leave staged state),
-//     but callers with external tooling that stages could
-//     lose staged work. Documented here, not protected.
+//     update/remove them as part of the branch swap.
+//     Documented, not protected.
 //
 //   - Case-insensitive filesystems (default macOS APFS)
 //     use exact-case match for tracked-path lookup; a
@@ -68,7 +60,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	gogit "github.com/go-git/go-git/v5"
 )
@@ -82,25 +73,18 @@ const PreserveDirSuffix = ".preserve-in-progress"
 
 // preservedEntry records one rename we performed during
 // preservation. Restore iterates this manifest to rename each
-// entry back into workDir. isDir distinguishes wholesale-
-// subtree preservations (where the whole dir moved in one
-// rename) from per-file preservations (where a tracked sibling
-// kept us from moving the parent).
+// entry back into workDir.
 type preservedEntry struct {
 	relPath string
-	isDir   bool
 }
 
-// movePreserveNonTracked scans the git index, then walks
-// workDir top-down and renames every non-tracked path into
+// movePreserveNonTracked scans the git index, walks workDir,
+// and renames every non-tracked file (or symlink) into
 // preserveDir. Returns a manifest of what was moved so the
 // caller can restore after its Force checkout.
 //
-// Top-down walk with subtree short-circuit: when we enter a
-// directory that has no tracked descendants, we rename the
-// whole subtree in one syscall and skip traversal. This is
-// O(1) regardless of subtree size, which is what makes
-// multi-GB gitignored artifact dirs safe.
+// Walks per-file. Empty directories are not preserved — git
+// doesn't track them and neither do we.
 //
 // On any rename failure, we return the partial manifest + the
 // error. The caller MUST NOT proceed with the Force checkout
@@ -117,10 +101,6 @@ func movePreserveNonTracked(repo *gogit.Repository, workDir, preserveDir string)
 	for _, e := range idx.Entries {
 		tracked = append(tracked, e.Name)
 	}
-	// go-git emits the index in sorted order, but a sort here
-	// is defensive — the prefix-check logic below depends on
-	// sortedness for correctness, and a cheap sort beats a
-	// subtle ordering bug.
 	sort.Strings(tracked)
 
 	var manifest []preservedEntry
@@ -139,31 +119,15 @@ func movePreserveNonTracked(repo *gogit.Repository, workDir, preserveDir string)
 
 		if info.IsDir() {
 			// .git/ is the git object store; touching it would
-			// corrupt the repo. Must skip before any other
-			// check. Also guards against the preserve dir
-			// itself being a sibling of workDir rather than
-			// inside it — we never walk into it.
+			// corrupt the repo.
 			if info.Name() == ".git" {
 				return filepath.SkipDir
 			}
-			if !hasTrackedDescendants(tracked, rel) {
-				if err := movePath(workDir, preserveDir, rel); err != nil {
-					return fmt.Errorf("preserving directory %q: %w", rel, err)
-				}
-				manifest = append(manifest, preservedEntry{relPath: rel, isDir: true})
-				// Children moved with the parent — don't walk in.
-				return filepath.SkipDir
-			}
-			// Mixed dir: some descendants are tracked. Recurse
-			// and handle files individually.
 			return nil
 		}
 
-		// Regular files and symlinks both go through rename.
-		// Sockets/fifos/devices are skipped — they don't fit
-		// the data-preservation model (a socket has no stable
-		// bytes to preserve; renaming it just moves the
-		// endpoint), and are virtually unheard of in workspaces.
+		// Regular files and symlinks go through rename.
+		// Sockets/fifos/devices are skipped.
 		if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 			return nil
 		}
@@ -174,7 +138,7 @@ func movePreserveNonTracked(repo *gogit.Repository, workDir, preserveDir string)
 		if err := movePath(workDir, preserveDir, rel); err != nil {
 			return fmt.Errorf("preserving file %q: %w", rel, err)
 		}
-		manifest = append(manifest, preservedEntry{relPath: rel, isDir: false})
+		manifest = append(manifest, preservedEntry{relPath: rel})
 		return nil
 	})
 	if walkErr != nil {
@@ -199,9 +163,19 @@ func restoreFromPreserve(workDir, preserveDir string, manifest []preservedEntry)
 		dst := filepath.Join(workDir, filepath.FromSlash(e.relPath))
 		if _, statErr := os.Lstat(dst); statErr == nil {
 			// Target exists — new branch tracks this path.
-			// Leaving the preserved copy lets the user
-			// diff/merge manually. We don't overwrite branch
-			// content.
+			// If the bytes match what we preserved, the tree
+			// rewrote our user's content identically (typical
+			// when the user just submitted those exact files
+			// and we're now seeing them via the new branch's
+			// tree); silently drop the preserved copy rather
+			// than flagging a phantom conflict that would
+			// pile up across iterations. Different bytes mean
+			// real divergence — keep the preserved copy in
+			// the preserve dir for manual review.
+			if same, _ := filesEqual(src, dst); same {
+				_ = os.Remove(src)
+				continue
+			}
 			conflicts = append(conflicts, e)
 			continue
 		} else if !os.IsNotExist(statErr) {
@@ -218,33 +192,6 @@ func restoreFromPreserve(workDir, preserveDir string, manifest []preservedEntry)
 	// left as-is for manual review.
 	_, _ = pruneEmptyDirs(preserveDir)
 	return conflicts, nil
-}
-
-// countConflictFiles totals the regular files stranded in the
-// preserve dir across all conflicted manifest entries. A
-// wholesale-dir conflict counts every file underneath, not
-// just the entry itself — otherwise a 50-file gitignored
-// subtree that couldn't be restored would log as
-// "conflict_count: 1" and understate the actual divergence.
-func countConflictFiles(preserveDir string, conflicts []preservedEntry) int {
-	total := 0
-	for _, e := range conflicts {
-		if !e.isDir {
-			total++
-			continue
-		}
-		root := filepath.Join(preserveDir, filepath.FromSlash(e.relPath))
-		_ = filepath.Walk(root, func(_ string, info os.FileInfo, werr error) error {
-			if werr != nil || info == nil {
-				return nil
-			}
-			if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-				total++
-			}
-			return nil
-		})
-	}
-	return total
 }
 
 // RecoverLeftoverPreserve drains a preserve dir left behind by
@@ -378,23 +325,6 @@ func movePath(workDir, preserveDir, rel string) error {
 	return nil
 }
 
-// hasTrackedDescendants returns true if any path in `tracked`
-// starts with `dir + "/"`. Uses sort.SearchStrings on the
-// pre-sorted tracked slice for O(log N) per query.
-//
-// The root case (dir == "") returns true whenever anything is
-// tracked — a whole-workspace wholesale preserve would only
-// make sense for an empty repo, and we never call this with
-// dir == "" in the walk anyway (workDir itself isn't a candidate).
-func hasTrackedDescendants(tracked []string, dir string) bool {
-	if dir == "" {
-		return len(tracked) > 0
-	}
-	needle := dir + "/"
-	i := sort.SearchStrings(tracked, needle)
-	return i < len(tracked) && strings.HasPrefix(tracked[i], needle)
-}
-
 // isTrackedPath returns true if `path` is an exact match for
 // some entry in the sorted tracked slice.
 func isTrackedPath(tracked []string, path string) bool {
@@ -438,4 +368,44 @@ func pruneEmptyDirs(root string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// filesEqual returns true when both paths exist as regular files
+// with identical contents. Any error (missing file, permission,
+// non-regular type, mismatched size or bytes) yields false. Used
+// by restoreFromPreserve to recognise "the new branch's tree
+// just rewrote the bytes we saved" so we drop a redundant
+// preserved copy instead of treating it as a real conflict.
+func filesEqual(a, b string) (bool, error) {
+	infoA, err := os.Lstat(a)
+	if err != nil {
+		return false, err
+	}
+	infoB, err := os.Lstat(b)
+	if err != nil {
+		return false, err
+	}
+	if !infoA.Mode().IsRegular() || !infoB.Mode().IsRegular() {
+		return false, nil
+	}
+	if infoA.Size() != infoB.Size() {
+		return false, nil
+	}
+	bytesA, err := os.ReadFile(a)
+	if err != nil {
+		return false, err
+	}
+	bytesB, err := os.ReadFile(b)
+	if err != nil {
+		return false, err
+	}
+	if len(bytesA) != len(bytesB) {
+		return false, nil
+	}
+	for i := range bytesA {
+		if bytesA[i] != bytesB[i] {
+			return false, nil
+		}
+	}
+	return true, nil
 }

@@ -35,14 +35,16 @@ type ScanResult struct {
 // branch context fall back to the project default rather than
 // silently skipping the fetch.
 func (w *Workflow) FetchBranch(branch string) error {
-	return translateGitError("fetch branch", w.git.FetchBranch(w.resolveBranch(branch)))
+	resolved := w.resolveBranch(branch)
+	return w.wrapGitError("fetch branch", resolved, w.git.FetchBranch(resolved))
 }
 
 // PullBranch fetches + fast-forwards the local branch. No-op
 // when the named branch doesn't exist on origin yet. Empty
 // branch → default branch, same rationale as FetchBranch.
 func (w *Workflow) PullBranch(branch string) error {
-	return translateGitError("pull branch", w.git.PullBranch(w.resolveBranch(branch)))
+	resolved := w.resolveBranch(branch)
+	return w.wrapGitError("pull branch", resolved, w.git.PullBranch(resolved))
 }
 
 // resolveBranch returns branch when non-empty, else the
@@ -69,7 +71,7 @@ func (w *Workflow) LocalBranchHash(branch string) (string, error) {
 // reconcile path's "skip switch when empty" semantics), else
 // equivalent to Checkout.
 func (w *Workflow) CheckoutBranch(branch string) error {
-	return translateGitError("checkout branch", w.git.CheckoutBranch(branch))
+	return w.wrapGitError("checkout branch", branch, w.git.CheckoutBranch(branch))
 }
 
 // CheckoutBranchFrom switches the worktree to `branch`,
@@ -88,7 +90,7 @@ func (w *Workflow) CheckoutBranch(branch string) error {
 // Atomic: the entire ref/worktree dance runs under one
 // WithLock call inside git.Clone.CheckoutBranchFrom.
 func (w *Workflow) CheckoutBranchFrom(branch, baseBranch string) error {
-	return translateGitError("checkout branch from",
+	return w.wrapGitError("checkout branch from", branch,
 		w.git.CheckoutBranchFrom(branch, baseBranch, w.DefaultBranch()))
 }
 

@@ -235,10 +235,35 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			// — subsequent ops (next iteration's fork, user's
 			// manual commit) would target the wrong branch.
 			// This is the lost-commit regression guard.
-			if cerr := g.Checkout(target); cerr != nil {
-				return trace.fail("checkout-target", translateGitError("checkout merge target", cerr))
+			//
+			// Skip when HEAD is ALREADY on target: the compute
+			// path enters MergeAcceptedTopic with HEAD on target
+			// (the run branch), and after a ref-only FF the ref
+			// is already updated — re-running the preserve-
+			// checkout-restore dance just risks losing untracked
+			// files in the worktree (the bug the post-FF
+			// Checkout was meant to defend against, inverted in
+			// this entry shape).
+			_, headBranch, herr := g.Head()
+			if herr == nil && headBranch == target {
+				trace.skipped("checkout-target", "HEAD already on target")
+				// Skipping the Checkout means the index isn't
+				// refreshed via the standard checkout path.
+				// After the FF, the index still reflects the
+				// pre-merge tree, which would make the next
+				// checkout's preserve walk misclassify newly-
+				// committed files as untracked. Force the index
+				// in sync with HEAD's new tip explicitly.
+				if rerr := g.SyncIndexToHead(); rerr != nil {
+					return trace.fail("sync-index", translateGitError("sync index to head", rerr))
+				}
+				trace.ok("sync-index")
+			} else {
+				if cerr := g.Checkout(target); cerr != nil {
+					return trace.fail("checkout-target", translateGitError("checkout merge target", cerr))
+				}
+				trace.ok("checkout-target")
 			}
-			trace.ok("checkout-target")
 			// Step 4a: push the FF'd target.
 			if perr := g.Push(target); perr != nil {
 				return trace.fail("push", translateGitError("push", perr))

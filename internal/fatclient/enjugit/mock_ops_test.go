@@ -331,6 +331,11 @@ func (f *fakeOps) ResetClean() error {
 	return nil
 }
 
+func (f *fakeOps) SyncIndexToHead() error {
+	f.record("SyncIndexToHead")
+	return f.checkErr("SyncIndexToHead")
+}
+
 func (f *fakeOps) RemoveFiles(paths []string) error {
 	f.record("RemoveFiles", paths)
 	return f.checkErr("RemoveFiles")
