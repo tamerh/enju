@@ -336,6 +336,19 @@ func (f *fakeOps) RemoveFiles(paths []string) error {
 	return f.checkErr("RemoveFiles")
 }
 
+func (f *fakeOps) PlumbingCommit(req git.PlumbingCommitRequest) (string, error) {
+	f.record("PlumbingCommit", req)
+	if err := f.checkErr("PlumbingCommit"); err != nil {
+		return "", err
+	}
+	return "fakeplumbingsha", nil
+}
+
+func (f *fakeOps) UpdateRef(name, newSHA, expectedOldSHA string) error {
+	f.record("UpdateRef", name, newSHA, expectedOldSHA)
+	return f.checkErr("UpdateRef")
+}
+
 func (f *fakeOps) CommitFiles(req git.CommitRequest) (git.CommitResult, error) {
 	f.record("CommitFiles", req)
 	if err := f.checkErr("CommitFiles"); err != nil {

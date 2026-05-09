@@ -62,6 +62,21 @@ type Ops interface {
 
 	// Commit / push / fetch — acquire the lock.
 	CommitFiles(req CommitRequest) (CommitResult, error)
+
+	// PlumbingCommit builds a commit object directly via the
+	// object store WITHOUT touching HEAD, .git/index, or the
+	// working tree. Returns the commit SHA. Caller is
+	// responsible for advancing a ref via UpdateRef. Designed
+	// for parallel compute: N goroutines on the same Clone can
+	// each invoke this concurrently because no shared mutable
+	// state is touched. See plumbing_commit.go.
+	PlumbingCommit(req PlumbingCommitRequest) (string, error)
+
+	// UpdateRef atomically sets refs/heads/<name> to newSHA.
+	// expectedOldSHA="" allows any current value (including
+	// non-existent ref); non-empty triggers compare-and-swap
+	// and fails when the ref's current value doesn't match.
+	UpdateRef(name, newSHA, expectedOldSHA string) error
 	Push(branch string) error
 	PushAllRefs(force bool) error
 	PushWithVerify(branch, expectedSHA string) error
