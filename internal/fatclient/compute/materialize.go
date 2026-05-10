@@ -18,6 +18,23 @@ import (
 // operation.
 type ReadFileFunc func(sha, path string) ([]byte, bool, error)
 
+// ScriptCwdFor picks the working directory the script should run
+// in. Direct-exec compute tasks with a TaskScratchDir set get
+// isolated in their scratch dir (Phase 2.3); legacy specs and
+// container-mode tasks keep the historical workDir.
+//
+// Container mode is excluded because docker bind-mounts workDir
+// to /workspace and translates ENJU_PROJECT_DIR through that
+// mapping; scratch lives outside the bind mount, so a container
+// scriptCwd of scratch would point at a host path the container
+// can't see. Container support for scratch isolation is deferred.
+func ScriptCwdFor(spec Spec, workDir string) string {
+	if spec.TaskScratchDir != "" && spec.Container == "" {
+		return spec.TaskScratchDir
+	}
+	return workDir
+}
+
 // MaterializeReads writes each declared input path under
 // scratchDir, populated by reading from sourceSHA via read.
 // Used by the compute wrapper (Phase 2.2) to seed a task's

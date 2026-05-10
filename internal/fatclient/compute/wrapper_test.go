@@ -238,3 +238,42 @@ func TestMaterializeReads_ReadError(t *testing.T) {
 		t.Errorf("error should carry underlying cause, got: %v", err)
 	}
 }
+
+// TestScriptCwdFor pins the Phase 2.3 picker: scratch wins for
+// direct-exec when a scratch dir is set; container mode + legacy
+// (no scratch) both keep the workDir.
+func TestScriptCwdFor(t *testing.T) {
+	cases := []struct {
+		name string
+		spec compute.Spec
+		want string
+	}{
+		{
+			name: "direct-exec with scratch ─► scratch",
+			spec: compute.Spec{TaskScratchDir: "/scratch/abc"},
+			want: "/scratch/abc",
+		},
+		{
+			name: "direct-exec without scratch ─► workDir",
+			spec: compute.Spec{},
+			want: "/work",
+		},
+		{
+			name: "container mode with scratch ─► workDir (bind-mount semantics)",
+			spec: compute.Spec{TaskScratchDir: "/scratch/abc", Container: "alpine:3"},
+			want: "/work",
+		},
+		{
+			name: "container mode without scratch ─► workDir",
+			spec: compute.Spec{Container: "alpine:3"},
+			want: "/work",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := compute.ScriptCwdFor(c.spec, "/work"); got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}

@@ -386,6 +386,11 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 
 	workDir := wf.WorkDir()
 
+	// Phase 2.3 — pick the script's working directory. With a
+	// scratch dir set + direct-exec mode, scripts run isolated
+	// in scratch; legacy / container paths stay on workDir.
+	scriptCwd := ScriptCwdFor(spec, workDir)
+
 	// Phase 2.2 — materialize declared reads_artifacts into the
 	// task's scratch dir BEFORE the script runs. The script's
 	// CWD is still workDir at this point (Phase 2.3 flips it),
@@ -465,7 +470,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	//     os.Environ() so it can find DOCKER_HOST, the user's
 	//     auth config, etc.
 	startTime := time.Now()
-	cmd, cmdErr := buildExecCommand(ctx, spec, env, workDir)
+	cmd, cmdErr := buildExecCommand(ctx, spec, env, scriptCwd)
 	if cmdErr != nil {
 		res.Error = cmdErr.Error()
 		return res
@@ -571,7 +576,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// root gives each kind its own home with no .gitignore trick.
 	trackedDecls, untrackedDecls := splitArtifactsByTrack(spec.WritesArtifacts)
 
-	tracked, missingT, expandErr := trackedDecls.ExpandAgainstWorkdir(workDir)
+	tracked, missingT, expandErr := trackedDecls.ExpandAgainstWorkdir(scriptCwd)
 	if expandErr != nil {
 		res.Error = fmt.Sprintf("expanding writes_artifacts: %v", expandErr)
 		return res
@@ -596,7 +601,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 
 	var committedPaths []string
 	for _, e := range tracked {
-		full := filepath.Join(workDir, enjugit.ArtifactPath(e.Path))
+		full := filepath.Join(scriptCwd, enjugit.ArtifactPath(e.Path))
 		body, rerr := os.ReadFile(full)
 		if rerr != nil {
 			// Expansion already stat'd this file moments
