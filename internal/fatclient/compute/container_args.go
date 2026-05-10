@@ -32,6 +32,18 @@ import (
 // target for the prefix substitution.
 const ContainerWorkDir = "/workspace"
 
+// ContainerScratchDir is where the host's TaskScratchDir is
+// bind-mounted inside the container when Phase 2.5 isolation
+// is in effect (spec.TaskScratchDir non-empty). Same fixed-
+// constant rationale as ContainerWorkDir.
+//
+// Scripts inside the container see their declared inputs +
+// outputs at this path; ENJU_PROJECT_DIR + ENJU_TASK_DIR are
+// rewritten to /scratch in the env-forwarding loop, so a
+// script that does "cat $ENJU_PROJECT_DIR/data/raw_a.txt"
+// reads from the bind-mounted scratch transparently.
+const ContainerScratchDir = "/scratch"
+
 // RuntimeDocker is the only supported runtime in v1. Named
 // constant so call sites don't hardcode the string.
 const RuntimeDocker = "docker"
@@ -84,6 +96,17 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		return nil, fmt.Errorf("script path %q is outside workspace %q — cannot translate to container path", spec.ScriptPath, workDir)
 	}
 
+	// Phase 2.5: when scratch isolation is active, the script's
+	// effective CWD inside the container is /scratch (where its
+	// inputs are materialized + outputs land). Without scratch
+	// (legacy specs), keep the pre-2.5 default of /workspace as
+	// CWD. Either way the workspace is bind-mounted so the
+	// script file itself (which lives under workDir) is reachable.
+	containerCWD := ContainerWorkDir
+	if spec.TaskScratchDir != "" {
+		containerCWD = ContainerScratchDir
+	}
+
 	args := []string{
 		"run", "--rm",
 		// `:z` is a shared SELinux label. On RHEL/Fedora/
@@ -95,9 +118,17 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		// etc.), so we append it universally rather than
 		// detecting the host's LSM.
 		"-v", workDir + ":" + ContainerWorkDir + ":z",
-		"-w", ContainerWorkDir,
-		"--user", fmt.Sprintf("%d:%d", hostUID, hostGID),
 	}
+	// Phase 2.5: scratch bind. Read-write because the script
+	// writes its outputs here (writes_artifacts expansion will
+	// pick them up from the host side after the container exits).
+	if spec.TaskScratchDir != "" {
+		args = append(args, "-v", spec.TaskScratchDir+":"+ContainerScratchDir+":z")
+	}
+	args = append(args,
+		"-w", containerCWD,
+		"--user", fmt.Sprintf("%d:%d", hostUID, hostGID),
+	)
 
 	// Shared-root bind-mount, when configured. Read-write so
 	// untracked artifacts written through workspace-side
@@ -138,7 +169,16 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		if !envKeyAllowed(k, spec.Env) {
 			continue
 		}
-		translated, _ := translatePath(v, workDir, ContainerWorkDir)
+		translated, ok := translatePath(v, workDir, ContainerWorkDir)
+		// Phase 2.5: a value that didn't match the workspace
+		// prefix may match the scratch prefix (e.g.
+		// ENJU_PROJECT_DIR / ENJU_TASK_DIR which the service
+		// layer points at host-side scratch). Translate to
+		// the in-container scratch path so the script sees
+		// the bind-mounted view.
+		if !ok && spec.TaskScratchDir != "" {
+			translated, _ = translatePath(v, spec.TaskScratchDir, ContainerScratchDir)
+		}
 		args = append(args, "-e", k+"="+translated)
 	}
 
@@ -234,13 +274,18 @@ func checkContainerRuntime(spec Spec) error {
 // Extracted from Run() so the container branch has one
 // obvious entry point that tests can cover without booting
 // the whole git + commit pipeline.
-func buildExecCommand(ctx context.Context, spec Spec, env []string, workDir string) (*exec.Cmd, error) {
+func buildExecCommand(ctx context.Context, spec Spec, env []string, workDir, scriptCwd string) (*exec.Cmd, error) {
 	if spec.Container == "" {
 		cmd := exec.CommandContext(ctx, spec.ScriptPath)
-		cmd.Dir = workDir
+		cmd.Dir = scriptCwd
 		cmd.Env = env
 		return cmd, nil
 	}
+	// Container mode passes the PROJECT workDir to BuildContainerArgs
+	// (becomes the /workspace bind), while the docker CLI itself
+	// runs from workDir on the host. The script's effective CWD
+	// inside the container is set via -w, picked by buildDockerArgs
+	// based on whether spec.TaskScratchDir is set (Phase 2.5).
 	args, err := BuildContainerArgs(RuntimeDocker, spec, env, workDir, os.Getuid(), os.Getgid())
 	if err != nil {
 		return nil, fmt.Errorf("building docker args: %w", err)

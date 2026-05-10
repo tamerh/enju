@@ -239,9 +239,14 @@ func TestMaterializeReads_ReadError(t *testing.T) {
 	}
 }
 
-// TestScriptCwdFor pins the Phase 2.3 picker: scratch wins for
-// direct-exec when a scratch dir is set; container mode + legacy
-// (no scratch) both keep the workDir.
+// TestScriptCwdFor pins the Phase 2.5 picker: scratch wins
+// whenever it's set, regardless of execution mode. Container
+// mode used to fall back to workDir (Phase 2.3 deferred container
+// support); 2.5 added the docker bind-mount + path translation
+// so container scripts also see scratch as their CWD via
+// ContainerScratchDir. The host-side path returned here is what
+// the wrapper uses to read writes_artifacts after exit and to
+// materialize reads_artifacts before start — same on both modes.
 func TestScriptCwdFor(t *testing.T) {
 	cases := []struct {
 		name string
@@ -259,12 +264,12 @@ func TestScriptCwdFor(t *testing.T) {
 			want: "/work",
 		},
 		{
-			name: "container mode with scratch ─► workDir (bind-mount semantics)",
+			name: "container with scratch ─► scratch (bind-mounted at /scratch in container)",
 			spec: compute.Spec{TaskScratchDir: "/scratch/abc", Container: "alpine:3"},
-			want: "/work",
+			want: "/scratch/abc",
 		},
 		{
-			name: "container mode without scratch ─► workDir",
+			name: "container without scratch ─► workDir",
 			spec: compute.Spec{Container: "alpine:3"},
 			want: "/work",
 		},

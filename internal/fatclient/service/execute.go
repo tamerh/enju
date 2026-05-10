@@ -419,20 +419,21 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 // per-task isolated location. Empty string suppresses the
 // export.
 func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir string, meta *TaskMeta) []string {
-	// Phase 2.3 — direct-exec compute tasks point ENJU_PROJECT_DIR
-	// at the scratch dir so legacy scripts that write via
-	// "$ENJU_PROJECT_DIR/<path>" land their outputs under scratch
-	// where writes_artifacts expansion picks them up. Container
-	// mode keeps workDir because docker bind-mounts the project
-	// at /workspace and translates host paths through it; scratch
-	// isn't in the bind mount.
+	// Phase 2.3 / 2.5 — point ENJU_PROJECT_DIR at the scratch
+	// dir whenever scratch is set, regardless of execution mode.
+	// Direct-exec scripts run with cmd.Dir = scratch and see the
+	// host path here. Container scripts get the host path
+	// translated to ContainerScratchDir (/scratch) by the docker
+	// arg builder's env-forwarding loop, so the value the
+	// container actually sees is /scratch.
 	//
 	// ENJU_RUN_DIR continues to point at workDir/<resultDir> —
 	// that's where context.json is written before exec and where
-	// script.log lands on disk for failure debugging. The wrapper
-	// reads context.json back from there at commit time.
+	// script.log lands on disk for failure debugging. Container
+	// mode translates that to /workspace/<resultDir> via the same
+	// env-forwarding loop.
 	projectDir := workDir
-	if taskScratchDir != "" && meta != nil && meta.Container == "" {
+	if taskScratchDir != "" {
 		projectDir = taskScratchDir
 	}
 	env := os.Environ()

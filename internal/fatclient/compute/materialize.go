@@ -18,18 +18,22 @@ import (
 // operation.
 type ReadFileFunc func(sha, path string) ([]byte, bool, error)
 
-// ScriptCwdFor picks the working directory the script should run
-// in. Direct-exec compute tasks with a TaskScratchDir set get
-// isolated in their scratch dir (Phase 2.3); legacy specs and
-// container-mode tasks keep the historical workDir.
+// ScriptCwdFor picks the host-side directory the script's outputs
+// land in. With TaskScratchDir set (Phase 2.3 / 2.5) → scratch
+// for both direct-exec and container modes; legacy specs without
+// scratch keep workDir.
 //
-// Container mode is excluded because docker bind-mounts workDir
-// to /workspace and translates ENJU_PROJECT_DIR through that
-// mapping; scratch lives outside the bind mount, so a container
-// scriptCwd of scratch would point at a host path the container
-// can't see. Container support for scratch isolation is deferred.
+// For container mode, the host scratch dir is bind-mounted into
+// the container at ContainerScratchDir (see container_args.go),
+// so the in-container CWD is /scratch. The host-side path
+// returned here is what the wrapper uses to:
+//   - read writes_artifacts after the container exits
+//   - materialize reads_artifacts before the container starts
+//
+// In other words: returns where outputs land on disk from the
+// HOST'S perspective, regardless of execution mode.
 func ScriptCwdFor(spec Spec, workDir string) string {
-	if spec.TaskScratchDir != "" && spec.Container == "" {
+	if spec.TaskScratchDir != "" {
 		return spec.TaskScratchDir
 	}
 	return workDir

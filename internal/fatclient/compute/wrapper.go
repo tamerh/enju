@@ -470,7 +470,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	//     os.Environ() so it can find DOCKER_HOST, the user's
 	//     auth config, etc.
 	startTime := time.Now()
-	cmd, cmdErr := buildExecCommand(ctx, spec, env, scriptCwd)
+	cmd, cmdErr := buildExecCommand(ctx, spec, env, workDir, scriptCwd)
 	if cmdErr != nil {
 		res.Error = cmdErr.Error()
 		return res

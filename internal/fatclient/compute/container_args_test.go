@@ -360,7 +360,7 @@ func TestBuildExecCommandDirectMode(t *testing.T) {
 	}
 	env := []string{"ENJU_TASK_ID=1:2:3", "FOO=bar"}
 
-	cmd, err := buildExecCommand(context.Background(), spec, env, "/host/ws")
+	cmd, err := buildExecCommand(context.Background(), spec, env, "/host/ws", "/host/ws")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func TestBuildExecCommandContainerMode(t *testing.T) {
 	}
 	env := []string{"ENJU_TASK_ID=1:2:3", "ENJU_PROJECT_DIR=/host/ws"}
 
-	cmd, err := buildExecCommand(context.Background(), spec, env, "/host/ws")
+	cmd, err := buildExecCommand(context.Background(), spec, env, "/host/ws", "/host/ws")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestBuildExecCommandContainerMode(t *testing.T) {
 func TestBuildExecCommandContainerWorkDir(t *testing.T) {
 	t.Setenv("ENJU_SHARED_ROOT", "")
 	spec := Spec{Container: "alpine", ScriptPath: "/host/ws/run.sh"}
-	cmd, err := buildExecCommand(context.Background(), spec, nil, "/host/ws")
+	cmd, err := buildExecCommand(context.Background(), spec, nil, "/host/ws", "/host/ws")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +446,7 @@ func TestBuildExecCommandContainerWorkDir(t *testing.T) {
 // panicking or silently falling through to a direct exec.
 func TestBuildExecCommandContainerBadSpecReturnsError(t *testing.T) {
 	spec := Spec{Container: "alpine", ScriptPath: "/outside/ws/run.sh"}
-	_, err := buildExecCommand(context.Background(), spec, nil, "/host/ws")
+	_, err := buildExecCommand(context.Background(), spec, nil, "/host/ws", "/host/ws")
 	if err == nil {
 		t.Fatal("expected builder error for out-of-workspace script")
 	}
@@ -648,5 +648,89 @@ func TestBuildContainerArgsFlagsBeforeImage(t *testing.T) {
 		case "-v", "-e", "-w", "--user", "--rm":
 			t.Errorf("flag %q appears after image (position %d > %d)", args[i], i, imgIdx)
 		}
+	}
+}
+
+// TestBuildContainerArgsScratchBindMount pins the Phase 2.5
+// behaviour: when spec.TaskScratchDir is set in container mode,
+// buildDockerArgs adds a second bind mount for the scratch dir,
+// sets -w to the in-container scratch path, and translates
+// host scratch paths in env values to the in-container path.
+func TestBuildContainerArgsScratchBindMount(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "")
+	scratch := "/host/scratch/task-1-1-fetch-iter-1"
+	spec := Spec{
+		Container:      "bioalpine:latest",
+		ScriptPath:     "/host/ws/scripts/run.sh",
+		TaskScratchDir: scratch,
+	}
+	env := []string{
+		"ENJU_TASK_ID=1:1:fetch",
+		"ENJU_PROJECT_DIR=" + scratch,
+		"ENJU_TASK_DIR=" + scratch,
+		"ENJU_RUN_DIR=/host/ws/enju/runs/3/fetch",
+	}
+
+	args, err := BuildContainerArgs(RuntimeDocker, spec, env, "/host/ws", 1000, 1000)
+	if err != nil {
+		t.Fatalf("BuildContainerArgs: %v", err)
+	}
+
+	// Workspace bind still present.
+	if !hasFlagValue(args, "-v", "/host/ws:/workspace:z") {
+		t.Errorf("workspace bind missing: %v", args)
+	}
+	// New scratch bind.
+	wantScratchBind := scratch + ":/scratch:z"
+	if !hasFlagValue(args, "-v", wantScratchBind) {
+		t.Errorf("scratch bind missing %q: %v", wantScratchBind, args)
+	}
+	// In-container CWD flipped to /scratch.
+	if !hasFlagValue(args, "-w", "/scratch") {
+		t.Errorf("expected -w /scratch, got: %v", args)
+	}
+	// ENJU_PROJECT_DIR + ENJU_TASK_DIR translated via scratch
+	// prefix; ENJU_RUN_DIR via workspace prefix; ENJU_TASK_ID
+	// passes through.
+	checks := map[string]string{
+		"ENJU_TASK_ID":     "1:1:fetch",
+		"ENJU_PROJECT_DIR": "/scratch",
+		"ENJU_TASK_DIR":    "/scratch",
+		"ENJU_RUN_DIR":     "/workspace/enju/runs/3/fetch",
+	}
+	for k, want := range checks {
+		if !hasFlagValue(args, "-e", k+"="+want) {
+			t.Errorf("env %s: want %q in args, got: %v", k, want, args)
+		}
+	}
+}
+
+// TestBuildContainerArgsNoScratchKeepsLegacy pins that container
+// tasks WITHOUT a TaskScratchDir still get the pre-Phase-2.5
+// behaviour: only the workspace is bound, -w is /workspace,
+// no /scratch in argv. Guards against regressions for legacy
+// specs (older spec files in flight, tests that don't set
+// TaskScratchDir).
+func TestBuildContainerArgsNoScratchKeepsLegacy(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "")
+	spec := Spec{
+		Container:  "alpine:3.19",
+		ScriptPath: "/host/ws/scripts/run.sh",
+		// TaskScratchDir intentionally empty.
+	}
+	env := []string{"ENJU_TASK_ID=1:1:t"}
+
+	args, err := BuildContainerArgs(RuntimeDocker, spec, env, "/host/ws", 1000, 1000)
+	if err != nil {
+		t.Fatalf("BuildContainerArgs: %v", err)
+	}
+	for _, a := range args {
+		if strings.Contains(a, "/scratch") {
+			t.Errorf("legacy spec should not produce /scratch refs, got: %v", args)
+			break
+		}
+	}
+	if !hasFlagValue(args, "-w", "/workspace") {
+		t.Errorf("legacy: expected -w /workspace, got: %v", args)
 	}
 }
