@@ -118,27 +118,32 @@ const (
 
 // RunState represents the state of a run.
 //
-// State transitions (living-workflow phase 1):
+// State transitions:
 //
 //	create → active
-//	active → idle   (no ready/in-flight work, but non-terminal tasks remain)
-//	idle → active   (a task transitions to ready, e.g. after invalidate or future task-spawn)
-//	active|idle → paused    (explicit enju_pause_run)
-//	paused → active|idle    (explicit enju_resume_run, then re-evaluate)
-//	active|idle → completed   (every task is in {accepted, skipped, failed})
+//	active → waiting   (no in-flight claim, but non-terminal tasks remain)
+//	waiting → active   (a task transitions to ready, e.g. after invalidate or future task-spawn)
+//	active|waiting → paused    (explicit enju_pause_run)
+//	paused → active|waiting    (explicit enju_resume_run, then re-evaluate)
+//	active|waiting → completed   (every task is in {accepted, skipped, failed})
 //
-// Idle is the "no ready work but the run isn't sealed" signal.
-// Today (phase 1) it's observable but rarely entered, since static
-// workflows go straight from active → completed in one transaction.
-// Phase 4 (spawn primitive) will make idle the wake-trigger surface
-// for auto-triage. Paused freezes the state machine until an
-// operator resumes; phase 1 ships the state, claim/submit gating
-// arrives with phase 4.
+// WAITING (Phase 8.1.c — replaced the legacy `idle` value) means
+// "no work currently in flight, but the run isn't sealed."
+// Distinct from ACTIVE (some claim is being worked) and from
+// COMPLETED (all tasks terminal). Phase 8.5 will pair this state
+// with a blocked_by JSON field naming the specific bottleneck
+// (review awaiting reviewer, dependent artifact still computing,
+// etc.) so the operator can see *why* the run is paused for
+// outside input rather than just "idle."
+//
+// Paused freezes the state machine until an operator resumes;
+// today the state is observable, claim/submit gating arrives
+// with the living-workflow polish.
 type RunState string
 
 const (
 	RunActive    RunState = "active"
-	RunIdle      RunState = "idle"
+	RunWaiting   RunState = "waiting"
 	RunPaused    RunState = "paused"
 	RunCompleted RunState = "completed"
 	RunFailed    RunState = "failed"
@@ -160,7 +165,7 @@ const (
 // one branch even if one of them is idle or paused.
 func (s RunState) IsAlive() bool {
 	switch s {
-	case RunActive, RunIdle, RunPaused:
+	case RunActive, RunWaiting, RunPaused:
 		return true
 	}
 	return false

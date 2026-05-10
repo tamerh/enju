@@ -363,7 +363,7 @@ func TestEvaluateRunState_OnlyPendingGoesIdle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != RunIdle {
+	if got != RunWaiting {
 		t.Fatalf("expected idle, got %s", got)
 	}
 }
@@ -462,7 +462,7 @@ func TestResumeRun_LandsOnActiveOrIdleByWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != RunIdle {
+	if got != RunWaiting {
 		t.Fatalf("resume with only pending → idle, got %s", got)
 	}
 }
@@ -514,8 +514,8 @@ func TestEvaluateRunState_EmitsLifecycleEvents(t *testing.T) {
 	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
-	if got := countEvents(t, s, runID, "run_idle"); got != 1 {
-		t.Fatalf("expected one run_idle event, got %d", got)
+	if got := countEvents(t, s, runID, "run_waiting"); got != 1 {
+		t.Fatalf("expected one run_waiting event, got %d", got)
 	}
 
 	// idle → completed by clearing the pending task
@@ -587,27 +587,27 @@ func TestListEvents_FiltersByTypeAndRun(t *testing.T) {
 	if _, err := helperEvaluateRunState(s, runID); err != nil {
 		t.Fatal(err)
 	}
-	// → run_idle event recorded; let async writer drain.
+	// → run_waiting event recorded; let async writer drain.
 	waitForEventsDrained(t, s)
 
-	// Project-scoped, no filter: should include the run_idle.
+	// Project-scoped, no filter: should include the run_waiting.
 	all, err := s.ListEvents(EventQuery{ProjectID: projectID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(all) == 0 {
-		t.Fatal("expected at least the run_idle event")
+		t.Fatal("expected at least the run_waiting event")
 	}
 
 	// event_types filter narrows.
 	idleOnly, err := s.ListEvents(EventQuery{
 		ProjectID: projectID,
-		EventTypes: []string{"run_idle"},
+		EventTypes: []string{"run_waiting"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(idleOnly) != 1 || idleOnly[0].Type != "run_idle" {
+	if len(idleOnly) != 1 || idleOnly[0].Type != "run_waiting" {
 		t.Fatalf("event_types filter mismatch: %+v", idleOnly)
 	}
 
@@ -916,7 +916,7 @@ func TestSpawnTask_LiftsIdleRunToActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, _ := s.GetRun(runID)
-	if r.State != RunIdle {
+	if r.State != RunWaiting {
 		t.Fatalf("setup: expected idle, got %s", r.State)
 	}
 
@@ -1386,7 +1386,7 @@ func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, _ := s.GetRun(first)
-	if r.State != RunIdle {
+	if r.State != RunWaiting {
 		t.Fatalf("setup: expected idle, got %s", r.State)
 	}
 	r1, _ := s.GetRun(first)

@@ -321,7 +321,7 @@ func TestMCPExecuteRunNonexistentRun(t *testing.T) {
 // accepted) reports no_ready_compute with zero entries. The
 // tool is safe to call on an idle run.
 func TestMCPExecuteRunEmpty(t *testing.T) {
-	h := newMCPHarness(t, "ExecRunIdle")
+	h := newMCPHarness(t, "ExecRunWaiting")
 	projectID := h.createTestProject()
 
 	yaml := `name: "single"

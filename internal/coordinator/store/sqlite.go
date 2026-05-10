@@ -700,7 +700,7 @@ func (s *Store) initSchema() error {
 	if _, err := s.db.Exec(`DROP INDEX IF EXISTS idx_runs_active_branch`); err != nil {
 		return fmt.Errorf("schema: drop idx_runs_active_branch: %w", err)
 	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state IN ('active', 'idle', 'paused')`); err != nil {
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state IN ('active', 'waiting', 'paused')`); err != nil {
 		return fmt.Errorf("schema: create idx_runs_active_branch: %w", err)
 	}
 
@@ -1046,7 +1046,7 @@ func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, e
 	var ref sql.NullString
 	err := s.db.QueryRow(
 		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
-		 FROM runs WHERE project_id = ? AND branch = ? AND state IN ('active', 'idle', 'paused')
+		 FROM runs WHERE project_id = ? AND branch = ? AND state IN ('active', 'waiting', 'paused')
 		 ORDER BY seq ASC LIMIT 1`,
 		projectID, branch,
 	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt)

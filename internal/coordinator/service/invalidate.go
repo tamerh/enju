@@ -214,7 +214,7 @@ func (c *Coordinator) EvaluateRunStateAndMaybeTriage(runID int64) {
 	if err != nil || r == nil {
 		return
 	}
-	if r.State == store.RunIdle {
+	if r.State == store.RunWaiting {
 		c.maybeAutoTriage(runID)
 	}
 }
@@ -228,7 +228,7 @@ func (c *Coordinator) MaybeAutoTriageIfIdle(runID int64) {
 	if err != nil || r == nil {
 		return
 	}
-	if r.State == store.RunIdle {
+	if r.State == store.RunWaiting {
 		c.maybeAutoTriage(runID)
 	}
 }

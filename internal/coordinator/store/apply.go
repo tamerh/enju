@@ -37,7 +37,7 @@ import (
 //
 //   - runs.state — fully governed. PauseRun / ResumeRun /
 //     CompleteRun all flow through ApplyPlan (Phase 4c.5);
-//     run_paused / run_resumed / run_active / run_idle /
+//     run_paused / run_resumed / run_active / run_waiting /
 //     run_completed events ride the EventSink and post-commit
 //     drain like every other event.
 //
@@ -1913,7 +1913,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	case active > 0:
 		next = RunActive
 	case holding > 0:
-		next = RunIdle
+		next = RunWaiting
 	default:
 		next = RunCompleted
 	}
@@ -1928,7 +1928,7 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 			`SELECT COUNT(*) FROM issues WHERE project_id = ? AND status = 'open'`, projectID,
 		).Scan(&openCount)
 		if openCount > 0 {
-			next = RunIdle
+			next = RunWaiting
 		}
 	}
 
@@ -2192,7 +2192,7 @@ func applySpawnTask(tx *sql.Tx, m SpawnTask, sink EventSink) (string, bool, erro
 		// Service caller checks ApplyResult.BudgetExhausted
 		// and converts to a typed user error.
 		if _, err := tx.Exec(
-			`UPDATE runs SET state = 'paused', updated_at = ? WHERE id = ? AND state IN ('active', 'idle')`,
+			`UPDATE runs SET state = 'paused', updated_at = ? WHERE id = ? AND state IN ('active', 'waiting')`,
 			now, spec.RunID,
 		); err != nil {
 			return "", false, fmt.Errorf("auto-pausing run on budget exhaustion: %w", err)
@@ -2262,8 +2262,8 @@ func applySpawnTask(tx *sql.Tx, m SpawnTask, sink EventSink) (string, bool, erro
 	}
 
 	runReactivated := false
-	if state == TaskReady && runState == string(RunIdle) {
-		if _, err := tx.Exec(`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'idle'`, now, spec.RunID); err != nil {
+	if state == TaskReady && runState == string(RunWaiting) {
+		if _, err := tx.Exec(`UPDATE runs SET state = 'active', updated_at = ? WHERE id = ? AND state = 'waiting'`, now, spec.RunID); err != nil {
 			return "", false, err
 		}
 		runReactivated = true
@@ -2272,11 +2272,11 @@ func applySpawnTask(tx *sql.Tx, m SpawnTask, sink EventSink) (string, bool, erro
 	if runReactivated {
 		sink.Emit(Event{
 			EventType:    "run_active",
-			EventSubtype: "idle",
+			EventSubtype: "waiting",
 			RunID:        spec.RunID,
 			ProjectID:    projectID,
 			Metadata: MarshalMetadata(map[string]any{
-				"from":    "idle",
+				"from":    "waiting",
 				"to":      "active",
 				"trigger": "spawn",
 			}),
@@ -2538,7 +2538,7 @@ func applyPauseRun(tx *sql.Tx, m PauseRun, sink EventSink) error {
 	now := time.Now()
 	res, err := tx.Exec(
 		`UPDATE runs SET state = 'paused', updated_at = ?
-		 WHERE id = ? AND state IN ('active', 'idle')`,
+		 WHERE id = ? AND state IN ('active', 'waiting')`,
 		now, m.RunID,
 	)
 	if err != nil {
@@ -2571,7 +2571,7 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 	switch RunState(current) {
 	case RunCompleted, RunFailed, RunTerminated:
 		return fmt.Errorf("run %d is %s — cannot resume a terminal run", m.RunID, current)
-	case RunActive, RunIdle:
+	case RunActive, RunWaiting:
 		// Idempotent: already non-paused, nothing to lift.
 		sink.SkipEvents("resume_run no-op: run already in active/idle")
 		return nil
@@ -2585,7 +2585,7 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 	}
 	// Emit run_resumed; the caller's CompleteRun mutation later
 	// in the plan may further transition active → idle, which
-	// emits its own run_idle event with citizen 0 (system).
+	// emits its own run_waiting event with citizen 0 (system).
 	sink.Emit(Event{
 		CitizenID:    m.CitizenID,
 		EventType:    "run_resumed",
@@ -2632,7 +2632,7 @@ func applyTerminateRun(tx *sql.Tx, m TerminateRun, result *ApplyResult, sink Eve
 	// 1. Run state → terminated.
 	res, err := tx.Exec(
 		`UPDATE runs SET state = 'terminated', updated_at = ?
-		 WHERE id = ? AND state IN ('active', 'idle', 'paused')`,
+		 WHERE id = ? AND state IN ('active', 'waiting', 'paused')`,
 		now, m.RunID,
 	)
 	if err != nil {
