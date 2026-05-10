@@ -5,8 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // MergeFFOrFail tries to fast-forward target to source's tip.
@@ -52,34 +54,52 @@ func (c *Clone) MergeFFOrFail(target, source string) (string, error) {
 	return sourceSHA.String(), nil
 }
 
-// MergeWithCommit performs a `git merge --no-ff` of source onto
-// target, producing a merge commit with the supplied message and
-// author. Used when the FF fast path is impossible (caller should
-// have tried MergeFFOrFail first) but conflicts shouldn't be
-// expected to be a hard failure.
+// MergeWithCommit performs a non-FF merge of source onto target,
+// producing a merge commit with the supplied message and author.
+// Used when the FF fast path is impossible (caller should have
+// tried MergeFFOrFail first) but conflicts shouldn't be expected
+// to be a hard failure.
 //
-// Shells out to system git because go-git's merge support doesn't
-// expose proper conflict-file reporting.
+// Phase 1 plumbing-merge: never touches the worktree. Uses
+// `git merge-tree --write-tree --name-only` to compute the
+// merged tree object, then writes a commit object directly via
+// the go-git store and atomically advances the target ref. The
+// bot's worktree can have any amount of unrelated state on disk;
+// this method ignores it entirely.
 //
-// On conflict: aborts the merge, parses unmerged files from
-// `git status --porcelain`, returns ErrMergeConflict (carrying
-// paths via ErrConflict). The target ref is restored to its
-// pre-merge state — no partial advance.
+// Pre-Phase-1 implementation shelled out to `git checkout target`
+// + `git merge --no-ff` which read+wrote the worktree. That path
+// failed with "untracked working tree files would be overwritten"
+// any time the worktree had stragglers — the production load-test
+// failure mode for parallel siblings sharing a clone.
+//
+// On conflict: returns *ErrConflict (errors.Is matches
+// ErrMergeConflict; errors.As extracts paths). No partial advance
+// — the target ref is left exactly as it was; the merged tree
+// object git wrote with conflict markers is harmless garbage left
+// in the object DB and gets reaped by `git gc`.
 //
 // Git operations performed:
-//   1. Resolve target/source SHAs.
-//   2. SetReference target to current tip (idempotent guard).
-//   3. git checkout target (worktree update).
-//   4. git merge --no-ff --no-edit -m <msg> <source>.
-//   5. On conflict: git merge --abort; restore ref; return error.
-//   6. On success: read new HEAD SHA; return it.
+//  1. Resolve target/source SHAs.
+//  2. Idempotent: ensure local target ref matches the resolved tip.
+//  3. `git merge-tree --write-tree --name-only target source`
+//     → merged tree SHA on stdout, conflicting paths on subsequent
+//     lines when exit code is 1.
+//  4. On conflict: return *ErrConflict.
+//  5. Build commit object: tree = merged-tree-sha,
+//     parents = [target, source], author/committer from args.
+//  6. Encode + store the commit object.
+//  7. Atomic CAS update of refs/heads/<target> from targetSHA to
+//     mergeCommitSHA.
 //
-// Worktree state: Pre any → Post StateClean (matches new merge tip).
+// Worktree state: untouched. Caller's responsibility if they want
+// to materialize the new tip via Checkout afterwards (the
+// MergeAcceptedTopic verb in enjugit/producing.go does that).
 //
 // Errors:
 //   - ErrRefNotFound: target or source can't be resolved.
-//   - ErrMergeConflict: real file-level conflict (carries paths).
-//   - any: shell-out failure wrapped.
+//   - ErrMergeConflict (via *ErrConflict): real file-level conflict.
+//   - any: merge-tree shellout failure or object-store write failure.
 func (c *Clone) MergeWithCommit(target, source, message, authorName, authorEmail string) (string, error) {
 	defer c.lock()()
 	targetSHA, err := c.resolveLocalOrPlantFromOrigin(target)
@@ -93,53 +113,94 @@ func (c *Clone) MergeWithCommit(target, source, message, authorName, authorEmail
 
 	refName := plumbing.NewBranchReferenceName(target)
 	// Idempotent guard: ensure local target ref points at our
-	// expected tip before checkout. Defends against split-brain
-	// where a prior aborted merge left the ref elsewhere.
+	// expected tip. Defends against split-brain where a prior
+	// aborted operation left the ref elsewhere.
 	if err := c.repo.Storer.SetReference(plumbing.NewHashReference(refName, targetSHA)); err != nil {
 		return "", fmt.Errorf("git: pre-merge SetReference %s: %w", target, err)
 	}
 
-	if out, err := runGit(c.workDir, "checkout", target); err != nil {
-		return "", fmt.Errorf("git checkout %s before merge: %s (%w)",
-			target, strings.TrimSpace(out), err)
+	// Compute the merged tree without touching the worktree.
+	// merge-tree --write-tree was added in git 2.38; --name-only
+	// in 2.40. Both are well-established in production builds.
+	out, mergeErr := runGit(c.workDir,
+		"merge-tree", "--write-tree", "--name-only",
+		targetSHA.String(), sourceSHA.String())
+	exitCode := 0
+	if exitErr, ok := mergeErr.(*exec.ExitError); ok {
+		exitCode = exitErr.ExitCode()
+	} else if mergeErr != nil {
+		return "", fmt.Errorf("git merge-tree: %s (%w)",
+			strings.TrimSpace(out), mergeErr)
 	}
 
+	// Output format:
+	//   <merged-tree-sha>\n
+	// followed (on conflict, exit code 1) by:
+	//   <conflicted-path-1>\n
+	//   <conflicted-path-2>\n
+	//   ...
+	//   \n
+	//   <human-readable conflict messages>
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) == 0 || !isHexSHA(lines[0]) {
+		return "", fmt.Errorf("git merge-tree: unexpected output: %q", out)
+	}
+	mergedTreeSHA := lines[0]
+
+	if exitCode != 0 {
+		var conflicts []string
+		for _, l := range lines[1:] {
+			if l == "" {
+				break
+			}
+			conflicts = append(conflicts, l)
+		}
+		// Same shape as pre-Phase-1: ErrConflict carries paths,
+		// errors.Is matches ErrMergeConflict.
+		return "", &ErrConflict{Paths: conflicts}
+	}
+
+	// Clean merge — build + store the commit object.
 	if authorName == "" {
 		authorName = "Enju git layer"
 	}
 	if authorEmail == "" {
 		authorEmail = "enju-git@localhost"
 	}
-	mergeOut, mergeErr := runGitWithEnv(c.workDir,
-		[]string{
-			"GIT_AUTHOR_NAME=" + authorName,
-			"GIT_AUTHOR_EMAIL=" + authorEmail,
-			"GIT_COMMITTER_NAME=" + authorName,
-			"GIT_COMMITTER_EMAIL=" + authorEmail,
+	sig := object.Signature{
+		Name:  authorName,
+		Email: authorEmail,
+		When:  time.Now(),
+	}
+	commit := &object.Commit{
+		Author:    sig,
+		Committer: sig,
+		Message:   message,
+		TreeHash:  plumbing.NewHash(mergedTreeSHA),
+		ParentHashes: []plumbing.Hash{
+			targetSHA,
+			sourceSHA,
 		},
-		"merge", "--no-ff", "--no-edit", "-m", message, sourceSHA.String(),
-	)
-	if mergeErr != nil {
-		conflicts := readUnmergedFiles(c.workDir)
-		// Best-effort abort + ref restoration.
-		_, _ = runGit(c.workDir, "merge", "--abort")
-		_ = c.repo.Storer.SetReference(plumbing.NewHashReference(refName, targetSHA))
-		if len(conflicts) > 0 {
-			// Return *ErrConflict directly. Its Is() method
-			// returns true for ErrMergeConflict so callers using
-			// errors.Is(err, ErrMergeConflict) match, AND
-			// errors.As(err, &*ErrConflict) extracts the paths.
-			return "", &ErrConflict{Paths: conflicts}
-		}
-		return "", fmt.Errorf("git merge --no-ff: %s (%w)",
-			strings.TrimSpace(mergeOut), mergeErr)
+	}
+	commitObj := c.repo.Storer.NewEncodedObject()
+	if err := commit.Encode(commitObj); err != nil {
+		return "", fmt.Errorf("git: encode merge commit: %w", err)
+	}
+	commitHash, err := c.repo.Storer.SetEncodedObject(commitObj)
+	if err != nil {
+		return "", fmt.Errorf("git: store merge commit: %w", err)
 	}
 
-	newRef, err := c.repo.Reference(refName, true)
-	if err != nil {
-		return "", fmt.Errorf("git: read %s post-merge: %w", target, err)
+	// Atomic ref advance from the resolved targetSHA to the new
+	// merge commit. If the ref moved underneath us between the
+	// resolve at the top of this function and now, the
+	// SetReference here would silently clobber that — but since
+	// we hold c.lock() across the whole operation no other
+	// in-process caller can have moved it.
+	if err := c.repo.Storer.SetReference(plumbing.NewHashReference(refName, commitHash)); err != nil {
+		return "", fmt.Errorf("git: advance %s to merge commit: %w", target, err)
 	}
-	return newRef.Hash().String(), nil
+	return commitHash.String(), nil
 }
 
 // (resolveLocalRef + resolveLocalOrPlantFromOrigin live in
@@ -185,46 +246,17 @@ func (c *Clone) commitIsAncestor(ancestor, descendant plumbing.Hash) (bool, erro
 	return ancCommit.IsAncestor(descCommit)
 }
 
-// readUnmergedFiles parses `git status --porcelain` for unmerged
-// entries and returns affected paths. Used to populate
-// ErrConflict.Paths after a non-FF merge fails.
-//
-// Format dependency: relies on porcelain v1 (`XY <path>`).
-func readUnmergedFiles(workDir string) []string {
-	out, err := runGit(workDir, "status", "--porcelain")
-	if err != nil {
-		return nil
-	}
-	var files []string
-	for _, line := range strings.Split(out, "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		switch line[:2] {
-		case "UU", "AA", "DD", "AU", "UA", "DU", "UD":
-			files = append(files, strings.TrimSpace(line[3:]))
-		}
-	}
-	return files
-}
-
 // runGit shells out to system git in workDir and returns combined
-// stdout+stderr. Used for operations go-git doesn't support cleanly
-// (merge with conflict reporting).
+// stdout+stderr. Currently used only by MergeWithCommit's
+// merge-tree call — kept narrow because once we've moved the
+// merge off the worktree, there's no other place a workdir-rooted
+// git invocation makes sense in the plumbing layer. Pre-Phase-1
+// this also drove `git checkout` + `git merge --no-ff`, both of
+// which are gone now.
 func runGit(workDir string, args ...string) (string, error) {
 	full := append([]string{"-C", workDir}, args...)
 	cmd := exec.Command("git", full...)
 	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
-// runGitWithEnv is like runGit but with extra environment vars
-// appended to os.Environ() — used for merge to set author/committer.
-func runGitWithEnv(workDir string, extraEnv []string, args ...string) (string, error) {
-	full := append([]string{"-C", workDir}, args...)
-	cmd := exec.Command("git", full...)
-	cmd.Env = append(os.Environ(), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

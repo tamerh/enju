@@ -2,6 +2,8 @@ package gitv6
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -235,5 +237,64 @@ func TestCompareToRemote_Ahead(t *testing.T) {
 	}
 	if cmp.Branches[0].State != RemoteAhead {
 		t.Errorf("expected Ahead, got %s", cmp.Branches[0].State)
+	}
+}
+
+// TestMergeWithCommit_DirtyWorktreeDoesNotBlock pins the Phase 1
+// architectural property: non-FF merges work even when the
+// worktree has untracked stragglers at paths the merge would
+// touch. Pre-Phase-1 implementation shelled out to
+// `git checkout + git merge --no-ff`, which refused with
+// "untracked working tree files would be overwritten by merge."
+// The plumbing path uses `git merge-tree --write-tree` and never
+// reads from or writes to the worktree.
+//
+// Repros the load-test scenario where parallel sibling tasks
+// leave files in a shared worktree (pre-Phase-2.3) or where any
+// other process has unrelated untracked state on disk.
+func TestMergeWithCommit_DirtyWorktreeDoesNotBlock(t *testing.T) {
+	bare := initBareRemote(t)
+	seedBareWithInitialCommit(t, bare)
+	c := freshClone(t, bare)
+
+	// Two divergent branches: main has main-only.txt, topic has
+	// data/raw_b.txt. Merge needs a non-FF commit.
+	rootSHA, _, _ := c.Head()
+	c.CreateBranchAt("topic", rootSHA)
+	c.Checkout("topic")
+	commitOneFile(t, c, "data/raw_b.txt", []byte("topic-version"))
+
+	c.Checkout("main")
+	commitOneFile(t, c, "main-only.txt", []byte("main"))
+
+	// Plant an UNTRACKED file in the worktree at the same path
+	// the merge would create. With the pre-Phase-1 shellout this
+	// causes "would be overwritten by merge" and the merge fails.
+	// With plumbing merge: never touched, never noticed.
+	dirty := filepath.Join(c.workDir, "data")
+	if err := os.MkdirAll(dirty, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dirty, "raw_b.txt"),
+		[]byte("untracked-stranger"), 0o644); err != nil {
+		t.Fatalf("write untracked: %v", err)
+	}
+
+	newTip, err := c.MergeWithCommit("main", "topic",
+		"merge topic into main", "Test", "test@x.com")
+	if err != nil {
+		t.Fatalf("MergeWithCommit (worktree dirty): %v", err)
+	}
+	if !isHexSHA(newTip) {
+		t.Errorf("expected merge commit SHA, got %q", newTip)
+	}
+
+	// The untracked stranger should still be on disk afterwards
+	// — the merge never touched the worktree.
+	body, rerr := os.ReadFile(filepath.Join(dirty, "raw_b.txt"))
+	if rerr != nil {
+		t.Errorf("untracked file disappeared after merge: %v", rerr)
+	} else if string(body) != "untracked-stranger" {
+		t.Errorf("untracked file got clobbered: got %q, want untracked-stranger", body)
 	}
 }
