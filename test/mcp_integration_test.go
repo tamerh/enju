@@ -10265,13 +10265,16 @@ tasks:
 		t.Errorf("beta:expand should be READY after request_changes on beta:check, got %q", got)
 	}
 	// alpha side must be unaffected by beta's cascade.
-	// Phase 8.3: alpha:expand is in SUBMITTED (its review
-	// approved and the merge would land both via /merges, but
-	// this test doesn't drive the fat-client merge flow — it
-	// stops at coord state). alpha:check went through the
-	// inline-accept path so it's ACCEPTED.
-	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "submitted" {
-		t.Errorf("alpha:expand should remain submitted (review approved but merge not yet driven), got %q", got)
+	// alpha:expand lands in SUBMITTED after its review approves;
+	// the reconcile-recovery path (coord-side reconcile.go's
+	// SUBMITTED branch) can then flip it to ACCEPTED if the test
+	// harness's branch sweep observes alpha:expand's trailer on
+	// the run branch — which is exactly what happens when a
+	// subsequent reviewer claim triggers a PullBranchWithReconcileWF
+	// cycle. Both terminal shapes preserve the load-bearing
+	// property under test: alpha is unaffected by beta's cascade.
+	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "submitted" && got != "accepted" {
+		t.Errorf("alpha:expand should remain submitted or accepted (alpha unaffected by beta cascade), got %q", got)
 	}
 	if got, _ := h.taskGet("alpha:check")["state"].(string); got != "submitted" && got != "accepted" {
 		t.Errorf("alpha:check should remain submitted or accepted, got %q", got)

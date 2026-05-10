@@ -87,12 +87,62 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 			task.State, shortCommit(task.CommitSHA), shortCommit(entry.CommitSHA))
 		return res
 	}
-	// Reconcile only advances tasks from in-flight states
-	// (claimed / running). Anything else is a stale trailer
-	// (e.g. scanner re-reads an old completion commit on a
-	// task that has since been invalidated). Advancing would
-	// silently resurrect the old completion and clobber any
-	// in-progress re-run, so treat as no-op.
+	// Reconcile advances tasks from three in-flight states:
+	//
+	//   - claimed / running: the standard async-compute happy
+	//     path. AcceptComputeTaskCore lands the submit + acceptTask
+	//     flips to ACCEPTED below.
+	//
+	//   - submitted (stuck-recovery): the citizen submit already
+	//     landed (state = SUBMITTED, commit_sha recorded) but the
+	//     /merges POST that drives SUBMITTED → ACCEPTED was lost
+	//     (fat-client crashed mid-merge, retry budget exhausted,
+	//     transport died after the topic merged on origin). The
+	//     trailer being on the run branch is the proof that the
+	//     merge actually landed; all we need is the state flip +
+	//     cascade. Branch into the SUBMITTED-recovery path below
+	//     — skip AcceptComputeTaskCore (the submit row is already
+	//     in place) and go straight to acceptTask. Gated on
+	//     task.commit_sha == entry.commit_sha so a stale trailer
+	//     for a re-claimed task doesn't flip it at the wrong
+	//     commit.
+	//
+	// Other states (pending, parked, accepted, failed, skipped,
+	// collecting): a trailer arriving here is a stale signal
+	// (scanner re-reads an old completion commit on a task that
+	// has since been invalidated, or a duplicate trailer for an
+	// already-terminal task). Advancing would silently resurrect
+	// the old completion and clobber any in-progress re-run, so
+	// treat as no-op.
+	if task.State == store.TaskSubmitted {
+		if task.CommitSHA != entry.CommitSHA {
+			// Different commit at SUBMITTED state means the
+			// trailer is from a prior iteration that landed on
+			// the branch after a re-claim. Don't mutate.
+			res.Status = "noop"
+			return res
+		}
+		// Membership gate before we touch state. Same shape as
+		// the claimed/running path below.
+		run, err := c.Store.GetRun(task.RunID)
+		if err != nil || run == nil {
+			res.Status = "error"
+			res.Error = fmt.Sprintf("run not found for task %q", entry.TaskID)
+			return res
+		}
+		if !CanReadProject(c.Store, run.ProjectID, callerID(caller)) {
+			res.Status = "error"
+			res.Error = "not a member of this project"
+			return res
+		}
+		if _, aerr := c.acceptTask(task, entry.CommitSHA); aerr != nil {
+			res.Status = "error"
+			res.Error = "submitted-recovery accept: " + aerr.Error()
+			return res
+		}
+		res.Status = "accepted"
+		return res
+	}
 	if task.State != store.TaskClaimed && task.State != store.TaskRunning {
 		res.Status = "noop"
 		return res
@@ -150,14 +200,14 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 		res.Error = aerr.Error()
 		return res
 	}
-	// Phase 8.3: the batch reconcile path scans commits already
-	// ON the run branch — by definition the merge has confirmed
-	// before the trailer is observable. Skip the SUBMITTED gate
-	// and accept inline. This is distinct from the sync submit
-	// (/tasks/:id/result) path, where the topic still needs a
-	// fat-client-driven merge → /merges round-trip; here the
-	// merge has happened in git already and the trailer is just
-	// catching the coord's state up.
+	// The batch reconcile path scans commits already ON the run
+	// branch — by definition the merge has confirmed before the
+	// trailer is observable. Skip the SUBMITTED gate and accept
+	// inline. This is distinct from the sync submit (/tasks/:id/result)
+	// path, where the topic still needs a fat-client-driven merge
+	// → /merges round-trip; here the merge has happened in git
+	// already and the trailer is just catching the coord's state
+	// up.
 	//
 	// AcceptComputeTaskCore left the task in SUBMITTED;
 	// acceptTask flips it to ACCEPTED + fires the cascade. Re-

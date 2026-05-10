@@ -84,6 +84,15 @@ type ExecuteRunResult struct {
 	Entries    []ExecuteRunEntry
 	StopReason string
 	Blocker    *ExecuteRunBlocker
+	// SelfStuckClaims lists task IDs in this run currently
+	// held by the calling citizen in claimed/running state —
+	// the most common cause of a "no_ready_compute" stop after
+	// an interrupted prior execute_run. Populated only when
+	// StopReason == StopNoReadyCompute, so handlers can render
+	// a self-recovery hint ("call enju_release_task X then
+	// retry") instead of the generic "run is idle" message.
+	// Empty in healthy completions.
+	SelfStuckClaims []string
 }
 
 // ExecuteRun drains ready compute tasks for (project, run)
@@ -108,7 +117,11 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 		entries, stopReason, blocker := s.runCascadeParallel(
 			ctx, p.ProjectID, p.RunID, runBranch, p.Parallel, p.MaxTasks,
 		)
-		return &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}, nil
+		res := &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}
+		if stopReason == StopNoReadyCompute {
+			res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunID)
+		}
+		return res, nil
 	}
 
 	var entries []ExecuteRunEntry
@@ -198,7 +211,11 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 		stopReason = StopMaxTasks
 	}
 
-	return &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}, nil
+	res := &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}
+	if stopReason == StopNoReadyCompute {
+		res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunID)
+	}
+	return res, nil
 }
 
 // ComputeCandidate is the filtered-and-sorted winner from a
@@ -421,6 +438,54 @@ func (s *FatClient) ListReadyTasks(ctx context.Context, projectID, runID int64) 
 		return nil, fmt.Errorf("decoding ready-tasks response: %w", err)
 	}
 	return out, nil
+}
+
+// findSelfHeldStuckTasks lists task IDs in this run that the
+// calling citizen currently holds an open claim on while the
+// task is in claimed/running state — the canonical signature
+// of an interrupted prior execute_run. The most common path:
+// the operator ESC'd a previous call, the wrap-task subprocess
+// (which is detached via Setsid) either finished without writing
+// its result file or got killed before it could; the claim row
+// stays open until the reaper expires it 30 minutes after the
+// claim deadline. In the meantime the cascade routes around the
+// orphan and reports no_ready_compute, with no hint that a
+// single enju_release_task call would unblock progress.
+//
+// Best-effort: any error fetching the run's task list is
+// swallowed and treated as "no stuck claims found." The caller
+// has already decided the run is idle; getting this lookup
+// wrong shouldn't escalate to a hard failure.
+func (s *FatClient) findSelfHeldStuckTasks(ctx context.Context, projectID, runID int) []string {
+	username := s.coord.Username()
+	if username == "" {
+		return nil
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runID)
+	data, err := s.coord.Get(ctx, path)
+	if err != nil {
+		return nil
+	}
+	var tasks []map[string]interface{}
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return nil
+	}
+	var stuck []string
+	for _, t := range tasks {
+		state, _ := t["state"].(string)
+		if state != "claimed" && state != "running" {
+			continue
+		}
+		holder, _ := t["claimed_by"].(string)
+		if holder != username {
+			continue
+		}
+		id, _ := t["id"].(string)
+		if id != "" {
+			stuck = append(stuck, id)
+		}
+	}
+	return stuck
 }
 
 // fetchReadyTasksForRun wraps the /api/v1/tasks/ready endpoint

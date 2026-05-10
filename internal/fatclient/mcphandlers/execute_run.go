@@ -73,7 +73,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText(formatExecuteRunSummary(res.Entries, res.StopReason, res.Blocker, maxTasks, parallel)), nil
+	return mcp.NewToolResultText(formatExecuteRunSummary(res.Entries, res.StopReason, res.Blocker, res.SelfStuckClaims, maxTasks, parallel)), nil
 }
 
 // formatExecuteRunSummary produces the human-readable response.
@@ -81,7 +81,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 // line per executed entry. Matches the shape of
 // formatClaimMatchingSummary + formatBatchSubmit so a caller
 // that parses batch responses can key off the same structure.
-func formatExecuteRunSummary(entries []service.ExecuteRunEntry, stopReason string, blocker *service.ExecuteRunBlocker, maxTasks, parallel int) string {
+func formatExecuteRunSummary(entries []service.ExecuteRunEntry, stopReason string, blocker *service.ExecuteRunBlocker, selfStuckClaims []string, maxTasks, parallel int) string {
 	var completed, failed, errored, async, gitFailed int
 	for _, e := range entries {
 		switch e.Status {
@@ -136,7 +136,23 @@ func formatExecuteRunSummary(entries []service.ExecuteRunEntry, stopReason strin
 		}
 		b.WriteString("\n  → wait for the assigned citizen to execute this task, then call enju_execute_run again.\n")
 	case service.StopNoReadyCompute:
-		b.WriteString("\n  → run is idle or complete; check enju_run_status.\n")
+		if len(selfStuckClaims) > 0 {
+			// Common cause: the operator ESC'd a previous
+			// execute_run, leaving wrap-task subprocesses
+			// detached. The claim row stays open until the coord
+			// reaper expires it 30 minutes after the deadline.
+			// The cascade routed around the orphan(s) and now
+			// has nothing to do — but a single release_task
+			// per stuck claim unblocks downstream immediately.
+			b.WriteString(fmt.Sprintf(" — but you hold %d stuck claim(s) on this run, likely from an interrupted prior call:\n",
+				len(selfStuckClaims)))
+			for _, id := range selfStuckClaims {
+				b.WriteString(fmt.Sprintf("       %s\n", id))
+			}
+			b.WriteString("  → To recover: call enju_release_task on each stuck task, then enju_execute_run again. (Or wait ~30 min for the coord reaper to expire them automatically.)\n")
+		} else {
+			b.WriteString("\n  → run is idle or complete; check enju_run_status.\n")
+		}
 	case service.StopComputeFailed:
 		if parallel > 1 {
 			// In parallel mode, in-flight siblings drain

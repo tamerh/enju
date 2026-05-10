@@ -2157,6 +2157,16 @@ func TestEventsLongPoll(t *testing.T) {
 // a fat-client (or any merge-driving consumer) reports a
 // successful FF merge, and the coordinator emits a branch_merged
 // event with the right metadata fields.
+//
+// The task must be in SUBMITTED before /merges fires — that's
+// the idempotency-contract precondition (a /merges arriving
+// against a non-SUBMITTED task is treated as a duplicate retry
+// and silently no-ops, both for the state flip and for the audit
+// emit). See coord-side report_merge.go's idempotency-contract
+// comment for the full rationale; the realistic call flow always
+// has the fat-client hand in a result + commit before posting
+// /merges, so the precondition is naturally satisfied in
+// production. We claim+submit task_a here to mirror that.
 func TestEvent_BranchMergedEmission(t *testing.T) {
 	s := newTestServer(t)
 	projectID := s.createTestProject()
@@ -2166,6 +2176,12 @@ func TestEvent_BranchMergedEmission(t *testing.T) {
 		t.Fatalf("unexpected run id shape: %q", runID)
 	}
 	runSeq := parts[1]
+
+	alice := s.register("alice")
+	s.claim("task_a", alice)
+	if subResp := s.submit("task_a", "result content"); subResp["error"] != nil {
+		t.Fatalf("submit task_a: %+v", subResp)
+	}
 
 	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges", projectID, runSeq),
 		map[string]interface{}{

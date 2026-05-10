@@ -32,18 +32,19 @@ type ReportMergeResponse struct {
 }
 
 // ReportMerge handles a successful FF/merge-commit landing of a
-// topic onto its run branch. Phase 8.3 expanded its job from
-// "stamp branch_merged for the audit timeline" to "complete the
-// task acceptance":
+// topic onto its run branch. Beyond stamping branch_merged for
+// the audit timeline, it completes the task acceptance:
 //
 //  1. Validate run + project membership.
-//  2. Emit branch_merged event (existing audit hook).
+//  2. Emit branch_merged event inside the SUBMITTED state guard
+//     (so a retry POST after the first one already landed
+//     produces no duplicate audit row).
 //  3. Look up the task. When it's in SUBMITTED, call acceptTask
 //     to land the SUBMITTED → ACCEPTED transition + run-level
-//     cascade. /merges is now the gate to ACCEPTED for tasks
-//     whose content needed integration; without this step,
-//     SUBMITTED tasks would never become ACCEPTED and downstream
-//     would stall.
+//     cascade. /merges is the gate to ACCEPTED for tasks whose
+//     content needed integration; without this step, SUBMITTED
+//     tasks would never become ACCEPTED and downstream would
+//     stall.
 //  4. Review-approve composition: when the merged task is a
 //     review with an approve verdict, the merge carries the
 //     upstream's content too (the review's topic was forked
@@ -71,10 +72,78 @@ func ReportMerge(c *Coordinator, caller *store.CitizenRecord, projectID int64, r
 	}
 	citizenID := callerID(caller)
 
-	// Step 1: branch_merged event. Always recorded, even when
-	// the task lookup that follows fails — the audit timeline
-	// reflects "the fat-client confirmed this merge" regardless
-	// of whether the task-level state-flip succeeds.
+	// Diagnostic INFO log on every /merges receipt — gives the
+	// "fat-client POST silently dropped" failure mode (load test:
+	// 2/488 stuck SUBMITTED with merges in origin) a per-receipt
+	// signal that survives even when the audit event below is
+	// suppressed by the state guard. Cheap log per merge — 1 line
+	// × N tasks at end-of-stage — well worth the future-incident
+	// debuggability.
+	if c.Logger != nil {
+		c.Logger.Info("/merges: received",
+			"task_id", params.TaskID,
+			"topic_branch", params.TopicBranch,
+			"run_branch", params.RunBranch,
+			"merge_sha", params.MergeSHA,
+			"project_id", projectID,
+			"run_seq", runSeq)
+	}
+
+	resp := &ReportMergeResponse{
+		Status:      "recorded",
+		TopicBranch: params.TopicBranch,
+		RunBranch:   params.RunBranch,
+		MergeSHA:    params.MergeSHA,
+	}
+
+	// Idempotency contract for /merges: the fat-client retry loop
+	// (see fatclient/service/submit.go reportMerge) means a
+	// successful merge can produce N POSTs to this endpoint when
+	// the first response is dropped on the way back. Both the
+	// audit event AND the state flip must be exactly-once across
+	// that retry cycle.
+	//
+	// branch_merged is therefore emitted at the merge-as-logical-
+	// event point — co-fired with acceptTask inside the SUBMITTED
+	// state guard — NOT per HTTP receipt. A retry POST that arrives
+	// after the state has already flipped finds the task past
+	// SUBMITTED and emits no audit row. The retry's diagnostic
+	// signal is preserved by the INFO log line above, which fires
+	// per receipt and is the right channel for "fat-client tried
+	// again." If a per-POST audit signal becomes valuable in the
+	// future, add a separate event type (e.g. merge_report_received)
+	// rather than overloading branch_merged.
+	//
+	// The two no-task-found defensive branches below
+	// (TaskID == "" and GetTask failure) intentionally drop the
+	// audit row too — they're unreachable in normal flow (the fat-
+	// client always sends task_id; coord state can't lose a row
+	// between submit and merge in a healthy system) and a "we got
+	// a /merges with no resolvable task" signal is better surfaced
+	// by the INFO/Warn log lines than by an orphaned branch_merged
+	// row that points at nothing.
+	if params.TaskID == "" {
+		return resp, nil
+	}
+	task, err := c.Store.GetTask(params.TaskID)
+	if err != nil || task == nil {
+		c.Logger.Warn("/merges: task not found", "task_id", params.TaskID, "error", err)
+		return resp, nil
+	}
+	if store.TaskState(task.State) != store.TaskSubmitted {
+		// Task already accepted (replay/retry) or in some other
+		// state where the merge confirmation doesn't map onto a
+		// state flip. Skip — both branch_merged and the state
+		// flip have already been recorded by the original POST
+		// that won the race; this is the second arrival.
+		return resp, nil
+	}
+
+	// State is SUBMITTED — this is the FIRST /merges POST to land
+	// for this merge. Stamp the audit row and run acceptTask in
+	// the same logical step. If a retry beats us into ApplyPlan
+	// for branch_merged, the state guard above will skip them on
+	// arrival; only one of the racers reaches this point.
 	c.Store.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{store.EmitEvent{Event: store.Event{
@@ -92,33 +161,6 @@ func ReportMerge(c *Coordinator, caller *store.CitizenRecord, projectID int64, r
 			CreatedAt: time.Now(),
 		}}},
 	})
-
-	resp := &ReportMergeResponse{
-		Status:      "recorded",
-		TopicBranch: params.TopicBranch,
-		RunBranch:   params.RunBranch,
-		MergeSHA:    params.MergeSHA,
-	}
-
-	// Step 2: SUBMITTED → ACCEPTED transition. Best-effort: a
-	// failure here leaves the audit event in place but the task
-	// stuck in SUBMITTED — the operator can re-trigger via a
-	// retry POST. Same semantics as the legacy "merge stamped
-	// but cascade failed" recovery mode.
-	if params.TaskID == "" {
-		return resp, nil
-	}
-	task, err := c.Store.GetTask(params.TaskID)
-	if err != nil || task == nil {
-		c.Logger.Warn("/merges: task not found", "task_id", params.TaskID, "error", err)
-		return resp, nil
-	}
-	if store.TaskState(task.State) != store.TaskSubmitted {
-		// Task already accepted (replay) or in some other state
-		// where the merge confirmation doesn't map onto a
-		// state flip. Skip — branch_merged already recorded.
-		return resp, nil
-	}
 
 	acceptRes, err := c.acceptTask(task, params.MergeSHA)
 	if err != nil {

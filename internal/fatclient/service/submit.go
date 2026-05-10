@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/common/types"
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
@@ -47,7 +48,7 @@ type SubmitParams struct {
 	Artifacts map[string]string
 	// UntrackedArtifacts lists the path-only set of artifact writes
 	// declared with track:false. These files are NOT committed (the
-	// .gitignore managed block keeps them out) but ARE reported to
+	//.gitignore managed block keeps them out) but ARE reported to
 	// the coordinator so it records a tracked=false index row that
 	// downstream tasks can verify by stat. Caller is responsible for
 	// having stat'd that the files exist on disk before passing
@@ -293,14 +294,14 @@ type preparedFatSubmit struct {
 // either a prepared bundle or an error.
 //
 // Invariants:
-//   - Terminal-state rejection before any git write (no
-//     phantom commits).
-//   - Review decision / vote option validation client-side.
-//   - Per-citizen result subdir for multi-citizen tasks.
-//   - Named outputs honoured (per-output file when schema
-//     declares one, else result.json blob).
-//   - Artifact paths sorted for deterministic commit-message
-//     ordering.
+// - Terminal-state rejection before any git write (no
+// phantom commits).
+// - Review decision / vote option validation client-side.
+// - Per-citizen result subdir for multi-citizen tasks.
+// - Named outputs honoured (per-output file when schema
+// declares one, else result.json blob).
+// - Artifact paths sorted for deterministic commit-message
+// ordering.
 func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (*preparedFatSubmit, error) {
 	taskID := params.TaskID
 	meta := params.Meta
@@ -441,9 +442,9 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		})
 	}
 
-	// Phase J.1 — list<string> named outputs are stringified
-	// to newline-joined text for on-disk storage so the
-	// existing file-per-output path and downstream
+	// list<string> named outputs are stringified to newline-
+	// joined text for on-disk storage so the existing file-
+	// per-output path and downstream
 	// `{{task.field}}` template resolution keep working
 	// unchanged. The structured list value is separately
 	// carried to the coordinator via reportBody.output_lists
@@ -524,7 +525,7 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	}
 
 	// Untracked artifact paths: stat-only verification — we never
-	// commit them (the .gitignore managed block keeps them out)
+	// commit them (the.gitignore managed block keeps them out)
 	// but we DO require they exist on disk before claiming the
 	// task succeeded. Silent acceptance of "I declared X but
 	// didn't write it" was the data-loss bug fixed here. Sorted
@@ -585,9 +586,9 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	}
 
 	if len(outputLists) > 0 {
-		// Phase J.1 — carry list<string> named output
-		// values through to the coordinator so it can
-		// materialize dynamic for_each downstreams from
+		// Carry list<string> named output values through to
+		// the coordinator so it can materialize dynamic
+		// for_each downstreams from
 		// the resolved lists.
 		reportBody["output_lists"] = outputLists
 	}
@@ -664,7 +665,7 @@ func (s *FatClient) reportMergeConflict(ctx context.Context, projectID, runSeq i
 
 // reportMergeFailed POSTs a merge_failed report to the
 // coordinator for non-conflict failures of the post-submit
-// auto-merge. Phase 8.4: the brief routes these terminal-merge
+// auto-merge. the brief routes these terminal-merge
 // failures (push rejected, transport timeout, ref not found)
 // through to a coord-side fail-cascade so the silent-stall
 // class of bugs can't reappear. Caller is expected to also
@@ -693,13 +694,43 @@ func (s *FatClient) reportMergeFailed(ctx context.Context, projectID, runSeq int
 	}
 }
 
-// reportMerge POSTs a branch_merged report to the coordinator.
-// fires after each successful FF push from
-// applyAcceptedMerges. Best-effort: on transport / coordinator
-// error we log and move on. The merge has already landed in
-// git; the audit gap is the only consequence and it's already
-// part of the "events are a strict consumer" contract.
-func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) {
+// reportMergeRetryBackoffs is the per-attempt sleep schedule
+// for reportMerge's bounded retry loop. Five attempts, ~7.75s
+// max wall-clock before giving up. Sized for the "transient
+// SQLITE_BUSY / coord overloaded under peak parallel-merge"
+// class of failure — long enough to ride out a multi-second
+// contention spike, short enough that a truly down coord
+// surfaces fast through ExecuteOutcome.
+//
+// Idempotency: the /merges handler emits branch_merged inside
+// the SUBMITTED state guard and only flips SUBMITTED→ACCEPTED,
+// so a duplicate POST after the first call already landed is a
+// no-op on coord side for both the audit event and the state
+// flip (see coordinator/service/report_merge.go).
+var reportMergeRetryBackoffs = []time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+}
+
+// reportMerge POSTs a branch_merged report to the coordinator
+// after each successful FF/merge-commit push from
+// applyAcceptedMerges. Retries on transport / coord error with
+// bounded exponential backoff (see reportMergeRetryBackoffs)
+// because a dropped POST leaves the task wedged at SUBMITTED
+// forever — the merge has already landed in git, but coord's
+// SUBMITTED→ACCEPTED gate fires only on /merges receipt, and
+// downstream's reads_artifacts dual-tier dep gate requires
+// ACCEPTED. Load testing (500-task fan-out) caught a small
+// number of tasks stuck this way under peak concurrency.
+//
+// Returns the final error when every retry fails so the caller
+// can surface the failure through ExecuteOutcome — silent stall
+// is the failure mode this guards against. ctx cancellation
+// short-circuits the backoff sleep cleanly.
+func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) error {
 	body := map[string]interface{}{
 		"topic_branch": topicBranch,
 		"run_branch":   runBranch,
@@ -709,10 +740,49 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 		body["task_id"] = taskID
 	}
 	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/merges", projectID, runSeq)
-	if _, err := s.coord.Post(ctx, path, body); err != nil {
-		// Soft-log; never bubble up.
-		_ = err
+	var lastErr error
+	for attempt := 0; attempt <= len(reportMergeRetryBackoffs); attempt++ {
+		if ctx.Err() != nil {
+			return fmt.Errorf("reportMerge cancelled (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
+		}
+		data, err := s.coord.Post(ctx, path, body)
+		// The coord HTTP client doesn't surface non-2xx as a Go
+		// error — it returns the body as `data` with err==nil
+		// (see coord/client.go's doWithAutoReregister). So a 503
+		// or 500 from /merges has to be detected via the
+		// `{"error": "..."}` envelope coord writes on every
+		// failure path. Treat both transport err and an
+		// envelope-error body as retry-worthy.
+		if err == nil {
+			if envMsg := coord.ExtractError(data); envMsg != "" {
+				err = fmt.Errorf("coord /merges error: %s", envMsg)
+			}
+		}
+		if err == nil {
+			if attempt > 0 {
+				s.logger.Info("reportMerge: succeeded after retry",
+					"task_id", taskID, "topic_branch", topicBranch,
+					"merge_sha", mergeSHA, "attempts", attempt+1)
+			}
+			return nil
+		}
+		lastErr = err
+		if attempt == len(reportMergeRetryBackoffs) {
+			break
+		}
+		backoff := reportMergeRetryBackoffs[attempt]
+		s.logger.Warn("reportMerge: post failed, retrying",
+			"task_id", taskID, "topic_branch", topicBranch,
+			"merge_sha", mergeSHA, "attempt", attempt+1,
+			"backoff", backoff, "error", err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("reportMerge cancelled mid-backoff (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
+		case <-time.After(backoff):
+		}
 	}
+	return fmt.Errorf("reportMerge exhausted retries (task=%s topic=%s merge=%s): %w",
+		taskID, topicBranch, mergeSHA, lastErr)
 }
 
 // applyAcceptedMerges drives the post-submit auto-merge of any
@@ -732,8 +802,7 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 // On *enjugit.ErrConflict the merge is left aborted (run branch
 // unchanged) and we POST a merge_conflict_detected report to
 // the coordinator instead of failing the whole submit. The
-// accept stood; the audit timeline carries the signal. Phase 3
-// of the parallel-merge work hooks that coord-side report into
+// accept stood; the audit timeline carries the signal. // of the parallel-merge work hooks that coord-side report into
 // a merge_resolve task spawn so downstream is unblocked once a
 // human (or future merge-resolver bot) finishes the merge by
 // hand.
@@ -810,7 +879,7 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 				}
 				continue
 			}
-			// Phase 8.4 — non-conflict merge failure (push
+			// — non-conflict merge failure (push
 			// rejected, transport timeout, "object not
 			// found" on a freshly-added remote, etc). Fire a
 			// /merges/failed report BEFORE returning so the
@@ -818,7 +887,7 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 			// on coord. The accept stood at submit time but
 			// the merge can't land — leaving the task in
 			// SUBMITTED is the silent-stall class of bugs
-			// Phase 8 closes. After the report, the caller
+			// closes. After the report, the caller
 			// gets the underlying error and surfaces it via
 			// the ExecuteOutcome chain.
 			if reportProjectID > 0 && reportRunSeq > 0 {
@@ -841,14 +910,20 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 		})
 	}
 	// Report each successful merge to the coordinator so the
-	// audit timeline gets a branch_merged event. Fire after
-	// the FF push to avoid emitting a phantom event for a
-	// merge that didn't actually land. Best-effort: a network
-	// blip drops the report but the merge stands.
+	// audit timeline gets a branch_merged event AND coord
+	// flips the task SUBMITTED→ACCEPTED. /merges is the gate;
+	// a dropped POST leaves the task stalled with the merge
+	// already integrated upstream — load testing caught this
+	// exact silent-stall (a small number of tasks wedged
+	// permanently). reportMerge retries with bounded backoff
+	// and bubbles the final error up so the operator sees a
+	// loud failure via ExecuteOutcome instead.
 	if reportProjectID > 0 && reportRunSeq > 0 {
 		for _, rep := range reports {
-			s.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
-				rep.topicBranch, rep.runBranch, rep.mergeSHA)
+			if err := s.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
+				rep.topicBranch, rep.runBranch, rep.mergeSHA); err != nil {
+				return fmt.Errorf("post-merge report to coord: %w", err)
+			}
 		}
 	}
 	return nil

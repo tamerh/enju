@@ -1,11 +1,10 @@
 package test
 
-// Reconcile endpoint tests (phase 2 of async compute). The
-// reconcile endpoint is the coordinator's state-advancement
-// path for commits produced by the compute wrapper — phase 3's
-// fetch-path scanner and phase 4's async-mode kickoff both
-// depend on its contract: idempotent, batchable, trust-the-
-// client.
+// Reconcile endpoint tests. The reconcile endpoint is the
+// coordinator's state-advancement path for commits produced by
+// the compute wrapper — the fetch-path scanner and async-mode
+// kickoff both depend on its contract: idempotent, batchable,
+// trust-the-client.
 //
 // Keep these tests HTTP-level. The batch handler delegates to
 // engine paths already covered by submit tests; reconcile-
@@ -16,6 +15,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/enju-ai/enju/internal/coordinator/engine"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // reconcilePost issues a reconcile batch request against the
@@ -30,9 +32,9 @@ func reconcilePost(s *testServer, tasks []map[string]interface{}) map[string]int
 // the commit_sha shape validator. The coordinator doesn't fetch
 // the commit (trust-the-client), so a well-shaped fake is
 // enough to exercise the endpoint's routing + state transitions
-// without needing a real git commit. Phase 3's integration
-// tests will reconcile real commits; here we stay focused on
-// the HTTP contract.
+// without needing a real git commit. Future integration tests
+// will reconcile real commits; here we stay focused on the HTTP
+// contract.
 func fakeSHA(seed string) string {
 	var b strings.Builder
 	for b.Len() < 40 {
@@ -285,5 +287,151 @@ func TestReconcileBatchResponseShapeOnMixedErrors(t *testing.T) {
 		if errMsg == "" {
 			t.Errorf("results[%d]: expected non-empty error message, got %+v", i, results[i])
 		}
+	}
+}
+
+// TestReconcileAcceptsSubmittedTaskWithMatchingSHA reproduces the
+// load-test stuck-SUBMITTED bug: the citizen successfully
+// submitted (task in SUBMITTED with commit_sha X) and the merge
+// landed on the run branch (trailer for task at commit X is now
+// observable on the branch tip), but /merges never reached the
+// coordinator before the fat-client process died. The retry-on-503
+// loop in reportMerge only saves transient 503s; a crash-after-
+// merge-before-POST or an exhaustion of retries leaves the task
+// permanently in SUBMITTED with no automated path to ACCEPTED.
+//
+// The recovery surface that DOES exist — the trailer-scan
+// reconcile path — used to reject this case as a "noop":
+// ReconcileTask gated eligibility on state ∈ {claimed, running}.
+// Today, "task is SUBMITTED with commit_sha == trailer
+// commit_sha" is exactly the recoverable shape — the submit
+// already landed, the merge is verified by the trailer being on
+// the run branch, all that's missing is the SUBMITTED → ACCEPTED
+// flip.
+//
+// This test posts a reconcile entry mirroring what the fat-client
+// scanner would post for that scenario, and asserts the task
+// advances to ACCEPTED.
+func TestReconcileAcceptsSubmittedTaskWithMatchingSHA(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+
+	taskID := s.taskID("task_a")
+	sha := fakeSHA("submitted-recoverable")
+
+	// Drive the task to SUBMITTED via a direct RecordSubmission
+	// mutation against the store, mirroring what the load-test
+	// scenario produces: citizen submitted, commit recorded on
+	// the task, but /merges (and therefore acceptTask) never
+	// fired. We could equivalently go through the /result HTTP
+	// handler, but that path's auto-accept logic is sensitive to
+	// the run's branch configuration; the direct mutation
+	// reproduces the stuck state regardless.
+	citizen, err := s.store.GetCitizenByUsername(alice)
+	if err != nil || citizen == nil {
+		t.Fatalf("GetCitizenByUsername(%s): citizen=%+v err=%v", alice, citizen, err)
+	}
+	if _, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{store.RecordSubmission{
+			TaskID:     taskID,
+			CitizenID:  citizen.ID,
+			CommitSHA:  sha,
+			ResultPath: "enju/runs/1-r1/task_a",
+			TokensUsed: 10,
+		}},
+	}); err != nil {
+		t.Fatalf("RecordSubmission: %v", err)
+	}
+
+	// Sanity: the precondition we're testing recovery FROM.
+	if pre := s.get("/api/v1/tasks/" + taskID); pre["state"] != "submitted" {
+		t.Fatalf("setup did not land task in submitted, got state=%v", pre["state"])
+	}
+
+	// What the fat-client trailer scanner would post once it
+	// observes the merge on the run branch tip.
+	resp := reconcilePost(s, []map[string]interface{}{
+		{
+			"task_id":    taskID,
+			"commit_sha": sha,
+			"exit_code":  0,
+			"username":   alice,
+		},
+	})
+	results, ok := resp["results"].([]interface{})
+	if !ok || len(results) != 1 {
+		t.Fatalf("expected one result, got %+v", resp)
+	}
+	r := results[0].(map[string]interface{})
+	if r["status"] != "accepted" {
+		t.Fatalf("expected status=accepted (reconcile must heal stuck SUBMITTED tasks "+
+			"whose commit landed on the run branch but whose /merges POST was lost), "+
+			"got %+v", r)
+	}
+
+	// Task must have advanced to accepted — this is the actual
+	// load-test recovery property under test.
+	task := s.get("/api/v1/tasks/" + taskID)
+	if state, _ := task["state"].(string); state != "accepted" {
+		t.Errorf("task state = %q, want accepted (the SUBMITTED-with-matching-SHA "+
+			"reconcile path should have flipped it via acceptTask)", state)
+	}
+}
+
+// TestReconcileNoopOnSubmittedTaskWithDifferentSHA pins the
+// safety side of the recovery path: a stale trailer for a
+// SUBMITTED task whose commit_sha doesn't match the trailer's is
+// NOT recoverable — it's an older iteration's commit landing on
+// the branch after a re-claim. Treat as noop, never as a destructive
+// state-flip. Pairs with TestReconcileAcceptsSubmittedTaskWithMatchingSHA
+// so the eligibility widening can't accidentally enable
+// commit-rewrite via reconcile.
+func TestReconcileNoopOnSubmittedTaskWithDifferentSHA(t *testing.T) {
+	s := newTestServer(t)
+	alice := s.register("alice")
+	s.submitYAML("testdata/simple-no-deps.yaml")
+	s.claim("task_a", alice)
+
+	taskID := s.taskID("task_a")
+	taskSHA := fakeSHA("recorded")
+	trailerSHA := fakeSHA("stale")
+
+	citizen, err := s.store.GetCitizenByUsername(alice)
+	if err != nil || citizen == nil {
+		t.Fatalf("GetCitizenByUsername: %+v err=%v", citizen, err)
+	}
+	if _, err := s.store.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{store.RecordSubmission{
+			TaskID:     taskID,
+			CitizenID:  citizen.ID,
+			CommitSHA:  taskSHA,
+			ResultPath: "enju/runs/1-r1/task_a",
+			TokensUsed: 10,
+		}},
+	}); err != nil {
+		t.Fatalf("RecordSubmission: %v", err)
+	}
+
+	resp := reconcilePost(s, []map[string]interface{}{
+		{
+			"task_id":    taskID,
+			"commit_sha": trailerSHA,
+			"exit_code":  0,
+			"username":   alice,
+		},
+	})
+	r := resp["results"].([]interface{})[0].(map[string]interface{})
+	if r["status"] != "noop" {
+		t.Fatalf("expected noop on SUBMITTED task with mismatched SHA "+
+			"(stale trailer must not flip task to accepted at the wrong commit), "+
+			"got %+v", r)
+	}
+	task := s.get("/api/v1/tasks/" + taskID)
+	if state, _ := task["state"].(string); state != "submitted" {
+		t.Errorf("task state = %q, want submitted (mismatched-SHA noop must not mutate)", state)
 	}
 }
