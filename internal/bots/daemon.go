@@ -77,6 +77,12 @@ type fatClient interface {
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
+	// SweepStaleScratch — Phase 2.4 startup hook. Removes any
+	// compute-task scratch dirs left behind by a previously
+	// crashed wrapper. No-op when the workspace isn't configured
+	// or the scratch tree is empty.
+	SweepStaleScratch() (int, error)
+
 	// ResolveBotWorkspace returns the abs path to this bot's
 	// per-bot per-project managed clone at
 	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
@@ -274,6 +280,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if resp.Count > 0 {
 		d.logger.Info("released orphaned claims from previous daemon run",
 			"count", resp.Count, "task_ids", resp.ReleasedTaskIDs)
+	}
+
+	// Phase 2.4 — sweep any compute-task scratch directories
+	// left behind by a crashed wrapper from a previous daemon
+	// run. Per-task scratch (Phase 2.1+) is ephemeral by
+	// design; defer-rm cleans the success / error paths but a
+	// hard kill (OOM, container shutdown, signal-9) leaks the
+	// dir. Sweeping at startup keeps disk from growing across
+	// restarts. Safe here: nothing else has started yet, no
+	// concurrent wrapper to race.
+	if n, err := d.fc.SweepStaleScratch(); err != nil {
+		d.logger.Warn("startup scratch sweep failed (proceeding)",
+			"error", err, "removed", n)
+	} else if n > 0 {
+		d.logger.Info("swept stale scratch dirs from previous daemon run",
+			"count", n)
 	}
 
 	backoff := d.pollFloor

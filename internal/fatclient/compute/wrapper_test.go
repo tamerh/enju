@@ -277,3 +277,49 @@ func TestScriptCwdFor(t *testing.T) {
 		})
 	}
 }
+
+// TestSweepStaleScratch covers the Phase 2.4 crash-recovery
+// helper: at bot startup, any scratch dirs left over from a
+// previous wrapper's crash get nuked. Empty and nonexistent
+// trees are no-ops.
+func TestSweepStaleScratch(t *testing.T) {
+	tmp := t.TempDir()
+	scratch := filepath.Join(tmp, "scratch")
+
+	// Empty scratch root: no-op.
+	if n, err := compute.SweepStaleScratch(tmp); err != nil || n != 0 {
+		t.Fatalf("empty: got n=%d err=%v, want 0/nil", n, err)
+	}
+
+	// Populated: simulate two crashed wrappers' leftovers.
+	for _, sub := range []string{"task-a-iter-1", "task-b-iter-3/data"} {
+		if err := os.MkdirAll(filepath.Join(scratch, sub), 0o755); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "task-b-iter-3/data/x.txt"),
+		[]byte("hi"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	n, err := compute.SweepStaleScratch(tmp)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("removed count: got %d, want 2", n)
+	}
+	if entries, _ := os.ReadDir(scratch); len(entries) != 0 {
+		t.Errorf("scratch root should be empty after sweep, has: %v", entries)
+	}
+
+	// Nonexistent scratch root: no-op.
+	if n, err := compute.SweepStaleScratch(filepath.Join(tmp, "no-such-dir")); err != nil || n != 0 {
+		t.Errorf("nonexistent: got n=%d err=%v, want 0/nil", n, err)
+	}
+
+	// Empty workspaceRoot: no-op.
+	if n, err := compute.SweepStaleScratch(""); err != nil || n != 0 {
+		t.Errorf("empty workspaceRoot: got n=%d err=%v, want 0/nil", n, err)
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/enju-ai/enju/internal/common/types"
+	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
@@ -209,6 +210,23 @@ func (s *FatClient) Coord() *coord.Client { return s.coord }
 // guard for "MCP client mode" — nil means no on-disk workspace
 // configured (test fixtures with coord-only setup).
 func (s *FatClient) Enjugit() *enjugit.Workspace { return s.enjugit }
+
+// SweepStaleScratch removes any leftover compute-task scratch
+// directories under the workspace root. Intended for bot startup
+// — a daemon that exited mid-task (crash, kill, OOM) leaves
+// scratch dirs whose owning task no longer runs; the next
+// daemon invocation should clear them so disk doesn't slowly
+// fill with orphans across restarts. No-op when the workspace
+// isn't configured (MCP-client-only mode).
+//
+// Returns (count_removed, first_error_or_nil). Caller may log
+// and continue on error — a partial sweep is harmless.
+func (s *FatClient) SweepStaleScratch() (int, error) {
+	if s.enjugit == nil {
+		return 0, nil
+	}
+	return compute.SweepStaleScratch(s.enjugit.RootDir())
+}
 
 // Username delegates to the coord client so callers see live values
 // across auto-reregister rotations.

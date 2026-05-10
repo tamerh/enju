@@ -149,6 +149,8 @@ func (f *fakeFC) ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAl
 	return &service.ReleaseAllMyOpenClaimsResponse{ReleasedTaskIDs: []string{}, Count: 0}, nil
 }
 
+func (f *fakeFC) SweepStaleScratch() (int, error) { return 0, nil }
+
 func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error) {
 	if m, ok := f.metaByID[taskID]; ok {
 		return m, nil

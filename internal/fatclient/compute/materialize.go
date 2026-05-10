@@ -35,6 +35,47 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 	return workDir
 }
 
+// SweepStaleScratch removes the entire scratch tree under the
+// given workspace root. Intended for crash-recovery on bot
+// startup: any scratch dirs surviving a previous daemon's exit
+// (crash, kill, OOM, container shutdown) are stale by definition
+// since their owning task is no longer running.
+//
+// Returns the number of entries removed (sub-dirs nuked, not file
+// count) and any error from the rm pass; an empty / nonexistent
+// scratch tree is a successful no-op.
+//
+// Safe to call ONLY when no other compute task is running on this
+// workspace — i.e. at bot startup before the poll loop begins. A
+// concurrent call against a live wrapper would race with that
+// wrapper's per-task mkdir/script lifecycle.
+func SweepStaleScratch(workspaceRoot string) (int, error) {
+	if workspaceRoot == "" {
+		return 0, nil
+	}
+	root := filepath.Join(workspaceRoot, "scratch")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("sweep scratch: read %s: %w", root, err)
+	}
+	count := 0
+	var firstErr error
+	for _, e := range entries {
+		full := filepath.Join(root, e.Name())
+		if rerr := os.RemoveAll(full); rerr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("sweep scratch: remove %s: %w", full, rerr)
+			}
+			continue
+		}
+		count++
+	}
+	return count, firstErr
+}
+
 // MaterializeReads writes each declared input path under
 // scratchDir, populated by reading from sourceSHA via read.
 // Used by the compute wrapper (Phase 2.2) to seed a task's
