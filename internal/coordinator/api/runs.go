@@ -457,6 +457,59 @@ func (s *Server) handleReportMergeConflict(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// reportMergeFailedRequest is the body shape for
+// POST /projects/{p}/runs/{r}/merges/failed. The fat-client
+// posts this when its post-submit auto-merge of an ACCEPTED
+// topic onto the run branch hit a non-conflict failure (push
+// rejected, transport timeout, ref not found). The accept
+// stood at submit time, but the merge couldn't land — Phase
+// 8.4 routes this through to a terminal task fail-cascade so
+// the silent-stall class of bugs can't reappear.
+type reportMergeFailedRequest struct {
+	TopicBranch string `json:"topic_branch"`
+	RunBranch   string `json:"run_branch"`
+	Error       string `json:"error"`
+	TaskID      string `json:"task_id"`
+}
+
+// handleReportMergeFailed — endpoint for non-conflict
+// post-submit merge failures. SUBMITTED → FAILED with
+// reason "merge_failed: <error>", fail-cascade fires
+// (descendants → SKIPPED, dynamic descendants deleted,
+// artifacts rolled back), task_failed contribution event
+// recorded against the original claimant. See
+// service.ReportMergeFailed for the design rationale.
+func (s *Server) handleReportMergeFailed(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	var req reportMergeFailedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	caller := citizenFromRequest(r)
+	resp, err := service.ReportMergeFailed(s.coord, caller, projectID, runSeq, service.ReportMergeFailedParams{
+		TopicBranch: req.TopicBranch,
+		RunBranch:   req.RunBranch,
+		Error:       req.Error,
+		TaskID:      req.TaskID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrNotMember):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // reportPushVerifyFailedRequest is the body shape for
 // POST /projects/{p}/runs/{r}/push-verify-failed. Fat-clients
 // post this when their post-push verify catches a silent-

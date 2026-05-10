@@ -2380,6 +2380,225 @@ func TestReportMergeConflict_RejectsEmptyTaskID(t *testing.T) {
 	}
 }
 
+// TestEvent_MergeFailedDrivesTaskToFailed pins the Phase 8.4
+// terminal-merge contract: a fat-client whose post-submit
+// auto-merge hit a non-conflict failure (push rejected,
+// transport timeout, etc.) POSTs /merges/failed; the underlying
+// SUBMITTED task transitions to FAILED with a merge_failed
+// reason, the standard fail-cascade fires (downstream tasks →
+// SKIPPED), and the audit timeline carries both merge_failed
+// and the task_failed contribution event.
+//
+// Pre-Phase-8.4 the fat-client logged a Warn and swallowed the
+// error; the task stayed ACCEPTED while downstream consumers
+// fanned out against an artifact whose underlying commit never
+// landed on the run branch — the silent-cascade-stall class of
+// bugs Phase 8 closes.
+func TestEvent_MergeFailedDrivesTaskToFailed(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	alice := s.register("alice")
+
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected run id shape: %q", runID)
+	}
+	runSeq := parts[1]
+
+	// Drive task_a through the production submit path so it
+	// lands in SUBMITTED with a topic-branch commit that the
+	// fat-client would have tried to merge.
+	taskID := fmt.Sprintf("%d:1:task_a", projectID)
+	s.claim("task_a", alice)
+	resp := s.post("/api/v1/tasks/"+taskID+"/result", map[string]interface{}{
+		"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+		"commit_sha":  "cafef00d0000000000000000000000000000abcd",
+		"content":     "hello",
+		"username":    "alice",
+		"tokens_used": 1,
+	})
+	if errMsg, _ := resp["error"].(string); errMsg != "" {
+		t.Fatalf("submit task_a: %s", errMsg)
+	}
+	// task_a should now be in 'submitted' (it has no
+	// downstream review and no inline-accept fired because the
+	// merge view was non-empty for the fat-client to drive).
+	if got, _ := s.get("/api/v1/tasks/"+taskID)["state"].(string); got != "submitted" {
+		t.Fatalf("expected submitted, got %q", got)
+	}
+
+	// The fat-client's MergeAcceptedTopic returned a non-
+	// conflict error; it POSTs /merges/failed so the coord
+	// drives the task to FAILED + cascades.
+	failResp := s.post(
+		fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/failed", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch": "run-1/task_a/iter-1",
+			"run_branch":   "main",
+			"error":        "push rejected: non-fast-forward",
+			"task_id":      taskID,
+		})
+	if status, _ := failResp["status"].(string); status != "failed" {
+		t.Fatalf("expected status=failed, got %+v", failResp)
+	}
+	if reason, _ := failResp["reason"].(string); !strings.Contains(reason, "merge_failed") {
+		t.Errorf("expected reason to start with merge_failed, got %q", reason)
+	}
+	if reason, _ := failResp["reason"].(string); !strings.Contains(reason, "push rejected") {
+		t.Errorf("expected reason to embed the underlying git error, got %q", reason)
+	}
+
+	// Task is now FAILED with the merge_failed reason in
+	// fail_reason — the operator's invalidate-to-retry path
+	// reads this column to render the failure cause.
+	taskAfter := s.get("/api/v1/tasks/" + taskID)
+	if state, _ := taskAfter["state"].(string); state != "failed" {
+		t.Errorf("expected state=failed, got %q", state)
+	}
+	if fr, _ := taskAfter["fail_reason"].(string); !strings.Contains(fr, "merge_failed") {
+		t.Errorf("expected fail_reason to embed merge_failed, got %q", fr)
+	}
+
+	// merge_failed audit event landed with the underlying
+	// error verbatim so post-mortem operators can read what
+	// went wrong without re-deriving it from the cascade.
+	ev := s.findEvent(projectID, "merge_failed")
+	if ev == nil {
+		t.Fatal("merge_failed event not emitted after /merges/failed report")
+	}
+	meta, _ := ev["metadata"].(map[string]interface{})
+	if meta == nil {
+		if metaStr, ok := ev["metadata"].(string); ok {
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+		}
+	}
+	if errStr, _ := meta["error"].(string); !strings.Contains(errStr, "push rejected") {
+		t.Errorf("merge_failed metadata.error should embed the git error, got %v", meta["error"])
+	}
+	for _, key := range []string{"topic_branch", "run_branch", "run_seq"} {
+		if _, ok := meta[key]; !ok {
+			t.Errorf("merge_failed metadata missing %q (got %+v)", key, meta)
+		}
+	}
+}
+
+// TestReportMergeFailed_RejectsBadInputs pins the input-
+// validation gate. Empty task_id / topic_branch / run_branch /
+// error each return a 400-shaped error. Without this the
+// coord-side fail-cascade would run on a phantom target or
+// with no audit context.
+func TestReportMergeFailed_RejectsBadInputs(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	parts := strings.Split(runID, ":")
+	runSeq := parts[1]
+	url := fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/failed", projectID, runSeq)
+
+	cases := []struct {
+		name string
+		body map[string]interface{}
+		hint string
+	}{
+		{
+			name: "empty task_id",
+			body: map[string]interface{}{
+				"topic_branch": "run-1/task_a/iter-1",
+				"run_branch":   "main",
+				"error":        "push rejected",
+			},
+			hint: "task_id",
+		},
+		{
+			name: "empty topic_branch",
+			body: map[string]interface{}{
+				"task_id":    fmt.Sprintf("%d:1:task_a", projectID),
+				"run_branch": "main",
+				"error":      "push rejected",
+			},
+			hint: "topic_branch",
+		},
+		{
+			name: "empty error",
+			body: map[string]interface{}{
+				"task_id":      fmt.Sprintf("%d:1:task_a", projectID),
+				"topic_branch": "run-1/task_a/iter-1",
+				"run_branch":   "main",
+				"error":        "   ",
+			},
+			hint: "error",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := s.post(url, c.body)
+			errMsg, _ := resp["error"].(string)
+			if errMsg == "" {
+				t.Fatalf("expected error in response, got %+v", resp)
+			}
+			if !strings.Contains(errMsg, c.hint) {
+				t.Errorf("error should mention %q, got %q", c.hint, errMsg)
+			}
+		})
+	}
+}
+
+// TestReportMergeFailed_NoOpOnNonSubmittedTask pins the
+// replay-safety contract: a /merges/failed report against a
+// task that's already past SUBMITTED (operator manually
+// invalidated, prior /merges/failed already drove it terminal,
+// etc.) is a no-op rather than a 5xx. The status field
+// surfaces the actual current state so the caller can decide
+// how to render rather than silently succeed-as-noop.
+func TestReportMergeFailed_NoOpOnNonSubmittedTask(t *testing.T) {
+	s := newTestServer(t)
+	projectID := s.createTestProject()
+	alice := s.register("alice")
+	runID := s.submitYAMLToProject("testdata/simple-no-deps.yaml", projectID)
+	runSeq := strings.Split(runID, ":")[1]
+
+	// Take task_a through claim+submit so it lands in
+	// SUBMITTED, then immediately invalidate it (simulating an
+	// operator decision before the fat-client's merge attempt
+	// completed). Now /merges/failed arrives late.
+	taskID := fmt.Sprintf("%d:1:task_a", projectID)
+	s.claim("task_a", alice)
+	s.post("/api/v1/tasks/"+taskID+"/result", map[string]interface{}{
+		"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+		"commit_sha":  "cafef00d0000000000000000000000000000abcd",
+		"content":     "hello", "username": "alice", "tokens_used": 1,
+	})
+	// Move past SUBMITTED via invalidate (clears claim,
+	// flips to READY) — the late /merges/failed should NOT
+	// resurrect this as FAILED.
+	s.post("/api/v1/tasks/"+taskID+"/invalidate", map[string]interface{}{"reason": "operator changed mind"})
+	priorState, _ := s.get("/api/v1/tasks/"+taskID)["state"].(string)
+	if priorState == "submitted" || priorState == "failed" {
+		t.Fatalf("test setup wrong: expected task past SUBMITTED+not-FAILED, got %q", priorState)
+	}
+
+	failResp := s.post(
+		fmt.Sprintf("/api/v1/projects/%d/runs/%s/merges/failed", projectID, runSeq),
+		map[string]interface{}{
+			"topic_branch": "run-1/task_a/iter-1",
+			"run_branch":   "main",
+			"error":        "push rejected (late report)",
+			"task_id":      taskID,
+		})
+	if errMsg, _ := failResp["error"].(string); errMsg != "" {
+		t.Fatalf("late /merges/failed should be soft no-op, got error: %s", errMsg)
+	}
+	if status, _ := failResp["status"].(string); status == "failed" {
+		t.Errorf("late /merges/failed should NOT flip the task to FAILED; got status=%q", status)
+	}
+	// State on the task row is unchanged.
+	postState, _ := s.get("/api/v1/tasks/"+taskID)["state"].(string)
+	if postState != priorState {
+		t.Errorf("late /merges/failed mutated task state: %q → %q", priorState, postState)
+	}
+}
+
 // TestParallelMerge_E2E_ConflictSpawnsTaskAndRendersInStatus is
 // the connecting integration test for the parallel-merge work
 // (phases 2 + 3 + 5). One conflict report drives:

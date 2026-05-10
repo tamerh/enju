@@ -24,10 +24,19 @@ import (
 // thrown away, leaving "verb returned nil but didn't actually do
 // the work" cases impossible to diagnose post-hoc.
 //
-// Severity rule: info when every step ran cleanly (ok/skipped),
-// warn when any step failed (so log filters surface the bad runs
-// without manual scanning). Either logger or traceFile may be nil
-// — Emit no-ops the missing destination. Both nil = silent.
+// Severity rule:
+//   - INFO when every step ran cleanly (ok/skipped) and the verb
+//     did not terminally fail.
+//   - WARN when a step failed but the verb still completed (e.g.
+//     a fetch-origin retry that recovered, recorded via
+//     AppendStep with status=failed but no Trace.Terminal flag).
+//   - ERROR when the verb terminally failed (Trace.Terminal=true
+//     via Failed or WrapTerminal). Distinguishes "verb returned
+//     an error" from "verb succeeded with a recovered hiccup" so
+//     log filters and operators can route on the difference.
+//
+// Either logger or traceFile may be nil — Emit no-ops the
+// missing destination. Both nil = silent.
 //
 // Structured fields written:
 //   - op: trace's Op name
@@ -50,15 +59,23 @@ func (t *Trace) Emit(logger *slog.Logger, traceFile *os.File) {
 		}
 		if failed {
 			attrs = append(attrs, "fail_detail", failDetail)
+		}
+		switch {
+		case t.Terminal:
+			logger.Error("oplog verb completed", attrs...)
+		case failed:
 			logger.Warn("oplog verb completed", attrs...)
-		} else {
+		default:
 			logger.Info("oplog verb completed", attrs...)
 		}
 	}
 
 	if traceFile != nil {
 		level := "INFO"
-		if failed {
+		switch {
+		case t.Terminal:
+			level = "ERROR"
+		case failed:
 			level = "WARN"
 		}
 		var line strings.Builder

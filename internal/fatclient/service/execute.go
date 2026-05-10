@@ -395,11 +395,31 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// collectAcceptedMerges enumerates the eligible merges and
 	// returns them in the response — applyAcceptedMerges executes
 	// each one locally and reports back via report_merge so coord
-	// stamps a branch_merged event. Best-effort: a merge failure
-	// shouldn't fail the compute task itself (the work is on
-	// origin via the topic branch); operator can re-run later.
+	// stamps a branch_merged event.
+	//
+	// Phase 8.4 — non-conflict merge failures (push rejected,
+	// transport timeout, etc.) are now terminal. applyAcceptedMerges
+	// posts /merges/failed before returning the error, which
+	// drives the underlying task to FAILED + fires the fail-cascade
+	// on coord. We surface the failure as a git_failed
+	// ExecuteOutcome so enju_execute_run renders it as a hard stop
+	// rather than silently logging a Warn — pre-Phase-8.4 the
+	// silent-stall let the task look ACCEPTED while downstream
+	// tasks fanned out against an artifact whose commit never
+	// reached the run branch.
 	if mergeErr := s.applyAcceptedMerges(ctx, wf, reportData); mergeErr != nil {
-		s.logger.Warn("post-compute auto-merge failed", "task_id", taskID, "error", mergeErr)
+		s.logger.Error("post-compute auto-merge failed", "task_id", taskID, "error", mergeErr)
+		return &ExecuteOutcome{
+			TaskID:        taskID,
+			Script:        meta.Script,
+			Status:        "git_failed",
+			ElapsedMS:     res.ElapsedMS,
+			CommitSHA:     res.CommitSHA,
+			ContentLen:    len(res.Content),
+			ScriptLogPath: res.ScriptLogPath,
+			ErrorMessage:  fmt.Sprintf("post-merge failed: %s", mergeErr.Error()),
+			Branch:        meta.Branch,
+		}, nil
 	}
 
 	out := &ExecuteOutcome{

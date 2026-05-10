@@ -162,6 +162,13 @@ func (s *Server) Router() http.Handler {
 		// 3 of the parallel-merge work converts this into a
 		// merge_resolve task spawn.
 		r.Post("/projects/{projectID}/runs/{runSeq}/merges/conflicts", s.handleReportMergeConflict)
+		// Phase 8.4 — sibling of /merges for non-conflict
+		// post-submit merge failures. Push rejected, transport
+		// timeout, "object not found" on a freshly-added remote.
+		// The accept at submit time stood, but the merge can't
+		// land. Drives the underlying task to FAILED with a
+		// merge_failed reason + fires the standard fail-cascade.
+		r.Post("/projects/{projectID}/runs/{runSeq}/merges/failed", s.handleReportMergeFailed)
 		// Audit hook for the verify-after-push fix: fat-client
 		// posts here when its post-push verify catches a
 		// silent-success state (push reported success but the

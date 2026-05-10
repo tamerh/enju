@@ -662,6 +662,37 @@ func (s *FatClient) reportMergeConflict(ctx context.Context, projectID, runSeq i
 	}
 }
 
+// reportMergeFailed POSTs a merge_failed report to the
+// coordinator for non-conflict failures of the post-submit
+// auto-merge. Phase 8.4: the brief routes these terminal-merge
+// failures (push rejected, transport timeout, ref not found)
+// through to a coord-side fail-cascade so the silent-stall
+// class of bugs can't reappear. Caller is expected to also
+// return the underlying error so enju_execute_run surfaces the
+// failure to the operator — this fn just records the audit +
+// drives the state flip.
+//
+// Best-effort POST: a transport failure here means the audit
+// is missing but the local merge state is unchanged; operator
+// can manually invalidate the SUBMITTED task to recover. Logs
+// at Warn (not silent) because the report failure compounds
+// the original problem.
+func (s *FatClient) reportMergeFailed(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, errMsg string) {
+	body := map[string]interface{}{
+		"topic_branch": topicBranch,
+		"run_branch":   runBranch,
+		"error":        errMsg,
+	}
+	if taskID != "" {
+		body["task_id"] = taskID
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/merges/failed", projectID, runSeq)
+	if _, err := s.coord.Post(ctx, path, body); err != nil {
+		s.logger.Warn("reportMergeFailed post: audit missing for merge failure",
+			"task_id", taskID, "topic_branch", topicBranch, "post_error", err, "merge_error", errMsg)
+	}
+}
+
 // reportMerge POSTs a branch_merged report to the coordinator.
 // fires after each successful FF push from
 // applyAcceptedMerges. Best-effort: on transport / coordinator
@@ -778,6 +809,27 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 						"conflict_files", conflict.Paths)
 				}
 				continue
+			}
+			// Phase 8.4 — non-conflict merge failure (push
+			// rejected, transport timeout, "object not
+			// found" on a freshly-added remote, etc). Fire a
+			// /merges/failed report BEFORE returning so the
+			// underlying task is driven to FAILED + cascaded
+			// on coord. The accept stood at submit time but
+			// the merge can't land — leaving the task in
+			// SUBMITTED is the silent-stall class of bugs
+			// Phase 8 closes. After the report, the caller
+			// gets the underlying error and surfaces it via
+			// the ExecuteOutcome chain.
+			if reportProjectID > 0 && reportRunSeq > 0 {
+				s.reportMergeFailed(ctx, reportProjectID, reportRunSeq, taskID,
+					topicBranch, runBranch, mergeErr.Error())
+			} else {
+				s.logger.Error("dropped merge_failed report: project_id/run_seq missing from submit response",
+					"task", taskID,
+					"topic_branch", topicBranch,
+					"run_branch", runBranch,
+					"merge_error", mergeErr)
 			}
 			return fmt.Errorf(
 				"task %s: merging topic %q onto run branch %q at %s: %w",

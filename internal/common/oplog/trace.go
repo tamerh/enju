@@ -34,6 +34,15 @@ type Trace struct {
 	Op      string
 	Steps   []Step
 	Context map[string]string
+	// Terminal is true when the verb returned an error via this
+	// Trace (Failed or WrapTerminal). Distinguishes a non-fatal
+	// failed step (e.g. a recovered fetch-origin retry whose
+	// failure is recorded via AppendStep but the verb keeps
+	// running) from a step whose failure aborted the verb.
+	// Emit uses this flag to choose ERROR vs WARN: a verb that
+	// terminally failed is an actionable problem; one that
+	// merely had a recoverable hiccup is informational.
+	Terminal bool
 }
 
 // Start begins a new trace for the named operation.
@@ -95,7 +104,10 @@ func (t *Trace) AppendStep(s Step) {
 
 // Failed records a failed step and returns an *OpError wrapping
 // `cause`. Callers route on the typed cause via `errors.Is`; the
-// trace travels with it for diagnostic display.
+// trace travels with it for diagnostic display. Marks the trace
+// Terminal so Emit logs at ERROR — a step recorded via Failed
+// short-circuits the verb (the caller propagates the returned
+// error), so the verb's outcome is "operation failed."
 func (t *Trace) Failed(name string, cause error) error {
 	if t == nil {
 		return cause
@@ -105,6 +117,7 @@ func (t *Trace) Failed(name string, cause error) error {
 		detail = cause.Error()
 	}
 	t.Steps = append(t.Steps, Step{Name: name, Status: StatusFailed, Detail: detail})
+	t.Terminal = true
 	return &OpError{
 		Op:      t.Op,
 		Cause:   cause,
@@ -116,10 +129,12 @@ func (t *Trace) Failed(name string, cause error) error {
 // WrapTerminal wraps `cause` in an OpError without adding a new
 // failed step. Use when the failing step has already been recorded
 // (or doesn't fit the step model — e.g. "all fallbacks exhausted").
+// Marks the trace Terminal so Emit logs at ERROR.
 func (t *Trace) WrapTerminal(cause error) error {
 	if t == nil {
 		return cause
 	}
+	t.Terminal = true
 	return &OpError{
 		Op:      t.Op,
 		Cause:   cause,

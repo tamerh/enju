@@ -338,7 +338,17 @@ func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath strin
 				return
 			}
 		} else if mergeErr := s.applyAcceptedMerges(ctx, wf, reportData); mergeErr != nil {
-			s.logger.Warn("post-async auto-merge failed", "task_id", spec.TaskID, "error", mergeErr)
+			// Phase 8.4 — applyAcceptedMerges posted
+			// /merges/failed before returning, so the
+			// underlying task is already in FAILED with the
+			// fail-cascade fired on coord. We bump severity
+			// to Error so this surfaces in operator log
+			// scans (the silent-stall class of bugs Phase
+			// 8.4 closes was hidden under Warn). The .json
+			// is still renamed to .done.json below so the
+			// next reap doesn't double-process.
+			s.logger.Error("post-async auto-merge failed; task driven to FAILED via /merges/failed",
+				"task_id", spec.TaskID, "error", mergeErr)
 		}
 		_ = os.Rename(resultPath, strings.TrimSuffix(resultPath, ".json")+".done.json")
 		return
