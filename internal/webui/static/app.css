@@ -561,11 +561,14 @@ pre.mermaid {
   .state-collecting { background: #4c1d95; color: #ede9fe; }
 }
 
-/* iter-badge — shown next to a task ID in the run table when
- * IterCount > 1 (Phase 8.6: tasks that bounced through
+/* iter-count-badge — shown next to a task ID in the run table
+ * when IterCount > 1 (Phase 8.6: tasks that bounced through
  * request_changes accumulate iter_seq rows). Distinct from
- * state badges so it can stack alongside one. */
-.iter-badge {
+ * .iter-badge below — that one is the iteration-history
+ * outcome/decision chip on the task page; this is the run-row
+ * count pill. Same name would cascade-override into the
+ * uppercase outcome look. */
+.iter-count-badge {
   display: inline-block;
   margin-left: 0.4rem;
   padding: 0.1rem 0.4rem;
@@ -577,7 +580,7 @@ pre.mermaid {
   vertical-align: middle;
 }
 @media (prefers-color-scheme: dark) {
-  .iter-badge { background: #78350f; color: #fef3c7; }
+  .iter-count-badge { background: #78350f; color: #fef3c7; }
 }
 
 /* blocked-by — Phase 8.5 waiting-state explainer banner. Same

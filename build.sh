@@ -22,8 +22,18 @@ cd "$(dirname "$0")"
 # Build / run
 # ---------------------------------------------------------------
 
+# _ldflags stamps commit + date into the binary. Version is left
+# at "dev" for local builds — only cmd_release sets it explicitly.
+_ldflags() {
+    local commit
+    commit=$(git rev-parse --short HEAD 2>/dev/null || echo "none")
+    local date
+    date=$(date -u +%Y-%m-%d)
+    echo "-X main.Commit=${commit} -X main.BuildDate=${date}"
+}
+
 cmd_build() {
-    go build -o enju ./cmd/enju/
+    go build -ldflags "$(_ldflags)" -o enju ./cmd/enju/
     # Hardlink the binary as enju-coord so the coordinator runs
     # under a distinct argv[0]/comm. This makes a coord process
     # invisible to "pkill -f enju" (which is too broad — matches
@@ -33,6 +43,110 @@ cmd_build() {
     # Hardlink (not symlink) keeps it as a real binary path so
     # ELF-loader behaviour is identical to ./enju.
     ln -f ./enju ./enju-coord
+}
+
+# cmd_release VERSION
+#   Full release pipeline:
+#     1. lint + test (gate — abort on any failure)
+#     2. git tag VERSION + push to origin
+#     3. cross-compile 6 targets → dist/
+#     4. create GitHub release with all archives attached
+#
+#   Requires `gh` (GitHub CLI) installed and authenticated.
+#
+#   Usage:
+#     ./build.sh release v1.0.0-alpha
+#     ./build.sh release v1.0.0
+cmd_release() {
+    local version="${1:-}"
+    if [ -z "$version" ]; then
+        echo "Usage: ./build.sh release <version>  (e.g. v1.0.0-alpha)" >&2
+        exit 1
+    fi
+
+    # Normalise: add leading 'v' if missing.
+    if [[ "$version" != v* ]]; then
+        version="v${version}"
+    fi
+
+    echo "==> Release: $version"
+    echo
+
+    # Gate 1: lint
+    echo "==> Running lints..."
+    cmd_lint
+    echo
+
+    # Gate 2: tests (fast, no LLM tokens)
+    echo "==> Running tests..."
+    go test ./... -count=1
+    echo
+
+    # Tag
+    echo "==> Creating git tag $version..."
+    if git rev-parse "$version" >/dev/null 2>&1; then
+        echo "    Tag $version already exists — skipping."
+    else
+        git tag "$version"
+    fi
+    echo "==> Pushing tag to origin..."
+    git push origin "$version"
+    echo
+
+    # Stamp version + commit + date into all release binaries.
+    local commit
+    commit=$(git rev-parse --short HEAD 2>/dev/null || echo "none")
+    local date
+    date=$(date -u +%Y-%m-%d)
+    local ldf="-X main.Version=${version} -X main.Commit=${commit} -X main.BuildDate=${date}"
+
+    rm -rf dist
+    mkdir -p dist
+
+    local targets=(
+        "linux   amd64"
+        "linux   arm64"
+        "darwin  amd64"
+        "darwin  arm64"
+        "windows amd64"
+        "windows arm64"
+    )
+
+    echo "==> Cross-compiling..."
+    for target in "${targets[@]}"; do
+        local goos goarch
+        read -r goos goarch <<< "$target"
+
+        local bin="enju"
+        [ "$goos" = "windows" ] && bin="enju.exe"
+
+        local outdir="dist/enju-${goos}-${goarch}"
+        mkdir -p "$outdir"
+
+        printf "    %-22s" "${goos}/${goarch}"
+        GOOS="$goos" GOARCH="$goarch" go build -ldflags "$ldf" -o "${outdir}/${bin}" ./cmd/enju/
+        echo "✓"
+
+        if [ "$goos" = "windows" ]; then
+            (cd dist && zip -q "enju-${goos}-${goarch}.zip" "enju-${goos}-${goarch}/${bin}")
+        else
+            tar -czf "dist/enju-${goos}-${goarch}.tar.gz" -C dist "enju-${goos}-${goarch}"
+        fi
+        rm -rf "$outdir"
+    done
+    echo
+
+    echo "==> Archives in dist/:"
+    ls -lh dist/
+    echo
+
+    echo "==> Creating GitHub release $version..."
+    gh release create "$version" dist/* \
+        --title "$version" \
+        --notes "See commit history for details."
+
+    echo
+    echo "==> Done. $version is live on GitHub."
 }
 
 cmd_run() {
@@ -390,6 +504,12 @@ Lints:
   check-chokepoint   SQL exec funnel + TestEngineVersion confinement.
   lint               Run all architectural lints.
 
+Release:
+  release <version>  Full release pipeline: lint → test → git tag →
+                     push tag → cross-compile 6 targets → dist/ archives
+                     → GitHub release. Requires 'gh' authenticated.
+                     Example: ./build.sh release v1.0.0-alpha
+
 Dev workflow:
   dev-restart [PORT] [--wipe]
                      Build + restart coordinator (default port 8333).
@@ -413,6 +533,7 @@ case "$cmd" in
     check-imports)    cmd_check_imports "$@" ;;
     check-chokepoint) cmd_check_chokepoint "$@" ;;
     lint)             cmd_lint "$@" ;;
+    release)          cmd_release "$@" ;;
     dev-restart)      cmd_dev_restart "$@" ;;
     help|-h|--help)   cmd_help ;;
     *)

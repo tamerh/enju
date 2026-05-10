@@ -132,7 +132,7 @@
       <tr>
         <td>
           <a href="/p/{{$.ProjectID}}/t/{{.ID}}"><code>{{.ID}}</code></a>
-          {{if gt .IterCount 1}}<span class="iter-badge" title="{{.IterCount}} iterations (request_changes loops)">iter {{.IterCount}}</span>{{end}}
+          {{if gt .IterCount 1}}<span class="iter-count-badge" title="{{.IterCount}} iterations (request_changes loops)">iter {{.IterCount}}</span>{{end}}
         </td>
         <td>{{.Action}}</td>
         <td><span class="state state-{{.State}}">{{.State}}</span></td>

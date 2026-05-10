@@ -7,8 +7,12 @@
 /enju-coord
 mytmpwork/
 
-# Database
+# Database (SQLite + WAL-mode sidecars). go test occasionally
+# spawns these in the repo root via stray store.New(":memory:")
+# wirings that fall back to disk under load.
 *.db
+*.db-shm
+*.db-wal
 
 # Coordinator log (written by build.sh dev-restart)
 /enju-coord.log

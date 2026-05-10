@@ -25,6 +25,14 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// Injected by -ldflags at release build time. Local builds keep the
+// "dev" fallbacks so no special flags are needed during development.
+var (
+	Version   = "dev"
+	Commit    = "none"
+	BuildDate = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -47,7 +55,7 @@ func main() {
 	case "bot":
 		cmdBot(os.Args[2:])
 	case "version":
-		fmt.Println("enju v0.1.0-dev")
+		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
