@@ -245,6 +245,20 @@ type RunRecord struct {
 	// resolve to a valid path. Stamped once at creation and
 	// never updated — same stability contract as Branch.
 	Slug   string
+	// BlockedBy carries a JSON description of why a WAITING run
+	// can't make progress. Populated by applyCompleteRun at
+	// the moment of the active|whatever → waiting transition;
+	// cleared when the run leaves waiting. Empty string for
+	// non-WAITING runs (the column is nullable; the scanner
+	// folds NULL → ""). Surface readers (enju_run_status)
+	// gate on State == RunWaiting before parsing.
+	//
+	// One of (JSON):
+	//   {"kind":"review",       "task":"...","assignee":"...","since":"..."}
+	//   {"kind":"human_claim",  "task":"...","assignee":"..."}
+	//   {"kind":"artifact",     "task":"...","awaiting_path":"..."}
+	//   {"kind":"stuck",        "detail":"..."}
+	BlockedBy string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

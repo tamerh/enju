@@ -83,6 +83,12 @@ type Run struct {
 	SourcePath      string    `json:"source_path,omitempty"`
 	SourceCommitSHA string    `json:"source_commit_sha,omitempty"`
 	Warnings        []string  `json:"warnings,omitempty"`
+	// BlockedBy is the JSON-encoded blocker description for a
+	// WAITING run (see store.BlockedBy + ParseBlockedBy).
+	// Empty for non-WAITING runs OR for older coordinators.
+	// Surface readers (enju_run_status renderer) check
+	// state==waiting before parsing.
+	BlockedBy string `json:"blocked_by,omitempty"`
 }
 
 // Member is the JSON shape for one project membership row.

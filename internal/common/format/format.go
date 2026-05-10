@@ -29,6 +29,105 @@ import (
 	"time"
 )
 
+// RenderBlockedBy turns the runs.blocked_by JSON column into
+// a single human-readable line for run_status. Phase 8.5
+// surface side: format/ stays free of any coordinator-side
+// dependency by parsing the JSON inline rather than importing
+// store.BlockedBy. The shape is small and stable enough that
+// duplication is cheaper than a cross-package coupling here.
+//
+// Returns an empty string for unparseable / empty input so
+// callers can unconditionally write the result without
+// guarding (the caller already gates on state == "waiting").
+//
+// Output forms (each leads with "Blocked by:"):
+//
+//	Blocked by: review of `task-id` (assigned: alice, since 2h ago)
+//	Blocked by: human claim — `task-id` (assigned: bob)
+//	Blocked by: artifact — `task-id` waiting on `path`
+//	Blocked by: stuck — <detail>
+func RenderBlockedBy(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b struct {
+		Kind         string `json:"kind"`
+		Task         string `json:"task"`
+		Assignee     string `json:"assignee"`
+		Since        string `json:"since"`
+		AwaitingPath string `json:"awaiting_path"`
+		Detail       string `json:"detail"`
+	}
+	// Inline struct mirrors store.BlockedBy field-for-field;
+	// keep the two in sync — adding a field there means
+	// adding it here AND in the switch below.
+	if err := json.Unmarshal([]byte(raw), &b); err != nil {
+		return ""
+	}
+	switch b.Kind {
+	case "review":
+		bits := []string{}
+		if b.Assignee != "" {
+			bits = append(bits, "assigned: "+b.Assignee)
+		}
+		if since := humanizeSince(b.Since); since != "" {
+			bits = append(bits, "since "+since)
+		}
+		out := fmt.Sprintf("Blocked by: review of `%s`", b.Task)
+		if len(bits) > 0 {
+			out += " (" + strings.Join(bits, ", ") + ")"
+		}
+		return out
+	case "human_claim":
+		out := fmt.Sprintf("Blocked by: human claim — `%s`", b.Task)
+		if b.Assignee != "" {
+			out += " (assigned: " + b.Assignee + ")"
+		}
+		return out
+	case "artifact":
+		return fmt.Sprintf("Blocked by: artifact — `%s` waiting on `%s`", b.Task, b.AwaitingPath)
+	case "stuck":
+		out := "Blocked by: stuck"
+		if b.Detail != "" {
+			out += " — " + b.Detail
+		}
+		return out
+	default:
+		return ""
+	}
+}
+
+// humanizeSince renders an RFC3339 timestamp as a relative
+// duration ("2h ago", "5m ago", "3d ago"). Used by
+// RenderBlockedBy for the review-blocker since field — the
+// operator wants "how long has this been stuck" at a glance,
+// not a literal timestamp. Empty input or unparseable
+// timestamp folds to empty so the caller's join skips it.
+func humanizeSince(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ""
+	}
+	d := time.Since(t)
+	if d < 0 {
+		return ""
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours())/24)
+	}
+}
+
 func ProjectMemberList(data []byte, projectID int64) string {
 	var members []map[string]interface{}
 	if err := json.Unmarshal(data, &members); err != nil {
@@ -1543,7 +1642,23 @@ func RunStatus(runData []byte, tasksData []byte, viewer ...string) string {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString(progressLine + "\n")
-	b.WriteString(fmt.Sprintf("%s\n\n", ProgressBar(done, total, 30)))
+	b.WriteString(fmt.Sprintf("%s\n", ProgressBar(done, total, 30)))
+	// Phase 8.5 — surface the WAITING blocker reason when the
+	// run is stuck. The coord populates runs.blocked_by JSON
+	// at the moment of the WAITING transition (see
+	// store.computeBlockedBy); the renderer reads it and
+	// turns it into a single human-actionable line so the
+	// operator can see "blocked by review of foo (assigned:
+	// alice, since 2h ago)" without clicking through to a
+	// detail screen.
+	if state == "waiting" {
+		if blockedRaw, _ := run["blocked_by"].(string); blockedRaw != "" {
+			if line := RenderBlockedBy(blockedRaw); line != "" {
+				b.WriteString(line + "\n")
+			}
+		}
+	}
+	b.WriteString("\n")
 
 	// Failed tasks at top — needs immediate attention.
 	var failedTasks []map[string]interface{}

@@ -26,6 +26,7 @@ func ToRunResponse(r store.RunRecord, taskCount int) RunResponse {
 		CreatedAt:       r.CreatedAt,
 		SourcePath:      r.SourcePath,
 		SourceCommitSHA: r.SourceCommitSHA,
+		BlockedBy:       r.BlockedBy,
 	}
 }
 

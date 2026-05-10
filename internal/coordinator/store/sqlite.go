@@ -647,6 +647,19 @@ func (s *Store) initSchema() error {
 		// the next claim — acceptable under the "no upgrade
 		// path for existing data" pre-launch contract.
 		`ALTER TABLE task_claims ADD COLUMN iter_seq INTEGER NOT NULL DEFAULT 0`,
+		// Phase 8.5 — JSON blob describing why a WAITING run
+		// can't make progress. Populated by applyCompleteRun
+		// at the moment of the active|whatever → waiting
+		// transition; cleared when the run leaves waiting.
+		// One of:
+		//   {kind:"review",       task, assignee, since}
+		//   {kind:"human_claim",  task, assignee}
+		//   {kind:"artifact",     task, awaiting_path}
+		//   {kind:"stuck",        detail}
+		// Nullable on purpose — non-WAITING runs have no
+		// blocker. Surface readers (enju_run_status) check
+		// state==waiting before reading the column.
+		`ALTER TABLE runs ADD COLUMN blocked_by TEXT`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -852,7 +865,7 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 // ListRunsByProject returns all runs in a project, ordered by seq.
 func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, created_at, updated_at
 		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
 	)
 	if err != nil {
@@ -863,11 +876,12 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	var runs []RunRecord
 	for rows.Next() {
 		var r RunRecord
-		var ref sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		var ref, blocked sql.NullString
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Ref = ref.String
+		r.BlockedBy = blocked.String
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
@@ -980,34 +994,36 @@ func (s *Store) ListProjectsForCitizen(citizenID int64) ([]ProjectRecord, error)
 // GetRun retrieves a run by its global ID.
 func (s *Store) GetRun(id int64) (*RunRecord, error) {
 	var p RunRecord
-	var ref sql.NullString
+	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at FROM runs WHERE id = ?`, id,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	p.Ref = ref.String
+	p.BlockedBy = blocked.String
 	return &p, err
 }
 
 // GetRunByProjectSeq retrieves a run by (project_id, seq).
 func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error) {
 	var p RunRecord
-	var ref sql.NullString
+	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	p.Ref = ref.String
+	p.BlockedBy = blocked.String
 	return &p, err
 }
 
 func (s *Store) ListRuns() ([]RunRecord, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at FROM runs ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, created_at, updated_at FROM runs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,11 +1032,12 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	var runs []RunRecord
 	for rows.Next() {
 		var p RunRecord
-		var ref sql.NullString
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		var ref, blocked sql.NullString
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Ref = ref.String
+		p.BlockedBy = blocked.String
 		runs = append(runs, p)
 	}
 	return runs, rows.Err()
@@ -1043,13 +1060,13 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 // ActiveRunOnBranch for callsite stability.
 func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, error) {
 	var r RunRecord
-	var ref sql.NullString
+	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND branch = ? AND state IN ('active', 'waiting', 'paused')
 		 ORDER BY seq ASC LIMIT 1`,
 		projectID, branch,
-	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &r.CreatedAt, &r.UpdatedAt)
+	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.CreatedAt, &r.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1057,6 +1074,7 @@ func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, e
 		return nil, err
 	}
 	r.Ref = ref.String
+	r.BlockedBy = blocked.String
 	return &r, nil
 }
 

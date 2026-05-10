@@ -2017,8 +2017,31 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 		return next == RunCompleted, nil
 	}
 	now := time.Now()
-	if _, err := tx.Exec(`UPDATE runs SET state = ?, updated_at = ? WHERE id = ?`, next, now, m.RunID); err != nil {
-		return false, err
+	// Phase 8.5 — runs.blocked_by tracks why a WAITING run
+	// can't progress. Compute on entry to WAITING; clear on
+	// exit. The column rides the same UPDATE as the state
+	// flip so a reader who sees state=waiting always sees a
+	// matching blocker (or NULL on the rare "stuck but
+	// unclassifiable" path), and a reader who sees a non-
+	// WAITING state never sees a stale blocker.
+	if next == RunWaiting {
+		blocker, berr := computeBlockedBy(tx, m.RunID)
+		if berr != nil {
+			return false, berr
+		}
+		if _, err := tx.Exec(
+			`UPDATE runs SET state = ?, blocked_by = ?, updated_at = ? WHERE id = ?`,
+			next, blocker, now, m.RunID,
+		); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err := tx.Exec(
+			`UPDATE runs SET state = ?, blocked_by = NULL, updated_at = ? WHERE id = ?`,
+			next, now, m.RunID,
+		); err != nil {
+			return false, err
+		}
 	}
 	// Stage a lifecycle event for post-commit emission. citizen
 	// 0 = system (not initiated by a specific actor — these
