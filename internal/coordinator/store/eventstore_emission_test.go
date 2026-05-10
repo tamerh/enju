@@ -81,6 +81,20 @@ func claimAndSubmit(t *testing.T, s *Store, runID int64, citizenID int64,
 	}}); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
+	// Phase 8.3 — RecordSubmission lands the task in SUBMITTED;
+	// the test helper drives the SUBMITTED → ACCEPTED transition
+	// inline so tests asserting end state and task_completed
+	// emission see the same shape they did pre-Phase-8.3.
+	// Production code routes this transition through
+	// service.acceptTask (called inline when no merge is needed,
+	// or from the /merges handler after the fat-client confirms
+	// a topic merge); the helper inlines it so store-package
+	// tests don't need a service-layer dependency.
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: taskID, NewState: TaskAccepted},
+	}}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
 	return taskID, branch
 }
 

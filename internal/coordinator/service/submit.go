@@ -145,12 +145,92 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	submitterID := core.SubmitterID
 
 	// Step 5. Apply review/vote resolution + fire cascades.
+	// Phase 8.3 ordering note: tally-resolve plans land FIRST
+	// so the submitting task's post-tally state is observable
+	// before we decide whether to inline-accept it (Step 5b).
+	// Inline-accept must precede the rejection/skip cascades
+	// because those walk descendants and would otherwise sweep
+	// a still-SUBMITTED submitting task into SKIPPED. Pre-
+	// Phase-8.3 the submit transition was directly to ACCEPTED,
+	// which the cascade's terminal filter excluded — same
+	// invariant restored here by accepting BEFORE the cascade.
 	var rejectResult *RemediationOrInvalidation
 	var skipResult *SkipCascadeResult
 	if actions != nil {
 		if actions.ReviewResolvePlan != nil {
 			c.Store.ApplyPlan(*actions.ReviewResolvePlan)
 		}
+		if actions.VoteResolvePlan != nil {
+			c.Store.ApplyPlan(*actions.VoteResolvePlan)
+		}
+	}
+
+	// Step 5b. Compute merge views + decide inline-accept.
+	// Inline-accept fires when the submitting task is in
+	// SUBMITTED, has no merge view of its own (suppressed for
+	// rejection verdicts, or non-applicable for vote/comment),
+	// AND has no downstream review pending. The downstream-
+	// review check is what keeps a reviewed task in SUBMITTED
+	// across its own submit — its content rides in on the
+	// review's merge later, so flipping ACCEPTED here would
+	// fan downstream out before the run-branch carries the
+	// content (the silent-cascade-stall bug). collectAcceptedMerges
+	// already encodes the "skip my merge" rule on its output,
+	// but checking taskHasDownstreamReview directly is cheaper
+	// than scanning the merge list and survives the rare case
+	// where collectAcceptedMerges has no entry yet still wants
+	// to wait (legacy/multi-citizen review-without-topic).
+	merges := c.collectAcceptedMerges(taskID, task, actions, run.Branch)
+	fresh, _ := c.Store.GetTask(taskID)
+	if fresh == nil {
+		fresh = task
+	}
+	selfHasMergeView := false
+	for _, m := range merges {
+		if m.TaskID == taskID {
+			selfHasMergeView = true
+			break
+		}
+	}
+	reachedTerminalGood := store.TaskState(fresh.State) == store.TaskSubmitted
+
+	var readied []store.ReadiedTask
+	var completed bool
+	if reachedTerminalGood && !selfHasMergeView && !c.taskHasDownstreamReview(fresh) {
+		acceptRes, acceptErr := c.acceptTask(fresh, "")
+		if acceptErr != nil {
+			c.Logger.Error("inline acceptTask after submit", "task_id", taskID, "error", acceptErr)
+		} else {
+			readied = acceptRes.ReadiedTasks
+			completed = acceptRes.RunCompleted
+		}
+	} else if reachedTerminalGood {
+		// Phase 8.3 — task reached SUBMITTED but isn't being
+		// inline-accepted (merge pending OR has downstream
+		// review). Fire the readiness cascade anyway so
+		// reviewer tasks observe their target as SUBMITTED and
+		// move PENDING → READY. Without this, a single-citizen
+		// reviewed task would land in SUBMITTED with the
+		// reviewer stuck in PENDING — no /merges call has
+		// fired (the review hasn't happened yet) and the
+		// reviewer can't claim. The dep gate in
+		// applyUpdateReadyTasks now treats 'submitted' as a
+		// satisfied parent state, so this cascade is the
+		// trigger that activates that path.
+		cascadeRes, _ := c.Store.ApplyPlan(store.Plan{
+			Version:   engine.EngineVersion,
+			Mutations: []store.Mutation{},
+		}.AppendCascade(task.RunID))
+		if cascadeRes.ReadiedTasks != nil {
+			readied = cascadeRes.ReadiedTasks
+		}
+	}
+
+	// Step 5c — rejection / skip cascades. Fire AFTER inline-
+	// accept so the submitting task is in ACCEPTED (or still
+	// SUBMITTED for the downstream-review path) before
+	// PerformInvalidate / PerformFailCascade walks descendants.
+	if actions != nil {
 		if actions.ShouldRejectTarget && actions.RejectTargetID != "" {
 			// emit task_request_changes BEFORE the
 			// remediation/invalidate branches so audit
@@ -234,9 +314,6 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 				}
 			}
 		}
-		if actions.VoteResolvePlan != nil {
-			c.Store.ApplyPlan(*actions.VoteResolvePlan)
-		}
 		// Phase 6c — review approve closes the upstream's
 		// claim with outcome=completed. Detected as "this is
 		// a review submit AND neither rejection flag is set."
@@ -280,47 +357,26 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 		}
 	}
 
-	// Step 7. Ready-task sweep + run completion.
-	// Fire the cascade as a dedicated plan through ApplyPlan so
-	// the single emit site (applyUpdateReadyTasks) handles it —
-	// step 5's review/vote-resolve plans + step 6's
-	// materialization may all have left tasks newly-ready, but
-	// none of them appended the cascade individually because we
-	// want ONE cascade after the whole sequence, not one per
-	// intermediate plan (avoids duplicate task_ready events for
-	// tasks that briefly looked ready then resolved further).
-	// Cascade + run-state evaluation in one plan: the readiness
-	// pass fires task_ready for any newly-promoted tasks; the
-	// CompleteRun re-evaluates the run's state from the
-	// resulting task counts (active / idle / completed). One tx,
-	// one drain.
-	cascadeResult, _ := c.Store.ApplyPlan(store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.CompleteRun{RunID: task.RunID},
-		},
-	}.AppendCascade(task.RunID))
-	readied := cascadeResult.ReadiedTasks
-	completed := cascadeResult.RunCompleted
-
-	// Step 7b. Living-workflow phase 4c — auto-triage hook on
-	// idle. CheckAndCompleteRun returns true only on the
-	// active|idle → completed edge; we still need to fire the
-	// idle hook on every transition that lands on idle.
-	if !completed {
-		c.MaybeAutoTriageIfIdle(task.RunID)
-	}
-
-	// Step 7c. Auto-close on accept (phase 4c). If this task
-	// was spawned by auto-triage to fix an issue, transition
-	// that issue to "closed" now that the fix landed.
-	if task.ClosesIssueSeq > 0 && submitOutcome.Resolved {
-		c.maybeAutoCloseIssue(task)
-	}
-
-	// Step 8. Build response.
+	// Step 8. Build response. Phase 8.3 moved the inline-accept
+	// + cascade-fire to Step 5b (before rejection cascades) and
+	// dropped the unconditional submit-time cascade — see those
+	// comments. Response shape just stitches together what
+	// Step 5b produced: `merges` for the fat-client to drive,
+	// `readied` + `completed` for surfaces that want to render
+	// the post-acceptance state without a re-fetch.
 	c.Logger.Info("result reported", "task_id", taskID, "path", resultPath, "commit", params.CommitSHA, "newly_ready", len(readied))
 
+	// Status semantics post-Phase-8.3:
+	//   submitted — the SUBMITTING task's merge is pending
+	//               (selfHasMergeView true). Fat-client drives
+	//               /merges to flip ACCEPTED.
+	//   accepted  — the submitting task is already in ACCEPTED
+	//               (inline-accept fired) OR its merge is going
+	//               to ride in on a different task's topic
+	//               (review-approve case where the upstream's
+	//               merge is in `merges` but the review itself
+	//               accepted inline).
+	//   collecting— multi-citizen mid-tally.
 	status := "accepted"
 	reviewTally := actions.ReviewTally
 	tallyOutcome := actions.VoteTally
@@ -328,6 +384,8 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	reviewStillCollecting := reviewTally != nil && !reviewTally.Resolved
 	if submitOutcome.Collecting && (voteStillCollecting || reviewStillCollecting || (tallyOutcome == nil && reviewTally == nil)) {
 		status = "collecting"
+	} else if reachedTerminalGood && selfHasMergeView {
+		status = "submitted"
 	}
 
 	resp := &SubmitResultResponse{
@@ -397,7 +455,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 		resp.RunCompleted = true
 	}
 
-	if merges := c.collectAcceptedMerges(taskID, task, actions, run.Branch); len(merges) > 0 {
+	if len(merges) > 0 {
 		resp.AcceptedMerges = merges
 		resp.ProjectID = run.ProjectID
 		resp.RunSeq = run.Seq
@@ -485,7 +543,7 @@ func (c *Coordinator) collectAcceptedMerges(
 	}
 	if !skipMergeOfSelf {
 		if cur, err := c.Store.GetTask(submittedTaskID); err == nil && cur != nil &&
-			store.TaskState(cur.State) == store.TaskAccepted {
+			store.TaskState(cur.State) == store.TaskSubmitted {
 			if t := c.acceptedMergeForTask(cur.ID, runBranch); t != nil {
 				out = append(out, *t)
 			}
@@ -517,7 +575,7 @@ func (c *Coordinator) collectAcceptedMerges(
 				if rt.InstanceKey != targetInstance {
 					continue
 				}
-				if store.TaskState(rt.State) != store.TaskAccepted {
+				if store.TaskState(rt.State) != store.TaskSubmitted {
 					continue
 				}
 				if t := c.acceptedMergeForTask(rt.ID, runBranch); t != nil {

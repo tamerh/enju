@@ -259,12 +259,19 @@ func (e *Engine) ComputePostSubmitActions(
 						actions.ShouldRejectTarget = true
 						actions.RejectTargetID = targetID
 					}
+					// Phase 8.3: tally resolves to SUBMITTED, not
+					// ACCEPTED. The tally-winning commit still
+					// needs to land on the run branch via the
+					// fat-client merge → /merges → acceptTask
+					// path, same shape as a single-citizen
+					// compute submit. ACCEPTED is the post-merge
+					// moment, not the post-tally moment.
 					actions.ReviewResolvePlan = &store.Plan{
 						Version: EngineVersion,
 						Mutations: []store.Mutation{
 							store.SetTaskState{
 								TaskID:    task.ID,
-								NewState:  store.TaskAccepted,
+								NewState:  store.TaskSubmitted,
 								CommitSHA: req.CommitSHA,
 							},
 						},
@@ -288,12 +295,19 @@ func (e *Engine) ComputePostSubmitActions(
 				if outcome.Resolved {
 					actions.ShouldSkipCascade = true
 					actions.WinningOption = outcome.WinningOption
+					// Phase 8.3: vote tally resolves to
+					// SUBMITTED, mirroring review tally above.
+					// The vote-resolved task's content (when it
+					// has any) still needs the merge step before
+					// becoming downstream-safe. acceptTask via
+					// /merges (or inline when the vote produces
+					// no merge view) lands the final ACCEPTED.
 					actions.VoteResolvePlan = &store.Plan{
 						Version: EngineVersion,
 						Mutations: []store.Mutation{
 							store.SetTaskState{
 								TaskID:     task.ID,
-								NewState:   store.TaskAccepted,
+								NewState:   store.TaskSubmitted,
 								VoteChoice: outcome.WinningOption,
 								CommitSHA:  req.CommitSHA,
 							},

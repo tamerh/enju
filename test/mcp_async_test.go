@@ -547,13 +547,23 @@ echo "content-at-$(date +%s%N)"
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 	})
-	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+	// Phase 8.3: gen has a downstream review (gate), so its
+	// merge is suppressed at submit time and the task stays
+	// in SUBMITTED until gate approves and /merges flips
+	// both. Pre-Phase-8.3 the task went directly to ACCEPTED
+	// at submit; the new "honest gate" semantic keeps it in
+	// SUBMITTED so downstream readiness queries don't fan
+	// out before the merge confirms.
+	if err := waitForTaskState(h, genID, "submitted", 5*time.Second); err != nil {
 		t.Fatalf("run1 accept: %v", err)
 	}
 
 	// Invalidate (models request_changes on the compute).
 	// A direct invalidate exercises the same state transition
-	// and sidesteps the review-submit plumbing.
+	// and sidesteps the review-submit plumbing. Phase 8.3
+	// extended applySetTaskState's clear-claim precondition
+	// to allow invalidating from SUBMITTED (was ACCEPTED|FAILED
+	// only) so this still works post-8.3.
 	h.callOK(t, "enju_invalidate_task", map[string]any{
 		"task_id": genID,
 		"reason":  "want rerun",
@@ -573,7 +583,7 @@ echo "content-at-$(date +%s%N)"
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 	})
-	if err := waitForTaskState(h, genID, "accepted", 5*time.Second); err != nil {
+	if err := waitForTaskState(h, genID, "submitted", 5*time.Second); err != nil {
 		t.Fatalf("run2 accept: %v", err)
 	}
 
@@ -725,7 +735,12 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 	})
-	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+	// Phase 8.3: compute_data has a downstream review, so its
+	// merge is suppressed at submit time. Stays in SUBMITTED
+	// until the review approves and /merges flips it; this
+	// test exercises the request_changes path so the task
+	// will be invalidated before reaching ACCEPTED.
+	if err := waitForTaskState(h, computeID, "submitted", 5*time.Second); err != nil {
 		t.Fatalf("run1 accept: %v", err)
 	}
 	compute1, _ := h.store.GetTask(computeID)
@@ -758,7 +773,7 @@ echo "computed-at-$(date +%s%N)" > "$ENJU_PROJECT_DIR/out/data.txt"
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 	})
-	if err := waitForTaskState(h, computeID, "accepted", 5*time.Second); err != nil {
+	if err := waitForTaskState(h, computeID, "submitted", 5*time.Second); err != nil {
 		t.Fatalf("run2 accept: %v", err)
 	}
 	compute2, _ := h.store.GetTask(computeID)

@@ -530,13 +530,25 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 
 	if m.ClearClaim {
 		// Invalidation-style transition. Validate preconditions:
-		// - Target (→READY): must be in ACCEPTED.
+		// - Target (→READY): must be ACCEPTED, SUBMITTED, or
+		//   FAILED. SUBMITTED added Phase 8.3 for the
+		//   request_changes path: a single-citizen reviewed
+		//   task is in SUBMITTED at the moment its reviewer
+		//   submits a request_changes verdict (the upstream
+		//   went through SUBMITTED instead of directly to
+		//   ACCEPTED), and PerformInvalidate must accept that
+		//   row to reset it for revision. Pre-Phase-8.3
+		//   ACCEPTED was the only "submission landed" terminal
+		//   so the precondition was tighter.
 		// - Descendant (→PENDING): skip if already PENDING
-		//  (no-op, not an error).
+		//   (no-op, not an error).
 		// - Descendant (→SKIPPED via fail-cascade): same clear
-		//  semantics as PENDING, but terminal.
-		if m.NewState == TaskReady && TaskState(currentState) != TaskAccepted && TaskState(currentState) != TaskFailed {
-			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted or failed)", m.TaskID, currentState)
+		//   semantics as PENDING, but terminal.
+		if m.NewState == TaskReady &&
+			TaskState(currentState) != TaskAccepted &&
+			TaskState(currentState) != TaskSubmitted &&
+			TaskState(currentState) != TaskFailed {
+			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted, submitted, or failed)", m.TaskID, currentState)
 		}
 		if m.NewState == TaskPending && TaskState(currentState) == TaskPending {
 			// Already pending — skip silently, matching the
@@ -695,18 +707,48 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 			})
 		} else if m.NewState == TaskAccepted && TaskState(currentState) != TaskAccepted {
 			var runID, projectID int64
-			var taskAction string
+			var taskAction, taskDefID, instanceKey string
 			var citizens int
+			var claimedBy sql.NullInt64
 			_ = tx.QueryRow(
-				`SELECT t.run_id, r.project_id, t.action, t.citizens
+				`SELECT t.run_id, r.project_id, t.action, t.task_def_id, t.instance_key, t.citizens, t.claimed_by
 				 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
 				m.TaskID,
-			).Scan(&runID, &projectID, &taskAction, &citizens)
+			).Scan(&runID, &projectID, &taskAction, &taskDefID, &instanceKey, &citizens, &claimedBy)
 			commit := m.CommitSHA
 			if commit == "" {
 				_ = tx.QueryRow(`SELECT COALESCE(commit_sha, '') FROM tasks WHERE id = ?`, m.TaskID).Scan(&commit)
 			}
-			sink.Emit(Event{
+			// "reviewed" flag: was this task subject to a
+			// downstream review? Mirrors the stayOpen check in
+			// applyRecordSubmission so the event metadata stays
+			// consistent across the SUBMITTED → ACCEPTED moment
+			// (single-citizen-unreviewed AND tally / review-
+			// approve paths now both fire from this branch).
+			reviewed := false
+			if taskAction != "review" {
+				target := BuildReviewsTargetKey(taskDefID, instanceKey)
+				var reviewerID sql.NullString
+				_ = tx.QueryRow(
+					`SELECT id FROM tasks WHERE run_id = ? AND action = 'review' AND reviews_target = ? LIMIT 1`,
+					runID, target,
+				).Scan(&reviewerID)
+				reviewed = reviewerID.Valid
+			}
+			// Phase 8.3 — stamp citizen attribution on the
+			// terminal-good event. Pre-Phase-8.3 task_completed
+			// fired from applyRecordSubmission with the
+			// submitter's m.CitizenID; the locus moved to here
+			// when the SUBMITTED → ACCEPTED transition was
+			// split out from RecordSubmission, but the attribution
+			// counter (CountByCitizenAndType in contributions.go)
+			// keys on event.citizen_id, not on metadata. Sourcing
+			// from tasks.claimed_by is correct for single-citizen
+			// (the only claimant submitted) and approximates for
+			// multi-citizen (the most-recent claim's owner —
+			// matches pre-Phase-8.3 attribution where the row
+			// reflected the tally-winning submission).
+			ev := Event{
 				EventType:    "task_completed",
 				EventSubtype: taskAction,
 				TaskID:       m.TaskID,
@@ -716,9 +758,14 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 					"commit_sha":  commit,
 					"citizens":    citizens,
 					"prior_state": currentState,
+					"reviewed":    reviewed,
 				}),
 				CreatedAt: time.Now(),
-			})
+			}
+			if claimedBy.Valid {
+				ev.CitizenID = claimedBy.Int64
+			}
+			sink.Emit(ev)
 		} else {
 			// Non-clear path covers many transitions: COLLECTING,
 			// FAILED tally, parking, restore, depends_on rewrite.
@@ -1357,12 +1404,22 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 	}
 
 	if citizens == 1 {
-		// Single-citizen: one submit → ACCEPTED at the task
-		// level (engine state machine, unchanged). The claim's
-		// outcome is conditional on whether a downstream
-		// review will weigh in.
+		// Single-citizen: one submit → SUBMITTED. The actual
+		// SUBMITTED → ACCEPTED transition lands later, either
+		// inline (no merge needed) or via the /merges handler
+		// after the fat-client confirms the topic merged onto
+		// the run branch. Phase 8.3: this is the "honest gate"
+		// — ACCEPTED now means "merge confirmed, downstream
+		// safe to fan out," not just "submission landed
+		// locally." See service.acceptTask for the closing
+		// sequence both call sites share.
+		//
+		// The claim's outcome is conditional on whether a
+		// downstream review will weigh in (stayOpen below) —
+		// orthogonal to the task-level state flip; a claim
+		// that closes here does NOT mean the task is accepted.
 		_, err := tx.Exec(
-			`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
+			`UPDATE tasks SET state = 'submitted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
 			now, m.ResultPath, m.CommitSHA, m.Decision, m.VoteChoice, m.TaskID,
 		)
 		if err != nil {
@@ -1404,10 +1461,21 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 			); err != nil {
 				return err
 			}
-			// Single-citizen, no pending review: this submit IS
-			// the terminal-good moment. Fire iteration_completed
-			// + task_completed together. Reviewed paths defer
-			// both to the review-approve handler in router.go.
+			// Phase 8.3: the citizen's iteration is complete at
+			// this moment (claim is closing here; their work is
+			// done). task_completed used to ride alongside, but
+			// the brief redefined it to fire on the terminal
+			// SUBMITTED → ACCEPTED transition — that's now a
+			// later moment (acceptTask, called inline or from
+			// the /merges handler). applySetTaskState's
+			// TaskAccepted branch emits task_completed when the
+			// flip lands, so removing the emission here doesn't
+			// drop the event; it just shifts WHEN it fires.
+			//
+			// iteration_completed stays here because it pairs
+			// with the claim row's outcome write — closing the
+			// claim IS the iteration ending, regardless of
+			// whether the task subsequently merges or fails.
 			sink.Emit(Event{
 				CitizenID:    m.CitizenID,
 				EventType:    "iteration_completed",
@@ -1419,21 +1487,6 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 					"iter_seq":         iterSeq.Int64,
 					"final_commit_sha": m.CommitSHA,
 					"action":           taskAction,
-				}),
-				CreatedAt: now,
-			})
-			sink.Emit(Event{
-				CitizenID:    m.CitizenID,
-				EventType:    "task_completed",
-				EventSubtype: taskAction,
-				TaskID:       m.TaskID,
-				RunID:        runID,
-				ProjectID:    projectID,
-				Metadata: MarshalMetadata(map[string]any{
-					"iter_seq":         iterSeq.Int64,
-					"commit_sha":       m.CommitSHA,
-					"reviewed":         false,
-					"estimated_tokens": m.EstimatedTokens,
 				}),
 				CreatedAt: now,
 			})

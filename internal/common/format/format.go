@@ -1887,6 +1887,16 @@ func RenderTemplateSummary(tasks []map[string]interface{}) string {
 			if n := info.byState["claimed"] + info.byState["running"]; n > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d in progress", n))
 			}
+			// Phase 8.3 — SUBMITTED is "submitted, awaiting
+			// merge confirmation." Renders as a distinct
+			// in-flight bucket so the operator can tell
+			// "claimed but stuck" (in progress) from "actually
+			// done with their work, just integrating" (the
+			// brief's silent-cascade-stall case made this
+			// distinction load-bearing).
+			if n := info.byState["submitted"]; n > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d ⏳ submitted", n))
+			}
 			if n := info.byState["collecting"]; n > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d collecting", n))
 			}

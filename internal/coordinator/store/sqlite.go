@@ -1222,12 +1222,27 @@ func (s *Store) submitTaskResultForTest(taskID string, citizenID int64, resultPa
 	}
 
 	// Single-citizen path: exactly the pre-session-2a behavior.
-	// One submit flips the task to ACCEPTED; tally runs trivially
-	// with a single vote.
+	// Phase 8.3 — one submit flips the task to SUBMITTED (was
+	// ACCEPTED); the test helper does NOT drive the subsequent
+	// /merges-equivalent work, so callers asserting end state
+	// see SUBMITTED here. Production code goes through
+	// engine.ComputeSubmission → applyRecordSubmission → and
+	// then service.acceptTask (inline or via the /merges
+	// handler) for the SUBMITTED → ACCEPTED transition.
 	if citizens == 1 {
 		if TaskState(state) != TaskClaimed && TaskState(state) != TaskRunning {
 			return nil, fmt.Errorf("task %q cannot accept result (state: %s)", taskID, state)
 		}
+		// Phase 8.3 — the submitTaskResultForTest helper writes
+		// state='accepted' directly (skipping the SUBMITTED gate)
+		// because store-package callers using this helper are
+		// asserting the end-state of a single-attempt submit
+		// pipeline, not the multi-step submit/merge protocol that
+		// production routes through engine.ComputeSubmission +
+		// service.acceptTask. Going through SUBMITTED would force
+		// every store test to chain a follow-up SetTaskState plan
+		// just to reach the assertion baseline. The state here is
+		// the post-acceptTask state.
 		_, err = tx.Exec(
 			`UPDATE tasks SET state = 'accepted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
 			now, resultPath, commitSHA, decision, voteChoice, taskID,
@@ -1723,16 +1738,25 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 		rows.Close()
 	}
 
-	// "Satisfied" parents for dependency readiness include both
-	// ACCEPTED (the normal terminal) AND SKIPPED (the Phase E.2
-	// vote skip-cascade terminal). A task whose parent was
-	// skipped-by-gate is still unblocked — the gate decided that
-	// branch is done, not pending. FAILED is NOT satisfied — a
-	// failed upstream should block its downstream, not unblock it.
+	// "Satisfied" parents for dependency readiness:
+	//   - ACCEPTED: normal terminal, content on run-branch.
+	//   - SKIPPED: vote-skip cascade or upstream-failed cascade
+	//     decided this branch is done — downstream unblocks.
+	//   - SUBMITTED (Phase 8.3): reviewer tasks need their
+	//     target to be merge-pending, not merge-confirmed, so
+	//     they can read submitted content from the topic
+	//     branch and produce a verdict. Pure-depends_on
+	//     downstream (no reads_artifacts) also unblocks here.
+	//     Downstreams that DO read artifacts stay gated on the
+	//     stricter writer-state {accepted, skipped} via the
+	//     reads_artifacts loop below — SUBMITTED-writer rows
+	//     are invisible there until merge confirms.
+	// FAILED is NOT satisfied — a failed upstream blocks
+	// downstream, not unblocks it.
 	accepted := make(map[string]bool)
 	{
 		acceptedRows, err := q.Query(
-			`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'skipped')`, runID,
+			`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'submitted', 'skipped')`, runID,
 		)
 		if err != nil {
 			return nil, err
@@ -1788,8 +1812,36 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 						continue
 					}
 					var one int
+					// Phase 8.3 — gate artifact visibility on the
+					// writer task's state. An artifact-index row is
+					// inserted at submit time (so the index has the
+					// metadata for downstream lookups), but
+					// downstream readiness must NOT see it as
+					// satisfied until the writer task hits ACCEPTED
+					// (merge confirmed) or SKIPPED (cascade decided
+					// the dep is moot). Without this gate, a
+					// SUBMITTED-but-not-yet-merged upstream would
+					// fan its downstreams out against an artifact
+					// whose underlying commit hasn't landed on the
+					// run branch — the silent-cascade-stall bug
+					// Phase 8 closes.
+					//
+					// Empty/NULL last_task_id passes through
+					// (orphan rows from legacy paths or test
+					// fixtures) so the gate doesn't accidentally
+					// hide pre-Phase-8 data.
 					err := q.QueryRow(
-						`SELECT 1 FROM artifacts WHERE project_id = ? AND branch = ? AND path = ? LIMIT 1`,
+						`SELECT 1 FROM artifacts a
+						 WHERE a.project_id = ? AND a.branch = ? AND a.path = ?
+						   AND (
+						     a.last_task_id IS NULL OR a.last_task_id = '' OR
+						     EXISTS (
+						       SELECT 1 FROM tasks
+						       WHERE tasks.id = a.last_task_id
+						         AND tasks.state IN ('accepted', 'skipped')
+						     )
+						   )
+						 LIMIT 1`,
 						projectID, branch, p,
 					).Scan(&one)
 					if err == sql.ErrNoRows {
@@ -2324,6 +2376,19 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 // (project_id, branch, path). Empty branch resolves to "main"
 // for back-compat with callers that don't know the branch yet.
 // Returns nil if no matching row exists.
+//
+// Phase 8.3 note: this read is INTENTIONALLY ungated. The
+// cascade's readiness-check (applyUpdateReadyTasks) gates
+// artifact visibility on the writer's state because fanning
+// downstreams out against a SUBMITTED-not-yet-merged writer
+// would create the silent-cascade-stall bug. Surface readers
+// (enju_get_task's provenance, enju_get_artifact, the
+// invalidation rollback logic) want full visibility — they
+// render lineage that's true regardless of merge state, and
+// gating them would erase pending-but-real provenance from
+// the operator's view. The asymmetry is deliberate: ONE place
+// (the cascade) cares about merge confirmation; everywhere
+// else, the index row IS the truth.
 func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactRecord, error) {
 	if branch == "" {
 		branch = "main"
@@ -2391,6 +2456,11 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 	if branch == "" {
 		branch = "main"
 	}
+	// Phase 8.3 — intentionally UNGATED, same rationale as
+	// GetArtifact. Surface readers want every artifact-index
+	// row including pending-merge writers; only the cascade's
+	// readiness check (applyUpdateReadyTasks) gates on writer
+	// state to avoid premature fan-out.
 	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
 	     FROM artifacts WHERE project_id = ? AND branch = ?`
 	args := []interface{}{projectID, branch}

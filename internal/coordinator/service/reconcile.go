@@ -150,23 +150,25 @@ func (c *Coordinator) ReconcileTask(caller *store.CitizenRecord, entry Reconcile
 		res.Error = aerr.Error()
 		return res
 	}
-	// Ready-task sweep. Without this, any downstream whose only
-	// remaining blocker was this task stays in PENDING. Errors
-	// logged-and-swallowed (the same pattern the sync path uses)
-	// since a sweep failure mid-flight still leaves the
-	// submission applied correctly. Fired through ApplyPlan so
-	// the single emit site (applyUpdateReadyTasks) handles it —
-	// AcceptComputeTaskCore's submit plan doesn't itself include
-	// the cascade.
-	// Cascade + run-state evaluation in one plan: same shape
-	// as submit.go's step 7 — one tx, one drain.
-	if _, uerr := c.Store.ApplyPlan(store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.CompleteRun{RunID: task.RunID},
-		},
-	}.AppendCascade(task.RunID)); uerr != nil {
-		c.Logger.Warn("reconcile ready-sweep", "task_id", task.ID, "run_id", task.RunID, "error", uerr)
+	// Phase 8.3: the batch reconcile path scans commits already
+	// ON the run branch — by definition the merge has confirmed
+	// before the trailer is observable. Skip the SUBMITTED gate
+	// and accept inline. This is distinct from the sync submit
+	// (/tasks/:id/result) path, where the topic still needs a
+	// fat-client-driven merge → /merges round-trip; here the
+	// merge has happened in git already and the trailer is just
+	// catching the coord's state up.
+	//
+	// AcceptComputeTaskCore left the task in SUBMITTED;
+	// acceptTask flips it to ACCEPTED + fires the cascade. Re-
+	// fetch so we hand acceptTask the post-submit row (with
+	// commit_sha + submitted_at populated by RecordSubmission).
+	fresh, _ := c.Store.GetTask(task.ID)
+	if fresh == nil {
+		fresh = task
+	}
+	if _, aerr := c.acceptTask(fresh, ""); aerr != nil {
+		c.Logger.Warn("reconcile inline-accept", "task_id", task.ID, "run_id", task.RunID, "error", aerr)
 	}
 	res.Status = "accepted"
 	return res

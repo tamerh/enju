@@ -520,7 +520,7 @@ func (s *Server) handleReportMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	caller := citizenFromRequest(r)
-	resp, err := service.ReportMerge(s.store, caller, projectID, runSeq, service.ReportMergeParams{
+	resp, err := service.ReportMerge(s.coord, caller, projectID, runSeq, service.ReportMergeParams{
 		TopicBranch: req.TopicBranch,
 		RunBranch:  req.RunBranch,
 		MergeSHA:  req.MergeSHA,

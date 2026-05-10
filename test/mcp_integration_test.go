@@ -915,8 +915,13 @@ func TestMCPRunStatusRendersTreeWithMixedStates(t *testing.T) {
 	})
 	text := mcpText(res)
 
+	// Phase 8.3 — draft is in SUBMITTED (waiting for check's
+	// review-approve + /merges). Pre-Phase-8.3 it would have
+	// been ACCEPTED at submit and shown ✅ + "Progress 1/3";
+	// the new semantic is "submitted, integration pending"
+	// rendered with the ⏳ glyph and not yet counted as done.
 	wantMarkers := map[string]string{
-		"accepted checkmark (✅)":  "✅",
+		"submitted hourglass (⏳)": "⏳",
 		"available summary word":  "available",
 		"waiting summary word":    "waiting",
 		"your-queue claim icon 🟡": "🟡",
@@ -935,9 +940,9 @@ func TestMCPRunStatusRendersTreeWithMixedStates(t *testing.T) {
 		}
 	}
 
-	// Progress line must report the done/total fraction.
-	if !strings.Contains(text, "Progress: 1/3") {
-		t.Errorf("expected 'Progress: 1/3' after one of three tasks accepted, got:\n%s", text)
+	// Progress line shows 0/3: SUBMITTED isn't a done state.
+	if !strings.Contains(text, "Progress: 0/3") {
+		t.Errorf("expected 'Progress: 0/3' (Phase 8.3: SUBMITTED is in flight, not done), got:\n%s", text)
 	}
 
 }
@@ -4063,9 +4068,13 @@ tasks:
 	}
 	// Sibling iteration unaffected — data's gate is still
 	// waiting for review, and its downstream is still
-	// legitimately pending.
-	if got := h.taskGet("data:scan")["state"]; got != "accepted" {
-		t.Errorf("data:scan should stay accepted (sibling iteration unaffected), got %v", got)
+	// legitimately pending. Phase 8.3: data:scan is in
+	// SUBMITTED (its downstream review hasn't approved yet,
+	// so the merge that would land its content on the run
+	// branch hasn't fired). Pre-Phase-8.3 it would have been
+	// ACCEPTED at submit time.
+	if got := h.taskGet("data:scan")["state"]; got != "submitted" {
+		t.Errorf("data:scan should stay submitted (sibling iteration unaffected), got %v", got)
 	}
 	if got := h.taskGet("data:gate")["state"]; got != "ready" {
 		t.Errorf("data:gate should stay ready for its own reviewer, got %v", got)
@@ -9098,8 +9107,8 @@ tasks:
 	if got := h.taskGet("alpha:expand")["state"]; got != "ready" {
 		t.Errorf("bug 3: expand:alpha should be READY after request_changes, got %v", got)
 	}
-	if got := h.taskGet("beta:expand")["state"]; got != "accepted" {
-		t.Errorf("bug 3: expand:beta should stay accepted (only alpha bounced), got %v", got)
+	if got := h.taskGet("beta:expand")["state"]; got != "submitted" {
+		t.Errorf("bug 3: expand:beta should stay submitted (only alpha bounced; Phase 8.3 leaves the upstream in SUBMITTED until the per-instance review approves and /merges flips it to ACCEPTED), got %v", got)
 	}
 	if got := h.taskGet("alpha:check")["state"]; got == "accepted" {
 		t.Errorf("bug 3: check:alpha should NOT stay accepted after cascade, got %v", got)
@@ -10256,11 +10265,16 @@ tasks:
 		t.Errorf("beta:expand should be READY after request_changes on beta:check, got %q", got)
 	}
 	// alpha side must be unaffected by beta's cascade.
-	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "accepted" {
-		t.Errorf("alpha:expand should remain accepted, got %q", got)
+	// Phase 8.3: alpha:expand is in SUBMITTED (its review
+	// approved and the merge would land both via /merges, but
+	// this test doesn't drive the fat-client merge flow — it
+	// stops at coord state). alpha:check went through the
+	// inline-accept path so it's ACCEPTED.
+	if got, _ := h.taskGet("alpha:expand")["state"].(string); got != "submitted" {
+		t.Errorf("alpha:expand should remain submitted (review approved but merge not yet driven), got %q", got)
 	}
-	if got, _ := h.taskGet("alpha:check")["state"].(string); got != "accepted" {
-		t.Errorf("alpha:check should remain accepted, got %q", got)
+	if got, _ := h.taskGet("alpha:check")["state"].(string); got != "submitted" && got != "accepted" {
+		t.Errorf("alpha:check should remain submitted or accepted, got %q", got)
 	}
 
 }
