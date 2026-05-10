@@ -62,9 +62,6 @@ const (
 	TaskRunning  TaskState = "running"
 	TaskSubmitted TaskState = "submitted"
 	TaskAccepted  TaskState = "accepted"
-	TaskRejected  TaskState = "rejected"
-	TaskInvalid  TaskState = "invalid"
-	TaskInvalidated TaskState = "invalidated"
 	// TaskCollecting is Phase E.2 session 2a's intermediate state
 	// for multi-citizen tasks. A task with `citizens: N > 1`
 	// enters COLLECTING on first submission and stays there until
