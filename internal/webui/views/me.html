@@ -1,0 +1,108 @@
+{{define "title"}}Me · Enju{{end}}
+
+{{define "main"}}
+<header class="task-header">
+  <h1>{{if .Dashboard}}{{.Dashboard.Citizen.Name}}{{else}}@{{.Username}}{{end}}</h1>
+  {{if .Dashboard}}
+  <p class="muted">
+    @{{.Dashboard.Citizen.Username}}
+    {{if .Dashboard.Citizen.Role}}· role: {{.Dashboard.Citizen.Role}}{{end}}
+    {{if .Dashboard.Citizen.Kind}}· kind: {{.Dashboard.Citizen.Kind}}{{end}}
+    {{if .Dashboard.Citizen.RegisteredAt}}· joined {{.Dashboard.Citizen.RegisteredAt}}{{end}}
+  </p>
+  {{end}}
+</header>
+
+{{if .Saved}}
+<div class="banner banner-success">Profile updated. Name: {{.Saved.Name}}; email: {{if .Saved.Email}}{{.Saved.Email}}{{else}}(unset){{end}}.</div>
+{{end}}
+
+<section x-data="{editing: {{if .Error}}true{{else}}false{{end}}}">
+  <h2>Profile</h2>
+  <p class="btn-row">
+    <button type="button" class="btn" x-show="!editing" @click="editing = true">Edit profile</button>
+  </p>
+
+  <form x-show="editing" x-cloak
+        method="POST" action="/me/profile"
+        hx-post="/me/profile"
+        hx-target="#main"
+        class="submit-form">
+    {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+    <label>
+      <span>Display name</span>
+      <input type="text" name="name" maxlength="200"
+             value="{{if .Submitted.Name}}{{.Submitted.Name}}{{else if .Dashboard}}{{.Dashboard.Citizen.Name}}{{end}}"
+             placeholder="How your name shows up in commits + dashboards">
+    </label>
+    <label>
+      <span>Email <span class="muted small">(used for git author line; optional)</span></span>
+      <input type="email" name="email"
+             value="{{if .Submitted.Email}}{{.Submitted.Email}}{{end}}"
+             placeholder="you@example.com">
+    </label>
+    <div class="btn-row">
+      <button type="submit" class="btn btn-primary">Save</button>
+      <button type="button" class="btn" @click="editing = false">Cancel</button>
+    </div>
+  </form>
+</section>
+
+{{if .Dashboard}}
+<section>
+  <h2>Active claims</h2>
+  {{if .Dashboard.ActiveTasks}}
+  <ul class="task-list-compact">
+    {{range .Dashboard.ActiveTasks}}
+    <li>
+      <a href="/p/{{.RunID}}/t/{{.ID}}"><code>{{.ID}}</code></a>
+      <span class="muted small">seq {{.Seq}}</span>
+    </li>
+    {{end}}
+  </ul>
+  <p class="muted small">
+    {{len .Dashboard.ActiveTasks}} task(s) currently in progress.
+    Note: links use the run's internal id; for cross-project context
+    open the corresponding project page.
+  </p>
+  {{else}}
+  <p class="muted">No active claims.</p>
+  {{end}}
+</section>
+
+<section>
+  <h2>Recent completions</h2>
+  {{if .Dashboard.RecentTasks}}
+  <ul class="task-list-compact">
+    {{range .Dashboard.RecentTasks}}
+    <li>
+      <a href="/p/{{.RunID}}/t/{{.ID}}"><code>{{.ID}}</code></a>
+      <span class="muted small">seq {{.Seq}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="muted">No completed tasks yet.</p>
+  {{end}}
+</section>
+{{end}}
+
+{{if .Contributions}}
+<section>
+  <h2>Contributions</h2>
+  <dl class="meta-list">
+    <div><dt>Tasks completed</dt><dd>{{.Contributions.TasksCompleted}}</dd></div>
+    <div><dt>Tasks rejected</dt><dd>{{.Contributions.TasksRejected}}</dd></div>
+    <div><dt>Tasks timed out</dt><dd>{{.Contributions.TasksTimedOut}}</dd></div>
+    <div><dt>Tasks released</dt><dd>{{.Contributions.TasksReleased}}</dd></div>
+    <div><dt>Reviews given</dt><dd>{{.Contributions.ReviewsGiven}} ({{.Contributions.ReviewApproves}} approve / {{.Contributions.ReviewRejects}} reject)</dd></div>
+    <div><dt>Votes cast</dt><dd>{{.Contributions.VotesCast}}</dd></div>
+    <div><dt>Runs created</dt><dd>{{.Contributions.RunsCreated}}</dd></div>
+    <div><dt>Tokens contributed</dt><dd>{{.Contributions.TokensTotal}}</dd></div>
+    <div><dt>Projects</dt><dd>{{.Contributions.ProjectCount}} total · {{.Contributions.ProjectsThisMonth}} new this month</dd></div>
+    <div><dt>Total contributions</dt><dd>{{.Contributions.TotalContributions}} events</dd></div>
+    <div><dt>Downstream impact</dt><dd>{{.Contributions.DownstreamImpact.Tasks}} task(s) across {{.Contributions.DownstreamImpact.Projects}} project(s) reading my outputs</dd></div>
+  </dl>
+</section>
+{{end}}
+{{end}}

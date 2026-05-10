@@ -1,0 +1,40 @@
+{{define "title"}}{{.Path}} · artifact · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/artifacts">artifacts</a>
+  <span> / </span>
+  <span><code>{{.Path}}</code></span>
+</nav>
+
+<header class="task-header">
+  <h1><code>{{.Path}}</code></h1>
+  <p class="btn-row">
+    <a class="btn" href="/p/{{.ProjectID}}/artifacts/history/{{.Path}}">History</a>
+  </p>
+</header>
+
+<section>
+  <h2>Metadata</h2>
+  <dl class="meta-list">
+    {{with index .Meta "commit_sha"}}{{if .}}<div><dt>Commit</dt><dd><code>{{slice . 0 12}}</code></dd></div>{{end}}{{end}}
+    {{with index .Meta "last_writer"}}{{if .}}<div><dt>Last writer</dt><dd>@{{.}}</dd></div>{{end}}{{end}}
+    {{with index .Meta "last_task_id"}}{{if .}}<div><dt>Last task</dt><dd><a href="/p/{{$.ProjectID}}/t/{{.}}"><code>{{.}}</code></a></dd></div>{{end}}{{end}}
+    {{with index .Meta "updated_at"}}{{if .}}<div><dt>Updated</dt><dd class="muted small">{{.}}</dd></div>{{end}}{{end}}
+    {{with index .Meta "tracked"}}<div><dt>Tracked</dt><dd>{{if .}}yes{{else}}no (kept out of git){{end}}</dd></div>{{end}}
+  </dl>
+</section>
+
+<section>
+  <h2>Content</h2>
+  {{if .Content}}
+  <pre class="result-content">{{.Content}}</pre>
+  {{else}}
+  <p class="muted">(empty or untracked — content lives only on the producing citizen's disk; pull from <code>$ENJU_SHARED_ROOT</code> if configured, otherwise unavailable here)</p>
+  {{end}}
+</section>
+{{end}}

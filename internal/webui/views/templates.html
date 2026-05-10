@@ -1,0 +1,53 @@
+{{define "title"}}Templates · project #{{.ProjectID}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <span>templates</span>
+</nav>
+
+<header class="task-header">
+  <h1>Templates</h1>
+  <p class="muted">
+    Reusable run recipes that live in this project's repo at
+    <code>enju/templates/&lt;bundle&gt;/</code>.
+    Pick one to see its declared parameters and create a new run from it.
+  </p>
+</header>
+
+{{if .Templates}}
+<section>
+  <ul class="template-list">
+    {{range .Templates}}
+    <li class="template-card">
+      <a href="/p/{{$.ProjectID}}/templates/show/{{.Path}}">
+        <strong>{{if .Name}}{{.Name}}{{else}}{{.Path}}{{end}}</strong>
+        <span class="meta"><code>{{.Path}}</code></span>
+        {{if .Description}}<p class="desc">{{.Description}}</p>{{end}}
+        {{if .Params}}
+        <p class="muted small">
+          {{len .Params}} param(s):
+          {{range $i, $p := .Params}}{{if $i}}, {{end}}<code>{{$p.Name}}</code>{{if $p.Required}} <span class="required">*</span>{{end}}{{end}}
+        </p>
+        {{end}}
+        {{if .ParseError}}
+        <p class="banner banner-error">parse error: {{.ParseError}}</p>
+        {{end}}
+      </a>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{else}}
+<section>
+  <p class="muted">
+    No templates in this project yet. Add one by writing
+    <code>enju/templates/&lt;bundle&gt;/enju.yaml</code>
+    in the project repo and pushing — refresh this page after.
+  </p>
+</section>
+{{end}}
+{{end}}

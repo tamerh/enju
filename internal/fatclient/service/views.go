@@ -66,6 +66,11 @@ type TaskSummary struct {
 	DependsOn      []string `json:"depends_on,omitempty"`
 	ClaimedBy      string   `json:"claimed_by,omitempty"`
 	IterationLabel string   `json:"iteration_label,omitempty"`
+	// IterCount is the number of distinct iter_seq values the
+	// task has been through (Phase 8.6). 1 for single-attempt
+	// tasks, > 1 for tasks that bounced through request_changes.
+	// UI gates on >1 to surface a "this iterated" indicator.
+	IterCount int `json:"iter_count,omitempty"`
 }
 
 // ListEventsOpts mirrors the coord /events query string.
@@ -306,6 +311,7 @@ type taskWire struct {
 	DependsOn      string   `json:"depends_on"`
 	ClaimedBy      string   `json:"claimed_by"`
 	IterationLabel string   `json:"iteration_label"`
+	IterCount      int      `json:"iter_count"`
 }
 
 func (t taskWire) toSummary() TaskSummary {
@@ -327,6 +333,7 @@ func (t taskWire) toSummary() TaskSummary {
 		DependsOn:      deps,
 		ClaimedBy:      t.ClaimedBy,
 		IterationLabel: t.IterationLabel,
+		IterCount:      t.IterCount,
 	}
 }
 

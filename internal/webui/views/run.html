@@ -1,0 +1,158 @@
+{{define "title"}}Run #{{.Run.Seq}} · Enju{{end}}
+
+{{define "scripts"}}
+<script src="/static/mermaid.min.js" defer></script>
+<script defer>
+  document.addEventListener('DOMContentLoaded', () => {
+    if (window.mermaid) {
+      window.mermaid.initialize({startOnLoad: false, theme: 'default'});
+      window.mermaid.run({querySelector: 'pre.mermaid'});
+    }
+  });
+  // Re-run mermaid after HTMX swaps in new content.
+  document.addEventListener('htmx:afterSwap', () => {
+    if (window.mermaid) {
+      window.mermaid.run({querySelector: 'pre.mermaid'});
+    }
+  });
+</script>
+{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <span>run #{{.Run.Seq}}</span>
+</nav>
+
+<header class="run-header">
+  <h1>{{.Run.Name}}</h1>
+  <dl class="meta-list">
+    <div><dt>Run</dt><dd>#{{.Run.Seq}}</dd></div>
+    <div><dt>State</dt><dd><span class="state state-{{.Run.State}}">{{.Run.State}}</span></dd></div>
+    <div><dt>Branch</dt><dd>{{.Run.Branch}}</dd></div>
+    <div><dt>Tasks</dt><dd>{{.Run.TaskCount}}</dd></div>
+    <div><dt>Created</dt><dd>{{.Run.CreatedAt.Format "2006-01-02 15:04"}}</dd></div>
+  </dl>
+
+  {{/* Phase 8.5 — when state=waiting, blocked_by names the
+       specific bottleneck (review awaiting reviewer, human
+       claim, dependent artifact, stuck). Rendered through
+       format.RenderBlockedBy so the same human-readable line
+       shows up in CLI run_status and the web UI. */}}
+  {{if .BlockedByText}}
+  <p class="blocked-by">{{.BlockedByText}}</p>
+  {{end}}
+
+  {{$canPause := or (eq .Run.State "active") (eq .Run.State "waiting")}}
+  {{$canResume := eq .Run.State "paused"}}
+  {{$isTerminal := or (eq .Run.State "completed") (or (eq .Run.State "failed") (eq .Run.State "terminated"))}}
+  {{if not $isTerminal}}
+  <div class="btn-row" x-data="{terminating: false}">
+    {{if $canPause}}
+    <form method="POST" action="/p/{{.ProjectID}}/r/{{.Run.Seq}}/pause"
+          hx-post="/p/{{.ProjectID}}/r/{{.Run.Seq}}/pause"
+          hx-target="#main">
+      <button type="submit" class="btn">Pause</button>
+    </form>
+    {{end}}
+    {{if $canResume}}
+    <form method="POST" action="/p/{{.ProjectID}}/r/{{.Run.Seq}}/resume"
+          hx-post="/p/{{.ProjectID}}/r/{{.Run.Seq}}/resume"
+          hx-target="#main">
+      <button type="submit" class="btn btn-primary">Resume</button>
+    </form>
+    {{end}}
+    {{if $canPause}}
+    <form method="POST" action="/p/{{.ProjectID}}/r/{{.Run.Seq}}/execute"
+          hx-post="/p/{{.ProjectID}}/r/{{.Run.Seq}}/execute"
+          hx-target="#main">
+      <button type="submit" class="btn">Run all ready compute</button>
+    </form>
+    {{end}}
+
+    <button type="button" class="btn" x-show="!terminating" @click="terminating = true">Terminate…</button>
+
+    <form x-show="terminating" x-cloak
+          method="POST" action="/p/{{.ProjectID}}/r/{{.Run.Seq}}/terminate"
+          hx-post="/p/{{.ProjectID}}/r/{{.Run.Seq}}/terminate"
+          hx-target="#main"
+          class="terminate-form">
+      <h3 class="terminate-title">Terminate run #{{.Run.Seq}}?</h3>
+      <p class="terminate-warn">
+        <strong>This is irreversible.</strong>
+        Every non-terminal task in this run is cascade-skipped;
+        every open claim is abandoned. Submits and claims are
+        refused after this.
+      </p>
+      <label class="terminate-reason">
+        <span>Reason <span class="muted small">— optional, recorded in the audit event</span></span>
+        <textarea name="reason" rows="4"
+                  placeholder="Why are you terminating? (e.g. wrong template instantiated, run is stuck on a flaky upstream, will resubmit with fixes)"></textarea>
+      </label>
+      <div class="btn-row terminate-actions">
+        <button type="submit" class="btn btn-primary">Confirm terminate</button>
+        <button type="button" class="btn" @click="terminating = false">Cancel</button>
+      </div>
+    </form>
+  </div>
+  {{end}}
+</header>
+
+<section>
+  <h2>DAG</h2>
+  {{if .Run.DiagramMermaid}}
+  <pre class="mermaid">{{.Run.DiagramMermaid}}</pre>
+  <script>
+    if (window.mermaid) { window.mermaid.run({querySelector: 'pre.mermaid'}); }
+  </script>
+  {{else}}
+  <p class="muted">(no diagram available)</p>
+  {{end}}
+</section>
+
+<section>
+  <h2>Tasks</h2>
+  {{if .Run.Tasks}}
+  <table class="task-table">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Action</th>
+        <th>State</th>
+        <th>Assigned</th>
+        <th>Claimed by</th>
+        <th>Depends on</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Run.Tasks}}
+      <tr>
+        <td>
+          <a href="/p/{{$.ProjectID}}/t/{{.ID}}"><code>{{.ID}}</code></a>
+          {{if gt .IterCount 1}}<span class="iter-badge" title="{{.IterCount}} iterations (request_changes loops)">iter {{.IterCount}}</span>{{end}}
+        </td>
+        <td>{{.Action}}</td>
+        <td><span class="state state-{{.State}}">{{.State}}</span></td>
+        <td>
+          {{if .AssignedTo}}
+            {{range $i, $u := .AssignedTo}}{{if $i}}, {{end}}@{{$u}}{{end}}
+          {{else}}<span class="muted">—</span>{{end}}
+        </td>
+        <td>{{if .ClaimedBy}}@{{.ClaimedBy}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>
+          {{if .DependsOn}}
+            {{range $i, $d := .DependsOn}}{{if $i}}, {{end}}<code>{{$d}}</code>{{end}}
+          {{else}}<span class="muted">—</span>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">(no tasks)</p>
+  {{end}}
+</section>
+{{end}}

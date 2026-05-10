@@ -1,0 +1,72 @@
+{{define "title"}}Projects · Enju{{end}}
+
+{{define "main"}}
+<section x-data="{creating: false}">
+  <header class="task-header">
+    <h1>Projects</h1>
+    <p class="muted">{{len .Projects}} project(s); {{len .Materialized}} with local clone.</p>
+    <p class="btn-row">
+      <button type="button" class="btn btn-primary" x-show="!creating" @click="creating = true">New project</button>
+    </p>
+  </header>
+
+  <form x-show="creating || {{if .Error}}true{{else}}false{{end}}" x-cloak
+        method="POST" action="/projects"
+        hx-post="/projects"
+        hx-target="#main"
+        class="submit-form">
+    <h3 class="muted small" style="margin: 0;">New project</h3>
+    {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+    <label>
+      <span>Name <span class="required">*</span></span>
+      <input type="text" name="name" required maxlength="128" value="{{.Submitted.Name}}" placeholder="e.g. paper-1, gwas-pilot, dogfood">
+    </label>
+    <label>
+      <span>Description <span class="muted small">(optional)</span></span>
+      <textarea name="description" rows="3" placeholder="One-line summary of what this project is for.">{{.Submitted.Description}}</textarea>
+    </label>
+    <label>
+      <span>Default branch <span class="muted small">(optional, defaults to <code>main</code>)</span></span>
+      <input type="text" name="default_branch" value="{{.Submitted.DefaultBranch}}" placeholder="main">
+    </label>
+    <label>
+      <span>Workspace path <span class="muted small">(optional)</span></span>
+      <input type="text" name="path" value="{{.Submitted.Path}}" placeholder="/absolute/path/to/empty/dir">
+      <span class="muted small">
+        Empty → defaults to <code>~/.enju/workspaces/&lt;slug&gt;-&lt;id&gt;/</code>.
+        Set an absolute path to use a different (empty or non-existent) directory.
+        <code>enju_create_project</code> with <code>path=</code> smart-detects folder state — it adopts populated folders too.
+      </span>
+    </label>
+    <label>
+      <span>External git remote <span class="muted small">(optional)</span></span>
+      <input type="text" name="remote_url" value="{{.Submitted.RemoteURL}}" placeholder="git@github.com:org/repo.git">
+      <span class="muted small">
+        When set, every task-result commit is pushed to this remote
+        (GitHub/GitLab/Gitea/self-hosted). Auth uses your existing
+        SSH/credential setup. <strong>Mutually exclusive with workspace path</strong> — pick one.
+      </span>
+    </label>
+    <div class="btn-row">
+      <button type="submit" class="btn btn-primary">Create project</button>
+      <button type="button" class="btn" @click="creating = false">Cancel</button>
+    </div>
+  </form>
+
+  {{if .Projects}}
+  <ul class="project-list">
+    {{range .Projects}}
+    <li class="project-card">
+      <a href="/p/{{.ID}}">
+        <strong>{{.Name}}</strong>
+        <span class="meta">id {{.ID}} · {{.RunCount}} run(s){{if .DefaultBranch}} · branch {{.DefaultBranch}}{{end}}</span>
+        {{if .Description}}<p class="desc">{{.Description}}</p>{{end}}
+      </a>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p>No projects yet. Click <strong>New project</strong> above to create one — or run <code>enju mcp</code> in a Claude session and call <code>enju_create_project</code> for advanced flows (custom path, external git remote).</p>
+  {{end}}
+</section>
+{{end}}

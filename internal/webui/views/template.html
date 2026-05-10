@@ -1,0 +1,84 @@
+{{define "title"}}{{if .Template}}{{if .Template.Summary.Name}}{{.Template.Summary.Name}}{{else}}{{.Path}}{{end}}{{else}}{{.Path}}{{end}} · template · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/templates">templates</a>
+  <span> / </span>
+  <span><code>{{.Path}}</code></span>
+</nav>
+
+{{if .Template}}
+<header class="task-header">
+  <h1>{{if .Template.Summary.Name}}{{.Template.Summary.Name}}{{else}}{{.Path}}{{end}}</h1>
+  <p class="muted small"><code>{{.Path}}</code></p>
+  {{if .Template.Summary.Description}}<p>{{.Template.Summary.Description}}</p>{{end}}
+</header>
+
+<section>
+  <h2>Create run from this template</h2>
+  {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+  <form method="POST" action="/p/{{.ProjectID}}/templates/run/{{.Path}}"
+        hx-post="/p/{{.ProjectID}}/templates/run/{{.Path}}"
+        hx-target="#main"
+        class="submit-form">
+
+    {{if .Template.Summary.Params}}
+    <h3 class="muted small">Parameters</h3>
+    {{range .Template.Summary.Params}}
+    {{$submitted := index $.SubmittedParams .Name}}
+    <label>
+      <span>
+        <code>{{.Name}}</code>
+        <span class="muted small">({{.Type}}{{if .Required}}, required{{end}})</span>
+      </span>
+      {{if .Description}}<span class="muted small">{{.Description}}</span>{{end}}
+      {{if eq .Type "list<string>"}}
+      <input type="text" name="p_{{.Name}}" value="{{$submitted}}" placeholder="comma-separated values">
+      {{else if eq .Type "bool"}}
+      <select name="p_{{.Name}}">
+        <option value="" {{if eq $submitted ""}}selected{{end}}>— default —</option>
+        <option value="true" {{if eq $submitted "true"}}selected{{end}}>true</option>
+        <option value="false" {{if eq $submitted "false"}}selected{{end}}>false</option>
+      </select>
+      {{else if eq .Type "int"}}
+      <input type="number" name="p_{{.Name}}" value="{{$submitted}}" placeholder="integer">
+      {{else}}
+      <input type="text" name="p_{{.Name}}" value="{{$submitted}}">
+      {{end}}
+    </label>
+    {{end}}
+    {{else}}
+    <p class="muted small">This template declares no parameters.</p>
+    {{end}}
+
+    <label>
+      <span>Branch <span class="muted small">(optional, defaults to project branch; pass <code>auto</code> for an isolated branch)</span></span>
+      <input type="text" name="branch" value="{{.SubmittedBranch}}" placeholder="leave empty for default">
+    </label>
+
+    <div class="btn-row">
+      <button type="submit" class="btn btn-primary">Create run</button>
+      <a class="btn" href="/p/{{.ProjectID}}/templates">Cancel</a>
+    </div>
+  </form>
+</section>
+
+{{if .Template.Raw}}
+<section>
+  <h2>Raw template</h2>
+  <details>
+    <summary>view <code>enju.yaml</code></summary>
+    <pre class="result-content">{{printf "%s" .Template.Raw}}</pre>
+  </details>
+</section>
+{{end}}
+{{else}}
+<section>
+  <p class="muted">(template did not load — check the path)</p>
+</section>
+{{end}}
+{{end}}

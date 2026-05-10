@@ -1,0 +1,47 @@
+{{define "title"}}{{.Path}} · history · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/artifacts">artifacts</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/artifacts/show/{{.Path}}"><code>{{.Path}}</code></a>
+  <span> / </span>
+  <span>history</span>
+</nav>
+
+<header class="task-header">
+  <h1>History · <code>{{.Path}}</code></h1>
+  <p class="muted">
+    Every commit that touched this artifact, newest first.
+    Annotations from the coord index identify the indexed pointer
+    (current value), invalidated cascades, and superseded versions.
+  </p>
+</header>
+
+{{if .Entries}}
+<section>
+  <ol class="iter-list">
+    {{range .Entries}}
+    <li class="iter-item">
+      <header class="iter-header">
+        {{with index . "commit_sha"}}{{if .}}<code>{{slice . 0 12}}</code>{{end}}{{end}}
+        {{with index . "task_id"}}{{if .}}<a href="/p/{{$.ProjectID}}/t/{{.}}"><code>{{.}}</code></a>{{end}}{{end}}
+        {{with index . "owner"}}{{if .}}<span class="muted small">@{{.}}</span>{{end}}{{end}}
+        {{with index . "timestamp"}}{{if .}}<span class="muted small">{{.}}</span>{{end}}{{end}}
+        {{with index . "annotation"}}{{if .}}<span class="iter-badge">{{.}}</span>{{end}}{{end}}
+      </header>
+      {{with index . "subject"}}{{if .}}<p class="muted small">{{.}}</p>{{end}}{{end}}
+    </li>
+    {{end}}
+  </ol>
+</section>
+{{else}}
+<section>
+  <p class="muted">(no history — git log returned no entries for this path)</p>
+</section>
+{{end}}
+{{end}}

@@ -1,0 +1,87 @@
+{{define "title"}}{{if .ScopeProjectID}}Inbox · project #{{.ScopeProjectID}}{{else}}Inbox{{end}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  {{if .ScopeProjectID}}
+  <span> / </span>
+  <a href="/p/{{.ScopeProjectID}}">project #{{.ScopeProjectID}}</a>
+  <span> / </span>
+  <span>inbox</span>
+  {{else}}
+  <span> / </span>
+  <span>inbox</span>
+  {{end}}
+</nav>
+
+<header class="task-header">
+  <h1>Inbox</h1>
+  <p class="muted">
+    {{if .ScopeProjectID}}
+      Tasks in this project waiting on you.
+    {{else}}
+      Tasks waiting on you across all projects.
+    {{end}}
+  </p>
+</header>
+
+{{if and .ScopeProjectID (not .CloneOK)}}
+<section>
+  <p class="muted">
+    Project clone not yet materialized in this fat-client.
+    Run a task in this project once via <code>enju mcp</code> to populate
+    the local workspace, then refresh.
+  </p>
+</section>
+{{else if .Rows}}
+<section>
+  <ul class="inbox-list">
+    {{range .Rows}}
+    <li class="inbox-item">
+      <div class="inbox-head">
+        <a href="/p/{{.ProjectID}}/t/{{.TaskID}}"><code>{{.TaskID}}</code></a>
+        <span class="action-badge">{{.Action}}</span>
+        {{if and (not $.ScopeProjectID) .ProjectName}}
+        <a class="project-tag" href="/p/{{.ProjectID}}">{{.ProjectName}}</a>
+        {{end}}
+      </div>
+      {{$rowPID := .ProjectID}}
+      {{if .Upstream}}
+      <div class="inbox-upstream">
+        {{range .Upstream}}
+        <details {{if .Content}}open{{end}}>
+          <summary>
+            Upstream <a href="/p/{{$rowPID}}/t/{{.TaskID}}"><code>{{.TaskID}}</code></a>
+            <span class="action-badge">{{.Action}}</span>
+            {{if .CommitSHA}}<span class="muted small">commit <code>{{.CommitSHA}}</code></span>{{end}}
+          </summary>
+          {{if .Content}}
+          <pre class="upstream-content">{{.Content}}</pre>
+          {{else}}
+          <p class="muted small">(no inlined content — likely a compute or vote parent; pull from git via the commit_sha)</p>
+          {{end}}
+        </details>
+        {{end}}
+      </div>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{else}}
+<section>
+  <p class="muted">No tasks waiting on you.</p>
+</section>
+{{end}}
+
+{{if .CloneIssues}}
+<section>
+  <h2 class="small">Skipped projects</h2>
+  <ul class="muted small">
+    {{range .CloneIssues}}
+    <li><a href="/p/{{.ProjectID}}">{{.ProjectName}}</a> — {{.Reason}}</li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+{{end}}

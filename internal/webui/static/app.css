@@ -1,0 +1,1127 @@
+/* Placeholder stylesheet. Pico.css drops in here in a follow-up
+   step (curl https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css
+   into ./pico.min.css and add a <link> in views/layout.html).
+   Until then, a minimum-viable look so the page is readable. */
+
+:root {
+  --fg: #1a1a1a;
+  --bg: #ffffff;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --border: #e5e7eb;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #f3f4f6;
+    --bg: #0b0b0c;
+    --muted: #9ca3af;
+    --border: #27272a;
+  }
+}
+
+body {
+  margin: 0;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.5;
+}
+
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.topnav .brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.topnav nav a {
+  color: var(--fg);
+  text-decoration: none;
+  margin-right: 1rem;
+}
+
+.topnav .who {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.topnav .who:hover { color: var(--accent); }
+
+/* Compact list of task links — used by the Me page's
+   active-claims and recent-completions sections. Same shape
+   as a bulleted list but tighter spacing and smaller font. */
+.task-list-compact {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+}
+.task-list-compact li { display: flex; gap: 0.5rem; align-items: baseline; }
+
+/* Banner success variant — used after a successful profile
+   update to confirm the change (mirrors banner-error styling). */
+.banner-success {
+  padding: 0.75rem 1rem;
+  margin: 0.75rem 0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: #d1fae5;
+  color: #065f46;
+  border: 1px solid #6ee7b7;
+}
+@media (prefers-color-scheme: dark) {
+  .banner-success { background: #064e3b; color: #d1fae5; border-color: #047857; }
+}
+
+main {
+  max-width: 960px;
+  margin: 1.5rem auto;
+  padding: 0 1.5rem;
+}
+
+.muted { color: var(--muted); }
+
+.project-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+.project-card a {
+  display: block;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--fg);
+}
+
+.project-card a:hover {
+  border-color: var(--accent);
+}
+
+.project-card strong { display: block; font-size: 1.05rem; }
+.project-card .meta { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+.project-card .desc { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; }
+
+/* Project view */
+.crumbs {
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.crumbs a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.crumbs a:hover { color: var(--accent); }
+
+.project-header {
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-header h1 { margin: 0 0 0.5rem; }
+
+.meta-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.5rem 1.5rem;
+  margin: 1rem 0 0;
+}
+
+.meta-list > div { margin: 0; }
+.meta-list dt {
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.15rem;
+}
+.meta-list dd { margin: 0; font-size: 0.95rem; }
+
+.member-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+
+.member-list li {
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.member-list .role {
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Runs table */
+.run-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+}
+
+.run-table th, .run-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.run-table th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.run-table tbody tr:hover { background: rgba(37, 99, 235, 0.05); }
+
+/* Data-table links use the accent color across the board so
+   unvisited links don't pick up the browser default dark-blue
+   (unreadable on the near-black dark-mode background). One
+   rule for run/task/events/issues tables — adding a new table
+   with .data-link-table or similar covers it free. */
+.run-table a,
+.task-table a,
+.events-table a,
+.issues-table a { color: var(--accent); text-decoration: none; }
+.run-table a:hover,
+.task-table a:hover,
+.events-table a:hover,
+.issues-table a:hover { text-decoration: underline; }
+
+.state {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--border);
+  color: var(--fg);
+}
+
+.state-active   { background: #dbeafe; color: #1e40af; }
+.state-waiting  { background: #e0e7ff; color: #3730a3; }
+.state-completed { background: #d1fae5; color: #065f46; }
+.state-failed    { background: #fee2e2; color: #991b1b; }
+.state-paused    { background: #fef3c7; color: #92400e; }
+.state-terminated { background: #f3f4f6; color: #4b5563; }
+
+@media (prefers-color-scheme: dark) {
+  .state-active   { background: #1e3a8a; color: #dbeafe; }
+  .state-waiting  { background: #312e81; color: #e0e7ff; }
+  .state-completed { background: #064e3b; color: #d1fae5; }
+  .state-failed    { background: #7f1d1d; color: #fee2e2; }
+  .state-paused    { background: #78350f; color: #fef3c7; }
+  .state-terminated { background: #374151; color: #f3f4f6; }
+}
+
+/* Alpine.js x-cloak: hide elements until Alpine has initialized
+   so the inline-confirm form doesn't flash visible during page
+   load. Alpine drops the attribute after init. */
+[x-cloak] { display: none !important; }
+
+/* Inline terminate-confirm form on the run page */
+.terminate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid #fca5a5;
+  border-left: 4px solid #dc2626;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.04);
+  max-width: 720px;
+}
+
+.terminate-title {
+  margin: 0;
+  font-size: 1.05rem;
+  color: #991b1b;
+}
+
+.terminate-warn {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--fg);
+}
+
+.terminate-warn strong { color: #991b1b; }
+
+.terminate-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+.terminate-reason > span:first-child { font-weight: 500; }
+
+.terminate-reason textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 5rem;
+}
+
+.terminate-reason textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.terminate-actions {
+  margin: 0;
+  padding-top: 0.25rem;
+  border-top: 1px solid rgba(252, 165, 165, 0.4);
+  padding-top: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .terminate-form {
+    border-color: #b91c1c;
+    border-left-color: #ef4444;
+    background: rgba(239, 68, 68, 0.08);
+  }
+  .terminate-title { color: #fca5a5; }
+  .terminate-warn strong { color: #fca5a5; }
+  .terminate-actions { border-top-color: rgba(185, 28, 28, 0.4); }
+}
+
+/* Run view */
+.run-header { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+.run-header h1 { margin: 0 0 0.5rem; }
+
+pre.mermaid {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  background: rgba(37, 99, 235, 0.04);
+}
+
+/* Task table */
+.task-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+  font-size: 0.92rem;
+}
+
+.task-table th, .task-table td {
+  padding: 0.45rem 0.7rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-table th {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.task-table tbody tr:hover { background: rgba(37, 99, 235, 0.05); }
+
+.task-table code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .task-table code { background: rgba(255, 255, 255, 0.06); }
+  pre.mermaid { background: rgba(37, 99, 235, 0.08); }
+}
+
+/* Severity badges for issues. Same pill shape as .state. */
+.severity {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--border);
+  color: var(--fg);
+}
+
+.severity-low      { background: #d1fae5; color: #065f46; }
+.severity-medium   { background: #dbeafe; color: #1e40af; }
+.severity-high     { background: #fef3c7; color: #92400e; }
+.severity-critical { background: #fee2e2; color: #991b1b; }
+
+@media (prefers-color-scheme: dark) {
+  .severity-low      { background: #064e3b; color: #d1fae5; }
+  .severity-medium   { background: #1e3a8a; color: #dbeafe; }
+  .severity-high     { background: #78350f; color: #fef3c7; }
+  .severity-critical { background: #7f1d1d; color: #fee2e2; }
+}
+
+/* Issue status states (open / triaged / closed / wontfix) */
+.state-open    { background: #dbeafe; color: #1e40af; }
+.state-triaged { background: #fef3c7; color: #92400e; }
+.state-closed  { background: #d1fae5; color: #065f46; }
+.state-wontfix { background: #f3f4f6; color: #4b5563; }
+
+@media (prefers-color-scheme: dark) {
+  .state-open    { background: #1e3a8a; color: #dbeafe; }
+  .state-triaged { background: #78350f; color: #fef3c7; }
+  .state-closed  { background: #064e3b; color: #d1fae5; }
+  .state-wontfix { background: #374151; color: #f3f4f6; }
+}
+
+/* Templates list — card grid like the project list */
+.template-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 1rem;
+}
+
+.template-card a {
+  display: block;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--fg);
+}
+
+.template-card a:hover { border-color: var(--accent); }
+
+.template-card strong { display: block; font-size: 1.05rem; }
+.template-card .meta { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+.template-card .desc { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; }
+.template-card .required { color: #dc2626; }
+
+/* Issues list table — same shape as run-table / events-table */
+.issues-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+  font-size: 0.92rem;
+}
+
+.issues-table th, .issues-table td {
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.issues-table th {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.issues-table tbody tr:hover { background: rgba(37, 99, 235, 0.05); }
+
+.issues-table code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+/* Inline file-issue form on the issues list page */
+.file-issue-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.04);
+  max-width: 720px;
+}
+
+.file-issue-title { margin: 0; font-size: 1.05rem; }
+
+.file-issue-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+.file-issue-form .required { color: #dc2626; }
+
+.file-issue-form input[type="text"],
+.file-issue-form input[type="number"],
+.file-issue-form select,
+.file-issue-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.file-issue-form textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 6rem;
+}
+
+.file-issue-form input:focus,
+.file-issue-form select:focus,
+.file-issue-form textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.file-issue-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .file-issue-form { background: rgba(37, 99, 235, 0.08); }
+}
+
+/* Per-state colors used by the task state machine.
+ * Phase 8.x added two new in-flight states between the old
+ * claimed → accepted transition: `running` (script executing)
+ * and `submitted` (commit pushed, awaiting cascade-merge into
+ * accepted). Each gets its own badge color so the run-page
+ * task list reflects which phase a task is in. */
+.state-pending    { background: var(--border); color: var(--muted); }
+.state-ready      { background: #fef3c7; color: #92400e; }
+.state-claimed    { background: #dbeafe; color: #1e40af; }
+.state-running    { background: #ddd6fe; color: #4c1d95; }
+.state-submitted  { background: #cffafe; color: #155e75; }
+.state-accepted   { background: #d1fae5; color: #065f46; }
+.state-collecting { background: #ede9fe; color: #5b21b6; }
+.state-skipped    { background: #f3f4f6; color: #6b7280; }
+.state-parked     { background: #f3f4f6; color: #6b7280; }
+
+@media (prefers-color-scheme: dark) {
+  .state-ready      { background: #78350f; color: #fef3c7; }
+  .state-claimed    { background: #1e3a8a; color: #dbeafe; }
+  .state-running    { background: #4c1d95; color: #ddd6fe; }
+  .state-submitted  { background: #155e75; color: #cffafe; }
+  .state-accepted   { background: #064e3b; color: #d1fae5; }
+  .state-collecting { background: #4c1d95; color: #ede9fe; }
+}
+
+/* iter-badge — shown next to a task ID in the run table when
+ * IterCount > 1 (Phase 8.6: tasks that bounced through
+ * request_changes accumulate iter_seq rows). Distinct from
+ * state badges so it can stack alongside one. */
+.iter-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  background: #fef3c7;
+  color: #92400e;
+  vertical-align: middle;
+}
+@media (prefers-color-scheme: dark) {
+  .iter-badge { background: #78350f; color: #fef3c7; }
+}
+
+/* blocked-by — Phase 8.5 waiting-state explainer banner. Same
+ * muted treatment as a meta line; full-width so the message
+ * (e.g. "Blocked by: review of `task-3` (assigned: alice, since
+ * 2h ago)") wraps gracefully on narrow viewports. */
+.blocked-by {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--border);
+  background: var(--bg-muted, #f9fafb);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.blocked-by code {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+@media (prefers-color-scheme: dark) {
+  .blocked-by { background: rgba(255,255,255,0.03); }
+}
+
+/* Task view */
+.task-header { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+.task-header h1 { margin: 0 0 0.5rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.4rem; }
+.task-header h1 code { background: none; padding: 0; }
+
+.badges {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.action-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prompt,
+.result-content {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.02);
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  max-height: 32rem;
+  overflow-y: auto;
+}
+
+.result-content {
+  background: rgba(16, 185, 129, 0.04); /* subtle green tint to set apart from the prompt */
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+/* Iteration history */
+.iter-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  counter-reset: iter;
+}
+
+.iter-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+
+.iter-item.iter-outcome-completed { border-left-color: #10b981; }
+.iter-item.iter-outcome-rejected  { border-left-color: #ef4444; }
+.iter-item.iter-outcome-abandoned { border-left-color: #f59e0b; }
+.iter-item.iter-outcome-active    { border-left-color: var(--accent); }
+
+.iter-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 0.75rem;
+}
+
+.iter-header code { font-size: 0.8rem; }
+
+.iter-badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--border);
+  color: var(--fg);
+}
+
+.iter-badge.iter-outcome-completed { background: #d1fae5; color: #065f46; }
+.iter-badge.iter-outcome-rejected  { background: #fee2e2; color: #991b1b; }
+.iter-badge.iter-outcome-abandoned { background: #fef3c7; color: #92400e; }
+.iter-badge.iter-outcome-active    { background: #dbeafe; color: #1e40af; }
+
+.iter-badge.iter-decision-approve         { background: #d1fae5; color: #065f46; }
+.iter-badge.iter-decision-request_changes { background: #fef3c7; color: #92400e; }
+.iter-badge.iter-decision-reject          { background: #fee2e2; color: #991b1b; }
+.iter-badge.iter-decision-comment         { background: #ede9fe; color: #5b21b6; }
+
+.iter-badge.iter-option { background: #ede9fe; color: #5b21b6; }
+
+/* Native disclosure-style <details><summary> elements: keep
+   the browser's arrow marker + size, just promote the cursor
+   so the target consistently reads as clickable. Global rule
+   so every page's collapsibles (iter-history, events meta,
+   inbox upstreams, raw template view, etc.) feel the same. */
+details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.iter-body {
+  margin: 0.5rem 0 0;
+  padding: 0.75rem;
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .iter-badge.iter-outcome-completed { background: #064e3b; color: #d1fae5; }
+  .iter-badge.iter-outcome-rejected  { background: #7f1d1d; color: #fee2e2; }
+  .iter-badge.iter-outcome-abandoned { background: #78350f; color: #fef3c7; }
+  .iter-badge.iter-outcome-active    { background: #1e3a8a; color: #dbeafe; }
+  .iter-badge.iter-decision-approve         { background: #064e3b; color: #d1fae5; }
+  .iter-badge.iter-decision-request_changes { background: #78350f; color: #fef3c7; }
+  .iter-badge.iter-decision-reject          { background: #7f1d1d; color: #fee2e2; }
+  .iter-badge.iter-decision-comment         { background: #4c1d95; color: #ede9fe; }
+  .iter-badge.iter-option                   { background: #4c1d95; color: #ede9fe; }
+  .iter-body { background: rgba(255, 255, 255, 0.04); }
+}
+
+@media (prefers-color-scheme: dark) {
+  .prompt { background: rgba(255, 255, 255, 0.04); }
+  .result-content { background: rgba(16, 185, 129, 0.08); }
+}
+
+.small { font-size: 0.85rem; }
+
+.vote-options {
+  list-style: none;
+  padding: 0;
+}
+
+.vote-options li {
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* Task actions: claim / release buttons + review form */
+.task-actions {
+  margin-top: 1rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.task-actions form { margin: 0; }
+
+/* === Unified button system ===
+ *
+ * Every button-like clickable in the UI uses .btn. Variants
+ * tweak emphasis. Restyling later means editing this block;
+ * no per-feature button classes (no .chip, .action-link).
+ *
+ *   .btn            — base (outlined neutral)
+ *   .btn-primary    — filled accent (primary CTA: Claim, Submit)
+ *   .btn-secondary  — subtle (low-emphasis: Release)
+ *   .btn-active     — selected state in toggle/filter contexts
+ *                     (visually identical to btn-primary today;
+ *                     kept distinct for semantic clarity so a
+ *                     future "filter selected" restyle doesn't
+ *                     have to disambiguate from real CTA buttons)
+ *
+ * Renders identically on <a class="btn">, <button class="btn">,
+ * and <button type="submit"> inside a form.
+ */
+.btn {
+  display: inline-block;
+  padding: 0.45rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  font-family: inherit;
+  text-decoration: none;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+.btn:hover {
+  background: rgba(37, 99, 235, 0.08);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn:active { transform: translateY(1px); }
+
+.btn-primary,
+.btn-active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.btn-primary:hover,
+.btn-active:hover {
+  background: #1d4ed8;
+  color: #fff;
+  border-color: #1d4ed8;
+}
+
+.btn-secondary {
+  background: var(--bg);
+  color: var(--muted);
+}
+
+.btn-danger {
+  background: #dc2626;
+  color: #fff;
+  border-color: #dc2626;
+}
+.btn-danger:hover { background: #b91c1c; color: #fff; border-color: #b91c1c; }
+
+@media (prefers-color-scheme: dark) {
+  .btn:hover { background: rgba(37, 99, 235, 0.18); }
+}
+
+/* .btn-row groups buttons horizontally with consistent gap.
+ * Used wherever multiple buttons appear side-by-side
+ * (project header actions, filter chips, task action bar). */
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0 0;
+}
+
+/* Shared write-form panel — used by submit-form (review,
+   answer, vote, triage, close, create-run) and file-issue-form
+   (file). Single block so look-and-feel changes hit every
+   form. The .file-issue-form block above keeps its own
+   per-feature tweaks (4px accent left-border, .file-issue-meta
+   grid, .required highlighting); .submit-form is the lighter
+   variant without the danger-style left border. */
+.submit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.04);
+  max-width: 720px;
+}
+
+.submit-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+.submit-form input[type="text"],
+.submit-form input[type="number"],
+.submit-form select,
+.submit-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.submit-form textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 5rem;
+}
+
+.submit-form input:focus,
+.submit-form select:focus,
+.submit-form textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+/* Direct-child buttons (Submit answer, Submit verdict, Submit
+   vote) sit at the bottom of the column-flex form. Without
+   align-self they'd stretch to the panel's full width — which
+   reads as "primary action looms large" when actually we want
+   them to size to their text. Buttons inside .btn-row keep
+   their default (the row owns layout). */
+.submit-form > button {
+  align-self: flex-start;
+}
+
+@media (prefers-color-scheme: dark) {
+  .submit-form { background: rgba(37, 99, 235, 0.08); }
+}
+
+/* Auto-attached copy button on every <pre> block.
+   The wrap is position:relative so the button can park
+   absolutely top-right inside the pre's bounding box. */
+.copy-wrap {
+  position: relative;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  padding: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.6;
+  transition: opacity 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+}
+
+/* The inline SVG inside the button can otherwise capture
+   pointer events with its own (default) cursor — pointer-events:
+   none routes hover/click straight to the button so the
+   pointer cursor is always visible over the icon. */
+.copy-btn svg { pointer-events: none; }
+
+.copy-wrap:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.copy-btn:active { transform: translateY(1px); }
+
+/* Brief success state — flips to green check for ~1.5s */
+.copy-btn-ok {
+  color: #10b981;
+  border-color: #10b981;
+  opacity: 1 !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .copy-btn { background: rgba(255, 255, 255, 0.04); }
+}
+
+/* Banner used by action error responses */
+.banner {
+  padding: 0.75rem 1rem;
+  margin: 0.75rem 0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.banner-error {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+
+/* Multi-line banner content (e.g. compute-failure stderr dump)
+   keeps newlines + uses monospace for the actual log block.
+   The banner itself stays in the page font; only the embedded
+   stderr region gets the monospace treatment via a child <pre>. */
+.banner-error pre {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem;
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .banner-error { background: #7f1d1d; color: #fee2e2; border-color: #b91c1c; }
+  .banner-error pre { background: rgba(255, 255, 255, 0.06); }
+}
+
+/* Events table */
+.events-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.events-table th, .events-table td {
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.events-table th {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.events-table tbody tr:hover { background: rgba(37, 99, 235, 0.05); }
+
+.events-table .meta-block {
+  margin: 0.25rem 0 0;
+  padding: 0.4rem;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .events-table .meta-block { background: rgba(255, 255, 255, 0.06); }
+}
+
+/* Notifications */
+.notify-list {
+  list-style: none;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+}
+
+.notify-item {
+  display: grid;
+  grid-template-columns: 1.2rem 11rem 1fr auto;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+  align-items: baseline;
+}
+
+.notify-item.unread .notify-marker { color: var(--accent); font-weight: 700; }
+.notify-item:not(.unread) { color: var(--muted); }
+
+.notify-marker { text-align: center; }
+.notify-rule { white-space: nowrap; }
+
+.inbox-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.inbox-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.inbox-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.inbox-head code { font-size: 0.95rem; }
+
+.project-tag {
+  display: inline-block;
+  margin-left: auto;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.project-tag:hover { border-color: var(--accent); color: var(--accent); }
+
+.inbox-upstream details {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 6px;
+}
+
+.inbox-upstream summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.upstream-content {
+  margin: 0.5rem 0 0;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .inbox-upstream details { background: rgba(255, 255, 255, 0.04); }
+}

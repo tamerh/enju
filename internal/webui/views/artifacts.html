@@ -1,0 +1,63 @@
+{{define "title"}}Artifacts · project #{{.ProjectID}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <span>artifacts</span>
+</nav>
+
+<header class="task-header">
+  <h1>Artifacts</h1>
+  <p class="muted">
+    Files written by tasks (declared via <code>writes_artifacts</code>) committed
+    to the project's git history. Click a row to view the content at the
+    indexed commit, or follow History to see every version.
+  </p>
+</header>
+
+{{if .Items}}
+<section>
+  <table class="run-table">
+    <thead>
+      <tr>
+        <th>Path</th>
+        <th>Tracked</th>
+        <th>Last writer</th>
+        <th>Last task</th>
+        <th>Commit</th>
+        <th>Updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Items}}
+      <tr>
+        <td><a href="/p/{{$.ProjectID}}/artifacts/show/{{.Path}}"><code>{{.Path}}</code></a></td>
+        <td>
+          {{if eq .TrackedLabel "tracked"}}<span class="state state-completed">tracked</span>
+          {{else if eq .TrackedLabel "untracked"}}<span class="state state-paused">untracked</span>
+          {{else}}<span class="muted small">—</span>{{end}}
+        </td>
+        <td>{{if .LastWriter}}@{{.LastWriter}}{{else}}<span class="muted small">—</span>{{end}}</td>
+        <td>{{if .LastTaskID}}<a href="/p/{{$.ProjectID}}/t/{{.LastTaskID}}"><code>{{.LastTaskID}}</code></a>{{else}}<span class="muted small">—</span>{{end}}</td>
+        <td>{{if .CommitSHA}}<code>{{slice .CommitSHA 0 12}}</code>{{else}}<span class="muted small">—</span>{{end}}</td>
+        <td class="muted small">{{.UpdatedAt}}</td>
+        <td><a class="muted small" href="/p/{{$.ProjectID}}/artifacts/history/{{.Path}}">history</a></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{else}}
+<section>
+  <p class="muted">
+    No artifacts in this project yet. Tasks declare files to write via
+    <code>writes_artifacts:</code> in their YAML; once a task submits with one
+    of those paths populated, it lands here.
+  </p>
+</section>
+{{end}}
+{{end}}

@@ -1,0 +1,98 @@
+{{define "title"}}Issues · project #{{.ProjectID}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <span>issues</span>
+</nav>
+
+<header class="task-header" x-data="{filing: false}">
+  <h1>Issues</h1>
+  <p class="muted">Project-level structured artifacts. File a problem, triage severity, close when fixed.</p>
+
+  <p class="btn-row">
+    <a class="btn {{if eq .Filter ""}}btn-active{{end}}" href="/p/{{.ProjectID}}/issues">All</a>
+    <a class="btn {{if eq .Filter "open"}}btn-active{{end}}" href="/p/{{.ProjectID}}/issues?status=open">Open</a>
+    <a class="btn {{if eq .Filter "triaged"}}btn-active{{end}}" href="/p/{{.ProjectID}}/issues?status=triaged">Triaged</a>
+    <a class="btn {{if eq .Filter "closed"}}btn-active{{end}}" href="/p/{{.ProjectID}}/issues?status=closed">Closed</a>
+    <button type="button" class="btn btn-primary" x-show="!filing" @click="filing = true">File new issue</button>
+  </p>
+
+  <form x-show="filing || {{if .Error}}true{{else}}false{{end}}" x-cloak
+        method="POST" action="/p/{{.ProjectID}}/issues"
+        hx-post="/p/{{.ProjectID}}/issues"
+        hx-target="#main"
+        class="file-issue-form">
+    <h3 class="file-issue-title">File new issue</h3>
+    {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+    <label>
+      Title <span class="required">*</span>
+      <input type="text" name="title" required maxlength="200" value="{{.Submitted.Title}}" placeholder="Short summary, e.g. 'foo step times out on big inputs'">
+    </label>
+    <label>
+      Body <span class="muted small">— what's wrong, repro steps, anything useful</span>
+      <textarea name="body" rows="6" placeholder="Markdown is fine. Include relevant task/run IDs.">{{.Submitted.Body}}</textarea>
+    </label>
+    <div class="file-issue-meta">
+      <label>
+        Severity
+        <select name="severity">
+          <option value="" {{if eq .Submitted.Severity ""}}selected{{end}}>— default —</option>
+          <option value="low" {{if eq .Submitted.Severity "low"}}selected{{end}}>low</option>
+          <option value="medium" {{if eq .Submitted.Severity "medium"}}selected{{end}}>medium</option>
+          <option value="high" {{if eq .Submitted.Severity "high"}}selected{{end}}>high</option>
+          <option value="critical" {{if eq .Submitted.Severity "critical"}}selected{{end}}>critical</option>
+        </select>
+      </label>
+      <label>
+        Found in run #
+        <input type="number" name="found_in_run_seq" min="1" value="{{if .Submitted.FoundInRunSeq}}{{.Submitted.FoundInRunSeq}}{{end}}" placeholder="optional">
+      </label>
+      <label>
+        Found in task ID
+        <input type="text" name="found_in_task_id" value="{{.Submitted.FoundInTaskID}}" placeholder="e.g. 1:1:draft (optional)">
+      </label>
+    </div>
+    <div class="btn-row">
+      <button type="submit" class="btn btn-primary">File issue</button>
+      <button type="button" class="btn" @click="filing = false">Cancel</button>
+    </div>
+  </form>
+</header>
+
+{{if .Issues}}
+<section>
+  <table class="issues-table">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Title</th>
+        <th>Severity</th>
+        <th>Status</th>
+        <th>Filed by</th>
+        <th>Filed at</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Issues}}
+      <tr>
+        <td><a href="/p/{{$.ProjectID}}/issues/{{.Seq}}"><code>{{.ID}}</code></a></td>
+        <td><a href="/p/{{$.ProjectID}}/issues/{{.Seq}}">{{.Title}}</a></td>
+        <td><span class="severity severity-{{.Severity}}">{{.Severity}}</span></td>
+        <td><span class="state state-{{.Status}}">{{.Status}}</span></td>
+        <td>@{{.FiledBy}}</td>
+        <td class="muted small">{{.FiledAt}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{else}}
+<section>
+  <p class="muted">No issues match the current filter.</p>
+</section>
+{{end}}
+{{end}}

@@ -1,0 +1,74 @@
+{{define "title"}}{{.Project.Name}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">← Projects</a>
+</nav>
+
+<header class="project-header">
+  <h1>{{.Project.Name}}</h1>
+  {{if .Project.Description}}<p class="muted">{{.Project.Description}}</p>{{end}}
+  <p class="btn-row">
+    <a class="btn" href="/p/{{.Project.ID}}/inbox">Inbox</a>
+    <a class="btn" href="/p/{{.Project.ID}}/events">Events</a>
+    <a class="btn" href="/p/{{.Project.ID}}/issues">Issues</a>
+    <a class="btn" href="/p/{{.Project.ID}}/templates">Templates</a>
+    <a class="btn" href="/p/{{.Project.ID}}/artifacts">Artifacts</a>
+  </p>
+  <dl class="meta-list">
+    <div><dt>ID</dt><dd>{{.Project.ID}}</dd></div>
+    <div><dt>Default branch</dt><dd>{{.Project.DefaultBranch}}</dd></div>
+    <div><dt>Runs</dt><dd>{{.Project.RunCount}}</dd></div>
+    <div><dt>Members</dt><dd>{{len .Project.Members}}</dd></div>
+    {{if .Project.RemoteURL}}<div><dt>Remote</dt><dd>{{.Project.RemoteURL}}</dd></div>{{end}}
+  </dl>
+</header>
+
+<section>
+  <h2>Members</h2>
+  {{if .Project.Members}}
+  <ul class="member-list">
+    {{range .Project.Members}}
+    <li>
+      <strong>@{{.Username}}</strong>{{if .Name}} <span class="muted">({{.Name}})</span>{{end}}
+      <span class="role">{{.Role}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="muted">(no members listed)</p>
+  {{end}}
+</section>
+
+<section>
+  <h2>Runs</h2>
+  {{if .Runs}}
+  <table class="run-table">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Name</th>
+        <th>State</th>
+        <th>Branch</th>
+        <th>Tasks</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Runs}}
+      <tr>
+        <td>{{.Seq}}</td>
+        <td><a href="/p/{{$.Project.ID}}/r/{{.Seq}}">{{.Name}}</a></td>
+        <td><span class="state state-{{.State}}">{{.State}}</span></td>
+        <td>{{.Branch}}</td>
+        <td>{{.TaskCount}}</td>
+        <td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No runs yet. Create one with <code>enju_create_run</code> in your MCP session.</p>
+  {{end}}
+</section>
+{{end}}

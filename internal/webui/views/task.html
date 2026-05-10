@@ -1,0 +1,277 @@
+{{define "title"}}{{.Task.TaskDefID}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/r/{{.Task.RunSeq}}">run #{{.Task.RunSeq}}</a>
+  <span> / </span>
+  <span><code>{{.Task.TaskDefID}}{{if .Task.InstanceKey}}/{{.Task.InstanceKey}}{{end}}</code></span>
+</nav>
+
+<header class="task-header">
+  <h1><code>{{.Task.ID}}</code></h1>
+  <div class="badges">
+    <span class="state state-{{.Task.State}}">{{.Task.State}}</span>
+    <span class="action-badge">{{.Task.Action}}</span>
+    {{if .Task.InstanceKey}}<span class="muted">instance: {{.Task.InstanceKey}}</span>{{end}}
+  </div>
+
+  <div id="task-actions" class="task-actions">
+    {{if .ActionError}}<div class="banner banner-error">{{.ActionError}}</div>{{end}}
+    {{/* Write actions only render for the citizen holding the
+         current claim. When state=claimed but somebody else
+         (a bot, a teammate) holds it, we surface that fact and
+         hide the action buttons / submit forms. */}}
+    {{if and (eq .Task.State "claimed") (not .ClaimedByMe)}}
+    <p class="muted small">Claimed by <strong>@{{.Task.ClaimedBy}}</strong> — actions are theirs to take. Release / submit / execute will be hidden until the claim is closed or returned.</p>
+    {{end}}
+
+    {{if eq .Task.Action "compute"}}
+      {{/* Compute: Run-script claims first if needed, so the
+           Claim button is redundant. Release + Run-script only
+           when the claim is mine. */}}
+      {{if and (eq .Task.State "claimed") .ClaimedByMe}}
+      <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/release"
+            hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/release"
+            hx-target="#main">
+        <button type="submit" class="btn btn-secondary">Release</button>
+      </form>
+      {{end}}
+      {{if or (eq .Task.State "ready") (and (eq .Task.State "claimed") .ClaimedByMe)}}
+      <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/execute"
+            hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/execute"
+            hx-target="#main">
+        <button type="submit" class="btn btn-primary">Run script</button>
+      </form>
+      {{end}}
+    {{else}}
+      {{if eq .Task.State "ready"}}
+      <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/claim"
+            hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/claim"
+            hx-target="#main">
+        <button type="submit" class="btn btn-primary">Claim</button>
+      </form>
+      {{end}}
+      {{if and (eq .Task.State "claimed") .ClaimedByMe}}
+      <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/release"
+            hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/release"
+            hx-target="#main">
+        <button type="submit" class="btn btn-secondary">Release</button>
+      </form>
+      {{end}}
+    {{end}}
+  </div>
+</header>
+
+{{if and (eq .Task.Action "review") (and (eq .Task.State "claimed") .ClaimedByMe)}}
+<section>
+  <h2>Submit verdict</h2>
+  <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/review"
+        hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/review"
+        hx-target="#main"
+        class="submit-form">
+    <label>
+      Decision
+      <select name="decision" required>
+        <option value="approve">approve — ship it</option>
+        <option value="request_changes">request_changes — author revises</option>
+        <option value="reject">reject — fail cascade (terminal)</option>
+        <option value="comment">comment — non-blocking note</option>
+      </select>
+    </label>
+    <label>
+      Feedback
+      <textarea name="content" rows="6" placeholder="Your prose is what the author sees."></textarea>
+    </label>
+    <button type="submit" class="btn btn-primary">Submit verdict</button>
+  </form>
+</section>
+{{end}}
+
+{{if and (eq .Task.Action "answer") (and (eq .Task.State "claimed") .ClaimedByMe)}}
+<section>
+  <h2>Submit answer</h2>
+  <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/submit"
+        hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/submit"
+        hx-target="#main"
+        class="submit-form">
+    <label>
+      Content
+      <textarea name="content" rows="10" required placeholder="Write your answer here. Markdown is fine."></textarea>
+    </label>
+    <button type="submit" class="btn btn-primary">Submit answer</button>
+  </form>
+</section>
+{{end}}
+
+{{if and (eq .Task.Action "vote") (and (eq .Task.State "claimed") .ClaimedByMe)}}
+<section>
+  <h2>Submit vote</h2>
+  {{if .VoteOptions}}
+  <form method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/submit"
+        hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/submit"
+        hx-target="#main"
+        class="submit-form">
+    <label>
+      Option
+      <select name="option" required>
+        <option value="">— choose —</option>
+        {{range .VoteOptions}}
+        <option value="{{.ID}}">{{.ID}}{{if .Label}} — {{.Label}}{{end}}</option>
+        {{end}}
+      </select>
+    </label>
+    <label>
+      Commentary <span class="muted small">(optional)</span>
+      <textarea name="content" rows="4" placeholder="Free-form prose explaining your choice."></textarea>
+    </label>
+    <button type="submit" class="btn btn-primary">Submit vote</button>
+  </form>
+  {{else}}
+  <p class="muted">(no options declared on this vote task — cannot submit)</p>
+  {{end}}
+</section>
+{{end}}
+
+{{if .Result}}
+<section>
+  <h2>Submitted result</h2>
+  <p class="muted small">
+    Read from <code>{{.Task.ResultDir}}/result.md</code>
+    {{if .Task.CommitSHA}}at commit <code>{{slice .Task.CommitSHA 0 12}}</code>{{end}}.
+  </p>
+  <pre class="result-content">{{.Result}}</pre>
+</section>
+{{end}}
+
+{{if .Iterations}}
+<section>
+  <h2>Iteration history</h2>
+  <p class="muted small">
+    Every claim attempt on this task, newest first.
+    Verdicts are the review decision rendered against that iteration (when reviewed).
+  </p>
+  <ol class="iter-list">
+    {{range .Iterations}}
+    <li class="iter-item iter-outcome-{{.Outcome}}">
+      <header class="iter-header">
+        <strong>iter {{.Seq}}</strong>
+        <span class="muted small">@{{.Citizen}}</span>
+        <span class="muted small">claimed {{.ClaimedAt.Format "2006-01-02 15:04"}}</span>
+        {{if .SubmittedAt}}<span class="muted small">submitted {{.SubmittedAt.Format "2006-01-02 15:04"}}</span>{{end}}
+        <span class="iter-badge iter-outcome-{{.Outcome}}">{{.Outcome}}</span>
+        {{if .ReviewDecision}}<span class="iter-badge iter-decision-{{.ReviewDecision}}">{{.ReviewDecision}}</span>{{end}}
+        {{if .Option}}<span class="iter-badge iter-option">option: {{.Option}}</span>{{end}}
+        {{if .ShortSHA}}<span class="muted small"><code>{{.ShortSHA}}</code></span>{{end}}
+      </header>
+      {{if .Body}}
+      <details>
+        <summary>view content</summary>
+        <pre class="iter-body">{{.Body}}</pre>
+      </details>
+      {{else if .CommitSHA}}
+      <p class="muted small">(content unavailable — commit unreachable from this clone)</p>
+      {{end}}
+    </li>
+    {{end}}
+  </ol>
+</section>
+{{end}}
+
+<section>
+  <h2>Prompt</h2>
+  {{if .Task.Prompt}}
+  <pre class="prompt">{{.Task.Prompt}}</pre>
+  <p class="muted small">Raw template — <code>{{"{{...}}"}}</code> placeholders are resolved client-side at claim time.</p>
+  {{else}}
+  <p class="muted">(no prompt declared)</p>
+  {{end}}
+</section>
+
+{{if eq .Task.Action "review"}}
+<section>
+  <h2>Review target</h2>
+  <p>This task reviews <code>{{.Task.ReviewsTarget}}</code>.</p>
+  {{if .Task.UpstreamIterationBranch}}
+  <p class="muted small">Upstream iteration branch: <code>{{.Task.UpstreamIterationBranch}}</code></p>
+  {{end}}
+</section>
+{{end}}
+
+{{if eq .Task.Action "vote"}}
+<section>
+  <h2>Options</h2>
+  {{if .VoteOptions}}
+  <ul class="vote-options">
+    {{range .VoteOptions}}
+    <li>
+      <strong>{{.ID}}</strong>{{if .Label}} — {{.Label}}{{end}}
+      {{if .Activates}}<span class="muted small"> activates: {{range $i, $a := .Activates}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}</span>{{end}}
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="muted">(no options declared)</p>
+  {{end}}
+</section>
+{{end}}
+
+{{if eq .Task.Action "compute"}}
+<section>
+  <h2>Compute</h2>
+  <dl class="meta-list">
+    {{if .Task.Script}}<div><dt>Script</dt><dd><code>{{.Task.Script}}</code></dd></div>{{end}}
+    {{if .Task.Container}}<div><dt>Container</dt><dd><code>{{.Task.Container}}</code></dd></div>{{end}}
+    {{if .Task.Mode}}<div><dt>Mode</dt><dd>{{.Task.Mode}}</dd></div>{{end}}
+  </dl>
+</section>
+{{end}}
+
+<section>
+  <h2>Wiring</h2>
+  <dl class="meta-list">
+    {{if .DependsOn}}
+    <div>
+      <dt>Depends on</dt>
+      <dd>
+        {{range $i, $d := .DependsOn}}{{if $i}}, {{end}}<a href="/p/{{$.ProjectID}}/t/{{$d}}"><code>{{$d}}</code></a>{{end}}
+      </dd>
+    </div>
+    {{end}}
+    {{if .Task.AssignTo}}
+    <div>
+      <dt>Assigned to</dt>
+      <dd>{{range $i, $u := .Task.AssignTo}}{{if $i}}, {{end}}@{{$u}}{{end}}</dd>
+    </div>
+    {{end}}
+    {{if .Task.ReadsArtifacts}}
+    <div>
+      <dt>Reads artifacts</dt>
+      <dd>{{range $i, $a := .Task.ReadsArtifacts}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}</dd>
+    </div>
+    {{end}}
+    {{if .Task.WritesArtifacts}}
+    <div>
+      <dt>Writes artifacts</dt>
+      <dd>
+        {{range $i, $a := .Task.WritesArtifacts}}{{if $i}}, {{end}}<code>{{$a.Path}}</code>{{if not $a.Track}} <span class="muted small">(untracked)</span>{{end}}{{end}}
+      </dd>
+    </div>
+    {{end}}
+  </dl>
+</section>
+
+<section>
+  <h2>State</h2>
+  <dl class="meta-list">
+    <div><dt>Branch</dt><dd>{{.Task.Branch}}</dd></div>
+    {{if .Task.IterationBranch}}<div><dt>Iteration branch</dt><dd><code>{{.Task.IterationBranch}}</code></dd></div>{{end}}
+    {{if .Task.IterSeq}}<div><dt>Iter seq</dt><dd>{{.Task.IterSeq}}</dd></div>{{end}}
+    {{if .Task.CommitSHA}}<div><dt>Commit</dt><dd><code>{{slice .Task.CommitSHA 0 12}}</code></dd></div>{{end}}
+    {{if .Task.PreviousIterationCommit}}<div><dt>Previous iter commit</dt><dd><code>{{slice .Task.PreviousIterationCommit 0 12}}</code></dd></div>{{end}}
+  </dl>
+</section>
+{{end}}

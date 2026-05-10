@@ -1,0 +1,28 @@
+{{define "layout"}}<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{block "title" .}}Enju{{end}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/alpine.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+  {{block "scripts" .}}{{end}}
+</head>
+<body>
+  <header class="topnav">
+    <a href="/" class="brand">Enju</a>
+    <nav>
+      <a href="/" hx-get="/" hx-target="#main" hx-push-url="true">Projects</a>
+      <a href="/inbox" hx-get="/inbox" hx-target="#main" hx-push-url="true">Inbox</a>
+      <a href="/events" hx-get="/events" hx-target="#main" hx-push-url="true">Events</a>
+    </nav>
+    <a class="who" href="/me" hx-get="/me" hx-target="#main" hx-push-url="true">@{{.Username}}</a>
+  </header>
+
+  <main id="main">
+    {{block "main" .}}<p>(no content)</p>{{end}}
+  </main>
+</body>
+</html>{{end}}

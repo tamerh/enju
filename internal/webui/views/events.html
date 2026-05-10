@@ -1,0 +1,75 @@
+{{define "title"}}Events{{if .ScopeProjectID}} · project #{{.ScopeProjectID}}{{end}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  {{if .ScopeProjectID}}
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ScopeProjectID}}">project #{{.ScopeProjectID}}</a>
+  <span> / </span>
+  <span>events</span>
+  {{else}}
+  <span>events</span>
+  {{end}}
+</nav>
+
+<header class="task-header">
+  <h1>Events</h1>
+  <p class="muted">
+    {{if .ScopeProjectID}}Project event log, newest first.{{else}}Cross-project event feed, newest first.{{end}}
+    Showing latest {{.Limit}}{{if .ForMe}} · filtered to events naming you{{end}}.
+  </p>
+  <p class="btn-row">
+    {{if .ScopeProjectID}}
+    <a class="btn {{if not .ForMe}}btn-active{{end}}" href="/p/{{.ScopeProjectID}}/events?limit={{.Limit}}">All</a>
+    <a class="btn {{if .ForMe}}btn-active{{end}}" href="/p/{{.ScopeProjectID}}/events?for_me=true&amp;limit={{.Limit}}">For me</a>
+    {{else}}
+    <a class="btn {{if not .ForMe}}btn-active{{end}}" href="/events?limit={{.Limit}}">All</a>
+    <a class="btn {{if .ForMe}}btn-active{{end}}" href="/events?for_me=true&amp;limit={{.Limit}}">For me</a>
+    {{end}}
+  </p>
+</header>
+
+{{if .Events}}
+<section>
+  <table class="events-table">
+    <thead>
+      <tr>
+        <th>Seq</th>
+        <th>Time</th>
+        <th>Type</th>
+        <th>Task</th>
+        <th>Citizen</th>
+        {{if not .ScopeProjectID}}<th>Project</th>{{end}}
+        <th>Metadata</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Events}}
+      <tr>
+        <td>{{.Seq}}</td>
+        <td class="muted small">{{.Timestamp.Format "2006-01-02 15:04:05"}}</td>
+        <td>
+          <strong>{{.Type}}</strong>
+          {{if .Subtype}}<span class="muted small"> · {{.Subtype}}</span>{{end}}
+        </td>
+        <td>{{if .TaskID}}<a href="/p/{{.ProjectID}}/t/{{.TaskID}}"><code>{{.TaskID}}</code></a>{{else}}—{{end}}</td>
+        <td>{{if .Citizen}}@{{.Citizen}}{{else}}—{{end}}</td>
+        {{if not $.ScopeProjectID}}
+        <td>{{if .ProjectName}}<a class="project-tag" href="/p/{{.ProjectID}}">{{.ProjectName}}</a>{{else}}—{{end}}</td>
+        {{end}}
+        <td class="muted small">
+          {{if .AssignTo}}assign:{{.AssignTo}} {{end}}
+          {{if .Metadata}}<details><summary>meta</summary><pre class="meta-block">{{printf "%+v" .Metadata}}</pre></details>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+{{else}}
+<section>
+  <p class="muted">(no events)</p>
+</section>
+{{end}}
+{{end}}

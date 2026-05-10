@@ -1,0 +1,94 @@
+{{define "title"}}{{.Issue.ID}} · {{.Issue.Title}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}/issues">issues</a>
+  <span> / </span>
+  <span><code>{{.Issue.ID}}</code></span>
+</nav>
+
+<header class="task-header">
+  <h1>{{.Issue.Title}}</h1>
+  <div class="badges">
+    <code class="muted">{{.Issue.ID}}</code>
+    <span class="state state-{{.Issue.Status}}">{{.Issue.Status}}</span>
+    <span class="severity severity-{{.Issue.Severity}}">{{.Issue.Severity}}</span>
+  </div>
+</header>
+
+<section>
+  <h2>Body</h2>
+  {{if .Issue.Body}}
+  <pre class="prompt">{{.Issue.Body}}</pre>
+  {{else}}
+  <p class="muted">(no body)</p>
+  {{end}}
+</section>
+
+<section>
+  <h2>Provenance</h2>
+  <dl class="meta-list">
+    <div><dt>Filed by</dt><dd>@{{.Issue.FiledBy}}</dd></div>
+    <div><dt>Filed at</dt><dd class="muted small">{{.Issue.FiledAt}}</dd></div>
+    {{if .Issue.UpdatedAt}}<div><dt>Updated at</dt><dd class="muted small">{{.Issue.UpdatedAt}}</dd></div>{{end}}
+    {{if .Issue.FoundInRunSeq}}<div><dt>Found in run</dt><dd><a href="/p/{{.ProjectID}}/r/{{.Issue.FoundInRunSeq}}">#{{.Issue.FoundInRunSeq}}</a></dd></div>{{end}}
+    {{if .Issue.FoundInTaskID}}<div><dt>Found in task</dt><dd><a href="/p/{{.ProjectID}}/t/{{.Issue.FoundInTaskID}}"><code>{{.Issue.FoundInTaskID}}</code></a></dd></div>{{end}}
+    {{if .Issue.TriagedBy}}<div><dt>Triaged by</dt><dd>@{{.Issue.TriagedBy}} <span class="muted small">at {{.Issue.TriagedAt}}</span></dd></div>{{end}}
+    {{if .Issue.ClosedAt}}<div><dt>Closed at</dt><dd class="muted small">{{.Issue.ClosedAt}}</dd></div>{{end}}
+    {{if .Issue.ClosedByTaskID}}<div><dt>Closed by task</dt><dd><a href="/p/{{.ProjectID}}/t/{{.Issue.ClosedByTaskID}}"><code>{{.Issue.ClosedByTaskID}}</code></a></dd></div>{{end}}
+  </dl>
+</section>
+
+{{$isClosed := or (eq .Issue.Status "closed") (eq .Issue.Status "wontfix")}}
+{{if not $isClosed}}
+<section x-data="{action: ''}">
+  <h2>Actions</h2>
+  <p class="btn-row">
+    <button type="button" class="btn" :class="{'btn-active': action === 'triage'}" @click="action = action === 'triage' ? '' : 'triage'">Triage</button>
+    <button type="button" class="btn" :class="{'btn-active': action === 'close'}" @click="action = action === 'close' ? '' : 'close'">Close</button>
+  </p>
+
+  <form x-show="action === 'triage'" x-cloak
+        method="POST" action="/p/{{.ProjectID}}/issues/{{.Issue.Seq}}/triage"
+        hx-post="/p/{{.ProjectID}}/issues/{{.Issue.Seq}}/triage"
+        hx-target="#main"
+        class="submit-form">
+    <p class="muted small">Update severity. Status flips to <code>triaged</code>.</p>
+    <label>
+      Severity
+      <select name="severity">
+        <option value="low" {{if eq .Issue.Severity "low"}}selected{{end}}>low</option>
+        <option value="medium" {{if eq .Issue.Severity "medium"}}selected{{end}}>medium</option>
+        <option value="high" {{if eq .Issue.Severity "high"}}selected{{end}}>high</option>
+        <option value="critical" {{if eq .Issue.Severity "critical"}}selected{{end}}>critical</option>
+      </select>
+    </label>
+    <button type="submit" class="btn btn-primary">Submit triage</button>
+  </form>
+
+  <form x-show="action === 'close'" x-cloak
+        method="POST" action="/p/{{.ProjectID}}/issues/{{.Issue.Seq}}/close"
+        hx-post="/p/{{.ProjectID}}/issues/{{.Issue.Seq}}/close"
+        hx-target="#main"
+        class="submit-form">
+    <p class="muted small">Close as <code>closed</code> (resolved) or <code>wontfix</code>.</p>
+    <label>
+      Status
+      <select name="status">
+        <option value="closed">closed — resolved</option>
+        <option value="wontfix">wontfix — won't address</option>
+      </select>
+    </label>
+    <label>
+      Closed by task <span class="muted small">(optional, links the fix task)</span>
+      <input type="text" name="closed_by_task_id" placeholder="e.g. 1:2:fix-foo">
+    </label>
+    <button type="submit" class="btn btn-primary">Confirm close</button>
+  </form>
+</section>
+{{end}}
+{{end}}

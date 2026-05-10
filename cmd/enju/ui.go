@@ -69,7 +69,7 @@ func cmdUI(args []string) {
 	email := fs.String("email", "", "Citizen email (optional)")
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json)")
-	port := fs.Int("port", 8080, "Port to bind the UI on (127.0.0.1 only)")
+	port := fs.Int("port", 8484, "Port to bind the UI on (127.0.0.1 only)")
 	dev := fs.Bool("dev", false, "Dev mode: re-parse templates per request, no-cache headers, debug overlay")
 	fs.Parse(args)
 
