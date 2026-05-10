@@ -1,9 +1,10 @@
 package gitv6
 
 // WithLock holds the project lock across the closure. Inside fn,
-// the passed Ops is the same Clone but with the reentrant flag
-// set, so nested mutating method calls don't try to re-acquire
-// the (non-recursive) lock.
+// the passed Ops is the same Clone; nested mutating method calls
+// from the SAME goroutine see themselves as the lock holder and
+// skip re-acquisition (the non-recursive sync.Mutex would
+// deadlock otherwise).
 //
 // Used by enjugit when a workflow verb needs multiple git ops to
 // land atomically (e.g. SubmitTaskResult: switch branch + write
@@ -13,20 +14,30 @@ package gitv6
 // Returns whatever fn returns. The lock is released even when fn
 // panics.
 //
-// Nested WithLock calls are safe: the inner one sees reentrant
-// already true, skips re-acquisition, and is a no-op around fn.
+// Goroutine semantics: another goroutine's WithLock or per-op
+// lock() blocks on mu until fn returns. An EARLIER design used a
+// shared `reentrant bool` that allowed any goroutine to observe
+// "we're inside WithLock" and skip locking — that collapsed
+// serialization across goroutines and is the bug this comment
+// outlives. Reentrancy is now keyed on the holder goroutine ID
+// stored on the Clone, not on a process-global flag.
+//
+// Nested WithLock calls from the same goroutine are safe: the
+// inner one sees holder==me, skips re-acquisition, and is a
+// no-op around fn.
 func (c *Clone) WithLock(fn func(Ops) error) error {
-	if c.reentrant {
-		// Already inside a WithLock; just invoke.
+	me := goroutineID()
+	if c.holder.Load() == me {
+		// Already inside this goroutine's WithLock; just invoke.
 		return fn(c)
 	}
 	c.mu.Lock()
 	if c.fileLock != nil {
 		_ = c.fileLock.Lock()
 	}
-	c.reentrant = true
+	c.holder.Store(me)
 	defer func() {
-		c.reentrant = false
+		c.holder.Store(0)
 		if c.fileLock != nil {
 			_ = c.fileLock.Unlock()
 		}

@@ -1,11 +1,15 @@
 package gitv6
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gogit "github.com/go-git/go-git/v6"
@@ -29,7 +33,24 @@ type Clone struct {
 
 	fileLock *flock.Flock
 
-	reentrant bool
+	// holder is the goroutine ID that currently holds mu, or 0
+	// when the lock is free. Set inside mu.Lock(), cleared
+	// before mu.Unlock(). Read without the mutex during the
+	// reentrancy fast-path: a goroutine that observes its own
+	// id here is guaranteed to already be the holder, so it can
+	// safely skip re-acquisition. A foreign read (other gid or
+	// 0) falls through to mu.Lock(), which is the correct
+	// outcome regardless of the value's freshness.
+	//
+	// Replaced an earlier `reentrant bool` field that was
+	// process-global rather than goroutine-local. Under that
+	// design, once any goroutine entered WithLock, every other
+	// goroutine arriving before the deferred clear saw the flag
+	// and bypassed the mutex — N concurrent MergeAcceptedTopic
+	// calls all ran their merge+push interleaved, producing
+	// orphaned commits on origin (load-test "4 commits, 2
+	// reachable" symptom).
+	holder atomic.Uint64
 
 	lastPushAt    time.Time
 	lastPushError string
@@ -252,20 +273,50 @@ func (c *Clone) RecordPush(t time.Time, errMsg string) {
 }
 
 // lock acquires both mu and (when configured) the flock. No-op
-// when reentrant is set. Returns a function the caller must call
-// to release. Use as: defer c.lock()()
+// when the calling goroutine already holds the lock (reentrant
+// fast path). Returns a function the caller must call to
+// release. Use as: defer c.lock()()
 func (c *Clone) lock() func() {
-	if c.reentrant {
+	me := goroutineID()
+	if c.holder.Load() == me {
 		return func() {}
 	}
 	c.mu.Lock()
 	if c.fileLock != nil {
 		_ = c.fileLock.Lock()
 	}
+	c.holder.Store(me)
 	return func() {
+		c.holder.Store(0)
 		if c.fileLock != nil {
 			_ = c.fileLock.Unlock()
 		}
 		c.mu.Unlock()
 	}
+}
+
+// goroutineID returns the current goroutine's ID by parsing the
+// header of runtime.Stack. Used as a per-goroutine reentrancy
+// key for the project lock. The 64-byte buffer always fits the
+// "goroutine N [state]:\n" prefix; we only need the digits
+// before the first space. Cost is a small stack scan + parse
+// (~100ns), paid only on lock acquisition (not on every method
+// inside a held lock — those see the cached holder).
+func goroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	s := buf[:n]
+	rest, ok := bytes.CutPrefix(s, []byte("goroutine "))
+	if !ok {
+		return 0
+	}
+	digits, _, ok := bytes.Cut(rest, []byte(" "))
+	if !ok {
+		return 0
+	}
+	id, err := strconv.ParseUint(string(digits), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
