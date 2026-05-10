@@ -180,7 +180,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// Resolve the per-task scratch dir (Phase 2.1). Empty
 	// workspace root falls back to "" — the wrapper's lifecycle
 	// is a no-op in that case, preserving legacy/test behavior.
-	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), taskID, meta.IterSeq)
+	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), s.coord.Username(), taskID, meta.IterSeq)
 
 	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir, meta)
 
@@ -446,6 +446,15 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskS
 		env = append(env, enjugit.BigfilesEnv+"="+bigfilesDir)
 	}
 	if taskScratchDir != "" {
+		// ENJU_TASK_DIR points at the per-task scratch dir
+		// (host path, or in-container ContainerScratchDir after
+		// the docker arg builder rewrites it). This is the
+		// script's CWD: declared reads_artifacts are
+		// materialized here before the script starts; declared
+		// writes_artifacts get picked up from here after exit.
+		// Scripts that only read/write under "$ENJU_TASK_DIR/"
+		// or "$ENJU_PROJECT_DIR/" (which equals task dir under
+		// 2.5) are guaranteed parallel-safe across siblings.
 		env = append(env, "ENJU_TASK_DIR="+taskScratchDir)
 	}
 	if templateDir != "" {

@@ -35,28 +35,31 @@ import (
 // ResolveTaskScratchDir returns the canonical absolute path for a
 // compute task's per-iteration scratch dir:
 //
-//	<workspaceRoot>/scratch/<task_id_safe>-iter-<iterSeq>
+//	<workspaceRoot>/scratch/<botUsername>/<task_id_safe>-iter-<iterSeq>
 //
 // task_id_safe replaces ':' (the task ID separator) with '-' so the
 // path is filesystem-friendly. workspaceRoot is the bot's per-machine
-// root (`s.enjugit.RootDir()` in production), so concurrent siblings
-// of the same bot get distinct scratch dirs and two bots on the same
-// host get fully separate trees.
+// root (`s.enjugit.RootDir()` in production); the botUsername segment
+// (Phase 2.5) keeps two replicas of the same bot on the same machine
+// from clobbering each other when their startup-sweeps run.
 //
-// Empty workspaceRoot returns "" — opts the caller out of scratch
-// entirely (legacy/test paths).
+// Without the username segment, replica-A's SweepStaleScratchAtStartup
+// would nuke replica-B's live scratch dir if B was mid-task during A's
+// startup. With it, each replica's sweep only touches its own subdir.
 //
-// Phase 2.1 just creates + cleans the dir up. Phase 2.3 will use it
-// as the script's CWD.
-func ResolveTaskScratchDir(workspaceRoot, taskID string, iterSeq int) string {
-	if workspaceRoot == "" || taskID == "" {
+// Empty workspaceRoot or empty botUsername returns "" — opts the caller
+// out of scratch entirely (legacy/test paths). botUsername is a soft
+// requirement (production callers always have one); the early-return
+// here keeps tests with empty identity strings working.
+func ResolveTaskScratchDir(workspaceRoot, botUsername, taskID string, iterSeq int) string {
+	if workspaceRoot == "" || botUsername == "" || taskID == "" {
 		return ""
 	}
 	safe := strings.ReplaceAll(taskID, ":", "-")
 	if iterSeq < 1 {
 		iterSeq = 1
 	}
-	return filepath.Join(workspaceRoot, "scratch",
+	return filepath.Join(workspaceRoot, "scratch", botUsername,
 		fmt.Sprintf("%s-iter-%d", safe, iterSeq))
 }
 
@@ -222,19 +225,30 @@ type Spec struct {
 	// before exec'ing the script and removes when Run returns
 	// (success or failure). Empty string suppresses the lifecycle
 	// — legacy spec files / tests that haven't opted in keep
-	// running with the script's CWD == workDir as before.
+	// running with the script's CWD == workDir as before. The
+	// legacy path is back-compat only; production callers via
+	// service/execute.go always populate this field.
 	//
-	// Phase 2.1 (this field): the dir is created + cleaned up,
-	// but the script's CWD remains workDir. Scripts can read the
-	// path from $ENJU_TASK_DIR but most won't yet.
-	// Phase 2.3 (later): cmd.Dir flips to TaskScratchDir, scripts
-	// see only their declared inputs + bundled scripts there.
+	// Cleanup-failure recovery: os.RemoveAll on exit is
+	// best-effort. If it fails (zombie subprocess holding a file
+	// open, EBUSY on a fuse mount, permissions changed mid-run),
+	// the dir leaks past this Run() call. The next iteration of
+	// the SAME task at the SAME iter_seq could collide with the
+	// leak — coord prevents that in practice (each iter_seq is
+	// claimed once), but the broader safety net is
+	// SweepStaleScratchAtStartup at the next bot daemon start,
+	// which nukes any survivor under this bot's scratch subtree.
+	//
+	// Phase 2.1 added the lifecycle. Phase 2.3 flipped the
+	// script's CWD to scratch for direct-exec mode. Phase 2.5
+	// extended that to container mode (docker bind-mounts the
+	// host scratch at ContainerScratchDir).
 	//
 	// Naming convention is the caller's choice; the wrapper just
 	// honors what the spec carries. Production callers compose
-	// <workspace_root>/scratch/<task-slug>-iter-<n>/ via
-	// service/execute.go so concurrent siblings of the same bot
-	// don't collide.
+	// <workspace_root>/scratch/<bot>/<task-slug>-iter-<n>/ via
+	// compute.ResolveTaskScratchDir — bot-scoped so replicas
+	// can share a workspace root without colliding.
 	TaskScratchDir string `json:"task_scratch_dir,omitempty"`
 
 	// Env is the task's declared env: block — keys + values
@@ -404,7 +418,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// travels together — so we reject loudly.
 	if spec.TaskScratchDir != "" && len(spec.ReadsArtifacts) > 0 {
 		if spec.ReadsSourceSHA == "" {
-			res.Error = "spec.reads_artifacts present but reads_source_sha empty (caller bug)"
+			res.Error = fmt.Sprintf("task %s: spec.reads_artifacts present but reads_source_sha empty (caller bug — service.execute should populate both as a pair)", spec.TaskID)
 			return res
 		}
 		missing, err := MaterializeReads(spec.TaskScratchDir, spec.ReadsSourceSHA,

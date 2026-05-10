@@ -39,25 +39,40 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 	return workDir
 }
 
-// SweepStaleScratch removes the entire scratch tree under the
-// given workspace root. Intended for crash-recovery on bot
-// startup: any scratch dirs surviving a previous daemon's exit
-// (crash, kill, OOM, container shutdown) are stale by definition
-// since their owning task is no longer running.
+// SweepStaleScratchAtStartup removes the calling bot's scratch
+// subtree under the given workspace root. Intended for crash-
+// recovery on bot startup: any scratch dirs surviving a previous
+// daemon's exit (crash, kill, OOM, container shutdown) are stale
+// by definition since their owning task is no longer running, and
+// the wrapper's defer-rm only handles the orderly-exit paths.
 //
-// Returns the number of entries removed (sub-dirs nuked, not file
-// count) and any error from the rm pass; an empty / nonexistent
-// scratch tree is a successful no-op.
+// Returns (entries_removed, first_error_or_nil). Empty /
+// nonexistent tree is a successful no-op.
 //
-// Safe to call ONLY when no other compute task is running on this
-// workspace — i.e. at bot startup before the poll loop begins. A
-// concurrent call against a live wrapper would race with that
-// wrapper's per-task mkdir/script lifecycle.
-func SweepStaleScratch(workspaceRoot string) (int, error) {
-	if workspaceRoot == "" {
+// Safety invariant — read this before adding a non-startup caller:
+// scratch by design holds only uncommitted work-in-progress (script
+// inputs that were materialized from git, plus outputs the wrapper
+// reads back into a commit on success). A surviving scratch dir is
+// always loss-tolerant: if work product mattered, it would be
+// committed; if it isn't, there's nothing to recover. So nuking
+// the directory at startup is correct AS LONG AS no concurrent
+// wrapper from THIS bot is using it. The function name carries
+// "AtStartup" precisely because that's the only call site that
+// holds the invariant — at startup the daemon's poll loop hasn't
+// begun yet, so no wrapper of ours is live. A future caller that
+// reaches for this from elsewhere would race a running wrapper.
+//
+// botUsername scopes the sweep to <workspaceRoot>/scratch/<bot>/
+// so replica configurations (two daemons of the same project
+// sharing one workspace root) don't clobber each other's live
+// scratch. Replica A's sweep stays inside replica A's subdir;
+// replica B's stays inside B's. Empty botUsername is a no-op
+// (test fixtures without a coord identity).
+func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) {
+	if workspaceRoot == "" || botUsername == "" {
 		return 0, nil
 	}
-	root := filepath.Join(workspaceRoot, "scratch")
+	root := filepath.Join(workspaceRoot, "scratch", botUsername)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {

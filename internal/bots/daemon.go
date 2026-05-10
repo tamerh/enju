@@ -77,11 +77,12 @@ type fatClient interface {
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
-	// SweepStaleScratch — Phase 2.4 startup hook. Removes any
-	// compute-task scratch dirs left behind by a previously
-	// crashed wrapper. No-op when the workspace isn't configured
-	// or the scratch tree is empty.
-	SweepStaleScratch() (int, error)
+	// SweepStaleScratchAtStartup — Phase 2.4 startup hook.
+	// Removes any compute-task scratch dirs left behind by a
+	// previously crashed wrapper, scoped to THIS bot's subtree
+	// (Phase 2.5 — replica-safe). No-op when the workspace
+	// isn't configured or the scratch tree is empty.
+	SweepStaleScratchAtStartup() (int, error)
 
 	// ResolveBotWorkspace returns the abs path to this bot's
 	// per-bot per-project managed clone at
@@ -290,7 +291,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// dir. Sweeping at startup keeps disk from growing across
 	// restarts. Safe here: nothing else has started yet, no
 	// concurrent wrapper to race.
-	if n, err := d.fc.SweepStaleScratch(); err != nil {
+	if n, err := d.fc.SweepStaleScratchAtStartup(); err != nil {
 		d.logger.Warn("startup scratch sweep failed (proceeding)",
 			"error", err, "removed", n)
 	} else if n > 0 {

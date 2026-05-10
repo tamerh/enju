@@ -211,21 +211,28 @@ func (s *FatClient) Coord() *coord.Client { return s.coord }
 // configured (test fixtures with coord-only setup).
 func (s *FatClient) Enjugit() *enjugit.Workspace { return s.enjugit }
 
-// SweepStaleScratch removes any leftover compute-task scratch
-// directories under the workspace root. Intended for bot startup
-// — a daemon that exited mid-task (crash, kill, OOM) leaves
-// scratch dirs whose owning task no longer runs; the next
-// daemon invocation should clear them so disk doesn't slowly
-// fill with orphans across restarts. No-op when the workspace
-// isn't configured (MCP-client-only mode).
+// SweepStaleScratchAtStartup removes any leftover compute-task
+// scratch directories under THIS bot's subtree of the workspace
+// root. Intended for bot startup — a daemon that exited mid-task
+// (crash, kill, OOM) leaves scratch dirs whose owning task no
+// longer runs; the next daemon invocation should clear them so
+// disk doesn't slowly fill with orphans across restarts. No-op
+// when the workspace or coord identity isn't configured
+// (MCP-client-only mode, test fixtures).
+//
+// The sweep is bot-username-scoped so two replicas of the same
+// bot sharing one workspace root don't clobber each other —
+// replica-A's startup only touches scratch/<replica-A>/, leaving
+// replica-B's live scratch alone. See
+// compute.SweepStaleScratchAtStartup for the safety invariant.
 //
 // Returns (count_removed, first_error_or_nil). Caller may log
 // and continue on error — a partial sweep is harmless.
-func (s *FatClient) SweepStaleScratch() (int, error) {
+func (s *FatClient) SweepStaleScratchAtStartup() (int, error) {
 	if s.enjugit == nil {
 		return 0, nil
 	}
-	return compute.SweepStaleScratch(s.enjugit.RootDir())
+	return compute.SweepStaleScratchAtStartup(s.enjugit.RootDir(), s.coord.Username())
 }
 
 // Username delegates to the coord client so callers see live values
