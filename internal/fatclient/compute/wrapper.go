@@ -499,13 +499,46 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 
 	// Always write script.log — makes failure debugging work
 	// from local disk even if commit never happens.
+	//
+	// Phase 2.6 — worktree isolation. Production callers populate
+	// TaskScratchDir, so the log lives in scratch (and on success
+	// gets committed via the in-memory FileWrite below; no on-disk
+	// copy survives the defer-cleanup since the commit is the
+	// canonical record). Legacy callers without scratch keep the
+	// old workDir/<resultDir>/script.log placement so existing tests
+	// and any out-of-tree consumers don't break.
+	//
+	// Why this matters: writing under workDir/<resultDir> leaves the
+	// log as an UNTRACKED file in the worktree (plumbing-commit
+	// adds it to the tree but doesn't `git add`). A later non-FF
+	// MergeAcceptedTopic does Checkout(target) which then refuses
+	// "untracked files would be overwritten" — exactly the
+	// parallel-merge stall the load test surfaced.
+	//
+	// On exec failure (script non-zero or wrapper-level), the log
+	// gets copied OUT of scratch to a persistent per-task path
+	// before the defer cleanup wipes scratch — see persistFailedLog
+	// at the failure branch below.
 	scriptLogPath := filepath.Join(workDir, spec.ResultDir, "script.log")
+	if spec.TaskScratchDir != "" {
+		scriptLogPath = filepath.Join(spec.TaskScratchDir, "script.log")
+	}
 	if err := os.MkdirAll(filepath.Dir(scriptLogPath), 0755); err == nil {
 		_ = os.WriteFile(scriptLogPath, scriptLog.Bytes(), 0644)
 		res.ScriptLogPath = scriptLogPath
 	}
 
 	if execErr != nil {
+		// Phase 2.6 — when the log lives in scratch, persist a copy
+		// to <workspaceRoot>/logs/ before the defer wipes scratch.
+		// Without this, post-mortem debugging would have nothing
+		// on disk: the commit never happens (no git copy) AND
+		// scratch goes away. Best-effort; on copy failure the
+		// in-memory Stderr surfaced via Result.Stderr is the
+		// last-resort signal for the caller.
+		if persisted := persistFailedLog(spec, scriptLog.Bytes()); persisted != "" {
+			res.ScriptLogPath = persisted
+		}
 		if exitErr, ok := execErr.(*exec.ExitError); ok {
 			res.ExitCode = exitErr.ExitCode()
 			res.Stderr = stderr.String()
@@ -531,8 +564,13 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// context.json was written by the handler before spawn; read
 	// it back so it lands in the same commit as the result. A
 	// reader can then reconstruct "what was this task told?" from
-	// the commit alone.
+	// the commit alone. Phase 2.6 — handler writes context.json
+	// to scratch (production), or workDir/<resultDir> (legacy
+	// callers without scratch). Match the placement on read.
 	contextPath := filepath.Join(workDir, spec.ResultDir, "context.json")
+	if spec.TaskScratchDir != "" {
+		contextPath = filepath.Join(spec.TaskScratchDir, "context.json")
+	}
 	if ctxBytes, cerr := os.ReadFile(contextPath); cerr == nil {
 		files = append(files, enjugit.FileWrite{
 			RepoRelPath: filepath.Join(spec.ResultDir, "context.json"),

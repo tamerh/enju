@@ -229,7 +229,20 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts.Paths()),
 	}
 	contextBytes, _ := json.MarshalIndent(contextPayload, "", "  ")
+	// Phase 2.6 — context.json lives in scratch (production) so the
+	// worktree never sees it as an untracked file. Without this,
+	// a non-FF MergeAcceptedTopic's post-merge Checkout(target)
+	// refuses to overwrite the untracked context.json/script.log
+	// the wrapper had left under enju/runs/<run>/<task>/, stalling
+	// parallel-merge fan-out at the second sibling. The wrapper's
+	// context.json read site honors the same placement.
+	//
+	// Legacy callers without scratch (older test fixtures) still
+	// land in workDir/<resultDir> so the existing contract holds.
 	contextFullPath := filepath.Join(workDir, resultDir, "context.json")
+	if taskScratchDir != "" {
+		contextFullPath = filepath.Join(taskScratchDir, "context.json")
+	}
 	if err := os.MkdirAll(filepath.Dir(contextFullPath), 0755); err != nil {
 		return nil, fmt.Errorf("creating run dir for context.json: %w", err)
 	}
@@ -427,20 +440,33 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskS
 	// arg builder's env-forwarding loop, so the value the
 	// container actually sees is /scratch.
 	//
-	// ENJU_RUN_DIR continues to point at workDir/<resultDir> —
-	// that's where context.json is written before exec and where
-	// script.log lands on disk for failure debugging. Container
-	// mode translates that to /workspace/<resultDir> via the same
-	// env-forwarding loop.
+	// ENJU_RUN_DIR points at the per-task scratch dir when scratch
+	// is set (Phase 2.6 — context.json + script.log live in scratch
+	// to keep the worktree clean of untracked task-metadata files
+	// that would otherwise block parallel-merge fan-out at
+	// MergeAcceptedTopic's post-merge Checkout step). Legacy callers
+	// without scratch keep workDir/<resultDir> so the documented
+	// `$ENJU_RUN_DIR/context.json` contract still resolves to the
+	// place the handler wrote the file.
+	//
+	// Container mode: buildDockerArgs translates host paths in env
+	// values, so a scratch host path here becomes ContainerScratchDir
+	// (/scratch) inside the container — same value scripts see for
+	// ENJU_TASK_DIR. The two are aliases inside the container, which
+	// is fine: both name the script's working directory.
 	projectDir := workDir
 	if taskScratchDir != "" {
 		projectDir = taskScratchDir
+	}
+	runDir := filepath.Join(workDir, resultDir)
+	if taskScratchDir != "" {
+		runDir = taskScratchDir
 	}
 	env := os.Environ()
 	env = append(env,
 		"ENJU_TASK_ID="+taskID,
 		"ENJU_PROJECT_DIR="+projectDir,
-		"ENJU_RUN_DIR="+filepath.Join(workDir, resultDir),
+		"ENJU_RUN_DIR="+runDir,
 	)
 	if bigfilesDir != "" {
 		env = append(env, enjugit.BigfilesEnv+"="+bigfilesDir)

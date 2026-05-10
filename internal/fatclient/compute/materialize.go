@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ReadFileFunc reads a file at a given commit SHA. Mirrors the
@@ -93,6 +94,39 @@ func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) 
 		count++
 	}
 	return count, firstErr
+}
+
+// persistFailedLog copies a failed task's script.log out of scratch
+// to a persistent per-task path so a human can post-mortem after
+// the scratch defer-cleanup wipes the live log. Returns the
+// persisted absolute path, or "" when persistence is suppressed
+// (no scratch / no workspace root / no taskID — all of which
+// indicate a legacy or test caller using the old workDir/<resultDir>
+// log placement).
+//
+// Path: <workspaceRoot>/logs/<task-safe>-iter-<n>.log, mirroring
+// the scratch path's bot-scoped layout but flat under one logs/
+// dir. We don't bot-scope here: a failed log without a known owner
+// is debugging-grade material, and over-organizing it would only
+// hide it from the operator who's actually looking.
+//
+// Best-effort: a write failure returns "" — the caller has already
+// captured stderr in-memory via Result.Stderr, which is the real
+// blast-radius signal.
+func persistFailedLog(spec Spec, body []byte) string {
+	if spec.TaskScratchDir == "" || spec.WorkspaceRoot == "" || spec.TaskID == "" {
+		return ""
+	}
+	logsDir := filepath.Join(spec.WorkspaceRoot, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		return ""
+	}
+	safeID := strings.ReplaceAll(spec.TaskID, ":", "-")
+	dst := filepath.Join(logsDir, fmt.Sprintf("%s.log", safeID))
+	if err := os.WriteFile(dst, body, 0o644); err != nil {
+		return ""
+	}
+	return dst
 }
 
 // MaterializeReads writes each declared input path under
