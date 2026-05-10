@@ -114,3 +114,55 @@ func TestWrapMainRejectsMissingFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapMainCreatesAndCleansScratchDir is the Phase 2.1 contract:
+// when Spec.TaskScratchDir is non-empty, the wrapper creates that
+// directory before exec'ing the script and removes it on the way
+// out — regardless of whether the script ran or even existed.
+//
+// Without this, scratch dirs would leak across runs and a crashed
+// wrapper would leave orphans that the next attempt would
+// rediscover (causing dirty-state confusion).
+//
+// Uses the missing-script path (same shape as the existing
+// TestWrapMainReadsSpecWritesResult) so we don't need git
+// infrastructure to verify the lifecycle.
+func TestWrapMainCreatesAndCleansScratchDir(t *testing.T) {
+	tmp := t.TempDir()
+	specPath := filepath.Join(tmp, "spec.json")
+	outPath := filepath.Join(tmp, "result.json")
+	scratch := filepath.Join(tmp, "scratch", "task-1-1-fetch-iter-1")
+
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("test setup: scratch should not exist yet (err=%v)", err)
+	}
+
+	spec := compute.Spec{
+		TaskID:         "1:1:fetch",
+		ScriptPath:     filepath.Join(tmp, "does-not-exist.sh"),
+		ScriptLabel:    "missing.sh",
+		TaskScratchDir: scratch,
+	}
+	data, _ := json.Marshal(spec)
+	if err := os.WriteFile(specPath, data, 0600); err != nil {
+		t.Fatalf("writing spec: %v", err)
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locating test binary: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd := exec.Command(self, "wrap-task", "--spec", specPath, "--output", outPath)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("wrap-task exit: %v (stderr: %s)", err, stderr.String())
+	}
+
+	// Even though the script didn't exist, scratch should have
+	// been created (so a real script could have used it) and
+	// then cleaned up on the way out.
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("scratch dir should have been cleaned up, but stat returned: %v", err)
+	}
+}

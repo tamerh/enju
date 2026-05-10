@@ -32,6 +32,34 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
+// ResolveTaskScratchDir returns the canonical absolute path for a
+// compute task's per-iteration scratch dir:
+//
+//	<workspaceRoot>/scratch/<task_id_safe>-iter-<iterSeq>
+//
+// task_id_safe replaces ':' (the task ID separator) with '-' so the
+// path is filesystem-friendly. workspaceRoot is the bot's per-machine
+// root (`s.enjugit.RootDir()` in production), so concurrent siblings
+// of the same bot get distinct scratch dirs and two bots on the same
+// host get fully separate trees.
+//
+// Empty workspaceRoot returns "" — opts the caller out of scratch
+// entirely (legacy/test paths).
+//
+// Phase 2.1 just creates + cleans the dir up. Phase 2.3 will use it
+// as the script's CWD.
+func ResolveTaskScratchDir(workspaceRoot, taskID string, iterSeq int) string {
+	if workspaceRoot == "" || taskID == "" {
+		return ""
+	}
+	safe := strings.ReplaceAll(taskID, ":", "-")
+	if iterSeq < 1 {
+		iterSeq = 1
+	}
+	return filepath.Join(workspaceRoot, "scratch",
+		fmt.Sprintf("%s-iter-%d", safe, iterSeq))
+}
+
 // GitSubmitFailedPrefix is the leading text of the wrapper's
 // legacy Result.Error string when the script ran fine but the
 // post-script commit/push failed. New wrappers populate
@@ -168,6 +196,25 @@ type Spec struct {
 	// older binaries keep working.
 	Container string `json:"container,omitempty"`
 
+	// TaskScratchDir is an absolute path the wrapper creates
+	// before exec'ing the script and removes when Run returns
+	// (success or failure). Empty string suppresses the lifecycle
+	// — legacy spec files / tests that haven't opted in keep
+	// running with the script's CWD == workDir as before.
+	//
+	// Phase 2.1 (this field): the dir is created + cleaned up,
+	// but the script's CWD remains workDir. Scripts can read the
+	// path from $ENJU_TASK_DIR but most won't yet.
+	// Phase 2.3 (later): cmd.Dir flips to TaskScratchDir, scripts
+	// see only their declared inputs + bundled scripts there.
+	//
+	// Naming convention is the caller's choice; the wrapper just
+	// honors what the spec carries. Production callers compose
+	// <workspace_root>/scratch/<task-slug>-iter-<n>/ via
+	// service/execute.go so concurrent siblings of the same bot
+	// don't collide.
+	TaskScratchDir string `json:"task_scratch_dir,omitempty"`
+
 	// Env is the task's declared env: block — keys + values
 	// the template author opted into as script inputs. Used
 	// only in container mode, as the allowlist alongside
@@ -255,6 +302,28 @@ type Result struct {
 // codes land in Result.ExitCode.
 func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, logger *slog.Logger) Result {
 	res := Result{}
+
+	// Scratch-dir lifecycle (Phase 2.1). Mkdir up front, defer
+	// rm. Doing it BEFORE the script-path / runtime checks means
+	// even early-return failure paths leave no orphan scratch
+	// behind. The defer runs regardless of which branch returns.
+	//
+	// Empty TaskScratchDir is a no-op: legacy spec files predate
+	// this field and the JSON omits it; their behavior is
+	// unchanged.
+	if spec.TaskScratchDir != "" {
+		if err := os.MkdirAll(spec.TaskScratchDir, 0o755); err != nil {
+			res.Error = fmt.Sprintf("creating task scratch dir %q: %v",
+				spec.TaskScratchDir, err)
+			return res
+		}
+		defer func() {
+			if err := os.RemoveAll(spec.TaskScratchDir); err != nil && logger != nil {
+				logger.Warn("scratch dir cleanup failed",
+					"path", spec.TaskScratchDir, "error", err)
+			}
+		}()
+	}
 
 	if spec.ScriptPath == "" {
 		res.Error = "spec.script_path is required"

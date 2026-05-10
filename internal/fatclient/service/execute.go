@@ -177,7 +177,12 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		_ = os.MkdirAll(bigfilesDir, 0755)
 	}
 
-	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, meta)
+	// Resolve the per-task scratch dir (Phase 2.1). Empty
+	// workspace root falls back to "" — the wrapper's lifecycle
+	// is a no-op in that case, preserving legacy/test behavior.
+	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), taskID, meta.IterSeq)
+
+	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir, meta)
 
 	// context.json — structured companion to the env vars.
 	var readsArtifacts []string
@@ -230,6 +235,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		ScriptPath:         scriptPath,
 		ScriptLabel:        meta.Script,
 		WritesArtifacts:    meta.WritesArtifacts,
+		TaskScratchDir:     taskScratchDir,
 		AuthorName:         s.coord.CitizenName(),
 		AuthorEmail:        s.coord.CitizenEmail(),
 		Username:           s.coord.Username(),
@@ -383,7 +389,13 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 // write directly via "$ENJU_BIGFILES/<path>". Empty string
 // suppresses the export — only happens in legacy / test paths
 // that haven't resolved a project root yet.
-func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir string, meta *TaskMeta) []string {
+//
+// taskScratchDir is the absolute path the wrapper creates +
+// cleans up around the script run (Phase 2.1). Exposed as
+// ENJU_TASK_DIR so scripts can opt in to writing under a
+// per-task isolated location. Empty string suppresses the
+// export.
+func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir string, meta *TaskMeta) []string {
 	env := os.Environ()
 	env = append(env,
 		"ENJU_TASK_ID="+taskID,
@@ -392,6 +404,9 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir string
 	)
 	if bigfilesDir != "" {
 		env = append(env, enjugit.BigfilesEnv+"="+bigfilesDir)
+	}
+	if taskScratchDir != "" {
+		env = append(env, "ENJU_TASK_DIR="+taskScratchDir)
 	}
 	if templateDir != "" {
 		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)

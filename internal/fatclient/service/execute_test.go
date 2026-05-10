@@ -166,3 +166,42 @@ func TestClaimTransientRetrySkipsSubstantiveErrors(t *testing.T) {
 		t.Errorf("expected 1 coordinator call (substantive error, no retry), got %d", got)
 	}
 }
+
+// TestBuildComputeEnvHonorsTaskScratchDir pins the Phase 2.1
+// contract: when buildComputeEnv is given a non-empty
+// taskScratchDir, the resulting env exports ENJU_TASK_DIR with
+// that value; an empty taskScratchDir suppresses the var.
+//
+// This is the boundary test for the env-vs-Spec split: the
+// wrapper's own scratch lifecycle is exercised in
+// internal/fatclient/compute/wrapper_test.go; here we just
+// verify the service-side caller composes the env the wrapper
+// expects.
+func TestBuildComputeEnvHonorsTaskScratchDir(t *testing.T) {
+	meta := &TaskMeta{}
+
+	envWith := buildComputeEnv("1:1:fetch",
+		"/some/work", "enju/runs/1/fetch", "", "",
+		"/scratch/abc-iter-1", meta)
+	if !containsEnv(envWith, "ENJU_TASK_DIR=/scratch/abc-iter-1") {
+		t.Errorf("ENJU_TASK_DIR missing or wrong: %v", envWith)
+	}
+
+	envWithout := buildComputeEnv("1:1:fetch",
+		"/some/work", "enju/runs/1/fetch", "", "",
+		"", meta)
+	for _, e := range envWithout {
+		if strings.HasPrefix(e, "ENJU_TASK_DIR=") {
+			t.Errorf("ENJU_TASK_DIR should be suppressed when scratch dir is empty, got: %v", e)
+		}
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, e := range env {
+		if e == want {
+			return true
+		}
+	}
+	return false
+}
