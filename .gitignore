@@ -1,13 +1,29 @@
 # Binary (anchored to repo root — without the leading slash, this
 # pattern would also match the cmd/enju/ directory and silently
-# exclude its source files from commits).
+# exclude its source files from commits). enju-coord is a hardlink
+# created by build.sh dev-restart so the coordinator runs under a
+# distinct argv[0] (defends against `pkill -f enju` killing it).
 /enju
+/enju-coord
+mytmpwork/
 
 # Database
 *.db
 
+# Coordinator log (written by build.sh dev-restart)
+/enju-coord.log
+/enju-coord.log.prev
+/enju-coord-signals.log
+/enju-coord-signals.log.prev
+
 # Test output (symlink to /tmp/enju-test-output)
 test/output
+
+# Integration-test runtime artifacts: enju/events/live.jsonl,
+# enju/runs/, scratch/, etc. — written by tests that spin up a
+# real coord + project under test/. Source-tree pollution; the
+# tests recreate everything they need.
+test/enju/
 
 # MCP config (contains local paths)
 .mcp.json
