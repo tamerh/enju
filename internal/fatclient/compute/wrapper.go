@@ -651,6 +651,31 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	}
 	res.MissingArtifacts = append(res.MissingArtifacts, missingU...)
 
+	// Required (non-optional) writes_artifacts that produced
+	// nothing fail the iteration loudly. ExpandAgainstWorkdir
+	// already filters Optional entries out of the missing list,
+	// so anything that landed there is by definition contractually
+	// required — committing without it would be silent acceptance
+	// of a broken task whose downstream consumers can't make
+	// progress (see the compute-load-test cascade-stall: a
+	// non-parametric script wrote raw_a.txt for every sibling, so
+	// fetch_data_b/c "succeeded" with empty artifacts and
+	// process_b/c sat PENDING forever on a dep that would never
+	// land in the artifact index).
+	//
+	// We emit a single Error covering the union of missing tracked
+	// + untracked, then return BEFORE the commit step. ExitCode
+	// stays 0 (the script itself ran fine; the contract violation
+	// is the wrapper's call) — the handler's classification path
+	// already routes Result.Error as a wrapper-level failure
+	// distinct from script-non-zero, surfacing this cleanly to
+	// the operator.
+	if total := len(missingT) + len(missingU); total > 0 {
+		all := append(append([]string{}, missingT...), missingU...)
+		res.Error = fmt.Sprintf("required writes_artifacts not produced: %v", all)
+		return res
+	}
+
 	var committedPaths []string
 	for _, e := range tracked {
 		full := filepath.Join(scriptCwd, enjugit.ArtifactPath(e.Path))
