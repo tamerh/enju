@@ -92,6 +92,13 @@ type fakeFC struct {
 	// claim" contract by asserting this fires every iteration.
 	fetchAllRefsCalls []int64
 	fetchAllRefsErr   error
+
+	// markStartedCalls records MarkTaskStarted invocations.
+	// Phase 8.2 contract: the daemon posts /started for every
+	// claimed task right before the LLM call. Tests assert this
+	// list mirrors the claimed taskIDs in order.
+	markStartedCalls []string
+	markStartedErr   error
 }
 
 type checkoutTopicCall struct {
@@ -184,6 +191,13 @@ func (f *fakeFC) FetchAllRefsForBot(ctx context.Context, projectID int64) error 
 	defer f.mu.Unlock()
 	f.fetchAllRefsCalls = append(f.fetchAllRefsCalls, projectID)
 	return f.fetchAllRefsErr
+}
+
+func (f *fakeFC) MarkTaskStarted(ctx context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markStartedCalls = append(f.markStartedCalls, taskID)
+	return f.markStartedErr
 }
 
 func (f *fakeFC) WipeDeclaredWrites(ctx context.Context, projectID int64, writes enjuYaml.WriteArtifacts) error {
@@ -456,6 +470,57 @@ func TestDaemon_RunOnce_AnswerAction(t *testing.T) {
 	}
 	if got.Decision != "" || got.Option != "" {
 		t.Errorf("answer should not set Decision/Option: %+v", got)
+	}
+}
+
+// TestDaemon_RunOnce_MarksTaskStartedBeforeHandler pins Phase
+// 8.2's CLAIMED → RUNNING signal: the daemon must POST
+// /tasks/:id/started for every claimed task before invoking
+// the handler. Without this, a bot stuck in pre-LLM setup
+// (workspace resolve, claim race, etc.) is indistinguishable
+// from one mid-LLM-call. The fake records each call so we can
+// also assert it's the same task we claimed.
+func TestDaemon_RunOnce_MarksTaskStartedBeforeHandler(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "ok")
+	stub := &StubHandler{Response: "ok"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(fc.markStartedCalls) != 1 {
+		t.Fatalf("expected 1 MarkTaskStarted call, got %d", len(fc.markStartedCalls))
+	}
+	if got, want := fc.markStartedCalls[0], "1:1:t"; got != want {
+		t.Errorf("MarkTaskStarted called for %q, want %q", got, want)
+	}
+	// One submit confirms the iteration completed past the
+	// MarkTaskStarted gate. A swallowed error in the handler
+	// path would have left submits empty here.
+	if len(fc.submits) != 1 {
+		t.Fatalf("expected 1 submit, got %d", len(fc.submits))
+	}
+}
+
+// TestDaemon_RunOnce_MarkStartedFailureDoesNotBlockHandler
+// pins the best-effort contract: a /started POST that errors
+// (e.g. coord transient 5xx, or a state-guard rejection on a
+// retry resume) MUST NOT abort the iteration. The daemon logs
+// and proceeds — the work itself is independent of this
+// observability hook.
+func TestDaemon_RunOnce_MarkStartedFailureDoesNotBlockHandler(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "ok")
+	fc.markStartedErr = errors.New("coord 503 transient")
+	stub := &StubHandler{Response: "ok"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	worked, err := d.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if !worked {
+		t.Fatal("expected worked=true; mark-started error must not abort")
+	}
+	if len(fc.submits) != 1 {
+		t.Errorf("expected 1 submit despite mark-started error, got %d", len(fc.submits))
 	}
 }
 

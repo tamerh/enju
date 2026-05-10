@@ -206,6 +206,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/tasks/{taskID}", s.handleGetTask)
 		r.Get("/tasks/{taskID}/inputs", s.handleGetTaskInputs)
 		r.Get("/tasks/{taskID}/iterations", s.handleListIterations)
+		r.Post("/tasks/{taskID}/started", s.handleMarkTaskStarted)
 		r.Post("/tasks/{taskID}/result", s.handleSubmitResult)
 		r.Post("/tasks/reconcile", s.handleReconcileTasks)
 		r.Post("/tasks/{taskID}/release", s.handleReleaseTask)

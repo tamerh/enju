@@ -287,6 +287,18 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		Env:       meta.Env,
 	}
 
+	// Phase 8.2 — signal CLAIMED → RUNNING just before kicking
+	// off compute (sync) or the wrapper subprocess (async). The
+	// coord-side handler validates state==CLAIMED so a duplicate
+	// POST on a resume retry returns a benign 400; we log and
+	// proceed since this transition is observability, not
+	// correctness. Human-action tasks skip RUNNING entirely (the
+	// brief's "no exec phase" path) and never reach this code.
+	if _, perr := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/started", nil); perr != nil {
+		s.logger.Debug("mark task started failed; observability only",
+			"task_id", taskID, "error", perr)
+	}
+
 	if ResolvedMode(meta) == "async" {
 		kick, err := s.kickoffAsyncWrapTask(spec, env, resultDir, workDir)
 		if err != nil {

@@ -666,7 +666,34 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 		// tally resolve, and any future "operator marks task
 		// accepted" admin tool. They each set NewState=accepted
 		// here.
-		if m.NewState == TaskAccepted && TaskState(currentState) != TaskAccepted {
+		if m.NewState == TaskRunning && TaskState(currentState) == TaskClaimed {
+			// task_started fires on CLAIMED → RUNNING. Emitted
+			// from the coord side when the fat-client posts
+			// /tasks/:id/started right before exec.Run / LLM call,
+			// providing a "claimed but stuck" vs "actually running"
+			// diagnostic signal. Companion to task_completed:
+			// together they bracket the work-execution window.
+			var runID, projectID int64
+			var taskAction string
+			var citizens int
+			_ = tx.QueryRow(
+				`SELECT t.run_id, r.project_id, t.action, t.citizens
+				 FROM tasks t JOIN runs r ON t.run_id = r.id WHERE t.id = ?`,
+				m.TaskID,
+			).Scan(&runID, &projectID, &taskAction, &citizens)
+			sink.Emit(Event{
+				EventType:    "task_started",
+				EventSubtype: taskAction,
+				TaskID:       m.TaskID,
+				RunID:        runID,
+				ProjectID:    projectID,
+				Metadata: MarshalMetadata(map[string]any{
+					"citizens":    citizens,
+					"prior_state": currentState,
+				}),
+				CreatedAt: time.Now(),
+			})
+		} else if m.NewState == TaskAccepted && TaskState(currentState) != TaskAccepted {
 			var runID, projectID int64
 			var taskAction string
 			var citizens int

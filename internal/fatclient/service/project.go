@@ -425,6 +425,25 @@ func (s *FatClient) FetchAllRefsForBot(ctx context.Context, projectID int64) err
 	return wf.FetchAllRefs()
 }
 
+// MarkTaskStarted posts /api/v1/tasks/:id/started to flip the
+// task CLAIMED → RUNNING. Phase 8.2 observability hook: tells
+// the coord (and any operator watching enju_run_status) that
+// the citizen has actually kicked off execution rather than
+// just claimed and stalled. Used by the bot daemon's
+// processAndSubmit right before the LLM call. The compute path
+// posts inline from execute.go since it has direct s.coord
+// access. Surfacing this on FatClient lets the daemon stay
+// behind its narrow `fatClient` interface without leaking the
+// raw coord client.
+//
+// Best-effort callers: a duplicate POST on a retry resume hits
+// the coord-side state==CLAIMED guard and returns an error
+// the caller should log + ignore.
+func (s *FatClient) MarkTaskStarted(ctx context.Context, taskID string) error {
+	_, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/started", nil)
+	return err
+}
+
 // CheckoutTopicBranchTip switches the bot clone's HEAD to the
 // named topic branch. Used by the bot daemon on iter-2+ re-claim
 // after a request_changes verdict so the LLM starts on the prior

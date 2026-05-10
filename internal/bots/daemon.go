@@ -138,6 +138,14 @@ type fatClient interface {
 	// citizens. Without this step, per-bot clones drift apart
 	// and reading bots see stale empty topic branches.
 	FetchAllRefsForBot(ctx context.Context, projectID int64) error
+
+	// MarkTaskStarted posts /api/v1/tasks/:id/started to flip the
+	// task CLAIMED → RUNNING. Phase 8.2 observability: tells the
+	// coord (and any operator watching enju_run_status) that the
+	// LLM call has actually kicked off, not just that the task
+	// got claimed. Best-effort — duplicate POSTs on a retry
+	// resume return a benign error the daemon logs and ignores.
+	MarkTaskStarted(ctx context.Context, taskID string) error
 }
 
 // Config bundles every dependency the Daemon needs at construction.
@@ -670,6 +678,18 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		b.WriteString("\n\n# Original task\n\n")
 		b.WriteString(prompt)
 		prompt = b.String()
+	}
+
+	// Phase 8.2 — signal CLAIMED → RUNNING just before the LLM
+	// call. Best-effort: the transition is observability, not
+	// correctness; a failure here doesn't stop the iteration.
+	// Coord rejects duplicate POSTs (state==RUNNING already)
+	// with 400, which we log and ignore — covers the resume-
+	// after-handler-error retry path where the daemon re-enters
+	// processAndSubmit on the same claim.
+	if perr := d.fc.MarkTaskStarted(ctx, taskID); perr != nil {
+		d.logger.Debug("mark task started failed; observability only",
+			"task_id", taskID, "error", perr)
 	}
 
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
