@@ -256,7 +256,8 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 		  COALESCE(c.username, '') AS username,
 		  COALESCE(tc.commit_sha, '') AS commit_sha,
 		  COALESCE(tc.decision, '') AS decision,
-		  COALESCE(tc.branch, '') AS branch
+		  COALESCE(tc.branch, '') AS branch,
+		  COALESCE(tc.iter_seq, 0) AS iter_seq
 		 FROM task_claims tc
 		 LEFT JOIN citizens c ON tc.citizen_id = c.id
 		 WHERE tc.task_id = ?
@@ -279,6 +280,7 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 			&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
 			&r.Outcome, &submittedAt, &r.Option, &modelID,
 			&r.Username, &r.CommitSHA, &r.ReviewDecision, &r.Branch,
+			&r.IterSeq,
 		); err != nil {
 			continue
 		}

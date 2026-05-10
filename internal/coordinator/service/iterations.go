@@ -55,6 +55,14 @@ func ListTaskIterations(s store.CoordinatorStore, caller *store.CitizenRecord, t
 		if it.SubmittedAt != nil {
 			t := it.SubmittedAt.UTC()
 			row.SubmittedAt = &t
+			// Phase 8.6 — duration in ms for surfaces that
+			// want a "took 5m / 2h" badge without doing the
+			// time arithmetic. Negative deltas (clock skew /
+			// out-of-order submitted_at) clamp to zero so the
+			// downstream renderer doesn't show "-3s ago."
+			if d := t.Sub(it.ClaimedAt.UTC()).Milliseconds(); d > 0 {
+				row.DurationMS = d
+			}
 		}
 		if it.ModelID != nil {
 			row.Model = CitizenUsername(s, *it.ModelID)

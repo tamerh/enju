@@ -488,6 +488,15 @@ type ProjectMemberRecord struct {
 type IterationRecord struct {
 	TaskID     string
 	Seq      int  // 1-based, ordered by claimed_at
+	// IterSeq is the task_claims.iter_seq column — the
+	// accept-cycle counter (Phase 6c). Distinct from Seq
+	// (the projection's 1-based row index): multi-citizen
+	// tasks have N citizens claiming with the SAME iter_seq
+	// for one accept-cycle, so for those tasks Seq counts
+	// claim-rows while IterSeq counts cycles. Surfaced in
+	// Phase 8.6 so iter_count = COUNT(DISTINCT iter_seq) is
+	// computable without a separate query.
+	IterSeq    int
 	CitizenID   int64 // claimant
 	Username    string // resolved at projection time
 	ClaimedAt   time.Time

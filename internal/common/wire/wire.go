@@ -120,4 +120,10 @@ type Iteration struct {
 	ReviewDecision string     `json:"review_decision,omitempty"`
 	Option         string     `json:"option,omitempty"`
 	Model          string     `json:"model,omitempty"`
+	// DurationMS is the elapsed wall-clock between claim and
+	// submission, in milliseconds. Phase 8.6 surface — lets
+	// run_status / web UI render "5m" / "2h" without doing
+	// the time arithmetic on the client. Zero for iterations
+	// that haven't submitted yet (claim still open).
+	DurationMS int64 `json:"duration_ms,omitempty"`
 }

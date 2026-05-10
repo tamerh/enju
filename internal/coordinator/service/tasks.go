@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/wire"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -85,6 +86,23 @@ type TaskResponse struct {
 	UpstreamIterationBranch  string                 `json:"upstream_iteration_branch,omitempty"`
 	LatestCompletedCommitSHA string                 `json:"latest_completed_commit_sha,omitempty"`
 	LatestCompletedBranch    string                 `json:"latest_completed_branch,omitempty"`
+
+	// IterCount is the number of distinct iter_seq values on
+	// this task's task_claims rows — i.e. how many accept-
+	// cycles it's been through. 1 for a single-attempt task,
+	// > 1 for tasks that bounced through request_changes /
+	// invalidate / re-claim. Surface readers (enju_run_status
+	// Iter column, Mermaid (N×) badge) gate on >1 so the
+	// common case stays uncluttered. Phase 8.6.
+	IterCount int `json:"iter_count,omitempty"`
+
+	// Iterations is the per-iteration projection embedded on
+	// the task response so callers don't need a follow-up
+	// /tasks/{id}/iterations roundtrip when rendering history.
+	// Same shape as the list endpoint returns. Phase 8.6
+	// suppresses this when IterCount <= 1 (single-attempt
+	// tasks have nothing interesting to render).
+	Iterations []wire.Iteration `json:"iterations,omitempty"`
 }
 
 // TaskHistoryEntry is one row of a task's claim/submission
@@ -443,6 +461,62 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 				entry.SubmittedAt = h.SubmittedAt.Format(time.RFC3339)
 			}
 			resp.TaskHistory = append(resp.TaskHistory, entry)
+		}
+	}
+
+	// Phase 8.6 — iteration projection. iter_count = the
+	// task's accept-cycle count (max iter_seq from
+	// task_claims); the embedded iterations[] gives a
+	// per-cycle history so callers don't need a follow-up
+	// /tasks/{id}/iterations roundtrip. Both suppress on
+	// single-attempt tasks (iter_count == 1) so the common
+	// case stays uncluttered.
+	if iters, err := s.ListTaskIterations(t.ID); err == nil && len(iters) > 0 {
+		distinct := map[int]bool{}
+		for _, it := range iters {
+			distinct[it.IterSeq] = true
+		}
+		// Fall back to the row count when iter_seq is
+		// uniformly zero (legacy rows pre-Phase-6c migration);
+		// matches the post-migration semantics of "one
+		// task_claims row per iteration."
+		count := len(distinct)
+		if len(distinct) == 1 {
+			for k := range distinct {
+				if k == 0 {
+					count = len(iters)
+				}
+			}
+		}
+		if count > 1 {
+			resp.IterCount = count
+			for _, it := range iters {
+				row := wire.Iteration{
+					Seq:            it.Seq,
+					Citizen:        it.Username,
+					ClaimedAt:      it.ClaimedAt.UTC(),
+					CommitSHA:      it.CommitSHA,
+					Branch:         it.Branch,
+					ReviewDecision: string(it.ReviewDecision),
+					Option:         it.Option,
+				}
+				if it.Outcome == "" {
+					row.Outcome = "active"
+				} else {
+					row.Outcome = string(it.Outcome)
+				}
+				if it.SubmittedAt != nil {
+					ts := it.SubmittedAt.UTC()
+					row.SubmittedAt = &ts
+					if d := ts.Sub(it.ClaimedAt.UTC()).Milliseconds(); d > 0 {
+						row.DurationMS = d
+					}
+				}
+				if it.ModelID != nil {
+					row.Model = CitizenUsername(s, *it.ModelID)
+				}
+				resp.Iterations = append(resp.Iterations, row)
+			}
 		}
 	}
 

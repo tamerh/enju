@@ -98,6 +98,30 @@ func RenderBlockedBy(raw string) string {
 	}
 }
 
+// humanDuration renders a millisecond duration as a compact
+// human-readable string ("450ms", "5m", "2h", "3d"). Used by
+// the iterations[] block to show how long each accept-cycle
+// took without forcing the renderer to split into seconds /
+// minutes manually. Returns "0s" for zero.
+func humanDuration(ms int64) string {
+	if ms <= 0 {
+		return "0s"
+	}
+	d := time.Duration(ms) * time.Millisecond
+	switch {
+	case d < time.Second:
+		return fmt.Sprintf("%dms", ms)
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours())/24)
+	}
+}
+
 // humanizeSince renders an RFC3339 timestamp as a relative
 // duration ("2h ago", "5m ago", "3d ago"). Used by
 // RenderBlockedBy for the review-blocker since field — the
@@ -2275,6 +2299,16 @@ func RenderMermaidBody(runData []byte, tasksData []byte) string {
 		state, _ := t["state"].(string)
 		skipReason, _ := t["skip_reason"].(string)
 		label := MermaidEscape(TaskShortName(t)) + " " + StateIconFor(state, skipReason)
+		// Phase 8.6 — surface iter_count > 1 as a "(N×)" badge
+		// so the diagram shows at a glance which nodes
+		// bounced through review/invalidate. The coord sets
+		// iter_count on the task projection only when > 1
+		// (suppressed otherwise to keep the common case
+		// uncluttered), so a missing/zero value drops the
+		// badge naturally.
+		if iterCount := IntFromJSON(t["iter_count"]); iterCount > 1 {
+			label += fmt.Sprintf(" (%d×)", iterCount)
+		}
 		cls := MermaidStateClass(state)
 		b.WriteString(fmt.Sprintf("    %s[\"%s\"]", nodeID[id], label))
 		if cls != "" {
@@ -2720,6 +2754,40 @@ func TaskDetail(taskData []byte, inputsData []byte, viewer string) string {
 				b.WriteString("\n")
 				b.WriteString(ResolvedArtifactsBlock(artMap, missingArts))
 			}
+		}
+	}
+
+	// Phase 8.6 — iterations[] block. Present only when the
+	// task accept-cycled more than once (iter_count > 1);
+	// suppressed otherwise to keep single-attempt task pages
+	// uncluttered. Renders verdict + duration per iteration
+	// so a reviewer / operator can see "iter 1 took 5m and
+	// got request_changes; iter 2 took 12m and was approved"
+	// at a glance. Distinct from the legacy task_history
+	// block below which exists for multi-citizen single-iter
+	// tasks (one row per claimant, no iter-cycle structure).
+	if iterCount := IntFromJSON(task["iter_count"]); iterCount > 1 {
+		if itersRaw, ok := task["iterations"].([]interface{}); ok && len(itersRaw) > 0 {
+			fmt.Fprintf(&b, "\n── Iterations (%d×) ─────────────────────────\n", iterCount)
+			for _, raw := range itersRaw {
+				it, _ := raw.(map[string]interface{})
+				seq := IntFromJSON(it["seq"])
+				citizen, _ := it["citizen"].(string)
+				outcome, _ := it["outcome"].(string)
+				verdict, _ := it["review_decision"].(string)
+				durationMS := IntFromJSON(it["duration_ms"])
+				line := fmt.Sprintf("  %d. @%s", seq, citizen)
+				if verdict != "" {
+					line += " → " + verdict
+				} else if outcome != "" {
+					line += " → " + outcome
+				}
+				if durationMS > 0 {
+					line += " (" + humanDuration(int64(durationMS)) + ")"
+				}
+				b.WriteString(line + "\n")
+			}
+			b.WriteString("────────────────────────────────────────────\n")
 		}
 	}
 
