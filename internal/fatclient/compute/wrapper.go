@@ -196,6 +196,28 @@ type Spec struct {
 	// older binaries keep working.
 	Container string `json:"container,omitempty"`
 
+	// ReadsArtifacts lists the declared input paths the task
+	// expects to find under TaskScratchDir before its script
+	// runs. Each path is read from ReadsSourceSHA via the
+	// workflow's ReadFileAtCommit and written under
+	// TaskScratchDir/<path>. Phase 2.2 contract.
+	//
+	// Empty / nil suppresses the materialization step entirely
+	// — tasks with no declared reads (e.g. a fetch from an
+	// external API) just see an empty scratch dir.
+	//
+	// Required when ReadsSourceSHA is set, and vice versa: the
+	// pair travels together. A read-only spec without a SHA
+	// (e.g. test fixtures) gets a sentinel-clean rejection.
+	ReadsArtifacts []string `json:"reads_artifacts,omitempty"`
+
+	// ReadsSourceSHA is the commit the wrapper reads each
+	// ReadsArtifacts entry from. Production callers populate
+	// this with the run-branch tip resolved at claim time —
+	// once a task claims, its inputs are pinned to that SHA so
+	// concurrent siblings don't race the materializer.
+	ReadsSourceSHA string `json:"reads_source_sha,omitempty"`
+
 	// TaskScratchDir is an absolute path the wrapper creates
 	// before exec'ing the script and removes when Run returns
 	// (success or failure). Empty string suppresses the lifecycle
@@ -363,6 +385,35 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	}
 
 	workDir := wf.WorkDir()
+
+	// Phase 2.2 — materialize declared reads_artifacts into the
+	// task's scratch dir BEFORE the script runs. The script's
+	// CWD is still workDir at this point (Phase 2.3 flips it),
+	// so ENJU_TASK_DIR is the only way for the script to find
+	// these files; most scripts won't yet, and that's fine —
+	// 2.2 lays the substrate, 2.3 cuts the worktree dependency.
+	//
+	// Skipped when scratch is unset (legacy spec) or no reads
+	// were declared (e.g. external-fetch task). A non-empty
+	// reads list with no source SHA is a wiring bug — the pair
+	// travels together — so we reject loudly.
+	if spec.TaskScratchDir != "" && len(spec.ReadsArtifacts) > 0 {
+		if spec.ReadsSourceSHA == "" {
+			res.Error = "spec.reads_artifacts present but reads_source_sha empty (caller bug)"
+			return res
+		}
+		missing, err := MaterializeReads(spec.TaskScratchDir, spec.ReadsSourceSHA,
+			spec.ReadsArtifacts, wf.ReadFileAtCommit)
+		if err != nil {
+			res.Error = err.Error()
+			return res
+		}
+		// Inputs absent at the source commit are a soft warning
+		// (matches existing MissingArtifacts semantics for
+		// declared-but-not-produced outputs). The handler maps
+		// res.MissingArtifacts → "warn" in the response.
+		res.MissingArtifacts = append(res.MissingArtifacts, missing...)
+	}
 
 	// Pre-exec: materialize shared-root symlinks for every
 	// declared untracked LITERAL path. When ENJU_SHARED_ROOT is

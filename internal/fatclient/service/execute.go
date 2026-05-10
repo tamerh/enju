@@ -198,6 +198,27 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 			}
 		}
 	}
+	// Phase 2.2 — resolve the run-branch tip so the wrapper can
+	// materialize each declared reads_artifacts entry from a
+	// pinned commit. Reading from the run-branch (not the
+	// task's own iteration branch) is correct here: upstream
+	// task outputs auto-merge to the run-branch on accept, so
+	// the run-branch tip carries every dep's content by the
+	// time this task claims.
+	//
+	// Empty hash → branch absent locally + on origin. We let
+	// the materializer no-op (it skips when ReadsSourceSHA is
+	// empty + ReadsArtifacts is empty) by leaving readsSourceSHA
+	// "" — combined with the ReadsArtifacts-non-empty guard in
+	// the wrapper, the task fails loud with a "caller bug" if
+	// it actually has declared reads but no resolvable source.
+	var readsSourceSHA string
+	if len(readsArtifacts) > 0 && wf != nil {
+		if sha, herr := wf.LocalBranchHash(meta.Branch); herr == nil {
+			readsSourceSHA = sha
+		}
+	}
+
 	contextPayload := map[string]interface{}{
 		"task_id":          taskID,
 		"task_def_id":      meta.TaskDefID,
@@ -235,6 +256,8 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		ScriptPath:         scriptPath,
 		ScriptLabel:        meta.Script,
 		WritesArtifacts:    meta.WritesArtifacts,
+		ReadsArtifacts:     readsArtifacts,
+		ReadsSourceSHA:     readsSourceSHA,
 		TaskScratchDir:     taskScratchDir,
 		AuthorName:         s.coord.CitizenName(),
 		AuthorEmail:        s.coord.CitizenEmail(),

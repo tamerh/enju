@@ -12,10 +12,12 @@ package compute_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/compute"
@@ -164,5 +166,75 @@ func TestWrapMainCreatesAndCleansScratchDir(t *testing.T) {
 	// then cleaned up on the way out.
 	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
 		t.Fatalf("scratch dir should have been cleaned up, but stat returned: %v", err)
+	}
+}
+
+// TestMaterializeReads pins the Phase 2.2 contract: given a list
+// of declared input paths and a read-from-commit function, the
+// helper writes each input under the scratch dir at its declared
+// path, creating intermediate directories as needed; missing
+// inputs surface in the returned slice (caller soft-warns) but
+// don't abort the rest.
+func TestMaterializeReads(t *testing.T) {
+	scratch := t.TempDir()
+
+	contents := map[string][]byte{
+		"data/raw_a.txt":      []byte("alpha\n"),
+		"data/raw_b.txt":      []byte("beta\n"),
+		"src/config/conf.yml": []byte("port: 8080\n"),
+	}
+	read := func(sha, path string) ([]byte, bool, error) {
+		if sha != "deadbeef" {
+			return nil, false, nil
+		}
+		body, ok := contents[path]
+		return body, ok, nil
+	}
+
+	paths := []string{
+		"data/raw_a.txt",
+		"data/raw_b.txt",
+		"src/config/conf.yml",
+		"data/raw_c.txt", // intentionally missing
+	}
+	missing, err := compute.MaterializeReads(scratch, "deadbeef", paths, read)
+	if err != nil {
+		t.Fatalf("MaterializeReads returned error: %v", err)
+	}
+	if len(missing) != 1 || missing[0] != "data/raw_c.txt" {
+		t.Errorf("expected missing=[data/raw_c.txt], got %v", missing)
+	}
+	for path, want := range contents {
+		got, err := os.ReadFile(filepath.Join(scratch, path))
+		if err != nil {
+			t.Errorf("reading materialized %s: %v", path, err)
+			continue
+		}
+		if string(got) != string(want) {
+			t.Errorf("content mismatch at %s: got %q, want %q", path, got, want)
+		}
+	}
+	// Ensure the missing one didn't leave an empty file behind.
+	if _, err := os.Stat(filepath.Join(scratch, "data/raw_c.txt")); !os.IsNotExist(err) {
+		t.Errorf("missing path should not have been written, stat err: %v", err)
+	}
+}
+
+// TestMaterializeReads_ReadError surfaces underlying read
+// failures verbatim (not as missing) so the caller can fail the
+// task loudly rather than silently treating an IO error as
+// "input absent."
+func TestMaterializeReads_ReadError(t *testing.T) {
+	scratch := t.TempDir()
+	read := func(sha, path string) ([]byte, bool, error) {
+		return nil, false, fmt.Errorf("disk on fire")
+	}
+	_, err := compute.MaterializeReads(scratch, "deadbeef",
+		[]string{"data/x.txt"}, read)
+	if err == nil {
+		t.Fatal("expected error to propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "disk on fire") {
+		t.Errorf("error should carry underlying cause, got: %v", err)
 	}
 }
