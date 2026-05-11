@@ -1,0 +1,26 @@
+# Worked example for the snapshot-as-CWD shape.
+#
+# Demonstrates that a compute task's script can reach sibling
+# files in the template via natural relative paths — no
+# $ENJU_TEMPLATE_DIR dance required:
+#
+#   entry.sh sources ./lib/utils.sh and invokes ./scripts/helper.sh.
+#
+# Run via:   enju_execute_run path=examples/scratch-tree-hello
+#
+# The script's working directory IS the template-snapshot tree.
+# Outputs that need to be written go to $ENJU_SCRATCH (a per-iter
+# writable sandbox). The snapshot itself is read-only — attempting
+# to write a file with a relative path (`echo > foo.txt`) returns
+# permission denied. See docs/async-compute.md for the full
+# rationale and the docs/troubleshooting.md entry for migrating
+# legacy scripts that wrote to CWD.
+
+name: Scratch-tree-as-CWD demo
+
+tasks:
+  - id: greet
+    action: compute
+    script: entry.sh
+    writes_artifacts:
+      - greeting.txt
