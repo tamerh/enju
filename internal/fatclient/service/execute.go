@@ -175,6 +175,25 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
 	}
 
+	// Enforce the read-only contract on the template snapshot.
+	// The snapshot is the script's working directory (read sibling
+	// files like ./scripts/helper.sh naturally); chmod 0444/0555
+	// is the host-side guard against silent pollution from Python
+	// __pycache__ writes, tool caches, or accidental relative-path
+	// writes. Container path gets a kernel-side :ro bind on top
+	// (defense in depth). Best-effort: surface chmod failure as
+	// a soft warning rather than blocking execution — the snapshot
+	// will still be readable; only the write-protection guarantee
+	// degrades.
+	if templateDir != "" {
+		if cerr := compute.ChmodSnapshotReadOnly(templateDir); cerr != nil {
+			s.logger.Warn("chmod snapshot read-only",
+				"template_dir", templateDir,
+				"task_id", taskID,
+				"error", cerr)
+		}
+	}
+
 	// Resolve + pre-create the bigfiles dir for this branch so
 	// the script can write track:false outputs into it without
 	// "no such file or directory". Best-effort: if MkdirAll fails
@@ -282,6 +301,13 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		ReadsArtifacts:     readsArtifacts,
 		ReadsSourceSHA:     readsSourceSHA,
 		TaskScratchDir:     taskScratchDir,
+		// SnapshotDir is the script's read-only working directory
+		// when the task came from a template run (RunSourcePath
+		// non-empty). Inline-YAML runs leave it empty — they don't
+		// have a snapshot to mount; the script lives in the
+		// project clone and CWD falls back to scratch or workDir
+		// via ScriptCwdFor.
+		SnapshotDir:        templateDir,
 		AuthorName:         s.coord.CitizenName(),
 		AuthorEmail:        s.coord.CitizenEmail(),
 		Username:           s.coord.Username(),
@@ -528,6 +554,14 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskS
 	}
 	if templateDir != "" {
 		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
+	}
+	// ENJU_SCRATCH points at the writable per-iter sandbox. With
+	// the snapshot-as-CWD shape, scripts that need to write
+	// intermediate files do so via $ENJU_SCRATCH rather than
+	// against the (read-only) CWD. Container path translates this
+	// to /scratch via the env-forwarding loop in container_args.go.
+	if taskScratchDir != "" {
+		env = append(env, "ENJU_SCRATCH="+taskScratchDir)
 	}
 	for k, v := range meta.RunParams {
 		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
