@@ -560,6 +560,17 @@ type TaskDef struct {
 	// Coexists with depends_on — an aggregator may also depend
 	// on non-fanned siblings; only the relationship to the
 	// named source is treated as a fan-in.
+	//
+	// Failure behavior: when a source instance FAILS, the
+	// aggregator stays at PENDING. The fail cascade does not
+	// transitively skip aggregators because partial results
+	// across the remaining accepted sources may still be
+	// valuable. Recover by: (a) invalidating the failed
+	// source so it re-runs, (b) manually failing the
+	// aggregator with enju_fail_task if partial results
+	// aren't useful, or (c) terminating the run. The
+	// docs/run-definition.md "aggregates" section carries the
+	// same note for template authors.
 	Aggregates string `yaml:"aggregates,omitempty"`
 
 	// Artifact access (Phase C). Repo-relative paths under artifacts/.
