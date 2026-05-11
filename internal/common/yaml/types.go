@@ -538,10 +538,29 @@ type TaskDef struct {
 	// downstream per-instance chaining works.
 	//
 	// Each variable's value can be a literal list (static) or
-	// a template reference like "{{upstream.field}}" (dynamic,
-	// Phase J.1). Dynamic tasks produce zero instances at
-	// parse time and materialize on upstream acceptance.
+	// a template reference like "{{upstream.field}}" (dynamic).
+	// Dynamic tasks produce zero instances at parse time and
+	// materialize on upstream acceptance.
 	ForEach ForEachMap `yaml:"for_each,omitempty"`
+
+	// Aggregates names a task def whose fan-out this task
+	// reduces over. When set, this task stays singular (one
+	// instance) regardless of expansion mode and waits on
+	// every instance of the named source before becoming
+	// ready. The fan-in resolution at claim time joins all
+	// source instances' content into one block so
+	// `{{<source>.content}}` reads naturally inside the
+	// aggregator's prompt.
+	//
+	// Target validation: the named task def must exist in the
+	// same run AND must itself be fanned (declare for_each, or
+	// be carried by a run-level for_each). The parser rejects
+	// both forms of misuse at parse time.
+	//
+	// Coexists with depends_on — an aggregator may also depend
+	// on non-fanned siblings; only the relationship to the
+	// named source is treated as a fan-in.
+	Aggregates string `yaml:"aggregates,omitempty"`
 
 	// Artifact access (Phase C). Repo-relative paths under artifacts/.
 	// ReadsArtifacts can be inferred from {{artifact:path}} prompt

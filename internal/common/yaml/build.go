@@ -119,14 +119,25 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 	}
 
 	taskIDs := make(map[string]bool)
+	aggregatorIDs := make(map[string]bool) // task_def_ids that stay singular
 	for _, t := range p.Tasks {
 		taskIDs[t.ID] = true
+		if t.Aggregates != "" {
+			aggregatorIDs[t.ID] = true
+		}
 	}
 
 	for _, inst := range instances {
 		var taskInstances []TaskInstance
 
 		for _, taskDef := range p.Tasks {
+			// Aggregator tasks stay singular regardless of run-
+			// level expansion — built once after this loop with
+			// fan-in dependencies into every iteration's copy of
+			// the source.
+			if aggregatorIDs[taskDef.ID] {
+				continue
+			}
 			fullID := MakeFullID(inst.key, taskDef.ID)
 
 			resolvedPrompt := template.ResolveParams(taskDef.Prompt, inst.params)
@@ -141,9 +152,16 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 
 			// Dependencies in run-level mode resolve within the current
 			// iteration: foundation depends on prior-same-iteration tasks.
+			// EXCEPT a dep on an aggregator task: that one stays
+			// singular, so the edge is the bare ID without an
+			// instance prefix.
 			resolvedDeps := make([]string, 0, len(allDeps))
 			for _, dep := range allDeps {
-				resolvedDeps = append(resolvedDeps, MakeFullID(inst.key, dep))
+				if aggregatorIDs[dep] {
+					resolvedDeps = append(resolvedDeps, dep)
+				} else {
+					resolvedDeps = append(resolvedDeps, MakeFullID(inst.key, dep))
+				}
 			}
 
 			ti := TaskInstance{
@@ -214,6 +232,83 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 		}
 
 		result.ExpandedTasks[inst.key] = taskInstances
+	}
+
+	// Aggregator pass — one singular instance per aggregator
+	// task def, with dependencies fanned across every iteration
+	// of the source. Deterministic iteration order (sorted by
+	// inst.key) so the rendered fan-in block at claim time is
+	// reproducible run-over-run.
+	var aggregatorSingletons []TaskInstance
+	for _, taskDef := range p.Tasks {
+		if !aggregatorIDs[taskDef.ID] {
+			continue
+		}
+		allDeps := template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt)
+		for _, dep := range allDeps {
+			if !taskIDs[dep] {
+				return nil, fmt.Errorf("task %q references %q which does not exist", taskDef.ID, dep)
+			}
+		}
+		// Sort iteration keys so fan-in produces a stable
+		// DependsOn order. expandForEach itself is already
+		// deterministic (input order), but sort makes the
+		// guarantee explicit at the point that matters.
+		sortedInstKeys := make([]string, 0, len(instances))
+		for _, inst := range instances {
+			sortedInstKeys = append(sortedInstKeys, inst.key)
+		}
+		sort.Strings(sortedInstKeys)
+		resolvedDeps := make([]string, 0, len(allDeps)*len(sortedInstKeys))
+		for _, dep := range allDeps {
+			if aggregatorIDs[dep] {
+				resolvedDeps = append(resolvedDeps, dep)
+				continue
+			}
+			for _, k := range sortedInstKeys {
+				resolvedDeps = append(resolvedDeps, MakeFullID(k, dep))
+			}
+		}
+		ti := TaskInstance{
+			TaskDef:     taskDef,
+			InstanceKey: "",
+			Params:      map[string]string{},
+			FullID:      taskDef.ID,
+		}
+		// Run-level params were already substituted into
+		// taskDef.Prompt before build() ran. The aggregator
+		// carries no per-iteration params of its own.
+		ti.Prompt = taskDef.Prompt
+		ti.UserPrompt = taskDef.UserPrompt
+		ti.DependsOn = resolvedDeps
+		if taskDef.Reviews != "" {
+			ti.Reviews = taskDef.Reviews
+		}
+		if ti.Requirements == nil {
+			ti.Requirements = p.Requirements
+		}
+		ti.ReadsArtifacts = template.MergeArtifactReads(
+			taskDef.ReadsArtifacts, taskDef.Prompt)
+		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, nil)
+		aggregatorSingletons = append(aggregatorSingletons, ti)
+
+		data := map[string]interface{}{
+			"instance_key": "",
+			"task_def_id":  taskDef.ID,
+		}
+		if err := result.DAG.AddNode(taskDef.ID, taskDef.Action, data); err != nil {
+			return nil, fmt.Errorf("adding node %q: %w", taskDef.ID, err)
+		}
+		for _, parentID := range resolvedDeps {
+			if err := result.DAG.AddEdge(parentID, taskDef.ID); err != nil {
+				return nil, fmt.Errorf("adding edge %s -> %s: %w", parentID, taskDef.ID, err)
+			}
+		}
+	}
+	if len(aggregatorSingletons) > 0 {
+		// Singletons share the "" instance key bucket — matches
+		// how the task-level builder groups its own singletons.
+		result.ExpandedTasks[""] = append(result.ExpandedTasks[""], aggregatorSingletons...)
 	}
 
 	if err := wireArtifactDeps(result); err != nil {
