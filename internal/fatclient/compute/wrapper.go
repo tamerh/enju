@@ -258,6 +258,20 @@ type Spec struct {
 	// can share a workspace root without colliding.
 	TaskScratchDir string `json:"task_scratch_dir,omitempty"`
 
+	// SnapshotDir is the absolute path on the host to the run's
+	// frozen template-snapshot directory. When set, it becomes the
+	// script's working directory (so `./scripts/helper.sh` and
+	// sibling-relative paths resolve naturally against the full
+	// template tree). The snapshot is treated as read-only: inside
+	// a container it's bind-mounted with :ro; on host exec we rely
+	// on the chmod 0444/0555 applied at snapshot creation time to
+	// block accidental writes. Scratch remains the writable channel
+	// for logs and intermediate state, exposed via $ENJU_SCRATCH.
+	//
+	// Empty for legacy specs that haven't been migrated; in that
+	// case ScriptCwdFor falls back to scratch (or workDir).
+	SnapshotDir string `json:"snapshot_dir,omitempty"`
+
 	// Env is the task's declared env: block — keys + values
 	// the template author opted into as script inputs. Used
 	// only in container mode, as the allowlist alongside

@@ -19,21 +19,34 @@ import (
 // operation.
 type ReadFileFunc func(sha, path string) ([]byte, bool, error)
 
-// ScriptCwdFor picks the host-side directory the script's outputs
-// land in. With TaskScratchDir set (Phase 2.3 / 2.5) → scratch
-// for both direct-exec and container modes; legacy specs without
-// scratch keep workDir.
+// ScriptCwdFor picks the host-side directory the script runs in.
+// Priority order:
 //
-// For container mode, the host scratch dir is bind-mounted into
-// the container at ContainerScratchDir (see container_args.go),
-// so the in-container CWD is /scratch. The host-side path
+//  1. SnapshotDir set → return the snapshot. The script's working
+//     directory is the frozen template tree (read-only) so sibling
+//     files like `./scripts/helper.sh` and `import lib.utils`
+//     resolve naturally against the full template. Outputs still
+//     go to scratch via $ENJU_SCRATCH.
+//  2. TaskScratchDir set, no snapshot → return scratch. Predates
+//     the snapshot-as-CWD shape; preserved for specs that haven't
+//     migrated.
+//  3. Neither → return workDir. Legacy fallback.
+//
+// For container mode the wrapper bind-mounts both the snapshot
+// and scratch into the container at /template and /scratch
+// respectively (see container_args.go), so the in-container CWD
+// matches the host-side priority above. The host-side path
 // returned here is what the wrapper uses to:
-//   - read writes_artifacts after the container exits
+//   - read writes_artifacts after the container exits (against
+//     scratch — outputs land there regardless of CWD)
 //   - materialize reads_artifacts before the container starts
 //
-// In other words: returns where outputs land on disk from the
-// HOST'S perspective, regardless of execution mode.
+// Returns where the script runs from on the HOST's perspective,
+// regardless of execution mode.
 func ScriptCwdFor(spec Spec, workDir string) string {
+	if spec.SnapshotDir != "" {
+		return spec.SnapshotDir
+	}
 	if spec.TaskScratchDir != "" {
 		return spec.TaskScratchDir
 	}

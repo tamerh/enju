@@ -33,16 +33,29 @@ import (
 const ContainerWorkDir = "/workspace"
 
 // ContainerScratchDir is where the host's TaskScratchDir is
-// bind-mounted inside the container when Phase 2.5 isolation
-// is in effect (spec.TaskScratchDir non-empty). Same fixed-
-// constant rationale as ContainerWorkDir.
+// bind-mounted inside the container. Same fixed-constant
+// rationale as ContainerWorkDir.
 //
-// Scripts inside the container see their declared inputs +
-// outputs at this path; ENJU_PROJECT_DIR + ENJU_TASK_DIR are
+// Scripts inside the container reach their writable per-iter
+// sandbox via this path (logs, intermediate state) and via the
+// ENJU_SCRATCH env var. ENJU_PROJECT_DIR + ENJU_TASK_DIR are
 // rewritten to /scratch in the env-forwarding loop, so a
 // script that does "cat $ENJU_PROJECT_DIR/data/raw_a.txt"
 // reads from the bind-mounted scratch transparently.
 const ContainerScratchDir = "/scratch"
+
+// ContainerTemplateDir is where the run's frozen template
+// snapshot is bind-mounted inside the container when
+// spec.SnapshotDir is set. Read-only bind: the snapshot is
+// canonical and immutable across iterations.
+//
+// When this bind is active, it becomes the script's working
+// directory. Sibling files in the template (scripts/helper.sh,
+// lib/utils.py, data/fixture.json, …) resolve naturally
+// against `.` without the template author needing to know
+// any env-var dance. Outputs still go to /scratch via
+// $ENJU_SCRATCH; the snapshot view is read-only by design.
+const ContainerTemplateDir = "/template"
 
 // Container-runtime selectors. Singularity is collapsed to
 // apptainer at YAML parse time (validateTaskContainerRuntime),
@@ -113,15 +126,22 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		return nil, fmt.Errorf("script path %q is outside workspace %q — cannot translate to container path", spec.ScriptPath, workDir)
 	}
 
-	// Phase 2.5: when scratch isolation is active, the script's
-	// effective CWD inside the container is /scratch (where its
-	// inputs are materialized + outputs land). Without scratch
-	// (legacy specs), keep the pre-2.5 default of /workspace as
-	// CWD. Either way the workspace is bind-mounted so the
-	// script file itself (which lives under workDir) is reachable.
+	// CWD selection (priority order):
+	//   1. SnapshotDir set → /template. The template tree is the
+	//      script's natural read-only working directory; sibling
+	//      files in the snapshot resolve against `.` via the
+	//      bind-mount below.
+	//   2. TaskScratchDir set → /scratch. Predates the snapshot
+	//      bind; keeps the contract for specs that didn't migrate.
+	//   3. Otherwise → /workspace. Legacy fallback.
+	// Either way the workspace is bind-mounted so the script
+	// file itself (which lives under workDir) is reachable.
 	containerCWD := ContainerWorkDir
 	if spec.TaskScratchDir != "" {
 		containerCWD = ContainerScratchDir
+	}
+	if spec.SnapshotDir != "" {
+		containerCWD = ContainerTemplateDir
 	}
 
 	args := []string{
@@ -136,11 +156,22 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		// detecting the host's LSM.
 		"-v", workDir + ":" + ContainerWorkDir + ":z",
 	}
-	// Phase 2.5: scratch bind. Read-write because the script
-	// writes its outputs here (writes_artifacts expansion will
-	// pick them up from the host side after the container exits).
+	// Scratch bind. Read-write because the script writes its
+	// outputs here (writes_artifacts expansion picks them up
+	// from the host side after the container exits), and
+	// because $ENJU_SCRATCH is the writable channel for logs +
+	// intermediate state.
 	if spec.TaskScratchDir != "" {
 		args = append(args, "-v", spec.TaskScratchDir+":"+ContainerScratchDir+":z")
+	}
+	// Snapshot bind, read-only. The template tree is canonical
+	// and immutable across iterations — every task in the run
+	// sees the same view. Read-only enforcement is kernel-side
+	// via the :ro flag (belt-and-suspenders with the chmod
+	// 0444/0555 applied at snapshot creation time, which is
+	// the host-side guard).
+	if spec.SnapshotDir != "" {
+		args = append(args, "-v", spec.SnapshotDir+":"+ContainerTemplateDir+":ro,z")
 	}
 	args = append(args,
 		"-w", containerCWD,
@@ -187,14 +218,17 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 			continue
 		}
 		translated, ok := translatePath(v, workDir, ContainerWorkDir)
-		// Phase 2.5: a value that didn't match the workspace
-		// prefix may match the scratch prefix (e.g.
-		// ENJU_PROJECT_DIR / ENJU_TASK_DIR which the service
-		// layer points at host-side scratch). Translate to
-		// the in-container scratch path so the script sees
-		// the bind-mounted view.
+		// Workspace prefix didn't match; try the other binds in
+		// priority order. ENJU_PROJECT_DIR / ENJU_TASK_DIR point
+		// at host-side scratch; ENJU_TEMPLATE_DIR / ENJU_SCRATCH
+		// point at the snapshot or scratch host paths. Translate
+		// each to its in-container view so the script sees the
+		// bind-mounted layout.
 		if !ok && spec.TaskScratchDir != "" {
-			translated, _ = translatePath(v, spec.TaskScratchDir, ContainerScratchDir)
+			translated, ok = translatePath(v, spec.TaskScratchDir, ContainerScratchDir)
+		}
+		if !ok && spec.SnapshotDir != "" {
+			translated, _ = translatePath(v, spec.SnapshotDir, ContainerTemplateDir)
 		}
 		args = append(args, "-e", k+"="+translated)
 	}
