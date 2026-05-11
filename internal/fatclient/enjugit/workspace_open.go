@@ -19,11 +19,47 @@ import (
 //
 // Returns the same Workflow on subsequent calls (cached by
 // projectID).
+// workflowMatchesRegistry checks whether a cached Workflow's
+// WorkDir is still consistent with the registry's current view
+// for the project ID. Returns true when no registry is attached
+// (legacy / test setups without persistent path tracking) or
+// when the registry has no entry (lookup will fall through
+// naturally). Returns false when the registry's LocalPath has
+// changed under the same ID — that's the wipe-and-recreate
+// scenario the cache must not silently honor.
+func (w *Workspace) workflowMatchesRegistry(id int64, wf *Workflow) bool {
+	if w.registry == nil {
+		return true
+	}
+	entry, err := w.registry.Get(id)
+	if err != nil || entry == nil || entry.LocalPath == "" {
+		return true
+	}
+	// Compare against ProjectRoot (canonical project dir) rather
+	// than WorkDir (clone dir under it). The registry stores the
+	// project root.
+	return wf.ProjectRoot() == entry.LocalPath
+}
+
 func (w *Workspace) ForProject(id int64, remoteURL string, projectName ...string) (*Workflow, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if wf, ok := w.workflows[id]; ok {
-		return wf, nil
+		// Validate: the cached Workflow's WorkDir must still
+		// agree with what the registry says for this project
+		// ID. They can diverge when coord state was wiped and
+		// a new project at a different path got the same ID
+		// recycled — the registry upserts to the new path on
+		// the create_project call, but a previously-cached
+		// Workflow keeps pointing at the old path. Without
+		// this check, downstream verbs (execute_run, etc.)
+		// resolve script paths against the stale dir and fail.
+		if w.workflowMatchesRegistry(id, wf) {
+			return wf, nil
+		}
+		// Drop the stale entry; fall through to re-open at
+		// the registry's current LocalPath.
+		delete(w.workflows, id)
 	}
 	name := ""
 	if len(projectName) > 0 {
