@@ -134,6 +134,15 @@ type CreateProjectParams struct {
 type CreateProjectResult struct {
 	CoordResponse []byte
 	ProjectID     int64
+	// InitWarning carries a non-fatal local-state warning the
+	// MCP handler should surface to the operator. Most common
+	// case: adoption refused because the working tree's git
+	// state is inconsistent (e.g. enju/.bare.git/ on disk but
+	// no .git/ — a partial cp from another project). The coord
+	// project was created, but the local clone wasn't
+	// materialized; the operator needs to fix the on-disk
+	// inconsistency before the project is usable locally.
+	InitWarning string
 }
 
 // CreateProject creates a project on the coordinator and
@@ -196,13 +205,15 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 	if idF, ok := result["id"].(float64); ok {
 		pid = int64(idF)
 	}
+	var initWarning string
 	if pid > 0 && s.enjugit != nil && params.Path != "" {
 		if ierr := s.EagerInitProjectClone(ctx, pid, params.Path, target); ierr != nil {
 			s.logger.Warn("eager workspace init failed (will retry on first task)",
 				"project_id", pid, "path", params.Path, "error", ierr)
+			initWarning = ierr.Error()
 		}
 	}
-	return &CreateProjectResult{CoordResponse: data, ProjectID: pid}, nil
+	return &CreateProjectResult{CoordResponse: data, ProjectID: pid, InitWarning: initWarning}, nil
 }
 
 // AdoptionTarget classifies the on-disk state of a directory the
@@ -356,6 +367,25 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 	// directory, so the existing user files end up on the initial
 	// commit instead of being shadowed by InitLocal's seed.
 	if target != nil && target.HasFiles && !target.HasGit {
+		// Refuse the adoption when a managed bare is already on
+		// disk at the canonical path. Combination "files + no
+		// .git + has .bare.git" means the dir was copied from
+		// another project (the user's `cp -r enju/`) or otherwise
+		// landed in an inconsistent state. Letting init proceed
+		// would seed a brand-new working tree whose history is
+		// unrelated to the existing bare's — producing the
+		// non-fast-forward push failures the operator can't
+		// recover from without manual git surgery.
+		barePath := filepath.Join(path, corelayout.BotPushTargetDir)
+		if _, statErr := os.Stat(filepath.Join(barePath, "HEAD")); statErr == nil {
+			return fmt.Errorf(
+				"refusing to adopt %q: found an existing managed bare at %q but "+
+					"no .git/ in the working tree. This usually means the project "+
+					"was partially copied from another location (e.g. cp -r enju/). "+
+					"Either restore the matching .git/ directory, or remove %q "+
+					"so a fresh bare can be created.",
+				path, barePath, barePath)
+		}
 		if _, err := s.initGitWithExistingFiles(path); err != nil {
 			return fmt.Errorf("initializing git in populated dir %q: %w", path, err)
 		}

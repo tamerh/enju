@@ -60,7 +60,11 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 		// Nil supervisor (notify-disabled session) no-ops cleanly.
 		c.notifySess.Switch(res.ProjectID)
 	}
-	return mcp.NewToolResultText(format.CreateProjectResult(res.CoordResponse)), nil
+	text := format.CreateProjectResult(res.CoordResponse)
+	if res.InitWarning != "" {
+		text += fmt.Sprintf("\n\n⚠ Local workspace not initialized — %s", res.InitWarning)
+	}
+	return mcp.NewToolResultText(text), nil
 }
 
 func (c *apiClient) handleProjectRemoteStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
