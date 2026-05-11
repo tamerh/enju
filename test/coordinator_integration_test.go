@@ -52,10 +52,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestMain cleans the shared output directory before running
@@ -518,14 +515,7 @@ func (s *testServer) createTestProject() int64 {
 	// Pick a bare-remote path unique to this project. We don't know
 	// the project ID yet so hash the timestamp suffix.
 	barePath := filepath.Join(s.bareBaseDir, name)
-	if _, err := gogit.PlainInitWithOptions(barePath, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-		Bare: true,
-	}); err != nil {
-		s.t.Fatalf("init bare remote: %v", err)
-	}
+	gittest.InitBare(s.t, barePath)
 	// Seed with an empty README commit on main so clones and pushes
 	// have a base to work from.
 	seedDir, err := os.MkdirTemp(s.bareBaseDir, "seed-")
@@ -533,31 +523,10 @@ func (s *testServer) createTestProject() int64 {
 		s.t.Fatalf("mkdir seed: %v", err)
 	}
 	defer os.RemoveAll(seedDir)
-	sRepo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	if err != nil {
-		s.t.Fatalf("init seed: %v", err)
-	}
-	if _, err := sRepo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{barePath},
-	}); err != nil {
-		s.t.Fatalf("create seed remote: %v", err)
-	}
-	wt, _ := sRepo.Worktree()
-	readme := filepath.Join(seedDir, "README.md")
-	_ = os.WriteFile(readme, []byte("# "+name+"\n"), 0644)
-	_, _ = wt.Add("README.md")
-	sig := &object.Signature{Name: "Test", Email: "test@localhost", When: time.Unix(1700000000, 0)}
-	if _, err := wt.Commit("initial", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		s.t.Fatalf("seed commit: %v", err)
-	}
-	if err := sRepo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
-		s.t.Fatalf("seed push: %v", err)
-	}
+	gittest.Init(s.t, seedDir)
+	gittest.AddRemote(s.t, seedDir, "origin", barePath)
+	gittest.CommitAs(s.t, seedDir, "README.md", "# "+name+"\n", "initial", "Test", "test@localhost")
+	gittest.Push(s.t, seedDir, "main")
 
 	resp := s.post("/api/v1/projects", map[string]string{
 		"name":       name,
@@ -1008,7 +977,7 @@ func (s *testServer) readArtifactFile(projectID int64, path string) (string, boo
 		return "", false
 	}
 	defer os.RemoveAll(cloneDir)
-	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+	if _, cloneErr := gittest.RunOK(s.t, "", "clone", remoteURL, cloneDir); cloneErr != nil {
 		return "", false
 	}
 	data, err := os.ReadFile(filepath.Join(cloneDir, enjugit.ArtifactPath(path)))
@@ -1033,7 +1002,7 @@ func (s *testServer) readRepoFile(projectID int64, repoRelPath string) ([]byte, 
 		return nil, false
 	}
 	defer os.RemoveAll(cloneDir)
-	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
+	if _, cloneErr := gittest.RunOK(s.t, "", "clone", remoteURL, cloneDir); cloneErr != nil {
 		return nil, false
 	}
 	data, err := os.ReadFile(filepath.Join(cloneDir, repoRelPath))
@@ -1078,14 +1047,7 @@ func (s *testServer) writeRepoFilesWithMode(projectID int64, files map[string]re
 		s.t.Fatalf("writeRepoFiles: mkdtemp: %v", err)
 	}
 	defer os.RemoveAll(cloneDir)
-	repo, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL})
-	if err != nil {
-		s.t.Fatalf("writeRepoFiles: clone: %v", err)
-	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		s.t.Fatalf("writeRepoFiles: worktree: %v", err)
-	}
+	gittest.Clone(s.t, cloneDir, remoteURL)
 	for rel, spec := range files {
 		full := filepath.Join(cloneDir, rel)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -1101,18 +1063,12 @@ func (s *testServer) writeRepoFilesWithMode(projectID int64, files map[string]re
 		if err := os.Chmod(full, mode); err != nil {
 			s.t.Fatalf("writeRepoFiles: chmod %s: %v", full, err)
 		}
-		if _, err := wt.Add(rel); err != nil {
-			s.t.Fatalf("writeRepoFiles: add %s: %v", rel, err)
-		}
+		gittest.Run(s.t, cloneDir, "add", rel)
 	}
-	if _, err := wt.Commit(commitMsg, &gogit.CommitOptions{
-		Author: &object.Signature{Name: "test", Email: "test@localhost", When: time.Now()},
-	}); err != nil {
-		s.t.Fatalf("writeRepoFiles: commit: %v", err)
-	}
-	if err := repo.Push(&gogit.PushOptions{}); err != nil {
-		s.t.Fatalf("writeRepoFiles: push: %v", err)
-	}
+	gittest.Run(s.t, cloneDir,
+		"-c", "user.name=test", "-c", "user.email=test@localhost",
+		"commit", "-m", commitMsg)
+	gittest.Push(s.t, cloneDir, "main")
 }
 
 func (s *testServer) release(taskID, username string) map[string]interface{} {
@@ -1306,9 +1262,7 @@ func (s *testServer) assertResultFile(runID, instanceKey, taskDefID, expectedCon
 		s.t.Fatalf("mkdtemp: %v", err)
 	}
 	defer os.RemoveAll(cloneDir)
-	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
-		s.t.Fatalf("clone bare: %v", err)
-	}
+	gittest.Clone(s.t, cloneDir, remoteURL)
 
 	// Ask the coordinator for the task's result_dir rather than
 	// rebuilding the layout rule here — the schema lives in

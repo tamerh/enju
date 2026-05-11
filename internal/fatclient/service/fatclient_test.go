@@ -19,41 +19,20 @@ import (
 	"strings"
 	"testing"
 
-	"time"
-
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // initRealClone plants a usable git clone at dir + commits one
-// file so OpenExisting (which uses gogit.PlainOpen) can read
-// it. Mirrors the helper in workspace/openexisting_test.go so
-// this test doesn't reach into the workspace package's test-
-// only helpers.
+// file so OpenExisting can read it. Mirrors the helper in
+// workspace/openexisting_test.go so this test doesn't reach
+// into the workspace package's test-only helpers.
 func initRealClone(t *testing.T, dir string) {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	repo, err := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# adopted\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, _ = wt.Add("README.md")
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{All: true}); err != nil {
-		t.Fatal(err)
-	}
+	gittest.Init(t, dir)
+	gittest.Commit(t, dir, "README.md", "# adopted\n", "seed")
 }
 
 // TestNew_BridgesRegistryToExternalDirs pins the cross-process
@@ -307,32 +286,16 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 }
 
 // initRealCloneWithAuthor is initRealClone but with an
-// explicit author. The vanilla helper relies on go-git reading
+// explicit author. The vanilla helper relies on git reading
 // the operator's ~/.gitconfig for user.name/user.email; tests
 // that t.Setenv("HOME", tmp) hide that file and need to
-// provide the author themselves.
+// provide the author themselves. gittest.CommitAs supplies
+// the identity via -c user.name / user.email so no global
+// config is consulted.
 func initRealCloneWithAuthor(t *testing.T, dir string) {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	repo, err := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# adopted\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, _ = wt.Add("README.md")
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{
-		All:    true,
-		Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(0, 0)},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "README.md", "# adopted\n", "seed", "test", "test@example.com")
 }
 
 // (Removed: tests for the isManagedWorkspaceClone discriminator

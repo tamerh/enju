@@ -12,8 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestAutoMergeAcceptedTopic_NonFFDisjointWritesIntegration is the
@@ -102,59 +101,44 @@ func TestAutoMergeAcceptedTopic_NonFFDisjointWritesIntegration(t *testing.T) {
 	}
 
 	// Verify on the bare: merge commit shape + reachable files +
-	// trailers + author. Re-clone fresh so we read the bare's
-	// truth, not the local clone's.
-	bareRepo, err := gogit.PlainOpen(bare)
-	if err != nil {
-		t.Fatalf("open bare: %v", err)
-	}
-	mainRef, err := bareRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
-	if err != nil {
-		t.Fatalf("read main: %v", err)
-	}
-	tip, err := bareRepo.CommitObject(mainRef.Hash())
-	if err != nil {
-		t.Fatalf("load tip: %v", err)
-	}
-	if got := tip.NumParents(); got != 2 {
-		t.Fatalf("merge tip should have 2 parents, got %d (msg: %q)", got, tip.Message)
+	// trailers + author. Read directly from the bare via git
+	// plumbing — no local clone needed.
+	tipSHA := gittest.RefSHA(t, bare, "refs/heads/main")
+
+	// rev-list --parents -n1 <tip> returns "<tip> <p1> <p2>...".
+	parentLine := gittest.Run(t, bare, "rev-list", "--parents", "-n1", tipSHA)
+	parts := strings.Fields(parentLine)
+	if len(parts) != 3 {
+		t.Fatalf("merge tip should have 2 parents (rev-list --parents -n1 = %q)", parentLine)
 	}
 	// Parent[0] is the run-branch tip we merged onto (topic-a's
 	// SHA, which FF'd to main). Parent[1] is topic-b's SHA.
-	if tip.ParentHashes[0].String() != topicA {
-		t.Errorf("merge parent[0] = %s, want topic-a SHA %s", tip.ParentHashes[0], topicA)
+	if parts[1] != topicA {
+		t.Errorf("merge parent[0] = %s, want topic-a SHA %s", parts[1], topicA)
 	}
-	if tip.ParentHashes[1].String() != topicB {
-		t.Errorf("merge parent[1] = %s, want topic-b SHA %s", tip.ParentHashes[1], topicB)
+	if parts[2] != topicB {
+		t.Errorf("merge parent[1] = %s, want topic-b SHA %s", parts[2], topicB)
 	}
-	// Author: auto merges use the Enju-System identity by design
-	// (enjugit's mergeAuthorIdentity returns convs.SystemAuthor for
-	// AutoOrManual="auto"). Project package's old test asserted the
-	// triggering citizen's email here; the redesign moved citizen-
-	// authored merges to the AutoOrManual="manual" path, which is
-	// covered by TestAutoMergeAcceptedTopic_ManualUsesCitizen in
-	// producing_test.go (fake-ops unit test).
-	if !strings.Contains(tip.Author.Email, "enju-system") {
-		t.Errorf("merge author email = %q, want enju-system identity for auto merge", tip.Author.Email)
+	// Author: auto merges use the Enju-System identity by design.
+	authorEmail := gittest.Run(t, bare, "log", "-1", "--format=%ae", tipSHA)
+	if !strings.Contains(authorEmail, "enju-system") {
+		t.Errorf("merge author email = %q, want enju-system identity for auto merge", authorEmail)
 	}
 	// Lineage trailers present (the 2 enjugit emits today).
+	body := gittest.Run(t, bare, "log", "-1", "--format=%B", tipSHA)
 	wantTrailers := []string{
 		"Enju-Merge: auto",
 		"Enju-Triggered-By: task-b",
 	}
 	for _, want := range wantTrailers {
-		if !strings.Contains(tip.Message, want) {
-			t.Errorf("merge message missing trailer %q\nfull message:\n%s", want, tip.Message)
+		if !strings.Contains(body, want) {
+			t.Errorf("merge message missing trailer %q\nfull message:\n%s", want, body)
 		}
 	}
 	// Both files reachable from the merge tip's tree.
-	tree, err := tip.Tree()
-	if err != nil {
-		t.Fatalf("tree: %v", err)
-	}
 	for _, p := range []string{"out/a.md", "out/b.md"} {
-		if _, err := tree.File(p); err != nil {
-			t.Errorf("file %q missing from merge tip tree: %v", p, err)
+		if _, err := gittest.RunOK(t, bare, "cat-file", "-e", tipSHA+":"+p); err != nil {
+			t.Errorf("file %q missing from merge tip tree", p)
 		}
 	}
 }

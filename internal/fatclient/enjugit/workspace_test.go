@@ -7,12 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // nullLogger discards everything.
@@ -21,41 +17,13 @@ func nullLogger() *slog.Logger {
 }
 
 // initBareForWorkspaceTest creates a bare git repo with one
-// initial commit on main. Returns the bare path.
+// initial commit on main. Returns the bare path. Thin wrapper
+// around gittest.InitBareWithSeed kept under this name so
+// existing call sites across enjugit tests don't churn.
 func initBareForWorkspaceTest(t *testing.T) string {
 	t.Helper()
 	bare := t.TempDir()
-	_, err := gogit.PlainInitWithOptions(bare, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-		Bare:        true,
-	})
-	if err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
-	// Seed.
-	seed := t.TempDir()
-	repo, err := gogit.PlainInitWithOptions(seed, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{bare},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644)
-	wt.Add("README.md")
-	sig := &object.Signature{Name: "T", Email: "t@x", When: time.Unix(1700000000, 0)}
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
-		t.Fatal(err)
-	}
+	gittest.InitBareWithSeed(t, bare)
 	return bare
 }
 

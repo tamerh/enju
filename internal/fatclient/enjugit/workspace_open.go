@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // ForProject returns a Workflow handle for the given project. If

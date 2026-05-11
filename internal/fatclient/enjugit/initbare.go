@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // initbare.go — bare-repo initialization helpers.

@@ -6,8 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestSubmitComputeTaskResult_HappyPath covers the basic case:
@@ -48,25 +47,15 @@ func TestSubmitComputeTaskResult_HappyPath(t *testing.T) {
 
 	// Verify topic branch was pushed to bare with the right commit.
 	verifyDir := t.TempDir()
-	verifyRepo, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{
-		URL:           bare,
-		ReferenceName: plumbing.NewBranchReferenceName(expectedBranch),
-		SingleBranch:  true,
-	})
-	if err != nil {
-		t.Fatalf("verify clone of topic branch: %v", err)
-	}
-	verifyHead, err := verifyRepo.Head()
-	if err != nil {
-		t.Fatalf("verify head: %v", err)
-	}
-	if verifyHead.Hash().String() != res.CommitSHA {
+	gittest.CloneBranch(t, verifyDir, bare, expectedBranch)
+	verifyHead := gittest.HeadSHA(t, verifyDir)
+	if verifyHead != res.CommitSHA {
 		t.Errorf("topic branch on bare: got %s, want %s",
-			verifyHead.Hash().String(), res.CommitSHA)
+			verifyHead, res.CommitSHA)
 	}
 
 	// File should be there.
-	bytes, err := readFileFromGogitWorktree(verifyDir, "data/fetch_a/result.md")
+	bytes, err := os.ReadFile(filepath.Join(verifyDir, "data/fetch_a/result.md"))
 	if err != nil {
 		t.Fatalf("read file: %v", err)
 	}
@@ -203,16 +192,8 @@ func TestSubmitComputeTaskResult_ConcurrentParallelTasks(t *testing.T) {
 	// Each topic branch should be on bare and contain its file.
 	for taskDef, r := range got {
 		verifyDir := t.TempDir()
-		_, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{
-			URL:           bare,
-			ReferenceName: plumbing.NewBranchReferenceName(r.branch),
-			SingleBranch:  true,
-		})
-		if err != nil {
-			t.Errorf("%s: clone topic branch %s: %v", taskDef, r.branch, err)
-			continue
-		}
-		bytes, err := readFileFromGogitWorktree(verifyDir, "out/"+taskDef+"/result.md")
+		gittest.CloneBranch(t, verifyDir, bare, r.branch)
+		bytes, err := os.ReadFile(filepath.Join(verifyDir, "out/"+taskDef+"/result.md"))
 		if err != nil {
 			t.Errorf("%s: read result: %v", taskDef, err)
 			continue
@@ -222,10 +203,4 @@ func TestSubmitComputeTaskResult_ConcurrentParallelTasks(t *testing.T) {
 			t.Errorf("%s: content: got %q, want %q", taskDef, string(bytes), want)
 		}
 	}
-}
-
-// readFileFromGogitWorktree reads a file from a checked-out
-// worktree, used by the verify-clone parts of these tests.
-func readFileFromGogitWorktree(dir, relPath string) ([]byte, error) {
-	return os.ReadFile(filepath.Join(dir, relPath))
 }

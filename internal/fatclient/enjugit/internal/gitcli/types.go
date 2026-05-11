@@ -1,0 +1,253 @@
+package gitcli
+
+import (
+	"os"
+	"time"
+)
+
+// CommitInfo describes a single commit for history-walking
+// purposes. Returned by LogFile in reverse-chronological order.
+type CommitInfo struct {
+	Hash    string
+	Message string
+	Author  string
+	Time    time.Time
+}
+
+// FileWrite is one file to write to the worktree as part of a
+// commit. Mode 0 defaults to 0644.
+//
+// RepoRelPath is relative to the repo root (e.g. "runs/1/foo/result.md"),
+// not absolute and not workdir-relative. Spelled out in the field name
+// because callers above this layer can easily get it wrong otherwise.
+type FileWrite struct {
+	RepoRelPath string
+	Content     []byte
+	Mode        os.FileMode
+}
+
+// TreeEntry is one direct entry of a tree at a given commit.
+// Used by ReadTreeEntriesAtCommit + WalkSubtreeBlobsAtCommit
+// so callers can classify file vs directory and inspect mode
+// without git-specific types leaking out of this package.
+type TreeEntry struct {
+	// Name is the entry name relative to the directory it was
+	// listed from (no path separator).
+	Name string
+
+	// IsDir is true when the entry is a subtree (directory).
+	IsDir bool
+
+	// Mode is the git tree mode bits, normalized to an os.FileMode.
+	// 0o100644 → 0644, 0o100755 → 0755, etc.
+	Mode os.FileMode
+}
+
+// BlobVisitor is invoked for each regular-file blob found by
+// WalkSubtreeBlobsAtCommit. relPath is relative to the walk's
+// root subtree (forward-slash separated). Returning an error
+// from the visitor stops the walk and surfaces the error.
+type BlobVisitor func(relPath string, mode os.FileMode, content []byte) error
+
+// CommitRequest packages inputs for CommitFiles. The message and
+// author are passed as raw strings — this layer doesn't compose
+// trailers or pick the author. Enjugit does that and hands the
+// result here.
+type CommitRequest struct {
+	// Files written to the worktree before staging. Mode 0 → 0644.
+	Files []FileWrite
+
+	// StagePaths is the explicit list of paths to stage. Must be
+	// a subset of (or equal to) Files' paths. We never `git add .`
+	// because that would sweep unrelated edits into the commit.
+	StagePaths []string
+
+	// Message is the complete commit message. Subject on first
+	// line, blank line, body. Trailers (if any) are already in
+	// the message — this layer doesn't compose them.
+	Message string
+
+	// AuthorName / AuthorEmail populate the commit's Author and
+	// Committer fields. If both empty, falls back to a generic
+	// "Enju git layer <enju-git@localhost>" placeholder so the
+	// commit at least has a parseable author. Enjugit always
+	// passes real values.
+	AuthorName  string
+	AuthorEmail string
+}
+
+// PlumbingCommitRequest packages inputs for PlumbingCommit.
+type PlumbingCommitRequest struct {
+	// BaseSHA is the commit to fork from. Its tree becomes the
+	// starting point that the Files overlay onto. Empty string
+	// means "no parent" — the resulting commit becomes a root
+	// commit with whatever Files alone form. Empty repos take
+	// the empty-string path; normal flows always pass a SHA.
+	BaseSHA string
+
+	// Files overlay onto BaseSHA's tree. Each FileWrite's
+	// RepoRelPath replaces (or adds) the entry at that path.
+	// Paths NOT in Files keep their content from BaseSHA. To
+	// delete an entry from BaseSHA's tree, this v1 doesn't
+	// support it — extend with a FileDelete list when the need
+	// surfaces.
+	Files []FileWrite
+
+	// Message is the complete commit message (subject + body +
+	// trailers, all pre-composed by the caller). This layer
+	// composes nothing.
+	Message string
+
+	// AuthorName / AuthorEmail populate Author + Committer.
+	// Both empty falls back to a placeholder (matches CommitFiles).
+	AuthorName  string
+	AuthorEmail string
+
+	// When sets Author.When + Committer.When. Zero means
+	// time.Now() at call time.
+	When time.Time
+}
+
+// CommitResult is what CommitFiles returns on success.
+type CommitResult struct {
+	// SHA of the commit as it landed in the local object DB. May
+	// be rewritten later by a rebase before push. PushWithVerify
+	// reports the post-push SHA.
+	SHA string
+
+	// NoOp is true when none of the requested files would change
+	// the worktree (every target path already holds identical
+	// content). When NoOp is true, no commit is made and SHA is
+	// the SHA of HEAD before the call.
+	NoOp bool
+}
+
+// RemoteComparison summarizes local-vs-remote sync state for one
+// or more branches. Returned by CompareToRemote.
+type RemoteComparison struct {
+	Branches []BranchStatus
+}
+
+// BranchStatus is the local-vs-remote state of one branch.
+type BranchStatus struct {
+	Name      string
+	LocalSHA  string // empty when no local ref
+	RemoteSHA string // empty when no remote ref
+	State     RemoteState
+}
+
+// RemoteState classifies the local-vs-remote relationship for one
+// branch. The values match the RemoteComparison output's enum.
+type RemoteState int
+
+const (
+	// RemoteUnknown is the zero value, used when CompareToRemote
+	// hasn't run yet for this branch. Should not appear in
+	// returned BranchStatus rows.
+	RemoteUnknown RemoteState = iota
+
+	// RemoteInSync — local SHA equals remote SHA.
+	RemoteInSync
+
+	// RemoteBehind — remote has commits the local doesn't (local
+	// is an ancestor of remote).
+	RemoteBehind
+
+	// RemoteAhead — local has commits the remote doesn't (remote
+	// is an ancestor of local). Push would fast-forward.
+	RemoteAhead
+
+	// RemoteDiverged — neither side is an ancestor of the other.
+	// Push would non-FF.
+	RemoteDiverged
+
+	// RemoteUnrelated — local and remote share no common ancestor
+	// (e.g., bare was rewritten or two unrelated repos pushed to
+	// the same name).
+	RemoteUnrelated
+
+	// RemoteUnreachable — couldn't reach the remote at all (network,
+	// auth). Distinct from any of the above which all imply we
+	// successfully read the remote ref.
+	RemoteUnreachable
+)
+
+func (r RemoteState) String() string {
+	switch r {
+	case RemoteInSync:
+		return "in-sync"
+	case RemoteBehind:
+		return "behind"
+	case RemoteAhead:
+		return "ahead"
+	case RemoteDiverged:
+		return "diverged"
+	case RemoteUnrelated:
+		return "unrelated"
+	case RemoteUnreachable:
+		return "unreachable"
+	default:
+		return "unknown"
+	}
+}
+
+// CommitCompareResult is the relation between two commits in the
+// same repo, with ahead/behind counts when classifiable. Returned
+// by CompareCommits. State is one of RemoteInSync, RemoteAhead,
+// RemoteBehind, RemoteDiverged, RemoteUnrelated.
+//
+// AheadBy / BehindBy counts are populated only for Ahead / Behind
+// (single-direction count from the named SHA back to the other
+// commit) and Diverged (both counts, each measured back to the
+// merge base). Best-effort: zero on walk error.
+type CommitCompareResult struct {
+	State    RemoteState
+	AheadBy  int
+	BehindBy int
+}
+
+// WorktreeState classifies the current state of the working tree
+// relative to HEAD. Used by verb pre/post contracts.
+type WorktreeState int
+
+const (
+	// StateClean — worktree matches HEAD exactly. No tracked-file
+	// modifications, no untracked files in tracked paths.
+	StateClean WorktreeState = iota
+
+	// StateDirtyTracked — at least one tracked file differs from
+	// HEAD. May or may not also have untracked files.
+	StateDirtyTracked
+
+	// StateDirtyUntracked — tracked files match HEAD but at least
+	// one untracked file is present in the worktree.
+	StateDirtyUntracked
+
+	// StateDetached — HEAD is detached (no current branch).
+	// Returned by CheckoutCommit.
+	StateDetached
+
+	// StateMidCheckout — preserved for API compatibility. With the
+	// CLI backend, real git's checkout is atomic-from-our-side —
+	// no preserve dir is ever created — so this state should not
+	// appear at runtime. Kept in the enum so the Ops contract is
+	// identical across backends.
+	StateMidCheckout
+)
+
+func (s WorktreeState) String() string {
+	switch s {
+	case StateClean:
+		return "clean"
+	case StateDirtyTracked:
+		return "dirty-tracked"
+	case StateDirtyUntracked:
+		return "dirty-untracked"
+	case StateDetached:
+		return "detached"
+	case StateMidCheckout:
+		return "mid-checkout"
+	default:
+		return "unknown"
+	}
+}

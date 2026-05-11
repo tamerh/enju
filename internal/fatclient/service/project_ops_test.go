@@ -22,39 +22,26 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // initBareRepoAt seeds a fresh bare git repo at dir for use as a
 // pretend remote. Returns dir for convenience.
 func initBareRepoAt(t *testing.T, dir string) string {
 	t.Helper()
-	if _, err := gogit.PlainInit(dir, true); err != nil {
-		t.Fatalf("init bare at %s: %v", dir, err)
-	}
+	gittest.InitBare(t, dir)
 	return dir
 }
 
 // initRepoWithCommit lays down a minimal git repo at dir with one
 // commit. Used to construct Case 4 / Case 5 fixtures.
-func initRepoWithCommit(t *testing.T, dir string, withEnjuMarker bool) *gogit.Repository {
+func initRepoWithCommit(t *testing.T, dir string, withEnjuMarker bool) {
 	t.Helper()
-	repo, err := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	if err != nil {
-		t.Fatalf("plain init: %v", err)
-	}
+	gittest.Init(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# pre-existing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -70,18 +57,7 @@ func initRepoWithCommit(t *testing.T, dir string, withEnjuMarker bool) *gogit.Re
 			t.Fatal(err)
 		}
 	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-	if err := wt.AddGlob("."); err != nil {
-		t.Fatalf("add glob: %v", err)
-	}
-	sig := &object.Signature{Name: "u", Email: "u@u", When: time.Now()}
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	return repo
+	gittest.CommitAll(t, dir, "seed")
 }
 
 // TestCreateProject_SmartDetectDispatch pins the 5-case + 2 force-
@@ -173,17 +149,12 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				if err := os.MkdirAll(p, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				repo := initRepoWithCommit(t, p, true)
+				initRepoWithCommit(t, p, true)
 				// Real-looking origin URL — ensureManagedBare's
 				// existing-origin guard skips bare creation when
 				// any URL is set, so we don't need a reachable
 				// remote.
-				if _, err := repo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{"git@github.com:enju-ai/test-fixture.git"},
-				}); err != nil {
-					t.Fatalf("create remote: %v", err)
-				}
+				gittest.AddRemote(t, p, "origin", "git@github.com:enju-ai/test-fixture.git")
 				return p
 			},
 			wantBareWired:         false,
@@ -269,15 +240,10 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 			}
 
 			// Origin URL check.
-			repo, openErr := gogit.PlainOpen(path)
-			if openErr != nil {
-				t.Fatalf("PlainOpen %q: %v", path, openErr)
+			gotOrigin, originErr := gittest.RunOK(t, path, "remote", "get-url", "origin")
+			if originErr != nil {
+				t.Fatalf("repo has no origin after dispatch: %v", originErr)
 			}
-			rem, remErr := repo.Remote("origin")
-			if remErr != nil {
-				t.Fatalf("repo has no origin after dispatch: %v", remErr)
-			}
-			gotOrigin := rem.Config().URLs[0]
 			switch {
 			case tc.wantOriginEquals != "":
 				if gotOrigin != tc.wantOriginEquals {
@@ -292,7 +258,7 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 
 			// HEAD resolves.
 			if tc.wantHEADResolves {
-				if _, herr := repo.Head(); herr != nil {
+				if _, herr := gittest.RunOK(t, path, "rev-parse", "--verify", "HEAD"); herr != nil {
 					t.Errorf("HEAD does not resolve: %v", herr)
 				}
 			}

@@ -18,14 +18,8 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
-
-// plumbingHash parses a hex SHA without dragging plumbing into
-// the test bodies. Lets verify-step assertions do CommitObject
-// lookups by SHA returned from SubmitTaskResult.
-func plumbingHash(s string) plumbing.Hash { return plumbing.NewHash(s) }
 
 // TestSubmitTaskResult_HappyPathIntegration covers the happy
 // path: clone a fresh project from a bare remote, submit a task
@@ -64,9 +58,7 @@ func TestSubmitTaskResult_HappyPathIntegration(t *testing.T) {
 	// Verify the bare remote now has the new commit by cloning
 	// it to a throwaway dir and checking the file is present.
 	verifyDir := t.TempDir()
-	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
-		t.Fatalf("verify clone: %v", err)
-	}
+	gittest.Clone(t, verifyDir, bare)
 	data, err := os.ReadFile(filepath.Join(verifyDir, resultDir, "result.md"))
 	if err != nil {
 		t.Fatalf("read result: %v", err)
@@ -111,27 +103,21 @@ func TestSubmitTaskResult_WithArtifactsIntegration(t *testing.T) {
 	// Verify the commit message on the remote contains the
 	// artifact line + count.
 	verifyDir := t.TempDir()
-	vRepo, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare})
-	if err != nil {
-		t.Fatalf("verify clone: %v", err)
-	}
-	commit, err := vRepo.CommitObject(plumbingHash(res.CommitSHA))
-	if err != nil {
-		t.Fatalf("load commit: %v", err)
-	}
-	if !strings.Contains(commit.Message, "Task 1:1:write by @bob") {
-		t.Fatalf("commit subject missing standard format: %q", commit.Message)
+	gittest.Clone(t, verifyDir, bare)
+	commitMsg := gittest.Run(t, verifyDir, "log", "-1", "--format=%B", res.CommitSHA)
+	if !strings.Contains(commitMsg, "Task 1:1:write by @bob") {
+		t.Fatalf("commit subject missing standard format: %q", commitMsg)
 	}
 	// enjugit threads the artifact list through the body line +
 	// the Enju-Artifacts trailer (rather than putting "+ N
 	// artifact(s)" in the subject like the project package did).
 	// Both the body line and the trailer are checked so the
 	// scanner round-trip stays covered.
-	if !strings.Contains(commit.Message, "Artifacts: notes/intro.md") {
-		t.Fatalf("commit body missing artifact list: %q", commit.Message)
+	if !strings.Contains(commitMsg, "Artifacts: notes/intro.md") {
+		t.Fatalf("commit body missing artifact list: %q", commitMsg)
 	}
-	if !strings.Contains(commit.Message, "Enju-Artifacts: notes/intro.md") {
-		t.Fatalf("commit message missing Enju-Artifacts trailer: %q", commit.Message)
+	if !strings.Contains(commitMsg, "Enju-Artifacts: notes/intro.md") {
+		t.Fatalf("commit message missing Enju-Artifacts trailer: %q", commitMsg)
 	}
 
 	// Verify the artifact file is on disk at the expected path.
@@ -178,23 +164,19 @@ func TestSubmitTaskResult_AuthorAttributionIntegration(t *testing.T) {
 	}
 
 	verifyDir := t.TempDir()
-	vRepo, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare})
-	if err != nil {
-		t.Fatalf("verify clone: %v", err)
+	gittest.Clone(t, verifyDir, bare)
+	authorName := gittest.Run(t, verifyDir, "log", "-1", "--format=%an", res.CommitSHA)
+	authorEmail := gittest.Run(t, verifyDir, "log", "-1", "--format=%ae", res.CommitSHA)
+	body := gittest.Run(t, verifyDir, "log", "-1", "--format=%B", res.CommitSHA)
+	if authorName != "Alice Researcher" {
+		t.Errorf("expected author name 'Alice Researcher', got %q", authorName)
 	}
-	c1, err := vRepo.CommitObject(plumbingHash(res.CommitSHA))
-	if err != nil {
-		t.Fatalf("load alice commit: %v", err)
-	}
-	if c1.Author.Name != "Alice Researcher" {
-		t.Errorf("expected author name 'Alice Researcher', got %q", c1.Author.Name)
-	}
-	if c1.Author.Email != "alice@example.com" {
-		t.Errorf("expected author email 'alice@example.com', got %q", c1.Author.Email)
+	if authorEmail != "alice@example.com" {
+		t.Errorf("expected author email 'alice@example.com', got %q", authorEmail)
 	}
 	// Human commit (no ModelName) should NOT have AI-Model trailer.
-	if strings.Contains(c1.Message, "AI-Model:") {
-		t.Errorf("human commit should not have AI-Model trailer, got: %s", c1.Message)
+	if strings.Contains(body, "AI-Model:") {
+		t.Errorf("human commit should not have AI-Model trailer, got: %s", body)
 	}
 
 	// Case 2: AI citizen has ModelName — commit gets AI-Model trailer.
@@ -216,19 +198,13 @@ func TestSubmitTaskResult_AuthorAttributionIntegration(t *testing.T) {
 
 	// Re-clone to pick up the new commit.
 	verifyDir2 := t.TempDir()
-	vRepo2, err := gogit.PlainClone(verifyDir2, false, &gogit.CloneOptions{URL: bare})
-	if err != nil {
-		t.Fatalf("verify clone 2: %v", err)
+	gittest.Clone(t, verifyDir2, bare)
+	body2 := gittest.Run(t, verifyDir2, "log", "-1", "--format=%B", res2.CommitSHA)
+	if !strings.Contains(body2, "AI-Model: claude-sonnet-4-20250514") {
+		t.Errorf("AI commit should have AI-Model trailer, got: %s", body2)
 	}
-	c2, err := vRepo2.CommitObject(plumbingHash(res2.CommitSHA))
-	if err != nil {
-		t.Fatalf("load bot commit: %v", err)
-	}
-	if !strings.Contains(c2.Message, "AI-Model: claude-sonnet-4-20250514") {
-		t.Errorf("AI commit should have AI-Model trailer, got: %s", c2.Message)
-	}
-	if !strings.Contains(c2.Message, "Co-Authored-By: Claude (claude-sonnet-4-20250514) <noreply@anthropic.com>") {
-		t.Errorf("AI commit should have Co-Authored-By trailer, got: %s", c2.Message)
+	if !strings.Contains(body2, "Co-Authored-By: Claude (claude-sonnet-4-20250514) <noreply@anthropic.com>") {
+		t.Errorf("AI commit should have Co-Authored-By trailer, got: %s", body2)
 	}
 }
 

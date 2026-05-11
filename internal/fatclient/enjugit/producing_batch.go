@@ -3,7 +3,7 @@ package enjugit
 import (
 	"fmt"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // BatchResult bundles the per-entry outcomes of a SubmitBatch

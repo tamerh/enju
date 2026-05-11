@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // openTwoBotWorkflows materializes per-bot clones at
@@ -127,18 +126,14 @@ func TestTwoBots_ConcurrentPushesBothLandIntegration(t *testing.T) {
 	}
 
 	// Verify both branches reached the bare with non-zero tips.
-	bareRepo, err := gogit.PlainOpen(bare)
-	if err != nil {
-		t.Fatalf("opening bare: %v", err)
-	}
 	for _, branch := range []string{"alice-topic", "bob-topic"} {
-		ref, err := bareRepo.Reference(plumbing.NewBranchReferenceName(branch), true)
+		sha, err := gittest.RunOK(t, bare, "rev-parse", "--verify", "refs/heads/"+branch)
 		if err != nil {
 			t.Errorf("bare missing branch %q: %v", branch, err)
 			continue
 		}
-		if ref.Hash().IsZero() {
-			t.Errorf("bare branch %q has zero hash", branch)
+		if sha == "" {
+			t.Errorf("bare branch %q has empty hash", branch)
 		}
 	}
 }

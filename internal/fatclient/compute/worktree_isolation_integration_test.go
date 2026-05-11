@@ -22,53 +22,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // initBareForComputeTest seeds a bare repo with one initial commit
-// on main + the run-branch ref (also pointing at the seed). Mirrors
-// enjugit's internal helper but lives here so compute_test stays
-// external. Returns the bare path.
+// on main. Returns the bare path.
 func initBareForComputeTest(t *testing.T) string {
 	t.Helper()
 	bare := t.TempDir()
-	if _, err := gogit.PlainInitWithOptions(bare, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-		Bare:        true,
-	}); err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
-	seed := t.TempDir()
-	repo, err := gogit.PlainInitWithOptions(seed, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin", URLs: []string{bare},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	_ = os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644)
-	wt.Add("README.md")
-	sig := &object.Signature{Name: "T", Email: "t@x", When: time.Unix(1700000000, 0)}
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
-		t.Fatal(err)
-	}
+	gittest.InitBareWithSeed(t, bare)
 	return bare
 }
 

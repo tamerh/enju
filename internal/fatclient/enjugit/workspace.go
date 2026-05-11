@@ -11,7 +11,7 @@ import (
 	"sync"
 
 	"github.com/enju-ai/enju/internal/common/oplog"
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 

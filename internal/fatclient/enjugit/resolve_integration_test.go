@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
 )
 
 // resolveTestResultDir composes the canonical task-result path
@@ -339,9 +338,3 @@ func TestResolve_MissingArtifactIntegration(t *testing.T) {
 	}
 }
 
-// _ keeps the gogit import live in case future resolve tests need
-// to verify commit graph state directly. Without it, removing the
-// import here forces editing the seed helper which already uses
-// CommitArbitraryFiles' result. Cheap insurance for the next
-// scenario port.
-var _ = gogit.PlainClone

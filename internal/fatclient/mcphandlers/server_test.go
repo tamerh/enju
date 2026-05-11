@@ -14,17 +14,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-	gogit "github.com/go-git/go-git/v5"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // TestAutoReregisterOnStaleCitizen verifies that an API call hitting
@@ -326,50 +322,15 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 	//    path, capture the commit SHA so we can point the
 	//    descriptor at it.
 	bareDir := t.TempDir()
-	if _, err := gogit.PlainInitWithOptions(bareDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-		Bare: true,
-	}); err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
+	gittest.InitBare(t, bareDir)
 
 	seedDir := t.TempDir()
-	seedRepo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	if err != nil {
-		t.Fatalf("init seed: %v", err)
-	}
-	if _, err := seedRepo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{bareDir},
-	}); err != nil {
-		t.Fatalf("seed remote: %v", err)
-	}
-	draftPath := filepath.Join(seedDir, "runs/1/draft/result.md")
-	if err := os.MkdirAll(filepath.Dir(draftPath), 0o755); err != nil {
-		t.Fatalf("mkdir seed: %v", err)
-	}
-	if err := os.WriteFile(draftPath, []byte(draftResult), 0o644); err != nil {
-		t.Fatalf("write draft: %v", err)
-	}
-	wt, _ := seedRepo.Worktree()
-	if _, err := wt.Add("runs/1/draft/result.md"); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	sig := &object.Signature{Name: "Seeder", Email: "seed@localhost", When: time.Unix(1700000000, 0)}
-	draftCommitHash, err := wt.Commit("seed draft", &gogit.CommitOptions{Author: sig, Committer: sig})
-	if err != nil {
-		t.Fatalf("commit seed: %v", err)
-	}
-	if err := seedRepo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
-		t.Fatalf("push seed: %v", err)
-	}
-	draftCommitSHA := draftCommitHash.String()
+	gittest.Init(t, seedDir)
+	gittest.AddRemote(t, seedDir, "origin", bareDir)
+	draftCommitSHA := gittest.CommitAs(t, seedDir,
+		"runs/1/draft/result.md", draftResult, "seed draft",
+		"Seeder", "seed@localhost")
+	gittest.Push(t, seedDir, "main")
 
 	// 2. httptest coordinator: /inputs returns the descriptor
 	//    naming draft as a dep at draftCommitSHA; /tasks/draft
@@ -618,23 +579,8 @@ func TestCreateProjectCustomPathRefusesPopulatedGitRepo(t *testing.T) {
 
 	customPath := t.TempDir()
 	// Make it a populated git repo with no Enju marker.
-	repo, err := gogit.PlainInitWithOptions(customPath, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: "refs/heads/main",
-		},
-	})
-	if err != nil {
-		t.Fatalf("PlainInit: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(customPath, "existing.txt"), []byte("user data"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	_ = wt.AddGlob(".")
-	sig := &object.Signature{Name: "u", Email: "u@u", When: time.Now()}
-	if _, err := wt.Commit("initial", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
+	gittest.Init(t, customPath)
+	gittest.CommitAs(t, customPath, "existing.txt", "user data", "initial", "u", "u@u")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
@@ -876,24 +822,8 @@ func TestCreateProjectRefusesPopulatedUnrelatedRepoAdoption(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	repo, err := gogit.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("user code"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := wt.Add("README.md"); err != nil {
-		t.Fatal(err)
-	}
-	sig := &object.Signature{Name: "User", Email: "user@example.com", When: time.Now()}
-	if _, err := wt.Commit("user's own work", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatal(err)
-	}
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "README.md", "user code", "user's own work", "User", "user@example.com")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
@@ -936,17 +866,8 @@ func TestCreateProjectForceAdoptsPopulatedRepo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	repo, err := gogit.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("user code"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	wt.Add("README.md")
-	sig := &object.Signature{Name: "User", Email: "user@example.com", When: time.Now()}
-	wt.Commit("user's work", &gogit.CommitOptions{Author: sig, Committer: sig})
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "README.md", "user code", "user's work", "User", "user@example.com")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
@@ -996,21 +917,9 @@ func TestCreateProjectAcceptsAlreadyAdoptedRepo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	repo, err := gogit.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	gittest.Init(t, dir)
 	// Pre-existing Enju scaffold + commit.
-	if err := os.MkdirAll(filepath.Join(dir, "enju"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "enju", ".gitkeep"), []byte(""), 0644); err != nil {
-		t.Fatal(err)
-	}
-	wt, _ := repo.Worktree()
-	wt.Add("enju/.gitkeep")
-	sig := &object.Signature{Name: "Enju", Email: "enju@localhost", When: time.Now()}
-	wt.Commit("prior adoption", &gogit.CommitOptions{Author: sig, Committer: sig})
+	gittest.CommitAs(t, dir, "enju/.gitkeep", "", "prior adoption", "Enju", "enju@localhost")
 
 	if reason := service.DetectPopulatedUnrelatedRepo(dir); reason != "" {
 		t.Errorf("repo with enju/ marker should pass safety check, got refusal: %s", reason)
@@ -1030,10 +939,7 @@ func TestCreateProjectDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
-	repo, err := gogit.PlainInit(dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	gittest.Init(t, dir)
 	// Create a regular file named "enju" — mimics the compiled
 	// binary in the enju source repo.
 	if err := os.WriteFile(filepath.Join(dir, "enju"), []byte("#!/bin/sh\nexec real-enju\n"), 0755); err != nil {
@@ -1042,10 +948,10 @@ func TestCreateProjectDetectsEnjuBinaryNotMistakenForScaffold(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	wt, _ := repo.Worktree()
-	wt.Add(".")
-	sig := &object.Signature{Name: "User", Email: "u@e.com", When: time.Now()}
-	wt.Commit("source repo with enju binary", &gogit.CommitOptions{Author: sig, Committer: sig})
+	gittest.RunOK(t, dir, "add", "enju", "main.go")
+	gittest.Run(t, dir,
+		"-c", "user.name=User", "-c", "user.email=u@e.com",
+		"commit", "-m", "source repo with enju binary")
 
 	if reason := service.DetectPopulatedUnrelatedRepo(dir); reason == "" {
 		t.Error("expected refusal for populated repo with regular-file 'enju' (compiled binary), got empty (mistaken for scaffold)")
@@ -1165,17 +1071,8 @@ func TestCreateProjectFolderWithExistingGit(t *testing.T) {
 
 	// Create a folder with git + one commit.
 	dir := t.TempDir()
-	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("pre-existing"), 0644)
-	wt, _ := repo.Worktree()
-	wt.Add("existing.txt")
-	wt.Commit("pre-existing commit", &gogit.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test", When: time.Now()},
-	})
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "existing.txt", "pre-existing", "pre-existing commit", "Test", "test@test")
 
 	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -1200,11 +1097,9 @@ func TestCreateProjectFolderWithExistingGit(t *testing.T) {
 	// Pre-existing commit preserved — existing-.git branch
 	// does NOT add a scaffold commit (that's reserved for the
 	// no-.git branches).
-	iter, _ := repo.Log(&gogit.LogOptions{})
-	count := 0
-	iter.ForEach(func(c *object.Commit) error { count++; return nil })
-	if count != 1 {
-		t.Errorf("expected 1 commit (pre-existing), got %d — existing-.git branch should not add commits on top", count)
+	count := gittest.Run(t, dir, "rev-list", "--count", "HEAD")
+	if count != "1" {
+		t.Errorf("expected 1 commit (pre-existing), got %s — existing-.git branch should not add commits on top", count)
 	}
 
 	// Pre-existing file preserved.
@@ -1333,17 +1228,8 @@ func TestCreateProjectOriginlessFolderGetsManagedBare(t *testing.T) {
 	// stall. With Phase 1's scanner fallback shipped, this
 	// case Just Works without any bare.
 	dir := t.TempDir()
-	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	_ = os.WriteFile(filepath.Join(dir, "paper.md"), []byte("# tp53\n"), 0644)
-	wt, _ := repo.Worktree()
-	_, _ = wt.Add("paper.md")
-	_, _ = wt.Commit("seed", &gogit.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "t@t", When: time.Now()},
-	})
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "paper.md", "# tp53\n", "seed", "Test", "t@t")
 
 	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
@@ -1388,12 +1274,12 @@ func TestCreateProjectOriginlessFolderGetsManagedBare(t *testing.T) {
 
 	// Working tree's origin MUST point at the managed bare —
 	// `git push` lands there; no more silent push-skip.
-	rem, err := repo.Remote("origin")
-	if err != nil {
-		t.Fatalf("origin not configured after init: %v", err)
+	gotOrigin, oerr := gittest.RunOK(t, dir, "remote", "get-url", "origin")
+	if oerr != nil {
+		t.Fatalf("origin not configured after init: %v", oerr)
 	}
-	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != managedBare {
-		t.Errorf("origin URL: got %v, want [%s]", cfg.URLs, managedBare)
+	if gotOrigin != managedBare {
+		t.Errorf("origin URL: got %s, want %s", gotOrigin, managedBare)
 	}
 
 	// Workspace's external dir registration succeeded — ForProject
@@ -1438,21 +1324,9 @@ func TestCreateProjectPreservesExistingOrigin(t *testing.T) {
 
 	// Folder with git init + commit + a pre-configured origin.
 	dir := t.TempDir()
-	repo, _ := gogit.PlainInitWithOptions(dir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	_ = os.WriteFile(filepath.Join(dir, "x.md"), []byte("hi"), 0644)
-	wt, _ := repo.Worktree()
-	_, _ = wt.Add("x.md")
-	_, _ = wt.Commit("seed", &gogit.CommitOptions{
-		Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()},
-	})
-	_, _ = repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{preExistingOrigin},
-	})
+	gittest.Init(t, dir)
+	gittest.CommitAs(t, dir, "x.md", "hi", "seed", "T", "t@t")
+	gittest.AddRemote(t, dir, "origin", preExistingOrigin)
 
 	ws, _ := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -1475,12 +1349,12 @@ func TestCreateProjectPreservesExistingOrigin(t *testing.T) {
 	}
 
 	// Origin must be untouched.
-	rem, err := repo.Remote("origin")
-	if err != nil {
-		t.Fatalf("origin removed by init: %v", err)
+	gotOrigin, oerr := gittest.RunOK(t, dir, "remote", "get-url", "origin")
+	if oerr != nil {
+		t.Fatalf("origin removed by init: %v", oerr)
 	}
-	if cfg := rem.Config(); cfg == nil || len(cfg.URLs) == 0 || cfg.URLs[0] != preExistingOrigin {
-		t.Errorf("origin URL changed: got %v, want %s", cfg.URLs, preExistingOrigin)
+	if gotOrigin != preExistingOrigin {
+		t.Errorf("origin URL changed: got %s, want %s", gotOrigin, preExistingOrigin)
 	}
 
 	// No managed bare should have been created.
@@ -1559,11 +1433,7 @@ func TestFormatClaimResultNoFeedbackOnFirstClaim(t *testing.T) {
 func TestIsLocalWorkingTree(t *testing.T) {
 	// Case 1: folder with .git → true.
 	wtDir := t.TempDir()
-	gogit.PlainInitWithOptions(wtDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
+	gittest.Init(t, wtDir)
 	if !enjugit.IsLocalWorkingTree(wtDir) {
 		t.Error("expected working tree detected")
 	}
@@ -1859,33 +1729,15 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// main + a run branch, NO origin configured. This is what
 	// a pre-Bug-1-fix init'd project looks like in practice.
 	workDir := t.TempDir()
-	repo, err := gogit.PlainInitWithOptions(workDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	if err != nil {
-		t.Fatalf("init repo: %v", err)
-	}
-	wt, _ := repo.Worktree()
-	_ = os.WriteFile(filepath.Join(workDir, "seed.md"), []byte("seed"), 0644)
-	_, _ = wt.Add("seed.md")
-	_, _ = wt.Commit("seed", &gogit.CommitOptions{
-		Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()},
-	})
+	gittest.Init(t, workDir)
+	gittest.CommitAs(t, workDir, "seed.md", "seed", "seed", "T", "t@t")
 	// Branch off and add a "trailer-bearing" run-branch commit
 	// so we can verify the bare receives it after set_remote.
 	branchName := "run-1"
-	if err := wt.Checkout(&gogit.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(branchName),
-		Create: true,
-	}); err != nil {
-		t.Fatalf("checkout run-1: %v", err)
-	}
-	_ = os.WriteFile(filepath.Join(workDir, "result.md"), []byte("ran"), 0644)
-	_, _ = wt.Add("result.md")
-	runCommitHash, _ := wt.Commit("Task 2:1:work by @t: result\n\nEnju-Task-Complete: 2:1:work\n",
-		&gogit.CommitOptions{Author: &object.Signature{Name: "T", Email: "t@t", When: time.Now()}})
+	gittest.Run(t, workDir, "checkout", "-b", branchName)
+	runCommitHash := gittest.CommitAs(t, workDir, "result.md", "ran",
+		"Task 2:1:work by @t: result\n\nEnju-Task-Complete: 2:1:work\n",
+		"T", "t@t")
 
 	// Wire the opener + project. Path resolution comes from a
 	// projectreg.Registry attached to the opener (the durable
@@ -1936,16 +1788,12 @@ func TestSetProjectRemoteResetsCursorsForRescan(t *testing.T) {
 	// proves the all-branches push happened. Without this,
 	// the scanner would have nothing to walk even after the
 	// cursor reset.
-	bareRepo, err := gogit.PlainOpen(bareDir)
-	if err != nil {
-		t.Fatalf("opening bare: %v", err)
+	bareRun, rerr := gittest.RunOK(t, bareDir, "rev-parse", "--verify", "refs/heads/run-1")
+	if rerr != nil {
+		t.Fatalf("bare missing refs/heads/run-1 — push did not seed the new remote: %v", rerr)
 	}
-	bareRun, err := bareRepo.Reference(plumbing.NewBranchReferenceName("run-1"), true)
-	if err != nil {
-		t.Fatalf("bare missing refs/heads/run-1 — push did not seed the new remote: %v", err)
-	}
-	if got := bareRun.Hash().String(); got != runCommitHash.String() {
-		t.Errorf("bare run-1 head: got %s, want %s", got, runCommitHash.String())
+	if bareRun != runCommitHash {
+		t.Errorf("bare run-1 head: got %s, want %s", bareRun, runCommitHash)
 	}
 
 	// Cursors must be set to the rescan sentinel for every

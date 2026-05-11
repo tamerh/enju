@@ -26,9 +26,6 @@ import (
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // DecorateProjectListWithPushStatus reads the coordinator's JSON
@@ -311,20 +308,14 @@ func inspectExistingDir(path string, target *AdoptionTarget) error {
 	if !target.HasGit {
 		return nil
 	}
-	repo, openErr := gogit.PlainOpen(path)
+	info, openErr := enjugit.InspectGitDir(path)
 	if openErr != nil {
 		// `.git` exists but is unreadable — surface the underlying
 		// error rather than silently treating it as no-git.
 		return fmt.Errorf("opening repo at %q: %w", path, openErr)
 	}
-	if rem, err := repo.Remote("origin"); err == nil {
-		if cfg := rem.Config(); cfg != nil && len(cfg.URLs) > 0 {
-			target.OriginURL = cfg.URLs[0]
-		}
-	}
-	if head, err := repo.Head(); err == nil && head.Name().IsBranch() {
-		target.DefaultBranch = head.Name().Short()
-	}
+	target.OriginURL = info.OriginURL
+	target.DefaultBranch = info.DefaultBranch
 	return nil
 }
 
@@ -416,41 +407,7 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 // the layout matches a fresh init. Returns the short branch name
 // of HEAD after the commit.
 func (s *FatClient) initGitWithExistingFiles(dirPath string) (string, error) {
-	repo, initErr := gogit.PlainInitWithOptions(dirPath, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{
-			DefaultBranch: plumbing.ReferenceName("refs/heads/main"),
-		},
-	})
-	if initErr != nil {
-		return "", fmt.Errorf("git init: %w", initErr)
-	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		return "", fmt.Errorf("worktree: %w", err)
-	}
-	templatesDir := filepath.Join(dirPath, corelayout.DefaultTemplatesDir)
-	if _, err := os.Stat(templatesDir); os.IsNotExist(err) {
-		_ = os.MkdirAll(templatesDir, 0755)
-		_ = os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), nil, 0644)
-	}
-	if err := wt.AddGlob("."); err != nil {
-		return "", fmt.Errorf("staging files: %w", err)
-	}
-	sig := &object.Signature{
-		Name:  "Enju",
-		Email: "enju@localhost",
-		When:  time.Now(),
-	}
-	if _, err := wt.Commit("Initialize Enju orchestration", &gogit.CommitOptions{
-		Author:    sig,
-		Committer: sig,
-	}); err != nil {
-		return "", fmt.Errorf("initial commit: %w", err)
-	}
-	if head, err := repo.Head(); err == nil && head.Name().IsBranch() {
-		return head.Name().Short(), nil
-	}
-	return "", nil
+	return enjugit.InitLocalAdoptExisting(dirPath, corelayout.DefaultTemplatesDir)
 }
 
 // ensureManagedBare guarantees the working tree at workDir has
@@ -523,11 +480,7 @@ func (s *FatClient) ensureManagedBare(workDir string, wf *enjugit.Workflow) erro
 // Returns "" if it's safe to proceed; non-empty string is the
 // refusal reason for the caller to splice into a curative error.
 func DetectPopulatedUnrelatedRepo(dirPath string) string {
-	repo, err := gogit.PlainOpen(dirPath)
-	if err != nil {
-		return ""
-	}
-	if _, err := repo.Head(); err != nil {
+	if !enjugit.HeadResolvesToCommit(dirPath) {
 		return ""
 	}
 	// Has commits. Check for Enju markers — either the scaffold

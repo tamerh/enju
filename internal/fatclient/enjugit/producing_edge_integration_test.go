@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestSubmitTaskResult_ConcurrentPushSurfacesNonFFIntegration
@@ -95,9 +95,7 @@ func TestSubmitTaskResult_ConcurrentPushSurfacesNonFFIntegration(t *testing.T) {
 	// A's commit must still be on the remote — B's failed push
 	// shouldn't have overwritten anything.
 	verifyDir := t.TempDir()
-	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
-		t.Fatalf("verify clone: %v", err)
-	}
+	gittest.Clone(t, verifyDir, bare)
 	if _, err := os.Stat(filepath.Join(verifyDir, resolveTestResultDir(1, "", "a"), "result.md")); err != nil {
 		t.Fatalf("A's file missing after B's failed submit (B should not have overwritten): %v", err)
 	}
@@ -177,9 +175,7 @@ func TestPushForceOverwritesDivergedRemoteIntegration(t *testing.T) {
 	}
 
 	verifyDir := t.TempDir()
-	if _, err := gogit.PlainClone(verifyDir, false, &gogit.CloneOptions{URL: bare}); err != nil {
-		t.Fatalf("verify clone: %v", err)
-	}
+	gittest.Clone(t, verifyDir, bare)
 	if _, err := os.Stat(filepath.Join(verifyDir, resolveTestResultDir(1, "", "a"), "result.md")); !os.IsNotExist(err) {
 		t.Errorf("expected A's file to be gone after force push, stat err: %v", err)
 	}

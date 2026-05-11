@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // SubmitTaskResult atomically commits the task's files on its

@@ -10,7 +10,7 @@ import (
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // templates.go — template discovery + bundle reading on the

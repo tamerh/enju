@@ -21,8 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestMCPBranchSerialRunsRefused verifies the coordinator
@@ -496,12 +495,7 @@ tasks:
 func readRepoFileOnBranch(t *testing.T, remoteURL, branch, repoRelPath string) ([]byte, bool) {
 	t.Helper()
 	cloneDir := t.TempDir()
-	_, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{
-		URL:           remoteURL,
-		ReferenceName: plumbing.NewBranchReferenceName(branch),
-		SingleBranch:  true,
-	})
-	if err != nil {
+	if _, err := gittest.RunOK(t, "", "clone", "--branch", branch, "--single-branch", remoteURL, cloneDir); err != nil {
 		return nil, false
 	}
 	b, err := os.ReadFile(filepath.Join(cloneDir, repoRelPath))
@@ -517,25 +511,19 @@ func readRepoFileOnBranch(t *testing.T, remoteURL, branch, repoRelPath string) (
 // coordinator's bookkeeping.
 func assertRemoteHasBranch(t *testing.T, remoteURL, branch string) {
 	t.Helper()
-	repo, err := gogit.PlainOpen(remoteURL)
-	if err != nil {
-		t.Fatalf("open bare %q: %v", remoteURL, err)
-	}
-	iter, err := repo.Branches()
-	if err != nil {
-		t.Fatalf("list branches on %q: %v", remoteURL, err)
-	}
-	defer iter.Close()
+	out := gittest.Run(t, remoteURL, "for-each-ref", "--format=%(refname:short)", "refs/heads/")
 	found := false
 	var names []string
-	_ = iter.ForEach(func(ref *plumbing.Reference) error {
-		name := ref.Name().Short()
+	for _, name := range strings.Split(out, "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
 		names = append(names, name)
 		if name == branch {
 			found = true
 		}
-		return nil
-	})
+	}
 	if !found {
 		t.Fatalf("bare remote %q missing branch %q (have: %v)", remoteURL, branch, names)
 	}

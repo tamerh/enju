@@ -17,13 +17,9 @@ import (
 	"testing"
 	"time"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 func TestListTaskIterations(t *testing.T) {
@@ -218,13 +214,7 @@ func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
 	// 1) Bare remote, seeded with one initial commit so the
 	// writer's ForProject can branch from refs/heads/main.
 	bare := t.TempDir()
-	if _, err := gogit.PlainInitWithOptions(bare, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-		Bare:        true,
-	}); err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
-	seedBareWithInitialCommit(t, bare)
+	gittest.InitBareWithSeed(t, bare)
 	// Seed the bare via a writer enjugit workspace: ForProject(7, bare)
 	// gives a Workflow whose clone is wired with origin=bare;
 	// CommitArbitraryFiles + implicit push lands the commit there.
@@ -347,38 +337,3 @@ func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
 	}
 }
 
-// seedBareWithInitialCommit pushes one README.md commit on
-// refs/heads/main into the given bare so ForProject's clone
-// has a branch to fork from. Mirrors the project package's
-// internal helper of the same name (kept inline here to avoid
-// cross-package test plumbing).
-func seedBareWithInitialCommit(t *testing.T, bareDir string) {
-	t.Helper()
-	seedDir := t.TempDir()
-	repo, err := gogit.PlainInitWithOptions(seedDir, &gogit.PlainInitOptions{
-		InitOptions: gogit.InitOptions{DefaultBranch: plumbing.ReferenceName("refs/heads/main")},
-	})
-	if err != nil {
-		t.Fatalf("init seed: %v", err)
-	}
-	if _, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{bareDir}}); err != nil {
-		t.Fatalf("create remote: %v", err)
-	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(seedDir, "README.md"), []byte("# seed\n"), 0o644); err != nil {
-		t.Fatalf("write readme: %v", err)
-	}
-	if _, err := wt.Add("README.md"); err != nil {
-		t.Fatalf("add readme: %v", err)
-	}
-	sig := &object.Signature{Name: "Test", Email: "test@localhost", When: time.Unix(1700000000, 0)}
-	if _, err := wt.Commit("seed", &gogit.CommitOptions{Author: sig, Committer: sig}); err != nil {
-		t.Fatalf("commit seed: %v", err)
-	}
-	if err := repo.Push(&gogit.PushOptions{RemoteName: "origin"}); err != nil {
-		t.Fatalf("push seed: %v", err)
-	}
-}

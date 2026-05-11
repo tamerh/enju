@@ -1,0 +1,278 @@
+package gitcli
+
+import (
+	"bytes"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gofrs/flock"
+)
+
+// Clone is the handle on one project's local git checkout, backed
+// by the system `git` CLI. Mirrors gitv5 / gitv6's shape exactly
+// (same fields above the library seam, same behavioural contracts
+// on each method) so the Ops interface is identical across
+// backends.
+type Clone struct {
+	workDir   string
+	remoteURL string
+	logger    *slog.Logger
+
+	mu sync.Mutex
+
+	fileLock *flock.Flock
+
+	// holder is the goroutine ID that currently holds mu, or 0
+	// when the lock is free. Set inside mu.Lock(), cleared
+	// before mu.Unlock(). Read without the mutex during the
+	// reentrancy fast-path: a goroutine that observes its own
+	// id here is guaranteed to already be the holder, so it can
+	// safely skip re-acquisition.
+	//
+	// Same per-goroutine reentrancy as gitv6 — process-global
+	// `reentrant bool` was the bug behind #381 (parallel-merge
+	// race), don't reintroduce it.
+	holder atomic.Uint64
+
+	lastPushAt    time.Time
+	lastPushError string
+}
+
+// OpenClone opens an existing git clone at workDir. If workDir
+// doesn't contain a .git, returns ErrCloneNotFound. Hydrates
+// remoteURL from `git remote get-url origin` so lazy-fetch and
+// push paths know where to talk to.
+//
+// lockPath is the file used for the cross-process flock. Pass
+// "" to skip cross-process locking (test fixtures).
+//
+// logger may be nil — falls back to slog.Default().
+//
+// Note on tmp_pack_* sweeping: gitv6's OpenClone proactively
+// removed orphan `tmp_pack_<n>` files because go-git's pack
+// reader would scan them and trip on the partial content.
+// Real `git` doesn't scan tmp_pack_* during fetch / read paths
+// (it's git's own private staging prefix), so orphans are
+// harmless to operations — verified empirically. We don't
+// sweep here; old orphans accumulate as minor disk-space waste
+// that `git gc` reaps. See TestFetchTolerantOfLeftoverTmpPack
+// for the regression pin.
+func OpenClone(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrCloneNotFound, workDir)
+		}
+		return nil, fmt.Errorf("git: stat %s/.git: %w", workDir, err)
+	}
+	c := &Clone{
+		workDir: workDir,
+		logger:  logger,
+	}
+	// Hydrate remoteURL from origin if present. A missing origin
+	// is fine — path-mode bootstrap leaves it unset until
+	// ensureManagedBare wires it.
+	if out, err := runGit(workDir, []string{"remote", "get-url", "origin"}, runOpts{}); err == nil {
+		c.remoteURL = strings.TrimSpace(string(out))
+	}
+	if lockPath != "" {
+		c.fileLock = flock.New(lockPath)
+	}
+	return c, nil
+}
+
+// CloneOrInit ensures a clone exists at workDir. If one exists,
+// behaves like OpenClone. If not, performs `git clone` from
+// remoteURL into workDir. When remoteURL is empty AND workDir is
+// missing, returns an error.
+func CloneOrInit(workDir, remoteURL, lockPath string, logger *slog.Logger) (*Clone, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); err == nil {
+		return OpenClone(workDir, lockPath, logger)
+	}
+	if remoteURL == "" {
+		return nil, fmt.Errorf("git: no clone at %s and no remoteURL given", workDir)
+	}
+	if err := os.MkdirAll(filepath.Dir(workDir), 0o755); err != nil {
+		return nil, fmt.Errorf("git: mkdir parent %s: %w", workDir, err)
+	}
+	// `git clone <url> <dir>` from the parent dir is fine — git
+	// will create <dir>. Use empty workDir for runGit so no -C is
+	// passed (the target dir doesn't exist yet).
+	args := []string{"clone", remoteURL, workDir}
+	if _, err := runGit("", args, runOpts{network: true}); err != nil {
+		return nil, fmt.Errorf("git: clone %s into %s: %w", remoteURL, workDir, err)
+	}
+	return OpenClone(workDir, lockPath, logger)
+}
+
+// InitLocal initializes a non-bare git repo at workDir with a
+// `main` default branch AND seeds an initial commit (README.md +
+// enju/templates/.gitkeep) so refs/heads/main has a SHA.
+// Bootstrap step for path-mode projects + test fixtures.
+//
+// Mirrors gitv6.InitLocal's contract exactly: callers
+// (initbare.go InitBareWithSeed, ensureManagedBare) depend on
+// `main` resolving immediately after this returns.
+func InitLocal(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, fmt.Errorf("git: mkdir %s: %w", workDir, err)
+	}
+	if _, err := runGit(workDir, []string{"init", "-b", "main"}, runOpts{}); err != nil {
+		return nil, fmt.Errorf("git: init %s: %w", workDir, err)
+	}
+	if err := seedInitialCommit(workDir); err != nil {
+		return nil, fmt.Errorf("git: seed local init %s: %w", workDir, err)
+	}
+	return OpenClone(workDir, lockPath, logger)
+}
+
+// seedInitialCommit writes README.md + enju/templates/.gitkeep
+// and commits them so refs/heads/main has a SHA. Authorship is
+// the placeholder Enju identity (callers that want their own
+// author go through CommitFiles afterward).
+func seedInitialCommit(workDir string) error {
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Enju project\n"), 0o644); err != nil {
+		return fmt.Errorf("write README: %w", err)
+	}
+	templatesDir := filepath.Join(workDir, "enju", "templates")
+	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+		return fmt.Errorf("create templates dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), []byte(""), 0o644); err != nil {
+		return fmt.Errorf("write .gitkeep: %w", err)
+	}
+	if _, err := runGit(workDir, []string{"add", "README.md", "enju/templates/.gitkeep"}, runOpts{}); err != nil {
+		return fmt.Errorf("git add seed files: %w", err)
+	}
+	env := authorEnvVars("Enju", "enju@localhost", time.Now())
+	if _, err := runGit(workDir, []string{"commit", "-m", "initial commit"}, runOpts{extraEnv: env}); err != nil {
+		return fmt.Errorf("git commit seed: %w", err)
+	}
+	return nil
+}
+
+// WorkDir returns the absolute path to this clone's worktree.
+func (c *Clone) WorkDir() string { return c.workDir }
+
+// RemoteURL returns the cached origin URL, or "" when origin is
+// not configured. Refreshed by EnsureOrigin / RemoveOrigin.
+func (c *Clone) RemoteURL() string { return c.remoteURL }
+
+// LastPushAt returns the timestamp of the last push attempt
+// (success or failure). Zero value when no push has happened.
+func (c *Clone) LastPushAt() time.Time { return c.lastPushAt }
+
+// LastPushError returns the error string from the most recent
+// push, or "" when the last push succeeded.
+func (c *Clone) LastPushError() string { return c.lastPushError }
+
+// RecordPush sets the cached LastPushAt/LastPushError fields.
+func (c *Clone) RecordPush(t time.Time, errMsg string) {
+	defer c.lock()()
+	c.lastPushAt = t
+	c.lastPushError = errMsg
+}
+
+// HeadCommitTime returns the commit time of HEAD. Zero time on
+// any error (no commits yet, detached HEAD pointing at nothing,
+// etc.) — callers treat the zero value as "unknown" rather than
+// branching on a separate error.
+func (c *Clone) HeadCommitTime() time.Time {
+	out, err := runGit(c.workDir, []string{"log", "-1", "--format=%ct", "HEAD"}, runOpts{})
+	if err != nil {
+		return time.Time{}
+	}
+	secs, parseErr := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if parseErr != nil {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
+}
+
+// lock acquires both mu and (when configured) the flock. No-op
+// when the calling goroutine already holds the lock (reentrant
+// fast path). Returns a function the caller must call to release.
+// Use as: defer c.lock()()
+func (c *Clone) lock() func() {
+	me := goroutineID()
+	if c.holder.Load() == me {
+		return func() {}
+	}
+	c.mu.Lock()
+	if c.fileLock != nil {
+		_ = c.fileLock.Lock()
+	}
+	c.holder.Store(me)
+	return func() {
+		c.holder.Store(0)
+		if c.fileLock != nil {
+			_ = c.fileLock.Unlock()
+		}
+		c.mu.Unlock()
+	}
+}
+
+// WithLock holds the project lock across the closure. Inside fn,
+// the passed Ops is the same Clone; nested mutating method calls
+// from the SAME goroutine see themselves as the lock holder and
+// skip re-acquisition (the non-recursive sync.Mutex would
+// deadlock otherwise). Goroutine semantics keyed on the holder
+// goroutine ID — same approach as gitv6's #381 fix.
+func (c *Clone) WithLock(fn func(Ops) error) error {
+	me := goroutineID()
+	if c.holder.Load() == me {
+		return fn(c)
+	}
+	c.mu.Lock()
+	if c.fileLock != nil {
+		_ = c.fileLock.Lock()
+	}
+	c.holder.Store(me)
+	defer func() {
+		c.holder.Store(0)
+		if c.fileLock != nil {
+			_ = c.fileLock.Unlock()
+		}
+		c.mu.Unlock()
+	}()
+	return fn(c)
+}
+
+// goroutineID returns the current goroutine's ID by parsing the
+// header of runtime.Stack. Used as a per-goroutine reentrancy
+// key for the project lock. ~100ns cost paid only on lock
+// acquisition, not on every method inside a held lock.
+func goroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	s := buf[:n]
+	rest, ok := bytes.CutPrefix(s, []byte("goroutine "))
+	if !ok {
+		return 0
+	}
+	digits, _, ok := bytes.Cut(rest, []byte(" "))
+	if !ok {
+		return 0
+	}
+	id, err := strconv.ParseUint(string(digits), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}

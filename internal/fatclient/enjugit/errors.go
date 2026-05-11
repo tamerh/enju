@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // Sentinel errors. Verbs document which they return; callers use

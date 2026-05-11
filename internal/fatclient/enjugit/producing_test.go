@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 func TestSubmitTaskResult_HappyPath(t *testing.T) {

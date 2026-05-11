@@ -11,8 +11,7 @@ import (
 	"strconv"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // submitTaskCommitOnMain lands one Enju-trailered commit on the
@@ -336,29 +335,10 @@ func TestScanBranchSinceUnknownBranchReturnsEmpty(t *testing.T) {
 // scan to start "from before anything the test created."
 func resolveSeedRoot(t *testing.T, bare string) string {
 	t.Helper()
-	bareRepo, err := gogit.PlainOpen(bare)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mainRef, err := bareRepo.Reference(plumbing.NewBranchReferenceName("main"), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	iter, err := bareRepo.Log(&gogit.LogOptions{From: mainRef.Hash()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer iter.Close()
-	var root string
-	for {
-		c, err := iter.Next()
-		if err != nil {
-			break
-		}
-		if c.NumParents() == 0 {
-			root = c.Hash.String()
-		}
-	}
+	// `git rev-list --max-parents=0 main` returns every root
+	// commit reachable from main (one per orphan branch, but
+	// fixtures only have one root).
+	root := gittest.Run(t, bare, "rev-list", "--max-parents=0", "main")
 	if root == "" {
 		t.Fatal("seed root not found")
 	}

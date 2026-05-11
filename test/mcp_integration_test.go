@@ -45,7 +45,7 @@ import (
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
-	gogit "github.com/go-git/go-git/v5"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -1960,9 +1960,7 @@ func TestMCPMultiFileOutputs(t *testing.T) {
 	if remoteURL == "" {
 		t.Fatal("no remote_url for multi-file-outputs project")
 	}
-	if _, err := gogit.PlainClone(cloneDir, false, &gogit.CloneOptions{URL: remoteURL}); err != nil {
-		t.Fatalf("clone bare: %v", err)
-	}
+	gittest.Clone(t, cloneDir, remoteURL)
 	resultsDir := filepath.Join(cloneDir, h.runDir(int(h.lastRunSeq)), "analyze")
 
 	fileChecks := []struct {

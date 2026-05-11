@@ -17,8 +17,7 @@ import (
 	"testing"
 	"time"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestMCPAsyncComputeEndToEnd launches a `mode: async` compute
@@ -625,40 +624,10 @@ echo "content-at-$(date +%s%N)"
 // to distinguish "which upstream commit the review saw."
 func readCommitFile(t *testing.T, remoteURL, commitSHA, repoRelPath string) []byte {
 	t.Helper()
-	tmp := t.TempDir()
-	repo, err := gogit.PlainClone(tmp, false, &gogit.CloneOptions{URL: remoteURL, NoCheckout: true})
-	if err != nil {
-		t.Fatalf("clone for readCommitFile: %v", err)
-	}
-	commit, err := repo.CommitObject(plumbing.NewHash(commitSHA))
-	if err != nil {
-		t.Fatalf("load commit %s: %v", commitSHA, err)
-	}
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("tree: %v", err)
-	}
-	file, err := tree.File(repoRelPath)
-	if err != nil {
-		t.Fatalf("file %s at %s: %v", repoRelPath, commitSHA, err)
-	}
-	r, err := file.Reader()
-	if err != nil {
-		t.Fatalf("reader: %v", err)
-	}
-	defer r.Close()
-	buf := make([]byte, 0, 1024)
-	chunk := make([]byte, 512)
-	for {
-		n, rerr := r.Read(chunk)
-		if n > 0 {
-			buf = append(buf, chunk[:n]...)
-		}
-		if rerr != nil {
-			break
-		}
-	}
-	return buf
+	// `git -C <bare> cat-file -p <sha>:<path>` prints the blob
+	// contents directly. NoCheckout-clone-then-walk-tree is
+	// equivalent but slower; cat-file is one process.
+	return []byte(gittest.Run(t, remoteURL, "cat-file", "-p", commitSHA+":"+repoRelPath))
 }
 
 // TestMCPAsyncRequestChangesRerunArtifactIndex is the tester's

@@ -19,11 +19,24 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/api"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
 	"github.com/enju-ai/enju/internal/coordinator/scheduler"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// needsGit reports whether the named subcommand exercises any
+// git verbs and therefore requires a recent enough `git`
+// binary on PATH. Coordinator-only commands (`serve`) and the
+// pure-string `version` command are exempt.
+func needsGit(subcommand string) bool {
+	switch subcommand {
+	case "mcp", "ui", "wrap-task", "inbox", "review", "bot":
+		return true
+	}
+	return false
+}
 
 // Injected by -ldflags at release build time. Local builds keep the
 // "dev" fallbacks so no special flags are needed during development.
@@ -37,6 +50,21 @@ func main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
+	}
+
+	// Subcommands that touch enjugit/gitcli verbs need a system
+	// `git` binary new enough for the load-bearing primitives
+	// (notably merge-tree --write-tree --name-only, used by
+	// MergeWithCommit). Fail-fast here with a clear "upgrade
+	// git" message; otherwise the operator hits cryptic
+	// "unknown option" errors mid-run. `serve` (coordinator)
+	// and `version` don't touch git, so they're allowed to run
+	// without it.
+	if needsGit(os.Args[1]) {
+		if err := enjugit.CheckGitMinVersion(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 
 	switch os.Args[1] {

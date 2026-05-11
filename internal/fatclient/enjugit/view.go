@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // View is the read-only handle for one project. Constructed by

@@ -15,7 +15,7 @@ package enjugit
 import (
 	"fmt"
 
-	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitv6"
+	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
 // SubmitComputeTaskResult builds a commit on a per-task topic

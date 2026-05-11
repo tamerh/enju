@@ -26,8 +26,7 @@ import (
 	"strings"
 	"testing"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
 // TestFatClientAutoBranchAvoidsOnDiskCollisions is the load-
@@ -117,16 +116,6 @@ func TestCoordRejectsAutoBranchDirectly(t *testing.T) {
 // objects — the picker collision is purely about the ref NAME.
 func seedOrphanBareBranch(t *testing.T, barePath, branchName string) {
 	t.Helper()
-	bare, err := gogit.PlainOpen(barePath)
-	if err != nil {
-		t.Fatalf("open bare %s: %v", barePath, err)
-	}
-	mainRef, err := bare.Reference(plumbing.NewBranchReferenceName("main"), false)
-	if err != nil {
-		t.Fatalf("resolving main on bare: %v", err)
-	}
-	branchRef := plumbing.NewBranchReferenceName(branchName)
-	if err := bare.Storer.SetReference(plumbing.NewHashReference(branchRef, mainRef.Hash())); err != nil {
-		t.Fatalf("set ref %s: %v", branchRef, err)
-	}
+	mainSHA := gittest.Run(t, barePath, "rev-parse", "--verify", "refs/heads/main")
+	gittest.SetRef(t, barePath, "refs/heads/"+branchName, mainSHA)
 }
