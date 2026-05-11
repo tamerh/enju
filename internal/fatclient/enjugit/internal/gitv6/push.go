@@ -71,6 +71,11 @@ func (c *Clone) PushWithVerify(branch, expectedSHA string) error {
 //     healthy projects after Phase 1's auto-bare).
 func (c *Clone) Fetch() error {
 	defer c.lock()()
+	// Pre-fetch sweep: clear any tmp_pack_* left from an
+	// interrupted earlier fetch in this session. Same rationale
+	// as FetchBranch — the OpenClone-time sweep only catches
+	// at-startup orphans, not mid-session ones.
+	sweepStaleTempPackFiles(c.workDir, c.logger)
 	err := c.repo.Fetch(&gogit.FetchOptions{
 		RemoteName: "origin",
 		RefSpecs: []config.RefSpec{
@@ -79,6 +84,10 @@ func (c *Clone) Fetch() error {
 		ClientOptions: clientOptionsFor(c.remoteURL),
 	})
 	if err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		// Sweep again — this fetch may have been the one
+		// interrupted, leaving its half-written temp file
+		// behind to break the next attempt.
+		sweepStaleTempPackFiles(c.workDir, c.logger)
 		return fmt.Errorf("git: fetch: %w", err)
 	}
 	return nil

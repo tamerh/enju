@@ -39,6 +39,14 @@ func (c *Clone) FetchBranch(branch string) error {
 	if branch == "" {
 		return fmt.Errorf("git: FetchBranch: branch required (caller should resolve to default)")
 	}
+	// Sweep before fetching. The OpenClone-time sweep only fires
+	// once per daemon start; if a PREVIOUS fetch in this same
+	// session was interrupted (cancellation, signal, panic), it
+	// left a tmp_pack_<n> that would cause THIS fetch to fail
+	// with "malformed pack file: bad signature". Cheap to run
+	// pre-fetch (one readdir), prevents the recurring breakage
+	// the operator reports as "bot polls forever, can't claim".
+	sweepStaleTempPackFiles(c.workDir, c.logger)
 	remoteSHA, err := c.remoteBranchHashLocked(branch)
 	if err != nil {
 		return err
@@ -55,6 +63,11 @@ func (c *Clone) FetchBranch(branch string) error {
 		ClientOptions: clientOptionsFor(c.remoteURL),
 	})
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
+		// Sweep again on failure: this fetch ITSELF may have
+		// been the one interrupted, leaving the temp file it
+		// half-wrote. Without this, the next fetch attempt
+		// hits the same orphan.
+		sweepStaleTempPackFiles(c.workDir, c.logger)
 		return fmt.Errorf("git: fetch branch %s: %w", branch, err)
 	}
 	return nil
@@ -76,6 +89,10 @@ func (c *Clone) PullBranch(branch string) error {
 		// no-oping.
 		return fmt.Errorf("git: PullBranch: branch required (caller should resolve to default)")
 	}
+	// Pre-pull sweep: pulls do an internal fetch which can leave
+	// tmp_pack_* behind on interruption. Same rationale as
+	// FetchBranch — clear any orphan before it breaks this op.
+	sweepStaleTempPackFiles(c.workDir, c.logger)
 	remoteSHA, err := c.remoteBranchHashLocked(branch)
 	if err != nil {
 		return err
