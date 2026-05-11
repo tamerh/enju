@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -67,9 +68,33 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "wrap-task" {
 		os.Exit(compute.WrapMain(os.Args[2:], os.Stderr))
 	}
-	os.RemoveAll(testOutputBase)
+	removeReadOnlyTree(testOutputBase)
 	os.MkdirAll(testOutputBase, 0755)
 	os.Exit(m.Run())
+}
+
+// removeReadOnlyTree is os.RemoveAll's chmod-aware cousin. The
+// template-snapshot read-only enforcement (chmod 0444/0555 on
+// every entry in enju/runs/<seq>/template-snapshot/) makes
+// os.RemoveAll fail with EACCES on the snapshot's parent dir.
+// This helper walks the tree first and chmods every entry back
+// to writable, then runs RemoveAll. Best-effort: any walk error
+// is swallowed so callers don't have to error-handle test setup.
+func removeReadOnlyTree(path string) {
+	if path == "" {
+		return
+	}
+	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // best-effort
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		_ = os.Chmod(p, 0o755)
+		return nil
+	})
+	os.RemoveAll(path)
 }
 
 // llmMode returns true when ENJU_LLM_TEST is set.
@@ -167,9 +192,12 @@ const testOutputBase = "/tmp/enju-test-output"
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 
-	// Create a test-specific subdirectory under the shared output base
+	// Create a test-specific subdirectory under the shared output base.
+	// removeReadOnlyTree chmods the tree writable before removal —
+	// template snapshots are chmod 0444/0555 by the read-only-CWD
+	// enforcement, and plain os.RemoveAll bombs on those.
 	testDir := filepath.Join(testOutputBase, t.Name())
-	os.RemoveAll(testDir)
+	removeReadOnlyTree(testDir)
 	os.MkdirAll(testDir, 0755)
 
 	dbPath := filepath.Join(testDir, "test.db")
