@@ -1766,20 +1766,24 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 	// FAILED is NOT satisfied — a failed upstream blocks
 	// downstream, not unblocks it.
 	accepted := make(map[string]bool)
+	skippedSet := make(map[string]bool)
 	{
 		acceptedRows, err := q.Query(
-			`SELECT id FROM tasks WHERE run_id = ? AND state IN ('accepted', 'submitted', 'skipped')`, runID,
+			`SELECT id, state FROM tasks WHERE run_id = ? AND state IN ('accepted', 'submitted', 'skipped')`, runID,
 		)
 		if err != nil {
 			return nil, err
 		}
 		for acceptedRows.Next() {
-			var id string
-			if err := acceptedRows.Scan(&id); err != nil {
+			var id, state string
+			if err := acceptedRows.Scan(&id, &state); err != nil {
 				acceptedRows.Close()
 				return nil, err
 			}
 			accepted[id] = true
+			if state == "skipped" {
+				skippedSet[id] = true
+			}
 		}
 		if err := acceptedRows.Err(); err != nil {
 			acceptedRows.Close()
@@ -1791,12 +1795,28 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 	var readied []ReadiedTask
 	for _, pt := range pending {
 		allDone := true
+		// Track whether every dependency is in the SKIPPED
+		// subset of the satisfied set (vs. having at least one
+		// ACCEPTED / SUBMITTED dep with real content). A task
+		// whose every dep was skipped has nothing to consume
+		// and should propagate the skip rather than run on
+		// empty inputs. Load-bearing for the fan-in aggregator
+		// case: when all source instances cascade-skip via
+		// upstream-failed, the singleton aggregator's deps are
+		// all SKIPPED — without this check it would silently
+		// promote to READY and "succeed" with an empty fan-in
+		// block.
+		allDepsSkipped := pt.dependsOn != ""
 
 		if pt.dependsOn != "" {
 			for _, dep := range strings.Split(pt.dependsOn, ",") {
-				if !accepted[strings.TrimSpace(dep)] {
+				d := strings.TrimSpace(dep)
+				if !accepted[d] {
 					allDone = false
 					break
+				}
+				if !skippedSet[d] {
+					allDepsSkipped = false
 				}
 			}
 		}
@@ -1868,6 +1888,34 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 		}
 
 		if allDone {
+			// All-deps-skipped → propagate the skip instead of
+			// promoting. The task has nothing to consume.
+			// Naturally fixes the fan-in aggregator case where
+			// cross-iteration sibling sources all cascade-skip:
+			// the singleton aggregator's dep list ends up
+			// entirely SKIPPED, which under the old rule
+			// promoted it to READY with empty `{{source.content}}`.
+			// The skip reason is generic — applies to
+			// aggregators and any other task pattern that
+			// reaches this state.
+			if allDepsSkipped {
+				_, err := q.Exec(
+					`UPDATE tasks SET state = 'skipped', skip_reason = ? WHERE id = ?`,
+					"all dependencies skipped — no content to consume",
+					pt.id,
+				)
+				if err != nil {
+					return readied, err
+				}
+				// Add to skippedSet so any downstream task
+				// considered later in THIS pass sees the
+				// updated state and cascades correctly. Without
+				// this, a multi-level all-skipped chain would
+				// need multiple cascade passes to converge.
+				skippedSet[pt.id] = true
+				accepted[pt.id] = true
+				continue
+			}
 			_, err := q.Exec(`UPDATE tasks SET state = 'ready' WHERE id = ?`, pt.id)
 			if err != nil {
 				return readied, err

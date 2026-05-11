@@ -24,6 +24,7 @@
 package dagcache
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -87,9 +88,43 @@ func (c *Cache) GetParsedRun(runID int64) (*enjuYaml.ParsedRun, error) {
 	if run == nil {
 		return nil, fmt.Errorf("run %d not found", runID)
 	}
-	parsed, err := enjuYaml.Parse([]byte(run.YAMLData))
-	if err != nil {
-		return nil, fmt.Errorf("parsing stored YAML for run %d: %w", runID, err)
+	// Re-parse with the run's stored params so any `{{param}}`
+	// references in `for_each:` resolve to their concrete
+	// values. Without this, a YAML like
+	//
+	//   for_each: {item: "{{items}}"}
+	//
+	// re-parses with `{{items}}` left as a literal — the
+	// expander treats the for_each variable as a single-element
+	// list of the literal string and materializes nodes under
+	// the wrong keys. The DAG ends up without the per-instance
+	// nodes the live state actually uses (e.g. "a:process_docker"),
+	// so any cascade walk (invalidate, fail-cascade) that calls
+	// d.Descendants("a:process_docker") returns empty and
+	// silently fails to propagate.
+	//
+	// Load-bearing for post-restart recovery: a coord restart
+	// wipes the in-memory cache; the next cascade-touching
+	// operation lands here on a cache miss. Pre-fix, the user
+	// saw "1 task(s) changed state (target)" with zero
+	// descendants — the structural DAG mismatch ate the cascade.
+	var parsed *enjuYaml.ParsedRun
+	var err2 error
+	if run.Params != "" {
+		var paramValues map[string]any
+		if jerr := json.Unmarshal([]byte(run.Params), &paramValues); jerr == nil {
+			parsed, err2 = enjuYaml.ParseWithParams([]byte(run.YAMLData), paramValues)
+		}
+	}
+	if parsed == nil {
+		// No stored params (legacy runs) or params couldn't
+		// unmarshal — fall through to plain Parse. Preserves
+		// pre-fix behavior for runs that genuinely don't carry
+		// params.
+		parsed, err2 = enjuYaml.Parse([]byte(run.YAMLData))
+	}
+	if err2 != nil {
+		return nil, fmt.Errorf("parsing stored YAML for run %d: %w", runID, err2)
 	}
 
 	c.mu.Lock()
