@@ -1,0 +1,35 @@
+# Minimal apptainer-backed compute task. Pulls alpine on first
+# run (~3 MB to ~/.apptainer/cache), runs a /bin/sh probe inside
+# the container, and writes one declared artifact back to the
+# project tree.
+#
+# Use this template to confirm an Enju host has apptainer wired
+# up correctly:
+#
+#   cp -r examples/apptainer-hello/ <project>/enju/templates/apptainer-hello/
+#   enju_create_run path=enju/templates/apptainer-hello
+#   enju_execute_task task_id=<the ready task>
+#
+# The committed artifact (greetings/hello.txt) names the
+# container's OS so a successful run is unambiguous — host-side
+# fallback would echo "ubuntu" or similar, not "alpine".
+#
+# `singularity` would also work here; Enju rewrites it to
+# apptainer at parse time. See docs/containers.md for the
+# Docker→Apptainer CLI mapping and the three semantic
+# differences (UID, network, no SELinux relabel).
+
+name: apptainer-hello
+version: 1
+
+tasks:
+  - id: greet
+    action: compute
+    script: scripts/hello.sh
+    container: docker://alpine:latest
+    container_runtime: apptainer
+    writes_artifacts:
+      - greetings/hello.txt
+    prompt: |
+      Smoke-test the apptainer runtime: run a tiny alpine
+      container and commit one greeting artifact.
