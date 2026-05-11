@@ -363,10 +363,10 @@ func cmdMCP(args []string) {
 	// to it over localhost — same code paths, no separate
 	// `enju serve` process needed.
 	//
-	// The port is pinned (127.0.0.1:8383) so the URL written
+	// The port is pinned (127.0.0.1:8333) so the URL written
 	// to credentials.json stays stable across sessions; that
 	// stability is what lets other tools (webui, CLI) read the
-	// URL and just use it. If 8383 is taken, error with a clear
+	// URL and just use it. If 8333 is taken, error with a clear
 	// hint rather than silently picking another port (which
 	// would create stale-URL drift the operator has to chase).
 	if *localMode {
@@ -405,7 +405,7 @@ func cmdMCP(args []string) {
 
 		// Pinned port. Stable URL = no sentinel needed for the
 		// credentials key. Bind failure prints a clear hint.
-		const localPort = "127.0.0.1:8383"
+		const localPort = "127.0.0.1:8333"
 		ln, err := net.Listen("tcp", localPort)
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
@@ -559,7 +559,7 @@ func credentialsPath() string {
 // else is configured. Matches the pinned port `enju mcp --local`
 // uses, so an operator running both modes never needs to think
 // about ports.
-const fallbackCoordinatorURL = "http://localhost:8383"
+const fallbackCoordinatorURL = "http://localhost:8333"
 
 func defaultCoordinatorURL() string {
 	data, err := os.ReadFile(credentialsPath())
