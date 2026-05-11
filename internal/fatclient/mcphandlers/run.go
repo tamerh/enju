@@ -633,38 +633,30 @@ func (c *apiClient) resolveAutoBranch(ctx context.Context, projectID int64, yaml
 	if slug == "" {
 		slug = "run"
 	}
-	// Pull the project's remote URL via the same metadata path
-	// other tools use. We don't need to open the workspace
-	// clone for the picker — ls-remote works directly against
-	// the URL.
-	remoteURL, _, _, err := c.fc.FetchProjectMetaExpanded(ctx, projectID)
-	if err != nil {
-		return "", fmt.Errorf("fetching project metadata: %w", err)
-	}
-	// Build the "used" set from two sources, in priority order:
-	//  1. On-disk: ls-remote against the project's bare repo
-	//     URL. This is the authoritative view (survives coord
-	//     DB wipes) and is what the disk-collision bug needs.
-	//  2. Coord DB: list of branches the coord has run records
-	//     for. Always available, used as both a fallback when
-	//     ls-remote can't run AND as a complement (a branch
-	//     coord knows about that hasn't been pushed yet won't
-	//     show on ls-remote).
+	// Build the "used" set from two sources:
+	//
+	//   1. On-disk bare repo (the source of truth for branch
+	//      existence). Found via the workspace's DiskLayout
+	//      convention — NOT via coord's remote_url. After a
+	//      coord DB wipe, coord may not have remote_url for the
+	//      re-created project, but the local bare is right there
+	//      on disk where it's always been. Going through coord
+	//      here would re-introduce the divergence the user hit.
+	//
+	//   2. Coord DB runs list. Catches in-session allocations
+	//      that haven't been pushed yet AND projects where the
+	//      local bare lookup fails for some reason.
 	used := make(map[string]bool)
-	if remoteURL != "" {
-		existing, lsErr := lsRemoteBranchNames(ctx, remoteURL)
-		if lsErr == nil {
-			for _, b := range existing {
-				used[b] = true
+	if wf, _, _, _, werr := c.fc.OpenWorkflow(ctx, projectID); werr == nil {
+		if barePath := wf.BarePath(); barePath != "" {
+			if existing, lsErr := lsRemoteBranchNames(ctx, barePath); lsErr == nil {
+				for _, b := range existing {
+					used[b] = true
+				}
 			}
 		}
 	}
-	// Always also union with the coord DB view via the runs
-	// list endpoint. Multi-source defense — works for projects
-	// whose remote_url is empty (fresh smart-detect projects
-	// where the managed bare exists on disk but coord doesn't
-	// know its path) and for in-flight allocations that haven't
-	// hit ls-remote yet within the same session.
+	// Coord DB view as a complement.
 	dbBranches, dbErr := c.listCoordBranches(ctx, projectID)
 	if dbErr == nil {
 		for _, b := range dbBranches {
