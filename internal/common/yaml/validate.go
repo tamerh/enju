@@ -605,18 +605,21 @@ func validateTaskContainer(t *TaskDef) error {
 	return nil
 }
 
-// validateTaskContainerRuntime enforces the reserved-field
-// contract on `container_runtime:`. v1 accepts only "docker"
-// (or empty, which defaults to docker). Future runtimes
-// (apptainer, singularity, podman) are rejected with a
-// concrete "not yet supported" message rather than a generic
-// "unknown field" — template authors who write against the
-// planned roadmap get a clear signal today, and when those
-// runtimes eventually ship, the existing templates just
-// start working.
+// validateTaskContainerRuntime enforces the shape of the
+// `container_runtime:` field. Accepts "docker", "apptainer",
+// or "singularity" (alias for apptainer, rewritten in place on
+// the TaskDef so internal storage + logs always say
+// "apptainer"). Empty defaults to docker at execute time.
 //
-// Only valid on action: compute (the concept of a runtime
-// doesn't apply to answer/review/vote tasks).
+// A runtime selector without a container image is a config
+// error — there's nothing for the runtime to execute, so the
+// declaration is almost certainly an author mistake (left over
+// from removing the image, or typed in advance of adding one).
+// Surface it at parse time rather than letting the wrapper hit
+// a more confusing failure later.
+//
+// Only valid on action: compute (runtimes don't apply to
+// answer/review/vote tasks).
 func validateTaskContainerRuntime(t *TaskDef) error {
 	if t.ContainerRuntime == "" {
 		return nil
@@ -624,13 +627,17 @@ func validateTaskContainerRuntime(t *TaskDef) error {
 	if t.Action != "compute" {
 		return fmt.Errorf("task %q: container_runtime: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
 	}
+	if t.Container == "" {
+		return fmt.Errorf("task %q: container_runtime %q is set without container: — declare an image for the runtime to execute (e.g. container: docker://alpine:latest)", t.ID, t.ContainerRuntime)
+	}
+	if t.ContainerRuntime == "singularity" {
+		t.ContainerRuntime = "apptainer"
+	}
 	switch t.ContainerRuntime {
-	case "docker":
+	case "docker", "apptainer":
 		return nil
 	default:
-		return fmt.Errorf("task %q: container_runtime %q is not yet supported in v1 (only \"docker\" is available). "+
-			"Apptainer/Singularity is planned alongside the SLURM executor post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
-			t.ID, t.ContainerRuntime)
+		return fmt.Errorf("task %q: container_runtime %q is not supported (valid values: \"docker\", \"apptainer\", \"singularity\")", t.ID, t.ContainerRuntime)
 	}
 }
 

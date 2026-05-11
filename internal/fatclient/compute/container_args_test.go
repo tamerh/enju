@@ -152,16 +152,18 @@ func TestBuildContainerArgsEmptyWorkDirRejected(t *testing.T) {
 }
 
 // TestBuildContainerArgsUnknownRuntimeRejected pins the
-// forward-compat seam: the switch case is the only place
-// runtime strings are accepted, so future apptainer support
-// slots in cleanly.
+// switch contract: anything outside {docker, apptainer} fails
+// here with a message that names the offending runtime. The
+// YAML validator catches this earlier in practice; the
+// duplicate guard at the args layer is defense-in-depth for
+// callers that don't route through parse.
 func TestBuildContainerArgsUnknownRuntimeRejected(t *testing.T) {
 	spec := Spec{Container: "alpine", ScriptPath: "/host/ws/run.sh"}
-	_, err := BuildContainerArgs("apptainer", spec, nil, "/host/ws", 1000, 1000)
+	_, err := BuildContainerArgs("podman", spec, nil, "/host/ws", 1000, 1000)
 	if err == nil {
 		t.Fatal("expected error for unknown runtime, got nil")
 	}
-	if !strings.Contains(err.Error(), "apptainer") {
+	if !strings.Contains(err.Error(), "podman") {
 		t.Errorf("error should name the offending runtime, got %q", err)
 	}
 }
@@ -732,5 +734,285 @@ func TestBuildContainerArgsNoScratchKeepsLegacy(t *testing.T) {
 	}
 	if !hasFlagValue(args, "-w", "/workspace") {
 		t.Errorf("legacy: expected -w /workspace, got: %v", args)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Apptainer runtime
+// ---------------------------------------------------------------------------
+
+// TestBuildApptainerArgsHappyPath is the apptainer mirror of
+// TestBuildContainerArgsHappyPath. Same input shape, asserted
+// against the CLI grammar apptainer accepts: `exec` instead of
+// `run --rm`, `--bind` with no `:z`, `--pwd` instead of `-w`,
+// `--env` instead of `-e`, no `--user`.
+func TestBuildApptainerArgsHappyPath(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "")
+
+	spec := Spec{
+		Container:        "docker://alpine:latest",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/host/workspaces/demo-1/enju/runs/3/template-snapshot/scripts/align.sh",
+	}
+	env := []string{
+		"ENJU_TASK_ID=1:3:align",
+		"ENJU_PROJECT_DIR=/host/workspaces/demo-1",
+		"ENJU_RUN_DIR=/host/workspaces/demo-1/enju/runs/3/align",
+		"ENJU_PARAM_sample=alpha",
+	}
+	args, err := BuildContainerArgs(RuntimeApptainer, spec, env, "/host/workspaces/demo-1", 1000, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if args[0] != "exec" {
+		t.Fatalf("expected leading 'exec', got %q (full args: %v)", args[0], args)
+	}
+
+	if !hasFlagValue(args, "--bind", "/host/workspaces/demo-1:/workspace") {
+		t.Errorf("missing workspace bind-mount: %v", args)
+	}
+	if !hasFlagValue(args, "--pwd", "/workspace") {
+		t.Errorf("missing --pwd /workspace: %v", args)
+	}
+
+	// Apptainer-specific: --cleanenv must be present so the
+	// container starts with an empty env and only the explicit
+	// --env flags carry forward. Without this, host PATH/HOME
+	// would leak through.
+	if argIndex(args, "--cleanenv") < 0 {
+		t.Errorf("missing --cleanenv: %v", args)
+	}
+
+	// No --user flag — apptainer runs as the host user by
+	// default. Pinning this prevents an accidental Docker-style
+	// uid mapping from getting copy-pasted in.
+	if argIndex(args, "--user") >= 0 {
+		t.Errorf("apptainer args should not contain --user, got: %v", args)
+	}
+
+	// No SELinux relabel — `:z` is docker-only.
+	for _, a := range args {
+		if strings.HasSuffix(a, ":z") {
+			t.Errorf("apptainer args should not use :z relabel, got: %v", args)
+			break
+		}
+	}
+
+	if !hasFlagValue(args, "--env", "ENJU_PROJECT_DIR=/workspace") {
+		t.Errorf("ENJU_PROJECT_DIR not translated: %v", args)
+	}
+	if !hasFlagValue(args, "--env", "ENJU_RUN_DIR=/workspace/enju/runs/3/align") {
+		t.Errorf("ENJU_RUN_DIR not translated: %v", args)
+	}
+	if !hasFlagValue(args, "--env", "ENJU_TASK_ID=1:3:align") {
+		t.Errorf("ENJU_TASK_ID not passed through: %v", args)
+	}
+	if !hasFlagValue(args, "--env", "ENJU_PARAM_sample=alpha") {
+		t.Errorf("ENJU_PARAM_sample not passed through: %v", args)
+	}
+
+	imgIdx := argIndex(args, "docker://alpine:latest")
+	shIdx := argIndex(args, "/bin/sh")
+	scriptIdx := argIndex(args, "/workspace/enju/runs/3/template-snapshot/scripts/align.sh")
+	if imgIdx < 0 || shIdx < 0 || scriptIdx < 0 {
+		t.Fatalf("image/shell/script not all present: img=%d sh=%d script=%d\n%v", imgIdx, shIdx, scriptIdx, args)
+	}
+	if !(imgIdx < shIdx && shIdx < scriptIdx) {
+		t.Errorf("expected order image < /bin/sh < script, got %d/%d/%d", imgIdx, shIdx, scriptIdx)
+	}
+}
+
+// TestBuildApptainerArgsScratchBind — when TaskScratchDir is
+// set, the scratch dir is bind-mounted at /scratch and --pwd
+// points there, mirroring the docker scratch-isolation path.
+func TestBuildApptainerArgsScratchBind(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "")
+	spec := Spec{
+		Container:        "docker://alpine:latest",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/host/ws/run.sh",
+		TaskScratchDir:   "/tmp/scratch-abc",
+	}
+	args, err := BuildContainerArgs(RuntimeApptainer, spec, nil, "/host/ws", 1000, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFlagValue(args, "--bind", "/tmp/scratch-abc:/scratch") {
+		t.Errorf("missing scratch bind-mount: %v", args)
+	}
+	if !hasFlagValue(args, "--pwd", "/scratch") {
+		t.Errorf("expected --pwd /scratch when scratch set, got: %v", args)
+	}
+}
+
+// TestBuildApptainerArgsSharedRootBindMount — ENJU_SHARED_ROOT
+// gets bind-mounted at the same path inside the container so
+// untracked-artifact symlinks resolve identically across the
+// boundary. No :z (apptainer doesn't relabel).
+func TestBuildApptainerArgsSharedRootBindMount(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "/mnt/nfs/enju")
+	spec := Spec{
+		Container:        "docker://alpine:latest",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/host/ws/run.sh",
+	}
+	args, err := BuildContainerArgs(RuntimeApptainer, spec, nil, "/host/ws", 1000, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFlagValue(args, "--bind", "/mnt/nfs/enju:/mnt/nfs/enju") {
+		t.Errorf("missing shared-root bind-mount: %v", args)
+	}
+}
+
+// TestBuildApptainerArgsRejectsBadInputs — the same hard-error
+// programmer-mistake guards as the docker builder. Pin them so
+// a refactor doesn't silently drop the safety net.
+func TestBuildApptainerArgsRejectsBadInputs(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    Spec
+		workDir string
+		match   string
+	}{
+		{"empty container", Spec{ContainerRuntime: RuntimeApptainer, ScriptPath: "/host/ws/run.sh"}, "/host/ws", "container is required"},
+		{"empty workdir", Spec{Container: "docker://alpine", ContainerRuntime: RuntimeApptainer, ScriptPath: "/host/ws/run.sh"}, "", "workDir is required"},
+		{"script outside workspace", Spec{Container: "docker://alpine", ContainerRuntime: RuntimeApptainer, ScriptPath: "/opt/elsewhere/run.sh"}, "/host/ws", "outside workspace"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := BuildContainerArgs(RuntimeApptainer, tc.spec, nil, tc.workDir, 1000, 1000)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.match) {
+				t.Errorf("error should contain %q, got: %v", tc.match, err)
+			}
+		})
+	}
+}
+
+// TestCheckContainerRuntimeApptainerMissingUserError — apptainer
+// declared, not on PATH: error names the task, the image, the
+// runtime, and points at the install URL.
+func TestCheckContainerRuntimeApptainerMissingUserError(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	spec := Spec{
+		TaskID:           "proj:1:fold",
+		Container:        "docker://oras.io/bio/colabfold:1.5.5",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/host/ws/fold.sh",
+	}
+	err := checkContainerRuntime(spec)
+	if err == nil {
+		t.Fatal("expected error when apptainer missing, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"proj:1:fold",
+		"docker://oras.io/bio/colabfold:1.5.5",
+		"apptainer",
+		"Apptainer",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %s", want, msg)
+		}
+	}
+}
+
+// TestCheckContainerRuntimeApptainerPresent — apptainer stub on
+// PATH passes the check. Confirms the per-runtime LookPath
+// indirection actually consults the resolved runtime, not a
+// hardcoded "docker".
+func TestCheckContainerRuntimeApptainerPresent(t *testing.T) {
+	fakeDir := t.TempDir()
+	if err := writeExecutableStub(fakeDir + "/apptainer"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir)
+
+	spec := Spec{
+		TaskID:           "1:1:t",
+		Container:        "docker://alpine:latest",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/x/y",
+	}
+	if err := checkContainerRuntime(spec); err != nil {
+		t.Errorf("unexpected error when apptainer stub is on PATH: %v", err)
+	}
+}
+
+// TestCheckContainerRuntimeDefaultsDockerWhenUnset — a spec with
+// Container set but ContainerRuntime empty must still LookPath
+// docker (the default). Pins the no-regression contract: every
+// template that worked before the apptainer plumbing must keep
+// working unchanged.
+func TestCheckContainerRuntimeDefaultsDockerWhenUnset(t *testing.T) {
+	fakeDir := t.TempDir()
+	if err := writeExecutableStub(fakeDir + "/docker"); err != nil {
+		t.Fatal(err)
+	}
+	// apptainer NOT installed in this fake PATH. If the resolver
+	// wrongly picked apptainer (or any other runtime) it would
+	// fail here.
+	t.Setenv("PATH", fakeDir)
+
+	spec := Spec{TaskID: "1:1:t", Container: "alpine", ScriptPath: "/x/y"}
+	if err := checkContainerRuntime(spec); err != nil {
+		t.Errorf("default runtime should be docker, got error: %v", err)
+	}
+}
+
+// TestBuildExecCommandApptainerMode — buildExecCommand with
+// apptainer routes the CLI through `apptainer exec ...` rather
+// than `docker run ...`. Mirrors TestBuildExecCommandContainerMode.
+func TestBuildExecCommandApptainerMode(t *testing.T) {
+	t.Setenv("ENJU_SHARED_ROOT", "")
+	spec := Spec{
+		Container:        "docker://alpine:latest",
+		ContainerRuntime: RuntimeApptainer,
+		ScriptPath:       "/host/ws/scripts/run.sh",
+	}
+	env := []string{"ENJU_TASK_ID=1:2:3", "ENJU_PROJECT_DIR=/host/ws"}
+
+	cmd, err := buildExecCommand(context.Background(), spec, env, "/host/ws", "/host/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(cmd.Args[0], "apptainer") && cmd.Args[0] != "apptainer" {
+		t.Errorf("expected apptainer invocation, got Args[0]=%q", cmd.Args[0])
+	}
+	if cmd.Args[1] != "exec" {
+		t.Errorf("expected 'exec' after apptainer, got Args[1]=%q", cmd.Args[1])
+	}
+	found := false
+	for i := 0; i < len(cmd.Args)-1; i++ {
+		if cmd.Args[i] == "--env" && cmd.Args[i+1] == "ENJU_PROJECT_DIR=/workspace" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("translated ENJU_PROJECT_DIR not in apptainer args: %v", cmd.Args)
+	}
+}
+
+// TestResolveRuntimeDefaultsDocker — empty ContainerRuntime
+// resolves to docker (today's behavior, no regression).
+func TestResolveRuntimeDefaultsDocker(t *testing.T) {
+	cases := []struct {
+		runtime string
+		want    string
+	}{
+		{"", RuntimeDocker},
+		{RuntimeDocker, RuntimeDocker},
+		{RuntimeApptainer, RuntimeApptainer},
+	}
+	for _, tc := range cases {
+		got := resolveRuntime(Spec{ContainerRuntime: tc.runtime})
+		if got != tc.want {
+			t.Errorf("resolveRuntime(%q) = %q, want %q", tc.runtime, got, tc.want)
+		}
 	}
 }

@@ -497,17 +497,15 @@ type TaskDef struct {
 	// See docs/containers.md.
 	Container string `yaml:"container,omitempty"`
 
-	// ContainerRuntime is the forward-compat seam for
-	// alternative container runtimes (apptainer/singularity
-	// for HPC). v1 accepts only "docker" (and empty, which
-	// defaults to docker). Future values are rejected at
-	// parse time with a "not yet supported" message — so
-	// templates pre-written against a planned runtime get
-	// a concrete signal today, and no migration is needed
-	// when that runtime actually ships.
+	// ContainerRuntime selects which container CLI the wrapper
+	// invokes for a compute task. Accepts "docker" (default
+	// when empty), "apptainer", or "singularity" (alias for
+	// apptainer — rewritten in place at parse time so internal
+	// storage and logs always say "apptainer").
 	//
-	// Only valid on action: compute. See WORKFLOW_GAPS.md §
-	// Executor abstraction for the roadmap.
+	// Setting this without a container: image is a parse error;
+	// the runtime needs something to execute. Only valid on
+	// action: compute. See docs/containers.md.
 	ContainerRuntime string `yaml:"container_runtime,omitempty"`
 
 	// Executor is the forward-compat seam for remote

@@ -44,9 +44,24 @@ const ContainerWorkDir = "/workspace"
 // reads from the bind-mounted scratch transparently.
 const ContainerScratchDir = "/scratch"
 
-// RuntimeDocker is the only supported runtime in v1. Named
-// constant so call sites don't hardcode the string.
-const RuntimeDocker = "docker"
+// Container-runtime selectors. Singularity is collapsed to
+// apptainer at YAML parse time (validateTaskContainerRuntime),
+// so internal code only deals with two values.
+const (
+	RuntimeDocker    = "docker"
+	RuntimeApptainer = "apptainer"
+)
+
+// resolveRuntime returns the effective runtime for a spec.
+// Empty spec.ContainerRuntime defaults to docker so the
+// pre-apptainer behavior (every container task ran under
+// docker) holds for templates that don't set the field.
+func resolveRuntime(spec Spec) string {
+	if spec.ContainerRuntime == "" {
+		return RuntimeDocker
+	}
+	return spec.ContainerRuntime
+}
 
 // BuildContainerArgs returns the argv (without the leading
 // command) for running spec.ScriptPath inside spec.Container
@@ -79,8 +94,10 @@ func BuildContainerArgs(runtime string, spec Spec, env []string, workDir string,
 	switch runtime {
 	case RuntimeDocker:
 		return buildDockerArgs(spec, env, workDir, hostUID, hostGID)
+	case RuntimeApptainer:
+		return buildApptainerArgs(spec, env, workDir)
 	default:
-		return nil, fmt.Errorf("unsupported container runtime %q (v1 only supports %q)", runtime, RuntimeDocker)
+		return nil, fmt.Errorf("unsupported container runtime %q", runtime)
 	}
 }
 
@@ -187,6 +204,78 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 	return args, nil
 }
 
+// buildApptainerArgs is the apptainer mirror of buildDockerArgs.
+// Same logical shape — workspace bind, optional scratch bind,
+// CWD selection, env allowlist with host→container path
+// translation, image + /bin/sh -c — but with the CLI grammar
+// apptainer accepts:
+//
+//   - `exec` instead of `run --rm` (apptainer has no persistent
+//     containers to remove).
+//   - `--bind host:container` instead of `-v host:container:z`.
+//     SELinux relabeling on bind mounts is a docker-only concept;
+//     apptainer's user-namespace mode doesn't need it.
+//   - `--pwd /work` instead of `-w /work`.
+//   - `--env KEY=VAL` instead of `-e KEY=VAL`.
+//   - No `--user`. Apptainer runs as the calling host user by
+//     default, so files written from inside the container land
+//     owned by that user — no uid mapping gymnastics.
+//   - `--cleanenv` so the container starts with an empty env
+//     and only the explicit `--env KEY=VAL` flags carry forward.
+//     Without this, apptainer leaks host PATH/HOME/etc. into
+//     the script's view, defeating the allowlist that docker
+//     gets implicitly from its own env-isolation default.
+func buildApptainerArgs(spec Spec, env []string, workDir string) ([]string, error) {
+	if spec.Container == "" {
+		return nil, fmt.Errorf("spec.container is required for container execution")
+	}
+	if workDir == "" {
+		return nil, fmt.Errorf("workDir is required for container execution")
+	}
+	scriptInContainer, ok := translatePath(spec.ScriptPath, workDir, ContainerWorkDir)
+	if !ok {
+		return nil, fmt.Errorf("script path %q is outside workspace %q — cannot translate to container path", spec.ScriptPath, workDir)
+	}
+
+	containerCWD := ContainerWorkDir
+	if spec.TaskScratchDir != "" {
+		containerCWD = ContainerScratchDir
+	}
+
+	args := []string{
+		"exec",
+		"--cleanenv",
+		"--bind", workDir + ":" + ContainerWorkDir,
+	}
+	if spec.TaskScratchDir != "" {
+		args = append(args, "--bind", spec.TaskScratchDir+":"+ContainerScratchDir)
+	}
+	args = append(args, "--pwd", containerCWD)
+
+	if shared := enjugit.SharedRoot(); shared != "" {
+		args = append(args, "--bind", shared+":"+shared)
+	}
+
+	for _, kv := range env {
+		k, v, split := splitEnvEntry(kv)
+		if !split {
+			continue
+		}
+		if !envKeyAllowed(k, spec.Env) {
+			continue
+		}
+		translated, ok := translatePath(v, workDir, ContainerWorkDir)
+		if !ok && spec.TaskScratchDir != "" {
+			translated, _ = translatePath(v, spec.TaskScratchDir, ContainerScratchDir)
+		}
+		args = append(args, "--env", k+"="+translated)
+	}
+
+	args = append(args, spec.Container)
+	args = append(args, "/bin/sh", "-c", scriptInContainer)
+	return args, nil
+}
+
 // envKeyAllowed reports whether a given env key is safe to
 // forward into a container. Allowlist rules:
 //
@@ -239,12 +328,12 @@ func translatePath(hostPath, workDir, containerWorkDir string) (string, bool) {
 	return containerWorkDir + "/" + filepath.ToSlash(rel), true
 }
 
-// checkContainerRuntime verifies the declared container runtime's
+// checkContainerRuntime verifies the resolved container runtime's
 // CLI is on PATH. Returns nil when spec.Container is empty (no
 // runtime needed) or when the CLI is found. Otherwise returns a
-// user-facing error pointing at the fix — friendlier than the
-// generic exec.LookPath failure the wrapper would surface a
-// second later.
+// user-facing error pointing at the install URL for the specific
+// runtime — friendlier than the generic exec.LookPath failure
+// the wrapper would surface a second later.
 //
 // Runs before workspace open + shared-root symlink setup so the
 // error arrives fast and no side effects happen on the way to
@@ -254,22 +343,42 @@ func checkContainerRuntime(spec Spec) error {
 	if spec.Container == "" {
 		return nil
 	}
-	if _, err := exec.LookPath(RuntimeDocker); err != nil {
+	runtime := resolveRuntime(spec)
+	if _, err := exec.LookPath(runtime); err != nil {
 		return fmt.Errorf(
-			"task %q declares container %q but %q is not on PATH — install Docker (https://docs.docker.com/get-docker/) or remove the container: field to run the script on the host directly",
-			spec.TaskID, spec.Container, RuntimeDocker,
+			"task %q declares container %q but %q is not on PATH — %s, or remove the container: field to run the script on the host directly",
+			spec.TaskID, spec.Container, runtime, installHintFor(runtime),
 		)
 	}
 	return nil
 }
 
+// installHintFor returns the per-runtime install pointer used
+// in the friendly "runtime not on PATH" error. Doesn't fail open
+// on unknown runtimes — those wouldn't reach here in practice
+// (validate.go rejects them at parse time) but the generic
+// fallback keeps the message useful if a new runtime constant
+// slips in without a hint update.
+func installHintFor(runtime string) string {
+	switch runtime {
+	case RuntimeDocker:
+		return "install Docker (https://docs.docker.com/get-docker/)"
+	case RuntimeApptainer:
+		return "install Apptainer (https://apptainer.org/docs/admin/main/installation.html)"
+	default:
+		return fmt.Sprintf("install %s", runtime)
+	}
+}
+
 // buildExecCommand returns the *exec.Cmd the wrapper will Run()
 // for a task. When spec.Container is empty, it's a direct
 // host-side exec of spec.ScriptPath with the assembled `env`
-// (legacy path). When spec.Container is set, it's
-// `docker run ...` built via BuildContainerArgs — `env` gets
-// funneled into -e flags, the docker CLI itself inherits
-// os.Environ() so it can find DOCKER_HOST + ~/.docker/config.
+// (legacy path). When spec.Container is set, it's the resolved
+// runtime CLI (docker or apptainer) built via BuildContainerArgs
+// — `env` gets funneled into the runtime's per-key env flags;
+// the runtime CLI itself inherits os.Environ() so it can find
+// DOCKER_HOST + ~/.docker/config (docker) or APPTAINER_CACHEDIR
+// + auth files (apptainer).
 //
 // Extracted from Run() so the container branch has one
 // obvious entry point that tests can cover without booting
@@ -281,23 +390,18 @@ func buildExecCommand(ctx context.Context, spec Spec, env []string, workDir, scr
 		cmd.Env = env
 		return cmd, nil
 	}
-	// Container mode passes the PROJECT workDir to BuildContainerArgs
-	// (becomes the /workspace bind), while the docker CLI itself
-	// runs from workDir on the host. The script's effective CWD
-	// inside the container is set via -w, picked by buildDockerArgs
-	// based on whether spec.TaskScratchDir is set (Phase 2.5).
-	args, err := BuildContainerArgs(RuntimeDocker, spec, env, workDir, os.Getuid(), os.Getgid())
+	runtime := resolveRuntime(spec)
+	args, err := BuildContainerArgs(runtime, spec, env, workDir, os.Getuid(), os.Getgid())
 	if err != nil {
-		return nil, fmt.Errorf("building docker args: %w", err)
+		return nil, fmt.Errorf("building %s args: %w", runtime, err)
 	}
-	cmd := exec.CommandContext(ctx, RuntimeDocker, args...)
-	// Docker CLI reads config + credentials from the invoking
-	// user's HOME, and DOCKER_HOST / DOCKER_TLS_VERIFY from env.
-	// Inherit the wrapper's environment so remote / auth setups
-	// work. The CONTAINER's environment comes from -e flags
-	// already baked into args — keeping these two namespaces
-	// separate avoids leaking host paths (PATH, HOME, ...) into
-	// the script's view unintentionally.
+	cmd := exec.CommandContext(ctx, runtime, args...)
+	// The runtime CLI reads config + credentials from the
+	// invoking user's HOME. Inherit the wrapper's environment so
+	// remote / auth setups work. The CONTAINER's environment
+	// comes from per-key flags already baked into args — keeping
+	// these two namespaces separate avoids leaking host paths
+	// (PATH, HOME, ...) into the script's view unintentionally.
 	cmd.Env = os.Environ()
 	cmd.Dir = workDir
 	return cmd, nil

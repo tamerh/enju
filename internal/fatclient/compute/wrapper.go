@@ -185,19 +185,26 @@ type Spec struct {
 	Model       string `json:"model,omitempty"`
 
 	// Container, when set, routes script execution through a
-	// container runtime (Docker in v1) instead of exec'ing the
-	// script directly on the host. The image reference is
-	// passed verbatim to the runtime CLI at invocation time;
-	// the wrapper handles workspace bind-mounting, env-var
-	// translation from host to container paths, and user
-	// mapping so output files land owned by the invoking
-	// host user.
+	// container runtime instead of exec'ing the script directly
+	// on the host. The image reference is passed verbatim to the
+	// runtime CLI at invocation time; the wrapper handles
+	// workspace bind-mounting, env-var translation from host to
+	// container paths, and (where the runtime needs it) user
+	// mapping so output files land owned by the invoking host
+	// user.
 	//
 	// Empty string = no container (run script on host, as
 	// before). Legacy spec files without this field decode
 	// cleanly to "", so in-flight async wrappers launched by
 	// older binaries keep working.
 	Container string `json:"container,omitempty"`
+
+	// ContainerRuntime picks the runtime CLI the wrapper invokes
+	// when Container is set: "docker" (default when empty),
+	// "apptainer". Singularity is rewritten to apptainer at
+	// parse time, so this field never carries that value.
+	// Ignored when Container is empty.
+	ContainerRuntime string `json:"container_runtime,omitempty"`
 
 	// ReadsArtifacts lists the declared input paths the task
 	// expects to find under TaskScratchDir before its script

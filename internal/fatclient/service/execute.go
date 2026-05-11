@@ -292,9 +292,10 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		// citizen who LAUNCHED THE SCRIPT — the script itself
 		// produces deterministic bytes from code + inputs, not LLM
 		// output. The "who initiated" answer doesn't change mid-run.
-		Model:     s.modelName,
-		Container: taskDef.Container,
-		Env:       meta.Env,
+		Model:            s.modelName,
+		Container:        taskDef.Container,
+		ContainerRuntime: taskDef.ContainerRuntime,
+		Env:              meta.Env,
 	}
 
 	// Phase 8.2 — signal CLAIMED → RUNNING just before kicking

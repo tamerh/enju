@@ -126,11 +126,8 @@ tasks:
 	}
 }
 
-// TestParseContainerRuntimeDockerAccepted — the reserved
-// forward-compat field accepts "docker" (and empty). Future
-// runtimes (apptainer, singularity) get a "not yet supported"
-// rejection so post-launch templates written ahead of
-// Apptainer shipping don't silently fall back to Docker.
+// TestParseContainerRuntimeDockerAccepted — explicit
+// container_runtime: docker round-trips unchanged.
 func TestParseContainerRuntimeDockerAccepted(t *testing.T) {
 	yaml := `
 name: "runtime docker accepted"
@@ -170,15 +167,62 @@ tasks:
 	}
 }
 
-// TestParseContainerRuntimeApptainerRejected — the whole
-// point of the reserved field: future values fail at parse
-// time with a concrete "not yet supported" message, not a
-// generic "unknown field" error. A template author writing
-// container_runtime: apptainer today knows exactly where
-// they stand instead of their job silently running under
-// Docker or their template getting rejected opaquely.
-func TestParseContainerRuntimeApptainerRejected(t *testing.T) {
-	for _, rt := range []string{"apptainer", "singularity", "podman", "nerdctl"} {
+// TestParseContainerRuntimeApptainerAccepted — apptainer is
+// the second runtime alongside docker. Value round-trips
+// unchanged onto the parsed TaskDef.
+func TestParseContainerRuntimeApptainerAccepted(t *testing.T) {
+	yaml := `
+name: "runtime apptainer"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container: docker://alpine:latest
+    container_runtime: apptainer
+    prompt: "Run"
+`
+	parsed, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+	if got := parsed.Run.Tasks[0].ContainerRuntime; got != "apptainer" {
+		t.Errorf("container_runtime not preserved: got %q", got)
+	}
+}
+
+// TestParseContainerRuntimeSingularityNormalizedToApptainer
+// — singularity is a YAML-side alias only. Internal storage
+// (and logs, error messages, etc.) collapses to "apptainer"
+// at parse time so downstream code has one runtime name to
+// reason about.
+func TestParseContainerRuntimeSingularityNormalizedToApptainer(t *testing.T) {
+	yaml := `
+name: "runtime singularity alias"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container: docker://alpine:latest
+    container_runtime: singularity
+    prompt: "Run"
+`
+	parsed, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+	if got := parsed.Run.Tasks[0].ContainerRuntime; got != "apptainer" {
+		t.Errorf("singularity should be rewritten to apptainer, got %q", got)
+	}
+}
+
+// TestParseContainerRuntimeUnknownRejected — anything outside
+// the {docker, apptainer, singularity} set is a parse error
+// that names the value and lists the valid options. Don't
+// silently fall back to docker.
+func TestParseContainerRuntimeUnknownRejected(t *testing.T) {
+	for _, rt := range []string{"podman", "nerdctl", "rkt", "containerd"} {
 		yaml := `
 name: "runtime unsupported"
 version: 1
@@ -195,11 +239,40 @@ tasks:
 			t.Errorf("container_runtime=%q: expected parse error, got nil", rt)
 			continue
 		}
-		if !strings.Contains(err.Error(), "not yet supported") {
-			t.Errorf("container_runtime=%q: error should say 'not yet supported', got: %v", rt, err)
+		if !strings.Contains(err.Error(), "not supported") {
+			t.Errorf("container_runtime=%q: error should say 'not supported', got: %v", rt, err)
 		}
 		if !strings.Contains(err.Error(), rt) {
 			t.Errorf("container_runtime=%q: error should name the value, got: %v", rt, err)
+		}
+	}
+}
+
+// TestParseContainerRuntimeWithoutContainerRejected — a
+// runtime selector with no image to run is almost always a
+// template-author mistake (image removed, runtime left
+// behind; or runtime declared before the image was decided).
+// Surface at parse time rather than letting the wrapper hit
+// a more confusing failure later.
+func TestParseContainerRuntimeWithoutContainerRejected(t *testing.T) {
+	for _, rt := range []string{"docker", "apptainer", "singularity"} {
+		yaml := `
+name: "runtime without image"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    container_runtime: ` + rt + `
+    prompt: "Run"
+`
+		_, err := Parse([]byte(yaml))
+		if err == nil {
+			t.Errorf("container_runtime=%q without container: expected parse error, got nil", rt)
+			continue
+		}
+		if !strings.Contains(err.Error(), "without container") {
+			t.Errorf("container_runtime=%q: error should mention missing container:, got: %v", rt, err)
 		}
 	}
 }
