@@ -70,7 +70,7 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 	// Branch resolution — three paths: empty → project
 	// default; "auto" → pick an unused "<slug>-N"; explicit →
 	// use verbatim, just validate shape.
-	branch, err := c.resolveRunBranch(projectID, proj.DefaultBranch, params.Branch, params.SourcePath, parsed.Run.Name)
+	branch, err := c.resolveRunBranch(proj.DefaultBranch, params.Branch)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
 	}
@@ -230,17 +230,20 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 	}, nil
 }
 
-// resolveRunBranch picks the run's git branch from the three
-// supported forms: empty (use project default, fallback "main"),
-// "auto" (allocate <slug>-N), or explicit (use verbatim, just
-// validate shape).
+// resolveRunBranch picks the run's git branch from two supported
+// shapes: empty (use project default, fallback "main") or
+// explicit (validate shape, use verbatim).
 //
-// The auto-allocation slug comes from engine.ComputeRunSlug
-// (the same slugger that stamps `enju/runs/{seq}-{slug}/`) so
-// the user never sees `git checkout quick-inline-1` pointing at
-// a run whose dir is `2-Quick_Inline/` (style drift that
-// surfaced on early testing).
-func (c *Coordinator) resolveRunBranch(projectID int64, defaultBranch, requested, sourcePath, runName string) (string, error) {
+// "auto" is intentionally NOT handled here. Auto-allocation is a
+// client-side convenience that depends on git state (existing
+// branches on the bare repo); coord owns DAG + state + events,
+// not git plumbing. The fat-client resolves "auto" against its
+// local bare repo before sending the create_run request, so
+// coord always sees a concrete name. Direct REST callers without
+// a bare repo to consult must pass an explicit name — we error
+// loudly rather than allocating from a DB-only view that's known
+// to drift from disk reality.
+func (c *Coordinator) resolveRunBranch(defaultBranch, requested string) (string, error) {
 	if requested == "" {
 		if defaultBranch == "" {
 			return "main", nil
@@ -248,31 +251,7 @@ func (c *Coordinator) resolveRunBranch(projectID int64, defaultBranch, requested
 		return defaultBranch, nil
 	}
 	if requested == "auto" {
-		// Walk <slug>-1, <slug>-2, ... picking the first
-		// unused. Bounded to 10_000 so a misbehaving caller
-		// can't stall the endpoint forever.
-		used := map[string]bool{}
-		branches, err := c.Store.ListRunBranches(projectID)
-		if err != nil {
-			return "", fmt.Errorf("allocating auto branch name: %w", err)
-		}
-		for _, b := range branches {
-			used[b] = true
-		}
-		slug := engine.ComputeRunSlug(sourcePath, runName)
-		// Defense in depth: a slug that slips past the kebab
-		// slugger into something git would reject (shouldn't
-		// happen — outputs are [a-z0-9-]+) falls back to "run".
-		if validateBranchName(slug) != nil {
-			slug = "run"
-		}
-		for n := 1; n <= 10000; n++ {
-			name := fmt.Sprintf("%s-%d", slug, n)
-			if !used[name] {
-				return name, nil
-			}
-		}
-		return "", fmt.Errorf("unable to allocate an auto branch name after 10000 tries — pass branch=\"<name>\" explicitly")
+		return "", fmt.Errorf(`branch="auto" is a client-side convenience and must be resolved before reaching the coordinator. The fat-client picks a name by consulting the project's bare repo; direct callers without a bare repo to consult should pass an explicit branch name`)
 	}
 	if err := validateBranchName(requested); err != nil {
 		return "", err

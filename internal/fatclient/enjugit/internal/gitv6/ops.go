@@ -141,6 +141,13 @@ type Ops interface {
 	// unreachable.
 	RemoteBranchHash(branch string) (string, error)
 
+	// RemoteBranches queries origin via ls-remote and returns
+	// every branch name on the remote. Used by the fat-client's
+	// auto-branch picker to avoid name collisions with branches
+	// that exist on the bare repo but aren't tracked by the
+	// coord DB (post-DB-wipe state).
+	RemoteBranches() ([]string, error)
+
 	// CompareCommits classifies the relationship between two
 	// commits in the local object DB. Both SHAs must be non-empty;
 	// callers handle missing-side cases (empty local / empty

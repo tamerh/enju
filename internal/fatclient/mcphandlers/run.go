@@ -13,10 +13,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/types"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -544,6 +548,20 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 	if branch := req.GetString("branch", ""); branch != "" {
+		// "auto" is a fat-client-side convenience. Coord owns
+		// state/events/DAG, not git plumbing — so when the
+		// caller asks for "auto", we resolve to a concrete name
+		// here by consulting the project's bare repo. Coord
+		// then sees an explicit branch name and the picker
+		// can't drift from on-disk reality (e.g., post-DB-wipe
+		// when on-disk refs survive but DB is empty).
+		if branch == "auto" {
+			resolved, err := c.resolveAutoBranch(ctx, int64(projectID), yamlContent, templatePath)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("resolving branch=auto: %v", err)), nil
+			}
+			branch = resolved
+		}
 		body["branch"] = branch
 	}
 
@@ -588,6 +606,136 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		text += fmt.Sprintf("\n⚠ Snapshot %s\n", snapshotWarning)
 	}
 	return mcp.NewToolResultText(text), nil
+}
+
+// resolveAutoBranch picks a concrete branch name when the caller
+// passes branch="auto". Walks <slug>-1, <slug>-2, ... and returns
+// the first name absent from the project's bare repo. The slug
+// comes from the parsed YAML's name field via the same slugger
+// the coord uses for runs/{seq}-{slug}/, so branch name and
+// run-dir name stay in lockstep.
+//
+// Coord ownership boundary: the coord intentionally doesn't do
+// git operations. It owns DAG + state + events; the fat-client
+// owns git. "auto" is a fat-client-side convenience, resolved
+// here against the bare repo (the source of truth for branch
+// existence). Coord then receives the concrete name and trusts
+// the client.
+//
+// Returns an error if the bare repo is unreachable, the YAML
+// can't be parsed, or we exhaust the 10_000-name search.
+func (c *apiClient) resolveAutoBranch(ctx context.Context, projectID int64, yamlContent, templatePath string) (string, error) {
+	parsed, err := enjuYaml.Parse([]byte(yamlContent))
+	if err != nil {
+		return "", fmt.Errorf("parsing YAML for slug: %w", err)
+	}
+	slug := corelayout.ComputeRunSlug(templatePath, parsed.Run.Name)
+	if slug == "" {
+		slug = "run"
+	}
+	// Pull the project's remote URL via the same metadata path
+	// other tools use. We don't need to open the workspace
+	// clone for the picker — ls-remote works directly against
+	// the URL.
+	remoteURL, _, _, err := c.fc.FetchProjectMetaExpanded(ctx, projectID)
+	if err != nil {
+		return "", fmt.Errorf("fetching project metadata: %w", err)
+	}
+	// Build the "used" set from two sources, in priority order:
+	//  1. On-disk: ls-remote against the project's bare repo
+	//     URL. This is the authoritative view (survives coord
+	//     DB wipes) and is what the disk-collision bug needs.
+	//  2. Coord DB: list of branches the coord has run records
+	//     for. Always available, used as both a fallback when
+	//     ls-remote can't run AND as a complement (a branch
+	//     coord knows about that hasn't been pushed yet won't
+	//     show on ls-remote).
+	used := make(map[string]bool)
+	if remoteURL != "" {
+		existing, lsErr := lsRemoteBranchNames(ctx, remoteURL)
+		if lsErr == nil {
+			for _, b := range existing {
+				used[b] = true
+			}
+		}
+	}
+	// Always also union with the coord DB view via the runs
+	// list endpoint. Multi-source defense — works for projects
+	// whose remote_url is empty (fresh smart-detect projects
+	// where the managed bare exists on disk but coord doesn't
+	// know its path) and for in-flight allocations that haven't
+	// hit ls-remote yet within the same session.
+	dbBranches, dbErr := c.listCoordBranches(ctx, projectID)
+	if dbErr == nil {
+		for _, b := range dbBranches {
+			used[b] = true
+		}
+	}
+	for n := 1; n <= 10000; n++ {
+		name := fmt.Sprintf("%s-%d", slug, n)
+		if !used[name] {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("unable to allocate an auto branch after 10000 tries — pass branch=<name> explicitly")
+}
+
+// listCoordBranches returns the branch names coord has run
+// records for. Used as a complement to ls-remote in the auto-
+// branch picker — coord-DB is always available even when the
+// project has no remote_url to ls-remote against.
+func (c *apiClient) listCoordBranches(ctx context.Context, projectID int64) ([]string, error) {
+	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if err != nil {
+		return nil, err
+	}
+	// Response is a JSON array of run records, each with a
+	// "branch" field. Extract just the names.
+	var runs []map[string]interface{}
+	if jerr := json.Unmarshal(data, &runs); jerr != nil {
+		return nil, jerr
+	}
+	var names []string
+	for _, r := range runs {
+		if b, ok := r["branch"].(string); ok && b != "" {
+			names = append(names, b)
+		}
+	}
+	return names, nil
+}
+
+// lsRemoteBranchNames runs `git ls-remote --heads <url>` and
+// returns the branch names. Works against any URL git
+// understands — managed bare repos (file://... or /abs/path)
+// and external remotes alike. 5-second timeout so a hung remote
+// doesn't stall create_run.
+//
+// We shell out rather than open a clone because the picker just
+// needs to enumerate refs on the remote; opening a workspace
+// clone is heavier (network, disk, lock) and isn't always
+// available (the local clone may not exist yet on first
+// create_run for a newly-adopted project).
+func lsRemoteBranchNames(ctx context.Context, remoteURL string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", remoteURL)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// "<sha>\trefs/heads/<branch>"
+		parts := strings.Split(line, "\t")
+		if len(parts) != 2 {
+			continue
+		}
+		names = append(names, strings.TrimPrefix(parts[1], "refs/heads/"))
+	}
+	return names, nil
 }
 
 // handleExportDiagram snapshots the run's current DAG as raw

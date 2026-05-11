@@ -130,6 +130,36 @@ func (c *Clone) remoteBranchHashLocked(branch string) (string, error) {
 	return "", nil
 }
 
+// RemoteBranches queries origin via ls-remote and returns every
+// branch name (the `<name>` part of refs/heads/<name>). Used by
+// the fat-client's auto-branch-name picker so it can avoid
+// colliding with branches that exist on the bare repo but
+// aren't known to the coord DB — the post-DB-wipe state where
+// on-disk refs survive independently of coord bookkeeping.
+//
+// Order is whatever the remote returns; callers that need
+// deterministic iteration should sort.
+func (c *Clone) RemoteBranches() ([]string, error) {
+	defer c.lock()()
+	rem, err := c.repo.Remote("origin")
+	if err != nil {
+		return nil, fmt.Errorf("git: remote-branches: %w", err)
+	}
+	refs, err := rem.List(&gogit.ListOptions{
+		ClientOptions: clientOptionsFor(c.remoteURL),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("git: ls-remote: %w", err)
+	}
+	var names []string
+	for _, r := range refs {
+		if r.Name().IsBranch() {
+			names = append(names, r.Name().Short())
+		}
+	}
+	return names, nil
+}
+
 // LocalBranchHash returns the SHA of the named local branch
 // ref, falling back to refs/remotes/origin/<branch> when the
 // local ref doesn't exist. Empty string when neither exists.

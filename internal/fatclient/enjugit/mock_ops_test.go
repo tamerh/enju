@@ -488,6 +488,11 @@ func (f *fakeOps) RemoteBranchHash(branch string) (string, error) {
 	return "", f.checkErr("RemoteBranchHash")
 }
 
+func (f *fakeOps) RemoteBranches() ([]string, error) {
+	f.record("RemoteBranches")
+	return nil, f.checkErr("RemoteBranches")
+}
+
 func (f *fakeOps) WalkCommitsFrom(fromSHA string, maxWalk int, visit func(sha, message string) bool) error {
 	f.record("WalkCommitsFrom", fromSHA, maxWalk)
 	return f.checkErr("WalkCommitsFrom")

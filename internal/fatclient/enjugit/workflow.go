@@ -182,6 +182,18 @@ func (w *Workflow) LocalBranches() ([]string, error) {
 	return branches, translateGitError("local branches", err)
 }
 
+// RemoteBranches returns the names of every branch on the
+// origin (bare) repo, via ls-remote. Distinct from LocalBranches
+// because the workspace clone may not have fetched every bare
+// branch — especially after a coord DB wipe that leaves on-disk
+// refs surviving independently. The auto-branch-name picker
+// consults THIS view to avoid colliding with branches that exist
+// only on the bare side.
+func (w *Workflow) RemoteBranches() ([]string, error) {
+	branches, err := w.git.RemoteBranches()
+	return branches, translateGitError("remote branches", err)
+}
+
 // wrapGitError attaches workdir + remote URL context to a git
 // error so error messages tell the operator WHICH on-disk
 // clone and WHICH remote the failure happened against — without
