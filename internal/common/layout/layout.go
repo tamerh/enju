@@ -145,10 +145,17 @@ func BotCloneDirFor(botUsername string) (string, error) {
 const BotPromptsDir = "enju/prompts"
 
 // TemplateSnapshotDirName is the per-run subdirectory name that
-// holds the frozen bundle copy. Named with the -snapshot suffix
-// to disambiguate from the live templates dir — otherwise a
-// failure message "reading from enju/runs/3/template-snapshot/..." was
-// indistinguishable from "enju/templates/..." at a glance.
+// holds the run's frozen YAML manifest (plus any scripts/data
+// when the run came from a template bundle). Inline-YAML runs
+// land here too — just the manifest, no bundle — so the on-disk
+// layout is uniform regardless of how the run was created.
+//
+// Named with the -snapshot suffix to disambiguate from the live
+// templates dir — otherwise a failure message "reading from
+// enju/runs/3/template-snapshot/..." was indistinguishable from
+// "enju/templates/..." at a glance. The "template-" prefix is a
+// slight misnomer for inline runs; renaming to "run-snapshot/"
+// is deferred to avoid disrupting existing on-disk layouts.
 const TemplateSnapshotDirName = "template-snapshot"
 
 // RunTemplateSnapshotDir returns the per-run bundle snapshot

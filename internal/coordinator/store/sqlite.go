@@ -526,12 +526,6 @@ func (s *Store) initSchema() error {
 		// default them to tracked=1 so the column's semantics
 		// stay uniform across old and new data.
 		`ALTER TABLE artifacts ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1`,
-		// Docker containerization (Phase A of containers).
-		// Empty string = no container (run script on host).
-		// Otherwise carries an image reference (biocontainers/samtools:1.18,
-		// ghcr.io/org/tool@sha256:..., etc.) the wrapper hands to
-		// `docker run` at execute time.
-		`ALTER TABLE tasks ADD COLUMN container TEXT NOT NULL DEFAULT ''`,
 		// Per-run slug for the self-documenting
 		// enju/runs/{seq}-{slug}/ directory layout. Stored on
 		// the run as the source of truth; denormalized onto
@@ -1103,7 +1097,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, container, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1119,7 +1113,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.ReadsArtifacts, &t.WritesArtifacts,
 		&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
+		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 		&t.ClosesIssueSeq,
 		&t.CreatedAt)
@@ -2354,7 +2348,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.ReadsArtifacts, &t.WritesArtifacts,
 			&t.AssignTo, &t.RequireRole, &t.ReviewsTarget, &t.ReviewDecision,
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
-			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.Container, &t.RunSlug,
+			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 			&t.ClosesIssueSeq,
 			&t.CreatedAt); err != nil {

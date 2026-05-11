@@ -150,12 +150,23 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	workDir := wf.WorkDir()
 	resultDir := meta.ResultDir
 
+	// Every run — template OR inline — writes its parsed YAML to
+	// the snapshot dir at create_run time. The fatclient reads
+	// per-task execution-policy fields (container image, runtime
+	// selector, env block) from there at execute time so coord
+	// never has to persist or transport fields it doesn't act on.
+	snapshotDir := filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+	taskDef, err := enjuYaml.LoadTaskDefFromSnapshot(snapshotDir, meta.TaskDefID)
+	if err != nil {
+		return nil, fmt.Errorf("loading task def from snapshot: %w", err)
+	}
+
 	// Script resolution: template runs pin scripts to the per-run
 	// snapshot directory; inline-YAML runs use project-relative
 	// paths as declared.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
-		templateDir = filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		templateDir = snapshotDir
 		scriptPath = filepath.Join(templateDir, meta.Script)
 	} else {
 		scriptPath = filepath.Join(workDir, meta.Script)
@@ -282,7 +293,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		// produces deterministic bytes from code + inputs, not LLM
 		// output. The "who initiated" answer doesn't change mid-run.
 		Model:     s.modelName,
-		Container: meta.Container,
+		Container: taskDef.Container,
 		Env:       meta.Env,
 	}
 

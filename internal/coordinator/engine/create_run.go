@@ -202,7 +202,6 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				Visibility:      ti.Visibility,
 				Env:             marshalStringMap(ti.Env),
 				Mode:            ti.Mode,
-				Container:       ti.Container,
 				CreatedAt:       now,
 			})
 		}

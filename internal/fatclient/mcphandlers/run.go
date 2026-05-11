@@ -562,16 +562,20 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	// fully synced.
 	ensureBranchWarning := c.fc.EnsureRunBranch(ctx, int64(projectID), data)
 
-	// Template mode: after the coordinator assigns a run seq,
-	// commit a frozen copy of the bundle into
-	// enju/runs/{seq}-{slug}/template-snapshot/. Errors here
-	// are non-fatal for the API response (the run exists on
-	// the coordinator side) but surface as a warning so the
-	// author knows the snapshot didn't land.
+	// After the coordinator assigns a run seq, freeze the run's
+	// YAML to enju/runs/{seq}-{slug}/template-snapshot/. Template
+	// runs snapshot the full bundle (scripts + data + manifest);
+	// inline runs snapshot just the YAML body. Either way the
+	// fatclient resolves per-task execution-policy fields
+	// (container image, container runtime) from this on-disk copy
+	// at execute time. Errors are non-fatal — the run exists on
+	// the coordinator side; failure surfaces as a warning.
 	var snapshotWarning string
+	authorName, authorEmail := c.commitAuthor(ctx)
 	if prep != nil {
-		authorName, authorEmail := c.commitAuthor(ctx)
 		snapshotWarning = c.fc.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
+	} else {
+		snapshotWarning = c.fc.CommitRunInlineSnapshot(ctx, int64(projectID), yamlContent, data, authorName, authorEmail)
 	}
 
 	c.fc.TouchProject(int64(projectID))
@@ -581,7 +585,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		text += fmt.Sprintf("\n⚠ %s\n", ensureBranchWarning)
 	}
 	if snapshotWarning != "" {
-		text += fmt.Sprintf("\n⚠ Template %s\n", snapshotWarning)
+		text += fmt.Sprintf("\n⚠ Snapshot %s\n", snapshotWarning)
 	}
 	return mcp.NewToolResultText(text), nil
 }

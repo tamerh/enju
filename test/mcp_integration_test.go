@@ -1538,8 +1538,9 @@ func TestMCPBranchingWithInferredDeps(t *testing.T) {
 	h.assertResultFile(h.lastRunID, "", "python_pros", "ecosystem")
 	h.assertResultFile(h.lastRunID, "", "go_pros", "binary")
 	h.assertResultFile(h.lastRunID, "", "comparison", "")
-	// 4 commits: 1 initial README + 3 task results.
-	h.assertGitCommits(projectID, 4)
+	// 5 commits: 1 initial README + 1 inline-YAML snapshot at
+	// run-creation time + 3 task results.
+	h.assertGitCommits(projectID, 5)
 
 }
 
@@ -7563,6 +7564,46 @@ printf 'develop-branch-bytes' > "$ENJU_BIGFILES/out/big.bam"
 	report := mcpText(res)
 	if !strings.Contains(report, "present") {
 		t.Errorf("expected present marker for bigfiles-resolved artifact, got:\n%s", report)
+	}
+}
+
+// TestMCPCreateRunInlineWritesSnapshot pins the invariant that
+// inline-YAML runs commit a copy of their manifest to the run
+// branch under enju/runs/{seq}-{slug}/template-snapshot/enju.yaml.
+// The fatclient resolves per-task execution-policy fields
+// (container image, container_runtime) from this on-disk copy at
+// execute time — its absence would silently strip those fields
+// for any run created with inline YAML rather than a template.
+func TestMCPCreateRunInlineWritesSnapshot(t *testing.T) {
+	h := newMCPHarness(t, "InlineSnapshot")
+	projectID := h.createTestProject()
+
+	yamlBody := `name: "inline snapshot"
+version: 1
+tasks:
+  - id: greet
+    action: answer
+    prompt: "hello"
+`
+	h.mcpCreateRunInline(t, projectID, yamlBody)
+
+	run := h.get(fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, h.lastRunSeq))
+	runBranch, _ := run["branch"].(string)
+	if runBranch == "" {
+		t.Fatalf("run %d has empty branch", h.lastRunSeq)
+	}
+
+	remoteURL := h.remoteFor(projectID)
+	snapshotPath := filepath.Join(h.runDir(h.lastRunSeq), "template-snapshot", "enju.yaml")
+	body, ok := readRepoFileOnBranch(t, remoteURL, runBranch, snapshotPath)
+	if !ok {
+		t.Fatalf("inline snapshot %s not found on run branch %q", snapshotPath, runBranch)
+	}
+	if !strings.Contains(string(body), "inline snapshot") {
+		t.Errorf("snapshot enju.yaml missing expected `name:`: %s", body)
+	}
+	if !strings.Contains(string(body), "id: greet") {
+		t.Errorf("snapshot enju.yaml missing task id: %s", body)
 	}
 }
 

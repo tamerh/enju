@@ -384,16 +384,6 @@ type TaskRecord struct {
 	// read sites so the default-to-sync rule lives in one place.
 	Mode string
 
-	// Container is the Docker image reference a compute task's
-	// script runs inside. When empty, the script runs directly
-	// on the host as before. When set, the wrapper invokes
-	// `docker run <image> /bin/sh -c <script>` with the
-	// workspace bind-mounted at /workspace. Only populated for
-	// action:compute tasks; copied verbatim from the YAML
-	// TaskDef.Container field. Image reference grammar isn't
-	// validated here — docker's CLI arbitrates at pull time.
-	Container string
-
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

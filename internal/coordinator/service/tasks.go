@@ -75,7 +75,6 @@ type TaskResponse struct {
 	InstanceParamsMap        map[string]interface{} `json:"instance_params_map,omitempty"`
 	Env                      map[string]string      `json:"env,omitempty"`
 	Mode                     string                 `json:"mode,omitempty"`
-	Container                string                 `json:"container,omitempty"`
 	VoteSubmissions          []VoteSubmissionRef    `json:"vote_submissions,omitempty"`
 	ActiveClaimants          []string               `json:"active_claimants,omitempty"`
 	IterationBranches        map[string]string      `json:"iteration_branches,omitempty"`
@@ -306,7 +305,6 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		InstanceParamsMap: instanceParams,
 		Env:               UnmarshalStringMapField(t.Env),
 		Mode:              t.Mode,
-		Container:         t.Container,
 	}
 
 	// Single-citizen task model attribution. Gate on state ==

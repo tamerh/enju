@@ -158,11 +158,6 @@ type TaskMeta struct {
 	// the resolvedMode helper) at read sites to get the
 	// default-applied value.
 	Mode string
-	// Container is the Docker image reference the compute
-	// script should run inside (empty = run directly on the
-	// host). Threaded verbatim into the compute.Spec so the
-	// wrapper can pick the container vs direct-exec branch.
-	Container string
 	// ResultDir is the pre-computed repo-relative path for
 	// this task's result files (e.g. enju/runs/3-gwas/align or
 	// enju/runs/3-gwas/align/sample=S1). The server computes
@@ -358,9 +353,6 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 	}
 	if v, ok := raw["mode"].(string); ok {
 		meta.Mode = v
-	}
-	if v, ok := raw["container"].(string); ok {
-		meta.Container = v
 	}
 	if v, ok := raw["result_dir"].(string); ok {
 		meta.ResultDir = v

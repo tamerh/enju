@@ -244,6 +244,63 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 	return ""
 }
 
+// CommitRunInlineSnapshot freezes a single-file copy of an
+// inline run's YAML into enju/runs/{seq}-{slug}/template-snapshot/enju.yaml
+// so the fatclient can resolve per-task execution-policy fields
+// (container image, container runtime) from disk at execute time
+// without round-tripping through the coordinator DB.
+//
+// Mirrors CommitRunTemplateSnapshot's contract for the inline
+// case (yaml: ... at create_run with no bundle behind it): yaml
+// body is the only artifact written, and the snapshot directory
+// name remains template-snapshot/ even for inline runs so the
+// on-disk layout is uniform across both create_run shapes.
+//
+// Returns "" on success or no-op (no workspace, malformed run
+// payload, empty yaml); a warning string when the commit failed
+// — non-fatal, the run already exists on the coordinator side.
+func (s *FatClient) CommitRunInlineSnapshot(ctx context.Context, projectID int64, yamlContent string, runData []byte, authorName, authorEmail string) string {
+	if s.enjugit == nil || yamlContent == "" {
+		return ""
+	}
+	var created map[string]interface{}
+	if err := json.Unmarshal(runData, &created); err != nil {
+		return ""
+	}
+	seqF, ok := created["seq"].(float64)
+	if !ok {
+		return ""
+	}
+	seq := int(seqF)
+	runBranch, _ := created["branch"].(string)
+	runSlug, _ := created["slug"].(string)
+	if runSlug == "" {
+		runSlug = corelayout.ComputeRunSlug("", "")
+	}
+
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return fmt.Sprintf("snapshot skipped: %v", err)
+	}
+
+	manifestPath := filepath.Join(corelayout.RunTemplateSnapshotDir(seq, runSlug), corelayout.BundleManifestName)
+	_, cerr := wf.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+		Files: []enjugit.FileWrite{{
+			RepoRelPath: manifestPath,
+			Content:     []byte(yamlContent),
+		}},
+		Branch:      runBranch,
+		Subject:     fmt.Sprintf("Snapshot inline yaml into run %d", seq),
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+		ModelName:   s.modelName,
+	})
+	if cerr != nil {
+		return fmt.Sprintf("snapshot commit failed: %v", cerr)
+	}
+	return ""
+}
+
 // ExportFileResult is the structured outcome of a "snapshot
 // X to git under enju/runs/{seq}/..." operation. Carries the
 // repo-relative path and the resulting commit SHA (or NoOp
