@@ -217,18 +217,24 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		if !envKeyAllowed(k, spec.Env) {
 			continue
 		}
-		translated, ok := translatePath(v, workDir, ContainerWorkDir)
-		// Workspace prefix didn't match; try the other binds in
-		// priority order. ENJU_PROJECT_DIR / ENJU_TASK_DIR point
-		// at host-side scratch; ENJU_TEMPLATE_DIR / ENJU_SCRATCH
-		// point at the snapshot or scratch host paths. Translate
-		// each to its in-container view so the script sees the
-		// bind-mounted layout.
+		// Path translation in priority order — more-specific
+		// prefixes first. The snapshot lives UNDER the workspace
+		// (e.g. <workDir>/enju/runs/3/template-snapshot/), so a
+		// naive workspace-first match would translate
+		// ENJU_TEMPLATE_DIR to /workspace/enju/runs/3/template-
+		// snapshot when /template is the right view. Same shape
+		// for scratch when it's nested. Try the most-specific
+		// binds first; fall back to the workspace prefix.
+		var translated string
+		var ok bool
+		if spec.SnapshotDir != "" {
+			translated, ok = translatePath(v, spec.SnapshotDir, ContainerTemplateDir)
+		}
 		if !ok && spec.TaskScratchDir != "" {
 			translated, ok = translatePath(v, spec.TaskScratchDir, ContainerScratchDir)
 		}
-		if !ok && spec.SnapshotDir != "" {
-			translated, _ = translatePath(v, spec.SnapshotDir, ContainerTemplateDir)
+		if !ok {
+			translated, _ = translatePath(v, workDir, ContainerWorkDir)
 		}
 		args = append(args, "-e", k+"="+translated)
 	}
