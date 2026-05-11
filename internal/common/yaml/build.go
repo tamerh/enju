@@ -245,6 +245,12 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			continue
 		}
 		allDeps := template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt)
+		// Belt-and-suspenders: the validator already rejected
+		// unknown depends_on entries earlier in the pipeline;
+		// re-checking here catches the impossible case where a
+		// future validator change drops the check but the
+		// builder still produces useful errors instead of a
+		// broken DAG.
 		for _, dep := range allDeps {
 			if !taskIDs[dep] {
 				return nil, fmt.Errorf("task %q references %q which does not exist", taskDef.ID, dep)

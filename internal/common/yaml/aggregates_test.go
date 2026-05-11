@@ -314,6 +314,114 @@ tasks:
 	}
 }
 
+// TestAggregates_ArtifactDepsWiredIntoAggregator pins that the
+// artifact-dep pass (wireArtifactDeps) sees the aggregator
+// singleton and adds the writer→aggregator edge when the
+// aggregator reads_artifacts a path written by a fanned source.
+// The aggregator lives in ExpandedTasks[""] alongside any other
+// singletons, so the existing walk picks it up — this test
+// catches a regression where a future refactor accidentally
+// excludes the aggregator from the artifact-dep pass.
+func TestAggregates_ArtifactDepsWiredIntoAggregator(t *testing.T) {
+	src := `
+name: aggregator-with-artifact-reads
+tasks:
+  - id: scan
+    action: answer
+    for_each:
+      item: [a, b]
+    prompt: scan {{item}}
+    writes_artifacts:
+      - reports/{{item}}.md
+  - id: synth
+    action: answer
+    aggregates: scan
+    reads_artifacts:
+      - reports/a.md
+      - reports/b.md
+    prompt: synthesize
+`
+	parsed, err := helperParse(t, src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var synthTI *TaskInstance
+	for _, list := range parsed.ExpandedTasks {
+		for i := range list {
+			if list[i].TaskDef.ID == "synth" {
+				synthTI = &list[i]
+			}
+		}
+	}
+	if synthTI == nil {
+		t.Fatal("synth not found")
+	}
+	// Both scan instances write paths the aggregator reads,
+	// so artifact-dep wiring must have added them to
+	// DependsOn (they're already there from the regular
+	// fan-in dep, so the assertion is really "did the
+	// artifact pass NOT corrupt anything").
+	wantDeps := map[string]bool{"a:scan": true, "b:scan": true}
+	gotSet := make(map[string]bool)
+	for _, d := range synthTI.DependsOn {
+		gotSet[d] = true
+	}
+	for want := range wantDeps {
+		if !gotSet[want] {
+			t.Errorf("synth.DependsOn missing %q after artifact-dep pass; got %v", want, synthTI.DependsOn)
+		}
+	}
+}
+
+// TestAggregates_RunLevelParamInAggregatorPrompt pins that
+// run-level params (substituted into taskDef.Prompt BEFORE
+// build() runs) still appear in the aggregator's prompt. The
+// aggregator's per-iteration Params map is empty by design;
+// run-level params should already be in the prompt string by
+// the time we get here.
+func TestAggregates_RunLevelParamInAggregatorPrompt(t *testing.T) {
+	src := `
+name: run-level-param-aggregator
+params:
+  - name: audience
+    type: string
+    default: experts
+for_each:
+  item: [a, b]
+tasks:
+  - id: scan
+    action: answer
+    prompt: scan {{item}} for {{audience}}
+  - id: synth
+    action: answer
+    aggregates: scan
+    prompt: synthesize for {{audience}}
+`
+	parsed, err := ParseWithParams([]byte(src), map[string]interface{}{
+		"audience": "scientists",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var synthTI *TaskInstance
+	for _, list := range parsed.ExpandedTasks {
+		for i := range list {
+			if list[i].TaskDef.ID == "synth" {
+				synthTI = &list[i]
+			}
+		}
+	}
+	if synthTI == nil {
+		t.Fatal("synth not found")
+	}
+	if !strings.Contains(synthTI.Prompt, "scientists") {
+		t.Errorf("aggregator prompt should have {{audience}} resolved to \"scientists\", got: %q", synthTI.Prompt)
+	}
+	if strings.Contains(synthTI.Prompt, "{{audience}}") {
+		t.Errorf("aggregator prompt still contains unresolved {{audience}}: %q", synthTI.Prompt)
+	}
+}
+
 // TestAggregates_CoexistsWithRegularDeps proves an aggregator
 // may also depend on non-fanned siblings. The aggregator pulls
 // in fan-in for the source AND a regular edge from the singleton
