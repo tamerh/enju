@@ -75,6 +75,17 @@ func OpenClone(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 		}
 		return nil, fmt.Errorf("git: stat %s/.git: %w", workDir, err)
 	}
+	// Sweep any half-written pack/idx temp files left over from
+	// a previous fetch that was killed mid-stream (bot stop
+	// signal, OOM, machine reboot). Git's fetch protocol writes
+	// to tmp_pack_<n> / tmp_idx_<n>, then renames into
+	// pack-<sha>.{pack,idx} on success. A surviving tmp_* file
+	// is by definition leftover from an interrupted fetch and
+	// causes the next fetch to fail with "malformed pack file:
+	// bad signature" because git tries to read it as a real
+	// pack. Cheap: one readdir, only removes the specific
+	// tmp_* prefix.
+	sweepStaleTempPackFiles(workDir, logger)
 	repo, err := gogit.PlainOpen(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("git: open %s: %w", workDir, err)

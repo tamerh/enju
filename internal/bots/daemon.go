@@ -424,8 +424,25 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	// a fetch failure is logged but doesn't block the claim;
 	// ReadFileAtCommit's lazy-fetch fallback picks up the slack.
 	if ferr := d.fc.FetchAllRefsForBot(ctx, projectID); ferr != nil {
-		d.logger.Warn("pre-claim fetch failed; will rely on read-time lazy fetch",
-			"project_id", projectID, "error", ferr)
+		// Log as ERROR, not WARN. The earlier WARN framing
+		// implied the read-time lazy-fetch fallback would
+		// recover; that's true for transient network blips,
+		// but NOT for structural corruption (malformed pack /
+		// missing object) where the lazy-fetch hits the same
+		// broken pack store and fails the same way. By the
+		// time this fires the bot is effectively stuck. The
+		// OpenClone-time sweep of stale tmp_pack_* files
+		// covers the most common cause (interrupted fetch
+		// from a bot stop signal); anything that gets past
+		// that sweep is a genuine error the operator needs
+		// to see in the log, not bury behind a WARN.
+		d.logger.Error("pre-claim fetch failed",
+			"project_id", projectID, "error", ferr,
+			"impact", "read-time lazy fetch will retry, but if this is structural "+
+				"corruption (malformed pack, missing object), the lazy retry will "+
+				"also fail and the bot will be stuck. Inspect "+
+				"<project>/enju/bots/<bot>/clone/.git/objects/pack/ for "+
+				"corruption; remove the clone to force re-clone if necessary.")
 	}
 
 	claim, err := d.fc.ClaimTask(ctx, service.ClaimParams{
