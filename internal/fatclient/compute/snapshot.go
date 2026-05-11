@@ -27,11 +27,19 @@ import (
 )
 
 // ChmodSnapshotReadOnly walks the snapshot tree rooted at `root`
-// and sets every file to 0444 and every dir to 0555. Symlinks are
-// left untouched — chmoding through a symlink would resolve to
-// the target, potentially modifying files outside the snapshot
-// boundary, which is a containment break, not just a hygiene
-// issue.
+// and strips the write bits (0222) from every entry's mode while
+// preserving read and execute bits. So a regular file at 0644
+// becomes 0444, an executable script at 0755 becomes 0555, a
+// directory at 0755 becomes 0555. Symlinks are left untouched —
+// chmoding through a symlink would resolve to the target,
+// potentially modifying files outside the snapshot boundary,
+// which is a containment break, not just a hygiene issue.
+//
+// Preserving execute bits is load-bearing: entry.sh and any
+// other executable scripts in the template need their exec bit
+// to stay set, or the wrapper's fork/exec fails with EACCES
+// before the script even runs. Read-only enforcement only needs
+// the write bit removed; execute is orthogonal.
 //
 // Returns the first chmod error encountered (rare in practice;
 // the bot owns the tree, so EPERM shouldn't happen). Missing
@@ -59,11 +67,14 @@ func ChmodSnapshotReadOnly(root string) error {
 		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
-		mode := os.FileMode(0o444)
-		if d.IsDir() {
-			mode = 0o555
+		info, err := d.Info()
+		if err != nil {
+			return err
 		}
-		if cerr := os.Chmod(p, mode); cerr != nil {
+		// Strip write bits, preserve everything else (read,
+		// execute, setuid/setgid/sticky if present).
+		newMode := info.Mode().Perm() &^ 0o222
+		if cerr := os.Chmod(p, newMode); cerr != nil {
 			return fmt.Errorf("chmod %s: %w", p, cerr)
 		}
 		return nil

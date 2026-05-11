@@ -190,55 +190,82 @@ func chmodReadonlyTempDir(t *testing.T) string {
 }
 
 
-// TestChmodSnapshotReadOnly_AppliesModes pins the load-bearing
-// chmod behavior. Files end up 0444, dirs 0555 — the host-side
-// guard against silent pollution (Python __pycache__, tool caches,
-// stray relative-path writes).
-func TestChmodSnapshotReadOnly_AppliesModes(t *testing.T) {
+// TestChmodSnapshotReadOnly_StripsWriteBitsPreservesExec pins the
+// load-bearing chmod behavior: write bits (0222) get stripped on
+// every entry, but read and execute bits are preserved. Without
+// the exec preservation, entry.sh and other scripts fail fork/exec
+// with EACCES before they ever run. With it, the snapshot is
+// read-only AND executable scripts still work.
+func TestChmodSnapshotReadOnly_StripsWriteBitsPreservesExec(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file modes; Windows uses the read-only attribute (see spec portability matrix)")
 	}
 	root := chmodReadonlyTempDir(t)
 
-	// Build a small representative tree.
+	// Build a small representative tree: dirs (0755), a non-
+	// executable data file (0644 → 0444), and an executable
+	// script (0755 → 0555).
 	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	files := map[string]string{
-		"entry.sh":           "#!/bin/sh\necho hi\n",
-		"scripts/helper.sh":  "#!/bin/sh\necho helper\n",
-		"lib/utils.py":       "def greet(): print('hi')\n",
+	dataFile := filepath.Join(root, "lib", "utils.py")
+	if err := os.WriteFile(dataFile, []byte("def greet(): pass\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	for rel, body := range files {
-		full := filepath.Join(root, rel)
-		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	scriptFile := filepath.Join(root, "scripts", "helper.sh")
+	if err := os.WriteFile(scriptFile, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := ChmodSnapshotReadOnly(root); err != nil {
 		t.Fatalf("ChmodSnapshotReadOnly: %v", err)
 	}
 
-	// Every file: 0444. Every dir: 0555.
+	// Non-executable data: 0644 → 0444.
+	dataInfo, err := os.Stat(dataFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dataInfo.Mode().Perm(); got != 0o444 {
+		t.Errorf("data file mode = %o, want 0444", got)
+	}
+
+	// Executable script: 0755 → 0555. CRITICAL — without
+	// preserving exec, fork/exec fails before the wrapper runs.
+	scriptInfo, err := os.Stat(scriptFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := scriptInfo.Mode().Perm(); got != 0o555 {
+		t.Errorf("script mode = %o, want 0555 (exec bit preserved)", got)
+	}
+
+	// Directories: 0755 → 0555 (exec on a dir means traversable).
+	libInfo, err := os.Stat(filepath.Join(root, "lib"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := libInfo.Mode().Perm(); got != 0o555 {
+		t.Errorf("dir mode = %o, want 0555", got)
+	}
+
+	// And the negative: no write bits anywhere.
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(p)
-		if err != nil {
-			return err
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
 		}
-		got := info.Mode().Perm()
-		want := os.FileMode(0o444)
-		if d.IsDir() {
-			want = 0o555
+		info, ierr := os.Stat(p)
+		if ierr != nil {
+			return ierr
 		}
-		if got != want {
-			t.Errorf("%s: mode = %o, want %o", p, got, want)
+		if info.Mode().Perm()&0o222 != 0 {
+			t.Errorf("%s: write bits not stripped (mode %o)", p, info.Mode().Perm())
 		}
 		return nil
 	})
