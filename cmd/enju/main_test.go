@@ -48,6 +48,46 @@ func TestLoadCredentialsCoordinatorMismatchReturnsNil(t *testing.T) {
 	}
 }
 
+// TestLoadCredentialsLocalSentinelMigratesToFallbackURL pins
+// the one-shot migration for legacy credentials.json files
+// that still carry the "local" sentinel from before --local
+// mode pinned its port. On load, the sentinel is rewritten to
+// the fallback URL (the pinned --local port) and persisted so
+// subsequent loads see the real URL and never trigger the
+// sentinel branch again.
+func TestLoadCredentialsLocalSentinelMigratesToFallbackURL(t *testing.T) {
+	path := isolateHome(t)
+	// Simulate the legacy file shape.
+	saveCredentials("local", "tamer", "Tamer", "tamer@example.com", "tok-tamer")
+
+	// Caller asks for the fallback URL (which `enju mcp --local`
+	// now uses verbatim). Migration must kick in and the
+	// matching record must load.
+	got := loadCredentials(fallbackCoordinatorURL)
+	if got == nil {
+		t.Fatal("expected creds to migrate + match fallback URL; got nil")
+	}
+	if got.Username != "tamer" || got.Token != "tok-tamer" {
+		t.Errorf("identity not preserved: %+v", got)
+	}
+	if got.Coordinator != fallbackCoordinatorURL {
+		t.Errorf("coordinator not migrated to fallback URL: %q", got.Coordinator)
+	}
+
+	// Check the migration persisted: re-read the file directly.
+	raw, _ := os.ReadFile(path)
+	var onDisk struct {
+		Coordinator string `json:"coordinator"`
+	}
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("re-read credentials: %v", err)
+	}
+	if onDisk.Coordinator != fallbackCoordinatorURL {
+		t.Errorf("on-disk coordinator after migration = %q, want %q",
+			onDisk.Coordinator, fallbackCoordinatorURL)
+	}
+}
+
 func TestLoadCredentialsMalformedJSONReturnsNil(t *testing.T) {
 	path := isolateHome(t)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

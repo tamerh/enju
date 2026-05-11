@@ -359,9 +359,16 @@ func cmdMCP(args []string) {
 	resolvedCredsPath := resolveCredentialsPath(*credsPath)
 
 	// Local-only mode: start an embedded coordinator in the
-	// same process on a random port. The MCP client talks to
-	// it over localhost — same code paths, no separate
+	// same process on the standard port. The MCP client talks
+	// to it over localhost — same code paths, no separate
 	// `enju serve` process needed.
+	//
+	// The port is pinned (127.0.0.1:8383) so the URL written
+	// to credentials.json stays stable across sessions; that
+	// stability is what lets other tools (webui, CLI) read the
+	// URL and just use it. If 8383 is taken, error with a clear
+	// hint rather than silently picking another port (which
+	// would create stale-URL drift the operator has to chase).
 	if *localMode {
 		dbPath := *localDB
 		if dbPath == "" {
@@ -396,25 +403,25 @@ func cmdMCP(args []string) {
 
 		srv := api.NewServer(st, logger)
 
-		// Find an available port.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		// Pinned port. Stable URL = no sentinel needed for the
+		// credentials key. Bind failure prints a clear hint.
+		const localPort = "127.0.0.1:8383"
+		ln, err := net.Listen("tcp", localPort)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to find a free port: %v\n", err)
+			fmt.Fprintf(os.Stderr,
+				"Failed to bind %s for local mode: %v\n"+
+					"  Likely another enju (or other service) is already on this port. "+
+					"Kill the conflicting process, or use `enju serve` + `enju mcp -coordinator <url>` "+
+					"to run a standalone coord on a different port.\n",
+				localPort, err)
 			os.Exit(1)
 		}
-		localAddr := ln.Addr().String()
 		go http.Serve(ln, srv.Router())
-		*coordinator = "http://" + localAddr
+		*coordinator = "http://" + ln.Addr().String()
 		fmt.Fprintf(os.Stderr, "Local mode: embedded coordinator on %s (db: %s)\n", *coordinator, dbPath)
 	}
 
-	// For local mode, use a fixed sentinel as the coordinator
-	// key in credentials.json so the identity persists across
-	// sessions (the actual port changes every run).
 	credsKey := *coordinator
-	if *localMode {
-		credsKey = "local"
-	}
 
 	// Load saved credentials. Persistent values beat CLI args —
 	// ~/.enju/credentials.json is the source of truth for a user's
@@ -548,7 +555,11 @@ func credentialsPath() string {
 // http://localhost:8333 doesn't have to re-pass that URL on
 // every CLI invocation. The flag still overrides; this only
 // kicks in when the operator omits --coordinator entirely.
-const fallbackCoordinatorURL = "http://localhost:8000"
+// fallbackCoordinatorURL is the default coord URL when nothing
+// else is configured. Matches the pinned port `enju mcp --local`
+// uses, so an operator running both modes never needs to think
+// about ports.
+const fallbackCoordinatorURL = "http://localhost:8383"
 
 func defaultCoordinatorURL() string {
 	data, err := os.ReadFile(credentialsPath())
@@ -610,7 +621,24 @@ func loadCredentialsAt(coordinator, path string) *credentials {
 	if json.Unmarshal(data, &creds) != nil {
 		return nil
 	}
-	if creds.Coordinator != coordinator || creds.Username == "" {
+	if creds.Username == "" {
+		return nil
+	}
+	// Migration: credentials.json may carry the legacy "local"
+	// sentinel from an older --local-mode session (when --local
+	// picked a random port and used "local" as a stable key).
+	// The pinned-port refactor made the URL stable; treat the
+	// sentinel as a stand-in for the fallback URL so old
+	// credentials files still load. Updates the URL in memory
+	// AND persists on first load so this migration is one-shot.
+	if creds.Coordinator == "local" {
+		fmt.Fprintf(os.Stderr,
+			"note: migrating legacy coordinator=\"local\" sentinel in credentials.json to %s\n",
+			fallbackCoordinatorURL)
+		creds.Coordinator = fallbackCoordinatorURL
+		saveCredentialsAt(creds.Coordinator, creds.Username, creds.Name, creds.Email, creds.Token, path)
+	}
+	if creds.Coordinator != coordinator {
 		return nil
 	}
 	return &creds
