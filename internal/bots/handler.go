@@ -19,11 +19,12 @@
 //   - StubHandler — canned responses for tests so the daemon
 //     loop can be exercised without spawning a subprocess.
 //
-// New handlers are NOT added here. Per the Phase 4b plug-in
-// model, "different handler" means "different binary the
-// SubprocessHandler invokes." A ShellHandler / RuleHandler /
-// HTTPHandler is just an operator-provided script that
-// satisfies the protocol — no Go change needed.
+// New handlers are NOT added here. Under the plug-in model
+// SubprocessHandler implements, "different handler" means
+// "different binary the SubprocessHandler invokes" — a
+// ShellHandler / RuleHandler / HTTPHandler is just an
+// operator-provided script that satisfies the protocol, no
+// Go change needed.
 //
 // In-tree bespoke handlers remain possible (write a new file,
 // add a NewHandler case) only when a binary genuinely can't fit
@@ -102,9 +103,8 @@ type HandlerInput struct {
 	RepoDir string
 
 	// GitDir is the absolute path to the .git/ that holds the
-	// project's full history — operator's clone today, post-P4d
-	// the operator's `.git/` directly. Exposed as $ENJU_GIT_DIR
-	// so handlers can query history via `git --git-dir=...`
+	// project's full history. Exposed as $ENJU_GIT_DIR so
+	// handlers can query history via `git --git-dir=...`
 	// without needing a checked-out worktree. Read-only by
 	// convention (the protocol forbids handlers from running
 	// `git commit` / `git push` — commits are citizen actions
@@ -204,7 +204,7 @@ const (
 // Handler is reused across iterations for the lifetime of the
 // daemon process.
 //
-// Routing (Phase 4b — see docs/handler-protocol.md):
+// Routing (see docs/handler-protocol.md):
 //   - handler: "stub"      → in-process StubHandler
 //   - handler: ""          → SubprocessHandler("claude")
 //                             (back-compat default)
@@ -238,16 +238,16 @@ type Preflighter interface {
 }
 
 // ClaimCWDOptOut is the opt-OUT seam for per-claim ephemeral
-// CWD materialization (Phase 4c). Handlers that don't need a
-// project-shaped working directory — StubHandler in tests,
-// future rule-based handlers that operate purely on coord
-// state — implement this returning false. The daemon skips
-// the (potentially expensive) iter-branch tree walk for
-// them.
+// CWD materialization. Handlers that don't need a project-
+// shaped working directory — StubHandler in tests, future
+// rule-based handlers that operate purely on coord state —
+// implement this returning true. The daemon skips the
+// (potentially expensive) iter-branch tree walk for them.
 //
-// Default (handler doesn't implement the interface) is true:
-// the daemon prepares the ephemeral CWD. SubprocessHandler
-// doesn't implement this — it always wants the CWD.
+// Default (handler doesn't implement the interface) is
+// "needs CWD": the daemon prepares the ephemeral CWD.
+// SubprocessHandler doesn't implement this — it always
+// wants the CWD.
 //
 // "OptOut" naming makes the polarity explicit: returning
 // false skips the materialization. The alternative
@@ -255,16 +255,14 @@ type Preflighter interface {
 // materialization for any new handler that forgot the
 // method, producing confusing "where are my files" failures.
 //
-// DESIGN CHOICE (review fix #9): this is a Go-side interface,
-// not a Bot manifest field. The opt-out is a property of the
-// handler IMPLEMENTATION (does the handler use its CWD or
-// not?), not of the operator's choice — a stub handler can
-// never sensibly want a CWD, regardless of how the operator
-// configured the bot. A manifest field would let operators
-// override the handler's intent, which is rarely what they
-// want and easy to misconfigure. If a real use case for
-// operator-side override appears, add a manifest field that
-// takes precedence over this interface assertion.
+// Why a Go-side interface and not a manifest field: the
+// opt-out is a property of the handler IMPLEMENTATION (does
+// the handler use its CWD or not?), not of the operator's
+// choice — a stub handler can never sensibly want a CWD,
+// regardless of how the operator configured the bot. A
+// manifest field would let operators override the handler's
+// intent, which is rarely what they want and easy to
+// misconfigure.
 type ClaimCWDOptOut interface {
 	SkipClaimCWD() bool
 }

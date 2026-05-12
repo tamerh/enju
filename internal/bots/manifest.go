@@ -173,21 +173,18 @@ type Bot struct {
 	// HandlerArgs are operator-defined values referenceable from
 	// Bot.Args via {{handler_args.<key>}} substitution.
 	//
-	// SEMANTIC SHIFT 4b → 4b-r1: pre-r1, HandlerArgs auto-
-	// translated to `--<key> <value>` flags appended to argv.
-	// Post-r1, that auto-translation is GONE — handler_args is
-	// substitution data only. Operators who want flags
-	// reference the keys explicitly in `args:`:
+	// Operators who want flags reference the keys explicitly in
+	// `args:`:
 	//
 	//   args:
 	//     - "--effort={{handler_args.effort}}"
 	//   handler_args:
 	//     effort: high
 	//
-	// The change happened pre-launch (no installed-base manifests
-	// existed under the auto-translate semantic) so there's no
-	// migration burden, but readers tracing the field's history
-	// should know the two semantics existed. Review fix #4.
+	// There is no enju-side auto-translation from map keys to
+	// argv flags — the operator's `args:` template is the only
+	// place that decides if/where each entry lands in the
+	// spawned command line.
 	//
 	// Workflow YAML:
 	//   handler_args:
@@ -630,11 +627,10 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	// StateDirRoot (.enju/) is the umbrella that transitively
 	// covers .enju/bots/, .enju/runs/, .enju/scratch/, and any
 	// future runtime-cache sibling. The standalone enju/bots/
-	// entry would be redundant after the Phase 4a path rename
-	// (BotsRuntimeDir = .enju/bots) and we skip it. BotPushTargetDir
-	// stays a separate entry — it lives at enju/.bare.git/ (under
-	// the VISIBLE enju/) for historical reasons; Phase 8 may move
-	// it under StateDirRoot too, at which point this also collapses.
+	// entry would be redundant since BotsRuntimeDir is now
+	// rooted under .enju/, so we skip it. BotPushTargetDir
+	// stays a separate entry — it lives at enju/.bare.git/
+	// (under the visible enju/) for historical reasons.
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
 		corelayout.BotPushTargetDir + "/",
 		corelayout.StateDirRoot + "/",

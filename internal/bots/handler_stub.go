@@ -51,11 +51,11 @@ func NewStubHandler() *StubHandler {
 }
 
 // SkipClaimCWD opts out of the per-claim ephemeral CWD
-// materialization (Phase 4c). Stub handlers don't read the
-// project tree from their working directory — they return
-// canned responses regardless. Materializing a fresh tree per
-// claim for them would be pure overhead, especially across the
-// many tests that spawn stub-handler bot daemons.
+// materialization. Stub handlers don't read the project tree
+// from their working directory — they return canned responses
+// regardless. Materializing a fresh tree per claim for them
+// would be pure overhead, especially across the many tests
+// that spawn stub-handler bot daemons.
 func (s *StubHandler) SkipClaimCWD() bool { return true }
 
 func (s *StubHandler) ProcessTask(ctx context.Context, in HandlerInput) (HandlerOutput, error) {

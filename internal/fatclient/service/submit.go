@@ -79,6 +79,18 @@ type SubmitParams struct {
 	// answer-task also rely on the worktree-update side
 	// effect so the next task's exec finds the script.
 	UsePlumbing bool
+
+	// ScratchDir, when non-empty, is the per-claim ephemeral
+	// CWD the LLM handler wrote into (P4c — typically
+	// <project>/.enju/scratch/<bot>/<task-iter>/). Phase 4d.2
+	// uses it as the stat target for untracked-artifact
+	// verification: declared track:false artifacts must
+	// EXIST somewhere the submit can see, and post-P4d the
+	// persistent worktree doesn't have them — the daemon
+	// stops copying. Empty value falls back to the
+	// workspace's worktree (pre-P4d behavior, MCP-side
+	// submits where the operator wrote into the worktree).
+	ScratchDir string
 }
 
 // SubmitResult bundles the data the formatter and downstream
@@ -585,12 +597,23 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 	// didn't write it" was the data-loss bug fixed here. Sorted
 	// for deterministic ordering across reportBody, the trailer,
 	// and any retry that re-prepares the same submit.
+	//
+	// Stat target — Phase 4d.2:
+	//   • params.ScratchDir set (bot daemon, post-P4c) →
+	//     verify against the ephemeral CWD where the LLM
+	//     handler wrote the file. No worktree copy needed.
+	//   • Empty (MCP-side, operator's flow) → fall back to
+	//     the workspace's worktree.
+	statRoot := wf.WorkDir()
+	if params.ScratchDir != "" {
+		statRoot = params.ScratchDir
+	}
 	untrackedPaths := append([]string(nil), params.UntrackedArtifacts...)
 	sort.Strings(untrackedPaths)
 	if len(untrackedPaths) > 0 {
 		var missing []string
 		for _, p := range untrackedPaths {
-			if _, statErr := os.Stat(filepath.Join(wf.WorkDir(), enjugit.ArtifactPath(p))); statErr != nil {
+			if _, statErr := os.Stat(filepath.Join(statRoot, enjugit.ArtifactPath(p))); statErr != nil {
 				missing = append(missing, p)
 			}
 		}

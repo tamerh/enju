@@ -861,6 +861,13 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		// update the persistent worktree. Concurrent claims in
 		// one daemon won't serialize on a worktree this way.
 		UsePlumbing: true,
+		// Phase 4d.2: untracked-artifact stat verifies against
+		// the ephemeral CWD (where the LLM actually wrote)
+		// rather than the persistent worktree. Empty when
+		// PrepareLLMClaimCWD didn't fire (stub handler) —
+		// submit falls back to worktree stat, matching pre-
+		// P4d behavior for that case.
+		ScratchDir: claimCWD,
 	}
 
 	// Honor the task's writes_artifacts declaration. Expand the
@@ -888,23 +895,20 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		if len(missing) > 0 {
 			return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", strings.Join(missing, ", "))
 		}
-		// Tracked / untracked split — review fix #5:
+		// Tracked / untracked split:
 		// Tracked files: read content from handlerCWD into
 		// params.Artifacts; the commit picks them up via the
 		// content path (no worktree dependency for the bytes).
-		// Untracked files: get copied from handlerCWD → the
-		// persistent worktree so the submit-side stat finds
-		// them (the path lives in the worktree's bigfiles dir,
-		// kept out of git by the managed .gitignore block).
-		// Both end at the commit; the routes differ because
-		// untracked is verified via stat, tracked is verified
-		// via content. P4d switches submit to plumb-from-CWD
-		// and drops the copy step.
+		// Untracked files: paths only — Phase 4d.2 routes the
+		// submit-side stat to handlerCWD via params.ScratchDir,
+		// so untracked artifacts don't need to be copied to
+		// the persistent worktree first. Both end at the
+		// commit; verification differs (tracked via content,
+		// untracked via stat-at-CWD).
 		artifactContents := make(map[string]string)
 		var untrackedPaths []string
 		for _, e := range expanded {
 			if e.Track {
-				// Tracked path: content goes through params.Artifacts.
 				body, rerr := os.ReadFile(filepath.Join(handlerCWD, e.Path))
 				if rerr != nil {
 					return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", e.Path)
@@ -912,15 +916,8 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 				artifactContents[e.Path] = string(body)
 				continue
 			}
-			// Untracked path: stat-verified at submit, so copy
-			// from ephemeral CWD to persistent worktree when
-			// they differ. Skip the copy when the two paths
-			// coincide (legacy single-dir flow).
-			if claimCWD != "" && claimCWD != workspacePath {
-				if cperr := copyFileForSubmit(filepath.Join(handlerCWD, e.Path), filepath.Join(workspacePath, e.Path)); cperr != nil {
-					return fmt.Errorf("copy untracked artifact %s to worktree: %w", e.Path, cperr)
-				}
-			}
+			// Untracked: name-only. submit-side stat reads from
+			// claimCWD when params.ScratchDir is set (above).
 			untrackedPaths = append(untrackedPaths, e.Path)
 		}
 		if len(artifactContents) > 0 {
@@ -1000,43 +997,10 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	return nil
 }
 
-// copyFileForSubmit copies a single regular file from src to
-// dst, creating the destination's parent dir if missing. Used
-// to mirror untracked writes_artifacts from the ephemeral CWD
-// into the persistent worktree so the submit path's stat-
-// based check finds them (Phase 4c → P4d will eliminate the
-// copy when submit goes plumbing-only).
-//
-// Preserves the source file's mode bits so executable
-// scripts stay executable.
-//
-// Defensive against directory paths (review item #1):
-// ExpandAgainstWorkdir today returns regular files only — it
-// walks dir-shaped declarations and emits per-file entries —
-// but the explicit check here keeps a future expander change
-// from triggering an opaque EISDIR on os.ReadFile. A dir or
-// non-regular file reaching this helper fails loud with a
-// clear message rather than later in the read.
-func copyFileForSubmit(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return fmt.Errorf("copy untracked artifact: source is a directory, not a file: %s", src)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("copy untracked artifact: source is not a regular file (mode %v): %s", info.Mode(), src)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	body, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, body, info.Mode().Perm())
-}
+// (copyFileForSubmit removed in P4d.2 — untracked-artifact
+// stat now reads from the ephemeral CWD via SubmitParams.
+// ScratchDir, so mirroring files to the persistent worktree
+// before submit is no longer needed.)
 
 // ReleaseActiveClaim hands a claimed-but-not-submitted task back
 // to the queue. Called from Run's deferred path so a Ctrl-C

@@ -478,16 +478,12 @@ func mergeHandlerArgs(botArgs, taskArgs map[string]string) map[string]string {
 	return out
 }
 
-// (handlerArgsToArgv removed — Phase 4b-r1.)
-//
-// The previous design auto-translated HandlerArgs to "--key value"
-// argv slots. That was an enju-side convention layered on top of
-// what the operator wrote, and the review noted the asymmetry:
-// some keys made sense as flags (max-turns), others didn't, and
-// the convention forced operators to either accept it or work
-// around it. The new design exposes handler_args as substitution
-// values ({{handler_args.<key>}}) so operators decide if and
-// where each entry lands in argv.
+// (handlerArgsToArgv was the auto-translation of HandlerArgs
+// to "--key value" argv slots that this package used briefly.
+// It's gone now: handler_args is substitution data only, exposed
+// via {{handler_args.<key>}} references inside Bot.Args. The
+// operator decides if and where each entry lands in argv —
+// no enju-side convention layered on top.)
 
 // buildSubprocessEnv assembles the env slice passed to the
 // subprocess. Inherits the daemon's env (so PATH, HOME,
@@ -518,9 +514,8 @@ func mergeHandlerArgs(botArgs, taskArgs map[string]string) map[string]string {
 //   - ENJU_BRANCH          this run's branch name
 //   - ENJU_SCRATCH         writable workspace (CWD)
 //   - ENJU_REVIEW_FEEDBACK reviewer prose on iter > 1
-//   - ENJU_MODEL           bot's model id (added Phase 4b-r1)
+//   - ENJU_MODEL           bot's model id
 //   - ENJU_ALLOWED_TOOLS   comma-joined MCP tool allowlist
-//                           (added Phase 4b-r1)
 func buildSubprocessEnv(h *SubprocessHandler, in HandlerInput) []string {
 	env := osEnviron()
 	if in.TaskID != "" {
@@ -542,11 +537,10 @@ func buildSubprocessEnv(h *SubprocessHandler, in HandlerInput) []string {
 		env = append(env, "ENJU_BRANCH="+in.Branch)
 	}
 	if in.Workspace != "" {
-		// ENJU_SCRATCH points at the writable CWD. Pre-P4c
-		// this IS the bot's persistent worktree; P4c switches
-		// it to the ephemeral per-claim dir under
-		// .enju/scratch/<bot>/<task-iter>/. Env-var name stays
-		// the same so handlers don't have to migrate.
+		// ENJU_SCRATCH points at the writable CWD — the
+		// ephemeral per-claim dir under
+		// .enju/scratch/<bot>/<task-iter>/. The handler
+		// uses this as its working directory.
 		env = append(env, "ENJU_SCRATCH="+in.Workspace)
 	}
 	if in.ReviewFeedback != "" {
@@ -566,7 +560,7 @@ func buildSubprocessEnv(h *SubprocessHandler, in HandlerInput) []string {
 // osEnviron is a seam for tests that want to control the
 // inherited env. Production: os.Environ(). Tests override via
 // setTestEnviron, which also installs the t.Cleanup to restore
-// the previous value — review fix R4 (the prior raw mutable
+// the previous value (the prior raw mutable
 // package var risked test cross-poisoning if a caller forgot to
 // reset).
 func osEnviron() []string {
@@ -584,9 +578,10 @@ var testEnviron func() []string
 
 // setTestEnviron installs a test-scoped osEnviron source and
 // registers the t.Cleanup that restores the previous value at
-// the end of the current test. Encodes the discipline the
-// review (R4) flagged: any direct mutation of the package var
-// risked poisoning later tests in the same package.
+// the end of the current test. Encodes the discipline that
+// any direct mutation of the package var risks poisoning
+// later tests in the same package — every caller goes through
+// this helper so the restore is automatic.
 //
 // Use:
 //
