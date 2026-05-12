@@ -207,6 +207,88 @@ func Load(projectRoot string) (*Manifest, error) {
 	return &m, nil
 }
 
+// FromInlineNode parses a `bots:` block embedded in a workflow
+// YAML's Run struct (per-run-snapshot redesign Phase 7) into a
+// Manifest. The node is the raw yamlv3.Node captured by
+// internal/common/yaml.Run.Bots; an absent or empty block is a
+// no-op and returns (nil, nil) so callers can chain
+// FromInlineNode → fall-back-to-Load without special casing.
+//
+// Inline blocks accept the same shape as the standalone
+// enju/bots.yaml file's `bots:` list (without the top-level
+// `version:` or `project_id:` keys — those belong to the
+// stand-alone manifest's wrapper). The block is a YAML sequence
+// of Bot entries; FromInlineNode wraps it in a Manifest{Bots:
+// ...} and runs the same expand-resolve-validate pipeline Load
+// uses, so inline + stand-alone produce byte-identical
+// Manifests for the same content.
+//
+// Errors: malformed inline content surfaces with a clear
+// "inline bots:" prefix so a typo in the workflow file
+// doesn't get attributed to the legacy bots.yaml.
+func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
+	// Zero-value Node (no `bots:` key in the workflow YAML) →
+	// no inline manifest. Kind==0 is the unset state.
+	if node.Kind == 0 {
+		return nil, nil
+	}
+	// Empty sequence (`bots: []`) → explicit "no bots". Same
+	// outcome as a missing block for caller purposes; surface
+	// as nil so the legacy bots.yaml fallback still fires. An
+	// author who wants to EXPLICITLY suppress bots can leave
+	// the block out.
+	if node.Kind == yamlv3.SequenceNode && len(node.Content) == 0 {
+		return nil, nil
+	}
+	var bots []Bot
+	if err := node.Decode(&bots); err != nil {
+		return nil, fmt.Errorf("parsing inline bots: %w", err)
+	}
+	m := &Manifest{
+		// Version defaults to 1 (the only known schema) — the
+		// inline form intentionally has no `version:` knob since
+		// the workflow YAML carries its own version on the Run
+		// struct. Validate still gates against unsupported
+		// versions when the legacy file path is used.
+		Version: 1,
+		Bots:    bots,
+	}
+	if err := m.expandReplicas(); err != nil {
+		return nil, fmt.Errorf("inline bots: %w", err)
+	}
+	if err := m.Resolve(); err != nil {
+		return nil, fmt.Errorf("inline bots: %w", err)
+	}
+	if err := m.Validate(); err != nil {
+		return nil, fmt.Errorf("inline bots: %w", err)
+	}
+	return m, nil
+}
+
+// LoadPreferringInline resolves the effective bot manifest for a
+// project: inline bots in the workflow YAML take precedence over
+// the legacy enju/bots.yaml file.
+//
+// Both sources return (nil, nil) when empty/absent — callers
+// can treat (nil, nil) as "this project has no bots" without
+// distinguishing where they didn't come from.
+//
+// Wiring note (Phase 7): today's `enju bot run` calls Load
+// directly with no workflow context, so inline bots aren't yet
+// consulted from the daemon's entry point. This helper is the
+// integration seam for whichever future CLI surface
+// (`enju go path/to/workflow.yaml`, or `enju bot run
+// --workflow=...`) starts threading workflow YAML through to
+// the daemon.
+func LoadPreferringInline(projectRoot string, inline yamlv3.Node) (*Manifest, error) {
+	if m, err := FromInlineNode(inline); err != nil {
+		return nil, err
+	} else if m != nil {
+		return m, nil
+	}
+	return Load(projectRoot)
+}
+
 // botReplicasCap bounds the number of synthetic entries a single
 // `replicas: N` field can spawn. The cap exists to make typo'd
 // configs (replicas: 1000 from a fat finger or a unit confusion)

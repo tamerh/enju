@@ -38,6 +38,28 @@ type Run struct {
 	// commit. Optional — templates that don't care use the
 	// project default.
 	BaseBranch   string                 `yaml:"base_branch,omitempty"`
+	// Bots is the per-run-snapshot-redesign Phase 7 inline bot
+	// roster. Same schema as the stand-alone enju/bots.yaml
+	// manifest, embedded directly in the workflow YAML so a
+	// single file can carry the whole pipeline + its bot fleet.
+	//
+	// Stored as a raw yamlv3.Node here to avoid an import cycle:
+	// the internal/bots package depends on common/yaml, so the
+	// concrete Manifest type can't live here. Callers that need
+	// the parsed Manifest invoke bots.FromInlineNode(run.Bots)
+	// after the yaml.Run is loaded. An empty / absent block
+	// leaves Bots.Kind == 0 (zero-value yamlv3.Node), which
+	// FromInlineNode treats as "no inline bots, fall back to
+	// the legacy enju/bots.yaml file".
+	//
+	// Wiring status: Phase 7 lands the parser + conversion path
+	// only. The bot-start CLI (`enju bot run`) still reads from
+	// enju/bots.yaml directly today; a follow-up will teach it
+	// to accept a workflow YAML and prefer its inline bots.
+	// Until then, inline declarations parse cleanly but don't
+	// drive the daemon — keep both forms in sync if you author
+	// inline bots before the CLI catches up.
+	Bots         yamlv3.Node            `yaml:"bots,omitempty"`
 	Params       []ParamDef             `yaml:"params,omitempty"` // top-level run params, substituted into {{param}} refs at submission
 	ForEach      ForEachMap             `yaml:"for_each,omitempty"`
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`

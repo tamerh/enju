@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	yamlv3 "gopkg.in/yaml.v3"
 )
 
 // helper: write enju/bots.yaml inside a fresh temp project dir
@@ -595,5 +597,227 @@ func TestByName(t *testing.T) {
 	var nilMan *Manifest
 	if got := nilMan.ByName("x"); got != nil {
 		t.Errorf("ByName on nil manifest: got %+v, want nil", got)
+	}
+}
+
+// inlineNode parses a YAML fragment as a sequence of Bot
+// entries and returns the resulting yamlv3.Node — the same
+// shape captured by yaml.Run.Bots when a workflow YAML carries
+// an inline `bots:` block.
+func inlineNode(t *testing.T, body string) yamlv3.Node {
+	t.Helper()
+	var wrapper struct {
+		Bots yamlv3.Node `yaml:"bots"`
+	}
+	if err := yamlv3.Unmarshal([]byte(body), &wrapper); err != nil {
+		t.Fatalf("parsing test inline fragment: %v", err)
+	}
+	return wrapper.Bots
+}
+
+// TestFromInlineNode_AbsentBlock pins the zero-value Node
+// shape: when a workflow YAML has no `bots:` key, the Run
+// struct's Bots field is the empty yamlv3.Node (Kind==0).
+// FromInlineNode must return (nil, nil) so callers can chain
+// to the legacy Load path without special casing.
+func TestFromInlineNode_AbsentBlock(t *testing.T) {
+	var empty yamlv3.Node // Kind == 0
+	m, err := FromInlineNode(empty)
+	if err != nil {
+		t.Errorf("absent block should be silent, got: %v", err)
+	}
+	if m != nil {
+		t.Errorf("absent block should return nil Manifest, got %+v", m)
+	}
+}
+
+// TestFromInlineNode_EmptySequence pins the explicit empty
+// shape (`bots: []`): same outcome as absent — fall back to
+// legacy file. Authors who want to actively suppress bots
+// should leave the block out entirely; an explicit empty list
+// is treated as "no inline" for forward-compat.
+func TestFromInlineNode_EmptySequence(t *testing.T) {
+	node := inlineNode(t, "bots: []\n")
+	m, err := FromInlineNode(node)
+	if err != nil {
+		t.Errorf("empty sequence should be silent, got: %v", err)
+	}
+	if m != nil {
+		t.Errorf("empty sequence should return nil Manifest, got %+v", m)
+	}
+}
+
+// TestFromInlineNode_RoundTripsWithStandalone verifies that an
+// inline block produces a byte-identical Manifest to the
+// standalone enju/bots.yaml form for the same content. This
+// is the core integration test for Phase 7's "same schema, two
+// locations" promise — if the produced Manifests diverge,
+// existing daemon code that reads Manifest.Bots won't behave
+// the same across the two authoring paths.
+func TestFromInlineNode_RoundTripsWithStandalone(t *testing.T) {
+	body := `
+bots:
+  - name: reviewer
+    model: claude-sonnet-4-6
+    handler: claude
+  - name: summarizer
+    model: claude-haiku-4-5
+    handler: claude
+`
+	inlineM, err := FromInlineNode(inlineNode(t, body))
+	if err != nil {
+		t.Fatalf("FromInlineNode: %v", err)
+	}
+	if inlineM == nil {
+		t.Fatal("inline manifest unexpectedly nil")
+	}
+
+	// Stand-alone equivalent — wrap the same list in the
+	// top-level Manifest shape and feed it through Load.
+	root := writeManifest(t, "version: 1\n"+body)
+	standaloneM, err := Load(root)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if standaloneM == nil {
+		t.Fatal("standalone manifest unexpectedly nil")
+	}
+
+	if len(inlineM.Bots) != len(standaloneM.Bots) {
+		t.Fatalf("bot count mismatch: inline=%d standalone=%d", len(inlineM.Bots), len(standaloneM.Bots))
+	}
+	for i := range inlineM.Bots {
+		if inlineM.Bots[i].Name != standaloneM.Bots[i].Name ||
+			inlineM.Bots[i].Model != standaloneM.Bots[i].Model ||
+			inlineM.Bots[i].Handler != standaloneM.Bots[i].Handler ||
+			inlineM.Bots[i].SystemPrompt != standaloneM.Bots[i].SystemPrompt ||
+			inlineM.Bots[i].Credentials != standaloneM.Bots[i].Credentials {
+			t.Errorf("bots[%d] mismatch:\n inline:     %+v\n standalone: %+v",
+				i, inlineM.Bots[i], standaloneM.Bots[i])
+		}
+	}
+}
+
+// TestFromInlineNode_RunsResolveAndValidate makes sure the
+// inline path goes through the same expand-resolve-validate
+// pipeline as Load. An invalid bot in the inline block must
+// surface a validation error (with an "inline bots:" prefix
+// so it's attributable), not produce a silently-bad Manifest.
+func TestFromInlineNode_RunsResolveAndValidate(t *testing.T) {
+	// Missing model on a claude-handler bot fails Validate.
+	body := `
+bots:
+  - name: broken
+    handler: claude
+`
+	_, err := FromInlineNode(inlineNode(t, body))
+	if err == nil {
+		t.Fatal("expected validation error for claude bot with no model")
+	}
+	if !strings.Contains(err.Error(), "inline bots:") {
+		t.Errorf("error should be attributed to inline bots, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "model is required") {
+		t.Errorf("error should mention model requirement, got: %v", err)
+	}
+}
+
+// TestFromInlineNode_ExpandsReplicas pins that inline blocks
+// honor the `replicas: N` expansion the same way the standalone
+// file does. Three replicas of one entry → three Bot entries
+// with suffixed names.
+func TestFromInlineNode_ExpandsReplicas(t *testing.T) {
+	body := `
+bots:
+  - name: dev
+    model: claude-sonnet-4-6
+    handler: claude
+    replicas: 3
+`
+	m, err := FromInlineNode(inlineNode(t, body))
+	if err != nil {
+		t.Fatalf("FromInlineNode: %v", err)
+	}
+	if len(m.Bots) != 3 {
+		t.Fatalf("expected 3 expanded replicas, got %d (%+v)", len(m.Bots), m.Bots)
+	}
+	wantNames := []string{"dev-1", "dev-2", "dev-3"}
+	for i, want := range wantNames {
+		if m.Bots[i].Name != want {
+			t.Errorf("Bots[%d].Name = %q, want %q", i, m.Bots[i].Name, want)
+		}
+	}
+}
+
+// TestLoadPreferringInline_InlineWinsOverFile pins the
+// precedence rule: when both inline and stand-alone manifests
+// are present, inline takes precedence. The transition from
+// stand-alone to inline must be opt-in — once an author adds
+// inline bots, the legacy file becomes shadowed.
+func TestLoadPreferringInline_InlineWinsOverFile(t *testing.T) {
+	root := writeManifest(t, `
+version: 1
+bots:
+  - name: from-file
+    model: claude-haiku-4-5
+    handler: claude
+`)
+	inlineBody := `
+bots:
+  - name: from-inline
+    model: claude-sonnet-4-6
+    handler: claude
+`
+	m, err := LoadPreferringInline(root, inlineNode(t, inlineBody))
+	if err != nil {
+		t.Fatalf("LoadPreferringInline: %v", err)
+	}
+	if m == nil || len(m.Bots) != 1 {
+		t.Fatalf("expected single bot from inline source, got %+v", m)
+	}
+	if m.Bots[0].Name != "from-inline" {
+		t.Errorf("inline should have won; got bot %q", m.Bots[0].Name)
+	}
+}
+
+// TestLoadPreferringInline_FallsBackToFile pins the
+// transition behavior: when inline is absent, the legacy
+// enju/bots.yaml is read. Without this fallback, every
+// existing project authoring stand-alone bots would silently
+// lose its roster once the schema acquires the inline knob.
+func TestLoadPreferringInline_FallsBackToFile(t *testing.T) {
+	root := writeManifest(t, `
+version: 1
+bots:
+  - name: legacy-bot
+    model: claude-haiku-4-5
+    handler: claude
+`)
+	var empty yamlv3.Node // no inline block
+	m, err := LoadPreferringInline(root, empty)
+	if err != nil {
+		t.Fatalf("LoadPreferringInline: %v", err)
+	}
+	if m == nil || len(m.Bots) != 1 {
+		t.Fatalf("expected single bot from legacy file, got %+v", m)
+	}
+	if m.Bots[0].Name != "legacy-bot" {
+		t.Errorf("fallback should have surfaced legacy bot, got %q", m.Bots[0].Name)
+	}
+}
+
+// TestLoadPreferringInline_BothEmptyReturnsNil pins the
+// no-bots-anywhere case: a project that authors neither
+// inline nor a stand-alone file returns (nil, nil) so the
+// daemon can treat "no bots" uniformly.
+func TestLoadPreferringInline_BothEmptyReturnsNil(t *testing.T) {
+	root := t.TempDir()
+	var empty yamlv3.Node
+	m, err := LoadPreferringInline(root, empty)
+	if err != nil {
+		t.Errorf("both empty should be silent, got: %v", err)
+	}
+	if m != nil {
+		t.Errorf("expected nil Manifest, got %+v", m)
 	}
 }
