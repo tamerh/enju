@@ -656,13 +656,11 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	// pull leaves HEAD on the run branch — exactly the wrong
 	// place for a revision, since the LLM should start from
 	// iter-1's tree (where the reviewer's feedback applies),
-	// not from the run-branch tip. Switch to the topic branch
-	// FIRST so the subsequent ResetBotCloneToCleanState lands
-	// the worktree on iter-1's state. Without this, the LLM
-	// runs against the wrong base, writes new files (often with
-	// non-deterministic filenames), and the submit-time
-	// CheckoutBranchFrom blows up with "worktree contains
-	// unstaged changes" because index ↔ worktree don't match.
+	// not from the run-branch tip. Updating the topic-branch
+	// tip here ensures the subsequent ephemeral-CWD materialize
+	// lands on iter-1's state. Without this, the LLM runs
+	// against the wrong base and writes outputs that wouldn't
+	// form a coherent revision on top of iter-1.
 	if meta.IterSeq > 1 && meta.IterationBranch != "" {
 		// For review tasks, the new iter-N topic must fork from
 		// the upstream's topic (which carries the developer's
@@ -987,10 +985,11 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	return nil
 }
 
-// (copyFileForSubmit removed in P4d.2 — untracked-artifact
-// stat now reads from the ephemeral CWD via SubmitParams.
-// ScratchDir, so mirroring files to the persistent worktree
-// before submit is no longer needed.)
+// (copyFileForSubmit was removed when the untracked-artifact
+// stat moved to the ephemeral CWD — submit reads file
+// presence from SubmitParams.ScratchDir directly, so
+// mirroring files to the persistent worktree before submit
+// is no longer needed.)
 
 // ReleaseActiveClaim hands a claimed-but-not-submitted task back
 // to the queue. Called from Run's deferred path so a Ctrl-C

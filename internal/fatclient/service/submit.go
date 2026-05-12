@@ -64,11 +64,11 @@ type SubmitParams struct {
 	// UsePlumbing routes the commit through the plumbing
 	// variant (SubmitComputeTaskResult — direct object/ref
 	// writes, no checkout, no worktree mutation) instead of
-	// the worktree-based porcelain path. Phase 4d.
+	// the worktree-based porcelain path.
 	//
 	// Set true by bot daemons: the LLM already wrote its
-	// outputs to an ephemeral per-claim CWD (P4c); the
-	// daemon doesn't need the worktree updated post-submit.
+	// outputs to an ephemeral per-claim CWD; the daemon
+	// doesn't need the worktree updated post-submit.
 	// Plumbing-mode also unblocks future concurrent claims
 	// within one bot daemon (worktree contention disappears).
 	//
@@ -78,6 +78,13 @@ type SubmitParams struct {
 	// Inline-YAML flows that bootstrap scripts via an
 	// answer-task also rely on the worktree-update side
 	// effect so the next task's exec finds the script.
+	//
+	// Two callers diverging on a bool is workable today (bot
+	// daemon: true; MCP: false). If a third call site needs
+	// a third behavior (a webui submit, a future enju-cli
+	// path, etc.), promote this to an enum or a strategy
+	// interface — the bool can't carry three states without
+	// implicit coupling.
 	UsePlumbing bool
 
 	// ScratchDir, when non-empty, is the per-claim ephemeral
@@ -428,6 +435,19 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		if msg := ValidateVoteOption(option, meta.VoteOptionsJSON); msg != "" {
 			return nil, fmt.Errorf("%s", msg)
 		}
+	}
+
+	// Plumbing-mode invariant: the underlying SubmitComputeTaskResult
+	// requires RunBranch to be non-empty (it's the resolve-base
+	// fallback when the topic branch has no local ref yet). The
+	// porcelain path tolerated empty RunBranch via a wider fallback
+	// set; plumbing is stricter. Validate at submit-entry so a
+	// caller who set UsePlumbing=true without a Branch on Meta
+	// fails loud here rather than mid-commit. The downstream call
+	// site (after this prep returns) uses prep.Meta.Branch as the
+	// runBranchForPlumbing fallback when baseBranch is empty.
+	if params.UsePlumbing && (meta == nil || meta.Branch == "") {
+		return nil, fmt.Errorf("UsePlumbing=true requires meta.Branch to be non-empty (the plumbing commit's resolve-base anchor)")
 	}
 
 	wf, _, _, _, err := s.OpenWorkflow(ctx, meta.ProjectID)
