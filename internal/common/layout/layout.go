@@ -28,6 +28,21 @@ import (
 // easy to read, not a ls -a discovery.
 const ResultDirRoot = "enju"
 
+// StateDirRoot is the hidden, gitignored top-level directory
+// holding per-run runtime state that is NOT committed: the
+// on-disk materialization of each run's frozen tree (see
+// RunSnapshotOnDiskDir), per-task scratch dirs, and similar
+// transient artifacts.
+//
+// The spec's "everything Enju" home is the visible enju/ dir
+// for committed audit trail and the hidden .enju/ dir for
+// runtime caches. Per the per-run-snapshot redesign, scripts
+// read the frozen repo tree from .enju/runs/<seq>-<slug>/snapshot/
+// at execute time instead of materializing per-task. The
+// directory is purely a cache — wipe and re-materialize is
+// always safe.
+const StateDirRoot = ".enju"
+
 // DefaultTemplatesDir is the built-in location template bundles
 // live when no enju/conf.yaml override is present. Unified under
 // ResultDirRoot so "everything Enju" lives under one visible
@@ -164,8 +179,36 @@ const TemplateSnapshotDirName = "template-snapshot"
 // themselves; keeps the snapshot naming rule in one place.
 // Empty slug falls back to "run" so the path is always
 // well-formed even for a run with no name or template.
+//
+// This is the IN-GIT path — where the bundle is committed under
+// the run branch. Distinct from RunSnapshotOnDiskDir, which is
+// the on-disk cache directory the materialized snapshot lives
+// at while a run is executing.
 func RunTemplateSnapshotDir(runSeq int, slug string) string {
 	return filepath.Join(RunDir(runSeq, slug), TemplateSnapshotDirName)
+}
+
+// RunSnapshotOnDiskDir returns the on-disk cache location where
+// a run's frozen tree gets materialized at create_run time.
+// Scripts read everything from here: the in-git template
+// snapshot, repo files at the run's base SHA, anything in the
+// run branch's tree. Lives under StateDirRoot (.enju/) so the
+// user-owned enju/ visible dir stays curated for audit trail
+// only.
+//
+// One snapshot per run, shared by every task in that run. The
+// run-completion sweep `rm -rf`s this directory; the operator's
+// .git/ retains the run branch + outputs forever as the
+// authoritative artifact trail.
+//
+// Empty slug falls back to "run" via RunDir's normalization so
+// the path is always well-formed.
+func RunSnapshotOnDiskDir(runSeq int, slug string) string {
+	s := slug
+	if s == "" {
+		s = "run"
+	}
+	return filepath.Join(StateDirRoot, "runs", fmt.Sprintf("%d-%s", runSeq, s), "snapshot")
 }
 
 // RunDir renders the per-run root segment

@@ -181,14 +181,14 @@ func TestBuildComputeEnvHonorsTaskScratchDir(t *testing.T) {
 	meta := &TaskMeta{}
 
 	envWith := buildComputeEnv("1:1:fetch",
-		"/some/work", "enju/runs/1/fetch", "", "",
+		"/some/work", "enju/runs/1/fetch", "", "", "",
 		"/scratch/abc-iter-1", meta)
 	if !containsEnv(envWith, "ENJU_TASK_DIR=/scratch/abc-iter-1") {
 		t.Errorf("ENJU_TASK_DIR missing or wrong: %v", envWith)
 	}
 
 	envWithout := buildComputeEnv("1:1:fetch",
-		"/some/work", "enju/runs/1/fetch", "", "",
+		"/some/work", "enju/runs/1/fetch", "", "", "",
 		"", meta)
 	for _, e := range envWithout {
 		if strings.HasPrefix(e, "ENJU_TASK_DIR=") {

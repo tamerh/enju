@@ -337,6 +337,100 @@ func TestCommitArbitraryFiles_WorktreePathLosesSnapshotsUnderConcurrency(t *test
 	}
 }
 
+// TestMaterializeRunRepo_WholeTreeIncludingBaseAndTemplate pins
+// the per-run-snapshot redesign's read-side contract: one call
+// materializes the whole tree at the run branch's tip — BOTH
+// the in-git template snapshot AND the repo content the run was
+// cut from. Scripts thus get a single coherent on-disk view via
+// $ENJU_REPO_DIR; sibling reads against the original repo at the
+// run's base SHA work without per-task materialization.
+//
+// Setup:
+//   - bare with main containing src/lib.go (seeded by
+//     initBareForWorkspaceTest).
+//   - run branch "run-snap" forked from main.
+//   - template snapshot landed under run-snap via plumbing.
+//
+// Assertion:
+//   - MaterializeRunRepo produces both src/lib.go (base content)
+//     and the template-snapshot subdir's files at the right
+//     relative paths under the target dir.
+//   - Operator's working tree is untouched (read came from
+//     .git/objects/, not a checkout).
+func TestMaterializeRunRepo_WholeTreeIncludingBaseAndTemplate(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wf, err := ws.ForProject(202, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+	// Seed a recognizable base-tree file on main, so the
+	// materialized tree's "non-template" content has something to
+	// match against.
+	if _, err := wf.CommitArbitraryFilesPlumbing(CommitArbitraryFilesRequest{
+		Files: []FileWrite{
+			{RepoRelPath: "src/lib.go", Content: []byte("package lib\n// v1\n")},
+		},
+		Branch:  "main",
+		Subject: "Seed src/lib.go",
+	}); err != nil {
+		t.Fatalf("seed main: %v", err)
+	}
+	mainSHA, err := wf.LocalBranchHash("main")
+	if err != nil || mainSHA == "" {
+		t.Fatalf("LocalBranchHash main: %v sha=%q", err, mainSHA)
+	}
+	if err := wf.git.CreateBranchAt("run-snap", mainSHA); err != nil {
+		t.Fatalf("CreateBranchAt run-snap: %v", err)
+	}
+	if err := wf.git.Push("run-snap"); err != nil {
+		t.Fatalf("Push run-snap: %v", err)
+	}
+	tmplYAML := []byte("name: snap-test\ntasks:\n  - id: t1\n    action: compute\n    script: ./run.sh\n")
+	tmplScript := []byte("#!/bin/sh\ncat \"$ENJU_REPO_DIR/src/lib.go\"\n")
+	snapshotSubdir := corelayout.RunTemplateSnapshotDir(7, "snap-test")
+	if _, err := wf.CommitArbitraryFilesPlumbing(CommitArbitraryFilesRequest{
+		Files: []FileWrite{
+			{RepoRelPath: filepath.Join(snapshotSubdir, "enju.yaml"), Content: tmplYAML},
+			{RepoRelPath: filepath.Join(snapshotSubdir, "run.sh"), Content: tmplScript, Mode: 0o755},
+		},
+		Branch:  "run-snap",
+		Subject: "Snapshot template into run-snap",
+	}); err != nil {
+		t.Fatalf("plumbing commit template: %v", err)
+	}
+
+	target := filepath.Join(t.TempDir(), "snapshot")
+	n, err := wf.MaterializeRunRepo("run-snap", target)
+	if err != nil {
+		t.Fatalf("MaterializeRunRepo: %v", err)
+	}
+	if n < 3 {
+		t.Errorf("expected at least 3 files materialized (lib + yaml + sh), got %d", n)
+	}
+
+	// Base file at its repo-relative path.
+	if got, err := os.ReadFile(filepath.Join(target, "src", "lib.go")); err != nil {
+		t.Errorf("base file src/lib.go missing: %v", err)
+	} else if string(got) != "package lib\n// v1\n" {
+		t.Errorf("base file content mismatch: %q", got)
+	}
+	// Template snapshot files.
+	if got, err := os.ReadFile(filepath.Join(target, snapshotSubdir, "enju.yaml")); err != nil {
+		t.Errorf("template yaml missing: %v", err)
+	} else if string(got) != string(tmplYAML) {
+		t.Errorf("template yaml mismatch: %q", got)
+	}
+	scriptFull := filepath.Join(target, snapshotSubdir, "run.sh")
+	info, serr := os.Stat(scriptFull)
+	if serr != nil {
+		t.Fatalf("stat materialized run.sh: %v", serr)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("run.sh exec bit lost (mode=%v)", info.Mode())
+	}
+}
+
 // (silence unused-import warnings — sort retained for future
 // use in expanding the parity check above)
 var _ = sort.Strings

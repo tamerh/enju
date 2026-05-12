@@ -23,7 +23,6 @@ import (
 	"strings"
 	"testing"
 
-	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
@@ -135,13 +134,11 @@ func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
 	snapBase := t.TempDir()
 	snap := seedSnapshotTree(t, snapBase)
 
-	// Apply the production-shaped read-only defense before
-	// invoking compute.Run, mirroring what service/execute.go
-	// does on the live path.
-	if err := compute.ChmodSnapshotReadOnly(snap); err != nil {
-		t.Fatalf("ChmodSnapshotReadOnly: %v", err)
-	}
-	t.Cleanup(func() { chmodTreeWritable(t, snap) })
+	// Read-only is convention now (per-run-snapshot redesign);
+	// no chmod step here. The snapshot stays writable on disk —
+	// scripts that target it are buggy and should write to
+	// $ENJU_SCRATCH instead. Container path retains the kernel-
+	// side :ro bind for the strong guarantee inside the sandbox.
 
 	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:siblings_check", 1)
 
@@ -196,91 +193,8 @@ func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
 	}
 }
 
-// TestSnapshotAsCWD_PollutionAttemptFails pins the host-side
-// safety guarantee end-to-end: a script that tries to write to
-// its CWD (the chmod-readonly snapshot) fails with permission
-// denied. The wrapper surfaces this as a non-zero exit code +
-// stderr containing the error. Without the chmod, the script
-// would have silently polluted the snapshot.
-func TestSnapshotAsCWD_PollutionAttemptFails(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("root bypasses POSIX permissions; this safety net is for unprivileged bots")
-	}
-	bare := initBareForComputeTest(t)
-	wsRoot := t.TempDir()
-	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
-
-	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
-	if err != nil {
-		t.Fatalf("NewWorkspace: %v", err)
-	}
-	wf, err := ws.ForProject(202, bare)
-	if err != nil {
-		t.Fatalf("ForProject: %v", err)
-	}
-
-	snapBase := t.TempDir()
-	snap := filepath.Join(snapBase, "snapshot")
-	if err := os.MkdirAll(snap, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Pollution script: tries to write to its CWD via a relative
-	// path. Under the new shape, CWD = snapshot (chmod 0555), so
-	// this should fail. set -e propagates the redirect failure
-	// to the script's exit code; without it, the trailing echo
-	// would mask the failure as exit 0.
-	pollute := `#!/bin/sh
-set -e
-echo "trying pollution"
-echo "oops" > pollution.txt
-echo "if you see this, pollution succeeded"
-`
-	if err := os.WriteFile(filepath.Join(snap, "pollute.sh"), []byte(pollute), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := compute.ChmodSnapshotReadOnly(snap); err != nil {
-		t.Fatalf("ChmodSnapshotReadOnly: %v", err)
-	}
-	t.Cleanup(func() { chmodTreeWritable(t, snap) })
-
-	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:pollute_check", 1)
-
-	spec := compute.Spec{
-		TaskID:          "1:1:pollute_check",
-		ProjectID:       202,
-		RemoteURL:       bare,
-		WorkspaceRoot:   wsRoot,
-		Branch:          "main",
-		IterationBranch: "1-test/pollute_check/iter-1",
-		ResultDir:       "enju/runs/1-test/pollute_check",
-		ScriptPath:      filepath.Join(snap, "pollute.sh"),
-		ScriptLabel:     "pollute.sh",
-		AuthorName:      "alice",
-		AuthorEmail:     "alice@example.com",
-		Username:        "alice",
-		TaskScratchDir:  scratch,
-		SnapshotDir:     snap,
-		// WritesArtifacts intentionally empty — even though the
-		// script tried to write pollution.txt, it's not declared
-		// as an artifact and we wouldn't pick it up anyway.
-		WritesArtifacts: enjuYaml.WriteArtifacts{},
-	}
-
-	res := compute.Run(context.Background(), wf, spec,
-		os.Environ(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	// The script's redirect should fail; the shell exits non-zero
-	// on a failed redirect (with `sh -c` semantics — write error
-	// is fatal at the redirect site).
-	if res.ExitCode == 0 {
-		t.Errorf("expected script to fail when writing to chmod-readonly CWD; "+
-			"got exit=0 stderr=%q", res.Stderr)
-	}
-	// And the snapshot must NOT have a pollution.txt afterward.
-	if _, err := os.Stat(filepath.Join(snap, "pollution.txt")); err == nil {
-		t.Errorf("snapshot got polluted with pollution.txt — chmod defense breached")
-	}
-}
+// Pollution-attempt-fails test was removed alongside the
+// ChmodSnapshotReadOnly helper in the per-run-snapshot redesign.
+// Read-only is convention now (scripts that write to the snapshot
+// are buggy and should target $ENJU_SCRATCH); the kernel-side :ro
+// bind inside the container still gives the strong sandbox guarantee.

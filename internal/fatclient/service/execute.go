@@ -150,50 +150,50 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	workDir := wf.WorkDir()
 	resultDir := meta.ResultDir
 
-	// Resolve the per-task scratch dir (Phase 2.1) early — we
-	// also materialize the run's template snapshot underneath
-	// it so the on-disk read below is decoupled from the shared
-	// operator worktree.
 	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), s.coord.Username(), taskID, meta.IterSeq)
 
-	// Every run — template OR inline — writes its parsed YAML to
-	// the snapshot dir at create_run time. The fatclient reads
-	// per-task execution-policy fields (container image, runtime
-	// selector, env block) from there at execute time so coord
-	// never has to persist or transport fields it doesn't act on.
+	// Per-run-snapshot redesign: a single materialization of the
+	// run branch's whole tree lives at <project>/.enju/runs/<N>/snapshot/
+	// (RunSnapshotOnDiskDir). Every task in the run reads from
+	// there — task defs, scripts, sibling files, and the rest of
+	// the frozen repo via $ENJU_REPO_DIR.
 	//
-	// Materialize the snapshot from the run-branch's commit into
-	// a per-task path (under scratch). Reading from git history
-	// is what makes concurrent create_run safe: the operator
-	// worktree only holds ONE branch's tree at a time, so two
-	// parallel runs' snapshots can't coexist there. Each
-	// execute_run pulls its own run's snapshot from .git/objects
-	// independently.
+	// create_run does the materialization once and the directory
+	// survives until the run sweep. If it's missing at claim time
+	// (operator wiped .enju/, or the sweep already ran while
+	// retrying a stale task) we re-materialize from .git/objects/
+	// — cheap and idempotent.
 	//
-	// Fallback: when taskScratchDir is empty (legacy/test paths
-	// without a workspace root), we still read from the worktree
-	// path the old way — those code paths only ever exercise one
-	// run at a time so the race doesn't bite.
-	var snapshotDir string
-	if taskScratchDir != "" && meta.Branch != "" {
-		snapshotDir = filepath.Join(taskScratchDir, "snapshot")
-		if _, merr := wf.MaterializeRunSnapshot(meta.Branch, meta.RunSeq, meta.RunSlug, snapshotDir); merr != nil {
-			return nil, fmt.Errorf("materializing run snapshot from branch %q: %w", meta.Branch, merr)
+	// Fallback path: when no workspace is set (legacy/test paths
+	// without a real project root) we still read from the
+	// worktree's enju/runs/<N>/template-snapshot/ directly. Those
+	// paths only ever exercise one run at a time so the
+	// concurrency hazard the per-run materialization addresses
+	// doesn't bite.
+	repoSnapshotDir := ""
+	templateSnapshotDir := ""
+	if wf.ProjectRoot() != "" && meta.Branch != "" {
+		repoSnapshotDir = filepath.Join(wf.ProjectRoot(), corelayout.RunSnapshotOnDiskDir(meta.RunSeq, meta.RunSlug))
+		templateSnapshotDir = filepath.Join(repoSnapshotDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		if _, statErr := os.Stat(templateSnapshotDir); os.IsNotExist(statErr) {
+			if _, merr := wf.MaterializeRunRepo(meta.Branch, repoSnapshotDir); merr != nil {
+				return nil, fmt.Errorf("materializing run snapshot from branch %q: %w", meta.Branch, merr)
+			}
 		}
 	} else {
-		snapshotDir = filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		templateSnapshotDir = filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
 	}
-	taskDef, err := enjuYaml.LoadTaskDefFromSnapshot(snapshotDir, meta.TaskDefID)
+	taskDef, err := enjuYaml.LoadTaskDefFromSnapshot(templateSnapshotDir, meta.TaskDefID)
 	if err != nil {
 		return nil, fmt.Errorf("loading task def from snapshot: %w", err)
 	}
 
 	// Script resolution: template runs pin scripts to the per-run
-	// snapshot directory; inline-YAML runs use project-relative
-	// paths as declared.
+	// template snapshot directory; inline-YAML runs use
+	// project-relative paths as declared.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
-		templateDir = snapshotDir
+		templateDir = templateSnapshotDir
 		scriptPath = filepath.Join(templateDir, meta.Script)
 	} else {
 		scriptPath = filepath.Join(workDir, meta.Script)
@@ -202,24 +202,11 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
 	}
 
-	// Enforce the read-only contract on the template snapshot.
-	// The snapshot is the script's working directory (read sibling
-	// files like ./scripts/helper.sh naturally); chmod 0444/0555
-	// is the host-side guard against silent pollution from Python
-	// __pycache__ writes, tool caches, or accidental relative-path
-	// writes. Container path gets a kernel-side :ro bind on top
-	// (defense in depth). Best-effort: surface chmod failure as
-	// a soft warning rather than blocking execution — the snapshot
-	// will still be readable; only the write-protection guarantee
-	// degrades.
-	if templateDir != "" {
-		if cerr := compute.ChmodSnapshotReadOnly(templateDir); cerr != nil {
-			s.logger.Warn("chmod snapshot read-only",
-				"template_dir", templateDir,
-				"task_id", taskID,
-				"error", cerr)
-		}
-	}
+	// Read-only is now convention, not host-side enforcement.
+	// Scripts that write to $ENJU_REPO_DIR or $ENJU_TEMPLATE_DIR
+	// are buggy and should target $ENJU_SCRATCH instead.
+	// Container path still gets a kernel-side :ro bind for the
+	// strong guarantee inside the sandbox.
 
 	// Resolve + pre-create the bigfiles dir for this branch so
 	// the script can write track:false outputs into it without
@@ -238,7 +225,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// wrapper's lifecycle is a no-op in that case, preserving
 	// legacy/test behavior.
 
-	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir, meta)
+	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir, meta)
 
 	// context.json — structured companion to the env vars.
 	var readsArtifacts []string
@@ -516,6 +503,15 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 // task — any divergence would show up as reproducibility drift
 // between a manual execute and a batched one.
 //
+// repoSnapshotDir is the absolute path to the per-run on-disk
+// snapshot of the run branch's whole tree. Exposed as
+// ENJU_REPO_DIR so scripts can read arbitrary repo files frozen
+// at the run's base SHA — `cat $ENJU_REPO_DIR/src/main.go`
+// always returns the bytes that were there when create_run
+// fired, regardless of subsequent operator edits to the
+// working tree. Empty string suppresses the export (legacy /
+// test paths without a workspace root).
+//
 // bigfilesDir is the absolute path the script's track:false
 // outputs go into; exposed as ENJU_BIGFILES so recipes can
 // write directly via "$ENJU_BIGFILES/<path>". Empty string
@@ -527,7 +523,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 // ENJU_TASK_DIR so scripts can opt in to writing under a
 // per-task isolated location. Empty string suppresses the
 // export.
-func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir string, meta *TaskMeta) []string {
+func buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir string, meta *TaskMeta) []string {
 	// Phase 2.3 / 2.5 — point ENJU_PROJECT_DIR at the scratch
 	// dir whenever scratch is set, regardless of execution mode.
 	// Direct-exec scripts run with cmd.Dir = scratch and see the
@@ -581,6 +577,15 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskS
 	}
 	if templateDir != "" {
 		env = append(env, "ENJU_TEMPLATE_DIR="+templateDir)
+	}
+	// ENJU_REPO_DIR is the per-run on-disk snapshot root —
+	// the frozen tree of the run branch's tip. Scripts read
+	// arbitrary repo content from here ($ENJU_REPO_DIR/src/main.go,
+	// $ENJU_REPO_DIR/data/...). Distinct from ENJU_TEMPLATE_DIR,
+	// which points at a SUBPATH of this dir (the workflow's
+	// committed bundle).
+	if repoSnapshotDir != "" {
+		env = append(env, "ENJU_REPO_DIR="+repoSnapshotDir)
 	}
 	// ENJU_SCRATCH points at the writable per-iter sandbox. With
 	// the snapshot-as-CWD shape, scripts that need to write

@@ -192,6 +192,13 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 // change the run's behavior — the executor resolves `script:`
 // paths from the snapshot.
 //
+// After the plumbing commit lands, the run's WHOLE tree (the
+// bundle plus the repo content at the base SHA) is materialized
+// to the per-run on-disk snapshot at <project>/.enju/runs/<N>/snapshot/.
+// One materialization per run, shared by every task in the run
+// — replaces the older per-task materialization that landed
+// under each task's scratch dir.
+//
 // Errors are returned as a warning message (non-fatal): the run
 // already exists on the coordinator side; only the snapshot
 // commit is in question. Empty string means success or no-op.
@@ -228,16 +235,16 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 		return fmt.Sprintf("snapshot skipped: %v", ferr)
 	}
 	if len(files) == 0 {
-		return ""
+		// Empty bundle is unusual but legal; still materialize
+		// the per-run on-disk snapshot so script execution
+		// (which now reads from there) has SOMETHING to read.
+		return s.materializeRunOnDisk(prep.Workflow, runBranch, seq, runSlug)
 	}
 	// Plumbing path: no checkout, no worktree mutation. Critical
 	// for concurrency — multiple parallel enju_create_run calls
 	// each land their snapshot on a distinct run branch
-	// simultaneously, and execute_run later materializes per-run
-	// snapshots from git history rather than reading from the
-	// shared worktree. See the matching execute_run change in
-	// execute.go that switches the read side to
-	// ReadSnapshotFromBranch / WalkSubtreeBlobsAtCommit.
+	// simultaneously. Execute_run reads from the per-run on-disk
+	// snapshot materialized just below.
 	_, cerr := prep.Workflow.CommitArbitraryFilesPlumbing(enjugit.CommitArbitraryFilesRequest{
 		Files:       files,
 		Branch:      runBranch,
@@ -248,6 +255,27 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 	})
 	if cerr != nil {
 		return fmt.Sprintf("snapshot commit failed: %v", cerr)
+	}
+	return s.materializeRunOnDisk(prep.Workflow, runBranch, seq, runSlug)
+}
+
+// materializeRunOnDisk writes the run branch's whole tree to
+// the per-run on-disk snapshot dir. Called after each create_run
+// path's plumbing commit so subsequent execute_task reads a
+// consistent on-disk view of the run.
+//
+// Best-effort: a failure here is reported as a warning string
+// (same contract as the snapshot-commit step) — the run already
+// exists on the coordinator side; only the on-disk cache is in
+// question. execute_task will re-attempt the materialization if
+// the directory is missing at claim time.
+func (s *FatClient) materializeRunOnDisk(wf *enjugit.Workflow, runBranch string, seq int, runSlug string) string {
+	if wf == nil || runBranch == "" {
+		return ""
+	}
+	target := filepath.Join(wf.ProjectRoot(), corelayout.RunSnapshotOnDiskDir(seq, runSlug))
+	if _, merr := wf.MaterializeRunRepo(runBranch, target); merr != nil {
+		return fmt.Sprintf("run snapshot materialization failed: %v", merr)
 	}
 	return ""
 }
@@ -309,7 +337,7 @@ func (s *FatClient) CommitRunInlineSnapshot(ctx context.Context, projectID int64
 	if cerr != nil {
 		return fmt.Sprintf("snapshot commit failed: %v", cerr)
 	}
-	return ""
+	return s.materializeRunOnDisk(wf, runBranch, seq, runSlug)
 }
 
 // ExportFileResult is the structured outcome of a "snapshot

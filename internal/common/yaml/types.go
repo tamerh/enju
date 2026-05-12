@@ -31,6 +31,13 @@ type Run struct {
 	Description  string                 `yaml:"description,omitempty"` // human-readable — surfaced to LLM for template discovery
 	Version      int                    `yaml:"version"`
 	Ref          string                 `yaml:"ref,omitempty"`
+	// BaseBranch names the project branch the run is cut from.
+	// When empty the run branches off the project's default
+	// branch (typically main). Carried through to coord at
+	// create_run so the run branch is created from the right
+	// commit. Optional — templates that don't care use the
+	// project default.
+	BaseBranch   string                 `yaml:"base_branch,omitempty"`
 	Params       []ParamDef             `yaml:"params,omitempty"` // top-level run params, substituted into {{param}} refs at submission
 	ForEach      ForEachMap             `yaml:"for_each,omitempty"`
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`
