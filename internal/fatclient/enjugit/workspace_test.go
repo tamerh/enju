@@ -194,9 +194,6 @@ func TestProductionDiskLayout(t *testing.T) {
 	if got := convs.DiskLayout.BarePath("/proj"); got != "/proj/enju/.bare.git" {
 		t.Errorf("BarePath: got %q", got)
 	}
-	if got := convs.DiskLayout.BotClonePath("/proj", "alice"); got != "/proj/.enju/bots/alice/worktree" {
-		t.Errorf("BotClonePath: got %q", got)
-	}
 	if got := convs.DiskLayout.OperatorClonePath("/proj"); got != "/proj/enju/.clone" {
 		t.Errorf("OperatorClonePath: got %q", got)
 	}
@@ -204,12 +201,9 @@ func TestProductionDiskLayout(t *testing.T) {
 	// ProjectRoot reverses the clone-suffix conventions so the
 	// per-project trace log can be a single file across operator
 	// + bots. Each input shape must round-trip back to the project
-	// root the other constructors started from. Phase 4a moved
-	// bot clones under .enju/bots/<name>/worktree/.
+	// root the other constructors started from.
 	cases := []struct{ in, want string }{
 		{"/proj/enju/.clone", "/proj"},
-		{"/proj/.enju/bots/alice/worktree", "/proj"},
-		{"/proj/.enju/bots/reviewer-bot-1/worktree", "/proj"},
 		{"/proj", "/proj"}, // autoLocal — workDir is already root
 		{"/some/random/path", "/some/random/path"},
 		{"", ""},

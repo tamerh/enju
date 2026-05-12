@@ -113,37 +113,12 @@ type fatClient interface {
 	// up the LLM's work from disk).
 	CleanupLLMClaimCWD(path string, successful bool)
 
-	// ResolveBotWorkspace returns the abs path to this bot's
-	// per-bot per-project managed clone at
-	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
-	// the operator's working tree AND from any other bot's
-	// clone on the same machine. Threaded to the Handler as
-	// cwd so claude -p operates in the bot's own clone —
-	// without per-bot isolation, two daemons on the same
-	// project share a working tree and trip over each other's
-	// branch switches and in-flight writes.
-	//
-	// botUsername scopes the clone to the citizen identity.
-	// One daemon = one citizen, so callers pass d.fc.Username()
-	// (the coord-assigned name, which may differ from the
-	// manifest's requested name when collision auto-suffix
-	// fired during registration). The coord username is what
-	// shows up in the audit log and is path-safe by validation.
-	//
-	// Why this is bot-specific (not the same call humans use):
-	// the operator's `enju mcp` flow operates directly on
-	// their adopted dir; their working tree IS the project.
-	// Bot flows must clone separately, one per bot, so multi-
-	// bot fleets work in parallel.
-	ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error)
-
-	// ResetBotCloneToCleanState wipes the bot clone's worktree
-	// residue between iterations: drops staged + unstaged
-	// changes and removes untracked files, leaving the clone
-	// synced to whatever HEAD currently is (the run branch
-	// tip post-pull). Daemon calls it after ClaimTask and
-	// before the handler runs.
-	ResetBotCloneToCleanState(ctx context.Context, projectID int64) error
+	// ProjectGitDir returns the project clone's .git/ path so
+	// the daemon can populate $ENJU_GIT_DIR for handlers that
+	// read git history. Returns "" with nil error when no
+	// workspace is configured (test fixtures); the env var is
+	// simply omitted in that case.
+	ProjectGitDir(ctx context.Context, projectID int64) (string, error)
 
 	// CheckoutTopicBranchTip switches HEAD to the named topic
 	// branch. Used on iter > 1 re-claim (after request_changes)
@@ -443,44 +418,14 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Pre-warm the bot's managed clone for this project BEFORE
-	// the claim. ClaimTask's pre-claim reconcile internally
-	// calls FatClient.OpenProject, which goes through
-	// workspace.ForProject — and ForProject's externalDirs
-	// short-circuit would otherwise resolve to the operator's
-	// adopted dir AND poison the workspace's per-project cache
-	// (`ws.clients[projectID]`) with that handle. Subsequent
-	// SubmitTaskResult and HandlerInput.Workspace calls would
-	// then keep returning the operator's tree even though the
-	// bot explicitly asked for a managed clone.
-	//
-	// By calling ResolveBotWorkspace first we force
-	// OpenBotCloneAt to populate the cache with the bot clone
-	// at `<projectHome>/enju/.clone/`. ForProject's cache check
-	// sees that and returns it.
-	//
-	// Production symptom this fixes (ISSUE-007 follow-up): bot
-	// daemon claimed work, claude -p ran in the operator's
-	// tree, bot's git checkout switched the operator's tree to
-	// the topic branch, multi-task runs jammed at the second
-	// branch switch on residue from the first task's commit.
-	workspacePath, err := d.fc.ResolveBotWorkspace(ctx, projectID, d.fc.Username())
-	if err != nil {
-		return false, fmt.Errorf("resolve workspace for project %d: %w", projectID, err)
-	}
-	if workspacePath == "" {
-		return false, fmt.Errorf("workspace path empty for project %d", projectID)
-	}
-
-	// Sync the bot's clone with everything other citizens have
-	// pushed since the last poll. With per-bot clones, each
-	// bot's local object DB only carries what THIS bot has
-	// fetched — without an explicit fetch, reviewer-bot reading
-	// developer-bot's freshly-pushed topic branch sees an empty
-	// branch and emits a bogus request_changes (production saw
-	// this as the develop_config rejection loop). Best-effort:
-	// a fetch failure is logged but doesn't block the claim;
-	// ReadFileAtCommit's lazy-fetch fallback picks up the slack.
+	// Sync the project clone with everything other citizens have
+	// pushed since the last poll. Without an explicit fetch,
+	// reviewer-bot reading developer-bot's freshly-pushed topic
+	// branch may see an empty branch and emit a bogus
+	// request_changes (production saw this as the develop_config
+	// rejection loop). Best-effort: a fetch failure is logged
+	// but doesn't block the claim; ReadFileAtCommit's lazy-fetch
+	// fallback picks up the slack on transient network blips.
 	if ferr := d.fc.FetchAllRefsForBot(ctx, projectID); ferr != nil {
 		// Log as ERROR, not WARN. The earlier WARN framing
 		// implied the read-time lazy-fetch fallback would
@@ -498,9 +443,8 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 			"project_id", projectID, "error", ferr,
 			"impact", "read-time lazy fetch will retry, but if this is structural "+
 				"corruption (malformed pack, missing object), the lazy retry will "+
-				"also fail and the bot will be stuck. Inspect "+
-				"<project>/enju/bots/<bot>/clone/.git/objects/pack/ for "+
-				"corruption; remove the clone to force re-clone if necessary.")
+				"also fail and the bot will be stuck. Remove the project clone "+
+				"to force a re-clone if necessary.")
 	}
 
 	claim, err := d.fc.ClaimTask(ctx, service.ClaimParams{
@@ -521,7 +465,7 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	}
 	d.activeClaim = taskID
 
-	if err := d.processAndSubmit(ctx, taskID, claim, workspacePath); err != nil {
+	if err := d.processAndSubmit(ctx, taskID, claim); err != nil {
 		// Don't auto-release on submit failure — the claim is
 		// ours, the work either succeeded or didn't. A retry
 		// pass on the same task can be valuable. The deferred
@@ -625,7 +569,7 @@ func (d *Daemon) findWork(ctx context.Context) (taskID string, projectID int64, 
 // state behind. The fix is a heartbeat goroutine that probes
 // claim status and cancels the handler ctx on flip; deferred
 // until the cost shows up against a real LLM workload.
-func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *service.ClaimResult, workspacePath string) error {
+func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *service.ClaimResult) error {
 	meta, err := d.fc.FetchTaskMeta(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("fetch meta: %w", err)
@@ -643,12 +587,6 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		// are missing.
 		prompt = meta.Prompt
 	}
-
-	// workspacePath was resolved by runOnce BEFORE ClaimTask
-	// so the managed clone is cached in ws.clients[projectID]
-	// and ClaimTask's pre-claim reconcile + this submit both
-	// see it. See runOnce's comment for why pre-warming is
-	// load-bearing.
 
 	// Revision branch state: on iter > 1 (re-claim after a
 	// reviewer's request_changes verdict), the existing topic
@@ -783,28 +721,25 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		var cwdErr error
 		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch)
 		if cwdErr != nil {
-			d.logger.Warn("prepare LLM claim CWD failed (falling back to persistent worktree)",
+			d.logger.Warn("prepare LLM claim CWD failed (handler will run with empty cwd)",
 				"task_id", taskID, "error", cwdErr)
 		}
 	}
-	// handlerCWD is what the handler runs in. After the handler
-	// returns, declared writes_artifacts are copied from
-	// handlerCWD into workspacePath at the same relative paths
-	// so the existing submit flow stages them from the
-	// persistent worktree (P4d switches to plumbing-from-CWD
-	// directly).
+	// handlerCWD is what the handler runs in: the ephemeral
+	// per-claim materialized tree, or empty for handlers that
+	// opted out of claim-CWD materialization (stub handlers
+	// don't read from CWD, so the empty value is harmless).
 	handlerCWD := claimCWD
-	if handlerCWD == "" {
-		handlerCWD = workspacePath
-	}
 
-	// $ENJU_GIT_DIR: the .git/ the handler can query for history.
-	// Pre-P4d this is the bot's persistent clone's .git (same
-	// content as operator's via fetch); P4d switches to the
-	// operator's .git/ directly. Env-var name stays the same.
-	gitDir := ""
-	if workspacePath != "" {
-		gitDir = filepath.Join(workspacePath, ".git")
+	// $ENJU_GIT_DIR: the project clone's .git/ so handlers can
+	// query history with `git --git-dir=$ENJU_GIT_DIR log`. Best-
+	// effort: if the lookup fails (no workspace configured for a
+	// test FatClient), proceed without exporting the env var.
+	gitDir, gitDirErr := d.fc.ProjectGitDir(ctx, meta.ProjectID)
+	if gitDirErr != nil {
+		d.logger.Debug("resolve project git dir for handler env (proceeding without it)",
+			"task_id", taskID, "error", gitDirErr)
+		gitDir = ""
 	}
 
 	// Track submit outcome so the deferred CleanupLLMClaimCWD

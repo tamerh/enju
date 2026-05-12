@@ -35,10 +35,9 @@ type Workspace struct {
 	// and "bot-<name>" for each bot daemon.
 	logName string
 
-	mu         sync.Mutex
-	workflows  map[int64]*Workflow // cached by projectID
-	views      map[int64]*View     // cached by projectID
-	botCloneAt map[int64]string    // bot-specific clone path overrides
+	mu        sync.Mutex
+	workflows map[int64]*Workflow // cached by projectID
+	views     map[int64]*View     // cached by projectID
 }
 
 // Option configures NewWorkspace via functional options.
@@ -85,12 +84,11 @@ func NewWorkspace(rootDir string, convs Conventions, opts ...Option) (*Workspace
 		return nil, fmt.Errorf("enjugit: create workspace root %s: %w", rootDir, err)
 	}
 	w := &Workspace{
-		rootDir:    rootDir,
-		convs:      convs,
-		logger:     slog.Default(),
-		workflows:  make(map[int64]*Workflow),
-		views:      make(map[int64]*View),
-		botCloneAt: make(map[int64]string),
+		rootDir:   rootDir,
+		convs:     convs,
+		logger:    slog.Default(),
+		workflows: make(map[int64]*Workflow),
+		views:     make(map[int64]*View),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -106,19 +104,15 @@ func (w *Workspace) RootDir() string { return w.rootDir }
 // ProjectDir returns the on-disk path for a project's clone root.
 // Resolves via:
 //
-//  1. Bot-specific override registered via OpenBotCloneAt.
-//  2. projectreg.Registry entry's LocalPath.
-//  3. Slug+id form: <rootDir>/<slug>-<id>/.
-//  4. Numeric fallback: <rootDir>/<id>/.
+//  1. projectreg.Registry entry's LocalPath.
+//  2. Slug+id form: <rootDir>/<slug>-<id>/.
+//  3. Numeric fallback: <rootDir>/<id>/.
 //
 // Returned even when no clone exists yet (used for "where would
 // the clone go?" queries).
 func (w *Workspace) ProjectDir(id int64) string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if path, ok := w.botCloneAt[id]; ok {
-		return path
-	}
 	return w.projectDirLocked(id)
 }
 
@@ -264,19 +258,7 @@ func (w *Workspace) projectDirForName(id int64, projectName string) string {
 
 // lockPathFor returns the cross-process flock file for one
 // project. Lives next to the project dir, suffixed with .lock.
-//
-// When a per-bot-clone override is registered for this id (via
-// OpenBotCloneAt), the lock follows the bot's clone path so each
-// bot daemon gets its own flock. Without this branch, two bots
-// on the same project share one lock and serialize even though
-// their clones are independent on disk — defeats the per-bot-
-// clone parallelism the bot architecture relies on.
-//
-// Mirrors the same override rule already in ProjectDir(id).
 func (w *Workspace) lockPathFor(id int64) string {
-	if path, ok := w.botCloneAt[id]; ok {
-		return path + ".lock"
-	}
 	return filepath.Join(w.rootDir, fmt.Sprintf("project-%d.lock", id))
 }
 

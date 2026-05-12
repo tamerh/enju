@@ -87,26 +87,6 @@ func (w *Workspace) ForProject(id int64, remoteURL string, projectName ...string
 	return wf, nil
 }
 
-// OpenBotCloneAt opens a bot-specific clone at an explicit path
-// (typically <project>/enju/bots/<bot>/clone/). Pre-warms the
-// per-bot clone path override so ProjectDir(id) returns this
-// path for subsequent calls.
-//
-// Different bots on the same project on the same machine each
-// get their own clone via this entry point. Service constructs
-// a Workspace per bot identity at startup.
-func (w *Workspace) OpenBotCloneAt(id int64, path, sourceURL string) (*Workflow, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.botCloneAt[id] = path
-	clone, err := w.openOrClone(id, path, sourceURL)
-	if err != nil {
-		return nil, err
-	}
-	wf := w.newWorkflowFromClone(id, clone)
-	w.workflows[id] = wf
-	return wf, nil
-}
 
 // OpenView returns a read-only View for project id. Errors with
 // ErrCloneNotFound when no clone exists on disk — does NOT

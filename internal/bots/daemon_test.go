@@ -46,28 +46,6 @@ type fakeFC struct {
 	// requested. Optional — most tests don't care.
 	listReadyHook func(pid, rid int64)
 
-	// workspacePath is the path returned by
-	// ResolveProjectWorkspace. Optional; default is a synthetic
-	// path. Tests pinning the cwd-threading contract set it
-	// explicitly.
-	workspacePath string
-	workspaceErr  error
-
-	// lastResolveBotUsername captures the username arg the
-	// daemon passed on its most recent ResolveBotWorkspace
-	// call. Tests asserting "the daemon passes its own
-	// citizen identity to the workspace resolver" check this
-	// directly rather than reaching for log strings.
-	lastResolveBotUsername string
-
-	// resetCalls counts ResetBotCloneToCleanState invocations
-	// keyed by projectID. Tests assert on this to pin "the
-	// daemon resets the clone between iterations." resetErr,
-	// when non-nil, is returned from every call — daemon
-	// should log + continue rather than abort.
-	resetCalls map[int64]int
-	resetErr   error
-
 	// checkoutTopicCalls captures the (projectID, branch) pairs
 	// the daemon asked CheckoutTopicBranchTip for. Tests pin
 	// the iter-2-revision flow by asserting this fires only on
@@ -76,11 +54,18 @@ type fakeFC struct {
 	checkoutTopicErr   error
 
 	// llmClaimCWDPath is returned from PrepareLLMClaimCWD.
-	// Default "" means "fall back to persistent worktree."
-	// Tests pinning the ephemeral-CWD wiring set it to a real
-	// path on disk.
+	// Default "" means handler runs with empty cwd. Tests
+	// pinning the ephemeral-CWD wiring set it to a real path
+	// on disk.
 	llmClaimCWDPath string
 	llmClaimCWDErr  error
+
+	// projectGitDir is returned from ProjectGitDir. Optional;
+	// default "" means the handler env-var $ENJU_GIT_DIR is
+	// omitted. Tests asserting the env-var threading set it
+	// explicitly.
+	projectGitDir    string
+	projectGitDirErr error
 	// llmCleanupCalls records each CleanupLLMClaimCWD
 	// invocation so tests can assert success vs preserve.
 	llmCleanupCalls []llmCleanupCall
@@ -181,6 +166,9 @@ func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int
 func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error) {
 	return f.llmClaimCWDPath, f.llmClaimCWDErr
 }
+func (f *fakeFC) ProjectGitDir(ctx context.Context, projectID int64) (string, error) {
+	return f.projectGitDir, f.projectGitDirErr
+}
 func (f *fakeFC) CleanupLLMClaimCWD(path string, successful bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -192,19 +180,6 @@ func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.Tas
 		return m, nil
 	}
 	return nil, errors.New("no meta for " + taskID)
-}
-
-// resetCalls counts ResetBotCloneToCleanState invocations
-// per (caller-supplied) projectID. Tests that pin the
-// "between iterations" call site assert against this.
-func (f *fakeFC) ResetBotCloneToCleanState(ctx context.Context, projectID int64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.resetCalls == nil {
-		f.resetCalls = map[int64]int{}
-	}
-	f.resetCalls[projectID]++
-	return f.resetErr
 }
 
 func (f *fakeFC) CheckoutTopicBranchTip(ctx context.Context, projectID int64, branch, baseBranch string) error {
@@ -238,22 +213,6 @@ func (f *fakeFC) WipeDeclaredWrites(ctx context.Context, projectID int64, writes
 	}
 	f.wipeWritesCalls = append(f.wipeWritesCalls, wipeWritesCall{projectID, paths})
 	return f.wipeWritesErr
-}
-
-func (f *fakeFC) ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error) {
-	f.mu.Lock()
-	f.lastResolveBotUsername = botUsername
-	f.mu.Unlock()
-	if f.workspaceErr != nil {
-		return "", f.workspaceErr
-	}
-	if f.workspacePath != "" {
-		return f.workspacePath, nil
-	}
-	// Default to a synthetic path that includes the bot
-	// username so tests asserting per-bot isolation can spot
-	// distinct resolves at a glance.
-	return "/tmp/fake-workspace/project-" + itoa(projectID) + "-bot-" + botUsername, nil
 }
 
 func (f *fakeFC) SubmitTaskResult(ctx context.Context, p service.SubmitParams) *service.SubmitResult {
@@ -346,91 +305,21 @@ func TestDaemon_FindWork_PassesRunSeqNotGlobalID(t *testing.T) {
 	}
 }
 
-// Pin the production bug: pre-fix the daemon never threaded a
-// workspace path to the handler, so claude -p inherited the
-// daemon's cwd. The LLM then read/wrote the operator's
-// filesystem instead of the bot's project clone, leaking
-// the source tree (Bug 3 in the report) and clobbering the
-// operator's checkout (Bug 4). Post-fix: the daemon resolves
-// the project clone via FatClient and passes it as
-// HandlerInput.Workspace; ClaudeHandler sets cmd.Dir from
-// there.
-func TestDaemon_ResolvesAndThreadsWorkspaceToHandler(t *testing.T) {
-	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = "/home/test/projects/myproject/enju/bots/bot1/clone"
-	stub := &StubHandler{Response: "ok"}
-	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
-	if _, err := d.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(stub.Inputs) != 1 {
-		t.Fatalf("expected 1 handler invocation, got %d", len(stub.Inputs))
-	}
-	if got := stub.Inputs[0].Workspace; got != "/home/test/projects/myproject/enju/bots/bot1/clone" {
-		t.Errorf("Workspace not threaded to handler: got %q (claude -p would inherit daemon cwd)", got)
-	}
-}
-
-// TestDaemon_RunOnce_PassesBotUsernameToWorkspaceResolver pins
-// the per-bot-clone contract: the daemon must thread its own
-// citizen identity (Username from the FatClient) into
-// ResolveBotWorkspace so the resolver can scope the clone to
-// `<project>/enju/bots/<botUsername>/clone/`. Pre-fix the call
-// took only projectID, all bots collided on a single shared
-// clone, and two daemons on the same project on the same
-// machine couldn't run in parallel.
-func TestDaemon_RunOnce_PassesBotUsernameToWorkspaceResolver(t *testing.T) {
-	fc := newFCWithTask("alice-bot", "answer", "")
-	stub := &StubHandler{Response: "ok"}
-	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
-	if _, err := d.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := fc.lastResolveBotUsername; got != "alice-bot" {
-		t.Errorf("daemon should pass its own citizen username to ResolveBotWorkspace; got %q, want %q", got, "alice-bot")
-	}
-}
-
-func TestDaemon_RunOnce_FailsWhenWorkspaceUnresolvable(t *testing.T) {
-	// If the project clone can't be resolved (no remote_url,
-	// network failure, etc.) the daemon must FAIL the iteration
-	// rather than letting the handler inherit cwd. Pre-fix this
-	// silently leaked the operator's filesystem to the LLM.
-	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspaceErr = errors.New("project has no remote_url")
-	stub := &StubHandler{Response: "ok"}
-	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
-	_, err := d.RunOnce(context.Background())
-	if err == nil {
-		t.Fatal("expected workspace-resolution error to surface")
-	}
-	if !strings.Contains(err.Error(), "no remote_url") {
-		t.Errorf("error should carry root cause: %v", err)
-	}
-	// Critical: handler must NOT have been invoked. Pre-fix,
-	// the daemon would call the handler with empty Workspace
-	// and claude -p would happily run with cwd=daemon.
-	if stub.Calls != 0 {
-		t.Errorf("handler should not run when workspace is unresolvable, got %d calls", stub.Calls)
-	}
-	if len(fc.submits) != 0 {
-		t.Errorf("submit should not fire on workspace failure, got %d", len(fc.submits))
-	}
-}
-
 // TestDaemon_Run_ExitsOnPermanentConfigError pins the
-// permanent-vs-transient error split: if ResolveBotWorkspace
-// returns service.ErrNoCloneSource (project has no remote_url
-// AND no registered adopted path), the Run loop must surface
-// the error and exit, not retry forever. Without this, a
+// permanent-vs-transient error split: when a permanent
+// deployment-config error (service.ErrNoCloneSource — project
+// has no remote and no registered adopted path) surfaces, the
+// Run loop must propagate it and exit. Without this, a
 // misconfigured project would spam log lines every poll cycle
-// indefinitely. Transient errors still get the retry-with-
-// backoff treatment — that's covered by other tests.
+// indefinitely. Transient errors still get retry-with-backoff —
+// covered by other tests.
 func TestDaemon_Run_ExitsOnPermanentConfigError(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
-	// Wrap the sentinel exactly like service.ResolveBotWorkspace
-	// does, so errors.Is in Run matches end-to-end.
-	fc.workspaceErr = fmt.Errorf("%w: project 1", service.ErrNoCloneSource)
+	// Inject the sentinel through the claim path — any code
+	// path inside runOnce that surfaces ErrNoCloneSource must
+	// trigger the exit. Wrapping mirrors the production
+	// fatclient call sites.
+	fc.claimErr = fmt.Errorf("%w: project 1", service.ErrNoCloneSource)
 	stub := &StubHandler{Response: "ok"}
 	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1, PollFloor: 10 * time.Millisecond})
 	if err != nil {
@@ -571,13 +460,13 @@ func TestDaemon_RunOnce_PopulatesArtifactsFromWritesArtifacts(t *testing.T) {
 	}
 
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = ws
+	fc.llmClaimCWDPath = ws
 	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
 		{Path: "out/tracked.md", Track: true},
 		{Path: "big.bam", Track: false},
 	}
 
-	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
 	worked, err := d.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -599,28 +488,6 @@ func TestDaemon_RunOnce_PopulatesArtifactsFromWritesArtifacts(t *testing.T) {
 		t.Errorf("UntrackedArtifacts = %v, want [big.bam]", got.UntrackedArtifacts)
 	}
 }
-
-// TestDaemon_RunOnce_DoesNotResetBotClone pins the removal
-// of the per-iteration worktree reset. The handler operates
-// in an ephemeral CWD freshly materialized per claim, so
-// prior-iteration residue can't leak across tasks. Resetting
-// the persistent worktree adds I/O cost with no behavioral
-// payoff — the daemon must NOT call it.
-func TestDaemon_RunOnce_DoesNotResetBotClone(t *testing.T) {
-	fc := newFCWithTask("bot1", "answer", "")
-	stub := &StubHandler{Response: "done"}
-	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
-	if _, err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
-	}
-	if got := fc.resetCalls[1]; got != 0 {
-		t.Errorf("daemon should NOT reset the bot clone between iterations; got %d reset calls", got)
-	}
-}
-
-// (TestDaemon_RunOnce_ContinuesWhenResetFails removed —
-//  the reset call is gone, so its failure mode no longer
-//  exists.)
 
 // Pin pattern expansion: when the manifest declares
 // `src/api/` (directory) and the bot writes 3 files inside,
@@ -645,12 +512,12 @@ func TestDaemon_RunOnce_DirectoryDeclarationCoversAllFilesInside(t *testing.T) {
 	}
 
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = ws
+	fc.llmClaimCWDPath = ws
 	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
 		{Path: "src/api/", Track: true},
 	}
 
-	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
 	worked, err := d.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -689,11 +556,11 @@ func TestDaemon_RunOnce_GlobDeclarationCoversMatchingFiles(t *testing.T) {
 	}
 
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = ws
+	fc.llmClaimCWDPath = ws
 	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
 		{Path: "src/*.go", Track: true},
 	}
-	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
 	if _, err := d.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -716,12 +583,12 @@ func TestDaemon_RunOnce_OptionalMissingArtifactSucceeds(t *testing.T) {
 	}
 
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = ws
+	fc.llmClaimCWDPath = ws
 	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
 		{Path: "out.txt", Track: true},
 		{Path: "go.sum", Track: true, Optional: true},
 	}
-	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
 	if _, err := d.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce should not fail with optional missing: %v", err)
 	}
@@ -744,12 +611,12 @@ func TestDaemon_RunOnce_FailsWhenDeclaredArtifactMissing(t *testing.T) {
 	ws := t.TempDir() // intentionally empty — no out/missing.md
 
 	fc := newFCWithTask("bot1", "answer", "")
-	fc.workspacePath = ws
+	fc.llmClaimCWDPath = ws
 	fc.metaByID["1:1:t"].WritesArtifacts = enjuYaml.WriteArtifacts{
 		{Path: "out/missing.md", Track: true},
 	}
 
-	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "done"}, Bot: scenarioBot(), ProjectID: 1})
+	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
 	_, err := d.RunOnce(context.Background())
 	if err == nil {
 		t.Fatal("expected error from missing artifact, got nil")

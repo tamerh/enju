@@ -47,11 +47,8 @@ func (s *FatClient) FetchProjectMetaFull(ctx context.Context, projectID int64) (
 // project's local clone, materializing it (clone or init) if
 // not yet present. Honors externalDirs (a folder adopted via
 // `enju_create_project path=`) over the managed `~/.enju/
-// workspaces/` path, which is the right call for HUMAN flows:
-// the
-// operator's edits in their adopted tree are visible to MCP /
-// webui directly. Bot flows MUST NOT use this — see
-// ResolveBotWorkspace below.
+// workspaces/` path so the operator's edits in their adopted
+// tree are visible to MCP / webui directly.
 func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64) (string, error) {
 	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
@@ -63,119 +60,24 @@ func (s *FatClient) ResolveProjectWorkspace(ctx context.Context, projectID int64
 	return wf.WorkDir(), nil
 }
 
-// ResolveBotWorkspace returns the absolute path to the bot's
-// managed clone, materializing it if absent. Distinct from
-// ResolveProjectWorkspace (operator-facing) because the bot
-// MUST operate in a working tree separate from the operator's:
-//
-//  1. **Branch switches collide with operator state.** The bot
-//     checks out a topic branch per claim; if the operator has
-//     uncommitted edits, git refuses with "worktree contains
-//     unstaged changes" and the bot loops on failed checkout.
-//  2. **Bot writes pollute operator status.** Files left over
-//     from a topic branch appear as untracked in the operator's
-//     `git status` after a checkout back to the run branch.
-//  3. **claude -p edits land in the wrong tree.** The Handler's
-//     cwd is whatever this function returns; if it were the
-//     operator's tree, Edit/Write tools would touch files the
-//     operator may also be editing.
-//
-// Layout: the clone lives at `<projectHome>/enju/.clone/`.
-// Source for the clone:
-//
-//   - **Real remote (https/git/ssh):** clone directly from the
-//     coord's remote_url. The bot pushes back to the same
-//     remote as the operator — sharing happens via the network.
-//   - **Local-only project:** clone from the bare at
-//     `<projectHome>/enju/.bare.git/`. The bare is created by
-//     `enju bot setup` (see EnsureBotPushTarget). If it doesn't
-//     exist, surface a clear "run setup first" error.
-//
-// Project home comes from the projectreg registry. Every project
-// is registered with an explicit path at create_project + init
-// time (both require `path=`), so the lookup is unambiguous —
-// no remote_url-as-path fallback, no filesystem walk.
-func (s *FatClient) ResolveBotWorkspace(ctx context.Context, projectID int64, botUsername string) (string, error) {
+// ProjectGitDir returns the absolute path to the project clone's
+// .git directory. Used by the bot daemon to populate
+// $ENJU_GIT_DIR for handlers that read git history via
+// `git --git-dir=$ENJU_GIT_DIR log ...`. Returns "" when no
+// workspace is configured (legacy callers without an enjugit
+// workspace), in which case the env var is simply not exported.
+func (s *FatClient) ProjectGitDir(ctx context.Context, projectID int64) (string, error) {
 	if s.enjugit == nil {
-		return "", fmt.Errorf("no workspace configured")
+		return "", nil
 	}
-	if botUsername == "" {
-		return "", fmt.Errorf("bot username is required")
-	}
-	remoteURL, _, _, err := s.FetchProjectMetaExpanded(ctx, projectID)
+	workDir, err := s.ResolveProjectWorkspace(ctx, projectID)
 	if err != nil {
 		return "", err
 	}
-
-	// Determine the project home: registry is authoritative.
-	// Both create_project and init require `path=`, so every
-	// project ends up with an entry. The coord's remote_url is
-	// reserved for the SHARED remote (github/gitlab) — it does
-	// not double as a local path.
-	var home string
-	if s.projectRegistry != nil {
-		entry, gerr := s.projectRegistry.Get(projectID)
-		if gerr == nil && entry != nil {
-			home = entry.LocalPath
-		}
+	if workDir == "" {
+		return "", nil
 	}
-	if home == "" {
-		return "", fmt.Errorf(
-			"%w: project %d — no registered home path. Register "+
-				"the project with `enju_create_project path=`",
-			ErrNoCloneSource, projectID)
-	}
-
-	// Compute this bot's clone path. Per-bot per-project so two
-	// bots running on the same machine for the same project have
-	// their own working trees and don't collide on branch
-	// switches or in-flight scratch files. The path safety
-	// guards inside BotCloneDirFor reject malformed usernames so
-	// a hostile manifest can't escape into the project tree.
-	relClone, cerr := corelayout.BotCloneDirFor(botUsername)
-	if cerr != nil {
-		return "", fmt.Errorf("invalid bot username %q: %w", botUsername, cerr)
-	}
-	clonePath := filepath.Join(home, relClone)
-
-	// Source: real remote wins (push/pull travels the network),
-	// else the per-project managed bare under <home>/enju/.bare.git.
-	// coord stores remote_url as either "" (path-mode) or a real
-	// network URL — never a local path — so no disambiguation
-	// needed.
-	var source string
-	if remoteURL != "" {
-		source = remoteURL
-	} else {
-		barePath := filepath.Join(home, corelayout.BotPushTargetDir)
-		if _, statErr := os.Stat(filepath.Join(barePath, "HEAD")); statErr != nil {
-			return "", fmt.Errorf(
-				"project %d has no push target — run `enju bot setup` "+
-					"to create the bare at %q (or set a real remote "+
-					"with `enju_set_project_remote`): %w",
-				projectID, barePath, statErr)
-		}
-		source = barePath
-	}
-
-	wf, err := s.enjugit.OpenBotCloneAt(projectID, clonePath, source)
-	if err != nil {
-		return "", err
-	}
-
-	// Stash the resolved Workflow keyed by projectID so subsequent
-	// OpenWorkflow calls inside this FatClient (claim, submit,
-	// reset) route to the bot clone instead of the operator-side
-	// ForProject lookup. One FatClient = one citizen, so a
-	// project-keyed map is sufficient.
-	s.botClonesMu.Lock()
-	if s.botWorkflows == nil {
-		s.botWorkflows = make(map[int64]*enjugit.Workflow)
-	}
-	s.botWorkflows[projectID] = wf
-	s.botClonesMu.Unlock()
-
-	return wf.WorkDir(), nil
+	return filepath.Join(workDir, ".git"), nil
 }
 
 // EnsureBotPushTarget makes sure the project has a non-working-
@@ -311,19 +213,6 @@ func (s *FatClient) OpenWorkflow(ctx context.Context, projectID int64) (wf *enju
 		return nil, "", "", "", err
 	}
 
-	// Bot path: ResolveBotWorkspace stashed a per-bot Workflow
-	// for this project — route to it. Without this lookup, a
-	// daemon's claim/submit would fall through to enjugit.ForProject
-	// and land on the operator's tree (the legacy "shared bot
-	// clone" failure mode).
-	s.botClonesMu.Lock()
-	cached := s.botWorkflows[projectID]
-	s.botClonesMu.Unlock()
-	if cached != nil {
-		cached.SetDefaultBranch(defaultBranch)
-		return cached, remoteURL, projName, defaultBranch, nil
-	}
-
 	wf, err = s.enjugit.ForProject(projectID, remoteURL, projName)
 	if err != nil {
 		return nil, remoteURL, projName, defaultBranch, err
@@ -360,58 +249,13 @@ func (s *FatClient) FetchProjectMetaExpanded(ctx context.Context, projectID int6
 	return remoteURL, name, defaultBranch, nil
 }
 
-// ResetBotCloneToCleanState wipes the bot clone's worktree
-// residue between iterations: drops staged + unstaged changes
-// to tracked files (hard reset to HEAD) and removes untracked
-// files. After ClaimTask's pre-claim pull, HEAD points at the
-// run branch tip the next task should fork from, so this
-// effectively syncs the clone to the latest run-branch state
-// while clearing the previous task's leftovers.
-//
-// **Bot-only.** The operator's `enju mcp` working tree is
-// the user's actual development directory and may legitimately
-// carry uncommitted WIP, scratch notes, or unrelated branches
-// — reset would clobber that. The daemon's clone at
-// <project>/enju/.clone/ is system-managed: anything not in
-// HEAD is residue.
-//
-// Why between iterations: a previous task's `claude -p` may
-// have left scratch files behind, or made unstaged tweaks to
-// a tracked file (go.mod, package.json) that didn't end up
-// in the commit. The next task's CheckoutBranchFrom can
-// produce a "staged-deletion + untracked" desync when the
-// new topic branch's tree disagrees with the residue. Clearing
-// the worktree first eliminates the desync class entirely.
-//
-// Idempotent — calling this on an already-clean clone is a
-// no-op (HardReset matches HEAD's tree, no untracked files
-// to remove).
-func (s *FatClient) ResetBotCloneToCleanState(ctx context.Context, projectID int64) error {
-	// OpenProject routes through the FatClient's bot-clone stash
-	// when present (populated by ResolveBotWorkspace), so this
-	// call resolves to the bot's own working tree at
-	// <project>/enju/bots/<bot>/clone/ rather than the operator's
-	// adopted dir. The contract "this method only touches bot
-	// clones" is enforced by the pre-warm requirement: a daemon
-	// MUST call ResolveBotWorkspace before ResetBotCloneToCleanState
-	// so the stash is populated; the existing daemon flow
-	// (runOnce → ResolveBotWorkspace → ClaimTask → reset) honors
-	// that ordering.
-	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
-	if err != nil {
-		return err
-	}
-	return wf.ResetCleanWorktree()
-}
-
 // FetchAllRefsForBot brings every remote branch's refs +
-// objects into the bot's clone. Used by the daemon's pre-claim
-// path so claude-p sees fresh topic branches pushed by other
-// bots since this daemon last fetched. Without this step, per-
-// bot clones drift apart: developer-bot pushes its iter-1
-// commit, reviewer-bot's clone has no record of it, claude-p
-// reads an empty topic branch and emits a bogus
-// request_changes.
+// objects into the project clone. Used by the daemon's pre-
+// claim path so claude-p sees fresh topic branches pushed by
+// other citizens since this daemon last fetched. Without this
+// step, a reading citizen may see an empty topic branch and
+// emit a bogus request_changes — the developer's commit is on
+// the remote, just not yet in the local object store.
 //
 // Best-effort: a fetch failure (network blip, transient
 // unreachable) is logged by the caller but doesn't block the

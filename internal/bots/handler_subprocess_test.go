@@ -632,26 +632,26 @@ func TestSubprocessHandler_Preflight_PATHResolution(t *testing.T) {
 	}
 }
 
-// TestDaemon_IntegrationWithSubprocessHandler is review fix R7:
-// drive a full daemon iteration with a REAL subprocess handler
-// (not the in-process stub) against a shell script pretending
-// to be an LLM CLI. Closes the loop between Phase 4a's path
-// rename (.enju/bots/<bot>/worktree/) and Phase 4b's handler
-// surface — proves they compose end-to-end.
+// TestDaemon_IntegrationWithSubprocessHandler drives a full
+// daemon iteration with a REAL subprocess handler (not the
+// in-process stub) against a shell script pretending to be an
+// LLM CLI. Closes the loop between the bot's ephemeral per-claim
+// CWD and the subprocess handler surface — proves they compose
+// end-to-end.
 //
 // The shell script:
 //   - asserts $ENJU_TASK_ID is set
-//   - asserts cwd matches the workspace path the daemon
-//     resolved (proves the P4a layout reaches the handler)
+//   - asserts cwd matches the ephemeral claim CWD the daemon
+//     prepared (proves the per-claim materialization reaches
+//     the handler)
 //   - echoes a deterministic response that the daemon then
 //     submits
 func TestDaemon_IntegrationWithSubprocessHandler(t *testing.T) {
-	// Build a fake workspace at the P4a layout
-	// (<tmp>/.enju/bots/<bot>/worktree/) so the handler's CWD
-	// matches the production shape.
+	// Build a stand-in claim CWD on disk so the handler's
+	// cmd.Dir is a real directory the script can chdir into.
 	tmp := t.TempDir()
-	workspace := filepath.Join(tmp, ".enju", "bots", "integ-bot", "worktree")
-	if err := os.MkdirAll(workspace, 0o755); err != nil {
+	claimCWD := filepath.Join(tmp, ".enju", "scratch", "integ-bot", "1-1-t")
+	if err := os.MkdirAll(claimCWD, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,10 +666,10 @@ if [ -z "$ENJU_TASK_ID" ]; then
     echo "missing ENJU_TASK_ID" >&2
     exit 2
 fi
-# Verify CWD matches what the daemon resolved as the workspace
-# (production shape: .enju/bots/<bot>/worktree/).
+# Verify CWD matches the daemon's prepared per-claim CWD
+# (production shape: .enju/scratch/<bot>/<task-iter>/).
 case "$(pwd)" in
-    */.enju/bots/integ-bot/worktree) : ;;
+    */.enju/scratch/integ-bot/*) : ;;
     *) echo "unexpected cwd: $(pwd)" >&2; exit 3 ;;
 esac
 # Read the prompt from stdin and emit a deterministic response.
@@ -681,11 +681,11 @@ echo "prompt-len=${#prompt}"
 		t.Fatal(err)
 	}
 
-	// fakeFC machinery shared with daemon_test.go. Set
-	// workspacePath so ResolveBotWorkspace returns the P4a-shape
-	// path our script asserts against.
+	// fakeFC machinery shared with daemon_test.go. The daemon
+	// runs the handler in the per-claim ephemeral CWD that
+	// PrepareLLMClaimCWD returns.
 	fc := newFCWithTask("integ-bot", "answer", "ignored-default")
-	fc.workspacePath = workspace
+	fc.llmClaimCWDPath = claimCWD
 
 	// REAL SubprocessHandler — not a stub.
 	bot := &Bot{Name: "integ-bot", Handler: scriptPath}
@@ -748,8 +748,7 @@ func (h *recordingHandler) ProcessTask(ctx context.Context, in HandlerInput) (Ha
 func TestDaemon_LLMClaimCWD_UsedAsHandlerWorkspace(t *testing.T) {
 	cwd := t.TempDir()
 	fc := newFCWithTask("integ-bot", "answer", "ignored")
-	fc.workspacePath = "/some/persistent/worktree" // legacy path; should NOT be used
-	fc.llmClaimCWDPath = cwd                       // per-claim ephemeral path
+	fc.llmClaimCWDPath = cwd
 
 	stub := &recordingHandler{response: "done"}
 	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
@@ -767,14 +766,16 @@ func TestDaemon_LLMClaimCWD_UsedAsHandlerWorkspace(t *testing.T) {
 	}
 }
 
-// TestDaemon_LLMClaimCWD_FallsBackToWorkspaceWhenEmpty pins
-// the back-compat path: when PrepareLLMClaimCWD returns ""
-// (no iter branch, legacy task, test fixture), the daemon
-// falls back to the persistent worktree as before.
-func TestDaemon_LLMClaimCWD_FallsBackToWorkspaceWhenEmpty(t *testing.T) {
+// TestDaemon_LLMClaimCWD_EmptyWhenPrepareReturnsEmpty pins
+// the no-fallback contract: when PrepareLLMClaimCWD returns ""
+// (handler opted out, or legacy task without an iter branch),
+// the handler's Workspace stays empty. There's no persistent
+// worktree to fall back to in the plumbing-everywhere model —
+// stub-style handlers don't read from CWD and the empty value
+// is harmless to them.
+func TestDaemon_LLMClaimCWD_EmptyWhenPrepareReturnsEmpty(t *testing.T) {
 	fc := newFCWithTask("integ-bot", "answer", "ignored")
-	fc.workspacePath = "/some/persistent/worktree"
-	fc.llmClaimCWDPath = "" // helper said "no CWD, use legacy"
+	fc.llmClaimCWDPath = ""
 
 	stub := &recordingHandler{response: "done"}
 	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
@@ -784,8 +785,8 @@ func TestDaemon_LLMClaimCWD_FallsBackToWorkspaceWhenEmpty(t *testing.T) {
 	if _, err := d.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if got := stub.inputs[0].Workspace; got != "/some/persistent/worktree" {
-		t.Errorf("handler Workspace fallback: got %q, want %q", got, "/some/persistent/worktree")
+	if got := stub.inputs[0].Workspace; got != "" {
+		t.Errorf("handler Workspace: got %q, want empty (no fallback to persistent worktree)", got)
 	}
 }
 
@@ -845,15 +846,16 @@ func TestDaemon_LLMClaimCWD_PreserveOnSubmitFail(t *testing.T) {
 	}
 }
 
-// TestDaemon_LLMClaimCWD_PrepareErrorFallsBackToWorkspace
-// pins review-fix #8: when PrepareLLMClaimCWD returns an
-// error (filesystem failure, missing git object, transient
-// I/O), the daemon logs a warning and falls back to the
-// persistent worktree path so the task can still progress.
-// No silent loss; no crash.
-func TestDaemon_LLMClaimCWD_PrepareErrorFallsBackToWorkspace(t *testing.T) {
+// TestDaemon_LLMClaimCWD_PrepareErrorProceedsWithEmptyCWD
+// pins the error-tolerance contract: when PrepareLLMClaimCWD
+// returns an error (filesystem failure, missing git object,
+// transient I/O), the daemon logs a warning and proceeds with
+// an empty handler Workspace. No silent loss; no crash.
+// Production SubprocessHandler will surface the failure
+// downstream when the handler binary needs to write to disk,
+// but stub-style handlers that don't need CWD continue to work.
+func TestDaemon_LLMClaimCWD_PrepareErrorProceedsWithEmptyCWD(t *testing.T) {
 	fc := newFCWithTask("integ-bot", "answer", "done")
-	fc.workspacePath = "/persistent/worktree"
 	fc.llmClaimCWDPath = ""
 	fc.llmClaimCWDErr = errors.New("mkdir denied: read-only filesystem")
 
@@ -865,9 +867,8 @@ func TestDaemon_LLMClaimCWD_PrepareErrorFallsBackToWorkspace(t *testing.T) {
 	if len(stub.inputs) != 1 {
 		t.Fatalf("handler should have been invoked despite Prepare error; got %d invocations", len(stub.inputs))
 	}
-	// Workspace falls back to the persistent worktree path.
-	if got := stub.inputs[0].Workspace; got != "/persistent/worktree" {
-		t.Errorf("handler Workspace fallback after Prepare error: got %q, want %q", got, "/persistent/worktree")
+	if got := stub.inputs[0].Workspace; got != "" {
+		t.Errorf("handler Workspace after Prepare error: got %q, want empty", got)
 	}
 	// Cleanup is still called (deferred) — with empty path,
 	// which CleanupLLMClaimCWD treats as a no-op in production.

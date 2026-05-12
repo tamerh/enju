@@ -55,7 +55,6 @@ type Conventions struct {
 	// infrastructure. Each function takes a projectDir and returns
 	// a path. Production layout:
 	//   BarePath:          <project>/enju/.bare.git
-	//   BotClonePath:      <project>/.enju/bots/<bot>/worktree
 	//   OperatorClonePath: <project>/enju/.clone
 	DiskLayout DiskLayout
 }
@@ -76,18 +75,16 @@ type Identity struct {
 // without mocking filesystem state.
 type DiskLayout struct {
 	BarePath          func(projectDir string) string
-	BotClonePath      func(projectDir, botName string) string
 	OperatorClonePath func(projectDir string) string
 
 	// ProjectRoot reverses the clone-suffix conventions: given a
-	// workDir (operator clone, bot clone, or autoLocal repo
-	// root), returns the user-facing project root. Used to route
-	// per-project trace logs to a single location regardless of
-	// which clone is doing the writing.
+	// workDir (operator clone, or autoLocal repo root), returns
+	// the user-facing project root. Used to route per-project
+	// trace logs to a single location regardless of which clone
+	// is doing the writing.
 	//
 	// Production rule:
 	//   - <root>/enju/.clone                   → <root>
-	//   - <root>/.enju/bots/<x>/worktree       → <root>
 	//   - any other path                       → workDir (autoLocal/unknown)
 	ProjectRoot func(workDir string) string
 }
@@ -105,9 +102,6 @@ func NewProductionConventions() Conventions {
 			BarePath: func(projectDir string) string {
 				return filepath.Join(projectDir, "enju", ".bare.git")
 			},
-			BotClonePath: func(projectDir, botName string) string {
-				return filepath.Join(projectDir, ".enju", "bots", botName, "worktree")
-			},
 			OperatorClonePath: func(projectDir string) string {
 				return filepath.Join(projectDir, "enju", ".clone")
 			},
@@ -120,13 +114,12 @@ func NewProductionConventions() Conventions {
 // conventions. Recognized suffixes (in priority order):
 //
 //   - .../enju/.clone                  → strip the trailing 2 segments
-//   - .../.enju/bots/<x>/worktree      → strip the trailing 4 segments
 //   - else                              → workDir is already the root
 //
 // Path-pattern based, but the patterns ARE the convention — every
-// other constructor (BarePath, BotClonePath, OperatorClonePath)
-// produces strings that match these. If the convention changes,
-// this function changes alongside.
+// other constructor (BarePath, OperatorClonePath) produces strings
+// that match these. If the convention changes, this function
+// changes alongside.
 func productionProjectRootFromWorkDir(workDir string) string {
 	if workDir == "" {
 		return ""
@@ -139,14 +132,6 @@ func productionProjectRootFromWorkDir(workDir string) string {
 	// Operator clone: <root>/enju/.clone
 	if leaf == ".clone" && parentBase == "enju" {
 		return filepath.Dir(parent)
-	}
-
-	// Bot clone: <root>/.enju/bots/<botName>/worktree (Phase 4a).
-	if leaf == "worktree" && parentBase != "" {
-		grand := filepath.Dir(parent)
-		if filepath.Base(grand) == "bots" && filepath.Base(filepath.Dir(grand)) == ".enju" {
-			return filepath.Dir(filepath.Dir(grand))
-		}
 	}
 
 	// autoLocal or unknown — workDir is already the project root.
