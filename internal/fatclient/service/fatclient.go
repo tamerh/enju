@@ -23,8 +23,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
@@ -278,6 +280,37 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 		}
 	}
 	return compute.SweepRunStateDirs(wf.ProjectRoot(), alive)
+}
+
+// RunSnapshotDir returns the absolute path to a run's on-disk
+// snapshot dir (<projectRoot>/.enju/runs/<seq>-<slug>/snapshot/).
+// Exposed so the bot daemon can thread the path into the
+// handler subprocess as $ENJU_REPO_DIR — handlers read frozen
+// project content from there.
+//
+// Returns ("", nil) when the workspace isn't configured
+// (test fixtures, MCP-client-only mode); the daemon treats
+// empty as "no $ENJU_REPO_DIR exported."
+//
+// Does NOT verify the directory exists on disk — create_run is
+// what materializes it, and we want this helper to be cheap
+// (no stat) so the daemon's claim hot-path doesn't pay for
+// per-task filesystem checks. A missing snapshot dir is the
+// handler's problem to surface at runtime, with the same env
+// var as a breadcrumb pointing operators at where to look.
+func (s *FatClient) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
+	if s.enjugit == nil {
+		return "", nil
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return "", err
+	}
+	root := wf.ProjectRoot()
+	if root == "" {
+		return "", nil
+	}
+	return filepath.Join(root, corelayout.RunSnapshotOnDiskDir(runSeq, runSlug)), nil
 }
 
 // Username delegates to the coord client so callers see live values

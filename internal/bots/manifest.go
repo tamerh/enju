@@ -120,6 +120,29 @@ type Bot struct {
 	// surfaces before the daemon starts.
 	Handler string `yaml:"handler,omitempty"`
 
+	// HandlerArgs are arbitrary extra CLI flags the subprocess
+	// handler appends to the LLM binary's argv. Each (key, value)
+	// pair translates to `--<key> <value>` (with bool conventions:
+	// "true" → bare flag, "false" → omitted). Keys are passed
+	// through verbatim; values land as one argv slot via
+	// exec.Command — never shell-evaluated.
+	//
+	// Workflow YAML:
+	//   handler_args:
+	//     effort: high
+	//     max-tokens: "8192"
+	//     thinking: "true"
+	//
+	// Used to thread per-bot LLM tuning that varies across
+	// providers / versions without requiring a Go change every
+	// time. The CLI rejects unknown flags as a normal exec
+	// failure with stderr in the audit log; no enju-side
+	// validation gates the keys.
+	//
+	// Per-task overrides come from TaskDef.HandlerArgs and win
+	// on collision (TaskDef.HandlerArgs ⨁ Bot.HandlerArgs).
+	HandlerArgs map[string]string `yaml:"handler_args,omitempty"`
+
 	// Replicas requests N independently-running copies of this
 	// bot — useful when you want parallel work from multiple
 	// instances of the same role (three developer bots picking

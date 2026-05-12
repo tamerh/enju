@@ -709,6 +709,20 @@ type TaskDef struct {
 	OnReviewReject         string                  `yaml:"on_review_reject,omitempty"`
 	OnReviewRequestChanges string                  `yaml:"on_review_request_changes,omitempty"`
 	RemediationTemplate    *RemediationTemplate    `yaml:"remediation_template,omitempty"`
+
+	// HandlerArgs are per-task overrides for the LLM subprocess
+	// handler's CLI flags (per-run-snapshot redesign Phase 4b).
+	// Merged on top of the bot's HandlerArgs with task-wins
+	// semantics — so a task can bump `effort: high` even when the
+	// bot's default is `effort: medium`. See bots.Bot.HandlerArgs
+	// for the value→argv translation rule.
+	//
+	// Only meaningful on tasks that route to the subprocess
+	// handler (action: claude / gemini / any LLM binary name).
+	// Compute / answer / vote tasks ignore the field. Validator
+	// could refuse it on non-LLM actions but doesn't yet — pass-
+	// through is harmless.
+	HandlerArgs map[string]string `yaml:"handler_args,omitempty"`
 }
 
 // RemediationTemplate is the inline task spec spawned when a

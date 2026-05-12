@@ -12,21 +12,23 @@
 //
 // Implementations included here:
 //
-//   - ClaudeHandler — spawns `claude -p` (the canonical local-LLM
-//     bridge: it owns model invocation, MCP host launch, tool
-//     allowlisting, streaming output).
-//   - StubHandler — canned responses for tests so the daemon loop
-//     can be exercised without an LLM subprocess.
+//   - SubprocessHandler — spawns any external binary that
+//     satisfies the handler protocol (claude, gemini, custom
+//     shell scripts, rule-based reviewers, anything that fits).
+//     See handler_subprocess.go and docs/handler-protocol.md.
+//   - StubHandler — canned responses for tests so the daemon
+//     loop can be exercised without spawning a subprocess.
 //
-// Future implementations (deliberately not built yet — extend when
-// a real bot needs them):
+// New handlers are NOT added here. Per the Phase 4b plug-in
+// model, "different handler" means "different binary the
+// SubprocessHandler invokes." A ShellHandler / RuleHandler /
+// HTTPHandler is just an operator-provided script that
+// satisfies the protocol — no Go change needed.
 //
-//   - ShellHandler — runs an arbitrary command and captures stdout.
-//     Lets a "linter-bot" wrap golangci-lint / pyright / similar.
-//   - RuleHandler — deterministic verdicts from a declarative
-//     ruleset. Useful for review bots that only care about commit
-//     metadata, file paths, etc.
-//   - Other LLM backends (OpenAI, Gemini, local llama.cpp, ...).
+// In-tree bespoke handlers remain possible (write a new file,
+// add a NewHandler case) only when a binary genuinely can't fit
+// the protocol — interactive CLIs, multi-turn state machines,
+// transport-level customization. None exist today.
 //
 // The interface is intentionally narrow. Anything richer than
 // "text in, text out" (streaming, tool schemas, multi-turn) is a
@@ -88,6 +90,39 @@ type HandlerInput struct {
 	// it — for the Claude handler the daemon already prepends
 	// it to the user-facing prompt.
 	ReviewFeedback string
+
+	// RepoDir is the absolute path to the run's frozen
+	// snapshot — <project>/.enju/runs/<seq>-<slug>/snapshot/.
+	// Exposed to the subprocess as $ENJU_REPO_DIR so handlers
+	// (LLM or otherwise) can read project context that's pinned
+	// to the run's base SHA, immune to operator edits on the
+	// live working tree. Empty when the daemon hasn't resolved
+	// the snapshot yet (legacy paths, test fixtures); the
+	// subprocess sees no env var.
+	RepoDir string
+
+	// GitDir is the absolute path to the .git/ that holds the
+	// project's full history — operator's clone today, post-P4d
+	// the operator's `.git/` directly. Exposed as $ENJU_GIT_DIR
+	// so handlers can query history via `git --git-dir=...`
+	// without needing a checked-out worktree. Read-only by
+	// convention (the protocol forbids handlers from running
+	// `git commit` / `git push` — commits are citizen actions
+	// mediated by enju's submit path).
+	GitDir string
+
+	// Branch is the run's git branch name. Exposed as
+	// $ENJU_BRANCH so handlers know what to pass to
+	// `git --git-dir=$ENJU_GIT_DIR log $ENJU_BRANCH` for
+	// in-run history (prior tasks' committed outputs).
+	Branch string
+
+	// HandlerArgs are per-task CLI-flag overrides that merge on
+	// top of the bot's manifest-level HandlerArgs at invoke
+	// time, with task-wins semantics. The subprocess handler
+	// translates the merged map to `--key value` argv slots.
+	// Empty when the task didn't override.
+	HandlerArgs map[string]string
 }
 
 // HandlerOutput is what the handler returns to the daemon. The
@@ -142,10 +177,21 @@ type HandlerOutput struct {
 	Option string
 }
 
-// HandlerType is the manifest discriminator for which Handler
-// implementation a bot uses. Default is HandlerTypeClaude when the
-// manifest omits the handler: field — preserves back-compat with
-// pre-Phase-7.2 manifests where every bot was implicitly Claude.
+// HandlerType is the manifest discriminator. Today only two
+// values get special treatment in NewHandler:
+//
+//   - HandlerTypeStub  → in-process StubHandler (testing).
+//   - empty            → SubprocessHandler with binary="claude"
+//                        (back-compat with pre-Phase-4b manifests).
+//
+// Any OTHER value is treated as the name of an external binary
+// — claude, gemini, ./bin/my-linter, /opt/foo, whatever. The
+// SubprocessHandler invokes it per the handler protocol; no
+// in-tree code per LLM or per tool.
+//
+// HandlerTypeClaude is retained as a constant because it remains
+// the implicit default for empty-handler manifests; "stub" is
+// the only OTHER name that needs an enum-like reference.
 type HandlerType string
 
 const (
@@ -158,14 +204,42 @@ const (
 // Handler is reused across iterations for the lifetime of the
 // daemon process.
 //
-// Empty Handler field is treated as "claude" — every pre-existing
-// manifest stays valid without an opt-in migration.
+// Routing (Phase 4b — see docs/handler-protocol.md):
+//   - handler: "stub"      → in-process StubHandler
+//   - handler: ""          → SubprocessHandler("claude")
+//                             (back-compat default)
+//   - handler: <anything>  → SubprocessHandler(<anything>) where
+//                             <anything> is the binary name
+//                             (resolved via $PATH) or an absolute
+//                             / repo-relative path
+//
+// The switch never grows. Adding a new "handler type" means
+// providing a binary that satisfies the protocol — no Go change.
 func NewHandler(b *Bot) (Handler, error) {
-	switch HandlerType(b.Handler) {
-	case "", HandlerTypeClaude:
-		return NewClaudeHandler(b), nil
-	case HandlerTypeStub:
+	if HandlerType(b.Handler) == HandlerTypeStub {
 		return NewStubHandler(), nil
 	}
-	return nil, fmt.Errorf("bot %q: unknown handler type %q (supported: claude, stub)", b.Name, b.Handler)
+	return NewSubprocessHandler(b), nil
 }
+
+// Preflighter is implemented by handlers that want a startup
+// readiness check before the daemon enters its poll loop. The
+// SubprocessHandler implements this to verify the configured
+// binary is locatable + executable; the StubHandler doesn't
+// need it. Daemon callers do an interface assertion and skip
+// the check for handlers that don't implement it.
+//
+// Returning a non-nil error from Preflight fails daemon startup
+// with a clear actionable message (typo'd path, missing binary,
+// wrong permissions) instead of silently waiting until the
+// first claim to surface the problem.
+type Preflighter interface {
+	Preflight() error
+}
+
+// Ensure SubprocessHandler satisfies Preflighter at compile time
+// so future refactors can't silently drop the method.
+var _ Preflighter = (*SubprocessHandler)(nil)
+
+// keep fmt used so future error wraps in this file build clean
+var _ = fmt.Errorf

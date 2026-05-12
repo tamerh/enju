@@ -92,6 +92,12 @@ type fatClient interface {
 	// configured.
 	SweepRunStateDirsForProject(ctx context.Context, projectID int64) (int, error)
 
+	// RunSnapshotDir resolves the run's on-disk snapshot dir
+	// (per-run-snapshot redesign Phase 4b — exposed to handlers
+	// as $ENJU_REPO_DIR). Returns "" when the workspace isn't
+	// configured.
+	RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error)
+
 	// ResolveBotWorkspace returns the abs path to this bot's
 	// per-bot per-project managed clone at
 	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
@@ -279,6 +285,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"bot", d.bot.Name,
 		"project_id", d.projectID,
 		"username", d.fc.Username())
+
+	// Handler preflight: fail loud at startup if the configured
+	// handler binary isn't locatable + executable. Without this,
+	// a typo'd path or missing binary only surfaces at first
+	// claim — possibly hours into the daemon's run, after the
+	// task has already been CLAIMED-and-failed once.
+	//
+	// Only SubprocessHandler implements Preflighter today;
+	// StubHandler skips this check (always available).
+	if pf, ok := d.handler.(Preflighter); ok {
+		if perr := pf.Preflight(); perr != nil {
+			return fmt.Errorf("handler preflight: %w", perr)
+		}
+	}
 
 	// Startup recovery: release any open claims held by this
 	// bot's identity from a previous daemon instance. Without
@@ -732,6 +752,24 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 			"task_id", taskID, "error", perr)
 	}
 
+	// Resolve $ENJU_REPO_DIR — the run's frozen snapshot. Best-
+	// effort: failures here log + proceed with empty, which the
+	// handler protocol treats as "no env var exported" so legacy
+	// or stub handlers don't see a confusing empty value.
+	repoDir, snapErr := d.fc.RunSnapshotDir(ctx, meta.ProjectID, meta.RunSeq, meta.RunSlug)
+	if snapErr != nil {
+		d.logger.Debug("resolve run snapshot dir for handler env (proceeding without it)",
+			"task_id", taskID, "error", snapErr)
+	}
+	// $ENJU_GIT_DIR: the .git/ the handler can query for history.
+	// Pre-P4d this is the bot's persistent clone's .git (same
+	// content as operator's via fetch); P4d switches to the
+	// operator's .git/ directly. Env-var name stays the same.
+	gitDir := ""
+	if workspacePath != "" {
+		gitDir = filepath.Join(workspacePath, ".git")
+	}
+
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
 		TaskID:         meta.ID,
 		Action:         meta.Action,
@@ -739,6 +777,16 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		SystemPrompt:   d.systemPrompt,
 		Workspace:      workspacePath,
 		ReviewFeedback: string(claim.ReviewFeedback),
+		RepoDir:        repoDir,
+		GitDir:         gitDir,
+		Branch:         meta.Branch,
+		// HandlerArgs (per-task override): not yet threaded
+		// through coord at the TaskMeta level. Bot-level args
+		// from manifest.Bot.HandlerArgs already reach the
+		// SubprocessHandler via NewSubprocessHandler; per-task
+		// overrides require a separate coord-side change to
+		// expose TaskDef.HandlerArgs through the /tasks/<id>
+		// payload. Tracked as a follow-up to P4b.
 	})
 	if err != nil {
 		return fmt.Errorf("handler: %w", err)

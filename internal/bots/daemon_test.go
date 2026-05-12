@@ -160,6 +160,9 @@ func (f *fakeFC) SweepStaleScratchAtStartup() (int, error) { return 0, nil }
 func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int64) (int, error) {
 	return 0, nil
 }
+func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
+	return "", nil
+}
 
 func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error) {
 	if m, ok := f.metaByID[taskID]; ok {

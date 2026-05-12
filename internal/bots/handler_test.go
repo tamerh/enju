@@ -7,17 +7,21 @@ import (
 	"testing"
 )
 
-func TestNewHandler_DefaultsToClaude(t *testing.T) {
-	// Pre-Phase-7.2 manifests omit the Handler field. The
-	// factory must keep returning a ClaudeHandler so existing
-	// projects don't need a migration.
+func TestNewHandler_DefaultsToClaudeBinary(t *testing.T) {
+	// Pre-Phase-4b manifests omit the Handler field. The factory
+	// must keep producing a working handler with claude as the
+	// binary so existing projects don't need a migration.
 	b := &Bot{Name: "x", Model: "claude-sonnet-4-6", Handler: ""}
 	h, err := NewHandler(b)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
-	if _, ok := h.(*ClaudeHandler); !ok {
-		t.Errorf("empty handler type should default to claude; got %T", h)
+	sub, ok := h.(*SubprocessHandler)
+	if !ok {
+		t.Fatalf("empty handler should yield *SubprocessHandler; got %T", h)
+	}
+	if sub.Binary != "claude" {
+		t.Errorf("empty handler should default Binary to %q, got %q", "claude", sub.Binary)
 	}
 }
 
@@ -27,12 +31,38 @@ func TestNewHandler_ExplicitClaude(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
-	cl, ok := h.(*ClaudeHandler)
+	sub, ok := h.(*SubprocessHandler)
 	if !ok {
-		t.Fatalf("explicit claude should yield *ClaudeHandler; got %T", h)
+		t.Fatalf("handler=claude should yield *SubprocessHandler; got %T", h)
 	}
-	if cl.Model != "claude-sonnet-4-6" {
-		t.Errorf("Model not threaded through: got %q", cl.Model)
+	if sub.Binary != "claude" {
+		t.Errorf("Binary: got %q, want %q", sub.Binary, "claude")
+	}
+	if sub.Model != "claude-sonnet-4-6" {
+		t.Errorf("Model not threaded through: got %q", sub.Model)
+	}
+}
+
+func TestNewHandler_ArbitraryBinaryName(t *testing.T) {
+	// The Phase 4b plug-in contract: any non-stub, non-empty
+	// handler string is the name of an external binary. No
+	// enum allowlist, no Go change per LLM. gemini, aider,
+	// my-rule-bot — all valid.
+	for _, bin := range []string{"gemini", "aider", "./bin/my-linter", "/opt/foo/runner"} {
+		t.Run(bin, func(t *testing.T) {
+			b := &Bot{Name: "x", Model: "m", Handler: bin}
+			h, err := NewHandler(b)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			sub, ok := h.(*SubprocessHandler)
+			if !ok {
+				t.Fatalf("handler=%q should yield *SubprocessHandler; got %T", bin, h)
+			}
+			if sub.Binary != bin {
+				t.Errorf("Binary: got %q, want %q", sub.Binary, bin)
+			}
+		})
 	}
 }
 
@@ -47,32 +77,22 @@ func TestNewHandler_StubForTests(t *testing.T) {
 	}
 }
 
-func TestNewHandler_UnknownType(t *testing.T) {
-	b := &Bot{Name: "x", Handler: "shell"} // not yet supported
-	_, err := NewHandler(b)
-	if err == nil {
-		t.Fatal("unknown handler type should error, got nil")
-	}
-	if !strings.Contains(err.Error(), "unknown handler type") {
-		t.Errorf("error message should name the failure: %v", err)
-	}
-}
-
-func TestClaudeHandler_PassesAllowToolsFromManifest(t *testing.T) {
+func TestSubprocessHandler_PassesAllowToolsFromManifest(t *testing.T) {
 	b := &Bot{
 		Name:     "x",
 		Model:    "claude-sonnet-4-6",
+		Handler:  "claude",
 		MCPTools: &MCPTools{Allow: []string{"Read", "Edit"}},
 	}
-	h := NewClaudeHandler(b)
+	h := NewSubprocessHandler(b)
 	if got, want := strings.Join(h.AllowTools, ","), "Read,Edit"; got != want {
 		t.Errorf("AllowTools: got %q, want %q", got, want)
 	}
 }
 
-func TestClaudeHandler_NilMCPToolsMeansNoAllowlist(t *testing.T) {
-	b := &Bot{Name: "x", Model: "claude-sonnet-4-6"}
-	h := NewClaudeHandler(b)
+func TestSubprocessHandler_NilMCPToolsMeansNoAllowlist(t *testing.T) {
+	b := &Bot{Name: "x", Model: "claude-sonnet-4-6", Handler: "claude"}
+	h := NewSubprocessHandler(b)
 	if len(h.AllowTools) != 0 {
 		t.Errorf("nil MCPTools should produce no allowlist; got %v", h.AllowTools)
 	}
