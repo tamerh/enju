@@ -21,6 +21,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -233,6 +234,50 @@ func (s *FatClient) SweepStaleScratchAtStartup() (int, error) {
 		return 0, nil
 	}
 	return compute.SweepStaleScratchAtStartup(s.enjugit.RootDir(), s.coord.Username())
+}
+
+// SweepRunStateDirsForProject removes per-run on-disk state
+// directories (<projectRoot>/.enju/runs/<seq>-<slug>/) for runs
+// the coordinator considers terminal (completed / failed /
+// terminated). Called at bot startup so snapshot dirs from
+// runs that finished while the previous daemon was down don't
+// accumulate.
+//
+// "Alive" set is fetched via ListRuns and filtered to
+// state ∉ {completed, failed, terminated}. Any on-disk per-run
+// dir whose seq isn't in that set is removed.
+//
+// Returns (removed, error). Errors don't abort caller startup —
+// the daemon logs and continues; a stale snapshot dir is dead
+// weight, not a correctness hazard.
+//
+// No-op when:
+//   - workspace isn't set (MCP-client-only mode)
+//   - ListRuns fails (coord unreachable at boot) — log + skip
+//     so the sweep doesn't WIDOW the daemon
+//   - the project's .enju/runs/ dir doesn't exist yet
+func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID int64) (int, error) {
+	if s.enjugit == nil {
+		return 0, nil
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return 0, err
+	}
+	runs, err := s.ListRuns(ctx, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("list runs for sweep: %w", err)
+	}
+	alive := make(map[int]bool, len(runs))
+	for _, r := range runs {
+		switch r.State {
+		case "completed", "failed", "terminated":
+			// terminal — eligible for sweep
+		default:
+			alive[r.Seq] = true
+		}
+	}
+	return compute.SweepRunStateDirs(wf.ProjectRoot(), alive)
 }
 
 // Username delegates to the coord client so callers see live values

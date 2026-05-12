@@ -116,16 +116,17 @@ func TestCommitArbitraryFilesPlumbing_ConcurrentBranches(t *testing.T) {
 	for _, r := range runs {
 		t.Run("materialize "+r.branch, func(t *testing.T) {
 			target := filepath.Join(t.TempDir(), "snapshot")
-			n, err := wf.MaterializeRunSnapshot(r.branch, r.seq, r.slug, target)
+			n, err := wf.MaterializeRunRepo(r.branch, target)
 			if err != nil {
-				t.Fatalf("MaterializeRunSnapshot: %v", err)
+				t.Fatalf("MaterializeRunRepo: %v", err)
 			}
 			if n == 0 {
 				t.Fatalf("materialized zero files for run %d on branch %s (the bug we're fixing)", r.seq, r.branch)
 			}
-			content, err := os.ReadFile(filepath.Join(target, "enju.yaml"))
+			yamlPath := filepath.Join(target, corelayout.RunTemplateSnapshotDir(r.seq, r.slug), "enju.yaml")
+			content, err := os.ReadFile(yamlPath)
 			if err != nil {
-				t.Fatalf("read materialized enju.yaml: %v", err)
+				t.Fatalf("read materialized enju.yaml at %s: %v", yamlPath, err)
 			}
 			if !strings.Contains(string(content), r.marker) {
 				t.Errorf("snapshot for %s does not contain expected marker %q: %s",
@@ -159,12 +160,12 @@ func TestCommitArbitraryFilesPlumbing_ConcurrentBranches(t *testing.T) {
 	}
 }
 
-// TestMaterializeRunSnapshot_PreservesExecutableBit pins the
+// TestMaterializeRunRepo_PreservesExecutableBit pins the
 // mode-preservation contract: a script file committed with
 // mode 0755 in git must come out of the materializer as 0755
 // on disk, so the wrapper's fork/exec can run it without
 // EACCES.
-func TestMaterializeRunSnapshot_PreservesExecutableBit(t *testing.T) {
+func TestMaterializeRunRepo_PreservesExecutableBit(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
 	wf, err := ws.ForProject(100, bare)
@@ -192,10 +193,10 @@ func TestMaterializeRunSnapshot_PreservesExecutableBit(t *testing.T) {
 	}
 
 	target := filepath.Join(t.TempDir(), "snapshot")
-	if _, err := wf.MaterializeRunSnapshot("run-exec", 1, "exec", target); err != nil {
-		t.Fatalf("MaterializeRunSnapshot: %v", err)
+	if _, err := wf.MaterializeRunRepo("run-exec", target); err != nil {
+		t.Fatalf("MaterializeRunRepo: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(target, "scripts", "entry.sh"))
+	info, err := os.Stat(filepath.Join(target, snapshotSubdir, "scripts", "entry.sh"))
 	if err != nil {
 		t.Fatalf("stat materialized script: %v", err)
 	}
@@ -204,9 +205,9 @@ func TestMaterializeRunSnapshot_PreservesExecutableBit(t *testing.T) {
 	}
 }
 
-// TestMaterializeRunSnapshot_BranchMissing returns a clear
+// TestMaterializeRunRepo_BranchMissing returns a clear
 // error rather than silently producing an empty dir.
-func TestMaterializeRunSnapshot_BranchMissing(t *testing.T) {
+func TestMaterializeRunRepo_BranchMissing(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
 	wf, err := ws.ForProject(101, bare)
@@ -214,7 +215,7 @@ func TestMaterializeRunSnapshot_BranchMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(t.TempDir(), "snapshot")
-	_, err = wf.MaterializeRunSnapshot("never-existed", 1, "ghost", target)
+	_, err = wf.MaterializeRunRepo("never-existed", target)
 	if err == nil {
 		t.Error("expected error for missing branch")
 	}

@@ -204,11 +204,35 @@ func RunTemplateSnapshotDir(runSeq int, slug string) string {
 // Empty slug falls back to "run" via RunDir's normalization so
 // the path is always well-formed.
 func RunSnapshotOnDiskDir(runSeq int, slug string) string {
+	return filepath.Join(RunStateDir(runSeq, slug), "snapshot")
+}
+
+// RunStateDir returns the per-run state directory under
+// StateDirRoot (.enju/runs/<seq>-<slug>/). This is the parent
+// of the run's snapshot/ subdir (RunSnapshotOnDiskDir) — and the
+// directory the run-completion sweep removes.
+//
+// Distinct from RunDir, which returns the VISIBLE enju/runs/...
+// path where committed artifact trails live. RunStateDir holds
+// only runtime caches (snapshot/, scratch/, future per-run
+// transient state); RunDir holds the audit trail.
+//
+// Empty slug falls back to "run" so the path is always
+// well-formed.
+func RunStateDir(runSeq int, slug string) string {
 	s := slug
 	if s == "" {
 		s = "run"
 	}
-	return filepath.Join(StateDirRoot, "runs", fmt.Sprintf("%d-%s", runSeq, s), "snapshot")
+	return filepath.Join(StateDirRoot, "runs", fmt.Sprintf("%d-%s", runSeq, s))
+}
+
+// RunStateRunsRoot returns the parent dir under which every
+// run's RunStateDir lives (.enju/runs/). Used by the sweep
+// pass to enumerate all per-run state dirs on disk and diff
+// against the coordinator's active-run set.
+func RunStateRunsRoot() string {
+	return filepath.Join(StateDirRoot, "runs")
 }
 
 // RunDir renders the per-run root segment

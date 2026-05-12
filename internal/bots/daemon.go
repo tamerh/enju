@@ -84,6 +84,14 @@ type fatClient interface {
 	// isn't configured or the scratch tree is empty.
 	SweepStaleScratchAtStartup() (int, error)
 
+	// SweepRunStateDirsForProject — per-run-snapshot-redesign
+	// Phase 3 startup hook. Removes <project>/.enju/runs/<seq>-<slug>/
+	// dirs for runs the coordinator considers terminal so on-disk
+	// snapshot caches from completed runs don't accumulate
+	// across daemon restarts. No-op when the workspace isn't
+	// configured.
+	SweepRunStateDirsForProject(ctx context.Context, projectID int64) (int, error)
+
 	// ResolveBotWorkspace returns the abs path to this bot's
 	// per-bot per-project managed clone at
 	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
@@ -304,6 +312,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 			"error", err, "removed", n)
 	} else if n > 0 {
 		d.logger.Info("swept stale scratch dirs from previous daemon run",
+			"count", n)
+	}
+
+	// Per-run-snapshot redesign Phase 3 — drop on-disk per-run
+	// state dirs (<project>/.enju/runs/<seq>-<slug>/) for runs
+	// the coordinator already considers terminal. Catches snapshots
+	// from runs that finished while this daemon was down or whose
+	// terminal-state was missed by the previous instance. Bounded
+	// disk savings since runs are immutable once terminal — never
+	// races with an active task.
+	if n, err := d.fc.SweepRunStateDirsForProject(ctx, d.projectID); err != nil {
+		d.logger.Warn("startup run-snapshot sweep failed (proceeding)",
+			"error", err, "removed", n)
+	} else if n > 0 {
+		d.logger.Info("swept terminal run snapshot dirs",
 			"count", n)
 	}
 
