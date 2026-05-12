@@ -9,50 +9,85 @@ import (
 	"testing"
 )
 
-// TestHandlerArgsToArgv pins the translation convention:
-//
-//	{key: "value"} → --key value
-//	{key: "true"}  → --key       (bare flag)
-//	{key: ""}      → --key       (bare flag)
-//	{key: "false"} → (omitted)
-//
-// Plus the determinism guarantee — keys are sorted so argv
-// is stable across calls (tests, cache keys, log grepping).
-func TestHandlerArgsToArgv(t *testing.T) {
+// TestArgSubstitute pins the single-arg substitution behavior:
+// {{var}} placeholders resolve from the context map; missing
+// or empty values are flagged via hasEmpty so the caller can
+// apply the drop rule. Unterminated braces fail loud.
+func TestArgSubstitute(t *testing.T) {
+	ctx := map[string]string{
+		"model":         "claude-sonnet-4-6",
+		"system_prompt": "be concise",
+		"empty_key":     "",
+	}
 	cases := []struct {
-		name string
-		in   map[string]string
-		want []string
+		name       string
+		in         string
+		wantOut    string
+		wantHasRef bool
+		wantEmpty  bool
+		wantErr    bool
 	}{
-		{"nil", nil, nil},
-		{"empty", map[string]string{}, nil},
-		{"single value", map[string]string{"effort": "high"}, []string{"--effort", "high"}},
-		{"true is bare flag", map[string]string{"strict": "true"}, []string{"--strict"}},
-		{"empty value is bare flag", map[string]string{"verbose": ""}, []string{"--verbose"}},
-		{"false omitted", map[string]string{"strict": "false"}, nil},
-		{
-			"deterministic ordering",
-			map[string]string{"z-last": "z", "a-first": "a", "m-mid": "m"},
-			[]string{"--a-first", "a", "--m-mid", "m", "--z-last", "z"},
-		},
-		{
-			"mixed shapes",
-			map[string]string{
-				"effort":     "high",
-				"thinking":   "true",
-				"streaming":  "false",
-				"max-tokens": "8192",
-			},
-			[]string{"--effort", "high", "--max-tokens", "8192", "--thinking"},
-		},
+		{"no placeholder", "-p", "-p", false, false, false},
+		{"single placeholder", "--model={{model}}", "--model=claude-sonnet-4-6", true, false, false},
+		{"empty value triggers hasEmpty", "--model={{empty_key}}", "--model=", true, true, false},
+		{"missing key treated as empty", "--model={{nonexistent}}", "--model=", true, true, false},
+		{"multiple placeholders one empty", "{{model}}/{{nonexistent}}", "claude-sonnet-4-6/", true, true, false},
+		{"placeholder in middle", "before-{{model}}-after", "before-claude-sonnet-4-6-after", true, false, false},
+		{"unterminated braces error", "--foo={{model", "", false, false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := handlerArgsToArgv(c.in)
-			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("handlerArgsToArgv(%v):\n  got  %v\n  want %v", c.in, got, c.want)
+			got, hasRef, hasEmpty, err := argSubstitute(c.in, ctx)
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil (out=%q)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.wantOut {
+				t.Errorf("out: got %q, want %q", got, c.wantOut)
+			}
+			if hasRef != c.wantHasRef {
+				t.Errorf("hasRef: got %v, want %v", hasRef, c.wantHasRef)
+			}
+			if hasEmpty != c.wantEmpty {
+				t.Errorf("hasEmpty: got %v, want %v", hasEmpty, c.wantEmpty)
 			}
 		})
+	}
+}
+
+// TestSubArgs_AppliesDropRule pins the empty-substitution
+// behavior: a {{var}} resolving to empty causes the whole arg
+// to drop from argv, but only when the arg actually CONTAINED
+// a {{var}}. Args with no placeholders pass through unchanged
+// regardless of context state.
+func TestSubArgs_AppliesDropRule(t *testing.T) {
+	ctx := map[string]string{
+		"model":         "claude-sonnet-4-6",
+		"system_prompt": "", // empty → drops args referencing it
+	}
+	template := []string{
+		"-p",                                  // no placeholder → keep
+		"--model={{model}}",                    // resolves → keep
+		"--append-system-prompt={{system_prompt}}", // empty → DROP
+		"--debug",                              // no placeholder → keep
+		"{{nonexistent}}",                      // missing → DROP
+	}
+	got, err := subArgs(template, ctx)
+	if err != nil {
+		t.Fatalf("subArgs: %v", err)
+	}
+	want := []string{
+		"-p",
+		"--model=claude-sonnet-4-6",
+		"--debug",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
@@ -100,12 +135,11 @@ func TestMergeHandlerArgs(t *testing.T) {
 // misbehave on the empty value.
 func TestBuildSubprocessEnv_OmitsEmptyValues(t *testing.T) {
 	// Lock the test against a known baseline env so we can assert
-	// only on the ENJU_* additions.
-	oldTestEnviron := testEnviron
-	t.Cleanup(func() { testEnviron = oldTestEnviron })
-	testEnviron = func() []string { return []string{"PATH=/usr/bin"} }
+	// only on the ENJU_* additions. setTestEnviron registers the
+	// t.Cleanup that restores the previous value (review fix R4).
+	setTestEnviron(t, func() []string { return []string{"PATH=/usr/bin"} })
 
-	got := buildSubprocessEnv(HandlerInput{
+	got := buildSubprocessEnv(nil, HandlerInput{
 		TaskID: "1:1:foo",
 		// Action, SystemPrompt, RepoDir, GitDir, Branch,
 		// Workspace, ReviewFeedback all empty — none should be
@@ -118,10 +152,10 @@ func TestBuildSubprocessEnv_OmitsEmptyValues(t *testing.T) {
 	for _, k := range []string{
 		"ENJU_ACTION", "ENJU_SYSTEM_PROMPT", "ENJU_REPO_DIR",
 		"ENJU_GIT_DIR", "ENJU_BRANCH", "ENJU_SCRATCH",
-		"ENJU_REVIEW_FEEDBACK",
+		"ENJU_REVIEW_FEEDBACK", "ENJU_MODEL", "ENJU_ALLOWED_TOOLS",
 	} {
 		if _, present := envMap[k]; present {
-			t.Errorf("%s should be absent when HandlerInput field is empty; got %q", k, envMap[k])
+			t.Errorf("%s should be absent when source field is empty; got %q", k, envMap[k])
 		}
 	}
 	// PATH from the inherited env survives.
@@ -131,15 +165,20 @@ func TestBuildSubprocessEnv_OmitsEmptyValues(t *testing.T) {
 }
 
 // TestBuildSubprocessEnv_ExposesFullProtocol pins that every
-// non-empty HandlerInput field lands as the right env var. This
-// is the contract operators read against when authoring
-// out-of-tree handlers.
+// non-empty source field lands as the right env var. This is
+// the contract operators read against when authoring out-of-
+// tree handlers. Includes ENJU_MODEL + ENJU_ALLOWED_TOOLS
+// which are sourced from the handler (per-bot), distinct from
+// the HandlerInput fields (per-claim) — review fix R1 moved
+// Model + AllowTools off the CLI argv and onto env vars.
 func TestBuildSubprocessEnv_ExposesFullProtocol(t *testing.T) {
-	oldTestEnviron := testEnviron
-	t.Cleanup(func() { testEnviron = oldTestEnviron })
-	testEnviron = func() []string { return nil }
+	setTestEnviron(t, func() []string { return nil })
 
-	got := buildSubprocessEnv(HandlerInput{
+	h := &SubprocessHandler{
+		Model:      "claude-sonnet-4-6",
+		AllowTools: []string{"Read", "Edit", "Bash"},
+	}
+	got := buildSubprocessEnv(h, HandlerInput{
 		TaskID:         "p1:r2:t3",
 		Action:         "compute",
 		SystemPrompt:   "You are a helpful bot.",
@@ -159,11 +198,61 @@ func TestBuildSubprocessEnv_ExposesFullProtocol(t *testing.T) {
 		"ENJU_REPO_DIR":        "/proj/.enju/runs/1-foo/snapshot",
 		"ENJU_GIT_DIR":         "/proj/.enju/bots/dev/worktree/.git",
 		"ENJU_BRANCH":          "1-foo",
+		"ENJU_MODEL":           "claude-sonnet-4-6",
+		"ENJU_ALLOWED_TOOLS":   "Read,Edit,Bash",
 	}
 	for k, v := range want {
 		if envMap[k] != v {
 			t.Errorf("%s: got %q, want %q", k, envMap[k], v)
 		}
+	}
+}
+
+// TestSubprocessHandler_NoHardcodedClaudeFlags pins the
+// binary-agnostic posture: enju emits zero CLI flags on its
+// own. A bot with Model + MCPTools set but no Args: list
+// produces an empty argv. To pass claude's flags, the
+// operator authors `args:` in the bot manifest with
+// {{model}} / {{system_prompt}} / {{allowed_tools}} templates
+// — claude's flag conventions live in YAML, not in Go.
+func TestSubprocessHandler_NoHardcodedClaudeFlags(t *testing.T) {
+	dir := t.TempDir()
+	// Script captures argv and exits 0; lets us see exactly
+	// what the handler tried to pass.
+	scriptPath := filepath.Join(dir, "argv-echo.sh")
+	body := "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\nexit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bot{
+		Name:     "x",
+		Handler:  scriptPath,
+		Model:    "claude-sonnet-4-6",
+		MCPTools: &MCPTools{Allow: []string{"Read", "Edit"}},
+	}
+	h := NewSubprocessHandler(b)
+	out, err := h.ProcessTask(context.Background(), HandlerInput{
+		TaskID:       "t",
+		SystemPrompt: "system body",
+	})
+	if err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+	// None of the claude-specific flags should appear in argv.
+	for _, forbidden := range []string{
+		"arg:-p", "arg:--model", "arg:--append-system-prompt",
+		"arg:--allowedTools", "arg:claude-sonnet-4-6",
+		"arg:system body",
+	} {
+		if strings.Contains(out.Response, forbidden) {
+			t.Errorf("argv leaked claude-specific flag %q; got:\n%s", forbidden, out.Response)
+		}
+	}
+	// And the empty handler_args means argv is effectively
+	// empty (no flags appear at all).
+	if strings.Contains(out.Response, "arg:") {
+		t.Errorf("argv should have been empty (no handler_args); got:\n%s", out.Response)
 	}
 }
 
@@ -262,10 +351,14 @@ func TestSubprocessHandler_ShellInjectionSafe(t *testing.T) {
 	// only as a literal echoed arg. If it ever appeared by
 	// itself, a shell layer evaluated the value.
 	const inject = "$(touch " + "/tmp/should-never-be-created" + "); echo OWNED"
+	// Wire the injection value into argv via a template substitution.
+	// The new design routes handler_args through {{handler_args.<key>}}
+	// in the bot's Args list — that's the realistic attack surface.
 	b := &Bot{
 		Name:        "x",
 		Handler:     scriptPath,
 		HandlerArgs: map[string]string{"prompt": inject},
+		Args:        []string{"{{handler_args.prompt}}"},
 	}
 	h := NewSubprocessHandler(b)
 	out, err := h.ProcessTask(context.Background(), HandlerInput{TaskID: "t"})
@@ -296,9 +389,11 @@ func TestSubprocessHandler_ShellInjectionSafe(t *testing.T) {
 }
 
 // TestSubprocessHandler_TaskHandlerArgsOverridesBot exercises
-// the per-call merge from inside ProcessTask. Bot config sets
-// effort=medium; the HandlerInput passes effort=high; the
-// subprocess argv must show --effort high.
+// the per-call merge inside ProcessTask via the
+// {{handler_args.<key>}} substitution path. Bot config sets
+// effort=medium; the HandlerInput passes effort=high. With the
+// bot's args: list referencing {{handler_args.effort}}, the
+// spawned argv must show "high" (task won on collision).
 func TestSubprocessHandler_TaskHandlerArgsOverridesBot(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "argv-echo.sh")
@@ -311,34 +406,136 @@ func TestSubprocessHandler_TaskHandlerArgsOverridesBot(t *testing.T) {
 		Name:        "x",
 		Handler:     scriptPath,
 		HandlerArgs: map[string]string{"effort": "medium", "shared": "from-bot"},
+		Args: []string{
+			"--effort={{handler_args.effort}}",
+			"--shared={{handler_args.shared}}",
+			"--task-extra={{handler_args.task-extra}}",
+		},
 	}
 	h := NewSubprocessHandler(b)
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID: "t",
 		HandlerArgs: map[string]string{
-			"effort":      "high",       // overrides bot's "medium"
-			"task-extra":  "task-only",   // task-only key
+			"effort":     "high",       // overrides bot's "medium"
+			"task-extra": "task-only",  // task-only key
 		},
 	})
 	if err != nil {
 		t.Fatalf("ProcessTask: %v", err)
 	}
-	// effort=high (task won), shared=from-bot (bot survives), task-extra=task-only (task contributed)
+	// effort=high (task won), shared=from-bot (bot value survived),
+	// task-extra=task-only (task contributed).
 	for _, want := range []string{
-		"arg:--effort", "arg:high",
-		"arg:--shared", "arg:from-bot",
-		"arg:--task-extra", "arg:task-only",
+		"arg:--effort=high",
+		"arg:--shared=from-bot",
+		"arg:--task-extra=task-only",
 	} {
 		if !strings.Contains(out.Response, want) {
 			t.Errorf("argv should contain %q; got:\n%s", want, out.Response)
 		}
 	}
-	// And the bot's stale "medium" must NOT appear (it was
-	// overridden — the test catches a regression where the
-	// merge accidentally appended both).
-	if strings.Contains(out.Response, "arg:medium") {
+	// And the bot's stale "medium" must NOT appear.
+	if strings.Contains(out.Response, "arg:--effort=medium") {
 		t.Errorf("bot's overridden value medium should not appear in argv; got:\n%s", out.Response)
+	}
+}
+
+// TestSubprocessHandler_ArgsTemplateSubstitution is the
+// end-to-end pin for the templated-argv design (Phase 4b-r1):
+// the operator writes claude's argv shape in YAML; enju
+// substitutes the runtime values. No claude-specific knowledge
+// in Go.
+func TestSubprocessHandler_ArgsTemplateSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "argv-echo.sh")
+	body := "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// System prompt body must come from a real file since the
+	// handler reads it at invoke time.
+	sysPromptPath := filepath.Join(dir, "system.md")
+	if err := os.WriteFile(sysPromptPath, []byte("be concise"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bot{
+		Name:         "claude-shape-bot",
+		Handler:      scriptPath,
+		Model:        "claude-sonnet-4-6",
+		SystemPrompt: sysPromptPath,
+		MCPTools:     &MCPTools{Allow: []string{"Read", "Write"}},
+		Args: []string{
+			"-p",
+			"--model={{model}}",
+			"--append-system-prompt={{system_prompt}}",
+			"--allowedTools={{allowed_tools}}",
+			"--task-id={{task_id}}",
+			"--branch={{branch}}",
+		},
+	}
+	h := NewSubprocessHandler(b)
+
+	out, err := h.ProcessTask(context.Background(), HandlerInput{
+		TaskID: "p:1:t",
+		Branch: "main",
+	})
+	if err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+	for _, want := range []string{
+		"arg:-p",
+		"arg:--model=claude-sonnet-4-6",
+		"arg:--append-system-prompt=be concise",
+		"arg:--allowedTools=Read,Write",
+		"arg:--task-id=p:1:t",
+		"arg:--branch=main",
+	} {
+		if !strings.Contains(out.Response, want) {
+			t.Errorf("argv should contain %q; got:\n%s", want, out.Response)
+		}
+	}
+}
+
+// TestSubprocessHandler_ArgsDropEmptySubstitutions pins the
+// empty-substitution rule end-to-end: a bot with no model
+// shouldn't emit `--model=` (which most CLIs reject); the
+// whole arg drops.
+func TestSubprocessHandler_ArgsDropEmptySubstitutions(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "argv-echo.sh")
+	body := "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bot{
+		Name:    "lint-bot",
+		Handler: scriptPath,
+		// No Model, no SystemPrompt — those templates resolve empty.
+		Args: []string{
+			"--format=json",                                       // no template → kept
+			"--model={{model}}",                                    // empty → dropped
+			"--append-system-prompt={{system_prompt}}",             // empty → dropped
+			"--strict",                                             // no template → kept
+		},
+	}
+	h := NewSubprocessHandler(b)
+	out, err := h.ProcessTask(context.Background(), HandlerInput{TaskID: "t"})
+	if err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+	if !strings.Contains(out.Response, "arg:--format=json") {
+		t.Errorf("--format=json arg should survive; got:\n%s", out.Response)
+	}
+	if !strings.Contains(out.Response, "arg:--strict") {
+		t.Errorf("--strict arg should survive; got:\n%s", out.Response)
+	}
+	if strings.Contains(out.Response, "arg:--model=") {
+		t.Errorf("--model= should have been dropped (empty substitution); got:\n%s", out.Response)
+	}
+	if strings.Contains(out.Response, "arg:--append-system-prompt=") {
+		t.Errorf("--append-system-prompt= should have been dropped; got:\n%s", out.Response)
 	}
 }
 
@@ -390,6 +587,91 @@ func TestSubprocessHandler_Preflight_PATHResolution(t *testing.T) {
 	h2 := NewSubprocessHandler(&Bot{Name: "x", Handler: "this-binary-does-not-exist-12345"})
 	if err := h2.Preflight(); err == nil {
 		t.Error("Preflight against a missing PATH binary should error")
+	}
+}
+
+// TestDaemon_IntegrationWithSubprocessHandler is review fix R7:
+// drive a full daemon iteration with a REAL subprocess handler
+// (not the in-process stub) against a shell script pretending
+// to be an LLM CLI. Closes the loop between Phase 4a's path
+// rename (.enju/bots/<bot>/worktree/) and Phase 4b's handler
+// surface — proves they compose end-to-end.
+//
+// The shell script:
+//   - asserts $ENJU_TASK_ID is set
+//   - asserts cwd matches the workspace path the daemon
+//     resolved (proves the P4a layout reaches the handler)
+//   - echoes a deterministic response that the daemon then
+//     submits
+func TestDaemon_IntegrationWithSubprocessHandler(t *testing.T) {
+	// Build a fake workspace at the P4a layout
+	// (<tmp>/.enju/bots/<bot>/worktree/) so the handler's CWD
+	// matches the production shape.
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, ".enju", "bots", "integ-bot", "worktree")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Handler binary: a shell script that captures its env
+	// + cwd, asserts they're right, and emits a deterministic
+	// response. The daemon wires the response back as the
+	// task's submitted content.
+	scriptPath := filepath.Join(tmp, "test-handler.sh")
+	script := `#!/bin/sh
+set -e
+if [ -z "$ENJU_TASK_ID" ]; then
+    echo "missing ENJU_TASK_ID" >&2
+    exit 2
+fi
+# Verify CWD matches what the daemon resolved as the workspace
+# (production shape: .enju/bots/<bot>/worktree/).
+case "$(pwd)" in
+    */.enju/bots/integ-bot/worktree) : ;;
+    *) echo "unexpected cwd: $(pwd)" >&2; exit 3 ;;
+esac
+# Read the prompt from stdin and emit a deterministic response.
+prompt=$(cat)
+echo "INTEG-OK task=$ENJU_TASK_ID branch=$ENJU_BRANCH"
+echo "prompt-len=${#prompt}"
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// fakeFC machinery shared with daemon_test.go. Set
+	// workspacePath so ResolveBotWorkspace returns the P4a-shape
+	// path our script asserts against.
+	fc := newFCWithTask("integ-bot", "answer", "ignored-default")
+	fc.workspacePath = workspace
+
+	// REAL SubprocessHandler — not a stub.
+	bot := &Bot{Name: "integ-bot", Handler: scriptPath}
+	h := NewSubprocessHandler(bot)
+
+	d, err := New(Config{FC: fc, Handler: h, Bot: bot, ProjectID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	// Daemon must have submitted what the handler produced.
+	if len(fc.submits) != 1 {
+		t.Fatalf("expected 1 submit, got %d", len(fc.submits))
+	}
+	got := fc.submits[0].Content
+	if !strings.Contains(got, "INTEG-OK") {
+		t.Errorf("daemon didn't submit handler's stdout; got %q", got)
+	}
+	// Spot-check: the handler observed the right env vars
+	// (encoded in its response). If absent here it means
+	// either buildSubprocessEnv didn't populate them or
+	// daemon didn't thread them through HandlerInput.
+	if !strings.Contains(got, "task=") {
+		t.Errorf("response missing task echo; env-var threading broken? got: %q", got)
 	}
 }
 

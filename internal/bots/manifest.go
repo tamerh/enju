@@ -107,18 +107,68 @@ type Bot struct {
 	// in Resolve.
 	Credentials string `yaml:"credentials,omitempty"`
 
-	// Handler picks which Handler implementation the daemon
-	// instantiates for this bot. Bots aren't necessarily LLMs:
-	// a "linter-bot" might run a deterministic command, a
-	// "review-by-rules" bot might match commit metadata.
-	// Implementations are registered in handler.go's NewHandler
-	// switch.
+	// Handler doubles as the discriminator AND the binary name
+	// the SubprocessHandler exec's. Two reserved values get
+	// special treatment in NewHandler:
+	//   - ""      → "claude" (back-compat default)
+	//   - "stub"  → in-process StubHandler (testing)
 	//
-	// Empty = "claude" (back-compat with pre-Phase-7.2 manifests
-	// where every bot was implicitly an LLM via `claude -p`).
-	// Validate rejects unknown values so a typo'd handler type
-	// surfaces before the daemon starts.
+	// Any other value is the binary name (resolved via $PATH
+	// for bare names like "claude" / "gemini", or treated as
+	// an absolute / repo-relative path when containing `/`).
+	// Adding a new handler = providing a binary that satisfies
+	// the protocol; no Go change.
+	//
+	// Bots aren't necessarily LLMs: a "linter-bot" might run a
+	// deterministic command, a "review-by-rules" bot might
+	// match commit metadata. Same field, same wiring.
 	Handler string `yaml:"handler,omitempty"`
+
+	// Args is the literal argv template the SubprocessHandler
+	// passes to the binary. Each entry can carry one or more
+	// {{var}} placeholders that get substituted at invoke
+	// time. Recognized vars:
+	//
+	//   {{model}}             Bot.Model field
+	//   {{system_prompt}}     Bot.SystemPrompt body (read
+	//                         from the file at invoke time)
+	//   {{allowed_tools}}     Bot.MCPTools.Allow joined with ","
+	//   {{task_id}}           coord task identifier
+	//   {{branch}}            run branch name
+	//   {{repo_dir}}          path to run snapshot
+	//   {{git_dir}}           path to .git/ for history reads
+	//   {{scratch}}           writable workspace path
+	//   {{review_feedback}}   reviewer prose on iter > 1
+	//   {{handler_args.<k>}}  the value at key <k> in the
+	//                          merged bot+task handler_args
+	//
+	// Empty-substitution rule: when a {{var}} resolves to an
+	// empty string, the WHOLE arg containing it is dropped from
+	// argv. That matches operator intent: a `--model={{model}}`
+	// entry should disappear entirely if no model is set,
+	// rather than passing `--model=` to the binary.
+	//
+	// Args that contain no {{var}} are passed through verbatim.
+	// Values land as single argv slots via exec.Command — never
+	// shell-evaluated, so a `{{var}}` whose value contains
+	// `$(rm -rf /)` reaches the subprocess as literal bytes.
+	//
+	// Example (claude bot):
+	//   handler: claude
+	//   model: claude-sonnet-4-6
+	//   system_prompt: enju/prompts/dev.md
+	//   args:
+	//     - "-p"
+	//     - "--model={{model}}"
+	//     - "--append-system-prompt={{system_prompt}}"
+	//
+	// Example (lint bot, no LLM):
+	//   handler: ./bin/lint-bot.sh
+	//   args:
+	//     - "--format={{handler_args.format}}"
+	//   handler_args:
+	//     format: json
+	Args []string `yaml:"args,omitempty"`
 
 	// HandlerArgs are arbitrary extra CLI flags the subprocess
 	// handler appends to the LLM binary's argv. Each (key, value)
