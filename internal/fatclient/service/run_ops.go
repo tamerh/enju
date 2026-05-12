@@ -230,7 +230,15 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 	if len(files) == 0 {
 		return ""
 	}
-	_, cerr := prep.Workflow.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+	// Plumbing path: no checkout, no worktree mutation. Critical
+	// for concurrency — multiple parallel enju_create_run calls
+	// each land their snapshot on a distinct run branch
+	// simultaneously, and execute_run later materializes per-run
+	// snapshots from git history rather than reading from the
+	// shared worktree. See the matching execute_run change in
+	// execute.go that switches the read side to
+	// ReadSnapshotFromBranch / WalkSubtreeBlobsAtCommit.
+	_, cerr := prep.Workflow.CommitArbitraryFilesPlumbing(enjugit.CommitArbitraryFilesRequest{
 		Files:       files,
 		Branch:      runBranch,
 		Subject:     fmt.Sprintf("Snapshot template %s into run %d", prep.LoadedTemplate.BundleDir, seq),
@@ -284,7 +292,10 @@ func (s *FatClient) CommitRunInlineSnapshot(ctx context.Context, projectID int64
 	}
 
 	manifestPath := filepath.Join(corelayout.RunTemplateSnapshotDir(seq, runSlug), corelayout.BundleManifestName)
-	_, cerr := wf.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
+	// Plumbing path for the same reason as CommitRunTemplateSnapshot
+	// (above): parallel create_run calls each write to their own
+	// run branch concurrently without fighting over the worktree.
+	_, cerr := wf.CommitArbitraryFilesPlumbing(enjugit.CommitArbitraryFilesRequest{
 		Files: []enjugit.FileWrite{{
 			RepoRelPath: manifestPath,
 			Content:     []byte(yamlContent),

@@ -150,12 +150,39 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	workDir := wf.WorkDir()
 	resultDir := meta.ResultDir
 
+	// Resolve the per-task scratch dir (Phase 2.1) early — we
+	// also materialize the run's template snapshot underneath
+	// it so the on-disk read below is decoupled from the shared
+	// operator worktree.
+	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), s.coord.Username(), taskID, meta.IterSeq)
+
 	// Every run — template OR inline — writes its parsed YAML to
 	// the snapshot dir at create_run time. The fatclient reads
 	// per-task execution-policy fields (container image, runtime
 	// selector, env block) from there at execute time so coord
 	// never has to persist or transport fields it doesn't act on.
-	snapshotDir := filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+	//
+	// Materialize the snapshot from the run-branch's commit into
+	// a per-task path (under scratch). Reading from git history
+	// is what makes concurrent create_run safe: the operator
+	// worktree only holds ONE branch's tree at a time, so two
+	// parallel runs' snapshots can't coexist there. Each
+	// execute_run pulls its own run's snapshot from .git/objects
+	// independently.
+	//
+	// Fallback: when taskScratchDir is empty (legacy/test paths
+	// without a workspace root), we still read from the worktree
+	// path the old way — those code paths only ever exercise one
+	// run at a time so the race doesn't bite.
+	var snapshotDir string
+	if taskScratchDir != "" && meta.Branch != "" {
+		snapshotDir = filepath.Join(taskScratchDir, "snapshot")
+		if _, merr := wf.MaterializeRunSnapshot(meta.Branch, meta.RunSeq, meta.RunSlug, snapshotDir); merr != nil {
+			return nil, fmt.Errorf("materializing run snapshot from branch %q: %w", meta.Branch, merr)
+		}
+	} else {
+		snapshotDir = filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+	}
 	taskDef, err := enjuYaml.LoadTaskDefFromSnapshot(snapshotDir, meta.TaskDefID)
 	if err != nil {
 		return nil, fmt.Errorf("loading task def from snapshot: %w", err)
@@ -206,10 +233,10 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		_ = os.MkdirAll(bigfilesDir, 0755)
 	}
 
-	// Resolve the per-task scratch dir (Phase 2.1). Empty
-	// workspace root falls back to "" — the wrapper's lifecycle
-	// is a no-op in that case, preserving legacy/test behavior.
-	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), s.coord.Username(), taskID, meta.IterSeq)
+	// taskScratchDir was resolved earlier (also used for snapshot
+	// materialization above). Empty workspace root → "" — the
+	// wrapper's lifecycle is a no-op in that case, preserving
+	// legacy/test behavior.
 
 	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, bigfilesDir, taskScratchDir, meta)
 

@@ -6823,25 +6823,25 @@ echo "ran original"
 		t.Errorf("snapshot script has wrong body: %s", snapScript)
 	}
 
-	// Assertion 1a: the snapshotted script is executable on
-	// disk in the client's local clone. Pre-fix, ReadBundleFiles
-	// wrote snapshot files at 0644 regardless of the source
-	// mode, so scripts silently became non-executable after
-	// snapshot — the exact regression the 2026-04-18 tester
-	// caught. Post-fix, source +x is preserved.
+	// Assertion 1a: the snapshotted script preserves its +x bit
+	// in git history. Pre-fix, ReadBundleFiles wrote snapshot
+	// files at 0644 regardless of source mode, so scripts
+	// silently became non-executable after snapshot — the
+	// 2026-04-18 tester regression. Post-fix, source +x is
+	// preserved.
 	//
-	// Workspace dirs may be numeric ("1") or named ("slug-1")
-	// depending on project-name + slug rules, so glob for the
-	// snapshotted path rather than hardcoding the dir shape.
-	snapMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh")))
-	if len(snapMatches) == 0 {
-		t.Fatalf("snapshotted script not found under %s", h.workspaceDir)
-	}
-	if info, err := os.Stat(snapMatches[0]); err != nil {
-		t.Fatalf("stat snapshotted script: %v", err)
-	} else if info.Mode().Perm()&0o100 == 0 {
-		t.Errorf("snapshotted script at %s is not executable (mode %v) — +x not preserved through snapshot",
-			snapMatches[0], info.Mode().Perm())
+	// Post-plumbing-migration the snapshot lives in git
+	// history, not the operator worktree (the worktree no
+	// longer holds snapshot files because concurrent
+	// create_run would otherwise race on it). Verify the mode
+	// directly against the bare via ls-tree.
+	scriptPath := filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh")
+	bareDir := h.testServer.remoteFor(projectID)
+	lsOut := gittest.Run(t, bareDir, "ls-tree", "refs/heads/main", "--", scriptPath)
+	// Format: "<mode> blob <sha>\t<path>"
+	if !strings.HasPrefix(lsOut, "100755") {
+		t.Errorf("snapshotted script %q on bare branch main does not have +x: ls-tree = %q",
+			scriptPath, lsOut)
 	}
 
 	// Mutate the live template to PROVE the run uses the
@@ -7761,10 +7761,27 @@ tasks:
 		_ = os.Chmod(m, 0o755)
 	}
 
-	// Now isolate PATH. This shadows any real docker so
-	// exec.LookPath("docker") inside compute.Run fails,
-	// exercising Phase D's presence-check branch.
-	t.Setenv("PATH", t.TempDir())
+	// Hide docker from PATH while keeping git reachable. We
+	// need `docker` to be missing so exec.LookPath("docker")
+	// inside compute.Run fails (the path under test). We CAN'T
+	// strip PATH entirely anymore because execute_run now
+	// materializes the run's template snapshot from git history
+	// — that needs the git binary on PATH. Pre-plumbing this
+	// test used `t.Setenv("PATH", t.TempDir())` (empty); post-
+	// plumbing we need a PATH that contains git but not docker.
+	//
+	// Strategy: a dir that contains a symlink to the real git
+	// binary, nothing else. exec.LookPath("git") resolves;
+	// exec.LookPath("docker") doesn't.
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git not on PATH — cannot construct isolation directory: %v", err)
+	}
+	isolationDir := t.TempDir()
+	if err := os.Symlink(gitBin, filepath.Join(isolationDir, "git")); err != nil {
+		t.Fatalf("symlink git into isolation dir: %v", err)
+	}
+	t.Setenv("PATH", isolationDir)
 
 	res := h.call(t, "enju_execute_task", map[string]any{
 		"task_id": h.taskID("needs_docker"),
