@@ -856,6 +856,11 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		Content:     out.Response,
 		AuthorName:  authorName,
 		AuthorEmail: authorEmail,
+		// Phase 4d: bot daemon submits via plumbing. The LLM
+		// wrote outputs to the ephemeral CWD (P4c); no need to
+		// update the persistent worktree. Concurrent claims in
+		// one daemon won't serialize on a worktree this way.
+		UsePlumbing: true,
 	}
 
 	// Honor the task's writes_artifacts declaration. Expand the

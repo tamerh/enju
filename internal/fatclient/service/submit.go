@@ -60,6 +60,25 @@ type SubmitParams struct {
 	ModelOverride      string
 	AuthorName         string
 	AuthorEmail        string
+
+	// UsePlumbing routes the commit through the plumbing
+	// variant (SubmitComputeTaskResult — direct object/ref
+	// writes, no checkout, no worktree mutation) instead of
+	// the worktree-based porcelain path. Phase 4d.
+	//
+	// Set true by bot daemons: the LLM already wrote its
+	// outputs to an ephemeral per-claim CWD (P4c); the
+	// daemon doesn't need the worktree updated post-submit.
+	// Plumbing-mode also unblocks future concurrent claims
+	// within one bot daemon (worktree contention disappears).
+	//
+	// Left false by MCP-side submits: an operator using
+	// claude-code wrote files to their working tree and
+	// expects the commit + worktree state to stay in sync.
+	// Inline-YAML flows that bootstrap scripts via an
+	// answer-task also rely on the worktree-update side
+	// effect so the next task's exec finds the script.
+	UsePlumbing bool
 }
 
 // SubmitResult bundles the data the formatter and downstream
@@ -174,7 +193,34 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	// topic; for vote/review/legacy paths it's the run branch
 	// directly. Pass it as BranchOverride so Workflow uses it
 	// verbatim instead of re-deriving via Conventions.
-	submitRes, err := prep.Workflow.SubmitTaskResult(enjugit.SubmitRequest{
+	//
+	// P4d — choice of submit variant:
+	//   • Worktree (SubmitTaskResult, porcelain): MCP-driven
+	//     submits where the OPERATOR wrote files to their
+	//     working tree first. Keeps worktree state in sync
+	//     with HEAD. Inline-YAML flows that bootstrap scripts
+	//     via an answer-task rely on this side effect.
+	//   • Plumbing (SubmitComputeTaskResult): bot-daemon
+	//     submits where the LLM wrote files to an ephemeral
+	//     CWD (P4c). No worktree mutation, no checkout — sets
+	//     up future concurrent claims within one bot daemon.
+	//
+	// params.UsePlumbing picks between the two. Bot daemons
+	// set it true; MCP-side submits leave it false.
+	//
+	// SubmitComputeTaskResult REQUIRES RunBranch (it's the
+	// resolve-base fallback). For vote/review actions where
+	// baseBranch was previously empty (commit lands on the
+	// run branch directly), thread prep.Meta.Branch as the
+	// run-branch reference so resolve-base has something to
+	// anchor on. The porcelain path tolerates empty RunBranch
+	// (its prepareBranchForCommit has a wider fallback set);
+	// we only set the fallback for the plumbing call.
+	runBranchForPlumbing := baseBranch
+	if runBranchForPlumbing == "" {
+		runBranchForPlumbing = prep.Meta.Branch
+	}
+	submitReq := enjugit.SubmitRequest{
 		TaskID:         prep.TaskID,
 		IterSeq:        prep.Meta.IterSeq,
 		RunSeq:         prep.Meta.RunSeq,
@@ -189,7 +235,15 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 		ModelName:      prep.EffectiveModel,
 		Verdict:        verdict,
 		CustomTrailers: customTrailers,
-	})
+	}
+	var submitRes *enjugit.SubmitResult
+	var err error
+	if params.UsePlumbing {
+		submitReq.RunBranch = runBranchForPlumbing
+		submitRes, err = prep.Workflow.SubmitComputeTaskResult(submitReq)
+	} else {
+		submitRes, err = prep.Workflow.SubmitTaskResult(submitReq)
+	}
 	if err != nil {
 		// Verify-after-push catches the production "commit
 		// reported but never landed in bare" failure mode.
