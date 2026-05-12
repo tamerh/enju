@@ -600,48 +600,27 @@ func TestDaemon_RunOnce_PopulatesArtifactsFromWritesArtifacts(t *testing.T) {
 	}
 }
 
-// TestDaemon_RunOnce_ResetsBotCloneBeforeHandler pins the
-// fix for the cross-iteration residue bug: the daemon must
-// call ResetBotCloneToCleanState between ClaimTask and the
-// handler invocation, so leftover untracked files / dirty
-// tracked-file edits from a previous task can't trip the
-// next task's CheckoutBranchFrom. The single-iteration
-// failure mode this guards against is task N's residue
-// disturbing task N+1; per-iteration the call shows up as
-// exactly one reset on the project's id.
-func TestDaemon_RunOnce_ResetsBotCloneBeforeHandler(t *testing.T) {
+// TestDaemon_RunOnce_DoesNotResetBotClone pins the removal
+// of the per-iteration worktree reset. The handler operates
+// in an ephemeral CWD freshly materialized per claim, so
+// prior-iteration residue can't leak across tasks. Resetting
+// the persistent worktree adds I/O cost with no behavioral
+// payoff — the daemon must NOT call it.
+func TestDaemon_RunOnce_DoesNotResetBotClone(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
 	stub := &StubHandler{Response: "done"}
 	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
 	if _, err := d.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if got := fc.resetCalls[1]; got != 1 {
-		t.Errorf("expected exactly one reset for project 1; got %d", got)
+	if got := fc.resetCalls[1]; got != 0 {
+		t.Errorf("daemon should NOT reset the bot clone between iterations; got %d reset calls", got)
 	}
 }
 
-// TestDaemon_RunOnce_ContinuesWhenResetFails pins the
-// best-effort policy: a reset failure logs but doesn't
-// abort the iteration. The handler still runs (against
-// possibly-dirty state) and any actual collision surfaces
-// at submit time where it's already handled.
-func TestDaemon_RunOnce_ContinuesWhenResetFails(t *testing.T) {
-	fc := newFCWithTask("bot1", "answer", "")
-	fc.resetErr = errors.New("disk full")
-	stub := &StubHandler{Response: "done"}
-	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
-	worked, err := d.RunOnce(context.Background())
-	if err != nil {
-		t.Fatalf("RunOnce should swallow reset errors: %v", err)
-	}
-	if !worked {
-		t.Error("worked should be true — handler still ran despite reset failure")
-	}
-	if len(fc.submits) != 1 {
-		t.Errorf("submit should still happen: got %d", len(fc.submits))
-	}
-}
+// (TestDaemon_RunOnce_ContinuesWhenResetFails removed —
+//  the reset call is gone, so its failure mode no longer
+//  exists.)
 
 // Pin pattern expansion: when the manifest declares
 // `src/api/` (directory) and the bot writes 3 files inside,

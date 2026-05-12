@@ -680,24 +680,14 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		}
 	}
 
-	// Reset the bot clone to a clean state before the handler
-	// runs. ClaimTask's pre-claim pull (or the iter > 1 topic
-	// checkout above) advanced HEAD to the right tip; the reset
-	// drops any leftover uncommitted edits and untracked files
-	// from the previous iteration so the handler starts on the
-	// same canvas every time. Without this, residue accumulates
-	// across tasks and the next CheckoutBranchFrom can produce
-	// a staged-deletion-plus-untracked desync.
-	//
-	// Best-effort: a reset failure logs but doesn't abort the
-	// iteration — the handler may still succeed if the residue
-	// happens not to collide with this task's outputs. Hard
-	// errors surface on the subsequent submit instead, where
-	// they're already handled.
-	if rerr := d.fc.ResetBotCloneToCleanState(ctx, meta.ProjectID); rerr != nil {
-		d.logger.Warn("bot clone reset failed; continuing with possibly-dirty worktree",
-			"task_id", taskID, "project_id", meta.ProjectID, "error", rerr)
-	}
+	// (Worktree reset removed.) The LLM handler now operates in
+	// an ephemeral per-claim CWD that's freshly materialized
+	// from the iter-branch tree, so prior-iteration residue
+	// can't leak across tasks. The persistent worktree is no
+	// longer a canvas for the handler — it serves only as the
+	// submit-side staging area for the legacy MCP-driven flow,
+	// and that flow doesn't accumulate state across iterations
+	// the way the daemon's loop used to.
 
 	// On iter > 1, wipe the prior iteration's declared writes
 	// so the LLM starts with a clean canvas in those paths and
