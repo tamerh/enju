@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ReadFileFunc reads a file at a given commit SHA. Mirrors the
@@ -53,12 +54,30 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 	return workDir
 }
 
+// StaleScratchAgeThreshold is the minimum mtime age a scratch
+// dir must reach before the startup sweep removes it. Anything
+// younger may belong to a submit-failed retry (TP53 Bug 2 fix
+// preserves scratch when the post-script commit fails so the
+// operator's next claim can pick up the outputs from disk).
+// Once it ages past this threshold the retry is presumed
+// abandoned and the dir becomes a leak; sweep reclaims it.
+const StaleScratchAgeThreshold = 24 * time.Hour
+
 // SweepStaleScratchAtStartup removes the calling bot's scratch
-// subtree under the given workspace root. Intended for crash-
-// recovery on bot startup: any scratch dirs surviving a previous
-// daemon's exit (crash, kill, OOM, container shutdown) are stale
-// by definition since their owning task is no longer running, and
-// the wrapper's defer-rm only handles the orderly-exit paths.
+// subtree under the given workspace root, filtered to dirs
+// whose mtime is older than StaleScratchAgeThreshold. Intended
+// for crash-recovery on bot startup: scratch dirs surviving a
+// previous daemon's exit (crash, kill, OOM, container shutdown)
+// are stale, AND scratch dirs preserved by the wrapper's
+// submit-failed path become stale once the retry window passes.
+//
+// The age filter matters since Phase 5 (TP53 Bug 2). Pre-fix,
+// the wrapper's defer-rm unconditionally wiped scratch — so the
+// startup sweep could be unconditional too (anything surviving
+// was a crash leak). Post-fix, submit-failed scratch survives
+// on purpose: the operator's retry needs to find the script's
+// outputs on disk. The age filter gives the retry a 24h grace
+// window; older dirs are presumed abandoned.
 //
 // Returns (entries_removed, first_error_or_nil). Empty /
 // nonexistent tree is a successful no-op.
@@ -66,11 +85,10 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 // Safety invariant — read this before adding a non-startup caller:
 // scratch by design holds only uncommitted work-in-progress (script
 // inputs that were materialized from git, plus outputs the wrapper
-// reads back into a commit on success). A surviving scratch dir is
-// always loss-tolerant: if work product mattered, it would be
-// committed; if it isn't, there's nothing to recover. So nuking
-// the directory at startup is correct AS LONG AS no concurrent
-// wrapper from THIS bot is using it. The function name carries
+// reads back into a commit on success, plus submit-failed retries
+// per above). The age filter keeps the retry window honest. So
+// nuking aged dirs at startup is correct AS LONG AS no concurrent
+// wrapper from THIS bot is using one. The function name carries
 // "AtStartup" precisely because that's the only call site that
 // holds the invariant — at startup the daemon's poll loop hasn't
 // begun yet, so no wrapper of ours is live. A future caller that
@@ -83,6 +101,13 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 // replica B's stays inside B's. Empty botUsername is a no-op
 // (test fixtures without a coord identity).
 func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) {
+	return sweepStaleScratchOlderThan(workspaceRoot, botUsername, StaleScratchAgeThreshold, time.Now())
+}
+
+// sweepStaleScratchOlderThan is the testable core of
+// SweepStaleScratchAtStartup. minAge + now are injected so unit
+// tests can age scratch dirs without sleeping.
+func sweepStaleScratchOlderThan(workspaceRoot, botUsername string, minAge time.Duration, now time.Time) (int, error) {
 	if workspaceRoot == "" || botUsername == "" {
 		return 0, nil
 	}
@@ -98,6 +123,16 @@ func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) 
 	var firstErr error
 	for _, e := range entries {
 		full := filepath.Join(root, e.Name())
+		info, ierr := e.Info()
+		if ierr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("sweep scratch: stat %s: %w", full, ierr)
+			}
+			continue
+		}
+		if now.Sub(info.ModTime()) < minAge {
+			continue
+		}
 		if rerr := os.RemoveAll(full); rerr != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("sweep scratch: remove %s: %w", full, rerr)

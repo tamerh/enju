@@ -48,6 +48,73 @@ func TestLoadCredentialsCoordinatorMismatchReturnsNil(t *testing.T) {
 	}
 }
 
+// TestPeekCredentialsFile pins the gate used by the bot
+// daemon's self-heal step (TP53 Bug 4). Unlike loadCredentialsAt,
+// peek returns true on coordinator-URL mismatch — the file is
+// PRESENT and parseable, just for a different coord. That's an
+// operator-config issue, not a needs-registering scenario, so
+// self-heal must NOT fire and produce the alarming
+// "self-heal: registering bot ... self-heal failed: 409"
+// noise.
+func TestPeekCredentialsFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Absent file → false.
+	if peekCredentialsFile(filepath.Join(dir, "missing.json")) {
+		t.Error("absent file: want false, got true")
+	}
+
+	// Unparseable JSON → false.
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if peekCredentialsFile(bad) {
+		t.Error("unparseable JSON: want false, got true")
+	}
+
+	// Empty username → false.
+	emptyUser := filepath.Join(dir, "empty-user.json")
+	if err := os.WriteFile(emptyUser, []byte(`{"coordinator":"http://x","token":"t"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if peekCredentialsFile(emptyUser) {
+		t.Error("empty username: want false, got true")
+	}
+
+	// Empty token → false. Token-less creds can't authenticate,
+	// so the daemon must re-register (the existing behavior).
+	emptyToken := filepath.Join(dir, "empty-token.json")
+	if err := os.WriteFile(emptyToken, []byte(`{"coordinator":"http://x","username":"alice"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if peekCredentialsFile(emptyToken) {
+		t.Error("empty token: want false, got true")
+	}
+
+	// Full and valid → true.
+	ok := filepath.Join(dir, "ok.json")
+	if err := os.WriteFile(ok, []byte(`{"coordinator":"http://x","username":"alice","token":"t"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !peekCredentialsFile(ok) {
+		t.Error("valid creds: want true, got false")
+	}
+
+	// Coordinator URL mismatch is intentionally NOT a fail
+	// here — that's the key behavioral difference vs
+	// loadCredentialsAt. peek answers "do creds exist on disk"
+	// not "do they match the running coord". This is what
+	// prevents TP53 Bug 4's 409 noise loop.
+	mismatched := filepath.Join(dir, "mismatched.json")
+	if err := os.WriteFile(mismatched, []byte(`{"coordinator":"http://other:9000","username":"alice","token":"t"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !peekCredentialsFile(mismatched) {
+		t.Error("coord-mismatched but parseable creds: peek should return true (lets caller surface a clearer error than triggering 409 self-heal)")
+	}
+}
+
 // TestLoadCredentialsLocalSentinelMigratesToFallbackURL pins
 // the one-shot migration for legacy credentials.json files
 // that still carry the "local" sentinel from before --local

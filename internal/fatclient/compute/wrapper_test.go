@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 )
@@ -285,9 +286,15 @@ func TestScriptCwdFor(t *testing.T) {
 
 // TestSweepStaleScratchAtStartup covers the Phase 2.4/2.5
 // crash-recovery helper: at bot startup, scratch dirs left over
-// from a previous wrapper of THIS bot get nuked. Replica
+// from a previous wrapper of THIS bot get nuked once they're
+// past the age threshold (Phase 5 — TP53 Bug 2). Replica
 // isolation: a second bot's scratch in the same workspace is
 // untouched (Phase 2.5 — scoping by botUsername).
+//
+// The age filter is exercised by chtimes-aging the seeded dirs
+// past compute.StaleScratchAgeThreshold so the public-API test
+// stays runnable without sleeping. A separate test covers the
+// fresh-dir-survives case.
 func TestSweepStaleScratchAtStartup(t *testing.T) {
 	tmp := t.TempDir()
 	bot := "alice-1"
@@ -310,6 +317,15 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(myScratch, "task-b-iter-3/data/x.txt"),
 		[]byte("hi"), 0o644); err != nil {
 		t.Fatalf("seed file: %v", err)
+	}
+	// Age the seeded top-level dirs past the threshold so the
+	// real public-API sweep treats them as eligible. Chtimes on
+	// the dir itself is what info.ModTime() reads.
+	old := time.Now().Add(-25 * time.Hour)
+	for _, sub := range []string{"task-a-iter-1", "task-b-iter-3"} {
+		if err := os.Chtimes(filepath.Join(myScratch, sub), old, old); err != nil {
+			t.Fatalf("age %s: %v", sub, err)
+		}
 	}
 	// Sibling replica's live work — must survive.
 	if err := os.MkdirAll(filepath.Join(otherScratch, "task-c-iter-1"), 0o755); err != nil {
@@ -344,5 +360,58 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 	// Empty botUsername: no-op (test-fixture path).
 	if n, err := compute.SweepStaleScratchAtStartup(tmp, ""); err != nil || n != 0 {
 		t.Errorf("empty botUsername: got n=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// TestSweepStaleScratchAtStartup_RespectsAgeFilter pins TP53
+// Bug 2's preservation invariant against the startup sweep:
+// fresh scratch dirs (younger than StaleScratchAgeThreshold)
+// MUST survive a sweep so that a submit-failed retry can pick
+// up the script's outputs from disk after a daemon restart.
+//
+// Without this filter, the wrapper's "preserve on submit-fail"
+// behavior is meaningless — the next daemon start would wipe
+// the dir before the operator's retry runs.
+func TestSweepStaleScratchAtStartup_RespectsAgeFilter(t *testing.T) {
+	tmp := t.TempDir()
+	bot := "alice-1"
+	myScratch := filepath.Join(tmp, "scratch", bot)
+
+	// Fresh dir — simulates a submit-failed wrapper from the
+	// previous daemon run that left outputs behind for retry.
+	freshTask := filepath.Join(myScratch, "fresh-task-iter-1")
+	if err := os.MkdirAll(freshTask, 0o755); err != nil {
+		t.Fatalf("seed fresh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(freshTask, "output.md"), []byte("retry me"), 0o644); err != nil {
+		t.Fatalf("seed output: %v", err)
+	}
+	// Aged dir — same shape but past the retry window.
+	agedTask := filepath.Join(myScratch, "aged-task-iter-1")
+	if err := os.MkdirAll(agedTask, 0o755); err != nil {
+		t.Fatalf("seed aged: %v", err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(agedTask, old, old); err != nil {
+		t.Fatalf("age aged: %v", err)
+	}
+
+	n, err := compute.SweepStaleScratchAtStartup(tmp, bot)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("removed count: got %d, want 1 (only aged)", n)
+	}
+	// Fresh dir + its output must survive.
+	if _, err := os.Stat(freshTask); err != nil {
+		t.Errorf("fresh scratch was wiped — retry would lose outputs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(freshTask, "output.md")); err != nil {
+		t.Errorf("fresh output.md was wiped: %v", err)
+	}
+	// Aged dir is gone.
+	if _, err := os.Stat(agedTask); !os.IsNotExist(err) {
+		t.Errorf("aged scratch should have been removed, got err=%v", err)
 	}
 }

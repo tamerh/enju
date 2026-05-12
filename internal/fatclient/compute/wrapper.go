@@ -361,9 +361,14 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	res := Result{}
 
 	// Scratch-dir lifecycle (Phase 2.1). Mkdir up front, defer
-	// rm. Doing it BEFORE the script-path / runtime checks means
-	// even early-return failure paths leave no orphan scratch
-	// behind. The defer runs regardless of which branch returns.
+	// rm. Early-return failure paths still get a clean wipe;
+	// only the SUBMIT-failed path (script ran fine, post-script
+	// commit/push failed — res.GitError set) preserves scratch
+	// so the operator's retry can pick up the script's outputs
+	// from disk. That's TP53 Bug 2: pre-fix, the wrapper's
+	// outputs survived only inside the failed submit's
+	// .wrap-result.done.json on disk; the scratch contents that
+	// the next retry needed were already gone.
 	//
 	// Empty TaskScratchDir is a no-op: legacy spec files predate
 	// this field and the JSON omits it; their behavior is
@@ -375,6 +380,20 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 			return res
 		}
 		defer func() {
+			if res.GitError != "" {
+				// Submit-failed path. Outputs are still in
+				// scratch; the operator's retry can re-claim
+				// the task and re-submit without re-running
+				// the script. Logged at Warn so it surfaces in
+				// daemon stdout/log.
+				if logger != nil {
+					logger.Warn("submit failed; preserving scratch for retry",
+						"path", spec.TaskScratchDir,
+						"task_id", spec.TaskID,
+						"git_error", res.GitError)
+				}
+				return
+			}
 			if err := os.RemoveAll(spec.TaskScratchDir); err != nil && logger != nil {
 				logger.Warn("scratch dir cleanup failed",
 					"path", spec.TaskScratchDir, "error", err)

@@ -640,6 +640,34 @@ func loadCredentials(coordinator string) *credentials {
 	return loadCredentialsAt(coordinator, credentialsPath())
 }
 
+// peekCredentialsFile returns true iff the file at path parses
+// as a credentials struct with non-empty username AND token,
+// REGARDLESS of which coordinator URL it names. Used to gate
+// the bot daemon's self-heal step (TP53 Bug 4): when a parseable
+// creds file is on disk we never want to fire registration, even
+// if the file's coordinator URL doesn't match the one the daemon
+// was launched against — that's an operator-config issue, not a
+// "needs registering" scenario. The 409 + alarming "self-heal
+// failed" log comes from running registration in that wrong-URL
+// case.
+//
+// Distinct from loadCredentialsAt by design: that function
+// returns nil on coordinator mismatch (correct for the auth
+// path — wrong-URL creds can't authenticate). This one only
+// answers "does the bot have credentials at all" so the daemon
+// can pick the right error message.
+func peekCredentialsFile(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var c credentials
+	if json.Unmarshal(data, &c) != nil {
+		return false
+	}
+	return c.Username != "" && c.Token != ""
+}
+
 func loadCredentialsAt(coordinator, path string) *credentials {
 	data, err := os.ReadFile(path)
 	if err != nil {

@@ -608,8 +608,17 @@ func cmdBotRun(args []string) {
 	// ~/.enju/credentials.json; an explicit --owner-credentials
 	// flag overrides for hosts running multiple operator
 	// identities.
+	//
+	// TP53 Bug 4 fix: gate self-heal on FILE-level presence, not
+	// on loadCredentialsAt's coordinator-aware return value. When
+	// a parseable creds file with token already lives at
+	// bot.Credentials, registration is wrong even if the file
+	// names a different coordinator URL — registering anyway
+	// produces "self-heal failed: register: coord 409: username
+	// already taken" noise on every startup. Coord-URL mismatch
+	// is surfaced as its own error instead.
 	creds := loadCredentialsAt(*coordinator, bot.Credentials)
-	if creds == nil || creds.Token == "" {
+	if (creds == nil || creds.Token == "") && !peekCredentialsFile(bot.Credentials) {
 		setupCtx, setupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		owner := loadCredentialsAt(*coordinator, resolveCredentialsPath(""))
 		if owner == nil || owner.Token == "" {
@@ -627,7 +636,6 @@ func cmdBotRun(args []string) {
 		if effectiveProjectID == 0 {
 			effectiveProjectID = manifest.ProjectID
 		}
-		fmt.Fprintf(os.Stderr, "self-heal: registering bot %q against %s (owner=%s)\n", bot.Name, *coordinator, owner.Username)
 		res, setupErr := setupBotIfNeeded(setupCtx, *coordinator, owner, bot, effectiveProjectID)
 		setupCancel()
 		if setupErr != nil {
@@ -636,14 +644,13 @@ func cmdBotRun(args []string) {
 		}
 		switch res.Status {
 		case "registered":
-			fmt.Fprintf(os.Stderr, "self-heal: registered as %s, credentials at %s\n", res.Username, bot.Credentials)
+			fmt.Fprintf(os.Stderr, "self-heal: registered bot %q as %s, credentials at %s\n", bot.Name, res.Username, bot.Credentials)
 			if effectiveProjectID > 0 && res.AddedToPr {
 				fmt.Fprintf(os.Stderr, "self-heal: added to project #%d as member\n", effectiveProjectID)
 			}
 		case "already-set-up":
 			// Defensive: setupBotIfNeeded saw a creds file even
-			// though loadCredentialsAt above didn't — schema
-			// mismatch (wrong coordinator URL?) or a race where
+			// though our outer gates missed it — race where
 			// another process landed creds between our checks.
 			fmt.Fprintf(os.Stderr, "self-heal: credentials file appeared at %s — re-loading\n", bot.Credentials)
 		}
@@ -652,6 +659,16 @@ func cmdBotRun(args []string) {
 			fmt.Fprintf(os.Stderr, "self-heal succeeded but credentials still unloadable at %s — coordinator URL mismatch?\n", bot.Credentials)
 			os.Exit(1)
 		}
+	}
+	// If we reached here with a still-nil creds but a parseable
+	// file on disk, the gate above suppressed self-heal — meaning
+	// the file's coordinator URL doesn't match the one we're
+	// running against. Surface that as a clear error rather than
+	// silently falling through.
+	if creds == nil || creds.Token == "" {
+		fmt.Fprintf(os.Stderr, "bot %q credentials at %s exist but don't match coordinator %s — check the coordinator URL in the file or pass --coordinator\n",
+			bot.Name, bot.Credentials, *coordinator)
+		os.Exit(1)
 	}
 
 	// Always ensure the project's push target exists AND that

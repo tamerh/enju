@@ -198,3 +198,170 @@ func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
 // Read-only is convention now (scripts that write to the snapshot
 // are buggy and should target $ENJU_SCRATCH); the kernel-side :ro
 // bind inside the container still gives the strong sandbox guarantee.
+
+// TestWrapper_PreservesScratchOnSubmitFail pins TP53 Bug 2's
+// fix: when the script exits 0 and produces outputs in scratch
+// but the post-script SubmitComputeTaskResult fails (commit
+// retry exhausted, push rejected, branch missing — anything at
+// the git layer), the wrapper must LEAVE scratch on disk so the
+// operator's retry can read the script's outputs from there.
+//
+// Pre-fix, the unconditional defer-rm in compute.Run wiped
+// scratch on every exit path, including the submit-failed one.
+// The tester's TP53 run lost 12 sections' worth of output to
+// this — they survived only inside the failed submit's
+// .wrap-result.done.json envelope on disk and were unrecoverable
+// once the daemon cycled.
+//
+// We force submit failure by pointing the spec at a non-existent
+// RunBranch: SubmitComputeTaskResult's resolve-base step fails
+// loudly, the wrapper sets res.GitError, and the defer must
+// see GitError set and skip cleanup.
+func TestWrapper_PreservesScratchOnSubmitFail(t *testing.T) {
+	bare := initBareForComputeTest(t)
+	wsRoot := t.TempDir()
+	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
+
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("NewWorkspace: %v", err)
+	}
+	wf, err := ws.ForProject(303, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+
+	snapBase := t.TempDir()
+	snap := filepath.Join(snapBase, "snapshot")
+	if err := os.MkdirAll(snap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Script writes a real output to scratch and exits 0. With
+	// the pre-fix unconditional cleanup, this output would be
+	// lost even though the submit will fail below.
+	script := `#!/bin/sh
+set -e
+echo "result content" > "$ENJU_SCRATCH/result.md"
+echo "stdout content"
+`
+	if err := os.WriteFile(filepath.Join(snap, "run.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:submit_fail_check", 1)
+
+	spec := compute.Spec{
+		TaskID:        "1:1:submit_fail_check",
+		ProjectID:     303,
+		RemoteURL:     bare,
+		WorkspaceRoot: wsRoot,
+		// Branch (→ SubmitRequest.RunBranch) points at a ref
+		// that doesn't exist anywhere. SubmitComputeTaskResult
+		// fails at the resolve-base step with a clear error,
+		// which the wrapper wraps into res.GitError. That's
+		// the exact submit-failed shape the spec preserves
+		// scratch for.
+		Branch:          "this-branch-does-not-exist-anywhere",
+		IterationBranch: "this-branch-does-not-exist-anywhere/iter-1",
+		ResultDir:       "enju/runs/1-fail/submit_fail_check",
+		ScriptPath:      filepath.Join(snap, "run.sh"),
+		ScriptLabel:     "run.sh",
+		AuthorName:      "alice",
+		AuthorEmail:     "alice@example.com",
+		Username:        "alice",
+		TaskScratchDir:  scratch,
+		SnapshotDir:     snap,
+	}
+
+	env := append(os.Environ(), "ENJU_SCRATCH="+scratch)
+	res := compute.Run(context.Background(), wf, spec,
+		env, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Script ran — exit 0, no wrapper-level error.
+	if res.Error != "" {
+		t.Fatalf("unexpected wrapper error (script-pre-submit failure?): %q", res.Error)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("script should have exited 0, got %d (stderr=%q)", res.ExitCode, res.Stderr)
+	}
+	// Submit failed → GitError set.
+	if res.GitError == "" {
+		t.Fatalf("expected GitError on submit failure, got empty (CommitSHA=%q)", res.CommitSHA)
+	}
+	// Scratch survives — this is the load-bearing assertion.
+	if _, err := os.Stat(scratch); err != nil {
+		t.Fatalf("scratch dir should have been preserved on submit failure, got: %v", err)
+	}
+	// And the script's outputs in scratch are readable.
+	got, err := os.ReadFile(filepath.Join(scratch, "result.md"))
+	if err != nil {
+		t.Fatalf("script output result.md should survive: %v", err)
+	}
+	if string(got) != "result content\n" {
+		t.Errorf("output content mismatch: %q", got)
+	}
+}
+
+// TestWrapper_CleansScratchOnSubmitSuccess complements the above:
+// when the submit succeeds, scratch goes away as before. Without
+// this, a regression that made the conditional cleanup never fire
+// would silently turn every task into a leaked scratch dir.
+func TestWrapper_CleansScratchOnSubmitSuccess(t *testing.T) {
+	bare := initBareForComputeTest(t)
+	wsRoot := t.TempDir()
+	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
+
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("NewWorkspace: %v", err)
+	}
+	wf, err := ws.ForProject(304, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+	snapBase := t.TempDir()
+	snap := filepath.Join(snapBase, "snapshot")
+	if err := os.MkdirAll(snap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snap, "run.sh"),
+		[]byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:submit_ok", 1)
+	spec := compute.Spec{
+		TaskID:          "1:1:submit_ok",
+		ProjectID:       304,
+		RemoteURL:       bare,
+		WorkspaceRoot:   wsRoot,
+		Branch:          "main",
+		IterationBranch: "1-test/submit_ok/iter-1",
+		ResultDir:       "enju/runs/1-test/submit_ok",
+		ScriptPath:      filepath.Join(snap, "run.sh"),
+		ScriptLabel:     "run.sh",
+		AuthorName:      "alice",
+		AuthorEmail:     "alice@example.com",
+		Username:        "alice",
+		TaskScratchDir:  scratch,
+		SnapshotDir:     snap,
+	}
+	env := append(os.Environ(), "ENJU_SCRATCH="+scratch)
+	res := compute.Run(context.Background(), wf, spec,
+		env, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if res.Error != "" {
+		t.Fatalf("wrapper error: %q", res.Error)
+	}
+	if res.GitError != "" {
+		t.Fatalf("unexpected GitError: %q", res.GitError)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("script exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	// Scratch must be gone — the success path still cleans up.
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Errorf("scratch should be cleaned on submit success, stat=%v", err)
+	}
+}
