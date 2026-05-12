@@ -98,6 +98,21 @@ type fatClient interface {
 	// configured.
 	RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error)
 
+	// PrepareLLMClaimCWD creates the per-claim ephemeral CWD
+	// for an LLM task's handler (per-run-snapshot redesign
+	// Phase 4c). Materializes the iter-branch tree into the
+	// scratch path; the handler runs with cmd.Dir = returned
+	// path. Returns "" when the bot has no workspace or iter
+	// branch yet — caller falls back to the persistent
+	// worktree path.
+	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error)
+
+	// CleanupLLMClaimCWD applies the success/fail lifecycle to
+	// the ephemeral CWD per Phase 5's pattern: rm on success,
+	// preserve on failure (so the operator's retry can pick
+	// up the LLM's work from disk).
+	CleanupLLMClaimCWD(path string, successful bool)
+
 	// ResolveBotWorkspace returns the abs path to this bot's
 	// per-bot per-project managed clone at
 	// `<project>/enju/bots/<botUsername>/clone/`, distinct from
@@ -761,6 +776,40 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		d.logger.Debug("resolve run snapshot dir for handler env (proceeding without it)",
 			"task_id", taskID, "error", snapErr)
 	}
+
+	// Per-run-snapshot redesign Phase 4c: prepare the ephemeral
+	// per-claim CWD. Materializes the iter-branch tree into a
+	// scratch dir; the handler runs there with cmd.Dir = CWD.
+	// Returns "" when no iter branch yet (legacy / first iter
+	// pre-fork) — caller falls back to the persistent worktree
+	// path so existing workflows still function.
+	//
+	// Skipped entirely when the handler implements ClaimCWDOptOut
+	// returning true (StubHandler, future rule-based handlers).
+	// Stub handlers don't read from CWD, so the per-claim tree
+	// materialization would be pure overhead. Production
+	// SubprocessHandler doesn't implement the interface and
+	// always materializes.
+	var claimCWD string
+	if optOut, ok := d.handler.(ClaimCWDOptOut); !ok || !optOut.SkipClaimCWD() {
+		var cwdErr error
+		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch)
+		if cwdErr != nil {
+			d.logger.Warn("prepare LLM claim CWD failed (falling back to persistent worktree)",
+				"task_id", taskID, "error", cwdErr)
+		}
+	}
+	// handlerCWD is what the handler runs in. After the handler
+	// returns, declared writes_artifacts are copied from
+	// handlerCWD into workspacePath at the same relative paths
+	// so the existing submit flow stages them from the
+	// persistent worktree (P4d switches to plumbing-from-CWD
+	// directly).
+	handlerCWD := claimCWD
+	if handlerCWD == "" {
+		handlerCWD = workspacePath
+	}
+
 	// $ENJU_GIT_DIR: the .git/ the handler can query for history.
 	// Pre-P4d this is the bot's persistent clone's .git (same
 	// content as operator's via fetch); P4d switches to the
@@ -770,12 +819,20 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		gitDir = filepath.Join(workspacePath, ".git")
 	}
 
+	// Track submit outcome so the deferred CleanupLLMClaimCWD
+	// applies the right success/preserve branch (Phase 5
+	// pattern: failed submit preserves the CWD for retry).
+	submitOK := false
+	defer func() {
+		d.fc.CleanupLLMClaimCWD(claimCWD, submitOK)
+	}()
+
 	out, err := d.handler.ProcessTask(ctx, HandlerInput{
 		TaskID:         meta.ID,
 		Action:         meta.Action,
 		Prompt:         prompt,
 		SystemPrompt:   d.systemPrompt,
-		Workspace:      workspacePath,
+		Workspace:      handlerCWD,
 		ReviewFeedback: string(claim.ReviewFeedback),
 		RepoDir:        repoDir,
 		GitDir:         gitDir,
@@ -803,45 +860,61 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 
 	// Honor the task's writes_artifacts declaration. Expand the
 	// declared patterns (literal / glob / directory) against the
-	// working tree the bot just wrote into; required-but-missing
-	// declarations fail the iteration loudly (silent acceptance
-	// was the data-loss bug fixed earlier this session). Optional
-	// declarations that produced nothing fold silently.
+	// directory the handler just wrote into; required-but-missing
+	// declarations fail the iteration loudly. Optional declarations
+	// that produced nothing fold silently.
 	//
-	// The expanded set is split:
-	//   - Tracked entries → read content into params.Artifacts so
-	//     prepareFatSubmit packs them into the commit.
-	//   - Untracked entries → paths only into
-	//     params.UntrackedArtifacts so the coord records a
-	//     tracked=false index row but the file stays out of git.
+	// Expansion source:
+	//   - If a per-claim ephemeral CWD was prepared (Phase 4c),
+	//     the handler wrote there — expand and read content from
+	//     handlerCWD.
+	//   - Else: legacy path, expand from the persistent worktree.
+	//
+	// Untracked-artifact stat: the submit path stat()s declared
+	// untracked paths inside the persistent worktree at commit
+	// time. When the handler wrote them to the ephemeral CWD,
+	// copy them across so the submit-side stat passes. P4d
+	// switches submit to plumbing-from-CWD and drops this copy.
 	if len(meta.WritesArtifacts) > 0 {
-		expanded, missing, err := meta.WritesArtifacts.ExpandAgainstWorkdir(workspacePath)
+		expanded, missing, err := meta.WritesArtifacts.ExpandAgainstWorkdir(handlerCWD)
 		if err != nil {
 			return fmt.Errorf("expanding writes_artifacts: %w", err)
 		}
 		if len(missing) > 0 {
-			// Only required (non-optional) entries land in missing —
-			// the expander folds optional misses silently. Naming
-			// the path AND noting it was required helps the operator
-			// triage at a glance: was the bot supposed to write
-			// this, or did the manifest forget `optional: true`?
 			return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", strings.Join(missing, ", "))
 		}
+		// Tracked / untracked split — review fix #5:
+		// Tracked files: read content from handlerCWD into
+		// params.Artifacts; the commit picks them up via the
+		// content path (no worktree dependency for the bytes).
+		// Untracked files: get copied from handlerCWD → the
+		// persistent worktree so the submit-side stat finds
+		// them (the path lives in the worktree's bigfiles dir,
+		// kept out of git by the managed .gitignore block).
+		// Both end at the commit; the routes differ because
+		// untracked is verified via stat, tracked is verified
+		// via content. P4d switches submit to plumb-from-CWD
+		// and drops the copy step.
 		artifactContents := make(map[string]string)
 		var untrackedPaths []string
 		for _, e := range expanded {
 			if e.Track {
-				body, rerr := os.ReadFile(filepath.Join(workspacePath, e.Path))
+				// Tracked path: content goes through params.Artifacts.
+				body, rerr := os.ReadFile(filepath.Join(handlerCWD, e.Path))
 				if rerr != nil {
-					// Expansion stat'd this path moments ago, so
-					// a read failure here is transient IO. Surface
-					// the same message format expansion would so
-					// the operator can't tell the two apart and
-					// retry resolves both.
 					return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", e.Path)
 				}
 				artifactContents[e.Path] = string(body)
 				continue
+			}
+			// Untracked path: stat-verified at submit, so copy
+			// from ephemeral CWD to persistent worktree when
+			// they differ. Skip the copy when the two paths
+			// coincide (legacy single-dir flow).
+			if claimCWD != "" && claimCWD != workspacePath {
+				if cperr := copyFileForSubmit(filepath.Join(handlerCWD, e.Path), filepath.Join(workspacePath, e.Path)); cperr != nil {
+					return fmt.Errorf("copy untracked artifact %s to worktree: %w", e.Path, cperr)
+				}
 			}
 			untrackedPaths = append(untrackedPaths, e.Path)
 		}
@@ -914,7 +987,50 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	if res != nil && res.ErrorMessage != "" {
 		return fmt.Errorf("submit: %s", res.ErrorMessage)
 	}
+	// Submit succeeded — flag for the deferred CleanupLLMClaimCWD
+	// so the ephemeral CWD is removed (success path). Failures
+	// before this line leave submitOK=false; the deferred call
+	// preserves the CWD on disk (Phase 5 pattern).
+	submitOK = true
 	return nil
+}
+
+// copyFileForSubmit copies a single regular file from src to
+// dst, creating the destination's parent dir if missing. Used
+// to mirror untracked writes_artifacts from the ephemeral CWD
+// into the persistent worktree so the submit path's stat-
+// based check finds them (Phase 4c → P4d will eliminate the
+// copy when submit goes plumbing-only).
+//
+// Preserves the source file's mode bits so executable
+// scripts stay executable.
+//
+// Defensive against directory paths (review item #1):
+// ExpandAgainstWorkdir today returns regular files only — it
+// walks dir-shaped declarations and emits per-file entries —
+// but the explicit check here keeps a future expander change
+// from triggering an opaque EISDIR on os.ReadFile. A dir or
+// non-regular file reaching this helper fails loud with a
+// clear message rather than later in the read.
+func copyFileForSubmit(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("copy untracked artifact: source is a directory, not a file: %s", src)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("copy untracked artifact: source is not a regular file (mode %v): %s", info.Mode(), src)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	body, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, body, info.Mode().Perm())
 }
 
 // ReleaseActiveClaim hands a claimed-but-not-submitted task back

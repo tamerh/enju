@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -280,6 +281,103 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 		}
 	}
 	return compute.SweepRunStateDirs(wf.ProjectRoot(), alive)
+}
+
+// PrepareLLMClaimCWD creates the per-claim ephemeral working
+// directory for an LLM task's handler invocation and
+// materializes the iter-branch tip's whole tree into it.
+//
+// Path shape: <wsRoot>/scratch/<botUsername>/<taskID>-iter-<N>/
+// (the same path compute scratch already uses, so the unified
+// startup sweep + age-filter mechanics from Phase 5 apply
+// without per-bot-type duplication).
+//
+// Why materialize the whole iter-branch tree? The LLM's tools
+// (Read, Write, Bash) expect a project-shaped CWD. Existing
+// prompts use relative paths like `Read goal.md` or
+// `cd src && go build ./...`. Materializing just declared
+// reads_artifacts would break those — the LLM's context shrinks
+// to the declared list only. The whole-tree path keeps
+// existing prompts working. Per-claim cost is bounded by
+// repo size (seconds of I/O for typical projects).
+//
+// FUTURE OPTIMIZATION (review fix #2): on filesystems that
+// support reflink / copy-on-write (btrfs, ZFS, APFS, recent
+// XFS), the materialization could hardlink-or-reflink rather
+// than copy file-by-file. The first-pass cost would drop to
+// constant time. Hasn't been measured against a 1GB+ repo
+// yet — that benchmark is the gate for considering the
+// optimization. For now the straight read-write loop in
+// MaterializeRunRepo keeps the code path simple.
+//
+// COST FLAG (review fix #6): each call resolves the project's
+// Workflow via OpenWorkflow, which on first hit per project
+// opens the git store and acquires the per-project flock. The
+// workspace layer caches the open across subsequent calls so
+// repeated claims within one bot daemon amortize. Cross-
+// project bots pay the open cost once per project; high-fleet
+// configurations (one daemon claiming across hundreds of
+// projects) would feel it. Not measured against such a fleet
+// yet — flag if real workloads surface latency here.
+//
+// iterBranch is the per-iteration topic branch ref the
+// coordinator assigned at claim time. When it has no local
+// ref yet (very first claim before any commits, or in tests),
+// the materialization is a no-op — the daemon falls back to
+// the persistent worktree path. The function returns ("", nil)
+// in that case so callers can branch on `path == ""`.
+//
+// Errors are unrecoverable filesystem failures (mkdir denied,
+// git object missing). Callers log + fall back to the
+// persistent worktree to keep workflows progressing under
+// transient i/o trouble.
+func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error) {
+	if s.enjugit == nil || botUsername == "" || taskID == "" {
+		return "", nil
+	}
+	if iterBranch == "" {
+		// No iter branch yet (legacy / pre-iteration). Caller
+		// falls back to the persistent worktree path.
+		return "", nil
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return "", err
+	}
+	path := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), botUsername, taskID, iter)
+	if path == "" {
+		return "", nil
+	}
+	// MaterializeRunRepo creates the target dir + walks the
+	// branch's tree into it. Idempotent on existing files
+	// (writes are file-by-file).
+	if _, merr := wf.MaterializeRunRepo(iterBranch, path); merr != nil {
+		return "", fmt.Errorf("materialize iter-branch tree into claim CWD: %w", merr)
+	}
+	return path, nil
+}
+
+// CleanupLLMClaimCWD applies the Phase-5-style lifecycle:
+// successful submits remove the CWD; failed submits preserve
+// it so the operator's retry can pick up the LLM's work from
+// disk. Stale preserves age out via the startup sweep at
+// StaleScratchAgeThreshold.
+//
+// Empty path is a no-op (caller fell back to the persistent
+// worktree).
+func (s *FatClient) CleanupLLMClaimCWD(path string, successful bool) {
+	if path == "" {
+		return
+	}
+	if !successful {
+		s.logger.Warn("submit failed; preserving LLM claim CWD for retry",
+			"path", path)
+		return
+	}
+	if err := os.RemoveAll(path); err != nil {
+		s.logger.Warn("LLM claim CWD cleanup failed",
+			"path", path, "error", err)
+	}
 }
 
 // RunSnapshotDir returns the absolute path to a run's on-disk

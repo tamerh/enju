@@ -2,6 +2,7 @@ package bots
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -55,6 +56,47 @@ func TestArgSubstitute(t *testing.T) {
 			}
 			if hasEmpty != c.wantEmpty {
 				t.Errorf("hasEmpty: got %v, want %v", hasEmpty, c.wantEmpty)
+			}
+		})
+	}
+}
+
+// TestValidateArgsTemplate pins review-fix #3 + #10: typo'd
+// {{var}} names and malformed brace syntax are rejected at
+// manifest-load time rather than silently producing dropped
+// argv at first claim.
+func TestValidateArgsTemplate(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        string
+		wantError string // substring; empty = expects success
+	}{
+		{"no placeholder", "-p", ""},
+		{"known static var", "--model={{model}}", ""},
+		{"known: system_prompt", "{{system_prompt}}", ""},
+		{"handler_args dynamic key", "{{handler_args.effort}}", ""},
+		{"handler_args arbitrary key", "{{handler_args.anything-the-operator-picks}}", ""},
+		{"two placeholders in one arg", "{{model}}/{{branch}}", ""},
+		// Errors:
+		{"unknown static var", "--model={{tsk_id}}", "unknown placeholder {{tsk_id}}"},
+		{"unknown static var listed valid names", "{{foo}}", "valid names:"},
+		{"unterminated brace", "--foo={{model", "unterminated {{"},
+		{"empty placeholder", "{{}}", "empty {{}} placeholder"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := ValidateArgsTemplate(c.in)
+			if c.wantError == "" {
+				if err != nil {
+					t.Errorf("expected success, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", c.wantError)
+			}
+			if !strings.Contains(err.Error(), c.wantError) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantError)
 			}
 		})
 	}
@@ -672,6 +714,191 @@ echo "prompt-len=${#prompt}"
 	// daemon didn't thread them through HandlerInput.
 	if !strings.Contains(got, "task=") {
 		t.Errorf("response missing task echo; env-var threading broken? got: %q", got)
+	}
+}
+
+// recordingHandler is a Handler that captures inputs and
+// returns a fixed Response — like StubHandler, but does NOT
+// implement ClaimCWDOptOut, so the daemon's per-claim CWD
+// preparation path actually fires. Tests pinning the
+// CWD-wiring contract use this; tests covering the rest of
+// the daemon lifecycle continue to use StubHandler which
+// opts out of the materialization to keep test runtime down.
+type recordingHandler struct {
+	response string
+	err      error
+	calls    int
+	inputs   []HandlerInput
+}
+
+func (h *recordingHandler) ProcessTask(ctx context.Context, in HandlerInput) (HandlerOutput, error) {
+	h.calls++
+	h.inputs = append(h.inputs, in)
+	if h.err != nil {
+		return HandlerOutput{}, h.err
+	}
+	return HandlerOutput{Response: h.response}, nil
+}
+
+// TestDaemon_LLMClaimCWD_UsedAsHandlerWorkspace pins P4c.2:
+// when the FatClient returns a non-empty claim CWD, the
+// daemon uses it (not the persistent worktree) as the
+// handler's workspace path. Verifies the per-claim
+// ephemeral-CWD shape reaches the handler.
+func TestDaemon_LLMClaimCWD_UsedAsHandlerWorkspace(t *testing.T) {
+	cwd := t.TempDir()
+	fc := newFCWithTask("integ-bot", "answer", "ignored")
+	fc.workspacePath = "/some/persistent/worktree" // legacy path; should NOT be used
+	fc.llmClaimCWDPath = cwd                       // per-claim ephemeral path
+
+	stub := &recordingHandler{response: "done"}
+	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(stub.inputs) != 1 {
+		t.Fatalf("expected 1 handler invocation, got %d", len(stub.inputs))
+	}
+	if got := stub.inputs[0].Workspace; got != cwd {
+		t.Errorf("handler Workspace: got %q, want claim CWD %q", got, cwd)
+	}
+}
+
+// TestDaemon_LLMClaimCWD_FallsBackToWorkspaceWhenEmpty pins
+// the back-compat path: when PrepareLLMClaimCWD returns ""
+// (no iter branch, legacy task, test fixture), the daemon
+// falls back to the persistent worktree as before.
+func TestDaemon_LLMClaimCWD_FallsBackToWorkspaceWhenEmpty(t *testing.T) {
+	fc := newFCWithTask("integ-bot", "answer", "ignored")
+	fc.workspacePath = "/some/persistent/worktree"
+	fc.llmClaimCWDPath = "" // helper said "no CWD, use legacy"
+
+	stub := &recordingHandler{response: "done"}
+	d, err := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := stub.inputs[0].Workspace; got != "/some/persistent/worktree" {
+		t.Errorf("handler Workspace fallback: got %q, want %q", got, "/some/persistent/worktree")
+	}
+}
+
+// TestDaemon_LLMClaimCWD_CleanupOnSuccess pins P4c.4 success
+// path: a successful submit triggers CleanupLLMClaimCWD with
+// successful=true. The fake records the call; production
+// CleanupLLMClaimCWD rm -rf's the dir on this branch.
+func TestDaemon_LLMClaimCWD_CleanupOnSuccess(t *testing.T) {
+	cwd := t.TempDir()
+	fc := newFCWithTask("integ-bot", "answer", "done")
+	fc.llmClaimCWDPath = cwd
+
+	stub := &recordingHandler{response: "done"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(fc.llmCleanupCalls) != 1 {
+		t.Fatalf("expected 1 cleanup call, got %d", len(fc.llmCleanupCalls))
+	}
+	got := fc.llmCleanupCalls[0]
+	if got.path != cwd {
+		t.Errorf("cleanup path: got %q, want %q", got.path, cwd)
+	}
+	if !got.successful {
+		t.Errorf("successful submit should trigger cleanup with successful=true")
+	}
+}
+
+// TestDaemon_LLMClaimCWD_PreserveOnSubmitFail pins P4c.4
+// failure path: when submit fails, the deferred
+// CleanupLLMClaimCWD is invoked with successful=false — the
+// CWD is preserved on disk so the operator's retry can pick
+// up the LLM's work. Mirrors the Phase 5 pattern that
+// compute tasks already use.
+func TestDaemon_LLMClaimCWD_PreserveOnSubmitFail(t *testing.T) {
+	cwd := t.TempDir()
+	fc := newFCWithTask("integ-bot", "answer", "done")
+	fc.llmClaimCWDPath = cwd
+	fc.submitErr = "coord rejected: token expired"
+
+	stub := &recordingHandler{response: "done"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	_, err := d.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected RunOnce error from submit failure, got nil")
+	}
+	if len(fc.llmCleanupCalls) != 1 {
+		t.Fatalf("expected 1 cleanup call, got %d", len(fc.llmCleanupCalls))
+	}
+	got := fc.llmCleanupCalls[0]
+	if got.path != cwd {
+		t.Errorf("cleanup path: got %q, want %q", got.path, cwd)
+	}
+	if got.successful {
+		t.Errorf("failed submit should trigger cleanup with successful=false (preserve on disk)")
+	}
+}
+
+// TestDaemon_LLMClaimCWD_PrepareErrorFallsBackToWorkspace
+// pins review-fix #8: when PrepareLLMClaimCWD returns an
+// error (filesystem failure, missing git object, transient
+// I/O), the daemon logs a warning and falls back to the
+// persistent worktree path so the task can still progress.
+// No silent loss; no crash.
+func TestDaemon_LLMClaimCWD_PrepareErrorFallsBackToWorkspace(t *testing.T) {
+	fc := newFCWithTask("integ-bot", "answer", "done")
+	fc.workspacePath = "/persistent/worktree"
+	fc.llmClaimCWDPath = ""
+	fc.llmClaimCWDErr = errors.New("mkdir denied: read-only filesystem")
+
+	stub := &recordingHandler{response: "done"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v (daemon should log + proceed on Prepare error)", err)
+	}
+	if len(stub.inputs) != 1 {
+		t.Fatalf("handler should have been invoked despite Prepare error; got %d invocations", len(stub.inputs))
+	}
+	// Workspace falls back to the persistent worktree path.
+	if got := stub.inputs[0].Workspace; got != "/persistent/worktree" {
+		t.Errorf("handler Workspace fallback after Prepare error: got %q, want %q", got, "/persistent/worktree")
+	}
+	// Cleanup is still called (deferred) — with empty path,
+	// which CleanupLLMClaimCWD treats as a no-op in production.
+	if len(fc.llmCleanupCalls) != 1 {
+		t.Fatalf("expected 1 cleanup call (no-op on empty path), got %d", len(fc.llmCleanupCalls))
+	}
+	if fc.llmCleanupCalls[0].path != "" {
+		t.Errorf("cleanup path: got %q, want empty (Prepare returned no path)", fc.llmCleanupCalls[0].path)
+	}
+}
+
+// TestDaemon_LLMClaimCWD_PreserveOnHandlerError pins the same
+// preserve-on-failure invariant for handler failures (LLM
+// crashed before submit). The CWD is still preserved so the
+// operator can inspect what the LLM produced before it died.
+func TestDaemon_LLMClaimCWD_PreserveOnHandlerError(t *testing.T) {
+	cwd := t.TempDir()
+	fc := newFCWithTask("integ-bot", "answer", "done")
+	fc.llmClaimCWDPath = cwd
+
+	stub := &recordingHandler{err: errors.New("LLM blew up")}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	_, err := d.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected RunOnce error from handler failure")
+	}
+	if len(fc.llmCleanupCalls) != 1 {
+		t.Fatalf("expected 1 cleanup call (preserve), got %d", len(fc.llmCleanupCalls))
+	}
+	if fc.llmCleanupCalls[0].successful {
+		t.Errorf("handler error should trigger cleanup with successful=false")
 	}
 }
 

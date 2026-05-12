@@ -237,6 +237,38 @@ type Preflighter interface {
 	Preflight() error
 }
 
+// ClaimCWDOptOut is the opt-OUT seam for per-claim ephemeral
+// CWD materialization (Phase 4c). Handlers that don't need a
+// project-shaped working directory — StubHandler in tests,
+// future rule-based handlers that operate purely on coord
+// state — implement this returning false. The daemon skips
+// the (potentially expensive) iter-branch tree walk for
+// them.
+//
+// Default (handler doesn't implement the interface) is true:
+// the daemon prepares the ephemeral CWD. SubprocessHandler
+// doesn't implement this — it always wants the CWD.
+//
+// "OptOut" naming makes the polarity explicit: returning
+// false skips the materialization. The alternative
+// (NeedsClaimCWD with default false) would silently skip
+// materialization for any new handler that forgot the
+// method, producing confusing "where are my files" failures.
+//
+// DESIGN CHOICE (review fix #9): this is a Go-side interface,
+// not a Bot manifest field. The opt-out is a property of the
+// handler IMPLEMENTATION (does the handler use its CWD or
+// not?), not of the operator's choice — a stub handler can
+// never sensibly want a CWD, regardless of how the operator
+// configured the bot. A manifest field would let operators
+// override the handler's intent, which is rarely what they
+// want and easy to misconfigure. If a real use case for
+// operator-side override appears, add a manifest field that
+// takes precedence over this interface assertion.
+type ClaimCWDOptOut interface {
+	SkipClaimCWD() bool
+}
+
 // Ensure SubprocessHandler satisfies Preflighter at compile time
 // so future refactors can't silently drop the method.
 var _ Preflighter = (*SubprocessHandler)(nil)

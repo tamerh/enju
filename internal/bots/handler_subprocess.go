@@ -239,6 +239,97 @@ func (h *SubprocessHandler) ProcessTask(ctx context.Context, in HandlerInput) (H
 	return HandlerOutput{Response: stdout.String()}, nil
 }
 
+// knownArgVars is the canonical set of static {{var}} names
+// the Args-template substitution recognizes. Exposed so
+// manifest validation (bots.Manifest.Validate) can reject
+// typo'd references at manifest-load time rather than at
+// first claim.
+//
+// Dynamic vars under the `handler_args.` prefix are NOT in
+// this set — they're operator-defined keys from
+// Bot.HandlerArgs. The validator handles that case separately
+// (any `handler_args.<key>` is accepted as long as the prefix
+// matches).
+//
+// Keep this list in sync with subContext below. A new {{var}}
+// added to subContext that isn't added here would work at
+// runtime but get rejected by the manifest validator — a
+// confusing failure for a reference the runtime would have
+// happily resolved.
+var knownArgVars = map[string]bool{
+	"model":           true,
+	"system_prompt":   true,
+	"allowed_tools":   true,
+	"task_id":         true,
+	"action":          true,
+	"branch":          true,
+	"repo_dir":        true,
+	"git_dir":         true,
+	"scratch":         true,
+	"review_feedback": true,
+}
+
+// ValidateArgsTemplate checks a single Args entry's {{var}}
+// references at manifest-load time. Returns an error on:
+//   - unterminated {{ (no closing }})
+//   - empty {{}} placeholder
+//   - unknown {{var}} that isn't a recognized static name and
+//     isn't under the handler_args. prefix
+//
+// Empty / no-template args pass through cleanly. Used by the
+// bots.Manifest validator so typo'd placeholders fail loud
+// rather than silently substituting to empty (which the drop
+// rule then deletes from argv — operator sees the flag vanish
+// with no diagnostic).
+//
+// "handler_args.X" references accept any X because the
+// operator picks the handler_args keys at manifest authoring
+// time; we can't validate against intent at parse time
+// without conflating validation with operator choice.
+//
+// Review-fix #3 + #10: catches both typo'd static-name
+// references and malformed brace syntax at manifest load.
+func ValidateArgsTemplate(arg string) error {
+	i := 0
+	for i < len(arg) {
+		open := strings.Index(arg[i:], "{{")
+		if open < 0 {
+			return nil
+		}
+		rest := arg[i+open+2:]
+		closeIdx := strings.Index(rest, "}}")
+		if closeIdx < 0 {
+			return fmt.Errorf("unterminated {{ at offset %d", i+open)
+		}
+		key := rest[:closeIdx]
+		if key == "" {
+			return fmt.Errorf("empty {{}} placeholder at offset %d", i+open)
+		}
+		if !knownArgVars[key] && !strings.HasPrefix(key, "handler_args.") {
+			return fmt.Errorf("unknown placeholder {{%s}} — valid names: %s, or handler_args.<key>", key, knownArgVarNamesList())
+		}
+		i += open + 2 + closeIdx + 2
+	}
+	return nil
+}
+
+// knownArgVarNamesList renders the recognized static-var
+// names as a comma-joined string for error messages. Sorted
+// for deterministic output.
+func knownArgVarNamesList() string {
+	names := make([]string, 0, len(knownArgVars))
+	for k := range knownArgVars {
+		names = append(names, k)
+	}
+	// Cheap insertion-sort — N is small.
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j-1] > names[j]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
 // subContext assembles the {{var}} substitution context for a
 // single ProcessTask invocation. Combines bot-static values
 // (Model, AllowTools, system prompt body) with per-claim

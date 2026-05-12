@@ -75,6 +75,16 @@ type fakeFC struct {
 	checkoutTopicCalls []checkoutTopicCall
 	checkoutTopicErr   error
 
+	// llmClaimCWDPath is returned from PrepareLLMClaimCWD.
+	// Default "" means "fall back to persistent worktree."
+	// Tests pinning the ephemeral-CWD wiring set it to a real
+	// path on disk.
+	llmClaimCWDPath string
+	llmClaimCWDErr  error
+	// llmCleanupCalls records each CleanupLLMClaimCWD
+	// invocation so tests can assert success vs preserve.
+	llmCleanupCalls []llmCleanupCall
+
 	// wipeWritesCalls captures the (projectID, paths) pairs the
 	// daemon asked WipeDeclaredWrites for. Tests pin the
 	// "iter-2 starts from a clean canvas in declared output
@@ -109,6 +119,11 @@ type checkoutTopicCall struct {
 type wipeWritesCall struct {
 	projectID int64
 	paths     []string
+}
+
+type llmCleanupCall struct {
+	path       string
+	successful bool
 }
 
 func (f *fakeFC) Username() string { return f.username }
@@ -162,6 +177,14 @@ func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int6
 }
 func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
 	return "", nil
+}
+func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error) {
+	return f.llmClaimCWDPath, f.llmClaimCWDErr
+}
+func (f *fakeFC) CleanupLLMClaimCWD(path string, successful bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.llmCleanupCalls = append(f.llmCleanupCalls, llmCleanupCall{path: path, successful: successful})
 }
 
 func (f *fakeFC) FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error) {

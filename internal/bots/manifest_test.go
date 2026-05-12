@@ -277,6 +277,76 @@ func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 	}
 }
 
+// TestValidate_RejectsUnknownArgsTemplate pins review-fix #3:
+// a Bot.Args entry referencing an unrecognized {{var}} name
+// fails manifest load with a clear error. Without this,
+// operator typos like {{tsk_id}} for {{task_id}} would
+// substitute to empty + drop the arg, surfacing as "the flag
+// vanished" at first daemon claim with no diagnostic.
+func TestValidate_RejectsUnknownArgsTemplate(t *testing.T) {
+	root := writeManifest(t, `
+version: 1
+bots:
+  - name: x
+    model: m
+    args:
+      - "-p"
+      - "--task-id={{tsk_id}}"
+`)
+	_, err := Load(root)
+	if err == nil {
+		t.Fatal("expected validation error for typo'd {{tsk_id}}")
+	}
+	if !strings.Contains(err.Error(), "{{tsk_id}}") {
+		t.Errorf("error should name the bad placeholder, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "args[1]") {
+		t.Errorf("error should name the bad arg index, got: %v", err)
+	}
+}
+
+// TestValidate_RejectsMalformedArgsTemplate pins review-fix
+// #10: unterminated braces fail loud at manifest load.
+func TestValidate_RejectsMalformedArgsTemplate(t *testing.T) {
+	root := writeManifest(t, `
+version: 1
+bots:
+  - name: x
+    model: m
+    args:
+      - "--model={{model"
+`)
+	_, err := Load(root)
+	if err == nil {
+		t.Fatal("expected validation error for unterminated {{")
+	}
+	if !strings.Contains(err.Error(), "unterminated") {
+		t.Errorf("error should mention unterminated brace, got: %v", err)
+	}
+}
+
+// TestValidate_AcceptsKnownArgsVars passes when args use any
+// recognized static var or any handler_args.<key>.
+func TestValidate_AcceptsKnownArgsVars(t *testing.T) {
+	root := writeManifest(t, `
+version: 1
+bots:
+  - name: x
+    model: m
+    args:
+      - "-p"
+      - "--model={{model}}"
+      - "--system={{system_prompt}}"
+      - "--tools={{allowed_tools}}"
+      - "--branch={{branch}}"
+      - "--effort={{handler_args.effort}}"
+      - "--any-operator-key={{handler_args.foo-bar}}"
+`)
+	if _, err := Load(root); err != nil {
+		t.Errorf("manifest with valid {{var}} references should load, got: %v", err)
+	}
+}
+
 func TestValidate_RejectsUnknownHandler(t *testing.T) {
 	root := writeManifest(t, `
 bots:

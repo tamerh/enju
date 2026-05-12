@@ -170,12 +170,24 @@ type Bot struct {
 	//     format: json
 	Args []string `yaml:"args,omitempty"`
 
-	// HandlerArgs are arbitrary extra CLI flags the subprocess
-	// handler appends to the LLM binary's argv. Each (key, value)
-	// pair translates to `--<key> <value>` (with bool conventions:
-	// "true" → bare flag, "false" → omitted). Keys are passed
-	// through verbatim; values land as one argv slot via
-	// exec.Command — never shell-evaluated.
+	// HandlerArgs are operator-defined values referenceable from
+	// Bot.Args via {{handler_args.<key>}} substitution.
+	//
+	// SEMANTIC SHIFT 4b → 4b-r1: pre-r1, HandlerArgs auto-
+	// translated to `--<key> <value>` flags appended to argv.
+	// Post-r1, that auto-translation is GONE — handler_args is
+	// substitution data only. Operators who want flags
+	// reference the keys explicitly in `args:`:
+	//
+	//   args:
+	//     - "--effort={{handler_args.effort}}"
+	//   handler_args:
+	//     effort: high
+	//
+	// The change happened pre-launch (no installed-base manifests
+	// existed under the auto-translate semantic) so there's no
+	// migration burden, but readers tracing the field's history
+	// should know the two semantics existed. Review fix #4.
 	//
 	// Workflow YAML:
 	//   handler_args:
@@ -543,6 +555,16 @@ func (m *Manifest) Validate() error {
 		// "all" or list at least one tool.
 		if b.MCPTools != nil && len(b.MCPTools.Allow) == 0 {
 			return fmt.Errorf("bot %q: mcp_tools.allow is present but empty — omit the section to allow all tools, or list at least one tool name", b.Name)
+		}
+		// Validate each Args entry's {{var}} placeholders. Catches
+		// typo'd static-var references AND malformed brace
+		// syntax at manifest load — otherwise these surface
+		// only at first claim, after the daemon's started and
+		// a task is in flight. Review-fix #3 + #10.
+		for j, a := range b.Args {
+			if err := ValidateArgsTemplate(a); err != nil {
+				return fmt.Errorf("bot %q: args[%d] %q: %w", b.Name, j, a, err)
+			}
 		}
 	}
 	return nil
