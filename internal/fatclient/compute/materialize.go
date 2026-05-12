@@ -54,14 +54,44 @@ func ScriptCwdFor(spec Spec, workDir string) string {
 	return workDir
 }
 
-// StaleScratchAgeThreshold is the minimum mtime age a scratch
-// dir must reach before the startup sweep removes it. Anything
-// younger may belong to a submit-failed retry (TP53 Bug 2 fix
-// preserves scratch when the post-script commit fails so the
-// operator's next claim can pick up the outputs from disk).
-// Once it ages past this threshold the retry is presumed
-// abandoned and the dir becomes a leak; sweep reclaims it.
+// StaleScratchAgeThreshold is the default minimum mtime age a
+// scratch dir must reach before the startup sweep removes it.
+// Anything younger may belong to a submit-failed retry (TP53
+// Bug 2 fix preserves scratch when the post-script commit
+// fails so the operator's next claim can pick up the outputs
+// from disk). Once it ages past this threshold the retry is
+// presumed abandoned and the dir becomes a leak; sweep
+// reclaims it.
+//
+// Override via the ENJU_SCRATCH_PRESERVE_HOURS env var
+// (positive integer hours). Operators with longer retry
+// windows — multi-day pipelines, weekend-only operators — set
+// it higher; aggressive recyclers set it lower. Invalid or
+// non-positive values silently fall back to the default so a
+// typo doesn't disable the safety net.
 const StaleScratchAgeThreshold = 24 * time.Hour
+
+// ScratchPreserveHoursEnv is the env var name operators set to
+// override StaleScratchAgeThreshold. Exposed as a constant so
+// docs, tests, and the read site stay in sync if the name
+// changes.
+const ScratchPreserveHoursEnv = "ENJU_SCRATCH_PRESERVE_HOURS"
+
+// effectiveStaleScratchAge reads ScratchPreserveHoursEnv and
+// returns the configured retention window. Falls back to the
+// compile-time default when the env var is unset, empty, or
+// not a parseable positive integer.
+func effectiveStaleScratchAge() time.Duration {
+	raw := os.Getenv(ScratchPreserveHoursEnv)
+	if raw == "" {
+		return StaleScratchAgeThreshold
+	}
+	var hours int
+	if _, err := fmt.Sscanf(raw, "%d", &hours); err != nil || hours <= 0 {
+		return StaleScratchAgeThreshold
+	}
+	return time.Duration(hours) * time.Hour
+}
 
 // SweepStaleScratchAtStartup removes the calling bot's scratch
 // subtree under the given workspace root, filtered to dirs
@@ -101,7 +131,7 @@ const StaleScratchAgeThreshold = 24 * time.Hour
 // replica B's stays inside B's. Empty botUsername is a no-op
 // (test fixtures without a coord identity).
 func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) {
-	return sweepStaleScratchOlderThan(workspaceRoot, botUsername, StaleScratchAgeThreshold, time.Now())
+	return sweepStaleScratchOlderThan(workspaceRoot, botUsername, effectiveStaleScratchAge(), time.Now())
 }
 
 // sweepStaleScratchOlderThan is the testable core of

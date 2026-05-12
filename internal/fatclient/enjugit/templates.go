@@ -53,11 +53,16 @@ type ParamSummary struct {
 // Path is the manifest YAML's repo-relative path; BundleDir is
 // the enclosing dir, used by snapshot-on-instantiate to enumerate
 // every file to copy.
+//
+// Parsed is the result of yaml.Parse on Raw; exposed so callers
+// don't re-parse to read fields like the inline `bots:` block.
+// Pre-Phase-7 callers that only needed Summary can ignore it.
 type LoadedTemplate struct {
 	Path      string
 	BundleDir string
 	Raw       []byte
 	Summary   TemplateSummary
+	Parsed    *enjuYaml.ParsedRun
 }
 
 // resolvedBundle pairs a classified manifest path with its
@@ -236,6 +241,7 @@ func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 			Description: parsed.Run.Description,
 			Params:      paramSummaries(parsed.Run.Params),
 		},
+		Parsed: parsed,
 	}, nil
 }
 

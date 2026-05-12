@@ -377,7 +377,7 @@ func TestEnsureGitignored_FreshProject(t *testing.T) {
 	// nest under enju/bots/<botname>/clone/ so the enju/bots/
 	// rule covers them transitively — no separate clone entry
 	// needed.
-	for _, want := range []string{"enju/bots/", "enju/.bare.git/"} {
+	for _, want := range []string{"enju/bots/", "enju/.bare.git/", ".enju/"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("expected %q in .gitignore, got:\n%s", want, body)
 		}

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/types"
@@ -528,6 +529,37 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		p, err := c.fc.PrepareRunTemplate(ctx, int64(projectID), templatePath, authorName, authorEmail)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+		// Pre-validate the inline bots block at create_run time
+		// (per-run-snapshot redesign Phase 7 + review fix R1).
+		// yaml.Parse only checks the block is a valid YAML node;
+		// the bot-roster schema (name, model, handler enum,
+		// replicas cap, credentials path shape) is validated by
+		// bots.FromInlineNode. Running it here catches malformed
+		// inline declarations at create_run rather than at first
+		// daemon start.
+		//
+		// Review fix R10 — also emit a one-shot warning when the
+		// inline block parses cleanly but isn't yet routed to the
+		// daemon. Inline bots in workflow YAMLs validate today but
+		// the `enju bot run` CLI still reads from enju/bots.yaml
+		// only; without this hint, authors can't tell whether
+		// their inline declaration "took effect." Logged via the
+		// fat-client logger so operators running `enju mcp` see
+		// it in their stderr at create_run.
+		if p.LoadedTemplate != nil && p.LoadedTemplate.Parsed != nil {
+			inlineNode := p.LoadedTemplate.Parsed.Run.Bots
+			inlineMan, berr := bots.FromInlineNode(inlineNode)
+			if berr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("template %s: %v", templatePath, berr)), nil
+			}
+			if inlineMan != nil && len(inlineMan.Bots) > 0 && c.fc.Logger() != nil {
+				c.fc.Logger().Warn("inline bots: section parsed but not yet routed to bot daemon — "+
+					"`enju bot run` still reads enju/bots.yaml only. "+
+					"Mirror the inline declarations to enju/bots.yaml until the workflow-aware CLI lands",
+					"template", templatePath,
+					"bot_count", len(inlineMan.Bots))
+			}
 		}
 		prep = p
 		yamlContent = prep.YAMLContent

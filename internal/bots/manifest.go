@@ -492,16 +492,18 @@ func (m *Manifest) ByName(name string) *Bot {
 // EnsureGitignored ensures the project's .gitignore lists the
 // machine-managed bot directories inside the existing enju-managed
 // block. Called by `enju bot setup` so the operator doesn't have
-// to remember the gitignore step manually. Three entries land in
-// the block:
+// to remember the gitignore step manually. Entries land in the
+// block:
 //
 //   - enju/bots/      — per-bot worktrees (transient runtime)
 //   - enju/.bare.git/ — bot push target bare (per-machine local)
-//   - enju/.clone/    — bot's managed clone (per-machine local)
+//   - .enju/          — hidden per-run state (snapshot cache,
+//                       scratch); per-run-snapshot redesign Phase 3
 //
-// All three are local-only state, never something to commit. The
-// bare and clone are dot-prefixed so they don't clutter `ls enju/`
-// alongside the human-curated templates and bots.yaml.
+// All are local-only state, never something to commit. The bare
+// is dot-prefixed so it doesn't clutter `ls enju/` alongside
+// the human-curated templates and bots.yaml. The .enju/ root
+// holds runtime caches that the sweep wipes on bot startup.
 //
 // Returns (changed=true, nil) when the file was updated; (false,
 // nil) when all paths were already present. Errors only on real
@@ -529,10 +531,12 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	}
 	// BotsRuntimeDir already covers each bot's per-bot clone at
 	// <project>/enju/bots/<botname>/clone/, so no separate clone
-	// entry is needed.
+	// entry is needed. StateDirRoot (.enju/) covers all per-run
+	// runtime caches (snapshot/, scratch/, future siblings).
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
 		corelayout.BotsRuntimeDir + "/",
 		corelayout.BotPushTargetDir + "/",
+		corelayout.StateDirRoot + "/",
 	})
 	if !changed {
 		return false, nil

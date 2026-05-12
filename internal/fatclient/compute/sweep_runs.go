@@ -10,10 +10,13 @@ package compute
 //
 // SweepRunStateDirs is the read-the-floor cleanup: enumerate
 // every per-run dir under .enju/runs/ and remove the ones whose
-// seq isn't in the caller-provided "alive" set. Used at bot
-// startup (catch dirs that outlived a coord crash or a missed
-// terminal-state signal) and periodically by the daemon's
-// poll loop.
+// seq isn't in the caller-provided "alive" set. Today the only
+// caller is the bot daemon's startup hook — runs that finished
+// while the daemon was down get reclaimed on the next start.
+// A periodic / signal-driven sweep is a future addition; absent
+// it, an in-session run that becomes terminal keeps its
+// snapshot dir until the daemon cycles, which is harmless since
+// runs are immutable once terminal.
 
 import (
 	"fmt"

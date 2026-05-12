@@ -363,6 +363,99 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 	}
 }
 
+// TestSweepStaleScratchAtStartup_HonorsEnvOverride pins R5:
+// ENJU_SCRATCH_PRESERVE_HOURS lets operators extend (or shorten)
+// the retry window without recompiling. A 1-hour override makes
+// a 2-hour-old dir eligible for sweep that the 24h default
+// would have kept. Invalid values fall back to the default
+// silently so a typo can't disable the safety net.
+func TestSweepStaleScratchAtStartup_HonorsEnvOverride(t *testing.T) {
+	tmp := t.TempDir()
+	bot := "alice-1"
+	myScratch := filepath.Join(tmp, "scratch", bot)
+
+	// Seed a dir aged 2 hours. Under the 24h default it survives;
+	// under a 1h override it's eligible.
+	twoHourOld := filepath.Join(myScratch, "task-2h-iter-1")
+	if err := os.MkdirAll(twoHourOld, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t2 := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(twoHourOld, t2, t2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity: default keeps it.
+	if n, err := compute.SweepStaleScratchAtStartup(tmp, bot); err != nil {
+		t.Fatalf("default sweep: %v", err)
+	} else if n != 0 {
+		t.Errorf("default 24h: want 0 removed for a 2h-old dir, got %d", n)
+	}
+	if _, err := os.Stat(twoHourOld); err != nil {
+		t.Fatalf("default sweep wrongly removed fresh dir: %v", err)
+	}
+
+	// Override to 1h → 2h-old dir is eligible.
+	t.Setenv("ENJU_SCRATCH_PRESERVE_HOURS", "1")
+	n, err := compute.SweepStaleScratchAtStartup(tmp, bot)
+	if err != nil {
+		t.Fatalf("override sweep: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("override 1h: want 1 removed, got %d", n)
+	}
+	if _, err := os.Stat(twoHourOld); !os.IsNotExist(err) {
+		t.Errorf("dir should be gone after override sweep, stat=%v", err)
+	}
+}
+
+// TestSweepStaleScratchAtStartup_InvalidEnvFallsBackToDefault
+// pins the safety-net behavior: a typo in
+// ENJU_SCRATCH_PRESERVE_HOURS (non-numeric, negative, zero)
+// silently falls back to the 24h default rather than disabling
+// the sweep entirely.
+func TestSweepStaleScratchAtStartup_InvalidEnvFallsBackToDefault(t *testing.T) {
+	tmp := t.TempDir()
+	bot := "alice-1"
+	myScratch := filepath.Join(tmp, "scratch", bot)
+
+	// Aged 2 hours.
+	fresh := filepath.Join(myScratch, "fresh-iter-1")
+	if err := os.MkdirAll(fresh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t2 := time.Now().Add(-2 * time.Hour)
+	_ = os.Chtimes(fresh, t2, t2)
+
+	// 25 hours — eligible under default.
+	aged := filepath.Join(myScratch, "aged-iter-1")
+	if err := os.MkdirAll(aged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t25 := time.Now().Add(-25 * time.Hour)
+	_ = os.Chtimes(aged, t25, t25)
+
+	for _, bad := range []string{"oops", "-3", "0", ""} {
+		t.Run("bad-"+bad, func(t *testing.T) {
+			t.Setenv("ENJU_SCRATCH_PRESERVE_HOURS", bad)
+			// Re-seed (previous subtest may have removed aged).
+			_ = os.MkdirAll(aged, 0o755)
+			_ = os.Chtimes(aged, t25, t25)
+			n, err := compute.SweepStaleScratchAtStartup(tmp, bot)
+			if err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+			// Default behavior: aged removed, fresh kept.
+			if n < 1 {
+				t.Errorf("expected aged dir removed under fallback default, got n=%d", n)
+			}
+			if _, err := os.Stat(fresh); err != nil {
+				t.Errorf("fresh dir was wrongly removed: %v", err)
+			}
+		})
+	}
+}
+
 // TestSweepStaleScratchAtStartup_RespectsAgeFilter pins TP53
 // Bug 2's preservation invariant against the startup sweep:
 // fresh scratch dirs (younger than StaleScratchAgeThreshold)

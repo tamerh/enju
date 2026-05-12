@@ -304,6 +304,129 @@ echo "stdout content"
 	}
 }
 
+// TestWrapper_RepoDirReadableAndScratchSurvivesSubmitFail is
+// the R7 combined E2E pin spanning Phases 1 and 5: a script
+// reads frozen repo content via $ENJU_REPO_DIR, writes its
+// output to $ENJU_SCRATCH, the post-script submit fails, and
+// BOTH the materialized repo input AND the script output
+// survive on disk for a retry to consume.
+//
+// The two phases meet inside the wrapper's defer block:
+// Phase 1 added $ENJU_REPO_DIR (per-run snapshot read path),
+// Phase 5 made the defer-cleanup conditional on res.GitError.
+// If either regresses independently the retry contract breaks —
+// either the operator's next claim sees no input ($ENJU_REPO_DIR
+// path wrong / not exposed), or sees no output (scratch wiped).
+// This test exercises both paths together against a real
+// workflow + bare.
+func TestWrapper_RepoDirReadableAndScratchSurvivesSubmitFail(t *testing.T) {
+	bare := initBareForComputeTest(t)
+	wsRoot := t.TempDir()
+	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
+
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("NewWorkspace: %v", err)
+	}
+	wf, err := ws.ForProject(305, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+
+	// Materialize a snapshot dir with a known-content "repo
+	// file" alongside the script. Production callers point
+	// $ENJU_REPO_DIR at the per-run snapshot at
+	// <project>/.enju/runs/<N>/snapshot/; for this test we use
+	// a sibling temp dir to keep setup minimal — the wrapper
+	// passes the env value through verbatim.
+	repoSnapBase := t.TempDir()
+	repoSnap := filepath.Join(repoSnapBase, "snapshot")
+	if err := os.MkdirAll(repoSnap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const repoFileContent = "frozen-input-v1\n"
+	if err := os.WriteFile(filepath.Join(repoSnap, "input.txt"),
+		[]byte(repoFileContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Script: reads $ENJU_REPO_DIR/input.txt and writes the
+	// derived content to $ENJU_SCRATCH/output.txt. set -e so a
+	// failing read fails the whole script (it shouldn't).
+	script := `#!/bin/sh
+set -e
+contents=$(cat "$ENJU_REPO_DIR/input.txt")
+echo "derived: $contents" > "$ENJU_SCRATCH/output.txt"
+echo "ok"
+`
+	if err := os.WriteFile(filepath.Join(repoSnap, "run.sh"),
+		[]byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:combined_check", 1)
+
+	spec := compute.Spec{
+		TaskID:        "1:1:combined_check",
+		ProjectID:     305,
+		RemoteURL:     bare,
+		WorkspaceRoot: wsRoot,
+		// Branch points at a nonexistent ref so the post-script
+		// submit fails — same forced-failure pattern as
+		// TestWrapper_PreservesScratchOnSubmitFail.
+		Branch:          "no-such-branch-combined",
+		IterationBranch: "no-such-branch-combined/iter-1",
+		ResultDir:       "enju/runs/1-test/combined_check",
+		ScriptPath:      filepath.Join(repoSnap, "run.sh"),
+		ScriptLabel:     "run.sh",
+		AuthorName:      "alice",
+		AuthorEmail:     "alice@example.com",
+		Username:        "alice",
+		TaskScratchDir:  scratch,
+		SnapshotDir:     repoSnap,
+	}
+
+	// Env: the wrapper exposes ENJU_SCRATCH itself based on
+	// spec.TaskScratchDir, but ENJU_REPO_DIR is set by the
+	// service layer in production (buildComputeEnv). Since
+	// we're calling compute.Run directly, plumb both env vars
+	// here to mirror the production wrapper view.
+	env := append(os.Environ(),
+		"ENJU_SCRATCH="+scratch,
+		"ENJU_REPO_DIR="+repoSnap,
+	)
+	res := compute.Run(context.Background(), wf, spec,
+		env, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if res.Error != "" {
+		t.Fatalf("unexpected wrapper error: %q", res.Error)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("script should have exited 0, got %d (stderr=%q)", res.ExitCode, res.Stderr)
+	}
+	if res.GitError == "" {
+		t.Fatalf("expected GitError on submit failure, got empty")
+	}
+
+	// Phase 5 invariant: scratch preserved on submit fail.
+	if _, err := os.Stat(scratch); err != nil {
+		t.Fatalf("scratch dir should have been preserved: %v", err)
+	}
+
+	// Phase 1 invariant + the combined contract: the script's
+	// output is in scratch, AND the output is derived from the
+	// frozen repo content the script read via $ENJU_REPO_DIR.
+	gotOutput, err := os.ReadFile(filepath.Join(scratch, "output.txt"))
+	if err != nil {
+		t.Fatalf("script output missing from scratch: %v", err)
+	}
+	wantOutput := "derived: frozen-input-v1\n"
+	if string(gotOutput) != wantOutput {
+		t.Errorf("output content mismatch:\n got  %q\n want %q", gotOutput, wantOutput)
+	}
+}
+
 // TestWrapper_CleansScratchOnSubmitSuccess complements the above:
 // when the submit succeeds, scratch goes away as before. Without
 // this, a regression that made the conditional cleanup never fire

@@ -19,8 +19,16 @@ import (
 
 // MaterializeRunRepo writes the entire commit tree at branch's
 // tip to targetDir. Walks .git/objects/ directly; never touches
-// the shared operator worktree. Safe to call concurrently from
-// multiple goroutines targeting DIFFERENT targetDirs.
+// the shared operator worktree.
+//
+// CONCURRENT WRITES OK: when two replicas of the same bot — or
+// any pair of callers — materialize the SAME branch into the
+// SAME targetDir simultaneously, both write the same bytes to
+// the same paths. The git tree at a SHA is reproducible (same
+// SHA → same tree → same blob contents → same on-disk bytes),
+// so concurrent writers race onto an idempotent end state.
+// Callers targeting DIFFERENT targetDirs are trivially
+// independent. Either way, no caller-side coordination needed.
 //
 // This is the per-run-snapshot variant: ONE call materializes
 // everything the run's tasks will read — the in-git
