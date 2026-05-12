@@ -73,11 +73,16 @@ const ProjectConfigPath = "enju/conf.yaml"
 const BotManifestPath = "enju/bots.yaml"
 
 // BotsRuntimeDir is the per-project runtime root where each bot
-// daemon's git worktree lives. Sibling to enju/runs/, both
-// transient runtime state. Conventionally git-ignored — worktrees
-// have their own .git pointer files anyway, so they never round-
-// trip through `git add` even if the ignore is missing.
-const BotsRuntimeDir = "enju/bots"
+// daemon's git worktree lives. Sibling to .enju/runs/ — both
+// hidden transient runtime state under StateDirRoot. Auto-gitignored
+// transitively by the .enju/ entry the bot-setup managed block
+// writes.
+//
+// Pre-Phase-4a this lived at "enju/bots" — visible, gitignored
+// individually. Phase 4a moves it under StateDirRoot so the
+// "everything system is hidden, everything user is visible"
+// invariant holds uniformly.
+const BotsRuntimeDir = StateDirRoot + "/bots"
 
 // BigfilesDir is the per-project root where action:compute tasks
 // land their declared-untracked outputs (writes_artifacts entries
@@ -120,18 +125,22 @@ func BigfilesBranchDir(branch string) string {
 // a bare belongs in the project's git history.
 const BotPushTargetDir = "enju/.bare.git"
 
-// BotCloneDirFor returns the per-bot per-project managed clone
-// directory. Each bot citizen running on a given machine gets
-// its own clone so multiple daemons can work in parallel
-// without stepping on each other's working tree (claude -p
-// writes scratch files, branch switches, in-flight commits —
-// all isolated per bot).
+// BotCloneDirFor returns the per-bot per-project managed
+// worktree directory. Each bot citizen running on a given
+// machine gets its own worktree so multiple daemons can work
+// in parallel without stepping on each other's worktree
+// (claude -p writes scratch files, branch switches, in-flight
+// commits — all isolated per bot).
 //
-// Layout: <project>/enju/bots/<botUsername>/clone/
+// Layout: <project>/.enju/bots/<botUsername>/worktree/
 //
-// Sits under BotsRuntimeDir so the existing `enju/bots/`
-// gitignore rule covers every bot's clone in one go and
-// `ls enju/bots/` advertises the local fleet to the operator.
+// Sits under BotsRuntimeDir (StateDirRoot + "/bots"), which is
+// transitively gitignored by the .enju/ entry in the
+// managed-block. The dir name is "worktree" rather than the
+// historical "clone" because Phase 4c's ephemeral-CWD model
+// will land sibling subdirs (claim-<task-iter>/) under the
+// same bot dir; "worktree" is the long-lived one, "claim-*"
+// are per-task ephemeral.
 //
 // botUsername is the coord-assigned username (the canonical
 // citizen identity). Coord-side ValidateUsername already
@@ -140,6 +149,10 @@ const BotPushTargetDir = "enju/.bare.git"
 // path separators, and `..` traversals all get refused so a
 // future un-validated caller can't escape into the project
 // tree.
+//
+// Pre-Phase-4a name: this returned <project>/enju/bots/<bot>/clone/.
+// The rename to .enju/bots/<bot>/worktree/ is purely cosmetic —
+// behavior unchanged.
 func BotCloneDirFor(botUsername string) (string, error) {
 	if botUsername == "" {
 		return "", fmt.Errorf("bot username is required")
@@ -150,7 +163,7 @@ func BotCloneDirFor(botUsername string) (string, error) {
 	if botUsername == "." || botUsername == ".." || strings.Contains(botUsername, "..") {
 		return "", fmt.Errorf("bot username %q contains path traversal", botUsername)
 	}
-	return filepath.Join(BotsRuntimeDir, botUsername, "clone"), nil
+	return filepath.Join(BotsRuntimeDir, botUsername, "worktree"), nil
 }
 
 // BotPromptsDir is the conventional location bot system prompts

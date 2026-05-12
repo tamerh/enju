@@ -490,20 +490,23 @@ func (m *Manifest) ByName(name string) *Bot {
 }
 
 // EnsureGitignored ensures the project's .gitignore lists the
-// machine-managed bot directories inside the existing enju-managed
-// block. Called by `enju bot setup` so the operator doesn't have
-// to remember the gitignore step manually. Entries land in the
-// block:
+// machine-managed enju directories inside the existing
+// enju-managed block. Called by `enju bot setup` so the operator
+// doesn't have to remember the gitignore step manually. Entries
+// land in the block:
 //
-//   - enju/bots/      — per-bot worktrees (transient runtime)
 //   - enju/.bare.git/ — bot push target bare (per-machine local)
-//   - .enju/          — hidden per-run state (snapshot cache,
-//                       scratch); per-run-snapshot redesign Phase 3
+//   - .enju/          — hidden runtime state: per-bot worktrees
+//                       (.enju/bots/), per-run snapshots
+//                       (.enju/runs/), per-task scratch, etc.
+//                       Covers everything Phase 3+ moved under
+//                       StateDirRoot.
 //
 // All are local-only state, never something to commit. The bare
 // is dot-prefixed so it doesn't clutter `ls enju/` alongside
 // the human-curated templates and bots.yaml. The .enju/ root
-// holds runtime caches that the sweep wipes on bot startup.
+// holds every transient runtime cache the sweep wipes on bot
+// startup.
 //
 // Returns (changed=true, nil) when the file was updated; (false,
 // nil) when all paths were already present. Errors only on real
@@ -512,7 +515,7 @@ func (m *Manifest) ByName(name string) *Bot {
 // Implementation note: directory paths get a trailing slash so
 // .gitignore matches the directory specifically rather than (also)
 // a sibling file with the same name — a typo'd plain file at
-// `enju/bots` should NOT be silently ignored.
+// `.enju` should NOT be silently ignored.
 func EnsureGitignored(projectRoot string) (bool, error) {
 	gitignorePath := filepath.Join(projectRoot, ".gitignore")
 	existing, err := os.ReadFile(gitignorePath)
@@ -529,12 +532,15 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	if st, statErr := os.Stat(gitignorePath); statErr == nil {
 		mode = st.Mode().Perm()
 	}
-	// BotsRuntimeDir already covers each bot's per-bot clone at
-	// <project>/enju/bots/<botname>/clone/, so no separate clone
-	// entry is needed. StateDirRoot (.enju/) covers all per-run
-	// runtime caches (snapshot/, scratch/, future siblings).
+	// StateDirRoot (.enju/) is the umbrella that transitively
+	// covers .enju/bots/, .enju/runs/, .enju/scratch/, and any
+	// future runtime-cache sibling. The standalone enju/bots/
+	// entry would be redundant after the Phase 4a path rename
+	// (BotsRuntimeDir = .enju/bots) and we skip it. BotPushTargetDir
+	// stays a separate entry — it lives at enju/.bare.git/ (under
+	// the VISIBLE enju/) for historical reasons; Phase 8 may move
+	// it under StateDirRoot too, at which point this also collapses.
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
-		corelayout.BotsRuntimeDir + "/",
 		corelayout.BotPushTargetDir + "/",
 		corelayout.StateDirRoot + "/",
 	})

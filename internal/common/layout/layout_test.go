@@ -21,12 +21,12 @@ func TestBotCloneDirFor(t *testing.T) {
 		{
 			name:        "happy path",
 			botUsername: "developer-bot",
-			wantPath:    "enju/bots/developer-bot/clone",
+			wantPath:    ".enju/bots/developer-bot/worktree",
 		},
 		{
 			name:        "alphanumerics + dashes ok",
 			botUsername: "reviewer-bot-1",
-			wantPath:    "enju/bots/reviewer-bot-1/clone",
+			wantPath:    ".enju/bots/reviewer-bot-1/worktree",
 		},
 		{
 			name:        "empty rejected",

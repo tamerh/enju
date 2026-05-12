@@ -377,10 +377,19 @@ func TestEnsureGitignored_FreshProject(t *testing.T) {
 	// nest under enju/bots/<botname>/clone/ so the enju/bots/
 	// rule covers them transitively — no separate clone entry
 	// needed.
-	for _, want := range []string{"enju/bots/", "enju/.bare.git/", ".enju/"} {
+	// Phase 4a moved per-bot worktrees under .enju/bots/, which is
+	// transitively covered by the .enju/ entry — so no separate
+	// enju/bots/ rule is needed (or wanted). enju/.bare.git/ stays
+	// a separate entry until Phase 8 relocates the bare too.
+	for _, want := range []string{"enju/.bare.git/", ".enju/"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("expected %q in .gitignore, got:\n%s", want, body)
 		}
+	}
+	// And verify the OLD entry is NOT present — regression guard
+	// against accidentally re-adding it.
+	if strings.Contains(string(body), "\nenju/bots/\n") {
+		t.Errorf("legacy enju/bots/ entry should be gone post-Phase-4a (covered transitively by .enju/), got:\n%s", body)
 	}
 	if !strings.Contains(string(body), "enju-untracked") {
 		t.Error(".gitignore should contain the managed block markers")
@@ -412,7 +421,7 @@ func TestEnsureGitignored_PreservesUserContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(root, ".gitignore"))
-	for _, want := range []string{"node_modules/", "*.log", "enju/bots/"} {
+	for _, want := range []string{"node_modules/", "*.log", ".enju/"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf(".gitignore missing %q after EnsureGitignored:\n%s", want, body)
 		}

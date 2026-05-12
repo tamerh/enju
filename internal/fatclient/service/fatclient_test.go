@@ -207,10 +207,11 @@ func TestResolveBotWorkspace_DistinctFromAdoptedDir(t *testing.T) {
 	if got == homeTree {
 		t.Fatalf("bot workspace must be distinct from operator's home tree; both got %q", got)
 	}
-	// Bot clone lives at <home>/enju/bots/<botname>/clone/.
-	wantClone := filepath.Join(homeTree, "enju", "bots", "test-bot", "clone")
+	// Bot worktree lives at <home>/.enju/bots/<botname>/worktree/
+	// post-Phase-4a (renamed from enju/bots/<name>/clone/).
+	wantClone := filepath.Join(homeTree, ".enju", "bots", "test-bot", "worktree")
 	if got != wantClone {
-		t.Errorf("bot clone path: got %q, want %q", got, wantClone)
+		t.Errorf("bot worktree path: got %q, want %q", got, wantClone)
 	}
 	// And it must be a real git clone.
 	if _, statErr := os.Stat(filepath.Join(got, ".git")); statErr != nil {
