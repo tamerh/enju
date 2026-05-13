@@ -33,8 +33,12 @@ type ScanResult struct {
 // branch doesn't exist on origin yet. Empty branch resolves to
 // the workflow's default branch so callers without a specific
 // branch context fall back to the project default rather than
-// silently skipping the fetch.
+// silently skipping the fetch. No-op when origin is unset — the
+// post-Phase-8 single-store layout has no remote to fetch from.
 func (w *Workflow) FetchBranch(branch string) error {
+	if w.git.RemoteURL() == "" {
+		return nil
+	}
 	resolved := w.resolveBranch(branch)
 	return w.wrapGitError("fetch branch", resolved, w.git.FetchBranch(resolved))
 }
@@ -42,7 +46,12 @@ func (w *Workflow) FetchBranch(branch string) error {
 // PullBranch fetches + fast-forwards the local branch. No-op
 // when the named branch doesn't exist on origin yet. Empty
 // branch → default branch, same rationale as FetchBranch.
+// No-op when origin is unset — the local branch tip IS the
+// source of truth in the post-Phase-8 single-store layout.
 func (w *Workflow) PullBranch(branch string) error {
+	if w.git.RemoteURL() == "" {
+		return nil
+	}
 	resolved := w.resolveBranch(branch)
 	return w.wrapGitError("pull branch", resolved, w.git.PullBranch(resolved))
 }

@@ -440,6 +440,52 @@ func TestFetchAllRefs(t *testing.T) {
 	}
 }
 
+// TestFetchAllRefs_NoOriginIsNoOp pins the post-Phase-8 single-store
+// contract: the bot daemon's pre-claim FetchAllRefs is a no-op when
+// origin isn't configured. Pre-fix it surfaced "fatal: 'origin' does
+// not appear to be a git repository" as a hard error from the bot's
+// ERROR log, scaring operators into thinking the project was broken.
+func TestFetchAllRefs_NoOriginIsNoOp(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.remoteURL = ""
+	if err := wf.FetchAllRefs(); err != nil {
+		t.Fatalf("FetchAllRefs without origin should not error: %v", err)
+	}
+	if fake.callCount("Fetch") != 0 {
+		t.Errorf("Fetch should be skipped when no origin, got %d calls",
+			fake.callCount("Fetch"))
+	}
+}
+
+// TestPullBranch_NoOriginIsNoOp pins the same contract for
+// PullBranch. This is the ls-remote-origin call that the bot
+// daemon's pre-claim reconcile hits via service.PullBranchWithReconcileWF.
+func TestPullBranch_NoOriginIsNoOp(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.remoteURL = ""
+	if err := wf.PullBranch("main"); err != nil {
+		t.Fatalf("PullBranch without origin should not error: %v", err)
+	}
+	if fake.callCount("PullBranch") != 0 {
+		t.Errorf("PullBranch should be skipped when no origin, got %d calls",
+			fake.callCount("PullBranch"))
+	}
+}
+
+// TestFetchBranch_NoOriginIsNoOp mirrors the pair above for the
+// branch-specific fetch entry point.
+func TestFetchBranch_NoOriginIsNoOp(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.remoteURL = ""
+	if err := wf.FetchBranch("main"); err != nil {
+		t.Fatalf("FetchBranch without origin should not error: %v", err)
+	}
+	if fake.callCount("FetchBranch") != 0 {
+		t.Errorf("FetchBranch should be skipped when no origin, got %d calls",
+			fake.callCount("FetchBranch"))
+	}
+}
+
 func TestReadFileAtCommit_Passthrough(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.readContent["sha:path"] = []byte("hello")

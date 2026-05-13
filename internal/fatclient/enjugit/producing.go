@@ -464,8 +464,13 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 
 // FetchAllRefs is a passthrough for git.Fetch. Wraps with
 // Enju-typed errors. Used by daemon's pre-claim pull so
-// cross-citizen refs are visible.
+// cross-citizen refs are visible. No-op when origin is unset —
+// the post-Phase-8 single-store layout has no remote to fetch
+// from; the local clone IS the source of truth.
 func (w *Workflow) FetchAllRefs() error {
+	if w.git.RemoteURL() == "" {
+		return nil
+	}
 	return translateGitError("fetch all refs", w.git.Fetch())
 }
 
