@@ -119,12 +119,19 @@ func cmdBotSetup(args []string) {
 		fmt.Fprintf(os.Stderr, "resolving --workflow=%q: %v\n", *workflowPath, err)
 		os.Exit(1)
 	}
+	// Existence check first so a typo'd path surfaces as
+	// "file not found" instead of misleading the operator into
+	// thinking the issue is the surrounding git repo.
+	if _, err := os.Stat(absWorkflow); err != nil {
+		fmt.Fprintf(os.Stderr, "workflow YAML not found at %q: %v\n", absWorkflow, err)
+		os.Exit(1)
+	}
 	// Project root = the git repo root containing the workflow
 	// YAML. Walking up from the workflow file is the natural
 	// way to find it without a separate flag.
 	absProject, err := findGitRoot(filepath.Dir(absWorkflow))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "locating project root from %q: %v\n", absWorkflow, err)
+		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 
@@ -482,7 +489,11 @@ func findGitRoot(start string) (string, error) {
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			return "", fmt.Errorf("no .git/ found in %q or any parent — workflow YAML must live inside a git repo", start)
+			return "", fmt.Errorf(
+				"workflow YAML at %q is not inside a git repository — "+
+					"every run must pin to a commit for audit. Initialize git at the project root "+
+					"(git init && git add . && git commit -m \"initial\") or move the workflow into an existing repo",
+				start)
 		}
 		cur = parent
 	}
@@ -550,9 +561,13 @@ func cmdBotRun(args []string) {
 		fmt.Fprintf(os.Stderr, "resolving --workflow=%q: %v\n", *workflowPath, err)
 		os.Exit(1)
 	}
+	if _, err := os.Stat(absWorkflow); err != nil {
+		fmt.Fprintf(os.Stderr, "workflow YAML not found at %q: %v\n", absWorkflow, err)
+		os.Exit(1)
+	}
 	absProject, err := findGitRoot(filepath.Dir(absWorkflow))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "locating project root from %q: %v\n", absWorkflow, err)
+		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 	manifest, err := bots.LoadFromWorkflow(absWorkflow)

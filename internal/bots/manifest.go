@@ -1,18 +1,17 @@
-// Package bots owns the project-local bot roster: parsing
-// enju/bots.yaml, resolving conventional defaults (credentials
-// paths, system-prompt paths), and validating the manifest before
-// any runtime tool acts on it.
+// Package bots owns the project-local bot roster: parsing the
+// inline `bots:` section from a workflow YAML, resolving
+// conventional defaults (credentials paths, system-prompt
+// paths), and validating the manifest before any runtime tool
+// acts on it.
 //
 // Coordinator-side scope: NONE. The coordinator knows bots only
 // as citizens with kind=bot — registration, attribution, terminate
 // cascade. The manifest is a fatclient-local declaration of "what
-// bots does this project use, with what runtime configuration,"
-// read by `enju bot setup` and `enju bot run`. Same status as
-// .gitignore: lives in repo, used by the local tool, opaque to
-// the server.
-//
-// Distribution: ships with example projects so a clone + setup +
-// run sequence brings a working bot roster up in three commands.
+// bots does this workflow use, with what runtime configuration,"
+// read by `enju bot setup` and `enju bot run` against the workflow
+// YAML the operator passes via --workflow. Same status as
+// .gitignore: lives in the repo, used by the local tool, opaque
+// to the server.
 package bots
 
 import (
@@ -261,37 +260,46 @@ func LoadFromWorkflow(workflowPath string) (*Manifest, error) {
 }
 
 // FromInlineNode parses a `bots:` block embedded in a workflow
-// YAML's Run struct (per-run-snapshot redesign Phase 7) into a
-// Manifest. The node is the raw yamlv3.Node captured by
-// internal/common/yaml.Run.Bots; an absent or empty block is a
-// no-op and returns (nil, nil) so callers can chain
-// FromInlineNode → fall-back-to-Load without special casing.
+// YAML's Run struct into a Manifest. The node is the raw
+// yamlv3.Node captured by internal/common/yaml.Run.Bots; an
+// absent or empty block returns (nil, nil) — workflows without
+// bots are valid.
 //
-// Inline blocks accept the same shape as the standalone
-// enju/bots.yaml file's `bots:` list (without the top-level
-// `version:` or `project_id:` keys — those belong to the
-// stand-alone manifest's wrapper). The block is a YAML sequence
-// of Bot entries; FromInlineNode wraps it in a Manifest{Bots:
-// ...} and runs the same expand-resolve-validate pipeline Load
-// uses, so inline + stand-alone produce byte-identical
-// Manifests for the same content.
+// The block is a YAML sequence of Bot entries. FromInlineNode
+// wraps it in a Manifest{Bots: ...} and runs the
+// expand-resolve-validate pipeline.
 //
 // Errors: malformed inline content surfaces with a clear
-// "inline bots:" prefix so a typo in the workflow file
-// doesn't get attributed to the legacy bots.yaml.
+// "inline bots:" prefix.
 func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 	// Zero-value Node (no `bots:` key in the workflow YAML) →
 	// no inline manifest. Kind==0 is the unset state.
 	if node.Kind == 0 {
 		return nil, nil
 	}
-	// Empty sequence (`bots: []`) → explicit "no bots". Same
-	// outcome as a missing block for caller purposes; surface
-	// as nil so the legacy bots.yaml fallback still fires. An
-	// author who wants to EXPLICITLY suppress bots can leave
-	// the block out.
+	// Empty sequence (`bots: []`) → explicit "no bots".
 	if node.Kind == yamlv3.SequenceNode && len(node.Content) == 0 {
 		return nil, nil
+	}
+	// Refuse `project_id:` at the bot level — it was a top-level
+	// Manifest field in the pre-inline standalone bots.yaml and
+	// has no semantic effect now. yaml.v3 would silently ignore
+	// an unknown key, so an operator copying a stale entry from
+	// the old file format would get a no-op. Catch it loudly so
+	// they redirect to `--project-id` on the CLI instead.
+	if node.Kind == yamlv3.SequenceNode {
+		for i, entry := range node.Content {
+			if entry.Kind != yamlv3.MappingNode {
+				continue
+			}
+			for j := 0; j < len(entry.Content); j += 2 {
+				if entry.Content[j].Value == "project_id" {
+					return nil, fmt.Errorf(
+						"inline bots[%d]: project_id is no longer accepted in bot manifests — "+
+							"pass via --project-id on the CLI (enju bot setup --project-id=N)", i)
+				}
+			}
+		}
 	}
 	var bots []Bot
 	if err := node.Decode(&bots); err != nil {

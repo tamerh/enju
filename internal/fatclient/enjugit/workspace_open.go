@@ -152,11 +152,9 @@ func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
 
 // openOrClone opens an existing clone at dir, or clones from
 // remoteURL if missing. When remoteURL is empty (path-mode
-// project's first creation, before ensureManagedBare wires
-// origin), bootstraps via InitLocal — the service layer follows
-// up with EnsureOrigin onto the managed bare under
-// <project>/enju/.bare.git/ so subsequent ops have a real remote.
-// Caller holds w.mu.
+// project with no real remote), bootstraps via InitLocal so the
+// repo has a HEAD; origin stays unset until the operator wires
+// one via enju_set_project_remote. Caller holds w.mu.
 func (w *Workspace) openOrClone(id int64, dir, remoteURL string) (*git.Clone, error) {
 	lockPath := w.lockPathFor(id)
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
@@ -166,9 +164,7 @@ func (w *Workspace) openOrClone(id int64, dir, remoteURL string) (*git.Clone, er
 		return nil, fmt.Errorf("enjugit: mkdir parent %s: %w", dir, err)
 	}
 	if remoteURL == "" {
-		// Path-mode bootstrap: caller is service.ensureManagedBare,
-		// which will wire origin onto the managed bare immediately
-		// after we return.
+		// Path-mode bootstrap: no remote, init a fresh local repo.
 		return git.InitLocal(dir, lockPath, w.logger)
 	}
 	return git.CloneOrInit(dir, remoteURL, lockPath, w.logger)

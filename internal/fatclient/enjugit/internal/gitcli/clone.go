@@ -80,8 +80,8 @@ func OpenClone(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 		logger:  logger,
 	}
 	// Hydrate remoteURL from origin if present. A missing origin
-	// is fine — path-mode bootstrap leaves it unset until
-	// ensureManagedBare wires it.
+	// is fine — solo single-machine projects stay local until the
+	// operator wires a remote.
 	if out, err := runGit(workDir, []string{"remote", "get-url", "origin"}, runOpts{}); err == nil {
 		c.remoteURL = strings.TrimSpace(string(out))
 	}

@@ -697,56 +697,10 @@ func TestFromInlineNode_EmptySequence(t *testing.T) {
 	}
 }
 
-// TestFromInlineNode_RoundTripsWithStandalone verifies that an
-// inline block produces a byte-identical Manifest to the
-// standalone enju/bots.yaml form for the same content. This
-// is the core integration test for Phase 7's "same schema, two
-// locations" promise — if the produced Manifests diverge,
-// existing daemon code that reads Manifest.Bots won't behave
-// the same across the two authoring paths.
-func TestFromInlineNode_RoundTripsWithStandalone(t *testing.T) {
-	body := `
-bots:
-  - name: reviewer
-    model: claude-sonnet-4-6
-    handler: claude
-  - name: summarizer
-    model: claude-haiku-4-5
-    handler: claude
-`
-	inlineM, err := FromInlineNode(inlineNode(t, body))
-	if err != nil {
-		t.Fatalf("FromInlineNode: %v", err)
-	}
-	if inlineM == nil {
-		t.Fatal("inline manifest unexpectedly nil")
-	}
-
-	// Stand-alone equivalent — wrap the same list in the
-	// top-level Manifest shape and feed it through Load.
-	path := writeWorkflowWithBots(t, "version: 1\n"+body)
-	standaloneM, err := LoadFromWorkflow(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if standaloneM == nil {
-		t.Fatal("standalone manifest unexpectedly nil")
-	}
-
-	if len(inlineM.Bots) != len(standaloneM.Bots) {
-		t.Fatalf("bot count mismatch: inline=%d standalone=%d", len(inlineM.Bots), len(standaloneM.Bots))
-	}
-	for i := range inlineM.Bots {
-		if inlineM.Bots[i].Name != standaloneM.Bots[i].Name ||
-			inlineM.Bots[i].Model != standaloneM.Bots[i].Model ||
-			inlineM.Bots[i].Handler != standaloneM.Bots[i].Handler ||
-			inlineM.Bots[i].SystemPrompt != standaloneM.Bots[i].SystemPrompt ||
-			inlineM.Bots[i].Credentials != standaloneM.Bots[i].Credentials {
-			t.Errorf("bots[%d] mismatch:\n inline:     %+v\n standalone: %+v",
-				i, inlineM.Bots[i], standaloneM.Bots[i])
-		}
-	}
-}
+// (Removed: TestFromInlineNode_RoundTripsWithStandalone. Phase 8.h.3
+// dropped the standalone bots.yaml file format; the test compared
+// inline-parse against file-parse to verify they produced identical
+// Manifests, which is no longer meaningful with one parse path.)
 
 // TestFromInlineNode_RunsResolveAndValidate makes sure the
 // inline path goes through the same expand-resolve-validate
@@ -799,8 +753,8 @@ bots:
 	}
 }
 
-// (Removed: TestLoadPreferringInline_* tests. Phase 8 dropped
-// LoadPreferringInline and the standalone enju/bots.yaml fallback
-// it bridged to. Workflow YAML's inline bots: is the only source
-// of truth; tests above cover the inline-only path directly via
-// LoadFromWorkflow + FromInlineNode.)
+// (Removed: TestLoadPreferringInline_* tests. Phase 8.h.3 dropped
+// LoadPreferringInline and the standalone bots.yaml fallback it
+// bridged to. Workflow YAML's inline bots: is the only source of
+// truth; tests above cover that path directly via LoadFromWorkflow
+// + FromInlineNode.)
