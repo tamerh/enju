@@ -360,7 +360,17 @@ func (w *Workflow) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mod
 		if werr != nil {
 			return werr
 		}
+		// Skip system directories that should never end up in a
+		// commit. Critical when bundleDir is "" (root-level
+		// workflow YAML) — without this guard the walk sweeps
+		// .git/ and .enju/ into the git add argv, and the
+		// resulting commit fails with "paths are ignored by
+		// .gitignore" or worse, an attempt to track .git/ itself.
 		if fi.IsDir() {
+			name := fi.Name()
+			if name == ".git" || name == ".enju" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		rel, rerr := filepath.Rel(workDir, path)
