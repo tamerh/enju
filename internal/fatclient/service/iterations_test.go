@@ -108,7 +108,7 @@ func TestReadResultAtCommit(t *testing.T) {
 	// then EagerInitProjectClone runs git init + commit + wires
 	// the managed bare.
 	clone := t.TempDir()
-	resultDir := "enju/runs/1-draft/draft"
+	resultDir := ".enju/runs/1-draft/draft"
 	resultPath := filepath.Join(clone, resultDir, "result.md")
 	if err := os.MkdirAll(filepath.Dir(resultPath), 0o755); err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestReadResultAtCommit_EmptyArgs(t *testing.T) {
 	for _, c := range []struct {
 		commit, dir string
 	}{
-		{"", "enju/runs/1"},
+		{"", ".enju/runs/1"},
 		{"abc", ""},
 		{"", ""},
 	} {
@@ -227,7 +227,7 @@ func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writer enjugit.ForProject: %v", err)
 	}
-	resultDir := "enju/runs/1-draft/draft"
+	resultDir := ".enju/runs/1-draft/draft"
 	// CommitArbitraryFiles takes WithLock internally via the
 	// enjugit git layer; no project-level Lock needed.
 	commitRes, err := writerWF.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
@@ -328,7 +328,7 @@ func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
 		Logger:    logger,
 	})
 
-	_, found, err := fc.ReadResultAtCommit(context.Background(), 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "enju/runs/1-x/x")
+	_, found, err := fc.ReadResultAtCommit(context.Background(), 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ".enju/runs/1-x/x")
 	if err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}

@@ -76,6 +76,7 @@ version: 1
 bots:
   - name: developer-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     mcp_tools:
       allow: [Read, Edit, Write, Bash]
 `)
@@ -122,6 +123,7 @@ version: 1
 bots:
   - name: x
     model: m
+    args: ["-p"]
 `)
 	m, err := LoadFromWorkflow(path)
 	if err != nil {
@@ -143,6 +145,7 @@ version: 1
 bots:
   - name: x
     model: m
+    args: ["-p"]
     mcp_tools:
       allow: []
 `)
@@ -165,6 +168,7 @@ func TestLoad_MissingVersionDefaultsToOne(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
 `)
 	m, err := LoadFromWorkflow(path)
 	if err != nil {
@@ -197,6 +201,7 @@ func TestLoad_TildeExpansion(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
     credentials: ~/custom-creds/x.json
 `)
 	m, err := LoadFromWorkflow(path)
@@ -237,12 +242,59 @@ bots:
 // project IDs since they're instance-specific. Operators pass
 // --project-id explicitly at bot setup time.)
 
+// TestValidate_RejectsClaudeHandlerWithoutArgs pins the showcase_v15
+// fix: `handler: claude` (or empty=default) without an `args:` block
+// is rejected at manifest load. Pre-fix the daemon would happily
+// spawn `claude` with zero arguments, claude would idle ~20s waiting
+// for nothing in particular and exit silently, and the operator
+// would see a baffling "writes_artifacts missing" failure with no
+// trace of what (didn't) happen.
+func TestValidate_RejectsClaudeHandlerWithoutArgs(t *testing.T) {
+	for _, h := range []string{"", "claude"} {
+		t.Run("handler="+h, func(t *testing.T) {
+			body := "bots:\n  - name: x\n    model: m\n"
+			if h != "" {
+				body += "    handler: " + h + "\n"
+			}
+			path := writeWorkflowWithBots(t, body)
+			_, err := LoadFromWorkflow(path)
+			if err == nil {
+				t.Fatalf("expected validation error for handler %q with no args:", h)
+			}
+			if !strings.Contains(err.Error(), "args: is required") {
+				t.Errorf("error should mention args being required, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidate_StubHandlerSkipsArgsGate confirms the gate is scoped
+// to claude. stub handlers (test fixtures) don't drive an LLM, so
+// requiring args: there would force callers to author boilerplate
+// for tests that don't even invoke the binary.
+func TestValidate_StubHandlerSkipsArgsGate(t *testing.T) {
+	path := writeWorkflowWithBots(t, `
+bots:
+  - name: x
+    model: m
+    handler: stub
+`)
+	if _, err := LoadFromWorkflow(path); err != nil {
+		t.Errorf("stub handler should not require args:, got: %v", err)
+	}
+}
+
 func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 	for _, h := range []string{"", "claude", "stub"} {
 		t.Run("handler="+h, func(t *testing.T) {
 			body := "bots:\n  - name: x\n    model: m\n"
 			if h != "" {
 				body += "    handler: " + h + "\n"
+			}
+			// claude (and empty=claude-default) require args:;
+			// stub skips the gate. Add args for the LLM cases.
+			if h == "" || h == "claude" {
+				body += "    args: [\"-p\"]\n"
 			}
 			path := writeWorkflowWithBots(t, body)
 			if _, err := LoadFromWorkflow(path); err != nil {
@@ -327,6 +379,7 @@ func TestValidate_RejectsUnknownHandler(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
     handler: shell
 `)
 	_, err := LoadFromWorkflow(path)
@@ -354,6 +407,7 @@ func TestValidate_RejectsDuplicateName(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
   - name: x
     model: n
 `)
@@ -371,6 +425,7 @@ func TestValidate_RejectsBadName(t *testing.T) {
 bots:
   - name: "`+name+`"
     model: m
+    args: ["-p"]
 `)
 			_, err := LoadFromWorkflow(path)
 			if err == nil {
@@ -385,6 +440,7 @@ func TestValidate_RejectsAbsoluteSystemPrompt(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
     system_prompt: /etc/passwd
 `)
 	_, err := LoadFromWorkflow(path)
@@ -398,6 +454,7 @@ func TestValidate_RejectsParentTraversal(t *testing.T) {
 bots:
   - name: x
     model: m
+    args: ["-p"]
     system_prompt: ../../../etc/passwd
 `)
 	_, err := LoadFromWorkflow(path)
@@ -479,6 +536,7 @@ version: 1
 bots:
   - name: only-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
 `)
 		m, err := LoadFromWorkflow(path)
 		if err != nil {
@@ -495,6 +553,7 @@ version: 1
 bots:
   - name: solo-dev
     model: claude-sonnet-4-6
+    args: ["-p"]
     replicas: 1
 `)
 		m, err := LoadFromWorkflow(path)
@@ -518,6 +577,7 @@ version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     replicas: 3
 `)
 		m, err := LoadFromWorkflow(path)
@@ -547,6 +607,7 @@ version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     system_prompt: prompts/dev.md
     replicas: 3
 `)
@@ -583,6 +644,7 @@ version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     replicas: -1
 `)
 		_, err := LoadFromWorkflow(path)
@@ -600,6 +662,7 @@ version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     replicas: 100
 `)
 		_, err := LoadFromWorkflow(path)
@@ -619,9 +682,11 @@ version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    args: ["-p"]
     replicas: 2
   - name: dev-bot-1
     model: claude-sonnet-4-6
+    args: ["-p"]
 `)
 		_, err := LoadFromWorkflow(path)
 		if err == nil {
@@ -735,6 +800,7 @@ func TestFromInlineNode_ExpandsReplicas(t *testing.T) {
 bots:
   - name: dev
     model: claude-sonnet-4-6
+    args: ["-p"]
     handler: claude
     replicas: 3
 `

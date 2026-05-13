@@ -48,7 +48,7 @@ func writeWorkflowForBot(t *testing.T, botName string, allow []string) string {
 	if allow != nil {
 		allowYaml = "    mcp_tools:\n      allow: [" + strings.Join(allow, ", ") + "]\n"
 	}
-	wf := "name: test-workflow\nbase_branch: main\nbots:\n  - name: " + botName + "\n    model: claude-sonnet-4-6\n" + allowYaml + "tasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	wf := "name: test-workflow\nbase_branch: main\nbots:\n  - name: " + botName + "\n    model: claude-sonnet-4-6\n    args: [\"-p\"]\n" + allowYaml + "tasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
 	path := filepath.Join(dir, "workflow.yaml")
 	if err := os.WriteFile(path, []byte(wf), 0644); err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestHandleBotStart_RefusesAmbiguousAutoDiscover(t *testing.T) {
 	defer c.supervisor.StopAll(context.Background())
 
 	dir := t.TempDir()
-	wf := "name: multi-bot\nbase_branch: main\nbots:\n  - name: alice\n    model: claude-sonnet-4-6\n  - name: bob\n    model: claude-sonnet-4-6\ntasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	wf := "name: multi-bot\nbase_branch: main\nbots:\n  - name: alice\n    model: claude-sonnet-4-6\n    args: [\"-p\"]\n  - name: bob\n    model: claude-sonnet-4-6\n    args: [\"-p\"]\ntasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
 	wfPath := filepath.Join(dir, "workflow.yaml")
 	if err := os.WriteFile(wfPath, []byte(wf), 0644); err != nil {
 		t.Fatal(err)

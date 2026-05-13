@@ -51,12 +51,14 @@ import (
 //   - filesystem write failure → wrapped error.
 //
 // Note on hidden segments: WalkSubtreeBlobsAtCommit skips
-// any path component beginning with ".". Files like
-// .gitignore or .github/workflows/* at the repo root will not
-// be materialized. The frozen recipe (in-git template
-// snapshot) and the rest of the visible repo tree are
-// covered — the dotfile skip matches the existing per-task
-// path's behavior, so this is not a regression.
+// dot-prefixed segments (.git, .DS_Store, .gitignore,
+// .github/workflows/*) EXCEPT for the snapshot-visible allowlist
+// — currently just `.enju/`. Enju's audit trail and committed
+// template-snapshot live under `.enju/runs/` (post-Phase-8.h
+// move from the old visible `enju/runs/`), and skipping them
+// would leave the executor unable to find the workflow YAML or
+// per-task result history. The rest of the dot-prefix skip
+// stands.
 func (w *Workflow) MaterializeRunRepo(branch, targetDir string) (int, error) {
 	if branch == "" {
 		return 0, fmt.Errorf("enjugit: MaterializeRunRepo: branch required")

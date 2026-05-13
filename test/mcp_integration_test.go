@@ -4934,10 +4934,10 @@ tasks:
 	// Corrupt task_b's result-dir path: write a regular
 	// FILE where PrepareCommit will need a directory. The
 	// run's slug is "r" (from name: "r" → kebab slug "r").
-	// task_b's result dir is enju/runs/1-r/task_b — pre-
+	// task_b's result dir is .enju/runs/1-r/task_b — pre-
 	// create a file at that exact path to make MkdirAll
 	// inside the eventual PrepareCommit fail.
-	bogusPath := filepath.Join(proj.WorkDir(), "enju", "runs", "1-r", "task_b")
+	bogusPath := filepath.Join(proj.WorkDir(), ".enju", "runs", "1-r", "task_b")
 	if err := os.MkdirAll(filepath.Dir(bogusPath), 0755); err != nil {
 		t.Fatalf("prep bogus parent: %v", err)
 	}

@@ -1868,7 +1868,7 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 	for _, bad := range malformed {
 		t.Run(bad, func(t *testing.T) {
 			resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-				"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+				"result_path": ".enju/runs/1-simple-no-dependencies/task_a",
 				"commit_sha":  bad,
 				"content":     "data",
 				"username":    alice,
@@ -1885,7 +1885,7 @@ func TestCoordinatorRejectsMalformedCommitSHA(t *testing.T) {
 	// stays). Any 40-hex string passes the shape check.
 	valid := "0123456789abcdef0123456789abcdef01234567"
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+		"result_path": ".enju/runs/1-simple-no-dependencies/task_a",
 		"commit_sha":  valid,
 		"content":     "data",
 		"username":    alice,
@@ -1914,7 +1914,7 @@ func TestReviewCommitShaOptional(t *testing.T) {
 	s.claim("check", bob)
 	fullID := s.taskID("check")
 	resp := s.post("/api/v1/tasks/"+fullID+"/result", map[string]interface{}{
-		"result_path": "enju/runs/1-review-flow/check",
+		"result_path": ".enju/runs/1-review-flow/check",
 		"commit_sha":  "",
 		"decision":    "approve",
 		"username":    "bob",
@@ -2434,7 +2434,7 @@ func TestEvent_MergeFailedDrivesTaskToFailed(t *testing.T) {
 	taskID := fmt.Sprintf("%d:1:task_a", projectID)
 	s.claim("task_a", alice)
 	resp := s.post("/api/v1/tasks/"+taskID+"/result", map[string]interface{}{
-		"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+		"result_path": ".enju/runs/1-simple-no-dependencies/task_a",
 		"commit_sha":  "cafef00d0000000000000000000000000000abcd",
 		"content":     "hello",
 		"username":    "alice",
@@ -2587,7 +2587,7 @@ func TestReportMergeFailed_NoOpOnNonSubmittedTask(t *testing.T) {
 	taskID := fmt.Sprintf("%d:1:task_a", projectID)
 	s.claim("task_a", alice)
 	s.post("/api/v1/tasks/"+taskID+"/result", map[string]interface{}{
-		"result_path": "enju/runs/1-simple-no-dependencies/task_a",
+		"result_path": ".enju/runs/1-simple-no-dependencies/task_a",
 		"commit_sha":  "cafef00d0000000000000000000000000000abcd",
 		"content":     "hello", "username": "alice", "tokens_used": 1,
 	})

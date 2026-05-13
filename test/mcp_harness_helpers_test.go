@@ -417,7 +417,7 @@ func (h *mcpHarness) runDir(runSeq int) string {
 	if slug == "" {
 		slug = "run"
 	}
-	return fmt.Sprintf("enju/runs/%d-%s", runSeq, slug)
+	return fmt.Sprintf(".enju/runs/%d-%s", runSeq, slug)
 }
 
 // mcpBareResultMD returns the result.md content written by a task

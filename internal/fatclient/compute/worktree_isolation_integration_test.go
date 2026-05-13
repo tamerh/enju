@@ -65,7 +65,7 @@ func TestComputeRun_NoWorktreePollutionUnderResultDir(t *testing.T) {
 		t.Fatal("ResolveTaskScratchDir unexpectedly returned empty")
 	}
 
-	resultDir := "enju/runs/1-test/isolation_check"
+	resultDir := ".enju/runs/1-test/isolation_check"
 
 	// Build a small shell script that runs in scratch and produces
 	// a tracked artifact + some stdout. The script's CWD is scratch
@@ -162,7 +162,7 @@ func TestComputeRun_FailsWhenRequiredArtifactMissing(t *testing.T) {
 	}
 
 	scratch := compute.ResolveTaskScratchDir(wf.ProjectRoot(), "alice", "1:1:wrong_file", 1)
-	resultDir := "enju/runs/1-test/wrong_file"
+	resultDir := ".enju/runs/1-test/wrong_file"
 
 	// Script exits 0 but writes a path the declaration doesn't
 	// cover. Mirrors the load-test's fetch.sh which always wrote
@@ -242,7 +242,7 @@ func TestComputeRun_OptionalMissingStaysSoft(t *testing.T) {
 	}
 
 	scratch := compute.ResolveTaskScratchDir(wf.ProjectRoot(), "alice", "1:1:opt_missing", 1)
-	resultDir := "enju/runs/1-test/opt_missing"
+	resultDir := ".enju/runs/1-test/opt_missing"
 
 	// Script writes the required output but skips the optional one.
 	scriptDir := t.TempDir()

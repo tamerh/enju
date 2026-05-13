@@ -17,8 +17,11 @@ import (
 // resolveTestResultDir composes the canonical task-result path
 // the resolver expects. instanceKey appended under task-def dir
 // when non-empty; matches the layout the coordinator emits.
+// Post-Phase-8.h: result dirs live under .enju/runs/... (the
+// audit trail is git-tracked but on-disk hidden so the worktree
+// stays clean of enju bookkeeping).
 func resolveTestResultDir(runSeq int, instanceKey, taskDefID string) string {
-	base := filepath.Join("enju", "runs",
+	base := filepath.Join(".enju", "runs",
 		intToString(runSeq), taskDefID)
 	if instanceKey != "" {
 		return filepath.Join(base, instanceKey)
@@ -47,7 +50,7 @@ func intToString(n int) string {
 }
 
 // seedResultCommit lands a single result.md under
-// enju/runs/{seq}/{taskDef}[/{instanceKey}]/ and returns the
+// .enju/runs/{seq}/{taskDef}[/{instanceKey}]/ and returns the
 // commit SHA. Wraps CommitArbitraryFiles so the resolve tests
 // don't have to spell out the SubmitRequest/topic-branch dance
 // just to seed a commit they'll read back through Resolve.

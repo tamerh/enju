@@ -205,6 +205,62 @@ func TestLoadTemplate_WorktreeFallback(t *testing.T) {
 	}
 }
 
+// TestLoadTemplate_RejectsUncommittedDivergence pins the
+// showcase_v16 fix: when the worktree's copy of the workflow YAML
+// differs from the default-branch commit, LoadTemplate must
+// refuse rather than silently use the committed bytes. Path=
+// runs execute against the committed tree, so quietly validating
+// the OLD bytes is a trap — the operator sees errors that don't
+// match the file they're looking at.
+func TestLoadTemplate_RejectsUncommittedDivergence(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.resolveMap["refs/heads/main"] = "tipsha"
+	// Default branch has an OLD version of enju.yaml.
+	fake.readContent["tipsha:enju.yaml"] = []byte("name: old-version\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: hi\n")
+
+	// Worktree has a NEWER version with different bytes.
+	tmp := t.TempDir()
+	if err := os.WriteFile(tmp+"/enju.yaml",
+		[]byte("name: new-version\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: hi\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake.workDir = tmp
+
+	_, err := wf.LoadTemplate("enju.yaml")
+	if err == nil {
+		t.Fatal("LoadTemplate should refuse when worktree diverges from committed bytes")
+	}
+	if !strings.Contains(err.Error(), "uncommitted changes") {
+		t.Errorf("error should mention uncommitted changes, got: %v", err)
+	}
+}
+
+// TestLoadTemplate_AcceptsMatchingWorktreeAndCommit pins the
+// no-false-positive case: when the worktree exactly matches the
+// committed bytes, LoadTemplate succeeds. The divergence guard
+// is a byte-equality check, not a heuristic.
+func TestLoadTemplate_AcceptsMatchingWorktreeAndCommit(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.resolveMap["refs/heads/main"] = "tipsha"
+	body := []byte("name: matched\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: hi\n")
+	fake.readContent["tipsha:enju.yaml"] = body
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(tmp+"/enju.yaml", body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake.workDir = tmp
+
+	loaded, err := wf.LoadTemplate("enju.yaml")
+	if err != nil {
+		t.Fatalf("matching worktree/commit should load cleanly: %v", err)
+	}
+	if loaded.Summary.Name != "matched" {
+		t.Errorf("expected name=matched, got %q", loaded.Summary.Name)
+	}
+}
+
 func TestReadBundleFiles_Empty(t *testing.T) {
 	wf, _ := makeWorkflow(t)
 	// No commits on default branch → friendly error.
@@ -225,7 +281,7 @@ func TestReadBundleFiles_RebasePathsToTarget(t *testing.T) {
 		"scripts/run.sh": {Mode: 0o755, Content: []byte("#!/bin/bash")},
 	}
 
-	files, err := wf.ReadBundleFiles("enju/templates/demo", "enju/runs/1/templates/demo")
+	files, err := wf.ReadBundleFiles("enju/templates/demo", ".enju/runs/1/templates/demo")
 	if err != nil {
 		t.Fatalf("ReadBundleFiles: %v", err)
 	}
@@ -236,10 +292,10 @@ func TestReadBundleFiles_RebasePathsToTarget(t *testing.T) {
 	for _, f := range files {
 		paths[f.RepoRelPath] = f.Mode
 	}
-	if _, ok := paths["enju/runs/1/templates/demo/enju.yaml"]; !ok {
+	if _, ok := paths[".enju/runs/1/templates/demo/enju.yaml"]; !ok {
 		t.Errorf("manifest path not rebased: %v", paths)
 	}
-	if got := paths["enju/runs/1/templates/demo/scripts/run.sh"]; got != 0o755 {
+	if got := paths[".enju/runs/1/templates/demo/scripts/run.sh"]; got != 0o755 {
 		t.Errorf("script should preserve +x via 0o755 mode, got %v", got)
 	}
 }

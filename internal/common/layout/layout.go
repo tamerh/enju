@@ -21,26 +21,32 @@ import (
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
 
-// ResultDirRoot is the visible top-level directory every task's
-// result files live under. Renamed from `.enju/` pre-launch so
-// `result.md`, `script.log`, and committed metadata don't hide
-// behind a dotfile — Enju's audit trail is supposed to be
-// easy to read, not a ls -a discovery.
-const ResultDirRoot = "enju"
+// ResultDirRoot is the top-level directory every task's result
+// files live under. Same root as StateDirRoot (.enju/) by design:
+// audit and runtime cache share the umbrella so removing `.enju/`
+// removes everything enju-managed. Tracked-vs-untracked is enforced
+// by the project's .gitignore (caches like `.enju/runs/*/snapshot/`
+// are ignored; the per-task audit files `result.md`, `metadata.json`,
+// `context.json`, `script.log` are not). Visibility on disk is
+// independent from being in git — operators reading history use
+// `git log .enju/runs/...`; operators reading the worktree see
+// their own content, not enju bookkeeping.
+const ResultDirRoot = ".enju"
 
-// StateDirRoot is the hidden, gitignored top-level directory
-// holding per-run runtime state that is NOT committed: the
-// on-disk materialization of each run's frozen tree (see
-// RunSnapshotOnDiskDir), per-task scratch dirs, and similar
-// transient artifacts.
+// StateDirRoot is the hidden top-level directory holding all
+// enju-managed state. The umbrella covers BOTH committed audit
+// files (under runs/) AND gitignored runtime caches (snapshot/,
+// scratch/, bigfiles/, events/, logs/). The project's .gitignore
+// distinguishes the two — tracked audit files survive the umbrella
+// ignore via explicit subdir rules, caches are caught by it.
 //
-// The spec's "everything Enju" home is the visible enju/ dir
-// for committed audit trail and the hidden .enju/ dir for
-// runtime caches. Per the per-run-snapshot redesign, scripts
-// read the frozen repo tree from .enju/runs/<seq>-<slug>/snapshot/
-// at execute time instead of materializing per-task. The
-// directory is purely a cache — wipe and re-materialize is
-// always safe.
+// Same value as ResultDirRoot — the split between "visible enju/"
+// and "hidden .enju/" was an incoherent pre-launch decision that
+// conflated visibility with traceability. Git history is the audit
+// trail; the worktree should stay free of enju bookkeeping. Both
+// constants are kept as named entry points so call sites read
+// semantically (a result dir, vs a cache root) even though they
+// resolve to the same path.
 const StateDirRoot = ".enju"
 
 // EventsDir holds the project-local event log (live.jsonl,

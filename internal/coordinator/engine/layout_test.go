@@ -8,7 +8,7 @@ import (
 
 func TestComputeResultDirSingleton(t *testing.T) {
 	got := ComputeResultDirForInstance(3, "gwas", "analyze", nil)
-	want := "enju/runs/3-gwas/analyze"
+	want := ".enju/runs/3-gwas/analyze"
 	if got != want {
 		t.Errorf("singleton: got %q want %q", got, want)
 	}
@@ -16,7 +16,7 @@ func TestComputeResultDirSingleton(t *testing.T) {
 
 func TestComputeResultDirSingleForEach(t *testing.T) {
 	got := ComputeResultDirForInstance(3, "gwas", "align", map[string]string{"sample": "S1"})
-	want := "enju/runs/3-gwas/align/sample=S1"
+	want := ".enju/runs/3-gwas/align/sample=S1"
 	if got != want {
 		t.Errorf("single for_each: got %q want %q", got, want)
 	}
@@ -28,7 +28,7 @@ func TestComputeResultDirNestedForEachAlphaSorted(t *testing.T) {
 		"tissue": "breast",
 		"gene":   "BRCA1",
 	})
-	want := "enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast"
+	want := ".enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast"
 	if got != want {
 		t.Errorf("nested alpha-sort: got %q want %q", got, want)
 	}
@@ -41,7 +41,7 @@ func TestComputeResultDirNestedForEachAlphaSorted(t *testing.T) {
 func TestComputeResultDirSlugsUnsafeValues(t *testing.T) {
 	got := ComputeResultDirForInstance(1, "gwas", "t", map[string]string{"sample": "a/b c"})
 	// "/" and " " both become "_"; adjacent runs collapse.
-	want := "enju/runs/1-gwas/t/sample=a_b_c"
+	want := ".enju/runs/1-gwas/t/sample=a_b_c"
 	if got != want {
 		t.Errorf("slugging: got %q want %q", got, want)
 	}
@@ -53,7 +53,7 @@ func TestComputeResultDirSlugsUnsafeValues(t *testing.T) {
 // `=` segment.
 func TestComputeResultDirEmptyParamsMap(t *testing.T) {
 	got := ComputeResultDirForInstance(2, "gwas", "answer", map[string]string{})
-	want := "enju/runs/2-gwas/answer"
+	want := ".enju/runs/2-gwas/answer"
 	if got != want {
 		t.Errorf("empty map: got %q want %q", got, want)
 	}
@@ -65,7 +65,7 @@ func TestComputeResultDirEmptyParamsMap(t *testing.T) {
 // fallback every helper relies on.
 func TestComputeResultDirEmptySlugFallback(t *testing.T) {
 	got := ComputeResultDirForInstance(4, "", "t", nil)
-	want := "enju/runs/4-run/t"
+	want := ".enju/runs/4-run/t"
 	if got != want {
 		t.Errorf("empty slug fallback: got %q want %q", got, want)
 	}
@@ -82,7 +82,7 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		InstanceParams: "",
 		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t1); got != "enju/runs/3-gwas/align" {
+	if got := ComputeResultDir(t1); got != ".enju/runs/3-gwas/align" {
 		t.Errorf("singleton via TaskRecord: got %q", got)
 	}
 
@@ -92,7 +92,7 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		InstanceParams: `{"sample":"S1"}`,
 		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t2); got != "enju/runs/3-gwas/align/sample=S1" {
+	if got := ComputeResultDir(t2); got != ".enju/runs/3-gwas/align/sample=S1" {
 		t.Errorf("for_each via TaskRecord: got %q", got)
 	}
 
@@ -102,7 +102,7 @@ func TestComputeResultDirFromTaskRecord(t *testing.T) {
 		InstanceParams: `{"gene":"BRCA1","tissue":"breast"}`,
 		RunSlug:        "gwas",
 	}
-	if got := ComputeResultDir(t3); got != "enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast" {
+	if got := ComputeResultDir(t3); got != ".enju/runs/5-gwas/analyze/gene=BRCA1/tissue=breast" {
 		t.Errorf("nested via TaskRecord: got %q", got)
 	}
 }
@@ -119,22 +119,24 @@ func TestComputeResultDirMalformedInstanceParams(t *testing.T) {
 		RunSlug:        "gwas",
 	}
 	got := ComputeResultDir(t1)
-	want := "enju/runs/2-gwas/weird"
+	want := ".enju/runs/2-gwas/weird"
 	if got != want {
 		t.Errorf("malformed params fallback: got %q want %q", got, want)
 	}
 }
 
-// TestComputeResultDirUsesVisibleRoot — pins the headline
-// pre-launch change: no dot prefix. Separate assertion so a
-// future accidental revert is loud.
-func TestComputeResultDirUsesVisibleRoot(t *testing.T) {
+// TestComputeResultDirUsesHiddenRoot — pins the post-Phase-8.h
+// reversal: audit files live under .enju/ alongside the rest of
+// enju-managed state. The earlier pre-launch decision to use a
+// visible enju/ for tracked audit conflated visibility with
+// traceability — audit is git-history, not worktree-content. The
+// gitignore handles the tracked-vs-untracked split inside .enju/.
+// Separate assertion so a future accidental revert (back to a
+// visible enju/) is loud.
+func TestComputeResultDirUsesHiddenRoot(t *testing.T) {
 	got := ComputeResultDirForInstance(1, "demo", "t", nil)
-	if len(got) < len("enju/") || got[:len("enju/")] != "enju/" {
-		t.Errorf("path should start with visible 'enju/', got %q", got)
-	}
-	if got[0] == '.' {
-		t.Errorf("path must not start with dot, got %q", got)
+	if len(got) < len(".enju/") || got[:len(".enju/")] != ".enju/" {
+		t.Errorf("path should start with hidden '.enju/', got %q", got)
 	}
 }
 
@@ -144,13 +146,13 @@ func TestComputeResultDirUsesVisibleRoot(t *testing.T) {
 // because task.go looks up exactly this path.
 func TestRunTemplateSnapshotDir(t *testing.T) {
 	got := RunTemplateSnapshotDir(3, "variant-calling")
-	want := "enju/runs/3-variant-calling/template-snapshot"
+	want := ".enju/runs/3-variant-calling/template-snapshot"
 	if got != want {
 		t.Errorf("snapshot dir: got %q want %q", got, want)
 	}
 	// Empty slug → "run" fallback, same as the result-dir
 	// variant. Keeps the path well-formed for legacy rows.
-	if got := RunTemplateSnapshotDir(5, ""); got != "enju/runs/5-run/template-snapshot" {
+	if got := RunTemplateSnapshotDir(5, ""); got != ".enju/runs/5-run/template-snapshot" {
 		t.Errorf("empty slug fallback: got %q", got)
 	}
 }

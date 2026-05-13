@@ -414,13 +414,39 @@ func parseGitMode(octalStr string) os.FileMode {
 }
 
 // hasHiddenSegment returns true when any "/"-separated segment
-// of relPath begins with a dot. Used by WalkSubtreeBlobsAtCommit
-// to skip .git, .DS_Store, etc. Matches gitv6's behavior exactly.
+// of relPath begins with a dot AND isn't on the snapshot-visible
+// allowlist. Used by WalkSubtreeBlobsAtCommit to skip .git,
+// .DS_Store, etc. while letting enju-managed dotted dirs (.enju/)
+// through.
+//
+// Post-Phase-8.h: `.enju/` holds the tracked audit trail (per-task
+// result.md, metadata.json, context.json, script.log) AND the
+// committed template-snapshot/ for inline runs. Skipping the entire
+// `.enju/` subtree on materialize would leave the executor unable
+// to find the workflow YAML or any audit context. The allowlist is
+// the minimal carve-out.
 func hasHiddenSegment(relPath string) bool {
 	for _, seg := range strings.Split(relPath, "/") {
-		if strings.HasPrefix(seg, ".") {
-			return true
+		if !strings.HasPrefix(seg, ".") {
+			continue
 		}
+		if snapshotVisibleDotSegment(seg) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// snapshotVisibleDotSegment lists dot-prefixed names that ARE
+// allowed through the walk's hidden-segment filter. Kept tiny on
+// purpose — adding entries here equals "this name is enju-managed
+// content callers want in their snapshot," and that's a load-
+// bearing claim.
+func snapshotVisibleDotSegment(seg string) bool {
+	switch seg {
+	case ".enju":
+		return true
 	}
 	return false
 }

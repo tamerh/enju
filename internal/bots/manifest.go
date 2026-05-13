@@ -475,6 +475,18 @@ func (m *Manifest) Validate() error {
 		if needsModel && b.Model == "" {
 			return fmt.Errorf("bot %q: model is required for handler %q (e.g. \"claude-sonnet-4-6\")", b.Name, b.Handler)
 		}
+		// args: required for the claude handler. Without it the
+		// daemon would exec `claude` with zero arguments — claude
+		// reads the prompt from stdin, exits silently in ~20s, and
+		// the operator sees a "writes_artifacts missing" failure
+		// with no trace of what claude tried to do. Phase 4b-r1
+		// made args templated; this gate makes the omission loud
+		// at manifest-load instead of surfacing as a confusing
+		// runtime symptom.
+		needsArgs := b.Handler == "" || HandlerType(b.Handler) == HandlerTypeClaude
+		if needsArgs && len(b.Args) == 0 {
+			return fmt.Errorf("bot %q: args: is required for handler %q — claude needs an explicit argv template (typical shape: [\"-p\", \"--model={{model}}\", \"--append-system-prompt={{system_prompt}}\", \"--allowedTools={{allowed_tools}}\"]). See example_bots/bots.yaml or enju.yaml.example.", b.Name, b.Handler)
+		}
 		if b.SystemPrompt != "" {
 			// system_prompt is repo-relative; reject absolute
 			// or .. paths that would escape the project root.
@@ -526,18 +538,28 @@ func (m *Manifest) ByName(name string) *Bot {
 }
 
 // EnsureGitignored ensures the project's .gitignore lists the
-// machine-managed enju directory inside the existing
+// machine-managed enju cache directories inside the existing
 // enju-managed block. Called by `enju bot setup` so the operator
-// doesn't have to remember the gitignore step manually. The
-// single entry:
+// doesn't have to remember the gitignore step manually.
 //
-//   - .enju/ — hidden runtime state: per-run snapshots
-//              (.enju/runs/), per-task scratch
-//              (.enju/scratch/), per-bot state, etc.
+// Post-Phase-8.h: the .enju/ umbrella holds BOTH tracked audit
+// files (`.enju/runs/<seq>-<slug>/<task>/{result.md,metadata.json,
+// context.json,script.log}` and `.enju/runs/<seq>-<slug>/template-
+// snapshot/`) AND gitignored caches/scratch (snapshot/, bots/,
+// bigfiles/, events/, logs/). Git's gitignore semantics don't let
+// us "exclude .enju/ but re-include specific files" — once a parent
+// directory is excluded, git skips traversal entirely. So instead
+// of one umbrella entry, we list each cache subdirectory explicitly.
+// Audit files live alongside in the same tree and stay tracked
+// because none of the gitignore rules match them.
 //
-// All transient local state; never something to commit. The
-// .enju/ umbrella covers every runtime cache the sweep wipes
-// on bot startup.
+// Cache subdirs ignored:
+//   - .enju/runs/*/snapshot/   per-run on-disk materialization
+//   - .enju/bots/              per-bot per-claim scratch
+//   - .enju/bigfiles/          track:false compute outputs
+//   - .enju/events/            project-level event log
+//   - .enju/logs/              per-clone trace logs
+//   - .enju/scratch/           legacy / future generic scratch
 //
 // Returns (changed=true, nil) when the file was updated; (false,
 // nil) when all paths were already present. Errors only on real
@@ -545,31 +567,24 @@ func (m *Manifest) ByName(name string) *Bot {
 //
 // Implementation note: directory paths get a trailing slash so
 // .gitignore matches the directory specifically rather than (also)
-// a sibling file with the same name — a typo'd plain file at
-// `.enju` should NOT be silently ignored.
+// a sibling file with the same name.
 func EnsureGitignored(projectRoot string) (bool, error) {
 	gitignorePath := filepath.Join(projectRoot, ".gitignore")
 	existing, err := os.ReadFile(gitignorePath)
 	if err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("reading %s: %w", gitignorePath, err)
 	}
-	// Preserve the existing file's mode if it's already on disk.
-	// A user with a hardened 0600 .gitignore (rare but possible
-	// for repos with sensitive ignore patterns) shouldn't see
-	// it relax to 0644 just because we appended a managed-block
-	// entry. New files default to 0644 (the umask-typical
-	// gitignore mode).
 	mode := os.FileMode(0644)
 	if st, statErr := os.Stat(gitignorePath); statErr == nil {
 		mode = st.Mode().Perm()
 	}
-	// StateDirRoot (.enju/) is the umbrella that transitively
-	// covers .enju/bots/, .enju/runs/, .enju/scratch/, and any
-	// future runtime-cache sibling. One entry is enough — Phase 8
-	// removed the visible enju/.bare.git/ tenant; no other enju/
-	// children need ignoring.
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
-		corelayout.StateDirRoot + "/",
+		corelayout.StateDirRoot + "/runs/*/snapshot/",
+		corelayout.StateDirRoot + "/bots/",
+		corelayout.StateDirRoot + "/bigfiles/",
+		corelayout.StateDirRoot + "/events/",
+		corelayout.StateDirRoot + "/logs/",
+		corelayout.StateDirRoot + "/scratch/",
 	})
 	if !changed {
 		return false, nil

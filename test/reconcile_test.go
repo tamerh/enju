@@ -339,7 +339,7 @@ func TestReconcileAcceptsSubmittedTaskWithMatchingSHA(t *testing.T) {
 			TaskID:     taskID,
 			CitizenID:  citizen.ID,
 			CommitSHA:  sha,
-			ResultPath: "enju/runs/1-r1/task_a",
+			ResultPath: ".enju/runs/1-r1/task_a",
 			TokensUsed: 10,
 		}},
 	}); err != nil {
@@ -409,7 +409,7 @@ func TestReconcileNoopOnSubmittedTaskWithDifferentSHA(t *testing.T) {
 			TaskID:     taskID,
 			CitizenID:  citizen.ID,
 			CommitSHA:  taskSHA,
-			ResultPath: "enju/runs/1-r1/task_a",
+			ResultPath: ".enju/runs/1-r1/task_a",
 			TokensUsed: 10,
 		}},
 	}); err != nil {

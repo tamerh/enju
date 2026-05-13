@@ -572,7 +572,7 @@ func TestTaskViewWithResult(t *testing.T) {
 		taskMeta: &service.TaskMeta{
 			ID: "1:1:draft", ProjectID: 1, RunSeq: 1, TaskDefID: "draft",
 			State: "accepted", Action: "answer",
-			ResultDir: "enju/runs/1-toy/draft", CommitSHA: "abc123def456789",
+			ResultDir: ".enju/runs/1-toy/draft", CommitSHA: "abc123def456789",
 		},
 		taskResult: "Hello, world. This is the rendered answer.",
 	})
@@ -584,7 +584,7 @@ func TestTaskViewWithResult(t *testing.T) {
 		"Submitted result",
 		"Hello, world. This is the rendered answer.",
 		"abc123def456",
-		"enju/runs/1-toy/draft/result.md",
+		".enju/runs/1-toy/draft/result.md",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
@@ -603,7 +603,7 @@ func TestTaskViewIterationHistory(t *testing.T) {
 		taskMeta: &service.TaskMeta{
 			ID: "1:1:draft", ProjectID: 1, RunSeq: 1, TaskDefID: "draft",
 			State: "ready", Action: "answer",
-			ResultDir: "enju/runs/1-toy/draft",
+			ResultDir: ".enju/runs/1-toy/draft",
 		},
 		iterations: []wire.Iteration{
 			{

@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
@@ -181,7 +182,7 @@ func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workf
 	if wf == nil {
 		return
 	}
-	root := filepath.Join(wf.WorkDir(), "enju", "runs")
+	root := filepath.Join(wf.WorkDir(), corelayout.RunStateRunsRoot())
 	if _, err := os.Stat(root); os.IsNotExist(err) {
 		return
 	}

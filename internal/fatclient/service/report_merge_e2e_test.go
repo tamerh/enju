@@ -236,7 +236,7 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 				TaskID:     taskID,
 				CitizenID:  reg.ID,
 				CommitSHA:  commitSHA,
-				ResultPath: "enju/runs/1-r1/write",
+				ResultPath: ".enju/runs/1-r1/write",
 				TokensUsed: 10,
 			},
 		},

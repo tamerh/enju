@@ -45,7 +45,7 @@ func TestValidateSubmit_DirectoryPatternMatchesNestedFiles(t *testing.T) {
 			"src/api/middleware.go",
 			"src/api/handlers/users.go",
 		},
-		ResultPath: "enju/runs/1-task/task",
+		ResultPath: ".enju/runs/1-task/task",
 	}
 	e := New(&mockStore{}, nil)
 	_, _, _, _, err := e.ValidateSubmitRequest(task, runRecord(), req)
@@ -66,7 +66,7 @@ func TestValidateSubmit_GlobPatternMatchesShallowFiles(t *testing.T) {
 	task := declaresArtifacts(t, `[{"path":"src/api/*.go","track":true}]`)
 	req := &SubmitRequest{
 		ArtifactsWritten: []string{"src/api/server.go", "src/api/middleware.go"},
-		ResultPath:       "enju/runs/1-task/task",
+		ResultPath:       ".enju/runs/1-task/task",
 	}
 	e := New(&mockStore{}, nil)
 	_, _, _, _, err := e.ValidateSubmitRequest(task, runRecord(), req)
@@ -77,7 +77,7 @@ func TestValidateSubmit_GlobPatternMatchesShallowFiles(t *testing.T) {
 	// Subdirectory file should NOT match a non-recursive glob.
 	reqRecursive := &SubmitRequest{
 		ArtifactsWritten: []string{"src/api/sub/x.go"},
-		ResultPath:       "enju/runs/1-task/task",
+		ResultPath:       ".enju/runs/1-task/task",
 	}
 	_, _, _, _, err = e.ValidateSubmitRequest(task, runRecord(), reqRecursive)
 	if err == nil || !strings.Contains(err.Error(), "not covered by writes_artifacts") {
@@ -93,7 +93,7 @@ func TestValidateSubmit_LiteralPatternIsExact(t *testing.T) {
 	task := declaresArtifacts(t, `[{"path":"src/server.go","track":true}]`)
 	req := &SubmitRequest{
 		ArtifactsWritten: []string{"src/server.go"},
-		ResultPath:       "enju/runs/1-task/task",
+		ResultPath:       ".enju/runs/1-task/task",
 	}
 	e := New(&mockStore{}, nil)
 	_, _, _, _, err := e.ValidateSubmitRequest(task, runRecord(), req)
@@ -103,7 +103,7 @@ func TestValidateSubmit_LiteralPatternIsExact(t *testing.T) {
 
 	reqWrong := &SubmitRequest{
 		ArtifactsWritten: []string{"src/other.go"},
-		ResultPath:       "enju/runs/1-task/task",
+		ResultPath:       ".enju/runs/1-task/task",
 	}
 	_, _, _, _, err = e.ValidateSubmitRequest(task, runRecord(), reqWrong)
 	if err == nil || !strings.Contains(err.Error(), "not covered by writes_artifacts") {
@@ -118,7 +118,7 @@ func TestValidateSubmit_RejectsPathOutsideAnyPattern(t *testing.T) {
 	task := declaresArtifacts(t, `[{"path":"src/api/","track":true},{"path":"go.mod","track":true}]`)
 	req := &SubmitRequest{
 		ArtifactsWritten: []string{"docs/notes.md"},
-		ResultPath:       "enju/runs/1-task/task",
+		ResultPath:       ".enju/runs/1-task/task",
 	}
 	e := New(&mockStore{}, nil)
 	_, _, _, _, err := e.ValidateSubmitRequest(task, runRecord(), req)

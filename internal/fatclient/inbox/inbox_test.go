@@ -47,10 +47,10 @@ func writeLog(t *testing.T, lines []string) string {
 // Inbox surfaces the row with the parent's result.md inlined.
 func TestBuildInbox_Happy(t *testing.T) {
 	livePath := writeLog(t, []string{
-		`{"type":"task_ready","subtype":"review","task_id":"5:1:review","assign_to":"tamer","metadata":{"parents":[{"task_id":"5:1:abstract","action":"answer","commit_sha":"abc1234","result_dir":"enju/runs/1-paper/abstract"}]}}`,
+		`{"type":"task_ready","subtype":"review","task_id":"5:1:review","assign_to":"tamer","metadata":{"parents":[{"task_id":"5:1:abstract","action":"answer","commit_sha":"abc1234","result_dir":".enju/runs/1-paper/abstract"}]}}`,
 	})
 	deps := &fakeGit{files: map[string]string{
-		"abc1234:enju/runs/1-paper/abstract/result.md": "The TP53 gene encodes a tumor suppressor.",
+		"abc1234:.enju/runs/1-paper/abstract/result.md": "The TP53 gene encodes a tumor suppressor.",
 	}}
 	rows, err := BuildInbox(livePath, "tamer", deps)
 	if err != nil {
@@ -183,11 +183,11 @@ func TestBuildInbox_MissingFile(t *testing.T) {
 // whole call for one missing parent.
 func TestBuildInbox_GitErrorIsBestEffort(t *testing.T) {
 	livePath := writeLog(t, []string{
-		`{"type":"task_ready","subtype":"review","task_id":"5:1:rev","assign_to":"tamer","metadata":{"parents":[{"task_id":"5:1:p","action":"answer","commit_sha":"deadbeef","result_dir":"enju/runs/1-r/p"}]}}`,
+		`{"type":"task_ready","subtype":"review","task_id":"5:1:rev","assign_to":"tamer","metadata":{"parents":[{"task_id":"5:1:p","action":"answer","commit_sha":"deadbeef","result_dir":".enju/runs/1-r/p"}]}}`,
 	})
 	deps := &fakeGit{
 		gitErr:  errors.New("simulated git error"),
-		failKey: "deadbeef:enju/runs/1-r/p/result.md",
+		failKey: "deadbeef:.enju/runs/1-r/p/result.md",
 	}
 	rows, err := BuildInbox(livePath, "tamer", deps)
 	if err != nil {

@@ -120,7 +120,7 @@ func TestBuildTaskReadyEvents_TableDriven(t *testing.T) {
 				Assignees: []string{"alice"},
 				RunID:     7, ProjectID: 3,
 				Parents: []ReadiedParent{
-					{TaskID: "1:1:up", Action: "answer", CommitSHA: "abc123", ResultDir: "enju/runs/1-r/answer/up"},
+					{TaskID: "1:1:up", Action: "answer", CommitSHA: "abc123", ResultDir: ".enju/runs/1-r/answer/up"},
 				},
 			}},
 			wantCount: 1,
@@ -129,7 +129,7 @@ func TestBuildTaskReadyEvents_TableDriven(t *testing.T) {
 					"parents-key":     `"parents":`,
 					"parent-task":     `"task_id":"1:1:up"`,
 					"parent-commit":   `"commit_sha":"abc123"`,
-					"parent-resultd":  `"result_dir":"enju/runs/1-r/answer/up"`,
+					"parent-resultd":  `"result_dir":".enju/runs/1-r/answer/up"`,
 				},
 			},
 		},

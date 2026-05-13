@@ -1,6 +1,7 @@
 package enjugit
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -243,9 +244,22 @@ func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	}, nil
 }
 
-// readBundleManifest tries the default-branch tree first, then
-// the worktree filesystem (when workdir is non-empty). Returns
-// a populated resolvedBundle or a clear "not found" error.
+// readBundleManifest reads the workflow YAML, prioritizing the
+// default-branch tree (the reproducible source) but error-ing
+// loudly when the worktree has uncommitted changes to the same
+// path. Returns a populated resolvedBundle or a clear "not
+// found" / "uncommitted-changes" error.
+//
+// Why error on divergence: path= mode pins the run branch to
+// the default branch's tip at create_run time, and execution
+// reads scripts + sibling files from that committed tree. If we
+// silently used the committed YAML for validation, then later
+// executed against the same committed tree, the user's
+// uncommitted enju.yaml edits would be invisible — and they'd
+// see "args: is required" or similar bewildering errors because
+// THE YAML THEY EDITED ISN'T THE YAML THAT RAN. Pre-fix on
+// showcase_v16 surfaced exactly this trap. Fail loudly here so
+// the operator commits first (or switches to yaml=<inline>).
 func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, workdir string) (*resolvedBundle, error) {
 	sha, err := w.resolveDefaultBranchSHA(defaultBranch)
 	if err != nil {
@@ -257,6 +271,16 @@ func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, wo
 			return nil, fmt.Errorf("reading template %s: %w", manifestPath, rerr)
 		}
 		if found {
+			// Divergence guard: if the same path on disk has
+			// different bytes, the operator has uncommitted
+			// edits. Validation against the committed bytes
+			// would lie about what executes. Refuse loudly.
+			if workdir != "" {
+				wtData, fsErr := os.ReadFile(filepath.Join(workdir, manifestPath))
+				if fsErr == nil && !bytes.Equal(wtData, data) {
+					return nil, fmt.Errorf("template %s has uncommitted changes — the worktree differs from the default-branch commit, but path= runs execute against the committed tree. Commit your edits first (`git add %s && git commit`) or pass yaml=<inline content> to use the worktree version verbatim", manifestPath, manifestPath)
+				}
+			}
 			return &resolvedBundle{
 				bundleDir:    bundleDir,
 				manifestPath: manifestPath,
@@ -264,7 +288,11 @@ func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, wo
 			}, nil
 		}
 	}
-	// Worktree fallback for pre-commit authoring UX.
+	// Worktree fallback for pre-commit authoring UX — when the
+	// file ISN'T on the default branch at all (first-time setup).
+	// The divergence guard above only fires when both versions
+	// exist; first-time create_run with an uncommitted YAML still
+	// works.
 	if workdir != "" {
 		data, fsErr := os.ReadFile(filepath.Join(workdir, manifestPath))
 		if fsErr == nil {
