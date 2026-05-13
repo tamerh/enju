@@ -308,24 +308,34 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 // projects) would feel it. Not measured against such a fleet
 // yet — flag if real workloads surface latency here.
 //
-// iterBranch is the per-iteration topic branch ref the
-// coordinator assigned at claim time. When it has no local
-// ref yet (very first claim before any commits, or in tests),
-// the materialization is a no-op — the daemon falls back to
-// the persistent worktree path. The function returns ("", nil)
-// in that case so callers can branch on `path == ""`.
+// iterBranch is the per-iteration topic branch the coordinator
+// assigned at claim time. For the very first iter-N claim it
+// has a NAME but no git ref yet (the ref gets created lazily
+// at submit time via prepareBranchForCommit). runBranch is the
+// fallback materialization source for that case — it's the
+// fork base for iter-N by definition, and EnsureRunBranch
+// guarantees its local ref exists.
+//
+// Branch-selection priority:
+//  1. iterBranch when its local ref exists → exact iteration state
+//     (re-claim after request_changes: the prior iteration's tree).
+//  2. runBranch → fork base for iter-1's first claim, or fallback
+//     when iter branch hasn't been refreshed locally.
+//  3. Both empty → return ("", nil); caller falls back to the
+//     persistent worktree path.
 //
 // Errors are unrecoverable filesystem failures (mkdir denied,
 // git object missing). Callers log + fall back to the
 // persistent worktree to keep workflows progressing under
 // transient i/o trouble.
-func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error) {
+func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch string) (string, error) {
 	if s.enjugit == nil || botUsername == "" || taskID == "" {
 		return "", nil
 	}
-	if iterBranch == "" {
-		// No iter branch yet (legacy / pre-iteration). Caller
-		// falls back to the persistent worktree path.
+	if iterBranch == "" && runBranch == "" {
+		// No branch context at all (legacy / pre-iteration with
+		// no run branch threaded through). Caller falls back to
+		// the persistent worktree path.
 		return "", nil
 	}
 	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
@@ -336,11 +346,27 @@ func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, bot
 	if path == "" {
 		return "", nil
 	}
+	// Pick the branch whose ref actually exists locally. Iter
+	// branch has no ref on first iter-N claim (coord-assigned
+	// name, ref deferred until submit); run branch is the fork
+	// base and is guaranteed live by EnsureRunBranch at run create.
+	materializeFrom := iterBranch
+	if materializeFrom != "" {
+		if sha, _ := wf.LocalBranchHash(materializeFrom); sha == "" {
+			materializeFrom = ""
+		}
+	}
+	if materializeFrom == "" {
+		materializeFrom = runBranch
+	}
+	if materializeFrom == "" {
+		return "", nil
+	}
 	// MaterializeRunRepo creates the target dir + walks the
 	// branch's tree into it. Idempotent on existing files
 	// (writes are file-by-file).
-	if _, merr := wf.MaterializeRunRepo(iterBranch, path); merr != nil {
-		return "", fmt.Errorf("materialize iter-branch tree into claim CWD: %w", merr)
+	if _, merr := wf.MaterializeRunRepo(materializeFrom, path); merr != nil {
+		return "", fmt.Errorf("materialize claim CWD from %q: %w", materializeFrom, merr)
 	}
 	return path, nil
 }

@@ -163,7 +163,7 @@ func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int6
 func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
 	return "", nil
 }
-func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error) {
+func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch string) (string, error) {
 	return f.llmClaimCWDPath, f.llmClaimCWDErr
 }
 func (f *fakeFC) ProjectGitDir(ctx context.Context, projectID int64) (string, error) {

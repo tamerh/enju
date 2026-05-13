@@ -102,10 +102,13 @@ type fatClient interface {
 	// for an LLM task's handler (per-run-snapshot redesign
 	// Phase 4c). Materializes the iter-branch tree into the
 	// scratch path; the handler runs with cmd.Dir = returned
-	// path. Returns "" when the bot has no workspace or iter
-	// branch yet — caller falls back to the persistent
-	// worktree path.
-	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch string) (string, error)
+	// path. runBranch is the fallback source when the iter
+	// branch has no local ref yet (very first iter-N claim —
+	// the coordinator assigned a name, but the ref is created
+	// lazily at submit time). Returns "" only when neither
+	// branch is materializable — caller falls back to the
+	// persistent worktree path.
+	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch string) (string, error)
 
 	// CleanupLLMClaimCWD applies the success/fail lifecycle to
 	// the ephemeral CWD per Phase 5's pattern: rm on success,
@@ -719,7 +722,7 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	var claimCWD string
 	if optOut, ok := d.handler.(ClaimCWDOptOut); !ok || !optOut.SkipClaimCWD() {
 		var cwdErr error
-		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch)
+		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch, meta.Branch)
 		if cwdErr != nil {
 			d.logger.Warn("prepare LLM claim CWD failed (handler will run with empty cwd)",
 				"task_id", taskID, "error", cwdErr)
