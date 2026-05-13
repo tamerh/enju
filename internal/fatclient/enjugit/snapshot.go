@@ -50,15 +50,13 @@ import (
 //   - branch can't be resolved → wrapped error.
 //   - filesystem write failure → wrapped error.
 //
-// Note on hidden segments: WalkSubtreeBlobsAtCommit skips
-// dot-prefixed segments (.git, .DS_Store, .gitignore,
-// .github/workflows/*) EXCEPT for the snapshot-visible allowlist
-// — currently just `.enju/`. Enju's audit trail and committed
-// template-snapshot live under `.enju/runs/` (post-Phase-8.h
-// move from the old visible `enju/runs/`), and skipping them
-// would leave the executor unable to find the workflow YAML or
-// per-task result history. The rest of the dot-prefix skip
-// stands.
+// Every tracked blob is materialized — including dotfiles
+// (.gitignore, .mcp.json, .editorconfig, .github/workflows/*,
+// .env.example, …) and the entire .enju/ subtree (which holds
+// the audit trail post-Phase-8.h). Tracking is the user's
+// decision; the materializer doesn't second-guess it. See
+// gitcli.WalkSubtreeBlobsAtCommit for the rationale on dropping
+// the old hidden-segment skip.
 func (w *Workflow) MaterializeRunRepo(branch, targetDir string) (int, error) {
 	if branch == "" {
 		return 0, fmt.Errorf("enjugit: MaterializeRunRepo: branch required")

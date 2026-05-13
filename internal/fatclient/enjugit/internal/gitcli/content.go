@@ -124,9 +124,19 @@ func (c *Clone) ReadTreeEntriesAtCommit(sha, dirPath string) ([]TreeEntry, bool,
 // WalkSubtreeBlobsAtCommit recursively walks every blob under
 // dirPath at sha and invokes visit(relPath, mode, content) for
 // each. relPath is forward-slash separated and rooted at dirPath
-// (i.e. doesn't include dirPath itself). Hidden entries (any
-// path component starting with ".") are skipped — callers don't
-// want .git, .DS_Store, etc. inside a snapshot.
+// (i.e. doesn't include dirPath itself).
+//
+// Every blob in the git tree is materialized — including those
+// whose path components start with `.` (`.gitignore`, `.mcp.json`,
+// `.editorconfig`, `.github/workflows/*`, `.env.example`, etc.).
+// Pre-fix the walker filtered dot-prefixed segments on the
+// rationale of "skip .git, .DS_Store, etc.", but git's tree
+// representation has no entry for `.git/` (that's the repo store,
+// not the worktree) and `.DS_Store` only shows up here if the
+// user explicitly committed it — same answer for any dotfile.
+// Tracking is the user's decision; the materializer doesn't
+// second-guess it. The earlier `.enju/` carve-out for the audit
+// trail is now subsumed by this same principle.
 //
 // dirPath missing or resolving to a non-tree is a no-op (visitor
 // not called); returns nil.
@@ -166,11 +176,6 @@ func (c *Clone) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit BlobVisitor)
 		modeOctal, typ, blobSHA := fields[0], fields[1], fields[2]
 		if typ != "blob" {
 			// Submodule (commit) or other — skip.
-			continue
-		}
-		// Skip hidden segments anywhere in the path. Matches
-		// gitv6's filter for snapshot consumers.
-		if hasHiddenSegment(relPath) {
 			continue
 		}
 		body, err := runGit(c.workDir, []string{"cat-file", "-p", blobSHA}, runOpts{})
@@ -413,41 +418,4 @@ func parseGitMode(octalStr string) os.FileMode {
 	return os.FileMode(n & 0o777)
 }
 
-// hasHiddenSegment returns true when any "/"-separated segment
-// of relPath begins with a dot AND isn't on the snapshot-visible
-// allowlist. Used by WalkSubtreeBlobsAtCommit to skip .git,
-// .DS_Store, etc. while letting enju-managed dotted dirs (.enju/)
-// through.
-//
-// Post-Phase-8.h: `.enju/` holds the tracked audit trail (per-task
-// result.md, metadata.json, context.json, script.log) AND the
-// committed template-snapshot/ for inline runs. Skipping the entire
-// `.enju/` subtree on materialize would leave the executor unable
-// to find the workflow YAML or any audit context. The allowlist is
-// the minimal carve-out.
-func hasHiddenSegment(relPath string) bool {
-	for _, seg := range strings.Split(relPath, "/") {
-		if !strings.HasPrefix(seg, ".") {
-			continue
-		}
-		if snapshotVisibleDotSegment(seg) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// snapshotVisibleDotSegment lists dot-prefixed names that ARE
-// allowed through the walk's hidden-segment filter. Kept tiny on
-// purpose — adding entries here equals "this name is enju-managed
-// content callers want in their snapshot," and that's a load-
-// bearing claim.
-func snapshotVisibleDotSegment(seg string) bool {
-	switch seg {
-	case ".enju":
-		return true
-	}
-	return false
-}
 

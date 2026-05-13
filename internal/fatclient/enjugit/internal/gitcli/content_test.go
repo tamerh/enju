@@ -263,10 +263,31 @@ func TestWalkSubtreeBlobsAtCommit(t *testing.T) {
 	}
 }
 
-func TestWalkSubtreeBlobsSkipsHidden(t *testing.T) {
+// TestWalkSubtreeBlobsWalksDotfiles pins the contract that
+// the walker materializes EVERY blob in git's tree, including
+// dotfiles. Tracking is the user's decision: if they committed
+// `.mcp.json` or `.editorconfig` or anything under `.github/`,
+// they did so on purpose and the materializer must honor it.
+//
+// Pre-fix the walker filtered any path component starting with
+// `.` on the rationale of "skip .git, .DS_Store, etc.", but
+// git's tree representation has no entry for `.git/` and
+// `.DS_Store` only appears here if the user explicitly committed
+// it — same answer either way. Showcase TP53 hit this when the
+// user authored `.mcp.json` at project root: the snapshot
+// silently dropped it, claude couldn't find the biobtree MCP
+// config, every section ran without tools.
+func TestWalkSubtreeBlobsWalksDotfiles(t *testing.T) {
 	dir := t.TempDir()
 	gitInit(t, dir)
-	for _, p := range []string{"visible.txt", "sub/.hidden", ".dotfile", "sub/.dotdir/x.txt"} {
+	for _, p := range []string{
+		"visible.txt",
+		".mcp.json",                  // common case: claude MCP config at root
+		".gitignore",                 // tracked gitignore
+		".github/workflows/ci.yml",   // CI config under dotted parent
+		"sub/.env.example",           // dotfile in subdir
+		"sub/.dotdir/nested.txt",     // file under dotted subdir
+	} {
 		full := filepath.Join(dir, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -286,9 +307,14 @@ func TestWalkSubtreeBlobsSkipsHidden(t *testing.T) {
 		return nil
 	})
 	sort.Strings(visited)
-	want := []string{"sub/.hidden", "visible.txt"} // sub/.hidden has a leading-dot SEGMENT — skip. wait...
-	// Actually sub/.hidden has segment ".hidden" which is hidden, so it SHOULD be skipped.
-	want = []string{"visible.txt"}
+	want := []string{
+		".github/workflows/ci.yml",
+		".gitignore",
+		".mcp.json",
+		"sub/.dotdir/nested.txt",
+		"sub/.env.example",
+		"visible.txt",
+	}
 	if !equalSlice(visited, want) {
 		t.Errorf("visited %v, want %v", visited, want)
 	}
