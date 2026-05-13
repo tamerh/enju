@@ -35,8 +35,10 @@ func (w *Workflow) materializeUpstreamForReview(upstreamBranch string) error {
 	trace.ctx("upstream_branch", upstreamBranch)
 
 	werr := w.git.WithLock(func(g git.Ops) error {
-		// Step 1: fetch (best-effort).
-		if err := g.Fetch(); err != nil {
+		// Step 1: fetch (best-effort). Skipped when origin is unset.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("fetch-origin", "skipped: no origin")
+		} else if err := g.Fetch(); err != nil {
 			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: err.Error(),
@@ -137,7 +139,10 @@ func (w *Workflow) startIterationBranch(
 		trace.okDetail("pick-fork-ref", forkRef)
 
 		// Step 2: fetch (best-effort) so cross-citizen refs are visible.
-		if ferr := g.Fetch(); ferr != nil {
+		// Skipped when origin is unset — no remote to sync from.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("fetch-origin", "skipped: no origin")
+		} else if ferr := g.Fetch(); ferr != nil {
 			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: ferr.Error(),
@@ -223,7 +228,10 @@ func (w *Workflow) resumeIterationBranch(
 		trace.okDetail("resolve-local", shortSHA(localSHA))
 
 		// Step 2: fetch (best-effort) so we can compare with origin.
-		if ferr := g.Fetch(); ferr != nil {
+		// Skipped when origin is unset — no origin to disagree with.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("fetch-origin", "skipped: no origin")
+		} else if ferr := g.Fetch(); ferr != nil {
 			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: ferr.Error(),
@@ -330,8 +338,12 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 
 	werr := w.git.WithLock(func(g git.Ops) error {
 		// Step 1: refresh origin refs so the local-vs-origin
-		// distinction below reflects current reality.
-		if err := g.Fetch(); err != nil {
+		// distinction below reflects current reality. Skipped when
+		// origin is unset — the post-Phase-8 single-store layout
+		// has no remote; the local clone IS the source of truth.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("fetch-origin", "skipped: no origin")
+		} else if err := g.Fetch(); err != nil {
 			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: err.Error(),
@@ -388,6 +400,12 @@ func (w *Workflow) EnsureRunBranch(branch, defaultBranch string) error {
 		// Step 6: push so the ref exists on origin too. Without
 		// this, follow-up verbs on a different machine couldn't
 		// see the branch and would either err or duplicate-create.
+		// Skipped when origin is unset — the local ref IS the
+		// source of truth in the post-Phase-8 single-store layout.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("push", "skipped: no origin")
+			return nil
+		}
 		if err := g.Push(branch); err != nil {
 			return trace.fail("push",
 				translateGitError("push run branch", err))

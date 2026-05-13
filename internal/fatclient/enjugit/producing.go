@@ -204,9 +204,14 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		if sha, err := g.ResolveRef(target); err == nil {
 			targetSHA = sha
 		}
-		// Step 1: pre-merge fetch (best-effort). Offline blips
-		// are recoverable; record without aborting.
-		if err := g.Fetch(); err != nil {
+		// Step 1: pre-merge fetch. Skipped when origin is unset —
+		// the post-Phase-8 single-store layout has no remote to
+		// sync from; the local clone IS the source of truth.
+		// When origin is configured, treat failures as best-effort
+		// (offline blips recoverable; record without aborting).
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("fetch-origin", "skipped: no origin")
+		} else if err := g.Fetch(); err != nil {
 			trace.appendStep(Step{
 				Name: "fetch-origin", Status: "failed",
 				Detail: err.Error(),
@@ -264,7 +269,15 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 				}
 				trace.ok("checkout-target")
 			}
-			// Step 4a: push the FF'd target.
+			// Step 4a: push the FF'd target. Skipped when origin
+			// is unset — the local ref update IS the final state
+			// in the single-store layout (post-Phase-8). Sharing
+			// with other citizens is a separate concern handled
+			// when origin points at a real remote.
+			if w.git.RemoteURL() == "" {
+				trace.okDetail("push", "skipped: no origin")
+				return nil
+			}
 			if perr := g.Push(target); perr != nil {
 				return trace.fail("push", translateGitError("push", perr))
 			}
@@ -307,7 +320,12 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 		}
 		trace.ok("checkout-target")
 
-		// Step 5: push the new target tip.
+		// Step 5: push the new target tip. Skipped when origin
+		// is unset — same rationale as Step 4a above.
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("push", "skipped: no origin")
+			return nil
+		}
 		if perr := g.Push(target); perr != nil {
 			return trace.fail("push", translateGitError("push", perr))
 		}
@@ -421,8 +439,12 @@ func (w *Workflow) CommitArbitraryFiles(req CommitArbitraryFilesRequest) (*Commi
 
 		// Step 3: push (best-effort). Offline blips are caller-
 		// policy to retry; trace records the failure without
-		// aborting the verb.
-		if perr := g.Push(branch); perr != nil {
+		// aborting the verb. Skipped when origin is unset —
+		// local update-ref already committed into the single
+		// store (post-Phase-8 layout).
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("push", "skipped: no origin")
+		} else if perr := g.Push(branch); perr != nil {
 			trace.appendStep(Step{
 				Name: "push", Status: "failed",
 				Detail: perr.Error(),

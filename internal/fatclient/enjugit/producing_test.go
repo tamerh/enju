@@ -293,6 +293,39 @@ func TestAutoMergeAcceptedTopic_FastForward(t *testing.T) {
 	}
 }
 
+// TestAutoMergeAcceptedTopic_NoOriginSkipsFetchAndPush pins the
+// post-Phase-8 single-store contract: when the workflow's clone has
+// no origin configured, the merge's Fetch + Push steps are skipped
+// rather than failing the merge. The local FF/merge-commit IS the
+// final state; there's no remote to sync with.
+//
+// Pre-fix, every merge in a no-origin project failed because git's
+// Push surfaced "fatal: 'origin' does not appear to be a git
+// repository", which the wrapper translated into a task failure.
+func TestAutoMergeAcceptedTopic_NoOriginSkipsFetchAndPush(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.remoteURL = "" // no origin configured
+
+	res, err := wf.MergeAcceptedTopic("topic", "main",
+		MergeAuthor{TaskID: "7:1:trigger", AutoOrManual: "auto"})
+	if err != nil {
+		t.Fatalf("MergeAcceptedTopic should succeed without origin: %v", err)
+	}
+	if !res.FastForwarded {
+		t.Errorf("FF still expected even without origin (it's a local ref op)")
+	}
+	if fake.callCount("Fetch") != 0 {
+		t.Errorf("Fetch should be skipped when no origin, got %d calls", fake.callCount("Fetch"))
+	}
+	if fake.callCount("Push") != 0 {
+		t.Errorf("Push should be skipped when no origin, got %d calls", fake.callCount("Push"))
+	}
+	if fake.callCount("MergeFFOrFail") != 1 {
+		t.Errorf("expected the local FF op to still fire, got %d MergeFFOrFail calls",
+			fake.callCount("MergeFFOrFail"))
+	}
+}
+
 func TestAutoMergeAcceptedTopic_NonFFFallsBackToMergeCommit(t *testing.T) {
 	wf, fake := makeWorkflow(t)
 	fake.inject("MergeFFOrFail", git.ErrPushNonFF)

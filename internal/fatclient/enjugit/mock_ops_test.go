@@ -75,6 +75,12 @@ type fakeOps struct {
 	// + ancestorReturn=false.
 	ancestorReturnSet bool
 	ancestorReturn    bool
+
+	// remoteURL controls what RemoteURL() returns. Defaults to a
+	// non-empty placeholder in newFakeOps so the canonical fetch/
+	// push paths fire by default; tests that exercise the
+	// "no origin → skip" branches set it to "".
+	remoteURL string
 }
 
 // WorkDir returns the configured test workdir or "". Workflow
@@ -88,7 +94,7 @@ func (f *fakeOps) WorkDir() string { return f.workDir }
 // rarely exercised in fake-ops unit tests (they're consumed by
 // service callers via Workflow's metadata accessors). Production
 // uses *git.Clone which reads them from on-disk state.
-func (f *fakeOps) RemoteURL() string       { return "" }
+func (f *fakeOps) RemoteURL() string       { return f.remoteURL }
 func (f *fakeOps) LastPushAt() time.Time   { return time.Time{} }
 func (f *fakeOps) LastPushError() string   { return "" }
 func (f *fakeOps) HeadCommitTime() time.Time { return time.Time{} }
@@ -108,6 +114,10 @@ func newFakeOps() *fakeOps {
 		state:       git.StateClean,
 		headSHA:     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		headBranch:  "main",
+		// Default to a non-empty placeholder so existing tests
+		// keep exercising the canonical fetch/push code paths.
+		// Tests for the "no origin" branch override to "".
+		remoteURL: "/test/remote.git",
 	}
 }
 

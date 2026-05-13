@@ -65,8 +65,11 @@ func (w *Workflow) prepareBranchForCommit(g git.Ops, branch string, preferredBas
 
 	// Step 1: fetch-origin (best-effort). Don't fail the whole
 	// verb — offline / network blips are recoverable. Failure
-	// recorded for debug.
-	if ferr := g.Fetch(); ferr != nil {
+	// recorded for debug. Skipped when origin is unset (post-
+	// Phase-8 single-store layout has no remote to sync from).
+	if w.git.RemoteURL() == "" {
+		trace.okDetail("fetch-origin", "skipped: no origin")
+	} else if ferr := g.Fetch(); ferr != nil {
 		trace.appendStep(Step{
 			Name: "fetch-origin", Status: "failed",
 			Detail: ferr.Error(),
