@@ -236,10 +236,10 @@ func (s *Supervisor) pruneStalePIDFiles() {
 // the cmdBotRun CLI flags so the MCP tool handler can pass
 // everything through.
 type StartParams struct {
-	BotName     string // required
-	ProjectDir  string // required, absolute
-	Coordinator string // required (e.g. http://localhost:8000)
-	ProjectID   int64  // optional (0 = across all projects bot is a member of)
+	BotName      string // required
+	WorkflowPath string // required, absolute — workflow YAML whose inline bots: includes BotName
+	Coordinator  string // required (e.g. http://localhost:8000)
+	ProjectID    int64  // optional (0 = across all projects bot is a member of)
 
 	// AllowTools, when non-empty, is forwarded to the daemon
 	// as --allow-tools=tool1,tool2,... — the daemon passes
@@ -276,13 +276,13 @@ type pidFileEntry struct {
 // for that bot is already running (single-bot-per-machine
 // invariant for v1; multi-instance is post-launch work).
 //
-// The daemon runs as `enju bot run --bot=<name> --project=<dir>
-// --coordinator=<url>` with stdin connected so Stop can close
-// it for graceful shutdown. Stdout/stderr go to the per-bot
-// log file, opened append-mode.
+// The daemon runs as `enju bot run --bot=<name>
+// --workflow=<path> --coordinator=<url>` with stdin connected
+// so Stop can close it for graceful shutdown. Stdout/stderr go
+// to the per-bot log file, opened append-mode.
 func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, error) {
-	if p.BotName == "" || p.ProjectDir == "" || p.Coordinator == "" {
-		return nil, fmt.Errorf("Start: bot_name, project_dir, and coordinator are required")
+	if p.BotName == "" || p.WorkflowPath == "" || p.Coordinator == "" {
+		return nil, fmt.Errorf("Start: bot_name, workflow_path, and coordinator are required")
 	}
 	s.procsMu.Lock()
 	if _, exists := s.procs[p.BotName]; exists {
@@ -322,7 +322,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, err
 	args := []string{
 		"bot", "run",
 		"--bot=" + p.BotName,
-		"--project=" + p.ProjectDir,
+		"--workflow=" + p.WorkflowPath,
 		"--coordinator=" + p.Coordinator,
 	}
 	if p.ProjectID > 0 {

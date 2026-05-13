@@ -64,14 +64,6 @@ const BundleManifestName = "enju.yaml"
 // Enju-owned paths live under enju/."
 const ProjectConfigPath = "enju/conf.yaml"
 
-// BotManifestPath is the optional per-project bot roster. When
-// present, declares the bots a project uses (name, model, system
-// prompt, tool allowlist, credentials path). Read by `enju bot
-// setup` to register identities and by `enju bot run` to spawn
-// each daemon with the declared configuration. Coordinator never
-// touches this file — bot execution is fatclient-local.
-const BotManifestPath = "enju/bots.yaml"
-
 // BigfilesDir is the per-project root where action:compute tasks
 // land their declared-untracked outputs (writes_artifacts entries
 // with track:false). Sibling to .clone/ and .bare.git/, so it

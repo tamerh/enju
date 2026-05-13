@@ -60,22 +60,24 @@ func cmdBot(args []string) {
 
 func printBotUsage() {
 	fmt.Println(`Usage:
- enju bot setup    Register every bot in enju/bots.yaml against the
-            coordinator and stash each bot's auth token at the
-            manifest's credentials path. Idempotent — bots whose
-            credentials file already exists are skipped.
+ enju bot setup --workflow path/to/workflow.yaml
+            Register every bot declared inline in the workflow
+            YAML's bots: section against the coordinator and
+            stash each bot's auth token at the manifest's
+            credentials path. Idempotent — bots whose credentials
+            file already exists are skipped.
 
- enju bot run     Run the bot daemon — polls the coordinator for
-            ready tasks assigned to the bot, invokes the LLM
-            (claude -p), and submits the result. Walking-skeleton
-            scope: action=review and action=vote tasks only.
+ enju bot run --workflow path/to/workflow.yaml --bot <name>
+            Run the bot daemon — polls the coordinator for ready
+            tasks assigned to the bot, invokes the handler, and
+            submits the result.
 
 Run 'enju bot <command> -h' for command-specific help.`)
 }
 
-// cmdBotSetup registers every bot declared in the project's
-// enju/bots.yaml that doesn't already have a stashed credentials
-// file. Owner identity comes from the operator's default
+// cmdBotSetup registers every bot declared inline in the workflow
+// YAML's bots: section that doesn't already have a stashed
+// credentials file. Owner identity comes from the operator's default
 // credentials (~/.enju/credentials.json by default) — bots are
 // parented to the registering owner via the coord's parent_id
 // link, so each operator running setup ends up with their own
@@ -103,27 +105,36 @@ func cmdBotSetup(args []string) {
 	fs := flag.NewFlagSet("bot setup", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	credsPath := fs.String("credentials", "", "Path to OWNER credentials.json (default ~/.enju/credentials.json). Used only to authenticate the registration calls — bot tokens land at each bot's manifest-declared path.")
-	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
-	projectIDFlag := fs.Int64("project-id", 0, "Project id to add bots to as members (overrides manifest's project_id). 0 = no auto-add; operator must call enju_add_project_member manually.")
+	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline bots: section declares this fleet (required)")
+	projectIDFlag := fs.Int64("project-id", 0, "Project id to add bots to as members. 0 = no auto-add; operator must call enju_add_project_member manually.")
 	dryRun := fs.Bool("dry-run", false, "Print what would happen without registering or writing files")
 	fs.Parse(args)
 
-	// Resolve the project root to an absolute path so error
-	// messages and credential paths show something meaningful
-	// regardless of where the operator invoked from.
-	absProject, err := filepath.Abs(*projectDir)
+	if *workflowPath == "" {
+		fmt.Fprintln(os.Stderr, "--workflow=<path/to/workflow.yaml> is required")
+		os.Exit(1)
+	}
+	absWorkflow, err := filepath.Abs(*workflowPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolving --project=%q: %v\n", *projectDir, err)
+		fmt.Fprintf(os.Stderr, "resolving --workflow=%q: %v\n", *workflowPath, err)
+		os.Exit(1)
+	}
+	// Project root = the git repo root containing the workflow
+	// YAML. Walking up from the workflow file is the natural
+	// way to find it without a separate flag.
+	absProject, err := findGitRoot(filepath.Dir(absWorkflow))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "locating project root from %q: %v\n", absWorkflow, err)
 		os.Exit(1)
 	}
 
-	manifest, err := bots.Load(absProject)
+	manifest, err := bots.LoadFromWorkflow(absWorkflow)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "loading %s/enju/bots.yaml: %v\n", absProject, err)
+		fmt.Fprintf(os.Stderr, "loading workflow %s: %v\n", absWorkflow, err)
 		os.Exit(1)
 	}
 	if manifest == nil || len(manifest.Bots) == 0 {
-		fmt.Fprintf(os.Stderr, "No bots declared at %s/enju/bots.yaml — nothing to do.\n", absProject)
+		fmt.Fprintf(os.Stderr, "No bots declared inline in %s — nothing to do.\n", absWorkflow)
 		return
 	}
 
@@ -134,14 +145,11 @@ func cmdBotSetup(args []string) {
 		os.Exit(1)
 	}
 
-	// Resolve effective project id for membership auto-add. Flag
-	// wins so an operator can override the committed manifest
-	// without editing it; manifest is the convenient default for
-	// projects with a single stable coord.
+	// Project ID for membership auto-add: caller-supplied only.
+	// Inline-bots workflows don't carry a project_id field; the
+	// operator passes --project-id=N when they want bots added
+	// to a project's membership at setup time. 0 = skip.
 	effectiveProjectID := *projectIDFlag
-	if effectiveProjectID == 0 {
-		effectiveProjectID = manifest.ProjectID
-	}
 
 	// Pre-loop summary so the operator sees what's about to
 	// happen before any coord write fires. Especially valuable
@@ -154,12 +162,12 @@ func cmdBotSetup(args []string) {
 	for i := range manifest.Bots {
 		names = append(names, manifest.Bots[i].Name)
 	}
-	fmt.Fprintf(os.Stderr, "Setting up %d bot(s) declared in %s/enju/bots.yaml: %s\n", len(manifest.Bots), absProject, strings.Join(names, ", "))
+	fmt.Fprintf(os.Stderr, "Setting up %d bot(s) declared inline in %s: %s\n", len(manifest.Bots), absWorkflow, strings.Join(names, ", "))
 	fmt.Fprintf(os.Stderr, "Coordinator: %s — owner: %s\n", *coordinator, owner.Username)
 	if effectiveProjectID > 0 {
 		fmt.Fprintf(os.Stderr, "Project membership: bots will be added to project #%d\n\n", effectiveProjectID)
 	} else {
-		fmt.Fprintln(os.Stderr, "Project membership: skipped (pass --project-id=N or set project_id in manifest to auto-add)")
+		fmt.Fprintln(os.Stderr, "Project membership: skipped (pass --project-id=N to auto-add)")
 		fmt.Fprintln(os.Stderr)
 	}
 
@@ -461,6 +469,25 @@ func writeBotCredentials(path, coordinator, username, name, token string) error 
 	return nil
 }
 
+// findGitRoot walks up from start to find the directory
+// containing a `.git/` entry — that's the project root. Errors
+// when no .git/ is found anywhere on the way up to the
+// filesystem root. Used to locate the project a workflow YAML
+// belongs to without requiring a separate --project flag.
+func findGitRoot(start string) (string, error) {
+	cur := start
+	for {
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			return cur, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fmt.Errorf("no .git/ found in %q or any parent — workflow YAML must live inside a git repo", start)
+		}
+		cur = parent
+	}
+}
+
 // cmdBotRun launches the bot daemon: a long-running loop that
 // finds tasks assigned to this bot, runs them through the bot's
 // Handler (Claude CLI by default, but pluggable per manifest),
@@ -483,8 +510,8 @@ func writeBotCredentials(path, coordinator, username, name, token string) error 
 func cmdBotRun(args []string) {
 	fs := flag.NewFlagSet("bot run", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
-	botName := fs.String("bot", "", "Bot name from enju/bots.yaml (required)")
-	projectDir := fs.String("project", ".", "Project directory containing enju/bots.yaml")
+	botName := fs.String("bot", "", "Bot name from the workflow's inline bots: section (required)")
+	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline bots: section declares this fleet (required)")
 	projectID := fs.Int64("project-id", 0, "Project id to scope task discovery (0 = every project the bot is a member of)")
 	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
@@ -499,7 +526,11 @@ func cmdBotRun(args []string) {
 	fs.Parse(args)
 
 	if *botName == "" {
-		fmt.Fprintln(os.Stderr, "--bot=<name> is required (must match a bot in enju/bots.yaml)")
+		fmt.Fprintln(os.Stderr, "--bot=<name> is required (must match a bot declared inline in the workflow YAML)")
+		os.Exit(1)
+	}
+	if *workflowPath == "" {
+		fmt.Fprintln(os.Stderr, "--workflow=<path/to/workflow.yaml> is required")
 		os.Exit(1)
 	}
 
@@ -514,23 +545,28 @@ func cmdBotRun(args []string) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	absProject, err := filepath.Abs(*projectDir)
+	absWorkflow, err := filepath.Abs(*workflowPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolving --project=%q: %v\n", *projectDir, err)
+		fmt.Fprintf(os.Stderr, "resolving --workflow=%q: %v\n", *workflowPath, err)
 		os.Exit(1)
 	}
-	manifest, err := bots.Load(absProject)
+	absProject, err := findGitRoot(filepath.Dir(absWorkflow))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "loading manifest: %v\n", err)
+		fmt.Fprintf(os.Stderr, "locating project root from %q: %v\n", absWorkflow, err)
+		os.Exit(1)
+	}
+	manifest, err := bots.LoadFromWorkflow(absWorkflow)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "loading workflow %s: %v\n", absWorkflow, err)
 		os.Exit(1)
 	}
 	if manifest == nil {
-		fmt.Fprintf(os.Stderr, "no enju/bots.yaml found at %s — run `enju bot setup` first\n", absProject)
+		fmt.Fprintf(os.Stderr, "no bots declared inline in %s\n", absWorkflow)
 		os.Exit(1)
 	}
 	bot := manifest.ByName(*botName)
 	if bot == nil {
-		fmt.Fprintf(os.Stderr, "bot %q not found in %s/enju/bots.yaml\n", *botName, absProject)
+		fmt.Fprintf(os.Stderr, "bot %q not found in %s\n", *botName, absWorkflow)
 		os.Exit(1)
 	}
 
@@ -562,14 +598,10 @@ func cmdBotRun(args []string) {
 			fmt.Fprintln(os.Stderr, "Register your own identity first by running `enju mcp` once, then re-run `enju bot run --bot=...`.")
 			os.Exit(1)
 		}
-		// Membership: prefer the run's --project-id flag (operator
-		// asked to scope to one project anyway), else fall back
-		// to the manifest's project_id. Same precedence
-		// `cmdBotSetup` uses.
+		// Membership: --project-id flag scopes the bot to one
+		// project at setup time. 0 = skip membership add; daemon
+		// polls every project the bot already belongs to.
 		effectiveProjectID := *projectID
-		if effectiveProjectID == 0 {
-			effectiveProjectID = manifest.ProjectID
-		}
 		res, setupErr := setupBotIfNeeded(setupCtx, *coordinator, owner, bot, effectiveProjectID)
 		setupCancel()
 		if setupErr != nil {
@@ -605,38 +637,26 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	// Always ensure the project's push target exists AND that
-	// this bot is a member of the project. Both calls are
-	// idempotent — a bare already in place is a no-op, and
-	// addBotToProject treats "already a member" as success —
-	// so the run path can fire them on every start without
-	// coord chatter or filesystem churn.
+	// Ensure this bot is a member of the project the operator
+	// scoped us to. Idempotent — addBotToProject treats "already
+	// a member" as success — so the run path can fire on every
+	// start without coord chatter.
 	//
-	// The membership step matters even when bot creds already
-	// exist: a bot may have been registered against project A
-	// (where setup ran) and is now starting against project B,
-	// or the manifest's project_id was 0 at setup time (so
-	// membership was skipped) and is set now. The user-reported
-	// failure mode was the daemon polling for tasks, hitting
-	// "not a member of this project" indefinitely, with the
-	// operator forced to call enju_add_project_member by hand
-	// for every bot in the manifest.
-	if *projectID > 0 || manifest.ProjectID > 0 {
-		// Use owner credentials for both calls: only the
-		// operator's identity is allowed to write into the
-		// project's enju/.bare.git/ scaffolding (the bot's
-		// project membership doesn't grant filesystem rights),
-		// and project membership additions require an existing
-		// member with permission to add (typically the project
-		// owner).
+	// Membership matters even when bot creds already exist:
+	// a bot may have been registered against project A (where
+	// setup ran) and is now starting against project B. The
+	// user-reported failure mode was the daemon polling for
+	// tasks, hitting "not a member of this project"
+	// indefinitely, with the operator forced to call
+	// enju_add_project_member by hand for every bot.
+	if *projectID > 0 {
+		// Membership additions require an existing member with
+		// permission to add (typically the project owner). Use
+		// the owner's credentials to make the API call.
 		owner := loadCredentialsAt(*coordinator, resolveCredentialsPath(""))
 		if owner != nil && owner.Token != "" {
-			pid := *projectID
-			if pid == 0 {
-				pid = manifest.ProjectID
-			}
 			ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			ensureBotMembership(ensureCtx, *coordinator, owner.Token, pid, creds.Username, os.Stderr)
+			ensureBotMembership(ensureCtx, *coordinator, owner.Token, *projectID, creds.Username, os.Stderr)
 			ensureCancel()
 		}
 		// No owner creds → skip silently. The daemon either

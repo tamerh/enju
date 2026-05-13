@@ -25,35 +25,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// resolveProjectDir returns the absolute path to the project
-// directory. Defaults to the fatclient's cwd when the caller
-// omits the field — same convention as the cmdBotRun CLI.
-//
-// MCP-side rationale: the operator's MCP host (claude-code,
-// web UI, etc.) typically runs in the project directory the
-// user is working in; defaulting to cwd matches that
-// expectation. Explicit --project / project= argument lets a
-// supervisor running under a different cwd point at the right
-// place without environment gymnastics.
-func resolveProjectDir(arg string) (string, error) {
+// resolveWorkflowPath returns the absolute path to the workflow
+// YAML the caller passed. Required — there is no sensible
+// cwd-based default when each workflow is its own self-contained
+// unit; the operator must name the YAML explicitly.
+func resolveWorkflowPath(arg string) (string, error) {
 	if arg == "" {
-		return os.Getwd()
+		return "", fmt.Errorf("workflow argument is required (path to the workflow YAML whose inline bots: section declares the bot)")
 	}
 	return filepath.Abs(arg)
 }
 
 func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	botName := req.GetString("bot", "")
-	projectDir, err := resolveProjectDir(req.GetString("project", ""))
+	workflowPath, err := resolveWorkflowPath(req.GetString("workflow", ""))
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("resolve project: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("resolve workflow: %v", err)), nil
 	}
 	// project_id is optional; mcp-go returns 0 when absent.
 	projectID := int64(req.GetFloat("project_id", 0))
@@ -63,34 +56,34 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(fmt.Sprintf("supervisor init: %v", err)), nil
 	}
 
-	// Read the manifest so we can pull this bot's tool
+	// Read the workflow YAML so we can pull this bot's tool
 	// allowlist (mcp_tools.allow). The supervisor passes it
 	// through to the daemon as --allow-tools so the trust
 	// model — manifest declares, runner pins, audit log
-	// records — is wired end-to-end. Missing manifest is
-	// fatal here (start needs the manifest to know the bot
+	// records — is wired end-to-end. Missing inline bots is
+	// fatal here (start needs the declaration to know the bot
 	// exists at all); the runner re-validates downstream.
 	//
 	// We don't pass the human's auth token to the daemon —
 	// the daemon authenticates via its own credentials file
 	// written by `enju bot setup` and resolved from the
 	// manifest's credentials path.
-	manifest, err := bots.Load(projectDir)
+	manifest, err := bots.LoadFromWorkflow(workflowPath)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("loading manifest: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("loading workflow: %v", err)), nil
 	}
 	if manifest == nil {
-		return mcp.NewToolResultError(fmt.Sprintf("no enju/bots.yaml found at %s", projectDir)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("no bots declared inline in %s", workflowPath)), nil
 	}
 	// Auto-discover when the operator didn't name a bot AND
-	// the manifest has exactly one. Cuts redundant typing for
-	// the dominant solo-project case (one bot, one project)
-	// without breaking the multi-bot path — there the operator
-	// must still disambiguate by name.
+	// the workflow declares exactly one. Cuts redundant typing
+	// for the dominant single-bot case without breaking the
+	// multi-bot path — there the operator must still
+	// disambiguate by name.
 	if botName == "" {
 		switch len(manifest.Bots) {
 		case 0:
-			return mcp.NewToolResultError(fmt.Sprintf("no bots declared in %s/enju/bots.yaml", projectDir)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("no bots declared inline in %s", workflowPath)), nil
 		case 1:
 			botName = manifest.Bots[0].Name
 		default:
@@ -98,21 +91,12 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 			for i := range manifest.Bots {
 				names = append(names, manifest.Bots[i].Name)
 			}
-			return mcp.NewToolResultError(fmt.Sprintf("manifest has %d bots — pick one: %v", len(manifest.Bots), names)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("workflow declares %d bots — pick one: %v", len(manifest.Bots), names)), nil
 		}
 	}
 	bot := manifest.ByName(botName)
 	if bot == nil {
-		return mcp.NewToolResultError(fmt.Sprintf("bot %q not found in %s/enju/bots.yaml", botName, projectDir)), nil
-	}
-	// Fall back to the manifest's project_id when the caller
-	// didn't supply one. Mirrors `enju bot setup`'s precedence
-	// rule (caller > manifest > 0). 0 is still valid — the
-	// daemon treats it as "poll every project the bot is a
-	// member of" — but solo projects with a single coord
-	// shouldn't have to repeat the id on every start call.
-	if projectID == 0 && manifest.ProjectID > 0 {
-		projectID = manifest.ProjectID
+		return mcp.NewToolResultError(fmt.Sprintf("bot %q not found in %s", botName, workflowPath)), nil
 	}
 	var allowTools []string
 	if bot.MCPTools != nil {
@@ -126,11 +110,11 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 	coordURL := c.fc.Coord().BaseURL()
 
 	rb, err := sup.Start(ctx, bots.StartParams{
-		BotName:     botName,
-		ProjectDir:  projectDir,
-		Coordinator: coordURL,
-		ProjectID:   projectID,
-		AllowTools:  allowTools,
+		BotName:      botName,
+		WorkflowPath: workflowPath,
+		Coordinator:  coordURL,
+		ProjectID:    projectID,
+		AllowTools:   allowTools,
 	})
 	if err != nil {
 		return mcp.NewToolResultError("✗ " + err.Error()), nil
@@ -216,23 +200,23 @@ func (c *apiClient) handleBotLogs(ctx context.Context, req mcp.CallToolRequest) 
 	return mcp.NewToolResultText(fmt.Sprintf("--- last %d lines from bot %q ---\n%s", len(got), botName, body)), nil
 }
 
-// handleBotStartAll iterates the manifest, starting every bot
-// not already running. Continues past per-bot failures so a
-// single misconfigured bot doesn't block the rest of the
-// fleet from coming up.
+// handleBotStartAll iterates the workflow's inline bots,
+// starting every one not already running. Continues past
+// per-bot failures so a single misconfigured bot doesn't
+// block the rest of the fleet from coming up.
 func (c *apiClient) handleBotStartAll(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	projectDir, err := resolveProjectDir(req.GetString("project", ""))
+	workflowPath, err := resolveWorkflowPath(req.GetString("workflow", ""))
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("resolve project: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("resolve workflow: %v", err)), nil
 	}
 	projectID := int64(req.GetFloat("project_id", 0))
 
-	manifest, err := bots.Load(projectDir)
+	manifest, err := bots.LoadFromWorkflow(workflowPath)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("loading manifest: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("loading workflow: %v", err)), nil
 	}
 	if manifest == nil || len(manifest.Bots) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("no bots declared at %s/enju/bots.yaml", projectDir)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("no bots declared inline in %s", workflowPath)), nil
 	}
 	sup, err := c.botSupervisor()
 	if err != nil {
@@ -253,11 +237,11 @@ func (c *apiClient) handleBotStartAll(ctx context.Context, req mcp.CallToolReque
 			allow = b.MCPTools.Allow
 		}
 		rb, err := sup.Start(ctx, bots.StartParams{
-			BotName:     b.Name,
-			ProjectDir:  projectDir,
-			Coordinator: coordURL,
-			ProjectID:   projectID,
-			AllowTools:  allow,
+			BotName:      b.Name,
+			WorkflowPath: workflowPath,
+			Coordinator:  coordURL,
+			ProjectID:    projectID,
+			AllowTools:   allow,
 		})
 		if err != nil {
 			results = append(results, result{Name: b.Name, OK: false, Error: err.Error()})

@@ -1184,18 +1184,19 @@ Note: unknown model names passed to -model auto-register on first use, so explic
 
 func BotStart() mcp.Tool {
 	return mcp.NewTool("enju_bot_start",
-		mcp.WithDescription(`Start a bot daemon defined in the project's enju/bots.yaml. The fatclient forks 'enju bot run --bot=<name>' as a subprocess, captures stdout/stderr to a per-bot log file (~/.enju/bots/logs/<name>.log), and tracks the PID for graceful stop.
+		mcp.WithDescription(`Start a bot daemon defined inline in a workflow YAML's bots: section. The fatclient forks 'enju bot run --bot=<name> --workflow=<path>' as a subprocess, captures stdout/stderr to a per-bot log file (~/.enju/bots/logs/<name>.log), and tracks the PID for graceful stop.
 
 One daemon per (machine, bot) for v1. Calling start on an already-running bot returns an error — call enju_bot_stop first if you want to restart.
 
-Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. Walking-skeleton scope: action=review and action=vote only. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.
+Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.
 
-When the manifest declares exactly one bot, the 'bot' argument may be omitted — the supervisor uses that single entry. project_id may also be omitted to fall back to the manifest's project_id.`),
+When the workflow declares exactly one bot, the 'bot' argument may be omitted — the supervisor uses that single entry.`),
 		mcp.WithString("bot",
-			mcp.Description("Bot name from enju/bots.yaml. Optional when the manifest has exactly one bot."),
+			mcp.Description("Bot name from the workflow's inline bots: section. Optional when the workflow declares exactly one bot."),
 		),
-		mcp.WithString("project",
-			mcp.Description("Project directory containing enju/bots.yaml. Defaults to the fatclient's current working directory."),
+		mcp.WithString("workflow",
+			mcp.Required(),
+			mcp.Description("Path to the workflow YAML whose inline bots: section declares this fleet."),
 		),
 		mcp.WithNumber("project_id",
 			mcp.Description("Optional project id to scope task discovery (0 / omitted = across every project the bot is a member of)"),
@@ -1238,9 +1239,10 @@ func BotLogs() mcp.Tool {
 
 func BotStartAll() mcp.Tool {
 	return mcp.NewTool("enju_bot_start_all",
-		mcp.WithDescription(`Start every bot declared in enju/bots.yaml. Convenience for first-touch demos where the operator wants the whole fleet up in one command. Skips bots that are already running. Returns the per-bot result list.`),
-		mcp.WithString("project",
-			mcp.Description("Project directory containing enju/bots.yaml. Defaults to the fatclient's current working directory."),
+		mcp.WithDescription(`Start every bot declared inline in a workflow YAML's bots: section. Convenience for first-touch demos where the operator wants the whole fleet up in one command. Skips bots that are already running. Returns the per-bot result list.`),
+		mcp.WithString("workflow",
+			mcp.Required(),
+			mcp.Description("Path to the workflow YAML whose inline bots: section declares this fleet."),
 		),
 		mcp.WithNumber("project_id",
 			mcp.Description("Optional project id passed through to each daemon"),

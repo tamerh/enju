@@ -23,41 +23,20 @@ import (
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/gitignore"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
-// Manifest is the parsed enju/bots.yaml. Aside from the bot
-// list itself, the manifest is intentionally minimal — top-level
-// project config (model defaults, prompt-dir overrides) belongs
-// in conf.yaml, not here.
+// Manifest is the parsed bot roster. Built from a workflow
+// YAML's inline `bots:` section via LoadFromWorkflow /
+// FromInlineNode — there's no separate per-project bots.yaml.
+// Workflow YAML is the single source of truth.
 //
-// Version: schema version. Currently 1. Older manifests without
-// the field default to 1 for forward compatibility, but new
-// authoring should always set it explicitly so older readers
-// can detect-and-warn when a future schema bump arrives. Other
-// Enju YAML files (run.yaml, enju.yaml template manifests) all
-// carry version: 1 — the bots manifest matches the convention.
+// Version: schema version, defaults to 1 when omitted. Reserved
+// for future schema bumps so older readers can detect-and-warn.
 type Manifest struct {
 	Version int   `yaml:"version,omitempty"`
 	Bots    []Bot `yaml:"bots"`
-
-	// ProjectID is the coordinator-assigned project id this
-	// manifest's bots belong to. Optional — when set, `enju bot
-	// setup` auto-adds each registered bot to the project's
-	// membership so the daemon can read /projects/{id}/runs and
-	// /tasks/ready scoped to this project. When empty, setup
-	// skips the membership step and the operator must add bots
-	// manually via enju_add_project_member.
-	//
-	// Why optional: manifests are committed to git and shared
-	// across operators / coord instances; project_id is
-	// instance-specific (different coord = different ids), so
-	// hard-coding it in the committed manifest is brittle. The
-	// recommended pattern is to omit it from the committed
-	// manifest and pass --project-id=N to `enju bot setup` per
-	// machine, OR to commit it for projects with a stable
-	// single coord (solo dev, fixed deployment).
-	ProjectID int64 `yaml:"project_id,omitempty"`
 }
 
 // Bot is one entry in the manifest. Every field has either a
@@ -251,42 +230,34 @@ type MCPTools struct {
 	Allow []string `yaml:"allow,omitempty"`
 }
 
-// Load reads enju/bots.yaml from a project directory. A missing
-// file is a normal state and returns (nil, nil) — projects
-// without bots are valid. Returns a parse error for malformed
-// YAML so the failure surfaces loudly instead of silently
-// pretending no bots exist.
+// LoadFromWorkflow reads a workflow YAML file and returns its
+// inline `bots:` section as a Manifest, fully resolved and
+// validated. workflowPath is the absolute or repo-relative path
+// to the workflow YAML; `enju bot setup` and `enju bot run`
+// receive it via --workflow.
 //
-// projectRoot is the absolute path to the project's working
-// tree (the directory containing enju/, .git/, etc.). The
-// caller — `enju bot setup` or `enju bot run` — typically
-// passes os.Getwd().
-func Load(projectRoot string) (*Manifest, error) {
-	path := filepath.Join(projectRoot, corelayout.BotManifestPath)
-	data, err := os.ReadFile(path)
+// Returns (nil, nil) when the workflow YAML has no `bots:` block
+// or declares an empty list — projects without bots are valid.
+// Returns a parse error for malformed YAML so failures surface
+// loudly instead of silently pretending no bots exist.
+//
+// Workflow YAML is the single source of truth for bot
+// definitions. There is no separate per-project bots.yaml file;
+// every bot a workflow uses is declared inline alongside the
+// tasks that reference it.
+func LoadFromWorkflow(workflowPath string) (*Manifest, error) {
+	data, err := os.ReadFile(workflowPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading %s: %w", corelayout.BotManifestPath, err)
+		return nil, fmt.Errorf("reading workflow %s: %w", workflowPath, err)
 	}
-	if len(data) == 0 {
+	parsed, err := enjuYaml.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("parsing workflow %s: %w", workflowPath, err)
+	}
+	if parsed == nil || parsed.Run == nil {
 		return nil, nil
 	}
-	var m Manifest
-	if err := yamlv3.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", corelayout.BotManifestPath, err)
-	}
-	if err := m.expandReplicas(); err != nil {
-		return nil, err
-	}
-	if err := m.Resolve(); err != nil {
-		return nil, err
-	}
-	if err := m.Validate(); err != nil {
-		return nil, err
-	}
-	return &m, nil
+	return FromInlineNode(parsed.Run.Bots)
 }
 
 // FromInlineNode parses a `bots:` block embedded in a workflow
@@ -345,30 +316,6 @@ func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 		return nil, fmt.Errorf("inline bots: %w", err)
 	}
 	return m, nil
-}
-
-// LoadPreferringInline resolves the effective bot manifest for a
-// project: inline bots in the workflow YAML take precedence over
-// the legacy enju/bots.yaml file.
-//
-// Both sources return (nil, nil) when empty/absent — callers
-// can treat (nil, nil) as "this project has no bots" without
-// distinguishing where they didn't come from.
-//
-// Wiring note (Phase 7): today's `enju bot run` calls Load
-// directly with no workflow context, so inline bots aren't yet
-// consulted from the daemon's entry point. This helper is the
-// integration seam for whichever future CLI surface
-// (`enju go path/to/workflow.yaml`, or `enju bot run
-// --workflow=...`) starts threading workflow YAML through to
-// the daemon.
-func LoadPreferringInline(projectRoot string, inline yamlv3.Node) (*Manifest, error) {
-	if m, err := FromInlineNode(inline); err != nil {
-		return nil, err
-	} else if m != nil {
-		return m, nil
-	}
-	return Load(projectRoot)
 }
 
 // botReplicasCap bounds the number of synthetic entries a single

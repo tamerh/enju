@@ -37,24 +37,23 @@ while IFS= read -r line; do : ; done
 	return path
 }
 
-// writeManifestForBot drops a minimal enju/bots.yaml at
-// projectDir with one bot whose mcp_tools.allow is the given
-// allowlist. Returns the project dir.
-func writeManifestForBot(t *testing.T, botName string, allow []string) string {
+// writeWorkflowForBot drops a minimal workflow YAML at a fresh
+// temp dir with one inline bot whose mcp_tools.allow is the
+// given allowlist. Returns the workflow file's absolute path —
+// callers pass it as the "workflow" arg to handleBotStart.
+func writeWorkflowForBot(t *testing.T, botName string, allow []string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "enju"), 0755); err != nil {
-		t.Fatal(err)
-	}
 	allowYaml := ""
 	if allow != nil {
 		allowYaml = "    mcp_tools:\n      allow: [" + strings.Join(allow, ", ") + "]\n"
 	}
-	body := "version: 1\nbots:\n  - name: " + botName + "\n    model: claude-sonnet-4-6\n" + allowYaml
-	if err := os.WriteFile(filepath.Join(dir, "enju", "bots.yaml"), []byte(body), 0644); err != nil {
+	wf := "name: test-workflow\nbase_branch: main\nbots:\n  - name: " + botName + "\n    model: claude-sonnet-4-6\n" + allowYaml + "tasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	path := filepath.Join(dir, "workflow.yaml")
+	if err := os.WriteFile(path, []byte(wf), 0644); err != nil {
 		t.Fatal(err)
 	}
-	return dir
+	return path
 }
 
 // newClientWithSupervisor builds an apiClient with a pre-injected
@@ -89,14 +88,14 @@ func TestHandleBotStart_ForwardsManifestAllowlistToDaemon(t *testing.T) {
 	c := newClientWithSupervisor(t, fakeBin, pidDir, logDir)
 	defer c.supervisor.StopAll(context.Background())
 
-	projectDir := writeManifestForBot(t, "scoped-bot", []string{"Read", "Grep", "Glob"})
+	wfPath := writeWorkflowForBot(t, "scoped-bot", []string{"Read", "Grep", "Glob"})
 
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name: "enju_bot_start",
 			Arguments: map[string]any{
 				"bot":     "scoped-bot",
-				"project": projectDir,
+				"workflow": wfPath,
 			},
 		},
 	}
@@ -143,14 +142,14 @@ func TestHandleBotStart_OmittedManifestAllowlistMeansAllTools(t *testing.T) {
 	c := newClientWithSupervisor(t, fakeBin, pidDir, logDir)
 	defer c.supervisor.StopAll(context.Background())
 
-	projectDir := writeManifestForBot(t, "open-bot", nil) // no mcp_tools.allow
+	wfPath := writeWorkflowForBot(t, "open-bot", nil) // no mcp_tools.allow
 
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name: "enju_bot_start",
 			Arguments: map[string]any{
 				"bot":     "open-bot",
-				"project": projectDir,
+				"workflow": wfPath,
 			},
 		},
 	}
@@ -189,12 +188,12 @@ func TestHandleBotStart_AutoDiscoversWhenSingleBotInManifest(t *testing.T) {
 	c := newClientWithSupervisor(t, fakeBin, pidDir, logDir)
 	defer c.supervisor.StopAll(context.Background())
 
-	projectDir := writeManifestForBot(t, "lonely-bot", nil)
+	wfPath := writeWorkflowForBot(t, "lonely-bot", nil)
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name: "enju_bot_start",
 			Arguments: map[string]any{
-				"project": projectDir, // no `bot` field
+				"workflow": wfPath, // no `bot` field
 			},
 		},
 	}
@@ -220,11 +219,9 @@ func TestHandleBotStart_RefusesAmbiguousAutoDiscover(t *testing.T) {
 	defer c.supervisor.StopAll(context.Background())
 
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "enju"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	body := "version: 1\nbots:\n  - name: alice\n    model: claude-sonnet-4-6\n  - name: bob\n    model: claude-sonnet-4-6\n"
-	if err := os.WriteFile(filepath.Join(dir, "enju", "bots.yaml"), []byte(body), 0644); err != nil {
+	wf := "name: multi-bot\nbase_branch: main\nbots:\n  - name: alice\n    model: claude-sonnet-4-6\n  - name: bob\n    model: claude-sonnet-4-6\ntasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	wfPath := filepath.Join(dir, "workflow.yaml")
+	if err := os.WriteFile(wfPath, []byte(wf), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -232,7 +229,7 @@ func TestHandleBotStart_RefusesAmbiguousAutoDiscover(t *testing.T) {
 		Params: mcp.CallToolParams{
 			Name: "enju_bot_start",
 			Arguments: map[string]any{
-				"project": dir,
+				"workflow": wfPath,
 			},
 		},
 	}

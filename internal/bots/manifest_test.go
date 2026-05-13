@@ -9,57 +9,69 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
-// helper: write enju/bots.yaml inside a fresh temp project dir
-// and return the project root.
-func writeManifest(t *testing.T, body string) string {
+// writeWorkflowWithBots wraps body (the YAML for the workflow's
+// version + bots: section) in a minimal workflow YAML that the
+// parser accepts, writes it to a fresh temp dir, and returns
+// the workflow file's path. Callers feed that path to
+// LoadFromWorkflow.
+//
+// The wrapper adds name/base_branch/tasks so the workflow parser
+// is satisfied; tests focus on bot-section behavior only.
+func writeWorkflowWithBots(t *testing.T, body string) string {
 	t.Helper()
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "enju"), 0755); err != nil {
+	wf := "name: test-workflow\nbase_branch: main\n" + body + "\ntasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	path := filepath.Join(root, "workflow.yaml")
+	if err := os.WriteFile(path, []byte(wf), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "enju", "bots.yaml"), []byte(body), 0644); err != nil {
-		t.Fatal(err)
-	}
-	return root
+	return path
 }
 
-func TestLoad_MissingFile(t *testing.T) {
-	// Empty project — no enju/bots.yaml. Must NOT error;
-	// projects without bots are valid.
+func TestLoadFromWorkflow_MissingFile(t *testing.T) {
+	// Pointing at a nonexistent workflow YAML is an error — the
+	// operator passed a bad --workflow path and we surface it
+	// rather than silently returning nil.
 	root := t.TempDir()
-	m, err := Load(root)
-	if err != nil {
-		t.Fatalf("missing manifest should be silent, got error: %v", err)
+	_, err := LoadFromWorkflow(filepath.Join(root, "does-not-exist.yaml"))
+	if err == nil {
+		t.Fatal("expected error for missing workflow file, got nil")
 	}
-	if m != nil {
-		t.Errorf("expected nil manifest for missing file, got %+v", m)
-	}
-}
-
-func TestLoad_EmptyFile(t *testing.T) {
-	root := writeManifest(t, "")
-	m, err := Load(root)
-	if err != nil {
-		t.Fatalf("empty manifest should be silent, got error: %v", err)
-	}
-	if m != nil {
-		t.Errorf("expected nil manifest for empty file, got %+v", m)
+	if !strings.Contains(err.Error(), "reading workflow") {
+		t.Errorf("expected error to mention reading workflow, got: %v", err)
 	}
 }
 
-func TestLoad_MalformedYAML(t *testing.T) {
-	root := writeManifest(t, "bots: not-a-list: oops")
-	_, err := Load(root)
+func TestLoadFromWorkflow_NoInlineBots(t *testing.T) {
+	// Workflow YAML with no bots: section parses cleanly and
+	// returns a nil manifest — the workflow may use system
+	// citizens only (humans / pre-registered bots) and not
+	// declare any inline.
+	root := t.TempDir()
+	wf := "name: solo\nbase_branch: main\ntasks:\n  - id: noop\n    action: answer\n    prompt: ok\n"
+	path := filepath.Join(root, "workflow.yaml")
+	if err := os.WriteFile(path, []byte(wf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := LoadFromWorkflow(path)
+	if err != nil {
+		t.Fatalf("LoadFromWorkflow: %v", err)
+	}
+	if m != nil {
+		t.Errorf("expected nil manifest when workflow has no inline bots, got %+v", m)
+	}
+}
+
+func TestLoadFromWorkflow_MalformedYAML(t *testing.T) {
+	path := writeWorkflowWithBots(t, "bots: not-a-list: oops")
+	_, err := LoadFromWorkflow(path)
 	if err == nil {
 		t.Fatal("expected parse error on malformed YAML, got nil")
-	}
-	if !strings.Contains(err.Error(), "parsing") {
-		t.Errorf("expected error message to mention parsing, got: %v", err)
 	}
 }
 
 func TestLoad_HappyPath_DefaultsResolved(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: developer-bot
@@ -67,7 +79,7 @@ bots:
     mcp_tools:
       allow: [Read, Edit, Write, Bash]
 `)
-	m, err := Load(root)
+	m, err := LoadFromWorkflow(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -104,13 +116,13 @@ func TestLoad_MCPToolsOmitted_NilPointer(t *testing.T) {
 	// Manifest without mcp_tools — the section is omitted
 	// entirely. Pointer must be nil so the runner knows
 	// "all tools" rather than "empty allowlist."
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: x
     model: m
 `)
-	m, err := Load(root)
+	m, err := LoadFromWorkflow(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -125,7 +137,7 @@ func TestValidate_RejectsExplicitEmptyAllow(t *testing.T) {
 	// would silently get the opposite if we treated empty as
 	// "all" — exactly the wrong direction for a security-
 	// motivated allowlist.
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: x
@@ -133,34 +145,27 @@ bots:
     mcp_tools:
       allow: []
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "mcp_tools.allow is present but empty") {
 		t.Errorf("expected explicit-empty-allow rejection, got: %v", err)
 	}
 }
 
-func TestValidate_RejectsUnknownVersion(t *testing.T) {
-	root := writeManifest(t, `
-version: 99
-bots:
-  - name: x
-    model: m
-`)
-	_, err := Load(root)
-	if err == nil || !strings.Contains(err.Error(), "unsupported manifest version 99") {
-		t.Errorf("expected version-mismatch error, got: %v", err)
-	}
-}
+// (Removed: TestValidate_RejectsUnknownVersion. Inline mode hard-
+// codes Manifest.Version = 1 in FromInlineNode — the workflow
+// YAML's top-level `version:` field is the WORKFLOW version,
+// not the bot-manifest version. There's no separate manifest
+// version knob to validate anymore.)
 
 func TestLoad_MissingVersionDefaultsToOne(t *testing.T) {
 	// Backwards compat: existing manifests without version: 1
 	// continue to load (Resolve sets version=1 silently).
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
 `)
-	m, err := Load(root)
+	m, err := LoadFromWorkflow(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -187,13 +192,13 @@ func TestEnsureGitignored_PreservesMode(t *testing.T) {
 }
 
 func TestLoad_TildeExpansion(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
     credentials: ~/custom-creds/x.json
 `)
-	m, err := Load(root)
+	m, err := LoadFromWorkflow(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -205,62 +210,31 @@ bots:
 }
 
 func TestValidate_RejectsMissingName(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - model: m
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "name is required") {
 		t.Errorf("expected name-required error, got: %v", err)
 	}
 }
 
 func TestValidate_RejectsMissingModel(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "model is required") {
 		t.Errorf("expected model-required error, got: %v", err)
 	}
 }
 
-func TestLoad_ProjectIDOptional(t *testing.T) {
-	// Manifest without project_id: legal — operator passes it
-	// at setup time via --project-id, or skips auto-add
-	// entirely.
-	root := writeManifest(t, `
-bots:
-  - name: x
-    model: m
-`)
-	m, err := Load(root)
-	if err != nil {
-		t.Fatalf("missing project_id should be accepted, got: %v", err)
-	}
-	if m.ProjectID != 0 {
-		t.Errorf("ProjectID: got %d, want 0 when omitted", m.ProjectID)
-	}
-}
-
-func TestLoad_ProjectIDParsed(t *testing.T) {
-	// Manifest with project_id: surfaced through Load so cmdBotSetup
-	// can default to it when --project-id isn't passed.
-	root := writeManifest(t, `
-project_id: 42
-bots:
-  - name: x
-    model: m
-`)
-	m, err := Load(root)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if m.ProjectID != 42 {
-		t.Errorf("ProjectID: got %d, want 42", m.ProjectID)
-	}
-}
+// (Removed: TestLoad_ProjectIDOptional + TestLoad_ProjectIDParsed.
+// Phase 8 dropped Manifest.ProjectID — workflow YAMLs don't carry
+// project IDs since they're instance-specific. Operators pass
+// --project-id explicitly at bot setup time.)
 
 func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 	for _, h := range []string{"", "claude", "stub"} {
@@ -269,8 +243,8 @@ func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 			if h != "" {
 				body += "    handler: " + h + "\n"
 			}
-			root := writeManifest(t, body)
-			if _, err := Load(root); err != nil {
+			path := writeWorkflowWithBots(t, body)
+			if _, err := LoadFromWorkflow(path); err != nil {
 				t.Errorf("expected handler %q to validate, got: %v", h, err)
 			}
 		})
@@ -284,7 +258,7 @@ func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 // substitute to empty + drop the arg, surfacing as "the flag
 // vanished" at first daemon claim with no diagnostic.
 func TestValidate_RejectsUnknownArgsTemplate(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: x
@@ -293,7 +267,7 @@ bots:
       - "-p"
       - "--task-id={{tsk_id}}"
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil {
 		t.Fatal("expected validation error for typo'd {{tsk_id}}")
 	}
@@ -308,7 +282,7 @@ bots:
 // TestValidate_RejectsMalformedArgsTemplate pins review-fix
 // #10: unterminated braces fail loud at manifest load.
 func TestValidate_RejectsMalformedArgsTemplate(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: x
@@ -316,7 +290,7 @@ bots:
     args:
       - "--model={{model"
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil {
 		t.Fatal("expected validation error for unterminated {{")
 	}
@@ -328,7 +302,7 @@ bots:
 // TestValidate_AcceptsKnownArgsVars passes when args use any
 // recognized static var or any handler_args.<key>.
 func TestValidate_AcceptsKnownArgsVars(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: x
@@ -342,19 +316,19 @@ bots:
       - "--effort={{handler_args.effort}}"
       - "--any-operator-key={{handler_args.foo-bar}}"
 `)
-	if _, err := Load(root); err != nil {
+	if _, err := LoadFromWorkflow(path); err != nil {
 		t.Errorf("manifest with valid {{var}} references should load, got: %v", err)
 	}
 }
 
 func TestValidate_RejectsUnknownHandler(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
     handler: shell
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "unknown handler") {
 		t.Errorf("expected unknown-handler error, got: %v", err)
 	}
@@ -364,25 +338,25 @@ func TestValidate_StubHandlerNoModelRequired(t *testing.T) {
 	// Non-LLM handlers don't need a model. A future linter-bot
 	// or rule-bot wouldn't have a model to declare; insisting
 	// would be cargo from the LLM-only past.
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     handler: stub
 `)
-	if _, err := Load(root); err != nil {
+	if _, err := LoadFromWorkflow(path); err != nil {
 		t.Errorf("stub handler should validate without model, got: %v", err)
 	}
 }
 
 func TestValidate_RejectsDuplicateName(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
   - name: x
     model: n
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Errorf("expected duplicate-name error, got: %v", err)
 	}
@@ -392,12 +366,12 @@ func TestValidate_RejectsBadName(t *testing.T) {
 	cases := []string{"bot with spaces", "bot/slash", "bot.dot", ""}
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
-			root := writeManifest(t, `
+			path := writeWorkflowWithBots(t, `
 bots:
   - name: "`+name+`"
     model: m
 `)
-			_, err := Load(root)
+			_, err := LoadFromWorkflow(path)
 			if err == nil {
 				t.Errorf("expected validation error for name %q, got nil", name)
 			}
@@ -406,26 +380,26 @@ bots:
 }
 
 func TestValidate_RejectsAbsoluteSystemPrompt(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
     system_prompt: /etc/passwd
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "repo-relative") {
 		t.Errorf("expected repo-relative rejection on absolute path, got: %v", err)
 	}
 }
 
 func TestValidate_RejectsParentTraversal(t *testing.T) {
-	root := writeManifest(t, `
+	path := writeWorkflowWithBots(t, `
 bots:
   - name: x
     model: m
     system_prompt: ../../../etc/passwd
 `)
-	_, err := Load(root)
+	_, err := LoadFromWorkflow(path)
 	if err == nil || !strings.Contains(err.Error(), "..") {
 		t.Errorf("expected .. rejection, got: %v", err)
 	}
@@ -499,13 +473,13 @@ func TestEnsureGitignored_PreservesUserContent(t *testing.T) {
 // after expansion (credentials per replica, prompt shared).
 func TestExpandReplicas(t *testing.T) {
 	t.Run("absent: single entry unchanged", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: only-bot
     model: claude-sonnet-4-6
 `)
-		m, err := Load(root)
+		m, err := LoadFromWorkflow(path)
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -515,14 +489,14 @@ bots:
 	})
 
 	t.Run("replicas: 1 stays single (sentinel for explicit single)", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: solo-dev
     model: claude-sonnet-4-6
     replicas: 1
 `)
-		m, err := Load(root)
+		m, err := LoadFromWorkflow(path)
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -538,14 +512,14 @@ bots:
 	})
 
 	t.Run("replicas: 3 expands to 3 suffixed entries", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
     replicas: 3
 `)
-		m, err := Load(root)
+		m, err := LoadFromWorkflow(path)
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -567,14 +541,14 @@ bots:
 	})
 
 	t.Run("replicas share BASE prompt, separate credentials", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
     replicas: 3
 `)
-		m, err := Load(root)
+		m, err := LoadFromWorkflow(path)
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -601,14 +575,14 @@ bots:
 	})
 
 	t.Run("replicas: -1 rejected", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
     replicas: -1
 `)
-		_, err := Load(root)
+		_, err := LoadFromWorkflow(path)
 		if err == nil {
 			t.Fatal("expected error on negative replicas")
 		}
@@ -618,14 +592,14 @@ bots:
 	})
 
 	t.Run("replicas exceeding cap rejected", func(t *testing.T) {
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
     replicas: 100
 `)
-		_, err := Load(root)
+		_, err := LoadFromWorkflow(path)
 		if err == nil {
 			t.Fatal("expected error on over-cap replicas")
 		}
@@ -637,7 +611,7 @@ bots:
 	t.Run("name collision between replica and explicit entry rejected", func(t *testing.T) {
 		// dev-bot replicas:2 expands to dev-bot-1 + dev-bot-2;
 		// the explicit dev-bot-1 below collides.
-		root := writeManifest(t, `
+		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
@@ -646,7 +620,7 @@ bots:
   - name: dev-bot-1
     model: claude-sonnet-4-6
 `)
-		_, err := Load(root)
+		_, err := LoadFromWorkflow(path)
 		if err == nil {
 			t.Fatal("expected duplicate-name error post-expansion")
 		}
@@ -747,8 +721,8 @@ bots:
 
 	// Stand-alone equivalent — wrap the same list in the
 	// top-level Manifest shape and feed it through Load.
-	root := writeManifest(t, "version: 1\n"+body)
-	standaloneM, err := Load(root)
+	path := writeWorkflowWithBots(t, "version: 1\n"+body)
+	standaloneM, err := LoadFromWorkflow(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -822,75 +796,8 @@ bots:
 	}
 }
 
-// TestLoadPreferringInline_InlineWinsOverFile pins the
-// precedence rule: when both inline and stand-alone manifests
-// are present, inline takes precedence. The transition from
-// stand-alone to inline must be opt-in — once an author adds
-// inline bots, the legacy file becomes shadowed.
-func TestLoadPreferringInline_InlineWinsOverFile(t *testing.T) {
-	root := writeManifest(t, `
-version: 1
-bots:
-  - name: from-file
-    model: claude-haiku-4-5
-    handler: claude
-`)
-	inlineBody := `
-bots:
-  - name: from-inline
-    model: claude-sonnet-4-6
-    handler: claude
-`
-	m, err := LoadPreferringInline(root, inlineNode(t, inlineBody))
-	if err != nil {
-		t.Fatalf("LoadPreferringInline: %v", err)
-	}
-	if m == nil || len(m.Bots) != 1 {
-		t.Fatalf("expected single bot from inline source, got %+v", m)
-	}
-	if m.Bots[0].Name != "from-inline" {
-		t.Errorf("inline should have won; got bot %q", m.Bots[0].Name)
-	}
-}
-
-// TestLoadPreferringInline_FallsBackToFile pins the
-// transition behavior: when inline is absent, the legacy
-// enju/bots.yaml is read. Without this fallback, every
-// existing project authoring stand-alone bots would silently
-// lose its roster once the schema acquires the inline knob.
-func TestLoadPreferringInline_FallsBackToFile(t *testing.T) {
-	root := writeManifest(t, `
-version: 1
-bots:
-  - name: legacy-bot
-    model: claude-haiku-4-5
-    handler: claude
-`)
-	var empty yamlv3.Node // no inline block
-	m, err := LoadPreferringInline(root, empty)
-	if err != nil {
-		t.Fatalf("LoadPreferringInline: %v", err)
-	}
-	if m == nil || len(m.Bots) != 1 {
-		t.Fatalf("expected single bot from legacy file, got %+v", m)
-	}
-	if m.Bots[0].Name != "legacy-bot" {
-		t.Errorf("fallback should have surfaced legacy bot, got %q", m.Bots[0].Name)
-	}
-}
-
-// TestLoadPreferringInline_BothEmptyReturnsNil pins the
-// no-bots-anywhere case: a project that authors neither
-// inline nor a stand-alone file returns (nil, nil) so the
-// daemon can treat "no bots" uniformly.
-func TestLoadPreferringInline_BothEmptyReturnsNil(t *testing.T) {
-	root := t.TempDir()
-	var empty yamlv3.Node
-	m, err := LoadPreferringInline(root, empty)
-	if err != nil {
-		t.Errorf("both empty should be silent, got: %v", err)
-	}
-	if m != nil {
-		t.Errorf("expected nil Manifest, got %+v", m)
-	}
-}
+// (Removed: TestLoadPreferringInline_* tests. Phase 8 dropped
+// LoadPreferringInline and the standalone enju/bots.yaml fallback
+// it bridged to. Workflow YAML's inline bots: is the only source
+// of truth; tests above cover the inline-only path directly via
+// LoadFromWorkflow + FromInlineNode.)
