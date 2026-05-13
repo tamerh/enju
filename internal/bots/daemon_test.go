@@ -847,6 +847,19 @@ func TestDaemon_RunOnce_ReviewAction_TolerantOfMarkdownDecorations(t *testing.T)
 		want string
 	}{
 		{"bold-on-decision-marker", "**DECISION: approve**", "approve"},
+		// VERDICT: synonym for DECISION: — added 2026-05-13.
+		// Showcase reviewer-bot writes "Verdict: approve" at the
+		// END of an analytical preamble (the system prompt says
+		// "verdict keyword" so the LLM naturally picks the word
+		// "Verdict:" over "DECISION:"). Pre-fix this was treated
+		// as "no marker found" → fell through to bare-keyword
+		// scan → no bare line → request_changes fallback →
+		// infinite review loop. Both spellings work now.
+		{"verdict-marker-leading", "Verdict: approve", "approve"},
+		{"verdict-marker-uppercase", "VERDICT: approve", "approve"},
+		{"verdict-marker-buried-after-prose", "Spot-checking the body for factual errors:\n- All quantitative claims trace.\n\nVerdict: approve", "approve"},
+		{"verdict-marker-bold", "**Verdict: approve**", "approve"},
+		{"verdict-marker-request-changes", "Verdict: request_changes", "request_changes"},
 		{"bold-on-bare-keyword", "**approve**", "approve"},
 		{"underscore-emphasis", "_approve_", "approve"},
 		{"inline-code", "`approve`", "approve"},

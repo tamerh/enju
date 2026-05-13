@@ -1121,31 +1121,45 @@ func cleanForVerdict(line string) string {
 }
 
 // extractDecisionFromLine looks at one already-cleaned line and
-// returns (verdict, true) if the line starts with `DECISION:`
-// (case-insensitive) followed by a recognized verdict token.
-// The line should already be free of markdown decoration —
-// callers pass cleanForVerdict(rawLine).
+// returns (verdict, true) if the line starts with one of the
+// accepted decision markers (`DECISION:` or `VERDICT:`, case-
+// insensitive) followed by a recognized verdict token. The line
+// should already be free of markdown decoration — callers pass
+// cleanForVerdict(rawLine).
+//
+// VERDICT: was added 2026-05-13 as a synonym for DECISION:. The
+// system prompt asks for "verdict keyword on first line" using
+// the word "verdict," so LLMs naturally write "Verdict: approve"
+// even when the parser doc recommends DECISION:. Documented
+// shape was DECISION:; observed shape was Verdict:. Either is
+// accepted now; keep the doc preference at DECISION: for clarity
+// in operator-facing examples but accept both at parse time.
 func extractDecisionFromLine(line string) (string, bool) {
-	const marker = "decision:"
-	if len(line) < len(marker) {
-		return "", false
+	markers := []string{"decision:", "verdict:"}
+	for _, marker := range markers {
+		if len(line) < len(marker) {
+			continue
+		}
+		if !strings.EqualFold(line[:len(marker)], marker) {
+			continue
+		}
+		rest := strings.TrimSpace(line[len(marker):])
+		if rest == "" {
+			continue
+		}
+		// First whitespace-separated token after the colon is the
+		// verdict; trailing rationale on the same line ("DECISION:
+		// approve — the design is sound") is recovered via the
+		// full-response rationale.
+		token := rest
+		if i := strings.IndexAny(token, " \t"); i > 0 {
+			token = token[:i]
+		}
+		if v, ok := normalizeVerdict(token); ok {
+			return v, true
+		}
 	}
-	if !strings.EqualFold(line[:len(marker)], marker) {
-		return "", false
-	}
-	rest := strings.TrimSpace(line[len(marker):])
-	if rest == "" {
-		return "", false
-	}
-	// First whitespace-separated token after the colon is the
-	// verdict; trailing rationale on the same line ("DECISION:
-	// approve — the design is sound") is recovered via the
-	// full-response rationale.
-	token := rest
-	if i := strings.IndexAny(token, " \t"); i > 0 {
-		token = token[:i]
-	}
-	return normalizeVerdict(token)
+	return "", false
 }
 
 // normalizeVerdict maps a free-text first line to one of the
