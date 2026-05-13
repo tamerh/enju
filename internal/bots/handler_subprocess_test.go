@@ -540,6 +540,102 @@ func TestSubprocessHandler_ArgsTemplateSubstitution(t *testing.T) {
 	}
 }
 
+// TestSubprocessHandler_SystemPromptRelativeToClaimCWD pins the
+// showcase_v15 fix: `system_prompt: prompts/dev-bot2.md` declared
+// inline in a workflow's bots: block is a repo-relative path and
+// must be opened relative to the per-claim materialized CWD,
+// NOT the daemon's process CWD.
+//
+// Pre-fix shape: os.ReadFile(SystemPromptPath) used the daemon's
+// process CWD, so any inline bot that authored a repo-relative
+// path (the natural way to write it) failed every claim with
+// "no such file or directory" — the file existed in the
+// materialized claim CWD but the read site didn't know that.
+func TestSubprocessHandler_SystemPromptRelativeToClaimCWD(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "argv-echo.sh")
+	body := "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the per-claim materialized CWD shape:
+	// <project>/.enju/bots/<bot>/scratch/<task-iter>/prompts/dev-bot2.md
+	claimCWD := filepath.Join(dir, ".enju", "bots", "dev-bot2", "scratch", "7-1-summarize-iter-1")
+	promptDir := filepath.Join(claimCWD, "prompts")
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(promptDir, "dev-bot2.md"),
+		[]byte("be concise and project-aware"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bot{
+		Name:         "dev-bot2",
+		Handler:      scriptPath,
+		Model:        "claude-haiku-4-5-20251001",
+		SystemPrompt: "prompts/dev-bot2.md", // REPO-RELATIVE, as authored inline
+		Args: []string{
+			"--append-system-prompt={{system_prompt}}",
+		},
+	}
+	h := NewSubprocessHandler(b)
+
+	out, err := h.ProcessTask(context.Background(), HandlerInput{
+		TaskID:    "7:1:summarize",
+		Workspace: claimCWD,
+	})
+	if err != nil {
+		t.Fatalf("ProcessTask should resolve system_prompt against claim CWD: %v", err)
+	}
+	if !strings.Contains(out.Response, "arg:--append-system-prompt=be concise and project-aware") {
+		t.Errorf("system prompt body didn't make it through {{system_prompt}} substitution; got:\n%s",
+			out.Response)
+	}
+}
+
+// TestSubprocessHandler_SystemPromptAbsolutePathStillWorks pins the
+// fallback contract: when an operator authors an absolute path
+// (e.g. /etc/enju/prompts/...), the claim-CWD resolution is bypassed
+// and the absolute path is used verbatim. Same logic for empty
+// Workspace (handler opted out of CWD materialization, test paths).
+func TestSubprocessHandler_SystemPromptAbsolutePathStillWorks(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "argv-echo.sh")
+	body := "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\n"
+	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	absPrompt := filepath.Join(dir, "absolute-prompt.md")
+	if err := os.WriteFile(absPrompt, []byte("absolute body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bot{
+		Name:         "absolute-bot",
+		Handler:      scriptPath,
+		SystemPrompt: absPrompt,
+		Args:         []string{"--append-system-prompt={{system_prompt}}"},
+	}
+	h := NewSubprocessHandler(b)
+
+	// Workspace points at a real (but otherwise empty) dir so the
+	// handler's chdir succeeds; the system_prompt path is absolute,
+	// so the Workspace value isn't consulted for prompt resolution.
+	emptyClaimCWD := t.TempDir()
+	out, err := h.ProcessTask(context.Background(), HandlerInput{
+		TaskID:    "p:1:t",
+		Workspace: emptyClaimCWD,
+	})
+	if err != nil {
+		t.Fatalf("ProcessTask with absolute system_prompt: %v", err)
+	}
+	if !strings.Contains(out.Response, "arg:--append-system-prompt=absolute body") {
+		t.Errorf("absolute system_prompt path lost in resolution; got:\n%s", out.Response)
+	}
+}
+
 // TestSubprocessHandler_ArgsDropEmptySubstitutions pins the
 // empty-substitution rule end-to-end: a bot with no model
 // shouldn't emit `--model=` (which most CLIs reject); the

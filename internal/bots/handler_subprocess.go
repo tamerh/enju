@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -337,7 +338,7 @@ func knownArgVarNamesList() string {
 // SystemPromptPath is set but the file can't be read — first
 // claim is where that surfaces if startup didn't preload.
 func (h *SubprocessHandler) subContext(in HandlerInput) (map[string]string, error) {
-	sysPrompt, err := h.systemPromptBody()
+	sysPrompt, err := h.systemPromptBody(in.Workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -367,16 +368,34 @@ func (h *SubprocessHandler) subContext(in HandlerInput) (map[string]string, erro
 // after that. Empty SystemPromptPath returns ("", nil) — the
 // {{system_prompt}} substitution becomes empty and any arg
 // referencing it gets dropped.
-func (h *SubprocessHandler) systemPromptBody() (string, error) {
+//
+// SystemPromptPath is a repo-relative path authored in the
+// workflow YAML's bots: block (e.g. `prompts/dev-bot2.md`).
+// claimCWD is the per-claim materialized run-branch tree where
+// that file actually lives — `<project>/.enju/bots/<bot>/scratch/
+// <task-iter>/`. Without resolving against it, os.ReadFile uses
+// the daemon's process CWD, which has no relation to the
+// project worktree.
+//
+// Absolute paths pass through unchanged so operators that point
+// at a fixed location (e.g. /etc/enju/prompts/...) keep working.
+// Empty claimCWD (handler opted out of CWD materialization, e.g.
+// the stub) falls back to the unresolved path so tests with
+// pre-staged absolute or process-cwd-relative paths still load.
+func (h *SubprocessHandler) systemPromptBody(claimCWD string) (string, error) {
 	if h.SystemPromptPath == "" {
 		return "", nil
 	}
 	if h.cachedSystemPrompt != "" {
 		return h.cachedSystemPrompt, nil
 	}
-	body, err := os.ReadFile(h.SystemPromptPath)
+	path := h.SystemPromptPath
+	if !filepath.IsAbs(path) && claimCWD != "" {
+		path = filepath.Join(claimCWD, path)
+	}
+	body, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read system prompt %q: %w", h.SystemPromptPath, err)
+		return "", fmt.Errorf("read system prompt %q: %w", path, err)
 	}
 	h.cachedSystemPrompt = string(body)
 	return h.cachedSystemPrompt, nil
