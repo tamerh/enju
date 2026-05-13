@@ -94,6 +94,15 @@ func Open(path string) *Registry {
 	return &Registry{path: path}
 }
 
+// Path returns the file path this Registry is rooted at. Used by
+// callers that need to pass the same path to a subprocess (e.g.
+// the compute wrapper) so it can attach the SAME registry the
+// operator is using — without this, the wrapper's standalone
+// Workspace falls back to scanning ~/.enju/workspaces/ and may
+// create a divergent clone from the operator's adopted-project
+// path.
+func (r *Registry) Path() string { return r.path }
+
 // Load reads the index from disk. Missing file returns an
 // empty Index with the current version (a freshly initialized
 // registry is indistinguishable from a missing file). Malformed

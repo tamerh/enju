@@ -27,6 +27,7 @@ import (
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // ExecuteOutcome is the structured result of one compute-task
@@ -320,6 +321,14 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		RemoteURL:          remoteURL,
 		WorkspaceRoot:      s.enjugit.RootDir(),
 		ProjectName:        projName,
+		// RegistryPath lets the async wrapper re-attach the same
+		// project registry the operator is using, so its ForProject
+		// resolves to the operator's adopted-project dir rather than
+		// a divergent fallback clone under WorkspaceRoot. Empty when
+		// no registry is configured (test fixtures) — the wrapper
+		// falls back to scanning, which is fine when there's no
+		// adopted path to diverge from.
+		RegistryPath: registryPathOrEmpty(s.projectRegistry),
 		Branch:             meta.Branch,
 		// IterationBranch is the per-task topic branch coord
 		// populated at claim time. compute.Run uses it as
@@ -714,6 +723,18 @@ func isTransientCoordinatorError(msg string) bool {
 // sleepBackoff is the exponential backoff between retry
 // attempts. Caps at 200ms so the worst case is ~350ms total
 // across 3 attempts.
+// registryPathOrEmpty returns the registry's on-disk path so it
+// can be threaded into the async wrapper's Spec. nil registry →
+// "" so the wrapper falls back to projectreg.DefaultPath() (the
+// canonical ~/.enju/projects.json). Tests with a non-default
+// registry path get the same path the operator is using.
+func registryPathOrEmpty(reg *projectreg.Registry) string {
+	if reg == nil {
+		return ""
+	}
+	return reg.Path()
+}
+
 func sleepBackoff(attempt int) {
 	d := time.Duration(50<<attempt) * time.Millisecond
 	if d > 200*time.Millisecond {

@@ -30,6 +30,7 @@ import (
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // ResolveTaskScratchDir returns the canonical absolute path for a
@@ -88,6 +89,19 @@ type Spec struct {
 	RemoteURL     string `json:"remote_url,omitempty"`
 	WorkspaceRoot string `json:"workspace_root"`
 	ProjectName   string `json:"project_name,omitempty"`
+
+	// RegistryPath is the absolute path to the operator's project
+	// registry (typically ~/.enju/projects.json). The async wrapper
+	// loads this when it re-opens the workspace so its ForProject
+	// resolves to the SAME on-disk clone the operator is using.
+	// Without it, the wrapper's standalone Workspace falls back to
+	// scanning WorkspaceRoot and creates a divergent clone at
+	// <root>/<slug>-<id>/ — the wrapper writes commits + refs there,
+	// the operator's merger reads from the registry-resolved path
+	// (the adopted-project dir), and refs are "not found." Empty
+	// value falls back to projectreg.DefaultPath() so single-machine
+	// no-test invocations still work without explicit threading.
+	RegistryPath string `json:"registry_path,omitempty"`
 
 	// Branch is the run branch (the integration target). The
 	// commit's per-task topic branch is built FROM this base via
@@ -425,10 +439,30 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// Subprocess fallback: wrap-task is a separate process and
 	// cannot inherit the parent fat-client's Workflow. Open one
 	// from spec — flock honors cross-process serialization.
+	//
+	// Attach the SAME project registry the operator uses so the
+	// wrapper's ForProject resolves to the same on-disk clone the
+	// operator is using. Without this, adopted-project paths (the
+	// path= flow on enju_create_project) diverge: operator reads
+	// the registry to find /the/adopted/path, wrapper has no
+	// registry and falls back to scanning WorkspaceRoot, then
+	// silently creates a NEW clone at ~/.enju/workspaces/<slug>-<id>/.
+	// Commits land in the wrapper's clone; the operator's merger
+	// later can't find the iter-branch refs there. Showcase TP53
+	// debug bundle #2 hit exactly this trap: 11 sections of work
+	// committed to the divergent clone, every post-submit merge
+	// failed "ref not found."
 	if wf == nil {
+		regPath := spec.RegistryPath
+		if regPath == "" {
+			regPath = projectreg.DefaultPath()
+		}
+		opts := []enjugit.Option{enjugit.WithLogger(logger)}
+		if regPath != "" {
+			opts = append(opts, enjugit.WithRegistry(projectreg.Open(regPath)))
+		}
 		ws, err := enjugit.NewWorkspace(spec.WorkspaceRoot,
-			enjugit.NewProductionConventions(),
-			enjugit.WithLogger(logger))
+			enjugit.NewProductionConventions(), opts...)
 		if err != nil {
 			res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
 			return res
