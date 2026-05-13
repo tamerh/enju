@@ -119,13 +119,13 @@ func CloneOrInit(workDir, remoteURL, lockPath string, logger *slog.Logger) (*Clo
 }
 
 // InitLocal initializes a non-bare git repo at workDir with a
-// `main` default branch AND seeds an initial commit (README.md +
-// enju/templates/.gitkeep) so refs/heads/main has a SHA.
-// Bootstrap step for path-mode projects + test fixtures.
+// `main` default branch AND seeds an initial commit (README.md)
+// so refs/heads/main has a SHA. Bootstrap step for path-mode
+// projects + test fixtures.
 //
-// Mirrors gitv6.InitLocal's contract exactly: callers
-// (initbare.go InitBareWithSeed, ensureManagedBare) depend on
-// `main` resolving immediately after this returns.
+// No enju/templates/ scaffold — Phase 8 dropped the required
+// directory structure; templates live wherever the user puts
+// them, identified by path at run-creation time.
 func InitLocal(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -142,22 +142,15 @@ func InitLocal(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 	return OpenClone(workDir, lockPath, logger)
 }
 
-// seedInitialCommit writes README.md + enju/templates/.gitkeep
-// and commits them so refs/heads/main has a SHA. Authorship is
-// the placeholder Enju identity (callers that want their own
-// author go through CommitFiles afterward).
+// seedInitialCommit writes README.md and commits it so
+// refs/heads/main has a SHA. Authorship is the placeholder Enju
+// identity (callers that want their own author go through
+// CommitFiles afterward).
 func seedInitialCommit(workDir string) error {
 	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Enju project\n"), 0o644); err != nil {
 		return fmt.Errorf("write README: %w", err)
 	}
-	templatesDir := filepath.Join(workDir, "enju", "templates")
-	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
-		return fmt.Errorf("create templates dir: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(templatesDir, ".gitkeep"), []byte(""), 0o644); err != nil {
-		return fmt.Errorf("write .gitkeep: %w", err)
-	}
-	if _, err := runGit(workDir, []string{"add", "README.md", "enju/templates/.gitkeep"}, runOpts{}); err != nil {
+	if _, err := runGit(workDir, []string{"add", "README.md"}, runOpts{}); err != nil {
 		return fmt.Errorf("git add seed files: %w", err)
 	}
 	env := authorEnvVars("Enju", "enju@localhost", time.Now())

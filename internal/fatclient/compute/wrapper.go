@@ -114,7 +114,7 @@ type Spec struct {
 	// declared-untracked outputs (writes_artifacts entries with
 	// track:false) live. Resolved by the handler via
 	// enjugit.ResolveBigfilesDir — either
-	// <project>/enju/bigfiles/<branch>/ for local-only mode, or
+	// <project>/.enju/bigfiles/<branch>/ for local-only mode, or
 	// <ENJU_BIGFILES>/<slug>-<id>/<branch>/ when the citizen has
 	// set the shared-mount env var.
 	//

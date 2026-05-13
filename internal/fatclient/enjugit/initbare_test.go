@@ -9,12 +9,11 @@ import (
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
-// TestInitBareWithSeedScaffoldsTemplatesDir verifies that a
-// freshly-initialized bare repo carries enju/templates/.gitkeep
-// in its initial commit. Without this scaffolding, a new
-// project's enju_list_templates returns empty immediately after
-// create_project — confusing "looks broken" UX.
-func TestInitBareWithSeedScaffoldsTemplatesDir(t *testing.T) {
+// TestInitBareWithSeedScaffoldsReadme verifies that a freshly-
+// initialized bare repo carries a README.md seed commit so
+// refs/heads/main has a SHA. No enju/templates/ scaffold —
+// Phase 8 dropped the required directory structure.
+func TestInitBareWithSeedScaffoldsReadme(t *testing.T) {
 	bareDir := filepath.Join(t.TempDir(), "seeded.git")
 	if err := InitBareWithSeed(bareDir); err != nil {
 		t.Fatalf("InitBareWithSeed: %v", err)
@@ -25,8 +24,8 @@ func TestInitBareWithSeedScaffoldsTemplatesDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cloneDir, "README.md")); err != nil {
 		t.Errorf("README.md missing from initial commit: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cloneDir, "enju", "templates", ".gitkeep")); err != nil {
-		t.Errorf("enju/templates/.gitkeep missing from initial commit: %v", err)
+	if _, err := os.Stat(filepath.Join(cloneDir, "enju", "templates", ".gitkeep")); err == nil {
+		t.Errorf("enju/templates/.gitkeep should NOT exist — Phase 8 dropped the scaffold")
 	}
 }
 

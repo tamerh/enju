@@ -552,11 +552,11 @@ func TestCreateProjectCustomPathFresh(t *testing.T) {
 	if _, _, err := proj.Head(); err != nil {
 		t.Errorf("clone has no HEAD ref — seedLocalWorkspace didn't fire: %v", err)
 	}
-	for _, rel := range []string{"README.md", "enju/templates/.gitkeep"} {
-		full := filepath.Join(proj.WorkDir(), rel)
-		if _, err := os.Stat(full); err != nil {
-			t.Errorf("expected seeded file %s after create, got: %v", rel, err)
-		}
+	// Only README.md seeds the initial commit — Phase 8 dropped
+	// the enju/templates/.gitkeep scaffold since templates live
+	// wherever the user puts them.
+	if _, err := os.Stat(filepath.Join(proj.WorkDir(), "README.md")); err != nil {
+		t.Errorf("expected seeded README.md after create, got: %v", err)
 	}
 
 	// No shadow bare under ~/.enju/repos/ — the legacy path is
@@ -1024,9 +1024,10 @@ func TestCreateProjectFolderWithoutGit(t *testing.T) {
 		t.Error("expected .git dir after init")
 	}
 
-	// Scaffold should exist.
-	if _, err := os.Stat(filepath.Join(dir, "enju", "templates", ".gitkeep")); err != nil {
-		t.Error("expected enju/templates/.gitkeep after init")
+	// No enju/templates/ scaffold — Phase 8 dropped the
+	// required directory structure.
+	if _, err := os.Stat(filepath.Join(dir, "enju", "templates", ".gitkeep")); err == nil {
+		t.Error("enju/templates/.gitkeep should not exist — Phase 8 dropped the auto-scaffold")
 	}
 
 	// Original file preserved.

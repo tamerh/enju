@@ -366,8 +366,8 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 			out = append(out, ur)
 			continue
 		}
-		// Untracked artifacts live in bigfilesDir, never in
-		// the worktree. Layout: <project>/enju/bigfiles/<branch>/<path>.
+		// Untracked artifacts live in bigfilesDir, gitignored.
+		// Layout: <project>/.enju/bigfiles/<branch>/<path>.
 		full := filepath.Join(bigfilesDir, enjugit.ArtifactPath(path))
 		fi, serr := os.Lstat(full)
 		if os.IsNotExist(serr) {

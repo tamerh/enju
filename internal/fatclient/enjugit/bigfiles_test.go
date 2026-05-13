@@ -6,13 +6,14 @@ import (
 )
 
 // TestResolveBigfilesDir_LocalDefault pins the local-mode path:
-// when ENJU_BIGFILES is unset, the bigfiles dir lives next to
-// .clone/ inside the project tree. Sibling-of-clone is the
-// invariant that keeps git out of the picture entirely.
+// when ENJU_BIGFILES is unset, the bigfiles dir lives under
+// .enju/ in the project tree. Living under the .enju/ umbrella
+// is what keeps the data gitignored — the operator's project
+// tree IS the worktree post-Phase-8.
 func TestResolveBigfilesDir_LocalDefault(t *testing.T) {
 	t.Setenv(BigfilesEnv, "")
 	got := ResolveBigfilesDir("/work/proj", 7, "myproj", "main")
-	want := filepath.Join("/work/proj", "enju", "bigfiles", "main")
+	want := filepath.Join("/work/proj", ".enju", "bigfiles", "main")
 	if got != want {
 		t.Errorf("local default: got %q, want %q", got, want)
 	}

@@ -7109,11 +7109,11 @@ echo "analyze complete"
 
 	// The untracked file MUST still exist on disk — we only skipped
 	// committing it, we didn't erase it. Phase 1.4 layout: the file
-	// lives at <project>/enju/bigfiles/<branch>/<path>, sibling of
+	// lives at <project>/.enju/bigfiles/<branch>/<path>, sibling of
 	// the worktree (.clone/). Downstream consumers stat() this path.
-	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "scratch.bam"))
+	matches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju", "bigfiles", "*", "out", "scratch.bam"))
 	if len(matches) == 0 {
-		t.Errorf("expected scratch.bam under enju/bigfiles/<branch>/out/; workspace=%s", h.workspaceDir)
+		t.Errorf("expected scratch.bam under .enju/bigfiles/<branch>/out/; workspace=%s", h.workspaceDir)
 	}
 
 	// scratch.bam must NOT be inside the worktree — that's what
@@ -7121,7 +7121,7 @@ echo "analyze complete"
 	// would mean we're back to the .gitignore-trick layout.
 	worktreeMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "out", "scratch.bam"))
 	for _, m := range worktreeMatches {
-		t.Errorf("untracked scratch.bam leaked into the worktree at %s — should live in enju/bigfiles/", m)
+		t.Errorf("untracked scratch.bam leaked into the worktree at %s — should live in .enju/bigfiles/", m)
 	}
 
 	// The tracked file is committed, so `git log` on the workspace
@@ -7199,10 +7199,10 @@ echo "produced"
 	// from disk. Tracked artifacts (committed) would still
 	// live in git, but out/big.bam is a track:false output —
 	// once removed, this workspace has no copy. Phase 1.4 layout:
-	// untracked artifacts live under enju/bigfiles/<branch>/.
-	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "big.bam"))
+	// untracked artifacts live under .enju/bigfiles/<branch>/.
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju", "bigfiles", "*", "out", "big.bam"))
 	if len(bamMatches) == 0 {
-		t.Fatalf("expected big.bam under enju/bigfiles/ before removal; workspace=%s", h.workspaceDir)
+		t.Fatalf("expected big.bam under .enju/bigfiles/ before removal; workspace=%s", h.workspaceDir)
 	}
 	for _, m := range bamMatches {
 		if err := os.Remove(m); err != nil {
@@ -7463,7 +7463,7 @@ printf 'bam-bytes' > "$ENJU_BIGFILES/out/big.bam"
 	// Now delete the untracked file from the bigfiles dir to
 	// simulate the "second citizen with no copy" case. Next
 	// listing should report missing.
-	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", "enju", "bigfiles", "*", "out", "big.bam"))
+	bamMatches, _ := filepath.Glob(filepath.Join(h.workspaceDir, "*", ".enju", "bigfiles", "*", "out", "big.bam"))
 	for _, m := range bamMatches {
 		_ = os.Remove(m)
 	}

@@ -554,7 +554,7 @@ func (s *FatClient) checkUntrackedReadsPresence(ctx context.Context, meta *TaskM
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteString("\nUntracked artifacts live outside git, in <project>/enju/bigfiles/<branch>/. Options: ")
+	b.WriteString("\nUntracked artifacts live outside git, in <project>/.enju/bigfiles/<branch>/. Options: ")
 	b.WriteString("re-run the producer task locally so it materializes the file here, or set $ENJU_BIGFILES to a shared mount the producer writes to.")
 	return fmt.Errorf("%s", b.String())
 }

@@ -93,10 +93,11 @@ bots:
 	if b.Model != "claude-sonnet-4-6" {
 		t.Errorf("model: got %q", b.Model)
 	}
-	// Default system_prompt = enju/prompts/<name>.md.
-	wantPrompt := "enju/prompts/developer-bot.md"
-	if b.SystemPrompt != wantPrompt {
-		t.Errorf("system_prompt: got %q, want %q", b.SystemPrompt, wantPrompt)
+	// No auto-default for system_prompt — empty means the bot
+	// runs without one. Authors who want a prompt declare the
+	// path explicitly via system_prompt: path/to/file.md.
+	if b.SystemPrompt != "" {
+		t.Errorf("system_prompt: expected empty (no auto-default), got %q", b.SystemPrompt)
 	}
 	// Default credentials = ~/.enju/credentials/<name>.json.
 	home, _ := os.UserHomeDir()
@@ -540,23 +541,25 @@ bots:
 		}
 	})
 
-	t.Run("replicas share BASE prompt, separate credentials", func(t *testing.T) {
+	t.Run("replicas share authored prompt, separate credentials", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
 bots:
   - name: dev-bot
     model: claude-sonnet-4-6
+    system_prompt: prompts/dev.md
     replicas: 3
 `)
 		m, err := LoadFromWorkflow(path)
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		// All replicas point at the same prompt file (the BASE
-		// name, not the suffixed name) — three identical bots.
+		// All replicas share the explicit prompt path the author
+		// declared on the base bot — three identical bots, one
+		// prompt file.
 		for i, b := range m.Bots {
-			if !strings.HasSuffix(b.SystemPrompt, "/dev-bot.md") {
-				t.Errorf("Bots[%d].SystemPrompt: got %q, want suffix /dev-bot.md (shared)", i, b.SystemPrompt)
+			if b.SystemPrompt != "prompts/dev.md" {
+				t.Errorf("Bots[%d].SystemPrompt: got %q, want %q (shared)", i, b.SystemPrompt, "prompts/dev.md")
 			}
 		}
 		// But each replica has its own credentials file (distinct

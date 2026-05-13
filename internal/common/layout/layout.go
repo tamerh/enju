@@ -57,26 +57,17 @@ const DefaultTemplatesDir = "enju/templates"
 // repo won't collide with GitHub Actions / Ansible / etc.
 const BundleManifestName = "enju.yaml"
 
-// ProjectConfigPath is the optional per-project config file
-// read at project-open time. Lives inside enju/ (same parent as
-// templates/ and runs/) rather than at the repo root — the file
-// is small and optional, and keeping it here advertises "all
-// Enju-owned paths live under enju/."
-const ProjectConfigPath = "enju/conf.yaml"
-
 // BigfilesDir is the per-project root where action:compute tasks
 // land their declared-untracked outputs (writes_artifacts entries
-// with track:false). Sibling to .clone/ and .bare.git/, so it
-// lives INSIDE the project tree but OUTSIDE the worktree — git
-// in .clone/ literally can't see files here, which is the whole
-// point: scripts produce multi-GB BAM/FASTQ data, the data lives
-// next to the run that produced it, and no .gitignore trickery
-// or preserve-during-checkout dance is needed.
+// with track:false). Lives under StateDirRoot (.enju/) so the
+// existing gitignore umbrella covers it — scripts produce multi-
+// GB BAM/FASTQ data, the data lives next to the run that produced
+// it, git never sees it.
 //
 // Per-branch subdirs (BigfilesBranchDir) keep parallel-branch
 // runs from clobbering each other's outputs at the same logical
 // path.
-const BigfilesDir = "enju/bigfiles"
+const BigfilesDir = StateDirRoot + "/bigfiles"
 
 // BigfilesBranchDir returns the per-branch root for untracked
 // artifacts produced on `branch`. Branch is used verbatim — git's
@@ -94,12 +85,6 @@ func BigfilesBranchDir(branch string) string {
 	}
 	return filepath.Join(BigfilesDir, branch)
 }
-
-// BotPromptsDir is the conventional location bot system prompts
-// live in. Convention only — the manifest's `system_prompt:`
-// field can point anywhere repo-relative; this constant just
-// names the place tooling expects to find them by default.
-const BotPromptsDir = "enju/prompts"
 
 // TemplateSnapshotDirName is the per-run subdirectory name that
 // holds the run's frozen YAML manifest (plus any scripts/data

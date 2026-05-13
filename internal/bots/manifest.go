@@ -57,11 +57,11 @@ type Bot struct {
 	// path. Required.
 	Model string `yaml:"model"`
 
-	// SystemPrompt is a repo-relative path to the bot's system
-	// prompt file. Read at runtime and concatenated with the
-	// per-task prompt; not committed into the daemon's binary.
-	// Default convention: enju/prompts/<name>.md (filled in by
-	// Resolve when the manifest leaves the field empty).
+	// SystemPrompt is an optional repo-relative path to the
+	// bot's system prompt file. Read at runtime and
+	// concatenated with the per-task prompt. Empty = no system
+	// prompt (the handler runs without one); workflow authors
+	// write the explicit path when they want one.
 	SystemPrompt string `yaml:"system_prompt,omitempty"`
 
 	// MCPTools declares which tools the bot's MCP host should
@@ -353,16 +353,10 @@ func (m *Manifest) expandReplicas() error {
 			continue
 		}
 		base := b.Name
-		// Pre-resolve the shared system_prompt default once for
-		// the whole replica family. If the user authored an
-		// explicit path, it carries through to every replica;
-		// if they left it empty, all replicas share the
-		// base-name prompt rather than each looking for its own
-		// suffixed file.
+		// Replicas share the user-authored system_prompt path
+		// verbatim (or empty when the family doesn't use one).
+		// No auto-default — prompts are explicit-or-omitted.
 		sharedPrompt := b.SystemPrompt
-		if sharedPrompt == "" && base != "" {
-			sharedPrompt = filepath.ToSlash(filepath.Join(corelayout.BotPromptsDir, base+".md"))
-		}
 		for n := 1; n <= b.Replicas; n++ {
 			rep := b
 			rep.Replicas = 0
@@ -398,13 +392,8 @@ func (m *Manifest) Resolve() error {
 	home, _ := os.UserHomeDir()
 	for i := range m.Bots {
 		b := &m.Bots[i]
-		// Default system_prompt path: enju/prompts/<name>.md.
-		// Authoring rule for users: name your prompt files
-		// after the bot and the manifest doesn't need to
-		// repeat the path.
-		if b.SystemPrompt == "" && b.Name != "" {
-			b.SystemPrompt = filepath.ToSlash(filepath.Join(corelayout.BotPromptsDir, b.Name+".md"))
-		}
+		// SystemPrompt has no auto-default — authors specify
+		// the path when they want one, or omit it entirely.
 		// Default credentials path: ~/.enju/credentials/<name>.json.
 		// One file per bot, in the same parent dir as the
 		// human's credentials.json — shared discovery rules.

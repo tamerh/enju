@@ -2,9 +2,9 @@ package enjugit
 
 // Bigfiles directory resolution — the per-project, per-branch
 // location where action:compute tasks land their declared-untracked
-// outputs (writes_artifacts entries with track:false). Lives next
-// to .clone/ and .bare.git/ inside <project>/enju/, so the data
-// never enters the worktree and git literally can't see it.
+// outputs (writes_artifacts entries with track:false). Lives under
+// <project>/.enju/bigfiles/ — covered by the .enju/ gitignore
+// umbrella so the data never enters git.
 
 import (
 	"fmt"
@@ -21,7 +21,7 @@ import (
 //
 // When set, the value is the SHARED ROOT — per-project /
 // per-branch subdirs are appended underneath. Unset, the
-// equivalent layout lives at <project>/enju/bigfiles/.
+// equivalent layout lives at <project>/.enju/bigfiles/.
 //
 // Same name on the script-side env (the wrapper passes it
 // through verbatim) so a recipe author can read it directly
@@ -39,9 +39,8 @@ const BigfilesEnv = "ENJU_BIGFILES"
 //     per-branch sharding for free.
 //
 //   - When unset, the path is
-//     <projectRoot>/enju/bigfiles/<branch>/ — a sibling of
-//     .clone/ and .bare.git/, inside the project tree but
-//     outside the worktree.
+//     <projectRoot>/.enju/bigfiles/<branch>/ — under the
+//     gitignored .enju/ umbrella so git never sees the data.
 //
 // Either way the caller can `os.MkdirAll(dir, 0755)` and write
 // `<dir>/<repoRelPath>` for any declared track:false output
@@ -63,7 +62,8 @@ func ResolveBigfilesDir(projectRoot string, projectID int64, projectName, branch
 			return filepath.Join(abs, projectDirSegment(projectID, projectName), branch)
 		}
 	}
-	// Local default: sibling of .clone/ inside the project tree.
+	// Local default: under the gitignored .enju/ umbrella in
+	// the project tree.
 	if projectRoot == "" {
 		return ""
 	}

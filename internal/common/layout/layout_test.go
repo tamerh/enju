@@ -18,10 +18,10 @@ func TestBigfilesBranchDir(t *testing.T) {
 		branch string
 		want   string
 	}{
-		{"main branch", "main", "enju/bigfiles/main"},
-		{"feature branch", "feature-x", "enju/bigfiles/feature-x"},
-		{"slashed branch", "user/work", "enju/bigfiles/user/work"},
-		{"empty defaults to main", "", "enju/bigfiles/main"},
+		{"main branch", "main", ".enju/bigfiles/main"},
+		{"feature branch", "feature-x", ".enju/bigfiles/feature-x"},
+		{"slashed branch", "user/work", ".enju/bigfiles/user/work"},
+		{"empty defaults to main", "", ".enju/bigfiles/main"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -29,16 +29,12 @@ func TestBigfilesBranchDir(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("BigfilesBranchDir(%q) = %q, want %q", tc.branch, got, tc.want)
 			}
-			// Sibling-of-clone invariant: must live under
-			// enju/ but NOT under enju/.clone/. A regression
-			// here would leak bigfiles back into the worktree
-			// and reintroduce the .gitignore problem this
-			// dir exists to avoid.
-			if !strings.HasPrefix(got, "enju/") {
-				t.Errorf("expected enju/ prefix, got %q", got)
-			}
-			if strings.HasPrefix(got, "enju/.clone/") {
-				t.Errorf("bigfiles must not live inside the worktree, got %q", got)
+			// .enju/-prefix invariant: bigfiles must live under
+			// the gitignored umbrella so the operator's project
+			// tree (which IS the worktree post-Phase-8) doesn't
+			// see them as untracked.
+			if !strings.HasPrefix(got, ".enju/") {
+				t.Errorf("expected .enju/ prefix, got %q", got)
 			}
 		})
 	}

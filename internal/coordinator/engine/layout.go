@@ -21,7 +21,6 @@ const (
 	ResultDirRoot           = layout.ResultDirRoot
 	DefaultTemplatesDir     = layout.DefaultTemplatesDir
 	BundleManifestName      = layout.BundleManifestName
-	ProjectConfigPath       = layout.ProjectConfigPath
 	TemplateSnapshotDirName = layout.TemplateSnapshotDirName
 )
 

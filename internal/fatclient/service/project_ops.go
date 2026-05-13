@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"time"
 
-	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
@@ -379,11 +378,11 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 // the user's existing files become the project's first commit
 // instead of being silently overwritten by InitLocal's seed.
 //
-// Also writes the enju/ scaffold (enju/templates/.gitkeep) so
-// the layout matches a fresh init. Returns the short branch name
-// of HEAD after the commit.
+// Phase 8 dropped the auto-scaffold of enju/templates/.gitkeep —
+// templates live wherever the user puts them; enju imposes zero
+// required directory structure on user content.
 func (s *FatClient) initGitWithExistingFiles(dirPath string) (string, error) {
-	return enjugit.InitLocalAdoptExisting(dirPath, corelayout.DefaultTemplatesDir)
+	return enjugit.InitLocalAdoptExisting(dirPath, "")
 }
 
 // DetectPopulatedUnrelatedRepo returns a non-empty refusal reason
@@ -419,7 +418,6 @@ func DetectPopulatedUnrelatedRepo(dirPath string) string {
 		isDir bool
 	}{
 		{"enju", true},
-		{"enju/conf.yaml", false},
 		{"enju.yaml", false},
 	}
 	for _, m := range markers {
