@@ -2595,3 +2595,47 @@ tasks:
 		t.Fatalf("templated paths should parse: %v", err)
 	}
 }
+
+// TestParseAcceptsInlineBots pins the post-Phase-7 contract: a
+// `bots:` section at the top level of a workflow YAML parses
+// cleanly through the strict-fields decoder. Phase 8.h.3 wired
+// the inline bots: section to the daemon CLI; if the yaml.Run
+// struct ever loses the Bots field (or grows the strict
+// decoder a typo), `enju_create_run` would refuse every
+// workflow YAML that declares inline bots — which is now the
+// only supported authoring path.
+func TestParseAcceptsInlineBots(t *testing.T) {
+	body := []byte(`name: research-analysis
+version: 1
+base_branch: main
+bots:
+  - name: developer-bot
+    model: claude-sonnet-4-6
+    handler: claude
+  - name: reviewer-bot
+    model: claude-opus-4-7
+    handler: claude
+tasks:
+  - id: draft
+    action: answer
+    assign_to: developer-bot
+    prompt: "draft an analysis plan"
+  - id: review
+    action: review
+    reviews: draft
+    assign_to: reviewer-bot
+    prompt: "review the plan"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("Parse rejected inline bots: %v", err)
+	}
+	if parsed == nil || parsed.Run == nil {
+		t.Fatal("Parse returned nil ParsedRun")
+	}
+	// The Bots node should be populated — bots.FromInlineNode
+	// can read it without round-tripping through any other API.
+	if parsed.Run.Bots.Kind == 0 {
+		t.Errorf("expected populated Bots node, got zero-value (Kind=0)")
+	}
+}
