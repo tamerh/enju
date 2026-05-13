@@ -49,12 +49,11 @@ const ContainerScratchDir = "/scratch"
 // spec.SnapshotDir is set. Read-only bind: the snapshot is
 // canonical and immutable across iterations.
 //
-// When this bind is active, it becomes the script's working
-// directory. Sibling files in the template (scripts/helper.sh,
-// lib/utils.py, data/fixture.json, …) resolve naturally
-// against `.` without the template author needing to know
-// any env-var dance. Outputs still go to /scratch via
-// $ENJU_SCRATCH; the snapshot view is read-only by design.
+// Scripts reach sibling template files via $ENJU_TEMPLATE_DIR
+// (which the env-forwarding loop rewrites to /template).
+// The script's CWD is /scratch — scratch wins over snapshot —
+// so relative-path writes land where writes_artifacts pickup
+// looks.
 const ContainerTemplateDir = "/template"
 
 // Container-runtime selectors. Singularity is collapsed to
@@ -127,21 +126,20 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 	}
 
 	// CWD selection (priority order):
-	//   1. SnapshotDir set → /template. The template tree is the
-	//      script's natural read-only working directory; sibling
-	//      files in the snapshot resolve against `.` via the
-	//      bind-mount below.
-	//   2. TaskScratchDir set → /scratch. Predates the snapshot
-	//      bind; keeps the contract for specs that didn't migrate.
-	//   3. Otherwise → /workspace. Legacy fallback.
+	//   1. TaskScratchDir set → /scratch. Per-task writable sandbox;
+	//      relative-path writes land where writes_artifacts pickup
+	//      looks. Read-only snapshot access is via $ENJU_TEMPLATE_DIR
+	//      (mapped to /template) for sibling files.
+	//   2. SnapshotDir set, no scratch → /template. Legacy branch.
+	//   3. Otherwise → /workspace. Deep legacy fallback.
 	// Either way the workspace is bind-mounted so the script
 	// file itself (which lives under workDir) is reachable.
 	containerCWD := ContainerWorkDir
-	if spec.TaskScratchDir != "" {
-		containerCWD = ContainerScratchDir
-	}
 	if spec.SnapshotDir != "" {
 		containerCWD = ContainerTemplateDir
+	}
+	if spec.TaskScratchDir != "" {
+		containerCWD = ContainerScratchDir
 	}
 
 	args := []string{

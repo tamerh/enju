@@ -1,22 +1,18 @@
 package compute
 
-// Tests for the snapshot-as-CWD shape: scripts run with the run's
-// frozen template-snapshot as their working directory (read sibling
-// files like ./scripts/helper.sh and import lib.utils naturally),
-// scratch is the writable per-iter sandbox exposed via ENJU_SCRATCH.
+// Tests for the scratch-as-CWD shape: scripts run with their per-task
+// scratch directory as the working directory (relative-path writes
+// like `data/$ITEM/s1.txt` land where writes_artifacts pickup looks).
+// The run's frozen snapshot is mounted read-only and accessed via
+// $ENJU_TEMPLATE_DIR / $ENJU_REPO_DIR for sibling files.
 //
 // Two layers under test:
-//   1. ScriptCwdFor priority — snapshot > scratch > workDir.
-//   2. Container argv shape with SnapshotDir set — second bind mount
-//      (snapshot:/template:ro,z), CWD switches to /template, env
-//      values pointing at the host snapshot path get rewritten to
-//      /template.
-//
-// Host-side chmod enforcement was dropped with the per-run-snapshot
-// redesign — read-only is convention now; scripts that write to the
-// snapshot are buggy and should target $ENJU_SCRATCH. Container path
-// still gets a kernel-side :ro bind for the strong guarantee inside
-// the sandbox.
+//   1. ScriptCwdFor priority — scratch > snapshot > workDir.
+//   2. Container argv shape with SnapshotDir + scratch set — the
+//      snapshot binds at /template:ro,z but CWD goes to /scratch.
+//      Env values pointing at the host snapshot path still get
+//      rewritten to /template so $ENJU_TEMPLATE_DIR resolves
+//      correctly from the script's POV.
 
 import (
 	"fmt"
@@ -26,27 +22,28 @@ import (
 
 // ─── ScriptCwdFor ──────────────────────────────────────────────
 
-// TestScriptCwdFor_SnapshotWinsWhenSet pins the priority order:
-// when SnapshotDir is set, it's the script's CWD regardless of
-// whether scratch is also configured. The snapshot is the read
-// channel; scratch is the write channel.
-func TestScriptCwdFor_SnapshotWinsWhenSet(t *testing.T) {
+// TestScriptCwdFor_ScratchWinsWhenSet pins the priority order:
+// scratch is the script's CWD whenever it's set, even alongside a
+// snapshot. Scripts that write relative paths (`data/$ITEM/s1.txt`)
+// land in scratch, where writes_artifacts pickup looks; the snapshot
+// is reached via $ENJU_TEMPLATE_DIR / $ENJU_REPO_DIR for reads.
+func TestScriptCwdFor_ScratchWinsWhenSet(t *testing.T) {
 	spec := Spec{
 		SnapshotDir:    "/host/snap",
 		TaskScratchDir: "/host/scratch",
 	}
-	if got := ScriptCwdFor(spec, "/host/work"); got != "/host/snap" {
-		t.Errorf("ScriptCwdFor = %q, want %q (snapshot wins over scratch)", got, "/host/snap")
+	if got := ScriptCwdFor(spec, "/host/work"); got != "/host/scratch" {
+		t.Errorf("ScriptCwdFor = %q, want %q (scratch wins over snapshot)", got, "/host/scratch")
 	}
 }
 
-// TestScriptCwdFor_ScratchWhenNoSnapshot pins the pre-snapshot
-// behavior is preserved for legacy specs that don't carry a
-// SnapshotDir. Critical regression guard for inline-YAML runs.
-func TestScriptCwdFor_ScratchWhenNoSnapshot(t *testing.T) {
-	spec := Spec{TaskScratchDir: "/host/scratch"}
-	if got := ScriptCwdFor(spec, "/host/work"); got != "/host/scratch" {
-		t.Errorf("ScriptCwdFor with no snapshot = %q, want scratch %q", got, "/host/scratch")
+// TestScriptCwdFor_SnapshotWhenNoScratch pins the legacy fallback for
+// the rare callers that populate SnapshotDir but not TaskScratchDir.
+// Without scratch the snapshot is the only candidate above workDir.
+func TestScriptCwdFor_SnapshotWhenNoScratch(t *testing.T) {
+	spec := Spec{SnapshotDir: "/host/snap"}
+	if got := ScriptCwdFor(spec, "/host/work"); got != "/host/snap" {
+		t.Errorf("ScriptCwdFor with no scratch = %q, want snapshot %q", got, "/host/snap")
 	}
 }
 
@@ -61,12 +58,11 @@ func TestScriptCwdFor_WorkDirFallback(t *testing.T) {
 
 // ─── Container argv with snapshot ──────────────────────────────
 
-// TestBuildContainerArgs_SnapshotBindAndCWD pins the load-bearing
-// container-arg behavior under the new shape: when SnapshotDir is
-// set, a second bind mount lands the snapshot at /template as
-// read-only, the CWD switches to /template, and env values that
-// reference the host snapshot path get rewritten to the in-
-// container view.
+// TestBuildContainerArgs_SnapshotBindAndCWD pins the container-arg
+// behavior: when SnapshotDir is set, a second bind mount lands the
+// snapshot at /template:ro,z, but CWD goes to /scratch (scratch wins
+// over snapshot). Env values referencing the host snapshot path still
+// get rewritten to /template so $ENJU_TEMPLATE_DIR resolves correctly.
 func TestBuildContainerArgs_SnapshotBindAndCWD(t *testing.T) {
 	t.Setenv("ENJU_SHARED_ROOT", "")
 
@@ -98,10 +94,11 @@ func TestBuildContainerArgs_SnapshotBindAndCWD(t *testing.T) {
 		t.Errorf("missing scratch bind %q in args: %v", wantScratchBind, args)
 	}
 
-	// Container CWD is /template when snapshot is bound — that's
-	// the snapshot-as-CWD shape's load-bearing claim.
-	if !hasFlagValue(args, "-w", "/template") {
-		t.Errorf("expected -w /template, got: %v", args)
+	// Container CWD is /scratch even with the snapshot bound —
+	// scratch wins over snapshot so relative-path writes land
+	// where writes_artifacts pickup looks.
+	if !hasFlagValue(args, "-w", "/scratch") {
+		t.Errorf("expected -w /scratch, got: %v", args)
 	}
 
 	// Env values pointing at the host snapshot path translate to

@@ -1,14 +1,13 @@
 package compute_test
 
-// End-to-end integration tests for the snapshot-as-CWD shape.
+// End-to-end integration tests for the scratch-as-CWD shape with
+// a snapshot side-bind.
 //
 // These complement the pure-unit tests in scratch_tree_test.go by
 // running a real compute.Run against a real workflow + bare with
 // a realistic snapshot tree on disk. The point: prove that scripts
-// can reach sibling files via relative paths when SnapshotDir is
-// set, and that the chmod-readonly defense actually blocks
-// pollution attempts when invoked from production-shaped code
-// paths.
+// run in scratch (their writable per-task sandbox) and reach
+// sibling files in the snapshot via $ENJU_TEMPLATE_DIR.
 //
 // We reuse initBareForComputeTest from the worktree-isolation
 // integration test (same package, defined there).
@@ -46,17 +45,16 @@ func seedSnapshotTree(t *testing.T, base string) string {
 		t.Fatal(err)
 	}
 
-	// entry.sh sources lib/utils.sh and runs scripts/helper.sh —
-	// both via relative paths against the snapshot CWD. Output
+	// entry.sh sources lib/utils.sh and runs scripts/helper.sh
+	// from the snapshot via $ENJU_TEMPLATE_DIR. CWD is scratch
+	// (per the scratch-as-CWD shape) — the snapshot is read-only
+	// substrate, reached by env-var, not by `.` traversal. Output
 	// goes to stdout, which the wrapper captures as Result.Content
-	// (the canonical result channel for compute tasks). Writing
-	// to $ENJU_SCRATCH would also work as an output channel but
-	// the wrapper wipes scratch on teardown, so we use stdout
-	// for the test's verification path.
+	// (the canonical result channel for compute tasks).
 	entry := `#!/bin/sh
 set -e
-. ./lib/utils.sh
-./scripts/helper.sh
+. "$ENJU_TEMPLATE_DIR/lib/utils.sh"
+"$ENJU_TEMPLATE_DIR/scripts/helper.sh"
 greet
 echo "siblings-ok"
 `
@@ -100,18 +98,17 @@ func chmodTreeWritable(t *testing.T, root string) {
 	})
 }
 
-// TestSnapshotAsCWD_SiblingsReachable is the load-bearing
-// end-to-end assertion for the spec: with SnapshotDir set, a
-// script's `./scripts/...` and `./lib/...` relative references
-// resolve naturally against the full template tree. The script
-// itself runs in the snapshot dir, sourcing lib/utils.sh and
-// invoking scripts/helper.sh both as relative paths, then writes
-// its output to $ENJU_SCRATCH.
+// TestScratchAsCWD_SnapshotReachableViaEnv is the load-bearing
+// end-to-end assertion for the shape: scripts run with scratch as
+// CWD, and reach sibling files in the run's snapshot through
+// $ENJU_TEMPLATE_DIR. The script sources lib/utils.sh and invokes
+// scripts/helper.sh both via the env-var, never via `.` relative.
 //
-// Pre-fix shape: scratch had only entry.sh + context.json, so
-// any `./scripts/<x>.sh` reference would have failed with "No
-// such file or directory."
-func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
+// The flip happened in Phase 8.h: snapshot is the read-only substrate
+// (mounted under $ENJU_TEMPLATE_DIR / $ENJU_REPO_DIR), scratch is the
+// per-task writable sandbox + CWD. Relative-path writes in scripts
+// land in scratch, where writes_artifacts pickup looks.
+func TestScratchAsCWD_SnapshotReachableViaEnv(t *testing.T) {
 	bare := initBareForComputeTest(t)
 	wsRoot := t.TempDir()
 	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
@@ -160,10 +157,14 @@ func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
 		SnapshotDir:     snap,
 	}
 
-	// ENJU_SCRATCH is set by buildComputeEnv in service/execute.go
-	// in production. Since we're calling compute.Run directly,
-	// add it explicitly so the script's `${ENJU_SCRATCH}` resolves.
-	env := append(os.Environ(), "ENJU_SCRATCH="+scratch)
+	// ENJU_SCRATCH + ENJU_TEMPLATE_DIR are set by buildComputeEnv
+	// in service/execute.go in production. Since we're calling
+	// compute.Run directly, add them explicitly so the script
+	// can resolve sibling lib/utils.sh and scripts/helper.sh.
+	env := append(os.Environ(),
+		"ENJU_SCRATCH="+scratch,
+		"ENJU_TEMPLATE_DIR="+snap,
+	)
 
 	res := compute.Run(context.Background(), wf, spec,
 		env, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -178,14 +179,15 @@ func TestSnapshotAsCWD_SiblingsReachable(t *testing.T) {
 	// Script stdout becomes res.Content. It must contain output
 	// from both reached siblings: helper.sh's "helper ran" line
 	// AND the greet() function from the sourced lib/utils.sh.
-	// Both are load-bearing — they prove `./scripts/...` and
-	// `. ./lib/...` resolve naturally with snapshot-as-CWD.
+	// Both are load-bearing — they prove
+	// `$ENJU_TEMPLATE_DIR/scripts/...` and `. $ENJU_TEMPLATE_DIR/lib/...`
+	// reach the snapshot tree even though CWD is scratch.
 	if !strings.Contains(res.Content, "helper ran") {
-		t.Errorf("res.Content missing helper.sh output (./scripts/ sibling unreachable?): %q",
+		t.Errorf("res.Content missing helper.sh output ($ENJU_TEMPLATE_DIR/scripts unreachable?): %q",
 			res.Content)
 	}
 	if !strings.Contains(res.Content, "hello from lib/utils.sh") {
-		t.Errorf("res.Content missing lib/utils.sh greet output (./lib/ sibling unreachable?): %q",
+		t.Errorf("res.Content missing lib/utils.sh greet output ($ENJU_TEMPLATE_DIR/lib unreachable?): %q",
 			res.Content)
 	}
 	if !strings.Contains(res.Content, "siblings-ok") {

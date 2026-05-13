@@ -669,13 +669,11 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	trackedDecls, untrackedDecls := splitArtifactsByTrack(spec.WritesArtifacts)
 
 	// Tracked writes_artifacts expand against scratch when it's
-	// set, falling back to the script's CWD otherwise. Under the
-	// snapshot-as-CWD shape, scriptCwd is the read-only template
-	// snapshot — scripts can't write there, so they output to
-	// $ENJU_SCRATCH (or the legacy aliases ENJU_PROJECT_DIR /
-	// ENJU_TASK_DIR which all point at scratch). The wrapper
-	// must look in the same place. Legacy specs without scratch
-	// keep the pre-existing CWD-based contract.
+	// set, falling back to the script's CWD otherwise. With the
+	// scratch-as-CWD shape, scriptCwd IS the scratch dir, so
+	// outputDir lines up naturally — scripts that write
+	// `data/foo.txt` (relative) land where pickup looks. The
+	// fallback covers legacy specs that didn't populate scratch.
 	outputDir := scriptCwd
 	if spec.TaskScratchDir != "" {
 		outputDir = spec.TaskScratchDir
@@ -733,8 +731,8 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 		// Read back from outputDir, which is where the script
 		// wrote its outputs and where ExpandAgainstWorkdir
 		// successfully resolved each path moments ago. Under
-		// the snapshot-as-CWD shape, scriptCwd may be the
-		// read-only snapshot; outputs land in scratch instead.
+		// the scratch-as-CWD shape, outputDir == scriptCwd
+		// == scratch — one path, no fan-out.
 		full := filepath.Join(outputDir, enjugit.ArtifactPath(e.Path))
 		body, rerr := os.ReadFile(full)
 		if rerr != nil {
