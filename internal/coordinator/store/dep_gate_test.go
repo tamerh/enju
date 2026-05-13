@@ -215,3 +215,169 @@ func TestDepGate_SubmittedDoesNotSatisfyReadsArtifacts(t *testing.T) {
 		t.Fatalf("reader.State = %q, want ready (writer ACCEPTED unblocks artifact-state gate)", reader.State)
 	}
 }
+
+// TestDepGate_ReviewerReadsSubmittedWritersArtifact pins the
+// reviewer-exception carve-out in the artifact-visibility gate.
+//
+// The deadlock this prevents:
+//
+//   writer  (action:answer, writes _summary.md, has downstream review)
+//     │ submits → state=SUBMITTED
+//     │ collectAcceptedMerges suppresses self-merge (review pending)
+//     ▼
+//   reviewer (action:review, reviews:writer, reads_artifacts [_summary.md])
+//     │
+//     ▼
+//   Without the carve-out: artifact-visibility gate requires writer
+//   ACCEPTED → reviewer stays PENDING → reviewer can't review →
+//   writer can't reach ACCEPTED. Frozen forever.
+//
+// With the carve-out: writer SUBMITTED + reader's reviews_target
+// matches writer's BuildReviewsTargetKey → gate accepts → reviewer
+// becomes READY. Reviewer claims, reads the writer's iter-branch
+// commit (via artifact-index's last_commit_sha — content lives on
+// the topic branch even though main hasn't merged yet), approves,
+// the review's merge brings the writer's content with it.
+//
+// TP53 debug bundle #3 hit this; the workflow pairs `reviews:` with
+// `reads_artifacts` on the same review task — first showcase to
+// trip the exact deadlock.
+func TestDepGate_ReviewerReadsSubmittedWritersArtifact(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	run, _ := s.GetRun(runID)
+	projectID := run.ProjectID
+	alice := createTestCitizen(t, s, "alice", "tok-dg3")
+
+	// Writer: action=answer, writes _summary.md, ends at SUBMITTED.
+	writerID := makeTaskWithAction(t, s, runID, "final_summary", "answer", TaskReady)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetClaim{TaskID: writerID, CitizenID: alice, Deadline: time.Now().Add(time.Hour)},
+	}}); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		RecordSubmission{
+			TaskID: writerID, CitizenID: alice,
+			CommitSHA: "writer-commit", TokensUsed: 1, EstimatedTokens: 1,
+		},
+	}}); err != nil {
+		t.Fatalf("submit writer: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		MoveArtifact{Artifact: ArtifactRecord{
+			ProjectID:  projectID,
+			Branch:     "main",
+			Path:       "sections/_summary.md",
+			LastTaskID: writerID,
+			LastWriter: alice,
+			LastRunID:  runID,
+			CommitSHA:  "writer-commit",
+			Tracked:    true,
+			CreatedAt:  now, UpdatedAt: now,
+		}},
+	}}); err != nil {
+		t.Fatalf("upsert artifact: %v", err)
+	}
+
+	// Reviewer: action=review, reviews_target points at the writer's
+	// def, declares reads_artifacts on the writer's output. State=
+	// PENDING.
+	if err := helperCreateTask(s, &TaskRecord{
+		ID: "1:1:review_summary", RunID: runID, Seq: 99, TaskDefID: "review_summary",
+		Action:         "review",
+		ResultType:     "text",
+		State:          TaskPending,
+		ReadsArtifacts: `["sections/_summary.md"]`,
+		ReviewsTarget:  BuildReviewsTargetKey("final_summary", ""), // singleton form
+		AssignTo:       `["alice"]`,
+		CreatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cascade. The reviewer-exception should let SUBMITTED writer
+	// satisfy the artifact-visibility gate, so the reviewer becomes
+	// READY without waiting for ACCEPTED.
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		UpdateReadyTasks{RunID: runID},
+	}}); err != nil {
+		t.Fatalf("cascade: %v", err)
+	}
+	reviewer, _ := s.GetTask("1:1:review_summary")
+	if reviewer == nil {
+		t.Fatal("reviewer task missing")
+	}
+	if reviewer.State != TaskReady {
+		t.Fatalf("reviewer.State = %q, want ready — reviewer-exception in artifact-visibility gate should allow SUBMITTED writer to satisfy when reader.reviews_target matches writer (TP53 debug bundle #3 deadlock)", reviewer.State)
+	}
+}
+
+// TestDepGate_NonReviewerStillBlockedBySubmittedWriter pins that
+// the reviewer-exception is SCOPED to reviewers. A non-review reader
+// that declares reads_artifacts on the writer's output stays PENDING
+// when the writer is SUBMITTED — the Phase 8.3 silent-cascade-stall
+// fix isn't loosened for general consumers.
+func TestDepGate_NonReviewerStillBlockedBySubmittedWriter(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	run, _ := s.GetRun(runID)
+	projectID := run.ProjectID
+	alice := createTestCitizen(t, s, "alice", "tok-dg4")
+
+	writerID := makeTaskWithAction(t, s, runID, "writer", "answer", TaskReady)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetClaim{TaskID: writerID, CitizenID: alice, Deadline: time.Now().Add(time.Hour)},
+	}}); err != nil {
+		t.Fatalf("claim writer: %v", err)
+	}
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		RecordSubmission{
+			TaskID: writerID, CitizenID: alice,
+			CommitSHA: "writer-commit", TokensUsed: 1, EstimatedTokens: 1,
+		},
+	}}); err != nil {
+		t.Fatalf("submit writer: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		MoveArtifact{Artifact: ArtifactRecord{
+			ProjectID: projectID, Branch: "main",
+			Path:       "out/payload.md",
+			LastTaskID: writerID, LastWriter: alice, LastRunID: runID,
+			CommitSHA: "writer-commit", Tracked: true,
+			CreatedAt: now, UpdatedAt: now,
+		}},
+	}}); err != nil {
+		t.Fatalf("upsert artifact: %v", err)
+	}
+
+	// Consumer: action=answer (NOT review), reviews_target empty.
+	// Should stay PENDING while writer is SUBMITTED — same
+	// behavior as the pre-carve-out test above.
+	if err := helperCreateTask(s, &TaskRecord{
+		ID: "1:1:consumer", RunID: runID, Seq: 99, TaskDefID: "consumer",
+		Action:         "answer",
+		ResultType:     "text",
+		State:          TaskPending,
+		ReadsArtifacts: `["out/payload.md"]`,
+		ReviewsTarget:  "", // empty — NOT a reviewer
+		AssignTo:       `["alice"]`,
+		CreatedAt:      time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		UpdateReadyTasks{RunID: runID},
+	}}); err != nil {
+		t.Fatalf("cascade: %v", err)
+	}
+	consumer, _ := s.GetTask("1:1:consumer")
+	if consumer.State != TaskPending {
+		t.Fatalf("consumer.State = %q, want pending — non-reviewer reader must still gate on writer ACCEPTED (carve-out is scoped to reviewers)", consumer.State)
+	}
+}

@@ -1722,11 +1722,17 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 		readsArtifacts string
 		action         string
 		assignTo       string
+		// reviewsTarget is the canonical reviews_target key from
+		// BuildReviewsTargetKey (bare def id for singletons,
+		// "instanceKey:defID" for for_each instances). Empty for
+		// non-review tasks. Used by the artifact-visibility gate's
+		// reviewer-exception below.
+		reviewsTarget string
 	}
 	var pending []pendingTask
 	{
 		rows, err := q.Query(
-			`SELECT id, depends_on, reads_artifacts, action, COALESCE(assign_to, '') FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
+			`SELECT id, depends_on, reads_artifacts, action, COALESCE(assign_to, ''), COALESCE(reviews_target, '') FROM tasks WHERE run_id = ? AND state = 'pending'`, runID,
 		)
 		if err != nil {
 			return nil, err
@@ -1737,7 +1743,7 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 		// closing here is a no-op cost. Same pattern below.
 		for rows.Next() {
 			var pt pendingTask
-			if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts, &pt.action, &pt.assignTo); err != nil {
+			if err := rows.Scan(&pt.id, &pt.dependsOn, &pt.readsArtifacts, &pt.action, &pt.assignTo, &pt.reviewsTarget); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -1858,6 +1864,22 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 					// run branch — the silent-cascade-stall bug
 					// Phase 8 closes.
 					//
+					// Reviewer exception: when the pending task is
+					// the REVIEW of the writer (pt.reviewsTarget
+					// matches the writer's BuildReviewsTargetKey),
+					// SUBMITTED counts as visible too. A reviewer's
+					// whole job is to read SUBMITTED content and
+					// decide approve/reject — making it wait for
+					// ACCEPTED deadlocks against the merge gate that
+					// holds the writer at SUBMITTED until review
+					// approves (see collectAcceptedMerges'
+					// skipMergeOfSelf logic). The reader resolves
+					// the actual file bytes via ReadFileAtCommit
+					// against the artifact-index's last_commit_sha
+					// (the writer's iter-branch tip), not via main —
+					// so reading SUBMITTED-but-not-merged content
+					// works.
+					//
 					// Empty/NULL last_task_id passes through
 					// (orphan rows from legacy paths or test
 					// fixtures) so the gate doesn't accidentally
@@ -1868,13 +1890,24 @@ func updateReadyTasksOn(q dbExecQueryer, runID int64) ([]ReadiedTask, error) {
 						   AND (
 						     a.last_task_id IS NULL OR a.last_task_id = '' OR
 						     EXISTS (
-						       SELECT 1 FROM tasks
-						       WHERE tasks.id = a.last_task_id
-						         AND tasks.state IN ('accepted', 'skipped')
+						       SELECT 1 FROM tasks writer
+						       WHERE writer.id = a.last_task_id
+						         AND (
+						           writer.state IN ('accepted', 'skipped')
+						           OR (
+						             writer.state = 'submitted'
+						             AND ? != ''
+						             AND ? = CASE
+						               WHEN writer.instance_key = '' THEN writer.task_def_id
+						               ELSE writer.instance_key || ':' || writer.task_def_id
+						             END
+						           )
+						         )
 						     )
 						   )
 						 LIMIT 1`,
 						projectID, branch, p,
+						pt.reviewsTarget, pt.reviewsTarget,
 					).Scan(&one)
 					if err == sql.ErrNoRows {
 						allDone = false
