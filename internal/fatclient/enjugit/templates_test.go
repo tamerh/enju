@@ -115,11 +115,16 @@ func TestLoadTemplate_RejectsPathEscapes(t *testing.T) {
 	}
 }
 
-func TestLoadTemplate_OutsideRoots(t *testing.T) {
+func TestLoadTemplate_AcceptsAnyPath(t *testing.T) {
+	// Post-Phase-8: workflow YAMLs live anywhere in the repo.
+	// LoadTemplate accepts any non-traversal path. The lookup
+	// fails with "not found" when the file isn't actually there;
+	// that's a different (correct) error class than the legacy
+	// "must live under enju/templates/" guard this test replaces.
 	wf, _ := makeWorkflow(t)
 	_, err := wf.LoadTemplate("totally/elsewhere")
-	if err == nil || !strings.Contains(err.Error(), "must live under") {
-		t.Errorf("expected 'must live under' error, got %v", err)
+	if err != nil && strings.Contains(err.Error(), "must live under") {
+		t.Errorf("LoadTemplate should not restrict templates to a hardcoded root; got: %v", err)
 	}
 }
 
@@ -155,19 +160,23 @@ func TestLoadTemplate_ManifestForm(t *testing.T) {
 	}
 }
 
-func TestLoadTemplate_ManifestAtRootRejected(t *testing.T) {
-	wf, _ := makeWorkflow(t)
-	_, err := wf.LoadTemplate("enju/templates/enju.yaml")
-	if err == nil || !strings.Contains(err.Error(), "must live inside a bundle subdirectory") {
-		t.Errorf("expected bundle-subdir error, got %v", err)
-	}
-}
+func TestLoadTemplate_RootLevelYAML(t *testing.T) {
+	// Post-Phase-8: a workflow YAML can live at the repo root
+	// (e.g. workflow.yaml). LoadTemplate treats the path as the
+	// manifest and resolves bundleDir to "" (root).
+	wf, fake := makeWorkflow(t)
+	fake.resolveMap["refs/heads/main"] = "tipsha"
+	fake.readContent["tipsha:my-workflow.yaml"] = []byte("name: root-workflow\nversion: 1\ntasks:\n  - id: t1\n    action: answer\n    prompt: hi\n")
 
-func TestLoadTemplate_LegacySingleFile(t *testing.T) {
-	wf, _ := makeWorkflow(t)
-	_, err := wf.LoadTemplate("enju/templates/old-style.yaml")
-	if err == nil || !strings.Contains(err.Error(), "legacy single-file") {
-		t.Errorf("expected legacy migration hint, got %v", err)
+	loaded, err := wf.LoadTemplate("my-workflow.yaml")
+	if err != nil {
+		t.Fatalf("LoadTemplate root-level yaml: %v", err)
+	}
+	if loaded.Path != "my-workflow.yaml" {
+		t.Errorf("Path: got %q, want my-workflow.yaml", loaded.Path)
+	}
+	if loaded.BundleDir != "" {
+		t.Errorf("BundleDir for root-level yaml: got %q, want empty string", loaded.BundleDir)
 	}
 }
 
@@ -235,20 +244,36 @@ func TestReadBundleFiles_RebasePathsToTarget(t *testing.T) {
 	}
 }
 
-func TestResolveBundlePathShape_DirAndManifest(t *testing.T) {
-	roots := []string{"enju/templates"}
-	bundleDir, manifestPath, err := resolveBundlePathShape("enju/templates/foo", roots)
-	if err != nil {
-		t.Fatal(err)
+func TestResolveBundlePathShape(t *testing.T) {
+	cases := []struct {
+		in            string
+		wantBundleDir string
+		wantManifest  string
+	}{
+		// Dir form — manifest assumed at <dir>/enju.yaml.
+		{"workflows/foo", "workflows/foo", "workflows/foo/enju.yaml"},
+		{"enju/templates/gwas", "enju/templates/gwas", "enju/templates/gwas/enju.yaml"},
+		// Manifest form — explicit *.yaml path is the manifest.
+		// bundleDir = its containing dir.
+		{"workflows/bar/enju.yaml", "workflows/bar", "workflows/bar/enju.yaml"},
+		{"tools/lint/.enju-workflow.yaml", "tools/lint", "tools/lint/.enju-workflow.yaml"},
+		// Root-level YAML — bundleDir collapses to empty string
+		// (the project root).
+		{"workflow.yaml", "", "workflow.yaml"},
+		{"my-pipeline.yml", "", "my-pipeline.yml"},
 	}
-	if bundleDir != "enju/templates/foo" || manifestPath != "enju/templates/foo/enju.yaml" {
-		t.Errorf("dir form: got bundleDir=%q manifestPath=%q", bundleDir, manifestPath)
-	}
-	bundleDir, manifestPath, err = resolveBundlePathShape("enju/templates/bar/enju.yaml", roots)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bundleDir != "enju/templates/bar" || manifestPath != "enju/templates/bar/enju.yaml" {
-		t.Errorf("manifest form: got bundleDir=%q manifestPath=%q", bundleDir, manifestPath)
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			bundleDir, manifestPath, err := resolveBundlePathShape(tc.in)
+			if err != nil {
+				t.Fatalf("resolveBundlePathShape(%q): %v", tc.in, err)
+			}
+			if bundleDir != tc.wantBundleDir {
+				t.Errorf("bundleDir: got %q, want %q", bundleDir, tc.wantBundleDir)
+			}
+			if manifestPath != tc.wantManifest {
+				t.Errorf("manifestPath: got %q, want %q", manifestPath, tc.wantManifest)
+			}
+		})
 	}
 }

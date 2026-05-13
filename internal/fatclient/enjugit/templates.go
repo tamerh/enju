@@ -196,30 +196,28 @@ func paramSummaries(ps []enjuYaml.ParamDef) []ParamSummary {
 	return out
 }
 
-// LoadTemplate reads a template bundle by either:
-//   - its directory path (e.g. "enju/templates/gwas-analysis")
-//   - the full path to its manifest (e.g. "enju/templates/gwas-analysis/enju.yaml")
+// LoadTemplate reads a workflow YAML by either:
+//   - its directory path (e.g. "workflows/gwas-analysis") —
+//     the YAML inside is named enju.yaml by convention
+//   - the full path to the YAML file (e.g. "workflows/gwas-analysis/enju.yaml",
+//     or any "*.yaml" anywhere in the repo)
 //
 // Tree-first, worktree-fallback: primary source is the
 // default-branch tree (so LoadTemplate works from any workspace
 // branch). The worktree fallback supports the author-on-disk
-// UX — a user writes enju.yaml into the worktree without
+// UX — a user writes the YAML into the worktree without
 // committing, then create_run's EnsureBundleOnDefault auto-commits.
 //
 // Default branch and workdir are read from workflow state —
 // set the default branch via SetDefaultBranch after Workflow
-// construction. Templates always live under
-// corelayout.DefaultTemplatesDir on the default branch.
+// construction. Workflow YAMLs can live anywhere in the repo
+// at any depth.
 func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
-	roots := []string{corelayout.DefaultTemplatesDir}
 	clean := filepath.ToSlash(filepath.Clean(repoRelPath))
 	if strings.Contains(clean, "../") || clean != repoRelPath {
 		return nil, fmt.Errorf("template path %q contains disallowed path components", repoRelPath)
 	}
-	if err := assertUnderRoots(repoRelPath, roots); err != nil {
-		return nil, err
-	}
-	bundleDir, manifestPath, err := resolveBundlePathShape(repoRelPath, roots)
+	bundleDir, manifestPath, err := resolveBundlePathShape(repoRelPath)
 	if err != nil {
 		return nil, err
 	}
@@ -449,44 +447,32 @@ func (w *Workflow) resolveDefaultBranchSHA(branch string) (string, error) {
 	return "", fmt.Errorf("resolving default branch %s: %w", branch, err)
 }
 
-// assertUnderRoots checks the path lives under at least one
-// configured root. Surfaces a single clear error so a caller
-// who typos doesn't get a "not found" that hides the real fix.
-func assertUnderRoots(repoRelPath string, roots []string) error {
-	for _, r := range roots {
-		if repoRelPath == r || strings.HasPrefix(repoRelPath, r+"/") {
-			return nil
-		}
-	}
-	return fmt.Errorf("template path %q must live under one of: %s", repoRelPath, strings.Join(roots, ", "))
-}
-
 // resolveBundlePathShape classifies a caller-supplied path into
 // (bundleDir, manifestPath) on shape alone — no tree or
 // filesystem check. So both tree and filesystem fallback paths
 // share the same classification logic.
-func resolveBundlePathShape(repoRelPath string, roots []string) (bundleDir, manifestPath string, err error) {
+//
+// Accepted shapes:
+//   - Manifest form: a path ending in a .yaml/.yml extension is
+//     the workflow YAML itself; its directory is the bundle.
+//     A bare ".yaml" at the repo root resolves to bundleDir="."
+//     (the project root).
+//   - Dir form: any other path is treated as a directory
+//     containing a default-named manifest (enju.yaml).
+func resolveBundlePathShape(repoRelPath string) (bundleDir, manifestPath string, err error) {
 	pth := strings.TrimSuffix(repoRelPath, "/")
-	// Manifest form: ends in /<BundleManifestName>.
-	if strings.HasSuffix(pth, "/"+corelayout.BundleManifestName) {
-		bundleDir = strings.TrimSuffix(pth, "/"+corelayout.BundleManifestName)
-		// Disallow manifest sitting directly in a templates root.
-		for _, r := range roots {
-			if bundleDir == r {
-				return "", "", fmt.Errorf("template manifest must live inside a bundle subdirectory, e.g. %s/NAME/%s", r, corelayout.BundleManifestName)
-			}
-		}
-		return bundleDir, pth, nil
+	if pth == "" {
+		return "", "", fmt.Errorf("template path is empty")
 	}
-	// Legacy single-file `.yaml` in the root → emit migration hint.
+	// Manifest form: any *.yaml / *.yml file is the workflow YAML.
+	// Its containing directory is the bundle.
 	if strings.HasSuffix(pth, ".yaml") || strings.HasSuffix(pth, ".yml") {
-		base := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(pth), ".yaml"), ".yml")
-		parentDir := filepath.ToSlash(filepath.Dir(pth))
-		return "", "", fmt.Errorf(
-			"legacy single-file template path %q — templates are now directory bundles. "+
-				"Move %s to %s/%s/%s and reference it as %s/%s (or the full manifest path)",
-			repoRelPath, repoRelPath, parentDir, base, corelayout.BundleManifestName, parentDir, base)
+		dir := filepath.ToSlash(filepath.Dir(pth))
+		if dir == "." {
+			dir = ""
+		}
+		return dir, pth, nil
 	}
-	// Dir form.
+	// Dir form: <pth>/<BundleManifestName>.
 	return pth, pth + "/" + corelayout.BundleManifestName, nil
 }
