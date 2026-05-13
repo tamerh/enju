@@ -3,8 +3,8 @@
 //
 // Run() long-polls the coordinator's events endpoint for one
 // project and appends each received event as a JSON line to
-// {ProjectDir}/enju/events/live.jsonl, advancing the cursor in
-// {ProjectDir}/enju/events/cursor.json after every batch.
+// {ProjectDir}/.enju/events/live.jsonl, advancing the cursor in
+// {ProjectDir}/.enju/events/cursor.json after every batch.
 //
 // That's the entire job. The historical "notifications" tool
 // (with hardcoded interesting-events rules + read/unread
@@ -80,7 +80,7 @@ type Config struct {
 	// in-memory configs leave it blank.
 	//
 	// Invariant: when ProjectDir is set, StateFile is ignored —
-	// the cursor lives at {ProjectDir}/enju/events/cursor.json.
+	// the cursor lives at {ProjectDir}/.enju/events/cursor.json.
 	// StateFile remains for explicit-path tests.
 	ProjectDir string
 
@@ -121,10 +121,10 @@ type Config struct {
 // What it does, end to end:
 //
 //  1. Load saved cursor (last seq seen) from
-//     {ProjectDir}/enju/events/cursor.json.
+//     {ProjectDir}/.enju/events/cursor.json.
 //  2. Long-poll /events?since_seq=N&wait=PollWait.
 //  3. Append each returned event as a JSON line to
-//     {ProjectDir}/enju/events/live.jsonl.
+//     {ProjectDir}/.enju/events/live.jsonl.
 //  4. Advance cursor to the highest seen seq, persist atomically.
 //  5. Repeat.
 //
@@ -317,7 +317,7 @@ func cursorPath(cfg Config) string {
 	if cfg.ProjectDir == "" {
 		return ""
 	}
-	return cfg.ProjectDir + "/enju/events/cursor.json"
+	return cfg.ProjectDir + "/.enju/events/cursor.json"
 }
 
 // liveJSONLPath resolves the append-only event log path. Empty
@@ -326,7 +326,7 @@ func liveJSONLPath(cfg Config) string {
 	if cfg.ProjectDir == "" {
 		return ""
 	}
-	return cfg.ProjectDir + "/enju/events/live.jsonl"
+	return cfg.ProjectDir + "/.enju/events/live.jsonl"
 }
 
 // isAuthError reports whether a poll error came from the

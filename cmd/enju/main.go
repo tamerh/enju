@@ -607,7 +607,7 @@ func defaultCoordinatorURL() string {
 }
 
 // deriveEventsDBPath turns a state-DB path like "/var/enju/state.db"
-// into the sibling "/var/enju/events.db". Bare ":memory:" stays
+// into the sibling "/var/.enju/events.db". Bare ":memory:" stays
 // in-memory (used by some tests). The two databases live in the
 // same directory so operators inspecting the deployment see them
 // next to each other.

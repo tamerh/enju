@@ -7,8 +7,8 @@ package mcphandlers
 // new one for X.
 //
 // All persistent state is project-scoped: the cursor lives at
-// {project_clone}/enju/events/cursor.json, the live event log at
-// {project_clone}/enju/events/live.jsonl, the user's Layer 3
+// {project_clone}/.enju/events/cursor.json, the live event log at
+// {project_clone}/.enju/events/live.jsonl, the user's Layer 3
 // rules at {project_clone}/enju/notify.yaml. There is no cross-
 // session record of "which project was active last time" — a
 // fresh MCP boot stays dormant until the user touches a project.

@@ -98,7 +98,7 @@ type Config struct {
 // importing private types.
 //
 // All notify state is now project-scoped (lives under
-// {project_clone}/enju/events/ and enju/notify.yaml), so the
+// {project_clone}/.enju/events/ and enju/notify.yaml), so the
 // only boot-time inputs are the parent shutdown context and the
 // project clone resolver (Workspace). The previous
 // active-project file is gone — sessions stay dormant until a
@@ -118,10 +118,10 @@ Core model:
 - Reviews are quality gates — you're deciding whether an upstream result is ready to feed into downstream tasks, not doing a line-by-line code review. Decisions: approve (ship it), request_changes (revise, target → READY), reject (fail cascade, target → FAILED terminal), or comment (non-blocking).
 - Every submission produces a git commit. The human is the author; you are credited via Co-Authored-By trailer. This is collaborative work, not autonomous — the human is accountable.
 - Tasks flow through a DAG: upstream results are automatically injected into downstream prompts via {{task.content}} references.
-- Templates are reproducible bundles. enju_create_run(path=enju/templates/foo) snapshots the full bundle (enju.yaml + scripts + data) into enju/runs/{seq}/template-snapshot/ at creation. The run is pinned to that frozen copy — later live-template edits don't affect in-flight runs. Compute scripts resolve from the snapshot.
+- Workflows are recipes committed in the project repo. enju_create_run(path=workflows/foo/enju.yaml) — or any YAML path; root-level (path=enju.yaml) works too — forks a run branch from the base SHA and materializes the snapshot at .enju/runs/{seq}/snapshot/. The run is pinned to that base SHA for reproducibility; later edits to the live workflow YAML don't affect in-flight runs. Compute scripts resolve relative to the workflow YAML's directory inside the snapshot.
 - Compute scripts get both env vars (ENJU_TASK_ID, ENJU_PROJECT_DIR, ENJU_RUN_DIR, ENJU_TEMPLATE_DIR, ENJU_PARAM_<name> for each param + iteration var) and a structured $ENJU_RUN_DIR/context.json with typed params/iteration/artifact declarations. Use env vars for shell, context.json for anything richer.
 
-Starting: enju_create_project takes path=<absolute folder> and smart-detects what to do: empty/nonexistent → init + seed + managed bare; populated, no git → init + commit existing files; existing repo → adopt as-is. Pass path explicitly (your cwd may be a different project than the one being adopted — very common when running inside one repo while creating an Enju project for another). When unclear, ask.
+Starting: enju_create_project takes path=<absolute folder> and smart-detects what to do: empty/nonexistent → init + seed README; populated, no git → init + commit existing files; existing repo → adopt as-is. No managed bare gets created (Phase 8 dropped it; the operator's own .git/ is the single store). Pass path explicitly (your cwd may be a different project than the one being adopted — very common when running inside one repo while creating an Enju project for another). When unclear, ask.
 
 Workflow: list ready tasks → claim one → read the prompt and upstream context → do the work with the human → submit when ready → check run status to see what unlocked → next task.
 

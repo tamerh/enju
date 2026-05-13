@@ -1,7 +1,7 @@
 package test
 
 // Helpers for tests that need to seed a project's
-// {projectDir}/enju/events/live.jsonl directly (the
+// {projectDir}/.enju/events/live.jsonl directly (the
 // inbox-projection tests, primarily). Defined locally so the
 // test package doesn't pull internal/notify just for the JSON
 // shape — we just need to write events the supervisor format
@@ -32,7 +32,7 @@ type notifyEvent struct {
 // to set up the substrate without driving the full poll loop.
 func seedLiveJSONL(t *testing.T, projectDir string, events []notifyEvent) {
 	t.Helper()
-	path := filepath.Join(projectDir, "enju", "events", "live.jsonl")
+	path := filepath.Join(projectDir, ".enju", "events", "live.jsonl")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}

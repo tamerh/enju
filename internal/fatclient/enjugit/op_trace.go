@@ -64,7 +64,7 @@ func (s *stepTrace) appendStep(step Step) { s.t.AppendStep(step) }
 //	defer trace.emit(w.logger, w.traceFile)
 //
 // traceFile is the per-process append-only log opened by
-// Workspace at <projectRoot>/enju/logs/trace-<pid>.log.
+// Workspace at <projectRoot>/.enju/logs/trace-<pid>.log.
 func (s *stepTrace) emit(logger *slog.Logger, traceFile *os.File) {
 	s.t.Emit(logger, traceFile)
 }

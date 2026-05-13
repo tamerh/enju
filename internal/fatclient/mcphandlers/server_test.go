@@ -903,9 +903,11 @@ func TestCreateProjectForceAdoptsPopulatedRepo(t *testing.T) {
 		t.Fatalf("handleCreateProject with force=true: err=%v result=%+v text=%s",
 			err, result, mcpResultText(t, result))
 	}
-	// Scaffold must exist now.
-	if _, err := os.Stat(filepath.Join(dir, "enju")); err != nil {
-		t.Errorf("expected enju/ scaffold after force adopt, got: %v", err)
+	// Post-Phase-8: no enju/ scaffold is created at adoption.
+	// The adopted repo just keeps its existing content; enju
+	// registers it without imposing a directory layout.
+	if _, err := os.Stat(filepath.Join(dir, "enju")); err == nil {
+		t.Errorf("enju/ scaffold should NOT exist post-Phase-8; force-adopt registers without scaffolding")
 	}
 }
 

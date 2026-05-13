@@ -17,7 +17,7 @@ import (
 
 // TestRunAppendsEventsToLiveJSONL pins the v1 contract: the
 // poll loop's only job is poll → append → advance cursor. No
-// dispatch, no adapters. The local enju/events/live.jsonl file
+// dispatch, no adapters. The local .enju/events/live.jsonl file
 // is the substrate that enju_notifications later reads.
 func TestRunAppendsEventsToLiveJSONL(t *testing.T) {
 	dir := t.TempDir()
@@ -50,7 +50,7 @@ func TestRunAppendsEventsToLiveJSONL(t *testing.T) {
 	})
 
 	// live.jsonl should exist and have 2 lines.
-	body, err := os.ReadFile(filepath.Join(dir, "enju", "events", "live.jsonl"))
+	body, err := os.ReadFile(filepath.Join(dir, ".enju", "events", "live.jsonl"))
 	if err != nil {
 		t.Fatalf("read live.jsonl: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestRunAppendsEventsToLiveJSONL(t *testing.T) {
 	}
 
 	// cursor.json should track last_seq=2.
-	curBody, err := os.ReadFile(filepath.Join(dir, "enju", "events", "cursor.json"))
+	curBody, err := os.ReadFile(filepath.Join(dir, ".enju", "events", "cursor.json"))
 	if err != nil {
 		t.Fatalf("read cursor.json: %v", err)
 	}

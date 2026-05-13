@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
 )
@@ -52,7 +53,7 @@ func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username st
 		return nil, fmt.Errorf("opening project clone: %w", err)
 	}
 
-	livePath := filepath.Join(projectDir, "enju", "events", "live.jsonl")
+	livePath := filepath.Join(projectDir, corelayout.EventsDir, "live.jsonl")
 	rows, err := inbox.BuildInbox(livePath, username, &inboxGitDeps{view: view})
 	if err != nil {
 		return nil, err

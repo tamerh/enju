@@ -158,7 +158,7 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 	var target *AdoptionTarget
 	if params.Path != "" {
 		var verr error
-		target, verr = validateAndInspectPath(params.Path, params.Force)
+		target, verr = validateAndInspectPath(params.Path, params.Force, s.alreadyAdoptedByEnju)
 		if verr != nil {
 			return nil, verr
 		}
@@ -240,15 +240,37 @@ type AdoptionTarget struct {
 	DefaultBranch string
 }
 
+// alreadyAdoptedByEnju reports whether `path` is already a
+// known project in the fat-client's registry. Used by the
+// adoption safety gate to skip the "populated unrelated repo"
+// refusal on idempotent re-create.
+func (s *FatClient) alreadyAdoptedByEnju(path string) bool {
+	if s.projectRegistry == nil {
+		return false
+	}
+	entries, err := s.projectRegistry.List()
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.LocalPath == path {
+			return true
+		}
+	}
+	return false
+}
+
 // validateAndInspectPath validates the path and classifies its
 // adoption state. Refuses symlinks and non-directories outright.
 // For directories that already contain a `.git` with commits but
 // no Enju metadata, refuses unless force=true (the LLM-typoed-
-// path footgun).
+// path footgun) OR alreadyAdopted reports the path was previously
+// adopted by this fat-client (idempotent re-create on a path enju
+// already manages — registry knows about it).
 //
 // Side effect: creates the directory when it doesn't exist, so
 // the subsequent materialize step has somewhere to land.
-func validateAndInspectPath(path string, force bool) (*AdoptionTarget, error) {
+func validateAndInspectPath(path string, force bool, alreadyAdopted func(string) bool) (*AdoptionTarget, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("path must be absolute, got %q", path)
 	}
@@ -277,8 +299,9 @@ func validateAndInspectPath(path string, force bool) (*AdoptionTarget, error) {
 		}
 	}
 	// Footgun gate: existing `.git` with commits, no Enju marker.
-	// Force=true is the operator's explicit override.
-	if target.HasGit && !force {
+	// Force=true is the operator's explicit override; an already-
+	// adopted path is implicitly safe (idempotent re-create).
+	if target.HasGit && !force && (alreadyAdopted == nil || !alreadyAdopted(path)) {
 		if reason := DetectPopulatedUnrelatedRepo(path); reason != "" {
 			return nil, fmt.Errorf("%s. To adopt this directory anyway, re-invoke enju_create_project with force=true", reason)
 		}

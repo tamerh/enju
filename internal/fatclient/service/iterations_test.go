@@ -118,7 +118,7 @@ func TestReadResultAtCommit(t *testing.T) {
 	}
 
 	fc := New(Config{WorkspaceRoot: ws.RootDir(), Logger: logger})
-	target, terr := validateAndInspectPath(clone, false)
+	target, terr := validateAndInspectPath(clone, false, nil)
 	if terr != nil {
 		t.Fatalf("inspect: %v", terr)
 	}

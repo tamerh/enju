@@ -43,7 +43,7 @@ func (c *apiClient) handleDescribeTemplate(ctx context.Context, req mcp.CallTool
 	}
 	templatePath, err := req.RequireString("path")
 	if err != nil {
-		return mcp.NewToolResultError("path is required (e.g. 'enju/templates/gwas.yaml')"), nil
+		return mcp.NewToolResultError("path is required (path to a workflow YAML file inside the project's repo — anywhere, e.g. 'enju.yaml', 'workflows/scan-deps/enju.yaml')"), nil
 	}
 	loaded, err := c.fc.DescribeTemplate(ctx, int64(projectID), templatePath)
 	if err != nil {

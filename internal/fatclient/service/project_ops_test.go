@@ -195,7 +195,7 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 			path := tc.setup(t, baseDir)
 
 			// Validate + inspect.
-			target, err := validateAndInspectPath(path, tc.force)
+			target, err := validateAndInspectPath(path, tc.force, nil)
 			if tc.wantValidationErr != "" {
 				if err == nil {
 					t.Fatalf("expected validation error containing %q, got nil", tc.wantValidationErr)

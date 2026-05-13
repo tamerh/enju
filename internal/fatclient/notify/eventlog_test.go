@@ -11,11 +11,11 @@ import (
 
 // TestAppendEventToLogWritesJSONL pins the substrate contract:
 // each event arrives as one JSON line in the project's
-// enju/events/live.jsonl, including seq for cursor-based replay
+// .enju/events/live.jsonl, including seq for cursor-based replay
 // by Tier 2 consumers.
 func TestAppendEventToLogWritesJSONL(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "enju", "events", "live.jsonl")
+	path := filepath.Join(dir, ".enju", "events", "live.jsonl")
 
 	events := []Event{
 		{Seq: 1, Timestamp: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), Type: "task_completed", TaskID: "1:1:draft"},
@@ -57,11 +57,11 @@ func TestAppendEventToLogWritesJSONL(t *testing.T) {
 // caller knows to ignore it. Self-installing per clone.
 func TestAppendEventToLogSelfInstallsGitignore(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "enju", "events", "live.jsonl")
+	path := filepath.Join(dir, ".enju", "events", "live.jsonl")
 	if err := appendEventToLog(path, Event{Seq: 1, Type: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	gi := filepath.Join(dir, "enju", "events", ".gitignore")
+	gi := filepath.Join(dir, ".enju", "events", ".gitignore")
 	body, err := os.ReadFile(gi)
 	if err != nil {
 		t.Fatalf("read gitignore: %v", err)
@@ -73,7 +73,7 @@ func TestAppendEventToLogSelfInstallsGitignore(t *testing.T) {
 
 // TestAppendEventToLogEmptyPathIsNoOp pins the test-friendly
 // degradation: configs without a ProjectDir get no-op file ops
-// (instead of writing to "/enju/events/live.jsonl" or similar
+// (instead of writing to "/.enju/events/live.jsonl" or similar
 // surprising default).
 func TestAppendEventToLogEmptyPathIsNoOp(t *testing.T) {
 	if err := appendEventToLog("", Event{Seq: 1, Type: "x"}); err != nil {

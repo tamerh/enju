@@ -43,11 +43,23 @@ const ResultDirRoot = "enju"
 // always safe.
 const StateDirRoot = ".enju"
 
-// DefaultTemplatesDir is the built-in location template bundles
-// live when no enju/conf.yaml override is present. Unified under
-// ResultDirRoot so "everything Enju" lives under one visible
-// top-level directory instead of scattering enju/templates/ and
-// enju/ as sibling entries.
+// EventsDir holds the project-local event log (live.jsonl,
+// cursor.json) the notify loop reads/writes. Sibling to runs/
+// and scratch/ under StateDirRoot — all runtime caches, all
+// gitignored.
+const EventsDir = StateDirRoot + "/events"
+
+// LogsDir holds per-clone trace logs (one per long-running
+// fatclient role: operator, bot-<name>). Under StateDirRoot so
+// the operator's project tree doesn't show trace files as
+// untracked content post-Phase-8.
+const LogsDir = StateDirRoot + "/logs"
+
+// DefaultTemplatesDir is a soft convention for where template
+// bundles tend to live. After Phase 8 LoadTemplate accepts any
+// path, so this constant is just a fallback hint for tooling
+// that wants "the conventional spot." User can put workflow
+// YAMLs anywhere.
 const DefaultTemplatesDir = "enju/templates"
 
 // BundleManifestName is the canonical filename at the root of

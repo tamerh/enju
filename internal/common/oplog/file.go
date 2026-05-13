@@ -14,7 +14,7 @@ import (
 //   - drop a self-installing `.gitignore` containing "*\n" so the
 //     directory's contents (including the .gitignore itself)
 //     never end up in git. Same pattern internal/fatclient/notify
-//     uses for enju/events/.
+//     uses for .enju/events/.
 //
 // Concurrency model: each PROCESS picks a unique filename
 // (typically with PID suffix — see ProcessTraceFilename) and
@@ -61,7 +61,7 @@ func OpenProjectLogFile(workDir, subdir, filename string) (*os.File, error) {
 // role. Empty role falls back to `trace-<pid>.log` so ad-hoc /
 // test wirings still get a file.
 //
-// Discovery flow: `tail -f <projectRoot>/enju/logs/*.log` for a
+// Discovery flow: `tail -f <projectRoot>/.enju/logs/*.log` for a
 // live aggregate view; `cat operator-*.log` for every operator
 // session's history; `ls -lt` to find the most recent.
 //

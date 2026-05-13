@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
 )
@@ -76,7 +77,7 @@ Flags:`)
 		os.Exit(1)
 	}
 
-	livePath := filepath.Join(projectDir, "enju", "events", "live.jsonl")
+	livePath := filepath.Join(projectDir, corelayout.EventsDir, "live.jsonl")
 	rows, err := inbox.BuildInbox(livePath, creds.Username, &cliInboxDeps{view: view})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

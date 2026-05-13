@@ -89,9 +89,10 @@ func TestHandleDescribeTemplateMissingPath(t *testing.T) {
 	if !strings.Contains(msg, "path is required") {
 		t.Errorf("expected path-required error, got %q", msg)
 	}
-	// The hint that points the LLM at the right directory.
-	if !strings.Contains(msg, "enju/templates/") {
-		t.Errorf("expected path error to include enju/templates/ hint, got %q", msg)
+	// Post-Phase-8: workflow YAMLs can live anywhere. The hint
+	// should mention an example path so the LLM knows the shape.
+	if !strings.Contains(msg, "enju.yaml") {
+		t.Errorf("expected path error to include an example path hint, got %q", msg)
 	}
 }
 

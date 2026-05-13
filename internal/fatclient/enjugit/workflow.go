@@ -80,13 +80,13 @@ type Workflow struct {
 	logger *slog.Logger
 
 	// traceFile is the per-process append-only log opened at
-	// <projectRoot>/enju/logs/trace-<pid>.log. Verbs `defer
+	// <projectRoot>/.enju/logs/trace-<pid>.log. Verbs `defer
 	// trace.emit(w.logger, w.traceFile)` so every invocation
 	// lands a structured one-liner here regardless of
 	// success/failure. Per-PROCESS naming sidesteps cross-
 	// process append-atomicity questions: operator MCP gets
 	// one file, each bot daemon gets its own, the user does
-	// `tail -f <projectRoot>/enju/logs/trace-*.log` to
+	// `tail -f <projectRoot>/.enju/logs/trace-*.log` to
 	// aggregate. Nil when Workspace failed to open it (mkdir
 	// denied, disk full); emit silently degrades to slog only.
 	traceFile *os.File

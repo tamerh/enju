@@ -51,9 +51,9 @@ func appendEventToLog(path string, ev Event) error {
 	}
 	// Split path into <workDir>/<subdir>/<filename> for the
 	// oplog primitive. notify configures `path` as
-	// "<projectDir>/enju/events/live.jsonl"; we hand each part
+	// "<projectDir>/.enju/events/live.jsonl"; we hand each part
 	// in separately so oplog can mkdir the right places and
-	// drop a .gitignore in <projectDir>/enju/events/.
+	// drop a .gitignore in <projectDir>/.enju/events/.
 	dir := filepath.Dir(path)
 	parent := filepath.Dir(dir)
 	subdir := filepath.Base(dir)

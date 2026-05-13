@@ -492,7 +492,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	// Three input shapes —
 	//   1. yaml (inline definition, no params)
-	//   2. path (template file under enju/templates/, optional params)
+	//   2. path (workflow YAML file in the repo — anywhere)
 	//   3. yaml + params (inline definition with a declared params: block)
 	//
 	// Exactly one of (yaml, path) must be set. Params are optional in
@@ -511,7 +511,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	if yamlContent == "" && templatePath == "" {
-		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (template under enju/templates/) is required"), nil
+		return mcp.NewToolResultError("either 'yaml' (inline definition) or 'path' (workflow YAML anywhere in the project repo, e.g. 'enju.yaml' or 'workflows/scan-deps/enju.yaml') is required"), nil
 	}
 	if yamlContent != "" && templatePath != "" {
 		return mcp.NewToolResultError("'yaml' and 'path' are mutually exclusive — pass one or the other"), nil
