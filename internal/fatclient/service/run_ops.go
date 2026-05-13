@@ -259,9 +259,40 @@ func (s *FatClient) CommitRunTemplateSnapshot(prep *RunTemplatePrep, runData []b
 	return s.materializeRunOnDisk(prep.Workflow, runBranch, seq, runSlug)
 }
 
+// MaterializeRunFromData is the path= path's snapshot step.
+// No template-snapshot commit needed — the workflow YAML and
+// its neighbors live at their authored paths in the run base
+// SHA's tree; the run branch starts at that SHA; materializing
+// the run branch to .enju/runs/N/snapshot/ naturally produces
+// the workflow at its authored path inside the snapshot.
+//
+// Best-effort: a failure is reported as a warning string (same
+// contract as the legacy snapshot-commit path).
+func (s *FatClient) MaterializeRunFromData(ctx context.Context, projectID int64, runData []byte) string {
+	if s.enjugit == nil {
+		return ""
+	}
+	var created map[string]interface{}
+	if err := json.Unmarshal(runData, &created); err != nil {
+		return ""
+	}
+	seqF, _ := created["seq"].(float64)
+	seq := int(seqF)
+	runBranch, _ := created["branch"].(string)
+	runSlug, _ := created["slug"].(string)
+	if seq == 0 || runBranch == "" {
+		return ""
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return fmt.Sprintf("materialize skipped: %v", err)
+	}
+	return s.materializeRunOnDisk(wf, runBranch, seq, runSlug)
+}
+
 // materializeRunOnDisk writes the run branch's whole tree to
 // the per-run on-disk snapshot dir. Called after each create_run
-// path's plumbing commit so subsequent execute_task reads a
+// path's snapshot step so subsequent execute_task reads a
 // consistent on-disk view of the run.
 //
 // Best-effort: a failure here is reported as a warning string

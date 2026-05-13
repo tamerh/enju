@@ -168,21 +168,24 @@ func TestComputeRunSlug(t *testing.T) {
 		runName  string
 		want     string
 	}{
-		{"template bundle wins", "enju/templates/variant-calling", "Ignored", "variant-calling"},
+		// Post-Phase-8: name: wins when set. Path basename is
+		// fallback only.
+		{"name wins over path", "enju/templates/variant-calling", "Smoke Test", "smoke-test"},
 		{"nested bundle path", "workflows/gwas-analysis", "", "gwas-analysis"},
 		{"inline with name", "", "My Smoke Test", "my-smoke-test"},
 		{"slug fallback on empty", "", "", "run"},
 		{"name with unsafe chars", "", "Run: A/B", "run-a-b"},
-		// Template bundle already lowercase-hyphenated — kebab
-		// slugger is idempotent, no drift.
-		{"bundle stays idempotent", "enju/templates/variant-calling", "", "variant-calling"},
+		// Directory path with no name: fall back to dir basename.
+		{"dir path no name", "enju/templates/variant-calling", "", "variant-calling"},
 		// Case normalization: mixed-case bundle becomes lower.
-		// Previously the loader accepted any dir name; now we
-		// normalize so on-disk and git paths agree with the
-		// display form.
 		{"uppercase bundle normalized", "enju/templates/MyBundle", "", "mybundle"},
-		// Only whitespace/punctuation → "run" fallback (trim
-		// of dashes leaves nothing).
+		// File path: parent-dir basename wins over filename.
+		{"yaml file in dir", "workflows/scan-deps/enju.yaml", "", "scan-deps"},
+		// Root-level yaml file: trim extension, slug the stem.
+		{"root yaml strips ext", "my-pipeline.yaml", "", "my-pipeline"},
+		// Generic enju.yaml at root with no name: → "run".
+		{"root enju.yaml no name", "enju.yaml", "", "enju"},
+		// Only whitespace/punctuation → "run" fallback.
 		{"all-punctuation falls back", "", "!!!", "run"},
 	}
 	for _, c := range cases {

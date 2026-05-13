@@ -6753,16 +6753,20 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 }
 
 // TestMCPTemplateBundleSnapshotAndExec covers the end-to-end
-// template-bundle feature introduced in the 2026-04-18 pass:
+// template-bundle feature introduced in the 2026-04-18 pass and
+// reshaped by Phase 8 (per-run-snapshot redesign):
 //
-//  1. A template is a directory under enju/templates/ containing
-//     enju.yaml + any bundled scripts / data.
-//  2. enju_create_run(path=<bundle-dir>) snapshots the bundle
-//     into enju/runs/{seq}/template-snapshot/ as part of run creation,
-//     committing a frozen copy.
-//  3. Compute tasks resolve `script:` from the snapshot path,
-//     not the live enju/templates/ tree. Editing the live
-//     template after the run was created CANNOT change the
+//  1. A bundle is a directory anywhere in the repo containing
+//     enju.yaml + sibling scripts / data. enju/templates/ is the
+//     conventional home, but path= accepts any directory.
+//  2. enju_create_run(path=<bundle-dir>) creates a run branch
+//     pinned at the base SHA — the bundle at its authored path
+//     in that tree IS the snapshot. No second copy is committed.
+//     The fatclient materializes the run branch's tree to
+//     .enju/runs/{seq}-{slug}/snapshot/ at create time.
+//  3. Compute tasks resolve `script:` from the materialized
+//     on-disk snapshot, not the live tree on main. Editing the
+//     live bundle after the run was created CANNOT change the
 //     run's behavior — provenance + reproducibility guarantee.
 //
 // The three assertions below are the contract the tester
@@ -6797,7 +6801,8 @@ echo "ran original"
 	}, "seed template bundle")
 
 	// Instantiate from the bundle dir. Post-creation, the
-	// client snapshots the bundle to enju/runs/1/template-snapshot/.
+	// fatclient creates a run branch pinned at the base SHA and
+	// materializes its tree to .enju/runs/{seq}-{slug}/snapshot/.
 	res := h.callOK(t, "enju_create_run", map[string]any{
 		"project_id": float64(projectID),
 		"path":       "enju/templates/sum",
@@ -6807,41 +6812,49 @@ echo "ran original"
 		t.Fatalf("template snapshot warning on create_run: %s", mcpText(res))
 	}
 
-	// Assertion 1: the snapshot landed at enju/runs/1/template-snapshot/.
-	snapYAML, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "template-snapshot/enju.yaml"))
+	// Run-branch metadata: the snapshot under path= mode IS the
+	// run branch's tree at base SHA. Reading the bundle through
+	// readRepoFileOnBranch(runBranch, …) is the contract test:
+	// if main mutates later, this view stays original because
+	// the run branch is pinned.
+	runRec := h.get(fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, 1))
+	runBranch, _ := runRec["branch"].(string)
+	if runBranch == "" {
+		t.Fatalf("run 1 has empty branch on coordinator record")
+	}
+	remoteURL := h.remoteFor(projectID)
+
+	// Assertion 1: the bundle is reachable on the run branch at
+	// its authored path. No second committed copy is expected —
+	// path= mode trusts the run branch tree as the snapshot.
+	snapYAML, ok := readRepoFileOnBranch(t, remoteURL, runBranch, "enju/templates/sum/enju.yaml")
 	if !ok {
-		t.Fatalf("expected enju/runs/1/template-snapshot/enju.yaml to exist after snapshot")
+		t.Fatalf("expected enju/templates/sum/enju.yaml on run branch %q", runBranch)
 	}
 	if !strings.Contains(string(snapYAML), "sum runner") {
 		t.Errorf("snapshot enju.yaml missing expected content: %s", snapYAML)
 	}
-	snapScript, ok := h.readRepoFile(projectID, filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh"))
+	snapScript, ok := readRepoFileOnBranch(t, remoteURL, runBranch, "enju/templates/sum/scripts/sum.sh")
 	if !ok {
-		t.Fatalf("expected enju/runs/1/template-snapshot/scripts/sum.sh to exist after snapshot")
+		t.Fatalf("expected enju/templates/sum/scripts/sum.sh on run branch %q", runBranch)
 	}
 	if !strings.Contains(string(snapScript), "ORIGINAL BEHAVIOR") {
 		t.Errorf("snapshot script has wrong body: %s", snapScript)
 	}
 
-	// Assertion 1a: the snapshotted script preserves its +x bit
-	// in git history. Pre-fix, ReadBundleFiles wrote snapshot
-	// files at 0644 regardless of source mode, so scripts
-	// silently became non-executable after snapshot — the
-	// 2026-04-18 tester regression. Post-fix, source +x is
-	// preserved.
-	//
-	// Post-plumbing-migration the snapshot lives in git
-	// history, not the operator worktree (the worktree no
-	// longer holds snapshot files because concurrent
-	// create_run would otherwise race on it). Verify the mode
-	// directly against the bare via ls-tree.
-	scriptPath := filepath.Join(h.runDir(1), "template-snapshot/scripts/sum.sh")
+	// Assertion 1a: the script preserves its +x bit on the run
+	// branch. Pre-fix (the 2026-04-18 regression) the snapshot
+	// code wrote files at 0644 regardless of source mode, so
+	// scripts silently became non-executable. The run-branch
+	// path inherits its tree from base SHA, so a regression in
+	// the seed→base→run-branch pipeline shows up here.
+	scriptPath := "enju/templates/sum/scripts/sum.sh"
 	bareDir := h.testServer.remoteFor(projectID)
-	lsOut := gittest.Run(t, bareDir, "ls-tree", "refs/heads/main", "--", scriptPath)
+	lsOut := gittest.Run(t, bareDir, "ls-tree", "refs/heads/"+runBranch, "--", scriptPath)
 	// Format: "<mode> blob <sha>\t<path>"
 	if !strings.HasPrefix(lsOut, "100755") {
-		t.Errorf("snapshotted script %q on bare branch main does not have +x: ls-tree = %q",
-			scriptPath, lsOut)
+		t.Errorf("snapshotted script %q on run branch %q does not have +x: ls-tree = %q",
+			scriptPath, runBranch, lsOut)
 	}
 
 	// Mutate the live template to PROVE the run uses the

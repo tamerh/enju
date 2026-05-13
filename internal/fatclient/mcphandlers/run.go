@@ -600,8 +600,15 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	var snapshotWarning string
 	authorName, authorEmail := c.commitAuthor(ctx)
 	if prep != nil {
-		snapshotWarning = c.fc.CommitRunTemplateSnapshot(prep, data, templatePath, authorName, authorEmail)
+		// path= mode: workflow YAML lives at its authored path in
+		// the base SHA. Materialize the run branch tree directly
+		// — no template-snapshot/ commit, no nested duplication.
+		// Per the per-run-snapshot redesign Phase 8.h.6.b direction.
+		snapshotWarning = c.fc.MaterializeRunFromData(ctx, int64(projectID), data)
 	} else {
+		// Inline-YAML mode: YAML isn't in the repo anywhere; the
+		// legacy template-snapshot/ commit puts it on the run
+		// branch so execute can read it.
 		snapshotWarning = c.fc.CommitRunInlineSnapshot(ctx, int64(projectID), yamlContent, data, authorName, authorEmail)
 	}
 

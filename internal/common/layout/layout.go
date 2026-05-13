@@ -192,33 +192,47 @@ func RunDir(runSeq int, slug string) string {
 }
 
 // ComputeRunSlug derives the filesystem-safe slug that shows
-// up in enju/runs/{seq}-{slug}/ AND in auto-branch names
+// up in .enju/runs/{seq}-{slug}/ AND in auto-branch names
 // (e.g. "variant-calling-2"). Canonical sources in order:
 //
-//  1. Template bundle dir's basename (e.g. "variant-calling"
-//     from enju/templates/variant-calling).
-//  2. Run's `name:` field.
-//  3. Fallback "run" for inline-YAML runs with no name:.
+//  1. Run's `name:` field — workflow author's intent wins.
+//  2. Source path basename — directory basename when sourcePath
+//     is a directory, parent-dir basename when sourcePath is a
+//     `*.yaml`/`*.yml` file (so `workflows/scan-deps/enju.yaml`
+//     yields "scan-deps" rather than the meaningless "enju-yaml").
+//  3. Fallback "run" when neither source produces a usable slug.
 //
 // Every candidate is normalized through slugifyKebab so the
-// output is uniform regardless of the source (template author
-// conventions, human-typed run names, etc.). Without uniform
-// normalization, a template "hello" produced dir `1-hello/`
-// while inline `name: "Quick Inline"` produced `2-Quick_Inline/`
-// — same system, two styles, user-visible inconsistency.
+// output is uniform regardless of source (workflow author
+// conventions, human-typed run names, etc.).
 //
 // Branch-auto naming calls this with the same arguments so
-// `git checkout quick-inline-1` lines up with
-// `cd enju/runs/2-quick-inline/` instead of diverging into
-// `run-1` on the git side and `2-Quick_Inline/` on disk.
+// `git checkout scan-deps-1` lines up with
+// `cd .enju/runs/2-scan-deps/`.
 func ComputeRunSlug(sourcePath, runName string) string {
-	if sourcePath != "" {
-		if slug := slugifyKebab(filepath.Base(sourcePath)); slug != "" {
+	if runName != "" {
+		if slug := slugifyKebab(runName); slug != "" {
 			return slug
 		}
 	}
-	if runName != "" {
-		if slug := slugifyKebab(runName); slug != "" {
+	if sourcePath != "" {
+		// For *.yaml / *.yml file paths, the filename ("enju.yaml")
+		// is rarely meaningful — the parent directory's basename
+		// is. For directory paths, use the basename directly.
+		base := filepath.Base(sourcePath)
+		if strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml") {
+			parent := filepath.Base(filepath.Dir(sourcePath))
+			if parent != "" && parent != "." && parent != "/" {
+				base = parent
+			} else {
+				// Root-level *.yaml file: trim the extension so
+				// "my-pipeline.yaml" → "my-pipeline" instead of
+				// "my-pipeline-yaml".
+				base = strings.TrimSuffix(base, ".yaml")
+				base = strings.TrimSuffix(base, ".yml")
+			}
+		}
+		if slug := slugifyKebab(base); slug != "" {
 			return slug
 		}
 	}

@@ -174,8 +174,29 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	templateSnapshotDir := ""
 	if wf.ProjectRoot() != "" && meta.Branch != "" {
 		repoSnapshotDir = filepath.Join(wf.ProjectRoot(), corelayout.RunSnapshotOnDiskDir(meta.RunSeq, meta.RunSlug))
-		templateSnapshotDir = filepath.Join(repoSnapshotDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
-		if _, statErr := os.Stat(templateSnapshotDir); os.IsNotExist(statErr) {
+		// path= runs: the workflow YAML and its neighbors live at
+		// their authored paths inside the materialized snapshot.
+		// The "template dir" is the workflow YAML's containing
+		// directory:
+		//   - YAML file path ("workflows/scan-deps/enju.yaml") →
+		//     dirname → "workflows/scan-deps"
+		//   - Directory path ("enju/templates/variant-calling") →
+		//     the dir itself
+		// No more enju/runs/N/template-snapshot/ subdir nesting.
+		//
+		// Inline-YAML runs (no RunSourcePath): legacy committed
+		// template-snapshot/ path still applies — the inline
+		// YAML doesn't exist anywhere else.
+		if meta.RunSourcePath != "" {
+			templateRel := meta.RunSourcePath
+			if strings.HasSuffix(templateRel, ".yaml") || strings.HasSuffix(templateRel, ".yml") {
+				templateRel = filepath.Dir(templateRel)
+			}
+			templateSnapshotDir = filepath.Join(repoSnapshotDir, templateRel)
+		} else {
+			templateSnapshotDir = filepath.Join(repoSnapshotDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		}
+		if _, statErr := os.Stat(repoSnapshotDir); os.IsNotExist(statErr) {
 			if _, merr := wf.MaterializeRunRepo(meta.Branch, repoSnapshotDir); merr != nil {
 				return nil, fmt.Errorf("materializing run snapshot from branch %q: %w", meta.Branch, merr)
 			}
