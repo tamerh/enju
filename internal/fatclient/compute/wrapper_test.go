@@ -299,8 +299,8 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 	tmp := t.TempDir()
 	bot := "alice-1"
 	otherBot := "alice-2"
-	myScratch := filepath.Join(tmp, "scratch", bot)
-	otherScratch := filepath.Join(tmp, "scratch", otherBot)
+	myScratch := filepath.Join(tmp, ".enju", "bots", bot, "scratch")
+	otherScratch := filepath.Join(tmp, ".enju", "bots", otherBot, "scratch")
 
 	// Empty scratch root: no-op.
 	if n, err := compute.SweepStaleScratchAtStartup(tmp, bot); err != nil || n != 0 {
@@ -352,9 +352,9 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 		t.Errorf("nonexistent: got n=%d err=%v, want 0/nil", n, err)
 	}
 
-	// Empty workspaceRoot: no-op.
+	// Empty projectRoot: no-op.
 	if n, err := compute.SweepStaleScratchAtStartup("", bot); err != nil || n != 0 {
-		t.Errorf("empty workspaceRoot: got n=%d err=%v, want 0/nil", n, err)
+		t.Errorf("empty projectRoot: got n=%d err=%v, want 0/nil", n, err)
 	}
 
 	// Empty botUsername: no-op (test-fixture path).
@@ -372,7 +372,7 @@ func TestSweepStaleScratchAtStartup(t *testing.T) {
 func TestSweepStaleScratchAtStartup_HonorsEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	bot := "alice-1"
-	myScratch := filepath.Join(tmp, "scratch", bot)
+	myScratch := filepath.Join(tmp, ".enju", "bots", bot, "scratch")
 
 	// Seed a dir aged 2 hours. Under the 24h default it survives;
 	// under a 1h override it's eligible.
@@ -417,7 +417,7 @@ func TestSweepStaleScratchAtStartup_HonorsEnvOverride(t *testing.T) {
 func TestSweepStaleScratchAtStartup_InvalidEnvFallsBackToDefault(t *testing.T) {
 	tmp := t.TempDir()
 	bot := "alice-1"
-	myScratch := filepath.Join(tmp, "scratch", bot)
+	myScratch := filepath.Join(tmp, ".enju", "bots", bot, "scratch")
 
 	// Aged 2 hours.
 	fresh := filepath.Join(myScratch, "fresh-iter-1")
@@ -468,7 +468,7 @@ func TestSweepStaleScratchAtStartup_InvalidEnvFallsBackToDefault(t *testing.T) {
 func TestSweepStaleScratchAtStartup_RespectsAgeFilter(t *testing.T) {
 	tmp := t.TempDir()
 	bot := "alice-1"
-	myScratch := filepath.Join(tmp, "scratch", bot)
+	myScratch := filepath.Join(tmp, ".enju", "bots", bot, "scratch")
 
 	// Fresh dir — simulates a submit-failed wrapper from the
 	// previous daemon run that left outputs behind for retry.

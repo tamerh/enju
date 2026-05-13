@@ -122,24 +122,24 @@ func effectiveStaleScratchAge() time.Duration {
 // begun yet, so no wrapper of ours is live. A future caller that
 // reaches for this from elsewhere would race a running wrapper.
 //
-// botUsername scopes the sweep to <workspaceRoot>/scratch/<bot>/
-// so replica configurations (two daemons of the same project
-// sharing one workspace root) don't clobber each other's live
+// botUsername scopes the sweep to
+// <projectRoot>/.enju/bots/<bot>/scratch/ so replica configurations
+// (two daemons of the same project) don't clobber each other's live
 // scratch. Replica A's sweep stays inside replica A's subdir;
 // replica B's stays inside B's. Empty botUsername is a no-op
 // (test fixtures without a coord identity).
-func SweepStaleScratchAtStartup(workspaceRoot, botUsername string) (int, error) {
-	return sweepStaleScratchOlderThan(workspaceRoot, botUsername, effectiveStaleScratchAge(), time.Now())
+func SweepStaleScratchAtStartup(projectRoot, botUsername string) (int, error) {
+	return sweepStaleScratchOlderThan(projectRoot, botUsername, effectiveStaleScratchAge(), time.Now())
 }
 
 // sweepStaleScratchOlderThan is the testable core of
 // SweepStaleScratchAtStartup. minAge + now are injected so unit
 // tests can age scratch dirs without sleeping.
-func sweepStaleScratchOlderThan(workspaceRoot, botUsername string, minAge time.Duration, now time.Time) (int, error) {
-	if workspaceRoot == "" || botUsername == "" {
+func sweepStaleScratchOlderThan(projectRoot, botUsername string, minAge time.Duration, now time.Time) (int, error) {
+	if projectRoot == "" || botUsername == "" {
 		return 0, nil
 	}
-	root := filepath.Join(workspaceRoot, "scratch", botUsername)
+	root := filepath.Join(projectRoot, ".enju", "bots", botUsername, "scratch")
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {

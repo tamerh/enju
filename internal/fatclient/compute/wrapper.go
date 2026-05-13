@@ -35,31 +35,32 @@ import (
 // ResolveTaskScratchDir returns the canonical absolute path for a
 // compute task's per-iteration scratch dir:
 //
-//	<workspaceRoot>/scratch/<botUsername>/<task_id_safe>-iter-<iterSeq>
+//	<projectRoot>/.enju/bots/<botUsername>/scratch/<task_id_safe>-iter-<iterSeq>
 //
 // task_id_safe replaces ':' (the task ID separator) with '-' so the
-// path is filesystem-friendly. workspaceRoot is the bot's per-machine
-// root (`s.enjugit.RootDir()` in production); the botUsername segment
-// (Phase 2.5) keeps two replicas of the same bot on the same machine
-// from clobbering each other when their startup-sweeps run.
+// path is filesystem-friendly. projectRoot is the user-facing project
+// directory (`wf.ProjectRoot()` in production) — bot scratch lives
+// under the project's hidden `.enju/` tree so removing the project
+// removes the bot state alongside the rest of the runtime cache.
 //
-// Without the username segment, replica-A's SweepStaleScratchAtStartup
-// would nuke replica-B's live scratch dir if B was mid-task during A's
-// startup. With it, each replica's sweep only touches its own subdir.
+// The botUsername segment keeps two replicas of the same bot on the
+// same machine from clobbering each other when their startup-sweeps
+// run (replica-A's SweepStaleScratchAtStartup would otherwise nuke
+// replica-B's live scratch dir if B was mid-task during A's startup).
 //
-// Empty workspaceRoot or empty botUsername returns "" — opts the caller
+// Empty projectRoot or empty botUsername returns "" — opts the caller
 // out of scratch entirely (legacy/test paths). botUsername is a soft
 // requirement (production callers always have one); the early-return
 // here keeps tests with empty identity strings working.
-func ResolveTaskScratchDir(workspaceRoot, botUsername, taskID string, iterSeq int) string {
-	if workspaceRoot == "" || botUsername == "" || taskID == "" {
+func ResolveTaskScratchDir(projectRoot, botUsername, taskID string, iterSeq int) string {
+	if projectRoot == "" || botUsername == "" || taskID == "" {
 		return ""
 	}
 	safe := strings.ReplaceAll(taskID, ":", "-")
 	if iterSeq < 1 {
 		iterSeq = 1
 	}
-	return filepath.Join(workspaceRoot, "scratch", botUsername,
+	return filepath.Join(projectRoot, ".enju", "bots", botUsername, "scratch",
 		fmt.Sprintf("%s-iter-%d", safe, iterSeq))
 }
 
@@ -253,9 +254,10 @@ type Spec struct {
 	//
 	// Naming convention is the caller's choice; the wrapper just
 	// honors what the spec carries. Production callers compose
-	// <workspace_root>/scratch/<bot>/<task-slug>-iter-<n>/ via
-	// compute.ResolveTaskScratchDir — bot-scoped so replicas
-	// can share a workspace root without colliding.
+	// <project_root>/.enju/bots/<bot>/scratch/<task-slug>-iter-<n>/
+	// via compute.ResolveTaskScratchDir — project-scoped, with the
+	// bot subsegment keeping replicas of the same bot from
+	// colliding on the same machine.
 	TaskScratchDir string `json:"task_scratch_dir,omitempty"`
 
 	// SnapshotDir is the absolute path on the host to the run's

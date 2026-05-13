@@ -156,7 +156,9 @@ func (f *fakeFC) ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAl
 	return &service.ReleaseAllMyOpenClaimsResponse{ReleasedTaskIDs: []string{}, Count: 0}, nil
 }
 
-func (f *fakeFC) SweepStaleScratchAtStartup() (int, error) { return 0, nil }
+func (f *fakeFC) SweepStaleScratchAtStartup(ctx context.Context, projectID int64) (int, error) {
+	return 0, nil
+}
 func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int64) (int, error) {
 	return 0, nil
 }

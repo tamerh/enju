@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
@@ -110,6 +111,16 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	}
 	if path == "" {
 		t.Fatal("expected materialized CWD path, got empty (handler would run with no CWD and system_prompt would fail)")
+	}
+
+	// Post-Phase-8 layout: bot scratch lives under the project's
+	// .enju/ tree, not under a machine-wide ~/.enju/workspaces/.
+	// Pin the shape so a future revert doesn't silently regress to
+	// the machine-scoped path (which broke single-machine no-origin
+	// projects on showcase_v14).
+	wantPrefix := "/.enju/bots/dev-bot2/scratch/"
+	if !strings.Contains(path, wantPrefix) {
+		t.Errorf("scratch path %q should contain %q (project-scoped layout)", path, wantPrefix)
 	}
 
 	// The materialized tree must contain the seeded files —

@@ -77,12 +77,14 @@ type fatClient interface {
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
 
-	// SweepStaleScratchAtStartup — Phase 2.4 startup hook.
+	// SweepStaleScratchAtStartup — startup hook scoped to the
+	// daemon's bound project. Scratch lives under
+	// <projectRoot>/.enju/bots/<bot>/scratch/.
 	// Removes any compute-task scratch dirs left behind by a
 	// previously crashed wrapper, scoped to THIS bot's subtree
 	// (Phase 2.5 — replica-safe). No-op when the workspace
 	// isn't configured or the scratch tree is empty.
-	SweepStaleScratchAtStartup() (int, error)
+	SweepStaleScratchAtStartup(ctx context.Context, projectID int64) (int, error)
 
 	// SweepRunStateDirsForProject — per-run-snapshot-redesign
 	// Phase 3 startup hook. Removes <project>/.enju/runs/<seq>-<slug>/
@@ -320,7 +322,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// dir. Sweeping at startup keeps disk from growing across
 	// restarts. Safe here: nothing else has started yet, no
 	// concurrent wrapper to race.
-	if n, err := d.fc.SweepStaleScratchAtStartup(); err != nil {
+	if n, err := d.fc.SweepStaleScratchAtStartup(ctx, d.projectID); err != nil {
 		d.logger.Warn("startup scratch sweep failed (proceeding)",
 			"error", err, "removed", n)
 	} else if n > 0 {

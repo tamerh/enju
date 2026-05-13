@@ -60,7 +60,7 @@ func TestComputeRun_NoWorktreePollutionUnderResultDir(t *testing.T) {
 
 	// Scratch dir per Phase 2.1 — production callers always
 	// resolve via compute.ResolveTaskScratchDir.
-	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:isolation_check", 1)
+	scratch := compute.ResolveTaskScratchDir(wf.ProjectRoot(), "alice", "1:1:isolation_check", 1)
 	if scratch == "" {
 		t.Fatal("ResolveTaskScratchDir unexpectedly returned empty")
 	}
@@ -161,7 +161,7 @@ func TestComputeRun_FailsWhenRequiredArtifactMissing(t *testing.T) {
 		t.Fatalf("ForProject: %v", err)
 	}
 
-	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:wrong_file", 1)
+	scratch := compute.ResolveTaskScratchDir(wf.ProjectRoot(), "alice", "1:1:wrong_file", 1)
 	resultDir := "enju/runs/1-test/wrong_file"
 
 	// Script exits 0 but writes a path the declaration doesn't
@@ -241,7 +241,7 @@ func TestComputeRun_OptionalMissingStaysSoft(t *testing.T) {
 		t.Fatalf("ForProject: %v", err)
 	}
 
-	scratch := compute.ResolveTaskScratchDir(wsRoot, "alice", "1:1:opt_missing", 1)
+	scratch := compute.ResolveTaskScratchDir(wf.ProjectRoot(), "alice", "1:1:opt_missing", 1)
 	resultDir := "enju/runs/1-test/opt_missing"
 
 	// Script writes the required output but skips the optional one.

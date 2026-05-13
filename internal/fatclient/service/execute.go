@@ -150,7 +150,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	workDir := wf.WorkDir()
 	resultDir := meta.ResultDir
 
-	taskScratchDir := compute.ResolveTaskScratchDir(s.enjugit.RootDir(), s.coord.Username(), taskID, meta.IterSeq)
+	taskScratchDir := compute.ResolveTaskScratchDir(wf.ProjectRoot(), s.coord.Username(), taskID, meta.IterSeq)
 
 	// Per-run-snapshot redesign: a single materialization of the
 	// run branch's whole tree lives at <project>/.enju/runs/<N>/snapshot/
