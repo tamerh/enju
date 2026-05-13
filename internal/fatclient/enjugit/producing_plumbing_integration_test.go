@@ -204,3 +204,58 @@ func TestSubmitComputeTaskResult_ConcurrentParallelTasks(t *testing.T) {
 		}
 	}
 }
+
+// TestSubmitComputeTaskResult_NoOriginSkipsPush pins the
+// Phase 8 invariant: when origin is unset, the trailing push
+// step is silently skipped — the local update-ref already
+// committed the branch into the (single) store. Without this
+// gate, the push would fail with "'origin' does not appear to
+// be a git repository" and roll back the submit, blocking
+// solo single-machine workflows that have no remote.
+func TestSubmitComputeTaskResult_NoOriginSkipsPush(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wf, err := ws.ForProject(42, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+
+	// Drop origin so the push step has no remote to target.
+	// Production flow that hits this: solo single-machine
+	// project with no GitHub remote configured.
+	if err := wf.git.RemoveOrigin(); err != nil {
+		t.Fatalf("RemoveOrigin: %v", err)
+	}
+
+	res, err := wf.SubmitComputeTaskResult(SubmitRequest{
+		TaskID:    "42:1:solo_task",
+		IterSeq:   1,
+		RunSeq:    1,
+		RunSlug:   "solo",
+		TaskDef:   "solo_task",
+		RunBranch: "main",
+		Citizen:   Identity{Name: "tamer", Email: "tamer@example.com"},
+		Files: []FileWrite{
+			{RepoRelPath: "out/solo.md", Content: []byte("alone but committed\n")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SubmitComputeTaskResult without origin must succeed (push is no-op): %v", err)
+	}
+	if res.CommitSHA == "" {
+		t.Fatal("empty commit SHA")
+	}
+
+	// The commit landed locally on the topic branch — that's
+	// the load-bearing assertion. Sharing via push is a separate
+	// concern (Phase 9 sync model); the commit being readable
+	// from this clone is what matters for single-machine flows.
+	expectedBranch := wf.convs.BranchName(1, "solo", "solo_task", "", 1)
+	localSHA, err := wf.git.LocalBranchHash(expectedBranch)
+	if err != nil {
+		t.Fatalf("LocalBranchHash(%s): %v", expectedBranch, err)
+	}
+	if localSHA != res.CommitSHA {
+		t.Errorf("local topic ref: got %s, want %s", localSHA, res.CommitSHA)
+	}
+}

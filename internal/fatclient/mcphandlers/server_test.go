@@ -1050,7 +1050,9 @@ func TestCreateProjectFolderWithoutGit(t *testing.T) {
 // already has git preserves existing history. Unlike the
 // no-.git or empty-folder branches, the existing-.git branch
 // does NOT add a scaffold commit — the existing repo is
-// adopted as-is and only origin is wired (managed bare).
+// adopted as-is. Post-Phase-8: no managed bare gets wired;
+// solo single-machine projects operate against the operator's
+// own `.git/` directly.
 func TestCreateProjectFolderWithExistingGit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	mux := http.NewServeMux()
@@ -1108,11 +1110,13 @@ func TestCreateProjectFolderWithExistingGit(t *testing.T) {
 		t.Errorf("existing.txt clobbered: %s", data)
 	}
 
-	// Managed bare wired (the existing-.git+no-origin branch
-	// always promotes a managed bare so origin is non-empty).
+	// No managed bare gets wired — Phase 8 stopped auto-creating
+	// the bare at project init. The existing-.git branch leaves
+	// the repo's origin state untouched (in this fixture, no
+	// origin was pre-configured, and no origin gets added).
 	managedBare := filepath.Join(dir, "enju", ".bare.git")
-	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err != nil {
-		t.Errorf("managed bare missing at %s: %v", managedBare, err)
+	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err == nil {
+		t.Errorf("unexpected managed bare at %s — Phase 8 stopped auto-creating bares", managedBare)
 	}
 }
 
@@ -1187,22 +1191,23 @@ func TestCreateProjectIdempotent(t *testing.T) {
 	}
 }
 
-// TestCreateProjectOriginlessFolderGetsManagedBare verifies the
-// "every project has origin" precondition (Phase 1 of the
-// no-remote collapse): enju_create_project (smart-detect
-// adoption) on a folder with no `origin` MUST create a managed
-// bare at <project>/enju/.bare.git/ and wire origin to it. This
-// eliminates the no-remote state class so verbs downstream don't
-// need to handle "what if there's no push target" branches.
+// TestCreateProjectOriginlessFolderStaysOriginless verifies the
+// post-Phase-8 contract: enju_create_project (smart-detect
+// adoption) on a folder with no `origin` does NOT wire one up.
+// Solo single-machine projects operate against the operator's
+// own `.git/` directly via plumbing — there's nothing to push
+// to and nothing that needs pushing. The user wires a real
+// remote later via enju_set_project_remote when they want to
+// share with collaborators.
 //
 // The legacy ~/.enju/repos/{id}.git/ shadow bare must NOT
-// appear — that path is removed by the layout refactor;
-// the new bare lives sibling-to the operator's working tree.
+// appear (removed by an earlier layout refactor), AND the
+// previously-auto-wired managed bare at <project>/enju/.bare.git/
+// must NOT appear either (removed by Phase 8).
 //
-// Coord must NOT receive a PUT /remote — the origin is local
-// to the operator's machine and coord-side state stays
-// remote_url="" (path-mode project).
-func TestCreateProjectOriginlessFolderGetsManagedBare(t *testing.T) {
+// Coord must NOT receive a PUT /remote — there's no remote to
+// register; coord-side state stays remote_url="" (path-mode).
+func TestCreateProjectOriginlessFolderStaysOriginless(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	mux := http.NewServeMux()
@@ -1265,21 +1270,17 @@ func TestCreateProjectOriginlessFolderGetsManagedBare(t *testing.T) {
 		t.Errorf("unexpected legacy shadow bare at %s", legacyBare)
 	}
 
-	// The managed bare MUST exist at <dir>/enju/.bare.git/ —
-	// every project gets a push target at creation time.
+	// No managed bare gets created — Phase 8 stopped auto-wiring.
 	managedBare := filepath.Join(dir, "enju", ".bare.git")
-	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err != nil {
-		t.Errorf("managed bare missing at %s: %v", managedBare, err)
+	if _, err := os.Stat(filepath.Join(managedBare, "HEAD")); err == nil {
+		t.Errorf("unexpected managed bare at %s — Phase 8 stopped auto-creating bares at init", managedBare)
 	}
 
-	// Working tree's origin MUST point at the managed bare —
-	// `git push` lands there; no more silent push-skip.
-	gotOrigin, oerr := gittest.RunOK(t, dir, "remote", "get-url", "origin")
-	if oerr != nil {
-		t.Fatalf("origin not configured after init: %v", oerr)
-	}
-	if gotOrigin != managedBare {
-		t.Errorf("origin URL: got %s, want %s", gotOrigin, managedBare)
+	// Origin stays unset — solo single-machine project, no
+	// remote configured yet. Plumbing-submit's push step skips
+	// when origin is empty (P8.a).
+	if got, oerr := gittest.RunOK(t, dir, "remote", "get-url", "origin"); oerr == nil {
+		t.Errorf("expected no origin after init, got %q", got)
 	}
 
 	// Workspace's external dir registration succeeded — ForProject

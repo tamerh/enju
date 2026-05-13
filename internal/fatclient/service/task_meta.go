@@ -404,9 +404,9 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 // UseFatClient entirely.
 //
 // Current behavior: workspace configured = always use the fat-
-// client path. Every project has origin (real remote or managed
-// bare under <project>/enju/.bare.git/), so commits land locally
-// and push always has a target.
+// client path. Plumbing-submit writes objects + non-HEAD refs
+// directly into the operator's .git/; push is conditional on
+// origin being a real remote.
 func (s *FatClient) UseFatClient(meta *TaskMeta) bool {
 	if s.enjugit == nil || meta == nil {
 		return false

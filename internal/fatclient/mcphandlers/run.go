@@ -13,9 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/common/format"
@@ -667,24 +665,22 @@ func (c *apiClient) resolveAutoBranch(ctx context.Context, projectID int64, yaml
 	}
 	// Build the "used" set from two sources:
 	//
-	//   1. On-disk bare repo (the source of truth for branch
-	//      existence). Found via the workspace's DiskLayout
-	//      convention — NOT via coord's remote_url. After a
-	//      coord DB wipe, coord may not have remote_url for the
-	//      re-created project, but the local bare is right there
-	//      on disk where it's always been. Going through coord
+	//   1. On-disk local refs (the source of truth for branch
+	//      existence in single-store mode — plumbing-submit writes
+	//      refs into the operator's .git/ directly). After a coord
+	//      DB wipe, coord may not have remote_url for the
+	//      re-created project, but the local refs are right there
+	//      on disk where they've always been. Going through coord
 	//      here would re-introduce the divergence the user hit.
 	//
 	//   2. Coord DB runs list. Catches in-session allocations
-	//      that haven't been pushed yet AND projects where the
-	//      local bare lookup fails for some reason.
+	//      that haven't been written to git yet AND projects where
+	//      the local ref lookup fails for some reason.
 	used := make(map[string]bool)
 	if wf, _, _, _, werr := c.fc.OpenWorkflow(ctx, projectID); werr == nil {
-		if barePath := wf.BarePath(); barePath != "" {
-			if existing, lsErr := lsRemoteBranchNames(ctx, barePath); lsErr == nil {
-				for _, b := range existing {
-					used[b] = true
-				}
+		if existing, lsErr := wf.LocalBranches(); lsErr == nil {
+			for _, b := range existing {
+				used[b] = true
 			}
 		}
 	}
@@ -724,40 +720,6 @@ func (c *apiClient) listCoordBranches(ctx context.Context, projectID int64) ([]s
 		if b, ok := r["branch"].(string); ok && b != "" {
 			names = append(names, b)
 		}
-	}
-	return names, nil
-}
-
-// lsRemoteBranchNames runs `git ls-remote --heads <url>` and
-// returns the branch names. Works against any URL git
-// understands — managed bare repos (file://... or /abs/path)
-// and external remotes alike. 5-second timeout so a hung remote
-// doesn't stall create_run.
-//
-// We shell out rather than open a clone because the picker just
-// needs to enumerate refs on the remote; opening a workspace
-// clone is heavier (network, disk, lock) and isn't always
-// available (the local clone may not exist yet on first
-// create_run for a newly-adopted project).
-func lsRemoteBranchNames(ctx context.Context, remoteURL string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", remoteURL)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		// "<sha>\trefs/heads/<branch>"
-		parts := strings.Split(line, "\t")
-		if len(parts) != 2 {
-			continue
-		}
-		names = append(names, strings.TrimPrefix(parts[1], "refs/heads/"))
 	}
 	return names, nil
 }

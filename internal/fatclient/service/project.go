@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 
-	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
@@ -78,120 +77,6 @@ func (s *FatClient) ProjectGitDir(ctx context.Context, projectID int64) (string,
 		return "", nil
 	}
 	return filepath.Join(workDir, ".git"), nil
-}
-
-// EnsureBotPushTarget makes sure the project has a non-working-
-// tree git destination the bot daemon can push to. Called by
-// `enju bot setup` so the moment a project opts into bots, it
-// gets a proper bare push target. Idempotent — re-runs are
-// safe.
-//
-// Layout: the bare lives at `<projectHome>/enju/.bare.git/`.
-// Gitignored, so it doesn't propagate via `git clone` to other
-// machines — each operator's `enju bot setup` creates their own
-// bare locally. This matches the "one project = one folder"
-// model: everything Enju touches is inside the project. No
-// `~/.enju/repos/`, no machine-shared state via the coord.
-//
-// Decision tree on the project's current remote_url:
-//
-//   - **Real remote (https://, git@, ssh://):** github / gitlab
-//     / etc. is already a bare. No-op. Returns the existing
-//     remote unchanged. The bot pushes there directly via the
-//     project's `origin`.
-//   - **Empty (path-mode):** fall back to the projectRegistry's
-//     home path. Call PromoteWorkingTreeToBare to bare-clone
-//     the home into `<home>/enju/.bare.git/`, rewire the home's
-//     `origin` to that bare. Returns the bare path.
-//   - **No registry entry:** error pointing at enju_create_project.
-//
-// No coord PUT: the bare path is local-per-machine and
-// derivable from the project home anyway. Other fatclient
-// processes on the same machine compute the same path; the
-// coord doesn't need to know.
-//
-// Historical note: Option B (commit d8e97b6) removed auto-bare
-// from project creation because once the scanner gained a
-// `refs/heads/<branch>` fallback (when no
-// `refs/remotes/origin/<branch>` exists), the bare became
-// redundant for single-citizen flows. Phase 1 of the no-remote
-// collapse re-introduced ensureManagedBare at create time
-// because every project needs an origin push target. In solo
-// mode nobody pushes — submit wrappers commit straight to the
-// working
-// tree's local heads, the scanner reads local heads, done.
-//
-// Bots break that property: the daemon runs in a SEPARATE
-// managed clone, makes commits there, and must push them
-// somewhere the scanner can see. Pushing into the operator's
-// working tree fails on whatever branch is currently checked
-// out (and topic-branch + FF-merge flows get fragile). A bare
-// has no working tree, so pushes never contend.
-//
-// Conclusion: solo flows stay bare-free (Option B's win
-// preserved); the bare appears the moment the operator
-// opts into bots, exactly when it starts earning its
-// keep.
-func (s *FatClient) EnsureBotPushTarget(ctx context.Context, projectID int64) (bareURL string, created bool, err error) {
-	if s.enjugit == nil {
-		return "", false, fmt.Errorf("no workspace configured")
-	}
-	remoteURL, _, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
-	if ferr != nil {
-		return "", false, ferr
-	}
-
-	// Real remote (https/git/ssh) — github plays the bare role.
-	// coord-side remote_url is now always either "" (path-mode)
-	// or a real network URL, so non-empty == real remote, no-op.
-	if remoteURL != "" {
-		return remoteURL, false, nil
-	}
-
-	// Path-mode: the project's home in the registry is the source
-	// to bare-clone from. Validate it's actually a working tree
-	// before promoting (defensive — a corrupted registry entry
-	// shouldn't silently produce an empty bare).
-	var source string
-	if s.projectRegistry != nil {
-		entry, gerr := s.projectRegistry.Get(projectID)
-		if gerr == nil && entry != nil {
-			source = entry.LocalPath
-		}
-	}
-	if source == "" {
-		return "", false, fmt.Errorf(
-			"%w: project %d — set a real remote with "+
-				"`enju_set_project_remote`, or register a project home "+
-				"with `enju_create_project path=`",
-			ErrNoCloneSource, projectID)
-	}
-	if !enjugit.IsLocalWorkingTree(source) {
-		return "", false, fmt.Errorf(
-			"registered project home %q for project %d is not a git working tree; "+
-				"cannot promote to a bare",
-			source, projectID)
-	}
-
-	// Bare lives inside the project home, at the convention
-	// path `<home>/enju/.bare.git/` (corelayout.BotPushTargetDir).
-	// Gitignored via the managed block so it stays out of the
-	// operator's commits.
-	barePath := filepath.Join(source, corelayout.BotPushTargetDir)
-
-	// Note whether this is a fresh promote or a no-op so the
-	// caller can render different UX ("created" vs "ready").
-	// Detect by the bare's HEAD presence, mirroring
-	// PromoteWorkingTreeToBare's idempotency check.
-	wasFresh := true
-	if _, statErr := os.Stat(filepath.Join(barePath, "HEAD")); statErr == nil {
-		wasFresh = false
-	}
-
-	if err := enjugit.PromoteWorkingTreeToBare(source, barePath); err != nil {
-		return "", false, fmt.Errorf("promoting %q to bare at %q: %w", source, barePath, err)
-	}
-	return barePath, wasFresh, nil
 }
 
 // OpenWorkflow fetches project metadata, opens (or reuses the bot

@@ -191,21 +191,14 @@ func TestProductionBranchName(t *testing.T) {
 
 func TestProductionDiskLayout(t *testing.T) {
 	convs := NewProductionConventions()
-	if got := convs.DiskLayout.BarePath("/proj"); got != "/proj/enju/.bare.git" {
-		t.Errorf("BarePath: got %q", got)
-	}
-	if got := convs.DiskLayout.OperatorClonePath("/proj"); got != "/proj/enju/.clone" {
-		t.Errorf("OperatorClonePath: got %q", got)
-	}
 
-	// ProjectRoot reverses the clone-suffix conventions so the
-	// per-project trace log can be a single file across operator
-	// + bots. Each input shape must round-trip back to the project
-	// root the other constructors started from.
+	// ProjectRoot is the identity (post-Phase-8 the operator's
+	// adopted dir IS the working tree). Empty input collapses
+	// to empty; everything else returns Clean(workDir).
 	cases := []struct{ in, want string }{
-		{"/proj/enju/.clone", "/proj"},
-		{"/proj", "/proj"}, // autoLocal — workDir is already root
+		{"/proj", "/proj"},
 		{"/some/random/path", "/some/random/path"},
+		{"/proj/", "/proj"}, // Clean strips trailing slash
 		{"", ""},
 	}
 	for _, c := range cases {

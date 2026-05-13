@@ -441,25 +441,19 @@ func TestEnsureGitignored_FreshProject(t *testing.T) {
 		t.Error("expected changed=true on fresh project")
 	}
 	body, _ := os.ReadFile(filepath.Join(root, ".gitignore"))
-	// Both machine-managed dirs must land in the managed block
-	// so a stray `git add enju/` doesn't accidentally commit
-	// bot worktrees or the bare push target. Per-bot clones
-	// nest under enju/bots/<botname>/clone/ so the enju/bots/
-	// rule covers them transitively — no separate clone entry
-	// needed.
-	// Phase 4a moved per-bot worktrees under .enju/bots/, which is
-	// transitively covered by the .enju/ entry — so no separate
-	// enju/bots/ rule is needed (or wanted). enju/.bare.git/ stays
-	// a separate entry until Phase 8 relocates the bare too.
-	for _, want := range []string{"enju/.bare.git/", ".enju/"} {
-		if !strings.Contains(string(body), want) {
-			t.Errorf("expected %q in .gitignore, got:\n%s", want, body)
-		}
+	// Post-Phase-8: only the .enju/ umbrella entry remains.
+	// It transitively covers .enju/bots/, .enju/runs/,
+	// .enju/scratch/, and any future runtime-cache sibling.
+	// No more enju/.bare.git/ entry — Phase 8 removed bare creation.
+	if !strings.Contains(string(body), ".enju/") {
+		t.Errorf("expected .enju/ in .gitignore, got:\n%s", body)
 	}
-	// And verify the OLD entry is NOT present — regression guard
-	// against accidentally re-adding it.
+	// Verify legacy entries are NOT present — regression guards.
 	if strings.Contains(string(body), "\nenju/bots/\n") {
 		t.Errorf("legacy enju/bots/ entry should be gone post-Phase-4a (covered transitively by .enju/), got:\n%s", body)
+	}
+	if strings.Contains(string(body), "enju/.bare.git/") {
+		t.Errorf("enju/.bare.git/ entry should be gone post-Phase-8 (no bare creation anymore), got:\n%s", body)
 	}
 	if !strings.Contains(string(body), "enju-untracked") {
 		t.Error(".gitignore should contain the managed block markers")

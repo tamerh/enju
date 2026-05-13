@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
@@ -133,12 +132,10 @@ type CreateProjectResult struct {
 	ProjectID     int64
 	// InitWarning carries a non-fatal local-state warning the
 	// MCP handler should surface to the operator. Most common
-	// case: adoption refused because the working tree's git
-	// state is inconsistent (e.g. enju/.bare.git/ on disk but
-	// no .git/ — a partial cp from another project). The coord
-	// project was created, but the local clone wasn't
-	// materialized; the operator needs to fix the on-disk
-	// inconsistency before the project is usable locally.
+	// case: local clone materialization hit a transient error.
+	// The coord project was created, but the local clone wasn't
+	// fully materialized; the operator needs to retry or fix
+	// the on-disk inconsistency before the project is usable.
 	InitWarning string
 }
 
@@ -321,20 +318,21 @@ func inspectExistingDir(path string, target *AdoptionTarget) error {
 
 // EagerInitProjectClone materializes the local working tree for
 // a freshly-created project at the operator's chosen path. The
-// project's working tree IS that directory.
+// project's working tree IS that directory; its `.git/` IS the
+// single git store enju writes objects + refs into via plumbing.
 //
 // Dispatch by inspected target state:
 //
 //   - empty / nonexistent: ForProject opens via InitLocal (seed
-//     README + enju/templates/.gitkeep + initial commit), then
-//     ensureManagedBare wires the bare.
+//     README + enju/templates/.gitkeep + initial commit).
 //   - populated, no .git: git init + add+commit existing files +
-//     write enju/ scaffold, then ForProject opens, then
-//     ensureManagedBare wires the bare.
-//   - .git present, no origin: ForProject opens, ensureManagedBare
-//     creates + wires the managed bare.
-//   - .git + origin: ForProject opens, ensureManagedBare is a
-//     no-op (existing origin wins).
+//     write enju/ scaffold, then ForProject opens.
+//   - .git present, no origin: ForProject opens. No origin gets
+//     auto-wired — solo single-machine projects stay local; the
+//     operator wires a real remote later via
+//     enju_set_project_remote to opt into sharing.
+//   - .git + origin: ForProject opens. Existing origin is left
+//     intact (user's github/gitlab clone keeps its remote).
 //
 // path is required — `enju_create_project` validates this at the
 // MCP handler boundary, so a zero-value here is a programming
@@ -358,25 +356,6 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 	// directory, so the existing user files end up on the initial
 	// commit instead of being shadowed by InitLocal's seed.
 	if target != nil && target.HasFiles && !target.HasGit {
-		// Refuse the adoption when a managed bare is already on
-		// disk at the canonical path. Combination "files + no
-		// .git + has .bare.git" means the dir was copied from
-		// another project (the user's `cp -r enju/`) or otherwise
-		// landed in an inconsistent state. Letting init proceed
-		// would seed a brand-new working tree whose history is
-		// unrelated to the existing bare's — producing the
-		// non-fast-forward push failures the operator can't
-		// recover from without manual git surgery.
-		barePath := filepath.Join(path, corelayout.BotPushTargetDir)
-		if _, statErr := os.Stat(filepath.Join(barePath, "HEAD")); statErr == nil {
-			return fmt.Errorf(
-				"refusing to adopt %q: found an existing managed bare at %q but "+
-					"no .git/ in the working tree. This usually means the project "+
-					"was partially copied from another location (e.g. cp -r enju/). "+
-					"Either restore the matching .git/ directory, or remove %q "+
-					"so a fresh bare can be created.",
-				path, barePath, barePath)
-		}
 		if _, err := s.initGitWithExistingFiles(path); err != nil {
 			return fmt.Errorf("initializing git in populated dir %q: %w", path, err)
 		}
@@ -390,11 +369,8 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 		ID:        projectID,
 		LocalPath: path,
 	})
-	wf, err := s.enjugit.ForProject(projectID, "")
-	if err != nil {
-		return err
-	}
-	return s.ensureManagedBare(path, wf)
+	_, err := s.enjugit.ForProject(projectID, "")
+	return err
 }
 
 // initGitWithExistingFiles runs `git init` then stages every
@@ -408,61 +384,6 @@ func (s *FatClient) EagerInitProjectClone(ctx context.Context, projectID int64, 
 // of HEAD after the commit.
 func (s *FatClient) initGitWithExistingFiles(dirPath string) (string, error) {
 	return enjugit.InitLocalAdoptExisting(dirPath, corelayout.DefaultTemplatesDir)
-}
-
-// ensureManagedBare guarantees the working tree at workDir has
-// origin configured by creating a managed bare at
-// <workDir>/enju/.bare.git/ and rewiring origin to point at it.
-// Refreshes the cached *git.Clone.remoteURL on the supplied
-// Workflow so subsequent verbs see the new origin without
-// reopening.
-//
-// Coord-free: the working tree path is the source of truth at
-// project-creation time (we just registered it), so no metadata
-// lookup is needed. EnsureBotPushTarget is the coord-aware
-// sibling for bot-setup time, where the project may already be
-// a real-remote one and the bare should be skipped.
-//
-// Idempotent at every layer: PromoteWorkingTreeToBare returns
-// silently when the bare already exists; SetRemote is
-// a no-op when origin already points at the right place.
-//
-// Errors propagate so the caller can surface them as warnings.
-// Returning nil with a soft-fail on the cache refresh keeps the
-// on-disk state authoritative — the cache will eventually
-// re-sync on the next clone open.
-func (s *FatClient) ensureManagedBare(workDir string, wf *enjugit.Workflow) error {
-	if workDir == "" || wf == nil {
-		return nil
-	}
-	// If origin is already configured (any URL — real remote like
-	// github, an already-wired managed bare, or a user-set local
-	// path), leave it alone. Three cases this handles:
-	//
-	//   - github.com clone adopted via enju_create_project: user's
-	//     origin stays intact; no bare promotion that would silently
-	//     repoint their push target.
-	//   - Re-running enju_create_project on the same path:
-	//     idempotent no-op.
-	//   - enju bot setup ran first: bare already wired, skip.
-	//
-	// The cache is fresh here — ForProject just opened the clone,
-	// so wf.RemoteURL() reflects current on-disk state. The
-	// stale-cache scenario can't apply at this entry point.
-	if existing := wf.RemoteURL(); existing != "" {
-		return nil
-	}
-	barePath := filepath.Join(workDir, corelayout.BotPushTargetDir)
-	if err := enjugit.PromoteWorkingTreeToBare(workDir, barePath); err != nil {
-		return fmt.Errorf("creating managed bare for %q: %w", workDir, err)
-	}
-	if err := wf.SetRemote(barePath); err != nil {
-		// Non-fatal: bare exists, on-disk origin set; cache
-		// refresh failed. Log so anomalies are visible.
-		s.logger.Warn("ensureManagedBare: cache refresh failed",
-			"work_dir", workDir, "bare_path", barePath, "error", err)
-	}
-	return nil
 }
 
 // DetectPopulatedUnrelatedRepo returns a non-empty refusal reason
@@ -642,42 +563,25 @@ func (s *FatClient) SyncProjectToRemote(ctx context.Context, projectID int64, fo
 //
 //  1. Update the on-disk origin URL so future pushes/fetches hit
 //     the right place.
-//  2. Push every local branch to it so the new bare contains all
-//     the work that accumulated against the prior origin (the
-//     managed bare for path-mode projects), now redirected to
-//     the new remote.
+//  2. Push every local branch to it so the new remote receives
+//     all the work that accumulated locally before origin was
+//     wired up.
 //  3. Reset scan cursors for every local branch to the sentinel
 //     that forces full-history rescans on next reconcile, so the
 //     scanner re-emits historical trailers and the artifact index
 //     catches up.
 //
-// Returns a migration note (non-empty when graduating from a
-// managed local bare to a real remote — formatter prints it as
-// a curative info line) and a warning (non-empty when the push
-// step failed; remote is set, but seeding failed). Empty
-// workspace returns ("", "").
-func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) (migrationNote, warning string) {
+// Returns a warning (non-empty when the push step failed; remote
+// is set, but seeding failed). Empty workspace returns "".
+func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) (warning string) {
 	if s.enjugit == nil {
-		return "", ""
+		return ""
 	}
 	wf, err := s.enjugit.ForProject(projectID, remoteURL)
 	if err != nil {
-		return "", ""
+		return ""
 	}
-	// Detect graduate path: clone's current origin points at the
-	// managed bare under <project>/enju/.bare.git/, NOT at the new
-	// remote. Surface a migration line so the operator sees that
-	// their local-only history is being mirrored to the new remote.
-	priorOrigin := wf.RemoteURL()
-	graduating := priorOrigin != "" &&
-		priorOrigin != remoteURL &&
-		strings.HasSuffix(filepath.ToSlash(priorOrigin), corelayout.BotPushTargetDir)
-
 	_ = wf.SetRemote(remoteURL)
-
-	if graduating {
-		migrationNote = "\n  → Migrating local commits from the managed bare to " + remoteURL + "..."
-	}
 
 	if pushErr := wf.PushAllRefs(false); pushErr != nil {
 		warning = fmt.Sprintf("\n⚠ Pushing local branches to new remote failed: %v", pushErr)
@@ -705,7 +609,7 @@ func (s *FatClient) MirrorRemoteAfterSet(projectID int64, remoteURL string) (mig
 		}
 		cursorMu.Unlock()
 	}
-	return migrationNote, warning
+	return warning
 }
 
 // LocalLeaveProject wipes the project's local clone (best-effort)

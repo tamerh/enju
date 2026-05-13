@@ -582,23 +582,18 @@ func (m *Manifest) ByName(name string) *Bot {
 }
 
 // EnsureGitignored ensures the project's .gitignore lists the
-// machine-managed enju directories inside the existing
+// machine-managed enju directory inside the existing
 // enju-managed block. Called by `enju bot setup` so the operator
-// doesn't have to remember the gitignore step manually. Entries
-// land in the block:
+// doesn't have to remember the gitignore step manually. The
+// single entry:
 //
-//   - enju/.bare.git/ — bot push target bare (per-machine local)
-//   - .enju/          — hidden runtime state: per-bot worktrees
-//                       (.enju/bots/), per-run snapshots
-//                       (.enju/runs/), per-task scratch, etc.
-//                       Covers everything Phase 3+ moved under
-//                       StateDirRoot.
+//   - .enju/ — hidden runtime state: per-run snapshots
+//              (.enju/runs/), per-task scratch
+//              (.enju/scratch/), per-bot state, etc.
 //
-// All are local-only state, never something to commit. The bare
-// is dot-prefixed so it doesn't clutter `ls enju/` alongside
-// the human-curated templates and bots.yaml. The .enju/ root
-// holds every transient runtime cache the sweep wipes on bot
-// startup.
+// All transient local state; never something to commit. The
+// .enju/ umbrella covers every runtime cache the sweep wipes
+// on bot startup.
 //
 // Returns (changed=true, nil) when the file was updated; (false,
 // nil) when all paths were already present. Errors only on real
@@ -626,13 +621,10 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	}
 	// StateDirRoot (.enju/) is the umbrella that transitively
 	// covers .enju/bots/, .enju/runs/, .enju/scratch/, and any
-	// future runtime-cache sibling. The standalone enju/bots/
-	// entry would be redundant since BotsRuntimeDir is now
-	// rooted under .enju/, so we skip it. BotPushTargetDir
-	// stays a separate entry — it lives at enju/.bare.git/
-	// (under the visible enju/) for historical reasons.
+	// future runtime-cache sibling. One entry is enough — Phase 8
+	// removed the visible enju/.bare.git/ tenant; no other enju/
+	// children need ignoring.
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
-		corelayout.BotPushTargetDir + "/",
 		corelayout.StateDirRoot + "/",
 	})
 	if !changed {

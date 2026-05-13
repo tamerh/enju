@@ -363,12 +363,8 @@ func (c *apiClient) handleSetProjectRemote(ctx context.Context, req mcp.CallTool
 
 	// Mirror the remote change into the existing local clone
 	// (origin URL update + push every local branch to seed the
-	// new bare + cursor reset to force full-history rescan). The
-	// migrationNote tells the operator when their project is
-	// graduating from a managed local bare to a real remote so the
-	// "all your local branches are being mirrored" effect isn't
-	// silent.
-	migrationNote, pushWarning := c.fc.MirrorRemoteAfterSet(int64(projectID), remoteURL)
+	// new remote + cursor reset to force full-history rescan).
+	pushWarning := c.fc.MirrorRemoteAfterSet(int64(projectID), remoteURL)
 
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s%s", projectID, remoteURL, migrationNote, pushWarning)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Set remote for project %d to %s%s", projectID, remoteURL, pushWarning)), nil
 }

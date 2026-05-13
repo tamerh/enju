@@ -103,16 +103,6 @@ func BigfilesBranchDir(branch string) string {
 	return filepath.Join(BigfilesDir, branch)
 }
 
-// BotPushTargetDir is the per-project bare repo the bot daemon
-// pushes its topic branches to. Created by `enju bot setup` (see
-// service.EnsureBotPushTarget); operator's working tree's `origin`
-// is rewired to point at this path so async submits land here too.
-// The dot prefix on the directory name keeps it out of normal
-// `ls`-ing while matching the visible/hidden split convention
-// elsewhere in enju/. Always gitignored — no scenario where
-// a bare belongs in the project's git history.
-const BotPushTargetDir = "enju/.bare.git"
-
 // BotPromptsDir is the conventional location bot system prompts
 // live in. Convention only — the manifest's `system_prompt:`
 // field can point anywhere repo-relative; this constant just

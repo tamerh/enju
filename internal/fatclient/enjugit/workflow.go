@@ -194,23 +194,6 @@ func (w *Workflow) RemoteBranches() ([]string, error) {
 	return branches, translateGitError("remote branches", err)
 }
 
-// BarePath returns the absolute on-disk path of the project's
-// managed bare repo. Computed from the workspace clone's project
-// root via the DiskLayout convention — does NOT consult coord
-// state. Load-bearing for the auto-branch picker after a coord
-// DB wipe: coord may not have remote_url for the re-created
-// project, but the local bare is right there on disk where it's
-// always been.
-//
-// Returns "" when the convention isn't configured (legacy tests
-// using bare Conventions{}).
-func (w *Workflow) BarePath() string {
-	if w.convs.DiskLayout.BarePath == nil {
-		return ""
-	}
-	return w.convs.DiskLayout.BarePath(w.ProjectRoot())
-}
-
 // wrapGitError attaches workdir + remote URL context to a git
 // error so error messages tell the operator WHICH on-disk
 // clone and WHICH remote the failure happened against — without

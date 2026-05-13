@@ -65,6 +65,13 @@ func initRepoWithCommit(t *testing.T, dir string, withEnjuMarker bool) {
 // against directly observable post-state on disk. One row per
 // branch of the dispatch table — failures point at exactly which
 // case regressed.
+//
+// Post-Phase-8 contract: no managed bare gets created at project
+// init. Operator's working tree's `.git/` IS the single store;
+// plumbing-submit writes objects + non-HEAD refs there directly.
+// Origin stays unset for solo single-machine projects; user wires
+// a real remote via enju_set_project_remote when they're ready
+// to share.
 func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -85,9 +92,8 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 
 		// Post-state expectations (only checked when validation
 		// + EagerInitProjectClone succeed).
-		wantBareWired       bool   // expect <path>/enju/.bare.git/HEAD
-		wantOriginEquals    string // expect origin == this URL; "" = bare path; "preserve" = pre-existing URL
-		wantHEADResolves    bool   // expect refs/heads/main has a SHA
+		wantOriginEquals      string // expected origin URL; "" = no origin expected
+		wantHEADResolves      bool   // expect refs/heads/main has a SHA
 		wantUserFilePreserved string // relative path that must exist post-init; "" = skip check
 	}{
 		{
@@ -97,7 +103,6 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				// Don't mkdir — validateAndInspectPath does it.
 				return p
 			},
-			wantBareWired:    true,
 			wantHEADResolves: true,
 		},
 		{
@@ -109,7 +114,6 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				}
 				return p
 			},
-			wantBareWired:    true,
 			wantHEADResolves: true,
 		},
 		{
@@ -124,7 +128,6 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				}
 				return p
 			},
-			wantBareWired:         true,
 			wantHEADResolves:      true,
 			wantUserFilePreserved: "user-data.txt",
 		},
@@ -138,7 +141,6 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				initRepoWithCommit(t, p, true /* enju marker so safety gate doesn't fire */)
 				return p
 			},
-			wantBareWired:         true,
 			wantHEADResolves:      true,
 			wantUserFilePreserved: "README.md",
 		},
@@ -150,14 +152,10 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 					t.Fatal(err)
 				}
 				initRepoWithCommit(t, p, true)
-				// Real-looking origin URL — ensureManagedBare's
-				// existing-origin guard skips bare creation when
-				// any URL is set, so we don't need a reachable
-				// remote.
+				// Pre-existing origin URL stays intact across init.
 				gittest.AddRemote(t, p, "origin", "git@github.com:enju-ai/test-fixture.git")
 				return p
 			},
-			wantBareWired:         false,
 			wantOriginEquals:      "git@github.com:enju-ai/test-fixture.git",
 			wantHEADResolves:      true,
 			wantUserFilePreserved: "README.md",
@@ -186,7 +184,6 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				return p
 			},
 			force:                 true,
-			wantBareWired:         true,
 			wantHEADResolves:      true,
 			wantUserFilePreserved: "README.md",
 		},
@@ -228,31 +225,26 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 				t.Fatalf("EagerInitProjectClone: %v", err)
 			}
 
-			// Bare presence check.
-			barePath := filepath.Join(path, corelayout.BotPushTargetDir)
-			_, statErr := os.Stat(filepath.Join(barePath, "HEAD"))
-			bareExists := statErr == nil
-			if tc.wantBareWired && !bareExists {
-				t.Errorf("expected managed bare at %q, got stat error: %v", barePath, statErr)
-			}
-			if !tc.wantBareWired && bareExists {
-				t.Errorf("expected NO managed bare at %q (case 5 should preserve existing origin), but bare exists", barePath)
+			// No managed bare gets created at init time.
+			barePath := filepath.Join(path, "enju", ".bare.git")
+			if _, statErr := os.Stat(filepath.Join(barePath, "HEAD")); statErr == nil {
+				t.Errorf("unexpected managed bare at %q — Phase 8 stopped auto-creating bares at project init", barePath)
 			}
 
-			// Origin URL check.
+			// Origin URL check. Empty wantOriginEquals = no origin
+			// expected (solo single-machine project, no remote
+			// configured yet).
 			gotOrigin, originErr := gittest.RunOK(t, path, "remote", "get-url", "origin")
-			if originErr != nil {
-				t.Fatalf("repo has no origin after dispatch: %v", originErr)
-			}
-			switch {
-			case tc.wantOriginEquals != "":
+			if tc.wantOriginEquals == "" {
+				if originErr == nil {
+					t.Errorf("expected no origin, got %q", gotOrigin)
+				}
+			} else {
+				if originErr != nil {
+					t.Fatalf("expected origin %q preserved, got error: %v", tc.wantOriginEquals, originErr)
+				}
 				if gotOrigin != tc.wantOriginEquals {
 					t.Errorf("origin: got %q, want %q (preserved)", gotOrigin, tc.wantOriginEquals)
-				}
-			case tc.wantBareWired:
-				// Origin should point at the managed bare.
-				if gotOrigin != barePath {
-					t.Errorf("origin: got %q, want %q (managed bare)", gotOrigin, barePath)
 				}
 			}
 

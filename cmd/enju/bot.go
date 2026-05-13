@@ -221,22 +221,6 @@ func cmdBotSetup(args []string) {
 		}
 	}
 
-	// Ensure the project has a non-working-tree push target
-	// (a managed bare at ~/.enju/repos/{id}.git/). Without
-	// this, a bot daemon pushing a topic branch into the
-	// operator's adopted folder hits "branch is currently
-	// checked out" or races against the operator's working-
-	// tree state. We do this AFTER membership is set up so
-	// the operator's "I just opted into bots" act is the same
-	// moment the push infrastructure appears — human-only
-	// flows never see a bare under ~/.enju/repos/.
-	//
-	// Real-remote projects (github / gitlab) skip this
-	// silently — github already plays the bare role.
-	if !*dryRun && effectiveProjectID > 0 {
-		ensureBotPushTarget(ctx, *coordinator, owner, effectiveProjectID)
-	}
-
 	fmt.Printf("\n%d registered, %d skipped, %d failed\n", registered, skipped, failed)
 	if failed > 0 {
 		os.Exit(2)
@@ -422,56 +406,6 @@ func addBotToProject(ctx context.Context, coordURL, ownerToken string, projectID
 		return nil
 	}
 	return fmt.Errorf("coord %d: %s", resp.StatusCode, string(respBody))
-}
-
-// ensureBotPushTarget calls service.FatClient.EnsureBotPushTarget
-// for the project so the moment bots are wired up, the project
-// has a non-working-tree push destination (a managed bare inside
-// the project at <project>/enju/.bare.git/). Idempotent —
-// re-running setup just re-confirms the bare exists and origin
-// points at it.
-//
-// The setup CLI is a one-shot, so we build a minimal FatClient
-// here (workspace + projectRegistry + coord) and discard it on
-// return. The bare lives inside the project home (gitignored,
-// per-machine), so no coord write is needed; this helper builds a
-// FatClient just for FetchProjectMetaExpanded and the registry
-// lookup.
-func ensureBotPushTarget(ctx context.Context, coordinator string, owner *credentials, projectID int64) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	wsRoot, err := defaultWorkspaceRoot()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ! couldn't resolve workspace root for bot push-target setup: %v\n", err)
-		return
-	}
-	wsRoot, err = resolveWorkspaceRoot(wsRoot)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ! couldn't open workspace for bot push-target setup: %v\n", err)
-		return
-	}
-	coordClient := coord.New(coord.Config{
-		BaseURL:     coordinator,
-		Username:    owner.Username,
-		CitizenName: owner.Name,
-		AuthToken:   owner.Token,
-		Logger:      logger,
-	})
-	fc := service.New(service.Config{
-		Coord:           coordClient,
-		WorkspaceRoot:   wsRoot,
-		Logger:          logger,
-		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
-	})
-	bareURL, created, err := fc.EnsureBotPushTarget(ctx, projectID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ! bot push target not ready for project #%d: %v\n", projectID, err)
-		return
-	}
-	if created {
-		fmt.Printf("  + created bot push target for project #%d at %s\n", projectID, bareURL)
-	} else {
-		fmt.Printf("  ✓ bot push target for project #%d ready at %s\n", projectID, bareURL)
-	}
 }
 
 // defaultWorkspaceRoot is the same path `enju bot run` uses for
@@ -702,15 +636,14 @@ func cmdBotRun(args []string) {
 				pid = manifest.ProjectID
 			}
 			ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			ensureBotPushTarget(ensureCtx, *coordinator, owner, pid)
 			ensureBotMembership(ensureCtx, *coordinator, owner.Token, pid, creds.Username, os.Stderr)
 			ensureCancel()
 		}
 		// No owner creds → skip silently. The daemon either
-		// works against an existing bare + pre-set membership
-		// (real-remote project) or the operator will see the
-		// push failure / "not a member" loop and run
-		// `enju mcp` to register an owner identity.
+		// works against an existing membership (real-remote
+		// project where collaborators were added out-of-band)
+		// or the operator will see the "not a member" loop and
+		// run `enju mcp` to register an owner identity.
 	}
 
 	// Maintain the managed gitignore block so a re-run of `enju
@@ -719,7 +652,7 @@ func cmdBotRun(args []string) {
 	// as ensureBotPushTarget — silent no-op when the block
 	// already covers everything.
 	if changed, err := bots.EnsureGitignored(absProject); err == nil && changed {
-		fmt.Fprintln(os.Stderr, "self-heal: .gitignore updated to ignore enju/bots/, enju/.bare.git/, enju/.clone/")
+		fmt.Fprintln(os.Stderr, "self-heal: .gitignore updated to ignore .enju/")
 	}
 
 	// Read the bot's system prompt. Empty is legal (some handler

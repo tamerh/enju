@@ -51,11 +51,10 @@ type Conventions struct {
 	// specify one. Production: "main".
 	DefaultRunBranch string
 
-	// DiskLayout names the per-project on-disk paths for git
-	// infrastructure. Each function takes a projectDir and returns
-	// a path. Production layout:
-	//   BarePath:          <project>/enju/.bare.git
-	//   OperatorClonePath: <project>/enju/.clone
+	// DiskLayout names per-project on-disk path policy. After
+	// Phase 8 the operator's adopted dir IS the working tree, so
+	// there's no managed clone path to compute — only ProjectRoot
+	// (reverses workDir → user-facing root) remains.
 	DiskLayout DiskLayout
 }
 
@@ -74,18 +73,11 @@ type Identity struct {
 // is a closure rather than a string so tests can inject layouts
 // without mocking filesystem state.
 type DiskLayout struct {
-	BarePath          func(projectDir string) string
-	OperatorClonePath func(projectDir string) string
-
-	// ProjectRoot reverses the clone-suffix conventions: given a
-	// workDir (operator clone, or autoLocal repo root), returns
-	// the user-facing project root. Used to route per-project
-	// trace logs to a single location regardless of which clone
-	// is doing the writing.
-	//
-	// Production rule:
-	//   - <root>/enju/.clone                   → <root>
-	//   - any other path                       → workDir (autoLocal/unknown)
+	// ProjectRoot maps a workDir to its user-facing project root.
+	// Post-Phase-8 the operator's adopted dir IS the working
+	// tree, so this is the identity for any path enju touches.
+	// Kept as a closure for test injectability and to leave a
+	// seam for future layout variants.
 	ProjectRoot func(workDir string) string
 }
 
@@ -99,43 +91,21 @@ func NewProductionConventions() Conventions {
 		TrailerOrder:     ProductionTrailerOrder(),
 		DefaultRunBranch: "main",
 		DiskLayout: DiskLayout{
-			BarePath: func(projectDir string) string {
-				return filepath.Join(projectDir, "enju", ".bare.git")
-			},
-			OperatorClonePath: func(projectDir string) string {
-				return filepath.Join(projectDir, "enju", ".clone")
-			},
 			ProjectRoot: productionProjectRootFromWorkDir,
 		},
 	}
 }
 
-// productionProjectRootFromWorkDir reverses the clone-suffix
-// conventions. Recognized suffixes (in priority order):
-//
-//   - .../enju/.clone                  → strip the trailing 2 segments
-//   - else                              → workDir is already the root
-//
-// Path-pattern based, but the patterns ARE the convention — every
-// other constructor (BarePath, OperatorClonePath) produces strings
-// that match these. If the convention changes, this function
-// changes alongside.
+// productionProjectRootFromWorkDir maps a workDir to the user-
+// facing project root. Post-Phase-8 the operator's adopted dir
+// IS the working tree, so this is the identity (modulo empty +
+// Clean). Kept as a discrete function so future layout shifts
+// have a single touchpoint.
 func productionProjectRootFromWorkDir(workDir string) string {
 	if workDir == "" {
 		return ""
 	}
-	clean := filepath.Clean(workDir)
-	parent := filepath.Dir(clean)
-	parentBase := filepath.Base(parent)
-	leaf := filepath.Base(clean)
-
-	// Operator clone: <root>/enju/.clone
-	if leaf == ".clone" && parentBase == "enju" {
-		return filepath.Dir(parent)
-	}
-
-	// autoLocal or unknown — workDir is already the project root.
-	return clean
+	return filepath.Clean(workDir)
 }
 
 // ProductionTrailerOrder is the canonical order Enju trailers

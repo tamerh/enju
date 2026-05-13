@@ -152,14 +152,25 @@ func (w *Workflow) SubmitComputeTaskResult(req SubmitRequest) (*SubmitResult, er
 	}
 	trace.ok("update-ref")
 
-	// Step 4: push topic branch with verify. Push acquires lock
-	// internally; concurrent pushes to DIFFERENT branches are
-	// safe (each pushes its own ref). Verify catches the silent-
-	// push-skip pattern that's bitten compute submits before.
-	if err := w.git.PushWithVerify(branchName, commitSHA); err != nil {
-		return nil, trace.fail("push-verify", translateGitError("push verify", err))
+	// Step 4: push topic branch with verify. Skipped when origin
+	// is unset — the local update-ref above already committed the
+	// branch into this clone's object store, which IS the single
+	// store in the single-machine no-origin shape. Sharing with
+	// other citizens is a separate concern (sync model) that only
+	// applies when origin points at a real remote.
+	//
+	// Push acquires lock internally; concurrent pushes to
+	// DIFFERENT branches are safe (each pushes its own ref).
+	// Verify catches the silent-push-skip pattern that's bitten
+	// compute submits before.
+	if w.git.RemoteURL() == "" {
+		trace.okDetail("push-verify", "skipped: no origin")
+	} else {
+		if err := w.git.PushWithVerify(branchName, commitSHA); err != nil {
+			return nil, trace.fail("push-verify", translateGitError("push verify", err))
+		}
+		trace.ok("push-verify")
 	}
-	trace.ok("push-verify")
 
 	return &SubmitResult{
 		CommitSHA:    commitSHA,
@@ -293,9 +304,16 @@ func (w *Workflow) CommitArbitraryFilesPlumbing(req CommitArbitraryFilesRequest)
 	}
 	trace.ok("update-ref")
 
-	// Step 4: push. Returns the error so the caller knows when
-	// the local commit landed but origin didn't — same shape as
-	// SubmitComputeTaskResult's push step.
+	// Step 4: push. Skipped when origin is unset — local update-ref
+	// already committed into this clone's store. Returns the push
+	// error so the caller knows when the local commit landed but
+	// origin didn't — same shape as SubmitComputeTaskResult.
+	if w.git.RemoteURL() == "" {
+		trace.appendStep(Step{
+			Name: "push", Status: "ok", Detail: "skipped: no origin",
+		})
+		return &CommitArbitraryFilesResult{CommitSHA: commitSHA}, nil
+	}
 	if perr := w.git.Push(req.Branch); perr != nil {
 		trace.appendStep(Step{
 			Name: "push", Status: "failed",

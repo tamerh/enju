@@ -7,19 +7,13 @@ package service
 // that project to its adopted location.
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
@@ -169,173 +163,8 @@ func initRealCloneWithAuthor(t *testing.T, dir string) {
 // can no longer hold a workspace-internal path, so the
 // discriminator and its tests are unreachable.)
 
-// pushTargetCoordStub stands in for the coord during
-// EnsureBotPushTarget tests. It serves GET /projects/{id} with a
-// configurable remote_url, and accepts the PUT
-// /projects/{id}/remote that the helper issues after promoting
-// the operator's tree to a bare. The PUT body is captured so
-// tests can assert what was sent.
-type pushTargetCoordStub struct {
-	remoteURL  string
-	gotPutBody map[string]string
-	putCount   int
-}
-
-func newPushTargetCoord(t *testing.T, initialRemote string) (*httptest.Server, *pushTargetCoordStub) {
-	t.Helper()
-	s := &pushTargetCoordStub{remoteURL: initialRemote}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/projects/"):
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"id":             42,
-				"name":           "demo",
-				"remote_url":     s.remoteURL,
-				"default_branch": "main",
-			})
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/remote"):
-			body, _ := io.ReadAll(r.Body)
-			_ = json.Unmarshal(body, &s.gotPutBody)
-			s.putCount++
-			s.remoteURL = s.gotPutBody["remote_url"]
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	return srv, s
-}
-
-// TestEnsureBotPushTarget_LocalTreePromotes pins the happy path:
-// project's remote_url is empty, registry has the project's
-// home path. EnsureBotPushTarget must
-//
-//	(a) promote the home tree to a bare INSIDE the project at
-//	    `<home>/enju/.bare.git/`,
-//	(b) NOT PUT to the coord (the bare is local-per-machine),
-//	(c) return created=true.
-//
-// Idempotency: a second call sees the existing bare and returns
-// created=false without re-cloning.
-func TestEnsureBotPushTarget_LocalTreePromotes(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tmp := t.TempDir()
-	// Pin GIT_AUTHOR_* + GIT_COMMITTER_* — initRealCloneWithAuthor
-	// supplies them via an explicit signature, but go-git's
-	// CommitOptions.All path still consults the env in some go-git
-	// versions. Keeps the test deterministic across versions.
-	t.Setenv("GIT_AUTHOR_NAME", "test")
-	t.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
-	t.Setenv("GIT_COMMITTER_NAME", "test")
-	t.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
-
-	homeTree := filepath.Join(tmp, "op-tree")
-	initRealCloneWithAuthor(t, homeTree)
-
-	regPath := filepath.Join(tmp, "projects.json")
-	reg := projectreg.Open(regPath)
-	if err := reg.Upsert(projectreg.Entry{ID: 42, LocalPath: homeTree, Name: "demo"}); err != nil {
-		t.Fatal(err)
-	}
-
-	srv, stub := newPushTargetCoord(t, "")
-	defer srv.Close()
-
-	wsRoot := filepath.Join(tmp, "workspaces")
-	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger, ProjectRegistry: projectreg.Open(regPath)})
-
-	bareURL, created, err := fc.EnsureBotPushTarget(context.Background(), 42)
-	if err != nil {
-		t.Fatalf("EnsureBotPushTarget: %v", err)
-	}
-	if !created {
-		t.Errorf("first call should report created=true")
-	}
-	wantBare := filepath.Join(homeTree, "enju", ".bare.git")
-	if bareURL != wantBare {
-		t.Errorf("bareURL: got %q, want %q", bareURL, wantBare)
-	}
-	if _, err := os.Stat(filepath.Join(wantBare, "HEAD")); err != nil {
-		t.Errorf("bare not materialized at %q: %v", wantBare, err)
-	}
-	if stub.putCount != 0 {
-		t.Errorf("must NOT PUT to coord — bare is purely local; got %d PUTs", stub.putCount)
-	}
-
-	// Second call must be idempotent — no re-clone, created=false.
-	_, created2, err := fc.EnsureBotPushTarget(context.Background(), 42)
-	if err != nil {
-		t.Fatalf("second EnsureBotPushTarget: %v", err)
-	}
-	if created2 {
-		t.Errorf("second call should report created=false")
-	}
-}
-
-// TestEnsureBotPushTarget_RealRemoteIsNoOp confirms that when
-// the project already has a real (https/git/ssh) remote — i.e.
-// github plays the bare role — EnsureBotPushTarget short-
-// circuits without writing anything to disk or calling PUT.
-func TestEnsureBotPushTarget_RealRemoteIsNoOp(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	srv, stub := newPushTargetCoord(t, "https://github.com/example/demo.git")
-	defer srv.Close()
-
-	wsRoot := filepath.Join(tmp, "workspaces")
-	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger})
-
-	url, created, err := fc.EnsureBotPushTarget(context.Background(), 42)
-	if err != nil {
-		t.Fatalf("EnsureBotPushTarget: %v", err)
-	}
-	if created {
-		t.Errorf("real-remote project should not promote (created=false)")
-	}
-	if url != "https://github.com/example/demo.git" {
-		t.Errorf("expected existing remote URL returned unchanged, got %q", url)
-	}
-	if stub.putCount != 0 {
-		t.Errorf("real-remote project should not PUT to coord, got %d PUTs", stub.putCount)
-	}
-	if _, err := os.Stat(filepath.Join(tmp, ".enju", "repos")); err == nil {
-		t.Errorf("real-remote project should not create a bare under ~/.enju/repos/")
-	}
-}
-
-// TestEnsureBotPushTarget_NoSourceErrors covers the failure
-// case the operator hits when they ran `enju bot setup` against
-// a project that was created without an adopted path AND
-// without a remote_url. Helper must error out with a clear
-// hint, NOT silently no-op.
-func TestEnsureBotPushTarget_NoSourceErrors(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-
-	srv, _ := newPushTargetCoord(t, "")
-	defer srv.Close()
-
-	wsRoot := filepath.Join(tmp, "workspaces")
-	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, _ := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	c := coord.New(coord.Config{BaseURL: srv.URL, Username: "u", AuthToken: "t", Logger: logger})
-	fc := New(Config{Coord: c, WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no projectRegistry
-
-	_, _, err := fc.EnsureBotPushTarget(context.Background(), 42)
-	if err == nil {
-		t.Fatal("expected error when neither remote_url nor adopted path is available")
-	}
-	if !errors.Is(err, ErrNoCloneSource) {
-		t.Errorf("error should be ErrNoCloneSource so the daemon's Run loop can detect a permanent config failure and exit; got: %v", err)
-	}
-}
+// (Removed: TestEnsureBotPushTarget_* tests. Phase 8 dropped
+// the managed bare and the EnsureBotPushTarget helper that
+// created it; solo single-machine projects now operate against
+// the operator's own .git/ via plumbing, with no separate push
+// target needed.)
