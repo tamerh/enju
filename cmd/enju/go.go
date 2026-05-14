@@ -222,6 +222,18 @@ func projectRootCandidate(workflowAbs string) string {
 // CommitRunTemplateSnapshot path and isn't reusable for path=
 // mode yet. Tracked follow-up: unify both call sites.
 //
+// GAP (auto_bots): handleCreateRun added an auto_bots=true
+// preflight (start every workflow bot, WaitForReady, MarkAutoRun
+// post-POST, register the live.jsonl tailer for auto-stop on
+// run completion). This CLI path does NOT yet honor it — `enju
+// go` runs always behave as auto_bots=false. Mirroring the
+// logic here is non-trivial (it owns Supervisor construction +
+// bot lifecycle), so the cleaner path is the shared helper
+// promotion: extract auto_bots preflight / hookup / rollback
+// into a service or bots-package helper that BOTH this CLI
+// path and handleCreateRun call. Until then, operators who
+// want auto_bots use the MCP create_run tool, not `enju go`.
+//
 // Returns the run's per-project seq and the global run_id from
 // the coord response. Surfaces ensure-branch / snapshot
 // warnings to stderr as the MCP handler does.
