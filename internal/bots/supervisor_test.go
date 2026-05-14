@@ -585,6 +585,96 @@ func TestSupervisor_MarkUnmarkAutoRun(t *testing.T) {
 	}
 }
 
+func TestSupervisor_PhaseAndWaitForReady_Succeeds(t *testing.T) {
+	// Fake daemon writes "ready" to ENJU_BOT_PHASE_FILE then
+	// holds open on stdin (mimics a real daemon entering the
+	// poll loop). Supervisor.WaitForReady should observe the
+	// transition.
+	bin := writeFakeBinary(t, `
+if [ -n "$ENJU_BOT_PHASE_FILE" ]; then
+    echo "ready" > "$ENJU_BOT_PHASE_FILE"
+fi
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "r", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "r", 2*time.Second); err != nil {
+		t.Fatalf("WaitForReady: %v", err)
+	}
+	got, err := s.Phase("r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != PhaseReady {
+		t.Errorf("Phase after wait: want %q, got %q", PhaseReady, got)
+	}
+}
+
+func TestSupervisor_WaitForReady_Timeout(t *testing.T) {
+	// Fake daemon never writes a phase marker. WaitForReady
+	// should fail with the last-seen phase in the message — the
+	// diagnostic that lets the operator distinguish "stuck in
+	// self-heal" from "process never even started."
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "stuck", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.WaitForReady(context.Background(), "stuck", 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("WaitForReady: want timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "did not reach ready phase") {
+		t.Errorf("error should explain the wait failed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "last seen") {
+		t.Errorf("error should include last-seen phase for diagnosis: %v", err)
+	}
+}
+
+func TestSupervisor_PhaseFile_RemovedOnDaemonExit(t *testing.T) {
+	// Fake daemon writes ready, then exits cleanly. Supervisor's
+	// reaper should drop the phase file alongside the pid file
+	// so the next Start doesn't see a stale "ready" before its
+	// fresh process has actually reached the loop.
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "exit", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "exit", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Stop(context.Background(), "exit"); err != nil {
+		t.Fatal(err)
+	}
+	// Allow the reaper to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(s.phasePathFor("exit")); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("phase file %s still present after daemon exit", s.phasePathFor("exit"))
+}
+
 func TestSupervisor_EligibleForAutoStop(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)

@@ -198,6 +198,16 @@ func (s *Supervisor) pruneStalePIDFiles() {
 		if ent.IsDir() {
 			continue
 		}
+		// PIDDir hosts both <bot>.json (pid files) and
+		// <bot>.phase (NDA.2 daemon phase markers). Prune
+		// only the .json side — phase files are reaped
+		// when their daemon exits and a stale .phase file
+		// alongside a live .json is correct on-disk state.
+		// Without this filter the json.Unmarshal below would
+		// classify the phase string as malformed and delete it.
+		if filepath.Ext(ent.Name()) != ".json" {
+			continue
+		}
 		path := filepath.Join(s.PIDDir, ent.Name())
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -211,11 +221,13 @@ func (s *Supervisor) pruneStalePIDFiles() {
 			continue
 		}
 		if entry.PID <= 0 {
+			s.pruneOrphanPhase(entry.Name)
 			_ = os.Remove(path)
 			continue
 		}
 		proc, err := os.FindProcess(entry.PID)
 		if err != nil {
+			s.pruneOrphanPhase(entry.Name)
 			_ = os.Remove(path)
 			continue
 		}
@@ -228,8 +240,19 @@ func (s *Supervisor) pruneStalePIDFiles() {
 		// which is the pre-fix behavior anyway.
 		if err := proc.Signal(syscall.Signal(0)); err != nil {
 			s.logger().Info("pruning stale pid file", "name", entry.Name, "pid", entry.PID)
+			s.pruneOrphanPhase(entry.Name)
 			_ = os.Remove(path)
 		}
+	}
+}
+
+// pruneOrphanPhase removes the phase file paired with a stale
+// pid file. Without this, a crashed daemon's "ready" phase
+// would survive across fatclient restarts and lie to the next
+// auto_bots wait.
+func (s *Supervisor) pruneOrphanPhase(botName string) {
+	if err := os.Remove(s.phasePathFor(botName)); err != nil && !os.IsNotExist(err) {
+		s.logger().Warn("removing orphan phase file", "bot", botName, "error", err)
 	}
 }
 
@@ -369,6 +392,15 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	}
 	logPath := filepath.Join(s.LogDir, p.BotName+".log")
 	pidPath := filepath.Join(s.PIDDir, p.BotName+".json")
+	phasePath := s.phasePathFor(p.BotName)
+	// Stale phase file from a previous daemon run would lie to
+	// the next auto_bots wait — claim it as ready before the
+	// fresh process has actually reached the loop. Remove
+	// before spawn; the daemon will rewrite it through the
+	// lifecycle transitions.
+	if err := os.Remove(phasePath); err != nil && !os.IsNotExist(err) {
+		s.logger().Warn("removing stale phase file", "bot", p.BotName, "error", err)
+	}
 
 	// O_APPEND: successive starts of the same bot keep the
 	// log history. Useful when a bot crashes; the operator
@@ -393,6 +425,10 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	cmd := exec.Command(s.EnjuExec, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// Tell the daemon where to drop phase markers. NDA.3's
+	// WaitForReady reads this file to know when create_run
+	// can unblock.
+	cmd.Env = append(os.Environ(), PhaseFileEnv+"="+phasePath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = logFile.Close()
@@ -651,6 +687,12 @@ func (s *Supervisor) reapOnExit(bp *botProcess, logFile *os.File) {
 	if err := os.Remove(bp.PIDPath); err != nil && !os.IsNotExist(err) {
 		s.logger().Warn("removing pid file", "bot", bp.Name, "error", err)
 	}
+	// Drop the phase file too — a stale "ready" left over from
+	// a crashed daemon would mislead the next auto_bots wait.
+	// Best-effort: missing file is fine.
+	if err := os.Remove(s.phasePathFor(bp.Name)); err != nil && !os.IsNotExist(err) {
+		s.logger().Warn("removing phase file", "bot", bp.Name, "error", err)
+	}
 }
 
 // RecentExits returns a copy of the recently-exited ring, oldest
@@ -696,6 +738,65 @@ func readPIDFile(path string) (pidFileEntry, error) {
 // the filepath.Join shape.
 func (s *Supervisor) pidPathFor(botName string) string {
 	return filepath.Join(s.PIDDir, botName+".json")
+}
+
+// phasePathFor returns the on-disk phase-file path the daemon
+// writes to via WritePhase. Lives next to the pid file (same
+// dir, same privacy posture) with a .phase extension so
+// directory listings stay grep-able. Empty file or missing
+// file → PhaseUnknown when read.
+func (s *Supervisor) phasePathFor(botName string) string {
+	return filepath.Join(s.PIDDir, botName+".phase")
+}
+
+// Phase reports the bot daemon's current lifecycle phase as
+// last written by WritePhase. Missing file (daemon hasn't
+// written yet, or already exited and the reaper cleaned up)
+// returns PhaseUnknown. Read errors other than not-exist
+// propagate so the caller can decide whether to retry.
+func (s *Supervisor) Phase(botName string) (Phase, error) {
+	data, err := os.ReadFile(s.phasePathFor(botName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return PhaseUnknown, nil
+		}
+		return PhaseUnknown, fmt.Errorf("read phase file: %w", err)
+	}
+	return Phase(strings.TrimSpace(string(data))), nil
+}
+
+// WaitForReady blocks until the bot's phase reaches
+// PhaseReady or timeout elapses. Used by create_run's
+// auto_bots flow to fail fast when a bot's startup wedges
+// (bad handler binary, network self-heal stuck, etc.) rather
+// than letting the run start with a non-functioning fleet.
+//
+// Returns nil on success. On timeout, returns an error that
+// includes the last-observed phase so the operator's surface
+// can show "stuck in self_healing" vs "still in starting" —
+// the diagnostic gap that the explicit phase model exists to
+// close.
+func (s *Supervisor) WaitForReady(ctx context.Context, botName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastSeen Phase
+	for {
+		p, err := s.Phase(botName)
+		if err != nil {
+			return err
+		}
+		lastSeen = p
+		if p == PhaseReady {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("bot %q did not reach ready phase within %s (last seen: %q)", botName, timeout, lastSeen)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // MarkAutoRun records that the auto_bots flow for run runSeq
