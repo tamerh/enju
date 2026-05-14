@@ -374,17 +374,29 @@ bots:
 	}
 }
 
-func TestValidate_RejectsUnknownHandler(t *testing.T) {
-	path := writeWorkflowWithBots(t, `
+// TestValidate_AcceptsArbitraryHandlerBinary pins the architecture
+// claim: handler: <name> works for ANY binary, not just claude/stub.
+// Closed-enum validation was wrong — the handler field doubles as
+// the binary name, and operators add support for new LLMs (gemini,
+// etc.) or custom scripts by naming the binary, not by patching Go.
+//
+// Reverses the prior TestValidate_RejectsUnknownHandler which
+// pinned the (incorrect) closed-enum behavior. The validator no
+// longer second-guesses the binary's existence at manifest-load —
+// the daemon's Preflight does that at startup.
+func TestValidate_AcceptsArbitraryHandlerBinary(t *testing.T) {
+	for _, h := range []string{"gemini", "shell", "./bin/lint-bot.sh", "/usr/local/bin/foo"} {
+		t.Run("handler="+h, func(t *testing.T) {
+			path := writeWorkflowWithBots(t, `
 bots:
   - name: x
-    model: m
     args: ["-p"]
-    handler: shell
+    handler: `+h+`
 `)
-	_, err := LoadFromWorkflow(path)
-	if err == nil || !strings.Contains(err.Error(), "unknown handler") {
-		t.Errorf("expected unknown-handler error, got: %v", err)
+			if _, err := LoadFromWorkflow(path); err != nil {
+				t.Errorf("handler %q should be accepted (binary names are open-set), got: %v", h, err)
+			}
+		})
 	}
 }
 
