@@ -42,10 +42,11 @@ func cmdGo(args []string) {
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
 	autoBots := fs.Bool("auto-bots", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_bots flag.")
+	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
 	fs.Parse(args)
 
 	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]")
 		os.Exit(2)
 	}
 	workflowArg := fs.Arg(0)
@@ -54,6 +55,15 @@ func cmdGo(args []string) {
 	if perr != nil {
 		fmt.Fprintf(os.Stderr, "--params: %v\n", perr)
 		os.Exit(2)
+	}
+
+	// --dry-run short-circuits before openCLISession. Doesn't
+	// need credentials, doesn't need a registered project,
+	// doesn't reach the coord. Pure YAML parse + render. The
+	// workflow path doesn't have to be inside any project on
+	// this machine.
+	if *dryRun {
+		os.Exit(runDryRun(workflowArg, params, *asJSON))
 	}
 
 	sess := openCLISession(*coordOverride)

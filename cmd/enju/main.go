@@ -33,7 +33,7 @@ import (
 // pure-string `version` command are exempt.
 func needsGit(subcommand string) bool {
 	switch subcommand {
-	case "mcp", "ui", "wrap-task", "inbox", "review", "bot", "go", "status":
+	case "mcp", "ui", "wrap-task", "inbox", "review", "bot", "go", "status", "runs", "graph":
 		return true
 	}
 	return false
@@ -89,6 +89,10 @@ func main() {
 		cmdGo(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "runs":
+		cmdRuns(os.Args[2:])
+	case "graph":
+		cmdGraph(os.Args[2:])
 	case "version":
 		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -107,6 +111,8 @@ Usage:
  enju ui     Start the web UI (browser, peer to enju mcp)
  enju go     Run a workflow YAML end-to-end (register + create + execute)
  enju status  Snapshot of current project's state
+ enju runs   List runs for the active project (with filters)
+ enju graph   Render a run's DAG (default | mermaid | json)
  enju validate Check a workflow YAML without running it
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
