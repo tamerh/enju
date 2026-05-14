@@ -24,7 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
+	"net/http"
 	"sync"
 
 	"github.com/enju-ai/enju/internal/bots"
@@ -142,20 +142,27 @@ func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
 
 // isRunTerminal implements bots.IsRunTerminal for the supervisor's
 // startup reconcile. Returns terminal=true when the coord reports
-// the run in {completed, failed, terminated, skipped} OR when the
-// coord doesn't know the run (404 → coord DB was wiped between
+// the run in {completed, failed, terminated} OR when the coord
+// doesn't know the run (HTTP 404 → coord DB was wiped between
 // fatclient sessions). The latter bias is intentional: a lingering
 // auto-managed bot waiting on a run that no longer exists serves
 // no purpose, and the operator can always restart it manually.
+//
+// Uses coord.Client.GetStatus to read the HTTP status without
+// the historical Client.Get behavior of swallowing 4xx into a
+// nil-error data return — string-matching the body for "404"
+// would silently break the moment the coord changed its error
+// format.
 func (c *apiClient) isRunTerminal(ctx context.Context, projectID, runSeq int64) (bool, error) {
-	data, err := c.fc.Coord().Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	data, status, err := c.fc.Coord().GetStatus(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
 	if err != nil {
-		// HTTP 404 surfaces as an error containing "404" from
-		// the coord client. Treat as terminal (run gone).
-		if strings.Contains(err.Error(), "404") {
-			return true, nil
-		}
 		return false, err
+	}
+	if status == http.StatusNotFound {
+		return true, nil
+	}
+	if status >= 400 {
+		return false, fmt.Errorf("coord run lookup: HTTP %d: %s", status, truncateForLog(data, 200))
 	}
 	var resp map[string]any
 	if jerr := json.Unmarshal(data, &resp); jerr != nil {
@@ -163,8 +170,18 @@ func (c *apiClient) isRunTerminal(ctx context.Context, projectID, runSeq int64) 
 	}
 	state, _ := resp["state"].(string)
 	switch state {
-	case "completed", "failed", "terminated", "skipped":
+	case "completed", "failed", "terminated":
 		return true, nil
 	}
 	return false, nil
+}
+
+// truncateForLog clips a byte slice for inclusion in an error
+// message — coord error bodies can be HTML pages on
+// proxy/middleware failures, and a 30KB error line is unhelpful.
+func truncateForLog(b []byte, max int) string {
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "…"
 }
