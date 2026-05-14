@@ -737,6 +737,17 @@ func (s *Supervisor) RecentExits() []ExitEvent {
 // writePIDFile serializes pidFileEntry as JSON. 0600 since the
 // file lives under ~/.enju/bots/pids and shares the same
 // privacy posture as the credentials directory.
+//
+// Concurrency note: os.WriteFile is open+truncate+write+close,
+// not atomic. A reader (Reconcile, the live.jsonl tailer's
+// onRunTerminal walk) can observe a torn JSON blob mid-write.
+// Today this is benign because every reader treats a decode
+// failure as a malformed pid file and skips it (warn + continue) —
+// the bot being written has no stale state to validate or auto-
+// stop refs to walk yet, so skipping the torn line is the
+// correct behavior. If external diagnostic tools start reading
+// these files concurrently, switch to write-temp + rename for
+// atomic visibility.
 func writePIDFile(path string, e pidFileEntry) error {
 	data, err := json.MarshalIndent(e, "", "  ")
 	if err != nil {

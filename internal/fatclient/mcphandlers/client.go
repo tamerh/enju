@@ -166,7 +166,7 @@ func (c *apiClient) isRunTerminal(ctx context.Context, projectID, runSeq int64) 
 		return true, nil
 	}
 	if status >= 400 {
-		return false, fmt.Errorf("coord run lookup: HTTP %d: %s", status, truncateForLog(data, 200))
+		return false, fmt.Errorf("coord run lookup: HTTP %d: %s", status, truncateForLog(data, 512))
 	}
 	var resp map[string]any
 	if jerr := json.Unmarshal(data, &resp); jerr != nil {

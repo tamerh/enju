@@ -44,12 +44,19 @@ func autoBotsReadyTimeout() time.Duration {
 
 // rollbackAutoStarts stops every bot in freshStarts. Used by
 // both the preflight-failure and post-POST-failure paths in
-// handleCreateRun. CRITICAL: callers must pass ONLY the bots
-// this auto_bots run freshly spawned (StartedFresh outcome
-// from Supervisor.Start), never the wider "bots involved in
-// this run" set — operator-started bots that rode along as
-// AlreadyRunning are doing other work and must survive a
-// run-creation failure.
+// handleCreateRun.
+//
+// CRITICAL contract — pre-REV.1 bug: callers MUST pass ONLY the
+// bots this auto_bots call freshly spawned (StartedFresh outcome
+// from Supervisor.Start), never the wider autoBotNames list
+// (which includes AlreadyRunning operator-started bots that rode
+// along). The helper itself can't enforce this — it just stops
+// whatever it's given — so a future refactor that mistakenly
+// passes the wide list reintroduces the bug silently. If you're
+// changing this code: the variable named autoFreshStarts is the
+// one that goes here. If you're looking at the variable named
+// autoBotNames and thinking "those are the bots, I'll stop
+// them," you've found the REV.1 bug — back away.
 func rollbackAutoStarts(ctx context.Context, sup *bots.Supervisor, freshStarts []string) {
 	for _, name := range freshStarts {
 		if _, err := sup.Stop(ctx, name); err != nil {
@@ -682,6 +689,12 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 			return nil
 		}
 		if perr := preflight(); perr != nil {
+			// REV.1 invariant: pass autoFreshStarts, NOT
+			// autoBotNames. autoBotNames includes AlreadyRunning
+			// (operator-owned) bots that came back from Start
+			// idempotently; stopping them on a run-creation
+			// failure would kill manual work the operator was
+			// using for other things.
 			rollbackAutoStarts(ctx, sup, autoFreshStarts)
 			return mcp.NewToolResultError("auto_bots: " + perr.Error()), nil
 		}
@@ -694,8 +707,13 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		// spun up the fleet. Roll back so a coord-side failure
 		// doesn't leak running bots that no run will ever
 		// reference — but only stop the bots THIS call started.
-		// Operator-started bots that came back as AlreadyRunning
-		// from Start are doing other work and must survive.
+		//
+		// REV.1 invariant: pass autoFreshStarts, NOT
+		// autoBotNames. Pre-fix this site used autoBotNames,
+		// killing operator-owned bots that came back from
+		// Start as AlreadyRunning. autoFreshStarts is the
+		// strict subset of "spawned by THIS call" — any
+		// rollback that calls Stop must source from it.
 		if autoBots {
 			if sup, _ := c.botSupervisor(); sup != nil {
 				rollbackAutoStarts(ctx, sup, autoFreshStarts)
@@ -781,8 +799,8 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		text += fmt.Sprintf("\n⚠ Snapshot %s\n", snapshotWarning)
 	}
 	if len(autoBotsUnhooked) > 0 {
-		text += fmt.Sprintf("\n⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%v) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use enju_bot_stop manually if they're still running.\n",
-			len(autoBotsUnhooked), len(autoBotNames), autoBotsUnhooked)
+		text += fmt.Sprintf("\n⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use enju_bot_stop manually if they're still running.\n",
+			len(autoBotsUnhooked), len(autoBotNames), strings.Join(autoBotsUnhooked, ", "))
 	}
 	return mcp.NewToolResultText(text), nil
 }
