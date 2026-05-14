@@ -12,8 +12,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/common/format"
@@ -23,6 +27,20 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+// autoBotsReadyTimeout is how long create_run waits for each
+// bot to reach PhaseReady. Defaults to 30s; tunable via env
+// for first-touch demos with cold claude-CLI subprocesses that
+// need longer warmup, and for tests that want to fail fast
+// without waiting for the production timeout.
+func autoBotsReadyTimeout() time.Duration {
+	if v := os.Getenv("ENJU_AUTO_BOTS_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * time.Second
+}
 
 func (c *apiClient) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var data []byte
@@ -583,10 +601,110 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		body["branch"] = branch
 	}
 
+	// auto_bots preflight (NDA.3). Spin up every bot declared
+	// in the workflow's inline bots: section before the run is
+	// created, and block until each reports PhaseReady. On
+	// partial failure, roll back the fresh starts (leave
+	// already-running bots alone — they may be doing other work)
+	// and return an error rather than creating a half-served run.
+	autoBots := req.GetBool("auto_bots", false)
+	var autoBotNames []string
+	if autoBots {
+		if templatePath == "" {
+			return mcp.NewToolResultError("auto_bots=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
+		}
+		if prep == nil || prep.LoadedTemplate == nil {
+			return mcp.NewToolResultError("auto_bots=true: workflow prep is empty (internal error — should not happen with path= set)"), nil
+		}
+		manifest, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots)
+		if perr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: parsing bots: %v", perr)), nil
+		}
+		if manifest == nil || len(manifest.Bots) == 0 {
+			return mcp.NewToolResultError(fmt.Sprintf("auto_bots=true but workflow at %s declares no bots in its inline bots: section", templatePath)), nil
+		}
+		sup, perr := c.botSupervisor()
+		if perr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: supervisor init: %v", perr)), nil
+		}
+		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
+		coordURL := c.fc.Coord().BaseURL()
+		readyTimeout := autoBotsReadyTimeout()
+
+		var rollback []string
+		preflight := func() error {
+			for _, b := range manifest.Bots {
+				var allow []string
+				if b.MCPTools != nil {
+					allow = b.MCPTools.Allow
+				}
+				_, outcome, serr := sup.Start(ctx, bots.StartParams{
+					BotName:      b.Name,
+					WorkflowPath: absWorkflow,
+					Coordinator:  coordURL,
+					ProjectID:    int64(projectID),
+					AllowTools:   allow,
+					StartedBy:    "auto_run",
+				})
+				if serr != nil {
+					return fmt.Errorf("starting bot %q: %w", b.Name, serr)
+				}
+				if outcome == bots.StartedFresh {
+					rollback = append(rollback, b.Name)
+				}
+				if rerr := sup.WaitForReady(ctx, b.Name, readyTimeout); rerr != nil {
+					return fmt.Errorf("bot %q: %w (check %s for daemon output)", b.Name, rerr, sup.LogPathFor(b.Name))
+				}
+				autoBotNames = append(autoBotNames, b.Name)
+			}
+			return nil
+		}
+		if perr := preflight(); perr != nil {
+			for _, name := range rollback {
+				if _, sterr := sup.Stop(ctx, name); sterr != nil {
+					slog.Default().Warn("auto_bots rollback: stop failed", "bot", name, "error", sterr)
+				}
+			}
+			return mcp.NewToolResultError("auto_bots: " + perr.Error()), nil
+		}
+	}
+
 	apiPath := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
 	data, err := c.post(ctx, apiPath, body)
 	if err != nil {
+		// POST failed AFTER the auto_bots preflight already
+		// spun up the fleet. Roll back so a coord-side failure
+		// doesn't leak running bots that no run will ever
+		// reference.
+		if autoBots {
+			sup, _ := c.botSupervisor()
+			for _, name := range autoBotNames {
+				if sup != nil {
+					_, _ = sup.Stop(ctx, name)
+				}
+			}
+		}
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// auto_bots: now that the coord has assigned a run seq,
+	// record it on each bot's pid file so NDA.4's tailer can
+	// decrement when the run finishes.
+	if autoBots && len(autoBotNames) > 0 {
+		var resp map[string]interface{}
+		if jerr := json.Unmarshal(data, &resp); jerr == nil {
+			if seq, ok := resp["seq"].(float64); ok {
+				runSeq := int64(seq)
+				sup, _ := c.botSupervisor()
+				if sup != nil {
+					for _, name := range autoBotNames {
+						if merr := sup.MarkAutoRun(name, runSeq); merr != nil {
+							slog.Default().Warn("auto_bots: MarkAutoRun failed", "bot", name, "run_seq", runSeq, "error", merr)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Materialize the run branch in the local workspace + on

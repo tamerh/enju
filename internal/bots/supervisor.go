@@ -749,6 +749,14 @@ func (s *Supervisor) phasePathFor(botName string) string {
 	return filepath.Join(s.PIDDir, botName+".phase")
 }
 
+// LogPathFor returns the on-disk log path the supervisor would
+// open for botName. Useful for error messages that want to
+// point the operator at the daemon's output without dragging
+// the full RunningBot record around.
+func (s *Supervisor) LogPathFor(botName string) string {
+	return filepath.Join(s.LogDir, botName+".log")
+}
+
 // Phase reports the bot daemon's current lifecycle phase as
 // last written by WritePhase. Missing file (daemon hasn't
 // written yet, or already exited and the reaper cleaned up)
