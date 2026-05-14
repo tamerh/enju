@@ -1265,6 +1265,27 @@ func injectReviewGating(p *Run) []string {
 			continue
 		}
 		target := reviewTask.Reviews
+		// Resolve the target's writes_artifacts once per review
+		// pass. A consumer that declares a matching
+		// reads_artifacts entry IS a downstream consumer for
+		// review-gating: build.go wireArtifactDeps wires the
+		// edge at parse time, and sqlite.go updateReadyTasksOn
+		// holds the reader PENDING until the writer is
+		// ACCEPTED. Counting these here keeps the lint aligned
+		// with runtime DAG semantics.
+		var targetWrites []string
+		for k := range p.Tasks {
+			if p.Tasks[k].ID == target {
+				targetWrites = p.Tasks[k].WritesArtifacts.Paths()
+				break
+			}
+		}
+		targetWriteSet := make(map[string]struct{}, len(targetWrites))
+		for _, w := range targetWrites {
+			if w != "" {
+				targetWriteSet[w] = struct{}{}
+			}
+		}
 		consumersCount := 0
 		for j := range p.Tasks {
 			if i == j {
@@ -1287,6 +1308,14 @@ func injectReviewGating(p *Run) []string {
 			if !consumes {
 				for _, inferred := range template.InferDependencies(consumer.Prompt) {
 					if inferred == target {
+						consumes = true
+						break
+					}
+				}
+			}
+			if !consumes && len(targetWriteSet) > 0 {
+				for _, r := range consumer.ReadsArtifacts {
+					if _, ok := targetWriteSet[r]; ok {
 						consumes = true
 						break
 					}
