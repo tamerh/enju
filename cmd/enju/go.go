@@ -373,6 +373,21 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		return 0, 0, err
 	}
 
+	// Coerce string-typed CLI params to the types declared in
+	// the workflow's params: block. The MCP path receives
+	// numbers/bools natively via JSON decode; the CLI's
+	// `--params k=v` syntax has no type tagging so every value
+	// arrives as a string. Without this step, any param of
+	// type int / bool / list<string> would fail the validator's
+	// checkParamValueType. See params.go for the coercion table.
+	if len(params) > 0 && prep != nil && prep.LoadedTemplate != nil {
+		coerced, cerr := coerceCLIParams(params, prep.LoadedTemplate.Parsed.Run.Params)
+		if cerr != nil {
+			return 0, 0, cerr
+		}
+		params = coerced
+	}
+
 	// Warn when the workflow declares bots but the operator
 	// didn't opt in to --auto-bots. Without this, `enju go
 	// workflow.yaml` on a bots-using workflow stops at the first
