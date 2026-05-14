@@ -42,6 +42,22 @@ func autoBotsReadyTimeout() time.Duration {
 	return 30 * time.Second
 }
 
+// rollbackAutoStarts stops every bot in freshStarts. Used by
+// both the preflight-failure and post-POST-failure paths in
+// handleCreateRun. CRITICAL: callers must pass ONLY the bots
+// this auto_bots run freshly spawned (StartedFresh outcome
+// from Supervisor.Start), never the wider "bots involved in
+// this run" set — operator-started bots that rode along as
+// AlreadyRunning are doing other work and must survive a
+// run-creation failure.
+func rollbackAutoStarts(ctx context.Context, sup *bots.Supervisor, freshStarts []string) {
+	for _, name := range freshStarts {
+		if _, err := sup.Stop(ctx, name); err != nil {
+			slog.Default().Warn("auto_bots rollback: stop failed", "bot", name, "error", err)
+		}
+	}
+}
+
 func (c *apiClient) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var data []byte
 	var err error
@@ -608,7 +624,14 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	// already-running bots alone — they may be doing other work)
 	// and return an error rather than creating a half-served run.
 	autoBots := req.GetBool("auto_bots", false)
-	var autoBotNames []string
+	// autoBotNames lists every bot that completed preflight
+	// (used for MarkAutoRun after the run is created so terminal
+	// events decrement them). autoFreshStarts is the strict
+	// subset that THIS call freshly spawned — only these are
+	// safe to Stop on rollback; bots that came back as
+	// AlreadyRunning are operator-owned (manual wins) and must
+	// be left alone even when the surrounding run fails.
+	var autoBotNames, autoFreshStarts []string
 	if autoBots {
 		if templatePath == "" {
 			return mcp.NewToolResultError("auto_bots=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
@@ -631,7 +654,6 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		coordURL := c.fc.Coord().BaseURL()
 		readyTimeout := autoBotsReadyTimeout()
 
-		var rollback []string
 		preflight := func() error {
 			for _, b := range manifest.Bots {
 				var allow []string
@@ -650,7 +672,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 					return fmt.Errorf("starting bot %q: %w", b.Name, serr)
 				}
 				if outcome == bots.StartedFresh {
-					rollback = append(rollback, b.Name)
+					autoFreshStarts = append(autoFreshStarts, b.Name)
 				}
 				if rerr := sup.WaitForReady(ctx, b.Name, readyTimeout); rerr != nil {
 					return fmt.Errorf("bot %q: %w (check %s for daemon output)", b.Name, rerr, sup.LogPathFor(b.Name))
@@ -660,11 +682,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 			return nil
 		}
 		if perr := preflight(); perr != nil {
-			for _, name := range rollback {
-				if _, sterr := sup.Stop(ctx, name); sterr != nil {
-					slog.Default().Warn("auto_bots rollback: stop failed", "bot", name, "error", sterr)
-				}
-			}
+			rollbackAutoStarts(ctx, sup, autoFreshStarts)
 			return mcp.NewToolResultError("auto_bots: " + perr.Error()), nil
 		}
 	}
@@ -675,13 +693,12 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		// POST failed AFTER the auto_bots preflight already
 		// spun up the fleet. Roll back so a coord-side failure
 		// doesn't leak running bots that no run will ever
-		// reference.
+		// reference — but only stop the bots THIS call started.
+		// Operator-started bots that came back as AlreadyRunning
+		// from Start are doing other work and must survive.
 		if autoBots {
-			sup, _ := c.botSupervisor()
-			for _, name := range autoBotNames {
-				if sup != nil {
-					_, _ = sup.Stop(ctx, name)
-				}
+			if sup, _ := c.botSupervisor(); sup != nil {
+				rollbackAutoStarts(ctx, sup, autoFreshStarts)
 			}
 		}
 		return mcp.NewToolResultError(err.Error()), nil
