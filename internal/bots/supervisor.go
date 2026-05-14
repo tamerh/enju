@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -253,6 +254,18 @@ type StartParams struct {
 	// audit log records) is wired end-to-end now even if the
 	// pinning is a no-op for current action types.
 	AllowTools []string
+
+	// StartedBy records who initiated this Start call so the
+	// supervisor can decide later whether the bot is eligible
+	// for auto-stop. Two values: "operator" (manual
+	// enju_bot_start; auto-stop ignores it — manual wins) and
+	// "auto_run" (the create_run auto_bots flow started it;
+	// auto-stop fires when its AutoRunIDs list empties). Empty
+	// defaults to "operator" so existing callers stay correct
+	// without changes. Only consulted on the StartedFresh
+	// path — when Start returns AlreadyRunning, the pid file's
+	// existing StartedBy is preserved (manual wins).
+	StartedBy string
 }
 
 // RunningBot is the public-facing per-bot status tuple.
@@ -265,11 +278,19 @@ type RunningBot struct {
 
 // pidFileEntry is what we write to disk per bot. Plain JSON
 // for grep-ability; readable by `cat ~/.enju/bots/pids/x.json`.
+//
+// StartedBy and AutoRunIDs power the auto_bots lifecycle:
+// StartedBy="auto_run" + empty AutoRunIDs means the bot is
+// eligible for auto-stop (the run that brought it up has
+// finished). StartedBy="operator" means manual start — auto-stop
+// ignores the bot regardless of AutoRunIDs (manual wins).
 type pidFileEntry struct {
-	Name      string    `json:"name"`
-	PID       int       `json:"pid"`
-	StartedAt time.Time `json:"started_at"`
-	LogPath   string    `json:"log_path"`
+	Name       string    `json:"name"`
+	PID        int       `json:"pid"`
+	StartedAt  time.Time `json:"started_at"`
+	LogPath    string    `json:"log_path"`
+	StartedBy  string    `json:"started_by,omitempty"`   // "operator" | "auto_run"; empty = "operator"
+	AutoRunIDs []int64   `json:"auto_run_ids,omitempty"` // run seqs that ref-count this bot
 }
 
 // StartOutcome classifies what happened when Start was called.
@@ -396,8 +417,13 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	s.procs[p.BotName] = bp
 	s.procsMu.Unlock()
 
+	startedBy := p.StartedBy
+	if startedBy == "" {
+		startedBy = "operator"
+	}
 	if err := writePIDFile(pidPath, pidFileEntry{
 		Name: p.BotName, PID: cmd.Process.Pid, StartedAt: now, LogPath: logPath,
+		StartedBy: startedBy,
 	}); err != nil {
 		// Non-fatal: the supervisor still has the process in
 		// memory. PID file is for external diagnostics.
@@ -648,6 +674,101 @@ func writePIDFile(path string, e pidFileEntry) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0600)
+}
+
+// readPIDFile parses one pid file. Returns os.ErrNotExist
+// unchanged when the file is missing so callers can branch
+// on "bot has no pid file yet" cleanly.
+func readPIDFile(path string) (pidFileEntry, error) {
+	var e pidFileEntry
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return e, err
+	}
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return e, fmt.Errorf("decode pid file %s: %w", path, err)
+	}
+	return e, nil
+}
+
+// pidPathFor returns the on-disk pid-file path for the named
+// bot. Helper so callers outside Start don't have to repeat
+// the filepath.Join shape.
+func (s *Supervisor) pidPathFor(botName string) string {
+	return filepath.Join(s.PIDDir, botName+".json")
+}
+
+// MarkAutoRun records that the auto_bots flow for run runSeq
+// is keeping botName alive. Idempotent: re-marking the same
+// run is a no-op. Does NOT change StartedBy — if the bot was
+// started manually, it stays operator-owned even when later
+// runs ride along.
+//
+// Caller must hold no supervisor lock (we take procsMu
+// briefly to serialize concurrent mark/unmark on the same
+// pid file).
+func (s *Supervisor) MarkAutoRun(botName string, runSeq int64) error {
+	s.procsMu.Lock()
+	defer s.procsMu.Unlock()
+	path := s.pidPathFor(botName)
+	entry, err := readPIDFile(path)
+	if err != nil {
+		return fmt.Errorf("MarkAutoRun %q: %w", botName, err)
+	}
+	if slices.Contains(entry.AutoRunIDs, runSeq) {
+		return nil
+	}
+	entry.AutoRunIDs = append(entry.AutoRunIDs, runSeq)
+	return writePIDFile(path, entry)
+}
+
+// UnmarkAutoRun removes runSeq from botName's ref list.
+// Idempotent: removing a missing run or operating on a missing
+// pid file is a no-op (the bot may have crashed and had its
+// pid file reaped). Returns no error in those cases — auto-stop
+// is best-effort cleanup, not a strict invariant.
+func (s *Supervisor) UnmarkAutoRun(botName string, runSeq int64) error {
+	s.procsMu.Lock()
+	defer s.procsMu.Unlock()
+	path := s.pidPathFor(botName)
+	entry, err := readPIDFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("UnmarkAutoRun %q: %w", botName, err)
+	}
+	out := entry.AutoRunIDs[:0]
+	for _, existing := range entry.AutoRunIDs {
+		if existing == runSeq {
+			continue
+		}
+		out = append(out, existing)
+	}
+	if len(out) == 0 {
+		entry.AutoRunIDs = nil
+	} else {
+		entry.AutoRunIDs = out
+	}
+	return writePIDFile(path, entry)
+}
+
+// EligibleForAutoStop reports whether botName should be Stop'd
+// when its last referencing auto-run completes. True iff
+// StartedBy=="auto_run" AND AutoRunIDs is empty. Missing pid
+// file → false (nothing to stop, and we won't have its in-memory
+// entry either).
+func (s *Supervisor) EligibleForAutoStop(botName string) (bool, error) {
+	s.procsMu.Lock()
+	defer s.procsMu.Unlock()
+	entry, err := readPIDFile(s.pidPathFor(botName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("EligibleForAutoStop %q: %w", botName, err)
+	}
+	return entry.StartedBy == "auto_run" && len(entry.AutoRunIDs) == 0, nil
 }
 
 // sortStrings is a tiny insertion-sort helper. Status results

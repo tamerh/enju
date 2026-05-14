@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -500,4 +501,135 @@ exit 0
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("reaper didn't clean up after self-exit; status: %+v", s.Status())
+}
+
+func TestSupervisor_PIDFileRecordsStartedBy(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	// Operator-start defaults StartedBy to "operator" so an
+	// auto_bots run that rides along can't accidentally claim
+	// the bot as auto-managed.
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "manual", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := readPIDFile(s.pidPathFor("manual"))
+	if err != nil {
+		t.Fatalf("read manual pid: %v", err)
+	}
+	if entry.StartedBy != "operator" {
+		t.Errorf("manual start: want StartedBy=operator, got %q", entry.StartedBy)
+	}
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "auto", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err = readPIDFile(s.pidPathFor("auto"))
+	if err != nil {
+		t.Fatalf("read auto pid: %v", err)
+	}
+	if entry.StartedBy != "auto_run" {
+		t.Errorf("auto start: want StartedBy=auto_run, got %q", entry.StartedBy)
+	}
+}
+
+func TestSupervisor_MarkUnmarkAutoRun(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "b", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark adds; re-marking the same seq is a no-op.
+	if err := s.MarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("b", 2); err != nil {
+		t.Fatal(err)
+	}
+	entry, _ := readPIDFile(s.pidPathFor("b"))
+	if want := []int64{1, 2}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("after mark 1,1,2: want %v, got %v", want, entry.AutoRunIDs)
+	}
+
+	// Unmark removes the seq; unmarking a missing seq is a no-op.
+	if err := s.UnmarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UnmarkAutoRun("b", 99); err != nil {
+		t.Fatal(err)
+	}
+	entry, _ = readPIDFile(s.pidPathFor("b"))
+	if want := []int64{2}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("after unmark 1,99: want %v, got %v", want, entry.AutoRunIDs)
+	}
+
+	// Unmarking a missing pid file is benign — auto-stop is
+	// best-effort cleanup, not a strict invariant.
+	if err := s.UnmarkAutoRun("never-started", 5); err != nil {
+		t.Errorf("unmark on missing pid: want nil, got %v", err)
+	}
+}
+
+func TestSupervisor_EligibleForAutoStop(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	cases := []struct {
+		name      string
+		startedBy string
+		runs      []int64
+		want      bool
+	}{
+		{"auto, empty list", "auto_run", nil, true},
+		{"auto, one ref", "auto_run", []int64{1}, false},
+		{"operator, empty list", "operator", nil, false},
+		{"operator, one ref", "operator", []int64{1}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := s.Start(context.Background(), StartParams{
+				BotName: tc.name, WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+				StartedBy: tc.startedBy,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, seq := range tc.runs {
+				if err := s.MarkAutoRun(tc.name, seq); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := s.EligibleForAutoStop(tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("eligible: want %v, got %v", tc.want, got)
+			}
+		})
+	}
+
+	// Missing pid file → not eligible (nothing to stop).
+	got, err := s.EligibleForAutoStop("never-existed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Errorf("eligible for missing pid: want false, got true")
+	}
 }
