@@ -35,3 +35,11 @@ test/enju/
 # IDE
 .idea/
 .vscode/
+docs/
+dist/
+examples/
+example_bots/
+node_modules/
+package-lock.json
+package.json
+
