@@ -207,6 +207,84 @@ func (s *Supervisor) consumeEventTail(path string, offset int64, projectID int64
 	return newOffset, nil
 }
 
+// IsRunTerminal reports whether (projectID, runSeq) is in a
+// terminal state. Used by Reconcile to GC stale auto_run_ids
+// from pid files left over after a supervisor crash. Callers
+// should return (true, nil) for unknown runs too (coord DB
+// wiped — bias toward releasing bots rather than holding them
+// hostage to a run that will never report completion).
+type IsRunTerminal func(ctx context.Context, projectID, runSeq int64) (bool, error)
+
+// Reconcile validates each pid file's AutoRunIDs against the
+// coord's current run state. For every (project, run_seq) pair
+// found in a pid file, lookup is called; pairs returning true
+// are removed. When a pid file's AutoRunIDs empties AND its
+// StartedBy is "auto_run", the bot is Stop'd — same eligibility
+// rule as the live.jsonl tailer.
+//
+// Use case: fatclient restart with active auto-runs. The tailer
+// only sees events going forward; without reconcile, a run that
+// completed while the supervisor was down would leak the bot
+// indefinitely. Best-effort: per-pid errors are logged and
+// reconcile moves on rather than aborting the whole sweep.
+func (s *Supervisor) Reconcile(ctx context.Context, lookup IsRunTerminal) error {
+	entries, err := os.ReadDir(s.PIDDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read pid dir: %w", err)
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || filepath.Ext(ent.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(s.PIDDir, ent.Name())
+		entry, err := readPIDFile(path)
+		if err != nil {
+			s.logger().Warn("reconcile: reading pid file", "path", path, "error", err)
+			continue
+		}
+		if len(entry.AutoRunIDs) == 0 || entry.ProjectID == 0 {
+			continue
+		}
+		// Walk a copy because UnmarkAutoRun mutates the pid file
+		// and a stale slice view would skip entries.
+		for _, runSeq := range slices.Clone(entry.AutoRunIDs) {
+			terminal, err := lookup(ctx, entry.ProjectID, runSeq)
+			if err != nil {
+				s.logger().Warn("reconcile: lookup failed (preserving ref)",
+					"bot", entry.Name, "project_id", entry.ProjectID, "run_seq", runSeq, "error", err)
+				continue
+			}
+			if !terminal {
+				continue
+			}
+			if err := s.UnmarkAutoRun(entry.Name, runSeq); err != nil {
+				s.logger().Warn("reconcile: unmark failed",
+					"bot", entry.Name, "run_seq", runSeq, "error", err)
+				continue
+			}
+			s.logger().Info("reconcile: dropped terminal run reference",
+				"bot", entry.Name, "project_id", entry.ProjectID, "run_seq", runSeq)
+		}
+		eligible, err := s.EligibleForAutoStop(entry.Name)
+		if err != nil {
+			s.logger().Warn("reconcile: eligibility check failed", "bot", entry.Name, "error", err)
+			continue
+		}
+		if !eligible {
+			continue
+		}
+		s.logger().Info("reconcile: stopping bot — all referencing runs are terminal",
+			"bot", entry.Name)
+		if _, err := s.Stop(ctx, entry.Name); err != nil {
+			s.logger().Warn("reconcile: stop failed", "bot", entry.Name, "error", err)
+		}
+	}
+	return nil
+}
+
 // onRunTerminal walks every pid file in PIDDir and, for each
 // entry whose ProjectID matches AND whose AutoRunIDs contains
 // runSeq, removes the seq and stops the bot if it's now

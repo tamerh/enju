@@ -3,8 +3,10 @@ package bots
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -248,6 +250,211 @@ func TestAutoStop_WatchProjectEventsIsIdempotent(t *testing.T) {
 	defer s.tailMu.Unlock()
 	if len(s.tailing) != 1 {
 		t.Errorf("want 1 tailed project, got %d (%v)", len(s.tailing), s.tailing)
+	}
+}
+
+func TestReconcile_DropsTerminalRefs(t *testing.T) {
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "shared", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run", ProjectID: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "shared", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, seq := range []int64{5, 6, 7} {
+		if err := s.MarkAutoRun("shared", seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Lookup says runs 5 and 7 are terminal; 6 is still active.
+	terminalSet := map[int64]bool{5: true, 7: true}
+	lookup := func(ctx context.Context, projectID, runSeq int64) (bool, error) {
+		if projectID != 7 {
+			t.Errorf("unexpected project_id in lookup: %d", projectID)
+		}
+		return terminalSet[runSeq], nil
+	}
+	if err := s.Reconcile(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := readPIDFile(s.pidPathFor("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{6}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("after reconcile: want %v, got %v", want, entry.AutoRunIDs)
+	}
+	// Bot must NOT have been stopped — still has one live ref.
+	if len(s.Status()) != 1 {
+		t.Errorf("bot stopped despite live ref: %+v", s.Status())
+	}
+}
+
+func TestReconcile_StopsWhenAllTerminal(t *testing.T) {
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "stale", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run", ProjectID: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "stale", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("stale", 5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every run is terminal — pretends the fatclient crashed and
+	// missed the run_completed events; reconcile should catch up.
+	lookup := func(_ context.Context, _ int64, _ int64) (bool, error) {
+		return true, nil
+	}
+	if err := s.Reconcile(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	// Give the reaper time to clean up after Stop.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.Status()) == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("bot still running after reconcile cleared all refs; status: %+v", s.Status())
+}
+
+func TestReconcile_TreatsUnknownRunsAsTerminal(t *testing.T) {
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "wiped", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run", ProjectID: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "wiped", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("wiped", 42); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a coord DB wipe: lookups for the (project, seq)
+	// pair come back terminal=true (the IsRunTerminal contract).
+	lookup := func(_ context.Context, _ int64, _ int64) (bool, error) {
+		return true, nil
+	}
+	if err := s.Reconcile(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	// Bot should have been stopped — coord-wipe biases toward
+	// releasing the bot rather than holding it forever waiting on
+	// a run that no longer exists. Give the reaper time to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.Status()) == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("bot still running after coord-wipe reconcile; status: %+v", s.Status())
+}
+
+func TestReconcile_LookupErrorPreservesRef(t *testing.T) {
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "transient", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run", ProjectID: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "transient", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("transient", 5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Coord is temporarily unreachable. Reconcile must NOT drop
+	// the ref — a transient network blip shouldn't kill auto-
+	// managed bots; the next tailer-driven check will catch it.
+	lookup := func(_ context.Context, _ int64, _ int64) (bool, error) {
+		return false, fmt.Errorf("connection refused")
+	}
+	if err := s.Reconcile(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := readPIDFile(s.pidPathFor("transient"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{5}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("transient lookup error: want refs preserved (%v), got %v", want, entry.AutoRunIDs)
+	}
+	if len(s.Status()) != 1 {
+		t.Errorf("bot stopped on lookup error: %+v", s.Status())
+	}
+}
+
+func TestReconcile_LeavesOperatorBotAlone(t *testing.T) {
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	// Operator-started bot with a stale auto_run_id from a
+	// prior run-ride-along. Reconcile clears the ref but must
+	// NOT stop the bot (manual wins).
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "manual", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		ProjectID: 7, // StartedBy left blank → operator
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "manual", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("manual", 5); err != nil {
+		t.Fatal(err)
+	}
+
+	lookup := func(_ context.Context, _ int64, _ int64) (bool, error) {
+		return true, nil
+	}
+	if err := s.Reconcile(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Status()) != 1 {
+		t.Errorf("operator-started bot should not be auto-stopped: %+v", s.Status())
+	}
+	entry, _ := readPIDFile(s.pidPathFor("manual"))
+	if len(entry.AutoRunIDs) != 0 {
+		t.Errorf("AutoRunIDs should be cleared after reconcile, got %v", entry.AutoRunIDs)
 	}
 }
 

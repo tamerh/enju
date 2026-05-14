@@ -21,6 +21,10 @@ package mcphandlers
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/service"
@@ -105,5 +109,45 @@ func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
 		return nil, err
 	}
 	c.supervisor = s
+	// Reconcile stale auto_run_ids from a previous fatclient
+	// session. Best-effort, fire-and-forget — if the coord
+	// is unreachable we'd rather log and continue than block
+	// supervisor construction. Stale refs that survive this
+	// pass will be GC'd lazily by the next terminal event the
+	// tailer observes for them.
+	go func() {
+		if err := s.Reconcile(context.Background(), c.isRunTerminal); err != nil {
+			slog.Default().Warn("supervisor reconcile failed", "error", err)
+		}
+	}()
 	return s, nil
+}
+
+// isRunTerminal implements bots.IsRunTerminal for the supervisor's
+// startup reconcile. Returns terminal=true when the coord reports
+// the run in {completed, failed, terminated, skipped} OR when the
+// coord doesn't know the run (404 → coord DB was wiped between
+// fatclient sessions). The latter bias is intentional: a lingering
+// auto-managed bot waiting on a run that no longer exists serves
+// no purpose, and the operator can always restart it manually.
+func (c *apiClient) isRunTerminal(ctx context.Context, projectID, runSeq int64) (bool, error) {
+	data, err := c.fc.Coord().Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	if err != nil {
+		// HTTP 404 surfaces as an error containing "404" from
+		// the coord client. Treat as terminal (run gone).
+		if strings.Contains(err.Error(), "404") {
+			return true, nil
+		}
+		return false, err
+	}
+	var resp map[string]any
+	if jerr := json.Unmarshal(data, &resp); jerr != nil {
+		return false, fmt.Errorf("decode run: %w", jerr)
+	}
+	state, _ := resp["state"].(string)
+	switch state {
+	case "completed", "failed", "terminated", "skipped":
+		return true, nil
+	}
+	return false, nil
 }
