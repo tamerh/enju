@@ -711,6 +711,15 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	// so the tailer is running by the time terminal events
 	// arrive — idempotent across concurrent auto_bots runs
 	// in the same project.
+	//
+	// Bots whose MarkAutoRun fails (typically: the daemon
+	// crashed between WaitForReady and here, reaper removed
+	// the pid file) get collected into autoBotsUnhooked so
+	// the operator-visible result text can flag them.
+	// Without that signal, the run proceeds silently and
+	// the operator only notices the leak when they wonder
+	// why a bot is still alive after the run completed.
+	var autoBotsUnhooked []string
 	if autoBots && len(autoBotNames) > 0 {
 		var resp map[string]interface{}
 		if jerr := json.Unmarshal(data, &resp); jerr == nil {
@@ -721,6 +730,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 					for _, name := range autoBotNames {
 						if merr := sup.MarkAutoRun(name, runSeq); merr != nil {
 							slog.Default().Warn("auto_bots: MarkAutoRun failed", "bot", name, "run_seq", runSeq, "error", merr)
+							autoBotsUnhooked = append(autoBotsUnhooked, name)
 						}
 					}
 					sup.WatchProjectEvents(ctx, prep.Workflow.WorkDir(), int64(projectID))
@@ -769,6 +779,10 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 	if snapshotWarning != "" {
 		text += fmt.Sprintf("\n⚠ Snapshot %s\n", snapshotWarning)
+	}
+	if len(autoBotsUnhooked) > 0 {
+		text += fmt.Sprintf("\n⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%v) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use enju_bot_stop manually if they're still running.\n",
+			len(autoBotsUnhooked), len(autoBotNames), autoBotsUnhooked)
 	}
 	return mcp.NewToolResultText(text), nil
 }
