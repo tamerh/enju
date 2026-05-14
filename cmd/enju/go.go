@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
-	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
+
 )
 
 // cmdGo wires register-if-needed + create_run + execute_run into
@@ -318,11 +318,11 @@ func resolveOrRegisterProject(ctx context.Context, sess *cliSession, workflowAbs
 	if reg == nil {
 		return 0, "", fmt.Errorf("no project registry configured")
 	}
-	entries, err := reg.List()
+	entry, err := reg.FindContaining(workflowAbs)
 	if err != nil {
 		return 0, "", fmt.Errorf("read registry: %w", err)
 	}
-	if entry := pickContainingEntry(entries, workflowAbs); entry != nil {
+	if entry != nil {
 		return entry.ID, entry.LocalPath, nil
 	}
 
@@ -343,28 +343,6 @@ func resolveOrRegisterProject(ctx context.Context, sess *cliSession, workflowAbs
 		fmt.Fprintf(os.Stderr, "  ⚠ %s\n", res.InitWarning)
 	}
 	return res.ProjectID, root, nil
-}
-
-// pickContainingEntry returns the registry entry whose LocalPath
-// is workflowAbs or an ancestor directory, preferring the
-// deepest match so nested project layouts resolve to the
-// closest project. Returns nil when no entry contains the file.
-func pickContainingEntry(entries []projectreg.Entry, workflowAbs string) *projectreg.Entry {
-	var best *projectreg.Entry
-	for i := range entries {
-		root := entries[i].LocalPath
-		if root == "" {
-			continue
-		}
-		rel, err := filepath.Rel(root, workflowAbs)
-		if err != nil || strings.HasPrefix(rel, "..") {
-			continue
-		}
-		if best == nil || len(entries[i].LocalPath) > len(best.LocalPath) {
-			best = &entries[i]
-		}
-	}
-	return best
 }
 
 // projectRootCandidate is the directory we hand to CreateProject

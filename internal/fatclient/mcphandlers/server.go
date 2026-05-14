@@ -227,6 +227,10 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 			ParentCtx:      cfg.Notify.ParentCtx,
 			Logger:         logger,
 		})
+		// Background opportunistic reconcile (the "ticker"). Tick
+		// every 20s for the project covering CWD. Scoped to
+		// Notify.ParentCtx so it dies on process exit.
+		go client.runReconcileTicker(cfg.Notify.ParentCtx)
 	}
 
 	// Build the allowlist set once outside the loop. Empty

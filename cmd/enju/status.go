@@ -71,24 +71,19 @@ func resolveActiveProject(sess *cliSession, override int64) (*projectreg.Entry, 
 	if reg == nil {
 		return nil, fmt.Errorf("no project registry configured")
 	}
-	entries, err := reg.List()
-	if err != nil {
-		return nil, fmt.Errorf("read registry: %w", err)
-	}
 	if override > 0 {
-		for i := range entries {
-			if entries[i].ID == override {
-				return &entries[i], nil
-			}
-		}
-		return nil, fmt.Errorf("project %d not registered on this machine; run `enju status --all` to list known projects", override)
+		return reg.Get(override)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("getwd: %w", err)
 	}
-	if e := pickContainingEntry(entries, cwd); e != nil {
-		return e, nil
+	entry, err := reg.FindContaining(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("read registry: %w", err)
+	}
+	if entry != nil {
+		return entry, nil
 	}
 	return nil, fmt.Errorf("no registered project covers %s; pass --project ID or run `enju status --all`", cwd)
 }
@@ -199,7 +194,7 @@ func splitRunsByState(runs []wire.Run) (active, recent []wire.Run) {
 	copy(sorted, runs)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Seq > sorted[j].Seq })
 	for _, r := range sorted {
-		if isTerminalRunState(r.State) {
+		if wire.IsTerminalRunState(r.State) {
 			if len(recent) < 5 {
 				recent = append(recent, r)
 			}
@@ -212,14 +207,6 @@ func splitRunsByState(runs []wire.Run) (active, recent []wire.Run) {
 	// naturally as "what should I unblock next").
 	sort.Slice(active, func(i, j int) bool { return active[i].Seq < active[j].Seq })
 	return active, recent
-}
-
-func isTerminalRunState(s string) bool {
-	switch strings.ToLower(s) {
-	case "completed", "failed", "aborted", "terminated":
-		return true
-	}
-	return false
 }
 
 // renderAllProjects is the --all branch: a flat listing of every

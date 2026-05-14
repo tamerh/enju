@@ -39,16 +39,3 @@ func TestSplitRunsByStateRecentCap(t *testing.T) {
 		t.Fatalf("expected seq 10 first, got %d", recent[0].Seq)
 	}
 }
-
-func TestIsTerminalRunState(t *testing.T) {
-	for _, s := range []string{"completed", "failed", "aborted", "terminated"} {
-		if !isTerminalRunState(s) {
-			t.Errorf("%q should be terminal", s)
-		}
-	}
-	for _, s := range []string{"active", "waiting", "idle", "paused"} {
-		if isTerminalRunState(s) {
-			t.Errorf("%q should not be terminal", s)
-		}
-	}
-}

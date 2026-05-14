@@ -30,7 +30,10 @@
 // expected to fade out without a flag-day rename.
 package wire
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Project is the JSON shape for one project.
 //
@@ -126,4 +129,14 @@ type Iteration struct {
 	// the time arithmetic on the client. Zero for iterations
 	// that haven't submitted yet (claim still open).
 	DurationMS int64 `json:"duration_ms,omitempty"`
+}
+
+// IsTerminalRunState returns true if the given state string (case-insensitive)
+// represents a run that has finished its lifecycle.
+func IsTerminalRunState(s string) bool {
+	switch strings.ToLower(s) {
+	case "completed", "failed", "aborted", "terminated":
+		return true
+	}
+	return false
 }

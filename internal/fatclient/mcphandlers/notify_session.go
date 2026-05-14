@@ -62,6 +62,15 @@ func newNotifySession(cfg notifySessionConfig) *notifySession {
 	return &notifySession{cfg: cfg}
 }
 
+func (s *notifySession) ProjectID() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.projectID
+}
+
 // Switch makes projectID the active notify target. Cancels the
 // prior goroutine (if any) and spawns a new one. No-op when
 // projectID matches the current active. Best-effort: errors

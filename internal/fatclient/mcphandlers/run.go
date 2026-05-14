@@ -22,6 +22,7 @@ import (
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/types"
+	"github.com/enju-ai/enju/internal/common/wire"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -81,11 +82,14 @@ func (c *apiClient) handleRunStatus(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// Opportunistic reconcile: any async compute tasks that
-	// committed + pushed since the last scan on this run's
-	// branch get picked up here, so the status we're about to
-	// render reflects the freshest coordinator state. Best-
-	// effort — a fetch or reconcile failure just means stale
-	// status this cycle, not a tool error.
+	// committed + pushed since the last scan on this run's branch
+	// get picked up here, so the status we're about to render
+	// reflects the freshest coordinator state. The background
+	// ticker (runReconcileTicker) sweeps active runs every 20s for
+	// the "operator isn't actively asking" case; this inline call
+	// closes the worst-case latency gap when the operator IS
+	// asking right now. Best-effort — a fetch failure just means
+	// stale status this cycle, not a tool error.
 	c.fc.ReconcileRunBranch(ctx, int64(projectID), run)
 
 	tasks, err := c.get(ctx, base+"/tasks")
@@ -935,4 +939,42 @@ func (c *apiClient) handleExportRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	return mcp.NewToolResultText(md), nil
+}
+
+// isReconcilableRunState returns true if the run should be
+// opportunistically reconciled. Excludes terminal runs (the
+// work is done) and paused runs (awaiting operator unblock).
+func isReconcilableRunState(state string) bool {
+	return !wire.IsTerminalRunState(state) && state != "paused"
+}
+
+// reconcileActiveRuns fetches all runs for projectID and triggers
+// an opportunistic reconciliation for each reconcilable run.
+// Best-effort: failures (coord unreachable, decode error) are
+// logged or ignored; the ticker continues.
+func (c *apiClient) reconcileActiveRuns(ctx context.Context, projectID int64) {
+	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
+	if err != nil {
+		return
+	}
+	var runs []json.RawMessage
+	if err := json.Unmarshal(data, &runs); err != nil {
+		return
+	}
+	// Minimal sniff struct: decode only the state field per run to
+	// gate reconciliation. Avoids unmarshaling the full record into
+	// map[string]interface{} and re-marshaling it back to bytes
+	// (ReconcileRunBranch already takes []byte).
+	for _, run := range runs {
+		var head struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(run, &head); err != nil {
+			continue
+		}
+		if !isReconcilableRunState(head.State) {
+			continue
+		}
+		c.fc.ReconcileRunBranch(ctx, projectID, []byte(run))
+	}
 }

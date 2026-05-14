@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -277,4 +278,35 @@ func (r *Registry) saveLocked(idx Index) error {
 		return fmt.Errorf("rename tmp registry: %w", err)
 	}
 	return nil
+}
+
+// FindContaining returns the registry entry whose LocalPath is absPath
+// or an ancestor directory. Prefer the deepest match so nested
+// project layouts resolve to the closest project. Returns nil
+// when no entry contains the path.
+func (r *Registry) FindContaining(absPath string) (*Entry, error) {
+	idx, err := r.Load()
+	if err != nil {
+		return nil, err
+	}
+	var best *Entry
+	for i := range idx.Projects {
+		root := idx.Projects[i].LocalPath
+		if root == "" {
+			continue
+		}
+		// os.Stat filter matches Registry.List() behavior — we
+		// don't resolve to paths that were manually deleted.
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(root, absPath)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		if best == nil || len(idx.Projects[i].LocalPath) > len(best.LocalPath) {
+			best = &idx.Projects[i]
+		}
+	}
+	return best, nil
 }

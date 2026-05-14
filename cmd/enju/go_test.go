@@ -96,32 +96,6 @@ func TestParseParamsArg(t *testing.T) {
 	}
 }
 
-// TestPickContainingEntryPrefersDeepest exercises the nested-
-// project case: when /home/foo is registered as project 1 AND
-// /home/foo/nested is registered as project 2, a file under
-// nested/ should resolve to project 2.
-func TestPickContainingEntryPrefersDeepest(t *testing.T) {
-	now := time.Now()
-	entries := []projectreg.Entry{
-		{ID: 1, LocalPath: "/home/foo", LastTouched: now},
-		{ID: 2, LocalPath: "/home/foo/nested", LastTouched: now},
-		{ID: 3, LocalPath: "/elsewhere", LastTouched: now},
-	}
-	got := pickContainingEntry(entries, "/home/foo/nested/workflow.yaml")
-	if got == nil || got.ID != 2 {
-		t.Fatalf("expected entry 2, got %+v", got)
-	}
-}
-
-func TestPickContainingEntryNoMatch(t *testing.T) {
-	entries := []projectreg.Entry{
-		{ID: 1, LocalPath: "/home/foo"},
-	}
-	if got := pickContainingEntry(entries, "/elsewhere/file"); got != nil {
-		t.Fatalf("expected nil, got %+v", got)
-	}
-}
-
 // TestProjectRootCandidateFindsGit places a workflow under a
 // directory tree with .git two levels up; the candidate should
 // walk up to the git root rather than picking the workflow's

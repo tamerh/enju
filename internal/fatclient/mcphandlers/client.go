@@ -25,11 +25,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
+
+// reconcileInterval is how often the background ticker sweeps each
+// served project for opportunistic reconcile. 20s is conservative
+const reconcileInterval = 20 * time.Second
 
 type apiClient struct {
 	fc         *service.FatClient
@@ -84,6 +90,46 @@ func (c *apiClient) put(ctx context.Context, path string, body interface{}) ([]b
 
 func (c *apiClient) delete(ctx context.Context, path string) ([]byte, error) {
 	return c.fc.Coord().Delete(ctx, path)
+}
+
+// runReconcileTicker starts the background opportunistic reconcile
+// loop. Tick every reconcileInterval. Scoped to CWD and the active
+// notify session to match "the project(s) this MCP is serving"
+// semantics. Only spawned when cfg.Notify is configured (i.e.,
+// notify session is active).
+func (c *apiClient) runReconcileTicker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.fc.Logger().Error("reconcile ticker panicked", "recover", r)
+		}
+	}()
+
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Dynamic resolution per tick: check both the CWD (implicit
+			// served project) and the notify session (explicitly
+			// touched project).
+			ids := make(map[int64]bool)
+			if cwd, err := os.Getwd(); err == nil {
+				if entry, _ := c.fc.ProjectRegistry().FindContaining(cwd); entry != nil {
+					ids[entry.ID] = true
+				}
+			}
+			if activeID := c.notifySess.ProjectID(); activeID != 0 {
+				ids[activeID] = true
+			}
+
+			for id := range ids {
+				c.reconcileActiveRuns(ctx, id)
+			}
+		}
+	}
 }
 
 // commitAuthor forwards to the FatClient's profile cache.

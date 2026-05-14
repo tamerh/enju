@@ -205,3 +205,73 @@ func TestLoad_MalformedJSON(t *testing.T) {
 		t.Errorf("Load on malformed JSON should error")
 	}
 }
+
+func TestFindContaining(t *testing.T) {
+	r := newTempRegistry(t)
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "nested")
+	if err := os.MkdirAll(inner, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, e := range []Entry{
+		{ID: 1, LocalPath: outer},
+		{ID: 2, LocalPath: inner},
+	} {
+		if err := r.Upsert(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Case 1: prefers deepest match
+	got, err := r.FindContaining(filepath.Join(inner, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != 2 {
+		t.Errorf("expected deepest match (ID=2), got %+v", got)
+	}
+
+	// Case 2: falls back to outer
+	got, err = r.FindContaining(filepath.Join(outer, "other.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != 1 {
+		t.Errorf("expected outer match (ID=1), got %+v", got)
+	}
+
+	// Case 3: no match
+	got, err = r.FindContaining("/elsewhere/entirely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for no match, got %+v", got)
+	}
+
+	// Case 4: entry whose LocalPath was removed — os.Stat filter
+	// should exclude it. To isolate the filter, create a fourth entry
+	// with an isolated path (not a parent of anything), delete it,
+	// and verify FindContaining filters it out.
+	isolated := filepath.Join(t.TempDir(), "isolated-project")
+	if err := os.MkdirAll(isolated, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Upsert(Entry{ID: 4, LocalPath: isolated}); err != nil {
+		t.Fatal(err)
+	}
+	// Delete the isolated directory
+	if err := os.RemoveAll(isolated); err != nil {
+		t.Fatal(err)
+	}
+	// Now try to find containing for a path under the deleted directory.
+	// The os.Stat filter should exclude the deleted entry.
+	got, err = r.FindContaining(filepath.Join(isolated, "file.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for entry whose dir was deleted, got %+v", got)
+	}
+}
