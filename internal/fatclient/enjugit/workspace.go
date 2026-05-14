@@ -168,7 +168,7 @@ func (w *Workspace) OpenExisting(id int64) (*Workflow, error) {
 		}
 		return nil, fmt.Errorf("enjugit: stat %s: %w", dir, err)
 	}
-	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	clone, err := git.OpenClone(dir, w.lockPathFor(id, dir), w.logger)
 	if err != nil {
 		if errors.Is(err, git.ErrCloneNotFound) {
 			return nil, ErrCloneNotFound
@@ -252,14 +252,28 @@ func slugify(name string) string {
 }
 
 // lockPathFor returns the cross-process flock file for one
-// project. Lives next to the project dir, suffixed with .lock.
+// project. Post-NDW.4 it lives at <projectPath>/.enju/locks/project.lock
+// — co-located with the project so:
 //
-// NDW.4 will relocate this under <projectPath>/.enju/locks/; for
-// NDW.2 we keep the workspace-rooted path so the lock-collision
-// risk between operator + wrapper that NDW.1 already mitigated
-// stays unchanged through this phase.
-func (w *Workspace) lockPathFor(id int64) string {
-	return filepath.Join(w.rootDir, fmt.Sprintf("project-%d.lock", id))
+//   - cross-machine project clones (rsync'd / shared mount) carry
+//     their own lock infrastructure with them, instead of relying
+//     on a host-side `~/.enju/workspaces/` directory that may not
+//     exist on the receiving machine.
+//   - removing the project's dir removes the lock alongside it
+//     (no stale ~/.enju/workspaces/project-N.lock files leak
+//     after a leave_project).
+//   - the operator + async wrapper both compute the SAME inode
+//     by feeding the same projectPath (resolved via projectreg)
+//     into this helper. The flock contract only holds when the
+//     path is byte-identical across processes.
+//
+// projectID is unused now but kept on the signature for
+// diagnostic logging (callers usually have it on hand). The
+// MkdirAll-on-demand happens at flock-acquire time inside
+// gitcli; this helper is path computation only.
+func (w *Workspace) lockPathFor(id int64, projectPath string) string {
+	_ = id // diagnostic-only; path is fully derived from projectPath
+	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
 }
 
 // newWorkflowFromClone wraps a *git.Clone in a Workflow with the

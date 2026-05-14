@@ -83,7 +83,7 @@ func (w *Workspace) OpenView(id int64) (*View, error) {
 	if err != nil {
 		return nil, err
 	}
-	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	clone, err := git.OpenClone(dir, w.lockPathFor(id, dir), w.logger)
 	if err != nil {
 		if errors.Is(err, git.ErrCloneNotFound) {
 			return nil, ErrCloneNotFound
@@ -125,7 +125,7 @@ func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
 		}
 		return nil, fmt.Errorf("enjugit: stat %s: %w", dir, err)
 	}
-	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	clone, err := git.OpenClone(dir, w.lockPathFor(id, dir), w.logger)
 	if err != nil {
 		if errors.Is(err, git.ErrCloneNotFound) {
 			return nil, ErrCloneNotFound
@@ -143,7 +143,7 @@ func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
 // repo has a HEAD; origin stays unset until the operator wires
 // one via enju_set_project_remote. Caller holds w.mu.
 func (w *Workspace) openOrClone(id int64, dir, remoteURL string) (*git.Clone, error) {
-	lockPath := w.lockPathFor(id)
+	lockPath := w.lockPathFor(id, dir)
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		return git.OpenClone(dir, lockPath, w.logger)
 	}

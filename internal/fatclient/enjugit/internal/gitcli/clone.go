@@ -86,6 +86,15 @@ func OpenClone(workDir, lockPath string, logger *slog.Logger) (*Clone, error) {
 		c.remoteURL = strings.TrimSpace(string(out))
 	}
 	if lockPath != "" {
+		// gofrs/flock won't auto-create the parent dir. Ensure
+		// <projectPath>/.enju/locks/ exists so the first
+		// fileLock.Lock() call (lazy create) doesn't fail with
+		// "no such file or directory". Cheap on subsequent
+		// OpenClone calls (MkdirAll is a stat-then-noop when
+		// the dir already exists).
+		if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+			return nil, fmt.Errorf("git: prep lock dir %s: %w", filepath.Dir(lockPath), err)
+		}
 		c.fileLock = flock.New(lockPath)
 	}
 	return c, nil
