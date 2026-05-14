@@ -30,7 +30,6 @@ import (
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // ResolveTaskScratchDir returns the canonical absolute path for a
@@ -85,23 +84,27 @@ const GitSubmitFailedPrefix = "git submit failed:"
 type Spec struct {
 	TaskID string `json:"task_id"`
 
-	ProjectID     int64  `json:"project_id"`
-	RemoteURL     string `json:"remote_url,omitempty"`
-	WorkspaceRoot string `json:"workspace_root"`
-	ProjectName   string `json:"project_name,omitempty"`
+	ProjectID int64  `json:"project_id"`
+	RemoteURL string `json:"remote_url,omitempty"`
 
-	// RegistryPath is the absolute path to the operator's project
-	// registry (typically ~/.enju/projects.json). The async wrapper
-	// loads this when it re-opens the workspace so its ForProject
-	// resolves to the SAME on-disk clone the operator is using.
-	// Without it, the wrapper's standalone Workspace falls back to
-	// scanning WorkspaceRoot and creates a divergent clone at
-	// <root>/<slug>-<id>/ — the wrapper writes commits + refs there,
-	// the operator's merger reads from the registry-resolved path
-	// (the adopted-project dir), and refs are "not found." Empty
-	// value falls back to projectreg.DefaultPath() so single-machine
-	// no-test invocations still work without explicit threading.
-	RegistryPath string `json:"registry_path,omitempty"`
+	// WorkDir is the absolute path to the operator's pre-resolved
+	// project clone (`wf.WorkDir()` on the caller side). Post-
+	// NDW.5 the wrapper opens THIS path directly via
+	// enjugit.OpenWorkflowAtPath instead of rebuilding a Workspace
+	// + Registry to re-resolve the same answer. That eliminates
+	// the dual-store class of bug entirely: there is no resolution
+	// step in the wrapper that could land on a divergent clone.
+	WorkDir string `json:"work_dir"`
+
+	// LockPath is the cross-process flock file the operator's
+	// Workflow uses. Threading it explicitly guarantees the
+	// wrapper computes the same inode the operator does, even
+	// across future flock-path moves — there is no compute-from-
+	// rootDir derivation that could drift across processes.
+	// Typically <WorkDir>/.enju/locks/project.lock (the post-
+	// NDW.4 layout); callers should derive it via
+	// enjugit.LockPathFor(<projectPath>).
+	LockPath string `json:"lock_path"`
 
 	// Branch is the run branch (the integration target). The
 	// commit's per-task topic branch is built FROM this base via
@@ -437,41 +440,25 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	}
 
 	// Subprocess fallback: wrap-task is a separate process and
-	// cannot inherit the parent fat-client's Workflow. Open one
-	// from spec — flock honors cross-process serialization.
-	//
-	// Attach the SAME project registry the operator uses so the
-	// wrapper's ForProject resolves to the same on-disk clone the
-	// operator is using. Without this, adopted-project paths (the
-	// path= flow on enju_create_project) diverge: operator reads
-	// the registry to find /the/adopted/path, wrapper has no
-	// registry and falls back to scanning WorkspaceRoot, then
-	// silently creates a NEW clone at ~/.enju/workspaces/<slug>-<id>/.
-	// Commits land in the wrapper's clone; the operator's merger
-	// later can't find the iter-branch refs there. Showcase TP53
-	// debug bundle #2 hit exactly this trap: 11 sections of work
-	// committed to the divergent clone, every post-submit merge
-	// failed "ref not found."
+	// cannot inherit the parent fat-client's Workflow. Post-NDW.5
+	// the wrapper opens the operator's PRE-RESOLVED clone path
+	// directly — no Workspace re-resolution, no registry attach,
+	// no risk of landing on a divergent clone. Spec.WorkDir +
+	// Spec.LockPath are byte-identical to what the operator used,
+	// so the cross-process flock contract holds without any
+	// derivation step in the wrapper.
 	if wf == nil {
-		regPath := spec.RegistryPath
-		if regPath == "" {
-			regPath = projectreg.DefaultPath()
-		}
-		opts := []enjugit.Option{enjugit.WithLogger(logger)}
-		if regPath != "" {
-			opts = append(opts, enjugit.WithRegistry(projectreg.Open(regPath)))
-		}
-		ws, err := enjugit.NewWorkspace(spec.WorkspaceRoot,
-			enjugit.NewProductionConventions(), opts...)
-		if err != nil {
-			res.Error = fmt.Sprintf("opening workspace %q: %v", spec.WorkspaceRoot, err)
+		if spec.WorkDir == "" {
+			res.Error = "spec.work_dir is required (caller must pre-resolve the project clone path before spawning the wrapper)"
 			return res
 		}
-		wf, err = ws.ForProject(spec.ProjectID, spec.RemoteURL, spec.ProjectName)
+		openedWF, err := enjugit.OpenWorkflowAtPath(spec.WorkDir, spec.LockPath,
+			spec.ProjectID, enjugit.NewProductionConventions(), logger)
 		if err != nil {
-			res.Error = fmt.Sprintf("opening project: %v", err)
+			res.Error = fmt.Sprintf("opening clone at %q: %v", spec.WorkDir, err)
 			return res
 		}
+		wf = openedWF
 	}
 
 	workDir := wf.WorkDir()
@@ -533,8 +520,15 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 		if decl.Path == "" || enjuYaml.IsGlob(decl.Path) || enjuYaml.IsDir(decl.Path) {
 			continue
 		}
+		// Post-NDW.5: projectName is no longer threaded through
+		// Spec — EnsureSharedSymlink's fallback to the numeric
+		// project dir (when name is empty) is good enough for the
+		// shared-storage symlink path. Operators who relied on
+		// the slug form for human-readable shared paths can
+		// thread a name via env if needed; tracked in the
+		// dynamic-outputs / shared-root cleanup backlog.
 		if err := enjugit.EnsureSharedSymlink(enjugit.ArtifactPath(decl.Path), workDir,
-			spec.ProjectID, spec.ProjectName, spec.Branch, decl.Path); err != nil {
+			spec.ProjectID, "", spec.Branch, decl.Path); err != nil {
 			logger.Warn("shared-root symlink setup failed",
 				"path", decl.Path, "error", err)
 			// Don't fail the whole task — if the mount is

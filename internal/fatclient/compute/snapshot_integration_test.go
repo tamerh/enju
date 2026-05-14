@@ -153,7 +153,6 @@ func TestScratchAsCWD_SnapshotReachableViaEnv(t *testing.T) {
 		TaskID:          "1:1:siblings_check",
 		ProjectID:       201,
 		RemoteURL:       bare,
-		WorkspaceRoot:   wsRoot,
 		Branch:          "main",
 		IterationBranch: "1-test/siblings_check/iter-1",
 		ResultDir:       ".enju/runs/1-test/siblings_check",
@@ -275,7 +274,6 @@ echo "stdout content"
 		TaskID:        "1:1:submit_fail_check",
 		ProjectID:     303,
 		RemoteURL:     bare,
-		WorkspaceRoot: wsRoot,
 		// Branch (→ SubmitRequest.RunBranch) points at a ref
 		// that doesn't exist anywhere. SubmitComputeTaskResult
 		// fails at the resolve-base step with a clear error,
@@ -398,7 +396,6 @@ echo "ok"
 		TaskID:        "1:1:combined_check",
 		ProjectID:     305,
 		RemoteURL:     bare,
-		WorkspaceRoot: wsRoot,
 		// Branch points at a nonexistent ref so the post-script
 		// submit fails — same forced-failure pattern as
 		// TestWrapper_PreservesScratchOnSubmitFail.
@@ -494,7 +491,6 @@ func TestWrapper_CleansScratchOnSubmitSuccess(t *testing.T) {
 		TaskID:          "1:1:submit_ok",
 		ProjectID:       304,
 		RemoteURL:       bare,
-		WorkspaceRoot:   wsRoot,
 		Branch:          "main",
 		IterationBranch: "1-test/submit_ok/iter-1",
 		ResultDir:       ".enju/runs/1-test/submit_ok",

@@ -190,10 +190,15 @@ func sweepStaleScratchOlderThan(projectRoot, botUsername string, minAge time.Dur
 // captured stderr in-memory via Result.Stderr, which is the real
 // blast-radius signal.
 func persistFailedLog(spec Spec, body []byte) string {
-	if spec.TaskScratchDir == "" || spec.WorkspaceRoot == "" || spec.TaskID == "" {
+	if spec.TaskScratchDir == "" || spec.WorkDir == "" || spec.TaskID == "" {
 		return ""
 	}
-	logsDir := filepath.Join(spec.WorkspaceRoot, "logs")
+	// Post-NDW.5 the persistent failure log lives inside the
+	// project at <WorkDir>/.enju/logs/failed/. Pre-NDW.5 it lived
+	// at <WorkspaceRoot>/logs/ — that was a per-machine dir that
+	// got abandoned when the project moved hosts. Inside the
+	// project the log moves with the project (rsync, archive, etc.).
+	logsDir := filepath.Join(spec.WorkDir, ".enju", "logs", "failed")
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
 		return ""
 	}

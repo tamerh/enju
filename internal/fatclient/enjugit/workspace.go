@@ -276,6 +276,65 @@ func (w *Workspace) lockPathFor(id int64, projectPath string) string {
 	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
 }
 
+// OpenWorkflowAtPath opens an existing clone at the given workDir
+// and returns a standalone Workflow. Bypasses the Workspace
+// registry resolution — the caller supplies both the working tree
+// and the flock path, byte-identical to what the operator would
+// have used. Production use case: the async compute wrapper
+// (cmd/enju wrap-task) re-opens the operator's clone in a
+// separate process via Spec.WorkDir + Spec.LockPath rather than
+// rebuilding a Workspace + Registry just to re-resolve the same
+// path.
+//
+// The returned Workflow is not cached by any Workspace — the
+// wrapper holds the only reference for the duration of the
+// subprocess. projectID populates the Workflow's identity for
+// trace logs and trailer attribution.
+func OpenWorkflowAtPath(workDir, lockPath string, projectID int64, convs Conventions, logger *slog.Logger) (*Workflow, error) {
+	if workDir == "" {
+		return nil, fmt.Errorf("enjugit: OpenWorkflowAtPath: workDir is required")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	clone, err := git.OpenClone(workDir, lockPath, logger)
+	if err != nil {
+		if errors.Is(err, git.ErrCloneNotFound) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: open clone %s: %w", workDir, err)
+	}
+	wf := &Workflow{
+		git:    clone,
+		convs:  convs,
+		projID: projectID,
+		logger: logger,
+	}
+	if convs.DiskLayout.ProjectRoot != nil {
+		projectRoot := convs.DiskLayout.ProjectRoot(workDir)
+		f, err := oplog.OpenProjectLogFile(projectRoot,
+			corelayout.LogsDir, oplog.TraceFilename(""))
+		if err == nil {
+			wf.traceFile = f
+		} else {
+			logger.Warn("enjugit: open trace log failed; verb traces go to slog only",
+				"project_id", projectID, "project_root", projectRoot, "error", err)
+		}
+	}
+	return wf, nil
+}
+
+// LockPathFor returns the cross-process flock path for a project
+// rooted at projectPath. Exposed so external callers (the async
+// compute wrapper's caller in particular) can compute the same
+// path the workspace's internal lockPathFor produces, without
+// reaching into private state. Mirrors workspace.lockPathFor —
+// the public form is keyed by path, not project ID, since the
+// caller already has the path on hand.
+func LockPathFor(projectPath string) string {
+	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
+}
+
 // newWorkflowFromClone wraps a *git.Clone in a Workflow with the
 // Workspace's conventions. Used by ForProject and friends.
 //
