@@ -42,21 +42,13 @@ func autoBotsReadyTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-// rollbackAutoStarts stops every bot in freshStarts. Used by
-// both the preflight-failure and post-POST-failure paths in
-// handleCreateRun.
-//
-// CRITICAL contract — pre-REV.1 bug: callers MUST pass ONLY the
-// bots this auto_bots call freshly spawned (StartedFresh outcome
-// from Supervisor.Start), never the wider autoBotNames list
-// (which includes AlreadyRunning operator-started bots that rode
-// along). The helper itself can't enforce this — it just stops
-// whatever it's given — so a future refactor that mistakenly
-// passes the wide list reintroduces the bug silently. If you're
-// changing this code: the variable named autoFreshStarts is the
-// one that goes here. If you're looking at the variable named
-// autoBotNames and thinking "those are the bots, I'll stop
-// them," you've found the REV.1 bug — back away.
+// rollbackAutoStarts is preserved for the existing
+// regression test (TestRollbackAutoStarts_SparesOperatorBots) —
+// the test predates the AutoRunManager extraction and pins the
+// REV.1 helper-level invariant. New call sites should NOT use
+// this directly; construct bots.AutoRunManager and call its
+// Rollback method, which owns the freshStarts slice internally
+// so the wrong-list bug class is unreachable.
 func rollbackAutoStarts(ctx context.Context, sup *bots.Supervisor, freshStarts []string) {
 	for _, name := range freshStarts {
 		if _, err := sup.Stop(ctx, name); err != nil {
@@ -630,15 +622,13 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	// partial failure, roll back the fresh starts (leave
 	// already-running bots alone — they may be doing other work)
 	// and return an error rather than creating a half-served run.
+	//
+	// The heavy lifting lives in bots.AutoRunManager so this
+	// handler and cmd/enju/go.go can't drift. The manager owns
+	// the freshStarts slice internally — Rollback reads from
+	// there, callers can't pass the wrong list (REV.1).
 	autoBots := req.GetBool("auto_bots", false)
-	// autoBotNames lists every bot that completed preflight
-	// (used for MarkAutoRun after the run is created so terminal
-	// events decrement them). autoFreshStarts is the strict
-	// subset that THIS call freshly spawned — only these are
-	// safe to Stop on rollback; bots that came back as
-	// AlreadyRunning are operator-owned (manual wins) and must
-	// be left alone even when the surrounding run fails.
-	var autoBotNames, autoFreshStarts []string
+	var autoRunMgr *bots.AutoRunManager
 	if autoBots {
 		if templatePath == "" {
 			return mcp.NewToolResultError("auto_bots=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
@@ -658,44 +648,10 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: supervisor init: %v", perr)), nil
 		}
 		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
-		coordURL := c.fc.Coord().BaseURL()
-		readyTimeout := autoBotsReadyTimeout()
+		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, c.fc.Coord().BaseURL(), int64(projectID), autoBotsReadyTimeout())
 
-		preflight := func() error {
-			for _, b := range manifest.Bots {
-				var allow []string
-				if b.MCPTools != nil {
-					allow = b.MCPTools.Allow
-				}
-				_, outcome, serr := sup.Start(ctx, bots.StartParams{
-					BotName:      b.Name,
-					WorkflowPath: absWorkflow,
-					Coordinator:  coordURL,
-					ProjectID:    int64(projectID),
-					AllowTools:   allow,
-					StartedBy:    "auto_run",
-				})
-				if serr != nil {
-					return fmt.Errorf("starting bot %q: %w", b.Name, serr)
-				}
-				if outcome == bots.StartedFresh {
-					autoFreshStarts = append(autoFreshStarts, b.Name)
-				}
-				if rerr := sup.WaitForReady(ctx, b.Name, readyTimeout); rerr != nil {
-					return fmt.Errorf("bot %q: %w (check %s for daemon output)", b.Name, rerr, sup.LogPathFor(b.Name))
-				}
-				autoBotNames = append(autoBotNames, b.Name)
-			}
-			return nil
-		}
-		if perr := preflight(); perr != nil {
-			// REV.1 invariant: pass autoFreshStarts, NOT
-			// autoBotNames. autoBotNames includes AlreadyRunning
-			// (operator-owned) bots that came back from Start
-			// idempotently; stopping them on a run-creation
-			// failure would kill manual work the operator was
-			// using for other things.
-			rollbackAutoStarts(ctx, sup, autoFreshStarts)
+		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
+			autoRunMgr.Rollback(ctx)
 			return mcp.NewToolResultError("auto_bots: " + perr.Error()), nil
 		}
 	}
@@ -706,52 +662,30 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		// POST failed AFTER the auto_bots preflight already
 		// spun up the fleet. Roll back so a coord-side failure
 		// doesn't leak running bots that no run will ever
-		// reference — but only stop the bots THIS call started.
-		//
-		// REV.1 invariant: pass autoFreshStarts, NOT
-		// autoBotNames. Pre-fix this site used autoBotNames,
-		// killing operator-owned bots that came back from
-		// Start as AlreadyRunning. autoFreshStarts is the
-		// strict subset of "spawned by THIS call" — any
-		// rollback that calls Stop must source from it.
-		if autoBots {
-			if sup, _ := c.botSupervisor(); sup != nil {
-				rollbackAutoStarts(ctx, sup, autoFreshStarts)
-			}
+		// reference — manager.Rollback only touches the strict
+		// freshStarts subset, leaving operator-owned bots alone.
+		if autoRunMgr != nil {
+			autoRunMgr.Rollback(ctx)
 		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// auto_bots: now that the coord has assigned a run seq,
-	// record it on each bot's pid file so the live.jsonl
-	// tailer can decrement when the run finishes. Also
-	// register the project's event log with the supervisor
-	// so the tailer is running by the time terminal events
-	// arrive — idempotent across concurrent auto_bots runs
-	// in the same project.
-	//
-	// Bots whose MarkAutoRun fails (typically: the daemon
-	// crashed between WaitForReady and here, reaper removed
-	// the pid file) get collected into autoBotsUnhooked so
-	// the operator-visible result text can flag them.
-	// Without that signal, the run proceeds silently and
-	// the operator only notices the leak when they wonder
-	// why a bot is still alive after the run completed.
+	// hook each preflighted bot to the live.jsonl tailer so
+	// terminal events fire auto-stop. Bots whose MarkAutoRun
+	// fails (typically: the daemon crashed between
+	// WaitForReady and here, reaper removed the pid file) end
+	// up in autoBotsUnhooked so the operator-visible result
+	// text can flag them.
 	var autoBotsUnhooked []string
-	if autoBots && len(autoBotNames) > 0 {
-		var resp map[string]interface{}
-		if jerr := json.Unmarshal(data, &resp); jerr == nil {
-			if seq, ok := resp["seq"].(float64); ok {
-				runSeq := int64(seq)
-				sup, _ := c.botSupervisor()
-				if sup != nil && prep != nil && prep.Workflow != nil {
-					for _, name := range autoBotNames {
-						if merr := sup.MarkAutoRun(name, runSeq); merr != nil {
-							slog.Default().Warn("auto_bots: MarkAutoRun failed", "bot", name, "run_seq", runSeq, "error", merr)
-							autoBotsUnhooked = append(autoBotsUnhooked, name)
-						}
-					}
-					sup.WatchProjectEvents(ctx, prep.Workflow.WorkDir(), int64(projectID))
+	autoBotNames := []string{}
+	if autoRunMgr != nil {
+		autoBotNames = autoRunMgr.AutoBotNames()
+		if len(autoBotNames) > 0 {
+			var resp map[string]interface{}
+			if jerr := json.Unmarshal(data, &resp); jerr == nil {
+				if seq, ok := resp["seq"].(float64); ok && prep != nil && prep.Workflow != nil {
+					autoBotsUnhooked = autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
 				}
 			}
 		}
