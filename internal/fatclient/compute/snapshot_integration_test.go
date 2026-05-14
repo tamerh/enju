@@ -24,6 +24,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // seedSnapshotTree drops a representative template snapshot onto
@@ -113,8 +114,16 @@ func TestScratchAsCWD_SnapshotReachableViaEnv(t *testing.T) {
 	wsRoot := t.TempDir()
 	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
 
+	reg1 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath1 := filepath.Join(wsRoot, "p1")
+	if err := os.MkdirAll(projectPath1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg1.Upsert(projectreg.Entry{ID: 201, LocalPath: projectPath1}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg1))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}
@@ -224,8 +233,16 @@ func TestWrapper_PreservesScratchOnSubmitFail(t *testing.T) {
 	wsRoot := t.TempDir()
 	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
 
+	reg2 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath2 := filepath.Join(wsRoot, "p2")
+	if err := os.MkdirAll(projectPath2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Upsert(projectreg.Entry{ID: 303, LocalPath: projectPath2}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg2))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}
@@ -326,8 +343,16 @@ func TestWrapper_RepoDirReadableAndScratchSurvivesSubmitFail(t *testing.T) {
 	wsRoot := t.TempDir()
 	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
 
+	reg3 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath3 := filepath.Join(wsRoot, "p3")
+	if err := os.MkdirAll(projectPath3, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg3.Upsert(projectreg.Entry{ID: 305, LocalPath: projectPath3}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg3))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}
@@ -438,8 +463,16 @@ func TestWrapper_CleansScratchOnSubmitSuccess(t *testing.T) {
 	wsRoot := t.TempDir()
 	t.Cleanup(func() { chmodTreeWritable(t, wsRoot) })
 
+	reg4 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath4 := filepath.Join(wsRoot, "p4")
+	if err := os.MkdirAll(projectPath4, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg4.Upsert(projectreg.Entry{ID: 304, LocalPath: projectPath4}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg4))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}

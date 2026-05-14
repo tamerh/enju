@@ -80,38 +80,20 @@ func (s *FatClient) ReadResultAtCommit(ctx context.Context, projectID int64, com
 	if s.enjugit == nil {
 		return "", true, fmt.Errorf("no workspace configured")
 	}
-	// Read-only: resolve the existing on-disk clone via
-	// OpenExisting. Critically NOT ForProject(id, "") — that
-	// path falls into a clone/init branch when the computed
-	// numeric directory doesn't match the actual slug-form
-	// clone on disk, silently creating an orphan empty repo
-	// at "{rootDir}/{id}" that outranks the real clone in
-	// subsequent lookups.
-	// Try OpenView first — read-only path that doesn't materialize
-	// a clone if one doesn't exist (the per-bot-clone case).
+	// Read-only path: resolve the existing on-disk clone via
+	// OpenView. Post-NDW.2 there is no lazy-clone fallback — when
+	// the project isn't registered on this machine, or the clone
+	// hasn't been materialized via enju_create_project yet, we
+	// surface (false, nil) so the read-only surface (e.g. the
+	// web UI) shows "no submission viewable here" instead of
+	// crashing on a project the user hasn't adopted locally.
 	view, verr := s.enjugit.OpenView(projectID)
 	if verr != nil {
-		if !errors.Is(verr, enjugit.ErrCloneNotFound) {
-			return "", true, fmt.Errorf("open project clone: %w", verr)
-		}
-		// Lazy-clone fallback for read-only surfaces (web UI):
-		// fetch remote_url and clone on demand. Skipped silently
-		// when remote_url is unset (path-only projects with no
-		// workspace clone).
-		remoteURL, _, _, ferr := s.FetchProjectMetaExpanded(ctx, projectID)
-		if ferr != nil {
-			s.logger.Warn("ReadResultAtCommit: fetch project meta failed; treating as not-found",
-				"project_id", projectID, "error", ferr)
+		if errors.Is(verr, enjugit.ErrCloneNotFound) ||
+			errors.Is(verr, enjugit.ErrProjectNotRegistered) {
 			return "", false, nil
 		}
-		if remoteURL == "" {
-			return "", false, nil
-		}
-		view2, verr2 := s.enjugit.OpenOrLazyClone(projectID, remoteURL)
-		if verr2 != nil {
-			return "", true, fmt.Errorf("lazy-clone project: %w", verr2)
-		}
-		view = view2
+		return "", true, fmt.Errorf("open project clone: %w", verr)
 	}
 	repoPath := resultDir + "/result.md"
 	data, ok, rerr := view.ReadFileAtCommit(commitSHA, repoPath)

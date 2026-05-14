@@ -76,7 +76,10 @@ tasks:
 	if _, err := h.enjugit.ForProject(projectID, h.remoteFor(projectID), "inbox-test"); err != nil {
 		t.Fatalf("workspace.ForProject: %v", err)
 	}
-	projectDir := h.enjugit.ProjectDir(projectID)
+	projectDir, err := h.enjugit.ProjectDir(projectID)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
 	// Seed task_ready events for all three. The candidate scan
 	// only fires on assign_to=h.username events, so theirs/open
 	// won't even be candidates. Including them here would no-op;
@@ -148,7 +151,10 @@ tasks:
 	if _, err := h.enjugit.ForProject(projectID, h.remoteFor(projectID), "claimed-test"); err != nil {
 		t.Fatalf("workspace.ForProject: %v", err)
 	}
-	projectDir := h.enjugit.ProjectDir(projectID)
+	projectDir, err := h.enjugit.ProjectDir(projectID)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
 
 	// Seed events for two tasks: one that's still ready, one that
 	// was ready then claimed. The newer claim event hides the

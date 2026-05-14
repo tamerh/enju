@@ -16,6 +16,7 @@ import (
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/inbox"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 func cmdInbox(args []string) {
@@ -64,16 +65,25 @@ Flags:`)
 		home, _ := os.UserHomeDir()
 		wsRoot = filepath.Join(home, ".enju", "workspaces")
 	}
+	// Attach the same registry the MCP server uses so ProjectDir/
+	// OpenView resolve to the operator's adopted project dir
+	// (anywhere on disk), not a slug-id sibling under wsRoot.
+	reg := projectreg.Open(projectreg.DefaultPath())
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		enjugit.WithRegistry(reg))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "opening workspace %s: %v\n", wsRoot, err)
 		os.Exit(1)
 	}
-	projectDir := ws.ProjectDir(projectID)
+	projectDir, derr := ws.ProjectDir(projectID)
+	if derr != nil {
+		fmt.Fprintf(os.Stderr, "project %d is not registered on this machine — run `enju mcp` once with `enju_create_project path=<abs/dir>` to adopt it locally first.\n", projectID)
+		os.Exit(1)
+	}
 	view, err := ws.OpenView(projectID)
-	if err != nil || projectDir == "" {
-		fmt.Fprintf(os.Stderr, "project %d has no local clone at %s — run `enju mcp` once with this credentials file to materialize the clone.\n", projectID, wsRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "project %d has no local clone at %s — run `enju mcp` once with this credentials file to materialize the clone.\n", projectID, projectDir)
 		os.Exit(1)
 	}
 

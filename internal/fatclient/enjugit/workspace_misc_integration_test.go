@@ -13,6 +13,7 @@ import (
 	"time"
 
 	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 // TestCrossWorkspaceFlockSerializationIntegration verifies that
@@ -30,13 +31,37 @@ func TestCrossWorkspaceFlockSerializationIntegration(t *testing.T) {
 
 	sharedRoot := t.TempDir()
 
-	wsA, _ := NewWorkspace(sharedRoot, NewProductionConventions(), WithLogger(nullLogger()))
+	// Both workspaces share the SAME registry file + project path so
+	// ForProject resolves to one on-disk clone — that's the whole
+	// point of the flock contract (two processes, same .git, one
+	// lock). The registry is the single source of truth for path
+	// resolution post-NDW.2.
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	projectPath := filepath.Join(sharedRoot, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	regA := projectreg.Open(regPath)
+	if err := regA.Upsert(projectreg.Entry{ID: 80, LocalPath: projectPath}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+
+	wsA, err := NewWorkspace(sharedRoot, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(regA))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wfA, err := wsA.ForProject(80, bare)
 	if err != nil {
 		t.Fatalf("wsA ForProject: %v", err)
 	}
 
-	wsB, _ := NewWorkspace(sharedRoot, NewProductionConventions(), WithLogger(nullLogger()))
+	regB := projectreg.Open(regPath)
+	wsB, err := NewWorkspace(sharedRoot, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(regB))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wfB, err := wsB.ForProject(80, bare)
 	if err != nil {
 		t.Fatalf("wsB ForProject: %v", err)
@@ -108,50 +133,39 @@ func TestCrossWorkspaceFlockSerializationIntegration(t *testing.T) {
 	}
 }
 
-// TestSlugifyProjectDirIntegration verifies that ForProject with
-// a project name creates a "{slug}-{id}" directory. This is the
-// human-readable layout that production uses
-// (~/.enju/workspaces/battle-test-alpha-7/) so cross-machine
-// rsync, manual inspection, and tab-completion stay sane.
-//
-// TODO(enjugit-numeric-migration): the project package's
-// equivalent test ALSO covered an auto-migration path: a clone
-// that already existed under <id>/ (legacy numeric form) would
-// be renamed to <slug>-<id>/ on the next ForProject call that
-// passed a name. enjugit doesn't auto-migrate — projectDirLocked
-// returns the existing numeric dir as-is and ForProject opens
-// it. Decide later whether to restore the migration or document
-// numeric as a permanent alternative form (and audit registry
-// behavior so an entry's LocalPath winning over scan-based
-// resolution stays consistent with that decision).
-func TestSlugifyProjectDirIntegration(t *testing.T) {
+// TestForProjectResolvesViaRegistry pins the post-NDW.2 path
+// resolution: ForProject ignores the projectName argument and
+// opens the clone at the registry's LocalPath, regardless of how
+// the caller spelled the project name. The slug-id layout is no
+// longer the workspace's responsibility — operators chose paths
+// via enju_create_project path=<abs/dir>.
+func TestForProjectResolvesViaRegistry(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
 	wsDir := t.TempDir()
-	ws, _ := NewWorkspace(wsDir, NewProductionConventions(), WithLogger(nullLogger()))
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	chosenPath := filepath.Join(wsDir, "operators-chosen-name")
+	if err := os.MkdirAll(chosenPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg := projectreg.Open(regPath)
+	if err := reg.Upsert(projectreg.Entry{ID: 7, LocalPath: chosenPath}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws, err := NewWorkspace(wsDir, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(reg))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Passing a project name creates a slug-based dir.
+	// Passing a different name does NOT change the resolved path
+	// — the registry wins. (projectName is accepted for back-compat
+	// with NDW.1 callers and ignored; NDW.5 removes the parameter.)
 	wf, err := ws.ForProject(7, bare, "Battle Test Alpha")
 	if err != nil {
-		t.Fatalf("clone with name: %v", err)
+		t.Fatalf("clone: %v", err)
 	}
-	expected := filepath.Join(wsDir, "battle-test-alpha-7")
-	if wf.WorkDir() != expected {
-		t.Errorf("expected workdir %s, got %s", expected, wf.WorkDir())
-	}
-	if _, err := os.Stat(expected); err != nil {
-		t.Errorf("expected slug-id dir on disk: %v", err)
-	}
-
-	// Cross-check via the workspace's own resolver — opening the
-	// same project a second time without re-passing the name
-	// must return the same dir (slug-id wins over numeric in
-	// projectDirLocked's scan).
-	wf2, err := ws.ForProject(7, bare)
-	if err != nil {
-		t.Fatalf("reopen by id: %v", err)
-	}
-	if wf2.WorkDir() != expected {
-		t.Errorf("reopen returned %s, want %s", wf2.WorkDir(), expected)
+	if wf.WorkDir() != chosenPath {
+		t.Errorf("expected workdir %s, got %s", chosenPath, wf.WorkDir())
 	}
 }

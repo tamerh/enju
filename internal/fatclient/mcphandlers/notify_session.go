@@ -90,14 +90,15 @@ func (s *notifySession) Switch(projectID int64) {
 
 	projectDir := ""
 	if s.cfg.Workspace != nil {
-		projectDir = s.cfg.Workspace.ProjectDir(projectID)
-	}
-	if projectDir == "" {
-		// No clone yet — happens between project creation and
-		// first workspace touch. Notify still runs but cursor +
-		// live.jsonl writes skip silently when path is empty.
-		s.cfg.Logger.Info("notify: no local clone for project, running with no on-disk state",
-			"project_id", projectID)
+		if dir, err := s.cfg.Workspace.ProjectDir(projectID); err == nil {
+			projectDir = dir
+		} else {
+			// Unregistered project (or registry unattached). Notify
+			// still runs against coord; cursor + live.jsonl writes
+			// skip silently when path is empty.
+			s.cfg.Logger.Info("notify: no registered local clone for project, running with no on-disk state",
+				"project_id", projectID, "error", err)
+		}
 	}
 
 	runCfg := notify.Config{

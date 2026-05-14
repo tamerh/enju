@@ -16,6 +16,16 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
+// ErrProjectNotRegistered is returned when a Workspace operation
+// resolves a project ID against the registry and finds no entry
+// (or no registry attached at all). Post-Phase-8 every project
+// lives at an operator-chosen path tracked in projectreg; there
+// is no scan-rootDir fallback. Callers that previously relied on
+// the silent fallback now surface this error to the user.
+var ErrProjectNotRegistered = errors.New(
+	"enjugit: project not registered — run enju_create_project " +
+		"path=<abs/dir> to register or adopt the project's directory")
+
 // Workspace is the multi-project entry point. Constructs Workflow
 // (mutating) and View (read-only) handles for individual projects,
 // using the injected Conventions to decide on-disk paths and
@@ -103,15 +113,13 @@ func (w *Workspace) RootDir() string { return w.rootDir }
 
 
 // ProjectDir returns the on-disk path for a project's clone root.
-// Resolves via:
-//
-//  1. projectreg.Registry entry's LocalPath.
-//  2. Slug+id form: <rootDir>/<slug>-<id>/.
-//  3. Numeric fallback: <rootDir>/<id>/.
+// Resolves via projectreg.Registry only — every project is
+// path-anchored at create_project time, and a missing entry
+// surfaces as ErrProjectNotRegistered (no scan-rootDir fallback).
 //
 // Returned even when no clone exists yet (used for "where would
-// the clone go?" queries).
-func (w *Workspace) ProjectDir(id int64) string {
+// the clone go?" queries) as long as the registry has the entry.
+func (w *Workspace) ProjectDir(id int64) (string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.projectDirLocked(id)
@@ -134,15 +142,18 @@ func (w *Workspace) AttachRegistry(reg *projectreg.Registry) {
 // disk — does NOT clone or init. Used by callers that want to
 // fail loudly when the on-disk state is missing rather than
 // silently materialize.
+//
+// Returns ErrProjectNotRegistered when the project ID isn't in
+// the registry (no scan-rootDir fallback post-Phase-8).
 func (w *Workspace) OpenExisting(id int64) (*Workflow, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if wf, ok := w.workflows[id]; ok {
 		return wf, nil
 	}
-	dir := w.projectDirLocked(id)
-	if dir == "" {
-		return nil, ErrCloneNotFound
+	dir, err := w.projectDirLocked(id)
+	if err != nil {
+		return nil, err
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
 		if os.IsNotExist(err) {
@@ -163,27 +174,33 @@ func (w *Workspace) OpenExisting(id int64) (*Workflow, error) {
 }
 
 // HasLocalClone reports whether a clone exists on disk for id.
-// Works the same as OpenView returning ErrCloneNotFound but
-// without constructing a View.
+// Returns false when the project isn't registered (no entry =
+// no clone the workspace knows about), matching the post-Phase-8
+// "registry is the source of truth" semantics.
 func (w *Workspace) HasLocalClone(id int64) bool {
-	dir := w.ProjectDir(id)
-	if dir == "" {
+	dir, err := w.ProjectDir(id)
+	if err != nil || dir == "" {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(dir, ".git"))
-	return err == nil
+	_, statErr := os.Stat(filepath.Join(dir, ".git"))
+	return statErr == nil
 }
 
 // LeaveProject removes the on-disk clone for id and drops the
 // in-memory Workflow/View caches. Used when a citizen explicitly
-// detaches from a project. No-op when no clone exists.
+// detaches from a project. No-op when the project isn't registered
+// or no clone exists (idempotent — leave_project must be safely
+// re-runnable).
 func (w *Workspace) LeaveProject(id int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.workflows, id)
 	delete(w.views, id)
-	dir := w.projectDirLocked(id)
-	if dir == "" {
+	dir, err := w.projectDirLocked(id)
+	if err != nil {
+		// Not registered — nothing for the workspace to remove.
+		// The handler still calls UnregisterProject afterwards
+		// to drop the (already absent) row.
 		return nil
 	}
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -195,42 +212,22 @@ func (w *Workspace) LeaveProject(id int64) error {
 	return nil
 }
 
-// projectDirLocked computes the project's on-disk path. Caller
-// holds w.mu.
-func (w *Workspace) projectDirLocked(id int64) string {
-	if w.registry != nil {
-		if entry, err := w.registry.Get(id); err == nil && entry != nil && entry.LocalPath != "" {
-			return entry.LocalPath
-		}
+// projectDirLocked resolves a project ID to its on-disk path via
+// the attached projectreg.Registry. No registry attached, or no
+// entry for the ID, returns ErrProjectNotRegistered — there is no
+// scan-rootDir fallback post-Phase-8. Caller holds w.mu.
+func (w *Workspace) projectDirLocked(id int64) (string, error) {
+	if w.registry == nil {
+		return "", fmt.Errorf("%w (programming error: Workspace must be opened with a projectreg.Registry attached via WithRegistry/AttachRegistry)", ErrProjectNotRegistered)
 	}
-	// Fallback: scan rootDir for a slug-id or numeric directory
-	// matching this project. Slug-id wins when both present (we
-	// prefer human-readable). Returns numeric form when nothing
-	// found — caller will create on first use.
-	if entries, err := os.ReadDir(w.rootDir); err == nil {
-		idSuffix := fmt.Sprintf("-%d", id)
-		numericName := fmt.Sprintf("%d", id)
-		var slugMatch, numericMatch string
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if strings.HasSuffix(name, idSuffix) {
-				slugMatch = filepath.Join(w.rootDir, name)
-			}
-			if name == numericName {
-				numericMatch = filepath.Join(w.rootDir, name)
-			}
-		}
-		if slugMatch != "" {
-			return slugMatch
-		}
-		if numericMatch != "" {
-			return numericMatch
-		}
+	entry, err := w.registry.Get(id)
+	if err != nil {
+		return "", fmt.Errorf("enjugit: registry lookup for project %d: %w", id, err)
 	}
-	return filepath.Join(w.rootDir, fmt.Sprintf("%d", id))
+	if entry == nil || entry.LocalPath == "" {
+		return "", fmt.Errorf("%w (project id=%d)", ErrProjectNotRegistered, id)
+	}
+	return entry.LocalPath, nil
 }
 
 // slugify turns a free-form name into a filesystem-safe slug:
@@ -247,18 +244,13 @@ func slugify(name string) string {
 	return out
 }
 
-// projectDirForName returns the canonical slug-id form for a
-// project. Used by ForProject when constructing fresh clone paths.
-func (w *Workspace) projectDirForName(id int64, projectName string) string {
-	slug := slugify(projectName)
-	if slug == "" {
-		return filepath.Join(w.rootDir, fmt.Sprintf("%d", id))
-	}
-	return filepath.Join(w.rootDir, fmt.Sprintf("%s-%d", slug, id))
-}
-
 // lockPathFor returns the cross-process flock file for one
 // project. Lives next to the project dir, suffixed with .lock.
+//
+// NDW.4 will relocate this under <projectPath>/.enju/locks/; for
+// NDW.2 we keep the workspace-rooted path so the lock-collision
+// risk between operator + wrapper that NDW.1 already mitigated
+// stays unchanged through this phase.
 func (w *Workspace) lockPathFor(id int64) string {
 	return filepath.Join(w.rootDir, fmt.Sprintf("project-%d.lock", id))
 }

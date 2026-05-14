@@ -8,8 +8,80 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
+
+// newTestWorkspaceWithProject constructs a fresh Workspace with a
+// projectreg.Registry attached and pre-upserts the given project
+// at a freshly-created subdir. Returns the workspace, the
+// registry, and the project's path. Post-NDW.2 the workspace
+// requires a registry; this helper collapses the boilerplate
+// every test would otherwise repeat.
+//
+// projectreg.Registry.Get filters entries whose LocalPath no
+// longer exists on disk (treats them as stale), so the helper
+// MkdirAll's the project path BEFORE upserting — otherwise the
+// registry would silently report the entry as missing and the
+// test would see ErrProjectNotRegistered. Mirrors the production
+// invariant from EagerInitProjectClone: the operator's chosen
+// dir already exists when the handler upserts.
+func newTestWorkspaceWithProject(t *testing.T, projectID int64) (*Workspace, *projectreg.Registry, string) {
+	t.Helper()
+	wsRoot := t.TempDir()
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath := filepath.Join(wsRoot, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project path: %v", err)
+	}
+	if err := reg.Upsert(projectreg.Entry{ID: projectID, LocalPath: projectPath}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws, err := NewWorkspace(wsRoot, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(reg))
+	if err != nil {
+		t.Fatalf("NewWorkspace: %v", err)
+	}
+	return ws, reg, projectPath
+}
+
+// newWorkspaceForIDs builds a Workspace + Registry where every
+// given ID is pre-mapped to a freshly-created subdir under the
+// workspace root. Used by tests that previously relied on the
+// implicit "scan rootDir, default to numeric form" path. Returns
+// the workspace and the registry — callers occasionally need to
+// upsert additional rows (e.g. a second project across a
+// different writer's clone).
+//
+// Multiple IDs all map to the SAME subdir (wsRoot/p) — the
+// pre-NDW.2 numeric-form layout used per-ID dirs, but every
+// existing call site uses one project per workspace, so the
+// collapsed shape is faithful enough and saves the helper from
+// taking per-ID path arguments. If a test needs distinct dirs
+// per ID it can call Upsert directly on the returned registry.
+func newWorkspaceForIDs(t *testing.T, ids ...int64) (*Workspace, *projectreg.Registry) {
+	t.Helper()
+	wsRoot := t.TempDir()
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath := filepath.Join(wsRoot, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project path: %v", err)
+	}
+	for _, id := range ids {
+		if err := reg.Upsert(projectreg.Entry{
+			ID:        id,
+			LocalPath: projectPath,
+		}); err != nil {
+			t.Fatalf("registry upsert id=%d: %v", id, err)
+		}
+	}
+	ws, err := NewWorkspace(wsRoot, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(reg))
+	if err != nil {
+		t.Fatalf("NewWorkspace: %v", err)
+	}
+	return ws, reg
+}
 
 // nullLogger discards everything.
 func nullLogger() *slog.Logger {
@@ -27,8 +99,7 @@ func initBareForWorkspaceTest(t *testing.T) string {
 	return bare
 }
 
-func TestNewWorkspace_DefaultsToHome(t *testing.T) {
-	// Use an explicit dir so we don't pollute ~ during tests.
+func TestNewWorkspace_ExplicitDir(t *testing.T) {
 	dir := t.TempDir()
 	ws, err := NewWorkspace(dir, NewProductionConventions(), WithLogger(nullLogger()))
 	if err != nil {
@@ -39,18 +110,49 @@ func TestNewWorkspace_DefaultsToHome(t *testing.T) {
 	}
 }
 
-func TestForProject_FreshClone(t *testing.T) {
+// TestForProject_NotRegistered pins the post-NDW.2 contract:
+// without a registry entry, ForProject errors with
+// ErrProjectNotRegistered. There is no scan-rootDir fallback —
+// every project is path-anchored via projectreg.
+func TestForProject_NotRegistered(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(),
+		WithLogger(nullLogger()),
+		WithRegistry(projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws.ForProject(7, bare); !errors.Is(err, ErrProjectNotRegistered) {
+		t.Errorf("ForProject without registry entry: got %v, want ErrProjectNotRegistered", err)
+	}
+}
+
+// TestForProject_NoRegistryAttached covers the programming-error
+// path: Workspace constructed without WithRegistry should refuse
+// to resolve any project ID.
+func TestForProject_NoRegistryAttached(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := ws.ForProject(7, bare); !errors.Is(err, ErrProjectNotRegistered) {
+		t.Errorf("ForProject with no registry: got %v, want ErrProjectNotRegistered", err)
+	}
+}
+
+func TestForProject_FreshClone(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, _, projectPath := newTestWorkspaceWithProject(t, 7)
 	wf, err := ws.ForProject(7, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
 	}
 	if wf.ProjectID() != 7 {
 		t.Errorf("ProjectID: got %d, want 7", wf.ProjectID())
+	}
+	if wf.WorkDir() != projectPath {
+		t.Errorf("WorkDir: got %s, want %s (registry resolution)", wf.WorkDir(), projectPath)
 	}
 	// Cached: second call returns same handle.
 	wf2, _ := ws.ForProject(7, bare)
@@ -64,10 +166,9 @@ func TestForProject_FreshClone(t *testing.T) {
 
 func TestForProject_NoSource_InitsLocal(t *testing.T) {
 	// Empty remoteURL is the "solo / no-remote" project mode.
-	// ForProject inits a local-only clone (with seed) so the
-	// workflow is usable without an upstream. Callers can wire
-	// origin later via SetRemote.
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	// ForProject inits a local-only clone (with seed) at the
+	// registered path so the workflow is usable without an upstream.
+	ws, _, _ := newTestWorkspaceWithProject(t, 7)
 	wf, err := ws.ForProject(7, "")
 	if err != nil {
 		t.Fatalf("ForProject with empty remoteURL: expected local-init, got %v", err)
@@ -81,96 +182,61 @@ func TestForProject_NoSource_InitsLocal(t *testing.T) {
 }
 
 func TestOpenView_CloneNotFound(t *testing.T) {
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _, _ := newTestWorkspaceWithProject(t, 7)
 	_, err := ws.OpenView(7)
 	if !errors.Is(err, ErrCloneNotFound) {
 		t.Errorf("expected ErrCloneNotFound, got %v", err)
 	}
 }
 
+func TestOpenView_NotRegistered(t *testing.T) {
+	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(),
+		WithLogger(nullLogger()),
+		WithRegistry(projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws.OpenView(7); !errors.Is(err, ErrProjectNotRegistered) {
+		t.Errorf("OpenView without registry entry: got %v, want ErrProjectNotRegistered", err)
+	}
+}
+
 // TestOpenView_DoesNotInitOnMissing pins the read-side contract:
-// when no clone exists, OpenView must REFUSE to silently init a
-// stub at <rootDir>/<id>. A buggy build's ForProject(id, "") could
-// PlainInit a numeric-form stub that findProjectDir would then
-// return as if it were the real clone. enjugit's OpenView only
-// reads, so the invariant is enforced by code structure; this test
-// pins it so any future "open-or-init" convenience accidentally
-// added to the read path fails loudly.
+// when the registered path exists but contains no .git, OpenView
+// must NOT create one. The post-NDW.2 invariant is that adoption
+// creates the .git (via enju_create_project); read-only verbs
+// only consume it.
 func TestOpenView_DoesNotInitOnMissing(t *testing.T) {
-	root := t.TempDir()
-	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _, projectPath := newTestWorkspaceWithProject(t, 42)
 	if _, err := ws.OpenView(42); !errors.Is(err, ErrCloneNotFound) {
 		t.Fatalf("expected ErrCloneNotFound, got %v", err)
 	}
-	entries, _ := os.ReadDir(root)
-	for _, e := range entries {
-		if e.Name() == "42" || e.Name() == "0" {
-			t.Errorf("OpenView created stub directory %q — must never init", e.Name())
-		}
+	if _, err := os.Stat(filepath.Join(projectPath, ".git")); !os.IsNotExist(err) {
+		t.Errorf("OpenView materialized a .git inside %q — must never init", projectPath)
 	}
 }
 
-// TestProjectDirLocked_PrefersSlugOverNumeric covers the tie-break
-// in projectDirLocked's scan path: when both slug-form (e.g.
-// "webui-toy-1") and numeric ("1") directories live under rootDir,
-// the slug-form wins. Without this rule, alphabetical os.ReadDir
-// returns "1" before "webui-toy-1" and a buggy build's leftover
-// numeric stub would shadow the real clone.
-func TestProjectDirLocked_PrefersSlugOverNumeric(t *testing.T) {
-	root := t.TempDir()
-	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
-
-	// Plant the slug-form clone (with .git so projectDirLocked's
-	// IsDir check would accept it; though scan only looks at name
-	// suffix, we keep .git for parity with project package's setup).
-	wantSlug := filepath.Join(root, "webui-toy-1")
-	if err := os.MkdirAll(filepath.Join(wantSlug, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Plant a numeric-form orphan stub.
-	stub := filepath.Join(root, "1")
-	if err := os.MkdirAll(filepath.Join(stub, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := ws.ProjectDir(1); got != wantSlug {
-		t.Errorf("tie-break failed: got %q, want %q (slug-form should beat numeric)", got, wantSlug)
-	}
-}
-
-// TestProjectDirLocked_NumericFallback verifies the legacy-compat
-// fallback: when ONLY the numeric form exists (no slug-id sibling),
-// projectDirLocked returns it. Otherwise pre-slug-rename projects
-// would silently lose their on-disk clone.
-func TestProjectDirLocked_NumericFallback(t *testing.T) {
-	root := t.TempDir()
-	ws, _ := NewWorkspace(root, NewProductionConventions(), WithLogger(nullLogger()))
-	dir := filepath.Join(root, "1")
-	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if got := ws.ProjectDir(1); got != dir {
-		t.Errorf("numeric fallback broke: got %q, want %q", got, dir)
-	}
-}
-
-func TestOpenOrLazyClone_LazyClonesWhenMissing(t *testing.T) {
-	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
-	v, err := ws.OpenOrLazyClone(7, bare)
+func TestOpenOrLazyClone_NotRegistered(t *testing.T) {
+	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(),
+		WithLogger(nullLogger()),
+		WithRegistry(projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))))
 	if err != nil {
-		t.Fatalf("OpenOrLazyClone: %v", err)
+		t.Fatal(err)
 	}
-	if v.ProjectID() != 7 {
-		t.Errorf("ProjectID: got %d, want 7", v.ProjectID())
+	if _, err := ws.OpenOrLazyClone(7, "remote-url-ignored"); !errors.Is(err, ErrProjectNotRegistered) {
+		t.Errorf("OpenOrLazyClone without registry entry: got %v, want ErrProjectNotRegistered", err)
 	}
 }
 
-func TestOpenOrLazyClone_NoSource(t *testing.T) {
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
-	_, err := ws.OpenOrLazyClone(7, "")
-	if !errors.Is(err, ErrNoCloneSource) {
-		t.Errorf("expected ErrNoCloneSource, got %v", err)
+// TestOpenOrLazyClone_RegisteredButNoClone covers the post-NDW.2
+// "no silent materialization" semantics: even when the project IS
+// registered, OpenOrLazyClone errors with ErrCloneNotFound when no
+// .git exists at the registered path. Adoption goes through
+// enju_create_project, not a silent webui-side clone.
+func TestOpenOrLazyClone_RegisteredButNoClone(t *testing.T) {
+	ws, _, _ := newTestWorkspaceWithProject(t, 7)
+	if _, err := ws.OpenOrLazyClone(7, "ignored"); !errors.Is(err, ErrCloneNotFound) {
+		t.Errorf("OpenOrLazyClone: got %v, want ErrCloneNotFound", err)
 	}
 }
 
@@ -210,14 +276,20 @@ func TestProductionDiskLayout(t *testing.T) {
 
 // TestLeaveProjectRemovesClone mirrors the project-side test that
 // moved here when service.LocalLeaveProject started routing the
-// disk-wipe through enjugit. ForProject → LeaveProject → ForProject
-// should clone, wipe, and re-clone the same dir.
+// disk-wipe through enjugit. ForProject → LeaveProject removes
+// the on-disk clone.
+//
+// Post-NDW.2 a re-adoption (re-clone after Leave) requires the
+// operator to re-register via enju_create_project: registry.Get
+// filters entries whose LocalPath no longer exists on disk, so
+// the second ForProject without re-registration errors with
+// ErrProjectNotRegistered. The pre-NDW.2 "same workspace, same
+// dir, reclone for free" semantics is intentionally gone — the
+// registry is the source of truth for what projects this
+// machine is "in."
 func TestLeaveProjectRemovesClone(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	ws, reg, projectPath := newTestWorkspaceWithProject(t, 70)
 	wf, err := ws.ForProject(70, bare)
 	if err != nil {
 		t.Fatalf("first clone: %v", err)
@@ -240,15 +312,29 @@ func TestLeaveProjectRemovesClone(t *testing.T) {
 		t.Error("HasLocalClone should be false after leave")
 	}
 
-	// Leaving a project that was never opened is a no-op.
+	// Leaving a project that was never registered is a no-op.
 	if err := ws.LeaveProject(999); err != nil {
 		t.Errorf("LeaveProject on unknown project: %v", err)
 	}
 
-	// Next ForProject re-clones into the same dir.
+	// Without re-registration the registry entry's stale LocalPath
+	// filters out — ForProject errors instead of silently re-
+	// materializing at the wiped path.
+	if _, err := ws.ForProject(70, bare); !errors.Is(err, ErrProjectNotRegistered) {
+		t.Errorf("ForProject after leave (no re-register): got %v, want ErrProjectNotRegistered", err)
+	}
+
+	// Operator re-adopts at the same path — mirrors
+	// enju_create_project's Upsert-then-ForProject sequence.
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Upsert(projectreg.Entry{ID: 70, LocalPath: projectPath}); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
 	wf2, err := ws.ForProject(70, bare)
 	if err != nil {
-		t.Fatalf("reclone after leave: %v", err)
+		t.Fatalf("reclone after re-register: %v", err)
 	}
 	if wf2.WorkDir() != workDir {
 		t.Errorf("expected same work dir after reclone, got %s vs %s", wf2.WorkDir(), workDir)

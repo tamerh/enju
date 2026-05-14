@@ -69,7 +69,8 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	reg1 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger), enjugit.WithRegistry(reg1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,31 +92,34 @@ func TestNew_BridgesRegistryToExternalDirs(t *testing.T) {
 	}
 }
 
-// TestNew_NoRegistry_NoBridge confirms the bridge is a no-op
-// when the registry is unconfigured. Tests and minimal
-// embeddings should keep working as before.
+// TestNew_NoRegistry_NoBridge confirms FatClient.New without a
+// ProjectRegistry produces a workspace whose operations error
+// loudly with ErrProjectNotRegistered. Post-NDW.2 the registry
+// is the single source of truth for project paths — there is no
+// silent fallback that would let a no-registry workspace open
+// arbitrary IDs.
 func TestNew_NoRegistry_NoBridge(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
+	// Construct an external workspace without a registry; this is
+	// what FatClient.New(Config{WorkspaceRoot: …, /* no
+	// ProjectRegistry */}) would do internally.
 	ws, err := enjugit.NewWorkspace(tmp, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = New(Config{WorkspaceRoot:   ws.RootDir(), Logger: logger}) // no ProjectRegistry
-	// Nothing was registered → OpenExisting on an arbitrary id
-	// returns ErrCloneNotFound, exactly as without the bridge.
+	_ = New(Config{WorkspaceRoot: ws.RootDir(), Logger: logger}) // no ProjectRegistry
 	_, err = ws.OpenExisting(99)
-	if !errors.Is(err, enjugit.ErrCloneNotFound) {
-		t.Errorf("expected ErrCloneNotFound, got %v", err)
+	if !errors.Is(err, enjugit.ErrProjectNotRegistered) {
+		t.Errorf("expected ErrProjectNotRegistered, got %v", err)
 	}
 }
 
 // TestNew_RegistryStaleEntry_Skipped pins the no-double-stat
-// behavior: Registry.List already filters stale paths, so a
-// registered entry whose dir was deleted between sessions
-// silently disappears (rather than the bridge faceplanting on
-// it). Tests this by registering an entry pointing at a
-// directory that doesn't exist; New must NOT register it.
+// behavior: Registry.Get filters stale paths, so a registered
+// entry whose dir was deleted between sessions surfaces as
+// ErrProjectNotRegistered to the caller (instead of the bridge
+// faceplanting on a missing dir).
 func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tmp := t.TempDir()
@@ -132,15 +136,19 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 
 	wsRoot := filepath.Join(tmp, "workspaces")
 	_ = os.MkdirAll(wsRoot, 0o755)
-	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	// The workspace consults the same on-disk registry FatClient.
+	// New is wired against. registry.Get filters stale rows, so the
+	// lookup for project 77 falls through to ErrProjectNotRegistered.
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger),
+		enjugit.WithRegistry(projectreg.Open(regPath)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = New(Config{WorkspaceRoot:   ws.RootDir(), ProjectRegistry: projectreg.Open(regPath), Logger: logger})
+	_ = New(Config{WorkspaceRoot: ws.RootDir(), ProjectRegistry: projectreg.Open(regPath), Logger: logger})
 
 	_, err = ws.OpenExisting(77)
-	if !errors.Is(err, enjugit.ErrCloneNotFound) {
-		t.Errorf("stale entry should be filtered; OpenExisting got: %v", err)
+	if !errors.Is(err, enjugit.ErrProjectNotRegistered) {
+		t.Errorf("stale entry should surface as ErrProjectNotRegistered; got: %v", err)
 	}
 }
 

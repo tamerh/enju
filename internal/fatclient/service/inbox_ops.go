@@ -37,8 +37,11 @@ func (s *FatClient) BuildInbox(ctx context.Context, projectID int64, username st
 	if s.enjugit == nil {
 		return nil, fmt.Errorf("workspace not configured")
 	}
-	projectDir := s.enjugit.ProjectDir(projectID)
-	if projectDir == "" {
+	projectDir, err := s.enjugit.ProjectDir(projectID)
+	if err != nil {
+		// Project not registered on this machine — the handler
+		// renders an empty inbox with the friendly "no clone"
+		// banner rather than bubbling a hard error to the user.
 		return &InboxResult{ProjectClonePresent: false}, nil
 	}
 

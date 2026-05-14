@@ -32,7 +32,7 @@ import (
 // pulls them back out at read time.
 func TestCommitArbitraryFilesPlumbing_ConcurrentBranches(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 99)
 	wf, err := ws.ForProject(99, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -167,7 +167,7 @@ func TestCommitArbitraryFilesPlumbing_ConcurrentBranches(t *testing.T) {
 // EACCES.
 func TestMaterializeRunRepo_PreservesExecutableBit(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 100)
 	wf, err := ws.ForProject(100, bare)
 	if err != nil {
 		t.Fatal(err)
@@ -209,7 +209,7 @@ func TestMaterializeRunRepo_PreservesExecutableBit(t *testing.T) {
 // error rather than silently producing an empty dir.
 func TestMaterializeRunRepo_BranchMissing(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 101)
 	wf, err := ws.ForProject(101, bare)
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +244,7 @@ func TestMaterializeRunRepo_BranchMissing(t *testing.T) {
 // simultaneously" without depending on Go's scheduler order.
 func TestCommitArbitraryFiles_WorktreePathLosesSnapshotsUnderConcurrency(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 98)
 	wf, err := ws.ForProject(98, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -360,7 +360,7 @@ func TestCommitArbitraryFiles_WorktreePathLosesSnapshotsUnderConcurrency(t *test
 //     .git/objects/, not a checkout).
 func TestMaterializeRunRepo_WholeTreeIncludingBaseAndTemplate(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 202)
 	wf, err := ws.ForProject(202, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)

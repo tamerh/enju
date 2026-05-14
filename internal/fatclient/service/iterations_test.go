@@ -19,7 +19,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
-	"github.com/enju-ai/enju/internal/testutil/gittest"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 func TestListTaskIterations(t *testing.T) {
@@ -98,15 +98,19 @@ func TestReadResultAtCommit(t *testing.T) {
 	// read returns the file contents at that commit.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	wsRoot := t.TempDir()
-	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	// Single shared registry: FatClient.EagerInitProjectClone
+	// upserts into it, and the sibling enjugit workspace we open
+	// for the seed commit reads via the same handle. Without this
+	// shared registry, the sibling workspace can't resolve project
+	// 7 post-NDW.2.
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg := projectreg.Open(regPath)
 
 	// Adopt a directory as project 7's local clone via the
 	// post-Phase-A entry point: inspect the populated folder,
 	// then EagerInitProjectClone runs git init + commit + wires
-	// the managed bare.
+	// the registry entry.
 	clone := t.TempDir()
 	resultDir := ".enju/runs/1-draft/draft"
 	resultPath := filepath.Join(clone, resultDir, "result.md")
@@ -117,7 +121,7 @@ func TestReadResultAtCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fc := New(Config{WorkspaceRoot: ws.RootDir(), Logger: logger})
+	fc := New(Config{WorkspaceRoot: wsRoot, ProjectRegistry: reg, Logger: logger})
 	target, terr := validateAndInspectPath(clone, false, nil)
 	if terr != nil {
 		t.Fatalf("inspect: %v", terr)
@@ -129,7 +133,9 @@ func TestReadResultAtCommit(t *testing.T) {
 	// Stage + commit the result file via a sibling enjugit
 	// workspace pointing at the same root (avoids the coord-stub
 	// dependency OpenWorkflow has via FetchProjectMetaExpanded).
-	enjuWS, eerr := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	// Re-open the same registry file so project 7 resolves.
+	enjuWS, eerr := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(logger), enjugit.WithRegistry(projectreg.Open(regPath)))
 	if eerr != nil {
 		t.Fatalf("enjugit Workspace: %v", eerr)
 	}
@@ -201,139 +207,88 @@ func TestReadResultAtCommit_EmptyArgs(t *testing.T) {
 // reads .ClaimedAt as a time.Time).
 var _ = time.Time{}
 
-// TestReadResultAtCommit_LazyClonesWhenMissing pins the webui-
-// blind-spot fix: a project's clone may not exist in the
-// reader's workspace (e.g. webui process for a bot-only project,
-// where the operator never ran `enju mcp` to seed a workspace
-// clone). When OpenExisting returns ErrCloneNotFound, the read
-// path should fall back to ForProject(remoteURL) so the bare's
-// objects become reachable, then return the file content.
-func TestReadResultAtCommit_LazyClonesWhenMissing(t *testing.T) {
+// TestReadResultAtCommit_UnregisteredProjectIsQuiet pins the
+// post-NDW.2 read-only-surface contract: a project that isn't
+// registered on this machine (the webui-blind-spot scenario:
+// browsing a project the user hasn't adopted locally) returns
+// (false, nil) — no submission viewable here, but not an error.
+//
+// Replaces the previous TestReadResultAtCommit_LazyClonesWhenMissing
+// which pinned the now-removed silent-lazy-clone fallback.
+// Adoption goes through enju_create_project; ReadResultAtCommit
+// never materializes a clone on its own.
+func TestReadResultAtCommit_UnregisteredProjectIsQuiet(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// 1) Bare remote, seeded with one initial commit so the
-	// writer's ForProject can branch from refs/heads/main.
-	bare := t.TempDir()
-	gittest.InitBareWithSeed(t, bare)
-	// Seed the bare via a writer enjugit workspace: ForProject(7, bare)
-	// gives a Workflow whose clone is wired with origin=bare;
-	// CommitArbitraryFiles + implicit push lands the commit there.
-	writerRoot := t.TempDir()
-	writerEnjugit, eerr := enjugit.NewWorkspace(writerRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	if eerr != nil {
-		t.Fatalf("writer enjugit: %v", eerr)
-	}
-	writerWF, err := writerEnjugit.ForProject(7, bare)
-	if err != nil {
-		t.Fatalf("writer enjugit.ForProject: %v", err)
-	}
-	resultDir := ".enju/runs/1-draft/draft"
-	// CommitArbitraryFiles takes WithLock internally via the
-	// enjugit git layer; no project-level Lock needed.
-	commitRes, err := writerWF.CommitArbitraryFiles(enjugit.CommitArbitraryFilesRequest{
-		Files: []enjugit.FileWrite{
-			{RepoRelPath: resultDir + "/result.md", Content: []byte("LAZY-CLONE-CONTENT")},
-		},
-		Subject:     "seed",
-		AuthorName:  "Writer",
-		AuthorEmail: "writer@example.com",
-		Branch:      "main",
-	})
-	if err != nil {
-		t.Fatalf("CommitArbitraryFiles: %v", err)
-	}
-	if commitRes == nil || commitRes.CommitSHA == "" {
-		t.Fatal("empty commit SHA")
-	}
-
-	// 2) Coord stub returns the bare path as remote_url.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":             7,
-			"name":           "lazy-test",
-			"remote_url":     bare,
-			"default_branch": "main",
-		})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// 3) Reader FatClient on a *fresh* workspace — no clone for
-	// project 7 exists yet. OpenExisting will return
-	// ErrCloneNotFound; the lazy-clone fallback should then
-	// materialize the clone from the bare and read at commit.
-	readerRoot := t.TempDir()
-	readerWS, err := enjugit.NewWorkspace(readerRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
-	if err != nil {
-		t.Fatalf("reader Opener: %v", err)
-	}
-	fc := New(Config{
-		Coord: coord.New(coord.Config{
-			BaseURL:   srv.URL,
-			Username:  "reader",
-			AuthToken: "tok",
-			Logger:    logger,
-		}),
-		WorkspaceRoot:   readerWS.RootDir(),
-		Logger:    logger,
-	})
-
-	got, found, err := fc.ReadResultAtCommit(context.Background(), 7, commitRes.CommitSHA, resultDir)
-	if err != nil {
-		t.Fatalf("ReadResultAtCommit (lazy): %v", err)
-	}
-	if !found {
-		t.Fatal("expected found=true after lazy clone")
-	}
-	if got != "LAZY-CLONE-CONTENT" {
-		t.Errorf("content mismatch after lazy clone: got %q", got)
-	}
-}
-
-// TestReadResultAtCommit_NoCloneNoRemoteIsQuiet covers the
-// other arm: a project has no clone AND no remote_url (path-
-// only project the reader has never been attached to). Lazy
-// clone has no source to pull from; the read should return
-// (false, nil) — same UX as "no submission yet".
-func TestReadResultAtCommit_NoCloneNoRemoteIsQuiet(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/projects/7", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":             7,
-			"name":           "no-remote",
-			"remote_url":     "",
-			"default_branch": "main",
-		})
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(),
+		enjugit.WithLogger(logger), enjugit.WithRegistry(reg))
 	if err != nil {
 		t.Fatalf("Opener: %v", err)
 	}
 	fc := New(Config{
 		Coord: coord.New(coord.Config{
-			BaseURL:   srv.URL,
+			BaseURL:   "http://example.invalid",
 			Username:  "reader",
 			AuthToken: "tok",
 			Logger:    logger,
 		}),
 		WorkspaceRoot:   ws.RootDir(),
-		Logger:    logger,
+		ProjectRegistry: reg,
+		Logger:          logger,
 	})
 
-	_, found, err := fc.ReadResultAtCommit(context.Background(), 7, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ".enju/runs/1-x/x")
+	_, found, err := fc.ReadResultAtCommit(context.Background(), 7,
+		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ".enju/runs/1-x/x")
 	if err != nil {
-		t.Errorf("expected nil error, got %v", err)
+		t.Errorf("expected nil error for unregistered project, got %v", err)
 	}
 	if found {
-		t.Error("expected found=false when no clone and no remote_url")
+		t.Error("expected found=false when project not registered")
+	}
+}
+
+// TestReadResultAtCommit_RegisteredButNoCloneIsQuiet covers the
+// arm where the project IS registered but the .git hasn't been
+// materialized yet. Mirrors the unregistered case — quiet
+// (false, nil) — so the webui's "no submission yet" banner
+// renders without surfacing a crash.
+func TestReadResultAtCommit_RegisteredButNoCloneIsQuiet(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	wsRoot := t.TempDir()
+	projectPath := filepath.Join(wsRoot, "adopted")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	if err := reg.Upsert(projectreg.Entry{ID: 7, LocalPath: projectPath}); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
+		enjugit.WithLogger(logger), enjugit.WithRegistry(reg))
+	if err != nil {
+		t.Fatalf("Opener: %v", err)
+	}
+	fc := New(Config{
+		Coord: coord.New(coord.Config{
+			BaseURL:   "http://example.invalid",
+			Username:  "reader",
+			AuthToken: "tok",
+			Logger:    logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		ProjectRegistry: reg,
+		Logger:          logger,
+	})
+
+	_, found, err := fc.ReadResultAtCommit(context.Background(), 7,
+		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ".enju/runs/1-x/x")
+	if err != nil {
+		t.Errorf("expected nil error for missing clone, got %v", err)
+	}
+	if found {
+		t.Error("expected found=false when registered but no clone")
 	}
 }
 

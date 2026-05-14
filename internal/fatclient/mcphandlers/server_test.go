@@ -383,17 +383,21 @@ func TestFetchAndResolveLocallyInlinesReviewingBlock(t *testing.T) {
 
 	// 3. Real Workspace. Clones the bare on first ForProject.
 	wsDir := t.TempDir()
-	ws, err := enjugit.NewWorkspace(wsDir, enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
-	if err != nil {
-		t.Fatalf("new workspace: %v", err)
+	projectPath := filepath.Join(wsDir, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := newClient(coord.New(coord.Config{
-			BaseURL:  ts.URL,
-			Username: "bob",
-			Logger:  logger,
-		}), ws.RootDir(), logger)
+		BaseURL:  ts.URL,
+		Username: "bob",
+		Logger:   logger,
+	}), wsDir, logger)
+	// Pre-register the project in the FatClient's auto-synthesized
+	// registry — the test bypasses enju_create_project, so the
+	// EagerInitProjectClone upsert never fires.
+	c.fc.RegisterProject(projectreg.Entry{ID: projectID, LocalPath: projectPath})
 	meta := &taskMeta{
 		ID:               reviewID,
 		ProjectID:        projectID,

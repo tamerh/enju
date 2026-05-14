@@ -78,7 +78,7 @@ func seedResultCommit(t *testing.T, wf *Workflow, runSeq int, instanceKey, taskD
 // Resolve reads via go-git.
 func TestResolve_FanInIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 46)
 	wf, err := ws.ForProject(46, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -160,7 +160,7 @@ func TestResolve_FanInIntegration(t *testing.T) {
 // {{task.content}}.
 func TestResolve_SingletonUpstreamIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 47)
 	wf, err := ws.ForProject(47, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -196,7 +196,7 @@ func TestResolve_SingletonUpstreamIntegration(t *testing.T) {
 // hits the top-level field lookup in extractField.
 func TestResolve_WinningOptionIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 90)
 	wf, err := ws.ForProject(90, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -241,7 +241,7 @@ func TestResolve_WinningOptionIntegration(t *testing.T) {
 // the fake-ops path.)
 func TestResolve_ForEachParamsIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 48)
 	wf, err := ws.ForProject(48, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -267,7 +267,7 @@ func TestResolve_ForEachParamsIntegration(t *testing.T) {
 // artifact via a commit + reads it back via Resolve at that SHA.
 func TestResolve_ArtifactReadIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 49)
 	wf, err := ws.ForProject(49, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -318,7 +318,7 @@ func TestResolve_ArtifactReadIntegration(t *testing.T) {
 // signal, and the path goes into MissingArtifacts.
 func TestResolve_MissingArtifactIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 50)
 	wf, err := ws.ForProject(50, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)

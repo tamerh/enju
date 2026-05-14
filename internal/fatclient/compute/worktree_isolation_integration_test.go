@@ -26,6 +26,7 @@ import (
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
@@ -47,8 +48,16 @@ func initBareForComputeTest(t *testing.T) string {
 func TestComputeRun_NoWorktreePollutionUnderResultDir(t *testing.T) {
 	bare := initBareForComputeTest(t)
 	wsRoot := t.TempDir()
+	reg1 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath1 := filepath.Join(wsRoot, "p1")
+	if err := os.MkdirAll(projectPath1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg1.Upsert(projectreg.Entry{ID: 101, LocalPath: projectPath1}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg1))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}
@@ -151,8 +160,16 @@ func TestComputeRun_NoWorktreePollutionUnderResultDir(t *testing.T) {
 func TestComputeRun_FailsWhenRequiredArtifactMissing(t *testing.T) {
 	bare := initBareForComputeTest(t)
 	wsRoot := t.TempDir()
+	reg2 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath2 := filepath.Join(wsRoot, "p2")
+	if err := os.MkdirAll(projectPath2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Upsert(projectreg.Entry{ID: 102, LocalPath: projectPath2}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg2))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}
@@ -231,8 +248,16 @@ func TestComputeRun_FailsWhenRequiredArtifactMissing(t *testing.T) {
 func TestComputeRun_OptionalMissingStaysSoft(t *testing.T) {
 	bare := initBareForComputeTest(t)
 	wsRoot := t.TempDir()
+	reg3 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	projectPath3 := filepath.Join(wsRoot, "p3")
+	if err := os.MkdirAll(projectPath3, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg3.Upsert(projectreg.Entry{ID: 103, LocalPath: projectPath3}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
-		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), enjugit.WithRegistry(reg3))
 	if err != nil {
 		t.Fatalf("NewWorkspace: %v", err)
 	}

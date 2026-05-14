@@ -49,10 +49,11 @@ func NewTestClient(cfg Config) *TestClient {
 		Logger:          logger,
 	})
 	fc := service.New(service.Config{
-		Coord:         coordClient,
-		WorkspaceRoot: cfg.WorkspaceRoot,
-		ModelName:     cfg.ModelName,
-		Logger:        logger,
+		Coord:           coordClient,
+		WorkspaceRoot:   cfg.WorkspaceRoot,
+		ModelName:       cfg.ModelName,
+		Logger:          logger,
+		ProjectRegistry: cfg.ProjectRegistry,
 	})
 	c := &apiClient{fc: fc}
 	return &TestClient{c: c}

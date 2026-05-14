@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
 
@@ -26,7 +27,7 @@ import (
 // result with one file, verify the file lands on the remote.
 func TestSubmitTaskResult_HappyPathIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 42)
 	wf, err := ws.ForProject(42, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -73,7 +74,7 @@ func TestSubmitTaskResult_HappyPathIntegration(t *testing.T) {
 // AND appear in the commit message body + subject count.
 func TestSubmitTaskResult_WithArtifactsIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 43)
 	wf, err := ws.ForProject(43, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -141,7 +142,7 @@ func TestSubmitTaskResult_WithArtifactsIntegration(t *testing.T) {
 // both `AI-Model:` and `Co-Authored-By:` trailers.
 func TestSubmitTaskResult_AuthorAttributionIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 51)
 	wf, err := ws.ForProject(51, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -218,7 +219,23 @@ func TestForProject_ReopenExistingClone(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
 	wsDir := t.TempDir()
-	ws1, _ := NewWorkspace(wsDir, NewProductionConventions(), WithLogger(nullLogger()))
+	projectPath := filepath.Join(wsDir, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two workspaces share the SAME registry file + project path
+	// so the second open hits the on-disk clone the first created.
+	// Simulates "process restart" recovery.
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg1 := projectreg.Open(regPath)
+	if err := reg1.Upsert(projectreg.Entry{ID: 45, LocalPath: projectPath}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws1, err := NewWorkspace(wsDir, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(reg1))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wf1, err := ws1.ForProject(45, bare)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
@@ -228,7 +245,12 @@ func TestForProject_ReopenExistingClone(t *testing.T) {
 	// Re-create the workspace — simulating a process restart.
 	// Pass empty remoteURL: the existing on-disk clone's origin
 	// is the source of truth.
-	ws2, _ := NewWorkspace(wsDir, NewProductionConventions(), WithLogger(nullLogger()))
+	reg2 := projectreg.Open(regPath)
+	ws2, err := NewWorkspace(wsDir, NewProductionConventions(),
+		WithLogger(nullLogger()), WithRegistry(reg2))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wf2, err := ws2.ForProject(45, "")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)

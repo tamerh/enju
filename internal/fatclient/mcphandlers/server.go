@@ -90,6 +90,15 @@ type Config struct {
 	// every bot manifest). Drop-and-warn is the more humane
 	// trade.
 	AllowTools []string
+
+	// ProjectRegistry, when non-nil, overrides the default
+	// `projectreg.Open(projectreg.DefaultPath())` (i.e.
+	// `~/.enju/projects.json`). Used by tests to point the MCP
+	// server at a per-test registry file that the test harness
+	// also reads, so direct test workspace ops + MCP-driven ops
+	// share the same project→path mapping. Nil keeps the
+	// production default.
+	ProjectRegistry *projectreg.Registry
 }
 
 // NotifyOptions carries the boot-time wiring for the auto-
@@ -184,13 +193,17 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 		SaveCredentials: cfg.SaveCredentials,
 		Logger:         logger,
 	})
+	reg := cfg.ProjectRegistry
+	if reg == nil {
+		reg = projectreg.Open(projectreg.DefaultPath())
+	}
 	fc := service.New(service.Config{
 		Coord:           coordClient,
 		WorkspaceRoot:   cfg.WorkspaceRoot,
 		ModelName:       cfg.ModelName,
 		Logger:          logger,
 		LogName:         "operator",
-		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
+		ProjectRegistry: reg,
 	})
 	client := &apiClient{fc: fc}
 

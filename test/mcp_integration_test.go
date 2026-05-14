@@ -94,14 +94,15 @@ func newMCPHarness(t *testing.T, citizenName string) *mcpHarness {
 	}
 
 	cfg := mcphandlers.Config{
-		CoordinatorURL: ts.url,
-		Username:       username,
-		CitizenName:    citizenName,
-		CitizenEmail:   citizen.Email,
-		AuthToken:      citizen.Token,
-		ModelName:      "test-model",
-		WorkspaceRoot:  ts.enjugit.RootDir(),
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		CoordinatorURL:  ts.url,
+		Username:        username,
+		CitizenName:     citizenName,
+		CitizenEmail:    citizen.Email,
+		AuthToken:       citizen.Token,
+		ModelName:       "test-model",
+		WorkspaceRoot:   ts.enjugit.RootDir(),
+		ProjectRegistry: ts.registry,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return &mcpHarness{
 		testServer: ts,
@@ -129,14 +130,15 @@ func (h *mcpHarness) newMCPClientAs(t *testing.T, citizenName string) *mcphandle
 		t.Fatalf("lookup citizen %q: %v", username, err)
 	}
 	cfg := mcphandlers.Config{
-		CoordinatorURL: h.url,
-		Username:       username,
-		CitizenName:    citizenName,
-		CitizenEmail:   citizen.Email,
-		AuthToken:      citizen.Token,
-		ModelName:      "test-model",
-		WorkspaceRoot:  h.enjugit.RootDir(),
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		CoordinatorURL:  h.url,
+		Username:        username,
+		CitizenName:     citizenName,
+		CitizenEmail:    citizen.Email,
+		AuthToken:       citizen.Token,
+		ModelName:       "test-model",
+		WorkspaceRoot:   h.enjugit.RootDir(),
+		ProjectRegistry: h.registry,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return mcphandlers.NewTestClient(cfg)
 }
@@ -428,13 +430,14 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 
 	// Build a TestClient identified as the bot.
 	botClient := mcphandlers.NewTestClient(mcphandlers.Config{
-		CoordinatorURL: h.url,
-		Username:       botUsername,
-		CitizenName:    "Notify Bot",
-		AuthToken:      botToken,
-		ModelName:      "test-model",
-		WorkspaceRoot:  h.enjugit.RootDir(),
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		CoordinatorURL:  h.url,
+		Username:        botUsername,
+		CitizenName:     "Notify Bot",
+		AuthToken:       botToken,
+		ModelName:       "test-model",
+		WorkspaceRoot:   h.enjugit.RootDir(),
+		ProjectRegistry: h.registry,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	// Need a run for the spawn target.

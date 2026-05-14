@@ -13,7 +13,7 @@ import (
 // submit one compute task, verify topic branch + commit + push.
 func TestSubmitComputeTaskResult_HappyPath(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 42)
 	wf, err := ws.ForProject(42, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -72,7 +72,7 @@ func TestSubmitComputeTaskResult_HappyPath(t *testing.T) {
 // acceptance), not as part of submit.
 func TestSubmitComputeTaskResult_DoesNotMoveRunBranch(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 42)
 	wf, err := ws.ForProject(42, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -125,7 +125,7 @@ func TestSubmitComputeTaskResult_ConcurrentParallelTasks(t *testing.T) {
 	const N = 4
 
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 42)
 	wf, err := ws.ForProject(42, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)
@@ -214,7 +214,7 @@ func TestSubmitComputeTaskResult_ConcurrentParallelTasks(t *testing.T) {
 // solo single-machine workflows that have no remote.
 func TestSubmitComputeTaskResult_NoOriginSkipsPush(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 42)
 	wf, err := ws.ForProject(42, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)

@@ -211,7 +211,8 @@ func TestCreateProject_SmartDetectDispatch(t *testing.T) {
 
 			// Materialize.
 			wsRoot := filepath.Join(baseDir, ".enju-workspaces")
-			ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+			reg1 := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+			ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger), enjugit.WithRegistry(reg1))
 			if err != nil {
 				t.Fatalf("workspace: %v", err)
 			}

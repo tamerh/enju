@@ -46,14 +46,14 @@ func TestSubmitTaskResult_ConcurrentPushSurfacesNonFFIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
 	// Client A.
-	wsA, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wsA, _ := newWorkspaceForIDs(t, 44)
 	wfA, err := wsA.ForProject(44, bare)
 	if err != nil {
 		t.Fatalf("clone A: %v", err)
 	}
 
 	// Client B (separate workspace dir, same remote).
-	wsB, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wsB, _ := newWorkspaceForIDs(t, 44)
 	wfB, err := wsB.ForProject(44, bare)
 	if err != nil {
 		t.Fatalf("clone B: %v", err)
@@ -119,7 +119,7 @@ func TestPushForceOverwritesDivergedRemoteIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
 	// Client A writes and pushes normally to bare.
-	wsA, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wsA, _ := newWorkspaceForIDs(t, 60)
 	wfA, err := wsA.ForProject(60, bare)
 	if err != nil {
 		t.Fatalf("clone A: %v", err)
@@ -138,7 +138,7 @@ func TestPushForceOverwritesDivergedRemoteIntegration(t *testing.T) {
 	// Client B starts on an unrelated bare (same seed shape,
 	// different history). Submit locally so HEAD is a real commit.
 	bareB := initBareForWorkspaceTest(t)
-	wsB, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	wsB, _ := newWorkspaceForIDs(t, 60)
 	wfB, err := wsB.ForProject(60, bareB)
 	if err != nil {
 		t.Fatalf("clone B: %v", err)
@@ -194,7 +194,7 @@ func TestPushForceOverwritesDivergedRemoteIntegration(t *testing.T) {
 func TestSubmitTaskResult_FailsClearlyAgainstUnreachableRemoteIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 61)
 	wf, err := ws.ForProject(61, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)

@@ -51,6 +51,7 @@ import (
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
@@ -129,8 +130,9 @@ type testServer struct {
 	bareBaseDir   string // base directory containing per-project bare remotes
 	workspaceDir  string // base directory for fat-client working clones
 	enjugit       *enjugit.Workspace
-	store         *store.Store // direct store access for testing reaper/internals
-	lastRunID     string       // "projectID:runSeq" of last submitted run
+	registry      *projectreg.Registry // attached to enjugit so ForProject resolves test project paths
+	store         *store.Store         // direct store access for testing reaper/internals
+	lastRunID     string               // "projectID:runSeq" of last submitted run
 	lastProjectID int64
 	lastRunSeq    int
 
@@ -232,9 +234,15 @@ func newTestServer(t *testing.T) *testServer {
 	t.Cleanup(func() { es.Close() })
 	st.AttachEventStore(es)
 
+	// Per-test registry — paths are mapped at createTestProject
+	// time so ForProject resolves to a known subdir under
+	// workspaceDir without scanning. Post-NDW.2 the workspace
+	// requires a registry; tests share this single one.
+	reg := projectreg.Open(filepath.Join(testDir, "projects.json"))
 	ws, err := enjugit.NewWorkspace(workspaceDir,
 		enjugit.NewProductionConventions(),
-		enjugit.WithLogger(logger))
+		enjugit.WithLogger(logger),
+		enjugit.WithRegistry(reg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,6 +258,7 @@ func newTestServer(t *testing.T) *testServer {
 		bareBaseDir:  bareBaseDir,
 		workspaceDir: workspaceDir,
 		enjugit:      ws,
+		registry:     reg,
 		store:        st,
 		remotes:      make(map[int64]string),
 		tokens:       make(map[string]string),
@@ -538,6 +547,7 @@ func (s *testServer) createTestProject() int64 {
 	}
 	projectID := int64(id)
 	s.rememberRemote(projectID, barePath)
+	s.registerProjectClone(projectID, name)
 	s.wipeProjectMembers(projectID)
 	return projectID
 }
@@ -559,8 +569,55 @@ func (s *testServer) createTestProjectAt(name, barePath string) int64 {
 	}
 	projectID := int64(id)
 	s.rememberRemote(projectID, barePath)
+	s.registerProjectClone(projectID, name)
 	s.wipeProjectMembers(projectID)
 	return projectID
+}
+
+// registerProjectClone upserts a projectreg.Registry entry so the
+// test workspace's ForProject/ProjectDir/OpenView resolve to a
+// known subdir under workspaceDir. Post-NDW.2 the workspace is
+// registry-only — without an entry every workspace op errors with
+// ErrProjectNotRegistered. Mirrors what enju_create_project does
+// in production via FatClient.RegisterProject.
+//
+// The chosen clone path is workspaceDir/<id> — a stable per-id dir
+// the test workspace creates on first ForProject. Tests that
+// previously expected slug-id forms (workspaceDir/<slug>-<id>) now
+// see <id> instead; the test assertions don't pin path shape,
+// they call wf.WorkDir() and rely on ForProject returning a valid
+// handle.
+func (s *testServer) registerProjectClone(projectID int64, projectName string) {
+	s.t.Helper()
+	if s.registry == nil {
+		return
+	}
+	// Path shape: <workspaceDir>/<projectName>-<id>. Pre-NDW.2
+	// ForProject(id, _, name) constructed this via projectDirForName;
+	// preserving the shape keeps glob-matching tests like
+	// TestMCPSubmitPreservesManualUserCommits working without per-
+	// test rewrites.
+	suffix := fmt.Sprintf("%d", projectID)
+	if projectName != "" {
+		suffix = projectName + "-" + suffix
+	}
+	clonePath := filepath.Join(s.workspaceDir, suffix)
+	// projectreg.Registry.Get filters entries whose LocalPath
+	// doesn't exist on disk (treats them as stale). Pre-create
+	// the dir before upserting so the registry's stale-filter
+	// doesn't shadow the row before ForProject's first call.
+	// Mirrors EagerInitProjectClone's "operator's chosen path
+	// already exists at upsert time" invariant.
+	if err := os.MkdirAll(clonePath, 0o755); err != nil {
+		s.t.Fatalf("registerProjectClone(%d) mkdir: %v", projectID, err)
+	}
+	if err := s.registry.Upsert(projectreg.Entry{
+		ID:        projectID,
+		LocalPath: clonePath,
+		Name:      projectName,
+	}); err != nil {
+		s.t.Fatalf("registerProjectClone(%d): %v", projectID, err)
+	}
 }
 
 func (s *testServer) submitYAML(path string) string {

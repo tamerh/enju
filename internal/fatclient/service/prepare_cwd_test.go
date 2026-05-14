@@ -31,6 +31,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
 func newProjectMetaServer(t *testing.T, projectID int64, defaultBranch string) *httptest.Server {
@@ -63,7 +64,16 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	defer srv.Close()
 
 	wsRoot := t.TempDir()
-	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger))
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg1 := projectreg.Open(regPath)
+	projectPath1 := filepath.Join(wsRoot, "p1")
+	if err := os.MkdirAll(projectPath1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg1.Upsert(projectreg.Entry{ID: 11, LocalPath: projectPath1}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger), enjugit.WithRegistry(reg1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +99,8 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	}
 
 	fc := New(Config{
-		WorkspaceRoot: ws.RootDir(),
+		WorkspaceRoot:   ws.RootDir(),
+		ProjectRegistry: projectreg.Open(regPath),
 		Coord: coord.New(coord.Config{
 			BaseURL:   srv.URL,
 			Username:  "dev-bot2",

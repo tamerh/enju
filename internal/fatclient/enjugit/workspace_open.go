@@ -9,74 +9,54 @@ import (
 	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
-// ForProject returns a Workflow handle for the given project. If
-// no on-disk clone exists yet, clones from remoteURL into the
-// canonical slug-id directory under rootDir. If a clone already
-// exists (or registry points at an adopted dir), opens it.
+// ForProject returns a Workflow handle for the given project. The
+// project must already be registered via projectreg (typically by
+// enju_create_project path=<abs/dir>); ForProject opens the path
+// the registry resolves to. If no on-disk clone exists yet, clones
+// from remoteURL into that path (or, when remoteURL is empty,
+// init-locals a fresh repo there).
 //
-// remoteURL may be empty for path-only projects only when an
-// adopted dir is registered. Otherwise returns ErrNoCloneSource.
+// projectName is accepted for back-compat with NDW.1 callers but
+// ignored — the path is registry-resolved, not slug-derived.
+// NDW.5 will drop the parameter.
 //
-// Returns the same Workflow on subsequent calls (cached by
-// projectID).
+// Returns ErrProjectNotRegistered when the project isn't in the
+// registry. Returns the same Workflow on subsequent calls (cached
+// by projectID).
+//
 // workflowMatchesRegistry checks whether a cached Workflow's
 // WorkDir is still consistent with the registry's current view
-// for the project ID. Returns true when no registry is attached
-// (legacy / test setups without persistent path tracking) or
-// when the registry has no entry (lookup will fall through
-// naturally). Returns false when the registry's LocalPath has
-// changed under the same ID — that's the wipe-and-recreate
-// scenario the cache must not silently honor.
+// for the project ID. Returns false when the registry's LocalPath
+// has changed under the same ID — that's the wipe-and-recreate
+// scenario the cache must not silently honor (coord state wiped,
+// new project at a different path got the same ID recycled).
 func (w *Workspace) workflowMatchesRegistry(id int64, wf *Workflow) bool {
-	if w.registry == nil {
-		return true
-	}
 	entry, err := w.registry.Get(id)
 	if err != nil || entry == nil || entry.LocalPath == "" {
-		return true
+		return false
 	}
-	// Compare against ProjectRoot (canonical project dir) rather
-	// than WorkDir (clone dir under it). The registry stores the
-	// project root.
 	return wf.ProjectRoot() == entry.LocalPath
 }
 
 func (w *Workspace) ForProject(id int64, remoteURL string, projectName ...string) (*Workflow, error) {
+	_ = projectName // accepted for back-compat; registry resolves the path
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if wf, ok := w.workflows[id]; ok {
 		// Validate: the cached Workflow's WorkDir must still
 		// agree with what the registry says for this project
-		// ID. They can diverge when coord state was wiped and
-		// a new project at a different path got the same ID
-		// recycled — the registry upserts to the new path on
-		// the create_project call, but a previously-cached
-		// Workflow keeps pointing at the old path. Without
-		// this check, downstream verbs (execute_run, etc.)
-		// resolve script paths against the stale dir and fail.
+		// ID. Downstream verbs (execute_run, etc.) resolve
+		// script paths against the cached dir; if the registry
+		// has rotated under the same ID we drop the cache and
+		// re-open.
 		if w.workflowMatchesRegistry(id, wf) {
 			return wf, nil
 		}
-		// Drop the stale entry; fall through to re-open at
-		// the registry's current LocalPath.
 		delete(w.workflows, id)
 	}
-	name := ""
-	if len(projectName) > 0 {
-		name = projectName[0]
-	}
-	dir := w.projectDirLocked(id)
-	// If no existing dir was found and we know the project name,
-	// prefer the slug-id form. Mirrors project.Opener.projectDir's
-	// choice so a wf-first ForProject creates the same path
-	// project pkg would have. Without this, wf creates `<root>/<id>/`
-	// while a later project.ForProject(...,name) creates
-	// `<root>/<slug>-<id>/` — divergent dirs for the same project,
-	// the failure mode behind the dual-handle test breakage.
-	if name != "" {
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			dir = w.projectDirForName(id, name)
-		}
+	dir, err := w.projectDirLocked(id)
+	if err != nil {
+		return nil, err
 	}
 	clone, err := w.openOrClone(id, dir, remoteURL)
 	if err != nil {
@@ -91,15 +71,17 @@ func (w *Workspace) ForProject(id int64, remoteURL string, projectName ...string
 // OpenView returns a read-only View for project id. Errors with
 // ErrCloneNotFound when no clone exists on disk — does NOT
 // silently lazy-clone (use OpenOrLazyClone for that semantics).
+// Errors with ErrProjectNotRegistered when the project isn't
+// registered.
 func (w *Workspace) OpenView(id int64) (*View, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if v, ok := w.views[id]; ok {
 		return v, nil
 	}
-	dir := w.projectDirLocked(id)
-	if dir == "" {
-		return nil, ErrCloneNotFound
+	dir, err := w.projectDirLocked(id)
+	if err != nil {
+		return nil, err
 	}
 	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
 	if err != nil {
@@ -113,37 +95,42 @@ func (w *Workspace) OpenView(id int64) (*View, error) {
 	return v, nil
 }
 
-// OpenOrLazyClone returns a read-only View for project id. When
-// no clone exists on disk, clones from remoteURL first. Used by
-// webui's read path so projects the user has never explicitly
-// attached to still render content.
+// OpenOrLazyClone returns a read-only View for project id. Post-
+// Phase-8 the name is a misnomer — there is no lazy-clone:
 //
-// Returns ErrNoCloneSource when no clone exists AND remoteURL is
-// empty (path-only project the webui process has never seen).
+//   - Unregistered project → ErrProjectNotRegistered.
+//   - Registered but no on-disk clone → ErrCloneNotFound. The webui
+//     surfaces this as "project not adopted on this machine" so the
+//     operator runs enju_create_project path=<abs/dir> to wire up
+//     a clone explicitly. We don't silently materialize at a
+//     directory the operator hasn't confirmed.
+//
+// remoteURL is accepted for back-compat with NDW.1 callers but
+// unused — adoption goes through enju_create_project, not a
+// silent webui-side clone.
 func (w *Workspace) OpenOrLazyClone(id int64, remoteURL string) (*View, error) {
+	_ = remoteURL // see doc comment
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if v, ok := w.views[id]; ok {
 		return v, nil
 	}
-	dir := w.projectDirLocked(id)
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		// Clone exists; use it.
-		clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
-		if err != nil {
-			return nil, fmt.Errorf("enjugit: open existing %s: %w", dir, err)
-		}
-		v := w.newViewFromClone(id, clone)
-		w.views[id] = v
-		return v, nil
-	}
-	// No clone; lazy-clone if we have a source.
-	if remoteURL == "" {
-		return nil, ErrNoCloneSource
-	}
-	clone, err := git.CloneOrInit(dir, remoteURL, w.lockPathFor(id), w.logger)
+	dir, err := w.projectDirLocked(id)
 	if err != nil {
-		return nil, fmt.Errorf("enjugit: lazy-clone for view %s: %w", dir, err)
+		return nil, err
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: stat %s: %w", dir, err)
+	}
+	clone, err := git.OpenClone(dir, w.lockPathFor(id), w.logger)
+	if err != nil {
+		if errors.Is(err, git.ErrCloneNotFound) {
+			return nil, ErrCloneNotFound
+		}
+		return nil, fmt.Errorf("enjugit: open existing %s: %w", dir, err)
 	}
 	v := w.newViewFromClone(id, clone)
 	w.views[id] = v

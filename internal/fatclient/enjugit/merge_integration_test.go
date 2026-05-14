@@ -34,7 +34,7 @@ import (
 // the lineage names, restore them in trailers.go and assert here.
 func TestAutoMergeAcceptedTopic_NonFFDisjointWritesIntegration(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 70)
 	wf, err := ws.ForProject(70, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)

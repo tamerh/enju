@@ -31,10 +31,7 @@ import (
 func TestMergeAcceptedTopic_FourParallelTopicsAllReachable(t *testing.T) {
 	const N = 4
 	bare := initBareForWorkspaceTest(t)
-	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
-	if err != nil {
-		t.Fatalf("NewWorkspace: %v", err)
-	}
+	ws, _ := newWorkspaceForIDs(t, 81)
 	wf, err := ws.ForProject(81, bare)
 	if err != nil {
 		t.Fatalf("ForProject: %v", err)

@@ -52,12 +52,12 @@ func submitTaskCommitOnMain(t *testing.T, wf *Workflow, taskID string, exitCode 
 func TestFetchBranchPureFetchNoWorktreeChange(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	readerWS, _ := newWorkspaceForIDs(t, 1)
 	reader, err := readerWS.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("reader clone: %v", err)
 	}
-	writerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	writerWS, _ := newWorkspaceForIDs(t, 1)
 	writer, err := writerWS.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("writer clone: %v", err)
@@ -95,7 +95,7 @@ func TestFetchBranchPureFetchNoWorktreeChange(t *testing.T) {
 // branches before any commit lands on them.
 func TestFetchBranchNonexistentRemoteBranchIsNoOp(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 1)
 	wf, err := ws.ForProject(1, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
@@ -118,12 +118,12 @@ func TestFetchBranchNonexistentRemoteBranchIsNoOp(t *testing.T) {
 // reconciled commit on startup.
 func TestScanBranchSinceBaselineAndIncremental(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	writerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	writerWS, _ := newWorkspaceForIDs(t, 1)
 	writer, _ := writerWS.ForProject(1, bare)
 	submitTaskCommitOnMain(t, writer, "1:1:t1", 0)
 	submitTaskCommitOnMain(t, writer, "1:1:t2", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	readerWS, _ := newWorkspaceForIDs(t, 1)
 	reader, _ := readerWS.ForProject(1, bare)
 	if err := reader.FetchBranch("main"); err != nil {
 		t.Fatalf("fetch: %v", err)
@@ -195,7 +195,7 @@ func TestScanBranchSinceBaselineAndIncremental(t *testing.T) {
 // completions.
 func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 	bare := initBareForWorkspaceTest(t)
-	writerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	writerWS, _ := newWorkspaceForIDs(t, 1)
 	writer, _ := writerWS.ForProject(1, bare)
 
 	taskA := submitTaskCommitOnMain(t, writer, "1:1:auto1", 0)
@@ -216,7 +216,7 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 
 	taskB := submitTaskCommitOnMain(t, writer, "1:1:auto2", 0)
 
-	readerWS, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	readerWS, _ := newWorkspaceForIDs(t, 1)
 	reader, _ := readerWS.ForProject(1, bare)
 	if err := reader.FetchBranch("main"); err != nil {
 		t.Fatalf("fetch: %v", err)
@@ -256,7 +256,7 @@ func TestScanBranchSinceSkipsNonTaskCommits(t *testing.T) {
 // hand-builds a trailer-bearing commit using go-git directly so
 // no SubmitTaskResult push path is exercised.
 func TestScanBranchSinceFallsBackToLocalHeads(t *testing.T) {
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 1)
 	wf, err := ws.ForProject(1, "")
 	if err != nil {
 		t.Fatalf("local-init ForProject: %v", err)
@@ -313,7 +313,7 @@ func TestScanBranchSinceFallsBackToLocalHeads(t *testing.T) {
 // the scanner returns the input cursor + empty results. This is
 // "branch is unknown" — a legitimate state, not an error.
 func TestScanBranchSinceUnknownBranchReturnsEmpty(t *testing.T) {
-	ws, _ := NewWorkspace(t.TempDir(), NewProductionConventions(), WithLogger(nullLogger()))
+	ws, _ := newWorkspaceForIDs(t, 1)
 	wf, err := ws.ForProject(1, "")
 	if err != nil {
 		t.Fatal(err)
