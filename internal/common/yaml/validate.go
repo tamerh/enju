@@ -429,6 +429,24 @@ func validateRunForEach(p *Run) error {
 			}
 		}
 	}
+	// Multi-variable for_each with a list<record> source is not yet
+	// supported. cartesianProduct only handles []string values and would
+	// silently drop the record metadata, leaving {{var.field}} refs
+	// unresolved in prompts. Reject now; extend when there's a concrete
+	// use case.
+	if len(p.ForEach) > 1 {
+		paramByName := make(map[string]*ParamDef, len(p.Params))
+		for i := range p.Params {
+			paramByName[p.Params[i].Name] = &p.Params[i]
+		}
+		for varName, src := range p.ForEach {
+			if paramName, ok := parseForEachParamRef(src.Ref); ok {
+				if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+					return fmt.Errorf("run for_each: variable %q references list<record> param %q — multi-variable for_each with a list<record> source is not yet supported; use a single for_each variable", varName, paramName)
+				}
+			}
+		}
+	}
 	return nil
 }
 

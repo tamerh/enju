@@ -3251,3 +3251,131 @@ tasks:
 	}
 }
 
+// ── Review fixes ──────────────────────────────────────────────────────────────
+
+// TestLRP3_MultiVarWithRecordRejected pins issue 1: a multi-variable
+// for_each that includes a list<record> source must be rejected at parse
+// time rather than silently dropping record metadata.
+func TestLRP3_MultiVarWithRecordRejected(t *testing.T) {
+	body := []byte(`
+name: "Multi-var + record"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      name: string
+      slug: string
+  - name: tissues
+    type: list<string>
+for_each:
+  gene: "{{genes}}"
+  tissue: "{{tissues}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "{{gene}} in {{tissue}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error: multi-variable for_each with list<record> source is not supported")
+	}
+	if !strings.Contains(err.Error(), "list<record>") {
+		t.Errorf("error should mention list<record>, got: %v", err)
+	}
+}
+
+// TestLRP4_UnknownRecordFieldRejected pins issue 2: {{var.typo}} where
+// typo is not a declared field must error at parse time, not silently
+// leave unresolved template text in the prompt.
+func TestLRP4_UnknownRecordFieldRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad field ref"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      name: string
+      slug: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "Gene: {{gene.tipo}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for undeclared field reference {{gene.tipo}}")
+	}
+	if !strings.Contains(err.Error(), "tipo") {
+		t.Errorf("error should mention the bad field name, got: %v", err)
+	}
+}
+
+// TestLRP1_FieldNameDoubleUnderscoreRejected pins the __ reserve so LRP.5's
+// env-var design (ENJU_PARAM_<var>__<field>) can rely on it.
+func TestLRP1_FieldNameDoubleUnderscoreRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad field name"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      bad__name: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "{{gene}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for field name containing __")
+	}
+	if !strings.Contains(err.Error(), "__") {
+		t.Errorf("error should mention __, got: %v", err)
+	}
+}
+
+// TestLRP2_EmptyKeyFieldRejected pins the contract that a record whose
+// designated key field has an empty value is rejected at substitution time.
+func TestLRP2_EmptyKeyFieldRejected(t *testing.T) {
+	body := []byte(`
+name: "Empty key field"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    key: slug
+    fields:
+      name: string
+      slug: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "{{gene}}"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	merged := map[string]interface{}{
+		"genes": []interface{}{
+			map[string]interface{}{"name": "TP53", "slug": ""},
+		},
+	}
+	err = substituteForEachParamRefs(parsed.Run.ForEach, merged, "run", parsed.Run.Params)
+	if err == nil {
+		t.Fatal("expected error for record with empty key field")
+	}
+	if !strings.Contains(err.Error(), "empty key field") && !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error should mention empty key field, got: %v", err)
+	}
+}
+

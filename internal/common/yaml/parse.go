@@ -495,10 +495,24 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 	// resolved at submission time, not at parse time, so the
 	// parser only needs to know *which* names are legal.
 	paramInScope := make(map[string]bool, len(p.Params))
-	for _, pp := range p.Params {
-		paramInScope[pp.Name] = true
+	paramByName := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		paramInScope[p.Params[i].Name] = true
+		paramByName[p.Params[i].Name] = &p.Params[i]
 	}
 	paramReferenced := make(map[string]bool, len(p.Params))
+
+	// forEachVarParam maps a for_each variable name to the list<record>
+	// ParamDef it iterates over (nil if the source is not a record param).
+	// Used to validate {{var.field}} field names at parse time.
+	forEachVarParam := make(map[string]*ParamDef, len(runScope))
+	for varName, src := range runScope {
+		if paramName, ok := parseForEachParamRef(src.Ref); ok {
+			if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+				forEachVarParam[varName] = pd
+			}
+		}
+	}
 
 	// Track which for_each variables we've actually seen referenced.
 	// Key: scope label ("run" or "task:id"), value: set of referenced
@@ -580,10 +594,21 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 			// {{task.field}} references must target a known task id.
 			// Exception: {{forEachVar.field}} where forEachVar is in
 			// scope is a record field ref, not a task ref — treat it
-			// as a use of that for_each variable.
+			// as a use of that for_each variable and validate the field
+			// name against the declared fields: of the record param.
 			for _, ref := range template.ExtractReferences(field) {
 				if visible[ref.TaskID] {
-					// for_each record field ref — count as variable use.
+					// for_each record field ref — validate field name
+					// when the source is a known list<record> param.
+					if pd, isRecord := forEachVarParam[ref.TaskID]; isRecord {
+						if _, declared := pd.Fields.TypeOf(ref.Field); !declared {
+							return fmt.Errorf(
+								"task %q: prompt references field {{%s.%s}} but %q is not declared in param %q's fields:",
+								t.ID, ref.TaskID, ref.Field, ref.Field, pd.Name,
+							)
+						}
+					}
+					// Count as variable use.
 					if scopeLabel == "run" {
 						runScopeReferenced[ref.TaskID] = true
 					} else if scopeLabel != "" {

@@ -435,6 +435,10 @@ func expandForEach(forEach map[string]ForEachSource) []forEachInstance {
 	}
 
 	// Multi-variable: cartesian product over list<string> sources.
+	// list<record> sources are rejected by validateRunForEach before
+	// this point, so RecordValues is always nil here — only Values
+	// is used. Extend cartesianProduct when record support is needed.
+	//
 	// Sort variable names so the order of dimensions within the
 	// generated slug is deterministic across runs (Go's randomized
 	// map iteration would otherwise produce `BRCA1_breast` one time
