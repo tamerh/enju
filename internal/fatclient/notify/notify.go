@@ -72,8 +72,9 @@ type Config struct {
 	// BearerToken (the static string).
 	BearerTokenFn func() string
 
-	// ProjectDir is the project's local clone directory (e.g.
-	// ~/.enju/workspaces/tp53-paper-5/). All project-scoped state
+	// ProjectDir is the project's local clone directory (the
+	// operator-chosen path adopted via enju_create_project
+	// path=<abs/dir>). All project-scoped state
 	// — the cursor file, the live.jsonl event log, the user
 	// rules file — lives under {ProjectDir}/enju/. Empty means
 	// "don't persist anything to disk"; tests that supply

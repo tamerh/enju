@@ -27,13 +27,13 @@ type Config struct {
 	Username       string // citizen's username (stable handle)
 	CitizenName    string // display name, for greetings
 	CitizenEmail   string // email used when re-registering after a DB wipe, optional
-	// WorkspaceRoot is the root directory under which per-project
-	// clones live. The fat-client iteration A.2 path resolves
-	// each project's working tree as a subdirectory of this root
-	// (typically `~/.enju/workspaces/`). Empty disables on-disk
+	// WorkspaceRoot is the fat-client's host-side housekeeping
+	// directory (logs, scratch, reconcile-cursor .state/). Post-
+	// NDW.5 it is NOT where project clones live — those live at
+	// registry-resolved paths the operator chose via
+	// enju_create_project path=<abs/dir>. Empty disables on-disk
 	// workspace flows entirely (test fixtures with coord-only
-	// setup); non-empty constructs an enjugit.Workspace at this
-	// root for production callers.
+	// setup).
 	WorkspaceRoot string
 	// SaveCredentials is called after a successful auto re-register
 	// so the new server-side identity is persisted to disk. The

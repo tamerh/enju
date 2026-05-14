@@ -38,9 +38,11 @@ import (
 // Config is the constructor input for New. Coord and WorkspaceRoot
 // are the load-bearing dependencies; ModelName + Logger are
 // process-scoped attribution / diagnostics. WorkspaceRoot is the
-// directory under which per-project clones live (default
-// `~/.enju/workspaces` for `enju mcp`); empty disables on-disk
-// workspace flows entirely (test fixtures with coord-only setup).
+// directory used for fat-client housekeeping (logs, scratch, the
+// reconcile cursor's .state/ dir); post-NDW.5 it is NOT where
+// project clones live — those live at registry-resolved paths.
+// Empty disables on-disk workspace flows entirely (test fixtures
+// with coord-only setup).
 type Config struct {
 	Coord         *coord.Client
 	WorkspaceRoot string

@@ -114,8 +114,11 @@ func NewWorkspace(rootDir string, convs Conventions, opts ...Option) (*Workspace
 	return w, nil
 }
 
-// RootDir returns the per-machine root holding all project clones
-// (default: ~/.enju/workspaces).
+// RootDir returns the per-machine root the workspace was opened
+// at. Post-NDW.5 this is fat-client housekeeping (logs, scratch,
+// reconcile state) — it is NOT where project clones live.
+// CLI entry points typically derive this from filepath.Dir of
+// the --registry flag.
 func (w *Workspace) RootDir() string { return w.rootDir }
 
 

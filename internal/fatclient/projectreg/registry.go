@@ -1,17 +1,9 @@
 // Package projectreg is the per-machine project registry —
 // `~/.enju/projects.json`. It records the projects this
 // fat-client is involved in, with the *durable* mapping from
-// project ID to local path (standard workspace clone or
-// externally adopted directory).
-//
-// Why a registry, vs walking the filesystem:
-//   - Standard clones at `~/.enju/workspaces/<id>-<slug>/` are
-//     discoverable from the filesystem alone, but
-//   - Externally adopted dirs (via enju_create_project path=...)
-//     live anywhere on disk and have no convention. Without this
-//     file, they're invisible to anything that didn't observe
-//     the original adoption — including the UI on a fresh
-//     process start.
+// project ID to local path. Post-NDW.2 every project is
+// path-anchored via this registry — no scan-rootDir fallback
+// exists, so the registry IS the resolution mechanism.
 //
 // Scope is deliberately tight: project-machine bindings only.
 // User preferences (last-active project, theme) belong in
@@ -94,13 +86,9 @@ func Open(path string) *Registry {
 	return &Registry{path: path}
 }
 
-// Path returns the file path this Registry is rooted at. Used by
-// callers that need to pass the same path to a subprocess (e.g.
-// the compute wrapper) so it can attach the SAME registry the
-// operator is using — without this, the wrapper's standalone
-// Workspace falls back to scanning ~/.enju/workspaces/ and may
-// create a divergent clone from the operator's adopted-project
-// path.
+// Path returns the file path this Registry is rooted at. Exposed
+// for callers that need to log it, surface it in --registry
+// echoes, or open a parallel handle from another process.
 func (r *Registry) Path() string { return r.path }
 
 // Load reads the index from disk. Missing file returns an

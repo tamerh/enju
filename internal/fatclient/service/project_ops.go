@@ -91,25 +91,29 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 // surface enju_create_project exposes: required name, optional
 // description / default_branch / path.
 //
-// Path: when non-empty, the project's working tree IS this
-// directory (filesystem-validated below — must be absolute,
-// no symlinks, no nested git repos under populated dirs without
-// `force`). When empty the workspace lands at the standard
-// ~/.enju/workspaces/{slug}-{id}/.
+// Path: the project's working tree IS this directory
+// (filesystem-validated below — must be absolute, no symlinks,
+// no nested git repos under populated dirs without `force`).
+// Post-NDW.2 path-anchoring is mandatory in practice: omitting
+// Path creates the coord project record but leaves no local
+// clone for the fat-client to operate on (every subsequent
+// workspace op errors ErrProjectNotRegistered until the operator
+// re-runs with path=<abs/dir>).
 //
 // Smart-detect: when Path points at an existing folder,
 // CreateProject inspects it and dispatches:
-//   - empty / nonexistent → git init + seed + managed bare
+//   - empty / nonexistent → git init + seed + register
 //   - populated, no .git  → git init + commit existing files +
-//     managed bare (Force gates the populated-unrelated-repo
+//     register (Force gates the populated-unrelated-repo
 //     safety check)
-//   - .git, no origin     → managed bare wired in
+//   - .git, no origin     → register the dir as-is
 //   - .git with origin    → register only; user's remote stays
 //
-// RemoteURL: when non-empty, configured as `origin` on a fresh
-// clone at the default workspace location. Mutually exclusive
-// with Path — Path adopts an existing tree; RemoteURL clones a
-// URL.
+// RemoteURL: when non-empty AND Path is empty, registered as
+// origin metadata on the coord project record only. Mutually
+// exclusive with Path — Path adopts an existing tree;
+// RemoteURL by itself doesn't materialize a clone (the
+// silent-clone behavior is gone post-NDW.5).
 //
 // Force: bypasses the populated-unrelated-repo safety check
 // (a `.git` directory with commits and no Enju marker). Default
@@ -139,15 +143,14 @@ type CreateProjectResult struct {
 }
 
 // CreateProject creates a project on the coordinator and
-// eagerly materializes the local workspace clone. Mirrors
-// mcphandlers.handleCreateProject: optional Path makes the
-// project's working tree be the user's chosen directory
-// (filesystem-validated below); empty Path falls back to the
-// standard ~/.enju/workspaces/ layout.
+// eagerly materializes the local clone at the operator's chosen
+// Path. Post-NDW.5 there is no "default workspace location"
+// fallback — operators always supply Path to make the project
+// usable locally.
 //
 // Eager init is best-effort: if the project record is created
-// on the coord but workspace init fails, we still return
-// success with a logged warning. Subsequent tool calls retry.
+// on the coord but local init fails, we still return success
+// with a logged warning. Subsequent tool calls retry.
 func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParams) (*CreateProjectResult, error) {
 	if params.Name == "" {
 		return nil, fmt.Errorf("name is required")

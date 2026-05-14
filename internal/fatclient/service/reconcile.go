@@ -35,16 +35,11 @@ import (
 )
 
 // StateDir returns the directory used for per-project cursor
-// files. Derived from the workspace root so:
-//
-//   - Production (workspace root = ~/.enju/workspaces) puts
-//     state at ~/.enju/workspaces/.state/, keeping everything
-//     the fat client persists under one directory tree.
-//   - Tests (workspace root = t.TempDir()/.../workspaces) get
-//     isolated state per test run — no writes to the real
-//     user home, no cursor contention across unrelated
-//     tests, cleanup is automatic when the test temp dir is
-//     removed.
+// files. Derived from the workspace root so production
+// installs put state next to other fat-client housekeeping
+// (post-NDW.6 the workspace root defaults to ~/.enju/, so
+// state lives at ~/.enju/.state/). Tests get isolated state
+// per t.TempDir() run.
 //
 // Falls back to ~/.enju/state/ only when no workspace is
 // configured (local-only / legacy callers).
