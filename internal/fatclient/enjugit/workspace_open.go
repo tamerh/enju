@@ -12,9 +12,19 @@ import (
 // ForProject returns a Workflow handle for the given project. The
 // project must already be registered via projectreg (typically by
 // enju_create_project path=<abs/dir>); ForProject opens the path
-// the registry resolves to. If no on-disk clone exists yet, clones
-// from remoteURL into that path (or, when remoteURL is empty,
-// init-locals a fresh repo there).
+// the registry resolves to.
+//
+// remoteURL semantics — only consulted on the first call per
+// project, and only when no on-disk clone exists yet at the
+// registered path:
+//
+//   - non-empty → `git clone <remoteURL> <path>`
+//   - empty     → `git init` (path-mode "solo" project)
+//
+// When the clone already exists on disk, remoteURL is ignored —
+// the existing origin (or absence of one) is the source of truth.
+// Callers that already know a clone exists (the cached-handle
+// path, every call after the first) can pass "" safely.
 //
 // Returns ErrProjectNotRegistered when the project isn't in the
 // registry. Returns the same Workflow on subsequent calls (cached
