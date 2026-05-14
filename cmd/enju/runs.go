@@ -30,7 +30,7 @@ func cmdRuns(args []string) {
 			"Literals: ready, claimed, running, accepted, completed, failed, aborted, terminated, waiting, paused, etc. "+
 			"Aliases: 'active' (covers active+waiting+idle — anything not terminal), 'done' (alias for completed). "+
 			"Comma-separated for multiple; aliases and literals can mix. "+
-			"Note: --status=active uses the alias, not the literal 'active' state alone — if you need only the literal, pass --status=active alongside an unrelated state to avoid the alias rule.")
+			"Known limit: when 'active' appears in the list it always expands to the alias set — there's no way to ask for ONLY the literal 'active' state today. File an issue if you hit this.")
 	last := fs.Int("last", 20, "Cap on rows rendered (0 = all)")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Emit the wire.Run array as JSON")
@@ -137,14 +137,22 @@ func renderRunsTable(w io.Writer, projectName string, projectID int64, runs []wi
 	}
 }
 
-// truncateRunes shortens s to at most max display runes, suffixing
-// "…" when it had to cut. Rune-aware (unlike s[:max-1]+"…") so
+// truncateRunes shortens s to at most max RUNES, suffixing "…"
+// when it had to cut. Rune-aware (unlike s[:max-1]+"…") so
 // CJK / emoji / combining-character project names don't get cut
 // mid-rune into invalid UTF-8 that renders as a replacement
-// character. Single-width-rune table layout still drifts on
-// double-width CJK chars; that's a fwidth problem for another
-// day. The byte-cut alternative produced strictly worse output
-// (broken UTF-8 in some terminals).
+// character.
+//
+// What's pinned: the rune count. The output is at most max runes.
+// What's NOT pinned: the visible column width. CJK / wide-emoji
+// runes render as two terminal columns each, so a 4-rune CJK
+// truncation followed by Go's %-30s padding produces a row that
+// occupies more than 30 columns in a CJK-aware terminal. Cells
+// drift visually but the rune-count invariant holds. Fixing
+// column alignment needs a fwidth helper (golang.org/x/text/width)
+// and is deferred. The byte-cut alternative produced strictly
+// worse output (invalid UTF-8 in some terminals), so this is a
+// strict improvement even without fwidth.
 func truncateRunes(s string, max int) string {
 	if max <= 0 {
 		return ""
