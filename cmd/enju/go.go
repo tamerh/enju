@@ -45,11 +45,11 @@ func cmdGo(args []string) {
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
 	fs.Parse(args)
 
-	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]")
+	workflowArg, uerr := pickWorkflowArg(fs.Args())
+	if uerr != nil {
+		fmt.Fprintln(os.Stderr, uerr.Error())
 		os.Exit(2)
 	}
-	workflowArg := fs.Arg(0)
 
 	params, perr := parseParamsArg(*paramsArg)
 	if perr != nil {
@@ -260,6 +260,37 @@ func shouldRenderPoll(res *service.ExecuteRunResult, lastStop, lastBlocker strin
 		curBlocker = res.Blocker.TaskID
 	}
 	return curBlocker != lastBlocker
+}
+
+// pickWorkflowArg implements Snakemake-style workflow discovery:
+//
+//   1 arg → use it verbatim (relative paths resolve against cwd).
+//   0 args → look for ./enju.yaml in cwd. Use it if present.
+//   0 args + no ./enju.yaml → usage error naming what was tried.
+//   2+ args → usage error (single workflow per invocation).
+//
+// The convention matches Snakemake's "run me from a project
+// directory" ergonomics and the spec's discovery table (item 3).
+// Lives at the cmdGo boundary so dry-run, regular runs, and any
+// future tier-1 verb that takes a workflow can share the same
+// rule by calling it.
+func pickWorkflowArg(args []string) (string, error) {
+	switch len(args) {
+	case 1:
+		return args[0], nil
+	case 0:
+		const defaultName = "enju.yaml"
+		if _, err := os.Stat(defaultName); err == nil {
+			return defaultName, nil
+		}
+		return "", fmt.Errorf(
+			"no workflow path supplied and ./%s not found.\n"+
+				"  usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]\n"+
+				"  or run from a directory that contains an %s file.",
+			defaultName, defaultName)
+	default:
+		return "", fmt.Errorf("usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]  (got %d positional args; expected 0 or 1)", len(args))
+	}
 }
 
 // resolveOrRegisterProject finds the project that owns

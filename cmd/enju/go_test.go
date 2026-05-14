@@ -11,6 +11,54 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
+// TestPickWorkflowArg exercises Snakemake-style auto-discovery:
+// the ./enju.yaml fallback when no positional path is supplied.
+// Uses t.Chdir to scope each case so they can't leak into one
+// another or other tests.
+func TestPickWorkflowArg_ExplicitArgWins(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "enju.yaml"), []byte("name: t\nversion: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	got, err := pickWorkflowArg([]string{"other.yaml"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "other.yaml" {
+		t.Errorf("explicit arg should win even with ./enju.yaml present: got %q", got)
+	}
+}
+
+func TestPickWorkflowArg_AutoDiscoversCwd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "enju.yaml"), []byte("name: t\nversion: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	got, err := pickWorkflowArg(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "enju.yaml" {
+		t.Errorf("auto-discovery: got %q, want enju.yaml", got)
+	}
+}
+
+func TestPickWorkflowArg_NoArgsNoCwdFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if _, err := pickWorkflowArg(nil); err == nil {
+		t.Error("expected error when no arg and no ./enju.yaml")
+	}
+}
+
+func TestPickWorkflowArg_TooManyArgsErrors(t *testing.T) {
+	if _, err := pickWorkflowArg([]string{"a.yaml", "b.yaml"}); err == nil {
+		t.Error("expected error for 2+ positional args")
+	}
+}
+
 func TestParseParamsArg(t *testing.T) {
 	cases := []struct {
 		in   string
