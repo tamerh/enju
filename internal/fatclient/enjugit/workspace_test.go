@@ -110,6 +110,15 @@ func TestNewWorkspace_ExplicitDir(t *testing.T) {
 	}
 }
 
+// TestNewWorkspace_EmptyRootDirRejected pins the post-NDW.3 hard
+// error: empty rootDir no longer falls back to ~/.enju/workspaces.
+func TestNewWorkspace_EmptyRootDirRejected(t *testing.T) {
+	_, err := NewWorkspace("", NewProductionConventions(), WithLogger(nullLogger()))
+	if err == nil {
+		t.Fatal("expected error for empty rootDir, got nil")
+	}
+}
+
 // TestForProject_NotRegistered pins the post-NDW.2 contract:
 // without a registry entry, ForProject errors with
 // ErrProjectNotRegistered. There is no scan-rootDir fallback —

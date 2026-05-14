@@ -76,8 +76,16 @@ func WithLogName(name string) Option {
 	return func(w *Workspace) { w.logName = name }
 }
 
-// NewWorkspace constructs a Workspace rooted at rootDir.
-// Empty rootDir defaults to ~/.enju/workspaces.
+// NewWorkspace constructs a Workspace rooted at rootDir. Post-
+// Phase-8 (NDW.3) every project lives at an operator-chosen path
+// tracked via projectreg.Registry; this rootDir is the host-side
+// staging directory for derived state (legacy flock files until
+// NDW.4 relocates them; cmd/enju helpers that drop temp files).
+// It is NEVER where project clones go.
+//
+// Empty rootDir is a hard error — there is no longer a
+// ~/.enju/workspaces fallback. Callers (cmd/enju entry points,
+// service.New) supply an explicit path; tests use t.TempDir().
 //
 // Conventions is passed positionally because it's load-bearing —
 // every operation depends on it. Other settings (registry,
@@ -85,11 +93,10 @@ func WithLogName(name string) Option {
 // reasonable defaults.
 func NewWorkspace(rootDir string, convs Conventions, opts ...Option) (*Workspace, error) {
 	if rootDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("enjugit: resolve home dir: %w", err)
-		}
-		rootDir = filepath.Join(home, ".enju", "workspaces")
+		return nil, fmt.Errorf("enjugit: NewWorkspace: rootDir is required " +
+			"(post-Phase-8 there is no ~/.enju/workspaces default — every " +
+			"project lives at its own operator-chosen path registered via " +
+			"enju_create_project path=<abs/dir>)")
 	}
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("enjugit: create workspace root %s: %w", rootDir, err)
