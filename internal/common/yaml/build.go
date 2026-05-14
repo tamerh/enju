@@ -110,7 +110,7 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 	// been substituted to literal Values in substituteParamsInPlace.
 	// StaticValues drops any still-unresolved refs (which should
 	// not exist here — this is a last-line safety net).
-	instances := expandForEach(p.ForEach.StaticValues())
+	instances := expandForEach(p.ForEach.StaticSources())
 
 	result := &ParsedRun{
 		Run:           p,
@@ -127,8 +127,31 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 		}
 	}
 
+	// for_each variable names must be excluded from inferred task deps
+	// so {{entry.name}} style record-field refs don't appear as edges
+	// to a nonexistent task named "entry".
+	forEachVarNames := make(map[string]bool, len(p.ForEach))
+	for name := range p.ForEach {
+		forEachVarNames[name] = true
+	}
+
 	for _, inst := range instances {
 		var taskInstances []TaskInstance
+
+		// Build a resolve map that includes "varName.field" → value
+		// entries for any record-typed for_each variable in this
+		// iteration. The base params map carries varName → key-field
+		// value; the extended map is used only for template resolution.
+		resolveMap := inst.params
+		if inst.recordVar != "" && inst.record != nil {
+			resolveMap = make(map[string]string, len(inst.params)+len(inst.record))
+			for k, v := range inst.params {
+				resolveMap[k] = v
+			}
+			for fieldName, fieldVal := range inst.record {
+				resolveMap[inst.recordVar+"."+fieldName] = fmt.Sprintf("%v", fieldVal)
+			}
+		}
 
 		for _, taskDef := range p.Tasks {
 			// Aggregator tasks stay singular regardless of run-
@@ -140,10 +163,10 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			}
 			fullID := MakeFullID(inst.key, taskDef.ID)
 
-			resolvedPrompt := template.ResolveParams(taskDef.Prompt, inst.params)
-			resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, inst.params)
+			resolvedPrompt := template.ResolveParams(taskDef.Prompt, resolveMap)
+			resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, resolveMap)
 
-			allDeps := template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt)
+			allDeps := filterForEachVarDeps(template.MergeDependencies(taskDef.DependsOn, taskDef.Prompt), forEachVarNames)
 			for _, dep := range allDeps {
 				if !taskIDs[dep] {
 					return nil, fmt.Errorf("task %q references %q which does not exist", taskDef.ID, dep)
@@ -208,9 +231,9 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			// then both substitute to the same path and
 			// surface as a duplicate in the claim response).
 			ti.ReadsArtifacts = template.MergeArtifactReads(
-				template.ResolveParamsSlice(taskDef.ReadsArtifacts, inst.params),
+				template.ResolveParamsSlice(taskDef.ReadsArtifacts, resolveMap),
 				resolvedPrompt)
-			ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, inst.params)
+			ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, resolveMap)
 
 			taskInstances = append(taskInstances, ti)
 
@@ -358,6 +381,11 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 	// Deferred tasks don't get instances materialized at parse time;
 	// the coordinator creates them when the upstream providing the
 	// dynamic list accepts (handled in step 4 of Phase J.1).
+	sharedVarNames := make(map[string]bool, len(shared))
+	for name := range shared {
+		sharedVarNames[name] = true
+	}
+
 	deferred := make(map[string]bool)
 	sharedIsDynamic := shared != nil && shared.IsDynamic()
 	if sharedIsDynamic {
@@ -376,7 +404,7 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 				if deferred[t.ID] {
 					continue
 				}
-				allDeps := template.MergeDependencies(t.DependsOn, t.Prompt)
+				allDeps := filterForEachVarDeps(template.MergeDependencies(t.DependsOn, t.Prompt), sharedVarNames)
 				for _, dep := range allDeps {
 					if deferred[dep] {
 						deferred[t.ID] = true
@@ -397,7 +425,7 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 	} else if len(shared) == 0 {
 		iterations = expandForEach(nil)
 	} else {
-		iterations = expandForEach(shared.StaticValues())
+		iterations = expandForEach(shared.StaticSources())
 	}
 
 	result := &ParsedRun{
@@ -426,8 +454,24 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 
 	createInstance := func(taskDef TaskDef, iter forEachInstance) TaskInstance {
 		fullID := MakeFullID(iter.key, taskDef.ID)
-		resolvedPrompt := template.ResolveParams(taskDef.Prompt, iter.params)
-		resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, iter.params)
+		// For record-typed for_each variables, extend the resolve map
+		// with "varName.field" → value entries so {{entry.name}} refs
+		// in prompts are resolved at parse time alongside the bare
+		// {{entry}} → key-field ref. The extended map is only used for
+		// template resolution; iter.params (no dotted keys) is what
+		// flows into TaskInstance.Params and downstream env var building.
+		resolveMap := iter.params
+		if iter.recordVar != "" && iter.record != nil {
+			resolveMap = make(map[string]string, len(iter.params)+len(iter.record))
+			for k, v := range iter.params {
+				resolveMap[k] = v
+			}
+			for fieldName, fieldVal := range iter.record {
+				resolveMap[iter.recordVar+"."+fieldName] = fmt.Sprintf("%v", fieldVal)
+			}
+		}
+		resolvedPrompt := template.ResolveParams(taskDef.Prompt, resolveMap)
+		resolvedUserPrompt := template.ResolveParams(taskDef.UserPrompt, resolveMap)
 		ti := TaskInstance{
 			TaskDef:     taskDef,
 			InstanceKey: iter.key,
@@ -444,9 +488,9 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 		// for the substitute-before-merge ordering that
 		// avoids duplicate reads in the claim response.
 		ti.ReadsArtifacts = template.MergeArtifactReads(
-			template.ResolveParamsSlice(taskDef.ReadsArtifacts, iter.params),
+			template.ResolveParamsSlice(taskDef.ReadsArtifacts, resolveMap),
 			resolvedPrompt)
-		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, iter.params)
+		ti.WritesArtifacts = ResolveWriteArtifacts(taskDef.WritesArtifacts, resolveMap)
 		// Same per-iteration qualification as the run-level
 		// for_each path — see the comment there for why.
 		if taskDef.Reviews != "" {
@@ -507,7 +551,7 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 	//     parent → every instance of child (handled per child)
 	//   parent singleton, child singleton → straight edge
 	wireDeps := func(ti *TaskInstance) error {
-		allDeps := template.MergeDependencies(ti.TaskDef.DependsOn, ti.TaskDef.Prompt)
+		allDeps := filterForEachVarDeps(template.MergeDependencies(ti.TaskDef.DependsOn, ti.TaskDef.Prompt), sharedVarNames)
 		for _, dep := range allDeps {
 			if !taskIDs[dep] {
 				return fmt.Errorf("task %q references %q which does not exist", ti.TaskDef.ID, dep)
@@ -655,4 +699,20 @@ func wireArtifactDeps(result *ParsedRun) error {
 		result.ExpandedTasks[key] = instances
 	}
 	return nil
+}
+
+// filterForEachVarDeps removes task IDs that are actually for_each variable
+// names from a dependency list. This prevents {{entry.field}} references from
+// creating spurious deps on a nonexistent task named "entry".
+func filterForEachVarDeps(deps []string, exclude map[string]bool) []string {
+	if len(exclude) == 0 || len(deps) == 0 {
+		return deps
+	}
+	out := make([]string, 0, len(deps))
+	for _, d := range deps {
+		if !exclude[d] {
+			out = append(out, d)
+		}
+	}
+	return out
 }

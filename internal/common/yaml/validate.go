@@ -450,13 +450,16 @@ func validateParams(p *Run) ([]string, error) {
 		}
 		paramNames[pp.Name] = true
 		if !isValidParamType(pp.Type) {
-			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, or list<string>)", pp.Name, pp.Type)
+			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, list<string>, or list<record>)", pp.Name, pp.Type)
+		}
+		if err := validateParamDef(pp); err != nil {
+			return nil, err
 		}
 		if pp.Required && pp.Default != nil {
 			return nil, fmt.Errorf("param %q: required and default are mutually exclusive", pp.Name)
 		}
 		if pp.Default != nil {
-			if err := checkParamValueType(pp.Name, pp.Type, pp.Default); err != nil {
+			if err := checkParamValueType(pp, pp.Default); err != nil {
 				return nil, err
 			}
 		}
@@ -465,6 +468,50 @@ func validateParams(p *Run) ([]string, error) {
 		}
 	}
 	return warnings, nil
+}
+
+// validateParamDef enforces the list<record>-specific shape rules
+// and defaults Key to the first declared field when absent.
+// Called for every param after the type is confirmed valid.
+func validateParamDef(pp *ParamDef) error {
+	if pp.Type == "list<record>" {
+		if pp.Fields.Len() == 0 {
+			return fmt.Errorf("param %q (list<record>): fields: is required — declare the record shape with field-name: type pairs", pp.Name)
+		}
+		for _, fname := range pp.Fields.Names() {
+			ftype, _ := pp.Fields.TypeOf(fname)
+			switch ftype {
+			case "string", "int", "bool":
+				// ok
+			default:
+				return fmt.Errorf("param %q fields.%s: unsupported type %q (must be string, int, or bool)", pp.Name, fname, ftype)
+			}
+			// Double-underscore is the env-var field separator
+			// (ENJU_PARAM_<var>__<field>). A field name containing
+			// __ would produce a collision with another field's
+			// env var slot.
+			if strings.Contains(fname, "__") {
+				return fmt.Errorf("param %q fields.%s: field names must not contain \"__\" (reserved for env var expansion)", pp.Name, fname)
+			}
+		}
+		if pp.Key != "" {
+			if _, ok := pp.Fields.TypeOf(pp.Key); !ok {
+				known := pp.Fields.Names()
+				return fmt.Errorf("param %q: key: %q is not a declared field (known fields: %s)", pp.Name, pp.Key, strings.Join(known, ", "))
+			}
+		} else {
+			// Default key to the first declared field.
+			pp.Key = pp.Fields.FirstName()
+		}
+	} else {
+		if pp.Fields.Len() > 0 {
+			return fmt.Errorf("param %q: fields: is only valid on type: list<record> (got %q)", pp.Name, pp.Type)
+		}
+		if pp.Key != "" {
+			return fmt.Errorf("param %q: key: is only valid on type: list<record> (got %q)", pp.Name, pp.Type)
+		}
+	}
+	return nil
 }
 
 // validateTasks walks every task def and enforces per-task

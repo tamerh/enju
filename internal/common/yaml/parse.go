@@ -169,7 +169,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 	}
 	for name, v := range supplied {
 		pp := declared[name]
-		if err := checkParamValueType(name, pp.Type, v); err != nil {
+		if err := checkParamValueType(pp, v); err != nil {
 			return nil, err
 		}
 		merged[name] = v
@@ -205,7 +205,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 	// Substitute {{paramname}} refs in run-level for_each.
 	// Same pattern as task-level (below) but resolved once at
 	// the run scope so buildRunLevel sees a static map.
-	if err := substituteForEachParamRefs(p.ForEach, merged, "run"); err != nil {
+	if err := substituteForEachParamRefs(p.ForEach, merged, "run", p.Params); err != nil {
 		return nil, err
 	}
 
@@ -269,7 +269,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 
 		// Task-level for_each param-ref substitution. Shared
 		// helper also handles the run-level scope above.
-		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID)); err != nil {
+		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID), p.Params); err != nil {
 			return nil, err
 		}
 	}
@@ -578,7 +578,19 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 				}
 			}
 			// {{task.field}} references must target a known task id.
+			// Exception: {{forEachVar.field}} where forEachVar is in
+			// scope is a record field ref, not a task ref — treat it
+			// as a use of that for_each variable.
 			for _, ref := range template.ExtractReferences(field) {
+				if visible[ref.TaskID] {
+					// for_each record field ref — count as variable use.
+					if scopeLabel == "run" {
+						runScopeReferenced[ref.TaskID] = true
+					} else if scopeLabel != "" {
+						taskScopeReferenced[scopeLabel][ref.TaskID] = true
+					}
+					continue
+				}
 				if !taskIDs[ref.TaskID] {
 					return fmt.Errorf(
 						"task %q: prompt references unknown task id {{%s.%s}}",

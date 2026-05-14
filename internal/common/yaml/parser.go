@@ -97,38 +97,37 @@ var _ = time.ParseDuration
 // block.
 func isValidParamType(s string) bool {
 	switch s {
-	case "string", "int", "bool", "list<string>":
+	case "string", "int", "bool", "list<string>", "list<record>":
 		return true
 	}
 	return false
 }
 
-// checkParamValueType reports whether v is assignable to a param
-// declared as paramType. Used both for default-value validation
-// at parse time and for supplied-value validation at submission
-// time. YAML decoding yields int for `1`, bool for `true`,
-// string for `"pcos"`, []interface{} for `[a, b]` — we accept
-// those shapes.
+// checkParamValueType reports whether v is assignable to the param
+// described by pd. Used both for default-value validation at parse
+// time and for supplied-value validation at submission time. YAML
+// decoding yields int for `1`, bool for `true`, string for `"pcos"`,
+// []interface{} for `[a, b]` — we accept those shapes.
 //
 // Error messages use natural-English type names ("a number",
 // "true/false") and quote the offending value so the LLM can
-// forward them to the user as conversation turns. Go-level
-// type names like `float64` never appear in user-facing output.
-func checkParamValueType(name, paramType string, v interface{}) error {
+// forward them to the user as conversation turns. Go-level type
+// names like `float64` never appear in user-facing output.
+func checkParamValueType(pd *ParamDef, v interface{}) error {
+	name, paramType := pd.Name, pd.Type
 	switch paramType {
 	case "string":
 		if _, ok := v.(string); !ok {
 			return fmt.Errorf("param %q: expected a string, got %s", name, describeValue(v))
 		}
 	case "int":
-		switch v.(type) {
+		switch vv := v.(type) {
 		case int, int64:
 			return nil
 		case float64:
 			// YAML/JSON decode whole numbers as float64. Accept
 			// them if they're integral; reject if they're not.
-			f := v.(float64)
-			if f == float64(int64(f)) {
+			if vv == float64(int64(vv)) {
 				return nil
 			}
 			return fmt.Errorf("param %q: expected a whole number, got a decimal (%v)", name, v)
@@ -150,6 +149,64 @@ func checkParamValueType(name, paramType string, v interface{}) error {
 			if _, ok := item.(string); !ok {
 				return fmt.Errorf("param %q: list item #%d is not a string — %s", name, i+1, describeValue(item))
 			}
+		}
+	case "list<record>":
+		xs, ok := v.([]interface{})
+		if !ok {
+			return fmt.Errorf("param %q: expected a list of records, got %s", name, describeValue(v))
+		}
+		for i, item := range xs {
+			entry, ok := item.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("param %q: item #%d is not an object — expected a {field: value} mapping, got %s", name, i+1, describeValue(item))
+			}
+			// All declared fields must be present and type-correct.
+			for _, fname := range pd.Fields.Names() {
+				ftype, _ := pd.Fields.TypeOf(fname)
+				val, present := entry[fname]
+				if !present {
+					return fmt.Errorf("param %q: item #%d missing field %q — declare it under fields:", name, i+1, fname)
+				}
+				if err := checkScalarFieldType(ftype, val); err != nil {
+					return fmt.Errorf("param %q: item #%d field %q: %w", name, i+1, fname, err)
+				}
+			}
+			// Extra fields (not declared under fields:) are rejected.
+			for k := range entry {
+				if _, declared := pd.Fields.TypeOf(k); !declared {
+					return fmt.Errorf("param %q: item #%d has unknown field %q — declare it under fields:", name, i+1, k)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkScalarFieldType validates that v is the right Go type for a
+// record field declared as ftype ("string", "int", or "bool").
+// Error messages name the expected type; the caller wraps with the
+// field name. Mirrors checkParamValueType for the scalar cases.
+func checkScalarFieldType(ftype string, v interface{}) error {
+	switch ftype {
+	case "string":
+		if _, ok := v.(string); !ok {
+			return fmt.Errorf("expected a string, got %s", describeValue(v))
+		}
+	case "int":
+		switch vv := v.(type) {
+		case int, int64:
+			return nil
+		case float64:
+			if vv == float64(int64(vv)) {
+				return nil
+			}
+			return fmt.Errorf("expected a whole number, got a decimal (%v)", v)
+		default:
+			return fmt.Errorf("expected a whole number, got %s", describeValue(v))
+		}
+	case "bool":
+		if _, ok := v.(bool); !ok {
+			return fmt.Errorf("expected true or false, got %s", describeValue(v))
 		}
 	}
 	return nil

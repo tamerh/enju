@@ -2678,3 +2678,576 @@ tasks:
 		t.Errorf("expected populated Bots node, got zero-value (Kind=0)")
 	}
 }
+
+// ── LRP.1: list<record> param schema ─────────────────────────────────────────
+
+func TestLRP1_ParseListRecordParam(t *testing.T) {
+	body := []byte(`
+name: "Gene analysis"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+    required: true
+    key: slug
+    fields:
+      name: string
+      title: string
+      slug: string
+      question: string
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: research
+    action: answer
+    prompt: "Research {{entry.name}} ({{entry.title}}): {{entry.question}}"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	pd := parsed.Run.Params[0]
+	if pd.Type != "list<record>" {
+		t.Errorf("Type: got %q, want list<record>", pd.Type)
+	}
+	if pd.Key != "slug" {
+		t.Errorf("Key: got %q, want slug", pd.Key)
+	}
+	if pd.Fields.Len() != 4 {
+		t.Errorf("Fields.Len: got %d, want 4", pd.Fields.Len())
+	}
+	// Insertion order preserved.
+	if pd.Fields.Names()[0] != "name" {
+		t.Errorf("first field name: got %q, want name", pd.Fields.Names()[0])
+	}
+	if typ, _ := pd.Fields.TypeOf("slug"); typ != "string" {
+		t.Errorf("slug field type: got %q, want string", typ)
+	}
+}
+
+func TestLRP1_KeyDefaultsToFirstField(t *testing.T) {
+	body := []byte(`
+name: "No explicit key"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      name: string
+      score: int
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "Process {{gene}}"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	pd := parsed.Run.Params[0]
+	if pd.Key != "name" {
+		t.Errorf("Key default: got %q, want name (first declared field)", pd.Key)
+	}
+}
+
+func TestLRP1_MissingFieldsRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad param"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{entry}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for list<record> without fields:")
+	}
+	if !strings.Contains(err.Error(), "fields:") {
+		t.Errorf("error should mention fields:, got: %v", err)
+	}
+}
+
+func TestLRP1_KeyNotInFieldsRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad key"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+    key: nonexistent
+    fields:
+      name: string
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{entry}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for key not in fields")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("error should mention the bad key name, got: %v", err)
+	}
+}
+
+func TestLRP1_UnsupportedFieldTypeRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad field type"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+    fields:
+      name: string
+      score: float
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{entry}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for unsupported field type float")
+	}
+	if !strings.Contains(err.Error(), "float") {
+		t.Errorf("error should mention 'float', got: %v", err)
+	}
+}
+
+func TestLRP1_FieldsOnNonRecordRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad fields"
+version: 1
+params:
+  - name: genes
+    type: list<string>
+    fields:
+      name: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{gene}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for fields: on list<string>")
+	}
+	if !strings.Contains(err.Error(), "fields:") {
+		t.Errorf("error should mention fields:, got: %v", err)
+	}
+}
+
+func TestLRP1_KeyOnNonRecordRejected(t *testing.T) {
+	body := []byte(`
+name: "Bad key"
+version: 1
+params:
+  - name: genes
+    type: list<string>
+    key: name
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{gene}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for key: on list<string>")
+	}
+	if !strings.Contains(err.Error(), "key:") {
+		t.Errorf("error should mention key:, got: %v", err)
+	}
+}
+
+func TestLRP1_DuplicateFieldNameRejected(t *testing.T) {
+	body := []byte(`
+name: "Dup fields"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+    fields:
+      name: string
+      name: int
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: t1
+    action: answer
+    prompt: "{{entry}}"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for duplicate field name")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error should mention duplicate, got: %v", err)
+	}
+}
+
+// ── LRP.2: value validation ───────────────────────────────────────────────────
+
+func listRecordParamDef() ParamDef {
+	pd := ParamDef{
+		Name: "entries",
+		Type: "list<record>",
+		Key:  "slug",
+	}
+	pd.Fields.names = []string{"name", "title", "slug"}
+	pd.Fields.types = map[string]string{"name": "string", "title": "string", "slug": "string"}
+	return pd
+}
+
+func TestLRP2_ValidRecordList(t *testing.T) {
+	pd := listRecordParamDef()
+	v := []interface{}{
+		map[string]interface{}{"name": "TP53", "title": "Tumor suppressor", "slug": "tp53"},
+		map[string]interface{}{"name": "BRCA1", "title": "DNA repair", "slug": "brca1"},
+	}
+	if err := checkParamValueType(&pd, v); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLRP2_NonListRejected(t *testing.T) {
+	pd := listRecordParamDef()
+	if err := checkParamValueType(&pd, "TP53"); err == nil {
+		t.Fatal("expected error for non-list input")
+	}
+}
+
+func TestLRP2_ItemNotMapRejected(t *testing.T) {
+	pd := listRecordParamDef()
+	v := []interface{}{"TP53"}
+	if err := checkParamValueType(&pd, v); err == nil {
+		t.Fatal("expected error for string item in record list")
+	}
+}
+
+func TestLRP2_MissingFieldRejected(t *testing.T) {
+	pd := listRecordParamDef()
+	v := []interface{}{
+		map[string]interface{}{"name": "TP53", "title": "Tumor suppressor"}, // missing slug
+	}
+	err := checkParamValueType(&pd, v)
+	if err == nil {
+		t.Fatal("expected error for missing field")
+	}
+	if !strings.Contains(err.Error(), "slug") {
+		t.Errorf("error should mention missing field name, got: %v", err)
+	}
+}
+
+func TestLRP2_FieldTypeMismatch(t *testing.T) {
+	pd := ParamDef{Name: "entries", Type: "list<record>", Key: "id"}
+	pd.Fields.names = []string{"id", "score"}
+	pd.Fields.types = map[string]string{"id": "string", "score": "int"}
+	v := []interface{}{
+		map[string]interface{}{"id": "x", "score": "not-a-number"},
+	}
+	err := checkParamValueType(&pd, v)
+	if err == nil {
+		t.Fatal("expected type mismatch error")
+	}
+	if !strings.Contains(err.Error(), "score") {
+		t.Errorf("error should mention field name, got: %v", err)
+	}
+}
+
+func TestLRP2_ExtraFieldRejected(t *testing.T) {
+	pd := listRecordParamDef()
+	v := []interface{}{
+		map[string]interface{}{"name": "TP53", "title": "T", "slug": "tp53", "extra": "oops"},
+	}
+	err := checkParamValueType(&pd, v)
+	if err == nil {
+		t.Fatal("expected error for unknown extra field")
+	}
+	if !strings.Contains(err.Error(), "extra") {
+		t.Errorf("error should mention the unknown field name, got: %v", err)
+	}
+}
+
+// ── LRP.3: for_each expansion ─────────────────────────────────────────────────
+
+func TestLRP3_RecordForEachExpansion(t *testing.T) {
+	body := []byte(`
+name: "Gene fan-out"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    key: slug
+    fields:
+      name: string
+      slug: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: research
+    action: answer
+    prompt: "Research {{gene.name}}"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	// Supply the param value so substituteForEachParamRefs can expand it.
+	merged := map[string]interface{}{
+		"genes": []interface{}{
+			map[string]interface{}{"name": "TP53", "slug": "tp53"},
+			map[string]interface{}{"name": "BRCA1", "slug": "brca1"},
+		},
+	}
+
+	// Re-parse with merged values applied (simulate run-create with params).
+	if err := substituteForEachParamRefs(parsed.Run.ForEach, merged, "run", parsed.Run.Params); err != nil {
+		t.Fatalf("substituteForEachParamRefs error: %v", err)
+	}
+
+	src, ok := parsed.Run.ForEach["gene"]
+	if !ok {
+		t.Fatal("for_each source 'gene' not found after substitution")
+	}
+	if len(src.Values) != 2 {
+		t.Fatalf("expected 2 Values, got %d", len(src.Values))
+	}
+	if src.Values[0] != "tp53" || src.Values[1] != "brca1" {
+		t.Errorf("Values: got %v, want [tp53 brca1]", src.Values)
+	}
+	if len(src.RecordValues) != 2 {
+		t.Fatalf("expected 2 RecordValues, got %d", len(src.RecordValues))
+	}
+	if src.RecordValues[0]["name"] != "TP53" {
+		t.Errorf("RecordValues[0][name]: got %v, want TP53", src.RecordValues[0]["name"])
+	}
+
+	// Expand to instances and verify record binding.
+	instances := expandForEach(map[string]ForEachSource{"gene": src})
+	if len(instances) != 2 {
+		t.Fatalf("expected 2 instances, got %d", len(instances))
+	}
+	inst := instances[0]
+	if inst.params["gene"] != "tp53" {
+		t.Errorf("inst.params[gene]: got %q, want tp53", inst.params["gene"])
+	}
+	if inst.recordVar != "gene" {
+		t.Errorf("inst.recordVar: got %q, want gene", inst.recordVar)
+	}
+	if inst.record["name"] != "TP53" {
+		t.Errorf("inst.record[name]: got %v, want TP53", inst.record["name"])
+	}
+	if inst.key != "tp53" {
+		t.Errorf("inst.key: got %q, want tp53", inst.key)
+	}
+}
+
+// ── LRP.4: template substitution ─────────────────────────────────────────────
+
+func allTaskInstances(pr *ParsedRun) []TaskInstance {
+	var out []TaskInstance
+	for _, list := range pr.ExpandedTasks {
+		out = append(out, list...)
+	}
+	return out
+}
+
+func TestLRP4_FullWorkflowWithRecords(t *testing.T) {
+	body := []byte(`
+name: "Gene analysis"
+version: 1
+params:
+  - name: entries
+    type: list<record>
+    key: slug
+    fields:
+      name: string
+      title: string
+      slug: string
+      question: string
+    required: true
+for_each:
+  entry: "{{entries}}"
+tasks:
+  - id: research
+    action: answer
+    prompt: "Research {{entry.name}} ({{entry.title}}): {{entry.question}}"
+`)
+	params := map[string]interface{}{
+		"entries": []interface{}{
+			map[string]interface{}{
+				"name": "TP53", "title": "Tumor suppressor",
+				"slug": "tp53", "question": "Drug pipeline?",
+			},
+			map[string]interface{}{
+				"name": "BRCA1", "title": "DNA repair",
+				"slug": "brca1", "question": "Carrier risk?",
+			},
+		},
+	}
+	parsed, err := ParseWithParams(body, params)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	var prompts []string
+	for _, ti := range allTaskInstances(parsed) {
+		if ti.TaskDef.ID == "research" {
+			prompts = append(prompts, ti.Prompt)
+		}
+	}
+	sort.Strings(prompts)
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 research instances, got %d", len(prompts))
+	}
+	want0 := "Research BRCA1 (DNA repair): Carrier risk?"
+	want1 := "Research TP53 (Tumor suppressor): Drug pipeline?"
+	if prompts[0] != want0 {
+		t.Errorf("prompt[0]: got %q, want %q", prompts[0], want0)
+	}
+	if prompts[1] != want1 {
+		t.Errorf("prompt[1]: got %q, want %q", prompts[1], want1)
+	}
+}
+
+func TestLRP4_BareVarProducesKeyField(t *testing.T) {
+	// {{entry}} (bare) must resolve to the designated key field value.
+	body := []byte(`
+name: "Bare var test"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    key: slug
+    fields:
+      name: string
+      slug: string
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "Gene: {{gene}}"
+`)
+	params := map[string]interface{}{
+		"genes": []interface{}{
+			map[string]interface{}{"name": "TP53", "slug": "tp53"},
+		},
+	}
+	parsed, err := ParseWithParams(body, params)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	all := allTaskInstances(parsed)
+	if len(all) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(all))
+	}
+	if all[0].Prompt != "Gene: tp53" {
+		t.Errorf("bare {{gene}} should resolve to slug (key field), got %q", all[0].Prompt)
+	}
+}
+
+func TestLRP4_ListStringBackCompat(t *testing.T) {
+	// list<string> workflows must keep working unchanged after LRP changes.
+	body := []byte(`
+name: "Back-compat"
+version: 1
+params:
+  - name: diseases
+    type: list<string>
+for_each:
+  disease: "{{diseases}}"
+tasks:
+  - id: analyze
+    action: answer
+    prompt: "Analyze {{disease}}"
+`)
+	params := map[string]interface{}{
+		"diseases": []interface{}{"endometriosis", "PCOS"},
+	}
+	parsed, err := ParseWithParams(body, params)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	var prompts []string
+	for _, ti := range allTaskInstances(parsed) {
+		prompts = append(prompts, ti.Prompt)
+	}
+	sort.Strings(prompts)
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 instances, got %d: %v", len(prompts), prompts)
+	}
+	if prompts[0] != "Analyze PCOS" || prompts[1] != "Analyze endometriosis" {
+		t.Errorf("back-compat failed: got %v", prompts)
+	}
+}
+
+func TestLRP4_RecordFieldRefNotConfusedWithTaskRef(t *testing.T) {
+	// {{entry.name}} must not be treated as a dep on task "entry".
+	// This tests validateTemplateReferences doesn't error on record field refs.
+	body := []byte(`
+name: "No spurious dep"
+version: 1
+params:
+  - name: items
+    type: list<record>
+    fields:
+      name: string
+      value: string
+for_each:
+  item: "{{items}}"
+tasks:
+  - id: process
+    action: answer
+    prompt: "Process {{item.name}}: {{item.value}}"
+`)
+	_, err := Parse(body)
+	if err != nil {
+		t.Fatalf("{{item.name}} should not create a spurious dep on task 'item': %v", err)
+	}
+}
+
+func TestLRP4_UnreferencedForEachVarStillFlagged(t *testing.T) {
+	// A for_each var that's never referenced at all (not bare, not field) still errors.
+	body := []byte(`
+name: "Unused var"
+version: 1
+params:
+  - name: items
+    type: list<record>
+    fields:
+      name: string
+for_each:
+  item: "{{items}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "No mention of the variable here"
+`)
+	_, err := Parse(body)
+	if err == nil {
+		t.Fatal("expected error for unused for_each variable")
+	}
+	if !strings.Contains(err.Error(), "item") {
+		t.Errorf("error should mention variable name, got: %v", err)
+	}
+}
+
