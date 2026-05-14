@@ -22,9 +22,10 @@ import (
 //   - Runs for the active project (state + branch + task count)
 //
 // Deferred to follow-ups:
-//   --watch       event-log subscription primitive lands later
-//   bot list      blocked on the bot-supervisor CLI wiring (sibling spec)
-//   recent commits  would shell out to git; not load-bearing for v1
+//
+//	--watch       event-log subscription primitive lands later
+//	bot list      blocked on the bot-supervisor CLI wiring (sibling spec)
+//	recent commits  would shell out to git; not load-bearing for v1
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	projectID := fs.Int64("project", 0, "Override project resolution (numeric id)")
@@ -95,6 +96,7 @@ type statusReport struct {
 	Coordinator   string     `json:"coordinator"`
 	CoordOK       bool       `json:"coordinator_ok"`
 	CoordError    string     `json:"coordinator_error,omitempty"`
+	As            string     `json:"as,omitempty"`
 	Runs          []wire.Run `json:"runs,omitempty"`
 }
 
@@ -105,6 +107,9 @@ func renderProjectStatus(ctx context.Context, sess *cliSession, entry *projectre
 		ProjectPath:   entry.LocalPath,
 		DefaultBranch: entry.DefaultBranch,
 		Coordinator:   sess.URL,
+	}
+	if sess.Creds != nil {
+		rep.As = sess.Creds.Username
 	}
 
 	// Use ListProjects as the cheapest reachability probe; it
@@ -148,6 +153,9 @@ func renderProjectStatusHuman(w io.Writer, r statusReport) {
 		fmt.Fprintf(w, "Coord:   %s (✗ %s)\n", r.Coordinator, r.CoordError)
 		return
 	}
+	if r.As != "" {
+		fmt.Fprintf(w, "As:      @%s\n", r.As)
+	}
 
 	if len(r.Runs) == 0 {
 		fmt.Fprintln(w, "\nNo runs yet.")
@@ -158,15 +166,15 @@ func renderProjectStatusHuman(w io.Writer, r statusReport) {
 	if len(active) > 0 {
 		fmt.Fprintln(w, "\nActive runs:")
 		for _, run := range active {
-			fmt.Fprintf(w, "  #%d %-30s %-10s branch=%s\n",
-				run.Seq, run.Name, run.State, run.Branch)
+			fmt.Fprintf(w, "  #%d %-30s %-10s tasks=%d branch=%s\n",
+				run.Seq, run.Name, run.State, run.TaskCount, run.Branch)
 		}
 	}
 	if len(terminal) > 0 {
 		fmt.Fprintf(w, "\nRecent (last %d):\n", len(terminal))
 		for _, run := range terminal {
-			fmt.Fprintf(w, "  #%d %-30s %-10s branch=%s\n",
-				run.Seq, run.Name, run.State, run.Branch)
+			fmt.Fprintf(w, "  #%d %-30s %-10s tasks=%d branch=%s\n",
+				run.Seq, run.Name, run.State, run.TaskCount, run.Branch)
 		}
 	}
 }
@@ -234,7 +242,11 @@ func renderAllProjects(ctx context.Context, sess *cliSession, asJSON bool) error
 	for _, e := range entries {
 		display := e.LocalPath
 		if rel, err := filepath.Rel(mustHome(), e.LocalPath); err == nil && !strings.HasPrefix(rel, "..") {
-			display = "~/" + rel
+			if rel == "." {
+				display = "~"
+			} else {
+				display = "~/" + rel
+			}
 		}
 		name := e.Name
 		if name == "" {

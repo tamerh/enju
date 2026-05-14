@@ -1124,11 +1124,11 @@ func validateActionFields(t *TaskDef) error {
 // validateForEachScopes enforces the two run-wide invariants
 // on for_each use:
 //
-//   1. Run-level and task-level for_each are mutually
-//      exclusive. Authors pick one or the other per run.
-//   2. If multiple tasks declare task-level for_each, they
-//      must agree on the same variable space. A single run
-//      supports one iteration dimension at a time.
+//  1. Run-level and task-level for_each are mutually
+//     exclusive. Authors pick one or the other per run.
+//  2. If multiple tasks declare task-level for_each, they
+//     must agree on the same variable space. A single run
+//     supports one iteration dimension at a time.
 func validateForEachScopes(p *Run, hasTaskLevelForEach bool) error {
 	if len(p.ForEach) > 0 && hasTaskLevelForEach {
 		return fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
@@ -1273,6 +1273,14 @@ func injectReviewGating(p *Run) []string {
 		// holds the reader PENDING until the writer is
 		// ACCEPTED. Counting these here keeps the lint aligned
 		// with runtime DAG semantics.
+		//
+		// Scope: this mirrors wireArtifactDeps, which today
+		// pairs only on explicit reads_artifacts / writes_artifacts
+		// declarations — not on {{artifact:path}} prompt refs
+		// (those resolve content but don't currently wire DAG
+		// edges). If wireArtifactDeps ever widens to include
+		// prompt-ref reads, mirror the broadened check here so
+		// the two stay in lockstep.
 		var targetWrites []string
 		for k := range p.Tasks {
 			if p.Tasks[k].ID == target {

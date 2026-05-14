@@ -20,16 +20,17 @@ import (
 //
 // Out of scope for this revision (deferred per scope-narrowing
 // discussion):
-//   --watch       requires the event-log subscription primitive
-//                 that lands with the sync-model work.
-//   --dry-run     useful but additive; ship after the core flow.
-//   --no-bots     no-op today since `enju go` doesn't start bots
-//                 at all (the bot auto-lifecycle is in-flight
-//                 in a sibling spec). Compute tasks drain;
-//                 citizen-action gates surface as Blocker.
-//   --parallel    ExecuteRun supports it but the multi-task
-//                 commit-author / scratch-dir contention story
-//                 isn't worth surfacing on the CLI yet.
+//
+//	--watch       requires the event-log subscription primitive
+//	              that lands with the sync-model work.
+//	--dry-run     useful but additive; ship after the core flow.
+//	--no-bots     no-op today since `enju go` doesn't start bots
+//	              at all (the bot auto-lifecycle is in-flight
+//	              in a sibling spec). Compute tasks drain;
+//	              citizen-action gates surface as Blocker.
+//	--parallel    ExecuteRun supports it but the multi-task
+//	              commit-author / scratch-dir contention story
+//	              isn't worth surfacing on the CLI yet.
 func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
@@ -69,7 +70,7 @@ func cmdGo(args []string) {
 		os.Exit(2)
 	}
 
-	projectID, projectRoot, err := resolveOrRegisterProject(ctx, sess, workflowAbs, *name)
+	projectID, projectRoot, err := resolveOrRegisterProject(ctx, sess, workflowAbs, *name, *asJSON)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolve project: %v\n", err)
 		os.Exit(1)
@@ -113,14 +114,23 @@ func cmdGo(args []string) {
 // workflowAbs by walking the project registry's local_path
 // entries. Returns (projectID, projectRoot). If no entry covers
 // the workflow, registers a fresh project rooted at the
-// workflow's directory (or its nearest .git ancestor).
+// workflow's nearest .git ancestor (or its containing directory
+// if no .git is found).
 //
-// Auto-register matches the spec's "If cwd's project isn't
-// registered with coord, register it (project name = cwd
-// basename, or `--name X`)" intent. Operators who don't want
-// this behavior can pre-register via `enju mcp` +
-// enju_create_project first.
-func resolveOrRegisterProject(ctx context.Context, sess *cliSession, workflowAbs, nameOverride string) (int64, string, error) {
+// Naming intent vs. implementation: the spec's prose talks
+// about "cwd's project" — in the common case (operator runs
+// `enju go workflow.yaml` from inside the project) cwd and the
+// workflow's directory coincide and the choice doesn't matter.
+// When the operator passes an absolute path to a workflow under
+// a different tree, this implementation prefers the workflow's
+// ancestry over cwd: the workflow's repo is what the run will
+// execute against, so registering THAT repo is the right
+// anchor. Operators who don't want auto-registration can
+// pre-register via `enju mcp` + enju_create_project first.
+//
+// asJSON routes the auto-register informational line through
+// logf so JSON-mode consumers see only structured output.
+func resolveOrRegisterProject(ctx context.Context, sess *cliSession, workflowAbs, nameOverride string, asJSON bool) (int64, string, error) {
 	reg := sess.FC.ProjectRegistry()
 	if reg == nil {
 		return 0, "", fmt.Errorf("no project registry configured")
@@ -138,7 +148,7 @@ func resolveOrRegisterProject(ctx context.Context, sess *cliSession, workflowAbs
 	if projectName == "" {
 		projectName = filepath.Base(root)
 	}
-	fmt.Fprintf(os.Stderr, "▶ no registered project covers %s; registering %q at %s\n", workflowAbs, projectName, root)
+	logf(asJSON, "▶ no registered project covers %s; registering %q at %s", workflowAbs, projectName, root)
 	res, err := sess.FC.CreateProject(ctx, service.CreateProjectParams{
 		Name: projectName,
 		Path: root,
@@ -201,6 +211,16 @@ func projectRootCandidate(workflowAbs string) string {
 // MaterializeRunFromData, not the older CommitRunTemplateSnapshot
 // service helper).
 //
+// PARITY: this is the second site implementing the same path=
+// create_run sequence. The first is mcphandlers/run.go's
+// handleCreateRun. Any fix to one MUST be mirrored to the
+// other until the shared bits are promoted into a service
+// helper (e.g. FatClient.CreateRunFromPath that takes the
+// snapshot-mode flag). Two-site duplication is deliberate —
+// service.CreateRunFromTemplate still uses the older
+// CommitRunTemplateSnapshot path and isn't reusable for path=
+// mode yet. Tracked follow-up: unify both call sites.
+//
 // Returns the run's per-project seq and the global run_id from
 // the coord response. Surfaces ensure-branch / snapshot
 // warnings to stderr as the MCP handler does.
@@ -240,7 +260,10 @@ func createRun(ctx context.Context, fc *service.FatClient, projectID int64, temp
 	}
 	fc.TouchProject(projectID)
 
-	seq, runID := runIdentityFromCreateResponse(data)
+	seq, runID, idErr := runIdentityFromCreateResponse(data)
+	if idErr != nil {
+		return 0, 0, fmt.Errorf("decoding coord response: %w: %s", idErr, string(data))
+	}
 	if seq == 0 || runID == 0 {
 		return 0, 0, fmt.Errorf("coord response missing seq/id: %s", string(data))
 	}
@@ -250,14 +273,17 @@ func createRun(ctx context.Context, fc *service.FatClient, projectID int64, temp
 // runIdentityFromCreateResponse extracts (seq, run_id) from the
 // /runs POST response. Coord returns JSON-number values; encoded
 // through encoding/json those land as float64 in a generic map.
-func runIdentityFromCreateResponse(data []byte) (int, int64) {
+// Returns a non-nil error only when JSON parsing fails; missing
+// seq/id fields produce zeros + nil error so the caller can
+// distinguish "malformed wire" from "decoded but absent."
+func runIdentityFromCreateResponse(data []byte) (int, int64, error) {
 	var m map[string]interface{}
 	if err := json.Unmarshal(data, &m); err != nil {
-		return 0, 0
+		return 0, 0, err
 	}
 	seq, _ := m["seq"].(float64)
 	id, _ := m["id"].(float64)
-	return int(seq), int64(id)
+	return int(seq), int64(id), nil
 }
 
 func errorFromCoord(data []byte) string {
@@ -302,16 +328,29 @@ func parseParamsArg(arg string) (map[string]interface{}, error) {
 }
 
 // renderExecuteResult prints the per-task lines + the trailing
-// stop-reason summary. JSON mode emits one JSON object per
-// entry (newline-delimited) plus a final summary record so
-// scripted consumers can stream-parse without buffering.
+// stop-reason summary. JSON mode emits NDJSON: one record per
+// task entry followed by a single summary record. Every record
+// carries a `type` discriminator ("entry" or "summary") so a
+// stream consumer can dispatch on a stable field rather than
+// guessing from field presence.
 func renderExecuteResult(w io.Writer, res *service.ExecuteRunResult, asJSON bool) {
 	if asJSON {
 		for _, e := range res.Entries {
-			b, _ := json.Marshal(e)
+			rec := map[string]any{
+				"type":       "entry",
+				"task_id":    e.TaskID,
+				"status":     e.Status,
+				"script":     e.Script,
+				"elapsed_ms": e.ElapsedMS,
+				"commit_sha": e.CommitSHA,
+				"reason":     e.Reason,
+				"artifacts":  e.Artifacts,
+			}
+			b, _ := json.Marshal(rec)
 			fmt.Fprintln(w, string(b))
 		}
 		summary := map[string]any{
+			"type":              "summary",
 			"stop_reason":       res.StopReason,
 			"blocker":           res.Blocker,
 			"self_stuck_claims": res.SelfStuckClaims,

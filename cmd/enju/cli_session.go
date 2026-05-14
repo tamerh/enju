@@ -23,8 +23,8 @@ import (
 // the operator can fix it rather than silently registering a
 // drive-by citizen.
 type cliSession struct {
-	FC   *service.FatClient
-	URL  string
+	FC    *service.FatClient
+	URL   string
 	Creds *credentials
 }
 

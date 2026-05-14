@@ -484,6 +484,15 @@ func (c *apiClient) handleSetCycleBudget(ctx context.Context, req mcp.CallToolRe
 func runBranchFromData(runData []byte) string { return service.RunBranchFromData(runData) }
 func runSlugFromData(runData []byte) string   { return service.RunSlugFromData(runData) }
 
+// PARITY: this handler's path= branch (PrepareRunTemplate →
+// POST → EnsureRunBranch → MaterializeRunFromData) is mirrored
+// in cmd/enju/go.go:createRun, which the CLI's `enju go` uses.
+// Any fix to the sequence below MUST be mirrored there until
+// the shared bits are promoted into a service helper (e.g.
+// FatClient.CreateRunFromPath). The existing
+// service.CreateRunFromTemplate still uses the older
+// CommitRunTemplateSnapshot path and isn't reusable for the
+// path= flow yet.
 func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	projectID, err := req.RequireInt("project_id")
 	if err != nil {
