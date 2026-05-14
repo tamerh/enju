@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"sync"
 
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
@@ -26,6 +31,73 @@ type cliSession struct {
 	FC    *service.FatClient
 	URL   string
 	Creds *credentials
+
+	// Bot supervisor — lazily constructed by Supervisor()
+	// because only the auto_bots code path needs it. Sharing
+	// the same lazy-init shape as mcphandlers/client.go's
+	// botSupervisor so the cross-session reconcile (pruning
+	// stale auto_run_ids from a prior fatclient session) fires
+	// the same way for both MCP and CLI callers.
+	supervisorMu sync.Mutex
+	supervisor   *bots.Supervisor
+}
+
+// Supervisor returns the lazily-constructed bot supervisor for
+// this session. First call resolves ~/.enju/bots/{pids,logs} and
+// kicks off a background reconcile against the coord; subsequent
+// calls return the cached instance. Mirrors
+// mcphandlers/client.go:botSupervisor so the two paths stay
+// behaviorally identical.
+func (s *cliSession) Supervisor() (*bots.Supervisor, error) {
+	s.supervisorMu.Lock()
+	defer s.supervisorMu.Unlock()
+	if s.supervisor != nil {
+		return s.supervisor, nil
+	}
+	sup, err := bots.NewSupervisor()
+	if err != nil {
+		return nil, err
+	}
+	s.supervisor = sup
+	// Fire reconcile in a goroutine — coord round-trip would
+	// otherwise block every auto-bots invocation on startup.
+	// Stale refs that survive this pass are GC'd lazily by the
+	// next terminal event the tailer observes.
+	go func() {
+		if rerr := sup.Reconcile(context.Background(), s.isRunTerminal); rerr != nil {
+			slog.Default().Warn("supervisor reconcile failed", "error", rerr)
+		}
+	}()
+	return sup, nil
+}
+
+// isRunTerminal mirrors mcphandlers/client.go:isRunTerminal —
+// returns terminal=true when the coord reports a terminal run
+// state OR when the coord doesn't know the run (HTTP 404 →
+// coord DB was wiped). The bias toward "terminal on 404"
+// matches the MCP path: a stale auto_run_id pointing at a
+// vanished run serves no purpose.
+func (s *cliSession) isRunTerminal(ctx context.Context, projectID, runSeq int64) (bool, error) {
+	data, status, err := s.FC.Coord().GetStatus(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusNotFound {
+		return true, nil
+	}
+	if status >= 400 {
+		return false, fmt.Errorf("coord run lookup: HTTP %d", status)
+	}
+	var resp map[string]any
+	if jerr := json.Unmarshal(data, &resp); jerr != nil {
+		return false, fmt.Errorf("decode run: %w", jerr)
+	}
+	state, _ := resp["state"].(string)
+	switch state {
+	case "completed", "failed", "terminated":
+		return true, nil
+	}
+	return false, nil
 }
 
 // openCLISession resolves coord URL → credentials → workspace →

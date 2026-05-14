@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,18 +27,12 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// autoBotsReadyTimeout is how long create_run waits for each
-// bot to reach PhaseReady. Defaults to 30s; tunable via env
-// for first-touch demos with cold claude-CLI subprocesses that
-// need longer warmup, and for tests that want to fail fast
-// without waiting for the production timeout.
+// autoBotsReadyTimeout is preserved as a thin alias so the
+// existing TestAutoBotsReadyTimeout_* regression tests keep
+// passing without modification. New code reads
+// bots.AutoRunReadyTimeout directly.
 func autoBotsReadyTimeout() time.Duration {
-	if v := os.Getenv("ENJU_AUTO_BOTS_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-	return 30 * time.Second
+	return bots.AutoRunReadyTimeout()
 }
 
 // rollbackAutoStarts is preserved for the existing
@@ -648,7 +641,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: supervisor init: %v", perr)), nil
 		}
 		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
-		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, c.fc.Coord().BaseURL(), int64(projectID), autoBotsReadyTimeout())
+		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, c.fc.Coord().BaseURL(), int64(projectID), bots.AutoRunReadyTimeout())
 
 		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
 			autoRunMgr.Rollback(ctx)

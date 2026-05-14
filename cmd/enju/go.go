@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
@@ -39,6 +41,7 @@ func cmdGo(args []string) {
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
+	autoBots := fs.Bool("auto-bots", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_bots flag.")
 	fs.Parse(args)
 
 	if fs.NArg() != 1 {
@@ -85,12 +88,27 @@ func cmdGo(args []string) {
 	logf(*asJSON, "▶ project %d at %s", projectID, projectRoot)
 	logf(*asJSON, "▶ workflow %s", templatePath)
 
-	runSeq, runID, err := createRun(ctx, sess.FC, projectID, templatePath, params, *branch)
+	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, *autoBots)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create run: %v\n", err)
 		os.Exit(1)
 	}
 	logf(*asJSON, "▶ run #%d created (id=%d)", runSeq, runID)
+
+	if *autoBots {
+		// Bot-driven runs cycle until the run reaches a
+		// terminal state. ExecuteRun drains compute until a
+		// citizen gate; the bot daemons resolve those gates;
+		// new compute becomes ready; we re-enter ExecuteRun.
+		// The loop exits when isRunTerminal reports
+		// completed/failed/terminated, at which point the
+		// supervisor's tailer has fired auto-stop on every
+		// auto-managed bot.
+		if exit := driveAutoBotsRun(ctx, sess, int(projectID), int(runID), runSeq, *maxTasks, *asJSON); exit != 0 {
+			os.Exit(exit)
+		}
+		return
+	}
 
 	res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
 		ProjectID: int(projectID),
@@ -108,6 +126,62 @@ func cmdGo(args []string) {
 		res.StopReason == service.StopComputeErrored ||
 		res.StopReason == service.StopGitOperationFailed {
 		os.Exit(1)
+	}
+}
+
+// driveAutoBotsRun is the --auto-bots execution loop. Cycles
+// ExecuteRun + terminal-state polling until the coord reports
+// the run completed / failed / terminated. Returns the shell
+// exit code (0 = success, 1 = compute or git failure).
+//
+// Why this exists: the supervisor's auto-stop tailer reads
+// live.jsonl on a goroutine owned by THIS process. If the
+// CLI exits before the run reaches a terminal state, the
+// goroutine is reaped and no auto-stop event ever fires for
+// the workflow's bots. The synchronous loop keeps the
+// process alive long enough for the terminal event to arrive.
+//
+// Poll interval is conservative (2s) — long enough that idle
+// runs don't hammer coord, short enough that humans don't
+// perceive lag between bot work completing and the next
+// compute round kicking off.
+func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, runSeq, maxTasks int, asJSON bool) int {
+	const pollInterval = 2 * time.Second
+	for {
+		res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
+			ProjectID: projectID,
+			RunID:     runID,
+			MaxTasks:  maxTasks,
+			Parallel:  1,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
+			return 1
+		}
+		renderExecuteResult(os.Stdout, res, asJSON)
+		if res.StopReason == service.StopComputeFailed ||
+			res.StopReason == service.StopComputeErrored ||
+			res.StopReason == service.StopGitOperationFailed {
+			return 1
+		}
+
+		// Check terminal state via coord. Cheap (one GET); the
+		// auto-managed bots are independently working through
+		// citizen tasks between our compute drains.
+		terminal, terr := sess.isRunTerminal(ctx, int64(projectID), int64(runSeq))
+		if terr == nil && terminal {
+			logf(asJSON, "▶ run terminal — auto-stop tailer will fire on any auto-managed bots")
+			return 0
+		}
+
+		// Wait a beat, then re-enter. ctx.Done lets the
+		// operator Ctrl-C out cleanly.
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(os.Stderr, "interrupted; auto-managed bots may still be running — use `enju bot list` and `enju_bot_stop` if needed")
+			return 1
+		case <-time.After(pollInterval):
+		}
 	}
 }
 
@@ -206,42 +280,57 @@ func projectRootCandidate(workflowAbs string) string {
 }
 
 // createRun runs the path= flavor of enju_create_run from CLI:
-// PrepareRunTemplate → POST → EnsureRunBranch → MaterializeRunFromData
-// → TouchProject. Mirrors mcphandlers/run.go:handleCreateRun for
+// PrepareRunTemplate → (optional auto_bots Preflight) → POST →
+// EnsureRunBranch → MaterializeRunFromData → (optional HookRunSeq) →
+// TouchProject. Mirrors mcphandlers/run.go:handleCreateRun for
 // the path= branch (the snapshot writeback uses the modern
 // MaterializeRunFromData, not the older CommitRunTemplateSnapshot
 // service helper).
 //
 // PARITY: this is the second site implementing the same path=
 // create_run sequence. The first is mcphandlers/run.go's
-// handleCreateRun. Any fix to one MUST be mirrored to the
-// other until the shared bits are promoted into a service
-// helper (e.g. FatClient.CreateRunFromPath that takes the
-// snapshot-mode flag). Two-site duplication is deliberate —
-// service.CreateRunFromTemplate still uses the older
-// CommitRunTemplateSnapshot path and isn't reusable for path=
-// mode yet. Tracked follow-up: unify both call sites.
-//
-// GAP (auto_bots): handleCreateRun added an auto_bots=true
-// preflight (start every workflow bot, WaitForReady, MarkAutoRun
-// post-POST, register the live.jsonl tailer for auto-stop on
-// run completion). This CLI path does NOT yet honor it — `enju
-// go` runs always behave as auto_bots=false. Mirroring the
-// logic here is non-trivial (it owns Supervisor construction +
-// bot lifecycle), so the cleaner path is the shared helper
-// promotion: extract auto_bots preflight / hookup / rollback
-// into a service or bots-package helper that BOTH this CLI
-// path and handleCreateRun call. Until then, operators who
-// want auto_bots use the MCP create_run tool, not `enju go`.
+// handleCreateRun. The auto_bots state machine is shared via
+// bots.AutoRunManager so both sites can't drift on bot-lifecycle
+// fixes; the surrounding POST + snapshot + ensure-branch
+// sequence is still duplicated (a future
+// FatClient.CreateRunFromPath could unify it).
 //
 // Returns the run's per-project seq and the global run_id from
 // the coord response. Surfaces ensure-branch / snapshot
 // warnings to stderr as the MCP handler does.
-func createRun(ctx context.Context, fc *service.FatClient, projectID int64, templatePath string, params map[string]interface{}, branch string) (int, int64, error) {
+func createRun(ctx context.Context, sess *cliSession, projectID int64, templatePath string, params map[string]interface{}, branch string, autoBots bool) (int, int64, error) {
+	fc := sess.FC
 	authorName, authorEmail := fc.CommitAuthor(ctx)
 	prep, err := fc.PrepareRunTemplate(ctx, projectID, templatePath, authorName, authorEmail)
 	if err != nil {
 		return 0, 0, err
+	}
+
+	// auto_bots preflight (mirrors handleCreateRun). Same
+	// AutoRunManager type so any bug fix in bot lifecycle
+	// lands in both places automatically.
+	var autoRunMgr *bots.AutoRunManager
+	if autoBots {
+		if prep == nil || prep.LoadedTemplate == nil {
+			return 0, 0, fmt.Errorf("auto_bots: workflow prep is empty (internal error)")
+		}
+		manifest, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots)
+		if perr != nil {
+			return 0, 0, fmt.Errorf("auto_bots: parsing bots: %w", perr)
+		}
+		if manifest == nil || len(manifest.Bots) == 0 {
+			return 0, 0, fmt.Errorf("--auto-bots set but workflow at %s declares no bots in its inline bots: section", templatePath)
+		}
+		sup, perr := sess.Supervisor()
+		if perr != nil {
+			return 0, 0, fmt.Errorf("auto_bots: supervisor init: %w", perr)
+		}
+		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
+		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, fc.Coord().BaseURL(), projectID, bots.AutoRunReadyTimeout())
+		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
+			autoRunMgr.Rollback(ctx)
+			return 0, 0, fmt.Errorf("auto_bots: %w", perr)
+		}
 	}
 
 	body := map[string]interface{}{
@@ -259,9 +348,20 @@ func createRun(ctx context.Context, fc *service.FatClient, projectID int64, temp
 
 	data, err := fc.Coord().Post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID), body)
 	if err != nil {
+		// POST failed after preflight already spun up the
+		// fleet. Roll back so a coord-side failure doesn't
+		// leak bots that no run will ever reference. The
+		// manager's Rollback only touches freshStarts —
+		// operator-owned bots survive.
+		if autoRunMgr != nil {
+			autoRunMgr.Rollback(ctx)
+		}
 		return 0, 0, err
 	}
 	if msg := errorFromCoord(data); msg != "" {
+		if autoRunMgr != nil {
+			autoRunMgr.Rollback(ctx)
+		}
 		return 0, 0, fmt.Errorf("%s", msg)
 	}
 
