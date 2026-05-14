@@ -429,6 +429,24 @@ func validateRunForEach(p *Run) error {
 			}
 		}
 	}
+	// Multi-variable for_each with a list<record> source is not yet
+	// supported. cartesianProduct only handles []string values and would
+	// silently drop the record metadata, leaving {{var.field}} refs
+	// unresolved in prompts. Reject now; extend when there's a concrete
+	// use case.
+	if len(p.ForEach) > 1 {
+		paramByName := make(map[string]*ParamDef, len(p.Params))
+		for i := range p.Params {
+			paramByName[p.Params[i].Name] = &p.Params[i]
+		}
+		for varName, src := range p.ForEach {
+			if paramName, ok := parseForEachParamRef(src.Ref); ok {
+				if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+					return fmt.Errorf("run for_each: variable %q references list<record> param %q — multi-variable for_each with a list<record> source is not yet supported; use a single for_each variable", varName, paramName)
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -450,13 +468,16 @@ func validateParams(p *Run) ([]string, error) {
 		}
 		paramNames[pp.Name] = true
 		if !isValidParamType(pp.Type) {
-			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, or list<string>)", pp.Name, pp.Type)
+			return nil, fmt.Errorf("param %q: invalid type %q (must be string, int, bool, list<string>, or list<record>)", pp.Name, pp.Type)
+		}
+		if err := validateParamDef(pp); err != nil {
+			return nil, err
 		}
 		if pp.Required && pp.Default != nil {
 			return nil, fmt.Errorf("param %q: required and default are mutually exclusive", pp.Name)
 		}
 		if pp.Default != nil {
-			if err := checkParamValueType(pp.Name, pp.Type, pp.Default); err != nil {
+			if err := checkParamValueType(pp, pp.Default); err != nil {
 				return nil, err
 			}
 		}
@@ -465,6 +486,50 @@ func validateParams(p *Run) ([]string, error) {
 		}
 	}
 	return warnings, nil
+}
+
+// validateParamDef enforces the list<record>-specific shape rules
+// and defaults Key to the first declared field when absent.
+// Called for every param after the type is confirmed valid.
+func validateParamDef(pp *ParamDef) error {
+	if pp.Type == "list<record>" {
+		if pp.Fields.Len() == 0 {
+			return fmt.Errorf("param %q (list<record>): fields: is required — declare the record shape with field-name: type pairs", pp.Name)
+		}
+		for _, fname := range pp.Fields.Names() {
+			ftype, _ := pp.Fields.TypeOf(fname)
+			switch ftype {
+			case "string", "int", "bool":
+				// ok
+			default:
+				return fmt.Errorf("param %q fields.%s: unsupported type %q (must be string, int, or bool)", pp.Name, fname, ftype)
+			}
+			// Double-underscore is the env-var field separator
+			// (ENJU_PARAM_<var>__<field>). A field name containing
+			// __ would produce a collision with another field's
+			// env var slot.
+			if strings.Contains(fname, "__") {
+				return fmt.Errorf("param %q fields.%s: field names must not contain \"__\" (reserved for env var expansion)", pp.Name, fname)
+			}
+		}
+		if pp.Key != "" {
+			if _, ok := pp.Fields.TypeOf(pp.Key); !ok {
+				known := pp.Fields.Names()
+				return fmt.Errorf("param %q: key: %q is not a declared field (known fields: %s)", pp.Name, pp.Key, strings.Join(known, ", "))
+			}
+		} else {
+			// Default key to the first declared field.
+			pp.Key = pp.Fields.FirstName()
+		}
+	} else {
+		if pp.Fields.Len() > 0 {
+			return fmt.Errorf("param %q: fields: is only valid on type: list<record> (got %q)", pp.Name, pp.Type)
+		}
+		if pp.Key != "" {
+			return fmt.Errorf("param %q: key: is only valid on type: list<record> (got %q)", pp.Name, pp.Type)
+		}
+	}
+	return nil
 }
 
 // validateTasks walks every task def and enforces per-task
@@ -481,6 +546,11 @@ func validateParams(p *Run) ([]string, error) {
 // t.Action = "answer" for tasks that left it blank — so the
 // action check below expects every task to have an action.
 func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err error) {
+	paramByName := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		paramByName[p.Params[i].Name] = &p.Params[i]
+	}
+
 	ids = make(map[string]bool)
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
@@ -553,6 +623,21 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 			hasTaskLevelForEach = true
 			if err := validateForEachMap("task "+t.ID, t.ForEach); err != nil {
 				return nil, false, err
+			}
+			// list<record> for_each sources are only supported at the
+			// run level. Task-level iteration over a record param would
+			// require threading record metadata through cartesianProduct
+			// and per-task build logic — deferred until there's a real
+			// use case. Declare the for_each at the run level instead.
+			for varName, src := range t.ForEach {
+				if paramName, ok := parseForEachParamRef(src.Ref); ok {
+					if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+						return nil, false, fmt.Errorf(
+							"task %q: for_each variable %q references list<record> param %q — list<record> for_each sources are supported at run level only; declare the for_each at the run level",
+							t.ID, varName, paramName,
+						)
+					}
+				}
 			}
 		}
 	}

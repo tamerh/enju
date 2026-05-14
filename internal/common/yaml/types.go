@@ -77,6 +77,62 @@ type Run struct {
 	AutoTriage *RemediationTemplate `yaml:"auto_triage,omitempty"`
 }
 
+// RecordFields is an ordered map from field name to scalar type
+// ("string", "int", or "bool"), used to declare the shape of a
+// list<record> param. The insertion order from the YAML document
+// is preserved via a custom unmarshaller that walks yaml.v3
+// Node.Content pairs instead of the unordered Go map decoder.
+//
+// Ordered keys matter in two places:
+//  1. ParamDef.Key default: the first declared field is the key
+//     when no explicit key: is supplied.
+//  2. Deterministic error messages during validation.
+type RecordFields struct {
+	names []string
+	types map[string]string
+}
+
+// UnmarshalYAML walks the mapping node in YAML declaration order so
+// field insertion order is preserved in rf.names.
+func (rf *RecordFields) UnmarshalYAML(node *yamlv3.Node) error {
+	if node.Kind != yamlv3.MappingNode {
+		return fmt.Errorf("fields: must be a map of field-name: type pairs (e.g. name: string)")
+	}
+	rf.types = make(map[string]string, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		name := node.Content[i].Value
+		typ := node.Content[i+1].Value
+		if _, dup := rf.types[name]; dup {
+			return fmt.Errorf("fields: duplicate field name %q", name)
+		}
+		rf.names = append(rf.names, name)
+		rf.types[name] = typ
+	}
+	return nil
+}
+
+// Names returns the field names in YAML declaration order.
+func (rf RecordFields) Names() []string { return rf.names }
+
+// TypeOf returns the declared scalar type for the named field and
+// whether the field was declared.
+func (rf RecordFields) TypeOf(name string) (string, bool) {
+	t, ok := rf.types[name]
+	return t, ok
+}
+
+// Len returns the number of declared fields.
+func (rf RecordFields) Len() int { return len(rf.names) }
+
+// FirstName returns the first declared field name (insertion order).
+// Returns "" when no fields are declared.
+func (rf RecordFields) FirstName() string {
+	if len(rf.names) == 0 {
+		return ""
+	}
+	return rf.names[0]
+}
+
 // ParamDef declares a single top-level run parameter. A run with
 // `params:` declared is a reusable recipe: the same YAML file can
 // be submitted directly (with values provided at submission time)
@@ -87,11 +143,21 @@ type Run struct {
 // a template into a conversation with the user — keep it
 // user-facing, not implementation-facing.
 type ParamDef struct {
-	Name        string      `yaml:"name"`
-	Type        string      `yaml:"type"`                  // string | int | bool | list<string>
-	Required    bool        `yaml:"required,omitempty"`
-	Default     interface{} `yaml:"default,omitempty"`
-	Description string      `yaml:"description,omitempty"` // natural-language description for the LLM
+	Name        string       `yaml:"name"`
+	Type        string       `yaml:"type"`                  // string | int | bool | list<string> | list<record>
+	Required    bool         `yaml:"required,omitempty"`
+	Default     interface{}  `yaml:"default,omitempty"`
+	Description string       `yaml:"description,omitempty"` // natural-language description for the LLM
+	// Key names the field whose value stamps the instance key (task ID
+	// slug, result-dir name, branch segment). Required to be one of the
+	// declared fields when set. When absent, defaults to the first
+	// declared field at parse time. Only valid on type: list<record>.
+	Key         string       `yaml:"key,omitempty"`
+	// Fields declares the flat record shape: field name → scalar type
+	// ("string", "int", or "bool"). Required on type: list<record>;
+	// rejected on every other type. Insertion order is preserved so
+	// the default Key (first field) is deterministic.
+	Fields      RecordFields `yaml:"fields,omitempty"`
 }
 
 // TaskDefaults holds default values for all tasks.
@@ -118,11 +184,18 @@ func (s *yamlStringList) UnmarshalYAML(value *yamlv3.Node) error {
 }
 
 // ForEachSource is the source of values for one for_each
-// variable. Exactly one of Values or Ref is populated.
+// variable. Exactly one of Values/RecordValues or Ref is populated
+// after parse-time substitution.
 //
-// - Values:  a literal list from YAML (`gene: [BRCA1, TP53]`)
-// - Ref:     a template reference resolved at submit time
-//            (`gene: "{{discover.gene_symbols}}"`)
+// - Values:       a literal list from YAML (`gene: [BRCA1, TP53]`)
+//                 OR the key-field values after a list<record>
+//                 param ref is resolved.
+// - RecordValues: populated alongside Values when the source is a
+//                 list<record> param. RecordValues[i] is the full
+//                 record map for Values[i]. Nil for list<string>
+//                 sources.
+// - Ref:          a template reference resolved at submit time
+//                 (`gene: "{{discover.gene_symbols}}"`)
 //
 // Phase J.1 adds Ref to support dynamic fan-out — a task
 // whose for_each list comes from an upstream task's named
@@ -130,8 +203,12 @@ func (s *yamlStringList) UnmarshalYAML(value *yamlv3.Node) error {
 // (`for_each:`) whether the values are static or dynamic;
 // only the per-variable shape (list vs scalar) changes.
 type ForEachSource struct {
-	Values []string
-	Ref    string
+	Values       []string
+	Ref          string
+	// RecordValues holds the full record maps when Values was populated
+	// from a list<record> param. len(RecordValues) == len(Values) when
+	// non-nil. Nil for list<string> and literal-list sources.
+	RecordValues []map[string]interface{}
 }
 
 // ForEachMap is a map from for_each variable name to its
@@ -193,6 +270,21 @@ func (f ForEachMap) StaticValues() map[string][]string {
 	for k, src := range f {
 		if src.Ref == "" {
 			out[k] = src.Values
+		}
+	}
+	return out
+}
+
+// StaticSources returns all resolved (non-dynamic) sources,
+// including both list<string> sources (Values) and list<record>
+// sources (RecordValues). Used by build paths that need the full
+// ForEachSource to detect and expand record-typed variables.
+// Dynamic entries (still-unresolved Refs) are omitted.
+func (f ForEachMap) StaticSources() map[string]ForEachSource {
+	out := make(map[string]ForEachSource, len(f))
+	for k, src := range f {
+		if src.Ref == "" {
+			out[k] = src
 		}
 	}
 	return out

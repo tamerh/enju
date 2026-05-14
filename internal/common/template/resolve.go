@@ -61,17 +61,30 @@ func InferDependencies(prompt string) []string {
 }
 
 // ResolveParams replaces {{param_name}} with values from the params map.
-// Only replaces bare references (no dot), leaving task references untouched.
+// Handles two forms:
+//   - bare {{name}} — resolved when name is a key in params.
+//   - dotted {{var.field}} — resolved when "var.field" is a key in params
+//     (used for for_each record field refs like {{entry.name}}).
+//     Task references whose "taskID.field" key is NOT in params pass through
+//     unchanged so the claim-time resolver can handle them.
 func ResolveParams(prompt string, params map[string]string) string {
 	return refPattern.ReplaceAllStringFunc(prompt, func(match string) string {
 		sub := refPattern.FindStringSubmatch(match)
 		if sub[2] == "" {
-			// Bare {{param}} — check if it's in params
+			// Bare {{param}} — check if it's in params.
 			if val, ok := params[sub[1]]; ok {
 				return val
 			}
+		} else {
+			// Dotted {{var.field}} — resolve only when the dotted key
+			// is explicitly in the params map (for_each record fields).
+			// This does not affect task references whose key is absent.
+			key := sub[1] + "." + sub[2]
+			if val, ok := params[key]; ok {
+				return val
+			}
 		}
-		// Task reference or unknown param — leave as-is
+		// Task reference or unknown param — leave as-is.
 		return match
 	})
 }

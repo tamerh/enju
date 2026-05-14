@@ -26,15 +26,22 @@ import (
 	"strings"
 )
 
-// substituteForEachParamRefs walks a ForEachMap and replaces
-// every `{{paramname}}` reference with the param's list<string>
-// value from the merged param map. Task references are left
-// alone — dynamic materialization handles those at run time.
-// Errors are phrased for LLM forwarding (the scope label lands
-// in the prefix so "task \"foo\"" or "run" shows up first).
-func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, scope string) error {
+// substituteForEachParamRefs walks a ForEachMap and resolves every
+// `{{paramname}}` reference against the merged param map. Handles
+// both list<string> and list<record> param types. Task references
+// are left alone — dynamic materialization handles those at run time.
+// Errors are phrased for LLM forwarding (the scope label lands in
+// the prefix so "task \"foo\"" or "run" shows up first).
+//
+// params is the run's declared param definitions, needed to determine
+// the type and key field for list<record> params.
+func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, scope string, params []ParamDef) error {
 	if len(fe) == 0 {
 		return nil
+	}
+	paramByName := make(map[string]*ParamDef, len(params))
+	for i := range params {
+		paramByName[params[i].Name] = &params[i]
 	}
 	for name, src := range fe {
 		if src.Ref == "" {
@@ -46,8 +53,31 @@ func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, sc
 		}
 		v, haveValue := merged[paramName]
 		if !haveValue {
-			return fmt.Errorf("%s for_each variable %q: parameter %q is required to have a value (supply it when creating the run, or give the param a default list)", scope, name, paramName)
+			return fmt.Errorf("%s for_each variable %q: parameter %q is required to have a value (supply it when creating the run, or give the param a default)", scope, name, paramName)
 		}
+
+		// Check whether the referenced param is a list<record>.
+		if pd, ok := paramByName[paramName]; ok && pd.Type == "list<record>" {
+			records, err := toRecordList(v)
+			if err != nil {
+				return fmt.Errorf("%s for_each variable %q: parameter %q: %w", scope, name, paramName, err)
+			}
+			if len(records) == 0 {
+				return fmt.Errorf("%s for_each variable %q: parameter %q must have at least one record", scope, name, paramName)
+			}
+			keyField := pd.Key // defaulted to first field at validateParams time
+			keyValues := make([]string, len(records))
+			for i, rec := range records {
+				keyValues[i] = fmt.Sprintf("%v", rec[keyField])
+				if keyValues[i] == "" {
+					return fmt.Errorf("%s for_each variable %q: parameter %q record #%d has empty key field %q", scope, name, paramName, i+1, keyField)
+				}
+			}
+			fe[name] = ForEachSource{Values: keyValues, RecordValues: records}
+			continue
+		}
+
+		// list<string> path (existing behavior).
 		list, ok := v.([]string)
 		if !ok {
 			// JSON-decoded params arrive as []interface{};
@@ -64,7 +94,7 @@ func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, sc
 				}
 				list = coerced
 			} else {
-				return fmt.Errorf("%s for_each variable %q: parameter %q must be a list of strings (got %T)", scope, name, paramName, v)
+				return fmt.Errorf("%s for_each variable %q: parameter %q must be a list (got %T)", scope, name, paramName, v)
 			}
 		}
 		if err := validateForEachLiteralMap(scope, map[string][]string{name: list}); err != nil {
@@ -73,6 +103,28 @@ func substituteForEachParamRefs(fe ForEachMap, merged map[string]interface{}, sc
 		fe[name] = ForEachSource{Values: list}
 	}
 	return nil
+}
+
+// toRecordList converts a YAML/JSON-decoded value to a
+// []map[string]interface{}. Accepts both []interface{} (the usual
+// decode shape) and []map[string]interface{} directly.
+func toRecordList(v interface{}) ([]map[string]interface{}, error) {
+	switch vv := v.(type) {
+	case []map[string]interface{}:
+		return vv, nil
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(vv))
+		for i, item := range vv {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("item #%d is not an object (got %T)", i+1, item)
+			}
+			out = append(out, m)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("expected a list of records, got %T", v)
+	}
 }
 // validateDynamicForEach checks every dynamic for_each
 // variable's reference. Two valid shapes:
@@ -119,8 +171,8 @@ func validateDynamicForEach(p *Run, taskIDs map[string]bool) error {
 				if !declared {
 					return fmt.Errorf("task %q: for_each variable %q: references unknown parameter %q — declare it under top-level params: or use {{upstream_task.field_name}} for a dynamic task reference", t.ID, name, paramName)
 				}
-				if pd.Type != "list<string>" {
-					return fmt.Errorf("task %q: for_each variable %q: parameter %q must be declared with type: list<string> to serve as a for_each source (got %q)", t.ID, name, paramName, pd.Type)
+				if pd.Type != "list<string>" && pd.Type != "list<record>" {
+					return fmt.Errorf("task %q: for_each variable %q: parameter %q must be declared with type: list<string> or list<record> to serve as a for_each source (got %q)", t.ID, name, paramName, pd.Type)
 				}
 				continue
 			}
@@ -283,8 +335,10 @@ func builtinTemplateVar(name string) bool {
 	return false
 }
 type forEachInstance struct {
-	key    string
-	params map[string]string
+	key       string
+	params    map[string]string           // varName → key-field value; used for InstanceParams + env vars
+	record    map[string]interface{}      // full record (non-nil only for list<record> sources)
+	recordVar string                      // for_each variable name when record is set
 }
 
 // SlugInstanceKey transforms a raw for_each value into an
@@ -333,20 +387,39 @@ func SlugInstanceKey(v string) string {
 	}
 	return strings.TrimRight(b.String(), "_")
 }
-// expandForEach generates all combinations of for_each parameters.
-// For now, supports single for_each variable (most common case).
-// Multi-variable cartesian product can be added later.
-func expandForEach(forEach map[string][]string) []forEachInstance {
+// expandForEach generates all iteration instances from a resolved
+// ForEachSource map. Handles both list<string> sources (Values) and
+// list<record> sources (RecordValues). Multi-variable cartesian
+// products are supported for list<string>; mixing record and
+// string sources in a multi-var for_each is not yet supported
+// and returns an error.
+func expandForEach(forEach map[string]ForEachSource) []forEachInstance {
 	if len(forEach) == 0 {
-		// No expansion — single instance with empty key
+		// No expansion — single instance with empty key.
 		return []forEachInstance{{key: "", params: map[string]string{}}}
 	}
 
-	// Single variable expansion (most common: for_each: disease: [...])
+	// Single variable expansion (most common).
 	if len(forEach) == 1 {
-		for varName, values := range forEach {
-			instances := make([]forEachInstance, 0, len(values))
-			for _, val := range values {
+		for varName, src := range forEach {
+			if len(src.RecordValues) > 0 {
+				// list<record> source: Values[i] = key-field value,
+				// RecordValues[i] = full record map.
+				instances := make([]forEachInstance, 0, len(src.RecordValues))
+				for i, rec := range src.RecordValues {
+					keyVal := src.Values[i]
+					instances = append(instances, forEachInstance{
+						key:       SlugInstanceKey(keyVal),
+						params:    map[string]string{varName: keyVal},
+						record:    rec,
+						recordVar: varName,
+					})
+				}
+				return instances
+			}
+			// list<string> source.
+			instances := make([]forEachInstance, 0, len(src.Values))
+			for _, val := range src.Values {
 				instances = append(instances, forEachInstance{
 					// Slug the key so values containing `/`,
 					// `:`, whitespace etc. produce routable
@@ -361,12 +434,15 @@ func expandForEach(forEach map[string][]string) []forEachInstance {
 		}
 	}
 
-	// Multi-variable: cartesian product. Sort variable names so the
-	// order of dimensions within the generated slug — and therefore
-	// the task IDs, iteration labels, and sort order of run_status —
-	// is deterministic across runs. Without this, Go's randomized map
-	// iteration leaks through: a run with gene+tissue might produce
-	// `BRCA1_breast` one time and `breast_BRCA1` the next.
+	// Multi-variable: cartesian product over list<string> sources.
+	// list<record> sources are rejected by validateRunForEach before
+	// this point, so RecordValues is always nil here — only Values
+	// is used. Extend cartesianProduct when record support is needed.
+	//
+	// Sort variable names so the order of dimensions within the
+	// generated slug is deterministic across runs (Go's randomized
+	// map iteration would otherwise produce `BRCA1_breast` one time
+	// and `breast_BRCA1` the next).
 	keys := make([]string, 0, len(forEach))
 	for k := range forEach {
 		keys = append(keys, k)
@@ -374,7 +450,7 @@ func expandForEach(forEach map[string][]string) []forEachInstance {
 	sort.Strings(keys)
 	vals := make([][]string, len(keys))
 	for i, k := range keys {
-		vals[i] = forEach[k]
+		vals[i] = forEach[k].Values
 	}
 
 	return cartesianProduct(keys, vals)

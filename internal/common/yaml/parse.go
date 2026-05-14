@@ -169,7 +169,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 	}
 	for name, v := range supplied {
 		pp := declared[name]
-		if err := checkParamValueType(name, pp.Type, v); err != nil {
+		if err := checkParamValueType(pp, v); err != nil {
 			return nil, err
 		}
 		merged[name] = v
@@ -205,7 +205,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 	// Substitute {{paramname}} refs in run-level for_each.
 	// Same pattern as task-level (below) but resolved once at
 	// the run scope so buildRunLevel sees a static map.
-	if err := substituteForEachParamRefs(p.ForEach, merged, "run"); err != nil {
+	if err := substituteForEachParamRefs(p.ForEach, merged, "run", p.Params); err != nil {
 		return nil, err
 	}
 
@@ -269,7 +269,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 
 		// Task-level for_each param-ref substitution. Shared
 		// helper also handles the run-level scope above.
-		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID)); err != nil {
+		if err := substituteForEachParamRefs(t.ForEach, merged, fmt.Sprintf("task %q", t.ID), p.Params); err != nil {
 			return nil, err
 		}
 	}
@@ -495,10 +495,24 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 	// resolved at submission time, not at parse time, so the
 	// parser only needs to know *which* names are legal.
 	paramInScope := make(map[string]bool, len(p.Params))
-	for _, pp := range p.Params {
-		paramInScope[pp.Name] = true
+	paramByName := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		paramInScope[p.Params[i].Name] = true
+		paramByName[p.Params[i].Name] = &p.Params[i]
 	}
 	paramReferenced := make(map[string]bool, len(p.Params))
+
+	// forEachVarParam maps a for_each variable name to the list<record>
+	// ParamDef it iterates over (nil if the source is not a record param).
+	// Used to validate {{var.field}} field names at parse time.
+	forEachVarParam := make(map[string]*ParamDef, len(runScope))
+	for varName, src := range runScope {
+		if paramName, ok := parseForEachParamRef(src.Ref); ok {
+			if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+				forEachVarParam[varName] = pd
+			}
+		}
+	}
 
 	// Track which for_each variables we've actually seen referenced.
 	// Key: scope label ("run" or "task:id"), value: set of referenced
@@ -578,7 +592,30 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 				}
 			}
 			// {{task.field}} references must target a known task id.
+			// Exception: {{forEachVar.field}} where forEachVar is in
+			// scope is a record field ref, not a task ref — treat it
+			// as a use of that for_each variable and validate the field
+			// name against the declared fields: of the record param.
 			for _, ref := range template.ExtractReferences(field) {
+				if visible[ref.TaskID] {
+					// for_each record field ref — validate field name
+					// when the source is a known list<record> param.
+					if pd, isRecord := forEachVarParam[ref.TaskID]; isRecord {
+						if _, declared := pd.Fields.TypeOf(ref.Field); !declared {
+							return fmt.Errorf(
+								"task %q: prompt references field {{%s.%s}} but %q is not declared in param %q's fields: (known fields: %v)",
+								t.ID, ref.TaskID, ref.Field, ref.Field, pd.Name, pd.Fields.Names(),
+							)
+						}
+					}
+					// Count as variable use.
+					if scopeLabel == "run" {
+						runScopeReferenced[ref.TaskID] = true
+					} else if scopeLabel != "" {
+						taskScopeReferenced[scopeLabel][ref.TaskID] = true
+					}
+					continue
+				}
 				if !taskIDs[ref.TaskID] {
 					return fmt.Errorf(
 						"task %q: prompt references unknown task id {{%s.%s}}",
