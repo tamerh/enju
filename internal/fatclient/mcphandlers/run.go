@@ -688,20 +688,25 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// auto_bots: now that the coord has assigned a run seq,
-	// record it on each bot's pid file so NDA.4's tailer can
-	// decrement when the run finishes.
+	// record it on each bot's pid file so the live.jsonl
+	// tailer can decrement when the run finishes. Also
+	// register the project's event log with the supervisor
+	// so the tailer is running by the time terminal events
+	// arrive — idempotent across concurrent auto_bots runs
+	// in the same project.
 	if autoBots && len(autoBotNames) > 0 {
 		var resp map[string]interface{}
 		if jerr := json.Unmarshal(data, &resp); jerr == nil {
 			if seq, ok := resp["seq"].(float64); ok {
 				runSeq := int64(seq)
 				sup, _ := c.botSupervisor()
-				if sup != nil {
+				if sup != nil && prep != nil && prep.Workflow != nil {
 					for _, name := range autoBotNames {
 						if merr := sup.MarkAutoRun(name, runSeq); merr != nil {
 							slog.Default().Warn("auto_bots: MarkAutoRun failed", "bot", name, "run_seq", runSeq, "error", merr)
 						}
 					}
+					sup.WatchProjectEvents(ctx, prep.Workflow.WorkDir(), int64(projectID))
 				}
 			}
 		}

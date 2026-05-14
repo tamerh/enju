@@ -82,6 +82,14 @@ type Supervisor struct {
 	procsMu     sync.Mutex
 	procs       map[string]*botProcess
 	recentExits []ExitEvent // bounded ring; see recentExitsMax
+
+	// tailMu guards `tailing`, the set of project dirs whose
+	// live.jsonl this supervisor is already tailing for
+	// auto_bots terminal events (NDA.4). WatchProjectEvents
+	// uses it to stay idempotent across concurrent auto_bots
+	// runs in the same project.
+	tailMu  sync.Mutex
+	tailing map[string]bool
 }
 
 // recentExitsMax bounds the in-memory exit-event ring buffer.
@@ -314,6 +322,14 @@ type pidFileEntry struct {
 	LogPath    string    `json:"log_path"`
 	StartedBy  string    `json:"started_by,omitempty"`   // "operator" | "auto_run"; empty = "operator"
 	AutoRunIDs []int64   `json:"auto_run_ids,omitempty"` // run seqs that ref-count this bot
+	// ProjectID scopes auto-stop matching when a terminal event
+	// for run #N arrives — we only act on bots whose ProjectID
+	// matches the event's project, since run seqs are
+	// per-project not globally unique. Zero = bot is not scoped
+	// to a project (cross-project poll mode); auto_bots always
+	// passes a real project id, so the field is always set on
+	// pid files written by the auto-run flow.
+	ProjectID int64 `json:"project_id,omitempty"`
 }
 
 // StartOutcome classifies what happened when Start was called.
@@ -460,6 +476,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	if err := writePIDFile(pidPath, pidFileEntry{
 		Name: p.BotName, PID: cmd.Process.Pid, StartedAt: now, LogPath: logPath,
 		StartedBy: startedBy,
+		ProjectID: p.ProjectID,
 	}); err != nil {
 		// Non-fatal: the supervisor still has the process in
 		// memory. PID file is for external diagnostics.
