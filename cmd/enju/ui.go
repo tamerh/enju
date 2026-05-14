@@ -67,7 +67,6 @@ func cmdUI(args []string) {
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
-	workspaceDir := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
 	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json)")
 	port := fs.Int("port", 8484, "Port to bind the UI on (127.0.0.1 only)")
@@ -113,9 +112,9 @@ func cmdUI(args []string) {
 		token = creds.Token
 	}
 
-	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceDir, *registryPath, os.Stderr)
+	wsRoot, regPath, err := resolveCLIRegistry(*registryPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to resolve registry: %v\n", err)
 		os.Exit(1)
 	}
 

@@ -362,7 +362,6 @@ func cmdMCP(args []string) {
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
 	model := fs.String("model", "", "LLM model name for contribution tracking (e.g. claude-opus-4, gpt-4o)")
-	workspaceDir := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
 	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json). Records project ID → on-disk path mappings adopted via enju_create_project.")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running multiple MCP processes for different citizens on one host — see docs/multi-citizen.md § Running multiple citizens on one host.")
 	// local-mode parity with `enju serve`. Useful
@@ -500,9 +499,9 @@ func cmdMCP(args []string) {
 	// legacy coordinator-writes path; this workspace stays unused
 	// for them but the creation itself is cheap and safe.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceDir, *registryPath, os.Stderr)
+	wsRoot, regPath, err := resolveCLIRegistry(*registryPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to resolve registry: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Hint: --registry's parent directory (default ~/.enju/) must be writable. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
 		os.Exit(1)
 	}

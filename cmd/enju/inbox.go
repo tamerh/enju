@@ -23,7 +23,6 @@ func cmdInbox(args []string) {
 	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json; only used to look up identity, inbox reads local files)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running for a non-default citizen.")
-	workspaceRoot := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
 	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: enju inbox <project_id> [flags]
@@ -34,10 +33,9 @@ work without claiming first.
 
 The inbox is derived entirely from local files: live.jsonl
 provides the event stream and the project clone provides upstream
-content via git. The project must already be cloned locally —
-typically by running 'enju mcp' once. If you've only used the
-CLI, the workspace won't exist; the command prints a helpful
-error.
+content via git. The project must already be registered locally
+via enju_create_project path=<abs/dir>; the command prints a
+helpful error if no registry entry exists for the project.
 
 Flags:`)
 		fs.PrintDefaults()
@@ -61,9 +59,9 @@ Flags:`)
 		os.Exit(1)
 	}
 
-	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceRoot, *registryPath, os.Stderr)
+	wsRoot, regPath, err := resolveCLIRegistry(*registryPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to resolve registry: %v\n", err)
 		os.Exit(1)
 	}
 	reg := projectreg.Open(regPath)

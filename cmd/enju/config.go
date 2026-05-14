@@ -184,44 +184,26 @@ func expandPath(p string) string {
 	return p
 }
 
-// resolveCLIWorkspace turns the (workspaceFlag, registryFlag) pair
-// the CLI entry points expose into the absolute workspace rootDir
-// and the absolute registry path to open. Encapsulates the
-// deprecation handshake:
+// resolveCLIRegistry turns the --registry flag value into the
+// absolute registry path and the workspace rootDir to hand to
+// service.Config / mcphandlers.Config.
 //
-//   - --registry default = projectreg.DefaultPath() (~/.enju/projects.json).
-//   - --workspace passed → emit a deprecation warning + use it as
-//     the workspace rootDir AND derive the registry path as
-//     <workspace>/projects.json unless --registry was also given
-//     explicitly (which then wins).
-//   - --workspace empty → derive the workspace rootDir from
-//     filepath.Dir(registryPath) so housekeeping state (scratch,
-//     logs that aren't project-internal) keeps a sibling home
-//     next to the registry file. The workspace rootDir is
-//     vestigial post-NDW.5 — clones don't live there — but
-//     NewWorkspace still requires a non-empty value.
-//
-// stderr accepts the destination for the deprecation warning so
-// tests can capture (or silence) it. Pass os.Stderr in production.
-func resolveCLIWorkspace(workspaceFlag, registryFlag string, stderr io.Writer) (workspaceRoot, registryPath string, err error) {
+//   - --registry empty → default to ~/.enju/projects.json.
+//   - workspace rootDir = filepath.Dir(registryPath) — housekeeping
+//     state (scratch, non-project-internal logs, reconcile cursor)
+//     keeps a sibling home next to the registry file. The rootDir
+//     is vestigial — clones don't live there — but
+//     enjugit.NewWorkspace still requires a non-empty value.
+func resolveCLIRegistry(registryFlag string) (workspaceRoot, registryPath string, err error) {
 	regPath := registryFlag
-	if workspaceFlag != "" {
-		fmt.Fprintln(stderr, "warning: --workspace is deprecated post-NDW.6 — projects are path-anchored via projectreg (use --registry to point at projects.json directly). The flag will be removed in a future release.")
-		if regPath == "" {
-			regPath = filepath.Join(workspaceFlag, "projects.json")
-		}
-	}
 	if regPath == "" {
 		home, herr := os.UserHomeDir()
 		if herr != nil {
-			return "", "", fmt.Errorf("resolveCLIWorkspace: resolving home dir for default --registry: %w", herr)
+			return "", "", fmt.Errorf("resolveCLIRegistry: resolving home dir for default --registry: %w", herr)
 		}
 		regPath = filepath.Join(home, ".enju", "projects.json")
 	}
-	wsRoot := workspaceFlag
-	if wsRoot == "" {
-		wsRoot = filepath.Dir(regPath)
-	}
+	wsRoot := filepath.Dir(regPath)
 	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
 		return "", "", fmt.Errorf("creating workspace root %s: %w", wsRoot, err)
 	}

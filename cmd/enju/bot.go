@@ -512,7 +512,6 @@ func cmdBotRun(args []string) {
 	botName := fs.String("bot", "", "Bot name from the workflow's inline bots: section (required)")
 	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline bots: section declares this fleet (required)")
 	projectID := fs.Int64("project-id", 0, "Project id to scope task discovery (0 = every project the bot is a member of)")
-	workspaceDir := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
 	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
 	pollInterval := fs.Duration("poll-interval", 1*time.Second, "Floor sleep between empty polls (doubles up to --backoff-max)")
@@ -698,9 +697,9 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceDir, *registryPath, os.Stderr)
+	wsRoot, regPath, err := resolveCLIRegistry(*registryPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve workspace/registry: %v\n", err)
+		fmt.Fprintf(os.Stderr, "resolve registry: %v\n", err)
 		os.Exit(1)
 	}
 	coordClient := coord.New(coord.Config{
