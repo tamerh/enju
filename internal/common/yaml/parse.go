@@ -603,8 +603,8 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 					if pd, isRecord := forEachVarParam[ref.TaskID]; isRecord {
 						if _, declared := pd.Fields.TypeOf(ref.Field); !declared {
 							return fmt.Errorf(
-								"task %q: prompt references field {{%s.%s}} but %q is not declared in param %q's fields:",
-								t.ID, ref.TaskID, ref.Field, ref.Field, pd.Name,
+								"task %q: prompt references field {{%s.%s}} but %q is not declared in param %q's fields: (known fields: %v)",
+								t.ID, ref.TaskID, ref.Field, ref.Field, pd.Name, pd.Fields.Names(),
 							)
 						}
 					}

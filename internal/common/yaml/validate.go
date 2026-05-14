@@ -546,6 +546,11 @@ func validateParamDef(pp *ParamDef) error {
 // t.Action = "answer" for tasks that left it blank — so the
 // action check below expects every task to have an action.
 func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err error) {
+	paramByName := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		paramByName[p.Params[i].Name] = &p.Params[i]
+	}
+
 	ids = make(map[string]bool)
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
@@ -618,6 +623,21 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 			hasTaskLevelForEach = true
 			if err := validateForEachMap("task "+t.ID, t.ForEach); err != nil {
 				return nil, false, err
+			}
+			// list<record> for_each sources are only supported at the
+			// run level. Task-level iteration over a record param would
+			// require threading record metadata through cartesianProduct
+			// and per-task build logic — deferred until there's a real
+			// use case. Declare the for_each at the run level instead.
+			for varName, src := range t.ForEach {
+				if paramName, ok := parseForEachParamRef(src.Ref); ok {
+					if pd, found := paramByName[paramName]; found && pd.Type == "list<record>" {
+						return nil, false, fmt.Errorf(
+							"task %q: for_each variable %q references list<record> param %q — list<record> for_each sources are supported at run level only; declare the for_each at the run level",
+							t.ID, varName, paramName,
+						)
+					}
+				}
 			}
 		}
 	}

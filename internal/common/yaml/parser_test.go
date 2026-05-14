@@ -3287,7 +3287,9 @@ tasks:
 
 // TestLRP4_UnknownRecordFieldRejected pins issue 2: {{var.typo}} where
 // typo is not a declared field must error at parse time, not silently
-// leave unresolved template text in the prompt.
+// leave unresolved template text in the prompt. The error must also
+// list the known fields so the operator can spot the typo without
+// scrolling back to the param block.
 func TestLRP4_UnknownRecordFieldRejected(t *testing.T) {
 	body := []byte(`
 name: "Bad field ref"
@@ -3311,6 +3313,75 @@ tasks:
 	}
 	if !strings.Contains(err.Error(), "tipo") {
 		t.Errorf("error should mention the bad field name, got: %v", err)
+	}
+	// Known-fields hint so the operator doesn't have to scroll.
+	if !strings.Contains(err.Error(), "name") || !strings.Contains(err.Error(), "slug") {
+		t.Errorf("error should list known fields (name, slug), got: %v", err)
+	}
+}
+
+// TestLRP3_TaskLevelRecordRejected pins the scope-gap fix: a task-level
+// for_each that references a list<record> param must be rejected at parse
+// time with a clear "run level only" message. Covers both single-var
+// (issue #2 gap: typo wouldn't be caught) and multi-var (issue #1 gap:
+// metadata silently dropped).
+func TestLRP3_TaskLevelRecordRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "single-var task-level",
+			body: `
+name: "Task-level record"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      name: string
+      slug: string
+tasks:
+  - id: t
+    action: answer
+    for_each:
+      gene: "{{genes}}"
+    prompt: "Gene: {{gene.name}}"
+`,
+		},
+		{
+			name: "multi-var task-level",
+			body: `
+name: "Task-level multi-var record"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    fields:
+      name: string
+      slug: string
+  - name: tissues
+    type: list<string>
+tasks:
+  - id: t
+    action: answer
+    for_each:
+      gene: "{{genes}}"
+      tissue: "{{tissues}}"
+    prompt: "{{gene.name}} in {{tissue}}"
+`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.body))
+			if err == nil {
+				t.Fatalf("expected error for task-level list<record> for_each")
+			}
+			if !strings.Contains(err.Error(), "run level only") {
+				t.Errorf("error should say 'run level only', got: %v", err)
+			}
+		})
 	}
 }
 
