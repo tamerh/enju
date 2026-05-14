@@ -55,6 +55,7 @@ func cmdGo(args []string) {
 
 	sess := openCLISession(*coordOverride)
 	ctx := context.Background()
+	logf(*asJSON, "▶ coord %s (as @%s)", sess.URL, sess.Creds.Username)
 
 	// Resolve the workflow YAML to an absolute path so project
 	// discovery can compare cwd vs ancestors safely. The string
@@ -335,6 +336,13 @@ func parseParamsArg(arg string) (map[string]interface{}, error) {
 // guessing from field presence.
 func renderExecuteResult(w io.Writer, res *service.ExecuteRunResult, asJSON bool) {
 	if asJSON {
+		// COUPLING: this map mirrors service.ExecuteRunEntry's
+		// JSON shape one field at a time so the "type"
+		// discriminator can live alongside the entry fields.
+		// When ExecuteRunEntry gains a field (RetryCount,
+		// WorkerID, etc.), add it here too — otherwise the
+		// new field silently disappears from `enju go --json`
+		// output while still appearing in MCP responses.
 		for _, e := range res.Entries {
 			rec := map[string]any{
 				"type":       "entry",

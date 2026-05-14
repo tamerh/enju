@@ -147,14 +147,19 @@ func renderProjectStatusHuman(w io.Writer, r statusReport) {
 	if r.DefaultBranch != "" {
 		fmt.Fprintf(w, "Default branch: %s\n", r.DefaultBranch)
 	}
+	// Render As: before the coord status. Identity is most
+	// useful precisely when coord is unreachable ("am I about
+	// to retry as the wrong user?") — surfacing it outside the
+	// CoordOK branch keeps the line visible in the failure path
+	// too.
+	if r.As != "" {
+		fmt.Fprintf(w, "As:      @%s\n", r.As)
+	}
 	if r.CoordOK {
 		fmt.Fprintf(w, "Coord:   %s (✓)\n", r.Coordinator)
 	} else {
 		fmt.Fprintf(w, "Coord:   %s (✗ %s)\n", r.Coordinator, r.CoordError)
 		return
-	}
-	if r.As != "" {
-		fmt.Fprintf(w, "As:      @%s\n", r.As)
 	}
 
 	if len(r.Runs) == 0 {

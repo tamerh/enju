@@ -126,6 +126,16 @@ func TestRunIdentityFromCreateResponseHandlesGarbage(t *testing.T) {
 // auto-register branch isn't testable here without an httptest
 // coord stub — covered by the manual smoke run against the
 // real coord in the merge commit's PR.
+//
+// FRAGILITY: the service.New(Config{ProjectRegistry: reg})
+// construction below is intentionally minimal — no coord,
+// no workspace, no logger. Today service.New tolerates this
+// because the registry-lookup path doesn't reach into those
+// dependencies. If service.New ever starts requiring more
+// fields at construction, these tests will surface the
+// regression early; the alternative (building a full
+// FatClient with httptest coord) is worth the cost only when
+// that regression actually fires.
 func TestResolveOrRegisterProjectAlreadyRegistered(t *testing.T) {
 	projectRoot := t.TempDir()
 	workflowPath := filepath.Join(projectRoot, "enju.yaml")
