@@ -79,7 +79,7 @@ Flags:`)
 	}
 	view, err := ws.OpenView(projectID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "project %d has no local clone at %s — run `enju mcp` once with this credentials file to materialize the clone.\n", projectID, projectDir)
+		fmt.Fprintf(os.Stderr, "project %d is registered at %s but has no .git on disk — re-adopt with `enju_create_project path=%s` to materialize the clone.\n", projectID, projectDir, projectDir)
 		os.Exit(1)
 	}
 

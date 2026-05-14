@@ -889,7 +889,7 @@ func TestMCPBranchTemplateUntrackedAutoCommitsToDefault(t *testing.T) {
 	// Force the MCP workspace to clone the project so we have
 	// a real local worktree to write an untracked file into.
 	remoteURL := h.remoteFor(projectID)
-	proj, err := h.enjugit.ForProject(projectID, remoteURL, "")
+	proj, err := h.enjugit.ForProject(projectID, remoteURL)
 	if err != nil {
 		t.Fatalf("open workspace: %v", err)
 	}

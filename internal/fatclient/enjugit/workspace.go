@@ -171,7 +171,7 @@ func (w *Workspace) OpenExisting(id int64) (*Workflow, error) {
 		}
 		return nil, fmt.Errorf("enjugit: stat %s: %w", dir, err)
 	}
-	clone, err := git.OpenClone(dir, w.lockPathFor(id, dir), w.logger)
+	clone, err := git.OpenClone(dir, LockPathFor(dir), w.logger)
 	if err != nil {
 		if errors.Is(err, git.ErrCloneNotFound) {
 			return nil, ErrCloneNotFound
@@ -254,30 +254,8 @@ func slugify(name string) string {
 	return out
 }
 
-// lockPathFor returns the cross-process flock file for one
-// project. Post-NDW.4 it lives at <projectPath>/.enju/locks/project.lock
-// — co-located with the project so:
-//
-//   - cross-machine project clones (rsync'd / shared mount) carry
-//     their own lock infrastructure with them, instead of relying
-//     on a host-side `~/.enju/workspaces/` directory that may not
-//     exist on the receiving machine.
-//   - removing the project's dir removes the lock alongside it
-//     (no stale ~/.enju/workspaces/project-N.lock files leak
-//     after a leave_project).
-//   - the operator + async wrapper both compute the SAME inode
-//     by feeding the same projectPath (resolved via projectreg)
-//     into this helper. The flock contract only holds when the
-//     path is byte-identical across processes.
-//
-// projectID is unused now but kept on the signature for
-// diagnostic logging (callers usually have it on hand). The
-// MkdirAll-on-demand happens at flock-acquire time inside
-// gitcli; this helper is path computation only.
-func (w *Workspace) lockPathFor(id int64, projectPath string) string {
-	_ = id // diagnostic-only; path is fully derived from projectPath
-	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
-}
+// (lockPathFor's internal helper collapsed into the package-level
+// LockPathFor below — workspace methods call it directly.)
 
 // OpenWorkflowAtPath opens an existing clone at the given workDir
 // and returns a standalone Workflow. Bypasses the Workspace
@@ -328,12 +306,21 @@ func OpenWorkflowAtPath(workDir, lockPath string, projectID int64, convs Convent
 }
 
 // LockPathFor returns the cross-process flock path for a project
-// rooted at projectPath. Exposed so external callers (the async
-// compute wrapper's caller in particular) can compute the same
-// path the workspace's internal lockPathFor produces, without
-// reaching into private state. Mirrors workspace.lockPathFor —
-// the public form is keyed by path, not project ID, since the
-// caller already has the path on hand.
+// rooted at projectPath. Post-NDW.4 the lock lives at
+// <projectPath>/.enju/locks/project.lock — co-located with the
+// project so:
+//
+//   - cross-machine project clones (rsync'd / shared mount) carry
+//     their own lock infrastructure with them, no separate
+//     host-side dir required.
+//   - removing the project's dir removes the lock alongside it.
+//   - the operator + async wrapper both compute the SAME inode
+//     by feeding the same projectPath (resolved via projectreg)
+//     into this helper. The flock contract only holds when the
+//     path is byte-identical across processes.
+//
+// MkdirAll-on-demand happens at flock-acquire time inside gitcli;
+// this helper is path computation only.
 func LockPathFor(projectPath string) string {
 	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
 }

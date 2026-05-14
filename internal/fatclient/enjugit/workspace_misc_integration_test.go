@@ -161,7 +161,7 @@ func TestForProjectResolvesViaRegistry(t *testing.T) {
 	// Passing a different name does NOT change the resolved path
 	// — the registry wins. (projectName is accepted for back-compat
 	// with NDW.1 callers and ignored; NDW.5 removes the parameter.)
-	wf, err := ws.ForProject(7, bare, "Battle Test Alpha")
+	wf, err := ws.ForProject(7, bare)
 	if err != nil {
 		t.Fatalf("clone: %v", err)
 	}

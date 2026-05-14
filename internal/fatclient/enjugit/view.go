@@ -8,8 +8,8 @@ import (
 )
 
 // View is the read-only handle for one project. Constructed by
-// Workspace.OpenView or OpenOrLazyClone. Used by surfaces that
-// only display content (webui, inbox).
+// Workspace.OpenView. Used by surfaces that only display content
+// (webui, inbox).
 //
 // The type itself is the capability boundary — code that takes
 // *View can't call mutating methods, full stop. That's the

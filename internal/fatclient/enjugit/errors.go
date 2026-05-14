@@ -17,7 +17,6 @@ import (
 var (
 	// Workspace
 	ErrCloneNotFound = errors.New("enjugit: no clone for project")
-	ErrNoCloneSource = errors.New("enjugit: no remote_url and no adopted path")
 
 	// Workflow state-prep
 	ErrUpstreamNotFound       = errors.New("enjugit: upstream branch not found on origin")

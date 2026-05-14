@@ -371,7 +371,8 @@ type Result struct {
 // compute goroutines share the in-process sync.Mutex instead of
 // falling through to the slower cross-process flock. Pass nil
 // from the wrap-task subprocess (separate process), and Run will
-// construct its own from spec.WorkspaceRoot.
+// open one directly via enjugit.OpenWorkflowAtPath(spec.WorkDir,
+// spec.LockPath, …) — no Workspace/Registry re-resolution.
 //
 // ctx cancellation propagates to the script via exec.CommandContext.
 // Wrapper-level errors are returned via Result.Error; script exit
@@ -983,8 +984,8 @@ func WrapMain(args []string, stderr io.Writer) int {
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	// Subprocess: no parent Workflow to share — Run opens its own
-	// from spec.WorkspaceRoot. Cross-process flock keeps it safe
-	// against the parent's concurrent ops.
+	// directly at spec.WorkDir with spec.LockPath. Cross-process
+	// flock keeps it safe against the parent's concurrent ops.
 	res := Run(context.Background(), nil, spec, os.Environ(), logger)
 
 	if err := WriteResult(outputPath, res); err != nil {

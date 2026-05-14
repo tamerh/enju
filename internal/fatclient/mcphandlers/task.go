@@ -138,8 +138,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 							// Read preview from local workspace if available.
 							if c.fc.Enjugit() != nil && resultPath != "" {
 								remoteURL, _ := taskMap["project_remote_url"].(string)
-								projName, _ := taskMap["project_name"].(string)
-								if wf, perr := c.fc.Enjugit().ForProject(int64(projectID), remoteURL, projName); perr == nil {
+								if wf, perr := c.fc.Enjugit().ForProject(int64(projectID), remoteURL); perr == nil {
 									taskMap["_review_target_abs_path"] = filepath.Join(wf.WorkDir(), resultPath, "result.md")
 									contentPath := filepath.Join(resultPath, "result.md")
 									if content, rerr := wf.ReadFile(contentPath); rerr == nil {

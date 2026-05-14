@@ -58,8 +58,7 @@ func (s *FatClient) DecorateProjectListWithPushStatus(data []byte) []byte {
 		if !s.enjugit.HasLocalClone(projectID) {
 			continue
 		}
-		pName, _ := p["name"].(string)
-		wf, err := s.enjugit.ForProject(projectID, remoteURL, pName)
+		wf, err := s.enjugit.ForProject(projectID, remoteURL)
 		if err != nil {
 			continue
 		}

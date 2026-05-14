@@ -225,30 +225,6 @@ func TestOpenView_DoesNotInitOnMissing(t *testing.T) {
 	}
 }
 
-func TestOpenOrLazyClone_NotRegistered(t *testing.T) {
-	ws, err := NewWorkspace(t.TempDir(), NewProductionConventions(),
-		WithLogger(nullLogger()),
-		WithRegistry(projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ws.OpenOrLazyClone(7, "remote-url-ignored"); !errors.Is(err, ErrProjectNotRegistered) {
-		t.Errorf("OpenOrLazyClone without registry entry: got %v, want ErrProjectNotRegistered", err)
-	}
-}
-
-// TestOpenOrLazyClone_RegisteredButNoClone covers the post-NDW.2
-// "no silent materialization" semantics: even when the project IS
-// registered, OpenOrLazyClone errors with ErrCloneNotFound when no
-// .git exists at the registered path. Adoption goes through
-// enju_create_project, not a silent webui-side clone.
-func TestOpenOrLazyClone_RegisteredButNoClone(t *testing.T) {
-	ws, _, _ := newTestWorkspaceWithProject(t, 7)
-	if _, err := ws.OpenOrLazyClone(7, "ignored"); !errors.Is(err, ErrCloneNotFound) {
-		t.Errorf("OpenOrLazyClone: got %v, want ErrCloneNotFound", err)
-	}
-}
-
 func TestProductionBranchName(t *testing.T) {
 	convs := NewProductionConventions()
 	got := convs.BranchName(2, "build", "develop_a", "", 3)
