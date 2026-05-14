@@ -372,11 +372,24 @@ func (o StartOutcome) String() string {
 // --workflow=<path> --coordinator=<url>` with stdin connected
 // so Stop can close it for graceful shutdown. Stdout/stderr go
 // to the per-bot log file, opened append-mode.
+//
+// Concurrency: procsMu is held for the entire function — the
+// existence check, fork, pid-file write, and procs-map insert
+// happen atomically. Without this, two concurrent Start("foo")
+// callers could both pass the existence check, both spawn a
+// process, both write the same pid file, and the second insert
+// would silently leak the first daemon. The cost is that
+// Status/Stop/MarkAutoRun on OTHER bots block during the
+// ~10-100ms fork window; acceptable for a tool not called in
+// tight loops. The reaper goroutine launched at the end takes
+// procsMu only AFTER cmd.Wait returns, so it can't deadlock
+// against the Start that birthed it.
 func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, StartOutcome, error) {
 	if p.BotName == "" || p.WorkflowPath == "" || p.Coordinator == "" {
 		return nil, StartedFresh, fmt.Errorf("Start: bot_name, workflow_path, and coordinator are required")
 	}
 	s.procsMu.Lock()
+	defer s.procsMu.Unlock()
 	if existing, exists := s.procs[p.BotName]; exists {
 		rb := &RunningBot{
 			Name:      existing.Name,
@@ -384,10 +397,8 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 			StartedAt: existing.StartedAt,
 			LogPath:   existing.LogPath,
 		}
-		s.procsMu.Unlock()
 		return rb, AlreadyRunning, nil
 	}
-	s.procsMu.Unlock()
 
 	if err := os.MkdirAll(s.PIDDir, 0700); err != nil {
 		return nil, StartedFresh, fmt.Errorf("preparing pid dir: %w", err)
@@ -465,9 +476,8 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 		LogPath:   logPath,
 		PIDPath:   pidPath,
 	}
-	s.procsMu.Lock()
+	// procsMu is already held by the outer defer; no re-lock.
 	s.procs[p.BotName] = bp
-	s.procsMu.Unlock()
 
 	startedBy := p.StartedBy
 	if startedBy == "" {

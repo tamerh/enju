@@ -503,6 +503,75 @@ exit 0
 	t.Errorf("reaper didn't clean up after self-exit; status: %+v", s.Status())
 }
 
+// TestSupervisor_ConcurrentStartIsAtomic is the regression for
+// the REV.2 race: pre-fix, Start released procsMu between the
+// existence check and the procs-map insert, so two concurrent
+// Start("foo") callers could both pass the check, both fork,
+// and the second insert would silently leak the first daemon.
+// Fixed by holding procsMu for the entire function.
+//
+// The test fires N goroutines, all calling Start("same-bot") at
+// once, then asserts that exactly one returns StartedFresh and
+// the rest return AlreadyRunning with the same PID. Without
+// the fix, multiple goroutines would observe StartedFresh.
+func TestSupervisor_ConcurrentStartIsAtomic(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	const goroutines = 8
+	type result struct {
+		rb      *RunningBot
+		outcome StartOutcome
+		err     error
+	}
+	results := make(chan result, goroutines)
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			<-start
+			rb, outcome, err := s.Start(context.Background(), StartParams{
+				BotName: "racey", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+			})
+			results <- result{rb, outcome, err}
+		}()
+	}
+	close(start)
+
+	freshCount := 0
+	alreadyCount := 0
+	var freshPID int
+	for i := 0; i < goroutines; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("Start err: %v", r.err)
+		}
+		switch r.outcome {
+		case StartedFresh:
+			freshCount++
+			freshPID = r.rb.PID
+		case AlreadyRunning:
+			alreadyCount++
+			// AlreadyRunning callers must surface the same PID
+			// as the one that actually spawned — without that,
+			// callers ref-counting by PID would split-brain.
+			if r.rb.PID == 0 {
+				t.Errorf("AlreadyRunning surfaced zero PID")
+			}
+		}
+	}
+	if freshCount != 1 {
+		t.Errorf("want exactly 1 StartedFresh across %d concurrent Start calls, got %d (alreadyCount=%d)",
+			goroutines, freshCount, alreadyCount)
+	}
+	if alreadyCount != goroutines-1 {
+		t.Errorf("want %d AlreadyRunning, got %d", goroutines-1, alreadyCount)
+	}
+	if freshPID == 0 {
+		t.Errorf("StartedFresh surfaced zero PID")
+	}
+}
+
 func TestSupervisor_PIDFileRecordsStartedBy(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)

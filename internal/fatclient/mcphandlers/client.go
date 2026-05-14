@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/service"
@@ -40,7 +41,16 @@ type apiClient struct {
 	// cost. Concurrent MCP tool calls share a single
 	// Supervisor instance so the in-memory tracking map is
 	// the authoritative state for this fatclient session.
-	supervisor *bots.Supervisor
+	//
+	// supervisorMu serializes lazy construction so concurrent
+	// first-callers can't each NewSupervisor + fire reconcile.
+	// MCP tool dispatch is serialized at the transport layer
+	// today, but the race window is real and would bite the
+	// moment dispatch went concurrent. Tests pre-inject
+	// c.supervisor at construction; the locked check at the
+	// top of botSupervisor() honors that path without racing.
+	supervisorMu sync.Mutex
+	supervisor   *bots.Supervisor
 }
 
 // username forwards to the FatClient's coord client. Updated
@@ -93,14 +103,21 @@ func (c *apiClient) citizenKind(ctx context.Context) string {
 // surfaced once at the call site so the MCP tool can return a
 // friendly message instead of panicking.
 //
-// Thread-safety note: this is a "first-use init" pattern not
-// guarded by a mutex. Concurrent first calls would each
-// construct a Supervisor and the last one written wins. In
-// practice MCP tool dispatch is serialized at the transport
-// layer (mcp-go's stdio handler is single-threaded per
-// connection), so the race window doesn't fire. If we ever
-// see concurrent MCP dispatch the obvious fix is sync.Once.
+// Thread-safety: supervisorMu serializes lazy construction so
+// concurrent first-callers can't each NewSupervisor + fire a
+// duplicate reconcile goroutine. MCP tool dispatch is
+// serialized at the transport layer today, but the race window
+// is real and would bite the moment dispatch went concurrent.
+//
+// Test seam: when c.supervisor is pre-injected (tests build
+// apiClient with a Supervisor pointing at a fake binary +
+// tempdir PIDDir/LogDir), the locked nil-check returns the
+// injected instance without calling NewSupervisor — otherwise
+// the lazy ctor would overwrite the test's supervisor with
+// one pointing at the operator's real ~/.enju/bots/pids.
 func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
+	c.supervisorMu.Lock()
+	defer c.supervisorMu.Unlock()
 	if c.supervisor != nil {
 		return c.supervisor, nil
 	}
@@ -110,8 +127,8 @@ func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
 	}
 	c.supervisor = s
 	// Reconcile stale auto_run_ids from a previous fatclient
-	// session. Best-effort, fire-and-forget — if the coord
-	// is unreachable we'd rather log and continue than block
+	// session. Best-effort, fire-and-forget — if the coord is
+	// unreachable we'd rather log and continue than block
 	// supervisor construction. Stale refs that survive this
 	// pass will be GC'd lazily by the next terminal event the
 	// tailer observes for them.
