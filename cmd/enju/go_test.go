@@ -226,3 +226,67 @@ func TestRunIdentityFromCreateResponseMissingFields(t *testing.T) {
 		t.Fatalf("expected zeros for missing fields, got seq=%d id=%d", seq, id)
 	}
 }
+
+// TestShouldRenderPoll covers the --auto-bots poll-dedup logic.
+// A long-running bot turn (5+ minute review) would otherwise
+// spam stdout with 150 identical "next gate: <task_id>" lines
+// at the 2s poll cadence. Render only when something changed.
+func TestShouldRenderPoll(t *testing.T) {
+	cases := []struct {
+		name        string
+		res         *service.ExecuteRunResult
+		lastStop    string
+		lastBlocker string
+		want        bool
+	}{
+		{
+			name: "entries present always renders",
+			res: &service.ExecuteRunResult{
+				Entries:    []service.ExecuteRunEntry{{TaskID: "1:task_a", Status: "ok"}},
+				StopReason: service.StopNoReadyCompute,
+			},
+			want: true,
+		},
+		{
+			name:     "stop reason changed renders",
+			res:      &service.ExecuteRunResult{StopReason: service.StopCitizenTaskReady},
+			lastStop: service.StopNoReadyCompute,
+			want:     true,
+		},
+		{
+			name: "blocker shifted renders",
+			res: &service.ExecuteRunResult{
+				StopReason: service.StopCitizenTaskReady,
+				Blocker:    &service.ExecuteRunBlocker{TaskID: "1:gate_b"},
+			},
+			lastStop:    service.StopCitizenTaskReady,
+			lastBlocker: "1:gate_a",
+			want:        true,
+		},
+		{
+			name: "same stop + same blocker + no entries suppresses",
+			res: &service.ExecuteRunResult{
+				StopReason: service.StopCitizenTaskReady,
+				Blocker:    &service.ExecuteRunBlocker{TaskID: "1:gate_a"},
+			},
+			lastStop:    service.StopCitizenTaskReady,
+			lastBlocker: "1:gate_a",
+			want:        false,
+		},
+		{
+			name: "first iteration renders (no prior state)",
+			res: &service.ExecuteRunResult{
+				StopReason: service.StopCitizenTaskReady,
+				Blocker:    &service.ExecuteRunBlocker{TaskID: "1:gate_a"},
+			},
+			want: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldRenderPoll(c.res, c.lastStop, c.lastBlocker); got != c.want {
+				t.Errorf("shouldRenderPoll: got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

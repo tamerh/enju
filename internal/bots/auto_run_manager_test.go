@@ -191,6 +191,75 @@ func TestAutoRunManagerEmptyManifestRejected(t *testing.T) {
 	}
 }
 
+// TestAutoRunManagerHookRunSeqMarksPidFile — HookRunSeq must
+// actually write the run seq into each preflighted bot's pid
+// file. This is the regression for "CLI's createRun never
+// called HookRunSeq" (review issue #1, AGO-followup) — a
+// passing call verifies the manager's side effects, not just
+// that the function returns nil. Future regressions where
+// HookRunSeq becomes a no-op surface here.
+func TestAutoRunManagerHookRunSeqMarksPidFile(t *testing.T) {
+	sup := newAutoRunTestSupervisor(t)
+	defer sup.StopAll(context.Background())
+
+	dir := t.TempDir()
+	const seqUnderTest int64 = 42
+
+	mgr := NewAutoRunManager(sup, "/tmp/p/workflow.yaml", "http://x", 7, 2*time.Second)
+	if err := mgr.Preflight(context.Background(), singleBotManifest("gamma")); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	unhooked := mgr.HookRunSeq(context.Background(), seqUnderTest, dir)
+	if len(unhooked) > 0 {
+		t.Fatalf("HookRunSeq: expected no unhooked bots, got %v", unhooked)
+	}
+
+	// Side-effect check: the bot's pid file should now carry
+	// the run seq in its AutoRunIDs list. RunningBot doesn't
+	// expose this field publicly (intentionally minimal), so
+	// read the pid file directly — same shape readPIDFile
+	// consumes everywhere else in the package.
+	entry, rerr := readPIDFile(sup.pidPathFor("gamma"))
+	if rerr != nil {
+		t.Fatalf("readPIDFile: %v", rerr)
+	}
+	if !contains(entry.AutoRunIDs, seqUnderTest) {
+		t.Errorf("AutoRunIDs missing %d: got %v", seqUnderTest, entry.AutoRunIDs)
+	}
+}
+
+func contains(haystack []int64, needle int64) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAutoRunManagerHookRunSeqEmptyProjectDir — empty
+// projectDir is a degraded but non-fatal path: HookRunSeq still
+// marks pid files (the supervisor only needs projectDir for the
+// tailer), but WatchProjectEvents logs and skips. Verify
+// MarkAutoRun still fires.
+func TestAutoRunManagerHookRunSeqEmptyProjectDir(t *testing.T) {
+	sup := newAutoRunTestSupervisor(t)
+	defer sup.StopAll(context.Background())
+
+	mgr := NewAutoRunManager(sup, "/tmp/p/workflow.yaml", "http://x", 7, 2*time.Second)
+	if err := mgr.Preflight(context.Background(), singleBotManifest("delta")); err != nil {
+		t.Fatal(err)
+	}
+	mgr.HookRunSeq(context.Background(), 99, "")
+	entry, rerr := readPIDFile(sup.pidPathFor("delta"))
+	if rerr != nil {
+		t.Fatalf("readPIDFile: %v", rerr)
+	}
+	if !contains(entry.AutoRunIDs, 99) {
+		t.Errorf("MarkAutoRun should fire even with empty projectDir; AutoRunIDs=%v", entry.AutoRunIDs)
+	}
+}
+
 // TestAutoRunManagerRollbackIdempotent — Rollback drains
 // freshStarts so a second call is a no-op. Important: the
 // MCP handler's POST-failure path may invoke Rollback after a

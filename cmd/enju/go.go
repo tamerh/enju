@@ -146,7 +146,19 @@ func cmdGo(args []string) {
 // perceive lag between bot work completing and the next
 // compute round kicking off.
 func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, runSeq, maxTasks int, asJSON bool) int {
-	const pollInterval = 2 * time.Second
+	const (
+		pollInterval     = 2 * time.Second
+		coordWarnEvery   = 10 // emit a warning every Nth consecutive failure
+	)
+	// lastStopReason de-duplicates the noisy "stopped: X" /
+	// "next gate: Y" block when nothing changed between
+	// polling iterations. The render still fires when entries
+	// are non-empty (real work happened) or when the blocker
+	// shifted (operator gets a fresh signal).
+	var lastStopReason string
+	var lastBlockerID string
+	consecutiveCoordErrors := 0
+
 	for {
 		res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
 			ProjectID: projectID,
@@ -158,7 +170,15 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, r
 			fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
 			return 1
 		}
-		renderExecuteResult(os.Stdout, res, asJSON)
+		if shouldRenderPoll(res, lastStopReason, lastBlockerID) {
+			renderExecuteResult(os.Stdout, res, asJSON)
+		}
+		lastStopReason = res.StopReason
+		if res.Blocker != nil {
+			lastBlockerID = res.Blocker.TaskID
+		} else {
+			lastBlockerID = ""
+		}
 		if res.StopReason == service.StopComputeFailed ||
 			res.StopReason == service.StopComputeErrored ||
 			res.StopReason == service.StopGitOperationFailed {
@@ -169,9 +189,30 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, r
 		// auto-managed bots are independently working through
 		// citizen tasks between our compute drains.
 		terminal, terr := sess.isRunTerminal(ctx, int64(projectID), int64(runSeq))
-		if terr == nil && terminal {
-			logf(asJSON, "▶ run terminal — auto-stop tailer will fire on any auto-managed bots")
-			return 0
+		if terr != nil {
+			// Persistent coord outage (network partition, coord
+			// crash) would otherwise spin forever silently. Warn
+			// every N consecutive failures so the operator can
+			// distinguish "bots working, coord healthy" from
+			// "coord unreachable, only Ctrl-C exits."
+			consecutiveCoordErrors++
+			if consecutiveCoordErrors%coordWarnEvery == 0 {
+				fmt.Fprintf(os.Stderr,
+					"⚠ coord unreachable for %d consecutive polls (last: %v) — Ctrl-C to abort\n",
+					consecutiveCoordErrors, terr)
+			}
+		} else {
+			consecutiveCoordErrors = 0
+			if terminal {
+				// Both mechanisms are now wired: the live.jsonl
+				// tailer (started by HookRunSeq) fires auto-stop
+				// based on terminal events, and the CLI process
+				// exit takes any subprocess bots down via
+				// stdin-EOF. Operator-owned bots that rode along
+				// as AlreadyRunning survive both paths.
+				logf(asJSON, "▶ run terminal — auto-stop firing on any auto-managed bots")
+				return 0
+			}
 		}
 
 		// Wait a beat, then re-enter. ctx.Done lets the
@@ -183,6 +224,32 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, r
 		case <-time.After(pollInterval):
 		}
 	}
+}
+
+// shouldRenderPoll filters out no-op iterations where ExecuteRun
+// found nothing new to do and the stop reason / blocker are
+// unchanged from the prior poll. Long bot turns (5+ minutes on a
+// review) would otherwise spam stdout with 150 identical "next
+// gate:" lines.
+//
+// Render fires when ANY of:
+//   - Entries non-empty (real work happened this iteration).
+//   - Stop reason changed (e.g. citizen_task_ready → no_ready_compute
+//     after the bot resolved the gate).
+//   - Blocker identity changed (one citizen gate cleared,
+//     another raised).
+func shouldRenderPoll(res *service.ExecuteRunResult, lastStop, lastBlocker string) bool {
+	if len(res.Entries) > 0 {
+		return true
+	}
+	if res.StopReason != lastStop {
+		return true
+	}
+	curBlocker := ""
+	if res.Blocker != nil {
+		curBlocker = res.Blocker.TaskID
+	}
+	return curBlocker != lastBlocker
 }
 
 // resolveOrRegisterProject finds the project that owns
@@ -306,6 +373,20 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		return 0, 0, err
 	}
 
+	// Warn when the workflow declares bots but the operator
+	// didn't opt in to --auto-bots. Without this, `enju go
+	// workflow.yaml` on a bots-using workflow stops at the first
+	// citizen gate with "next gate: <task_id>" and an operator
+	// may not realize the workflow's own bots could have
+	// resolved it — they were just never started.
+	if !autoBots && prep != nil && prep.LoadedTemplate != nil {
+		if m, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots); perr == nil && m != nil && len(m.Bots) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"⚠ workflow declares %d bot(s); pass --auto-bots to start them automatically (or `enju bot run` per bot for manual control)\n",
+				len(m.Bots))
+		}
+	}
+
 	// auto_bots preflight (mirrors handleCreateRun). Same
 	// AutoRunManager type so any bug fix in bot lifecycle
 	// lands in both places automatically.
@@ -380,6 +461,26 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	if seq == 0 || runID == 0 {
 		return 0, 0, fmt.Errorf("coord response missing seq/id: %s", string(data))
 	}
+
+	// Post-POST hook: mark each preflighted bot's pid file with
+	// the new run's seq and start the live.jsonl tailer so
+	// terminal events fire auto-stop. Mirrors handleCreateRun's
+	// HookRunSeq call. Without this, auto-managed bots in CLI
+	// runs lacked the tailer entirely — they'd only ever stop
+	// via stdin-EOF when the CLI process exits, never via the
+	// run-completed event. (Functionally fresh-started bots
+	// still got cleaned up via parent-death, but operator bots
+	// that came back AlreadyRunning lacked the run-seq ref and
+	// the tailer was missing for cross-process inspection.)
+	if autoRunMgr != nil && prep != nil && prep.Workflow != nil {
+		unhooked := autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
+		if len(unhooked) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
+				len(unhooked), len(autoRunMgr.AutoBotNames()), strings.Join(unhooked, ", "))
+		}
+	}
+
 	return seq, runID, nil
 }
 

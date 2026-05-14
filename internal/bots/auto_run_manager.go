@@ -31,14 +31,17 @@ import (
 	"time"
 )
 
-// AutoRunReadyTimeout is how long Preflight waits for each bot
-// to reach PhaseReady. Defaults to 30s; tunable via
+// AutoRunReadyTimeout is the per-bot Preflight wait used by
+// both create_run call sites (MCP handler + CLI `enju go
+// --auto-bots`). Defaults to 30s; tunable in production via
 // ENJU_AUTO_BOTS_TIMEOUT for first-touch demos with cold
-// claude-CLI subprocesses that need longer warmup, and for
-// tests that want to fail fast without waiting the production
-// timeout. Both create_run call sites (MCP handler + CLI `enju
-// go --auto-bots`) read this so the env override applies
-// uniformly.
+// claude-CLI subprocesses that need longer warmup.
+//
+// Test path: tests construct AutoRunManager directly via
+// NewAutoRunManager(... readyTimeout), bypassing this function
+// — that's intentional so test cases can pin a deterministic
+// timeout without depending on global env. The env-override
+// path is for operator use; tests don't go through it.
 func AutoRunReadyTimeout() time.Duration {
 	if v := os.Getenv("ENJU_AUTO_BOTS_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
