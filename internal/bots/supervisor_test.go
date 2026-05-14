@@ -64,7 +64,7 @@ func TestSupervisor_StartAndStatus(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 
-	rb, err := s.Start(context.Background(), StartParams{
+	rb, _, err := s.Start(context.Background(), StartParams{
 		BotName:     "developer-bot",
 		WorkflowPath: "/tmp/project/workflow.yaml",
 		Coordinator: "http://localhost:8000",
@@ -98,22 +98,32 @@ func TestSupervisor_StartAndStatus(t *testing.T) {
 	}
 }
 
-func TestSupervisor_DoubleStartFails(t *testing.T) {
+func TestSupervisor_DoubleStartIsIdempotent(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 	defer s.StopAll(context.Background())
 
-	_, err := s.Start(context.Background(), StartParams{
+	first, outcome, err := s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.Start(context.Background(), StartParams{
+	if outcome != StartedFresh {
+		t.Errorf("first Start outcome: want StartedFresh, got %v", outcome)
+	}
+	var second *RunningBot
+	second, outcome, err = s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
-	if err == nil || !strings.Contains(err.Error(), "already running") {
-		t.Errorf("expected double-start error, got: %v", err)
+	if err != nil {
+		t.Fatalf("second Start: want nil error (idempotent), got %v", err)
+	}
+	if outcome != AlreadyRunning {
+		t.Errorf("second Start outcome: want AlreadyRunning, got %v", outcome)
+	}
+	if second.PID != first.PID {
+		t.Errorf("second Start should return existing PID %d, got %d", first.PID, second.PID)
 	}
 }
 
@@ -124,7 +134,7 @@ func TestSupervisor_StopGracefulShutdown(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -165,7 +175,7 @@ wait
 `)
 	s := newTestSupervisor(t, bin)
 
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "stuck-bot", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -204,7 +214,7 @@ echo "hello from fake bot"
 echo "second line"
 `)
 	s := newTestSupervisor(t, bin)
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "logged", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -255,7 +265,7 @@ func TestSupervisor_StopAll(t *testing.T) {
 	s := newTestSupervisor(t, bin)
 
 	for _, name := range []string{"a", "b", "c"} {
-		if _, err := s.Start(context.Background(), StartParams{
+		if _, _, err := s.Start(context.Background(), StartParams{
 			BotName: name, WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 		}); err != nil {
 			t.Fatal(err)
@@ -277,7 +287,7 @@ func TestSupervisor_StopReportsGracefulFlag(t *testing.T) {
 	// Graceful path → Graceful=true.
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "g", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -298,7 +308,7 @@ wait
 `)
 	s2 := newTestSupervisor(t, hangBin)
 	s2.GracefulTimeout = 100 * time.Millisecond
-	if _, err := s2.Start(context.Background(), StartParams{
+	if _, _, err := s2.Start(context.Background(), StartParams{
 		BotName: "h", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -320,7 +330,7 @@ echo "about to crash"
 exit 7
 `)
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "crashy", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -389,7 +399,7 @@ while IFS= read -r line; do : ; done
 	defer s.StopAll(context.Background())
 
 	// Start a, expect success.
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "a", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Errorf("Start a: %v", err)
@@ -397,7 +407,7 @@ while IFS= read -r line; do : ; done
 	// Start b — the supervisor itself doesn't reject; the
 	// daemon process just exits non-zero. Reaper records the
 	// crash and clears the entry.
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "b", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Errorf("Start b (process spawned even if it'll exit): %v", err)
@@ -442,7 +452,7 @@ func TestSupervisor_AllowToolsForwardedToDaemon(t *testing.T) {
 	// we can grep the log for the flag.
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName:      "checker",
 		WorkflowPath: "/tmp/p/workflow.yaml",
 		Coordinator:  "http://x",
@@ -475,7 +485,7 @@ echo "exiting on my own"
 exit 0
 `)
 	s := newTestSupervisor(t, bin)
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "self-exit", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {

@@ -109,7 +109,7 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 	// client the apiClient already owns.
 	coordURL := c.fc.Coord().BaseURL()
 
-	rb, err := sup.Start(ctx, bots.StartParams{
+	rb, outcome, err := sup.Start(ctx, bots.StartParams{
 		BotName:      botName,
 		WorkflowPath: workflowPath,
 		Coordinator:  coordURL,
@@ -120,8 +120,12 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError("✗ " + err.Error()), nil
 	}
 	body, _ := json.MarshalIndent(rb, "", "  ")
-	return mcp.NewToolResultText(fmt.Sprintf("✓ bot %q started (pid=%d, log=%s)\n%s",
-		rb.Name, rb.PID, rb.LogPath, string(body))), nil
+	verb := "started"
+	if outcome == bots.AlreadyRunning {
+		verb = "already running"
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ bot %q %s (pid=%d, log=%s)\n%s",
+		rb.Name, verb, rb.PID, rb.LogPath, string(body))), nil
 }
 
 func (c *apiClient) handleBotStop(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -224,11 +228,17 @@ func (c *apiClient) handleBotStartAll(ctx context.Context, req mcp.CallToolReque
 	}
 	coordURL := c.fc.Coord().BaseURL()
 
+	// Per-bot status reflects the supervisor's idempotent Start
+	// surface: "started" = fresh process spawned this call,
+	// "already_running" = no-op success (daemon was up from a
+	// prior start), "failed" = Start returned an error. The
+	// first two satisfy the post-condition "fleet is up"; only
+	// "failed" is a real problem.
 	type result struct {
-		Name  string `json:"name"`
-		OK    bool   `json:"ok"`
-		PID   int    `json:"pid,omitempty"`
-		Error string `json:"error,omitempty"`
+		Name   string `json:"name"`
+		Status string `json:"status"` // started | already_running | failed
+		PID    int    `json:"pid,omitempty"`
+		Error  string `json:"error,omitempty"`
 	}
 	results := make([]result, 0, len(manifest.Bots))
 	for _, b := range manifest.Bots {
@@ -236,7 +246,7 @@ func (c *apiClient) handleBotStartAll(ctx context.Context, req mcp.CallToolReque
 		if b.MCPTools != nil {
 			allow = b.MCPTools.Allow
 		}
-		rb, err := sup.Start(ctx, bots.StartParams{
+		rb, outcome, err := sup.Start(ctx, bots.StartParams{
 			BotName:      b.Name,
 			WorkflowPath: workflowPath,
 			Coordinator:  coordURL,
@@ -244,10 +254,10 @@ func (c *apiClient) handleBotStartAll(ctx context.Context, req mcp.CallToolReque
 			AllowTools:   allow,
 		})
 		if err != nil {
-			results = append(results, result{Name: b.Name, OK: false, Error: err.Error()})
+			results = append(results, result{Name: b.Name, Status: "failed", Error: err.Error()})
 			continue
 		}
-		results = append(results, result{Name: b.Name, OK: true, PID: rb.PID})
+		results = append(results, result{Name: b.Name, Status: outcome.String(), PID: rb.PID})
 	}
 	body, _ := json.MarshalIndent(results, "", "  ")
 	return mcp.NewToolResultText(string(body)), nil

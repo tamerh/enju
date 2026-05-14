@@ -272,27 +272,65 @@ type pidFileEntry struct {
 	LogPath   string    `json:"log_path"`
 }
 
-// Start spawns a new bot daemon. Returns an error if a daemon
-// for that bot is already running (single-bot-per-machine
-// invariant for v1; multi-instance is post-launch work).
+// StartOutcome classifies what happened when Start was called.
+// StartedFresh means a new daemon process was spawned;
+// AlreadyRunning means a daemon for that bot was already up
+// and Start was a no-op (idempotent). Both are success — the
+// post-condition "the bot is running" holds either way. Callers
+// that want to distinguish them (the auto_bots flow reporting
+// per-bot status, or enju_bot_start_all classifying results)
+// branch on the outcome; callers that just want "the bot is
+// up" can ignore it.
+type StartOutcome int
+
+const (
+	StartedFresh   StartOutcome = iota // a new process was spawned
+	AlreadyRunning                     // no-op, daemon was up already
+)
+
+func (o StartOutcome) String() string {
+	switch o {
+	case StartedFresh:
+		return "started"
+	case AlreadyRunning:
+		return "already_running"
+	default:
+		return fmt.Sprintf("StartOutcome(%d)", int(o))
+	}
+}
+
+// Start spawns a new bot daemon, or returns the existing
+// running record if a daemon for that bot is already up.
+// Idempotent at the result surface: callers that want to bring
+// the post-condition "this bot is running" into effect can call
+// Start unconditionally and branch on outcome only for
+// diagnostics. Required for auto_bots, where a workflow's
+// declared bots may already be running from a manual start or
+// a prior auto-managed run.
 //
 // The daemon runs as `enju bot run --bot=<name>
 // --workflow=<path> --coordinator=<url>` with stdin connected
 // so Stop can close it for graceful shutdown. Stdout/stderr go
 // to the per-bot log file, opened append-mode.
-func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, error) {
+func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, StartOutcome, error) {
 	if p.BotName == "" || p.WorkflowPath == "" || p.Coordinator == "" {
-		return nil, fmt.Errorf("Start: bot_name, workflow_path, and coordinator are required")
+		return nil, StartedFresh, fmt.Errorf("Start: bot_name, workflow_path, and coordinator are required")
 	}
 	s.procsMu.Lock()
-	if _, exists := s.procs[p.BotName]; exists {
+	if existing, exists := s.procs[p.BotName]; exists {
+		rb := &RunningBot{
+			Name:      existing.Name,
+			PID:       existing.Cmd.Process.Pid,
+			StartedAt: existing.StartedAt,
+			LogPath:   existing.LogPath,
+		}
 		s.procsMu.Unlock()
-		return nil, fmt.Errorf("bot %q is already running — call enju_bot_stop first", p.BotName)
+		return rb, AlreadyRunning, nil
 	}
 	s.procsMu.Unlock()
 
 	if err := os.MkdirAll(s.PIDDir, 0700); err != nil {
-		return nil, fmt.Errorf("preparing pid dir: %w", err)
+		return nil, StartedFresh, fmt.Errorf("preparing pid dir: %w", err)
 	}
 	// MkdirAll only sets mode on creation. If the dir
 	// already exists at 0755 from a prior tool, bot PID
@@ -300,13 +338,13 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, err
 	// include bot names) via directory traversal. Same
 	// hardening pattern as Phase 1's credentials directory.
 	if err := os.Chmod(s.PIDDir, 0700); err != nil {
-		return nil, fmt.Errorf("tightening pid dir mode: %w", err)
+		return nil, StartedFresh, fmt.Errorf("tightening pid dir mode: %w", err)
 	}
 	if err := os.MkdirAll(s.LogDir, 0700); err != nil {
-		return nil, fmt.Errorf("preparing log dir: %w", err)
+		return nil, StartedFresh, fmt.Errorf("preparing log dir: %w", err)
 	}
 	if err := os.Chmod(s.LogDir, 0700); err != nil {
-		return nil, fmt.Errorf("tightening log dir mode: %w", err)
+		return nil, StartedFresh, fmt.Errorf("tightening log dir mode: %w", err)
 	}
 	logPath := filepath.Join(s.LogDir, p.BotName+".log")
 	pidPath := filepath.Join(s.PIDDir, p.BotName+".json")
@@ -316,7 +354,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, err
 	// reading enju_bot_logs after a restart sees the lead-up.
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("opening log file: %w", err)
+		return nil, StartedFresh, fmt.Errorf("opening log file: %w", err)
 	}
 
 	args := []string{
@@ -337,12 +375,12 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, err
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("opening stdin pipe: %w", err)
+		return nil, StartedFresh, fmt.Errorf("opening stdin pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = logFile.Close()
-		return nil, fmt.Errorf("spawning bot daemon: %w", err)
+		return nil, StartedFresh, fmt.Errorf("spawning bot daemon: %w", err)
 	}
 
 	now := time.Now()
@@ -377,7 +415,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, err
 		PID:       cmd.Process.Pid,
 		StartedAt: now,
 		LogPath:   logPath,
-	}, nil
+	}, StartedFresh, nil
 }
 
 // StopResult tells callers HOW the daemon exited. graceful=true
