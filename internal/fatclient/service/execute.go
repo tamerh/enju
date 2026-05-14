@@ -152,66 +152,21 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 
 	taskScratchDir := compute.ResolveTaskScratchDir(wf.ProjectRoot(), s.coord.Username(), taskID, meta.IterSeq)
 
-	// Per-run-snapshot redesign: a single materialization of the
-	// run branch's whole tree lives at <project>/.enju/runs/<N>/snapshot/
-	// (RunSnapshotOnDiskDir). Every task in the run reads from
-	// there — task defs, scripts, sibling files, and the rest of
-	// the frozen repo via $ENJU_REPO_DIR.
-	//
-	// create_run does the materialization once and the directory
-	// survives until the run sweep. If it's missing at claim time
-	// (operator wiped .enju/, or the sweep already ran while
-	// retrying a stale task) we re-materialize from .git/objects/
-	// — cheap and idempotent.
-	//
-	// Fallback path: when no workspace is set (legacy/test paths
-	// without a real project root) we still read from the
-	// worktree's enju/runs/<N>/template-snapshot/ directly. Those
-	// paths only ever exercise one run at a time so the
-	// concurrency hazard the per-run materialization addresses
-	// doesn't bite.
-	repoSnapshotDir := ""
-	templateSnapshotDir := ""
-	if wf.ProjectRoot() != "" && meta.Branch != "" {
-		repoSnapshotDir = filepath.Join(wf.ProjectRoot(), corelayout.RunSnapshotOnDiskDir(meta.RunSeq, meta.RunSlug))
-		// path= runs: the workflow YAML and its neighbors live at
-		// their authored paths inside the materialized snapshot.
-		// The "template dir" is the workflow YAML's containing
-		// directory:
-		//   - YAML file path ("workflows/scan-deps/enju.yaml") →
-		//     dirname → "workflows/scan-deps"
-		//   - Directory path ("enju/templates/variant-calling") →
-		//     the dir itself
-		// No more enju/runs/N/template-snapshot/ subdir nesting.
-		//
-		// Inline-YAML runs (no RunSourcePath): legacy committed
-		// template-snapshot/ path still applies — the inline
-		// YAML doesn't exist anywhere else.
-		if meta.RunSourcePath != "" {
-			templateRel := meta.RunSourcePath
-			if strings.HasSuffix(templateRel, ".yaml") || strings.HasSuffix(templateRel, ".yml") {
-				templateRel = filepath.Dir(templateRel)
-			}
-			templateSnapshotDir = filepath.Join(repoSnapshotDir, templateRel)
-		} else {
-			templateSnapshotDir = filepath.Join(repoSnapshotDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
-		}
+	repoSnapshotDir, templateSnapshotDir := resolveSnapshotDirs(wf, meta)
+	if repoSnapshotDir != "" {
 		if _, statErr := os.Stat(repoSnapshotDir); os.IsNotExist(statErr) {
 			if _, merr := wf.MaterializeRunRepo(meta.Branch, repoSnapshotDir); merr != nil {
 				return nil, fmt.Errorf("materializing run snapshot from branch %q: %w", meta.Branch, merr)
 			}
 		}
-	} else {
-		templateSnapshotDir = filepath.Join(workDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
 	}
-	taskDef, err := enjuYaml.LoadTaskDefFromSnapshot(templateSnapshotDir, meta.TaskDefID)
-	if err != nil {
-		return nil, fmt.Errorf("loading task def from snapshot: %w", err)
+	bigfilesDir := enjugit.ResolveBigfilesDir(wf.ProjectRoot(), meta.ProjectID, projName, meta.Branch)
+	if bigfilesDir != "" {
+		_ = os.MkdirAll(bigfilesDir, 0755)
 	}
 
-	// Script resolution: template runs pin scripts to the per-run
-	// template snapshot directory; inline-YAML runs use
-	// project-relative paths as declared.
+	// Script path is task-specific (meta.Script varies per task def);
+	// templateSnapshotDir is the run-level snapshot dir where scripts live.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
 		templateDir = templateSnapshotDir
@@ -222,29 +177,6 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
 	}
-
-	// Read-only is now convention, not host-side enforcement.
-	// Scripts that write to $ENJU_REPO_DIR or $ENJU_TEMPLATE_DIR
-	// are buggy and should target $ENJU_SCRATCH instead.
-	// Container path still gets a kernel-side :ro bind for the
-	// strong guarantee inside the sandbox.
-
-	// Resolve + pre-create the bigfiles dir for this branch so
-	// the script can write track:false outputs into it without
-	// "no such file or directory". Best-effort: if MkdirAll fails
-	// (permission, full disk), let the script error path surface
-	// it — the resolver always returns a non-empty path in the
-	// production layout, so an mkdir failure here is genuine IO
-	// trouble worth seeing.
-	bigfilesDir := enjugit.ResolveBigfilesDir(wf.ProjectRoot(), meta.ProjectID, projName, meta.Branch)
-	if bigfilesDir != "" {
-		_ = os.MkdirAll(bigfilesDir, 0755)
-	}
-
-	// taskScratchDir was resolved earlier (also used for snapshot
-	// materialization above). Empty workspace root → "" — the
-	// wrapper's lifecycle is a no-op in that case, preserving
-	// legacy/test behavior.
 
 	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir, meta)
 
@@ -358,8 +290,8 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		// produces deterministic bytes from code + inputs, not LLM
 		// output. The "who initiated" answer doesn't change mid-run.
 		Model:            s.modelName,
-		Container:        taskDef.Container,
-		ContainerRuntime: taskDef.ContainerRuntime,
+		Container:        meta.Container,
+		ContainerRuntime: meta.ContainerRuntime,
 		Env:              meta.Env,
 	}
 
@@ -520,6 +452,28 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}
 	}
 	return out, nil
+}
+
+// resolveSnapshotDirs derives the on-disk snapshot paths for a run
+// from the task meta and workflow. Returns (repoSnapshotDir,
+// templateSnapshotDir); both may be empty for inline-YAML runs
+// without a project root.
+func resolveSnapshotDirs(wf *enjugit.Workflow, meta *TaskMeta) (repoSnapshotDir, templateSnapshotDir string) {
+	if wf.ProjectRoot() != "" && meta.Branch != "" {
+		repoSnapshotDir = filepath.Join(wf.ProjectRoot(), corelayout.RunSnapshotOnDiskDir(meta.RunSeq, meta.RunSlug))
+		if meta.RunSourcePath != "" {
+			templateRel := meta.RunSourcePath
+			if strings.HasSuffix(templateRel, ".yaml") || strings.HasSuffix(templateRel, ".yml") {
+				templateRel = filepath.Dir(templateRel)
+			}
+			templateSnapshotDir = filepath.Join(repoSnapshotDir, templateRel)
+		} else {
+			templateSnapshotDir = filepath.Join(repoSnapshotDir, corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+		}
+	} else {
+		templateSnapshotDir = filepath.Join(wf.WorkDir(), corelayout.RunTemplateSnapshotDir(meta.RunSeq, meta.RunSlug))
+	}
+	return
 }
 
 // buildComputeEnv assembles the env slice passed to the wrapper

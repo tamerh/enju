@@ -384,6 +384,20 @@ type TaskRecord struct {
 	// read sites so the default-to-sync rule lives in one place.
 	Mode string
 
+	// Container is the OCI image reference for compute tasks
+	// that run inside a container (e.g. "alpine:3.19"). Empty
+	// for bare-host compute tasks. Copied from the YAML
+	// TaskDef.Container field at create_run time so the
+	// fat-client executor doesn't need to parse the template
+	// snapshot YAML at execute time.
+	Container string
+
+	// ContainerRuntime selects the container backend
+	// ("docker", "podman", etc.). Empty means the executor
+	// uses its configured default. Copied from YAML at
+	// create_run time for the same reason as Container.
+	ContainerRuntime string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

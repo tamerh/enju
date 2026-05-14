@@ -268,6 +268,8 @@ func (s *Store) initSchema() error {
 		vote_deadline TEXT NOT NULL DEFAULT '',
 		anonymize INTEGER NOT NULL DEFAULT 0,
 		visibility TEXT NOT NULL DEFAULT '',
+		container TEXT NOT NULL DEFAULT '',
+		container_runtime TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -654,6 +656,8 @@ func (s *Store) initSchema() error {
 		// blocker. Surface readers (enju_run_status) check
 		// state==waiting before reading the column.
 		`ALTER TABLE runs ADD COLUMN blocked_by TEXT`,
+		`ALTER TABLE tasks ADD COLUMN container TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN container_runtime TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1097,7 +1101,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1115,7 +1119,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-		&t.ClosesIssueSeq,
+		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2431,7 +2435,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-			&t.ClosesIssueSeq,
+			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

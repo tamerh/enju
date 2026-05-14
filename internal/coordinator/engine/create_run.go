@@ -200,9 +200,11 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				VoteDeadline:    ti.Deadline,
 				Anonymize:       ti.Anonymize,
 				Visibility:      ti.Visibility,
-				Env:             marshalStringMap(ti.Env),
-				Mode:            ti.Mode,
-				CreatedAt:       now,
+				Env:              marshalStringMap(ti.Env),
+				Mode:             ti.Mode,
+				Container:        ti.Container,
+				ContainerRuntime: ti.ContainerRuntime,
+				CreatedAt:        now,
 			})
 		}
 	}
