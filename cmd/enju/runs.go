@@ -25,7 +25,12 @@ import (
 func cmdRuns(args []string) {
 	fs := flag.NewFlagSet("runs", flag.ExitOnError)
 	projectID := fs.Int64("project", 0, "Override project resolution (numeric id)")
-	statusFilter := fs.String("status", "", "Filter by state: active | done | failed | aborted | terminated | waiting | paused (comma-separated for multiple)")
+	statusFilter := fs.String("status", "",
+		"Filter by state: literal coord states or convenience aliases. "+
+			"Literals: ready, claimed, running, accepted, completed, failed, aborted, terminated, waiting, paused, etc. "+
+			"Aliases: 'active' (covers active+waiting+idle — anything not terminal), 'done' (alias for completed). "+
+			"Comma-separated for multiple; aliases and literals can mix. "+
+			"Note: --status=active uses the alias, not the literal 'active' state alone — if you need only the literal, pass --status=active alongside an unrelated state to avoid the alias rule.")
 	last := fs.Int("last", 20, "Cap on rows rendered (0 = all)")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Emit the wire.Run array as JSON")
@@ -34,7 +39,7 @@ func cmdRuns(args []string) {
 	sess := openCLISession(*coordOverride)
 	ctx := context.Background()
 
-	entry, err := resolveStatusProject(sess, *projectID)
+	entry, err := resolveActiveProject(sess, *projectID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runs: %v\n", err)
 		os.Exit(2)
@@ -127,11 +132,26 @@ func renderRunsTable(w io.Writer, projectName string, projectID int64, runs []wi
 	}
 	fmt.Fprintf(w, "%-4s  %-30s  %-10s  %-6s  %s\n", "SEQ", "NAME", "STATE", "TASKS", "BRANCH")
 	for _, r := range runs {
-		name := r.Name
-		if len(name) > 30 {
-			name = name[:29] + "…"
-		}
 		fmt.Fprintf(w, "%-4d  %-30s  %-10s  %-6d  %s\n",
-			r.Seq, name, r.State, r.TaskCount, r.Branch)
+			r.Seq, truncateRunes(r.Name, 30), r.State, r.TaskCount, r.Branch)
 	}
+}
+
+// truncateRunes shortens s to at most max display runes, suffixing
+// "…" when it had to cut. Rune-aware (unlike s[:max-1]+"…") so
+// CJK / emoji / combining-character project names don't get cut
+// mid-rune into invalid UTF-8 that renders as a replacement
+// character. Single-width-rune table layout still drifts on
+// double-width CJK chars; that's a fwidth problem for another
+// day. The byte-cut alternative produced strictly worse output
+// (broken UTF-8 in some terminals).
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max-1]) + "…"
 }

@@ -37,7 +37,7 @@ func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
 	branch := fs.String("base-branch", "", "Override the run's base branch (passed through to create_run; default: project default)")
-	paramsArg := fs.String("params", "", "k=v[,k=v...] template parameter values")
+	paramsArg := fs.String("params", "", "k=v[,k=v...] template parameter values. List-typed params use pipes inside the value: k=a|b|c.")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")

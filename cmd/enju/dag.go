@@ -55,7 +55,7 @@ func cmdDag(args []string) {
 	sess := openCLISession(*coordOverride)
 	ctx := context.Background()
 
-	entry, err := resolveStatusProject(sess, *projectID)
+	entry, err := resolveActiveProject(sess, *projectID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dag: %v\n", err)
 		os.Exit(2)
@@ -90,7 +90,7 @@ func cmdDag(args []string) {
 			// mermaid block — point at the cheapest path
 			// (mermaid.live, no install) and the local-render
 			// option (mmdc) for those who'd rather pipe.
-			fmt.Println("\nRender: paste at https://mermaid.live, or pipe with `enju dag", detail.Run.Seq, "-format=mermaid | mmdc -i - -o dag.png` (npm i -g @mermaid-js/mermaid-cli)")
+			fmt.Println("\nRender: paste at https://mermaid.live, or pipe with `enju dag", detail.Run.Seq, "--format=mermaid | mmdc -i - -o dag.png` (npm i -g @mermaid-js/mermaid-cli)")
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "dag: unknown --format %q (use default, mermaid, or json)\n", *format)

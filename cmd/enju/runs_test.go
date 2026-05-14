@@ -78,3 +78,26 @@ func TestFilterRuns_StateFilter(t *testing.T) {
 		t.Errorf("state filter: got %+v", got)
 	}
 }
+
+// TestTruncateRunes pins the rune-aware truncation so a future
+// refactor doesn't slip back to byte-slicing (which can cut
+// multi-byte CJK / emoji chars mid-rune and emit invalid UTF-8).
+func TestTruncateRunes(t *testing.T) {
+	cases := []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"hello", 10, "hello"},      // short input, untouched
+		{"hello world", 5, "hell…"}, // ASCII cut
+		{"こんにちは世界", 4, "こんに…"},      // CJK; 4 runes incl. ellipsis
+		{"🚀🚀🚀🚀🚀", 3, "🚀🚀…"},        // emoji; runes have len > 1 byte
+		{"", 5, ""},                 // empty
+		{"x", 0, ""},                // max=0 is "nothing"
+	}
+	for _, c := range cases {
+		if got := truncateRunes(c.in, c.max); got != c.want {
+			t.Errorf("truncateRunes(%q, %d): got %q, want %q", c.in, c.max, got, c.want)
+		}
+	}
+}

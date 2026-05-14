@@ -45,7 +45,7 @@ func cmdStatus(args []string) {
 		return
 	}
 
-	entry, err := resolveStatusProject(sess, *projectID)
+	entry, err := resolveActiveProject(sess, *projectID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "status: %v\n", err)
 		os.Exit(2)
@@ -56,12 +56,17 @@ func cmdStatus(args []string) {
 	}
 }
 
-// resolveStatusProject returns the registry entry to render. If
-// the operator passed --project, look up by id; otherwise walk
-// cwd → ancestors looking for a registered LocalPath. A miss
-// here is a usage error: there's no useful default for a
-// per-project snapshot.
-func resolveStatusProject(sess *cliSession, override int64) (*projectreg.Entry, error) {
+// resolveActiveProject returns the registry entry the CLI verb
+// should operate on. If the operator passed --project, look up
+// by id; otherwise walk cwd → ancestors looking for a registered
+// LocalPath. A miss here is a usage error: there's no useful
+// default for a per-project view.
+//
+// Shared across status, runs, dag (and any future verb that
+// takes --project). Originally named resolveStatusProject when
+// only status used it; renamed because the scope is now broader
+// than the status command.
+func resolveActiveProject(sess *cliSession, override int64) (*projectreg.Entry, error) {
 	reg := sess.FC.ProjectRegistry()
 	if reg == nil {
 		return nil, fmt.Errorf("no project registry configured")
