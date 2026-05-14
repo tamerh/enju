@@ -23,7 +23,8 @@ func cmdInbox(args []string) {
 	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json; only used to look up identity, inbox reads local files)")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running for a non-default citizen.")
-	workspaceRoot := fs.String("workspace", "", "Workspace root (default ~/.enju/workspaces/). The project clone is expected at <workspace>/{slug}-{id}/.")
+	workspaceRoot := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
+	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: enju inbox <project_id> [flags]
 
@@ -60,15 +61,12 @@ Flags:`)
 		os.Exit(1)
 	}
 
-	wsRoot := *workspaceRoot
-	if wsRoot == "" {
-		home, _ := os.UserHomeDir()
-		wsRoot = filepath.Join(home, ".enju", "workspaces")
+	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceRoot, *registryPath, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
+		os.Exit(1)
 	}
-	// Attach the same registry the MCP server uses so ProjectDir/
-	// OpenView resolve to the operator's adopted project dir
-	// (anywhere on disk), not a slug-id sibling under wsRoot.
-	reg := projectreg.Open(projectreg.DefaultPath())
+	reg := projectreg.Open(regPath)
 	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(),
 		enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		enjugit.WithRegistry(reg))

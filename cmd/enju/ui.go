@@ -67,7 +67,8 @@ func cmdUI(args []string) {
 	name := fs.String("name", "", "Citizen display name (e.g. \"Tamer Gur\")")
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
-	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
+	workspaceDir := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
+	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json)")
 	port := fs.Int("port", 8484, "Port to bind the UI on (127.0.0.1 only)")
 	dev := fs.Bool("dev", false, "Dev mode: re-parse templates per request, no-cache headers, debug overlay")
@@ -112,9 +113,9 @@ func cmdUI(args []string) {
 		token = creds.Token
 	}
 
-	wsRoot, err := resolveWorkspaceRoot(*workspaceDir)
+	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceDir, *registryPath, os.Stderr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create workspace: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -134,7 +135,7 @@ func cmdUI(args []string) {
 		WorkspaceRoot:   wsRoot,
 		Logger:          logger,
 		LogName:         "webui",
-		ProjectRegistry: projectreg.Open(projectreg.DefaultPath()),
+		ProjectRegistry: projectreg.Open(regPath),
 	})
 
 	srv, err := webui.New(webui.Config{

@@ -184,24 +184,48 @@ func expandPath(p string) string {
 	return p
 }
 
-// resolveWorkspaceRoot canonicalizes the -workspace-dir flag value
-// the same way the legacy project.NewOpener used to: empty falls
-// back to ~/.enju/workspaces, and the directory is created with
-// 0755 if it doesn't exist. Returns the absolute path the boot
-// path should hand to service.Config.WorkspaceRoot /
-// mcphandlers.Config.WorkspaceRoot.
-func resolveWorkspaceRoot(rootDir string) (string, error) {
-	if rootDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("resolving home dir: %w", err)
+// resolveCLIWorkspace turns the (workspaceFlag, registryFlag) pair
+// the CLI entry points expose into the absolute workspace rootDir
+// and the absolute registry path to open. Encapsulates the
+// deprecation handshake:
+//
+//   - --registry default = projectreg.DefaultPath() (~/.enju/projects.json).
+//   - --workspace passed → emit a deprecation warning + use it as
+//     the workspace rootDir AND derive the registry path as
+//     <workspace>/projects.json unless --registry was also given
+//     explicitly (which then wins).
+//   - --workspace empty → derive the workspace rootDir from
+//     filepath.Dir(registryPath) so housekeeping state (scratch,
+//     logs that aren't project-internal) keeps a sibling home
+//     next to the registry file. The workspace rootDir is
+//     vestigial post-NDW.5 — clones don't live there — but
+//     NewWorkspace still requires a non-empty value.
+//
+// stderr accepts the destination for the deprecation warning so
+// tests can capture (or silence) it. Pass os.Stderr in production.
+func resolveCLIWorkspace(workspaceFlag, registryFlag string, stderr io.Writer) (workspaceRoot, registryPath string, err error) {
+	regPath := registryFlag
+	if workspaceFlag != "" {
+		fmt.Fprintln(stderr, "warning: --workspace is deprecated post-NDW.6 — projects are path-anchored via projectreg (use --registry to point at projects.json directly). The flag will be removed in a future release.")
+		if regPath == "" {
+			regPath = filepath.Join(workspaceFlag, "projects.json")
 		}
-		rootDir = filepath.Join(home, ".enju", "workspaces")
 	}
-	if err := os.MkdirAll(rootDir, 0o755); err != nil {
-		return "", fmt.Errorf("creating workspace root: %w", err)
+	if regPath == "" {
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			return "", "", fmt.Errorf("resolveCLIWorkspace: resolving home dir for default --registry: %w", herr)
+		}
+		regPath = filepath.Join(home, ".enju", "projects.json")
 	}
-	return rootDir, nil
+	wsRoot := workspaceFlag
+	if wsRoot == "" {
+		wsRoot = filepath.Dir(regPath)
+	}
+	if err := os.MkdirAll(wsRoot, 0o755); err != nil {
+		return "", "", fmt.Errorf("creating workspace root %s: %w", wsRoot, err)
+	}
+	return wsRoot, regPath, nil
 }
 
 // defaultConfigPath returns the conventional location for the server

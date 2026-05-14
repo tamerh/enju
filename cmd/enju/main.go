@@ -21,6 +21,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/mcphandlers"
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/coordinator/scheduler"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/mark3labs/mcp-go/server"
@@ -361,7 +362,8 @@ func cmdMCP(args []string) {
 	username := fs.String("username", "", "Citizen username (optional, auto-generated from name if omitted)")
 	email := fs.String("email", "", "Citizen email (optional)")
 	model := fs.String("model", "", "LLM model name for contribution tracking (e.g. claude-opus-4, gpt-4o)")
-	workspaceDir := fs.String("workspace", "", "Directory for per-project local clones (default ~/.enju/workspaces)")
+	workspaceDir := fs.String("workspace", "", "DEPRECATED post-NDW.6 — use --registry. Kept for back-compat: passing it emits a warning and treats <value>/projects.json as the registry.")
+	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json). Records project ID → on-disk path mappings adopted via enju_create_project.")
 	credsPath := fs.String("credentials", "", "Path to credentials.json (default ~/.enju/credentials.json). Use a per-identity path when running multiple MCP processes for different citizens on one host — see docs/multi-citizen.md § Running multiple citizens on one host.")
 	// local-mode parity with `enju serve`. Useful
 	// for testers reproducing "events disabled" behavior end-
@@ -498,12 +500,13 @@ func cmdMCP(args []string) {
 	// legacy coordinator-writes path; this workspace stays unused
 	// for them but the creation itself is cheap and safe.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	wsRoot, err := resolveWorkspaceRoot(*workspaceDir)
+	wsRoot, regPath, err := resolveCLIWorkspace(*workspaceDir, *registryPath, os.Stderr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create MCP workspace: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Hint: the workspace directory (default ~/.enju/workspaces) must be writable and have free disk space. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
+		fmt.Fprintf(os.Stderr, "Failed to resolve workspace/registry: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Hint: --registry's parent directory (default ~/.enju/) must be writable. Check permissions with `ls -ld ~/.enju` and free space with `df -h ~`.\n")
 		os.Exit(1)
 	}
+	registry := projectreg.Open(regPath)
 
 	// Tier 1 notification session — stays dormant at boot. When
 	// the user calls enju_create_project, mcpserver
@@ -516,18 +519,19 @@ func cmdMCP(args []string) {
 	notifyOpts := &mcphandlers.NotifyOptions{ParentCtx: notifyCtx}
 
 	s := mcphandlers.New(mcphandlers.Config{
-		CoordinatorURL: *coordinator,
-		Username:    *username,
-		CitizenName:  *name,
-		CitizenEmail:  *email,
-		ModelName:   *model,
-		AuthToken:   token,
-		WorkspaceRoot: wsRoot,
-		Logger:     logger,
+		CoordinatorURL:  *coordinator,
+		Username:        *username,
+		CitizenName:     *name,
+		CitizenEmail:    *email,
+		ModelName:       *model,
+		AuthToken:       token,
+		WorkspaceRoot:   wsRoot,
+		ProjectRegistry: registry,
+		Logger:          logger,
 		SaveCredentials: func(gotUsername, gotName, gotEmail, gotToken string) {
 			saveCredentialsAt(credsKey, gotUsername, gotName, gotEmail, gotToken, resolvedCredsPath)
 		},
-		Notify:   notifyOpts,
+		Notify:     notifyOpts,
 		AllowTools: allowedTools,
 	})
 
