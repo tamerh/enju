@@ -41,6 +41,18 @@ import (
 // runTerminalTypes lists the event types that trigger
 // auto-stop bookkeeping. Other event types in live.jsonl are
 // ignored.
+//
+// run_failed is included even though no coord code path emits
+// it today — applyCompleteRun's switch only produces
+// run_active / run_waiting / run_completed, and there's no
+// applyFailRun yet. Forward-compatible: when a failed-run
+// emission path lands, it MUST include run_seq in the event
+// metadata (same convention as applyCompleteRun and
+// applyTerminateRun) or the tailer will log
+// "terminal event has no run_seq metadata" and skip,
+// leaking the auto-managed bot. Catching that gap at the
+// emitter side is the right pattern; this set is the contract
+// the emitter has to satisfy.
 var runTerminalTypes = map[string]bool{
 	"run_completed":  true,
 	"run_failed":     true,
@@ -227,6 +239,18 @@ type IsRunTerminal func(ctx context.Context, projectID, runSeq int64) (bool, err
 // completed while the supervisor was down would leak the bot
 // indefinitely. Best-effort: per-pid errors are logged and
 // reconcile moves on rather than aborting the whole sweep.
+//
+// Concurrent-Start interaction: Reconcile runs as a fire-and-
+// forget goroutine from botSupervisor's lazy ctor, so an
+// operator may issue enju_create_run auto_bots=true before the
+// sweep finishes. Two safeguards keep that benign: (1) pid
+// files for a fresh bot are written under procsMu by Start,
+// so Reconcile either sees the pre-Start absence (early-skip
+// via os.ReadDir / readPIDFile error) or the post-Start state
+// with AutoRunIDs still empty (len-zero early-skip); and
+// (2) any in-flight run's seq will return terminal=false from
+// the lookup, preserving the ref. No correctness window;
+// worst case is a wasted lookup or two.
 func (s *Supervisor) Reconcile(ctx context.Context, lookup IsRunTerminal) error {
 	entries, err := os.ReadDir(s.PIDDir)
 	if err != nil {

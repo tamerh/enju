@@ -148,6 +148,10 @@ func (c *apiClient) botSupervisor() (*bots.Supervisor, error) {
 // auto-managed bot waiting on a run that no longer exists serves
 // no purpose, and the operator can always restart it manually.
 //
+// "skipped" is NOT in the terminal set: it's a TASK state, never
+// a RUN state — runs that ought to be "skipped" become "terminated"
+// via the cascade in applyTerminateRun.
+//
 // Uses coord.Client.GetStatus to read the HTTP status without
 // the historical Client.Get behavior of swallowing 4xx into a
 // nil-error data return — string-matching the body for "404"
