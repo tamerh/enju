@@ -116,11 +116,13 @@ func (c *apiClient) runReconcileTicker(ctx context.Context) {
 			// served project) and the notify session (explicitly
 			// touched project).
 			ids := make(map[int64]bool)
+
 			if cwd, err := os.Getwd(); err == nil {
 				if entry, _ := c.fc.ProjectRegistry().FindContaining(cwd); entry != nil {
 					ids[entry.ID] = true
 				}
 			}
+
 			if activeID := c.notifySess.ProjectID(); activeID != 0 {
 				ids[activeID] = true
 			}

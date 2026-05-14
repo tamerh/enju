@@ -722,6 +722,12 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 
 	c.fc.TouchProject(int64(projectID))
 
+	// Bind the project to the notify session so the reconcile ticker
+	// can discover it. This ensures the ticker arms for any project
+	// we create a run for, regardless of which directory enju_create_run
+	// was called from. Nil session (notify-disabled) no-ops cleanly.
+	c.notifySess.Switch(int64(projectID))
+
 	text := format.CreateRun(data)
 	if ensureBranchWarning != "" {
 		text += fmt.Sprintf("\n⚠ %s\n", ensureBranchWarning)
@@ -957,10 +963,12 @@ func (c *apiClient) reconcileActiveRuns(ctx context.Context, projectID int64) {
 	if err != nil {
 		return
 	}
+
 	var runs []json.RawMessage
 	if err := json.Unmarshal(data, &runs); err != nil {
 		return
 	}
+
 	// Minimal sniff struct: decode only the state field per run to
 	// gate reconciliation. Avoids unmarshaling the full record into
 	// map[string]interface{} and re-marshaling it back to bytes
