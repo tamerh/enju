@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func TestSupervisor_StartAndStatus(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 
-	rb, err := s.Start(context.Background(), StartParams{
+	rb, _, err := s.Start(context.Background(), StartParams{
 		BotName:     "developer-bot",
 		WorkflowPath: "/tmp/project/workflow.yaml",
 		Coordinator: "http://localhost:8000",
@@ -98,22 +99,32 @@ func TestSupervisor_StartAndStatus(t *testing.T) {
 	}
 }
 
-func TestSupervisor_DoubleStartFails(t *testing.T) {
+func TestSupervisor_DoubleStartIsIdempotent(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 	defer s.StopAll(context.Background())
 
-	_, err := s.Start(context.Background(), StartParams{
+	first, outcome, err := s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.Start(context.Background(), StartParams{
+	if outcome != StartedFresh {
+		t.Errorf("first Start outcome: want StartedFresh, got %v", outcome)
+	}
+	var second *RunningBot
+	second, outcome, err = s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
-	if err == nil || !strings.Contains(err.Error(), "already running") {
-		t.Errorf("expected double-start error, got: %v", err)
+	if err != nil {
+		t.Fatalf("second Start: want nil error (idempotent), got %v", err)
+	}
+	if outcome != AlreadyRunning {
+		t.Errorf("second Start outcome: want AlreadyRunning, got %v", outcome)
+	}
+	if second.PID != first.PID {
+		t.Errorf("second Start should return existing PID %d, got %d", first.PID, second.PID)
 	}
 }
 
@@ -124,7 +135,7 @@ func TestSupervisor_StopGracefulShutdown(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
 
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "x", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -165,7 +176,7 @@ wait
 `)
 	s := newTestSupervisor(t, bin)
 
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "stuck-bot", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -204,7 +215,7 @@ echo "hello from fake bot"
 echo "second line"
 `)
 	s := newTestSupervisor(t, bin)
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "logged", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -255,7 +266,7 @@ func TestSupervisor_StopAll(t *testing.T) {
 	s := newTestSupervisor(t, bin)
 
 	for _, name := range []string{"a", "b", "c"} {
-		if _, err := s.Start(context.Background(), StartParams{
+		if _, _, err := s.Start(context.Background(), StartParams{
 			BotName: name, WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 		}); err != nil {
 			t.Fatal(err)
@@ -277,7 +288,7 @@ func TestSupervisor_StopReportsGracefulFlag(t *testing.T) {
 	// Graceful path → Graceful=true.
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "g", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -298,7 +309,7 @@ wait
 `)
 	s2 := newTestSupervisor(t, hangBin)
 	s2.GracefulTimeout = 100 * time.Millisecond
-	if _, err := s2.Start(context.Background(), StartParams{
+	if _, _, err := s2.Start(context.Background(), StartParams{
 		BotName: "h", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -320,7 +331,7 @@ echo "about to crash"
 exit 7
 `)
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "crashy", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Fatal(err)
@@ -389,7 +400,7 @@ while IFS= read -r line; do : ; done
 	defer s.StopAll(context.Background())
 
 	// Start a, expect success.
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "a", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Errorf("Start a: %v", err)
@@ -397,7 +408,7 @@ while IFS= read -r line; do : ; done
 	// Start b — the supervisor itself doesn't reject; the
 	// daemon process just exits non-zero. Reaper records the
 	// crash and clears the entry.
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "b", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	}); err != nil {
 		t.Errorf("Start b (process spawned even if it'll exit): %v", err)
@@ -442,7 +453,7 @@ func TestSupervisor_AllowToolsForwardedToDaemon(t *testing.T) {
 	// we can grep the log for the flag.
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)
-	if _, err := s.Start(context.Background(), StartParams{
+	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName:      "checker",
 		WorkflowPath: "/tmp/p/workflow.yaml",
 		Coordinator:  "http://x",
@@ -475,7 +486,7 @@ echo "exiting on my own"
 exit 0
 `)
 	s := newTestSupervisor(t, bin)
-	_, err := s.Start(context.Background(), StartParams{
+	_, _, err := s.Start(context.Background(), StartParams{
 		BotName: "self-exit", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
 	})
 	if err != nil {
@@ -490,4 +501,294 @@ exit 0
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("reaper didn't clean up after self-exit; status: %+v", s.Status())
+}
+
+// TestSupervisor_ConcurrentStartIsAtomic is the regression for
+// the REV.2 race: pre-fix, Start released procsMu between the
+// existence check and the procs-map insert, so two concurrent
+// Start("foo") callers could both pass the check, both fork,
+// and the second insert would silently leak the first daemon.
+// Fixed by holding procsMu for the entire function.
+//
+// The test fires N goroutines, all calling Start("same-bot") at
+// once, then asserts that exactly one returns StartedFresh and
+// the rest return AlreadyRunning with the same PID. Without
+// the fix, multiple goroutines would observe StartedFresh.
+func TestSupervisor_ConcurrentStartIsAtomic(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	const goroutines = 8
+	type result struct {
+		rb      *RunningBot
+		outcome StartOutcome
+		err     error
+	}
+	results := make(chan result, goroutines)
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			<-start
+			rb, outcome, err := s.Start(context.Background(), StartParams{
+				BotName: "racey", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+			})
+			results <- result{rb, outcome, err}
+		}()
+	}
+	close(start)
+
+	freshCount := 0
+	alreadyCount := 0
+	var freshPID int
+	for i := 0; i < goroutines; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("Start err: %v", r.err)
+		}
+		switch r.outcome {
+		case StartedFresh:
+			freshCount++
+			freshPID = r.rb.PID
+		case AlreadyRunning:
+			alreadyCount++
+			// AlreadyRunning callers must surface the same PID
+			// as the one that actually spawned — without that,
+			// callers ref-counting by PID would split-brain.
+			if r.rb.PID == 0 {
+				t.Errorf("AlreadyRunning surfaced zero PID")
+			}
+		}
+	}
+	if freshCount != 1 {
+		t.Errorf("want exactly 1 StartedFresh across %d concurrent Start calls, got %d (alreadyCount=%d)",
+			goroutines, freshCount, alreadyCount)
+	}
+	if alreadyCount != goroutines-1 {
+		t.Errorf("want %d AlreadyRunning, got %d", goroutines-1, alreadyCount)
+	}
+	if freshPID == 0 {
+		t.Errorf("StartedFresh surfaced zero PID")
+	}
+}
+
+func TestSupervisor_PIDFileRecordsStartedBy(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	// Operator-start defaults StartedBy to "operator" so an
+	// auto_bots run that rides along can't accidentally claim
+	// the bot as auto-managed.
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "manual", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := readPIDFile(s.pidPathFor("manual"))
+	if err != nil {
+		t.Fatalf("read manual pid: %v", err)
+	}
+	if entry.StartedBy != "operator" {
+		t.Errorf("manual start: want StartedBy=operator, got %q", entry.StartedBy)
+	}
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "auto", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err = readPIDFile(s.pidPathFor("auto"))
+	if err != nil {
+		t.Fatalf("read auto pid: %v", err)
+	}
+	if entry.StartedBy != "auto_run" {
+		t.Errorf("auto start: want StartedBy=auto_run, got %q", entry.StartedBy)
+	}
+}
+
+func TestSupervisor_MarkUnmarkAutoRun(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "b", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark adds; re-marking the same seq is a no-op.
+	if err := s.MarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAutoRun("b", 2); err != nil {
+		t.Fatal(err)
+	}
+	entry, _ := readPIDFile(s.pidPathFor("b"))
+	if want := []int64{1, 2}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("after mark 1,1,2: want %v, got %v", want, entry.AutoRunIDs)
+	}
+
+	// Unmark removes the seq; unmarking a missing seq is a no-op.
+	if err := s.UnmarkAutoRun("b", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UnmarkAutoRun("b", 99); err != nil {
+		t.Fatal(err)
+	}
+	entry, _ = readPIDFile(s.pidPathFor("b"))
+	if want := []int64{2}; !slices.Equal(entry.AutoRunIDs, want) {
+		t.Errorf("after unmark 1,99: want %v, got %v", want, entry.AutoRunIDs)
+	}
+
+	// Unmarking a missing pid file is benign — auto-stop is
+	// best-effort cleanup, not a strict invariant.
+	if err := s.UnmarkAutoRun("never-started", 5); err != nil {
+		t.Errorf("unmark on missing pid: want nil, got %v", err)
+	}
+}
+
+func TestSupervisor_PhaseAndWaitForReady_Succeeds(t *testing.T) {
+	// Fake daemon writes "ready" to ENJU_BOT_PHASE_FILE then
+	// holds open on stdin (mimics a real daemon entering the
+	// poll loop). Supervisor.WaitForReady should observe the
+	// transition.
+	bin := writeFakeBinary(t, `
+if [ -n "$ENJU_BOT_PHASE_FILE" ]; then
+    echo "ready" > "$ENJU_BOT_PHASE_FILE"
+fi
+`)
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "r", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "r", 2*time.Second); err != nil {
+		t.Fatalf("WaitForReady: %v", err)
+	}
+	got, err := s.Phase("r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != PhaseReady {
+		t.Errorf("Phase after wait: want %q, got %q", PhaseReady, got)
+	}
+}
+
+func TestSupervisor_WaitForReady_Timeout(t *testing.T) {
+	// Fake daemon never writes a phase marker. WaitForReady
+	// should fail with the last-seen phase in the message — the
+	// diagnostic that lets the operator distinguish "stuck in
+	// self-heal" from "process never even started."
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "stuck", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+		StartedBy: "auto_run",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.WaitForReady(context.Background(), "stuck", 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("WaitForReady: want timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "did not reach ready phase") {
+		t.Errorf("error should explain the wait failed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "last seen") {
+		t.Errorf("error should include last-seen phase for diagnosis: %v", err)
+	}
+}
+
+func TestSupervisor_PhaseFile_RemovedOnDaemonExit(t *testing.T) {
+	// Fake daemon writes ready, then exits cleanly. Supervisor's
+	// reaper should drop the phase file alongside the pid file
+	// so the next Start doesn't see a stale "ready" before its
+	// fresh process has actually reached the loop.
+	bin := writeFakeBinary(t, `
+echo "ready" > "$ENJU_BOT_PHASE_FILE"
+`)
+	s := newTestSupervisor(t, bin)
+
+	if _, _, err := s.Start(context.Background(), StartParams{
+		BotName: "exit", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitForReady(context.Background(), "exit", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Stop(context.Background(), "exit"); err != nil {
+		t.Fatal(err)
+	}
+	// Allow the reaper to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(s.phasePathFor("exit")); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("phase file %s still present after daemon exit", s.phasePathFor("exit"))
+}
+
+func TestSupervisor_EligibleForAutoStop(t *testing.T) {
+	bin := writeFakeBinary(t, "")
+	s := newTestSupervisor(t, bin)
+	defer s.StopAll(context.Background())
+
+	cases := []struct {
+		name      string
+		startedBy string
+		runs      []int64
+		want      bool
+	}{
+		{"auto, empty list", "auto_run", nil, true},
+		{"auto, one ref", "auto_run", []int64{1}, false},
+		{"operator, empty list", "operator", nil, false},
+		{"operator, one ref", "operator", []int64{1}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := s.Start(context.Background(), StartParams{
+				BotName: tc.name, WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
+				StartedBy: tc.startedBy,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, seq := range tc.runs {
+				if err := s.MarkAutoRun(tc.name, seq); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := s.EligibleForAutoStop(tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("eligible: want %v, got %v", tc.want, got)
+			}
+		})
+	}
+
+	// Missing pid file → not eligible (nothing to stop).
+	got, err := s.EligibleForAutoStop("never-existed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Errorf("eligible for missing pid: want false, got true")
+	}
 }

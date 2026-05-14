@@ -184,7 +184,20 @@ func (c *Client) SetToken(tok string) {
 // so a stale-citizen 404/401 triggers a transparent re-register +
 // retry once.
 func (c *Client) Get(ctx context.Context, path string) ([]byte, error) {
-	return c.doWithAutoReregister(ctx, func() (*http.Response, error) {
+	data, _, err := c.GetStatus(ctx, path)
+	return data, err
+}
+
+// GetStatus is Get plus the HTTP status from the (possibly re-
+// registered) final response. Used by callers that need to
+// distinguish 404 from a non-error 2xx — the wider Get
+// signature swallows the status code (and treats 4xx bodies as
+// successful reads of an error-shaped payload), which is the
+// historical contract; this variant exists so newer callers
+// like the supervisor's reconcile lookup can branch on
+// "run not found" without string-matching the body.
+func (c *Client) GetStatus(ctx context.Context, path string) ([]byte, int, error) {
+	return c.doWithAutoReregisterStatus(ctx, func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
 		if err != nil {
 			return nil, err
@@ -258,14 +271,25 @@ func (c *Client) attachAuth(req *http.Request) {
 // Only one retry is attempted. If the retry also fails (for
 // any reason), the retry's response is returned as-is.
 func (c *Client) doWithAutoReregister(ctx context.Context, do func() (*http.Response, error)) ([]byte, error) {
+	data, _, err := c.doWithAutoReregisterStatus(ctx, do)
+	return data, err
+}
+
+// doWithAutoReregisterStatus is the status-preserving variant.
+// Behavior is otherwise identical to doWithAutoReregister; the
+// existing surface delegates here. Status is the FINAL
+// response's status — i.e. after any stale-citizen retry — so
+// a caller that sees 404 can trust the run actually doesn't
+// exist (not that we just hadn't refreshed our token yet).
+func (c *Client) doWithAutoReregisterStatus(ctx context.Context, do func() (*http.Response, error)) ([]byte, int, error) {
 	resp, err := do()
 	if err != nil {
-		return nil, fmt.Errorf("coordinator unreachable: %w", err)
+		return nil, 0, fmt.Errorf("coordinator unreachable: %w", err)
 	}
 	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if !isStaleCitizenResponse(resp.StatusCode, data) {
-		return data, nil
+		return data, resp.StatusCode, nil
 	}
 	if c.CitizenName() == "" {
 		// No display name to re-register with — caller invoked
@@ -273,20 +297,20 @@ func (c *Client) doWithAutoReregister(ctx context.Context, do func() (*http.Resp
 		// the record automatically. Surface the original error.
 		c.logger.Warn("stale citizen detected but CitizenName is empty; cannot auto re-register",
 			"username", c.Username())
-		return data, nil
+		return data, resp.StatusCode, nil
 	}
 	if err := c.EnsureCitizenFresh(ctx); err != nil {
 		c.logger.Warn("auto re-register failed", "username", c.Username(), "error", err)
-		return data, nil
+		return data, resp.StatusCode, nil
 	}
 	c.logger.Info("auto re-registered stale citizen, retrying request", "username", c.Username())
 	resp2, err := do()
 	if err != nil {
-		return nil, fmt.Errorf("coordinator unreachable (after re-register): %w", err)
+		return nil, 0, fmt.Errorf("coordinator unreachable (after re-register): %w", err)
 	}
 	data2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
-	return data2, nil
+	return data2, resp2.StatusCode, nil
 }
 
 // isStaleCitizenResponse tells whether the response body looks

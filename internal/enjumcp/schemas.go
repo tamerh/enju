@@ -283,6 +283,9 @@ If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithString("branch",
 			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name — for template runs this is "<bundle>-1", "<bundle>-2", ... (e.g. path="enju/templates/gene-mapping" → "gene-mapping-1"); for inline YAML it falls back to "run-1", "run-2", .... Useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
 		),
+		mcp.WithBoolean("auto_bots",
+			mcp.Description(`Opt-in: spin up every bot declared in the workflow's inline bots: section before the run starts, and stop them automatically when the run reaches a terminal state. Reference-counted so concurrent runs that share bots are safe — the last-finishing run triggers the stop. Bots started manually with enju_bot_start are left alone (manual wins). Requires path= mode; inline yaml= has no on-disk workflow file for the bot daemons to read. Default false: the operator drives bot lifecycle explicitly with enju_bot_start / enju_bot_stop_all.`),
+		),
 	)
 }
 

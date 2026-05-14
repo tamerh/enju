@@ -459,33 +459,45 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("bots[%d]: duplicate name %q (each bot must have a unique name in the manifest)", i, b.Name)
 		}
 		seen[b.Name] = struct{}{}
-		// Handler discriminator: empty (=claude back-compat),
-		// "claude", or "stub". Future handlers extend this list
-		// here AND in NewHandler — keep them in sync.
-		switch HandlerType(b.Handler) {
-		case "", HandlerTypeClaude, HandlerTypeStub:
-			// ok
-		default:
-			return fmt.Errorf("bot %q: unknown handler %q (supported: claude, stub)", b.Name, b.Handler)
-		}
-		// Model is required only for handlers that drive an LLM.
-		// A future ShellHandler / RuleHandler bot has nothing to
-		// pass --model to; insisting on it there would be cargo.
-		needsModel := b.Handler == "" || HandlerType(b.Handler) == HandlerTypeClaude
-		if needsModel && b.Model == "" {
+		// Handler discriminator. Two reserved values:
+		//   - ""      → defaults to "claude" at SubprocessHandler
+		//               construction time (back-compat).
+		//   - "stub"  → in-process StubHandler for tests; no
+		//               binary spawn, no args/model required.
+		// Anything else is treated as a binary name or path the
+		// SubprocessHandler exec's at claim time. Bare names
+		// resolve via $PATH (claude, gemini, …); slash-containing
+		// values are absolute or repo-relative paths used
+		// verbatim (./bin/lint-bot.sh, /usr/local/bin/foo).
+		//
+		// The validator deliberately doesn't try to verify the
+		// binary exists at load time — the daemon's Preflight
+		// does that at startup with the right $PATH context.
+		// Manifest-load validation here would force operators to
+		// have every bot's binary installed BEFORE editing the
+		// YAML; not the right gate.
+		//
+		// model: required only for the claude handler. Other
+		// handlers (gemini, lint scripts, rule-based bots, …)
+		// decide for themselves whether they need a `model:`
+		// field — typically by whether the args: template
+		// references {{model}}. Adding a strict "every handler
+		// needs a model" rule would force lint-bots to declare
+		// fake models; the rule stays narrow on purpose.
+		isStub := HandlerType(b.Handler) == HandlerTypeStub
+		isClaude := b.Handler == "" || HandlerType(b.Handler) == HandlerTypeClaude
+		if isClaude && b.Model == "" {
 			return fmt.Errorf("bot %q: model is required for handler %q (e.g. \"claude-sonnet-4-6\")", b.Name, b.Handler)
 		}
-		// args: required for the claude handler. Without it the
-		// daemon would exec `claude` with zero arguments — claude
-		// reads the prompt from stdin, exits silently in ~20s, and
-		// the operator sees a "writes_artifacts missing" failure
-		// with no trace of what claude tried to do. Phase 4b-r1
-		// made args templated; this gate makes the omission loud
-		// at manifest-load instead of surfacing as a confusing
-		// runtime symptom.
-		needsArgs := b.Handler == "" || HandlerType(b.Handler) == HandlerTypeClaude
-		if needsArgs && len(b.Args) == 0 {
-			return fmt.Errorf("bot %q: args: is required for handler %q — claude needs an explicit argv template (typical shape: [\"-p\", \"--model={{model}}\", \"--append-system-prompt={{system_prompt}}\", \"--allowedTools={{allowed_tools}}\"]). See example_bots/bots.yaml or enju.yaml.example.", b.Name, b.Handler)
+		// args: is required for every subprocess handler — without
+		// it the binary spawns with zero arguments. The default
+		// `claude` invocation in particular reads the prompt from
+		// stdin, exits silently in ~20s with no output, and the
+		// operator sees a "writes_artifacts missing" failure with
+		// no trace of what happened. Stub handler is the lone
+		// exception (it returns canned responses without spawning).
+		if !isStub && len(b.Args) == 0 {
+			return fmt.Errorf("bot %q: args: is required for handler %q — supply the literal argv template the binary expects (claude shape: [\"-p\", \"--model={{model}}\", \"--append-system-prompt={{system_prompt}}\", \"--allowedTools={{allowed_tools}}\"]). See example_bots/bots.yaml or docs/handler-protocol.md.", b.Name, b.Handler)
 		}
 		if b.SystemPrompt != "" {
 			// system_prompt is repo-relative; reject absolute

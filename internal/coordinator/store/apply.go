@@ -1952,9 +1952,10 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	var current string
 	var projectID int64
 	var autoTriage string
+	var runSeq int64
 	err := tx.QueryRow(
-		`SELECT state, project_id, auto_triage_template FROM runs WHERE id = ?`, m.RunID,
-	).Scan(&current, &projectID, &autoTriage)
+		`SELECT state, project_id, auto_triage_template, seq FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID, &autoTriage, &runSeq)
 	if err != nil {
 		return false, err
 	}
@@ -2048,13 +2049,22 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	// transitions fall out of task-graph state). The matching
 	// post-commit drain in applyPlanOnce flushes to the
 	// EventStore only if the whole plan commits.
+	// run_seq is included so consumers (notify→live.jsonl→bot
+	// supervisor's auto_stop tailer) can identify which run hit
+	// a terminal state without joining the runs table. Otherwise
+	// the wire-shape event has no run identifier (RunID is the
+	// store's internal id, not exposed; seq is what callers know).
 	sink.Emit(Event{
 		EventType:    "run_" + string(next),
 		EventSubtype: current,
 		RunID:        m.RunID,
 		ProjectID:    projectID,
-		Metadata:     MarshalMetadata(map[string]any{"from": current, "to": next}),
-		CreatedAt:    now,
+		Metadata: MarshalMetadata(map[string]any{
+			"from":    current,
+			"to":      next,
+			"run_seq": runSeq,
+		}),
+		CreatedAt: now,
 	})
 	return next == RunCompleted, nil
 }
@@ -2721,9 +2731,10 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 func applyTerminateRun(tx *sql.Tx, m TerminateRun, result *ApplyResult, sink EventSink) error {
 	var current string
 	var projectID int64
+	var runSeq int64
 	if err := tx.QueryRow(
-		`SELECT state, project_id FROM runs WHERE id = ?`, m.RunID,
-	).Scan(&current, &projectID); err != nil {
+		`SELECT state, project_id, seq FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&current, &projectID, &runSeq); err != nil {
 		return err
 	}
 	switch RunState(current) {
@@ -2804,6 +2815,7 @@ func applyTerminateRun(tx *sql.Tx, m TerminateRun, result *ApplyResult, sink Eve
 			"reason":           m.Reason,
 			"skipped_tasks":    skippedTasks,
 			"abandoned_claims": abandonedClaims,
+			"run_seq":          runSeq,
 		}),
 		CreatedAt: now,
 	})

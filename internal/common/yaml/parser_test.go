@@ -1134,6 +1134,45 @@ tasks:
 	}
 }
 
+// TestParseReviewWithArtifactConsumerNoWarning — review-gating
+// lint recognizes reads_artifacts ↔ writes_artifacts pairing as
+// a downstream-consumer relationship. The runtime's
+// wireArtifactDeps pass + the artifact-visibility readiness
+// gate already enforce the dependency; this lint should agree
+// rather than fire a misleading "review gates nothing" warning.
+func TestParseReviewWithArtifactConsumerNoWarning(t *testing.T) {
+	parsed, err := Parse([]byte(`
+name: "Review with artifact-only consumer"
+version: 1
+tasks:
+  - id: gen
+    action: compute
+    script: scripts/run.sh
+    prompt: "Produce summary"
+    writes_artifacts:
+      - results/summary.md
+  - id: check
+    action: review
+    reviews: gen
+    prompt: "Review {{artifact:results/summary.md}}"
+    reads_artifacts:
+      - results/summary.md
+  - id: publish
+    action: answer
+    reads_artifacts:
+      - results/summary.md
+    prompt: "Ship {{artifact:results/summary.md}}"
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, w := range parsed.Warnings {
+		if contains(w, "no downstream consumers") {
+			t.Errorf("unexpected orphan-review warning: %s", w)
+		}
+	}
+}
+
 // TestParseComputeTaskNoDepsWarns — a compute task with no
 // visible upstream linkage (no task-field refs, no reads,
 // no depends_on) AND a downstream consumer trips the

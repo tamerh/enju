@@ -533,6 +533,14 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
+	// Phase signal: the daemon process is up and committed
+	// to a bot identity. Auto_bots in the supervisor reads
+	// this file (path via ENJU_BOT_PHASE_FILE) to decide when
+	// create_run can unblock. No-op when the env var is empty
+	// (operator launched `enju bot run` directly, not through
+	// the supervisor).
+	_ = bots.WritePhase(bots.PhaseStarting)
+
 	// Hard dependency: enju shells out to system `git` for
 	// rebase-on-non-FF and merge-commit-on-conflict paths.
 	// Catch a missing binary at startup rather than mid-submit
@@ -592,6 +600,7 @@ func cmdBotRun(args []string) {
 	// is surfaced as its own error instead.
 	creds := loadCredentialsAt(*coordinator, bot.Credentials)
 	if (creds == nil || creds.Token == "") && !peekCredentialsFile(bot.Credentials) {
+		_ = bots.WritePhase(bots.PhaseSelfHealing)
 		setupCtx, setupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		owner := loadCredentialsAt(*coordinator, resolveCredentialsPath(""))
 		if owner == nil || owner.Token == "" {

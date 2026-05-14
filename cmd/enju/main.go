@@ -33,7 +33,7 @@ import (
 // pure-string `version` command are exempt.
 func needsGit(subcommand string) bool {
 	switch subcommand {
-	case "mcp", "ui", "wrap-task", "inbox", "review", "bot":
+	case "mcp", "ui", "wrap-task", "inbox", "review", "bot", "go", "status":
 		return true
 	}
 	return false
@@ -83,6 +83,12 @@ func main() {
 		cmdReview(os.Args[2:])
 	case "bot":
 		cmdBot(os.Args[2:])
+	case "validate":
+		cmdValidate(os.Args[2:])
+	case "go":
+		cmdGo(os.Args[2:])
+	case "status":
+		cmdStatus(os.Args[2:])
 	case "version":
 		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -99,6 +105,9 @@ Usage:
  enju serve   Start the coordinator server
  enju mcp    Start the MCP server (for Claude Desktop/Code)
  enju ui     Start the web UI (browser, peer to enju mcp)
+ enju go     Run a workflow YAML end-to-end (register + create + execute)
+ enju status  Snapshot of current project's state
+ enju validate Check a workflow YAML without running it
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
  enju bot    Bot lifecycle (setup, run, status — see 'enju bot')

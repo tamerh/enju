@@ -1,0 +1,228 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/enju-ai/enju/internal/fatclient/projectreg"
+	"github.com/enju-ai/enju/internal/fatclient/service"
+)
+
+func TestParseParamsArg(t *testing.T) {
+	cases := []struct {
+		in   string
+		want map[string]string
+		err  bool
+	}{
+		{"", nil, false},
+		{"gene=TP53", map[string]string{"gene": "TP53"}, false},
+		{"gene=TP53, effort=high", map[string]string{"gene": "TP53", "effort": "high"}, false},
+		{"  gene = TP53  ", map[string]string{"gene": "TP53"}, false},
+		{"gene", nil, true},
+		{"=value", nil, true},
+	}
+	for _, c := range cases {
+		got, err := parseParamsArg(c.in)
+		if c.err {
+			if err == nil {
+				t.Errorf("parseParamsArg(%q): expected error, got %v", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseParamsArg(%q): unexpected error %v", c.in, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("parseParamsArg(%q): got %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for k, v := range c.want {
+			if got[k] != v {
+				t.Errorf("parseParamsArg(%q)[%s] = %v, want %v", c.in, k, got[k], v)
+			}
+		}
+	}
+}
+
+// TestPickContainingEntryPrefersDeepest exercises the nested-
+// project case: when /home/foo is registered as project 1 AND
+// /home/foo/nested is registered as project 2, a file under
+// nested/ should resolve to project 2.
+func TestPickContainingEntryPrefersDeepest(t *testing.T) {
+	now := time.Now()
+	entries := []projectreg.Entry{
+		{ID: 1, LocalPath: "/home/foo", LastTouched: now},
+		{ID: 2, LocalPath: "/home/foo/nested", LastTouched: now},
+		{ID: 3, LocalPath: "/elsewhere", LastTouched: now},
+	}
+	got := pickContainingEntry(entries, "/home/foo/nested/workflow.yaml")
+	if got == nil || got.ID != 2 {
+		t.Fatalf("expected entry 2, got %+v", got)
+	}
+}
+
+func TestPickContainingEntryNoMatch(t *testing.T) {
+	entries := []projectreg.Entry{
+		{ID: 1, LocalPath: "/home/foo"},
+	}
+	if got := pickContainingEntry(entries, "/elsewhere/file"); got != nil {
+		t.Fatalf("expected nil, got %+v", got)
+	}
+}
+
+// TestProjectRootCandidateFindsGit places a workflow under a
+// directory tree with .git two levels up; the candidate should
+// walk up to the git root rather than picking the workflow's
+// immediate parent.
+func TestProjectRootCandidateFindsGit(t *testing.T) {
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "a", "b")
+	if err := os.MkdirAll(deep, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	got := projectRootCandidate(filepath.Join(deep, "wf.yaml"))
+	if got != dir {
+		t.Fatalf("expected %s, got %s", dir, got)
+	}
+}
+
+func TestProjectRootCandidateFallsBackToParent(t *testing.T) {
+	dir := t.TempDir()
+	got := projectRootCandidate(filepath.Join(dir, "wf.yaml"))
+	if got != dir {
+		t.Fatalf("expected fallback %s, got %s", dir, got)
+	}
+}
+
+func TestRunIdentityFromCreateResponse(t *testing.T) {
+	data := []byte(`{"seq":3,"id":42,"branch":"foo-3"}`)
+	seq, id, err := runIdentityFromCreateResponse(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if seq != 3 || id != 42 {
+		t.Fatalf("got seq=%d id=%d, want 3,42", seq, id)
+	}
+}
+
+func TestRunIdentityFromCreateResponseHandlesGarbage(t *testing.T) {
+	seq, id, err := runIdentityFromCreateResponse([]byte("not json"))
+	if err == nil {
+		t.Fatalf("expected error for malformed JSON, got seq=%d id=%d", seq, id)
+	}
+}
+
+// TestResolveOrRegisterProjectAlreadyRegistered covers the
+// happy path: a registry entry covers the workflow's
+// directory, so resolveOrRegisterProject returns it WITHOUT
+// calling CreateProject (which would need a live coord). The
+// auto-register branch isn't testable here without an httptest
+// coord stub — covered by the manual smoke run against the
+// real coord in the merge commit's PR.
+//
+// FRAGILITY: the service.New(Config{ProjectRegistry: reg})
+// construction below is intentionally minimal — no coord,
+// no workspace, no logger. Today service.New tolerates this
+// because the registry-lookup path doesn't reach into those
+// dependencies. If service.New ever starts requiring more
+// fields at construction, these tests will surface the
+// regression early; the alternative (building a full
+// FatClient with httptest coord) is worth the cost only when
+// that regression actually fires.
+func TestResolveOrRegisterProjectAlreadyRegistered(t *testing.T) {
+	projectRoot := t.TempDir()
+	workflowPath := filepath.Join(projectRoot, "enju.yaml")
+	if err := os.WriteFile(workflowPath, []byte("name: t\nversion: 1\ntasks: []\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg := projectreg.Open(regPath)
+	if err := reg.Upsert(projectreg.Entry{
+		ID:          42,
+		LocalPath:   projectRoot,
+		Name:        "fixture",
+		LastTouched: time.Now(),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Construct a FatClient with no coord — the registry
+	// lookup path doesn't touch coord, so nil is safe for
+	// this test slice. WorkspaceRoot="" disables enjugit
+	// init; ProjectRegistry attaches our fixture.
+	fc := service.New(service.Config{
+		ProjectRegistry: reg,
+	})
+	sess := &cliSession{FC: fc, URL: "http://stub"}
+
+	gotID, gotRoot, err := resolveOrRegisterProject(context.Background(), sess, workflowPath, "", true)
+	if err != nil {
+		t.Fatalf("resolveOrRegisterProject: %v", err)
+	}
+	if gotID != 42 {
+		t.Errorf("project id: got %d, want 42", gotID)
+	}
+	if gotRoot != projectRoot {
+		t.Errorf("project root: got %s, want %s", gotRoot, projectRoot)
+	}
+}
+
+// TestResolveOrRegisterProjectNestedPrefersDeeper exercises the
+// nested-project case: workflow lives under a deeper registered
+// path, so the deeper project (not the outer one) wins. Pure
+// registry resolution; no CreateProject call.
+func TestResolveOrRegisterProjectNestedPrefersDeeper(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "nested")
+	if err := os.MkdirAll(inner, 0755); err != nil {
+		t.Fatal(err)
+	}
+	workflowPath := filepath.Join(inner, "enju.yaml")
+	if err := os.WriteFile(workflowPath, []byte("name: t\nversion: 1\ntasks: []\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg := projectreg.Open(regPath)
+	for _, e := range []projectreg.Entry{
+		{ID: 1, LocalPath: outer, Name: "outer", LastTouched: time.Now()},
+		{ID: 2, LocalPath: inner, Name: "inner", LastTouched: time.Now()},
+	} {
+		if err := reg.Upsert(e); err != nil {
+			t.Fatalf("upsert %d: %v", e.ID, err)
+		}
+	}
+
+	fc := service.New(service.Config{ProjectRegistry: reg})
+	sess := &cliSession{FC: fc, URL: "http://stub"}
+
+	gotID, _, err := resolveOrRegisterProject(context.Background(), sess, workflowPath, "", true)
+	if err != nil {
+		t.Fatalf("resolveOrRegisterProject: %v", err)
+	}
+	if gotID != 2 {
+		t.Errorf("expected deeper project id=2, got %d", gotID)
+	}
+}
+
+func TestRunIdentityFromCreateResponseMissingFields(t *testing.T) {
+	// Valid JSON, no seq/id — caller distinguishes "decoded but
+	// fields absent" (returns zeros, nil error) from "wire
+	// malformed" (returns error). Tests pin the contract so a
+	// future refactor doesn't conflate the two.
+	seq, id, err := runIdentityFromCreateResponse([]byte(`{"branch":"foo-3"}`))
+	if err != nil {
+		t.Fatalf("unexpected error for well-formed JSON: %v", err)
+	}
+	if seq != 0 || id != 0 {
+		t.Fatalf("expected zeros for missing fields, got seq=%d id=%d", seq, id)
+	}
+}

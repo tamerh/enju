@@ -345,6 +345,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			"count", n)
 	}
 
+	// Phase signal: startup recovery is complete and the poll
+	// loop is about to fire its first claim attempt. The
+	// supervisor's auto_bots WaitForReady unblocks on this so
+	// create_run can proceed knowing the fleet is actually
+	// fielding work. Write best-effort; no-op when this daemon
+	// wasn't launched via the supervisor (ENJU_BOT_PHASE_FILE
+	// unset).
+	if err := WritePhase(PhaseReady); err != nil {
+		d.logger.Warn("writing ready phase marker (proceeding)", "error", err)
+	}
+
 	backoff := d.pollFloor
 	for {
 		if err := ctx.Err(); err != nil {

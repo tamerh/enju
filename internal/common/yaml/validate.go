@@ -1124,11 +1124,11 @@ func validateActionFields(t *TaskDef) error {
 // validateForEachScopes enforces the two run-wide invariants
 // on for_each use:
 //
-//   1. Run-level and task-level for_each are mutually
-//      exclusive. Authors pick one or the other per run.
-//   2. If multiple tasks declare task-level for_each, they
-//      must agree on the same variable space. A single run
-//      supports one iteration dimension at a time.
+//  1. Run-level and task-level for_each are mutually
+//     exclusive. Authors pick one or the other per run.
+//  2. If multiple tasks declare task-level for_each, they
+//     must agree on the same variable space. A single run
+//     supports one iteration dimension at a time.
 func validateForEachScopes(p *Run, hasTaskLevelForEach bool) error {
 	if len(p.ForEach) > 0 && hasTaskLevelForEach {
 		return fmt.Errorf("run declares a run-level for_each AND task-level for_each on at least one task — these are mutually exclusive; move the for_each block to either the run level or the individual tasks but not both")
@@ -1265,6 +1265,35 @@ func injectReviewGating(p *Run) []string {
 			continue
 		}
 		target := reviewTask.Reviews
+		// Resolve the target's writes_artifacts once per review
+		// pass. A consumer that declares a matching
+		// reads_artifacts entry IS a downstream consumer for
+		// review-gating: build.go wireArtifactDeps wires the
+		// edge at parse time, and sqlite.go updateReadyTasksOn
+		// holds the reader PENDING until the writer is
+		// ACCEPTED. Counting these here keeps the lint aligned
+		// with runtime DAG semantics.
+		//
+		// Scope: this mirrors wireArtifactDeps, which today
+		// pairs only on explicit reads_artifacts / writes_artifacts
+		// declarations — not on {{artifact:path}} prompt refs
+		// (those resolve content but don't currently wire DAG
+		// edges). If wireArtifactDeps ever widens to include
+		// prompt-ref reads, mirror the broadened check here so
+		// the two stay in lockstep.
+		var targetWrites []string
+		for k := range p.Tasks {
+			if p.Tasks[k].ID == target {
+				targetWrites = p.Tasks[k].WritesArtifacts.Paths()
+				break
+			}
+		}
+		targetWriteSet := make(map[string]struct{}, len(targetWrites))
+		for _, w := range targetWrites {
+			if w != "" {
+				targetWriteSet[w] = struct{}{}
+			}
+		}
 		consumersCount := 0
 		for j := range p.Tasks {
 			if i == j {
@@ -1287,6 +1316,14 @@ func injectReviewGating(p *Run) []string {
 			if !consumes {
 				for _, inferred := range template.InferDependencies(consumer.Prompt) {
 					if inferred == target {
+						consumes = true
+						break
+					}
+				}
+			}
+			if !consumes && len(targetWriteSet) > 0 {
+				for _, r := range consumer.ReadsArtifacts {
+					if _, ok := targetWriteSet[r]; ok {
 						consumes = true
 						break
 					}
