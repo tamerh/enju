@@ -3060,6 +3060,63 @@ tasks:
 	}
 }
 
+// TestRecordForEach_FlattensFieldsToEnvParams pins the
+// list<record> → ENJU_PARAM_<var>__<field> contract that
+// validate.go reserves `__` for. Pre-fix, expandForEach only
+// carried the bare key field in params, so compute scripts in a
+// record for_each got ENJU_PARAM_<var> (key) but never the other
+// fields as env vars — contradicting the validator + docs.
+func TestRecordForEach_FlattensFieldsToEnvParams(t *testing.T) {
+	body := []byte(`
+name: "Gene fan-out"
+version: 1
+params:
+  - name: genes
+    type: list<record>
+    key: slug
+    fields:
+      name: string
+      slug: string
+      hits: int
+for_each:
+  gene: "{{genes}}"
+tasks:
+  - id: research
+    action: answer
+    prompt: "Research {{gene.name}}"
+`)
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	merged := map[string]interface{}{
+		"genes": []interface{}{
+			map[string]interface{}{"name": "TP53", "slug": "tp53", "hits": 7},
+		},
+	}
+	if err := substituteForEachParamRefs(parsed.Run.ForEach, merged, "run", parsed.Run.Params); err != nil {
+		t.Fatalf("substituteForEachParamRefs error: %v", err)
+	}
+	inst := expandForEach(map[string]ForEachSource{"gene": parsed.Run.ForEach["gene"]})[0]
+
+	// Bare var == key field (bare-var-resolves-to-key, unchanged).
+	if inst.params["gene"] != "tp53" {
+		t.Errorf("params[gene]: got %q, want tp53 (key field)", inst.params["gene"])
+	}
+	// Every record field flattened as <var>__<field> — these
+	// become ENJU_PARAM_<var>__<field> for compute scripts.
+	want := map[string]string{
+		"gene__name": "TP53",
+		"gene__slug": "tp53",
+		"gene__hits": "7", // int rendered via %v
+	}
+	for k, v := range want {
+		if inst.params[k] != v {
+			t.Errorf("params[%s]: got %q, want %q", k, inst.params[k], v)
+		}
+	}
+}
+
 // ── LRP.4: template substitution ─────────────────────────────────────────────
 
 func allTaskInstances(pr *ParsedRun) []TaskInstance {
@@ -3410,6 +3467,59 @@ tasks:
 	if !strings.Contains(err.Error(), "__") {
 		t.Errorf("error should mention __, got: %v", err)
 	}
+}
+
+// TestForEachVarNameDoubleUnderscoreRejected closes the
+// symmetric half of the `__` reservation: validateParamDef
+// rejects `__` in list<record> FIELD names; this asserts
+// for_each VARIABLE names are rejected too (run-level and
+// task-level). Without both halves `<var>__<field>` is
+// ambiguous and FormatIterationLabel silently drops the
+// binding. Mirrors the field-name `__` rejection in
+// validateParamDef.
+func TestForEachVarNameDoubleUnderscoreRejected(t *testing.T) {
+	t.Run("run-level", func(t *testing.T) {
+		body := []byte(`
+name: "Bad run for_each var"
+version: 1
+params:
+  - name: genes
+    type: list<string>
+for_each:
+  gene__set: "{{genes}}"
+tasks:
+  - id: t
+    action: answer
+    prompt: "{{gene__set}}"
+`)
+		_, err := Parse(body)
+		if err == nil {
+			t.Fatal("expected error for run for_each variable name containing __")
+		}
+		if !strings.Contains(err.Error(), "__") {
+			t.Errorf("error should mention __, got: %v", err)
+		}
+	})
+
+	t.Run("task-level", func(t *testing.T) {
+		body := []byte(`
+name: "Bad task for_each var"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    for_each:
+      row__id: ["a", "b"]
+    prompt: "{{row__id}}"
+`)
+		_, err := Parse(body)
+		if err == nil {
+			t.Fatal("expected error for task for_each variable name containing __")
+		}
+		if !strings.Contains(err.Error(), "__") {
+			t.Errorf("error should mention __, got: %v", err)
+		}
+	})
 }
 
 // TestLRP2_EmptyKeyFieldRejected pins the contract that a record whose

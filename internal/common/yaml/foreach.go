@@ -220,6 +220,22 @@ func validateForEachLiteralMap(scope string, fe map[string][]string) error {
 	}
 	return nil
 }
+// rejectDoubleUnderscoreForEachVar enforces the symmetric half
+// of the `__` reservation. validateParamDef already forbids `__`
+// in list<record> FIELD names; this forbids it in for_each
+// VARIABLE names. Both must hold or `<var>__<field>` is
+// ambiguous (var `g` + field `x__y` vs var `g__x` + field `y`),
+// and FormatIterationLabel — which hides any `__` key as
+// env-expansion — would silently drop a real variable binding
+// from run-status output. Same rationale + message shape as the
+// field-name rejection.
+func rejectDoubleUnderscoreForEachVar(scope, name string) error {
+	if strings.Contains(name, "__") {
+		return fmt.Errorf("%s for_each: variable %q: names must not contain \"__\" (reserved for env var expansion)", scope, name)
+	}
+	return nil
+}
+
 // validateForEachMap validates a task-level ForEachMap. Each
 // variable's source is either a literal list (must be
 // non-empty) or a template reference scalar. Accepted ref
@@ -230,6 +246,9 @@ func validateForEachLiteralMap(scope string, fe map[string][]string) error {
 // the task ID + param tables are built.
 func validateForEachMap(scope string, fe ForEachMap) error {
 	for name, src := range fe {
+		if err := rejectDoubleUnderscoreForEachVar(scope, name); err != nil {
+			return err
+		}
 		switch {
 		case src.Ref != "":
 			// Accept either task-ref shape ({{x.y}}) or
@@ -408,9 +427,24 @@ func expandForEach(forEach map[string]ForEachSource) []forEachInstance {
 				instances := make([]forEachInstance, 0, len(src.RecordValues))
 				for i, rec := range src.RecordValues {
 					keyVal := src.Values[i]
+					// params carries the bare var (== the key
+					// field) AND every record field flattened
+					// as `<var>__<field>`. The flattened keys are
+					// what reach compute scripts as
+					// ENJU_PARAM_<var>__<field> env vars — the
+					// contract validate.go reserves `__` for and
+					// the docs/MCP schema promise. Without this the
+					// env only ever had the key field; non-key
+					// fields were reachable only via context.json.
+					// FormatIterationLabel hides `__` keys so the
+					// iteration label stays `<var>=<key>`.
+					p := map[string]string{varName: keyVal}
+					for fieldName, fieldVal := range rec {
+						p[varName+"__"+fieldName] = fmt.Sprintf("%v", fieldVal)
+					}
 					instances = append(instances, forEachInstance{
 						key:       SlugInstanceKey(keyVal),
-						params:    map[string]string{varName: keyVal},
+						params:    p,
 						record:    rec,
 						recordVar: varName,
 					})

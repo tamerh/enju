@@ -197,9 +197,20 @@ func FormatIterationLabel(instanceParams, instanceKey string) string {
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
+		// `<var>__<field>` keys are the list<record> env-var
+		// expansion (ENJU_PARAM_<var>__<field>), not iteration
+		// identity — the bare `<var>` key already names the
+		// instance. Hide them so the label stays "<var>=<key>"
+		// instead of dumping every record field.
+		if strings.Contains(k, "__") {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	if len(keys) == 0 {
+		return instanceKey
+	}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		parts = append(parts, k+"="+m[k])

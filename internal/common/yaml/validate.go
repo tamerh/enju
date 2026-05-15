@@ -415,6 +415,9 @@ func validateHeader(p *Run) error {
 // shapes.
 func validateRunForEach(p *Run) error {
 	for name, src := range p.ForEach {
+		if err := rejectDoubleUnderscoreForEachVar("run", name); err != nil {
+			return err
+		}
 		switch {
 		case src.Ref != "":
 			if _, ok := parseForEachParamRef(src.Ref); ok {
