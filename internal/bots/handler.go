@@ -215,11 +215,17 @@ const (
 //
 // The switch never grows. Adding a new "handler type" means
 // providing a binary that satisfies the protocol — no Go change.
-func NewHandler(b *Bot) (Handler, error) {
+// projectRoot anchors a repo-relative handler: path (e.g.
+// ./bin/foo.sh) to the project clone root; pass "" when the
+// caller has no project context (StubHandler ignores it; an
+// empty root is a documented no-op). Threading it through the
+// constructor — rather than a mutate-after-construct call —
+// makes the repo-relative anchor unforgettable by construction.
+func NewHandler(b *Bot, projectRoot string) (Handler, error) {
 	if HandlerType(b.Handler) == HandlerTypeStub {
 		return NewStubHandler(), nil
 	}
-	return NewSubprocessHandler(b), nil
+	return NewSubprocessHandler(b, projectRoot), nil
 }
 
 // Preflighter is implemented by handlers that want a startup

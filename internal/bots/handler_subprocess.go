@@ -123,9 +123,14 @@ func effectiveBinary(b *Bot) string {
 // NewSubprocessHandler builds a handler from a manifest entry.
 // Captures the bot's argv template + the static values that
 // feed {{var}} substitution at invoke time.
-func NewSubprocessHandler(b *Bot) *SubprocessHandler {
+func NewSubprocessHandler(b *Bot, projectRoot string) *SubprocessHandler {
 	h := &SubprocessHandler{
-		Binary:           effectiveBinary(b),
+		// Anchor a repo-relative handler path to the project
+		// clone root unconditionally here — see
+		// anchorRelativeBinary. Doing it in the constructor (vs.
+		// a mutate-after-construct call a future caller could
+		// forget) makes the anchor a construction invariant.
+		Binary:           anchorRelativeBinary(effectiveBinary(b), projectRoot),
 		Model:            b.Model,
 		SystemPromptPath: b.SystemPrompt,
 	}
@@ -146,6 +151,46 @@ func NewSubprocessHandler(b *Bot) *SubprocessHandler {
 		}
 	}
 	return h
+}
+
+// anchorRelativeBinary anchors a repo-relative handler path to
+// the project clone root. The manifest contract documents
+// `handler: ./bin/foo.sh` as a "repo-relative path; used
+// verbatim" (example_bots/bots.yaml), but both Preflight's
+// os.Stat and ProcessTask's exec resolve a relative path
+// against the PROCESS CWD — and a supervisor-spawned
+// `enju bot run` daemon's CWD is not the project clone root, so
+// the documented form would fail with "no such file or
+// directory". NewSubprocessHandler calls this UNCONDITIONALLY at
+// construction (projectRoot threaded in via NewHandler), so the
+// anchor can't be forgotten by a future second construction
+// path — it's a constructor invariant, not a caller convention.
+//
+// Untouched: bare names (no separator → resolved via $PATH) and
+// already-absolute paths. Empty projectRoot is a no-op, so a
+// caller without one (tests, callers genuinely running at the
+// repo root) degrades to the prior CWD-relative behavior rather
+// than mis-anchoring.
+//
+// No containment check: a `..`-traversing relative handler (e.g.
+// `../../x`) escapes projectRoot. This is intentionally NOT
+// guarded — bots manifests are operator-authored and committed,
+// the daemon already runs with operator privileges executing
+// operator-authored handlers, and an operator who can write
+// `../../x` could equally write the equivalent absolute path. No
+// new capability, same trust level; a guard would add no
+// security and reject legitimate shared-tooling layouts.
+func anchorRelativeBinary(bin, projectRoot string) string {
+	if projectRoot == "" || bin == "" {
+		return bin
+	}
+	if !strings.ContainsAny(bin, "/\\") {
+		return bin // bare name → $PATH, not a path
+	}
+	if filepath.IsAbs(bin) {
+		return bin // operator gave an absolute path; respect it
+	}
+	return filepath.Join(projectRoot, bin)
 }
 
 // Preflight verifies the handler binary is locatable before the

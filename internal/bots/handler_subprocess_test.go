@@ -273,7 +273,7 @@ func TestSubprocessHandler_NoHardcodedClaudeFlags(t *testing.T) {
 		Model:    "claude-sonnet-4-6",
 		MCPTools: &MCPTools{Allow: []string{"Read", "Edit"}},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID:       "t",
 		SystemPrompt: "system body",
@@ -314,7 +314,7 @@ func TestSubprocessHandler_SpawnsConfiguredBinary(t *testing.T) {
 	}
 
 	b := &Bot{Name: "x", Handler: scriptPath}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID: "p:1:fake",
@@ -360,7 +360,7 @@ func TestSubprocessHandler_NonLLMBinary(t *testing.T) {
 
 	b := &Bot{Name: "lint", Handler: scriptPath}
 	// Deliberately no Model — this isn't an LLM.
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID:  "p:1:lint",
@@ -372,6 +372,66 @@ func TestSubprocessHandler_NonLLMBinary(t *testing.T) {
 	if !strings.Contains(out.Response, "lines:2") {
 		t.Errorf("non-LLM handler should have counted 2 lines via $ENJU_REPO_DIR; got %q", out.Response)
 	}
+}
+
+// TestNewSubprocessHandler_AnchorsRelativeBinary pins the
+// repo-relative handler-path contract: NewSubprocessHandler
+// anchors a `./bin/foo.sh`-shaped handler to the project clone
+// root IN THE CONSTRUCTOR (so it can't be forgotten by a future
+// construction path), while bare $PATH names and absolute paths
+// are left untouched. Regression: a supervisor-spawned non-LLM
+// bot failed `stat ./bin/lint-bot.sh: no such file or directory`
+// because the documented repo-relative path was resolved
+// against the daemon CWD instead of the repo.
+func TestNewSubprocessHandler_AnchorsRelativeBinary(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "bin", "lint-bot.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("repo-relative anchored at construction + Preflight passes", func(t *testing.T) {
+		h := NewSubprocessHandler(&Bot{Name: "lint", Handler: "./bin/lint-bot.sh"}, root)
+		if h.Binary != filepath.Join(root, "bin/lint-bot.sh") {
+			t.Fatalf("Binary = %q, want %q", h.Binary, filepath.Join(root, "bin/lint-bot.sh"))
+		}
+		if err := h.Preflight(); err != nil {
+			t.Errorf("Preflight after anchoring should pass, got %v", err)
+		}
+	})
+
+	t.Run("bare name untouched ($PATH)", func(t *testing.T) {
+		h := NewSubprocessHandler(&Bot{Name: "x", Handler: "claude"}, root)
+		if h.Binary != "claude" {
+			t.Errorf("bare name mutated: %q", h.Binary)
+		}
+	})
+
+	t.Run("absolute path respected", func(t *testing.T) {
+		h := NewSubprocessHandler(&Bot{Name: "x", Handler: script}, root)
+		if h.Binary != script {
+			t.Errorf("absolute path mutated: %q, want %q", h.Binary, script)
+		}
+	})
+
+	t.Run("empty projectRoot is a no-op", func(t *testing.T) {
+		h := NewSubprocessHandler(&Bot{Name: "x", Handler: "./bin/lint-bot.sh"}, "")
+		if h.Binary != "./bin/lint-bot.sh" {
+			t.Errorf("empty root should no-op, got %q", h.Binary)
+		}
+	})
+
+	t.Run("no containment check: .. escapes root (documented, by design)", func(t *testing.T) {
+		h := NewSubprocessHandler(&Bot{Name: "x", Handler: "../../x"}, root)
+		// Same trust level as an absolute path the operator could
+		// equivalently write; we anchor, we do not sandbox.
+		if h.Binary != filepath.Join(root, "../../x") {
+			t.Errorf("traversal path: got %q, want %q", h.Binary, filepath.Join(root, "../../x"))
+		}
+	})
 }
 
 // TestSubprocessHandler_ShellInjectionSafe pins the security
@@ -402,7 +462,7 @@ func TestSubprocessHandler_ShellInjectionSafe(t *testing.T) {
 		HandlerArgs: map[string]string{"prompt": inject},
 		Args:        []string{"{{handler_args.prompt}}"},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 	out, err := h.ProcessTask(context.Background(), HandlerInput{TaskID: "t"})
 	if err != nil {
 		t.Fatalf("ProcessTask: %v", err)
@@ -454,7 +514,7 @@ func TestSubprocessHandler_TaskHandlerArgsOverridesBot(t *testing.T) {
 			"--task-extra={{handler_args.task-extra}}",
 		},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID: "t",
@@ -517,7 +577,7 @@ func TestSubprocessHandler_ArgsTemplateSubstitution(t *testing.T) {
 			"--branch={{branch}}",
 		},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID: "p:1:t",
@@ -580,7 +640,7 @@ func TestSubprocessHandler_SystemPromptRelativeToClaimCWD(t *testing.T) {
 			"--append-system-prompt={{system_prompt}}",
 		},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	out, err := h.ProcessTask(context.Background(), HandlerInput{
 		TaskID:    "7:1:summarize",
@@ -618,7 +678,7 @@ func TestSubprocessHandler_SystemPromptAbsolutePathStillWorks(t *testing.T) {
 		SystemPrompt: absPrompt,
 		Args:         []string{"--append-system-prompt={{system_prompt}}"},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 
 	// Workspace points at a real (but otherwise empty) dir so the
 	// handler's chdir succeeds; the system_prompt path is absolute,
@@ -658,7 +718,7 @@ func TestSubprocessHandler_ArgsDropEmptySubstitutions(t *testing.T) {
 			"--strict",                                             // no template → kept
 		},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 	out, err := h.ProcessTask(context.Background(), HandlerInput{TaskID: "t"})
 	if err != nil {
 		t.Fatalf("ProcessTask: %v", err)
@@ -683,7 +743,7 @@ func TestSubprocessHandler_ArgsDropEmptySubstitutions(t *testing.T) {
 // the typo only surfaces at first claim — possibly days later.
 func TestSubprocessHandler_Preflight_BinaryMissing(t *testing.T) {
 	bogus := filepath.Join(t.TempDir(), "does-not-exist")
-	h := NewSubprocessHandler(&Bot{Name: "x", Handler: bogus})
+	h := NewSubprocessHandler(&Bot{Name: "x", Handler: bogus}, "")
 	err := h.Preflight()
 	if err == nil {
 		t.Fatal("expected Preflight error for missing binary, got nil")
@@ -702,7 +762,7 @@ func TestSubprocessHandler_Preflight_NotExecutable(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h := NewSubprocessHandler(&Bot{Name: "x", Handler: path})
+	h := NewSubprocessHandler(&Bot{Name: "x", Handler: path}, "")
 	err := h.Preflight()
 	if err == nil {
 		t.Fatal("expected Preflight error for non-executable file, got nil")
@@ -717,12 +777,12 @@ func TestSubprocessHandler_Preflight_NotExecutable(t *testing.T) {
 // looked up via exec.LookPath. Verified by pointing the bot at
 // "true" (always present on POSIX) — should succeed.
 func TestSubprocessHandler_Preflight_PATHResolution(t *testing.T) {
-	h := NewSubprocessHandler(&Bot{Name: "x", Handler: "true"})
+	h := NewSubprocessHandler(&Bot{Name: "x", Handler: "true"}, "")
 	if err := h.Preflight(); err != nil {
 		t.Errorf("Preflight against `true` should succeed; got %v", err)
 	}
 
-	h2 := NewSubprocessHandler(&Bot{Name: "x", Handler: "this-binary-does-not-exist-12345"})
+	h2 := NewSubprocessHandler(&Bot{Name: "x", Handler: "this-binary-does-not-exist-12345"}, "")
 	if err := h2.Preflight(); err == nil {
 		t.Error("Preflight against a missing PATH binary should error")
 	}
@@ -785,7 +845,7 @@ echo "prompt-len=${#prompt}"
 
 	// REAL SubprocessHandler — not a stub.
 	bot := &Bot{Name: "integ-bot", Handler: scriptPath}
-	h := NewSubprocessHandler(bot)
+	h := NewSubprocessHandler(bot, "")
 
 	d, err := New(Config{FC: fc, Handler: h, Bot: bot, ProjectID: 1})
 	if err != nil {

@@ -721,7 +721,11 @@ func cmdBotRun(args []string) {
 		}
 	}
 
-	handler, err := bots.NewHandler(bot)
+	// absProject anchors a repo-relative `handler:` path (e.g.
+	// ./bin/foo.sh) to the project clone root inside the
+	// constructor — unconditional, so no construction path can
+	// forget it. See bots.anchorRelativeBinary.
+	handler, err := bots.NewHandler(bot, absProject)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build handler: %v\n", err)
 		os.Exit(1)
@@ -739,10 +743,26 @@ func cmdBotRun(args []string) {
 		AuthToken:   creds.Token,
 		Logger:      logger,
 	})
+	// Provenance ("model") is the named producer of the bot's
+	// output, not necessarily an LLM — the coord auto-registers
+	// whatever string it gets and only requires that a bot name
+	// SOMETHING (requireModelForBot). An LLM bot names its model;
+	// a non-LLM script handler's producer IS its script, so
+	// derive it when no model is declared and the handler isn't
+	// the claude/stub default. Without this a script-handler bot
+	// sends an empty model and the coord rightly refuses every
+	// claim/submit. Citizen identity is unchanged — this only
+	// fills the provenance slot.
+	modelName := bot.Model
+	if modelName == "" {
+		if h := strings.TrimSpace(bot.Handler); h != "" && h != "claude" && h != "stub" {
+			modelName = nonLLMModelName(h)
+		}
+	}
 	fc := service.New(service.Config{
 		Coord:           coordClient,
 		WorkspaceRoot:   wsRoot,
-		ModelName:       bot.Model,
+		ModelName:       modelName,
 		Logger:          logger,
 		LogName:         "bot-" + creds.Username,
 		ProjectRegistry: projectreg.Open(regPath),

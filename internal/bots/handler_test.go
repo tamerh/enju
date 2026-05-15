@@ -12,7 +12,7 @@ func TestNewHandler_DefaultsToClaudeBinary(t *testing.T) {
 	// must keep producing a working handler with claude as the
 	// binary so existing projects don't need a migration.
 	b := &Bot{Name: "x", Model: "claude-sonnet-4-6", Handler: ""}
-	h, err := NewHandler(b)
+	h, err := NewHandler(b, "")
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestNewHandler_DefaultsToClaudeBinary(t *testing.T) {
 
 func TestNewHandler_ExplicitClaude(t *testing.T) {
 	b := &Bot{Name: "x", Model: "claude-sonnet-4-6", Handler: "claude"}
-	h, err := NewHandler(b)
+	h, err := NewHandler(b, "")
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestNewHandler_ArbitraryBinaryName(t *testing.T) {
 	for _, bin := range []string{"gemini", "aider", "./bin/my-linter", "/opt/foo/runner"} {
 		t.Run(bin, func(t *testing.T) {
 			b := &Bot{Name: "x", Model: "m", Handler: bin}
-			h, err := NewHandler(b)
+			h, err := NewHandler(b, "")
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -68,7 +68,7 @@ func TestNewHandler_ArbitraryBinaryName(t *testing.T) {
 
 func TestNewHandler_StubForTests(t *testing.T) {
 	b := &Bot{Name: "x", Handler: "stub"}
-	h, err := NewHandler(b)
+	h, err := NewHandler(b, "")
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestSubprocessHandler_PassesAllowToolsFromManifest(t *testing.T) {
 		Handler:  "claude",
 		MCPTools: &MCPTools{Allow: []string{"Read", "Edit"}},
 	}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 	if got, want := strings.Join(h.AllowTools, ","), "Read,Edit"; got != want {
 		t.Errorf("AllowTools: got %q, want %q", got, want)
 	}
@@ -92,7 +92,7 @@ func TestSubprocessHandler_PassesAllowToolsFromManifest(t *testing.T) {
 
 func TestSubprocessHandler_NilMCPToolsMeansNoAllowlist(t *testing.T) {
 	b := &Bot{Name: "x", Model: "claude-sonnet-4-6", Handler: "claude"}
-	h := NewSubprocessHandler(b)
+	h := NewSubprocessHandler(b, "")
 	if len(h.AllowTools) != 0 {
 		t.Errorf("nil MCPTools should produce no allowlist; got %v", h.AllowTools)
 	}
