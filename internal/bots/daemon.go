@@ -73,6 +73,7 @@ type fatClient interface {
 
 	ClaimTask(ctx context.Context, params service.ClaimParams) (*service.ClaimResult, error)
 	ReleaseTask(ctx context.Context, taskID string) error
+	FailTask(ctx context.Context, taskID, reason string) error
 	ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAllMyOpenClaimsResponse, error)
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
@@ -221,7 +222,46 @@ type Daemon struct {
 	// shutdown path so a Ctrl-C mid-handler still releases the
 	// claim cleanly.
 	activeClaim string
+
+	// failStreak counts CONSECUTIVE process+submit failures per
+	// task id. A deterministic error (unparseable vote, coord
+	// rejecting the same option, missing required artifact) repeats
+	// every claim — without a bound the daemon releases + re-claims
+	// the same task forever, the run hangs, and the only signal is
+	// a WARN per backoff. After maxFailStreak consecutive failures
+	// on one task the daemon drives it to FAILED (fail cascade)
+	// instead of looping. Reset on that task's success. A transient
+	// blip that then succeeds never reaches the bound.
+	failStreak map[string]int
+	// failReason caches the terminal reason string per task so a
+	// FailTask retry (after a coord outage blocked the first
+	// attempt) doesn't re-run the expensive work just to
+	// reconstruct it. Same lifetime as failStreak.
+	failReason    map[string]string
+	maxFailStreak int
 }
+
+// defaultMaxFailStreak is the consecutive-failure bound after
+// which a task is driven to FAILED instead of retried. 3 is
+// enough to tell a deterministic error from a one-off blip
+// without burning many wasted LLM/compute iterations. Tunable
+// knob — package const for grep-ability (mirrors the
+// reconcile-interval constant's evolution).
+const defaultMaxFailStreak = 3
+
+// maxFailStreakEntries caps the failStreak/failReason maps.
+// Orphaned partial streaks (a task that failed 1–2× then was
+// never re-claimed — daemon moved to other ready work) are
+// never individually evicted; deletion happens only on that
+// task's success or terminal FAIL. This is the same
+// never-evicted pattern flagged on runCache/snapshotCache:
+// bounded-in-practice, not a correctness bug (a heuristic
+// counter — resetting it at worst grants a task a few extra
+// retries). The cap drops the maps wholesale if they grow
+// pathologically so a very long-lived daemon can't leak
+// unboundedly. Named here so it's a known trade-off, not an
+// oversight.
+const maxFailStreakEntries = 1024
 
 // New constructs a Daemon. Validates required Config fields up
 // front — FC, Handler, and Bot are load-bearing; the daemon
@@ -257,6 +297,9 @@ func New(cfg Config) (*Daemon, error) {
 		pollFloor:    pollFloor,
 		backoffMax:   backoffMax,
 		logger:       logger,
+		failStreak:    make(map[string]int),
+		failReason:    make(map[string]string),
+		maxFailStreak: defaultMaxFailStreak,
 	}, nil
 }
 
@@ -475,20 +518,118 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 		// would key off those instead.
 		if isAlreadyClaimedError(err) {
 			d.logger.Debug("claim race lost", "task_id", taskID)
+			return false, nil // healthy contention — NEVER counts
+		}
+		// Non-race claim error (deterministic: wrong
+		// require_role, the bot's own model/provenance
+		// misconfig, a wedged task; or transient: coord blip).
+		// Crucially, the bot does NOT hold this task — failing
+		// it here would terminate work meant for the right
+		// citizen ("I can't take this" ≠ "this is broken"), and
+		// the coord's claimant guard would reject the fail
+		// anyway. So we do NOT FailTask on the claim path. The
+		// gap to close is the *silent* WARN-loop-forever: count
+		// a per-task streak purely to ESCALATE SEVERITY — once
+		// it's clearly persistent (not a transient blip that a
+		// later successful claim would reset), surface a loud,
+		// actionable bot-level ERROR instead of an infinite
+		// WARN. process+submit is never reached, so no expensive
+		// work re-runs for an unclaimable task.
+		if len(d.failStreak) >= maxFailStreakEntries {
+			d.failStreak = make(map[string]int)
+			d.failReason = make(map[string]string)
+		}
+		d.failStreak[taskID]++
+		if d.failStreak[taskID] >= d.maxFailStreak {
+			d.logger.Error("bot cannot claim task — persistent non-race claim failure; NOT failing the task (bot is not its owner)",
+				"task_id", taskID, "attempts", d.failStreak[taskID], "error", err,
+				"likely_cause", "this bot lacks the task's require_role, is mis-configured "+
+					"(e.g. no model for an LLM handler), or the task is wedged",
+				"action", "fix the bot/manifest or have an operator fail/invalidate the task; "+
+					"the daemon will keep retrying and re-log this until then")
+			// Resolved as far as the loop is concerned — the
+			// ERROR above is the single, correct signal. Returning
+			// nil suppresses the generic per-iteration WARN and
+			// lets the backoff path slow the ERROR cadence.
 			return false, nil
 		}
+		// Under budget — could still be a transient blip. Loop
+		// logs WARN + backs off.
 		return false, fmt.Errorf("claim %s: %w", taskID, err)
 	}
 	d.activeClaim = taskID
 
+	// Budget already exhausted on a prior pass, but FailTask
+	// couldn't reach coord then. Retry ONLY the FailTask POST —
+	// do NOT re-run process+submit (the expensive LLM/compute
+	// work). Without this short-circuit a coord outage would
+	// burn a full expensive iteration every poll cycle just to
+	// re-attempt the cheap fail POST.
+	if d.failStreak[taskID] >= d.maxFailStreak {
+		return d.failTaskTerminally(ctx, taskID, d.failReason[taskID])
+	}
+
 	if err := d.processAndSubmit(ctx, taskID, claim); err != nil {
-		// Don't auto-release on submit failure — the claim is
-		// ours, the work either succeeded or didn't. A retry
-		// pass on the same task can be valuable. The deferred
-		// ReleaseActiveClaim catches the genuine shutdown case.
+		// Cap the maps before growing them. Orphaned partial
+		// streaks are never individually evicted (see
+		// maxFailStreakEntries); drop wholesale if pathological.
+		if len(d.failStreak) >= maxFailStreakEntries {
+			d.failStreak = make(map[string]int)
+			d.failReason = make(map[string]string)
+		}
+		d.failStreak[taskID]++
+		if d.failStreak[taskID] >= d.maxFailStreak {
+			// Deterministic, repeating failure (unparseable
+			// vote, coord rejecting the same option, missing
+			// required artifact). Releasing + re-claiming would
+			// loop forever and the run would hang with only a
+			// WARN per backoff. Cache the reason and drive the
+			// task to FAILED so the fail cascade runs.
+			d.failReason[taskID] = fmt.Sprintf(
+				"bot %q: %d consecutive iteration failures; last error: %v",
+				d.bot.Name, d.failStreak[taskID], err)
+			return d.failTaskTerminally(ctx, taskID, d.failReason[taskID])
+		}
+		// Under budget — could still be a transient blip. Don't
+		// auto-release; the claim is ours and a retry pass can
+		// succeed. The loop logs this at WARN (a retry, not a
+		// terminal failure) and backs off.
 		return true, fmt.Errorf("process+submit %s: %w", taskID, err)
 	}
+	// Success — clear any prior failure streak for this task.
+	delete(d.failStreak, taskID)
+	delete(d.failReason, taskID)
 	d.activeClaim = ""
+	return true, nil
+}
+
+// failTaskTerminally drives taskID to FAILED via the coord and
+// clears its streak. Called both from the post-process budget-
+// exhausted path and from the pre-process short-circuit (a
+// FailTask retry after a prior coord outage — no work re-run).
+//
+// On a FailTask error the streak + reason are RETAINED on
+// purpose: the next runOnce re-claims this task, the pre-process
+// check sees the still-exhausted streak, and routes straight
+// back here — retrying only the cheap fail POST, never the
+// expensive process+submit again. Returns (true, err) so the
+// loop backs off between retries; logs ERROR (terminal, not a
+// transient retry).
+func (d *Daemon) failTaskTerminally(ctx context.Context, taskID, reason string) (bool, error) {
+	attempts := d.failStreak[taskID]
+	d.logger.Error("task failed after repeated deterministic iteration errors",
+		"task_id", taskID, "attempts", attempts, "reason", reason)
+	if ferr := d.fc.FailTask(ctx, taskID, reason); ferr != nil {
+		d.logger.Error("FailTask failed; streak retained, next pass retries the fail POST without re-running the work",
+			"task_id", taskID, "error", ferr)
+		return true, fmt.Errorf("FailTask %s (after %d attempts): %w", taskID, attempts, ferr)
+	}
+	delete(d.failStreak, taskID)
+	delete(d.failReason, taskID)
+	d.activeClaim = ""
+	// Task is resolved (FAILED) — not an open error for the loop
+	// to re-log at WARN or back off on. The ERROR above is the
+	// single, correct signal.
 	return true, nil
 }
 

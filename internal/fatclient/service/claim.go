@@ -132,6 +132,32 @@ func (s *FatClient) ReleaseTask(ctx context.Context, taskID string) error {
 	return nil
 }
 
+// FailTask drives a claimed task to FAILED with an operator-
+// visible reason via POST /api/v1/tasks/{id}/fail (the same
+// endpoint the compute executor and reconcile use). Unlike
+// ReleaseTask (CLAIMED → READY, re-claimable), this is terminal:
+// the task enters the fail cascade so the run surfaces a real
+// failure instead of a bot silently re-claiming and looping on a
+// deterministic error forever. Used by the daemon's
+// bounded-retry policy.
+func (s *FatClient) FailTask(ctx context.Context, taskID, reason string) error {
+	if taskID == "" {
+		return fmt.Errorf("task_id is required")
+	}
+	data, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/fail",
+		map[string]string{"reason": reason})
+	if err != nil {
+		return err
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) == nil {
+		if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+			return fmt.Errorf("%s", errMsg)
+		}
+	}
+	return nil
+}
+
 // ReleaseAllMyOpenClaimsResponse is the fat-client mirror of
 // the coord's wire shape for POST /api/v1/me/release-claims.
 type ReleaseAllMyOpenClaimsResponse struct {

@@ -194,6 +194,31 @@ type FailTaskResponse struct {
 	Rollbacks      []ArtifactRollbackView `json:"rollbacks,omitempty"`
 }
 
+// failTaskOwnershipOK is the load-bearing ownership invariant for
+// FailTask, extracted as a pure function so the three-way truth
+// table is unit-pinned independent of the store/cascade.
+//
+// Rule: a BOT may only FAIL a task it currently holds the claim
+// on. Humans keep operator-override (FailTask's CanReadProject
+// gate) so a person can kill a wedged task they don't own.
+// Without this, a bot that merely *couldn't claim* a task (wrong
+// require_role, its own model misconfig) could drive that task —
+// and every descendant via the fail cascade — through FAILED,
+// terminating work meant for the right citizen who never got a
+// turn. The process+submit budget is sound precisely because a
+// successful claim already established ownership; the claim path
+// has none. "I can't take this" must never mean "this is
+// broken." Path-independent — defends against any non-owning
+// caller, not just the daemon's claim path.
+func failTaskOwnershipOK(caller *store.CitizenRecord, task *store.TaskRecord) error {
+	if caller.Kind == store.CitizenKindBot && task.ClaimedBy != caller.ID {
+		return fmt.Errorf(
+			"%w: bot %q is not the claimant of task %q (claimed_by=%d); a bot may only fail a task it holds",
+			ErrForbidden, caller.Username, task.ID, task.ClaimedBy)
+	}
+	return nil
+}
+
 // FailTask is the operator-facing wrapper around
 // PerformFailCascade. Validates the target via engine.ComputeFailTask
 // (state precondition), gates on project membership, runs the
@@ -215,6 +240,10 @@ func (c *Coordinator) FailTask(caller *store.CitizenRecord, taskID, reason strin
 	}
 	if !CanReadProject(c.Store, run.ProjectID, caller.ID) {
 		return nil, fmt.Errorf("%w: not a member of this project", ErrForbidden)
+	}
+
+	if err := failTaskOwnershipOK(caller, task); err != nil {
+		return nil, err
 	}
 
 	// Engine validates state precondition before we cascade.

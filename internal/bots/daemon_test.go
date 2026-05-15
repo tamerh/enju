@@ -20,6 +20,11 @@ import (
 // Every method records its calls so tests can assert what the
 // daemon did. Fields are public so each test composes the shape
 // it needs without builder methods.
+type failRecord struct {
+	TaskID string
+	Reason string
+}
+
 type fakeFC struct {
 	mu sync.Mutex
 
@@ -34,9 +39,11 @@ type fakeFC struct {
 	claims    []service.ClaimParams
 	submits   []service.SubmitParams
 	releases  []string
+	fails     []failRecord
 	metaByID  map[string]*service.TaskMeta
 	claimErr  error
 	submitErr string
+	failErr   error
 
 	// Inputs JSON returned by ClaimTask. Same key as ready map.
 	claimInputs map[string][]byte
@@ -149,6 +156,16 @@ func (f *fakeFC) ReleaseTask(ctx context.Context, taskID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.releases = append(f.releases, taskID)
+	return nil
+}
+
+func (f *fakeFC) FailTask(ctx context.Context, taskID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failErr != nil {
+		return f.failErr
+	}
+	f.fails = append(f.fails, failRecord{TaskID: taskID, Reason: reason})
 	return nil
 }
 
@@ -972,6 +989,41 @@ func TestDaemon_RunOnce_VoteAction_FindsOptionInProse(t *testing.T) {
 	}
 }
 
+// TestDaemon_RunOnce_VoteAction_CoordCanonicalShape feeds the
+// VoteOptionsJSON exactly as the coord now produces it —
+// json.Marshal([]yaml.VoteOption{...}) → lowercase id/label.
+// Regression: the coord's engine marshaler used to emit Go
+// field-name keys ([{"ID":"terse"}]), which parseVoteOptions
+// (lowercase "id") couldn't read → empty options → the LLM's
+// whole rationale shipped as the option → coord rejected. The
+// existing vote tests all hand-wrote lowercase JSON, so none
+// caught the real wire shape. This one does.
+func TestDaemon_RunOnce_VoteAction_CoordCanonicalShape(t *testing.T) {
+	fc := newFCWithTask("bot1", "vote", "")
+	// Verbatim json.Marshal of []yaml.VoteOption{{ID:"terse",
+	// Label:"Terse one-block report"},{ID:"detailed",...}} with
+	// the json: tags in place.
+	fc.metaByID["1:1:t"].VoteOptionsJSON =
+		`[{"id":"terse","label":"Terse one-block report"},{"id":"detailed","label":"Detailed report"}]`
+	// The exact prose shape that broke production: rationale that
+	// mentions one option as a word, no leading bare keyword.
+	stub := &StubHandler{Response: "The data is minimal, so a terse format fits best."}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := fc.submits[0].Option; got != "terse" {
+		t.Errorf("Option: got %q, want terse (canonical coord options must parse)", got)
+	}
+
+	// Guard the regression cause directly: the OLD Go-field-name
+	// shape must NOT parse (documents why it failed, and that the
+	// fix is the lowercase contract, not parser leniency).
+	if opts := parseVoteOptions(`[{"ID":"terse"},{"ID":"detailed"}]`); len(opts) != 0 {
+		t.Errorf("uppercase Go-field-name shape should yield no options, got %v", opts)
+	}
+}
+
 func TestDaemon_RunOnce_VoteAction_AmbiguousResponseFails(t *testing.T) {
 	// Multiple options mentioned in the prose — no safe pick,
 	// so the iteration errors. No phantom submit is sent.
@@ -1095,6 +1147,69 @@ func TestDaemon_RunOnce_AlreadyClaimedRace_NotAnError(t *testing.T) {
 	}
 }
 
+// TestDaemon_AlreadyClaimedRace_NeverCountsTowardBudget pins the
+// hard guard for fix B: healthy claim-race contention must never
+// accumulate toward the FAIL budget, no matter how many times it
+// loses the race. Otherwise a busy multi-bot project would FAIL
+// perfectly good tasks.
+func TestDaemon_AlreadyClaimedRace_NeverCountsTowardBudget(t *testing.T) {
+	fc := newFCWithTask("bot1", "review", "")
+	fc.claimErr = errors.New("task already claimed by someone else")
+	d, _ := New(Config{FC: fc, Handler: NewStubHandler(), Bot: scenarioBot(), ProjectID: 1})
+	for i := 0; i < d.maxFailStreak+3; i++ {
+		if _, err := d.RunOnce(context.Background()); err != nil {
+			t.Fatalf("pass %d: race must not surface as error: %v", i, err)
+		}
+	}
+	if len(d.failStreak) != 0 {
+		t.Errorf("claim race must not accumulate a streak, got %v", d.failStreak)
+	}
+	if len(fc.fails) != 0 {
+		t.Errorf("claim race must NEVER FAIL the task, got %+v", fc.fails)
+	}
+}
+
+// TestDaemon_DeterministicClaimError_EscalatesToErrorNeverFails
+// pins the corrected fix B (review point 1): a repeating
+// non-race claim error (e.g. the bot lacks require_role, or its
+// own model/provenance misconfig) must NEVER drive the task to
+// FAILED — the bot doesn't own it; failing it would terminate
+// work meant for the right citizen. It only escalates severity:
+// under budget the loop surfaces an error (WARN); at/after the
+// budget RunOnce returns nil (the daemon has logged a loud
+// bot-level ERROR — no misleading WARN, and crucially no
+// FailTask). process+submit is never reached either way. This is
+// the boundary the reviewer asked to encode.
+func TestDaemon_DeterministicClaimError_EscalatesToErrorNeverFails(t *testing.T) {
+	fc := newFCWithTask("bot1", "review", "")
+	fc.claimErr = errors.New(
+		"conflict: set_claim: operator citizen 19 is a bot — model_id is required")
+	stub := &StubHandler{Response: "x"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+
+	// Under budget: error surfaces (loop WARNs + retries).
+	for i := 1; i < d.maxFailStreak; i++ {
+		_, err := d.RunOnce(context.Background())
+		if err == nil {
+			t.Fatalf("pass %d: under budget should surface an error", i)
+		}
+	}
+	// At + well past the budget: NO error returned (ERROR-only
+	// path), and the task is NEVER failed, ever.
+	for i := 0; i < 4; i++ {
+		_, err := d.RunOnce(context.Background())
+		if err != nil {
+			t.Fatalf("at/after budget pass %d: expected nil (ERROR-only), got %v", i, err)
+		}
+	}
+	if len(fc.fails) != 0 {
+		t.Fatalf("a bot must NEVER FAIL a task it could not claim, got %+v", fc.fails)
+	}
+	if stub.Calls != 0 {
+		t.Errorf("process+submit must never run for an unclaimable task, got %d handler calls", stub.Calls)
+	}
+}
+
 func TestDaemon_ResolvedPromptThreadedToHandler(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
 	fc.claimInputs = map[string][]byte{
@@ -1178,6 +1293,132 @@ func TestDaemon_RunOnce_SubmitFailureSurfacesAsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "coord rejected") {
 		t.Errorf("error should carry coord message, got: %v", err)
+	}
+}
+
+// TestDaemon_DeterministicFailure_FailsTaskAfterBudget pins the
+// bounded-retry policy: a task that fails process+submit the
+// same way every claim must, after maxFailStreak consecutive
+// failures, be driven to FAILED (fc.FailTask) instead of looping
+// forever. Under budget it surfaces an error (loop WARNs +
+// retries — possibly transient); at the bound it FAILs the task
+// and returns nil (resolved — the single ERROR log is the
+// signal, no misleading WARN).
+func TestDaemon_DeterministicFailure_FailsTaskAfterBudget(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.submitErr = "coord rejected: deterministic" // every submit fails identically
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "x"}, Bot: scenarioBot(), ProjectID: 1})
+
+	// Attempts 1..2: under budget → error surfaces, NOT failed.
+	for i := 1; i < d.maxFailStreak; i++ {
+		_, err := d.RunOnce(context.Background())
+		if err == nil {
+			t.Fatalf("attempt %d: expected error (under budget), got nil", i)
+		}
+		if len(fc.fails) != 0 {
+			t.Fatalf("attempt %d: task failed too early: %+v", i, fc.fails)
+		}
+	}
+
+	// Attempt maxFailStreak: budget exhausted → FailTask called,
+	// task resolved (nil returned, no loop WARN/backoff).
+	_, err := d.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("at budget: expected nil (task resolved via FAIL), got %v", err)
+	}
+	if len(fc.fails) != 1 {
+		t.Fatalf("expected exactly 1 FailTask call, got %d (%+v)", len(fc.fails), fc.fails)
+	}
+	if fc.fails[0].TaskID != "1:1:t" {
+		t.Errorf("FailTask task id: got %q, want 1:1:t", fc.fails[0].TaskID)
+	}
+	if !strings.Contains(fc.fails[0].Reason, "consecutive") ||
+		!strings.Contains(fc.fails[0].Reason, "coord rejected") {
+		t.Errorf("FailTask reason should name the streak + last error, got: %q", fc.fails[0].Reason)
+	}
+}
+
+// TestDaemon_TransientThenSuccess_ResetsStreak pins that a
+// failure followed by a success clears the streak — a one-off
+// blip must never accumulate toward the FAIL bound.
+func TestDaemon_TransientThenSuccess_ResetsStreak(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.submitErr = "transient blip"
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "x"}, Bot: scenarioBot(), ProjectID: 1})
+
+	if _, err := d.RunOnce(context.Background()); err == nil {
+		t.Fatal("attempt 1: expected the injected failure")
+	}
+	if d.failStreak["1:1:t"] != 1 {
+		t.Fatalf("streak should be 1 after one failure, got %d", d.failStreak["1:1:t"])
+	}
+	// Clear the injected error → next iteration succeeds.
+	fc.submitErr = ""
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("attempt 2: expected success after blip cleared, got %v", err)
+	}
+	if _, ok := d.failStreak["1:1:t"]; ok {
+		t.Errorf("streak not reset on success: %v", d.failStreak)
+	}
+	if len(fc.fails) != 0 {
+		t.Errorf("a blip-then-success must never FAIL the task, got %+v", fc.fails)
+	}
+}
+
+// TestDaemon_FailTaskErrors_RetriesFailOnlyNotWork pins review
+// issue #1: when FailTask itself errors (coord outage), the
+// streak is retained and the NEXT RunOnce short-circuits BEFORE
+// process+submit — it retries only the cheap fail POST, never
+// re-running the expensive handler work. StubHandler.Calls is
+// the witness: it must not increment on the short-circuit pass.
+func TestDaemon_FailTaskErrors_RetriesFailOnlyNotWork(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "")
+	fc.submitErr = "deterministic"             // every process+submit fails
+	fc.failErr = errors.New("coord unreachable") // FailTask POST fails too
+	stub := &StubHandler{Response: "x"}
+	d, _ := New(Config{FC: fc, Handler: stub, Bot: scenarioBot(), ProjectID: 1})
+
+	// Drive to the budget. Each pass runs the handler once.
+	for i := 0; i < d.maxFailStreak; i++ {
+		_, err := d.RunOnce(context.Background())
+		if err == nil {
+			t.Fatalf("pass %d: expected error", i+1)
+		}
+	}
+	if stub.Calls != d.maxFailStreak {
+		t.Fatalf("handler should have run once per pass to budget: got %d want %d", stub.Calls, d.maxFailStreak)
+	}
+	if len(fc.fails) != 0 {
+		t.Fatalf("FailTask errored, so no recorded fail; got %+v", fc.fails)
+	}
+	if d.failStreak["1:1:t"] < d.maxFailStreak {
+		t.Fatalf("streak must be retained after FailTask error, got %d", d.failStreak["1:1:t"])
+	}
+
+	// Next pass: budget already exhausted → short-circuit. Handler
+	// MUST NOT run again (the issue-#1 guarantee).
+	callsBefore := stub.Calls
+	if _, err := d.RunOnce(context.Background()); err == nil {
+		t.Fatal("FailTask still failing → expected error")
+	}
+	if stub.Calls != callsBefore {
+		t.Errorf("issue #1: work re-ran on FailTask-retry pass (handler calls %d → %d); must short-circuit",
+			callsBefore, stub.Calls)
+	}
+
+	// Coord recovers → the retry FAILs the task, no extra work.
+	fc.failErr = nil
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("FailTask should now succeed, got %v", err)
+	}
+	if stub.Calls != callsBefore {
+		t.Errorf("recovery pass must also short-circuit work; handler calls %d", stub.Calls)
+	}
+	if len(fc.fails) != 1 || fc.fails[0].TaskID != "1:1:t" {
+		t.Errorf("expected the task FAILED exactly once on recovery, got %+v", fc.fails)
+	}
+	if _, ok := d.failStreak["1:1:t"]; ok {
+		t.Errorf("streak must clear after successful FAIL, got %v", d.failStreak)
 	}
 }
 
