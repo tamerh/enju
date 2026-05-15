@@ -251,18 +251,60 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			// this entry shape).
 			_, headBranch, herr := g.Head()
 			if herr == nil && headBranch == target {
+				// HEAD is already on target, so we skip the
+				// branch-switching Checkout (its preserve-
+				// checkout-restore dance can drop untracked files
+				// in this entry shape). But the FF was ref-only:
+				// the worktree still reflects target's PRE-merge
+				// tip. The old code only ran SyncIndexToHead here
+				// — index-only — so every file the FF added sat
+				// in HEAD + index but never on disk, surfacing as
+				// a phantom `git status` delete (the bug this
+				// fixes). FastForwardWorktree applies the
+				// targetSHA..NewTip delta to index AND worktree
+				// while preserving untracked files (it errors
+				// rather than clobbering .enju/ runtime, bigfiles,
+				// or in-flight scratch — the safety the skip was
+				// reaching for).
 				trace.skipped("checkout-target", "HEAD already on target")
-				// Skipping the Checkout means the index isn't
-				// refreshed via the standard checkout path.
-				// After the FF, the index still reflects the
-				// pre-merge tree, which would make the next
-				// checkout's preserve walk misclassify newly-
-				// committed files as untracked. Force the index
-				// in sync with HEAD's new tip explicitly.
-				if rerr := g.SyncIndexToHead(); rerr != nil {
-					return trace.fail("sync-index", translateGitError("sync index to head", rerr))
+				switch {
+				case targetSHA == "":
+					// Pre-merge target ref didn't resolve, so the
+					// FF delta is uncomputable. Degrade to the
+					// historical index-only sync — worktree may
+					// lag, but nothing is lost (it's all in HEAD).
+					if rerr := g.SyncIndexToHead(); rerr != nil {
+						return trace.fail("sync-index", translateGitError("sync index to head", rerr))
+					}
+					trace.okDetail("sync-index", "degraded: pre-merge targetSHA unresolved, worktree may lag")
+				case targetSHA == result.NewTip:
+					// The ref did NOT advance this pass: either a
+					// redundant/no-op merge, or a RETRY after a
+					// prior sync-worktree failure (the untracked/
+					// tracked collision case). The FF delta is
+					// empty, so FastForwardWorktree would no-op and
+					// leave a possibly-stale worktree stale with no
+					// recovery. Reconcile to HEAD idempotently
+					// instead — this is the self-heal path.
+					//
+					// Asymmetry by design: the first attempt's
+					// FastForwardWorktree REFUSED to clobber a
+					// colliding untracked file (loud failure);
+					// ReconcileWorktreeToHead, reached by retry,
+					// lets the committed bytes win at that path
+					// (canonical post-merge). Non-colliding
+					// untracked files stay untouched either way.
+					// See ReconcileWorktreeToHead's doc.
+					if rerr := g.ReconcileWorktreeToHead(); rerr != nil {
+						return trace.fail("sync-worktree", translateGitError("reconcile worktree to head", rerr))
+					}
+					trace.okDetail("sync-worktree", "reconciled (ref already at tip)")
+				default:
+					if rerr := g.FastForwardWorktree(targetSHA, result.NewTip); rerr != nil {
+						return trace.fail("sync-worktree", translateGitError("fast-forward worktree", rerr))
+					}
+					trace.ok("sync-worktree")
 				}
-				trace.ok("sync-index")
 			} else {
 				if cerr := g.Checkout(target); cerr != nil {
 					return trace.fail("checkout-target", translateGitError("checkout merge target", cerr))

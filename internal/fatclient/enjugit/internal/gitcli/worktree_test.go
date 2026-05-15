@@ -322,6 +322,165 @@ func TestSyncIndexToHead(t *testing.T) {
 	}
 }
 
+// --- FastForwardWorktree ---
+
+func TestFastForwardWorktree(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	seedCommitOnMain(t, dir, "a.txt", "old")
+	oldSHA := strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
+
+	// Build the "new" commit: modify a.txt, add b.txt.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("added"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "a.txt", "b.txt")
+	gitRun(t, dir, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "new")
+	newSHA := strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
+
+	// Reproduce the post-ref-only-FF precondition: the branch ref
+	// is at newSHA, but index + worktree still reflect oldSHA.
+	gitRun(t, dir, "read-tree", "--reset", "-u", oldSHA)
+	// An untracked file that MUST survive (the whole reason the
+	// FF path historically skipped Checkout).
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("untracked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _ := OpenClone(dir, "", nullLogger())
+	if err := c.FastForwardWorktree(oldSHA, newSHA); err != nil {
+		t.Fatalf("FastForwardWorktree: %v", err)
+	}
+
+	// a.txt updated, b.txt materialized on disk.
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "new" {
+		t.Errorf("a.txt = %q, want %q", got, "new")
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "b.txt")); err != nil || string(got) != "added" {
+		t.Errorf("b.txt not materialized: %q err=%v", got, err)
+	}
+	// Untracked file preserved.
+	if got, err := os.ReadFile(filepath.Join(dir, "keep.txt")); err != nil || string(got) != "untracked" {
+		t.Errorf("untracked keep.txt lost: %q err=%v", got, err)
+	}
+	// Index now matches newSHA → clean status (no phantom delete).
+	if out := strings.TrimSpace(gitRun(t, dir, "status", "--porcelain", "--untracked-files=no")); out != "" {
+		t.Errorf("worktree/index not clean vs HEAD: %s", out)
+	}
+
+	// Unresolvable SHA → typed ErrRefNotFound.
+	if err := c.FastForwardWorktree("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", newSHA); !errors.Is(err, ErrRefNotFound) {
+		t.Errorf("bad oldSHA: got %v, want ErrRefNotFound", err)
+	}
+}
+
+// --- ReconcileWorktreeToHead ---
+
+func TestReconcileWorktreeToHead(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	seedCommitOnMain(t, dir, "a.txt", "v1")
+	// Add a second tracked file in a follow-up commit so HEAD has
+	// {a.txt, b.txt}.
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("btext"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "b.txt")
+	gitRun(t, dir, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "add b")
+
+	// Simulate a stale worktree: tracked b.txt missing from disk,
+	// a.txt clobbered with wrong content — but the ref/HEAD is
+	// correct. (This is the post-partial-FF / empty-delta shape
+	// the FF path can't fix via read-tree.)
+	if err := os.Remove(filepath.Join(dir, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("STALE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Untracked file that MUST survive.
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("untracked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _ := OpenClone(dir, "", nullLogger())
+	if err := c.ReconcileWorktreeToHead(); err != nil {
+		t.Fatalf("ReconcileWorktreeToHead: %v", err)
+	}
+
+	// Missing tracked file materialized; clobbered one restored.
+	if got, err := os.ReadFile(filepath.Join(dir, "b.txt")); err != nil || string(got) != "btext" {
+		t.Errorf("b.txt not materialized: %q err=%v", got, err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "v1" {
+		t.Errorf("a.txt = %q, want %q", got, "v1")
+	}
+	// Untracked preserved.
+	if got, err := os.ReadFile(filepath.Join(dir, "keep.txt")); err != nil || string(got) != "untracked" {
+		t.Errorf("untracked keep.txt lost: %q err=%v", got, err)
+	}
+	// Clean vs HEAD (no phantom delete).
+	if out := strings.TrimSpace(gitRun(t, dir, "status", "--porcelain", "--untracked-files=no")); out != "" {
+		t.Errorf("worktree/index not clean vs HEAD: %s", out)
+	}
+}
+
+// TestReconcileWorktreeToHead_CollidingUntrackedOverwritten pins
+// the intentional asymmetry with FastForwardWorktree: where an
+// untracked file shares a path with a tracked HEAD entry, the
+// committed bytes win (no error). This is the actual
+// collision-retry shape the targetSHA==NewTip branch exists to
+// recover, and the only case where the untracked behavior is
+// subtle — FastForwardWorktree REFUSES it, Reconcile overrides.
+func TestReconcileWorktreeToHead_CollidingUntrackedOverwritten(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	seedCommitOnMain(t, dir, "a.txt", "base")
+	// HEAD commit adds tracked results.csv (the merged-in artifact).
+	if err := os.WriteFile(filepath.Join(dir, "results.csv"), []byte("COMMITTED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "results.csv")
+	gitRun(t, dir, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "add results")
+	headSHA := strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
+	baseSHA := strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD~1"))
+
+	// Reproduce the collision-retry shape: ref/HEAD = headSHA, but
+	// index is back at base (no results.csv) and disk has an
+	// UNTRACKED results.csv with stale scratch content at the same
+	// path the HEAD commit tracks.
+	gitRun(t, dir, "read-tree", "--reset", "-u", baseSHA)
+	_ = headSHA // ref/branch still points here; only index/worktree moved
+	if err := os.WriteFile(filepath.Join(dir, "results.csv"), []byte("scratch-leftover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A non-colliding untracked file must still survive.
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("untracked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _ := OpenClone(dir, "", nullLogger())
+	if err := c.ReconcileWorktreeToHead(); err != nil {
+		t.Fatalf("ReconcileWorktreeToHead must recover (not error) on collision: %v", err)
+	}
+
+	// Committed bytes win at the colliding path.
+	if got, _ := os.ReadFile(filepath.Join(dir, "results.csv")); string(got) != "COMMITTED" {
+		t.Errorf("colliding path: got %q, want committed %q", got, "COMMITTED")
+	}
+	// Non-colliding untracked file untouched.
+	if got, err := os.ReadFile(filepath.Join(dir, "keep.txt")); err != nil || string(got) != "untracked" {
+		t.Errorf("non-colliding untracked lost: %q err=%v", got, err)
+	}
+	// Clean vs HEAD.
+	if out := strings.TrimSpace(gitRun(t, dir, "status", "--porcelain", "--untracked-files=no")); out != "" {
+		t.Errorf("not clean vs HEAD: %s", out)
+	}
+}
+
 // --- RemoveFiles ---
 
 func TestRemoveFiles(t *testing.T) {

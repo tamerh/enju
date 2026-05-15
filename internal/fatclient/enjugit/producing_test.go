@@ -293,6 +293,64 @@ func TestAutoMergeAcceptedTopic_FastForward(t *testing.T) {
 	}
 }
 
+// TestAutoMergeAcceptedTopic_FFWorktreeSyncRouting pins the
+// load-bearing three-way switch in the FF / HEAD-already-on-target
+// branch: which worktree-sync primitive fires depends solely on
+// the pre-merge targetSHA relative to the post-FF NewTip
+// ("ffsha", from fakeOps.MergeFFOrFail). headBranch defaults to
+// "main" == merge target, so every case enters the skip-branch.
+//
+// This is the routing the phantom-delete fix hinges on; the
+// gitcli unit tests prove each primitive in isolation, this
+// proves the wiring picks the right one.
+func TestAutoMergeAcceptedTopic_FFWorktreeSyncRouting(t *testing.T) {
+	cases := []struct {
+		name        string
+		targetSHA   string // resolveMap["main"]; "" = unset → ErrRefNotFound
+		wantCall    string
+		notExpected []string
+	}{
+		{
+			name:        "normal FF: targetSHA != NewTip → FastForwardWorktree",
+			targetSHA:   "oldmain",
+			wantCall:    "FastForwardWorktree",
+			notExpected: []string{"ReconcileWorktreeToHead", "SyncIndexToHead"},
+		},
+		{
+			name:        "ref already at tip: targetSHA == NewTip → ReconcileWorktreeToHead",
+			targetSHA:   "ffsha",
+			wantCall:    "ReconcileWorktreeToHead",
+			notExpected: []string{"FastForwardWorktree", "SyncIndexToHead"},
+		},
+		{
+			name:        "degraded: targetSHA unresolved → SyncIndexToHead",
+			targetSHA:   "",
+			wantCall:    "SyncIndexToHead",
+			notExpected: []string{"FastForwardWorktree", "ReconcileWorktreeToHead"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wf, fake := makeWorkflow(t)
+			if tc.targetSHA != "" {
+				fake.resolveMap["main"] = tc.targetSHA
+			} // else: leave unset → ResolveRef("main") errors → targetSHA==""
+			if _, err := wf.MergeAcceptedTopic("topic", "main",
+				MergeAuthor{TaskID: "x", AutoOrManual: "auto"}); err != nil {
+				t.Fatalf("MergeAcceptedTopic: %v", err)
+			}
+			if n := fake.callCount(tc.wantCall); n != 1 {
+				t.Errorf("expected exactly 1 %s call, got %d", tc.wantCall, n)
+			}
+			for _, m := range tc.notExpected {
+				if n := fake.callCount(m); n != 0 {
+					t.Errorf("expected 0 %s calls, got %d", m, n)
+				}
+			}
+		})
+	}
+}
+
 // TestAutoMergeAcceptedTopic_NoOriginSkipsFetchAndPush pins the
 // post-Phase-8 single-store contract: when the workflow's clone has
 // no origin configured, the merge's Fetch + Push steps are skipped

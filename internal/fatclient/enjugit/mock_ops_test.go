@@ -346,6 +346,16 @@ func (f *fakeOps) SyncIndexToHead() error {
 	return f.checkErr("SyncIndexToHead")
 }
 
+func (f *fakeOps) FastForwardWorktree(oldSHA, newSHA string) error {
+	f.record("FastForwardWorktree", oldSHA, newSHA)
+	return f.checkErr("FastForwardWorktree")
+}
+
+func (f *fakeOps) ReconcileWorktreeToHead() error {
+	f.record("ReconcileWorktreeToHead")
+	return f.checkErr("ReconcileWorktreeToHead")
+}
+
 func (f *fakeOps) RemoveFiles(paths []string) error {
 	f.record("RemoveFiles", paths)
 	return f.checkErr("RemoveFiles")

@@ -164,6 +164,108 @@ func (c *Clone) SyncIndexToHead() error {
 	return nil
 }
 
+// FastForwardWorktree advances the working tree from oldSHA to
+// newSHA the way `git merge`'s fast-forward does: it applies the
+// oldSHA..newSHA file delta to the working tree (add / modify /
+// delete tracked paths), brings the index to newSHA, and
+// PRESERVES untracked files.
+//
+// Precondition: the ref/HEAD is ALREADY at newSHA (the caller
+// did a ref-only fast-forward, e.g. MergeFFOrFail) while the
+// working tree still reflects oldSHA. This closes the gap where
+// a ref-only FF + SyncIndexToHead left the worktree stale —
+// files added by the fast-forwarded commits sat in HEAD + index
+// but never on disk, so `git status` reported phantom deletes.
+//
+// `read-tree -m -u oldSHA newSHA` is the two-tree merge git uses
+// internally for a fast-forward checkout: it refuses (errors)
+// rather than overwrite an untracked or locally-modified file,
+// so it can't clobber .enju/ runtime state, bigfiles, or an
+// in-flight compute task's scratch — the exact safety the old
+// checkout-skip was reaching for, but without leaving the
+// worktree behind. A blunt `reset --hard` (see ResetClean) was
+// never an option here for that reason.
+//
+// Errors:
+//   - ErrRefNotFound: oldSHA or newSHA is unresolvable.
+func (c *Clone) FastForwardWorktree(oldSHA, newSHA string) error {
+	defer c.lock()()
+	for _, s := range []string{oldSHA, newSHA} {
+		if _, err := runGit(c.workDir, []string{"rev-parse", "--verify", "-q", s + "^{commit}"}, runOpts{}); err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrRefNotFound, s, err)
+		}
+	}
+	if _, err := runGit(c.workDir,
+		[]string{"read-tree", "-m", "-u", oldSHA, newSHA}, runOpts{}); err != nil {
+		return fmt.Errorf("git: fast-forward worktree %s..%s: %w", oldSHA, newSHA, err)
+	}
+	return nil
+}
+
+// ReconcileWorktreeToHead idempotently materializes every
+// tracked file from HEAD into the working tree. Unlike
+// FastForwardWorktree it needs no before/after SHAs and is
+// delta-independent: it always brings the worktree's TRACKED
+// set to HEAD.
+//
+// Why it exists: FastForwardWorktree applies an oldSHA..newSHA
+// delta. On a retry after a partial sync-worktree failure, or
+// on a redundant/no-op merge, the caller's pre-merge targetSHA
+// already equals the new tip — the delta is EMPTY, so
+// FastForwardWorktree would no-op and leave a known-stale
+// worktree stale forever (no auto-recovery). This is the
+// self-heal path for exactly that shape: the caller routes
+// here when targetSHA == NewTip.
+//
+// Untracked-file behavior — read carefully, this is the crux of
+// the recovery design and is INTENTIONALLY ASYMMETRIC with
+// FastForwardWorktree:
+//
+//   - Non-colliding untracked files (.enju/ runtime, bigfiles,
+//     unrelated compute scratch) are untouched — they have no
+//     index entry, so checkout-index never writes them.
+//
+//   - An untracked file whose path COLLIDES with a tracked
+//     entry IS overwritten by the committed version. This is
+//     the case that routed execution here: the first-attempt
+//     FastForwardWorktree (read-tree -m -u) REFUSED rather than
+//     clobber that untracked path, surfacing a loud
+//     sync-worktree failure. On the operator's retry this
+//     function resolves it the only way that converges — the
+//     committed bytes win, because post-merge they are
+//     canonical and a leftover untracked file at a now-tracked
+//     path is exactly the stale scratch the merge supersedes.
+//     `reset --mixed HEAD` makes the colliding path a tracked
+//     index entry, so `checkout-index -a -f` force-writes it.
+//
+// So: refuse-then-recover. FastForwardWorktree protects
+// untracked files (errors); ReconcileWorktreeToHead is the
+// deliberate override the operator reaches by retrying.
+//
+// Other trade-off: a file deleted between the stale state and
+// HEAD lingers as a now-untracked file rather than being
+// removed — a rare edge, visible (untracked, not silent
+// corruption), strictly better than a permanently stale
+// worktree. A blunt `reset --hard` is NOT used: it would delete
+// ALL untracked files, including non-colliding .enju/ runtime,
+// bigfiles, and in-flight scratch.
+//
+// Errors:
+//   - ErrRefNotFound: HEAD is unresolvable.
+func (c *Clone) ReconcileWorktreeToHead() error {
+	defer c.lock()()
+	if _, err := runGit(c.workDir, []string{"rev-parse", "--verify", "-q", "HEAD"}, runOpts{}); err != nil {
+		return fmt.Errorf("%w: HEAD: %v", ErrRefNotFound, err)
+	}
+	if _, err := runGit(c.workDir, []string{"reset", "--mixed", "HEAD"}, runOpts{}); err != nil {
+		return fmt.Errorf("git: reconcile mixed reset: %w", err)
+	}
+	if _, err := runGit(c.workDir, []string{"checkout-index", "-a", "-f"}, runOpts{}); err != nil {
+		return fmt.Errorf("git: reconcile checkout-index: %w", err)
+	}
+	return nil
+}
+
 // RemoveFiles deletes the given paths from the worktree.
 // Idempotent: a path that doesn't exist is silently skipped.
 //
