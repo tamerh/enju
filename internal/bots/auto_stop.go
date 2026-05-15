@@ -104,6 +104,19 @@ func runSeqFromMetadata(md map[string]any) int64 {
 // no explicit Stop. Fat-client shutdown takes everything down
 // in one move; the tailer's only resource is one file handle
 // + a sleep loop.
+//
+// ctx is DETACHED via context.WithoutCancel before it reaches
+// the goroutine. The sole caller is enju_create_run's
+// HookRunSeq, whose ctx is the per-MCP-request context — it is
+// cancelled the instant create_run returns its result, which
+// is always long before the run reaches a terminal state. A
+// request-scoped tailer therefore dies within one poll
+// interval and never sees the run_completed event, leaking
+// every auto_bots-managed bot (the symptom this detach fixes).
+// WithoutCancel keeps any context values but strips
+// cancellation + deadline, so the tailer outlives the request
+// and is bounded only by fat-client process exit — exactly the
+// lifetime the paragraph above describes.
 func (s *Supervisor) WatchProjectEvents(ctx context.Context, projectDir string, projectID int64) {
 	if projectDir == "" {
 		s.logger().Warn("WatchProjectEvents: empty projectDir, skipping", "project_id", projectID)
@@ -133,7 +146,9 @@ func (s *Supervisor) WatchProjectEvents(ctx context.Context, projectDir string, 
 	if info, err := os.Stat(path); err == nil {
 		offset = info.Size()
 	}
-	go s.runEventTailer(ctx, path, offset, projectID)
+	// Detach: the tailer must outlive the create_run request
+	// whose ctx this is. See the doc comment above.
+	go s.runEventTailer(context.WithoutCancel(ctx), path, offset, projectID)
 }
 
 // runEventTailer is the per-project poll loop. Reads new
