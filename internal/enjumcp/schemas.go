@@ -286,6 +286,9 @@ If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithBoolean("auto_bots",
 			mcp.Description(`Opt-in: spin up every bot declared in the workflow's inline bots: section before the run starts, and stop them automatically when the run reaches a terminal state. Reference-counted so concurrent runs that share bots are safe — the last-finishing run triggers the stop. Bots started manually with enju_bot_start are left alone (manual wins). Requires path= mode; inline yaml= has no on-disk workflow file for the bot daemons to read. Default false: the operator drives bot lifecycle explicitly with enju_bot_start / enju_bot_stop_all.`),
 		),
+		mcp.WithString("sync_mode_override",
+			mcp.Description(`Override the workflow YAML's sync: block for this run. Controls what happens to the run branch when the run completes. "merge": merge the run branch into base_branch locally (default if not set in YAML). "push": merge locally then push base_branch to origin. "none": skip both — useful for dry runs or workflows where you manage branching yourself. Omit to use the workflow's own sync: setting.`),
+		),
 	)
 }
 

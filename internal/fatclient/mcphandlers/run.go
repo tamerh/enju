@@ -612,6 +612,9 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		}
 		body["branch"] = branch
 	}
+	if sm := req.GetString("sync_mode_override", ""); sm != "" {
+		body["sync_mode_override"] = sm
+	}
 
 	// auto_bots preflight (NDA.3). Spin up every bot declared
 	// in the workflow's inline bots: section before the run is

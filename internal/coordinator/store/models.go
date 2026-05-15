@@ -259,6 +259,13 @@ type RunRecord struct {
 	//   {"kind":"artifact",     "task":"...","awaiting_path":"..."}
 	//   {"kind":"stuck",        "detail":"..."}
 	BlockedBy string
+	// SyncModeOverride is the operator-supplied sync mode from the
+	// CLI `--sync` flag (or the `sync_mode_override` MCP param).
+	// When non-empty, it takes precedence over the workflow YAML's
+	// `sync:` block at run-completion time. One of "none", "merge",
+	// "push". Empty means "use the YAML's sync: block (default:
+	// merge)".
+	SyncModeOverride string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

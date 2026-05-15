@@ -22,6 +22,11 @@ type CreateRunParams struct {
 	SourceCommitSHA string
 	Username    string // citizen who created this run, for contribution tracking
 	Branch     string // empty | "auto" | explicit branch name
+	// SyncModeOverride is the CLI --sync flag value (or
+	// enju_create_run's sync_mode_override param). When non-empty,
+	// takes precedence over the workflow YAML's sync: block at
+	// run-completion time. One of "none", "merge", "push".
+	SyncModeOverride string
 }
 
 // CreateRun parses + validates the run YAML, resolves the
@@ -111,19 +116,20 @@ func (c *Coordinator) CreateRun(projectID int64, params CreateRunParams) (*RunRe
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
 			store.CreateRun{Run: store.RunRecord{
-				ProjectID:       projectID,
-				Name:            parsed.Run.Name,
-				Ref:             parsed.Run.Ref,
-				YAMLData:        params.YAML,
-				RepoURL:         params.RepoURL,
-				State:           store.RunActive,
-				SourcePath:      params.SourcePath,
-				SourceCommitSHA: params.SourceCommitSHA,
-				Params:          paramsJSON,
-				Branch:          branch,
-				Slug:            runSlug,
-				CreatedAt:       now,
-				UpdatedAt:       now,
+				ProjectID:        projectID,
+				Name:             parsed.Run.Name,
+				Ref:              parsed.Run.Ref,
+				YAMLData:         params.YAML,
+				RepoURL:          params.RepoURL,
+				State:            store.RunActive,
+				SourcePath:       params.SourcePath,
+				SourceCommitSHA:  params.SourceCommitSHA,
+				Params:           paramsJSON,
+				Branch:           branch,
+				Slug:             runSlug,
+				SyncModeOverride: params.SyncModeOverride,
+				CreatedAt:        now,
+				UpdatedAt:        now,
 			}},
 		},
 	})

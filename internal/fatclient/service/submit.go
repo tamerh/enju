@@ -299,6 +299,7 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 	if err := s.applyAcceptedMerges(ctx, prep.Workflow, data); err != nil {
 		return &SubmitResult{ErrorMessage: "auto-merging accepted topic branch: " + err.Error()}
 	}
+	s.applyRunCompletion(ctx, mergeWorkflowOrNil(prep.Workflow), prep.Meta, data)
 	if prep.Meta != nil && prep.Meta.ProjectID > 0 {
 		s.TouchProject(prep.Meta.ProjectID)
 	}
@@ -880,6 +881,117 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 	}
 	return fmt.Errorf("reportMerge exhausted retries (task=%s topic=%s merge=%s): %w",
 		taskID, topicBranch, mergeSHA, lastErr)
+}
+
+// mergeWorkflow is the Workflow surface applyRunCompletion needs.
+// The narrow interface makes the call-chain testable without a real
+// git repo and avoids the nil-interface gotcha when prep.Workflow is
+// a typed nil (see mergeWorkflowOrNil).
+type mergeWorkflow interface {
+	DefaultBranch() string
+	RemoteURL() string
+	MergeRunIntoBase(runBranch, baseBranch string, author enjugit.MergeAuthor) (*enjugit.MergeResult, error)
+	PushBranch(branch string) error
+}
+
+// mergeWorkflowOrNil converts a concrete *enjugit.Workflow to the
+// mergeWorkflow interface, returning nil when wf is nil. A direct
+// conversion (*enjugit.Workflow)(nil) → mergeWorkflow produces a
+// non-nil interface that holds a nil pointer, breaking == nil checks
+// inside applyRunCompletion.
+func mergeWorkflowOrNil(wf *enjugit.Workflow) mergeWorkflow {
+	if wf == nil {
+		return nil
+	}
+	return wf
+}
+
+// applyRunCompletion handles the run-completion sync step. Called
+// after applyAcceptedMerges when RunCompleted=true comes back in
+// the coordinator's submit response. Non-fatal: failures are logged
+// and surfaced as warnings, not returned as submit errors (the local
+// commit already landed; the merge/push is a best-effort step).
+//
+// Sync modes (from the workflow's sync: block, defaulting to "merge"):
+//
+//	none  — no-op.
+//	merge — FF-merge run-branch into base_branch locally.
+//	push  — same as merge, then push base_branch to remote.
+//
+// Conflicts are surfaced via fat-client logs only by design — the run
+// branch is preserved for manual git merge; there is intentionally no
+// coord-side signal (enju_run_status shows the run completed normally).
+func (s *FatClient) applyRunCompletion(_ context.Context, wf mergeWorkflow, meta *TaskMeta, responseBody []byte) {
+	if wf == nil || meta == nil || len(responseBody) == 0 {
+		return
+	}
+	var resp struct {
+		RunCompleted bool   `json:"run_completed"`
+		SyncMode     string `json:"sync_mode"`
+		SyncRemote   string `json:"sync_remote"`
+	}
+	if err := json.Unmarshal(responseBody, &resp); err != nil || !resp.RunCompleted {
+		return
+	}
+	mode := resp.SyncMode
+	if mode == "" {
+		mode = "merge"
+	}
+	if mode == "none" {
+		return
+	}
+	runBranch := meta.Branch
+	baseBranch := wf.DefaultBranch()
+	if runBranch == "" || baseBranch == "" {
+		s.logger.Warn("applyRunCompletion: missing branch names",
+			"run_branch", runBranch, "base_branch", baseBranch)
+		return
+	}
+	author := enjugit.MergeAuthor{AutoOrManual: "auto"}
+	_, err := wf.MergeRunIntoBase(runBranch, baseBranch, author)
+	if err != nil {
+		var conflict *enjugit.ErrConflict
+		if errors.As(err, &conflict) {
+			// Run completed; the conflict is an operational git concern.
+			// The run branch is intact and base_branch is unchanged.
+			// No coord-side signal is emitted — by design for v1 (see
+			// docstring). A future contributor should not add a coord
+			// POST here without a dedicated endpoint + run state.
+			s.logger.Error("applyRunCompletion: run-branch merge conflict — resolve manually",
+				"run_branch", runBranch, "base_branch", baseBranch,
+				"conflict_files", conflict.Paths,
+				"hint", "git checkout "+baseBranch+" && git merge "+runBranch,
+				"project_id", meta.ProjectID, "run_seq", meta.RunSeq)
+			return
+		}
+		s.logger.Warn("applyRunCompletion: merge failed",
+			"run_branch", runBranch, "base_branch", baseBranch, "err", err)
+		return
+	}
+
+	if mode != "push" {
+		s.logger.Info("applyRunCompletion: run merged into base branch",
+			"run_branch", runBranch, "base_branch", baseBranch)
+		return
+	}
+	remote := resp.SyncRemote
+	if remote == "" {
+		remote = "origin"
+	}
+	if wf.RemoteURL() == "" {
+		s.logger.Warn("applyRunCompletion: push requested but no remote configured",
+			"base_branch", baseBranch)
+		return
+	}
+	// Push base_branch to the configured remote. Non-fatal on failure —
+	// local merge already landed; operator retries with `git push`.
+	if err := wf.PushBranch(baseBranch); err != nil {
+		s.logger.Warn("applyRunCompletion: push failed; run merged locally but not shared",
+			"base_branch", baseBranch, "remote", remote, "err", err)
+		return
+	}
+	s.logger.Info("applyRunCompletion: run merged and pushed",
+		"run_branch", runBranch, "base_branch", baseBranch, "remote", remote)
 }
 
 // applyAcceptedMerges drives the post-submit auto-merge of any

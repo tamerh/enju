@@ -150,6 +150,35 @@ tasks:
 	}
 }
 
+// TestValidateSyncMode pins the run-level sync: mode: validator.
+// Valid values (none/merge/push) and the empty-omit case must be
+// accepted; anything else is a fatal parse error.
+func TestValidateSyncMode(t *testing.T) {
+	validModes := []string{"none", "merge", "push", ""}
+	for _, m := range validModes {
+		yaml := "name: t\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: p\n"
+		if m != "" {
+			yaml += "sync:\n  mode: " + m + "\n"
+		}
+		if _, err := Parse([]byte(yaml)); err != nil {
+			t.Errorf("sync mode %q should be accepted, got error: %v", m, err)
+		}
+	}
+
+	invalidModes := []string{"psh", "PUSH", "Merge", "fast-forward", "auto"}
+	for _, m := range invalidModes {
+		yaml := "name: t\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: p\nsync:\n  mode: " + m + "\n"
+		_, err := Parse([]byte(yaml))
+		if err == nil {
+			t.Errorf("sync mode %q should be rejected, got nil error", m)
+			continue
+		}
+		if !strings.Contains(err.Error(), m) {
+			t.Errorf("error for mode %q should mention the bad value; got: %v", m, err)
+		}
+	}
+}
+
 // ResolvedMode on non-compute tasks returns "" — the concept
 // doesn't apply. Callers branching on mode scope to compute
 // first.

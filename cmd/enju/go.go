@@ -43,11 +43,17 @@ func cmdGo(args []string) {
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
 	autoBots := fs.Bool("auto-bots", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_bots flag.")
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
+	syncMode := fs.String("sync", "", `Sync mode at run completion: none | merge | push. Overrides the workflow YAML's sync: block. "merge" merges the run branch into base_branch locally; "push" also pushes base_branch to origin; "none" skips both. Defaults to the YAML setting, or "merge" if the YAML has no sync: block.`)
 	fs.Parse(args)
 
 	workflowArg, uerr := pickWorkflowArg(fs.Args())
 	if uerr != nil {
 		fmt.Fprintln(os.Stderr, uerr.Error())
+		os.Exit(2)
+	}
+
+	if err := validateSyncFlag(*syncMode); err != nil {
+		fmt.Fprintf(os.Stderr, "--sync: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -98,7 +104,7 @@ func cmdGo(args []string) {
 	logf(*asJSON, "▶ project %d at %s", projectID, projectRoot)
 	logf(*asJSON, "▶ workflow %s", templatePath)
 
-	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, *autoBots)
+	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, *autoBots, *syncMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create run: %v\n", err)
 		os.Exit(1)
@@ -384,7 +390,7 @@ func projectRootCandidate(workflowAbs string) string {
 // Returns the run's per-project seq and the global run_id from
 // the coord response. Surfaces ensure-branch / snapshot
 // warnings to stderr as the MCP handler does.
-func createRun(ctx context.Context, sess *cliSession, projectID int64, templatePath string, params map[string]interface{}, branch string, autoBots bool) (int, int64, error) {
+func createRun(ctx context.Context, sess *cliSession, projectID int64, templatePath string, params map[string]interface{}, branch string, autoBots bool, syncMode string) (int, int64, error) {
 	fc := sess.FC
 	authorName, authorEmail := fc.CommitAuthor(ctx)
 	prep, err := fc.PrepareRunTemplate(ctx, projectID, templatePath, authorName, authorEmail)
@@ -459,6 +465,9 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	}
 	if branch != "" {
 		body["branch"] = branch
+	}
+	if syncMode != "" {
+		body["sync_mode_override"] = syncMode
 	}
 
 	data, err := fc.Coord().Post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID), body)
@@ -549,6 +558,19 @@ func errorFromCoord(data []byte) string {
 		return s
 	}
 	return ""
+}
+
+// validateSyncFlag returns an error when v is not one of the valid
+// sync modes. Empty string (flag not set) is accepted. Extracted so
+// tests can cover the validation logic independent of cmdGo's
+// flag.Parse / os.Exit plumbing.
+func validateSyncFlag(v string) error {
+	switch v {
+	case "", "none", "merge", "push":
+		return nil
+	default:
+		return fmt.Errorf("invalid value %q (must be none, merge, or push)", v)
+	}
 }
 
 // parseParamsArg parses the --params shorthand: a comma-separated

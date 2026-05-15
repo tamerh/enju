@@ -338,6 +338,78 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 	return result, nil
 }
 
+// MergeRunIntoBase merges a completed run branch into the project's
+// base branch (typically "main"). Called at run completion after all
+// topic→run merges are done.
+//
+// Merge strategy:
+//   - Fast-forward when possible (run branch is linear descendant
+//     of base branch tip).
+//   - Merge commit (system author) when base branch has advanced
+//     since the run forked — e.g. a parallel run already landed.
+//   - Idempotent: if run branch is already an ancestor of base
+//     branch, returns immediately with no-op.
+//
+// Push is NOT performed here. The caller (applyRunCompletion in
+// fatclient/service/submit.go) handles the optional push step based
+// on the resolved sync mode.
+//
+// Errors:
+//   - *ErrConflict: real file conflict; base branch unchanged.
+//   - ErrCannotAutoMerge: non-conflict merge failure.
+func (w *Workflow) MergeRunIntoBase(runBranch, baseBranch string, author MergeAuthor) (*MergeResult, error) {
+	if runBranch == "" || baseBranch == "" {
+		return nil, fmt.Errorf("enjugit: MergeRunIntoBase: runBranch and baseBranch required")
+	}
+	authorName, authorEmail := w.mergeAuthorIdentity(author)
+	subject := fmt.Sprintf("Merge run %s into %s", runBranch, baseBranch)
+	trailers := buildMergeTrailers(author)
+	message := composeCommitMessage(w.convs, subject, "", trailers)
+
+	trace := startTrace("MergeRunIntoBase")
+	defer trace.emit(w.logger, w.traceFile)
+	trace.ctx("run_branch", runBranch)
+	trace.ctx("base_branch", baseBranch)
+
+	result := &MergeResult{}
+	werr := w.git.WithLock(func(g git.Ops) error {
+		// Idempotency: if run branch is already reachable from
+		// base branch, the merge already happened (e.g. fatclient
+		// restarted after completion). No-op.
+		if isAnc, err := g.IsAncestor(runBranch, baseBranch); err == nil && isAnc {
+			trace.okDetail("already-merged", "run branch is ancestor of base branch")
+			result.FastForwarded = true
+			return nil
+		}
+
+		// Try fast-forward first (ref-only — doesn't touch worktree).
+		if tip, err := g.MergeFFOrFail(baseBranch, runBranch); err == nil {
+			result.NewTip = tip
+			result.FastForwarded = true
+			trace.okDetail("merge-ff", shortSHA(tip))
+			if err := g.Checkout(baseBranch); err != nil {
+				trace.appendStep(Step{Name: "checkout-base", Status: "failed", Detail: err.Error()})
+			} else {
+				trace.ok("checkout-base")
+			}
+			return nil
+		}
+
+		// Non-FF: create a merge commit.
+		tip, merr := g.MergeWithCommit(baseBranch, runBranch, message, authorName, authorEmail)
+		if merr != nil {
+			return trace.fail("merge-commit", translateGitError("merge", merr))
+		}
+		result.NewTip = tip
+		trace.okDetail("merge-commit", shortSHA(tip))
+		return nil
+	})
+	if werr != nil {
+		return nil, werr
+	}
+	return result, nil
+}
+
 // CommitArbitraryFiles commits a set of files to a target
 // branch. Used for non-task commits — diagram exports, event
 // timeline JSONLs, README updates — anything that belongs in

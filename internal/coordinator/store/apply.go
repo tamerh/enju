@@ -923,9 +923,9 @@ func applyCreateRun(tx *sql.Tx, m CreateRun, sink EventSink) (int64, int, error)
 		slug = "run"
 	}
 	result, err := tx.Exec(
-		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, r.Params, branch, slug, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, sync_mode_override, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ProjectID, nextSeq, r.Name, r.Ref, r.YAMLData, r.RepoURL, r.State, r.SourcePath, r.SourceCommitSHA, r.Params, branch, slug, r.SyncModeOverride, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return 0, 0, err

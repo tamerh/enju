@@ -75,6 +75,25 @@ type Run struct {
 	// {{issue.title}}, {{issue.body}}, {{issue.severity}},
 	// {{issue.id}} are substituted at spawn time.
 	AutoTriage *RemediationTemplate `yaml:"auto_triage,omitempty"`
+
+	// Sync controls what happens when the run completes.
+	// See SyncConfig for the three modes. Optional; omitting the
+	// block is equivalent to `sync: mode: merge`.
+	Sync *SyncConfig `yaml:"sync,omitempty"`
+}
+
+// SyncConfig is the per-workflow sync policy declared under the
+// optional `sync:` block. All fields apply only at run completion —
+// per-task topic and run-branch pushes are unaffected.
+type SyncConfig struct {
+	// Mode is one of "none", "merge", or "push".
+	//   none  — do nothing; run branch stays as-is; base_branch unchanged.
+	//   merge — FF-merge run-branch into base_branch locally (default when omitted).
+	//   push  — same as merge, then push base_branch to Remote.
+	Mode string `yaml:"mode,omitempty"`
+	// Remote is the git remote to push to when mode=push.
+	// Defaults to "origin" when empty.
+	Remote string `yaml:"remote,omitempty"`
 }
 
 // RecordFields is an ordered map from field name to scalar type

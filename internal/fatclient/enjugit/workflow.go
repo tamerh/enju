@@ -226,3 +226,12 @@ func (w *Workflow) wrapGitError(op, branch string, err error) error {
 func (w *Workflow) PushAllRefs(force bool) error {
 	return translateGitError("push all refs", w.git.PushAllRefs(force))
 }
+
+// PushBranch pushes a single branch to origin. Used by
+// applyRunCompletion to share base_branch after a run-completion
+// merge when sync mode is "push".
+func (w *Workflow) PushBranch(branch string) error {
+	return w.git.WithLock(func(g git.Ops) error {
+		return translateGitError("push branch", g.Push(branch))
+	})
+}

@@ -7,6 +7,8 @@ import (
 
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	yamlv3 "gopkg.in/yaml.v3"
 )
 
 // SubmitResultParams is the input shape for SubmitTaskResult.
@@ -44,6 +46,14 @@ type SubmitResultResponse struct {
 	VoteResolution    *VoteResolutionView   `json:"vote_resolution,omitempty"`
 	ArtifactsWritten   []string        `json:"artifacts_written,omitempty"`
 	RunCompleted     bool          `json:"run_completed,omitempty"`
+	// SyncMode is the resolved sync mode for this run, included
+	// only when RunCompleted=true so the fat-client knows what to
+	// do after the final accepted merge. One of "none", "merge",
+	// "push". Defaults to "merge" when the workflow omits sync:.
+	SyncMode        string        `json:"sync_mode,omitempty"`
+	// SyncRemote is the remote name to push to when SyncMode="push".
+	// Defaults to "origin" when the workflow omits sync.remote.
+	SyncRemote      string        `json:"sync_remote,omitempty"`
 	AcceptedMerges    []AcceptedMergeView   `json:"accepted_merges,omitempty"`
 	ProjectID       int64          `json:"project_id,omitempty"`
 	RunSeq        int           `json:"run_seq,omitempty"`
@@ -453,14 +463,64 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 	if completed {
 		resp.RunCompleted = true
+		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
+		resp.ProjectID = run.ProjectID
+		resp.RunSeq = run.Seq
 	}
 
 	if len(merges) > 0 {
 		resp.AcceptedMerges = merges
-		resp.ProjectID = run.ProjectID
-		resp.RunSeq = run.Seq
+		if resp.ProjectID == 0 {
+			resp.ProjectID = run.ProjectID
+			resp.RunSeq = run.Seq
+		}
 	}
 	return resp, nil
+}
+
+// parseSyncConfig resolves (mode, remote) for the run-completion sync
+// step. Resolution is two independent passes so --sync only controls
+// the mode; sync.remote is always honored regardless of override:
+//
+//  1. YAML pass: read sync.mode and sync.remote from stored YAML.
+//  2. Override pass: if SyncModeOverride is a known value it wins the
+//     mode; remote is unchanged (still from YAML or default "origin").
+//
+// Unknown overrides and unknown YAML modes fall back to "merge" —
+// the single chokepoint that catches MCP typos and direct DB edits.
+func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
+	mode, remote = "merge", "origin"
+	if run == nil {
+		return
+	}
+
+	// Pass 1 — YAML: apply both mode and remote.
+	if run.YAMLData != "" {
+		var r enjuYaml.Run
+		if err := yamlv3.Unmarshal([]byte(run.YAMLData), &r); err == nil && r.Sync != nil {
+			if r.Sync.Remote != "" {
+				remote = r.Sync.Remote
+			}
+			switch r.Sync.Mode {
+			case "none", "merge", "push":
+				mode = r.Sync.Mode
+			// Unknown YAML mode: leave the default. validate.go
+			// blocks bad modes at create_run; this guards DB edits.
+			}
+		}
+	}
+
+	// Pass 2 — override: mode only; remote is already resolved.
+	switch run.SyncModeOverride {
+	case "none", "merge", "push":
+		mode = run.SyncModeOverride
+	case "":
+		// No override: keep YAML/default mode.
+	default:
+		// Unknown override (MCP typo, DB edit): keep YAML/default mode.
+	}
+
+	return
 }
 
 // RemediationOrInvalidation collapses the two shapes the

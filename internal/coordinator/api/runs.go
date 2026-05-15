@@ -78,6 +78,10 @@ type createRunRequest struct {
 	// Refused when there's already an active run on the resolved
 	// branch (serial-per-branch invariant).
 	Branch string `json:"branch,omitempty"`
+	// SyncModeOverride is the CLI --sync flag (or enju_create_run's
+	// sync_mode_override param). Overrides the workflow YAML's sync:
+	// block at run-completion. One of "none", "merge", "push".
+	SyncModeOverride string `json:"sync_mode_override,omitempty"`
 }
 
 // runResponse aliases service.RunResponse so the literal-struct
@@ -98,13 +102,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := s.coord.CreateRun(projectID, service.CreateRunParams{
-		YAML:      req.YAML,
-		RepoURL:     req.RepoURL,
-		Params:     req.Params,
-		SourcePath:   req.SourcePath,
-		SourceCommitSHA: req.SourceCommitSHA,
-		Username:    req.Username,
-		Branch:     req.Branch,
+		YAML:             req.YAML,
+		RepoURL:          req.RepoURL,
+		Params:           req.Params,
+		SourcePath:       req.SourcePath,
+		SourceCommitSHA:  req.SourceCommitSHA,
+		Username:         req.Username,
+		Branch:           req.Branch,
+		SyncModeOverride: req.SyncModeOverride,
 	})
 	if err != nil {
 		switch {

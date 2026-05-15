@@ -90,6 +90,9 @@ func validate(p *Run) ([]string, error) {
 	if err := validateDynamicForEach(p, ids); err != nil {
 		return nil, err
 	}
+	if err := validateSyncMode(p); err != nil {
+		return nil, err
+	}
 	computeWarnings := validateComputeDependsDeclared(p)
 	contentRefWarnings := validateComputeContentRefs(p)
 	warnings := append(paramWarnings, reviewWarnings...)
@@ -642,6 +645,22 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		}
 	}
 	return ids, hasTaskLevelForEach, nil
+}
+
+// validateSyncMode rejects unknown values in the run-level sync:
+// mode: field. Empty (omitted block) is always accepted — it defaults
+// to "merge" at run-completion time. Validated here so a bad mode in
+// the YAML file is caught at create_run, not silently at completion.
+func validateSyncMode(p *Run) error {
+	if p.Sync == nil || p.Sync.Mode == "" {
+		return nil
+	}
+	switch p.Sync.Mode {
+	case "none", "merge", "push":
+		return nil
+	default:
+		return fmt.Errorf("sync: mode %q is invalid (must be \"none\", \"merge\", or \"push\")", p.Sync.Mode)
+	}
 }
 
 // validateTaskMode enforces the shape of the `mode:` field on a
