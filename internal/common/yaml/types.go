@@ -867,10 +867,18 @@ type VoteOption struct {
 	// ID is the stable identifier used in submit payloads and in
 	// winning-option references. Must be unique within one vote
 	// task's options list.
-	ID string `yaml:"id"`
+	//
+	// json: tags are load-bearing, not cosmetic. tasks.vote_options
+	// is json.Marshal(VoteOption) on the coord side and is decoded
+	// by the bot daemon (parseVoteOptions), the submit handler, and
+	// tally — all keyed on lowercase "id". Without these tags
+	// json.Marshal falls back to the exported Go field names
+	// ("ID"), which the decoders don't recognize → empty options →
+	// vote responses ship unparsed. One struct, one wire shape.
+	ID string `yaml:"id" json:"id"`
 	// Label is the human-readable description shown to voters
 	// when they claim the task. Optional — defaults to ID.
-	Label string `yaml:"label,omitempty"`
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
 	// Activates is the list of task def ids to keep alive when
 	// this option wins. Tasks in other options' Activates (and
 	// not in this one's) flip to SKIPPED. Optional — a vote
@@ -878,7 +886,7 @@ type VoteOption struct {
 	// DAG routing, and downstream tasks can still read the
 	// winning option via `{{task.winning_option}}`
 	// (session 2 accessor).
-	Activates []string `yaml:"activates,omitempty"`
+	Activates []string `yaml:"activates,omitempty" json:"activates,omitempty"`
 }
 
 // ParsedRun is the result of parsing and validating a run file.

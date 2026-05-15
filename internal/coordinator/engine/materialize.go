@@ -1109,6 +1109,16 @@ func unmarshalStringMap(s string) map[string]string {
 	return m
 }
 
+// marshalVoteOptions serializes the declared vote options into
+// the JSON stored in tasks.vote_options. Twin of
+// coordinator/api.marshalVoteOptions (separate package to avoid a
+// circular dep; the store treats the column as opaque). The two
+// MUST stay byte-identical — and do, by construction: the wire
+// shape is defined by VoteOption's `json:` tags, not by this
+// function. A contributor adding/renaming a field changes the
+// struct tag; both wrappers then follow automatically. Decoders
+// (bot parseVoteOptions, submit handler, tally) all key on those
+// lowercase tags.
 func marshalVoteOptions(opts []enjuYaml.VoteOption) string {
 	if len(opts) == 0 {
 		return ""

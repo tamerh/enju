@@ -67,25 +67,19 @@ func marshalStringSlice(xs []string) string {
 // JSON form stored in tasks.vote_options. Keeping this helper in
 // the api package (not yaml) avoids a circular dep — the store
 // treats the column as opaque JSON.
+//
+// VoteOption now carries json: tags (lowercase id/label/activates),
+// so a direct json.Marshal IS the canonical wire shape — the same
+// shape engine/marshalVoteOptions, the submit handler, tally, and
+// the bot daemon's parseVoteOptions all read. The previous
+// re-shape-through-an-anonymous-wire-struct dance existed only
+// because the tags were missing; with them, one Marshal = one
+// shape, no second code path to drift.
 func marshalVoteOptions(options []enjuYaml.VoteOption) string {
 	if len(options) == 0 {
 		return ""
 	}
-	// Round-trip through an anonymous struct with lowercase JSON
-	// tags so the stored shape matches what the router's submit
-	// handler decodes. yaml.VoteOption's field tags are yaml:...,
-	// not json:..., so re-shaping here is simpler than adding
-	// json tags upstream.
-	type wire struct {
-		ID        string   `json:"id"`
-		Label     string   `json:"label,omitempty"`
-		Activates []string `json:"activates,omitempty"`
-	}
-	out := make([]wire, len(options))
-	for i, o := range options {
-		out[i] = wire{ID: o.ID, Label: o.Label, Activates: o.Activates}
-	}
-	b, err := json.Marshal(out)
+	b, err := json.Marshal(options)
 	if err != nil {
 		return ""
 	}
