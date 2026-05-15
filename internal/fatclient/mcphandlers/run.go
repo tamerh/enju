@@ -680,10 +680,21 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		autoBotNames = autoRunMgr.AutoBotNames()
 		if len(autoBotNames) > 0 {
 			var resp map[string]interface{}
-			if jerr := json.Unmarshal(data, &resp); jerr == nil {
-				if seq, ok := resp["seq"].(float64); ok && prep != nil && prep.Workflow != nil {
-					autoBotsUnhooked = autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
-				}
+			if jerr := json.Unmarshal(data, &resp); jerr != nil {
+				slog.Default().Warn("auto_bots: failed to parse run response, tailer will not start",
+					"bots", autoBotNames, "error", jerr)
+			} else if seq, ok := resp["seq"].(float64); !ok {
+				slog.Default().Warn("auto_bots: run response missing or invalid seq field, tailer will not start",
+					"bots", autoBotNames, "seq_type", fmt.Sprintf("%T", resp["seq"]))
+			} else if prep == nil {
+				slog.Default().Warn("auto_bots: prep is nil, cannot start tailer (internal error)",
+					"bots", autoBotNames, "seq", int64(seq))
+			} else if prep.Workflow == nil {
+				slog.Default().Warn("auto_bots: prep.Workflow is nil, cannot start tailer (internal error)",
+					"bots", autoBotNames, "seq", int64(seq))
+			} else {
+				slog.Default().Warn("auto_bots: hooking bots to live.jsonl tailer", "bots", autoBotNames, "run_seq", int64(seq))
+				autoBotsUnhooked = autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
 			}
 		}
 	}

@@ -506,12 +506,18 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	// still got cleaned up via parent-death, but operator bots
 	// that came back AlreadyRunning lacked the run-seq ref and
 	// the tailer was missing for cross-process inspection.)
-	if autoRunMgr != nil && prep != nil && prep.Workflow != nil {
-		unhooked := autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
-		if len(unhooked) > 0 {
-			fmt.Fprintf(os.Stderr,
-				"⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
-				len(unhooked), len(autoRunMgr.AutoBotNames()), strings.Join(unhooked, ", "))
+	if autoRunMgr != nil {
+		if prep == nil {
+			fmt.Fprintf(os.Stderr, "⚠ auto_bots: prep is nil, tailer will not start (internal error)\n")
+		} else if prep.Workflow == nil {
+			fmt.Fprintf(os.Stderr, "⚠ auto_bots: prep.Workflow is nil, tailer will not start (internal error)\n")
+		} else {
+			unhooked := autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
+			if len(unhooked) > 0 {
+				fmt.Fprintf(os.Stderr,
+					"⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
+					len(unhooked), len(autoRunMgr.AutoBotNames()), strings.Join(unhooked, ", "))
+			}
 		}
 	}
 
