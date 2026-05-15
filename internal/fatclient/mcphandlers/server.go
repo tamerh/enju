@@ -114,6 +114,15 @@ type Config struct {
 // tool call (create_project / init) calls Switch.
 type NotifyOptions struct {
 	ParentCtx context.Context
+
+	// SlogRepoint, when non-nil, is invoked with the active
+	// project's local clone dir each time notifySession.Switch
+	// resolves one. cmdMCP supplies a closure that re-points the
+	// MCP process slog to <projectDir>/.enju/logs/ so it sits
+	// beside the project's oplog ledger (see cmd/enju/slogsink.go).
+	// nil when the slog sink is pinned (ENJU_MCP_LOG) or in
+	// callers that don't manage a switchable slog.
+	SlogRepoint func(projectDir string)
 }
 
 // agentInstructions is the long agent-facing prompt passed to
@@ -225,6 +234,7 @@ func Register(handlers map[string]enjumcp.Handler, cfg Config) {
 			Username:       cfg.Username,
 			Workspace:      fc.Enjugit(),
 			ParentCtx:      cfg.Notify.ParentCtx,
+			SlogRepoint:    cfg.Notify.SlogRepoint,
 			Logger:         logger,
 		})
 		// Background opportunistic reconcile (the "ticker"). Tick

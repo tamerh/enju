@@ -513,7 +513,22 @@ func cmdMCP(args []string) {
 	// Self-hosted projects without a remote fall back to the
 	// legacy coordinator-writes path; this workspace stays unused
 	// for them but the creation itself is cheap and safe.
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// MCP slog sink. enju mcp runs under Claude Code (or another
+	// MCP client) over stdio; its stderr is captured by the client
+	// and never surfaced to the operator, so a bare
+	// slog→os.Stderr handler is a black hole — supervisor /
+	// auto_bots / handler debug logs vanish.
+	//
+	// Scope rule (matches the oplog ledger): project-scoped logs
+	// live under <project>/.enju/logs/. The slog follows: it
+	// starts at a host-level bootstrap file (the MCP daemon is
+	// dormant + project-less until the first Switch) and re-points
+	// to <project>/.enju/logs/operator-slog-<pid>.log — a sibling
+	// of operator-<pid>.log — once a project becomes active.
+	// `tail -f <project>/.enju/logs/*.log` then shows oplog + slog
+	// for that project together. setupMCPSlog returns the
+	// re-point hook; it's wired into the notify Switch below.
+	logger, slogRepoint := setupMCPSlog()
 	wsRoot, regPath, err := resolveCLIRegistry(*registryPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to resolve registry: %v\n", err)
@@ -530,7 +545,7 @@ func cmdMCP(args []string) {
 	// in ~/.enju/.
 	notifyCtx, cancelNotify := context.WithCancel(context.Background())
 	defer cancelNotify()
-	notifyOpts := &mcphandlers.NotifyOptions{ParentCtx: notifyCtx}
+	notifyOpts := &mcphandlers.NotifyOptions{ParentCtx: notifyCtx, SlogRepoint: slogRepoint}
 
 	s := mcphandlers.New(mcphandlers.Config{
 		CoordinatorURL:  *coordinator,

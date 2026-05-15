@@ -46,6 +46,12 @@ type notifySessionConfig struct {
 	Workspace *enjugit.Workspace // resolves project clone dirs
 	ParentCtx context.Context   // cancels every child goroutine on shutdown
 	Logger    *slog.Logger
+	// SlogRepoint, when non-nil, is called with the active
+	// project's local clone dir on every Switch that resolves
+	// one. cmdMCP wires this to the switchable slog sink so the
+	// MCP process's debug log follows the active project (see
+	// cmd/enju/slogsink.go). nil = pinned sink / non-MCP caller.
+	SlogRepoint func(projectDir string)
 }
 
 // notifySession is the runtime handle. Methods are safe for
@@ -108,6 +114,16 @@ func (s *notifySession) Switch(projectID int64) {
 			s.cfg.Logger.Info("notify: no registered local clone for project, running with no on-disk state",
 				"project_id", projectID, "error", err)
 		}
+	}
+
+	// Re-point the MCP process slog to this project's
+	// .enju/logs/ before the poller goroutine starts, so even
+	// the "poller started" line lands in the project-scoped
+	// file. Only fires with a resolved local clone dir;
+	// project-less coord-only sessions keep the host bootstrap
+	// sink. No-op when SlogRepoint is nil (pinned sink).
+	if projectDir != "" && s.cfg.SlogRepoint != nil {
+		s.cfg.SlogRepoint(projectDir)
 	}
 
 	runCfg := notify.Config{

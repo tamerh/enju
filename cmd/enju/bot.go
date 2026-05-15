@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
+	"github.com/enju-ai/enju/internal/common/layout"
+	"github.com/enju-ai/enju/internal/common/oplog"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
@@ -550,8 +552,6 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
 	absWorkflow, err := filepath.Abs(*workflowPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolving --workflow=%q: %v\n", *workflowPath, err)
@@ -566,6 +566,27 @@ func cmdBotRun(args []string) {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
+
+	// Bot slog → <project>/.enju/logs/bot-<bot>-slog-<pid>.log,
+	// a sibling of the bot's oplog ledger (bot-<user>-<pid>.log)
+	// so a project's whole debug stream lives in one dir. This
+	// mirrors the MCP operator slog (cmd/enju/slogsink.go) but is
+	// deliberately the trivial version: a bot daemon is spawned
+	// for one project, knows it at startup (absProject above),
+	// and never switches — so no switchable-writer / re-point
+	// machinery is needed, unlike the dormant-at-boot MCP server.
+	// Fallback is os.Stderr, which the supervisor still captures
+	// into ~/.enju/bots/logs/<bot>.log; a log-path failure must
+	// never abort the daemon.
+	var slogW io.Writer = os.Stderr
+	if f, ferr := oplog.OpenProjectLogFile(absProject, layout.LogsDir,
+		oplog.TraceFilename("bot-"+*botName+"-slog")); ferr != nil {
+		fmt.Fprintf(os.Stderr, "bot slog: project sink unavailable (%v); using stderr\n", ferr)
+	} else {
+		slogW = f
+		fmt.Fprintf(os.Stderr, "bot slog → %s\n", f.Name())
+	}
+	logger := slog.New(slog.NewTextHandler(slogW, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	manifest, err := bots.LoadFromWorkflow(absWorkflow)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loading workflow %s: %v\n", absWorkflow, err)
