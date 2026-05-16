@@ -294,6 +294,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case SetClaimDeadline:
+			if err := applySetClaimDeadline(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		case RecordSubmission:
 			if err := applyRecordSubmission(tx, m, sink); err != nil {
 				return result, err
@@ -1285,6 +1290,25 @@ func applyExpireClaim(tx *sql.Tx, m ExpireClaim, sink EventSink) error {
 		// a concurrent path). UPDATE was a no-op.
 		sink.SkipEvents("expire_claim no-op: open claim not found at emit-time lookup")
 	}
+	return nil
+}
+
+// applySetClaimDeadline re-anchors the open claim's deadline. Pure
+// lease bookkeeping — no state change, no event, no claim-history
+// mutation (the row stays the same open claim, just with a later
+// deadline). No-op when the task has no open claim (e.g. a race
+// where the claim closed between plan-build and apply).
+func applySetClaimDeadline(tx *sql.Tx, m SetClaimDeadline, sink EventSink) error {
+	if _, err := tx.Exec(
+		`UPDATE task_claims SET deadline = ? WHERE task_id = ? AND outcome IS NULL`,
+		m.Deadline, m.TaskID,
+	); err != nil {
+		return err
+	}
+	// Pure lease bookkeeping — no state change, no audit signal.
+	// (A re-anchor is not a claim/release/expire; nothing
+	// observable changed for downstream consumers.)
+	sink.SkipEvents("set_claim_deadline: lease re-anchor carries no event")
 	return nil
 }
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -39,7 +40,12 @@ func (c *Coordinator) MarkTaskRunning(caller *store.CitizenRecord, taskID string
 	if !CanReadProject(c.Store, run.ProjectID, caller.ID) {
 		return nil, fmt.Errorf("%w: not a member of this project", ErrForbidden)
 	}
-	plan, err := engine.New(c.Store, c.Logger).ComputeStartTask(taskID)
+	// Re-anchor the lease at RUNNING: the budget should cover the
+	// task's actual execution (which starts now), not the time
+	// elapsed since claim. Same timeout source as ClaimTask so the
+	// two anchor points can't drift.
+	deadline := time.Now().Add(taskClaimTimeout(task))
+	plan, err := engine.New(c.Store, c.Logger).ComputeStartTask(taskID, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
 	}

@@ -154,6 +154,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutExpireClaim:
 		var m ExpireClaim
 		return m, json.Unmarshal(data, &m)
+	case MutSetClaimDeadline:
+		var m SetClaimDeadline
+		return m, json.Unmarshal(data, &m)
 	case MutRecordSubmission:
 		var m RecordSubmission
 		return m, json.Unmarshal(data, &m)
@@ -260,6 +263,7 @@ const (
 	MutSetClaim     MutationKind = "set_claim"
 	MutReleaseClaim   MutationKind = "release_claim"
 	MutExpireClaim   MutationKind = "expire_claim"
+	MutSetClaimDeadline MutationKind = "set_claim_deadline"
 	MutRecordSubmission   MutationKind = "submit_result"
 	MutMoveArtifact   MutationKind = "move_artifact"
 	MutDeleteArtifact  MutationKind = "delete_artifact"
@@ -315,6 +319,7 @@ var AllMutationKinds = []MutationKind{
 	MutSetClaim,
 	MutReleaseClaim,
 	MutExpireClaim,
+	MutSetClaimDeadline,
 	MutRecordSubmission,
 	MutMoveArtifact,
 	MutDeleteArtifact,
@@ -467,6 +472,22 @@ type ExpireClaim struct {
 }
 
 func (ExpireClaim) mutationKind() MutationKind { return MutExpireClaim }
+
+// SetClaimDeadline re-anchors the deadline of a task's open claim
+// (outcome IS NULL) to a fresh value, without touching claimant,
+// state, or claim history. Used by the CLAIMED → RUNNING
+// transition so the lease covers the task's actual execution
+// (which begins at RUNNING) instead of the claim-time guess: the
+// claim deadline alone reaped long legitimate work (a 3-hour
+// assembly, or a first-run multi-GB image pull) the same as a
+// dead worker, because nothing distinguished "still running" from
+// "claimed and died." No-op when there is no open claim.
+type SetClaimDeadline struct {
+	TaskID   string
+	Deadline time.Time
+}
+
+func (SetClaimDeadline) mutationKind() MutationKind { return MutSetClaimDeadline }
 
 // RecordSubmission records a citizen's submission on a task.
 // Updates the task_claims row with the result path, commit

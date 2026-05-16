@@ -53,6 +53,25 @@ type ClaimTaskResponse struct {
 //   - ErrForbidden: assign_to / require_role gate refuses
 //   - ErrConflict: claim collision (slot full, race lost) —
 //   wraps the engine.ComputeClaim error verbatim
+// defaultClaimTimeout is the lease length when a task declares no
+// explicit `timeout:`. It bounds "claimed/running but the worker
+// went silent" recovery — see taskClaimTimeout.
+const defaultClaimTimeout = 30 * time.Minute
+
+// taskClaimTimeout is the single source for a task's lease length,
+// shared by ClaimTask (anchors at claim) and MarkTaskRunning
+// (re-anchors at RUNNING so the budget covers actual execution,
+// not the claim-time guess). Keeping one function means the two
+// anchor points can never drift to different durations.
+func taskClaimTimeout(task *store.TaskRecord) time.Duration {
+	if task != nil && task.Timeout != "" {
+		if d, perr := time.ParseDuration(task.Timeout); perr == nil {
+			return d
+		}
+	}
+	return defaultClaimTimeout
+}
+
 func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, params ClaimTaskParams) (*ClaimTaskResponse, error) {
 	if params.Username == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
@@ -87,13 +106,7 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 		return nil, fmt.Errorf("%w: %s", ErrForbidden, err.Error())
 	}
 
-	timeout := 30 * time.Minute
-	if task.Timeout != "" {
-		if d, perr := time.ParseDuration(task.Timeout); perr == nil {
-			timeout = d
-		}
-	}
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(taskClaimTimeout(task))
 
 	modelID, err := ResolveModelByUsername(s, params.Model)
 	if err != nil {

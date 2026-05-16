@@ -3,36 +3,46 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // TestComputeStartTask_AcceptsClaimed pins the only legal
-// from-state for the CLAIMED → RUNNING transition. The plan
-// must carry exactly one SetTaskState mutation targeting
-// TaskRunning so apply.go's emission branch fires.
+// from-state for CLAIMED → RUNNING, and that the plan both flips
+// to RUNNING (claim stays open) AND re-anchors the claim lease to
+// the supplied deadline — the half that stops the reaper from
+// killing long legitimate work on a stale claim-time deadline.
 func TestComputeStartTask_AcceptsClaimed(t *testing.T) {
 	ms := &mockStore{
 		tasks: map[string]*store.TaskRecord{
 			"t1": {ID: "t1", State: store.TaskClaimed, Citizens: 1},
 		},
 	}
-	plan, err := New(ms, nil).ComputeStartTask("t1")
+	dl := time.Now().Add(2 * time.Hour)
+	plan, err := New(ms, nil).ComputeStartTask("t1", dl)
 	if err != nil {
 		t.Fatalf("expected ok, got %v", err)
 	}
-	if len(plan.Mutations) != 1 {
-		t.Fatalf("expected 1 mutation, got %d", len(plan.Mutations))
+	if len(plan.Mutations) != 2 {
+		t.Fatalf("expected 2 mutations (SetTaskState + SetClaimDeadline), got %d", len(plan.Mutations))
 	}
-	m, ok := plan.Mutations[0].(store.SetTaskState)
+	st, ok := plan.Mutations[0].(store.SetTaskState)
 	if !ok {
-		t.Fatalf("expected SetTaskState, got %T", plan.Mutations[0])
+		t.Fatalf("mutation[0]: expected SetTaskState, got %T", plan.Mutations[0])
 	}
-	if m.TaskID != "t1" || m.NewState != store.TaskRunning {
-		t.Errorf("wrong mutation: %+v", m)
+	if st.TaskID != "t1" || st.NewState != store.TaskRunning {
+		t.Errorf("wrong state mutation: %+v", st)
 	}
-	if m.ClearClaim {
+	if st.ClearClaim {
 		t.Error("ClearClaim must be false for start transition (claim stays open)")
+	}
+	scd, ok := plan.Mutations[1].(store.SetClaimDeadline)
+	if !ok {
+		t.Fatalf("mutation[1]: expected SetClaimDeadline, got %T", plan.Mutations[1])
+	}
+	if scd.TaskID != "t1" || !scd.Deadline.Equal(dl) {
+		t.Errorf("re-anchor mutation wrong: got %+v want TaskID=t1 Deadline=%v", scd, dl)
 	}
 }
 
@@ -61,7 +71,7 @@ func TestComputeStartTask_RejectsNonClaimed(t *testing.T) {
 					"t1": {ID: "t1", State: s, Citizens: 1},
 				},
 			}
-			_, err := New(ms, nil).ComputeStartTask("t1")
+			_, err := New(ms, nil).ComputeStartTask("t1", time.Now())
 			if err == nil {
 				t.Fatalf("expected rejection for state=%s, got nil", s)
 			}
@@ -77,7 +87,7 @@ func TestComputeStartTask_RejectsNonClaimed(t *testing.T) {
 // not-found error rather than the fat-client retrying forever.
 func TestComputeStartTask_RejectsMissingTask(t *testing.T) {
 	ms := &mockStore{tasks: map[string]*store.TaskRecord{}}
-	_, err := New(ms, nil).ComputeStartTask("ghost")
+	_, err := New(ms, nil).ComputeStartTask("ghost", time.Now())
 	if err == nil {
 		t.Fatal("expected not-found error")
 	}
