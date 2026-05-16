@@ -28,6 +28,8 @@ type fakeFC struct {
 	projDetail  *service.ProjectDetail
 	runs        []wire.Run
 	runDetail   *service.RunDetail
+	exportMD    string
+	exportErr   error
 	taskMeta    *service.TaskMeta
 	taskResult  string
 	iterations  []wire.Iteration
@@ -46,6 +48,9 @@ type fakeFC struct {
 	claimedID       string
 	releaseErr      error
 	releasedID      string
+	failedID        string
+	failedReason    string
+	failErr         error
 	submitResult    *service.SubmitResult
 	submitParams    service.SubmitParams
 	submitCalled    bool
@@ -116,6 +121,8 @@ type fakeFC struct {
 	gotArtifactPath       string
 	artifactHistory       []byte
 	getArtifactHistoryErr error
+	untracked             *service.UntrackedArtifactReport
+	untrackedErr          error
 
 	// Me captures
 	dashboard           *service.DashboardResponse
@@ -142,6 +149,9 @@ func (f *fakeFC) ListRuns(ctx context.Context, id int64) ([]wire.Run, error) {
 }
 func (f *fakeFC) GetRun(ctx context.Context, id int64, seq int) (*service.RunDetail, error) {
 	return f.runDetail, f.getRunErr
+}
+func (f *fakeFC) ExportRunMarkdown(ctx context.Context, id int64, seq int) (string, error) {
+	return f.exportMD, f.exportErr
 }
 func (f *fakeFC) ListEvents(ctx context.Context, id int64, opts service.ListEventsOpts) ([]service.EventRow, error) {
 	return f.events, nil
@@ -177,6 +187,11 @@ func (f *fakeFC) ClaimTask(ctx context.Context, params service.ClaimParams) (*se
 func (f *fakeFC) ReleaseTask(ctx context.Context, id string) error {
 	f.releasedID = id
 	return f.releaseErr
+}
+func (f *fakeFC) FailTask(ctx context.Context, id, reason string) error {
+	f.failedID = id
+	f.failedReason = reason
+	return f.failErr
 }
 func (f *fakeFC) SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult {
 	f.submitCalled = true
@@ -275,6 +290,9 @@ func (f *fakeFC) GetArtifactContent(ctx context.Context, pid int64, path string)
 }
 func (f *fakeFC) GetArtifactHistory(ctx context.Context, pid int64, path string) ([]byte, error) {
 	return f.artifactHistory, f.getArtifactHistoryErr
+}
+func (f *fakeFC) ListUntrackedArtifacts(ctx context.Context, pid int64, branch string) (*service.UntrackedArtifactReport, error) {
+	return f.untracked, f.untrackedErr
 }
 func (f *fakeFC) GetDashboard(ctx context.Context) (*service.DashboardResponse, error) {
 	return f.dashboard, f.getDashboardErr
@@ -487,6 +505,59 @@ func TestRunViewBadSeq(t *testing.T) {
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status: got %d, want 400", rr.Code)
+	}
+}
+
+// TestExportRun: GET /p/{pid}/r/{seq}/export.md streams the
+// Markdown report as an attachment with the right headers, and
+// the run page links to it.
+func TestExportRun(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		exportMD: "# Run: Hello run\n\nProject: #1, Run: #1\n",
+		runDetail: &service.RunDetail{
+			Run: wire.Run{ID: 10, ProjectID: 1, Seq: 1, Name: "Hello run", State: "completed"},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/p/1/r/1/export.md", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "text/markdown; charset=utf-8" {
+		t.Errorf("Content-Type: got %q", ct)
+	}
+	if cd := rr.Header().Get("Content-Disposition"); cd != `attachment; filename="run-1.md"` {
+		t.Errorf("Content-Disposition: got %q", cd)
+	}
+	if !strings.Contains(rr.Body.String(), "# Run: Hello run") {
+		t.Errorf("body missing report content: %q", rr.Body.String())
+	}
+
+	// Run page should link to the download.
+	req2 := httptest.NewRequest(http.MethodGet, "/p/1/r/1", nil)
+	rr2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr2, req2)
+	if !strings.Contains(rr2.Body.String(), "/p/1/r/1/export.md") {
+		t.Errorf("run page missing export link")
+	}
+}
+
+// TestExportRunError: a FatClient export failure surfaces as a
+// 502, not a 200 with a bogus file.
+func TestExportRunError(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username:  "tamer",
+		exportErr: fmt.Errorf("coord unreachable"),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/p/1/r/1/export.md", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502", rr.Code)
 	}
 }
 
@@ -1027,6 +1098,64 @@ func TestReleaseAction(t *testing.T) {
 	}
 	if fc.releasedID != "1:1:draft" {
 		t.Errorf("ReleaseTask called with %q, want 1:1:draft", fc.releasedID)
+	}
+}
+
+// TestFailTask: POST /fail with a reason drives FailTask with
+// the task ID + reason, and the page re-renders.
+func TestFailTask(t *testing.T) {
+	fc := &fakeFC{
+		username: "tamer",
+		taskMeta: &service.TaskMeta{
+			ID: "1:1:draft", ProjectID: 1, RunSeq: 1,
+			TaskDefID: "draft", State: "claimed", Action: "answer",
+			ClaimedBy: "tamer",
+		},
+	}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("reason=upstream+artifact+missing")
+	req := httptest.NewRequest(http.MethodPost, "/p/1/t/1:1:draft/fail", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.failedID != "1:1:draft" {
+		t.Errorf("FailTask task id: got %q, want 1:1:draft", fc.failedID)
+	}
+	if fc.failedReason != "upstream artifact missing" {
+		t.Errorf("FailTask reason: got %q", fc.failedReason)
+	}
+}
+
+// TestFailTaskMissingReason: an empty reason is rejected with
+// the validation banner; FailTask is not called (mirror of the
+// MCP tool's required `reason`).
+func TestFailTaskMissingReason(t *testing.T) {
+	fc := &fakeFC{
+		username: "tamer",
+		taskMeta: &service.TaskMeta{
+			ID: "1:1:draft", ProjectID: 1, RunSeq: 1,
+			TaskDefID: "draft", State: "claimed", Action: "answer",
+			ClaimedBy: "tamer",
+		},
+	}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("reason=+++")
+	req := httptest.NewRequest(http.MethodPost, "/p/1/t/1:1:draft/fail", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.failedID != "" {
+		t.Errorf("FailTask should not be called on empty reason; got id %q", fc.failedID)
+	}
+	if !strings.Contains(rr.Body.String(), "reason is required") {
+		t.Errorf("expected validation banner, body: %q", rr.Body.String())
 	}
 }
 
@@ -1599,6 +1728,63 @@ func TestArtifactsList(t *testing.T) {
 		}
 	}
 	_ = boolPtr // keep helper available for future tests
+}
+
+// TestArtifactsUntrackedPanel: the untracked-visibility panel
+// renders its rows + present/missing states when the report is
+// available.
+func TestArtifactsUntrackedPanel(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		untracked: &service.UntrackedArtifactReport{
+			ResolvedBranch: "main",
+			SharedRoot:     "/srv/enju-shared",
+			Rows: []service.UntrackedArtifactRow{
+				{Path: "data/big.bam", Producer: "1:1:align", LocalState: "present"},
+				{Path: "data/missing.bam", Producer: "1:1:align", LocalState: "missing"},
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/p/1/artifacts", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{
+		"Untracked artifact visibility",
+		"data/big.bam", "data/missing.bam",
+		">present<", ">missing<",
+		"/srv/enju-shared",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+}
+
+// TestArtifactsUntrackedUnavailable: when the diagnostic errors
+// (MCP-client mode / no workspace) the page still renders 200
+// and shows the muted explanation, not a 502.
+func TestArtifactsUntrackedUnavailable(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username:     "tamer",
+		untrackedErr: fmt.Errorf("enju_list_untracked_artifacts requires a local workspace (MCP client mode)"),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/p/1/artifacts", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Local visibility check unavailable here") {
+		t.Errorf("expected unavailable note; body: %q", body)
+	}
+	if !strings.Contains(body, "requires a local workspace") {
+		t.Errorf("expected the underlying reason surfaced; body: %q", body)
+	}
 }
 
 // TestArtifactView: GET /p/{pid}/artifacts/show/{path} renders

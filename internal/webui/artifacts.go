@@ -27,6 +27,13 @@ type artifactsListPage struct {
 	Branch    string
 	Prefix    string
 	Items     []artifactRowView
+	// Untracked is the local-workspace visibility diagnostic.
+	// nil when ListUntrackedArtifacts errored (e.g. MCP-client
+	// mode, no local workspace) — the template then shows
+	// UntrackedNote instead of the panel rather than failing
+	// the whole page over a diagnostic side-panel.
+	Untracked     *service.UntrackedArtifactReport
+	UntrackedNote string
 }
 
 // artifactRowView wraps service.ArtifactResponse with a
@@ -90,12 +97,28 @@ func (s *Server) handleArtifactsList(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, v)
 	}
+	// Local-workspace visibility diagnostic. Best-effort: it
+	// needs a local clone (enju ui always has one), but in
+	// MCP-client mode it errors — that's a "skip the panel"
+	// signal, not a reason to 502 the whole artifacts page.
+	var untracked *service.UntrackedArtifactReport
+	var untrackedNote string
+	if rpt, uerr := s.fc.ListUntrackedArtifacts(r.Context(), pid, opts.Branch); uerr != nil {
+		s.logger.Info("ListUntrackedArtifacts unavailable; omitting panel",
+			"project_id", pid, "error", uerr)
+		untrackedNote = uerr.Error()
+	} else {
+		untracked = rpt
+	}
+
 	s.render(w, r, "artifacts.html", artifactsListPage{
-		pageData:  s.commonPageData(),
-		ProjectID: pid,
-		Branch:    opts.Branch,
-		Prefix:    opts.Prefix,
-		Items:     rows,
+		pageData:      s.commonPageData(),
+		ProjectID:     pid,
+		Branch:        opts.Branch,
+		Prefix:        opts.Prefix,
+		Items:         rows,
+		Untracked:     untracked,
+		UntrackedNote: untrackedNote,
 	})
 }
 

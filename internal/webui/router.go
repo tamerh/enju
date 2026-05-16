@@ -31,6 +31,7 @@ func (s *Server) router() http.Handler {
 	r.Post("/me/profile", s.handleUpdateProfile)
 	r.Get("/p/{projectID}", s.handleProjectView)
 	r.Get("/p/{projectID}/r/{runSeq}", s.handleRunView)
+	r.Get("/p/{projectID}/r/{runSeq}/export.md", s.handleExportRun)
 	r.Get("/p/{projectID}/t/{taskID}", s.handleTaskView)
 	r.Get("/p/{projectID}/inbox", s.handleProjectInbox)
 	r.Get("/inbox", s.handleGlobalInbox)
@@ -63,6 +64,7 @@ func (s *Server) router() http.Handler {
 	r.Post("/p/{projectID}/t/{taskID}/release", s.handleRelease)
 	r.Post("/p/{projectID}/t/{taskID}/review", s.handleReview)
 	r.Post("/p/{projectID}/t/{taskID}/submit", s.handleSubmit)
+	r.Post("/p/{projectID}/t/{taskID}/fail", s.handleFailTask)
 	r.Post("/p/{projectID}/t/{taskID}/execute", s.handleExecuteComputeTask)
 
 	// Run-level write actions

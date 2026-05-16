@@ -66,6 +66,42 @@
   </div>
 </header>
 
+{{/* Fail task — terminal escape hatch for any action type when
+     you hold the claim and can't complete it (missing data,
+     broken upstream, environment). Disclosure + required reason,
+     same destructive treatment as the run terminate-form.
+     reason is enforced server-side too (HTMX can skip native
+     validation). */}}
+{{if and (eq .Task.State "claimed") .ClaimedByMe}}
+<section x-data="{failing: false}">
+  <button type="button" class="btn" x-show="!failing" @click="failing = true">Fail task…</button>
+  <form x-show="failing" x-cloak
+        method="POST" action="/p/{{.ProjectID}}/t/{{.Task.ID}}/fail"
+        hx-post="/p/{{.ProjectID}}/t/{{.Task.ID}}/fail"
+        hx-target="#main"
+        class="terminate-form">
+    <h3 class="terminate-title">Fail task <code>{{.Task.ID}}</code>?</h3>
+    <p class="terminate-warn">
+      <strong>This is terminal.</strong>
+      The task moves to <code>failed</code>, every downstream
+      descendant is blocked, and the reason is shown to all
+      citizens in run status. Recoverable only by bouncing it
+      back to <code>ready</code> via invalidate (run author or
+      any citizen).
+    </p>
+    <label class="terminate-reason">
+      <span>Reason <span class="muted small">— required, shown to all citizens in run status</span></span>
+      <textarea name="reason" rows="4" required
+                placeholder="Why can't this task be completed? (e.g. upstream artifact missing, environment broken, blocked on external input)"></textarea>
+    </label>
+    <div class="btn-row terminate-actions">
+      <button type="submit" class="btn btn-primary">Confirm fail</button>
+      <button type="button" class="btn" @click="failing = false">Cancel</button>
+    </div>
+  </form>
+</section>
+{{end}}
+
 {{if and (eq .Task.Action "review") (and (eq .Task.State "claimed") .ClaimedByMe)}}
 <section>
   <h2>Submit verdict</h2>

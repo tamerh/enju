@@ -46,6 +46,14 @@
   <p class="blocked-by">{{.BlockedByText}}</p>
   {{end}}
 
+  {{/* Always available, terminal runs included — the report is
+       most useful precisely after a run finishes. Plain GET
+       download (no side effects), so a link, not a form. */}}
+  <div class="btn-row">
+    <a class="btn" href="/p/{{.ProjectID}}/r/{{.Run.Seq}}/export.md"
+       download="run-{{.Run.Seq}}.md">Download report (.md)</a>
+  </div>
+
   {{$canPause := or (eq .Run.State "active") (eq .Run.State "waiting")}}
   {{$canResume := eq .Run.State "paused"}}
   {{$isTerminal := or (eq .Run.State "completed") (or (eq .Run.State "failed") (eq .Run.State "terminated"))}}

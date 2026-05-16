@@ -58,6 +58,32 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	s.renderTaskAfterAction(w, r, pid, taskID)
 }
 
+// handleFailTask is POST /p/{projectID}/t/{taskID}/fail. Drives
+// the task to terminal `failed` (mirror of enju_fail_task).
+// Reason is required — the MCP tool requires it and it's shown
+// to every citizen in run status, so we enforce it server-side
+// rather than trust the form's `required` attribute (HTMX can
+// bypass native validation). On success the page re-renders:
+// state flips to `failed`, the action forms disappear.
+func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
+	pid, taskID, ok := parseTaskRoute(w, r)
+	if !ok {
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		s.renderTaskActionError(w, r, pid, taskID,
+			"a reason is required to fail a task (it's shown to all citizens in run status)")
+		return
+	}
+	if err := s.fc.FailTask(r.Context(), taskID, reason); err != nil {
+		s.logger.Error("FailTask failed", "task_id", taskID, "error", err)
+		s.renderTaskActionError(w, r, pid, taskID, "fail failed: "+err.Error())
+		return
+	}
+	s.renderTaskAfterAction(w, r, pid, taskID)
+}
+
 // handleSubmit is POST /p/{projectID}/t/{taskID}/submit.
 // Generic submit endpoint for action:answer and action:vote.
 //

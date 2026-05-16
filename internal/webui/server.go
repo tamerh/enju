@@ -42,6 +42,10 @@ type fatClient interface {
 	ClaimTask(ctx context.Context, params service.ClaimParams) (*service.ClaimResult, error)
 	ReleaseTask(ctx context.Context, taskID string) error
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
+	// FailTask drives the task to terminal `failed` with a
+	// required reason (mirror of enju_fail_task). Blocks
+	// descendants; recoverable only via invalidate_task.
+	FailTask(ctx context.Context, taskID, reason string) error
 
 	// Write-side actions — run level
 	PauseRun(ctx context.Context, projectID int64, runSeq int) error
@@ -72,10 +76,23 @@ type fatClient interface {
 	ExecuteComputeTask(ctx context.Context, taskID string) (*service.ExecuteOutcome, error)
 	ExecuteRun(ctx context.Context, params service.ExecuteRunParams) (*service.ExecuteRunResult, error)
 
+	// Run export — Markdown report. Pure read (two coord GETs +
+	// string build, no disk write / no git commit), so safe to
+	// stream straight to the browser as a download on a GET.
+	ExportRunMarkdown(ctx context.Context, projectID int64, runSeq int) (string, error)
+
 	// Artifacts — read only (list / get / history)
 	ListArtifacts(ctx context.Context, projectID int64, opts service.ListArtifactsOpts) ([]service.ArtifactResponse, error)
 	GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error)
 	GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error)
+	// ListUntrackedArtifacts is the local-workspace visibility
+	// diagnostic (mirror of enju_list_untracked_artifacts):
+	// per untracked artifact, is the byte payload actually
+	// present in this clone's bigfiles dir, missing, or a
+	// symlink into shared storage. Errors in MCP-client mode
+	// (no local workspace) — caller treats that as "skip the
+	// panel", not a page failure.
+	ListUntrackedArtifacts(ctx context.Context, projectID int64, branch string) (*service.UntrackedArtifactReport, error)
 
 	// "Me" — calling citizen's dashboard / contributions / profile
 	GetDashboard(ctx context.Context) (*service.DashboardResponse, error)

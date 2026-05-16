@@ -60,4 +60,52 @@
   </p>
 </section>
 {{end}}
+
+{{/* Untracked-artifact diagnostic (mirror of
+     enju_list_untracked_artifacts). Distinct from the index
+     above: this answers "are the bytes of each untracked
+     artifact actually in *this* clone" — the thing that causes
+     downstream "untracked artifact missing" claim errors. */}}
+<section>
+  <h2>Untracked artifact visibility</h2>
+  <p class="muted">
+    Untracked artifacts (<code>track: false</code>) live outside git in this
+    clone's bigfiles dir, gitignored. This panel reports whether each one's
+    bytes are actually present locally — a <code>missing</code> row is what
+    breaks a downstream task that depends on it.
+  </p>
+  {{if .Untracked}}
+    <p class="muted small">
+      Branch <code>{{if .Untracked.ResolvedBranch}}{{.Untracked.ResolvedBranch}}{{else}}(default){{end}}</code>{{if .Untracked.SharedRoot}} · shared root <code>{{.Untracked.SharedRoot}}</code>{{end}}
+    </p>
+    {{if .Untracked.Rows}}
+    <table class="run-table">
+      <thead>
+        <tr><th>Path</th><th>Producer</th><th>Local state</th><th>Symlink target</th></tr>
+      </thead>
+      <tbody>
+        {{range .Untracked.Rows}}
+        <tr>
+          <td><code>{{.Path}}</code></td>
+          <td>{{if .Producer}}<code>{{.Producer}}</code>{{else}}<span class="muted small">—</span>{{end}}</td>
+          <td>
+            {{if eq .LocalState "present"}}<span class="state state-completed">present</span>
+            {{else if eq .LocalState "missing"}}<span class="state state-failed">missing</span>
+            {{else}}<span class="muted small">{{.LocalState}}</span>{{end}}
+          </td>
+          <td>{{if .Target}}<code>{{.Target}}</code>{{else}}<span class="muted small">—</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="muted">No untracked artifacts — every indexed artifact is committed to git.</p>
+    {{end}}
+  {{else}}
+    <p class="muted small">
+      Local visibility check unavailable here{{if .UntrackedNote}} ({{.UntrackedNote}}){{end}}.
+      It needs a local workspace clone; <code>enju ui</code> normally has one.
+    </p>
+  {{end}}
+</section>
 {{end}}
