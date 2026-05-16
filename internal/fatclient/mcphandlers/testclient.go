@@ -133,6 +133,8 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleReleaseTask(ctx, req)
 	case "enju_invalidate_task":
 		return t.c.handleInvalidateTask(ctx, req)
+	case "enju_retry_task":
+		return t.c.handleRetryTask(ctx, req)
 	case "enju_tally_task":
 		return t.c.handleTallyTask(ctx, req)
 	case "enju_fail_task":

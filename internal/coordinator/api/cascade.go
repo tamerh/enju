@@ -13,6 +13,40 @@ type invalidateRequest struct {
 	Reason string `json:"reason"`
 }
 
+type retryRequest struct {
+	From string `json:"from,omitempty"` // "head" (default) | "snapshot"
+}
+
+// handleRetryTask sends a failed_retryable compute task back to
+// READY for a fresh attempt. Mirrors handleInvalidateTask's
+// caller-resolution; the from intent is forwarded verbatim and
+// validated in the service layer.
+func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+
+	var req retryRequest
+	json.NewDecoder(r.Body).Decode(&req)
+
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+
+	resp, err := s.coord.RetryTask(caller, taskID, service.RetryFrom(req.From))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleInvalidateTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 

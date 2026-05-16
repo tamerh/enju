@@ -113,6 +113,7 @@ var allToolFactories = []struct {
 	{"enju_my_dashboard", enjumcp.MyDashboard},
 	{"enju_my_profile", enjumcp.MyProfile},
 	{"enju_invalidate_task", enjumcp.InvalidateTask},
+	{"enju_retry_task", enjumcp.RetryTask},
 	{"enju_tally_task", enjumcp.TallyTask},
 	// operator/model design — bot + model registration tools.
 	{"enju_register_bot", enjumcp.RegisterBot},

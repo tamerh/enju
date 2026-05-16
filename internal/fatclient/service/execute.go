@@ -459,6 +459,55 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	return out, nil
 }
 
+// RetryComputeTask is the client half of enju_retry_task. The
+// coordinator has already flipped the task failed_retryable→READY
+// (see service.RetryTask); this re-runs it, honoring the from
+// axis:
+//
+//   - "head": re-materialize the run snapshot from the run
+//     branch's current tip so the operator's committed fix is the
+//     script that runs. ExecuteComputeTask only materializes when
+//     the snapshot dir is absent (it persists across attempts), so
+//     without this overwrite the retry would silently re-run the
+//     unfixed script.
+//   - "snapshot": leave the existing snapshot untouched —
+//     ExecuteComputeTask reuses it and re-runs the pinned script
+//     verbatim (transient-failure retry).
+//
+// Then it delegates to ExecuteComputeTask, which claims the now
+// READY task — a fresh claim, so iter_seq advances and this retry
+// is its own auditable iteration.
+func (s *FatClient) RetryComputeTask(ctx context.Context, taskID, from string) (*ExecuteOutcome, error) {
+	if s.enjugit == nil {
+		return nil, fmt.Errorf("enju_retry_task requires a local workspace")
+	}
+	if from == "" {
+		from = "head"
+	}
+	if from == "head" {
+		meta, err := s.FetchTaskMeta(ctx, taskID)
+		if err != nil {
+			return nil, fmt.Errorf("task %q not found: %w", taskID, err)
+		}
+		wf, _, _, _, err := s.OpenWorkflow(ctx, meta.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("opening workspace to re-materialize fixed script: %w", err)
+		}
+		repoSnapshotDir, _ := resolveSnapshotDirs(wf, meta)
+		// Empty for inline-YAML runs with no project root —
+		// there's no branch snapshot to refresh from a commit,
+		// so head and snapshot collapse to the same thing.
+		if repoSnapshotDir != "" {
+			if _, merr := wf.MaterializeRunRepo(meta.Branch, repoSnapshotDir); merr != nil {
+				return nil, fmt.Errorf(
+					"re-materializing run snapshot from branch %q (retry from=head): %w",
+					meta.Branch, merr)
+			}
+		}
+	}
+	return s.ExecuteComputeTask(ctx, taskID)
+}
+
 // resolveSnapshotDirs derives the on-disk snapshot paths for a run
 // from the task meta and workflow. Returns (repoSnapshotDir,
 // templateSnapshotDir); both may be empty for inline-YAML runs

@@ -199,6 +199,54 @@ func (c *apiClient) handleExecuteTask(ctx context.Context, req mcp.CallToolReque
 	return mcp.NewToolResultText(formatExecuteOutcome(outcome)), nil
 }
 
+// handleRetryTask is a two-step composition: ask the coordinator
+// to re-open the failed_retryable task (state + provenance), then
+// re-run it client-side (re-materializing the fixed script first
+// when from=head). The execute half reports through the same
+// formatter as enju_execute_task so a retry reads identically to
+// a first run, just prefixed with what was retried.
+func (c *apiClient) handleRetryTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	taskID, err := req.RequireString("task_id")
+	if err != nil {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	from := req.GetString("from", "head")
+
+	data, err := c.post(ctx, "/api/v1/tasks/"+taskID+"/retry", map[string]string{
+		"from": from,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp struct {
+		Error string `json:"error"`
+		From  string `json:"from"`
+	}
+	json.Unmarshal(data, &resp)
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+	if resp.From != "" {
+		from = resp.From // coordinator-normalized intent
+	}
+
+	outcome, err := c.fc.RetryComputeTask(ctx, taskID, from)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	header := fmt.Sprintf("↻ Retrying %s (from=%s — %s)\n\n", taskID, from, retryFromBlurb(from))
+	return mcp.NewToolResultText(header + formatExecuteOutcome(outcome)), nil
+}
+
+// retryFromBlurb is the one-line reminder of what the from mode
+// actually did, so the retry response is self-explaining.
+func retryFromBlurb(from string) string {
+	if from == "snapshot" {
+		return "re-ran the pinned snapshot script unchanged"
+	}
+	return "re-materialized the script from the run branch tip"
+}
+
 // formatExecuteOutcome renders the free-text response returned
 // to MCP callers. Split out so enju_execute_task and the batch
 // tool can share the formatter for per-task entries.

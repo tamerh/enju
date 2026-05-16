@@ -355,6 +355,8 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleReview, true
 	case "enju_invalidate_task":
 		return c.handleInvalidateTask, true
+	case "enju_retry_task":
+		return c.handleRetryTask, true
 	case "enju_tally_task":
 		return c.handleTallyTask, true
 	case "enju_fail_task":

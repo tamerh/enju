@@ -52,6 +52,7 @@ var Registry = []mcp.Tool{
 	ListArtifacts(),
 	MyProfile(),
 	InvalidateTask(),
+	RetryTask(),
 	TallyTask(),
 	FailTask(),
 	ExecuteTask(),

@@ -1082,6 +1082,28 @@ Only tasks in the 'accepted' state can be invalidated.`),
 	)
 }
 
+func RetryTask() mcp.Tool {
+	return mcp.NewTool("enju_retry_task",
+		mcp.WithDescription(`Re-run a single failed compute task — without re-running the whole run.
+
+For tasks in state 'failed_retryable' (a compute script that errored on its own merits — exit non-zero). The task is sent back to READY and its script is executed again in one call. The failed attempt is preserved as its own closed iteration; this retry runs as a fresh iteration (iter_seq advances), so the history shows every attempt.
+
+from:
+  "head" (default) — re-materialize the run snapshot from the run branch's current tip first. Use this after you've committed a fix to the failing script: the retry picks up your fix.
+  "snapshot"        — re-run the exact pinned snapshot script unchanged. Use this for a transient failure (flaky network, a busy box) where the code was never the problem.
+
+Only 'failed_retryable' tasks can be retried. A terminal 'failed' task is dead (its descendants already cascaded to SKIPPED) — retry does not apply.`),
+		mcp.WithString("task_id",
+			mcp.Required(),
+			mcp.Description("The fully-qualified ID of the failed_retryable task to retry"),
+		),
+		mcp.WithString("from",
+			mcp.Description("Which script version to run: \"head\" (default — re-materialize from the run branch tip, picking up a committed fix) or \"snapshot\" (re-run the pinned snapshot unchanged, for a transient failure)."),
+			mcp.Enum("head", "snapshot"),
+		),
+	)
+}
+
 func ListUntrackedArtifacts() mcp.Tool {
 	return mcp.NewTool("enju_list_untracked_artifacts",
 		mcp.WithDescription(`List artifacts produced by this project that are NOT tracked in git (declared with track:false in writes_artifacts). For each entry, reports whether the file is visible in this citizen's workspace so you can spot missing untracked dependencies before claiming a downstream task.

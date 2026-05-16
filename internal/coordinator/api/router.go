@@ -222,6 +222,7 @@ func (s *Server) Router() http.Handler {
 		// all projects. Identity from the Bearer token.
 		r.Post("/me/release-claims", s.handleReleaseAllOpenClaims)
 		r.Post("/tasks/{taskID}/invalidate", s.handleInvalidateTask)
+		r.Post("/tasks/{taskID}/retry", s.handleRetryTask)
 		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
 		r.Post("/tasks/{taskID}/fail", s.handleFailTask)
 

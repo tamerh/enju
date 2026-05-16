@@ -540,16 +540,21 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 
 	if m.ClearClaim {
 		// Invalidation-style transition. Validate preconditions:
-		// - Target (→READY): must be ACCEPTED, SUBMITTED, or
-		//   FAILED. SUBMITTED added Phase 8.3 for the
-		//   request_changes path: a single-citizen reviewed
-		//   task is in SUBMITTED at the moment its reviewer
-		//   submits a request_changes verdict (the upstream
-		//   went through SUBMITTED instead of directly to
-		//   ACCEPTED), and PerformInvalidate must accept that
-		//   row to reset it for revision. Pre-Phase-8.3
+		// - Target (→READY): must be ACCEPTED, SUBMITTED,
+		//   FAILED, or FAILED_RETRYABLE. SUBMITTED added Phase
+		//   8.3 for the request_changes path: a single-citizen
+		//   reviewed task is in SUBMITTED at the moment its
+		//   reviewer submits a request_changes verdict (the
+		//   upstream went through SUBMITTED instead of directly
+		//   to ACCEPTED), and PerformInvalidate must accept
+		//   that row to reset it for revision. Pre-Phase-8.3
 		//   ACCEPTED was the only "submission landed" terminal
-		//   so the precondition was tighter.
+		//   so the precondition was tighter. FAILED_RETRYABLE
+		//   is the enju_retry_task transition: a compute task
+		//   that errored on its own merits is sent back to
+		//   READY for a fresh attempt (the failed iteration was
+		//   already closed by MarkOpenClaimsFailed at fail
+		//   time, so this is a clean re-open, not a verdict).
 		// - Descendant (→PENDING): skip if already PENDING
 		//   (no-op, not an error).
 		// - Descendant (→SKIPPED via fail-cascade): same clear
@@ -557,8 +562,9 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 		if m.NewState == TaskReady &&
 			TaskState(currentState) != TaskAccepted &&
 			TaskState(currentState) != TaskSubmitted &&
-			TaskState(currentState) != TaskFailed {
-			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted, submitted, or failed)", m.TaskID, currentState)
+			TaskState(currentState) != TaskFailed &&
+			TaskState(currentState) != TaskFailedRetryable {
+			return fmt.Errorf("task %q cannot be invalidated (state: %s, must be accepted, submitted, failed, or failed_retryable)", m.TaskID, currentState)
 		}
 		if m.NewState == TaskPending && TaskState(currentState) == TaskPending {
 			// Already pending — skip silently, matching the

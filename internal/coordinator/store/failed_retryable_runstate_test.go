@@ -53,3 +53,36 @@ func TestApplyCompleteRun_FailedRetryableKeepsRunAlive(t *testing.T) {
 		t.Errorf("terminal failed leaf: run = %q, want completed (contrast — must differ from failed_retryable)", got)
 	}
 }
+
+// TestApplySetTaskState_RetryReopensFailedRetryable pins the FSM
+// gate Slice 3 opened: the ClearClaim→READY precondition must now
+// admit failed_retryable (the enju_retry_task transition: a
+// compute task that errored on its own merits is sent back for a
+// fresh attempt). Before Slice 3 the gate admitted only
+// accepted/submitted/failed, so a retry was rejected with "cannot
+// be invalidated". The contrast case proves the gate widened by
+// exactly one state — an ineligible state (pending) is still
+// rejected, so this is not a wholesale loosening.
+func TestApplySetTaskState_RetryReopensFailedRetryable(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	taskID := makeTaskWithAction(t, s, runID, "1:1:t", "compute", TaskFailedRetryable)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: taskID, NewState: TaskReady, ClearClaim: true},
+	}}); err != nil {
+		t.Fatalf("failed_retryable→ready (retry) must be allowed: %v", err)
+	}
+	if tk, _ := s.GetTask(taskID); tk == nil || tk.State != TaskReady {
+		t.Fatalf("after retry transition, state = %v, want ready", tk)
+	}
+
+	// Contrast: pending→ready via ClearClaim is still rejected.
+	s2 := newTestStore(t)
+	r2 := createTestRun(t, s2)
+	pid := makeTaskWithAction(t, s2, r2, "1:1:p", "compute", TaskPending)
+	if _, err := s2.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: pid, NewState: TaskReady, ClearClaim: true},
+	}}); err == nil {
+		t.Fatal("pending→ready via ClearClaim must still be rejected — Slice 3 widened the gate by one state, not opened it")
+	}
+}

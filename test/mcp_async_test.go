@@ -946,6 +946,102 @@ exit 7
 
 }
 
+// TestMCPRetryTaskRecoversFailedCompute is the end-to-end proof
+// of Slice 3 composed with Slices 1–2: a sync compute task whose
+// script errors parks failed_retryable (not terminal), and
+// enju_retry_task re-opens AND re-runs it in one call, driving it
+// to accepted. The script fails its first attempt (no marker) and
+// succeeds on the second (marker present, in the stable
+// ENJU_PROJECT_DIR — not per-iter scratch) — exactly the
+// transient-failure case from=snapshot exists for: re-run the
+// pinned script unchanged.
+//
+// It also pins the cross-slice trackability guarantee: the failed
+// attempt and the successful retry are TWO distinct iterations
+// (iter-1 failed → MarkOpenClaimsFailed closed it → retry
+// re-claim advanced iter_seq), so the history shows every attempt.
+func TestMCPRetryTaskRecoversFailedCompute(t *testing.T) {
+	h := newMCPHarness(t, "RetryTask")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/flaky/enju.yaml": {body: `name: "flaky"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    prompt: "flaky compute"
+`, mode: 0o644},
+		"enju/templates/flaky/scripts/run.sh": {body: `#!/bin/bash
+# ENJU_REPO_DIR is the per-RUN snapshot dir — stable across
+# iterations (unlike ENJU_PROJECT_DIR, which is per-iter scratch)
+# and NOT re-materialized on a from=snapshot retry, so a marker
+# written on attempt 1 survives to attempt 2. This models a
+# transient failure that clears on retry without any code change.
+M="$ENJU_REPO_DIR/.attempt_marker"
+if [ -f "$M" ]; then
+  echo "recovered on retry"
+  exit 0
+fi
+touch "$M"
+echo "transient failure" >&2
+exit 1
+`, mode: 0o755},
+	}, "seed flaky template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/flaky",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	// First attempt: exit 1 → parks failed_retryable (Slice 2),
+	// not terminal failed.
+	res := h.call(t, "enju_execute_task", map[string]any{"task_id": h.taskID("run")})
+	if !strings.Contains(mcpText(res), "failed") {
+		t.Fatalf("first attempt should report failure, got:\n%s", mcpText(res))
+	}
+	if err := waitForTaskState(h, h.taskID("run"), "failed_retryable", 5*time.Second); err != nil {
+		t.Fatalf("first failure must park failed_retryable: %v", err)
+	}
+
+	// enju_retry_task from=snapshot: same pinned script, but the
+	// marker now exists → exit 0. One call re-opens (Slice 3) and
+	// re-executes.
+	rres := h.call(t, "enju_retry_task", map[string]any{
+		"task_id": h.taskID("run"),
+		"from":    "snapshot",
+	})
+	if rres.IsError {
+		t.Fatalf("enju_retry_task errored: %s", mcpText(rres))
+	}
+	if !strings.Contains(mcpText(rres), "Retrying") {
+		t.Errorf("retry response missing header, got:\n%s", mcpText(rres))
+	}
+
+	// The retried attempt succeeds → single task auto-submits →
+	// accepted.
+	if err := waitForTaskState(h, h.taskID("run"), "accepted", 8*time.Second); err != nil {
+		t.Fatalf("retry should drive the task to accepted: %v", err)
+	}
+
+	// Trackability: failed attempt and successful retry are two
+	// distinct iterations.
+	iters := mcpText(h.callOK(t, "enju_list_iterations", map[string]any{
+		"task_id": h.taskID("run"),
+	}))
+	if !strings.Contains(iters, "iter-1") || !strings.Contains(iters, "iter-2") {
+		t.Errorf("expected iter-1 (failed) AND iter-2 (retry) in iteration history, got:\n%s", iters)
+	}
+
+	// Guard against terminal-failed regression: a failed_retryable
+	// retry must not have left a terminal `failed` anywhere.
+	if strings.Contains(iters, "iter-3") {
+		t.Errorf("unexpected third iteration — retry should be exactly one re-attempt:\n%s", iters)
+	}
+}
+
 // waitForFile polls a filesystem path until it exists or the
 // timeout elapses. Used to await the detached wrapper's result
 // file without tying the test to a specific process-signaling
