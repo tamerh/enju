@@ -63,20 +63,31 @@ func FlattenFile(p string) ([]byte, error) {
 	// security boundary — includes are operator-authored committed
 	// files, so the trust model is the real boundary (same stance
 	// as the handler-anchor path).
+	// Containment compares REAL ABSOLUTE paths. Relative inputs
+	// (a bare `enju.yaml`, `./wf.yaml`) must be made absolute
+	// first — otherwise EvalSymlinks(".") vs EvalSymlinks("x.yaml")
+	// are both relative and the prefix check false-positives on a
+	// perfectly ordinary, non-symlinked file. That was a real
+	// regression: `enju validate enju.yaml` (relative, cwd) failed
+	// with a bogus "resolves via symlink" error.
 	realEntryDir := ""
-	if d, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
-		realEntryDir = d
+	if absEntry, aerr := filepath.Abs(p); aerr == nil {
+		if d, derr := filepath.EvalSymlinks(filepath.Dir(absEntry)); derr == nil {
+			realEntryDir = d
+		}
 	}
 	confined := func(q string) ([]byte, error) {
 		// Resolve symlinks BEFORE reading so an escaping include's
-		// pointed-at bytes are never touched. EvalSymlinks fails on
-		// a missing/broken path — fall through to os.ReadFile so a
-		// genuinely-absent include still yields the resolver's
-		// clean not-found message rather than a symlink error.
+		// pointed-at bytes are never touched. Any failure to
+		// abs/resolve falls through to os.ReadFile so a genuinely
+		// absent include still yields the resolver's clean
+		// not-found message rather than a symlink error.
 		if realEntryDir != "" {
-			if rq, eerr := filepath.EvalSymlinks(q); eerr == nil &&
-				rq != realEntryDir && !strings.HasPrefix(rq, realEntryDir+string(filepath.Separator)) {
-				return nil, fmt.Errorf("%s resolves via symlink outside the workflow directory %s — includes must stay inside it so the run snapshot is reproducible", q, realEntryDir)
+			if absQ, qerr := filepath.Abs(q); qerr == nil {
+				if rq, eerr := filepath.EvalSymlinks(absQ); eerr == nil &&
+					rq != realEntryDir && !strings.HasPrefix(rq, realEntryDir+string(filepath.Separator)) {
+					return nil, fmt.Errorf("%s resolves via symlink outside the workflow directory %s — includes must stay inside it so the run snapshot is reproducible", q, realEntryDir)
+				}
 			}
 		}
 		return os.ReadFile(q)

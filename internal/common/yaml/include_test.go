@@ -182,6 +182,42 @@ func TestFlattenFile_SymlinkEscapeRejected(t *testing.T) {
 	}
 }
 
+// TestFlattenFile_RelativePathNotFalseSymlink pins the Bug-1
+// regression: a bare/cwd-relative path to an ordinary
+// non-symlinked file must NOT trip the symlink-confinement guard.
+// Before the abs-normalization fix, `enju validate enju.yaml`
+// (relative, dir==".") failed with a bogus "resolves via symlink
+// outside the workflow directory ." error.
+func TestFlattenFile_RelativePathNotFalseSymlink(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "enju.yaml"),
+		"name: rel\nversion: 1\ninclude:\n  - parts/t.yaml\n")
+	mustWrite(t, filepath.Join(dir, "parts", "t.yaml"),
+		"tasks:\n  - id: t\n    action: compute\n    script: s.sh\n")
+
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(prev)
+
+	// Bare filename (dir == ".") — the exact failing shape.
+	out, err := FlattenFile("enju.yaml")
+	if err != nil {
+		t.Fatalf("relative bare path must not false-positive: %v", err)
+	}
+	if p, perr := Parse(out); perr != nil || p == nil || len(p.Run.Tasks) != 1 {
+		t.Errorf("flattened relative workflow didn't resolve include: err=%v out=%s", perr, out)
+	}
+	// "./enju.yaml" form too.
+	if _, err := FlattenFile("./enju.yaml"); err != nil {
+		t.Fatalf("./relative path must not false-positive: %v", err)
+	}
+}
+
 func TestFlattenIncludes_NestedIncludeAndMissingFile(t *testing.T) {
 	ok := map[string]string{
 		"wf/enju.yaml": "name: N\nversion: 1\ninclude:\n  - mid.yaml\n",
