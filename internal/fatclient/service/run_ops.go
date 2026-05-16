@@ -18,6 +18,7 @@ import (
 
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
@@ -634,4 +635,56 @@ func (s *FatClient) runStateAction(ctx context.Context, projectID int64, runSeq 
 		}
 	}
 	return nil
+}
+
+// ResolveAutoBranch picks the concrete run-branch name for a
+// caller that passed branch="auto". The coordinator refuses raw
+// "auto" by design — it owns DAG/state/events, not git, and
+// resolving "auto" needs to know which branches exist on disk.
+// Both the MCP create_run handler and `enju go` route through
+// here so the <slug>-N allocation has exactly ONE implementation
+// (the MCP path had it; the CLI didn't, so `enju go -base-branch
+// auto` died at the coord — Finding F).
+//
+// Walks <slug>-1, <slug>-2, … and returns the first name absent
+// from BOTH the operator's local refs (the post-Phase-8 source of
+// truth — submits write refs straight into .git/) AND the coord's
+// run list (catches in-session allocations not yet on disk, and
+// projects where the local lookup fails). The slug comes from the
+// same slugger the coord uses for runs/{seq}-{slug}/ so the
+// branch and run-dir names stay in lockstep.
+func (s *FatClient) ResolveAutoBranch(ctx context.Context, projectID int64, yamlContent, templatePath string) (string, error) {
+	parsed, err := enjuYaml.Parse([]byte(yamlContent))
+	if err != nil {
+		return "", fmt.Errorf("parsing YAML for slug: %w", err)
+	}
+	slug := corelayout.ComputeRunSlug(templatePath, parsed.Run.Name)
+	if slug == "" {
+		slug = "run"
+	}
+	used := make(map[string]bool)
+	if wf, _, _, _, werr := s.OpenWorkflow(ctx, projectID); werr == nil {
+		if existing, lsErr := wf.LocalBranches(); lsErr == nil {
+			for _, b := range existing {
+				used[b] = true
+			}
+		}
+	}
+	// Coord run list as a complement — always available even when
+	// the local ref lookup fails, and catches in-session
+	// allocations not yet written to git.
+	if runs, rErr := s.ListRuns(ctx, projectID); rErr == nil {
+		for _, r := range runs {
+			if r.Branch != "" {
+				used[r.Branch] = true
+			}
+		}
+	}
+	for n := 1; n <= 10000; n++ {
+		name := fmt.Sprintf("%s-%d", slug, n)
+		if !used[name] {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("unable to allocate an auto branch after 10000 tries — pass branch=<name> explicitly")
 }

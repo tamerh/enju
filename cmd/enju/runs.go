@@ -34,6 +34,8 @@ func cmdRuns(args []string) {
 	last := fs.Int("last", 20, "Cap on rows rendered (0 = all)")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Emit the wire.Run array as JSON")
+	terminateSeq := fs.Int("terminate", 0, "Irreversibly terminate run <seq> instead of listing (cascade-skips non-terminal tasks, abandons open claims). Same operation as MCP enju_terminate_run.")
+	reason := fs.String("reason", "", "Audit reason recorded in the run_terminated event (used with -terminate).")
 	fs.Parse(args)
 
 	sess := openCLISession(*coordOverride)
@@ -43,6 +45,19 @@ func cmdRuns(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runs: %v\n", err)
 		os.Exit(2)
+	}
+
+	// -terminate short-circuits the list path: a thin wrapper over
+	// the same FatClient.TerminateRun the MCP tool calls. The
+	// explicit flag is the confirmation (matches MCP — no extra
+	// prompt, so it stays scriptable).
+	if *terminateSeq > 0 {
+		if err := sess.FC.TerminateRun(ctx, entry.ID, *terminateSeq, *reason); err != nil {
+			fmt.Fprintf(os.Stderr, "terminate run %d:%d: %v\n", entry.ID, *terminateSeq, err)
+			os.Exit(1)
+		}
+		fmt.Printf("⊘ run %d:%d terminated (irreversible; topic branches preserved in git)\n", entry.ID, *terminateSeq)
+		return
 	}
 
 	runs, err := sess.FC.ListRuns(ctx, entry.ID)

@@ -96,6 +96,105 @@ func TestParseParamsArg(t *testing.T) {
 	}
 }
 
+// TestSplitTopLevelCommas pins the depth/quote-aware splitter:
+// plain k=v lists split exactly like strings.Split, but commas
+// inside a JSON array/object or a quoted string are NOT split
+// points (the bug that made inline list<record> impossible).
+func TestSplitTopLevelCommas(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"a=1", []string{"a=1"}},
+		{"a=1,b=2", []string{"a=1", "b=2"}},
+		{`e=[{"s":"a","l":"A"},{"s":"b","l":"B"}],x=1`,
+			[]string{`e=[{"s":"a","l":"A"},{"s":"b","l":"B"}]`, "x=1"}},
+		{`q={"k":"has,comma"},y=2`, []string{`q={"k":"has,comma"}`, "y=2"}},
+		{`s="a,b\"c",z=3`, []string{`s="a,b\"c"`, "z=3"}},
+	}
+	for _, c := range cases {
+		got := splitTopLevelCommas(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("splitTopLevelCommas(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for i := range c.want {
+			if got[i] != c.want[i] {
+				t.Errorf("splitTopLevelCommas(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+// TestParseParamsArgJSON covers Gap B: a [/{-leading value is
+// decoded as JSON (records flow through as typed maps/slices),
+// non-JSON values stay raw strings for the declared-type coercer,
+// and malformed-but-JSON-shaped values fail loudly rather than
+// silently degrading to a string.
+func TestParseParamsArgJSON(t *testing.T) {
+	got, err := parseParamsArg(`entries=[{"slug":"a","label":"A","question":"Q?"}],effort=high`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s, ok := got["effort"].(string); !ok || s != "high" {
+		t.Errorf("effort: got %#v, want string \"high\"", got["effort"])
+	}
+	list, ok := got["entries"].([]interface{})
+	if !ok || len(list) != 1 {
+		t.Fatalf("entries: got %#v, want a 1-element slice", got["entries"])
+	}
+	rec, ok := list[0].(map[string]interface{})
+	if !ok || rec["slug"] != "a" || rec["label"] != "A" || rec["question"] != "Q?" {
+		t.Errorf("entries[0]: got %#v", list[0])
+	}
+	if _, err := parseParamsArg(`entries=[{"slug":"a"`); err == nil {
+		t.Errorf("malformed JSON value: expected error, got nil")
+	}
+}
+
+// TestLoadParamsFile / TestMergeParams pin the --params-file
+// route (the clean path for list<record>) and the inline-wins
+// merge order.
+func TestLoadParamsFile(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "p.json")
+	if err := os.WriteFile(good, []byte(`{"entries":[{"slug":"a"}],"n":3}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := loadParamsFile(good)
+	if err != nil {
+		t.Fatalf("loadParamsFile: %v", err)
+	}
+	if _, ok := m["entries"].([]interface{}); !ok {
+		t.Errorf("entries not a slice: %#v", m["entries"])
+	}
+	if n, ok := m["n"].(float64); !ok || n != 3 {
+		t.Errorf("n: got %#v, want float64(3) (MCP-shaped numeric)", m["n"])
+	}
+
+	bad := filepath.Join(dir, "arr.json")
+	_ = os.WriteFile(bad, []byte(`[1,2]`), 0o644)
+	if _, err := loadParamsFile(bad); err == nil {
+		t.Errorf("top-level array: expected error, got nil")
+	}
+	if _, err := loadParamsFile(filepath.Join(dir, "nope.json")); err == nil {
+		t.Errorf("missing file: expected error, got nil")
+	}
+}
+
+func TestMergeParams(t *testing.T) {
+	if got := mergeParams(nil, nil); got != nil {
+		t.Errorf("mergeParams(nil,nil) = %v, want nil", got)
+	}
+	got := mergeParams(
+		map[string]interface{}{"a": 1, "b": 2},
+		map[string]interface{}{"b": 99},
+	)
+	if got["a"] != 1 || got["b"] != 99 {
+		t.Errorf("mergeParams: got %v, want a=1 b=99 (hi wins)", got)
+	}
+}
+
 // TestProjectRootCandidateFindsGit places a workflow under a
 // directory tree with .git two levels up; the candidate should
 // walk up to the git root rather than picking the workflow's

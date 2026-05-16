@@ -36,8 +36,9 @@ import (
 func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
-	branch := fs.String("base-branch", "", "Override the run's base branch (passed through to create_run; default: project default)")
-	paramsArg := fs.String("params", "", "k=v[,k=v...] template parameter values. List-typed params use pipes inside the value: k=a|b|c.")
+	branch := fs.String("branch", "", `Run branch: "auto" (client-resolved to <slug>-N), an explicit name to isolate this run, or empty for the project default. The run forks from the project default and merges back per -sync.`)
+	paramsArg := fs.String("params", "", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split.")
+	paramsFile := fs.String("params-file", "", "Path to a JSON object of typed params (the MCP-shaped params payload). Merged UNDER --params: inline keys win per key, even when the two forms differ (e.g. an inline string overrides a file list<record> of the same name). The clean route for list<record> and nested params the k=v grammar can't express.")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
@@ -61,6 +62,15 @@ func cmdGo(args []string) {
 	if perr != nil {
 		fmt.Fprintf(os.Stderr, "--params: %v\n", perr)
 		os.Exit(2)
+	}
+	if *paramsFile != "" {
+		fileParams, ferr := loadParamsFile(*paramsFile)
+		if ferr != nil {
+			fmt.Fprintf(os.Stderr, "--params-file %s: %v\n", *paramsFile, ferr)
+			os.Exit(2)
+		}
+		// File is the base; inline --params overrides per key.
+		params = mergeParams(fileParams, params)
 	}
 
 	// --dry-run short-circuits before openCLISession. Doesn't
@@ -120,15 +130,19 @@ func cmdGo(args []string) {
 		// completed/failed/terminated, at which point the
 		// supervisor's tailer has fired auto-stop on every
 		// auto-managed bot.
-		if exit := driveAutoBotsRun(ctx, sess, int(projectID), int(runID), runSeq, *maxTasks, *asJSON); exit != 0 {
+		if exit := driveAutoBotsRun(ctx, sess, int(projectID), runSeq, *maxTasks, *asJSON); exit != 0 {
 			os.Exit(exit)
 		}
 		return
 	}
 
+	// ExecuteRun resolves the run by per-project seq (every coord
+	// run endpoint is /projects/{pid}/runs/{seq}). Passing the
+	// global runID here was the long-standing bug that made every
+	// `enju go` invocation die with "run P:ID not found".
 	res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
 		ProjectID: int(projectID),
-		RunID:     int(runID),
+		RunSeq:    runSeq,
 		MaxTasks:  *maxTasks,
 		Parallel:  1,
 	})
@@ -161,7 +175,7 @@ func cmdGo(args []string) {
 // runs don't hammer coord, short enough that humans don't
 // perceive lag between bot work completing and the next
 // compute round kicking off.
-func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, runSeq, maxTasks int, asJSON bool) int {
+func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, maxTasks int, asJSON bool) int {
 	const (
 		pollInterval     = 2 * time.Second
 		coordWarnEvery   = 10 // emit a warning every Nth consecutive failure
@@ -178,7 +192,7 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runID, r
 	for {
 		res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
 			ProjectID: projectID,
-			RunID:     runID,
+			RunSeq:    runSeq,
 			MaxTasks:  maxTasks,
 			Parallel:  1,
 		})
@@ -291,11 +305,11 @@ func pickWorkflowArg(args []string) (string, error) {
 		}
 		return "", fmt.Errorf(
 			"no workflow path supplied and ./%s not found.\n"+
-				"  usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]\n"+
-				"  or run from a directory that contains an %s file.",
+				"  usage: enju go [--name X] [--branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>\n"+
+				"  (flags must precede the workflow path), or run from a directory that contains an %s file.",
 			defaultName, defaultName)
 	default:
-		return "", fmt.Errorf("usage: enju go <workflow.yaml> [--name X] [--base-branch X] [--params k=v,k=v] [--dry-run] [--json]  (got %d positional args; expected 0 or 1)", len(args))
+		return "", fmt.Errorf("usage: enju go [--name X] [--branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>  (flags must precede the path; got %d positional args, expected 0 or 1 — a flag placed AFTER the workflow path is the usual cause)", len(args))
 	}
 }
 
@@ -464,6 +478,18 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		body["params"] = params
 	}
 	if branch != "" {
+		// "auto" is a client-side convenience the coord refuses
+		// raw — resolve it via the shared FatClient allocator
+		// (same one the MCP create_run handler uses) so the coord
+		// only ever sees a concrete name. Without this, `enju go
+		// -branch auto` died at the coord (Finding F).
+		if branch == "auto" {
+			resolved, rerr := fc.ResolveAutoBranch(ctx, projectID, prep.YAMLContent, templatePath)
+			if rerr != nil {
+				return 0, 0, fmt.Errorf("resolving branch=auto: %w", rerr)
+			}
+			branch = resolved
+		}
 		body["branch"] = branch
 	}
 	if syncMode != "" {
@@ -584,7 +610,7 @@ func parseParamsArg(arg string) (map[string]interface{}, error) {
 		return nil, nil
 	}
 	out := map[string]interface{}{}
-	for _, tok := range strings.Split(arg, ",") {
+	for _, tok := range splitTopLevelCommas(arg) {
 		t := strings.TrimSpace(tok)
 		if t == "" {
 			continue
@@ -598,9 +624,111 @@ func parseParamsArg(arg string) (map[string]interface{}, error) {
 		if key == "" {
 			return nil, fmt.Errorf("empty key in %q", t)
 		}
-		out[key] = val
+		v, isJSON, jerr := decodeJSONValue(val)
+		if jerr != nil {
+			return nil, fmt.Errorf("param %q looks like JSON but did not parse: %w", key, jerr)
+		}
+		if isJSON {
+			out[key] = v
+		} else {
+			out[key] = val
+		}
 	}
 	return out, nil
+}
+
+// splitTopLevelCommas splits on commas that are NOT inside a JSON
+// array/object or a double-quoted string. Plain "k=a,k2=b" splits
+// exactly like strings.Split; an embedded record value such as
+// entries=[{"slug":"a","label":"A,B"}] keeps its own commas intact
+// so the JSON survives to decodeJSONValue. ASCII-only structural
+// runes, so byte-index slicing over the range loop is safe.
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	depth, start := 0, 0
+	inStr, esc := false, false
+	for i, r := range s {
+		switch {
+		case esc:
+			esc = false
+		case inStr && r == '\\':
+			esc = true
+		case r == '"':
+			inStr = !inStr
+		case inStr:
+			// structural runes inside a string literal don't count
+		case r == '[' || r == '{':
+			depth++
+		case r == ']' || r == '}':
+			depth--
+		case r == ',' && depth == 0:
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(parts, s[start:])
+}
+
+// decodeJSONValue parses values that begin with '[' or '{' as
+// JSON (records, lists of records, nested objects). Returns
+// (decoded, true, nil) on success; (nil, false, nil) when the
+// value is not JSON-shaped — the caller keeps the raw string and
+// the declared-type coercer handles string/int/bool/list<string>;
+// (nil, false, err) when it looked like JSON but is malformed.
+// Failing loudly on broken JSON beats silently shipping it as a
+// string and letting the validator emit a type error three layers
+// down with no hint that the JSON itself was the problem.
+func decodeJSONValue(val string) (interface{}, bool, error) {
+	if val == "" || (val[0] != '[' && val[0] != '{') {
+		return nil, false, nil
+	}
+	var v interface{}
+	if err := json.Unmarshal([]byte(val), &v); err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
+}
+
+// loadParamsFile reads a JSON object of typed params. Values
+// arrive already-typed (JSON numbers → float64, arrays → slices,
+// records → maps) exactly as the MCP transport produces them, so
+// they bypass the CLI's string→type coercer and flow straight to
+// the validator. This is what makes list<record> expressible
+// from the CLI at all — the k=v string grammar cannot.
+func loadParamsFile(path string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return nil, fmt.Errorf("file is empty")
+	}
+	if s[0] != '{' {
+		return nil, fmt.Errorf("expected a JSON object at the top level (params are name→value); got a leading %q", s[:1])
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	return m, nil
+}
+
+// mergeParams overlays hi onto lo (hi wins per key); either may
+// be nil/empty. Returns nil only when both are empty so the
+// downstream "len(params) > 0" guards behave unchanged.
+func mergeParams(lo, hi map[string]interface{}) map[string]interface{} {
+	if len(lo) == 0 && len(hi) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(lo)+len(hi))
+	for k, v := range lo {
+		out[k] = v
+	}
+	for k, v := range hi {
+		out[k] = v
+	}
+	return out
 }
 
 // renderExecuteResult prints the per-task lines + the trailing
@@ -643,12 +771,14 @@ func renderExecuteResult(w io.Writer, res *service.ExecuteRunResult, asJSON bool
 		return
 	}
 	for _, e := range res.Entries {
-		switch e.Status {
-		case "ok", "accepted":
+		switch service.ClassifyEntryStatus(e.Status) {
+		case service.EntryClassSuccess:
 			fmt.Fprintf(w, "  ✓ %s (%dms)\n", e.TaskID, e.ElapsedMS)
-		case "skipped":
+		case service.EntryClassSkipped:
 			fmt.Fprintf(w, "  · %s skipped\n", e.TaskID)
-		default:
+		case service.EntryClassPending:
+			fmt.Fprintf(w, "  … %s started (async)\n", e.TaskID)
+		default: // Failed, GitFailed, Error, Unknown
 			fmt.Fprintf(w, "  ✗ %s — %s\n", e.TaskID, e.Reason)
 		}
 	}

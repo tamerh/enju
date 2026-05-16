@@ -257,7 +257,7 @@ func (f *fakeFC) ExecuteComputeTask(ctx context.Context, id string) (*service.Ex
 	return &service.ExecuteOutcome{TaskID: id, Status: "completed"}, nil
 }
 func (f *fakeFC) ExecuteRun(ctx context.Context, p service.ExecuteRunParams) (*service.ExecuteRunResult, error) {
-	f.executedRunPID, f.executedRunSeq = int64(p.ProjectID), p.RunID
+	f.executedRunPID, f.executedRunSeq = int64(p.ProjectID), p.RunSeq
 	f.executedRunMax, f.executedRunPar = p.MaxTasks, p.Parallel
 	if f.executeRunErr != nil {
 		return nil, f.executeRunErr

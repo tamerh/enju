@@ -38,7 +38,9 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
-	runID, err := req.RequireInt("run_id")
+	// The MCP wire arg `run_id` is the user-facing run number,
+	// which is the per-project seq — ExecuteRunParams.RunSeq.
+	runSeq, err := req.RequireInt("run_id")
 	if err != nil {
 		return mcp.NewToolResultError("run_id is required"), nil
 	}
@@ -66,7 +68,7 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 
 	res, err := c.fc.ExecuteRun(ctx, service.ExecuteRunParams{
 		ProjectID: projectID,
-		RunID:     runID,
+		RunSeq:    runSeq,
 		MaxTasks:  maxTasks,
 		Parallel:  parallel,
 	})
@@ -84,16 +86,16 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 func formatExecuteRunSummary(entries []service.ExecuteRunEntry, stopReason string, blocker *service.ExecuteRunBlocker, selfStuckClaims []string, maxTasks, parallel int) string {
 	var completed, failed, errored, async, gitFailed int
 	for _, e := range entries {
-		switch e.Status {
-		case "completed":
+		switch service.ClassifyEntryStatus(e.Status) {
+		case service.EntryClassSuccess:
 			completed++
-		case "failed":
+		case service.EntryClassFailed:
 			failed++
-		case "git_failed":
+		case service.EntryClassGitFailed:
 			gitFailed++
-		case "async_started":
+		case service.EntryClassPending:
 			async++
-		case "error":
+		case service.EntryClassError:
 			errored++
 		}
 	}
@@ -195,16 +197,16 @@ func formatExecuteRunSummary(entries []service.ExecuteRunEntry, stopReason strin
 
 func writeExecuteRunEntryLine(b *strings.Builder, e service.ExecuteRunEntry) {
 	var prefix string
-	switch e.Status {
-	case "completed":
+	switch service.ClassifyEntryStatus(e.Status) {
+	case service.EntryClassSuccess:
 		prefix = "✓"
-	case "failed":
+	case service.EntryClassFailed:
 		prefix = "✗"
-	case "git_failed":
+	case service.EntryClassGitFailed:
 		prefix = "✗git"
-	case "async_started":
+	case service.EntryClassPending:
 		prefix = "…"
-	default:
+	default: // Error, Skipped, Unknown — same "!" as before
 		prefix = "!"
 	}
 	b.WriteString(fmt.Sprintf("  %s %s", prefix, e.TaskID))

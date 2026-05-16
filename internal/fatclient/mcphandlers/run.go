@@ -20,10 +20,8 @@ import (
 
 	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/common/format"
-	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/common/wire"
-	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -596,15 +594,15 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 	if branch := req.GetString("branch", ""); branch != "" {
-		// "auto" is a fat-client-side convenience. Coord owns
+		// "auto" is a client-side convenience. Coord owns
 		// state/events/DAG, not git plumbing — so when the
-		// caller asks for "auto", we resolve to a concrete name
-		// here by consulting the project's bare repo. Coord
-		// then sees an explicit branch name and the picker
-		// can't drift from on-disk reality (e.g., post-DB-wipe
-		// when on-disk refs survive but DB is empty).
+		// caller asks for "auto", resolve to a concrete name
+		// here. The allocation lives on FatClient so this
+		// handler and `enju go` share one implementation
+		// (Finding F); coord then sees an explicit name and
+		// can't drift from on-disk reality (post-DB-wipe).
 		if branch == "auto" {
-			resolved, err := c.resolveAutoBranch(ctx, int64(projectID), yamlContent, templatePath)
+			resolved, err := c.fc.ResolveAutoBranch(ctx, int64(projectID), yamlContent, templatePath)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("resolving branch=auto: %v", err)), nil
 			}
@@ -756,91 +754,11 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	return mcp.NewToolResultText(text), nil
 }
 
-// resolveAutoBranch picks a concrete branch name when the caller
-// passes branch="auto". Walks <slug>-1, <slug>-2, ... and returns
-// the first name absent from the project's bare repo. The slug
-// comes from the parsed YAML's name field via the same slugger
-// the coord uses for runs/{seq}-{slug}/, so branch name and
-// run-dir name stay in lockstep.
-//
-// Coord ownership boundary: the coord intentionally doesn't do
-// git operations. It owns DAG + state + events; the fat-client
-// owns git. "auto" is a fat-client-side convenience, resolved
-// here against the bare repo (the source of truth for branch
-// existence). Coord then receives the concrete name and trusts
-// the client.
-//
-// Returns an error if the bare repo is unreachable, the YAML
-// can't be parsed, or we exhaust the 10_000-name search.
-func (c *apiClient) resolveAutoBranch(ctx context.Context, projectID int64, yamlContent, templatePath string) (string, error) {
-	parsed, err := enjuYaml.Parse([]byte(yamlContent))
-	if err != nil {
-		return "", fmt.Errorf("parsing YAML for slug: %w", err)
-	}
-	slug := corelayout.ComputeRunSlug(templatePath, parsed.Run.Name)
-	if slug == "" {
-		slug = "run"
-	}
-	// Build the "used" set from two sources:
-	//
-	//   1. On-disk local refs (the source of truth for branch
-	//      existence in single-store mode — plumbing-submit writes
-	//      refs into the operator's .git/ directly). After a coord
-	//      DB wipe, coord may not have remote_url for the
-	//      re-created project, but the local refs are right there
-	//      on disk where they've always been. Going through coord
-	//      here would re-introduce the divergence the user hit.
-	//
-	//   2. Coord DB runs list. Catches in-session allocations
-	//      that haven't been written to git yet AND projects where
-	//      the local ref lookup fails for some reason.
-	used := make(map[string]bool)
-	if wf, _, _, _, werr := c.fc.OpenWorkflow(ctx, projectID); werr == nil {
-		if existing, lsErr := wf.LocalBranches(); lsErr == nil {
-			for _, b := range existing {
-				used[b] = true
-			}
-		}
-	}
-	// Coord DB view as a complement.
-	dbBranches, dbErr := c.listCoordBranches(ctx, projectID)
-	if dbErr == nil {
-		for _, b := range dbBranches {
-			used[b] = true
-		}
-	}
-	for n := 1; n <= 10000; n++ {
-		name := fmt.Sprintf("%s-%d", slug, n)
-		if !used[name] {
-			return name, nil
-		}
-	}
-	return "", fmt.Errorf("unable to allocate an auto branch after 10000 tries — pass branch=<name> explicitly")
-}
-
-// listCoordBranches returns the branch names coord has run
-// records for. Used as a complement to ls-remote in the auto-
-// branch picker — coord-DB is always available even when the
-// project has no remote_url to ls-remote against.
-func (c *apiClient) listCoordBranches(ctx context.Context, projectID int64) ([]string, error) {
-	data, err := c.get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID))
-	if err != nil {
-		return nil, err
-	}
-	// Response is a JSON array of run records, each with a
-	// "branch" field. Extract just the names.
-	var runs []map[string]interface{}
-	if jerr := json.Unmarshal(data, &runs); jerr != nil {
-		return nil, jerr
-	}
-	var names []string
-	for _, r := range runs {
-		if b, ok := r["branch"].(string); ok && b != "" {
-			names = append(names, b)
-		}
-	}
-	return names, nil
-}
+// resolveAutoBranch moved to FatClient.ResolveAutoBranch
+// (service/run_ops.go) so this handler and `enju go` share one
+// <slug>-N allocator (Finding F). listCoordBranches went with
+// it — the FatClient version reuses the typed ListRuns instead
+// of a raw GET.
 
 // handleExportDiagram snapshots the run's current DAG as raw
 // Mermaid and commits it to enju/runs/{seq}-{slug}/graph/{phase}.mmd.

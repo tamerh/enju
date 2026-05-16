@@ -135,7 +135,7 @@ func (s *Server) handleExecuteRun(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := s.fc.ExecuteRun(r.Context(), service.ExecuteRunParams{
 		ProjectID: int(pid),
-		RunID:     seq,
+		RunSeq:    seq,
 		MaxTasks:  max,
 		Parallel:  parallel,
 	})

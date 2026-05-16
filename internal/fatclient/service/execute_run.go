@@ -72,9 +72,18 @@ const (
 )
 
 // ExecuteRunParams is the input for FatClient.ExecuteRun.
+//
+// RunSeq is the run's PER-PROJECT sequence number (the "#11" a
+// user sees), NOT the global runs.id. Every coord run endpoint
+// resolves /projects/{pid}/runs/{X} as project-seq, so callers
+// MUST pass the seq. The field was historically named RunID,
+// which invited `enju go` to thread the global id and produced
+// the silent "run P:ID not found" failure for every CLI run.
+// The rename is the by-construction guard: a caller writing
+// `RunID:` no longer compiles.
 type ExecuteRunParams struct {
 	ProjectID int
-	RunID     int
+	RunSeq    int
 	MaxTasks  int
 	Parallel  int
 }
@@ -108,18 +117,18 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 	// error (vs. the misleading "idle run" the main loop would
 	// produce for an empty /ready on a nonexistent run) and
 	// caches the branch for the cold-reconcile fallback below.
-	runBranch, err := s.fetchRunBranch(ctx, p.ProjectID, p.RunID)
+	runBranch, err := s.fetchRunBranch(ctx, p.ProjectID, p.RunSeq)
 	if err != nil {
 		return nil, err
 	}
 
 	if p.Parallel > 1 {
 		entries, stopReason, blocker := s.runCascadeParallel(
-			ctx, p.ProjectID, p.RunID, runBranch, p.Parallel, p.MaxTasks,
+			ctx, p.ProjectID, p.RunSeq, runBranch, p.Parallel, p.MaxTasks,
 		)
 		res := &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}
 		if stopReason == StopNoReadyCompute {
-			res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunID)
+			res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunSeq)
 		}
 		return res, nil
 	}
@@ -135,7 +144,7 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 			break
 		}
 
-		ready, err := s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunID)
+		ready, err := s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunSeq)
 		if err != nil {
 			entries = append(entries, ExecuteRunEntry{
 				Status: "error",
@@ -155,7 +164,7 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 			coldReconcileTried = true
 			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(p.ProjectID)); perr == nil && wf != nil {
 				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(p.ProjectID), runBranch)
-				ready, err = s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunID)
+				ready, err = s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunSeq)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{
 						Status: "error",
@@ -213,7 +222,7 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 
 	res := &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}
 	if stopReason == StopNoReadyCompute {
-		res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunID)
+		res.SelfStuckClaims = s.findSelfHeldStuckTasks(ctx, p.ProjectID, p.RunSeq)
 	}
 	return res, nil
 }
@@ -395,18 +404,18 @@ func pickAllEligibleCompute(ready []map[string]interface{}, username string, dis
 // a nonexistent run surfaces as a clear "run not found" error
 // here rather than bleeding through the main loop as a
 // misleading "no_ready_compute" (empty /ready).
-func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runID int) (string, error) {
-	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runID)
+func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runSeq int) (string, error) {
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq)
 	data, err := s.coord.Get(ctx, path)
 	if err != nil {
-		return "", fmt.Errorf("run %d:%d not found: %w", projectID, runID, err)
+		return "", fmt.Errorf("run %d:%d not found: %w", projectID, runSeq, err)
 	}
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return "", fmt.Errorf("decoding run response: %w", err)
 	}
 	if errMsg, _ := resp["error"].(string); errMsg != "" {
-		return "", fmt.Errorf("run %d:%d: %s", projectID, runID, errMsg)
+		return "", fmt.Errorf("run %d:%d: %s", projectID, runSeq, errMsg)
 	}
 	branch, _ := resp["branch"].(string)
 	return branch, nil
@@ -456,12 +465,12 @@ func (s *FatClient) ListReadyTasks(ctx context.Context, projectID, runID int64) 
 // swallowed and treated as "no stuck claims found." The caller
 // has already decided the run is idle; getting this lookup
 // wrong shouldn't escalate to a hard failure.
-func (s *FatClient) findSelfHeldStuckTasks(ctx context.Context, projectID, runID int) []string {
+func (s *FatClient) findSelfHeldStuckTasks(ctx context.Context, projectID, runSeq int) []string {
 	username := s.coord.Username()
 	if username == "" {
 		return nil
 	}
-	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runID)
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runSeq)
 	data, err := s.coord.Get(ctx, path)
 	if err != nil {
 		return nil
@@ -490,8 +499,8 @@ func (s *FatClient) findSelfHeldStuckTasks(ctx context.Context, projectID, runID
 
 // fetchReadyTasksForRun wraps the /api/v1/tasks/ready endpoint
 // scoped to (project, run).
-func (s *FatClient) fetchReadyTasksForRun(ctx context.Context, projectID, runID int) ([]map[string]interface{}, error) {
-	path := fmt.Sprintf("/api/v1/tasks/ready?project_id=%d&run_id=%d", projectID, runID)
+func (s *FatClient) fetchReadyTasksForRun(ctx context.Context, projectID, runSeq int) ([]map[string]interface{}, error) {
+	path := fmt.Sprintf("/api/v1/tasks/ready?project_id=%d&run_id=%d", projectID, runSeq)
 	data, err := s.coord.Get(ctx, path)
 	if err != nil {
 		return nil, err
@@ -530,6 +539,58 @@ func EntryFromOutcome(out *ExecuteOutcome) ExecuteRunEntry {
 	return e
 }
 
+// EntryClass is the presentation-neutral classification of an
+// ExecuteRunEntry.Status. It exists so every renderer (CLI, MCP,
+// …) derives success/failure from ONE place instead of each
+// carrying its own `switch e.Status`. Those switches drifted
+// once: the CLI renderer only knew "ok"/"accepted" as success,
+// so the canonical success status "completed" fell to its ✗
+// default arm and every successful `enju go` task printed as a
+// failure with an empty reason. Adding a new Status string is
+// now a single edit here; renderers switch on the closed
+// EntryClass set and keep working. Glyph choice stays in each
+// renderer — this only unifies the string→meaning map that was
+// duplicated, not the presentation.
+type EntryClass int
+
+const (
+	// EntryClassUnknown is the fail-safe default: an
+	// unrecognized status must never read as success, so
+	// renderers treat Unknown as a failure-ish ✗/!, never ✓.
+	EntryClassUnknown EntryClass = iota
+	EntryClassSuccess            // "completed"
+	EntryClassFailed             // "failed" (task script non-zero)
+	EntryClassGitFailed          // "git_failed" (commit/push failed)
+	EntryClassError              // "error" (coord/claim/infra)
+	EntryClassPending            // "async_started" (not terminal)
+	EntryClassSkipped            // "skipped"
+)
+
+// ClassifyEntryStatus maps an ExecuteRunEntry.Status to its
+// EntryClass. The recognized strings are exactly those producers
+// in this package set — see EntryFromOutcome ("completed",
+// "failed", "git_failed"), execute.go ("async_started"), and the
+// Status:"error" sites in ExecuteRun/runCascadeParallel. Anything
+// else is EntryClassUnknown by design.
+func ClassifyEntryStatus(status string) EntryClass {
+	switch status {
+	case "completed":
+		return EntryClassSuccess
+	case "failed":
+		return EntryClassFailed
+	case "git_failed":
+		return EntryClassGitFailed
+	case "error":
+		return EntryClassError
+	case "async_started":
+		return EntryClassPending
+	case "skipped":
+		return EntryClassSkipped
+	default:
+		return EntryClassUnknown
+	}
+}
+
 // runCascadeParallel is the parallel sibling of the serial
 // loop in ExecuteRun. Dispatches up to `parallel` compute
 // tasks concurrently, drains their outcomes as they finish,
@@ -552,7 +613,7 @@ func EntryFromOutcome(out *ExecuteOutcome) ExecuteRunEntry {
 // canonical chronological record.
 func (s *FatClient) runCascadeParallel(
 	ctx context.Context,
-	projectID, runID int,
+	projectID, runSeq int,
 	runBranch string,
 	parallel, maxTasks int,
 ) ([]ExecuteRunEntry, string, *ExecuteRunBlocker) {
@@ -641,7 +702,7 @@ func (s *FatClient) runCascadeParallel(
 			break
 		}
 
-		ready, err := s.fetchReadyTasksForRun(ctx, projectID, runID)
+		ready, err := s.fetchReadyTasksForRun(ctx, projectID, runSeq)
 		if err != nil {
 			entries = append(entries, ExecuteRunEntry{
 				Status: "error",
@@ -656,7 +717,7 @@ func (s *FatClient) runCascadeParallel(
 			coldReconcileTried = true
 			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(projectID)); perr == nil && wf != nil {
 				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(projectID), runBranch)
-				ready, err = s.fetchReadyTasksForRun(ctx, projectID, runID)
+				ready, err = s.fetchReadyTasksForRun(ctx, projectID, runSeq)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{
 						Status: "error",
