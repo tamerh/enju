@@ -225,22 +225,22 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		// — they already accept a list-valued param directly.
 		// options[].activates stays structural.
 		scope := fmt.Sprintf("task %q", t.ID)
-		expandedWrites, err := expandStarRefsInWrites(t.WritesArtifacts, merged, scope+".writes_artifacts")
+		expandedWrites, err := expandStarRefsInWrites(t.WritesArtifacts, merged, declared, scope+".writes_artifacts")
 		if err != nil {
 			return nil, err
 		}
 		t.WritesArtifacts = expandedWrites
-		expandedReads, err := expandStarRefsInSlice([]string(t.ReadsArtifacts), merged, scope+".reads_artifacts")
+		expandedReads, err := expandStarRefsInSlice([]string(t.ReadsArtifacts), merged, declared, scope+".reads_artifacts")
 		if err != nil {
 			return nil, err
 		}
 		t.ReadsArtifacts = expandedReads
-		expandedAssign, err := expandStarRefsInSlice([]string(t.AssignTo), merged, scope+".assign_to")
+		expandedAssign, err := expandStarRefsInSlice([]string(t.AssignTo), merged, declared, scope+".assign_to")
 		if err != nil {
 			return nil, err
 		}
 		t.AssignTo = expandedAssign
-		expandedDeps, err := expandStarRefsInSlice([]string(t.DependsOn), merged, scope+".depends_on")
+		expandedDeps, err := expandStarRefsInSlice([]string(t.DependsOn), merged, declared, scope+".depends_on")
 		if err != nil {
 			return nil, err
 		}
@@ -278,18 +278,26 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 	return merged, nil
 }
 
-// starRefPattern matches `{{name[*]}}` — the list-expansion
-// syntax used in list-valued fields (writes_artifacts,
-// reads_artifacts, assign_to, depends_on). The referenced
-// param must be list<string>; each list element containing
-// a `[*]` ref expands into N entries, one per list value,
-// with the ref substituted for that value.
+// starRefPattern matches the list-expansion syntax used in
+// list-valued fields (writes_artifacts, reads_artifacts,
+// assign_to, depends_on):
+//
+//   {{name[*]}}          list<string>: one entry per string.
+//                        list<record>: one entry per record,
+//                        value = the record's key: field.
+//   {{name[*].field}}    list<record>: one entry per record,
+//                        value = record[field] (field must be
+//                        a declared fields: entry).
+//
+// Each list element containing a `[*]` ref expands into N
+// entries. Group 1 = param name; group 2 = optional record
+// field (empty for the bare form).
 //
 // Deliberately a separate pattern from the general `{{name}}`
 // ref — the bracket suffix makes the list-expansion intent
 // explicit (opt-in, not magical) and keeps the scalar path
 // untouched.
-var starRefPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\[\*\]\}\}`)
+var starRefPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\[\*\](?:\.([A-Za-z_][A-Za-z0-9_]*))?\}\}`)
 
 // expandStarRefsInSlice duplicates list elements containing
 // `{{param[*]}}` into N entries, one per value in the
@@ -311,13 +319,13 @@ var starRefPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\[\*\]\}\}`
 //
 // `scope` is free-form context for error messages
 // ("writes_artifacts on task X", "assign_to on task Y").
-func expandStarRefsInSlice(items []string, merged map[string]interface{}, scope string) ([]string, error) {
+func expandStarRefsInSlice(items []string, merged map[string]interface{}, declared map[string]*ParamDef, scope string) ([]string, error) {
 	if len(items) == 0 {
 		return items, nil
 	}
 	out := make([]string, 0, len(items))
 	for _, item := range items {
-		expanded, err := expandOneStarElement(item, merged, scope)
+		expanded, err := expandOneStarElement(item, merged, declared, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -327,8 +335,9 @@ func expandStarRefsInSlice(items []string, merged map[string]interface{}, scope 
 }
 
 // expandOneStarElement returns the 1-or-N entries a single
-// list element produces after `{{param[*]}}` expansion.
-func expandOneStarElement(item string, merged map[string]interface{}, scope string) ([]string, error) {
+// list element produces after `{{param[*]}}` /
+// `{{param[*].field}}` expansion.
+func expandOneStarElement(item string, merged map[string]interface{}, declared map[string]*ParamDef, scope string) ([]string, error) {
 	matches := starRefPattern.FindAllStringSubmatch(item, -1)
 	if len(matches) == 0 {
 		return []string{item}, nil
@@ -336,21 +345,77 @@ func expandOneStarElement(item string, merged map[string]interface{}, scope stri
 	if len(matches) > 1 {
 		return nil, fmt.Errorf("%s: element %q contains multiple [*] refs; only one is supported per element", scope, item)
 	}
+	full := matches[0][0]  // the exact `{{name[*]}}` or `{{name[*].field}}` text
 	name := matches[0][1]
+	field := matches[0][2] // "" for the bare form
 	raw, ok := merged[name]
 	if !ok {
-		return nil, fmt.Errorf("%s: {{%s[*]}} references unknown parameter %q", scope, name, name)
+		return nil, fmt.Errorf("%s: %s references unknown parameter %q", scope, full, name)
+	}
+	values, err := starExpansionValues(name, field, raw, declared[name], scope)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, strings.ReplaceAll(item, full, v))
+	}
+	return out, nil
+}
+
+// starExpansionValues resolves a `[*]` ref to its expansion
+// values, dispatching on the declared param type:
+//
+//   - list<record>: `{{p[*].f}}` → record[f] for each record;
+//     bare `{{p[*]}}` → the record's key: field (same
+//     bare-record==key rule as for_each {{entry}}). The field
+//     must be a declared fields: entry — an unknown field is a
+//     hard parse error naming the declared set, so a typo
+//     surfaces here, not as a silently-broken artifact path.
+//   - list<string> (or no declared ParamDef): `{{p[*]}}` →
+//     each string. A `.field` suffix on a string list is an
+//     error — strings have no fields.
+func starExpansionValues(name, field string, raw interface{}, pd *ParamDef, scope string) ([]string, error) {
+	if pd != nil && pd.Type == "list<record>" {
+		eff := field
+		if eff == "" {
+			eff = pd.Key // defaulted to the first declared field at validate time
+		}
+		if eff == "" {
+			return nil, fmt.Errorf("%s: list<record> parameter %q has no key field to expand {{%s[*]}}", scope, name, name)
+		}
+		if _, declaredField := pd.Fields.TypeOf(eff); !declaredField {
+			return nil, fmt.Errorf("%s: {{%s[*].%s}} references unknown field %q on list<record> %q; declared fields: %s",
+				scope, name, field, eff, name, strings.Join(pd.Fields.Names(), ", "))
+		}
+		recs, ok := starRecordList(raw)
+		if !ok {
+			// Curative: when it's a list but an element isn't a
+			// record, name that element rather than the list type.
+			if lst, isList := raw.([]interface{}); isList {
+				for i, e := range lst {
+					if _, isMap := e.(map[string]interface{}); !isMap {
+						return nil, fmt.Errorf("%s: {{%s[*]}} expects list<record> values, but element #%d is %T, not a record", scope, name, i+1, e)
+					}
+				}
+			}
+			return nil, fmt.Errorf("%s: {{%s[*]}} expects a list<record> parameter; got %T", scope, name, raw)
+		}
+		out := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			out = append(out, stringifyParamValue(rec[eff]))
+		}
+		return out, nil
+	}
+	// list<string> path (or param with no declared ParamDef).
+	if field != "" {
+		return nil, fmt.Errorf("%s: {{%s[*].%s}} uses .field, which requires a list<record> parameter; %q is not list<record>", scope, name, field, name)
 	}
 	values, ok := starListValues(raw)
 	if !ok {
 		return nil, fmt.Errorf("%s: {{%s[*]}} requires a list<string> parameter; got %T", scope, name, raw)
 	}
-	placeholder := fmt.Sprintf("{{%s[*]}}", name)
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		out = append(out, strings.ReplaceAll(item, placeholder, v))
-	}
-	return out, nil
+	return values, nil
 }
 
 // starListValues normalizes a YAML-decoded list param to
@@ -377,19 +442,46 @@ func starListValues(raw interface{}) ([]string, bool) {
 	return nil, false
 }
 
+// starRecordList normalizes a list<record> param value to
+// []map[string]interface{}. The param validator enforces the
+// []interface{}-of-map[string]interface{} shape for list<record>
+// — that's what BOTH YAML decode and a --params-file
+// (json.Unmarshal into interface{}) produce, so it's the only
+// shape that reaches here in practice. The []map[string]
+// interface{} arm is defensive for a directly-constructed value
+// (e.g. a future in-process caller) and is not a pipeline path.
+// Returns false on any other shape.
+func starRecordList(raw interface{}) ([]map[string]interface{}, bool) {
+	switch v := raw.(type) {
+	case []map[string]interface{}:
+		return v, true
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(v))
+		for _, e := range v {
+			m, ok := e.(map[string]interface{})
+			if !ok {
+				return nil, false
+			}
+			out = append(out, m)
+		}
+		return out, true
+	}
+	return nil, false
+}
+
 // expandStarRefsInWrites is the WriteArtifacts analogue of
 // expandStarRefsInSlice — one input entry with `{{param[*]}}`
 // in its Path becomes N entries, each carrying the same
 // Track and Optional flags. Track and Optional are literal
 // bools — never param refs — so the per-expansion entry
 // inherits them verbatim from the source declaration.
-func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, scope string) (WriteArtifacts, error) {
+func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, declared map[string]*ParamDef, scope string) (WriteArtifacts, error) {
 	if len(ws) == 0 {
 		return ws, nil
 	}
 	out := make(WriteArtifacts, 0, len(ws))
 	for _, w := range ws {
-		paths, err := expandOneStarElement(w.Path, merged, scope)
+		paths, err := expandOneStarElement(w.Path, merged, declared, scope)
 		if err != nil {
 			return nil, err
 		}

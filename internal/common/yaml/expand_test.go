@@ -422,7 +422,7 @@ func TestExpand_OptionalSurvivesStarRefExpansion(t *testing.T) {
 		{Path: "out/{{items[*]}}.lock", Track: true, Optional: true},
 	}
 	merged := map[string]interface{}{"items": []interface{}{"a", "b", "c"}}
-	expanded, err := expandStarRefsInWrites(source, merged, "task.writes_artifacts")
+	expanded, err := expandStarRefsInWrites(source, merged, nil, "task.writes_artifacts")
 	if err != nil {
 		t.Fatalf("expandStarRefsInWrites: %v", err)
 	}
