@@ -48,6 +48,7 @@ func (c *apiClient) handleTallyTask(ctx context.Context, req mcp.CallToolRequest
 	}
 	return mcp.NewToolResultText(format.TallyResult(data, taskID)), nil
 }
+
 // handleListIterations is the living-workflow phase 5 surface
 // for the iteration history of a task. Returns one row per
 // task_claims row, with the per-task seq computed and the
@@ -162,6 +163,7 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 
 	return mcp.NewToolResultText(format.TaskDetail(data, inputs, c.username())), nil
 }
+
 // handleListTemplates — pure client-side tool. Walks the
 // project's enju/templates/ directory in the local clone and
 // returns one entry per YAML file with its metadata.
@@ -264,6 +266,9 @@ func formatExecuteOutcome(out *service.ExecuteOutcome) string {
 		if out.ScriptLogPath != "" {
 			b.WriteString(fmt.Sprintf("  Transcript: %s (local only, not committed on failure)\n", out.ScriptLogPath))
 		}
+		if out.ScratchDir != "" {
+			b.WriteString(fmt.Sprintf("  Scratch (preserved for inspection, auto-cleaned after ~24h): %s\n", out.ScratchDir))
+		}
 		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", out.TaskID))
 	case "git_failed":
 		// Distinct from "failed" so the user knows the script
@@ -305,4 +310,3 @@ func formatExecuteOutcome(out *service.ExecuteOutcome) string {
 	}
 	return b.String()
 }
-

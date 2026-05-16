@@ -574,8 +574,20 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 		}
 		// Fail-cascade skip carries a reason; everything else
 		// the ClearClaim path handles wipes all per-claim state.
-		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = '', skip_reason = ?`
-		args := []interface{}{m.NewState, m.SkipReason}
+		//
+		// fail_reason is bound to m.FailReason rather than
+		// hardcoded ''. Re-ready callers (request_changes,
+		// unfail, cascade-pending) leave FailReason zero, so they
+		// still clear it — identical to the old behavior. But
+		// performComputeFailure parks a task in failed_retryable
+		// via this same ClearClaim path (it must drop the claim
+		// pointer) WITH a reason; hardcoding '' silently threw
+		// that reason away, so every failed_retryable task showed
+		// an empty fail_reason and the operator genuinely flew
+		// blind. Preserving it here is the load-bearing half of
+		// "don't fly blind".
+		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = ?, skip_reason = ?`
+		args := []interface{}{m.NewState, m.FailReason, m.SkipReason}
 		// depends_on rewrite (singleton-reopen case): the
 		// caller supplies a new edge set when a reconciled
 		// instance set changes which parents this task should
@@ -1974,9 +1986,9 @@ func buildTaskReadyEvents(readied []ReadiedTask, now time.Time) []Event {
 //
 // State rule:
 //
-//  - Any task in {ready, claimed, running, collecting} → active
-//  - Else any task in {pending, parked} → idle
-//  - Else (all in {accepted, skipped, failed}) → completed
+//   - Any task in {ready, claimed, running, collecting} → active
+//   - Else any task in {pending, parked} → idle
+//   - Else (all in {accepted, skipped, failed}) → completed
 //
 // Paused is preserved — pause is a deliberate operator action and
 // must only be left via explicit resume. The function returns

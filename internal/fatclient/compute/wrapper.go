@@ -423,17 +423,37 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 			return res
 		}
 		defer func() {
-			if res.GitError != "" {
-				// Submit-failed path. Outputs are still in
-				// scratch; the operator's retry can re-claim
-				// the task and re-submit without re-running
-				// the script. Logged at Warn so it surfaces in
-				// daemon stdout/log.
+			// Preserve scratch whenever the script actually RAN
+			// and the run wasn't clean, so an operator can see
+			// what it left behind — intermediate files, partial
+			// outputs, script.log. The startup age-sweep
+			// (SweepStaleScratchAtStartup,
+			// ENJU_SCRATCH_PRESERVE_HOURS, default 24h) is the
+			// TTL that reclaims these; each iteration gets its
+			// own -iter-N scratch so a retry never rediscovers a
+			// stale one.
+			//
+			//  - GitError: script ran fine, submit/commit failed
+			//    — retry can re-submit without re-running.
+			//  - ExitCode!=0: the script ran and failed. THIS is
+			//    the debugging state the tester needs; pre-Slice-4
+			//    it was deleted out from under them ("silent"
+			//    failures).
+			//
+			// res.Error (pre-exec: bad spec, missing script,
+			// missing container runtime) is deliberately NOT
+			// preserved: the script never ran, scratch is empty,
+			// so keeping it just leaks a useless dir until the
+			// sweep. Pre-exec errors still clean up (the Phase-2.1
+			// missing-script contract).
+			if res.GitError != "" || res.ExitCode != 0 {
 				if logger != nil {
-					logger.Warn("submit failed; preserving scratch for retry",
+					logger.Warn("preserving scratch for inspection/retry",
 						"path", spec.TaskScratchDir,
 						"task_id", spec.TaskID,
-						"git_error", res.GitError)
+						"exit_code", res.ExitCode,
+						"git_error", res.GitError,
+						"error", res.Error)
 				}
 				return
 			}

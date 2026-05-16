@@ -1042,6 +1042,91 @@ exit 1
 	}
 }
 
+// TestMCPFailedComputePreservesScratchAndTailsStderr pins Slice 4
+// ("don't fly blind"). Two regressions, one test:
+//
+//	(a) the wrapper used to wipe the task scratch dir on a script
+//	    failure (it only preserved when a git submit ALSO failed),
+//	    so the very state needed to debug was deleted. Now any
+//	    non-clean run preserves scratch (the 24h startup sweep is
+//	    the TTL). The sentinel the failing script writes into its
+//	    CWD (= scratch) must survive.
+//
+//	(b) fail_reason captured stderr[:N] — the HEAD (startup noise)
+//	    — and threw away the tail where the actual error is. Now
+//	    it keeps the tail. The script emits 300 noise lines then
+//	    the real error LAST.
+func TestMCPFailedComputePreservesScratchAndTailsStderr(t *testing.T) {
+	h := newMCPHarness(t, "FailScratch")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/boom/enju.yaml": {body: `name: "boom"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    prompt: "boom"
+`, mode: 0o644},
+		"enju/templates/boom/scripts/run.sh": {body: `#!/bin/bash
+# CWD is the task scratch dir — drop a sentinel so the test can
+# prove scratch survived the failure.
+touch sentinel-marker.txt
+for i in $(seq 1 300); do
+  echo "noise-line-$i: routine progress chatter, not the error" >&2
+done
+echo "FATAL: the actual root cause is right here" >&2
+exit 1
+`, mode: 0o755},
+	}, "seed boom template")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/boom",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	res := h.call(t, "enju_execute_task", map[string]any{"task_id": h.taskID("run")})
+	txt := mcpText(res)
+	if !strings.Contains(txt, "Script failed") {
+		t.Fatalf("expected failure report, got:\n%s", txt)
+	}
+	if !strings.Contains(txt, "Scratch (preserved for inspection") {
+		t.Errorf("failure output must point at the preserved scratch dir, got:\n%s", txt)
+	}
+	if err := waitForTaskState(h, h.taskID("run"), "failed_retryable", 5*time.Second); err != nil {
+		t.Fatalf("script failure must park failed_retryable: %v", err)
+	}
+
+	// (a) Scratch preserved: the sentinel the failing script wrote
+	// into its CWD must still be on disk.
+	root := h.workspaceDirForProject(projectID)
+	var sentinel string
+	filepath.Walk(filepath.Join(root, ".enju", "bots"), func(p string, fi os.FileInfo, err error) error {
+		if err == nil && fi != nil && !fi.IsDir() && filepath.Base(p) == "sentinel-marker.txt" {
+			sentinel = p
+		}
+		return nil
+	})
+	if sentinel == "" {
+		t.Errorf("scratch wiped on script failure — sentinel-marker.txt missing under %s/.enju/bots (Slice 4 regression)", root)
+	}
+
+	// (b) fail_reason carries the TAIL of stderr, not the head.
+	task := h.get("/api/v1/tasks/" + h.taskID("run"))
+	fr, _ := task["fail_reason"].(string)
+	if !strings.Contains(fr, "FATAL: the actual root cause is right here") {
+		t.Errorf("fail_reason must retain the final stderr line (the real error), got:\n%s", fr)
+	}
+	if !strings.Contains(fr, "...(truncated)") {
+		t.Errorf("a long stderr must be marked truncated, got:\n%s", fr)
+	}
+	if strings.Contains(fr, "noise-line-1:") {
+		t.Errorf("fail_reason kept the HEAD noise instead of the tail (pre-Slice-4 behavior):\n%s", fr)
+	}
+}
+
 // waitForFile polls a filesystem path until it exists or the
 // timeout elapses. Used to await the detached wrapper's result
 // file without tying the test to a specific process-signaling

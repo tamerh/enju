@@ -44,6 +44,7 @@ type ExecuteOutcome struct {
 	ArtifactsWritten []string
 	MissingArtifacts []string
 	ScriptLogPath    string
+	ScratchDir       string // preserved on failure for inspection
 	ErrorMessage     string
 	Stderr           string
 	ContribNum       int
@@ -263,25 +264,25 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		// parallel sibling commits to its own ref, isolated from
 		// the others. Coord's auto-merge then FFs the topic onto
 		// meta.Branch (the run branch) on accept.
-		IterationBranch:    meta.IterationBranch,
-		ResultDir:          resultDir,
-		BigfilesDir:        bigfilesDir,
-		ScriptPath:         scriptPath,
-		ScriptLabel:        meta.Script,
-		WritesArtifacts:    meta.WritesArtifacts,
-		ReadsArtifacts:     readsArtifacts,
-		ReadsSourceSHA:     readsSourceSHA,
-		TaskScratchDir:     taskScratchDir,
+		IterationBranch: meta.IterationBranch,
+		ResultDir:       resultDir,
+		BigfilesDir:     bigfilesDir,
+		ScriptPath:      scriptPath,
+		ScriptLabel:     meta.Script,
+		WritesArtifacts: meta.WritesArtifacts,
+		ReadsArtifacts:  readsArtifacts,
+		ReadsSourceSHA:  readsSourceSHA,
+		TaskScratchDir:  taskScratchDir,
 		// SnapshotDir is the script's read-only working directory
 		// when the task came from a template run (RunSourcePath
 		// non-empty). Inline-YAML runs leave it empty — they don't
 		// have a snapshot to mount; the script lives in the
 		// project clone and CWD falls back to scratch or workDir
 		// via ScriptCwdFor.
-		SnapshotDir:        templateDir,
-		AuthorName:         s.coord.CitizenName(),
-		AuthorEmail:        s.coord.CitizenEmail(),
-		Username:           s.coord.Username(),
+		SnapshotDir: templateDir,
+		AuthorName:  s.coord.CitizenName(),
+		AuthorEmail: s.coord.CitizenEmail(),
+		Username:    s.coord.Username(),
 		// Compute attribution uses the session model unconditionally,
 		// no per-call override path. Rationale: a citizen-action
 		// submit attributes the LLM that produced the words, which
@@ -356,10 +357,8 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	}
 
 	if res.ExitCode != 0 {
-		stderr := res.Stderr
-		if len(stderr) > 1000 {
-			stderr = stderr[:1000] + "...(truncated)"
-		}
+		// Tail, not head: the error is at the bottom of stderr.
+		stderr := compute.StderrTail(res.Stderr, 1000)
 		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, res.ExitCode)
 		if stderr != "" {
 			reason += ": " + stderr
@@ -378,9 +377,14 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 			ExitCode:      res.ExitCode,
 			ElapsedMS:     res.ElapsedMS,
 			ScriptLogPath: res.ScriptLogPath,
-			ErrorMessage:  reason,
-			Stderr:        stderr,
-			Branch:        meta.Branch,
+			// Scratch is now preserved on script failure (the
+			// wrapper only wipes on a clean run) — surface it so
+			// the operator knows where to look instead of flying
+			// blind.
+			ScratchDir:   taskScratchDir,
+			ErrorMessage: reason,
+			Stderr:       stderr,
+			Branch:       meta.Branch,
 		}, nil
 	}
 

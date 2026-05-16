@@ -86,3 +86,45 @@ func TestApplySetTaskState_RetryReopensFailedRetryable(t *testing.T) {
 		t.Fatal("pending→ready via ClearClaim must still be rejected — Slice 3 widened the gate by one state, not opened it")
 	}
 }
+
+// TestApplySetTaskState_ClearClaimPreservesFailReason pins the
+// load-bearing Slice-4 fix. performComputeFailure parks a task in
+// failed_retryable via the ClearClaim path (it must drop the claim
+// pointer) WITH a reason. That UPDATE used to hardcode
+// fail_reason=” and silently discard the reason, so every
+// failed_retryable task showed an empty fail_reason and the
+// operator flew blind. The fix must (1) persist a non-empty
+// FailReason through ClearClaim, while (2) still CLEARING it for
+// re-ready callers (request_changes / unfail / cascade) that pass
+// no reason — those depend on the wipe.
+func TestApplySetTaskState_ClearClaimPreservesFailReason(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+
+	// (1) carries a reason → persisted through ClearClaim.
+	t1 := makeTaskWithAction(t, s, runID, "1:1:fail", "compute", TaskRunning)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: t1, NewState: TaskFailedRetryable, FailReason: "boom: exit 7", ClearClaim: true},
+	}}); err != nil {
+		t.Fatalf("park ApplyPlan: %v", err)
+	}
+	if tk, _ := s.GetTask(t1); tk == nil || tk.FailReason != "boom: exit 7" {
+		t.Fatalf("fail_reason dropped by ClearClaim — operator would fly blind: %+v", tk)
+	}
+
+	// (2) re-ready with no reason → stale fail_reason cleared.
+	t2 := makeTaskWithAction(t, s, runID, "1:1:rr", "compute", TaskRunning)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: t2, NewState: TaskFailedRetryable, FailReason: "stale", ClearClaim: true},
+	}}); err != nil {
+		t.Fatalf("seed ApplyPlan: %v", err)
+	}
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetTaskState{TaskID: t2, NewState: TaskReady, ClearClaim: true},
+	}}); err != nil {
+		t.Fatalf("re-ready ApplyPlan: %v", err)
+	}
+	if tk, _ := s.GetTask(t2); tk == nil || tk.FailReason != "" {
+		t.Fatalf("re-ready must clear stale fail_reason (request_changes/unfail rely on this), got %q", tk.FailReason)
+	}
+}

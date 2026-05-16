@@ -393,11 +393,9 @@ func buildFailReason(spec compute.Spec, res compute.Result) string {
 	}
 	msg := fmt.Sprintf("async %s exited with code %d", label, res.ExitCode)
 	if res.Stderr != "" {
-		tail := res.Stderr
-		if len(tail) > 800 {
-			tail = tail[:800] + "...(truncated)"
-		}
-		msg += ": " + tail
+		// Tail, not head — the failing command's error is at the
+		// end of stderr, not buried under startup noise.
+		msg += ": " + compute.StderrTail(res.Stderr, 800)
 	}
 	return msg
 }
