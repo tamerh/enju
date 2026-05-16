@@ -695,13 +695,13 @@ func RequestClarification() mcp.Tool {
 // in-session "what's new" surfacing. Differs from show_events:
 //
 //   - Tighter description framing ("call at natural pause
-//   points" vs show_events' "ad-hoc filter queries"). The
-//   LLM picks the right tool for the right intent.
+//     points" vs show_events' "ad-hoc filter queries"). The
+//     LLM picks the right tool for the right intent.
 //   - Smaller default limit (20 vs 100) — recent context, not
-//   full history.
+//     full history.
 //   - Concise output formatting suited for inline conversation
-//   ("Run #5 completed at 14:32; @bot submitted task X") vs
-//   show_events' raw JSONL.
+//     ("Run #5 completed at 14:32; @bot submitted task X") vs
+//     show_events' raw JSONL.
 //
 // Both tools call the same underlying endpoint; the difference
 // is intent + presentation.
@@ -1089,7 +1089,7 @@ func RetryTask() mcp.Tool {
 For tasks in state 'failed_retryable' (a compute script that errored on its own merits — exit non-zero). The task is sent back to READY and its script is executed again in one call. The failed attempt is preserved as its own closed iteration; this retry runs as a fresh iteration (iter_seq advances), so the history shows every attempt.
 
 from:
-  "head" (default) — re-materialize the run snapshot from the run branch's current tip first. Use this after you've committed a fix to the failing script: the retry picks up your fix.
+  "head" (default) — re-materialize the run snapshot from the RUN BRANCH's current tip first. Use this after you've committed a fix to the failing script. Commit the fix to the run branch (NOT the default branch — the run executes against its own branch; a commit to main is invisible to it). The refresh is overwrite-in-place, not a clean checkout: a modified script is picked up, but a file deleted/renamed on the branch since run creation lingers — a delete/rename fix needs a fresh run, not a retry.
   "snapshot"        — re-run the exact pinned snapshot script unchanged. Use this for a transient failure (flaky network, a busy box) where the code was never the problem.
 
 Only 'failed_retryable' tasks can be retried. A terminal 'failed' task is dead (its descendants already cascaded to SKIPPED) — retry does not apply.`),
@@ -1098,7 +1098,7 @@ Only 'failed_retryable' tasks can be retried. A terminal 'failed' task is dead (
 			mcp.Description("The fully-qualified ID of the failed_retryable task to retry"),
 		),
 		mcp.WithString("from",
-			mcp.Description("Which script version to run: \"head\" (default — re-materialize from the run branch tip, picking up a committed fix) or \"snapshot\" (re-run the pinned snapshot unchanged, for a transient failure)."),
+			mcp.Description("Which script version to run: \"head\" (default — re-materialize from the RUN BRANCH tip; commit your fix to the run branch, not main, and note the refresh is overwrite-in-place so a delete/rename needs a fresh run) or \"snapshot\" (re-run the pinned snapshot unchanged, for a transient failure)."),
 			mcp.Enum("head", "snapshot"),
 		),
 	)
@@ -1140,7 +1140,6 @@ The tally response includes the current counts, whether the task resolved, and i
 		),
 	)
 }
-
 
 // --- operator/model design: bot + model registration ---
 

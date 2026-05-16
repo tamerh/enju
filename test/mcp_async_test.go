@@ -1042,6 +1042,104 @@ exit 1
 	}
 }
 
+// TestMCPRetryFromHeadPicksUpCommittedFix is the from=head e2e —
+// the default mode and the entire point of the feature, previously
+// verified only by reading RetryComputeTask. It proves the from
+// axis actually BIFURCATES behavior on the *same* committed state:
+//
+//  1. broken script (exit 1) → create_run → execute → failed_retryable
+//  2. operator commits a FIXED script to the run branch (modelled
+//     by a detached worktree + update-ref on the workspace clone —
+//     LocalBranchHash reads local refs and retry does not fetch,
+//     so this mirrors the real single-machine flow: fix locally,
+//     retry)
+//  3. retry from=SNAPSHOT → re-runs the FROZEN pinned script →
+//     still fails (proves snapshot ignores the new commit)
+//  4. retry from=HEAD → re-materializes the run-branch tip → runs
+//     the FIXED script → accepted (proves head picks it up)
+//
+// A regression that reverted RetryComputeTask's explicit
+// MaterializeRunRepo back to materialize-if-absent would pass the
+// from=snapshot test but FAIL step 4 here.
+func TestMCPRetryFromHeadPicksUpCommittedFix(t *testing.T) {
+	h := newMCPHarness(t, "RetryHead")
+	projectID := h.createTestProject()
+
+	const scriptRel = "enju/templates/headfix/scripts/run.sh"
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"enju/templates/headfix/enju.yaml": {body: `name: "headfix"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    prompt: "headfix"
+`, mode: 0o644},
+		scriptRel: {body: "#!/bin/bash\necho 'broken' >&2\nexit 1\n", mode: 0o755},
+	}, "seed broken script")
+
+	h.callOK(t, "enju_create_run", map[string]any{
+		"project_id": float64(projectID),
+		"path":       "enju/templates/headfix",
+	})
+	h.rememberRunFromTaskID(t, fmt.Sprintf("%d:1:run", projectID))
+
+	// 1. First attempt fails → failed_retryable.
+	h.call(t, "enju_execute_task", map[string]any{"task_id": h.taskID("run")})
+	if err := waitForTaskState(h, h.taskID("run"), "failed_retryable", 5*time.Second); err != nil {
+		t.Fatalf("first attempt must park failed_retryable: %v", err)
+	}
+
+	// 2. Operator commits a FIXED script onto the run branch in
+	// the workspace clone. Detached worktree + update-ref so it
+	// works regardless of which branch the live workspace has
+	// checked out, and MaterializeRunRepo reads git objects (not
+	// the worktree) so the moved ref is exactly what it resolves.
+	runBranch, _ := h.get(fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, 1))["branch"].(string)
+	if runBranch == "" {
+		t.Fatal("run 1 has no branch on the coordinator record")
+	}
+	ws := h.workspaceDirForProject(projectID)
+	wt := filepath.Join(t.TempDir(), "wt")
+	gittest.Run(t, ws, "worktree", "add", "--detach", wt, "refs/heads/"+runBranch)
+	if err := os.WriteFile(filepath.Join(wt, scriptRel),
+		[]byte("#!/bin/bash\necho 'FIXED-SCRIPT-RAN'\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing fixed script: %v", err)
+	}
+	gittest.Run(t, wt, "add", scriptRel)
+	gittest.Run(t, wt, "-c", "user.email=op@test", "-c", "user.name=op",
+		"commit", "-m", "operator fixes the script on the run branch")
+	newSHA := strings.TrimSpace(gittest.Run(t, wt, "rev-parse", "HEAD"))
+	gittest.Run(t, ws, "update-ref", "refs/heads/"+runBranch, newSHA)
+	gittest.Run(t, ws, "worktree", "remove", "--force", wt)
+
+	// 3. from=SNAPSHOT ignores the new commit — frozen pinned
+	// script still exits 1, task stays failed_retryable.
+	snapRes := h.call(t, "enju_retry_task", map[string]any{
+		"task_id": h.taskID("run"), "from": "snapshot",
+	})
+	if snapRes.IsError {
+		t.Fatalf("retry from=snapshot transport error: %s", mcpText(snapRes))
+	}
+	if err := waitForTaskState(h, h.taskID("run"), "failed_retryable", 5*time.Second); err != nil {
+		t.Fatalf("from=snapshot must re-run the FROZEN broken script and stay failed_retryable "+
+			"(if this passed, snapshot wrongly picked up the branch fix): %v", err)
+	}
+
+	// 4. from=HEAD re-materializes the run-branch tip → the FIXED
+	// script runs → accepted.
+	headRes := h.call(t, "enju_retry_task", map[string]any{
+		"task_id": h.taskID("run"), "from": "head",
+	})
+	if headRes.IsError {
+		t.Fatalf("retry from=head transport error: %s", mcpText(headRes))
+	}
+	if err := waitForTaskState(h, h.taskID("run"), "accepted", 8*time.Second); err != nil {
+		t.Fatalf("from=head must re-materialize the committed fix and succeed — "+
+			"if this fails, RetryComputeTask is not refreshing the snapshot from the branch tip: %v", err)
+	}
+}
+
 // TestMCPFailedComputePreservesScratchAndTailsStderr pins Slice 4
 // ("don't fly blind"). Two regressions, one test:
 //

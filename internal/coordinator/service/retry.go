@@ -14,11 +14,25 @@ import (
 type RetryFrom string
 
 const (
-	// RetryFromHead re-runs against the run branch's current tip
+	// RetryFromHead re-runs against the RUN BRANCH's current tip
 	// — the operator committed a fix to the failing script and
-	// wants the next attempt to pick it up. This is the default
-	// (the common case: you saw the failure, fixed the bug,
-	// retried).
+	// wants the next attempt to pick it up. The default (common
+	// case: saw the failure, fixed the bug, retried).
+	//
+	// Two precision points the operator must know:
+	//   - The fix must be committed to the *run branch*, not the
+	//     default branch. The run executes against its own
+	//     branch (forked at the pinned base SHA); a commit to
+	//     main is invisible to it. "retry still failed" with a
+	//     fix on main means the fix landed on the wrong branch.
+	//   - The refresh is overwrite-in-place, not a clean
+	//     checkout: MaterializeRunRepo walks the branch tip's
+	//     blobs and rewrites them, but a file *deleted or
+	//     renamed* on the branch since the last materialize is
+	//     never visited and lingers in the snapshot. Fixing a
+	//     bug in an existing script (the dominant case) is
+	//     correct; a fix that deletes/renames a sibling needs a
+	//     fresh run, not a retry.
 	RetryFromHead RetryFrom = "head"
 	// RetryFromSnapshot re-runs the exact pinned snapshot script
 	// unchanged — for a transient failure (flaky network, a
@@ -110,8 +124,8 @@ func (c *Coordinator) RetryTask(caller *store.CitizenRecord, taskID string, from
 			// is back on their plate. failed_retryable→ready is
 			// permitted by applySetTaskState's ClearClaim gate.
 			store.SetTaskState{
-				TaskID:   taskID,
-				NewState: store.TaskReady,
+				TaskID:     taskID,
+				NewState:   store.TaskReady,
 				ClearClaim: true,
 			},
 		},

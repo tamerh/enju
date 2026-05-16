@@ -472,8 +472,15 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 //     branch's current tip so the operator's committed fix is the
 //     script that runs. ExecuteComputeTask only materializes when
 //     the snapshot dir is absent (it persists across attempts), so
-//     without this overwrite the retry would silently re-run the
-//     unfixed script.
+//     without this explicit refresh the retry would silently
+//     re-run the unfixed script. The refresh is overwrite-in-
+//     place, not a clean checkout: MaterializeRunRepo rewrites
+//     the branch tip's blobs but never visits a path deleted or
+//     renamed on the branch since the last materialize, so such
+//     a path lingers in the snapshot. Modifying a script (the
+//     dominant fix) is correct; a delete/rename needs a fresh
+//     run. The fix must be on the RUN BRANCH — a commit to the
+//     default branch is invisible to the run.
 //   - "snapshot": leave the existing snapshot untouched —
 //     ExecuteComputeTask reuses it and re-runs the pinned script
 //     verbatim (transient-failure retry).
