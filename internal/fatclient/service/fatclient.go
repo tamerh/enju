@@ -32,6 +32,7 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/executor"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 )
 
@@ -95,6 +96,25 @@ type FatClient struct {
 	profileEmail string
 	profileKind  string
 
+	// executorOverride lets tests substitute a FakeExecutor for
+	// the launch seam. Nil in production — pickExecutor falls
+	// back to executor.Pick, so the real local/slurm dispatch is
+	// untouched and no constructor needs to set this. The whole
+	// SLURM dispatch→reap→host-commit loop is cluster-free
+	// testable purely by setting this field.
+	executorOverride func(kind string) (executor.Executor, error)
+}
+
+// pickExecutor resolves the launcher for an executor kind. Tests
+// inject a FakeExecutor via executorOverride; production leaves
+// it nil and gets executor.Pick (local fork / sbatch). Single
+// chokepoint so kickoff, the slurm reaper, and CancelRunWrappers
+// all honor the same (overridable) resolution.
+func (s *FatClient) pickExecutor(kind string) (executor.Executor, error) {
+	if s.executorOverride != nil {
+		return s.executorOverride(kind)
+	}
+	return executor.Pick(kind)
 }
 
 // New constructs a FatClient. Logger defaults to slog.Default() when

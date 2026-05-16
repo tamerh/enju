@@ -161,6 +161,11 @@ func (c *apiClient) handleTerminateRun(ctx context.Context, req mcp.CallToolRequ
 	if msg := errorFromResponse(data); msg != "" {
 		return mcp.NewToolResultError(msg), nil
 	}
+	// Coord cascade is done; stop any in-flight local process /
+	// SLURM job the cascade can't reach (the gap the .wrap-job
+	// sidecar closes). Best-effort: never let local cleanup
+	// failure mask the terminate the operator just performed.
+	c.fc.CancelRunWrappers(ctx, int64(projectID), runID)
 	return mcp.NewToolResultText(format.TerminateRunResult(data)), nil
 }
 

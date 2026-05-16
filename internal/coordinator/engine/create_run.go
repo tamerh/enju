@@ -205,6 +205,8 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				Container:        ti.Container,
 				ContainerRuntime: ti.ContainerRuntime,
 				Volumes:          marshalStringSlice(ti.Volumes),
+				Executor:         ti.Executor,
+				Resources:        marshalResources(ti.Resources),
 				CreatedAt:        now,
 			})
 		}

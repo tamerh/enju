@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -27,6 +26,7 @@ import (
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/executor"
 )
 
 // ExecuteOutcome is the structured result of one compute-task
@@ -57,7 +57,13 @@ type ExecuteOutcome struct {
 // `enju wrap-task` subprocess so callers can tell the user
 // exactly what was spawned and where its logs go.
 type AsyncKickoffResult struct {
-	PID        int
+	// Executor is the launcher kind ("local" | "slurm") so the
+	// formatter can render the right "what was spawned" text
+	// (a PID + log for local, a SLURM job id + sacct hint for
+	// slurm).
+	Executor   string
+	PID        int    // local
+	JobID      string // slurm
 	SpecPath   string
 	OutputPath string
 	WrapperLog string
@@ -71,7 +77,7 @@ func ResolvedMode(meta *TaskMeta) string {
 	if meta == nil {
 		return ""
 	}
-	return enjuYaml.ResolvedModeFields(meta.Action, meta.Mode)
+	return enjuYaml.ResolvedModeFields(meta.Action, meta.Mode, meta.Executor)
 }
 
 // ExecuteComputeTask runs one action:compute task end-to-end:
@@ -310,7 +316,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	}
 
 	if ResolvedMode(meta) == "async" {
-		kick, err := s.kickoffAsyncWrapTask(spec, env, resultDir, workDir)
+		kick, err := s.kickoffWrapTask(ctx, meta, spec, env, resultDir, workDir)
 		if err != nil {
 			return nil, fmt.Errorf("async kickoff: %w", err)
 		}
@@ -745,69 +751,64 @@ func sleepBackoff(attempt int) {
 	time.Sleep(d)
 }
 
-// kickoffAsyncWrapTask spawns a detached `enju wrap-task`
-// subprocess and returns without waiting. The subprocess
-// inherits `env` (so ENJU_PARAM_* + task env vars reach the
-// script). Its stdin is /dev/null, stdout/stderr redirect to
-// a log file alongside the task's result dir so post-mortem
-// debugging works even when the MCP session is long gone.
+// kickoffWrapTask serializes the spec and launches the wrapper
+// through the executor seam, returning without waiting. Spec
+// serialization + run-dir creation stay HERE — the seam's
+// contract is that Submit only launches. The launcher is chosen
+// from the task's executor: local/"" forks a detached process
+// on this host (unchanged behavior, now via
+// executor.LocalExecutor); slurm sbatches a job.
 //
-// Detach mechanism: Setsid puts the child in a new session /
-// process group / no controlling terminal, so SIGHUP from the
-// user's shell doesn't propagate, and when the parent MCP
-// process exits, the child is adopted by init rather than
-// killed. The parent doesn't Wait() — a background goroutine
-// reaps to avoid a zombie.
-func (s *FatClient) kickoffAsyncWrapTask(spec compute.Spec, env []string, resultDir, workDir string) (*AsyncKickoffResult, error) {
-	self, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("locating enju binary: %w", err)
-	}
-
+// DeferCommit is set from the executor, not a launcher flag: a
+// remote node must not touch git / credentials / network, so
+// for any non-local executor the wrapper produces the result
+// and the host-side reaper replays the commit (byte-identical
+// — same DeferredCommit, same SubmitComputeTaskResult). Local
+// async still commits inline (it runs on a git-capable host).
+//
+// Submit also writes the .wrap-job.json sidecar, which is what
+// lets the reaper discover a still-queued SLURM job (no
+// .wrap-result.json yet) and lets enju_terminate_run Cancel an
+// in-flight job (the handle — PID or job id — is now persisted).
+func (s *FatClient) kickoffWrapTask(ctx context.Context, meta *TaskMeta, spec compute.Spec, env []string, resultDir, workDir string) (*AsyncKickoffResult, error) {
 	runSubdir := filepath.Join(workDir, resultDir)
-	if err := os.MkdirAll(runSubdir, 0755); err != nil {
+	if err := os.MkdirAll(runSubdir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating run dir: %w", err)
 	}
 	specPath := filepath.Join(runSubdir, ".wrap-spec.json")
 	outputPath := filepath.Join(runSubdir, ".wrap-result.json")
 	wrapperLogPath := filepath.Join(runSubdir, "wrapper.log")
 
+	exKind := ""
+	if meta != nil {
+		exKind = meta.Executor
+	}
+	spec.DeferCommit = exKind != "" && exKind != executor.KindLocal
+
 	specBytes, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("encoding spec: %w", err)
 	}
-	if err := os.WriteFile(specPath, specBytes, 0600); err != nil {
+	if err := os.WriteFile(specPath, specBytes, 0o600); err != nil {
 		return nil, fmt.Errorf("writing spec: %w", err)
 	}
 
-	logFile, err := os.Create(wrapperLogPath)
+	impl, err := s.pickExecutor(exKind)
 	if err != nil {
-		return nil, fmt.Errorf("opening wrapper log: %w", err)
+		return nil, err
 	}
-	// We do NOT defer logFile.Close(). The subprocess inherits
-	// the fd; closing here would yank it mid-write. The OS
-	// closes it when the subprocess exits.
-
-	cmd := exec.Command(self, "wrap-task", "--spec", specPath, "--output", outputPath)
-	cmd.Env = env
-	cmd.Stdin = nil
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = detachSysProcAttr()
-
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return nil, fmt.Errorf("starting wrap-task: %w", err)
+	var res enjuYaml.Resources
+	if meta != nil && meta.Resources != nil {
+		res = *meta.Resources
 	}
-	pid := cmd.Process.Pid
-
-	go func() {
-		_ = cmd.Wait()
-		logFile.Close()
-	}()
-
+	h, err := impl.Submit(ctx, specPath, outputPath, env, res)
+	if err != nil {
+		return nil, fmt.Errorf("executor submit: %w", err)
+	}
 	return &AsyncKickoffResult{
-		PID:        pid,
+		Executor:   h.Executor,
+		PID:        h.PID,
+		JobID:      h.JobID,
 		SpecPath:   specPath,
 		OutputPath: outputPath,
 		WrapperLog: wrapperLogPath,

@@ -271,6 +271,8 @@ func (s *Store) initSchema() error {
 		container TEXT NOT NULL DEFAULT '',
 		container_runtime TEXT NOT NULL DEFAULT '',
 		volumes TEXT NOT NULL DEFAULT '',
+		executor TEXT NOT NULL DEFAULT '',
+		resources TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -670,6 +672,13 @@ func (s *Store) initSchema() error {
 		// bioinformatics pipelines reach inputs / reference DBs
 		// that live outside the project directory.
 		`ALTER TABLE tasks ADD COLUMN volumes TEXT NOT NULL DEFAULT ''`,
+		// Executor abstraction (WORKFLOW_GAPS #1). executor selects
+		// where a compute task's wrapper runs ("" / local / slurm);
+		// resources is the JSON-encoded SLURM ask. Both empty for
+		// every pre-migration task and every non-slurm task — the
+		// local/host path is unchanged by their absence.
+		`ALTER TABLE tasks ADD COLUMN executor TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN resources TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1113,7 +1122,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1131,7 +1140,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes,
+		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2447,7 +2456,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes,
+			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

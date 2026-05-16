@@ -169,6 +169,16 @@ type TaskMeta struct {
 	// Empty for non-container tasks or container tasks with no
 	// extra volumes. Passed verbatim into compute.Spec.
 	Volumes []string
+	// Executor selects where this compute task's wrapper runs:
+	// "" / "local" (detached host process) or "slurm" (sbatch
+	// job). Drives launcher selection in execute.go and feeds
+	// the effective-async rule (yaml.ResolvedModeFields) — a
+	// non-local executor is always async.
+	Executor string
+	// Resources is the decoded SLURM ask for an executor: slurm
+	// task (nil for local/inline or a zero ask). Handed to
+	// executor.Executor.Submit to build the #SBATCH header.
+	Resources *enjuYaml.Resources
 	// ResultDir is the pre-computed repo-relative path for
 	// this task's result files (e.g. enju/runs/3-gwas/align or
 	// enju/runs/3-gwas/align/sample=S1). The server computes
@@ -378,6 +388,22 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 		for _, e := range v {
 			if str, ok := e.(string); ok {
 				meta.Volumes = append(meta.Volumes, str)
+			}
+		}
+	}
+	if v, ok := raw["executor"].(string); ok {
+		meta.Executor = v
+	}
+	// resources arrives as a JSON object (toTaskResponse emits
+	// the typed *yaml.Resources). Re-marshal the raw element +
+	// decode through the struct, same pattern as writes_artifacts
+	// above. Zero ask collapses to nil so launch code can treat
+	// nil as "no SBATCH knobs, SLURM site defaults".
+	if v, ok := raw["resources"]; ok && v != nil {
+		if b, err := json.Marshal(v); err == nil {
+			var r enjuYaml.Resources
+			if err := json.Unmarshal(b, &r); err == nil && !r.IsZero() {
+				meta.Resources = &r
 			}
 		}
 	}

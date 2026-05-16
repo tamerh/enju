@@ -623,6 +623,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskExecutor(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskResources(t); err != nil {
+			return nil, false, err
+		}
 
 		if t.ResultType != "" && t.ResultType != "text" && t.ResultType != "json" && t.ResultType != "file" {
 			return nil, false, fmt.Errorf("task %q: invalid result_type %q", t.ID, t.ResultType)
@@ -808,13 +811,14 @@ func validateTaskVolumes(t *TaskDef) error {
 	return nil
 }
 
-// validateTaskExecutor enforces the reserved-field contract
-// on `executor:`. v1 accepts only "local" (or empty, which
-// defaults to local). Remote executors (SLURM, Kubernetes,
-// AWS Batch, GCP Batch) are rejected with a "not yet
-// supported" message pointing at the roadmap.
+// validateTaskExecutor enforces the executor enum. v1 accepts
+// "" / "local" (host fork — today's behavior) and "slurm"
+// (sbatch job). Kubernetes / AWS Batch / GCP Batch stay
+// roadmap and are still rejected with a pointer to it.
 //
-// Only valid on action: compute.
+// Only valid on action: compute. Resource-shape rules live in
+// validateTaskResources (called separately from the loop) so
+// the enum check and the slurm-ask check stay independent.
 func validateTaskExecutor(t *TaskDef) error {
 	if t.Executor == "" {
 		return nil
@@ -823,13 +827,49 @@ func validateTaskExecutor(t *TaskDef) error {
 		return fmt.Errorf("task %q: executor: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
 	}
 	switch t.Executor {
-	case "local":
+	case "local", "slurm":
 		return nil
 	default:
-		return fmt.Errorf("task %q: executor %q is not yet supported in v1 (only \"local\" is available). "+
-			"Remote executors (SLURM, Kubernetes, AWS Batch, GCP Batch) are planned post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
+		return fmt.Errorf("task %q: executor %q is not yet supported (only \"local\" and \"slurm\" are available). "+
+			"Kubernetes / AWS Batch / GCP Batch executors are planned post-launch — see WORKFLOW_GAPS.md § Executor abstraction.",
 			t.ID, t.Executor)
 	}
+}
+
+// validateTaskResources anchors resources: to its purpose:
+// it only means anything for executor: slurm. A resources
+// block on a local / inline / non-compute task is dead config
+// — almost always an author mistake (left over from flipping
+// executor, or typed in advance) — so surface it at parse
+// time, mirroring the container_runtime-without-container and
+// volumes-without-container guards.
+//
+// The field values themselves are NOT grammar-checked: SLURM
+// arbitrates partition / time / mem syntax at submit time (same
+// stance as container: — we don't re-implement the runtime's
+// vocabulary). Only nonsensical numerics (negative cpus/gpus)
+// are rejected here, since those can't be an intentional ask.
+func validateTaskResources(t *TaskDef) error {
+	if t.Resources.IsZero() {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: resources: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	if t.Executor != "slurm" {
+		ex := t.Executor
+		if ex == "" {
+			ex = "local"
+		}
+		return fmt.Errorf("task %q: resources: is set but executor is %q — resource asks only apply to executor: slurm (a host fork takes whatever the host has)", t.ID, ex)
+	}
+	if t.Resources.CPUs < 0 {
+		return fmt.Errorf("task %q: resources.cpus %d is negative", t.ID, t.Resources.CPUs)
+	}
+	if t.Resources.GPUs < 0 {
+		return fmt.Errorf("task %q: resources.gpus %d is negative", t.ID, t.Resources.GPUs)
+	}
+	return nil
 }
 
 // ResolvedMode returns the mode a compute task should run in,
@@ -838,17 +878,26 @@ func validateTaskExecutor(t *TaskDef) error {
 // scheduler, the MCP execute handler) should scope the check
 // to compute tasks first.
 func ResolvedMode(t *TaskDef) string {
-	return ResolvedModeFields(t.Action, t.Mode)
+	return ResolvedModeFields(t.Action, t.Mode, t.Executor)
 }
 
 // ResolvedModeFields is the field-level variant of ResolvedMode.
 // Useful for sites like the MCP execute handler that have an
-// action + mode string pair from a task record (not a full
-// TaskDef struct) — avoids constructing a synthetic TaskDef
-// purely to call the defaulting logic.
-func ResolvedModeFields(action, mode string) string {
+// action + mode + executor triple from a task record (not a
+// full TaskDef struct) — avoids constructing a synthetic
+// TaskDef purely to call the defaulting logic.
+//
+// Effective-async rule (the single source of truth): a compute
+// task is async iff mode == "async" OR it has a non-local
+// executor. A queued/remote job (slurm, …) can never be
+// synchronous — the execute_task call can't block on the SLURM
+// queue — so the executor forces async regardless of mode:.
+func ResolvedModeFields(action, mode, executor string) string {
 	if action != "compute" {
 		return ""
+	}
+	if mode == "async" || (executor != "" && executor != "local") {
+		return "async"
 	}
 	if mode == "" {
 		return "sync"

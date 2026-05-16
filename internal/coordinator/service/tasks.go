@@ -78,6 +78,8 @@ type TaskResponse struct {
 	Container                string                 `json:"container,omitempty"`
 	ContainerRuntime         string                 `json:"container_runtime,omitempty"`
 	Volumes                  []string               `json:"volumes,omitempty"`
+	Executor                 string                 `json:"executor,omitempty"`
+	Resources                *enjuYaml.Resources    `json:"resources,omitempty"`
 	VoteSubmissions          []VoteSubmissionRef    `json:"vote_submissions,omitempty"`
 	ActiveClaimants          []string               `json:"active_claimants,omitempty"`
 	IterationBranches        map[string]string      `json:"iteration_branches,omitempty"`
@@ -167,6 +169,27 @@ func UnmarshalWriteArtifacts(s string) enjuYaml.WriteArtifacts {
 		return nil
 	}
 	return w
+}
+
+// UnmarshalResources decodes the JSON-encoded SLURM ask stored
+// in tasks.resources (marshalResources in engine/materialize.go
+// is the inverse). Returns nil for the empty/clean-default case
+// and for a corrupt row (a bad resources blob shouldn't fail a
+// task lookup) — callers treat nil as "no ask, SLURM defaults".
+// A zero-but-present struct also collapses to nil so the wire
+// stays terse.
+func UnmarshalResources(s string) *enjuYaml.Resources {
+	if s == "" {
+		return nil
+	}
+	var r enjuYaml.Resources
+	if err := json.Unmarshal([]byte(s), &r); err != nil {
+		return nil
+	}
+	if r.IsZero() {
+		return nil
+	}
+	return &r
 }
 
 // UnmarshalStringMapField decodes the JSON-encoded env: map
@@ -322,6 +345,8 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		Container:         t.Container,
 		ContainerRuntime:  t.ContainerRuntime,
 		Volumes:           UnmarshalStringSlice(t.Volumes),
+		Executor:          t.Executor,
+		Resources:         UnmarshalResources(t.Resources),
 	}
 
 	// Single-citizen task model attribution. Gate on state ==

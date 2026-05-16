@@ -321,14 +321,13 @@ tasks:
 	}
 }
 
-// TestParseExecutorRemoteRejected — future executors
-// (slurm, k8s, aws-batch, gcp-batch) get a "not yet
+// TestParseExecutorRemoteRejected — the still-roadmap
+// executors (k8s, aws-batch, gcp-batch) get a "not yet
 // supported" rejection that names the value and points at
-// the roadmap. Post-launch when the SLURM executor ships,
-// existing templates with executor: slurm just start
-// working — no migration needed.
+// the roadmap. slurm is NO LONGER here: it ships in this
+// change and has its own positive test below.
 func TestParseExecutorRemoteRejected(t *testing.T) {
-	for _, exec := range []string{"slurm", "k8s", "kubernetes", "aws-batch", "gcp-batch"} {
+	for _, exec := range []string{"k8s", "kubernetes", "aws-batch", "gcp-batch"} {
 		yaml := `
 name: "executor unsupported"
 version: 1
@@ -350,6 +349,43 @@ tasks:
 		if !strings.Contains(err.Error(), exec) {
 			t.Errorf("executor=%q: error should name the value, got: %v", exec, err)
 		}
+	}
+}
+
+// TestParseExecutorSlurmAccepted — slurm now parses (the
+// executor-abstraction change). resources: is optional;
+// when present its shape is validated separately.
+func TestParseExecutorSlurmAccepted(t *testing.T) {
+	yaml := `
+name: "executor slurm"
+version: 1
+tasks:
+  - id: run
+    action: compute
+    script: scripts/run.sh
+    executor: slurm
+    resources:
+      partition: gpu
+      time: "02:00:00"
+      cpus: 8
+      mem: 32G
+      gpus: 1
+      sbatch_extra:
+        - "--account=lab123"
+    prompt: "Run"
+`
+	parsed, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("unexpected parse failure: %v", err)
+	}
+	tk := parsed.Run.Tasks[0]
+	if tk.Executor != "slurm" {
+		t.Errorf("executor not preserved: got %q", tk.Executor)
+	}
+	if tk.Resources.Partition != "gpu" || tk.Resources.CPUs != 8 ||
+		tk.Resources.Mem != "32G" || tk.Resources.GPUs != 1 ||
+		len(tk.Resources.SbatchExtra) != 1 {
+		t.Errorf("resources not parsed as expected: %+v", tk.Resources)
 	}
 }
 
@@ -413,5 +449,165 @@ tasks:
 	}
 	if count != 2 {
 		t.Fatalf("expected 2 analyze instances, got %d", count)
+	}
+}
+
+// TestValidateTaskResourcesRejections pins all four guard
+// branches of validateTaskResources. The guard's whole point is
+// catching the author who flips executor: slurm→local (or off)
+// and leaves a resources: block, or types a nonsensical knob —
+// so every rejection path gets a case, not just the happy path.
+//
+// Note the reachability subtlety: validateTaskExecutor runs
+// before validateTaskResources in the loop, so the "resources
+// on a non-compute task" branch is only reachable when NO
+// executor is set (executor: slurm on a non-compute task is
+// rejected earlier by validateTaskExecutor). The cases below
+// are constructed to actually exercise each branch.
+func TestValidateTaskResourcesRejections(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "resources with executor local",
+			body: `
+name: r
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: s.sh
+    executor: local
+    resources: { partition: gpu }
+    prompt: x
+`,
+			want: "resources: is set but executor is",
+		},
+		{
+			name: "resources with no executor (defaults local)",
+			body: `
+name: r
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: s.sh
+    resources: { cpus: 4 }
+    prompt: x
+`,
+			want: "resources: is set but executor is",
+		},
+		{
+			name: "resources on non-compute task",
+			body: `
+name: r
+version: 1
+tasks:
+  - id: t
+    action: answer
+    resources: { partition: gpu }
+    prompt: x
+`,
+			want: "resources: is only valid on action: compute",
+		},
+		{
+			name: "negative cpus",
+			body: `
+name: r
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: s.sh
+    executor: slurm
+    resources: { cpus: -1 }
+    prompt: x
+`,
+			want: "resources.cpus -1 is negative",
+		},
+		{
+			name: "negative gpus",
+			body: `
+name: r
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: s.sh
+    executor: slurm
+    resources: { gpus: -2 }
+    prompt: x
+`,
+			want: "resources.gpus -2 is negative",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Parse([]byte(c.body))
+			if err == nil {
+				t.Fatalf("expected parse error, got nil")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error should contain %q, got: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// TestParseWithParamsResolvesResources closes the
+// substituteResourcesInPlace coverage gap: parameterizing the
+// string SLURM knobs + sbatch_extra is a documented author
+// feature (sibling of volumes/writes_artifacts substitution).
+func TestParseWithParamsResolvesResources(t *testing.T) {
+	yaml := []byte(`
+name: "resources param resolution"
+version: 1
+params:
+  - name: part
+    type: string
+    required: true
+    description: "SLURM partition"
+  - name: acct
+    type: string
+    required: true
+    description: "billing account"
+tasks:
+  - id: align
+    action: compute
+    script: scripts/align.sh
+    executor: slurm
+    resources:
+      partition: "{{part}}"
+      time: "01:00:00"
+      mem: "16G"
+      sbatch_extra:
+        - "--account={{acct}}"
+        - "--constraint=a100"
+    prompt: "Run"
+`)
+	parsed, err := ParseWithParams(yaml, map[string]interface{}{
+		"part": "gpu-a100",
+		"acct": "lab-42",
+	})
+	if err != nil {
+		t.Fatalf("ParseWithParams failed: %v", err)
+	}
+	r := parsed.Run.Tasks[0].Resources
+	if r.Partition != "gpu-a100" {
+		t.Errorf("partition: got %q, want gpu-a100", r.Partition)
+	}
+	if len(r.SbatchExtra) != 2 || r.SbatchExtra[0] != "--account=lab-42" {
+		t.Errorf("sbatch_extra not resolved: %v", r.SbatchExtra)
+	}
+	// Non-param fields untouched; no stray {{ }} anywhere.
+	if r.Time != "01:00:00" || r.Mem != "16G" {
+		t.Errorf("non-param knobs altered: %+v", r)
+	}
+	for _, s := range append([]string{r.Partition, r.Time, r.Mem}, r.SbatchExtra...) {
+		if strings.Contains(s, "{{") {
+			t.Errorf("unresolved param ref left in %q", s)
+		}
 	}
 }

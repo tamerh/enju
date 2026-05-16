@@ -32,6 +32,7 @@ import (
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/executor"
 )
 
 // StateDir returns the directory used for per-project cursor
@@ -191,6 +192,124 @@ func (s *FatClient) ReapWrapperFailuresWF(ctx context.Context, wf *enjugit.Workf
 		s.handleOneWrapperResult(ctx, path, wf)
 		return nil
 	})
+	// Same sweep, second pass: SLURM jobs whose .wrap-job.json
+	// exists but whose .wrap-result.json doesn't yet — the walk
+	// above can't see a still-queued job. Pull-based, no daemon.
+	s.reapSlurmSidecars(ctx, wf)
+}
+
+// reapSlurmSidecars polls sacct for every outstanding SLURM
+// job sidecar and drives terminal ones to /result or /fail.
+// Local sidecars are skipped here — the .wrap-result.json walk
+// already reaps them; the local sidecar exists only so
+// enju_terminate_run can Cancel an in-flight PID.
+//
+// Discovery keys off .wrap-job.json because a queued job has no
+// .wrap-result.json yet. For each, gated by the
+// .wrap-result.done.json marker handleOneWrapperResult writes:
+//
+//   - queued / running        → skip, next sweep retries
+//   - terminal, result on disk → handleOneWrapperResult (does the
+//     host-side commit for the deferred result, posts, renames)
+//   - terminal, NO result      → the node died before writing one:
+//     /fail kind=compute_error with the SLURM state as the reason,
+//     so it parks failed_retryable and composes with
+//     enju_retry_task (from=snapshot for a transient infra state)
+//
+// On any terminal outcome the sidecar is renamed
+// .wrap-job.done.json so the next sweep doesn't re-poll sacct.
+func (s *FatClient) reapSlurmSidecars(ctx context.Context, wf *enjugit.Workflow) {
+	if wf == nil {
+		return
+	}
+	root := filepath.Join(wf.WorkDir(), corelayout.RunStateRunsRoot())
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != executor.JobSidecarName {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		donePath := strings.TrimSuffix(path, ".json") + ".done.json"
+
+		h, herr := executor.ReadJobSidecar(path)
+		if herr != nil || h.Executor != executor.KindSlurm {
+			return nil // local sidecar (or unreadable) — not ours to poll
+		}
+
+		// Spec §5 gate: ".wrap-job.json without an adjacent
+		// .wrap-result.done.json". The .wrap-result.json walk
+		// (first pass of this same sweep) renames the result to
+		// .done after it commits + posts; if that already
+		// happened, the job is fully reaped — just retire the
+		// sidecar so we stop polling sacct. Without this check
+		// the pass below would find no .wrap-result.json and
+		// spuriously /fail an already-accepted task.
+		if _, doneErr := os.Stat(filepath.Join(dir, ".wrap-result.done.json")); doneErr == nil {
+			_ = os.Rename(path, donePath)
+			return nil
+		}
+
+		slurm, perr := s.pickExecutor(h.Executor)
+		if perr != nil {
+			return nil
+		}
+		st, perr := slurm.Poll(ctx, h)
+		if perr != nil {
+			// sacct itself failed (not on a submit host, slurmdbd
+			// down). Poll already returned StateRunning; just wait
+			// for the next sweep rather than mis-failing the task.
+			return nil
+		}
+		switch st.State {
+		case executor.StateQueued, executor.StateRunning:
+			return nil // still going
+		}
+
+		// Terminal. Prefer the result the node wrote to the shared
+		// FS — handleOneWrapperResult performs the host-side commit
+		// and posts /result|/fail exactly as for local async.
+		resultPath := filepath.Join(dir, ".wrap-result.json")
+		if _, statErr := os.Stat(resultPath); statErr == nil {
+			s.handleOneWrapperResult(ctx, resultPath, wf)
+			_ = os.Rename(path, donePath)
+			return nil
+		}
+
+		// No result: the job ended (lost / crashed / OOM / timeout)
+		// without producing one. Name the task from the spec and
+		// fail it through the standard recoverable contract.
+		taskID := ""
+		if sb, serr := os.ReadFile(filepath.Join(dir, ".wrap-spec.json")); serr == nil {
+			var sp compute.Spec
+			if json.Unmarshal(sb, &sp) == nil {
+				taskID = sp.TaskID
+			}
+		}
+		if taskID == "" {
+			// Can't name the task — leave the sidecar for a human
+			// to inspect rather than renaming it away silently.
+			return nil
+		}
+		why := st.Reason
+		if why == "" {
+			why = "no result produced"
+		}
+		_, postErr := s.coord.Post(ctx, fmt.Sprintf("/api/v1/tasks/%s/fail", taskID), map[string]string{
+			"reason": fmt.Sprintf("slurm job %s ended (%s) with no result on the shared filesystem", h.JobID, why),
+			"kind":   "compute_error",
+		})
+		if postErr != nil && !strings.Contains(postErr.Error(), "terminal") {
+			s.logger.Debug("reap slurm fail post", "task_id", taskID, "job", h.JobID, "error", postErr)
+			return nil // network blip — retry next sweep
+		}
+		_ = os.Rename(path, donePath)
+		return nil
+	})
 }
 
 // ReconcileRunBranch is the read-only reconcile path used by
@@ -313,6 +432,43 @@ func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath strin
 			_ = os.Rename(resultPath, strings.TrimSuffix(resultPath, ".json")+".done.json")
 			return
 		}
+
+		// Produce-vs-commit split (executor: slurm). The compute
+		// node ran the script and captured the would-be commit but
+		// did NOT touch git. Replay it host-side now — same
+		// DeferredCommit through the same SubmitComputeTaskResult,
+		// so the commit is byte-identical to the local inline path.
+		// On git failure, route through the same compute_error /
+		// failed_retryable contract (no new failure UX): the work
+		// product is intact on the shared FS, the operator fixes +
+		// enju_retry_task. We rename .done rather than leaving the
+		// result for the next sweep because SubmitComputeTaskResult
+		// already exhausted its own internal commit/rebase retry —
+		// retrying the bare CommitDeferred here wouldn't add a new
+		// attempt. The likeliest real cause is NOT a permanent
+		// error but a transient run-branch push race; the cost of
+		// that is a full SLURM re-run via enju_retry_task
+		// from=snapshot (the code was fine — only the host-side
+		// push lost). Accepted for v1: rare, and the alternative
+		// (an un-bounded reaper retry loop on a genuinely broken
+		// remote) is worse. Revisit if push races show up in
+		// practice — a bounded host-side re-commit before failing
+		// is the natural follow-up.
+		if res.CommitSHA == "" && res.DeferredCommit != nil {
+			submitRes, cerr := compute.CommitDeferred(wf, *res.DeferredCommit)
+			if cerr != nil {
+				s.logger.Error("host-side deferred commit failed",
+					"task_id", spec.TaskID, "error", cerr)
+				_, _ = s.coord.Post(ctx, fmt.Sprintf("/api/v1/tasks/%s/fail", spec.TaskID), map[string]string{
+					"reason": fmt.Sprintf("host-side commit failed for slurm job result: %v", cerr),
+					"kind":   "compute_error",
+				})
+				_ = os.Rename(resultPath, strings.TrimSuffix(resultPath, ".json")+".done.json")
+				return
+			}
+			res.CommitSHA = submitRes.CommitSHA
+		}
+
 		reportBody := map[string]interface{}{
 			"commit_sha":  res.CommitSHA,
 			"result_path": spec.ResultDir,

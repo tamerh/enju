@@ -565,6 +565,8 @@ func (e *Engine) ComputeMaterialization(
 			Container:        ti.Container,
 			ContainerRuntime: ti.ContainerRuntime,
 			Volumes:          marshalStringSlice(ti.Volumes),
+			Executor:         ti.Executor,
+			Resources:        marshalResources(ti.Resources),
 			OnReviewReject:         ti.OnReviewReject,
 			OnReviewRequestChanges: ti.OnReviewRequestChanges,
 			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
@@ -887,6 +889,8 @@ func (e *Engine) ComputeMaterialization(
 			Container:        ti.Container,
 			ContainerRuntime: ti.ContainerRuntime,
 			Volumes:          marshalStringSlice(ti.Volumes),
+			Executor:         ti.Executor,
+			Resources:        marshalResources(ti.Resources),
 			OnReviewReject:         ti.OnReviewReject,
 			OnReviewRequestChanges: ti.OnReviewRequestChanges,
 			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
@@ -1076,6 +1080,22 @@ func marshalRemediationTemplate(t *enjuYaml.RemediationTemplate) string {
 		return ""
 	}
 	data, err := json.Marshal(t)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// marshalResources JSON-encodes the SLURM ask so it round-trips
+// through the tasks.resources TEXT column. Zero value → "" so
+// the DB default stays clean and "no resource ask" is
+// unambiguous (UnmarshalResources in service/tasks.go is the
+// inverse). Same shape as marshalRemediationTemplate.
+func marshalResources(r enjuYaml.Resources) string {
+	if r.IsZero() {
+		return ""
+	}
+	data, err := json.Marshal(r)
 	if err != nil {
 		return ""
 	}

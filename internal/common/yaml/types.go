@@ -684,17 +684,34 @@ type TaskDef struct {
 	// action: compute. See docs/containers.md.
 	Volumes []string `yaml:"volumes,omitempty"`
 
-	// Executor is the forward-compat seam for remote
-	// execution (SLURM / K8s / AWS Batch / GCP Batch). v1
-	// accepts only "local" (and empty, which defaults to
-	// local). Future values are rejected at parse time; when
-	// the executor abstraction ships post-launch, existing
-	// templates with executor: slurm just start working
-	// without any migration.
+	// Executor selects WHERE a compute task's wrapper process
+	// runs. "" / "local" → a detached process on this host
+	// (today's behavior, unchanged). "slurm" → an sbatch job on
+	// the cluster this fat-client submits to. K8s / AWS Batch /
+	// GCP Batch remain roadmap and are still rejected at parse
+	// time (validateTaskExecutor).
 	//
-	// Only valid on action: compute. See WORKFLOW_GAPS.md §
-	// Executor abstraction for the roadmap.
+	// executor: slurm implies async semantics — a queued job is
+	// never synchronous (see ResolvedModeFields). The executor
+	// only changes the launch; snapshot, env, scratch, the
+	// wrapper, the result/reaper machinery are byte-identical.
+	//
+	// Only valid on action: compute. Rides the run snapshot
+	// like every other task field (reproducible; later edits
+	// don't touch in-flight runs).
 	Executor string `yaml:"executor,omitempty"`
+
+	// Resources declares the SLURM ask for an executor: slurm
+	// task. Ignored for local/inline execution (a host fork
+	// takes whatever the host has). Five modeled knobs cover
+	// the common case; SbatchExtra is the raw passthrough
+	// escape hatch for everything else — we model the common
+	// case, not all of SLURM. Param refs are resolved at
+	// run-create time like every other field.
+	//
+	// Only meaningful with executor: slurm; validateTaskResources
+	// checks its shape when that executor is selected.
+	Resources Resources `yaml:"resources,omitempty"`
 
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
@@ -879,6 +896,36 @@ type TaskDef struct {
 // engine fills in id, depends_on, and reviewer-feedback
 // substitution at spawn time.
 //
+// Resources is the SLURM ask for an executor: slurm compute
+// task. Deliberately five modeled knobs + a raw escape hatch —
+// model the common case, not all of SLURM. Empty/zero fields
+// are omitted from the generated #SBATCH header (SLURM applies
+// its partition/site defaults). SbatchExtra lines are spliced
+// verbatim, so anything the five knobs don't cover
+// (--account, --constraint, --qos, …) still works.
+//
+// Carried on TaskDef.Resources, JSON-marshaled through the
+// tasks.resources column like Env, surfaced on TaskMeta, and
+// handed to executor.Executor.Submit. Ignored unless the task's
+// effective executor is slurm.
+type Resources struct {
+	Partition   string   `yaml:"partition,omitempty" json:"partition,omitempty"`
+	Time        string   `yaml:"time,omitempty" json:"time,omitempty"` // HH:MM:SS
+	CPUs        int      `yaml:"cpus,omitempty" json:"cpus,omitempty"`
+	Mem         string   `yaml:"mem,omitempty" json:"mem,omitempty"` // e.g. "32G"
+	GPUs        int      `yaml:"gpus,omitempty" json:"gpus,omitempty"`
+	SbatchExtra []string `yaml:"sbatch_extra,omitempty" json:"sbatch_extra,omitempty"`
+}
+
+// IsZero reports whether no resource knob was set. Used by the
+// validator (slurm wants at least a partition or time in
+// practice, but we don't force it — SLURM has site defaults)
+// and by the SBATCH-header generator to stay terse.
+func (r Resources) IsZero() bool {
+	return r.Partition == "" && r.Time == "" && r.CPUs == 0 &&
+		r.Mem == "" && r.GPUs == 0 && len(r.SbatchExtra) == 0
+}
+
 // Stored as JSON in tasks.remediation_template — kept inline
 // (not as a reference to a separate template file) so the rule
 // is self-contained and the run YAML stays readable.

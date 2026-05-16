@@ -323,6 +323,17 @@ type Spec struct {
 	// env slice already carries the same values, and the host
 	// process inherits its own env naturally.
 	Env map[string]string `json:"env,omitempty"`
+
+	// DeferCommit splits "produce the result" from "commit the
+	// result". When false (local / inline — today's behavior)
+	// Run commits inline on the host that ran the script. When
+	// true (executor: slurm — the compute node must not touch
+	// git/credentials/network) Run produces the result, captures
+	// the exact would-be commit into Result.DeferredCommit, and
+	// returns with CommitSHA="" WITHOUT calling git. The
+	// host-side reaper replays Result.DeferredCommit verbatim, so
+	// the resulting commit is byte-identical to the local path.
+	DeferCommit bool `json:"defer_commit,omitempty"`
 }
 
 // Result is the wrapper→handler contract. Returned as JSON via the
@@ -381,6 +392,57 @@ type Result struct {
 	// failed:" the new handler still classifies correctly via
 	// fallback heuristic in execute_compute.go.
 	GitError string `json:"git_error,omitempty"`
+
+	// DeferredCommit is set only on the produce-vs-commit split
+	// path (spec.DeferCommit, i.e. executor: slurm): the exact
+	// commit Run assembled but did NOT apply, because the compute
+	// node must not touch git. CommitSHA is "" in this case. The
+	// host-side reaper calls CommitDeferred(wf, *DeferredCommit)
+	// to apply it and obtain the real SHA, then posts /result —
+	// the resulting commit is byte-identical to the inline path
+	// (same SubmitRequest, just applied on a git-capable host).
+	// nil on every non-deferred result.
+	DeferredCommit *DeferredCommit `json:"deferred_commit,omitempty"`
+}
+
+// DeferredCommit is the serialized SubmitComputeTaskResult call
+// Run would have made inline. It rides inside .wrap-result.json
+// (Result.DeferredCommit) so the reaper can replay the identical
+// commit host-side for executor: slurm tasks. enjugit.FileWrite
+// JSON-encodes cleanly (RepoRelPath string + Content []byte →
+// base64); Files only ever holds the small result/metadata/
+// script.log/context.json blobs plus TRACKED artifact contents
+// (untracked/bigfiles are stat-only, never in Files), so the
+// payload stays bounded.
+type DeferredCommit struct {
+	TaskID          string              `json:"task_id"`
+	IterationBranch string              `json:"iteration_branch"`
+	RunBranch       string              `json:"run_branch"`
+	Files           []enjugit.FileWrite `json:"files"`
+	ArtifactPaths   []string            `json:"artifact_paths,omitempty"`
+	AuthorName      string              `json:"author_name"`
+	AuthorEmail     string              `json:"author_email"`
+	Model           string              `json:"model,omitempty"`
+	CustomTrailers  map[string]string   `json:"custom_trailers,omitempty"`
+}
+
+// CommitDeferred applies a DeferredCommit via the same
+// no-checkout plumbing path Run uses inline. Called by the
+// reaper host-side once a deferred (slurm) job is observed
+// terminal-success. Single source of truth for "turn a
+// DeferredCommit into a commit", so the local and deferred
+// paths can never drift.
+func CommitDeferred(wf *enjugit.Workflow, dc DeferredCommit) (*enjugit.SubmitResult, error) {
+	return wf.SubmitComputeTaskResult(enjugit.SubmitRequest{
+		TaskID:         dc.TaskID,
+		BranchOverride: dc.IterationBranch,
+		RunBranch:      dc.RunBranch,
+		Files:          dc.Files,
+		ArtifactPaths:  dc.ArtifactPaths,
+		Citizen:        enjugit.Identity{Name: dc.AuthorName, Email: dc.AuthorEmail},
+		ModelName:      dc.Model,
+		CustomTrailers: dc.CustomTrailers,
+	})
 }
 
 // Run executes a compute task's script per the given Spec and, on
@@ -895,21 +957,49 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// LLM/bot tasks keep using SubmitTaskResult (porcelain) —
 	// they run in their own per-bot clone and need the worktree
 	// flow for tools that exec git commands inside the script.
-	submitRes, err := wf.SubmitComputeTaskResult(enjugit.SubmitRequest{
-		TaskID:         spec.TaskID,
-		BranchOverride: spec.IterationBranch,
-		RunBranch:      spec.Branch,
-		Files:          files,
-		// ArtifactPaths feeds the commit message + Enju-Artifacts
-		// trailer — these describe what's *in* this commit, so only
-		// tracked artifacts belong. Untracked paths go via
-		// CustomTrailers["Enju-Untracked-Artifacts"] so the async
-		// reconcile path can see them too.
-		ArtifactPaths:  committedPaths,
-		Citizen:        enjugit.Identity{Name: spec.AuthorName, Email: spec.AuthorEmail},
-		ModelName:      spec.Model,
-		CustomTrailers: customTrailers,
-	})
+	// The commit Run would apply inline. ArtifactPaths feeds the
+	// commit message + Enju-Artifacts trailer — these describe
+	// what's *in* this commit, so only tracked artifacts belong;
+	// untracked paths ride CustomTrailers["Enju-Untracked-
+	// Artifacts"] so the async reconcile path sees them too.
+	dc := DeferredCommit{
+		TaskID:          spec.TaskID,
+		IterationBranch: spec.IterationBranch,
+		RunBranch:       spec.Branch,
+		Files:           files,
+		ArtifactPaths:   committedPaths,
+		AuthorName:      spec.AuthorName,
+		AuthorEmail:     spec.AuthorEmail,
+		Model:           spec.Model,
+		CustomTrailers:  customTrailers,
+	}
+
+	// Produce-vs-commit split. executor: slurm sets DeferCommit:
+	// the compute node must not touch git / credentials / the
+	// network, so capture the exact commit and return with
+	// CommitSHA="". WrapMain serializes res (incl. DeferredCommit)
+	// into .wrap-result.json; the host-side reaper replays it via
+	// CommitDeferred — byte-identical to the inline path below
+	// because it's the SAME DeferredCommit through the SAME
+	// SubmitComputeTaskResult call.
+	if spec.DeferCommit {
+		res.DeferredCommit = &dc
+		return res
+	}
+
+	// Compute submits via the no-checkout plumbing path: each
+	// parallel goroutine builds a commit on its OWN topic branch
+	// (spec.IterationBranch) without touching HEAD/.git/index/
+	// working-tree, then pushes that topic branch. Coord's
+	// existing acceptedMergeForTask + fat-client applyAcceptedMerges
+	// handles the integration: on accept, the topic branch is
+	// FF-merged into spec.Branch (the run branch), same flow LLM
+	// tasks already use.
+	//
+	// LLM/bot tasks keep using SubmitTaskResult (porcelain) —
+	// they run in their own per-bot clone and need the worktree
+	// flow for tools that exec git commands inside the script.
+	submitRes, err := CommitDeferred(wf, dc)
 	if err != nil {
 		// Script ran fine; the failure is at the git layer
 		// (commit retry exhausted, push rejected, rebase

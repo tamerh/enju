@@ -264,6 +264,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		substituteStringSliceInPlace(t.AssignTo, strMap)
 		substituteStringSliceInPlace(t.ReadsArtifacts, strMap)
 		substituteStringSliceInPlace(t.Volumes, strMap)
+		substituteResourcesInPlace(&t.Resources, strMap)
 		substituteWriteArtifactsInPlace(t.WritesArtifacts, strMap)
 		for k, v := range t.Env {
 			t.Env[k] = template.ResolveParams(v, strMap)
@@ -516,6 +517,24 @@ func substituteWriteArtifactsInPlace(ws WriteArtifacts, strMap map[string]string
 	for i := range ws {
 		ws[i].Path = template.ResolveParams(ws[i].Path, strMap)
 	}
+}
+
+// substituteResourcesInPlace runs {{param}} substitution across
+// the string-valued SLURM knobs (partition / time / mem) and
+// every sbatch_extra line, so authors can parameterize e.g.
+// `partition: "{{slurm_partition}}"` or
+// `sbatch_extra: ["--account={{lab_account}}"]`. CPUs / GPUs
+// are ints — never param refs — so they're untouched. Mirrors
+// substituteWriteArtifactsInPlace; pointer receiver because
+// Resources is a value field on TaskDef, not a slice.
+func substituteResourcesInPlace(r *Resources, strMap map[string]string) {
+	if r == nil {
+		return
+	}
+	r.Partition = template.ResolveParams(r.Partition, strMap)
+	r.Time = template.ResolveParams(r.Time, strMap)
+	r.Mem = template.ResolveParams(r.Mem, strMap)
+	substituteStringSliceInPlace(r.SbatchExtra, strMap)
 }
 
 // ResolveWriteArtifacts returns a new WriteArtifacts slice with

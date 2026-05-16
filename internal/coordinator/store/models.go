@@ -435,6 +435,20 @@ type TaskRecord struct {
 	// the fat-client executor doesn't re-parse the snapshot.
 	Volumes string
 
+	// Executor selects where a compute task's wrapper runs:
+	// "" / "local" (host fork) or "slurm" (sbatch job). Copied
+	// from the YAML TaskDef.Executor at create_run time, surfaced
+	// on the wire so the fat-client picks the right launcher and
+	// the effective-async rule (yaml.ResolvedModeFields) sees it.
+	Executor string
+
+	// Resources is the JSON-encoded yaml.Resources SLURM ask
+	// (partition/time/cpus/mem/gpus/sbatch_extra). Empty string
+	// for non-slurm tasks or a zero ask. Copied from the YAML
+	// TaskDef.Resources at create_run time; the fat-client
+	// decodes it and hands it to executor.Executor.Submit.
+	Resources string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

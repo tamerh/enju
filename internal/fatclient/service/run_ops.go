@@ -13,13 +13,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
 	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/fatclient/compute"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
+	"github.com/enju-ai/enju/internal/fatclient/executor"
 )
 
 // EnsureRunBranch materializes the run branch in the local
@@ -609,7 +612,78 @@ func (s *FatClient) TerminateRun(ctx context.Context, projectID int64, runSeq in
 	if reason != "" {
 		body["reason"] = reason
 	}
-	return s.runStateAction(ctx, projectID, runSeq, "terminate", body)
+	if err := s.runStateAction(ctx, projectID, runSeq, "terminate", body); err != nil {
+		return err
+	}
+	// Coord state is now authoritative (cascade-skipped tasks,
+	// abandoned claims). Stop any wrapper the coord can't reach:
+	// pre-seam an in-flight async compute job had no persisted
+	// handle, so terminate only cascaded DB state and the local
+	// process / SLURM job kept burning. Best-effort — a failed
+	// cancel must not fail the terminate the operator asked for.
+	s.CancelRunWrappers(ctx, projectID, runSeq)
+	return nil
+}
+
+// CancelRunWrappers stops every still-outstanding wrapper of one
+// run: it walks that run's .wrap-job.json sidecars, dispatches
+// each to its executor's Cancel (kill the local PID / scancel
+// the SLURM job), and renames the sidecar .done so the reaper
+// won't keep polling a job we deliberately killed. Scoped to
+// runSeq via the spec's task id ({proj}:{runSeq}:{taskdef}), so
+// terminating one run never touches a sibling run's jobs.
+//
+// Best-effort and idempotent: Cancel on an already-finished
+// process/job is a harmless no-op, and a missing workspace /
+// unreadable sidecar is skipped rather than surfaced — the
+// coordinator cascade already happened; this is local cleanup.
+func (s *FatClient) CancelRunWrappers(ctx context.Context, projectID int64, runSeq int) {
+	if s.enjugit == nil {
+		return
+	}
+	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
+	if err != nil || wf == nil {
+		return
+	}
+	root := filepath.Join(wf.WorkDir(), corelayout.RunStateRunsRoot())
+	if _, statErr := os.Stat(root); os.IsNotExist(statErr) {
+		return
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != executor.JobSidecarName {
+			return nil
+		}
+		h, herr := executor.ReadJobSidecar(path)
+		if herr != nil {
+			return nil
+		}
+		// Scope to this run. The task id in the sibling spec is
+		// authoritative (slug-independent): {proj}:{runSeq}:{def}.
+		sb, serr := os.ReadFile(filepath.Join(filepath.Dir(path), ".wrap-spec.json"))
+		if serr != nil {
+			return nil
+		}
+		var sp compute.Spec
+		if json.Unmarshal(sb, &sp) != nil {
+			return nil
+		}
+		parts := strings.Split(sp.TaskID, ":")
+		if len(parts) < 3 || parts[1] != fmt.Sprintf("%d", runSeq) {
+			return nil
+		}
+		impl, perr := s.pickExecutor(h.Executor)
+		if perr != nil {
+			return nil
+		}
+		if cerr := impl.Cancel(ctx, h); cerr != nil {
+			s.logger.Debug("cancel run wrapper", "task_id", sp.TaskID, "executor", h.Executor, "error", cerr)
+		}
+		_ = os.Rename(path, strings.TrimSuffix(path, ".json")+".done.json")
+		return nil
+	})
 }
 
 // runStateAction is the common pattern for pause/resume/
