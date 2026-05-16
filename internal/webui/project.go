@@ -309,3 +309,40 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 	}
 	s.renderProjectPage(w, r, pid, msg, "")
 }
+
+// handleLeaveProject is POST /p/{projectID}/leave (mirror of
+// enju_leave_project). Destructive: removes the caller's
+// membership and wipes the local clone. `keep_membership`
+// (checkbox) wipes the clone only. A full leave makes the
+// project inaccessible to this user, so on success we redirect
+// to the landing page rather than re-render a project the
+// caller can no longer see; keep-membership stays on the page
+// with a notice. A sole-owner refusal (or any error) re-renders
+// the project with the error banner.
+func (s *Server) handleLeaveProject(w http.ResponseWriter, r *http.Request) {
+	pid, ok := s.projectIDOrBadRequest(w, r)
+	if !ok {
+		return
+	}
+	keep := r.FormValue("keep_membership") == "true" || r.FormValue("keep_membership") == "on"
+	summary, err := s.fc.LeaveProject(r.Context(), pid, keep)
+	if err != nil {
+		s.logger.Info("LeaveProject failed", "project_id", pid, "keep_membership", keep, "error", err)
+		s.renderProjectPage(w, r, pid, "", "leave project failed: "+err.Error())
+		return
+	}
+	if keep {
+		// Membership intact — the project is still viewable.
+		s.renderProjectPage(w, r, pid, "✓ "+summary, "")
+		return
+	}
+	// Membership gone: the project page would 4xx for this
+	// user now. Redirect to the landing list. Mirror the
+	// HX-Redirect / 303 pattern used by file-issue + create.
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", "/")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}

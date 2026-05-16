@@ -239,6 +239,15 @@ main {
   margin: 0;
 }
 
+.leave-keep {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+.leave-keep input { margin: 0; }
+
 /* Runs table */
 .run-table {
   width: 100%;

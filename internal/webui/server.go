@@ -98,6 +98,11 @@ type fatClient interface {
 	SetProjectDefaultBranch(ctx context.Context, projectID int64, branch string) (warning string, err error)
 	SetProjectRemote(ctx context.Context, projectID int64, remoteURL string) (warning string, err error)
 	RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error)
+	// LeaveProject removes the caller's own membership (unless
+	// keepMembership) and wipes the local clone (mirror of
+	// enju_leave_project). Refused by the coord when the caller
+	// is the sole owner — surfaces as err.
+	LeaveProject(ctx context.Context, projectID int64, keepMembership bool) (summary string, err error)
 
 	// Compute task execution — single + bulk
 	ExecuteComputeTask(ctx context.Context, taskID string) (*service.ExecuteOutcome, error)

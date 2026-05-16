@@ -190,6 +190,35 @@
     Changing these is owner-only.
   </p>
   {{end}}
+
+  {{/* Leave project — destructive, any member (not owner-gated;
+       the coord refuses only a sole owner). Disclosure +
+       confirm, same treatment as the run terminate-form.
+       keep_membership wipes just the local clone. */}}
+  <div class="btn-row" x-data="{leaving: false}">
+    <button type="button" class="btn" x-show="!leaving" @click="leaving = true">Leave project…</button>
+    <form x-show="leaving" x-cloak
+          method="POST" action="/p/{{.Project.ID}}/leave"
+          hx-post="/p/{{.Project.ID}}/leave" hx-target="#main"
+          class="terminate-form">
+      <h3 class="terminate-title">Leave project #{{.Project.ID}}?</h3>
+      <p class="terminate-warn">
+        <strong>This is destructive.</strong>
+        Your membership row is removed and your local clone is
+        wiped to reclaim disk. The remote repo is untouched —
+        other members keep their access. Refused if you are the
+        sole remaining owner (promote another member first).
+      </p>
+      <label class="leave-keep">
+        <input type="checkbox" name="keep_membership" value="true">
+        Keep my membership — only wipe the local clone
+      </label>
+      <div class="btn-row terminate-actions">
+        <button type="submit" class="btn btn-primary">Confirm leave</button>
+        <button type="button" class="btn" @click="leaving = false">Cancel</button>
+      </div>
+    </form>
+  </div>
 </section>
 
 <section>

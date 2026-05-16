@@ -77,3 +77,42 @@ func (s *FatClient) SetProjectMemberRole(ctx context.Context, projectID int64, u
 	// No structured `changed` field — coordinator applied it.
 	return true, nil
 }
+
+// LeaveProject removes the caller's own membership (unless
+// keepMembership) and wipes the local clone to reclaim disk
+// (mirror of enju_leave_project). The remote repo is untouched
+// — other members keep access. Membership is removed BEFORE the
+// clone wipe so a sole-owner refusal (the coord rejects removing
+// the last owner) bails out without orphaning the clone on top.
+// Returns a human summary; err is set only on a hard failure.
+func (s *FatClient) LeaveProject(ctx context.Context, projectID int64, keepMembership bool) (summary string, err error) {
+	if s.enjugit == nil {
+		return "", fmt.Errorf("leave project is only available with a local workspace")
+	}
+	var membershipMsg string
+	if !keepMembership {
+		me := s.Username()
+		if me == "" {
+			return "", fmt.Errorf("cannot determine current username to leave the project")
+		}
+		// Same coord endpoint as removing any member, targeted
+		// at self. A sole-owner refusal surfaces as the error
+		// here and we return before touching the clone.
+		if rmErr := s.RemoveProjectMember(ctx, projectID, me); rmErr != nil {
+			return "", rmErr
+		}
+		membershipMsg = "membership removed; "
+	}
+	hadClone, err := s.LocalLeaveProject(projectID)
+	if err != nil {
+		return "", err
+	}
+	cloneMsg := "local clone removed"
+	if !hadClone {
+		cloneMsg = "no local clone to remove"
+	}
+	if keepMembership {
+		return cloneMsg + " — membership kept", nil
+	}
+	return membershipMsg + cloneMsg, nil
+}

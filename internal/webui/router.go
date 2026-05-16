@@ -80,6 +80,7 @@ func (s *Server) router() http.Handler {
 	r.Post("/p/{projectID}/members/{username}/role", s.handleSetProjectMemberRole)
 	r.Post("/p/{projectID}/default-branch", s.handleSetProjectDefaultBranch)
 	r.Post("/p/{projectID}/remote", s.handleSetProjectRemote)
+	r.Post("/p/{projectID}/leave", s.handleLeaveProject)
 
 	// Static asset serving. The path prefix is stripped by
 	// chi.StripPrefix so /static/app.css maps to app.css inside

@@ -121,6 +121,10 @@ type fakeFC struct {
 	setRemoteErr         error
 	remoteStatus         map[string]interface{}
 	remoteStatusErr      error
+	leftProject          int64
+	leftKeepMembership   bool
+	leaveSummary         string
+	leaveErr             error
 
 	// Execute captures
 	executedTaskID  string
@@ -366,6 +370,11 @@ func (f *fakeFC) SetProjectRemote(ctx context.Context, id int64, remoteURL strin
 }
 func (f *fakeFC) RemoteStatusReport(ctx context.Context, id int64) (map[string]interface{}, error) {
 	return f.remoteStatus, f.remoteStatusErr
+}
+func (f *fakeFC) LeaveProject(ctx context.Context, id int64, keepMembership bool) (string, error) {
+	f.leftProject = id
+	f.leftKeepMembership = keepMembership
+	return f.leaveSummary, f.leaveErr
 }
 
 func newTestServer(t *testing.T, fc *fakeFC) *Server {
@@ -950,6 +959,120 @@ func TestProjectSettingsNonOwner(t *testing.T) {
 	}
 	if !strings.Contains(body, "Changing these is owner-only") {
 		t.Errorf("expected read-only settings summary; body: %q", body)
+	}
+}
+
+// TestProjectShowsLeaveButton: the leave control is available
+// to any member (not owner-gated).
+func TestProjectShowsLeaveButton(t *testing.T) {
+	fc := &fakeFC{
+		username: "bob",
+		projDetail: &service.ProjectDetail{
+			Project: wire.Project{ID: 1, Name: "p", DefaultBranch: "main"},
+			Members: []wire.Member{
+				{Username: "tamer", Role: "owner"},
+				{Username: "bob", Role: "member"},
+			},
+		},
+	}
+	s := newTestServer(t, fc)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	if !strings.Contains(rr.Body.String(), `action="/p/1/leave"`) {
+		t.Errorf("expected leave form for a plain member")
+	}
+}
+
+// TestLeaveProjectFull: a full leave (membership removed)
+// redirects away — the project is no longer viewable for this
+// user. HX-Request → HX-Redirect header; plain → 303.
+func TestLeaveProjectFull(t *testing.T) {
+	fc := &fakeFC{
+		username:     "tamer",
+		projDetail:   ownerProjDetail(),
+		leaveSummary: "membership removed; local clone removed",
+	}
+	s := newTestServer(t, fc)
+
+	// HTMX path.
+	req := httptest.NewRequest(http.MethodPost, "/p/1/leave", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	req.Header.Set("HX-Request", "true")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Header().Get("HX-Redirect") != "/" {
+		t.Errorf("HX-Redirect: got %q, want /", rr.Header().Get("HX-Redirect"))
+	}
+	if fc.leftProject != 1 || fc.leftKeepMembership {
+		t.Errorf("LeaveProject got (pid=%d keep=%v)", fc.leftProject, fc.leftKeepMembership)
+	}
+
+	// Non-HTMX path → 303 to /.
+	fc2 := &fakeFC{username: "tamer", projDetail: ownerProjDetail(), leaveSummary: "ok"}
+	s2 := newTestServer(t, fc2)
+	req2 := httptest.NewRequest(http.MethodPost, "/p/1/leave", nil)
+	req2.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr2 := httptest.NewRecorder()
+	s2.Handler().ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusSeeOther || rr2.Header().Get("Location") != "/" {
+		t.Errorf("non-HTMX: got %d Location=%q, want 303 /", rr2.Code, rr2.Header().Get("Location"))
+	}
+}
+
+// TestLeaveProjectKeepMembership: keep_membership=true wipes the
+// clone only — membership intact, so the page stays with a
+// notice rather than redirecting.
+func TestLeaveProjectKeepMembership(t *testing.T) {
+	fc := &fakeFC{
+		username:     "tamer",
+		projDetail:   ownerProjDetail(),
+		leaveSummary: "local clone removed — membership kept",
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/leave",
+		strings.NewReader("keep_membership=true"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if !fc.leftKeepMembership {
+		t.Errorf("expected keep_membership=true passed through")
+	}
+	if !strings.Contains(rr.Body.String(), "membership kept") {
+		t.Errorf("expected keep-membership notice; body: %q", rr.Body.String())
+	}
+	if rr.Header().Get("HX-Redirect") != "" {
+		t.Errorf("keep-membership must not redirect")
+	}
+}
+
+// TestLeaveProjectSoleOwnerRefused: a coord refusal (sole
+// owner) surfaces as a banner on a re-rendered page, not a 5xx
+// and not a redirect.
+func TestLeaveProjectSoleOwnerRefused(t *testing.T) {
+	fc := &fakeFC{
+		username:   "tamer",
+		projDetail: ownerProjDetail(),
+		leaveErr:   fmt.Errorf("cannot remove the sole remaining owner — promote another member first"),
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/leave", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if rr.Header().Get("HX-Redirect") != "" {
+		t.Errorf("a refused leave must not redirect")
+	}
+	if !strings.Contains(rr.Body.String(), "sole remaining owner") {
+		t.Errorf("expected sole-owner refusal bannered; body: %q", rr.Body.String())
 	}
 }
 
