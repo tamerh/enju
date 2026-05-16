@@ -871,14 +871,22 @@ echo "payload"
 
 }
 
-// TestMCPAsyncComputeFailurePropagatesViaReaper verifies the
-// failure-on-return path: a detached wrapper whose script
-// exits non-zero drops a .wrap-result.json locally but does
-// NOT commit (matching today's sync path). The submitter's
-// next claim/execute/run_status call triggers the reaper,
-// which reads the result file and posts /tasks/:id/fail,
-// flipping the coordinator's view to failed.
-func TestMCPAsyncComputeFailurePropagatesViaReaper(t *testing.T) {
+// TestMCPAsyncComputeFailureParksRetryable verifies the
+// failure-on-return path end to end: a detached wrapper whose
+// script exits non-zero drops a .wrap-result.json locally but
+// does NOT commit. The submitter's next run_status call triggers
+// the reconcile hook, which reads the result file and posts
+// /tasks/:id/fail with kind=compute_error.
+//
+// Contract (changed by the non-terminal-compute-failure slice):
+// a compute script error is RECOVERABLE, so the task parks in
+// `failed_retryable` (run stays WAITING, operator retries via
+// enju_retry_task) — NOT the terminal `failed` it used to flip
+// to. This also exercises the async/reconcile wire end to end
+// (kind=compute_error → FailComputeTaskRetryable). Run-state
+// classification (failed_retryable ⇒ WAITING, incl. the leaf
+// case) is unit-pinned in store.TestApplyCompleteRun_*.
+func TestMCPAsyncComputeFailureParksRetryable(t *testing.T) {
 	h := newMCPHarness(t, "AsyncFail")
 	projectID := h.createTestProject()
 
@@ -926,8 +934,8 @@ exit 7
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 	})
-	if err := waitForTaskState(h, h.taskID("run"), "failed", 5*time.Second); err != nil {
-		t.Fatalf("task did not reach failed via reaper: %v", err)
+	if err := waitForTaskState(h, h.taskID("run"), "failed_retryable", 5*time.Second); err != nil {
+		t.Fatalf("async compute failure must park as failed_retryable (recoverable), not terminal failed: %v", err)
 	}
 
 	// Reaper should have moved the result file aside so a

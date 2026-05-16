@@ -36,6 +36,7 @@ const (
 	ClaimOutcomeTimedOut    = types.ClaimOutcomeTimedOut
 	ClaimOutcomeInvalidated = types.ClaimOutcomeInvalidated
 	ClaimOutcomeAbandoned   = types.ClaimOutcomeAbandoned
+	ClaimOutcomeFailed      = types.ClaimOutcomeFailed
 )
 
 // IsValidClaimOutcome re-exports types.IsValidClaimOutcome.
@@ -79,12 +80,31 @@ const (
 	// counting and dependency satisfaction — a skipped task is
 	// "done, not taken," not "failed" or "pending."
 	TaskSkipped TaskState = "skipped"
-	// TaskFailed is a terminal state for tasks that a citizen
-	// explicitly failed (via enju_fail_task) or that a compute
-	// script exited non-zero on. Downstream descendants
-	// cascade to FAILED. Recovery: enju_invalidate_task
-	// bounces the task back to READY.
+	// TaskFailed is the TERMINAL "stop, this is dead" state: a
+	// citizen explicitly failed it (enju_fail_task), a review
+	// rejected it, or a vote resolved against it. Downstream
+	// descendants cascade to SKIPPED. Recovery is operator-
+	// driven (enju_invalidate_task). Contrast TaskFailedRetryable.
 	TaskFailed TaskState = "failed"
+	// TaskFailedRetryable is the NON-terminal "this attempt
+	// errored, but it's recoverable" state. Entered ONLY by a
+	// compute task whose script exited non-zero (or a transient
+	// infra failure) — never by a review reject / vote / explicit
+	// enju_fail_task (those stay TaskFailed). Semantics:
+	//  - NOT terminal: a run with a failed_retryable task stays
+	//   WAITING (blocked on it), never auto-FAILED. The operator
+	//   fixes + enju_retry_task, or explicitly terminates.
+	//  - Blocks dependents like PENDING (an unsatisfied dep), NOT
+	//   like SKIPPED — descendants are "waiting for this to
+	//   succeed," not "done, not taken." The fail cascade does
+	//   NOT run for this state.
+	//  - Counts as "not done" for run-completion (a live blocker).
+	//  - Has no open claim (the failed attempt's claim closed);
+	//   the reaper ignores it.
+	// enju_retry_task re-runs just this task (fresh iteration,
+	// script from HEAD by default) without re-running accepted
+	// upstream work.
+	TaskFailedRetryable TaskState = "failed_retryable"
 	// TaskParked is introduced by the J.2 "partial
 	// re-materialization" pass. When a dynamic for_each source
 	// is invalidated, its materialized descendants used to be

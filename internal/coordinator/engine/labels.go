@@ -30,6 +30,8 @@ func StateLabel(state store.TaskState) string {
 		return "skipped"
 	case store.TaskFailed:
 		return "failed"
+	case store.TaskFailedRetryable:
+		return "failed (retryable)"
 	case store.TaskParked:
 		return "parked"
 	}

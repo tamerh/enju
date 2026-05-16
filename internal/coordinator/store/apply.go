@@ -376,6 +376,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case MarkOpenClaimsFailed:
+			if err := applyMarkOpenClaimsFailed(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		case MarkLatestClaimOutcome:
 			if err := applyMarkLatestClaimOutcome(tx, m, sink); err != nil {
 				return result, err
@@ -1994,12 +1999,19 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 		return false, nil
 	}
 
+	// 'failed_retryable' counts as holding (→ RunWaiting), not
+	// done: a compute task that errored is a live blocker the
+	// operator must retry. Without it here, a *leaf* retryable
+	// failure (no pending descendants) would fall through to
+	// RunCompleted and wrongly settle the run. With pending
+	// descendants the result is the same (they're holding too);
+	// this also covers the leaf case.
 	var active, holding, total int
 	err = tx.QueryRow(
 		`SELECT
 		  COUNT(*),
 		  COUNT(CASE WHEN state IN ('ready','claimed','running','collecting') THEN 1 END),
-		  COUNT(CASE WHEN state IN ('pending','parked') THEN 1 END)
+		  COUNT(CASE WHEN state IN ('pending','parked','failed_retryable') THEN 1 END)
 		 FROM tasks WHERE run_id = ?`,
 		m.RunID,
 	).Scan(&total, &active, &holding)
@@ -2899,6 +2911,73 @@ func applyMarkOpenClaimsInvalidated(tx *sql.Tx, m MarkOpenClaimsInvalidated, sin
 				"final_commit_sha": c.commit.String,
 				"action":           c.taskAction,
 				"reason":           "cascade_invalidate",
+			}),
+			CreatedAt: now,
+		})
+	}
+	return nil
+}
+
+// applyMarkOpenClaimsFailed mirrors applyMarkOpenClaimsInvalidated
+// but stamps outcome='failed': the attempt's compute script
+// errored on its own merits. The closed row keeps its iter_seq /
+// commit so the failed attempt stays an auditable iteration, and
+// — because the open row is now closed — a later enju_retry_task
+// re-claim computes MAX(iter_seq WHERE outcome IS NOT NULL)+1
+// instead of reusing the dead attempt's seq. Idempotent.
+func applyMarkOpenClaimsFailed(tx *sql.Tx, m MarkOpenClaimsFailed, sink EventSink) error {
+	type closedClaim struct {
+		claimID, citizenID, runID, projectID int64
+		iterSeq                              sql.NullInt64
+		commit                               sql.NullString
+		taskAction                           string
+	}
+	var affected []closedClaim
+	rows, err := tx.Query(
+		`SELECT tc.id, tc.citizen_id, tc.iter_seq, COALESCE(tc.commit_sha, ''),
+		    t.run_id, r.project_id, t.action
+		 FROM task_claims tc
+		 JOIN tasks t ON tc.task_id = t.id
+		 JOIN runs r ON t.run_id = r.id
+		 WHERE tc.task_id = ? AND tc.outcome IS NULL`,
+		m.TaskID,
+	)
+	if err == nil {
+		for rows.Next() {
+			var c closedClaim
+			if scanErr := rows.Scan(&c.claimID, &c.citizenID, &c.iterSeq, &c.commit,
+				&c.runID, &c.projectID, &c.taskAction); scanErr == nil {
+				affected = append(affected, c)
+			}
+		}
+		rows.Close()
+	}
+	res, err := tx.Exec(
+		`UPDATE task_claims SET outcome = 'failed' WHERE task_id = ? AND outcome IS NULL`,
+		m.TaskID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("mark_open_claims_failed no-op: no open claims to close")
+		return nil
+	}
+	now := time.Now()
+	for _, c := range affected {
+		sink.Emit(Event{
+			CitizenID:    c.citizenID,
+			EventType:    "iteration_completed",
+			EventSubtype: string(ClaimOutcomeFailed),
+			TaskID:       m.TaskID,
+			RunID:        c.runID,
+			ProjectID:    c.projectID,
+			Metadata: MarshalMetadata(map[string]any{
+				"iter_seq":         c.iterSeq.Int64,
+				"final_commit_sha": c.commit.String,
+				"action":           c.taskAction,
+				"reason":           "compute_error",
 			}),
 			CreatedAt: now,
 		})

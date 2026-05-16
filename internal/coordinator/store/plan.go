@@ -199,6 +199,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutMarkOpenClaimsInvalidated:
 		var m MarkOpenClaimsInvalidated
 		return m, json.Unmarshal(data, &m)
+	case MutMarkOpenClaimsFailed:
+		var m MarkOpenClaimsFailed
+		return m, json.Unmarshal(data, &m)
 	case MutMarkLatestClaimOutcome:
 		var m MarkLatestClaimOutcome
 		return m, json.Unmarshal(data, &m)
@@ -280,6 +283,7 @@ const (
 	MutSetProjectMemberRole    MutationKind = "set_project_member_role"
 
 	MutMarkOpenClaimsInvalidated MutationKind = "mark_open_claims_invalidated"
+	MutMarkOpenClaimsFailed      MutationKind = "mark_open_claims_failed"
 	MutMarkLatestClaimOutcome    MutationKind = "mark_latest_claim_outcome"
 
 	MutPauseRun     MutationKind = "pause_run"
@@ -334,6 +338,7 @@ var AllMutationKinds = []MutationKind{
 	MutRemoveProjectMember,
 	MutSetProjectMemberRole,
 	MutMarkOpenClaimsInvalidated,
+	MutMarkOpenClaimsFailed,
 	MutMarkLatestClaimOutcome,
 	MutPauseRun,
 	MutResumeRun,
@@ -668,6 +673,21 @@ type MarkOpenClaimsInvalidated struct {
 }
 
 func (MarkOpenClaimsInvalidated) mutationKind() MutationKind { return MutMarkOpenClaimsInvalidated }
+
+// MarkOpenClaimsFailed closes any open (outcome IS NULL) claim
+// rows for TaskID with outcome='failed'. Sibling of
+// MarkOpenClaimsInvalidated, but for a different cause: the
+// attempt's compute script errored on its own merits (not
+// collateral, not a reviewer verdict). Closing the iteration
+// here is load-bearing — it's what makes the failed attempt an
+// auditable closed iteration AND lets the next enju_retry_task
+// re-claim advance iter_seq instead of reusing the dead row.
+// Idempotent (no-op when there is no open claim).
+type MarkOpenClaimsFailed struct {
+	TaskID string
+}
+
+func (MarkOpenClaimsFailed) mutationKind() MutationKind { return MutMarkOpenClaimsFailed }
 
 // MarkLatestClaimOutcome sets the outcome of the most recent
 // claim row for TaskID to Outcome, regardless of its current

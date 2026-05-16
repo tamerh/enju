@@ -15,6 +15,33 @@ import (
 // guarantee. A regression in the guard (auth-check reorder, a
 // "simplified" Kind condition during an unrelated FailTask
 // refactor) passes every bot-side test but fails here.
+// TestFailedRetryableIsNotTerminal pins the load-bearing Slice-1
+// invariant: failed_retryable must NOT classify as terminal.
+// isTerminalTaskState gates whether the fail cascade may (re)touch
+// a descendant; treating failed_retryable as terminal would make
+// it un-retryable and let a run with one wrongly count as
+// settled. The terminal trio (accepted/failed/skipped) is
+// asserted alongside so a future edit that "tidies" the set is
+// caught.
+func TestFailedRetryableIsNotTerminal(t *testing.T) {
+	if isTerminalTaskState(store.TaskFailedRetryable) {
+		t.Fatal("failed_retryable must be NON-terminal (live blocker, retryable)")
+	}
+	for _, s := range []store.TaskState{store.TaskAccepted, store.TaskFailed, store.TaskSkipped} {
+		if !isTerminalTaskState(s) {
+			t.Errorf("%s must remain terminal", s)
+		}
+	}
+	for _, s := range []store.TaskState{
+		store.TaskPending, store.TaskReady, store.TaskClaimed,
+		store.TaskRunning, store.TaskCollecting, store.TaskParked,
+	} {
+		if isTerminalTaskState(s) {
+			t.Errorf("%s must remain non-terminal", s)
+		}
+	}
+}
+
 func TestFailTaskOwnershipOK(t *testing.T) {
 	const botID, otherID = int64(7), int64(99)
 

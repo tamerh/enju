@@ -360,6 +360,10 @@ func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath strin
 	reason := buildFailReason(spec, res)
 	_, postErr := s.coord.Post(ctx, fmt.Sprintf("/api/v1/tasks/%s/fail", spec.TaskID), map[string]string{
 		"reason": reason,
+		// Async-compute outcome failure is the same recoverable
+		// class as the sync path: park failed_retryable, don't
+		// terminally cascade. Coord re-checks the precondition.
+		"kind": "compute_error",
 	})
 	if postErr != nil {
 		// Coordinator-side refusal (already terminal,

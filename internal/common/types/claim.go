@@ -36,16 +36,26 @@ const (
 	ClaimOutcomeTimedOut    ClaimOutcome = "timed_out"
 	ClaimOutcomeInvalidated ClaimOutcome = "invalidated"
 	ClaimOutcomeAbandoned   ClaimOutcome = "abandoned"
+	// ClaimOutcomeFailed closes the iteration of an attempt whose
+	// compute script errored. Distinct from `invalidated` (no
+	// verdict, collateral) and `rejected` (a reviewer judged it):
+	// the work ran and failed on its own merits. Closing the row
+	// with this outcome is what lets a subsequent enju_retry_task
+	// re-claim get a fresh iter_seq instead of colliding with the
+	// failed attempt's still-open row — each retry is its own
+	// auditable iteration.
+	ClaimOutcomeFailed ClaimOutcome = "failed"
 )
 
-// IsValidClaimOutcome reports whether s is one of the six
+// IsValidClaimOutcome reports whether s is one of the seven
 // declared terminal outcomes. Empty string is rejected —
 // callers that want to allow "still open" check that explicitly.
 func IsValidClaimOutcome(s string) bool {
 	switch ClaimOutcome(s) {
 	case ClaimOutcomeCompleted, ClaimOutcomeRejected,
 		ClaimOutcomeReleased, ClaimOutcomeTimedOut,
-		ClaimOutcomeInvalidated, ClaimOutcomeAbandoned:
+		ClaimOutcomeInvalidated, ClaimOutcomeAbandoned,
+		ClaimOutcomeFailed:
 		return true
 	}
 	return false

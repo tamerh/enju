@@ -366,6 +366,10 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}
 		s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
 			"reason": reason,
+			// Recoverable: script exited non-zero. Park as
+			// failed_retryable (run stays alive) rather than the
+			// terminal fail cascade — operator fixes + retries.
+			"kind": "compute_error",
 		})
 		return &ExecuteOutcome{
 			TaskID:        taskID,

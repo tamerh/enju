@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/enju-ai/enju/internal/coordinator/service"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/go-chi/chi/v5"
 )
@@ -49,6 +50,14 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
 	var req struct {
 		Reason string `json:"reason"`
+		// Kind="compute_error" marks a recoverable compute-script
+		// failure: the task parks as failed_retryable (run stays
+		// alive, descendants stay PENDING) instead of the terminal
+		// fail cascade. Set ONLY by the compute executor/reconcile;
+		// operator enju_fail_task / review-reject / vote leave it
+		// empty and keep the terminal path. By-construction signal,
+		// not reason-string sniffing.
+		Kind string `json:"kind,omitempty"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -64,7 +73,13 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 		caller = citizenFromRequest(r)
 	}
 
-	resp, err := s.coord.FailTask(caller, taskID, req.Reason)
+	var resp *service.FailTaskResponse
+	var err error
+	if req.Kind == "compute_error" {
+		resp, err = s.coord.FailComputeTaskRetryable(caller, taskID, req.Reason)
+	} else {
+		resp, err = s.coord.FailTask(caller, taskID, req.Reason)
+	}
 	if err != nil {
 		writeFailErr(w, err)
 		return

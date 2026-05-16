@@ -702,3 +702,64 @@ func TestEventEmission_IterationCompletedOnInvalidate(t *testing.T) {
 		t.Errorf("subtype = %q, want invalidated", ic.Subtype)
 	}
 }
+
+// TestEventEmission_FailedClaimClosesIterationAndAdvancesSeq is
+// the load-bearing trackability guarantee behind enju_retry_task:
+// when a compute attempt fails, MarkOpenClaimsFailed must close
+// that attempt's claim as a real iteration (iteration_completed
+// subtype=failed, reason=compute_error) AND — because the row is
+// now closed (outcome NOT NULL) — the *next* claim on the same
+// task must advance to iter_seq=2 rather than reuse the dead
+// attempt's seq. If the open row leaked, the retry would collapse
+// into the failed attempt and the failure would not be a
+// separately auditable iteration. This is exactly the question
+// "is each failed attempt tracked inside an iteration?".
+func TestEventEmission_FailedClaimClosesIterationAndAdvancesSeq(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	alice := createTestCitizen(t, s, "alice", "tok-failseq")
+
+	taskID := makeTaskWithAction(t, s, runID, "1:1:t", "compute", TaskReady)
+	deadline := time.Now().Add(time.Hour)
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetClaim{TaskID: taskID, CitizenID: alice, Deadline: deadline},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForEventsDrained(t, s)
+
+	// The attempt's compute script errored → close the iteration.
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{MarkOpenClaimsFailed{TaskID: taskID}},
+	}); err != nil {
+		t.Fatalf("MarkOpenClaimsFailed: %v", err)
+	}
+	ic := hasEventWithMetadata(t, s, runID, "iteration_completed", "compute_error")
+	if ic == nil {
+		t.Fatal("MarkOpenClaimsFailed did not emit iteration_completed(failed) with reason=compute_error")
+	}
+	if ic.Subtype != "failed" {
+		t.Errorf("subtype = %q, want failed (distinct from invalidated/rejected)", ic.Subtype)
+	}
+	waitForEventsDrained(t, s)
+
+	// Retry: a fresh claim must be iter_seq=2, proving the failed
+	// attempt was closed (not reused) and is its own iteration.
+	if _, err := s.ApplyPlan(Plan{Mutations: []Mutation{
+		SetClaim{TaskID: taskID, CitizenID: alice, Deadline: deadline},
+	}}); err != nil {
+		t.Fatalf("retry SetClaim: %v", err)
+	}
+	if reopen := hasEventWithMetadata(t, s, runID, "iteration_started", `"iter_seq":2`); reopen == nil {
+		t.Fatal("retry claim did not advance to iter_seq=2 — failed attempt's claim leaked open (retry would collapse into it)")
+	}
+
+	// Idempotent: re-closing with no open claim is a clean no-op.
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{MarkOpenClaimsFailed{TaskID: taskID}, MarkOpenClaimsFailed{TaskID: taskID}},
+	}); err != nil {
+		t.Fatalf("MarkOpenClaimsFailed idempotent path errored: %v", err)
+	}
+}

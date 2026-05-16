@@ -182,6 +182,10 @@ func isTerminalTaskState(s store.TaskState) bool {
 	case store.TaskAccepted, store.TaskFailed, store.TaskSkipped:
 		return true
 	}
+	// TaskFailedRetryable is deliberately NOT terminal — a
+	// compute task that errored is a live blocker the operator
+	// will retry, not a settled outcome. Do not add it to the
+	// case above; the fail cascade must be able to (re)touch it.
 	return false
 }
 
@@ -288,4 +292,175 @@ func (c *Coordinator) FailTask(caller *store.CitizenRecord, taskID, reason strin
 		SkippedDescendants: res.SkippedDescendants,
 		Rollbacks:      rb,
 	}, nil
+}
+
+// FailComputeTaskRetryable is the NON-terminal sibling of
+// FailTask, for a compute task whose script exited non-zero (the
+// /fail kind="compute_error" path). The task parks as
+// failed_retryable instead of FAILED: the run stays alive,
+// descendants are NOT skip-cascaded (they stay PENDING, blocked
+// on this task by ordinary dependency-not-satisfied — see the
+// failed_retryable doc), and the operator recovers with
+// enju_retry_task. The failed attempt's partial writes are still
+// rolled back (same as the terminal cascade) so a retry starts
+// from a clean upstream state.
+//
+// Strict precondition: only an actually-running compute task can
+// enter this path. Anything else (a review, a non-running task,
+// an explicit operator fail) goes through the terminal FailTask —
+// "errored" must not be confused with "rejected".
+func (c *Coordinator) FailComputeTaskRetryable(caller *store.CitizenRecord, taskID, reason string) (*FailTaskResponse, error) {
+	if caller == nil {
+		return nil, fmt.Errorf("%w: authentication required", ErrForbidden)
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("%w: reason is required", ErrInvalidArgument)
+	}
+	task, err := c.Store.GetTask(taskID)
+	if err != nil || task == nil {
+		return nil, fmt.Errorf("%w: task %q not found", ErrNotFound, taskID)
+	}
+	run, err := c.Store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, fmt.Errorf("%w: run for task %q not found", ErrNotFound, taskID)
+	}
+	if !CanReadProject(c.Store, run.ProjectID, caller.ID) {
+		return nil, fmt.Errorf("%w: not a member of this project", ErrForbidden)
+	}
+	if err := failTaskOwnershipOK(caller, task); err != nil {
+		return nil, err
+	}
+	if task.Script == "" {
+		return nil, fmt.Errorf("%w: compute_error is only valid for a compute task (task %q has no script)", ErrInvalidArgument, taskID)
+	}
+	st := store.TaskState(task.State)
+	if st != store.TaskClaimed && st != store.TaskRunning {
+		return nil, fmt.Errorf("%w: task %q is %s, not running — compute_error requires a running compute task", ErrInvalidArgument, taskID, st)
+	}
+
+	rollbacks, err := c.performComputeFailure(taskID, reason)
+	if err != nil {
+		return nil, err
+	}
+
+	if updated, _ := c.Store.GetTask(taskID); updated != nil && updated.ClaimedBy > 0 {
+		c.Store.RecordContributionEvent(&store.ContributionEvent{
+			CitizenID: updated.ClaimedBy,
+			EventType: "task_failed",
+			TaskID:  taskID,
+			RunID:   updated.RunID,
+			ProjectID: run.ProjectID,
+			Metadata: store.MarshalMetadata(map[string]any{
+				"reason": reason, "kind": "compute_error", "retryable": true,
+			}),
+			CreatedAt: time.Now(),
+		})
+	}
+
+	rb := make([]ArtifactRollbackView, 0, len(rollbacks))
+	for _, r := range rollbacks {
+		v := ArtifactRollbackView{Path: r.Path}
+		if r.Deleted {
+			v.Deleted = true
+		} else {
+			v.RestoredFromTask = r.RestoredFromTask
+			v.RestoredFromCommit = r.RestoredFromCommit
+		}
+		rb = append(rb, v)
+	}
+	return &FailTaskResponse{
+		Status:    "failed_retryable",
+		TaskID:    taskID,
+		Reason:    reason,
+		Rollbacks: rb,
+	}, nil
+}
+
+// performComputeFailure applies the retryable Plan: roll back the
+// failed attempt's partial writes (reusing ComputeInvalidation's
+// rollback computation — identical to the terminal cascade's step
+// 1), flip the target to failed_retryable + close its claim, emit
+// cascade_fired{compute_error}. It deliberately does NOT touch
+// regular or dynamic descendants — leaving them PENDING is what
+// keeps the run a WAITING, retryable state instead of a dead one.
+func (c *Coordinator) performComputeFailure(taskID, reason string) ([]RollbackOutcome, error) {
+	task, err := c.Store.GetTask(taskID)
+	if err != nil || task == nil {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	d, err := c.Cache.GetDAG(task.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("loading DAG for run %d: %w", task.RunID, err)
+	}
+	run, err := c.Store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, fmt.Errorf("run not found for task %q", taskID)
+	}
+	parsed, _ := c.Cache.GetParsedRun(task.RunID)
+
+	outcome, err := engine.New(c.Store, c.Logger).ComputeInvalidation(task, run, d, parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	var mutations []store.Mutation
+	var rollbacks []RollbackOutcome
+	for _, rbk := range outcome.ArtifactRollbacks {
+		if rbk.Delete {
+			mutations = append(mutations, store.DeleteArtifact{
+				ProjectID: rbk.ProjectID, Branch: rbk.Branch, Path: rbk.Path,
+			})
+			rollbacks = append(rollbacks, RollbackOutcome{Path: rbk.Path, Deleted: true})
+		} else if rbk.RestoreTo != nil {
+			mutations = append(mutations, store.MoveArtifact{Artifact: *rbk.RestoreTo})
+			rollbacks = append(rollbacks, RollbackOutcome{
+				Path:        rbk.Path,
+				RestoredFromTask:  rbk.RestoreTo.LastTaskID,
+				RestoredFromCommit: rbk.RestoreTo.CommitSHA,
+			})
+		}
+	}
+
+	// Close the failed attempt's iteration ledger row with
+	// outcome='failed'. SetTaskState{ClearClaim} only clears the
+	// task-level claim pointer (tasks columns); it does NOT close
+	// the task_claims row. Without this the failed attempt's row
+	// stays open (outcome IS NULL), so a later enju_retry_task
+	// re-claim would REUSE its iter_seq instead of advancing —
+	// collapsing the retry into the failed attempt instead of
+	// recording it as its own auditable iteration.
+	mutations = append(mutations, store.MarkOpenClaimsFailed{TaskID: taskID})
+
+	mutations = append(mutations, store.SetTaskState{
+		TaskID:   taskID,
+		NewState:  store.TaskFailedRetryable,
+		FailReason: reason,
+		ClearClaim: true, // drop the task-level claim pointer
+	})
+
+	plan := store.Plan{
+		Version:   engine.EngineVersion,
+		Mutations: mutations,
+	}.AppendCascade(task.RunID)
+	plan.Mutations = append(plan.Mutations, store.EmitEvent{Event: store.Event{
+		EventType:    "cascade_fired",
+		EventSubtype: "compute_error",
+		TaskID:       taskID,
+		RunID:        task.RunID,
+		ProjectID:    run.ProjectID,
+		Metadata: store.MarshalMetadata(map[string]any{
+			"reason":    reason,
+			"retryable": true,
+			"rollbacks": len(rollbacks),
+		}),
+		CreatedAt: time.Now(),
+	}})
+	if _, err := c.Store.ApplyPlan(plan); err != nil {
+		return nil, err
+	}
+	// Recompute run state: with the target failed_retryable and
+	// descendants left PENDING, applyCompleteRun lands on WAITING
+	// (failed_retryable counts as holding), never terminal.
+	c.EvaluateRunStateAndMaybeTriage(task.RunID)
+	return rollbacks, nil
 }
