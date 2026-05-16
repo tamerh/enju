@@ -30,6 +30,40 @@ func (c *Clone) ReadFile(repoRelPath string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(c.workDir, repoRelPath))
 }
 
+// ListBundleFiles returns the repo-relative slash paths under
+// pathspec that git considers in scope for a template bundle:
+// tracked files PLUS untracked files that are not gitignored.
+// It shells `git ls-files --cached --others --exclude-standard`,
+// so .gitignore, the global excludes file, and .git/info/exclude
+// are all honored exactly as the operator's git would — no
+// hand-rolled ignore logic, and it reads the index rather than
+// statting the (possibly multi-GB) data tree. An empty pathspec
+// scopes the whole repository. ls-files reports symlinks as
+// ordinary entries; the caller lstat-filters those out.
+func (c *Clone) ListBundleFiles(pathspec string) ([]string, error) {
+	args := []string{"ls-files", "--cached", "--others", "--exclude-standard", "-z"}
+	if pathspec != "" {
+		args = append(args, "--", pathspec)
+	}
+	out, err := runGit(c.workDir, args, runOpts{})
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue // --cached/--others are disjoint; defensive
+		}
+		seen[p] = struct{}{}
+		paths = append(paths, p)
+	}
+	return paths, nil
+}
+
 // ReadFileAtCommit reads the contents of path at the given commit.
 // ok=false (with nil err) when the commit exists but path doesn't.
 // Returns ErrCommitNotFound when sha can't be resolved locally

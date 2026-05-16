@@ -125,6 +125,12 @@ type Ops interface {
 	// ReadFile reads a worktree file at a repo-relative path.
 	ReadFile(repoRelPath string) ([]byte, error)
 
+	// ListBundleFiles returns repo-relative paths under pathspec
+	// that git considers in scope (tracked + untracked-not-
+	// ignored), honoring .gitignore natively. Empty pathspec =
+	// whole repo. See git.Clone.ListBundleFiles.
+	ListBundleFiles(pathspec string) ([]string, error)
+
 	// CheckoutBranch is a no-op when branch is "" (matches
 	// project.PullBranchWithReconcile's "skip switch when empty"
 	// semantics), else equivalent to Checkout.

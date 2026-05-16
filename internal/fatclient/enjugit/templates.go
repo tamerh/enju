@@ -420,45 +420,25 @@ func (w *Workflow) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mod
 	if !info.IsDir() {
 		return "", fmt.Errorf("enjugit: EnsureBundleOnDefault: %q is not a directory", bundleDir)
 	}
-	var files []FileWrite
-	walkErr := filepath.Walk(absBundle, func(path string, fi os.FileInfo, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		// Skip system directories that should never end up in a
-		// commit. Critical when bundleDir is "" (root-level
-		// workflow YAML) — without this guard the walk sweeps
-		// .git/ and .enju/ into the git add argv, and the
-		// resulting commit fails with "paths are ignored by
-		// .gitignore" or worse, an attempt to track .git/ itself.
-		if fi.IsDir() {
-			name := fi.Name()
-			if name == ".git" || name == ".enju" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, rerr := filepath.Rel(workDir, path)
-		if rerr != nil {
-			return rerr
-		}
-		body, rerr := os.ReadFile(path)
-		if rerr != nil {
-			return fmt.Errorf("read %s: %w", rel, rerr)
-		}
-		mode := os.FileMode(0o644)
-		if fi.Mode()&0o111 != 0 {
-			mode = 0o755
-		}
-		files = append(files, FileWrite{
-			RepoRelPath: filepath.ToSlash(rel),
-			Content:     body,
-			Mode:        mode,
-		})
-		return nil
-	})
-	if walkErr != nil {
-		return "", walkErr
+	// Enumerate via git, not a raw filesystem walk. `git ls-files
+	// --cached --others --exclude-standard` is exactly the set git
+	// itself would stage: tracked files plus untracked files that
+	// are NOT gitignored. This is the only correct scoping when
+	// bundleDir is "" (root-level workflow YAML) — the old
+	// filepath.Walk swept the entire project (gitignored databases,
+	// raw reads, the lot) into `git add`, which then rejected the
+	// ignored paths; and it crashed on a directory symlink because
+	// Walk lstats, so a dir-symlink read as a file. ls-files reads
+	// the index (no statting the multi-GB data tree) and honors
+	// .gitignore, the global excludes, and .git/info/exclude
+	// natively. Symlinks still need filtering — see below.
+	rels, lerr := w.git.ListBundleFiles(bundleDir)
+	if lerr != nil {
+		return "", fmt.Errorf("enjugit: EnsureBundleOnDefault: %w", lerr)
+	}
+	files, cerr := collectBundleFiles(workDir, rels)
+	if cerr != nil {
+		return "", fmt.Errorf("enjugit: EnsureBundleOnDefault: %w", cerr)
 	}
 	if len(files) == 0 {
 		// Bundle dir was empty on disk — caller still wants the
@@ -492,6 +472,52 @@ func (w *Workflow) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mod
 		return sha, nil
 	}
 	return res.CommitSHA, nil
+}
+
+// collectBundleFiles turns the git-enumerated repo-relative paths
+// (tracked + untracked-not-ignored — gitignore already applied by
+// ListBundleFiles) into the FileWrite list the commit takes. It is
+// the load-bearing half of the ISSUE-2 fix and is split out so the
+// symlink-skip is unit-pinned independently of git: a recipe bundle
+// is enju.yaml + scripts/prompts (text), so a symlink under it
+// points at external data (databases, raw reads) that must never be
+// pinned — and os.ReadFile on a directory symlink would crash. That
+// is exactly the `current -> checkv-db-v1.5` case from the report.
+func collectBundleFiles(workDir string, rels []string) ([]FileWrite, error) {
+	var files []FileWrite
+	for _, rel := range rels {
+		abs := filepath.Join(workDir, filepath.FromSlash(rel))
+		fi, lstatErr := os.Lstat(abs)
+		if lstatErr != nil {
+			// TOCTOU: ListBundleFiles enumerated, then we Lstat —
+			// a file vanishing in between aborts the whole bundle
+			// commit. Acceptable: template bundles are small,
+			// static, operator-authored, and not concurrently
+			// mutated during create_run (the old filepath.Walk
+			// likewise propagated per-entry errors fatally).
+			return nil, fmt.Errorf("stat %s: %w", rel, lstatErr)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			continue // never pin a symlink (see func doc)
+		}
+		if fi.IsDir() {
+			continue // ls-files lists files only; defensive
+		}
+		body, rerr := os.ReadFile(abs)
+		if rerr != nil {
+			return nil, fmt.Errorf("read %s: %w", rel, rerr)
+		}
+		mode := os.FileMode(0o644)
+		if fi.Mode()&0o111 != 0 {
+			mode = 0o755
+		}
+		files = append(files, FileWrite{
+			RepoRelPath: filepath.ToSlash(rel),
+			Content:     body,
+			Mode:        mode,
+		})
+	}
+	return files, nil
 }
 
 // resolveDefaultBranchSHA returns the SHA of the default branch

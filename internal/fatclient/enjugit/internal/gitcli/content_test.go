@@ -22,6 +22,95 @@ func commitWithMessage(t *testing.T, dir, filename, content, message string) str
 	return strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
 }
 
+// TestListBundleFiles reproduces ISSUE-2: the template-pin walker
+// must honor .gitignore and must not crash on a directory symlink.
+// The old filepath.Walk swept a gitignored multi-GB tree into
+// `git add` (rejected) and os.ReadFile'd a dir-symlink ("is a
+// directory"). git ls-files closes both: ignored paths are gone
+// before the caller sees them, and ls-files never stats a symlink
+// target so it can't crash on one.
+func TestListBundleFiles(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	mk := func(rel, body string) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("enju.yaml", "name: x\n")
+	mk(".gitignore", "resources/\n")
+	mk("scripts/run.sh", "#!/bin/sh\n")
+	mk("resources/big.db", "HUGE")           // gitignored
+	mk("resources/raw/reads.fastq", "@SEQ")  // gitignored
+	// Directory symlink inside the ignored tree — the phase-1
+	// crash trigger under the old walker. ls-files must not stat it.
+	if err := os.Symlink("raw", filepath.Join(dir, "resources", "current")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	// A non-ignored in-tree symlink: ls-files DOES list it (a
+	// symlink is a blob to git); skipping it is the caller's job,
+	// so assert it surfaces here.
+	if err := os.Symlink("/tmp", filepath.Join(dir, "external")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+
+	c, _ := OpenClone(dir, "", nullLogger())
+	got, err := c.ListBundleFiles("")
+	if err != nil {
+		t.Fatalf("ListBundleFiles must not crash on a dir symlink / huge ignored tree: %v", err)
+	}
+	in := map[string]bool{}
+	for _, p := range got {
+		in[p] = true
+	}
+	for _, want := range []string{"enju.yaml", ".gitignore", "scripts/run.sh", "external"} {
+		if !in[want] {
+			t.Errorf("expected %q in scope; got %v", want, got)
+		}
+	}
+	for _, banned := range []string{"resources/big.db", "resources/raw/reads.fastq", "resources/current"} {
+		if in[banned] {
+			t.Errorf("gitignored path %q must be excluded; got %v", banned, got)
+		}
+	}
+}
+
+// TestListBundleFiles_Pathspec pins the scoped-enumeration path
+// (the common case: bundleDir="enju/templates/foo"): only that
+// subtree is returned, sibling dirs and the repo root are not.
+func TestListBundleFiles_Pathspec(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	for _, rel := range []string{
+		"enju.yaml",
+		"workflows/a/enju.yaml",
+		"workflows/a/scripts/x.sh",
+		"workflows/b/enju.yaml",
+	} {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _ := OpenClone(dir, "", nullLogger())
+	got, err := c.ListBundleFiles("workflows/a")
+	if err != nil {
+		t.Fatalf("ListBundleFiles: %v", err)
+	}
+	sort.Strings(got)
+	want := []string{"workflows/a/enju.yaml", "workflows/a/scripts/x.sh"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("pathspec scoping: got %v, want %v (root + sibling must be excluded)", got, want)
+	}
+}
+
 // --- ReadFile ---
 
 func TestReadFile(t *testing.T) {

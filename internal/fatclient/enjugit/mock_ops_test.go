@@ -474,6 +474,11 @@ func (f *fakeOps) ReadFile(path string) ([]byte, error) {
 	return nil, f.checkErr("ReadFile")
 }
 
+func (f *fakeOps) ListBundleFiles(pathspec string) ([]string, error) {
+	f.record("ListBundleFiles", pathspec)
+	return nil, f.checkErr("ListBundleFiles")
+}
+
 func (f *fakeOps) CheckoutBranch(branch string) error {
 	f.record("CheckoutBranch", branch)
 	if branch == "" {
