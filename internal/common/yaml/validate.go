@@ -761,20 +761,25 @@ func validateTaskContainerRuntime(t *TaskDef) error {
 //     container image is meaningless — almost certainly an
 //     author mistake (same reasoning as container_runtime:
 //     without container:).
-//   - each entry must be a non-empty "host[:container[:mode]]"
+//   - each entry must be a non-empty "host[:container[:options]]"
 //     spec: 1–3 colon-separated segments, no whitespace, with
 //     a non-empty host segment.
-//   - the optional mode segment, when present and free of
-//     unresolved param refs, must be "ro" or "rw".
+//
+// The options segment is NOT interpreted here. Same stance as
+// container: — we don't re-implement the runtime's grammar; the
+// runtime CLI arbitrates option validity (ro, rw, z, Z, ro,z,
+// nocopy, …) at run time, and a bogus option surfaces as a
+// clear runtime error. Hardcoding an allowlist would (a) drift
+// from docker/apptainer's actual vocabulary and (b) block the
+// author from opting into an SELinux relabel (:z/:Z), which is
+// the very escape hatch buildDockerArgs leaves them now that
+// declared volumes are passed verbatim (see review of ISSUE-4).
 //
 // Validation runs BEFORE param substitution (see
 // parseInternal's pipeline), so entries can still contain raw
-// {{param}} tokens here. We therefore only check structural
-// shape and skip the mode keyword check on any segment that
-// still carries a `{{...}}` ref. No execute-time re-validation
-// is needed: the wrapper passes the resolved spec to the
-// runtime verbatim, and an unresolvable path surfaces as a
-// clear runtime bind error.
+// {{param}} tokens here — the structural checks tolerate them,
+// and no execute-time re-validation is needed because the
+// wrapper passes the resolved spec to the runtime verbatim.
 func validateTaskVolumes(t *TaskDef) error {
 	if len(t.Volumes) == 0 {
 		return nil
@@ -790,20 +795,14 @@ func validateTaskVolumes(t *TaskDef) error {
 			return fmt.Errorf("task %q: volumes: has an empty entry", t.ID)
 		}
 		if strings.ContainsAny(v, " \t\n\r") {
-			return fmt.Errorf("task %q: volume %q contains whitespace — each entry must be a single host[:container[:mode]] token", t.ID, v)
+			return fmt.Errorf("task %q: volume %q contains whitespace — each entry must be a single host[:container[:options]] token", t.ID, v)
 		}
 		parts := strings.Split(v, ":")
 		if len(parts) > 3 {
-			return fmt.Errorf("task %q: volume %q has too many ':'-separated segments (want host[:container[:mode]])", t.ID, v)
+			return fmt.Errorf("task %q: volume %q has too many ':'-separated segments (want host[:container[:options]])", t.ID, v)
 		}
 		if parts[0] == "" {
 			return fmt.Errorf("task %q: volume %q has an empty host path", t.ID, v)
-		}
-		if len(parts) == 3 {
-			mode := parts[2]
-			if !strings.Contains(mode, "{{") && mode != "ro" && mode != "rw" {
-				return fmt.Errorf("task %q: volume %q has invalid mode %q (valid: \"ro\", \"rw\")", t.ID, v, mode)
-			}
 		}
 	}
 	return nil

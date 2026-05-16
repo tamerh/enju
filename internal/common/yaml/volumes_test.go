@@ -122,12 +122,16 @@ tasks:
 	}
 }
 
-// TestParseVolumesInvalidModeRejected — a literal third segment
-// must be ro or rw. (Unresolved {{param}} modes are tolerated;
-// that's covered by the param-resolution test below.)
-func TestParseVolumesInvalidModeRejected(t *testing.T) {
-	yaml := `
-name: "volumes bad mode"
+// TestParseVolumesOpaqueOptionsAccepted — Enju does NOT
+// re-implement the runtime's mount-option grammar (same stance
+// as container:). The options segment is passed through; the
+// runtime CLI arbitrates ro/rw/z/Z/combos at run time. This is
+// also what lets an author opt INTO an SELinux relabel that
+// Enju deliberately no longer auto-applies (ISSUE-4 review).
+func TestParseVolumesOpaqueOptionsAccepted(t *testing.T) {
+	for _, opt := range []string{"ro", "rw", "ro,z", "Z", "rw,Z", "readonly"} {
+		yaml := `
+name: "volumes opaque options"
 version: 1
 tasks:
   - id: t
@@ -135,15 +139,18 @@ tasks:
     script: scripts/run.sh
     container: alpine:3.19
     volumes:
-      - /data/db:/db:readonly
+      - /data/db:/db:` + opt + `
     prompt: "x"
 `
-	_, err := Parse([]byte(yaml))
-	if err == nil {
-		t.Fatal("expected parse error, got nil")
-	}
-	if !strings.Contains(err.Error(), "invalid mode") {
-		t.Errorf("error should cite invalid mode, got %q", err)
+		parsed, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Errorf("options=%q: unexpected parse error: %v", opt, err)
+			continue
+		}
+		want := "/data/db:/db:" + opt
+		if got := parsed.Run.Tasks[0].Volumes[0]; got != want {
+			t.Errorf("options=%q: volume not preserved verbatim: got %q, want %q", opt, got, want)
+		}
 	}
 }
 

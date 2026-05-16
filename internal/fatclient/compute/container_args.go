@@ -188,22 +188,29 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 	// keep large inputs + reference databases OUTSIDE the
 	// project directory; without these binds a containerized
 	// task can't reach any of that data. Each entry is a
-	// "host[:container[:mode]]" spec with run params already
-	// resolved by the YAML parser. The :z SELinux relabel is
-	// appended for the same reason as the workspace mount above
-	// (a no-op off SELinux); when an explicit ro/rw mode is
-	// given it becomes ":mode,z" — the same shape the snapshot
-	// bind uses.
+	// "host[:container[:options]]" spec with run params already
+	// resolved by the YAML parser, passed to docker VERBATIM.
+	//
+	// Deliberately NOT relabeled: unlike the Enju-owned binds
+	// above (workspace/scratch/snapshot/shared-root — project-
+	// owned, ephemeral, ours to relabel), declared volumes are
+	// arbitrary host paths the author points at. Auto-appending
+	// the shared `:z` SELinux label here would recursively
+	// relabel a possibly-multi-GB reference DB on first run
+	// (slow, host-mutating) and change its context for every
+	// other consumer on an SELinux-enforcing host — exactly the
+	// HPC/bioinformatics environments this feature targets, and
+	// exactly why docker makes :z/:Z opt-in. An author who does
+	// want a relabel writes it themselves in the options segment
+	// (e.g. "/data/db:/db:ro,z"); we pass it through unchanged.
 	for _, vol := range spec.Volumes {
-		host, ctr, mode, err := parseVolumeSpec(vol)
+		host, ctr, opts, err := parseVolumeSpec(vol)
 		if err != nil {
 			return nil, fmt.Errorf("task %q: %w", spec.TaskID, err)
 		}
 		bind := host + ":" + ctr
-		if mode != "" {
-			bind += ":" + mode + ",z"
-		} else {
-			bind += ":z"
+		if opts != "" {
+			bind += ":" + opts
 		}
 		args = append(args, "-v", bind)
 	}
@@ -319,17 +326,18 @@ func buildApptainerArgs(spec Spec, env []string, workDir string) ([]string, erro
 	}
 
 	// Author-declared extra volumes — apptainer mirror of the
-	// docker branch. `--bind host:container[:mode]`; no SELinux
-	// relabel (apptainer's user-namespace mode doesn't use it,
-	// same as the workspace/shared binds above).
+	// docker branch. `--bind host:container[:options]`, options
+	// passed verbatim. Apptainer's user-namespace bind never
+	// took an SELinux relabel anyway, so this side was already
+	// non-mutating; the symmetry with docker is now explicit.
 	for _, vol := range spec.Volumes {
-		host, ctr, mode, err := parseVolumeSpec(vol)
+		host, ctr, opts, err := parseVolumeSpec(vol)
 		if err != nil {
 			return nil, fmt.Errorf("task %q: %w", spec.TaskID, err)
 		}
 		bind := host + ":" + ctr
-		if mode != "" {
-			bind += ":" + mode
+		if opts != "" {
+			bind += ":" + opts
 		}
 		args = append(args, "--bind", bind)
 	}
@@ -407,13 +415,13 @@ func translatePath(hostPath, workDir, containerWorkDir string) (string, bool) {
 }
 
 // parseVolumeSpec splits an author-declared volume entry into
-// its host path, container path, and optional mount mode.
+// its host path, container path, and optional options segment.
 // Forms accepted (run params already substituted by the YAML
 // parser before this point):
 //
-//	"host"                → host, host, ""
-//	"host:container"      → host, container, ""
-//	"host:container:mode" → host, container, mode  (mode: ro|rw)
+//	"host"                   → host, host, ""
+//	"host:container"         → host, container, ""
+//	"host:container:options" → host, container, options
 //
 // The bare-host form mounts the path at the identical path
 // inside the container — the common bioinformatics case where
@@ -421,22 +429,31 @@ func translatePath(hostPath, workDir, containerWorkDir string) (string, bool) {
 // see them at exactly the host location. An empty container
 // segment ("host:") also falls back to host.
 //
+// The options segment is opaque: returned verbatim and handed
+// straight to the runtime CLI (docker -v / apptainer --bind),
+// which arbitrates "ro", "rw", "z", "Z", "ro,z", etc. Enju does
+// not interpret it and — crucially — does not inject one (see
+// buildDockerArgs: declared volumes are NOT auto-relabeled).
+//
+// Host paths are Linux-style. A Windows "C:\refs" would split
+// on its drive-letter colon and mis-parse; that's a non-input
+// here — the runtime, the test harnesses, and bioinformatics
+// containers are all POSIX, consistent with the rest of the
+// container path handling (translatePath, ContainerWorkDir).
+//
 // Returns an error on an empty entry, an empty host segment,
 // or more than three ':'-separated segments. validateTaskVolumes
 // already rejects these on the YAML path; the check is repeated
 // here as a defensive guard because an async spec file written
 // by an older binary — or a direct compute.Spec construction in
-// a test — never passes through the YAML validator. Mode keyword
-// validity is intentionally NOT re-checked here: the runtime CLI
-// gives a clear error for a bogus mode, and duplicating the
-// ro/rw allowlist in two places invites drift.
-func parseVolumeSpec(raw string) (host, container, mode string, err error) {
+// a test — never passes through the YAML validator.
+func parseVolumeSpec(raw string) (host, container, options string, err error) {
 	if raw == "" {
 		return "", "", "", fmt.Errorf("empty volume entry")
 	}
 	parts := strings.Split(raw, ":")
 	if len(parts) > 3 {
-		return "", "", "", fmt.Errorf("volume %q has too many ':'-separated segments (want host[:container[:mode]])", raw)
+		return "", "", "", fmt.Errorf("volume %q has too many ':'-separated segments (want host[:container[:options]])", raw)
 	}
 	host = parts[0]
 	if host == "" {
@@ -447,9 +464,9 @@ func parseVolumeSpec(raw string) (host, container, mode string, err error) {
 		container = parts[1]
 	}
 	if len(parts) == 3 {
-		mode = parts[2]
+		options = parts[2]
 	}
-	return host, container, mode, nil
+	return host, container, options, nil
 }
 
 // checkContainerRuntime verifies the resolved container runtime's

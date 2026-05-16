@@ -656,20 +656,27 @@ type TaskDef struct {
 	// databases that live OUTSIDE the project directory; without
 	// this, a containerized task can't reach any of that data.
 	//
-	// Each entry is a docker-style spec, with param refs allowed
-	// (resolved at run-create time alongside every other
-	// {{param}} field):
+	// Each entry is a docker-style spec (Linux-style host
+	// paths), with param refs allowed (resolved at run-create
+	// time alongside every other {{param}} field):
 	//
-	//   - "/data/refs"                      → /data/refs:/data/refs (same path in)
-	//   - "{{raw_data_root}}:/inputs"       → host:container
-	//   - "{{checkv_db}}:{{checkv_db}}:ro"  → host:container:mode
+	//   - "/data/refs"                       → /data/refs:/data/refs (same path in)
+	//   - "{{raw_data_root}}:/inputs"        → host:container
+	//   - "{{checkv_db}}:{{checkv_db}}:ro"   → host:container:options
+	//   - "/data/db:/db:ro,z"                → opt into an SELinux relabel
 	//
 	// The bare form maps the host path to the identical path
 	// inside the container — the common case for tools that
 	// embed absolute reference-DB paths. The optional third
-	// segment is the mount mode ("ro" or "rw"; default rw). The
-	// runtime-specific SELinux relabel flag is added by the
-	// wrapper, not declared here.
+	// segment is the runtime's mount-options field, passed
+	// through verbatim ("ro", "rw", "z", "Z", "ro,z", …); Enju
+	// does not interpret it and the runtime CLI arbitrates.
+	//
+	// Note: declared volumes are NOT auto-relabeled for SELinux.
+	// They are arbitrary author-pointed paths (often large
+	// shared reference DBs); a forced shared-label relabel would
+	// be slow and host-mutating on SELinux-enforcing clusters.
+	// Append :z/:Z yourself if you need it.
 	//
 	// Setting this without a container: image is a parse error
 	// (a bare-host script already sees the host filesystem, so

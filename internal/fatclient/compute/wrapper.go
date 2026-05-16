@@ -227,11 +227,19 @@ type Spec struct {
 	// Volumes is the list of extra host paths bind-mounted into
 	// the container, on top of the implicit workspace / scratch
 	// / snapshot / shared-root binds. Each entry is a docker-
-	// style "host[:container[:mode]]" spec with run params
-	// already resolved (the YAML parser substitutes {{param}}
-	// before this reaches the wrapper). The bare "host" form
-	// maps to host:host. The runtime-specific SELinux relabel
-	// flag is appended by buildContainerArgs, not declared here.
+	// style "host[:container[:options]]" spec (Linux-style host
+	// paths) with run params already resolved (the YAML parser
+	// substitutes {{param}} before this reaches the wrapper).
+	// The bare "host" form maps to host:host.
+	//
+	// The options segment is passed to the runtime VERBATIM.
+	// Unlike the Enju-owned binds, buildContainerArgs does NOT
+	// auto-append an SELinux relabel here: these are arbitrary
+	// author-pointed host paths (often multi-GB shared reference
+	// DBs), and a forced shared-label relabel would be slow and
+	// host-mutating on the SELinux-enforcing clusters this
+	// targets. An author who wants one writes it themselves
+	// (e.g. "/data/db:/db:ro,z").
 	//
 	// Empty/absent = no extra mounts. Legacy spec files without
 	// this field decode cleanly to nil, so in-flight async
