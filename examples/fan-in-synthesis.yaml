@@ -1,12 +1,12 @@
-# Worked example for the `aggregates:` fan-in primitive.
+# Worked example for the `collects:` fan-in primitive.
 #
 # Shape: 3 items → each gets analyzed independently → one
 # singular synth task reduces over all 3 analyses to produce a
 # single final output.
 #
-# Without `aggregates:`, this run-level for_each would multiply
+# Without `collects:`, this run-level for_each would multiply
 # every task — including `synth` — producing 3 redundant
-# synthesis tasks instead of 1. The `aggregates: analyze` line
+# synthesis tasks instead of 1. The `collects: analyze` line
 # tells the planner to keep `synth` singular and wait for all
 # 3 instances of `analyze` before becoming ready. Inside synth's
 # prompt, `{{analyze.content}}` resolves to the joined content
@@ -31,7 +31,7 @@ tasks:
 
   - id: synth
     action: answer
-    aggregates: analyze
+    collects: analyze
     prompt: |
       You're synthesizing across three independent analyses of
       adjacent workplace topics. Each was produced without

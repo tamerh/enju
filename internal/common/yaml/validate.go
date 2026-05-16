@@ -167,7 +167,7 @@ func validateComputeDependsDeclared(p *Run) []string {
 		}
 		warnings = append(warnings, fmt.Sprintf(
 			"compute task %q has no declared dependencies "+
-				"(no {{task.*}} refs, no {{param}} refs, no reads_artifacts, no depends_on). "+
+				"(no {{task.*}} refs, no {{param}} refs, no reads, no depends_on). "+
 				"If its script reads output from another task, declare that "+
 				"dependency explicitly — otherwise the scheduler may run this "+
 				"task in parallel with its unknown upstream and a citizen "+
@@ -300,7 +300,7 @@ func validateComputeContentRefs(p *Run) []string {
 				}
 				warnings = append(warnings, fmt.Sprintf(
 					"task %q: {{%s.content}} references compute task %q's stdout (result.md), "+
-						"not its declared writes_artifacts (%s). "+
+						"not its declared writes (%s). "+
 						"Most compute scripts write data to artifacts and echo a status line to stdout — "+
 						"the downstream will see the status line, not the data. "+
 						"To pull the artifact bytes, use {{artifact:%s}} instead "+
@@ -1402,10 +1402,10 @@ func validateDependsOnReferences(p *Run, ids map[string]bool) error {
 		}
 		if t.Aggregates != "" {
 			if t.Aggregates == t.ID {
-				return fmt.Errorf("task %q: aggregates cannot reference itself", t.ID)
+				return fmt.Errorf("task %q: collects cannot reference itself", t.ID)
 			}
 			if !ids[t.Aggregates] {
-				return fmt.Errorf("task %q: aggregates target %q does not exist", t.ID, t.Aggregates)
+				return fmt.Errorf("task %q: collects target %q does not exist", t.ID, t.Aggregates)
 			}
 			// Target must be a fanned task: either it declares
 			// its own task-level for_each, or the run carries a
@@ -1420,13 +1420,13 @@ func validateDependsOnReferences(p *Run, ids map[string]bool) error {
 			}
 			targetIsFanned := target != nil && (len(target.ForEach) > 0 || len(p.ForEach) > 0)
 			if !targetIsFanned {
-				return fmt.Errorf("task %q: aggregates target %q is not fanned (the target needs its own for_each, or the run must declare a run-level for_each that multiplies it)", t.ID, t.Aggregates)
+				return fmt.Errorf("task %q: collects target %q is not fanned (the target needs its own for_each, or the run must declare a run-level for_each that multiplies it)", t.ID, t.Aggregates)
 			}
 			// An aggregator with its own for_each is a category
 			// error — the whole point of aggregates is to STAY
 			// singular while reducing over the fanned source.
 			if len(t.ForEach) > 0 {
-				return fmt.Errorf("task %q: aggregates and for_each are mutually exclusive — an aggregator stays singular by definition", t.ID)
+				return fmt.Errorf("task %q: collects and for_each are mutually exclusive — an aggregator stays singular by definition", t.ID)
 			}
 			// Auto-add as a dependency so authors don't have
 			// to write the same relationship twice (mirrors

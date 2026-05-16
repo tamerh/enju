@@ -104,7 +104,7 @@ func SubmitResult() mcp.Tool {
 
 For simple tasks: provide 'content' as a string.
 For tasks with named outputs: provide 'outputs_json' as a JSON object mapping output names to their values.
-For tasks with writes_artifacts: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
+For tasks with writes: provide 'artifacts_json' mapping each declared artifact path to its new content. You may write any subset of declared paths (permissive — declared is an upper bound).
 For action:review tasks: provide 'decision' — one of:
   - "approve"          — target → ACCEPTED, downstream unblocks
   - "request_changes"  — retry cascade: target → READY, artifact rolls back, descendants → PENDING (author revises + resubmits)
@@ -112,7 +112,7 @@ For action:review tasks: provide 'decision' — one of:
   - "comment"          — non-blocking; target state unchanged
 Your prose content is the reviewer's feedback in all cases.
 For action:vote tasks: provide 'option' as one of the declared option ids from the task's 'options:' list. Your prose content is free-form commentary. If the winning option has 'activates:' set, the DAG routes down that branch and tasks on losing branches flip to SKIPPED. Votes without 'activates:' are pure decisions — downstream tasks can still read the choice via {{task.winning_option}}.
-The task detail shows the schema (outputs, writes_artifacts, reviews target, options) so you know what's expected.
+The task detail shows the schema (outputs, writes, reviews target, options) so you know what's expected.
 After submitting, call enju_run_status to show the human the updated DAG tree — they want to see progress.`),
 		mcp.WithString("task_id",
 			mcp.Required(),
@@ -125,7 +125,7 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 			mcp.Description(`For tasks with named outputs: a JSON string of the outputs object. Example: '{"gene_list": "BRCA1, TP53", "pathways": "KEGG:hsa04110"}'`),
 		),
 		mcp.WithString("artifacts_json",
-			mcp.Description(`For tasks with writes_artifacts: a JSON string mapping each artifact path to its new content. Example: '{"src/analyze.py": "def analyze():\n    pass\n"}'. Paths must be in the task's writes_artifacts list.`),
+			mcp.Description(`For tasks with writes: a JSON string mapping each artifact path to its new content. Example: '{"src/analyze.py": "def analyze():\n    pass\n"}'. Paths must be in the task's writes list.`),
 		),
 		mcp.WithString("decision",
 			mcp.Description(`Required for action:review tasks: "approve", "request_changes", "reject", or "comment". approve = ship it; request_changes = send back for revision; reject = hard stop (FAILED); comment = non-blocking note.`),
@@ -264,7 +264,7 @@ To browse available templates in a project, call enju_list_templates first. To s
 
 Dependencies between tasks are inferred automatically from {{task_id.content}} references. Tasks without references to other tasks run in parallel.
 
-List-valued params support a {{param[*]}} expansion in writes_artifacts / reads_artifacts / assign_to / depends_on — one declared element expands to N entries, one per value in the list<string> param. Useful for one-shot tasks that emit or read N files without enumerating every path.
+List-valued params support a {{param[*]}} expansion in writes / reads / assign_to / depends_on — one declared element expands to N entries, one per value in the list<string> param. Useful for one-shot tasks that emit or read N files without enumerating every path.
 
 If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithString("yaml",
@@ -363,7 +363,7 @@ Environment variables exposed to the script:
 
 Also writes $ENJU_RUN_DIR/context.json with structured task context (task_id, iteration, params, reads_artifacts, writes_artifacts) for scripts that need typed access beyond env vars. Read via jq/json in any language.
 
-Declared writes_artifacts paths are picked up from disk post-exit-0 and registered in the artifact index.
+Declared writes paths are picked up from disk post-exit-0 and registered in the artifact index.
 
 Exit 0 → submit; non-0 → fail (stderr becomes failure reason).`),
 		mcp.WithString("task_id",
@@ -1106,7 +1106,7 @@ Only 'failed_retryable' tasks can be retried. A terminal 'failed' task is dead (
 
 func ListUntrackedArtifacts() mcp.Tool {
 	return mcp.NewTool("enju_list_untracked_artifacts",
-		mcp.WithDescription(`List artifacts produced by this project that are NOT tracked in git (declared with track:false in writes_artifacts). For each entry, reports whether the file is visible in this citizen's workspace so you can spot missing untracked dependencies before claiming a downstream task.
+		mcp.WithDescription(`List artifacts produced by this project that are NOT tracked in git (declared with track:false in writes). For each entry, reports whether the file is visible in this citizen's workspace so you can spot missing untracked dependencies before claiming a downstream task.
 
 Typical causes of "missing" locally:
 - The producer task was run by another citizen and this citizen never re-ran it.

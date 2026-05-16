@@ -1149,17 +1149,17 @@ tasks:
     action: compute
     script: scripts/run.sh
     prompt: "Produce summary"
-    writes_artifacts:
+    writes:
       - results/summary.md
   - id: check
     action: review
     reviews: gen
     prompt: "Review {{artifact:results/summary.md}}"
-    reads_artifacts:
+    reads:
       - results/summary.md
   - id: publish
     action: answer
-    reads_artifacts:
+    reads:
       - results/summary.md
     prompt: "Ship {{artifact:results/summary.md}}"
 `))
@@ -1319,13 +1319,13 @@ tasks:
   - id: gen
     action: compute
     script: scripts/run.py
-    writes_artifacts:
+    writes:
       - out/data.txt
     prompt: "Produce data"
 
   - id: consume
     action: answer
-    reads_artifacts:
+    reads:
       - out/data.txt
     prompt: "Read: {{artifact:out/data.txt}}"
 `))
@@ -1446,7 +1446,7 @@ tasks:
   - id: gen
     action: compute
     script: scripts/run.py
-    reads_artifacts: [data/input.csv]
+    reads: [data/input.csv]
     prompt: "Run on input.csv"
 `))
 	if err != nil {
@@ -1454,7 +1454,7 @@ tasks:
 	}
 	for _, w := range parsed.Warnings {
 		if contains(w, "compute task \"gen\"") {
-			t.Errorf("unexpected compute-no-deps warning with reads_artifacts: %s", w)
+			t.Errorf("unexpected compute-no-deps warning with reads: %s", w)
 		}
 	}
 }
@@ -1508,7 +1508,7 @@ tasks:
   - id: aggregate
     action: compute
     script: scripts/aggregate.sh
-    writes_artifacts:
+    writes:
       - out/totals.tsv
     prompt: "Aggregate the data"
 
@@ -1552,7 +1552,7 @@ tasks:
   - id: aggregate
     action: compute
     script: scripts/aggregate.sh
-    writes_artifacts:
+    writes:
       - out/totals.tsv
     prompt: "Aggregate the data"
 
@@ -1640,7 +1640,7 @@ tasks:
     outputs:
       gene_list:
         description: "list of genes"
-    writes_artifacts:
+    writes:
       - out/genes.tsv
     prompt: "Analyze"
 
@@ -1990,12 +1990,12 @@ params:
 tasks:
   - id: seed
     action: answer
-    writes_artifacts: ["state/items/{{items[*]}}.json"]
+    writes: ["state/items/{{items[*]}}.json"]
     prompt: "Emit {{items}} items."
   - id: consume
     action: answer
     depends_on: [seed]
-    reads_artifacts: ["state/items/{{items[*]}}.json"]
+    reads: ["state/items/{{items[*]}}.json"]
     prompt: "Consume {{items}}."
 `)
 	parsed, err := ParseWithParams(yamlData, map[string]interface{}{
@@ -2030,7 +2030,7 @@ params:
 tasks:
   - id: t
     action: answer
-    writes_artifacts: ["state/{{name[*]}}.json"]
+    writes: ["state/{{name[*]}}.json"]
     prompt: "x"
 `)
 	_, err := ParseWithParams(yamlData, map[string]interface{}{"name": "x"})
@@ -2060,7 +2060,7 @@ params:
 tasks:
   - id: t
     action: answer
-    writes_artifacts: ["{{a[*]}}/{{b[*]}}.json"]
+    writes: ["{{a[*]}}/{{b[*]}}.json"]
     prompt: "x"
 `)
 	_, err := ParseWithParams(yamlData, map[string]interface{}{
@@ -2535,12 +2535,12 @@ tasks:
   - id: alpha
     action: answer
     prompt: "alpha"
-    writes_artifacts:
+    writes:
       - path: shared/notes.md
   - id: beta
     action: answer
     prompt: "beta"
-    writes_artifacts:
+    writes:
       - path: shared/notes.md
 `)
 	_, err := Parse(yamlData)
@@ -2568,13 +2568,13 @@ tasks:
   - id: alpha
     action: answer
     prompt: "alpha"
-    writes_artifacts:
+    writes:
       - path: shared/notes.md
   - id: beta
     action: answer
     prompt: "beta"
     depends_on: [alpha]
-    writes_artifacts:
+    writes:
       - path: shared/notes.md
 `)
 	if _, err := Parse(yamlData); err != nil {
@@ -2593,12 +2593,12 @@ tasks:
   - id: alpha
     action: answer
     prompt: "alpha"
-    writes_artifacts:
+    writes:
       - path: out/alpha.md
   - id: beta
     action: answer
     prompt: "beta"
-    writes_artifacts:
+    writes:
       - path: out/beta.md
 `)
 	if _, err := Parse(yamlData); err != nil {
@@ -2622,12 +2622,12 @@ tasks:
   - id: alpha
     action: answer
     prompt: "alpha {{case}}"
-    writes_artifacts:
+    writes:
       - path: "out/{{case}}/alpha.md"
   - id: beta
     action: answer
     prompt: "beta {{case}}"
-    writes_artifacts:
+    writes:
       - path: "out/{{case}}/beta.md"
 `)
 	if _, err := Parse(yamlData); err != nil {

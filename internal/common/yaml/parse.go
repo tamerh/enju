@@ -116,6 +116,16 @@ func parseInternal(data []byte, paramValues map[string]interface{}, substitute b
 func resolveDefaults(p *Run) {
 	for i := range p.Tasks {
 		resolveAction(&p.Tasks[i])
+
+		// Seed assign_to from the workflow-level default only
+		// when the task left it unset. An explicit per-task
+		// assign_to (scalar or list) always wins. Copy the
+		// slice so tasks don't alias one backing array.
+		if len(p.Tasks[i].AssignTo) == 0 && len(p.Defaults.AssignTo) > 0 {
+			seeded := make(yamlStringList, len(p.Defaults.AssignTo))
+			copy(seeded, p.Defaults.AssignTo)
+			p.Tasks[i].AssignTo = seeded
+		}
 	}
 }
 // substituteParamsInPlace merges supplied parameter values with declared
@@ -225,12 +235,12 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		// — they already accept a list-valued param directly.
 		// options[].activates stays structural.
 		scope := fmt.Sprintf("task %q", t.ID)
-		expandedWrites, err := expandStarRefsInWrites(t.WritesArtifacts, merged, declared, scope+".writes_artifacts")
+		expandedWrites, err := expandStarRefsInWrites(t.WritesArtifacts, merged, declared, scope+".writes")
 		if err != nil {
 			return nil, err
 		}
 		t.WritesArtifacts = expandedWrites
-		expandedReads, err := expandStarRefsInSlice([]string(t.ReadsArtifacts), merged, declared, scope+".reads_artifacts")
+		expandedReads, err := expandStarRefsInSlice([]string(t.ReadsArtifacts), merged, declared, scope+".reads")
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +329,7 @@ var starRefPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\[\*\](?:\.
 // invalid."
 //
 // `scope` is free-form context for error messages
-// ("writes_artifacts on task X", "assign_to on task Y").
+// ("writes on task X", "assign_to on task Y").
 func expandStarRefsInSlice(items []string, merged map[string]interface{}, declared map[string]*ParamDef, scope string) ([]string, error) {
 	if len(items) == 0 {
 		return items, nil

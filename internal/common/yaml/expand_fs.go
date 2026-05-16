@@ -85,7 +85,7 @@ func (w WriteArtifacts) ExpandAgainstWorkdir(workDir string) ([]WriteArtifact, [
 	for _, decl := range w {
 		matched, err := expandOne(workDir, decl)
 		if err != nil {
-			return nil, nil, fmt.Errorf("expanding writes_artifacts %q: %w", decl.Path, err)
+			return nil, nil, fmt.Errorf("expanding writes %q: %w", decl.Path, err)
 		}
 		if len(matched) == 0 {
 			if !decl.Optional {

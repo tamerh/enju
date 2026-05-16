@@ -236,7 +236,7 @@ tasks:
     prompt: produce {{item}}
   - id: aggregate
     action: answer
-    aggregates: source
+    collects: source
     prompt: synthesize
 `)
 

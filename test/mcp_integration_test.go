@@ -2055,7 +2055,7 @@ version: 1
 tasks:
   - id: reader
     action: answer
-    reads_artifacts: [doesnt/exist.md]
+    reads: [doesnt/exist.md]
     prompt: "Use {{artifact:doesnt/exist.md}} to summarize."
 `
 	h.mcpCreateRunInline(t, projectID, yaml)
@@ -2289,7 +2289,7 @@ version: 1
 tasks:
   - id: maybe
     action: answer
-    writes_artifacts:
+    writes:
       - src/a.py
       - src/b.py
     prompt: "Optionally update either or both files."
@@ -2564,7 +2564,7 @@ version: 1
 tasks:
   - id: write_v1
     action: answer
-    writes_artifacts: [notes/intro.md]
+    writes: [notes/intro.md]
     prompt: "Write the first version."
 `
 	firstID := h.mcpCreateRunInline(t, projectID, v1YAML)
@@ -2580,8 +2580,8 @@ version: 1
 tasks:
   - id: write_v2
     action: answer
-    reads_artifacts: [notes/intro.md]
-    writes_artifacts: [notes/intro.md]
+    reads: [notes/intro.md]
+    writes: [notes/intro.md]
     prompt: "Read {{artifact:notes/intro.md}} and replace with v2."
 `
 	h.mcpCreateRunInline(t, projectID, v2YAML)
@@ -2646,7 +2646,7 @@ version: 1
 tasks:
   - id: create
     action: answer
-    writes_artifacts: [config/settings.yaml]
+    writes: [config/settings.yaml]
     prompt: "Create the config."
 `
 	h.mcpCreateRunInline(t, projectID, yaml)
@@ -2691,7 +2691,7 @@ version: 1
 tasks:
   - id: write_v1
     action: answer
-    writes_artifacts: [notes/intro.md]
+    writes: [notes/intro.md]
     prompt: "Write v1."
 `
 	h.mcpCreateRunInline(t, projectID, yaml1)
@@ -2703,7 +2703,7 @@ version: 1
 tasks:
   - id: write_v2
     action: answer
-    writes_artifacts: [notes/intro.md]
+    writes: [notes/intro.md]
     prompt: "Write v2."
 `
 	h.mcpCreateRunInline(t, projectID, yaml2)
@@ -3446,7 +3446,7 @@ version: 1
 tasks:
   - id: write_data
     action: answer
-    writes_artifacts: [data/payload.md]
+    writes: [data/payload.md]
     prompt: "Write the payload."
   - id: check
     action: review
@@ -4276,14 +4276,14 @@ version: 1
 tasks:
   - id: seed
     action: answer
-    writes_artifacts: [state/items/i01.json]
+    writes: [state/items/i01.json]
     prompt: "Seed."
   - id: consume
     for_each:
       item: [i01]
     action: answer
     depends_on: [seed]
-    reads_artifacts: ["state/items/{{item}}.json"]
+    reads: ["state/items/{{item}}.json"]
     prompt: "Use {{item}}: {{artifact:state/items/i01.json}}"
 `
 	// Call directly to surface any validation error rather
@@ -4498,12 +4498,12 @@ version: 1
 tasks:
   - id: seed
     action: answer
-    writes_artifacts: [data/payload.md]
+    writes: [data/payload.md]
     prompt: "Write the payload."
   - id: consume
     action: answer
     depends_on: [seed]
-    reads_artifacts: [data/payload.md]
+    reads: [data/payload.md]
     prompt: "Use the payload: {{seed.content}} with artifact {{artifact:data/payload.md}}"
 `
 	h.mcpCreateRunInline(t, projectID, yaml)
@@ -5832,7 +5832,7 @@ tasks:
 // TestMCPForEachArtifactPathSubstitution reproduces three
 // related bugs around templated artifact paths + for_each:
 //
-//  1. `{{var}}` in `writes_artifacts:` / `reads_artifacts:`
+//  1. `{{var}}` in `writes:` / `reads:`
 //     isn't substituted per-instance — every materialized
 //     instance carries the LITERAL "summaries/{{stem}}.md"
 //     string instead of "summaries/alpha.md" etc.
@@ -5864,14 +5864,14 @@ tasks:
     for_each:
       stem: [alpha, beta]
     action: answer
-    writes_artifacts:
+    writes:
       - "summaries/{{stem}}.md"
     prompt: "Describe {{stem}}."
   - id: categorize
     for_each:
       stem: [alpha, beta]
     action: answer
-    reads_artifacts:
+    reads:
       - "summaries/{{stem}}.md"
     prompt: "Categorize {{stem}} using the summary artifact."
 `
@@ -5978,14 +5978,14 @@ tasks:
     for_each:
       stem: "{{discover.items}}"
     action: answer
-    writes_artifacts:
+    writes:
       - "summaries/{{stem}}.md"
     prompt: "Describe {{stem}}"
   - id: categorize
     for_each:
       stem: "{{discover.items}}"
     action: answer
-    reads_artifacts:
+    reads:
       - "summaries/{{stem}}.md"
     prompt: "Categorize {{stem}}"
 `
@@ -6792,7 +6792,7 @@ tasks:
   - id: run
     action: compute
     script: scripts/sum.sh
-    writes_artifacts:
+    writes:
       - "out/total.txt"
     prompt: "Run sum.sh"
 `, mode: 0o644},
@@ -6940,7 +6940,7 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the describe script."
-    writes_artifacts:
+    writes:
       - "scripts/describe.sh"
 
   - id: describe
@@ -6948,7 +6948,7 @@ tasks:
       stem: [alpha, beta]
     action: compute
     script: scripts/describe.sh
-    writes_artifacts:
+    writes:
       - "summaries/{{stem}}.md"
     prompt: "Describe {{stem}}"
 `
@@ -7047,13 +7047,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the analyze script."
-    writes_artifacts:
+    writes:
       - "scripts/analyze.sh"
 
   - id: analyze
     action: compute
     script: scripts/analyze.sh
-    writes_artifacts:
+    writes:
       - out/summary.json
       - path: out/scratch.bam
         track: false
@@ -7169,13 +7169,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the producer script."
-    writes_artifacts:
+    writes:
       - "scripts/produce.sh"
 
   - id: produce
     action: compute
     script: scripts/produce.sh
-    writes_artifacts:
+    writes:
       - path: out/big.bam
         track: false
     prompt: "Produce the untracked artifact"
@@ -7183,7 +7183,7 @@ tasks:
 
   - id: consume
     action: answer
-    reads_artifacts:
+    reads:
       - out/big.bam
     prompt: "Analyze out/big.bam"
     depends_on: [produce]
@@ -7270,13 +7270,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the producer script."
-    writes_artifacts:
+    writes:
       - "scripts/produce.sh"
 
   - id: produce
     action: compute
     script: scripts/produce.sh
-    writes_artifacts:
+    writes:
       - path: out/big.bam
         track: false
     prompt: "Produce the untracked artifact"
@@ -7284,7 +7284,7 @@ tasks:
 
   - id: consume
     action: answer
-    reads_artifacts:
+    reads:
       - out/big.bam
     prompt: "Analyze out/big.bam"
     depends_on: [produce]
@@ -7344,13 +7344,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the producer script."
-    writes_artifacts:
+    writes:
       - "scripts/produce.sh"
 
   - id: produce
     action: compute
     script: scripts/produce.sh
-    writes_artifacts:
+    writes:
       - path: out/shared.bam
         track: false
     prompt: "Produce via shared bigfiles"
@@ -7358,7 +7358,7 @@ tasks:
 
   - id: consume
     action: answer
-    reads_artifacts:
+    reads:
       - out/shared.bam
     prompt: "Read shared.bam"
     depends_on: [produce]
@@ -7422,13 +7422,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the producer script."
-    writes_artifacts:
+    writes:
       - "scripts/produce.sh"
 
   - id: produce
     action: compute
     script: scripts/produce.sh
-    writes_artifacts:
+    writes:
       - out/summary.json
       - path: out/big.bam
         track: false
@@ -7527,13 +7527,13 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed produce.sh"
-    writes_artifacts:
+    writes:
       - "scripts/produce.sh"
 
   - id: produce
     action: compute
     script: scripts/produce.sh
-    writes_artifacts:
+    writes:
       - path: out/big.bam
         track: false
     prompt: "Produce big.bam on develop"
@@ -7665,14 +7665,14 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the script."
-    writes_artifacts:
+    writes:
       - "scripts/run.sh"
 
   - id: run_in_container
     action: compute
     script: scripts/run.sh
     container: alpine:3.19
-    writes_artifacts:
+    writes:
       - out/summary.txt
     prompt: "Run alpine container"
     depends_on: [setup]
@@ -7758,7 +7758,7 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed"
-    writes_artifacts:
+    writes:
       - "scripts/run.sh"
 
   - id: needs_docker
@@ -7859,7 +7859,7 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the apptainer hello script."
-    writes_artifacts:
+    writes:
       - "scripts/hello.sh"
 
   - id: greet
@@ -7867,7 +7867,7 @@ tasks:
     script: scripts/hello.sh
     container: docker://alpine:latest
     container_runtime: apptainer
-    writes_artifacts:
+    writes:
       - "greetings/hello.txt"
     prompt: "Run the hello script under apptainer."
     depends_on: [setup]
@@ -9417,7 +9417,7 @@ tasks:
   - id: aggregate
     action: answer
     prompt: "Produce a single consolidated summary document combining all expansions and their tags.\n\nExpansions:\n{{expand.content}}\n\nTags:\n{{tag.content}}"
-    writes_artifacts:
+    writes:
       - stress/summary.md
 `
 	h.mcpCreateRunInline(t, projectID, yaml)
@@ -10213,7 +10213,7 @@ tasks:
   - id: setup
     action: answer
     prompt: "Seed the script."
-    writes_artifacts:
+    writes:
       - scripts/echo_iter.sh
 
   - id: discover

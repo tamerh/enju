@@ -666,7 +666,7 @@ tasks:
     action: compute
     mode: async
     script: scripts/compute.sh
-    writes_artifacts:
+    writes:
       - out/data.txt
   - id: review_data
     action: review

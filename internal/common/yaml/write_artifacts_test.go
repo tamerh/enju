@@ -11,7 +11,7 @@ import (
 // TestWriteArtifactsYAMLShorthand exercises the bare-string form.
 // Every entry must round-trip with Track defaulting to true.
 func TestWriteArtifactsYAMLShorthand(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - out/stats.json
   - out/summary.md`
 	var td TaskDef
@@ -35,7 +35,7 @@ func TestWriteArtifactsYAMLShorthand(t *testing.T) {
 // form, including the Track=false opt-out and the implicit
 // Track=true default when the key is omitted.
 func TestWriteArtifactsYAMLObjectForm(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - path: out/aligned.bam
     track: false
   - path: out/stats.json
@@ -63,7 +63,7 @@ func TestWriteArtifactsYAMLObjectForm(t *testing.T) {
 // TestWriteArtifactsYAMLMixedList confirms that shorthand and
 // object form can mix in the same list.
 func TestWriteArtifactsYAMLMixedList(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - out/stats.json
   - path: out/aligned.bam
     track: false`
@@ -79,7 +79,7 @@ func TestWriteArtifactsYAMLMixedList(t *testing.T) {
 // TestWriteArtifactsYAMLMalformedTrack — a non-bool track value
 // must surface as a schema error, not silently decode to false.
 func TestWriteArtifactsYAMLMalformedTrack(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - path: out/x
     track: yes-please`
 	var td TaskDef
@@ -92,7 +92,7 @@ func TestWriteArtifactsYAMLMalformedTrack(t *testing.T) {
 // TestWriteArtifactsYAMLInvalidShape — a sequence/scalar hybrid
 // (e.g. a list inside the entry) should also reject.
 func TestWriteArtifactsYAMLInvalidShape(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - - nested
     - list`
 	var td TaskDef
@@ -100,8 +100,8 @@ func TestWriteArtifactsYAMLInvalidShape(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected YAML parse error on sequence entry, got nil")
 	}
-	if !strings.Contains(err.Error(), "writes_artifacts entry") {
-		t.Errorf("expected error to cite writes_artifacts, got: %v", err)
+	if !strings.Contains(err.Error(), "writes entry") {
+		t.Errorf("expected error to cite writes, got: %v", err)
 	}
 }
 
@@ -245,7 +245,7 @@ func TestWriteArtifactsHelpers(t *testing.T) {
 // expand step at submit time. Pre-pattern YAML callers that
 // still write literals get unchanged behavior.
 func TestWriteArtifactsYAMLPatternForms(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - src/api/
   - src/handlers/*.go
   - cmd/*/main.go
@@ -275,7 +275,7 @@ func TestWriteArtifactsYAMLPatternForms(t *testing.T) {
 // way to express optional — that's by design (bare paths
 // declare required outputs).
 func TestWriteArtifactsYAMLOptionalRoundTrip(t *testing.T) {
-	src := `writes_artifacts:
+	src := `writes:
   - path: src/server.go
   - path: src/go.sum
     optional: true

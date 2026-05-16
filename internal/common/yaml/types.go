@@ -179,9 +179,21 @@ type ParamDef struct {
 	Fields      RecordFields `yaml:"fields,omitempty"`
 }
 
-// TaskDefaults holds default values for all tasks.
+// TaskDefaults holds default values for all tasks. This is the
+// single home for workflow-level defaults — resolveDefaults seeds
+// each task's zero-valued field from here before validate +
+// expansion, so a per-task explicit value always wins. Future
+// defaults (executor:, container:, mode:) land here too rather
+// than as N separate default_* keys.
 type TaskDefaults struct {
 	Timeout string `yaml:"timeout,omitempty"` // e.g., "30m", "2h"
+
+	// AssignTo seeds every task whose assign_to is unset. Scalar
+	// or list (yamlStringList), same as TaskDef.AssignTo. Defaulted
+	// in resolveDefaults before the emit-time assign_to event
+	// enrichment, so inbox/review/assigned-ready all see the
+	// effective value with no downstream change.
+	AssignTo yamlStringList `yaml:"assign_to,omitempty"`
 }
 
 // yamlStringList accepts either a scalar or a list in YAML and exposes
@@ -440,7 +452,7 @@ func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
 		return nil
 	}
 	if value.Kind != yamlv3.MappingNode {
-		return fmt.Errorf("writes_artifacts entry: expected string or mapping, got %s", nodeKindName(value.Kind))
+		return fmt.Errorf("writes entry: expected string or mapping, got %s", nodeKindName(value.Kind))
 	}
 	// Decode via an alias to avoid recursing into our custom
 	// unmarshaller. Pre-set Track=true so an omitted `track:`
@@ -715,7 +727,6 @@ type TaskDef struct {
 
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
-	Gather     bool              `yaml:"gather,omitempty"`
 	Outputs      map[string]OutputSpec  `yaml:"outputs,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
 	Config       map[string]interface{} `yaml:"config,omitempty"`
@@ -760,16 +771,19 @@ type TaskDef struct {
 	// source so it re-runs, (b) manually failing the
 	// aggregator with enju_fail_task if partial results
 	// aren't useful, or (c) terminating the run. The
-	// docs/run-definition.md "aggregates" section carries the
+	// docs/run-definition.md "collects" section carries the
 	// same note for template authors.
-	Aggregates string `yaml:"aggregates,omitempty"`
+	//
+	// YAML surface key is `collects:`; the Go field stays
+	// Aggregates and all consumers are unchanged.
+	Aggregates string `yaml:"collects,omitempty"`
 
 	// Artifact access (Phase C). Repo-relative paths under artifacts/.
 	// ReadsArtifacts can be inferred from {{artifact:path}} prompt
 	// references — the parser will merge inferred reads with any
 	// explicitly declared paths. WritesArtifacts is always explicit.
-	ReadsArtifacts  []string       `yaml:"reads_artifacts,omitempty"`
-	WritesArtifacts WriteArtifacts `yaml:"writes_artifacts,omitempty"`
+	ReadsArtifacts  []string       `yaml:"reads,omitempty"`
+	WritesArtifacts WriteArtifacts `yaml:"writes,omitempty"`
 
 	// Reviews names the task this one reviews. Required on
 	// `action: review` tasks, ignored elsewhere. The reviewer reads

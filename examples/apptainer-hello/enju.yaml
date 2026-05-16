@@ -28,7 +28,7 @@ tasks:
     script: scripts/hello.sh
     container: docker://alpine:latest
     container_runtime: apptainer
-    writes_artifacts:
+    writes:
       - greetings/hello.txt
     prompt: |
       Smoke-test the apptainer runtime: run a tiny alpine

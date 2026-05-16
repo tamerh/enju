@@ -166,7 +166,7 @@ func TestWipeDeclaredWrites_MissingFileIsNoOp(t *testing.T) {
 // (literal + glob + dir) gets fully cleaned in a single call.
 // Without this composability, a task like
 //
-//	writes_artifacts:
+//	writes:
 //	  - go.mod
 //	  - "src/*.go"
 //	  - docs/

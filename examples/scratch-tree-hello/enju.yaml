@@ -22,5 +22,5 @@ tasks:
   - id: greet
     action: compute
     script: entry.sh
-    writes_artifacts:
+    writes:
       - greeting.txt

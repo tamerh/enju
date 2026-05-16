@@ -15,6 +15,6 @@ greet
 
 # Outputs that need to be persisted as artifacts go via
 # $ENJU_SCRATCH (writable per-iter sandbox). The wrapper will
-# pick up declared writes_artifacts from the workspace after
+# pick up declared writes from the workspace after
 # the script exits.
 echo "synthesis complete" > "${ENJU_SCRATCH}/greeting.txt"

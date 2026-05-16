@@ -1,6 +1,6 @@
 package yaml
 
-// Tests for the `aggregates:` task field — a marker that keeps
+// Tests for the `collects:` task field — a marker that keeps
 // a task singular regardless of expansion mode and gathers all
 // instances of a fanned source into one fan-in. Pairs with the
 // existing resolve.go fan-in content-aggregation path, which
@@ -58,7 +58,7 @@ tasks:
     prompt: step 3 for {{item}}
   - id: synth
     action: answer
-    aggregates: step3
+    collects: step3
     prompt: |
       synthesize across all items:
       {{step3.content}}
@@ -128,7 +128,7 @@ tasks:
     prompt: scan {{item}}
   - id: synth
     action: answer
-    aggregates: scan
+    collects: scan
     prompt: synthesize {{scan.content}}
 `
 	parsed, err := helperParse(t, src)
@@ -162,7 +162,7 @@ tasks:
 }
 
 // TestAggregates_ValidatorRejects_UnknownTarget pins the
-// hard-error on `aggregates: <nonexistent>`. Catching this at
+// hard-error on `collects: <nonexistent>`. Catching this at
 // parse time means run-creation fails loudly instead of producing
 // a runtime "dependency not satisfied" stall.
 func TestAggregates_ValidatorRejects_UnknownTarget(t *testing.T) {
@@ -176,12 +176,12 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: nope
+    collects: nope
     prompt: synthesize
 `
 	_, err := helperParse(t, src)
 	if err == nil {
-		t.Fatal("expected error for nonexistent aggregates target")
+		t.Fatal("expected error for nonexistent collects target")
 	}
 	if !strings.Contains(err.Error(), "does not exist") {
 		t.Errorf("error should mention the missing target, got: %v", err)
@@ -202,12 +202,12 @@ tasks:
     prompt: just one
   - id: synth
     action: answer
-    aggregates: solo
+    collects: solo
     prompt: synthesize
 `
 	_, err := helperParse(t, src)
 	if err == nil {
-		t.Fatal("expected error for non-fanned aggregates target")
+		t.Fatal("expected error for non-fanned collects target")
 	}
 	if !strings.Contains(err.Error(), "not fanned") {
 		t.Errorf("error should mention the target isn't fanned, got: %v", err)
@@ -215,7 +215,7 @@ tasks:
 }
 
 // TestAggregates_ValidatorRejects_SelfReference protects against
-// the typo "aggregates: <self.id>". The cycle would manifest as a
+// the typo "collects: <self.id>". The cycle would manifest as a
 // DAG-validation failure deeper in the pipeline; catching it at
 // parse-time gives the author a clear message instead.
 func TestAggregates_ValidatorRejects_SelfReference(t *testing.T) {
@@ -226,7 +226,7 @@ for_each:
 tasks:
   - id: synth
     action: answer
-    aggregates: synth
+    collects: synth
     prompt: synthesize
 `
 	_, err := helperParse(t, src)
@@ -239,7 +239,7 @@ tasks:
 }
 
 // TestAggregates_ValidatorRejects_WithForEach pins that
-// `aggregates:` and a task's own `for_each:` are mutually
+// `collects:` and a task's own `for_each:` are mutually
 // exclusive — the whole point of aggregates is to STAY singular
 // while reducing over a fanned source. Combining them is a
 // category error.
@@ -254,7 +254,7 @@ tasks:
     prompt: scan {{item}}
   - id: synth
     action: answer
-    aggregates: scan
+    collects: scan
     for_each:
       item: [a, b]
     prompt: bad
@@ -269,7 +269,7 @@ tasks:
 }
 
 // TestAggregates_AutoAddsDependency checks the convenience
-// mutation: an `aggregates: X` task gets an auto-injected
+// mutation: an `collects: X` task gets an auto-injected
 // depends_on entry for X if the author didn't write it. Mirrors
 // the reviews auto-dep behavior.
 func TestAggregates_AutoAddsDependency(t *testing.T) {
@@ -283,7 +283,7 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: source
+    collects: source
     prompt: synthesize {{source.content}}
 `
 	parsed, err := helperParse(t, src)
@@ -331,12 +331,12 @@ tasks:
     for_each:
       item: [a, b]
     prompt: scan {{item}}
-    writes_artifacts:
+    writes:
       - reports/{{item}}.md
   - id: synth
     action: answer
-    aggregates: scan
-    reads_artifacts:
+    collects: scan
+    reads:
       - reports/a.md
       - reports/b.md
     prompt: synthesize
@@ -394,7 +394,7 @@ tasks:
     prompt: scan {{item}} for {{audience}}
   - id: synth
     action: answer
-    aggregates: scan
+    collects: scan
     prompt: synthesize for {{audience}}
 `
 	parsed, err := ParseWithParams([]byte(src), map[string]interface{}{
@@ -440,7 +440,7 @@ tasks:
     prompt: setup
   - id: synth
     action: answer
-    aggregates: scan
+    collects: scan
     depends_on: [setup]
     prompt: synthesize {{scan.content}} after {{setup.content}}
 `

@@ -48,7 +48,7 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: source
+    collects: source
     prompt: synthesize
 `)
 
@@ -132,7 +132,7 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: source
+    collects: source
     prompt: |
       synthesize:
       {{source.content}}
@@ -236,7 +236,7 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: source
+    collects: source
     prompt: synthesize
 `)
 
@@ -303,7 +303,7 @@ tasks:
     prompt: do {{item}}
   - id: synth
     action: answer
-    aggregates: source
+    collects: source
     prompt: synthesize
 `)
 

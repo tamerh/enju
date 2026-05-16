@@ -13,7 +13,7 @@ set -e
 . /etc/os-release
 echo "hello from $ID $VERSION_ID"
 
-# Write the declared artifact. writes_artifacts in the manifest
+# Write the declared artifact. writes in the manifest
 # (greetings/hello.txt) tells Enju to pick this up from the
 # workspace after the script exits and commit it to the run
 # branch.

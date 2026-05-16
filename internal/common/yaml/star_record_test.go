@@ -29,7 +29,7 @@ tasks:
     action: compute
     script: scripts/agg.sh
     prompt: "aggregate"
-    reads_artifacts:
+    reads:
       - "q/{{samples[*].sample_id}}/qc.tsv"
       - "c/{{samples[*]}}/pharokka.gff"
       - "n/{{names[*]}}.txt"
@@ -105,7 +105,7 @@ tasks:
     action: compute
     script: s.sh
     prompt: "x"
-    reads_artifacts:
+    reads:
       - "n/{{samples[*].count}}.txt"
       - "k/{{samples[*]}}.flag"
 `

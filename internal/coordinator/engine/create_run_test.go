@@ -42,16 +42,16 @@ tasks:
     action: compute
     script: x.sh
     prompt: "qc {{sample.sample_id}}"
-    writes_artifacts:
+    writes:
       - "{{outdir}}/{{project}}/qc/{{sample.sample_id}}/stats.txt"
   - id: agg
     action: compute
-    aggregates: qc
+    collects: qc
     script: y.sh
     prompt: "aggregate"
-    reads_artifacts:
+    reads:
       - "{{outdir}}/{{project}}/qc/{{samples[*].sample_id}}/stats.txt"
-    writes_artifacts:
+    writes:
       - "{{outdir}}/{{project}}/summary.txt"
 `
 	parsed, err := enjuYaml.ParseWithParams([]byte(y), map[string]interface{}{
