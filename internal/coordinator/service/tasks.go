@@ -77,6 +77,7 @@ type TaskResponse struct {
 	Mode                     string                 `json:"mode,omitempty"`
 	Container                string                 `json:"container,omitempty"`
 	ContainerRuntime         string                 `json:"container_runtime,omitempty"`
+	Volumes                  []string               `json:"volumes,omitempty"`
 	VoteSubmissions          []VoteSubmissionRef    `json:"vote_submissions,omitempty"`
 	ActiveClaimants          []string               `json:"active_claimants,omitempty"`
 	IterationBranches        map[string]string      `json:"iteration_branches,omitempty"`
@@ -320,6 +321,7 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		Mode:              t.Mode,
 		Container:         t.Container,
 		ContainerRuntime:  t.ContainerRuntime,
+		Volumes:           UnmarshalStringSlice(t.Volumes),
 	}
 
 	// Single-citizen task model attribution. Gate on state ==

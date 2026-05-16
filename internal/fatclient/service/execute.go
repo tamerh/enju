@@ -292,6 +292,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		Model:            s.modelName,
 		Container:        meta.Container,
 		ContainerRuntime: meta.ContainerRuntime,
+		Volumes:          meta.Volumes,
 		Env:              meta.Env,
 	}
 

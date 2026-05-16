@@ -270,6 +270,7 @@ func (s *Store) initSchema() error {
 		visibility TEXT NOT NULL DEFAULT '',
 		container TEXT NOT NULL DEFAULT '',
 		container_runtime TEXT NOT NULL DEFAULT '',
+		volumes TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL
 	);
 
@@ -662,6 +663,13 @@ func (s *Store) initSchema() error {
 		// survives fatclient restarts and is read by parseSyncConfig
 		// at run-completion time. Empty = use YAML sync: block.
 		`ALTER TABLE runs ADD COLUMN sync_mode_override TEXT NOT NULL DEFAULT ''`,
+		// Task-level volumes: block — JSON-encoded []string of
+		// extra container bind mounts ("host[:container[:mode]]").
+		// Populated on container compute tasks that declare
+		// volumes:; empty string for every other task. Lets
+		// bioinformatics pipelines reach inputs / reference DBs
+		// that live outside the project directory.
+		`ALTER TABLE tasks ADD COLUMN volumes TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1105,7 +1113,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1123,7 +1131,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime,
+		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2439,7 +2447,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.VoteOptions, &t.VoteChoice, &t.Citizens, &t.MinQuorum, &t.VoteThreshold, &t.VoteDeadline,
 			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
-			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime,
+			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

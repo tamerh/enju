@@ -164,6 +164,11 @@ type TaskMeta struct {
 	// ContainerRuntime selects the container backend ("docker",
 	// "podman", etc.). Empty means use the executor's default.
 	ContainerRuntime string
+	// Volumes is the resolved list of extra container bind
+	// mounts ("host[:container[:mode]]") declared on the task.
+	// Empty for non-container tasks or container tasks with no
+	// extra volumes. Passed verbatim into compute.Spec.
+	Volumes []string
 	// ResultDir is the pre-computed repo-relative path for
 	// this task's result files (e.g. enju/runs/3-gwas/align or
 	// enju/runs/3-gwas/align/sample=S1). The server computes
@@ -365,6 +370,16 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 	}
 	if v, ok := raw["container_runtime"].(string); ok {
 		meta.ContainerRuntime = v
+	}
+	// volumes arrives as a JSON array (toTaskResponse decodes
+	// the stored JSON column via UnmarshalStringSlice). Decode
+	// the typed list the same way assign_to is handled below.
+	if v, ok := raw["volumes"].([]interface{}); ok {
+		for _, e := range v {
+			if str, ok := e.(string); ok {
+				meta.Volumes = append(meta.Volumes, str)
+			}
+		}
 	}
 	if v, ok := raw["result_dir"].(string); ok {
 		meta.ResultDir = v

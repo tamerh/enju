@@ -617,6 +617,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskContainerRuntime(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskVolumes(t); err != nil {
+			return nil, false, err
+		}
 		if err := validateTaskExecutor(t); err != nil {
 			return nil, false, err
 		}
@@ -746,6 +749,64 @@ func validateTaskContainerRuntime(t *TaskDef) error {
 	default:
 		return fmt.Errorf("task %q: container_runtime %q is not supported (valid values: \"docker\", \"apptainer\", \"singularity\")", t.ID, t.ContainerRuntime)
 	}
+}
+
+// validateTaskVolumes enforces the shape of the `volumes:`
+// field — extra host paths bind-mounted into the container.
+//
+// Rules:
+//   - compute-only (mirrors container:/env:/executor:).
+//   - requires container: set. A bare-host script already sees
+//     the host filesystem, so a volume declaration without a
+//     container image is meaningless — almost certainly an
+//     author mistake (same reasoning as container_runtime:
+//     without container:).
+//   - each entry must be a non-empty "host[:container[:mode]]"
+//     spec: 1–3 colon-separated segments, no whitespace, with
+//     a non-empty host segment.
+//   - the optional mode segment, when present and free of
+//     unresolved param refs, must be "ro" or "rw".
+//
+// Validation runs BEFORE param substitution (see
+// parseInternal's pipeline), so entries can still contain raw
+// {{param}} tokens here. We therefore only check structural
+// shape and skip the mode keyword check on any segment that
+// still carries a `{{...}}` ref. No execute-time re-validation
+// is needed: the wrapper passes the resolved spec to the
+// runtime verbatim, and an unresolvable path surfaces as a
+// clear runtime bind error.
+func validateTaskVolumes(t *TaskDef) error {
+	if len(t.Volumes) == 0 {
+		return nil
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: volumes: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	if t.Container == "" {
+		return fmt.Errorf("task %q: volumes: is set without container: — extra mounts only apply to containerized tasks; a bare-host script already sees the host filesystem", t.ID)
+	}
+	for _, v := range t.Volumes {
+		if v == "" {
+			return fmt.Errorf("task %q: volumes: has an empty entry", t.ID)
+		}
+		if strings.ContainsAny(v, " \t\n\r") {
+			return fmt.Errorf("task %q: volume %q contains whitespace — each entry must be a single host[:container[:mode]] token", t.ID, v)
+		}
+		parts := strings.Split(v, ":")
+		if len(parts) > 3 {
+			return fmt.Errorf("task %q: volume %q has too many ':'-separated segments (want host[:container[:mode]])", t.ID, v)
+		}
+		if parts[0] == "" {
+			return fmt.Errorf("task %q: volume %q has an empty host path", t.ID, v)
+		}
+		if len(parts) == 3 {
+			mode := parts[2]
+			if !strings.Contains(mode, "{{") && mode != "ro" && mode != "rw" {
+				return fmt.Errorf("task %q: volume %q has invalid mode %q (valid: \"ro\", \"rw\")", t.ID, v, mode)
+			}
+		}
+	}
+	return nil
 }
 
 // validateTaskExecutor enforces the reserved-field contract

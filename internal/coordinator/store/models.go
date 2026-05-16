@@ -405,6 +405,16 @@ type TaskRecord struct {
 	// create_run time for the same reason as Container.
 	ContainerRuntime string
 
+	// Volumes is the JSON-encoded []string of extra host paths
+	// bind-mounted into the container, on top of the implicit
+	// workspace/scratch/snapshot/shared-root binds. Each entry
+	// is a "host[:container[:mode]]" spec with run params
+	// already resolved. Empty string for non-container tasks or
+	// container tasks that declared no extra volumes. Copied
+	// from the YAML TaskDef.Volumes field at create_run time so
+	// the fat-client executor doesn't re-parse the snapshot.
+	Volumes string
+
 	// ParkedFromState stashes the prior state when a task
 	// transitions to TaskParked during J.2 partial
 	// re-materialization. Restored lossless on reconciliation:

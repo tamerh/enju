@@ -184,6 +184,30 @@ func buildDockerArgs(spec Spec, env []string, workDir string, hostUID, hostGID i
 		args = append(args, "-v", shared+":"+shared+":z")
 	}
 
+	// Author-declared extra volumes. Bioinformatics pipelines
+	// keep large inputs + reference databases OUTSIDE the
+	// project directory; without these binds a containerized
+	// task can't reach any of that data. Each entry is a
+	// "host[:container[:mode]]" spec with run params already
+	// resolved by the YAML parser. The :z SELinux relabel is
+	// appended for the same reason as the workspace mount above
+	// (a no-op off SELinux); when an explicit ro/rw mode is
+	// given it becomes ":mode,z" — the same shape the snapshot
+	// bind uses.
+	for _, vol := range spec.Volumes {
+		host, ctr, mode, err := parseVolumeSpec(vol)
+		if err != nil {
+			return nil, fmt.Errorf("task %q: %w", spec.TaskID, err)
+		}
+		bind := host + ":" + ctr
+		if mode != "" {
+			bind += ":" + mode + ",z"
+		} else {
+			bind += ":z"
+		}
+		args = append(args, "-v", bind)
+	}
+
 	// Env-var forwarding with a strict allowlist. Two classes
 	// survive the filter:
 	//
@@ -294,6 +318,22 @@ func buildApptainerArgs(spec Spec, env []string, workDir string) ([]string, erro
 		args = append(args, "--bind", shared+":"+shared)
 	}
 
+	// Author-declared extra volumes — apptainer mirror of the
+	// docker branch. `--bind host:container[:mode]`; no SELinux
+	// relabel (apptainer's user-namespace mode doesn't use it,
+	// same as the workspace/shared binds above).
+	for _, vol := range spec.Volumes {
+		host, ctr, mode, err := parseVolumeSpec(vol)
+		if err != nil {
+			return nil, fmt.Errorf("task %q: %w", spec.TaskID, err)
+		}
+		bind := host + ":" + ctr
+		if mode != "" {
+			bind += ":" + mode
+		}
+		args = append(args, "--bind", bind)
+	}
+
 	for _, kv := range env {
 		k, v, split := splitEnvEntry(kv)
 		if !split {
@@ -364,6 +404,52 @@ func translatePath(hostPath, workDir, containerWorkDir string) (string, bool) {
 	}
 	rel := cleanHost[len(prefix):]
 	return containerWorkDir + "/" + filepath.ToSlash(rel), true
+}
+
+// parseVolumeSpec splits an author-declared volume entry into
+// its host path, container path, and optional mount mode.
+// Forms accepted (run params already substituted by the YAML
+// parser before this point):
+//
+//	"host"                → host, host, ""
+//	"host:container"      → host, container, ""
+//	"host:container:mode" → host, container, mode  (mode: ro|rw)
+//
+// The bare-host form mounts the path at the identical path
+// inside the container — the common bioinformatics case where
+// tools embed absolute reference-DB paths and the script must
+// see them at exactly the host location. An empty container
+// segment ("host:") also falls back to host.
+//
+// Returns an error on an empty entry, an empty host segment,
+// or more than three ':'-separated segments. validateTaskVolumes
+// already rejects these on the YAML path; the check is repeated
+// here as a defensive guard because an async spec file written
+// by an older binary — or a direct compute.Spec construction in
+// a test — never passes through the YAML validator. Mode keyword
+// validity is intentionally NOT re-checked here: the runtime CLI
+// gives a clear error for a bogus mode, and duplicating the
+// ro/rw allowlist in two places invites drift.
+func parseVolumeSpec(raw string) (host, container, mode string, err error) {
+	if raw == "" {
+		return "", "", "", fmt.Errorf("empty volume entry")
+	}
+	parts := strings.Split(raw, ":")
+	if len(parts) > 3 {
+		return "", "", "", fmt.Errorf("volume %q has too many ':'-separated segments (want host[:container[:mode]])", raw)
+	}
+	host = parts[0]
+	if host == "" {
+		return "", "", "", fmt.Errorf("volume %q has an empty host path", raw)
+	}
+	container = host
+	if len(parts) >= 2 && parts[1] != "" {
+		container = parts[1]
+	}
+	if len(parts) == 3 {
+		mode = parts[2]
+	}
+	return host, container, mode, nil
 }
 
 // checkContainerRuntime verifies the resolved container runtime's

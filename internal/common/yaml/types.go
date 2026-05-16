@@ -648,6 +648,35 @@ type TaskDef struct {
 	// action: compute. See docs/containers.md.
 	ContainerRuntime string `yaml:"container_runtime,omitempty"`
 
+	// Volumes declares extra host paths bind-mounted into the
+	// container, on top of the implicit workspace / scratch /
+	// snapshot / shared-root binds the wrapper always sets up.
+	// Bioinformatics pipelines separate small git-tracked
+	// workflow code from large shared inputs and reference
+	// databases that live OUTSIDE the project directory; without
+	// this, a containerized task can't reach any of that data.
+	//
+	// Each entry is a docker-style spec, with param refs allowed
+	// (resolved at run-create time alongside every other
+	// {{param}} field):
+	//
+	//   - "/data/refs"                      → /data/refs:/data/refs (same path in)
+	//   - "{{raw_data_root}}:/inputs"       → host:container
+	//   - "{{checkv_db}}:{{checkv_db}}:ro"  → host:container:mode
+	//
+	// The bare form maps the host path to the identical path
+	// inside the container — the common case for tools that
+	// embed absolute reference-DB paths. The optional third
+	// segment is the mount mode ("ro" or "rw"; default rw). The
+	// runtime-specific SELinux relabel flag is added by the
+	// wrapper, not declared here.
+	//
+	// Setting this without a container: image is a parse error
+	// (a bare-host script already sees the host filesystem, so
+	// the declaration is meaningless). Only valid on
+	// action: compute. See docs/containers.md.
+	Volumes []string `yaml:"volumes,omitempty"`
+
 	// Executor is the forward-compat seam for remote
 	// execution (SLURM / K8s / AWS Batch / GCP Batch). v1
 	// accepts only "local" (and empty, which defaults to

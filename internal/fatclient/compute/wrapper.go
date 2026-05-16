@@ -224,6 +224,21 @@ type Spec struct {
 	// Ignored when Container is empty.
 	ContainerRuntime string `json:"container_runtime,omitempty"`
 
+	// Volumes is the list of extra host paths bind-mounted into
+	// the container, on top of the implicit workspace / scratch
+	// / snapshot / shared-root binds. Each entry is a docker-
+	// style "host[:container[:mode]]" spec with run params
+	// already resolved (the YAML parser substitutes {{param}}
+	// before this reaches the wrapper). The bare "host" form
+	// maps to host:host. The runtime-specific SELinux relabel
+	// flag is appended by buildContainerArgs, not declared here.
+	//
+	// Empty/absent = no extra mounts. Legacy spec files without
+	// this field decode cleanly to nil, so in-flight async
+	// wrappers launched by older binaries keep working. Ignored
+	// when Container is empty.
+	Volumes []string `json:"volumes,omitempty"`
+
 	// ReadsArtifacts lists the declared input paths the task
 	// expects to find under TaskScratchDir before its script
 	// runs. Each path is read from ReadsSourceSHA via the

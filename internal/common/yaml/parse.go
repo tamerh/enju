@@ -263,6 +263,7 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 		t.Reviews = template.ResolveParams(t.Reviews, strMap)
 		substituteStringSliceInPlace(t.AssignTo, strMap)
 		substituteStringSliceInPlace(t.ReadsArtifacts, strMap)
+		substituteStringSliceInPlace(t.Volumes, strMap)
 		substituteWriteArtifactsInPlace(t.WritesArtifacts, strMap)
 		for k, v := range t.Env {
 			t.Env[k] = template.ResolveParams(v, strMap)
