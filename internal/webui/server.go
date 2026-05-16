@@ -79,6 +79,15 @@ type fatClient interface {
 	// the action on Project.RemoteURL and treats the error as a
 	// friendly note, not a failure.
 	SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error)
+	// Project membership writes (mirror of
+	// enju_add/remove_project_member, promote_member,
+	// demote_owner). Owner-only is enforced coord-side; the
+	// handlers surface the coord error as a banner. role "" on
+	// add lets the coord default it; SetProjectMemberRole's
+	// changed=false means the member already held that role.
+	AddProjectMember(ctx context.Context, projectID int64, username, role string) error
+	RemoveProjectMember(ctx context.Context, projectID int64, username string) error
+	SetProjectMemberRole(ctx context.Context, projectID int64, username, role string) (changed bool, err error)
 
 	// Compute task execution — single + bulk
 	ExecuteComputeTask(ctx context.Context, taskID string) (*service.ExecuteOutcome, error)

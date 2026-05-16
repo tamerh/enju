@@ -23,8 +23,8 @@
     {{if .Project.RemoteURL}}<div><dt>Remote</dt><dd>{{.Project.RemoteURL}}</dd></div>{{end}}
   </dl>
 
-  {{if .SyncResult}}<div class="banner banner-success">{{.SyncResult}}</div>{{end}}
-  {{if .SyncError}}<div class="banner banner-error">{{.SyncError}}</div>{{end}}
+  {{if .Notice}}<div class="banner banner-success">{{.Notice}}</div>{{end}}
+  {{if .NoticeError}}<div class="banner banner-error">{{.NoticeError}}</div>{{end}}
 
   {{/* project_sync — manual catch-up push of local HEAD to the
        coord-known remote, no new commit. NOT the per-run sync:
@@ -93,11 +93,55 @@
     <li>
       <strong>@{{.Username}}</strong>{{if .Name}} <span class="muted">({{.Name}})</span>{{end}}
       <span class="role">{{.Role}}</span>
+      {{/* Owner-only roster controls. The coord enforces the
+           real rules (can't remove the last owner, etc.); we
+           show the actions and surface any refusal as a
+           banner. */}}
+      {{if $.IsOwner}}
+      <span class="member-actions">
+        {{if eq .Role "owner"}}
+        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/role"
+              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/role" hx-target="#main">
+          <input type="hidden" name="role" value="member">
+          <button type="submit" class="btn btn-small">Demote to member</button>
+        </form>
+        {{else}}
+        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/role"
+              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/role" hx-target="#main">
+          <input type="hidden" name="role" value="owner">
+          <button type="submit" class="btn btn-small">Promote to owner</button>
+        </form>
+        {{end}}
+        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/remove"
+              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/remove" hx-target="#main">
+          <button type="submit" class="btn btn-small btn-secondary">Remove</button>
+        </form>
+      </span>
+      {{end}}
     </li>
     {{end}}
   </ul>
   {{else}}
   <p class="muted">(no members listed)</p>
+  {{end}}
+
+  {{if .IsOwner}}
+  <form class="add-member" method="POST" action="/p/{{.Project.ID}}/members"
+        hx-post="/p/{{.Project.ID}}/members" hx-target="#main">
+    <h3>Add member</h3>
+    <div class="add-member-row">
+      <input type="text" name="username" placeholder="username" required>
+      <select name="role">
+        <option value="">member (default)</option>
+        <option value="owner">owner</option>
+      </select>
+      <button type="submit" class="btn">Add</button>
+    </div>
+    <p class="muted small">
+      The citizen must already be registered on the coordinator.
+      Owner-only — non-owners can't change the roster.
+    </p>
+  </form>
   {{end}}
 </section>
 

@@ -104,6 +104,15 @@ type fakeFC struct {
 	syncResp             map[string]interface{}
 	syncErr              error
 	syncedForce          bool
+	addedMemberUser      string
+	addedMemberRole      string
+	addMemberErr         error
+	removedMemberUser    string
+	removeMemberErr      error
+	roleUser             string
+	roleValue            string
+	roleChanged          bool
+	roleErr              error
 
 	// Execute captures
 	executedTaskID  string
@@ -326,6 +335,18 @@ func (f *fakeFC) CreateProject(ctx context.Context, params service.CreateProject
 func (f *fakeFC) SyncProjectToRemote(ctx context.Context, id int64, force bool) (map[string]interface{}, error) {
 	f.syncedForce = force
 	return f.syncResp, f.syncErr
+}
+func (f *fakeFC) AddProjectMember(ctx context.Context, id int64, username, role string) error {
+	f.addedMemberUser, f.addedMemberRole = username, role
+	return f.addMemberErr
+}
+func (f *fakeFC) RemoveProjectMember(ctx context.Context, id int64, username string) error {
+	f.removedMemberUser = username
+	return f.removeMemberErr
+}
+func (f *fakeFC) SetProjectMemberRole(ctx context.Context, id int64, username, role string) (bool, error) {
+	f.roleUser, f.roleValue = username, role
+	return f.roleChanged, f.roleErr
 }
 
 func newTestServer(t *testing.T, fc *fakeFC) *Server {
@@ -579,6 +600,189 @@ func TestProjectSyncNoRemoteError(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "no remote URL configured") {
 		t.Errorf("expected the error surfaced as a banner; body: %q", rr.Body.String())
+	}
+}
+
+// ownerProjDetail is a project whose only member is @tamer as
+// owner — so renderProjectPage computes IsOwner=true and the
+// roster controls render.
+func ownerProjDetail() *service.ProjectDetail {
+	return &service.ProjectDetail{
+		Project: wire.Project{ID: 1, Name: "webui-toy", DefaultBranch: "main"},
+		Members: []wire.Member{
+			{Username: "tamer", Role: "owner"},
+			{Username: "bob", Role: "member"},
+		},
+	}
+}
+
+// TestProjectMemberControlsOwnerGated: an owner sees add/
+// remove/role forms; a non-owner viewer sees the roster only.
+func TestProjectMemberControlsOwnerGated(t *testing.T) {
+	owner := newTestServer(t, &fakeFC{username: "tamer", projDetail: ownerProjDetail()})
+	rr := httptest.NewRecorder()
+	owner.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	body := rr.Body.String()
+	for _, want := range []string{
+		`action="/p/1/members"`,
+		`action="/p/1/members/bob/remove"`,
+		`action="/p/1/members/bob/role"`,
+		"Add member",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("owner view missing %q", want)
+		}
+	}
+
+	// Same project, viewer is a plain member → no controls.
+	viewer := newTestServer(t, &fakeFC{username: "bob", projDetail: ownerProjDetail()})
+	rr2 := httptest.NewRecorder()
+	viewer.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	if strings.Contains(rr2.Body.String(), `action="/p/1/members"`) {
+		t.Errorf("non-owner should not see roster controls")
+	}
+	if !strings.Contains(rr2.Body.String(), "@bob") {
+		t.Errorf("non-owner should still see the roster")
+	}
+}
+
+// TestAddProjectMember: POST adds the member and banners the
+// outcome; role defaults through when blank.
+func TestAddProjectMember(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members",
+		strings.NewReader("username=carol&role="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.addedMemberUser != "carol" || fc.addedMemberRole != "" {
+		t.Errorf("AddProjectMember got (%q,%q)", fc.addedMemberUser, fc.addedMemberRole)
+	}
+	if !strings.Contains(rr.Body.String(), "Added @carol to the project as member") {
+		t.Errorf("expected add banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestAddProjectMemberMissingUsername: blank username is
+// rejected with a banner; the service is not called.
+func TestAddProjectMemberMissingUsername(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members",
+		strings.NewReader("username=+"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if fc.addedMemberUser != "" {
+		t.Errorf("service should not be called; got %q", fc.addedMemberUser)
+	}
+	if !strings.Contains(rr.Body.String(), "username is required") {
+		t.Errorf("expected validation banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestRemoveProjectMember: POST removes by username from the
+// path and banners it.
+func TestRemoveProjectMember(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members/bob/remove", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.removedMemberUser != "bob" {
+		t.Errorf("RemoveProjectMember got %q, want bob", fc.removedMemberUser)
+	}
+	if !strings.Contains(rr.Body.String(), "Removed @bob from the project") {
+		t.Errorf("expected remove banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectMemberRolePromote: role=owner with changed=true
+// banners "promoted".
+func TestSetProjectMemberRolePromote(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail(), roleChanged: true}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members/bob/role",
+		strings.NewReader("role=owner"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.roleUser != "bob" || fc.roleValue != "owner" {
+		t.Errorf("SetProjectMemberRole got (%q,%q)", fc.roleUser, fc.roleValue)
+	}
+	if !strings.Contains(rr.Body.String(), "@bob promoted to owner") {
+		t.Errorf("expected promote banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectMemberRoleNoChange: changed=false banners the
+// no-op rather than implying a mutation.
+func TestSetProjectMemberRoleNoChange(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail(), roleChanged: false}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members/bob/role",
+		strings.NewReader("role=member"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if !strings.Contains(rr.Body.String(), "already member — no change") {
+		t.Errorf("expected no-change banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectMemberRoleBadRole: a role other than
+// owner/member is rejected before hitting the service.
+func TestSetProjectMemberRoleBadRole(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members/bob/role",
+		strings.NewReader("role=admin"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if fc.roleUser != "" {
+		t.Errorf("service should not be called for bad role")
+	}
+	// The banner is HTML-escaped by the template, so the quotes
+	// render as entities — assert the quote-free prefix.
+	if !strings.Contains(rr.Body.String(), "role must be") {
+		t.Errorf("expected bad-role banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestAddProjectMemberCoordError: a coord rejection (e.g.
+// non-owner) surfaces as a banner on a 200, not a 5xx.
+func TestAddProjectMemberCoordError(t *testing.T) {
+	fc := &fakeFC{
+		username:     "tamer",
+		projDetail:   ownerProjDetail(),
+		addMemberErr: fmt.Errorf("only owners can add members"),
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/members",
+		strings.NewReader("username=carol"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "only owners can add members") {
+		t.Errorf("expected coord error bannered; body: %q", rr.Body.String())
 	}
 }
 

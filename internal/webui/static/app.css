@@ -181,6 +181,37 @@ main {
   letter-spacing: 0.04em;
 }
 
+/* Owner-only roster controls. Forms are inline so the
+ * per-member row stays one line until it wraps. */
+.member-actions {
+  display: inline-flex;
+  gap: 0.4rem;
+  margin-left: 0.75rem;
+}
+.member-actions form { display: inline; margin: 0; }
+
+.btn-small {
+  padding: 0.12rem 0.45rem;
+  font-size: 0.72rem;
+}
+
+.add-member { margin-top: 1.25rem; }
+.add-member h3 { margin: 0 0 0.5rem; font-size: 0.95rem; }
+.add-member-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.add-member-row input[type="text"],
+.add-member-row select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
 /* Runs table */
 .run-table {
   width: 100%;
