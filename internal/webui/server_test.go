@@ -113,6 +113,14 @@ type fakeFC struct {
 	roleValue            string
 	roleChanged          bool
 	roleErr              error
+	setBranch            string
+	setBranchWarn        string
+	setBranchErr         error
+	setRemote            string
+	setRemoteWarn        string
+	setRemoteErr         error
+	remoteStatus         map[string]interface{}
+	remoteStatusErr      error
 
 	// Execute captures
 	executedTaskID  string
@@ -347,6 +355,17 @@ func (f *fakeFC) RemoveProjectMember(ctx context.Context, id int64, username str
 func (f *fakeFC) SetProjectMemberRole(ctx context.Context, id int64, username, role string) (bool, error) {
 	f.roleUser, f.roleValue = username, role
 	return f.roleChanged, f.roleErr
+}
+func (f *fakeFC) SetProjectDefaultBranch(ctx context.Context, id int64, branch string) (string, error) {
+	f.setBranch = branch
+	return f.setBranchWarn, f.setBranchErr
+}
+func (f *fakeFC) SetProjectRemote(ctx context.Context, id int64, remoteURL string) (string, error) {
+	f.setRemote = remoteURL
+	return f.setRemoteWarn, f.setRemoteErr
+}
+func (f *fakeFC) RemoteStatusReport(ctx context.Context, id int64) (map[string]interface{}, error) {
+	return f.remoteStatus, f.remoteStatusErr
 }
 
 func newTestServer(t *testing.T, fc *fakeFC) *Server {
@@ -783,6 +802,154 @@ func TestAddProjectMemberCoordError(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "only owners can add members") {
 		t.Errorf("expected coord error bannered; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectDefaultBranch: POST sets the branch and banners
+// it; a non-fatal warning is appended.
+func TestSetProjectDefaultBranch(t *testing.T) {
+	fc := &fakeFC{
+		username:      "tamer",
+		projDetail:    ownerProjDetail(),
+		setBranchWarn: "could not push new branch",
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/default-branch",
+		strings.NewReader("branch=develop"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.setBranch != "develop" {
+		t.Errorf("SetProjectDefaultBranch got %q, want develop", fc.setBranch)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "Default branch set to") || !strings.Contains(body, "could not push new branch") {
+		t.Errorf("expected branch banner + warning; body: %q", body)
+	}
+}
+
+// TestSetProjectDefaultBranchMissing: blank branch is rejected
+// before the service.
+func TestSetProjectDefaultBranchMissing(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/default-branch",
+		strings.NewReader("branch=+"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if fc.setBranch != "" {
+		t.Errorf("service should not be called; got %q", fc.setBranch)
+	}
+	if !strings.Contains(rr.Body.String(), "branch is required") {
+		t.Errorf("expected validation banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectRemote: POST sets the remote and banners it.
+func TestSetProjectRemote(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjDetail()}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/remote",
+		strings.NewReader("remote_url=git@example.com:o/r.git"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.setRemote != "git@example.com:o/r.git" {
+		t.Errorf("SetProjectRemote got %q", fc.setRemote)
+	}
+	if !strings.Contains(rr.Body.String(), "Remote set to git@example.com:o/r.git") {
+		t.Errorf("expected remote banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestSetProjectRemoteError: service rejection (e.g. empty)
+// surfaces as a banner on a 200, not a 5xx.
+func TestSetProjectRemoteError(t *testing.T) {
+	fc := &fakeFC{
+		username:     "tamer",
+		projDetail:   ownerProjDetail(),
+		setRemoteErr: fmt.Errorf("remote_url cannot be empty"),
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/remote",
+		strings.NewReader("remote_url=x"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "remote_url cannot be empty") {
+		t.Errorf("expected error banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestProjectRemoteStatusLine: when a remote is configured the
+// page renders the format.ProjectRemoteStatus one-liner; the
+// settings forms are owner-gated.
+func TestProjectRemoteStatusLine(t *testing.T) {
+	fc := &fakeFC{
+		username: "tamer",
+		projDetail: &service.ProjectDetail{
+			Project: wire.Project{
+				ID: 1, Name: "p", DefaultBranch: "main",
+				RemoteURL: "git@example.com:o/r.git",
+			},
+			Members: []wire.Member{{Username: "tamer", Role: "owner"}},
+		},
+		remoteStatus: map[string]interface{}{
+			"project_id": float64(1),
+			"status":     "ahead",
+			"ahead_by":   float64(2),
+			"behind_by":  float64(0),
+		},
+	}
+	s := newTestServer(t, fc)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "Remote status:") {
+		t.Errorf("expected remote status line; body: %q", body)
+	}
+	if !strings.Contains(body, `action="/p/1/default-branch"`) ||
+		!strings.Contains(body, `action="/p/1/remote"`) {
+		t.Errorf("expected owner settings forms; body: %q", body)
+	}
+}
+
+// TestProjectSettingsNonOwner: a non-owner sees the read-only
+// settings summary, not the forms, and no remote-status fetch
+// crash when none is configured.
+func TestProjectSettingsNonOwner(t *testing.T) {
+	fc := &fakeFC{
+		username: "bob",
+		projDetail: &service.ProjectDetail{
+			Project: wire.Project{ID: 1, Name: "p", DefaultBranch: "main"},
+			Members: []wire.Member{
+				{Username: "tamer", Role: "owner"},
+				{Username: "bob", Role: "member"},
+			},
+		},
+	}
+	s := newTestServer(t, fc)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	body := rr.Body.String()
+	if strings.Contains(body, `action="/p/1/default-branch"`) {
+		t.Errorf("non-owner should not see settings forms")
+	}
+	if !strings.Contains(body, "Changing these is owner-only") {
+		t.Errorf("expected read-only settings summary; body: %q", body)
 	}
 }
 

@@ -39,6 +39,12 @@ type projectPage struct {
 	// roster, just no add/remove/promote/demote (the coord
 	// would reject them anyway; hiding avoids a misleading UI).
 	IsOwner bool
+	// RemoteStatus is the format.ProjectRemoteStatus one-liner
+	// (local-vs-remote ahead/behind), rendered server-side like
+	// the CLI. Empty when no remote is configured or the
+	// best-effort RemoteStatusReport errored (MCP-client mode /
+	// no workspace) — the template just omits the line then.
+	RemoteStatus string
 }
 
 // handleProjectView renders /p/{projectID} — project overview
@@ -99,13 +105,28 @@ func (s *Server) renderProjectPage(w http.ResponseWriter, r *http.Request, pid i
 			break
 		}
 	}
+	// Remote status is a read-only local-vs-remote comparison.
+	// Best-effort, same contract as the untracked-artifact
+	// panel: only meaningful with a remote + a local workspace;
+	// any error just omits the line rather than failing the page.
+	var remoteStatus string
+	if proj.RemoteURL != "" {
+		if rpt, rerr := s.fc.RemoteStatusReport(ctx, pid); rerr != nil {
+			s.logger.Info("RemoteStatusReport unavailable; omitting line",
+				"project_id", pid, "error", rerr)
+		} else if data, merr := json.Marshal(rpt); merr == nil {
+			remoteStatus = format.ProjectRemoteStatus(data)
+		}
+	}
+
 	s.render(w, r, "project.html", projectPage{
-		pageData:    s.commonPageData(),
-		Project:     proj,
-		Runs:        runs,
-		Notice:      notice,
-		NoticeError: noticeErr,
-		IsOwner:     isOwner,
+		pageData:     s.commonPageData(),
+		Project:      proj,
+		Runs:         runs,
+		Notice:       notice,
+		NoticeError:  noticeErr,
+		IsOwner:      isOwner,
+		RemoteStatus: remoteStatus,
 	})
 }
 
@@ -231,4 +252,60 @@ func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Reque
 		verb = "demoted to member"
 	}
 	s.renderProjectPage(w, r, pid, fmt.Sprintf("✓ @%s %s", username, verb), "")
+}
+
+// handleSetProjectDefaultBranch is POST
+// /p/{projectID}/default-branch (mirror of
+// enju_set_project_default_branch). The service composes the
+// coord update with a local materialize; a non-empty warning is
+// appended to the success banner (coord update still landed).
+func (s *Server) handleSetProjectDefaultBranch(w http.ResponseWriter, r *http.Request) {
+	pid, ok := s.projectIDOrBadRequest(w, r)
+	if !ok {
+		return
+	}
+	branch := strings.TrimSpace(r.FormValue("branch"))
+	if branch == "" {
+		s.renderProjectPage(w, r, pid, "", "branch is required")
+		return
+	}
+	warning, err := s.fc.SetProjectDefaultBranch(r.Context(), pid, branch)
+	if err != nil {
+		s.logger.Info("SetProjectDefaultBranch failed", "project_id", pid, "branch", branch, "error", err)
+		s.renderProjectPage(w, r, pid, "", "set default branch failed: "+err.Error())
+		return
+	}
+	msg := fmt.Sprintf("✓ Default branch set to %q", branch)
+	if warning != "" {
+		msg += " — ⚠ " + warning
+	}
+	s.renderProjectPage(w, r, pid, msg, "")
+}
+
+// handleSetProjectRemote is POST /p/{projectID}/remote (mirror
+// of enju_set_project_remote). Empty remote_url is refused by
+// the service (clearing a remote bifurcates multi-machine
+// teams). A non-empty warning from the local-mirror seed step
+// is appended to the success banner.
+func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) {
+	pid, ok := s.projectIDOrBadRequest(w, r)
+	if !ok {
+		return
+	}
+	remoteURL := strings.TrimSpace(r.FormValue("remote_url"))
+	if remoteURL == "" {
+		s.renderProjectPage(w, r, pid, "", "remote_url is required")
+		return
+	}
+	warning, err := s.fc.SetProjectRemote(r.Context(), pid, remoteURL)
+	if err != nil {
+		s.logger.Info("SetProjectRemote failed", "project_id", pid, "error", err)
+		s.renderProjectPage(w, r, pid, "", "set remote failed: "+err.Error())
+		return
+	}
+	msg := fmt.Sprintf("✓ Remote set to %s", remoteURL)
+	if warning != "" {
+		msg += " — ⚠ " + warning
+	}
+	s.renderProjectPage(w, r, pid, msg, "")
 }

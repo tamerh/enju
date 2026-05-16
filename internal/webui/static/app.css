@@ -212,6 +212,33 @@ main {
   color: var(--fg);
 }
 
+.settings-form {
+  margin: 0 0 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+.settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.settings-form input[type="text"] {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  min-width: 22rem;
+}
+.settings-form .muted {
+  flex-basis: 100%;
+  margin: 0;
+}
+
 /* Runs table */
 .run-table {
   width: 100%;

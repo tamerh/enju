@@ -88,6 +88,16 @@ type fatClient interface {
 	AddProjectMember(ctx context.Context, projectID int64, username, role string) error
 	RemoveProjectMember(ctx context.Context, projectID int64, username string) error
 	SetProjectMemberRole(ctx context.Context, projectID int64, username, role string) (changed bool, err error)
+	// Project settings writes (mirror of
+	// enju_set_project_default_branch, enju_set_project_remote).
+	// The returned warning is non-fatal — the coord update
+	// landed; warning != "" means only the local materialize /
+	// mirror step had trouble. RemoteStatusReport is the
+	// read-only local-vs-remote comparison (enju_project_remote_status),
+	// best-effort: errors in MCP-client mode without a workspace.
+	SetProjectDefaultBranch(ctx context.Context, projectID int64, branch string) (warning string, err error)
+	SetProjectRemote(ctx context.Context, projectID int64, remoteURL string) (warning string, err error)
+	RemoteStatusReport(ctx context.Context, projectID int64) (map[string]interface{}, error)
 
 	// Compute task execution — single + bulk
 	ExecuteComputeTask(ctx context.Context, taskID string) (*service.ExecuteOutcome, error)

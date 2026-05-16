@@ -145,6 +145,53 @@
   {{end}}
 </section>
 
+{{/* Project settings — default branch + remote. Owner-gated
+     (coord enforces; hiding avoids a misleading UI). Remote
+     status is read-only and shown to everyone when available.
+     enju_set_project_default_branch / set_project_remote /
+     project_remote_status. */}}
+<section>
+  <h2>Settings</h2>
+  {{if .RemoteStatus}}
+  <p class="muted small">Remote status: {{.RemoteStatus}}</p>
+  {{end}}
+  {{if .IsOwner}}
+  <form class="settings-form" method="POST" action="/p/{{.Project.ID}}/default-branch"
+        hx-post="/p/{{.Project.ID}}/default-branch" hx-target="#main">
+    <label>Default branch
+      <input type="text" name="branch" value="{{.Project.DefaultBranch}}"
+             placeholder="main" required>
+    </label>
+    <button type="submit" class="btn">Set default branch</button>
+    <p class="muted small">
+      Owner-only. A brand-new branch is forked from the current
+      default and materialized locally so future runs can use it.
+    </p>
+  </form>
+
+  <form class="settings-form" method="POST" action="/p/{{.Project.ID}}/remote"
+        hx-post="/p/{{.Project.ID}}/remote" hx-target="#main">
+    <label>Remote URL
+      <input type="text" name="remote_url" value="{{.Project.RemoteURL}}"
+             placeholder="git@host:org/repo.git" required>
+    </label>
+    <button type="submit" class="btn">Set remote</button>
+    <p class="muted small">
+      Owner-only. The local clone's origin is reconfigured and
+      every local branch pushed to seed the new remote. Clearing
+      it is refused — it silently forks multi-machine teams; to
+      stop using this project here, leave the project instead.
+    </p>
+  </form>
+  {{else}}
+  <p class="muted small">
+    Default branch: <code>{{.Project.DefaultBranch}}</code>{{if .Project.RemoteURL}} ·
+    remote <code>{{.Project.RemoteURL}}</code>{{end}}.
+    Changing these is owner-only.
+  </p>
+  {{end}}
+</section>
+
 <section>
   <h2>Runs</h2>
   {{if .Runs}}
