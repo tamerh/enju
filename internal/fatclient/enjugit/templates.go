@@ -474,18 +474,60 @@ func (w *Workflow) EnsureBundleOnDefault(bundleDir, authorName, authorEmail, mod
 	return res.CommitSHA, nil
 }
 
+// isRuntimeOrInternalPath reports whether a repo-relative slash
+// path is enju runtime state (.enju/) or git internals (.git/).
+// Used by collectBundleFiles to keep a *recipe bundle* free of
+// either, regardless of git tracked-status: task result history
+// is committed under .enju/runs/... by design via plumbing (which
+// bypasses .gitignore), so ls-files --cached surfaces it; .git/
+// is defensive belt-and-suspenders.
+//
+// NOT reusable for MaterializeRunRepo, despite the surface
+// symmetry. .enju/ is overloaded: besides accreted result
+// history it also holds THIS run's own pinned template snapshot
+// (RunTemplateSnapshotDir → .enju/runs/<seq>/template-snapshot/),
+// and delivering that frozen recipe to scripts via $ENJU_REPO_DIR
+// is the entire point of MaterializeRunRepo. A blanket .enju/
+// exclusion there throws away the run's own recipe (caught by
+// TestMaterializeRunRepo_WholeTreeIncludingBaseAndTemplate). A
+// recipe bundle is the source tree and never the snapshot area,
+// so the same blanket rule is correct here but wrong there;
+// separating "this run's snapshot (keep)" from "result history
+// (drop)" in the materialized tree is a real per-seq design
+// task, not a shared one-liner.
+func isRuntimeOrInternalPath(rel string) bool {
+	return rel == ".enju" || strings.HasPrefix(rel, ".enju/") ||
+		rel == ".git" || strings.HasPrefix(rel, ".git/")
+}
+
 // collectBundleFiles turns the git-enumerated repo-relative paths
 // (tracked + untracked-not-ignored — gitignore already applied by
 // ListBundleFiles) into the FileWrite list the commit takes. It is
 // the load-bearing half of the ISSUE-2 fix and is split out so the
-// symlink-skip is unit-pinned independently of git: a recipe bundle
-// is enju.yaml + scripts/prompts (text), so a symlink under it
-// points at external data (databases, raw reads) that must never be
-// pinned — and os.ReadFile on a directory symlink would crash. That
-// is exactly the `current -> checkv-db-v1.5` case from the report.
+// exclusions are unit-pinned independently of git:
+//
+//   - Symlinks are never pinned: a recipe bundle is enju.yaml +
+//     scripts/prompts (text); a symlink under it points at external
+//     data (databases, raw reads), and os.ReadFile on a directory
+//     symlink would crash — the `current -> checkv-db-v1.5` case.
+//
+//   - .enju/ and .git/ are NEVER pinned, unconditionally —
+//     regardless of git tracked-status. ListBundleFiles' --cached
+//     arm lists *tracked* files even if .gitignored, and enju's own
+//     run bookkeeping (.enju/runs/<seq>/…/context.json|result.md|
+//     script.log) can become tracked on the default branch when a
+//     task's iteration branch is merged through (the deeper ISSUE-2
+//     root cause — runtime state leaking into history). Pinning
+//     that back into the next bundle snowballs the snapshot. A
+//     recipe bundle must never contain runtime state or git
+//     internals, full stop — this restores (as an explicit filter)
+//     the .git/.enju SkipDir the pre-ls-files walker had.
 func collectBundleFiles(workDir string, rels []string) ([]FileWrite, error) {
 	var files []FileWrite
 	for _, rel := range rels {
+		if isRuntimeOrInternalPath(rel) {
+			continue // runtime state / git internals — never a recipe
+		}
 		abs := filepath.Join(workDir, filepath.FromSlash(rel))
 		fi, lstatErr := os.Lstat(abs)
 		if lstatErr != nil {
