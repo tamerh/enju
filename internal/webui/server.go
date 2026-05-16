@@ -71,6 +71,14 @@ type fatClient interface {
 
 	// Projects — write
 	CreateProject(ctx context.Context, params service.CreateProjectParams) (*service.CreateProjectResult, error)
+	// SyncProjectToRemote pushes local HEAD to the coord-known
+	// remote (mirror of enju_project_sync). Fast-forward
+	// succeeds; a diverged remote is refused unless force=true
+	// (destructive). Errors when no remote is configured —
+	// no-origin is first-class post-Phase-8, so the UI gates
+	// the action on Project.RemoteURL and treats the error as a
+	// friendly note, not a failure.
+	SyncProjectToRemote(ctx context.Context, projectID int64, force bool) (map[string]interface{}, error)
 
 	// Compute task execution — single + bulk
 	ExecuteComputeTask(ctx context.Context, taskID string) (*service.ExecuteOutcome, error)

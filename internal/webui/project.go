@@ -1,10 +1,12 @@
 package webui
 
 import (
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
 
+	"github.com/enju-ai/enju/internal/common/format"
 	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/go-chi/chi/v5"
@@ -22,6 +24,13 @@ type projectPage struct {
 	pageData
 	Project *service.ProjectDetail
 	Runs    []wire.Run
+	// SyncResult / SyncError surface the outcome of a
+	// project_sync POST inline on the re-rendered page.
+	// SyncResult is the format.ProjectSyncResult one-liner
+	// (same text the CLI prints); SyncError is a hard failure
+	// (e.g. no remote configured). At most one is non-empty.
+	SyncResult string
+	SyncError  string
 }
 
 // handleProjectView renders /p/{projectID} — project overview
@@ -38,6 +47,15 @@ func (s *Server) handleProjectView(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid project id", http.StatusBadRequest)
 		return
 	}
+	s.renderProjectPage(w, r, pid, "", "")
+}
+
+// renderProjectPage does the GetProject + ListRuns fetch and
+// renders project.html. Shared by handleProjectView (no sync
+// banner) and handleProjectSync (passes the sync outcome). On a
+// hard fetch error it writes the error response itself and
+// returns — callers must not write after calling it.
+func (s *Server) renderProjectPage(w http.ResponseWriter, r *http.Request, pid int64, syncResult, syncError string) {
 	ctx := r.Context()
 	proj, err := s.fc.GetProject(ctx, pid)
 	if err != nil {
@@ -61,8 +79,38 @@ func (s *Server) handleProjectView(w http.ResponseWriter, r *http.Request) {
 	// promise.
 	sort.Slice(runs, func(i, j int) bool { return runs[i].Seq > runs[j].Seq })
 	s.render(w, r, "project.html", projectPage{
-		pageData: s.commonPageData(),
-		Project:  proj,
-		Runs:     runs,
+		pageData:   s.commonPageData(),
+		Project:    proj,
+		Runs:       runs,
+		SyncResult: syncResult,
+		SyncError:  syncError,
 	})
+}
+
+// handleProjectSync is POST /p/{projectID}/sync (mirror of
+// enju_project_sync): push local HEAD to the coord-known
+// remote. `force` (checkbox) does a destructive force-push when
+// histories diverged; default is the safe fast-forward-only
+// push. The result map is rendered through the same
+// format.ProjectSyncResult the CLI uses, then the project page
+// re-renders with that one-liner as a banner. A hard error
+// (notably "no remote configured" — common post-Phase-8 where
+// no-origin is first-class) becomes a friendly SyncError note
+// rather than a 5xx.
+func (s *Server) handleProjectSync(w http.ResponseWriter, r *http.Request) {
+	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil || pid <= 0 {
+		http.Error(w, "invalid project id", http.StatusBadRequest)
+		return
+	}
+	force := r.FormValue("force") == "true" || r.FormValue("force") == "on"
+	resp, serr := s.fc.SyncProjectToRemote(r.Context(), pid, force)
+	if serr != nil {
+		s.logger.Info("SyncProjectToRemote returned error",
+			"project_id", pid, "force", force, "error", serr)
+		s.renderProjectPage(w, r, pid, "", serr.Error())
+		return
+	}
+	data, _ := json.Marshal(resp)
+	s.renderProjectPage(w, r, pid, format.ProjectSyncResult(data), "")
 }

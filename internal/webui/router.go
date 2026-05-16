@@ -73,6 +73,9 @@ func (s *Server) router() http.Handler {
 	r.Post("/p/{projectID}/r/{runSeq}/terminate", s.handleTerminateRun)
 	r.Post("/p/{projectID}/r/{runSeq}/execute", s.handleExecuteRun)
 
+	// Project-level write actions
+	r.Post("/p/{projectID}/sync", s.handleProjectSync)
+
 	// Static asset serving. The path prefix is stripped by
 	// chi.StripPrefix so /static/app.css maps to app.css inside
 	// the FS (which is sub-rooted at static/ in production).

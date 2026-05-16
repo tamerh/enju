@@ -22,6 +22,67 @@
     <div><dt>Members</dt><dd>{{len .Project.Members}}</dd></div>
     {{if .Project.RemoteURL}}<div><dt>Remote</dt><dd>{{.Project.RemoteURL}}</dd></div>{{end}}
   </dl>
+
+  {{if .SyncResult}}<div class="banner banner-success">{{.SyncResult}}</div>{{end}}
+  {{if .SyncError}}<div class="banner banner-error">{{.SyncError}}</div>{{end}}
+
+  {{/* project_sync — manual catch-up push of local HEAD to the
+       coord-known remote, no new commit. NOT the per-run sync:
+       policy (none/merge/push) — that folds each run into the
+       default branch automatically on completion. This is the
+       repair path for when that automatic push got stuck
+       (push failure, mode:merge merged locally but never
+       pushed, an invalidation that didn't push). Label + help
+       say so explicitly because "sync" is overloaded. Hidden
+       when no remote is configured (no-origin is first-class
+       post-Phase-8). Force-push is destructive — behind a
+       disclosure, same treatment as the run terminate-form. */}}
+  {{if .Project.RemoteURL}}
+  <section class="sync-block">
+    <h2>Remote push</h2>
+    <p class="muted small">
+      Completed runs already fold into the remote automatically,
+      per the workflow's <code>sync:</code> policy
+      (<code>none</code>/<code>merge</code>/<code>push</code>).
+      Use this only as a manual catch-up when a push got stuck
+      and the remote is behind your local history — it pushes
+      local <code>HEAD</code> with no new commit.
+    </p>
+  <div class="btn-row" x-data="{forcing: false}">
+    <form method="POST" action="/p/{{.Project.ID}}/sync"
+          hx-post="/p/{{.Project.ID}}/sync" hx-target="#main">
+      <button type="submit" class="btn">Push local commits to remote</button>
+    </form>
+    <button type="button" class="btn" x-show="!forcing" @click="forcing = true">Force-push…</button>
+    <form x-show="forcing" x-cloak
+          method="POST" action="/p/{{.Project.ID}}/sync"
+          hx-post="/p/{{.Project.ID}}/sync" hx-target="#main"
+          class="terminate-form">
+      <input type="hidden" name="force" value="true">
+      <h3 class="terminate-title">Force-push project #{{.Project.ID}} to remote?</h3>
+      <p class="terminate-warn">
+        <strong>This is destructive.</strong>
+        A force-push overwrites the remote branch even when
+        histories have diverged — it can discard remote-side
+        contributions. Use only when you intentionally want the
+        local history to win. A normal sync refuses a diverged
+        remote instead.
+      </p>
+      <div class="btn-row terminate-actions">
+        <button type="submit" class="btn btn-primary">Confirm force-push</button>
+        <button type="button" class="btn" @click="forcing = false">Cancel</button>
+      </div>
+    </form>
+  </div>
+  </section>
+  {{else}}
+  <p class="muted small">
+    No remote configured — this is a single-machine project
+    (no-origin is first-class). Runs stay local; there's nothing
+    to push. Wire a remote with <code>enju_set_project_remote</code>
+    if you want off-machine sync.
+  </p>
+  {{end}}
 </header>
 
 <section>

@@ -101,6 +101,9 @@ type fakeFC struct {
 	createdProjectParams service.CreateProjectParams
 	createProjectResult  *service.CreateProjectResult
 	createProjectErr     error
+	syncResp             map[string]interface{}
+	syncErr              error
+	syncedForce          bool
 
 	// Execute captures
 	executedTaskID  string
@@ -320,6 +323,10 @@ func (f *fakeFC) CreateProject(ctx context.Context, params service.CreateProject
 	}
 	return &service.CreateProjectResult{ProjectID: 42, CoordResponse: []byte(`{"id":42,"name":"x"}`)}, nil
 }
+func (f *fakeFC) SyncProjectToRemote(ctx context.Context, id int64, force bool) (map[string]interface{}, error) {
+	f.syncedForce = force
+	return f.syncResp, f.syncErr
+}
 
 func newTestServer(t *testing.T, fc *fakeFC) *Server {
 	t.Helper()
@@ -456,6 +463,122 @@ func TestProjectViewBadID(t *testing.T) {
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status: got %d, want 400", rr.Code)
+	}
+}
+
+// projDetailWithRemote is a minimal project detail whose remote
+// is configured, so the sync UI renders.
+func projDetailWithRemote() *service.ProjectDetail {
+	return &service.ProjectDetail{
+		Project: wire.Project{
+			ID: 1, Name: "webui-toy", DefaultBranch: "main",
+			RemoteURL: "git@example.com:org/webui-toy.git",
+		},
+		Members: []wire.Member{{Username: "tamer", Role: "owner"}},
+	}
+}
+
+// TestProjectSyncShowsButtonOnlyWithRemote: the sync controls
+// appear when a remote is configured and collapse to the
+// no-origin note when it isn't.
+func TestProjectSyncShowsButtonOnlyWithRemote(t *testing.T) {
+	withRemote := newTestServer(t, &fakeFC{username: "tamer", projDetail: projDetailWithRemote()})
+	rr := httptest.NewRecorder()
+	withRemote.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	if !strings.Contains(rr.Body.String(), "/p/1/sync") {
+		t.Errorf("expected sync form when remote configured")
+	}
+
+	noRemote := newTestServer(t, &fakeFC{
+		username: "tamer",
+		projDetail: &service.ProjectDetail{
+			Project: wire.Project{ID: 1, Name: "local-only", DefaultBranch: "main"},
+		},
+	})
+	rr2 := httptest.NewRecorder()
+	noRemote.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	body := rr2.Body.String()
+	if strings.Contains(body, `action="/p/1/sync"`) {
+		t.Errorf("sync form should be hidden with no remote")
+	}
+	if !strings.Contains(body, "No remote configured") {
+		t.Errorf("expected the no-origin note")
+	}
+}
+
+// TestProjectSyncPushed: a successful sync re-renders the
+// project page with the format.ProjectSyncResult one-liner as a
+// success banner; force defaults to false.
+func TestProjectSyncPushed(t *testing.T) {
+	fc := &fakeFC{
+		username:   "tamer",
+		projDetail: projDetailWithRemote(),
+		syncResp: map[string]interface{}{
+			"project_id": float64(1),
+			"remote_url": "git@example.com:org/webui-toy.git",
+			"result":     "pushed",
+		},
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/sync", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.syncedForce {
+		t.Errorf("force should default to false")
+	}
+	if !strings.Contains(rr.Body.String(), "pushed to git@example.com:org/webui-toy.git") {
+		t.Errorf("expected pushed banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestProjectSyncForce: the force-push form sets force=true.
+func TestProjectSyncForce(t *testing.T) {
+	fc := &fakeFC{
+		username:   "tamer",
+		projDetail: projDetailWithRemote(),
+		syncResp: map[string]interface{}{
+			"project_id": float64(1), "remote_url": "r", "result": "force_pushed",
+		},
+	}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("force=true")
+	req := httptest.NewRequest(http.MethodPost, "/p/1/sync", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if !fc.syncedForce {
+		t.Errorf("force should be true when force=true posted")
+	}
+	if !strings.Contains(rr.Body.String(), "force-pushed") {
+		t.Errorf("expected force-pushed banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestProjectSyncNoRemoteError: a hard error (no remote) becomes
+// a friendly banner on a 200 page, not a 5xx.
+func TestProjectSyncNoRemoteError(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username:   "tamer",
+		projDetail: &service.ProjectDetail{Project: wire.Project{ID: 1, Name: "local-only"}},
+		syncErr:    fmt.Errorf("project has no remote URL configured on the coordinator"),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/p/1/sync", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "no remote URL configured") {
+		t.Errorf("expected the error surfaced as a banner; body: %q", rr.Body.String())
 	}
 }
 
