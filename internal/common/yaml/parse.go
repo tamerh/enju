@@ -16,7 +16,6 @@ package yaml
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -26,11 +25,13 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 )
 
-// ParseFile reads and parses a run YAML file.
+// ParseFile reads and parses a run YAML file, resolving any
+// top-level `include:` directive first (see FlattenIncludes). A
+// file with no `include:` is read through byte-identical.
 func ParseFile(path string) (*ParsedRun, error) {
-	data, err := os.ReadFile(path)
+	data, err := FlattenFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading file: %w", err)
+		return nil, err
 	}
 	return Parse(data)
 }

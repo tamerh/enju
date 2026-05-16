@@ -53,7 +53,7 @@ type validateReport struct {
 func validateOne(path string, strict, asJSON bool) bool {
 	rep := validateReport{Path: path}
 
-	data, readErr := os.ReadFile(path)
+	data, readErr := enjuYaml.FlattenFile(path)
 	if readErr != nil {
 		rep.Error = readErr.Error()
 		emitReport(rep, asJSON)

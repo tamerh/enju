@@ -226,14 +226,34 @@ func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := enjuYaml.Parse(rb.manifest)
+	// Resolve any `include:` directive against the SAME pinned
+	// source the manifest came from, so a fragment can't diverge
+	// from what executes either. No-include manifests pass through
+	// byte-identical, so existing single-file workflows are
+	// unaffected.
+	sha, _ := w.resolveDefaultBranchSHA(w.DefaultBranch())
+	workdir := w.WorkDir()
+	raw, err := enjuYaml.FlattenIncludes(rb.manifestPath, func(p string) ([]byte, error) {
+		data, found, rerr := w.readPinnedRepoFile(sha, workdir, p)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if !found {
+			return nil, fmt.Errorf("included file %q not found on the default branch or in the worktree", p)
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := enjuYaml.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parsing template %s: %w", rb.manifestPath, err)
 	}
 	return &LoadedTemplate{
 		Path:      rb.manifestPath,
 		BundleDir: rb.bundleDir,
-		Raw:       rb.manifest,
+		Raw:       raw,
 		Summary: TemplateSummary{
 			Path:        rb.manifestPath,
 			Name:        parsed.Run.Name,
@@ -265,27 +285,48 @@ func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, wo
 	if err != nil {
 		return nil, err
 	}
+	data, found, rerr := w.readPinnedRepoFile(sha, workdir, manifestPath)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if !found {
+		return nil, fmt.Errorf("template %q not found on default branch or in worktree — check `enju_list_templates` for available recipes", manifestPath)
+	}
+	return &resolvedBundle{
+		bundleDir:    bundleDir,
+		manifestPath: manifestPath,
+		manifest:     data,
+	}, nil
+}
+
+// readPinnedRepoFile reads ONE repo-relative file the reproducible
+// way path= runs require, and is the single implementation of that
+// contract — used for the workflow manifest AND for every file an
+// `include:` directive pulls in, so a fragment can't diverge from
+// what executes any more than the manifest can.
+//
+// Ladder: prefer the default-branch commit (sha); if the same path
+// also exists in the worktree with different bytes, the operator
+// has uncommitted edits and we refuse loudly (validating against
+// bytes that won't be the bytes that execute is the showcase_v16
+// trap); fall back to the worktree only when the file isn't
+// committed at all (first-time authoring UX). found=false means the
+// file is nowhere — the caller decides whether that is fatal (the
+// manifest: yes; an include: yes; both with their own message).
+func (w *Workflow) readPinnedRepoFile(sha, workdir, repoRelPath string) ([]byte, bool, error) {
 	if sha != "" {
-		data, found, rerr := w.git.ReadFileAtCommit(sha, manifestPath)
+		data, found, rerr := w.git.ReadFileAtCommit(sha, repoRelPath)
 		if rerr != nil && !errors.Is(rerr, git.ErrCommitNotFound) {
-			return nil, fmt.Errorf("reading template %s: %w", manifestPath, rerr)
+			return nil, false, fmt.Errorf("reading %s: %w", repoRelPath, rerr)
 		}
 		if found {
-			// Divergence guard: if the same path on disk has
-			// different bytes, the operator has uncommitted
-			// edits. Validation against the committed bytes
-			// would lie about what executes. Refuse loudly.
 			if workdir != "" {
-				wtData, fsErr := os.ReadFile(filepath.Join(workdir, manifestPath))
+				wtData, fsErr := os.ReadFile(filepath.Join(workdir, repoRelPath))
 				if fsErr == nil && !bytes.Equal(wtData, data) {
-					return nil, fmt.Errorf("template %s has uncommitted changes — the worktree differs from the default-branch commit, but path= runs execute against the committed tree. Commit your edits first (`git add %s && git commit`) or pass yaml=<inline content> to use the worktree version verbatim", manifestPath, manifestPath)
+					return nil, false, fmt.Errorf("%s has uncommitted changes — the worktree differs from the default-branch commit, but path= runs execute against the committed tree. Commit your edits first (`git add %s && git commit`) or pass yaml=<inline content> to use the worktree version verbatim", repoRelPath, repoRelPath)
 				}
 			}
-			return &resolvedBundle{
-				bundleDir:    bundleDir,
-				manifestPath: manifestPath,
-				manifest:     data,
-			}, nil
+			return data, true, nil
 		}
 	}
 	// Worktree fallback for pre-commit authoring UX — when the
@@ -294,19 +335,15 @@ func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, wo
 	// exist; first-time create_run with an uncommitted YAML still
 	// works.
 	if workdir != "" {
-		data, fsErr := os.ReadFile(filepath.Join(workdir, manifestPath))
+		data, fsErr := os.ReadFile(filepath.Join(workdir, repoRelPath))
 		if fsErr == nil {
-			return &resolvedBundle{
-				bundleDir:    bundleDir,
-				manifestPath: manifestPath,
-				manifest:     data,
-			}, nil
+			return data, true, nil
 		}
 		if !os.IsNotExist(fsErr) {
-			return nil, fmt.Errorf("reading template %s from worktree: %w", manifestPath, fsErr)
+			return nil, false, fmt.Errorf("reading %s from worktree: %w", repoRelPath, fsErr)
 		}
 	}
-	return nil, fmt.Errorf("template %q not found on default branch or in worktree — check `enju_list_templates` for available recipes", manifestPath)
+	return nil, false, nil
 }
 
 // ReadBundleFiles walks the bundle dir on the default branch and

@@ -27,7 +27,7 @@ import (
 // raise verbatim — the same enjuYaml.ParseWithParams entry point
 // the MCP handler uses.
 func runDryRun(workflowPath string, params map[string]interface{}, asJSON bool) int {
-	data, err := os.ReadFile(workflowPath)
+	data, err := enjuYaml.FlattenFile(workflowPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dry-run: %v\n", err)
 		return 4
