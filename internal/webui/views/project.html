@@ -223,6 +223,10 @@
 
 <section>
   <h2>Runs</h2>
+  <p class="btn-row">
+    <a class="btn btn-primary" href="/p/{{.Project.ID}}/new-run">New run from YAML</a>
+    <a class="btn" href="/p/{{.Project.ID}}/templates">Run from template</a>
+  </p>
   {{if .Runs}}
   <table class="run-table">
     <thead>

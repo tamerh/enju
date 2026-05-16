@@ -53,6 +53,12 @@ func (s *Server) router() http.Handler {
 	r.Get("/p/{projectID}/templates/show/*", s.handleTemplateDetail)
 	r.Post("/p/{projectID}/templates/run/*", s.handleCreateRunFromTemplate)
 
+	// New run from inline YAML — the paste-a-workflow authoring
+	// path. GET renders the form (read); POST validates and
+	// optionally creates (write, CSRF-gated).
+	r.Get("/p/{projectID}/new-run", s.handleNewRunForm)
+	r.Post("/p/{projectID}/new-run", s.handleNewRun)
+
 	// Artifacts — list, content view, history (read-only).
 	r.Get("/p/{projectID}/artifacts", s.handleArtifactsList)
 	r.Get("/p/{projectID}/artifacts/show/*", s.handleArtifactView)

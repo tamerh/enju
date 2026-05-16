@@ -67,6 +67,12 @@ type fatClient interface {
 	ListTemplates(ctx context.Context, projectID int64) ([]service.TemplateSummary, error)
 	DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*service.LoadedTemplate, error)
 	CreateRunFromTemplate(ctx context.Context, projectID int64, templatePath string, params map[string]interface{}, branch, authorName, authorEmail string) (*service.CreateRunFromTemplateResult, error)
+	// CreateRunFromYAML creates a run from an inline YAML
+	// definition (mirror of enju_create_run yaml= mode). No
+	// on-disk bundle — the run's reproducible copy is the
+	// auto-committed inline snapshot. Callers validate with
+	// yaml.Parse first so authoring mistakes surface locally.
+	CreateRunFromYAML(ctx context.Context, projectID int64, yamlContent string, params map[string]interface{}, branch, authorName, authorEmail string) (*service.CreateRunFromTemplateResult, error)
 	CommitAuthor(ctx context.Context) (name, email string)
 
 	// Projects — write

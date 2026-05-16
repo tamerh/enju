@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -94,6 +95,8 @@ type fakeFC struct {
 	createdFromPath     string
 	createdParams       map[string]interface{}
 	createdBranch       string
+	createdYAML         string
+	createdYAMLBranch   string
 	createRunResult     *service.CreateRunFromTemplateResult
 	createRunErr        error
 
@@ -284,6 +287,17 @@ func (f *fakeFC) CreateRunFromTemplate(ctx context.Context, pid int64, path stri
 		return f.createRunResult, nil
 	}
 	return &service.CreateRunFromTemplateResult{CoordResponse: []byte(`{"seq":3,"name":"new run"}`)}, nil
+}
+func (f *fakeFC) CreateRunFromYAML(ctx context.Context, pid int64, yamlContent string, params map[string]interface{}, branch, name, email string) (*service.CreateRunFromTemplateResult, error) {
+	f.createdYAML = yamlContent
+	f.createdYAMLBranch = branch
+	if f.createRunErr != nil {
+		return nil, f.createRunErr
+	}
+	if f.createRunResult != nil {
+		return f.createRunResult, nil
+	}
+	return &service.CreateRunFromTemplateResult{CoordResponse: []byte(`{"seq":7,"name":"yaml run"}`)}, nil
 }
 func (f *fakeFC) CommitAuthor(ctx context.Context) (string, string) {
 	return "tamer", "tamer@example.com"
@@ -2794,6 +2808,129 @@ func TestCreateRunFromTemplateError(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "missing required param") {
 		t.Errorf("expected error banner with backend message")
+	}
+}
+
+const validWorkflowYAML = `name: "ui smoke"
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: "say hi"
+`
+
+// TestNewRunForm: GET renders the paste form.
+func TestNewRunForm(t *testing.T) {
+	s := newTestServer(t, &fakeFC{username: "tamer"})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/new-run", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"New run from YAML", `name="yaml"`, `value="create"`, `value="validate"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("form missing %q", want)
+		}
+	}
+}
+
+// TestNewRunValidateOnly: action=validate parses but does NOT
+// create; valid YAML → green confirmation, no service call.
+func TestNewRunValidateOnly(t *testing.T) {
+	fc := &fakeFC{username: "tamer"}
+	s := newTestServer(t, fc)
+	form := url.Values{"yaml": {validWorkflowYAML}, "action": {"validate"}}
+	req := httptest.NewRequest(http.MethodPost, "/p/1/new-run", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.createdYAML != "" {
+		t.Errorf("validate must not create a run; got createdYAML=%q", fc.createdYAML)
+	}
+	if !strings.Contains(rr.Body.String(), "Valid workflow") {
+		t.Errorf("expected validation confirmation; body: %q", rr.Body.String())
+	}
+}
+
+// TestNewRunInvalidYAML: a parse error is surfaced and the run
+// is NOT created; the paste is preserved.
+func TestNewRunInvalidYAML(t *testing.T) {
+	fc := &fakeFC{username: "tamer"}
+	s := newTestServer(t, fc)
+	bad := "name: [unterminated\ntasks: nope"
+	form := url.Values{"yaml": {bad}, "action": {"create"}}
+	req := httptest.NewRequest(http.MethodPost, "/p/1/new-run", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.createdYAML != "" {
+		t.Errorf("invalid YAML must not reach CreateRunFromYAML; got %q", fc.createdYAML)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "invalid workflow YAML") {
+		t.Errorf("expected parse-error banner; body: %q", body)
+	}
+	if !strings.Contains(body, "unterminated") {
+		t.Errorf("expected the paste preserved in the textarea; body: %q", body)
+	}
+}
+
+// TestNewRunCreateRedirects: valid YAML + action=create calls
+// the service and redirects to the created run.
+func TestNewRunCreateRedirects(t *testing.T) {
+	fc := &fakeFC{
+		username:        "tamer",
+		createRunResult: &service.CreateRunFromTemplateResult{CoordResponse: []byte(`{"seq":7}`)},
+	}
+	s := newTestServer(t, fc)
+	form := url.Values{"yaml": {validWorkflowYAML}, "branch": {"auto"}, "action": {"create"}}
+	req := httptest.NewRequest(http.MethodPost, "/p/1/new-run", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	req.Header.Set("HX-Request", "true")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if fc.createdYAML == "" {
+		t.Fatalf("CreateRunFromYAML not called")
+	}
+	if fc.createdYAMLBranch != "auto" {
+		t.Errorf("branch passthrough: got %q, want auto", fc.createdYAMLBranch)
+	}
+	if rr.Header().Get("HX-Redirect") != "/p/1/r/7" {
+		t.Errorf("HX-Redirect: got %q, want /p/1/r/7", rr.Header().Get("HX-Redirect"))
+	}
+}
+
+// TestNewRunCreateError: a coord rejection (e.g. params block
+// the inline path doesn't collect) re-renders with the error
+// and the paste intact, not a 5xx.
+func TestNewRunCreateError(t *testing.T) {
+	fc := &fakeFC{
+		username:     "tamer",
+		createRunErr: fmt.Errorf("missing required param: items"),
+	}
+	s := newTestServer(t, fc)
+	form := url.Values{"yaml": {validWorkflowYAML}, "action": {"create"}}
+	req := httptest.NewRequest(http.MethodPost, "/p/1/new-run", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "missing required param: items") {
+		t.Errorf("expected coord error bannered; body: %q", rr.Body.String())
 	}
 }
 

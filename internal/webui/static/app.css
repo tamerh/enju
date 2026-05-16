@@ -87,6 +87,22 @@ body {
   .banner-success { background: #064e3b; color: #d1fae5; border-color: #047857; }
 }
 
+/* Banner warn variant — non-fatal yaml.Parse advisories on the
+   new-run page (author can still create the run). */
+.banner-warn {
+  padding: 0.75rem 1rem;
+  margin: 0.75rem 0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+.banner-warn ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
+@media (prefers-color-scheme: dark) {
+  .banner-warn { background: #78350f; color: #fef3c7; border-color: #b45309; }
+}
+
 main {
   max-width: 960px;
   margin: 1.5rem auto;

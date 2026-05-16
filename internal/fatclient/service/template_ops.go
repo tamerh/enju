@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
@@ -140,6 +141,70 @@ func (s *FatClient) CreateRunFromTemplate(ctx context.Context, projectID int64, 
 	return &CreateRunFromTemplateResult{
 		CoordResponse:   data,
 		SnapshotWarning: snapshotWarning,
+	}, nil
+}
+
+// CreateRunFromYAML creates a run from an inline YAML definition
+// (mirror of mcphandlers.handleCreateRun's yaml= mode for
+// in-process consumers). Unlike the template path there is no
+// on-disk bundle: the YAML is POSTed directly and the run's
+// reproducible copy is the auto-committed inline snapshot
+// (enju/runs/{seq}-{slug}/template-snapshot/enju.yaml on the run
+// branch). branch=="auto" is resolved client-side because the
+// coord owns run state, not git plumbing — same as the
+// mcphandler. Snapshot + branch-ensure are best-effort: the run
+// already exists on the coord once the POST returns, so their
+// failures surface as SnapshotWarning, not a hard error.
+//
+// Callers should validate the YAML with yaml.Parse before
+// calling this so authoring mistakes are caught locally rather
+// than as an opaque coord rejection.
+func (s *FatClient) CreateRunFromYAML(ctx context.Context, projectID int64, yamlContent string, params map[string]interface{}, branch, authorName, authorEmail string) (*CreateRunFromTemplateResult, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("project_id is required")
+	}
+	if strings.TrimSpace(yamlContent) == "" {
+		return nil, fmt.Errorf("yaml is required")
+	}
+
+	if branch == "auto" {
+		resolved, rerr := s.ResolveAutoBranch(ctx, projectID, yamlContent, "")
+		if rerr != nil {
+			return nil, fmt.Errorf("resolving branch=auto: %w", rerr)
+		}
+		branch = resolved
+	}
+
+	body := map[string]interface{}{
+		"yaml":     yamlContent,
+		"username": s.coord.Username(),
+	}
+	if len(params) > 0 {
+		body["params"] = params
+	}
+	if branch != "" {
+		body["branch"] = branch
+	}
+
+	data, err := s.coord.Post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID), body)
+	if err != nil {
+		return nil, err
+	}
+	if msg := errorMsg(data); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+
+	// Best-effort, in the same order as the inline path of
+	// handleCreateRun: materialize the run branch, then commit
+	// the inline YAML snapshot so execute can read it.
+	ensureWarn := s.EnsureRunBranch(ctx, projectID, data)
+	snapWarn := s.CommitRunInlineSnapshot(ctx, projectID, yamlContent, data, authorName, authorEmail)
+
+	s.TouchProject(projectID)
+
+	return &CreateRunFromTemplateResult{
+		CoordResponse:   data,
+		SnapshotWarning: strings.TrimSpace(ensureWarn + " " + snapWarn),
 	}, nil
 }
 

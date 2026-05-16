@@ -1,0 +1,55 @@
+{{define "title"}}New run · project #{{.ProjectID}} · Enju{{end}}
+
+{{define "main"}}
+<nav class="crumbs">
+  <a href="/">Projects</a>
+  <span> / </span>
+  <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
+  <span> / </span>
+  <span>new run</span>
+</nav>
+
+<header class="task-header">
+  <h1>New run from YAML</h1>
+  <p class="muted">
+    Paste an <code>enju.yaml</code> workflow definition and run it. It's
+    validated with the same parser the coordinator uses before anything is
+    created, and the exact YAML is snapshotted into the run for
+    reproducibility. For parameterized workflows (a <code>params:</code>
+    block) use a <a href="/p/{{.ProjectID}}/templates">template</a> instead —
+    this path doesn't collect parameter values.
+  </p>
+</header>
+
+<section>
+  {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+  {{if .Validated}}<div class="banner banner-success">✓ Valid workflow — review any warnings below, then Create run.</div>{{end}}
+  {{if .Warnings}}
+  <div class="banner banner-warn">
+    <strong>Warnings (non-fatal):</strong>
+    <ul>{{range .Warnings}}<li>{{.}}</li>{{end}}</ul>
+  </div>
+  {{end}}
+
+  <form method="POST" action="/p/{{.ProjectID}}/new-run"
+        hx-post="/p/{{.ProjectID}}/new-run"
+        hx-target="#main"
+        class="submit-form">
+    <label>
+      <span>Workflow YAML</span>
+      <textarea name="yaml" rows="22" spellcheck="false"
+                placeholder="name: my-workflow&#10;tasks:&#10;  - id: draft&#10;    action: answer&#10;    prompt: ...">{{.SubmittedYAML}}</textarea>
+    </label>
+
+    <label class="newrun-branch">
+      <span>Branch <span class="muted small">— optional; blank = project default, <code>auto</code> = coordinator picks an unused name</span></span>
+      <input type="text" name="branch" value="{{.SubmittedBranch}}" placeholder="(default)">
+    </label>
+
+    <div class="btn-row">
+      <button type="submit" name="action" value="validate" class="btn">Validate</button>
+      <button type="submit" name="action" value="create" class="btn btn-primary">Create run</button>
+    </div>
+  </form>
+</section>
+{{end}}
