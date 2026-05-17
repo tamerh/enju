@@ -33,6 +33,16 @@ type mePage struct {
 	Saved         *service.CitizenResponse
 	Error         string
 	Submitted     service.UpdateProfileParams
+	// Agents is the caller's agent roster (best-effort, like
+	// Dashboard/Contributions). NewAgent is set ONLY on the
+	// turn an agent was just registered — it carries the
+	// one-time token, surfaced once and never re-fetched.
+	// AgentError / SubmittedAgent thread the register-form
+	// failure path (banner + repopulate).
+	Agents         []service.AgentSummary
+	NewAgent       *service.RegisterAgentResult
+	AgentError     string
+	SubmittedAgent service.RegisterAgentParams
 }
 
 // handleMe renders /me.
@@ -85,7 +95,58 @@ func (s *Server) renderMe(w http.ResponseWriter, r *http.Request, pre mePage) {
 		s.logger.Warn("GetContributions failed; rendering without contributions",
 			"error", cerr)
 	}
+	// Agent roster — best-effort, same contract: a wedged
+	// endpoint leaves the slot empty, not a dead page. Don't
+	// clobber a roster the caller already supplied (none today,
+	// but keeps the pre-pass-through contract honest).
+	if pre.Agents == nil {
+		agents, aerr := s.fc.ListMyAgents(r.Context())
+		if aerr != nil {
+			s.logger.Warn("ListMyAgents failed; rendering without agent roster",
+				"error", aerr)
+		} else {
+			pre.Agents = agents
+		}
+	}
 	pre.Dashboard = dash
 	pre.Contributions = contrib
 	s.render(w, r, "me.html", pre)
+}
+
+// handleRegisterAgent is POST /me/agents. Form: name (required),
+// optional username / role / token-label. On success the page
+// re-renders with the new agent's one-time token shown once
+// (NewAgent) — there is no recovery path, so the reveal is
+// prominent and the token is never re-fetched. On failure the
+// form repopulates with the submitted values + an error banner.
+func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	params := service.RegisterAgentParams{
+		Name:     strings.TrimSpace(r.FormValue("name")),
+		Username: strings.TrimSpace(r.FormValue("username")),
+		Role:     strings.TrimSpace(r.FormValue("role")),
+		Label:    strings.TrimSpace(r.FormValue("label")),
+	}
+	if params.Name == "" {
+		s.renderMe(w, r, mePage{
+			pageData:       s.commonPageData(),
+			AgentError:     "an agent name is required",
+			SubmittedAgent: params,
+		})
+		return
+	}
+	res, err := s.fc.RegisterAgent(r.Context(), params)
+	if err != nil {
+		s.logger.Error("RegisterAgent failed", "error", err)
+		s.renderMe(w, r, mePage{
+			pageData:       s.commonPageData(),
+			AgentError:     "register agent failed: " + err.Error(),
+			SubmittedAgent: params,
+		})
+		return
+	}
+	s.renderMe(w, r, mePage{pageData: s.commonPageData(), NewAgent: res})
 }

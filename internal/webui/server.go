@@ -136,6 +136,13 @@ type fatClient interface {
 	GetDashboard(ctx context.Context) (*service.DashboardResponse, error)
 	GetContributions(ctx context.Context, username string) (*service.ContributionsResponse, error)
 	UpdateProfile(ctx context.Context, params service.UpdateProfileParams) (*service.CitizenResponse, error)
+	// Agents — user-scoped identity/roster (mirror of
+	// enju_register_agent, enju_list_my_agents). Lifecycle
+	// (start/stop/status/logs) is intentionally absent: it's
+	// process-local supervision, a CLI concern, not a webui
+	// surface. RegisterAgent's Token is one-time.
+	RegisterAgent(ctx context.Context, params service.RegisterAgentParams) (*service.RegisterAgentResult, error)
+	ListMyAgents(ctx context.Context) ([]service.AgentSummary, error)
 }
 
 // Config holds the boot-time settings for the UI server. All

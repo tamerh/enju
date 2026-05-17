@@ -105,4 +105,84 @@
   </dl>
 </section>
 {{end}}
+
+{{/* Agents — user-scoped identity/roster (enju_register_agent /
+     enju_list_my_agents). Identity only: process lifecycle
+     (start/stop/status/logs) is a CLI concern on the machine
+     that runs the agents, not a webui surface. */}}
+<section x-data="{registering: {{if or .AgentError .SubmittedAgent.Name}}true{{else}}false{{end}}}">
+  <h2>Agents</h2>
+  <p class="muted small">
+    Agents are non-human citizens you own — give one a token, drop it into a
+    launcher (CI, daemon), and it claims/submits as itself. Starting and
+    stopping agent processes is done with the <code>enju agent</code> CLI on
+    the machine that runs them.
+  </p>
+
+  {{if .NewAgent}}
+  <div class="banner banner-warn">
+    <strong>Agent <code>@{{.NewAgent.Username}}</code> registered{{if .NewAgent.ParentName}} (owned by @{{.NewAgent.ParentName}}){{end}}.</strong>
+    This token is shown <em>once</em> and cannot be retrieved later — copy it
+    now into the agent's launcher as its Bearer token.{{if .NewAgent.Label}}
+    Token label: <code>{{.NewAgent.Label}}</code>.{{end}}
+    <pre class="result-content">{{.NewAgent.Token}}</pre>
+    {{if .NewAgent.Warning}}<span class="muted small">{{.NewAgent.Warning}}</span>{{end}}
+  </div>
+  {{end}}
+
+  {{if .Agents}}
+  <table class="run-table">
+    <thead>
+      <tr><th>Username</th><th>Name</th><th>Role</th><th>Registered</th><th>Tokens</th></tr>
+    </thead>
+    <tbody>
+      {{range .Agents}}
+      <tr>
+        <td><code>@{{.Username}}</code></td>
+        <td>{{.Name}}</td>
+        <td>{{if .Role}}{{.Role}}{{else}}<span class="muted small">—</span>{{end}}</td>
+        <td class="muted small">{{.Registered}}</td>
+        <td>
+          {{if .Tokens}}
+            {{range $i, $t := .Tokens}}{{if $i}}, {{end}}<span class="{{if $t.RevokedAt}}muted small{{end}}">{{if $t.Label}}{{$t.Label}}{{else}}(unlabeled){{end}}{{if $t.RevokedAt}} — revoked{{end}}</span>{{end}}
+          {{else}}<span class="muted small">(no tokens)</span>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">You don't own any agents yet.</p>
+  {{end}}
+
+  <button type="button" class="btn" x-show="!registering" @click="registering = true">Register an agent…</button>
+
+  <form x-show="registering" x-cloak
+        method="POST" action="/me/agents"
+        hx-post="/me/agents" hx-target="#main"
+        class="submit-form">
+    <h3>Register agent</h3>
+    {{if .AgentError}}<div class="banner banner-error">{{.AgentError}}</div>{{end}}
+    <label>
+      <span>Name <span class="muted small">— required</span></span>
+      <input type="text" name="name" value="{{.SubmittedAgent.Name}}" placeholder="Tamer's Reviewer Agent" required>
+    </label>
+    <label>
+      <span>Username <span class="muted small">— optional; slug auto-derived from name</span></span>
+      <input type="text" name="username" value="{{.SubmittedAgent.Username}}" placeholder="(auto)">
+    </label>
+    <label>
+      <span>Role <span class="muted small">— optional; defaults to "citizen"</span></span>
+      <input type="text" name="role" value="{{.SubmittedAgent.Role}}" placeholder="citizen">
+    </label>
+    <label>
+      <span>Token label <span class="muted small">— optional; tells deployments apart when you rotate</span></span>
+      <input type="text" name="label" value="{{.SubmittedAgent.Label}}" placeholder="ci-server">
+    </label>
+    <div class="btn-row">
+      <button type="submit" class="btn btn-primary">Register</button>
+      <button type="button" class="btn" @click="registering = false">Cancel</button>
+    </div>
+  </form>
+</section>
 {{end}}

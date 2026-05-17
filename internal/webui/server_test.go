@@ -159,6 +159,11 @@ type fakeFC struct {
 	updateProfileParams service.UpdateProfileParams
 	savedProfile        *service.CitizenResponse
 	updateProfileErr    error
+	agents              []service.AgentSummary
+	listAgentsErr       error
+	registeredAgent     service.RegisterAgentParams
+	registerAgentResult *service.RegisterAgentResult
+	registerAgentErr    error
 }
 
 func (f *fakeFC) Username() string { return f.username }
@@ -347,6 +352,22 @@ func (f *fakeFC) UpdateProfile(ctx context.Context, params service.UpdateProfile
 		return f.savedProfile, nil
 	}
 	return &service.CitizenResponse{Username: f.username, Name: "saved"}, nil
+}
+func (f *fakeFC) ListMyAgents(ctx context.Context) ([]service.AgentSummary, error) {
+	return f.agents, f.listAgentsErr
+}
+func (f *fakeFC) RegisterAgent(ctx context.Context, p service.RegisterAgentParams) (*service.RegisterAgentResult, error) {
+	f.registeredAgent = p
+	if f.registerAgentErr != nil {
+		return nil, f.registerAgentErr
+	}
+	if f.registerAgentResult != nil {
+		return f.registerAgentResult, nil
+	}
+	return &service.RegisterAgentResult{
+		Username: "auto-slug", Name: p.Name, ParentName: f.username,
+		Token: "tok_secret_once", Warning: "stash it",
+	}, nil
 }
 func (f *fakeFC) CreateProject(ctx context.Context, params service.CreateProjectParams) (*service.CreateProjectResult, error) {
 	f.createdProjectParams = params
@@ -2358,6 +2379,119 @@ func TestUpdateProfile(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "Profile updated") {
 		t.Errorf("expected success banner")
+	}
+}
+
+// --- Agents (/me roster + register) ---
+
+// TestMeAgentsRoster: GET /me lists the caller's agents and
+// always shows the register affordance.
+func TestMeAgentsRoster(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		agents: []service.AgentSummary{
+			{Username: "rev-bot", Name: "Reviewer", Role: "citizen", Registered: "2026-05-10",
+				Tokens: []service.AgentToken{{Label: "ci", IssuedAt: "2026-05-10"}}},
+		},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/me", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"Agents", "@rev-bot", "Reviewer", "ci", `action="/me/agents"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("roster missing %q", want)
+		}
+	}
+}
+
+// TestMeAgentsEmpty: no agents → explicit empty state, register
+// form still reachable.
+func TestMeAgentsEmpty(t *testing.T) {
+	s := newTestServer(t, &fakeFC{username: "tamer"})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/me", nil))
+	if !strings.Contains(rr.Body.String(), "don't own any agents yet") {
+		t.Errorf("expected empty-roster copy")
+	}
+}
+
+// TestRegisterAgent: POST /me/agents registers and reveals the
+// one-time token exactly once, with the stash warning.
+func TestRegisterAgent(t *testing.T) {
+	fc := &fakeFC{
+		username: "tamer",
+		registerAgentResult: &service.RegisterAgentResult{
+			Username: "tamers-reviewer", Name: "Tamer's Reviewer", ParentName: "tamer",
+			Token: "tok_ONLY_ONCE_abc123", Label: "ci-server", Warning: "cannot be retrieved later",
+		},
+	}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("name=Tamer%27s+Reviewer&label=ci-server")
+	req := httptest.NewRequest(http.MethodPost, "/me/agents", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.registeredAgent.Name != "Tamer's Reviewer" || fc.registeredAgent.Label != "ci-server" {
+		t.Errorf("RegisterAgent params: %+v", fc.registeredAgent)
+	}
+	body2 := rr.Body.String()
+	for _, want := range []string{"tok_ONLY_ONCE_abc123", "shown <em>once</em>", "@tamers-reviewer", "cannot be retrieved later"} {
+		if !strings.Contains(body2, want) {
+			t.Errorf("token reveal missing %q; body: %q", want, body2)
+		}
+	}
+}
+
+// TestRegisterAgentMissingName: blank name rejected before the
+// service; form repopulates.
+func TestRegisterAgentMissingName(t *testing.T) {
+	fc := &fakeFC{username: "tamer"}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("name=+&role=citizen")
+	req := httptest.NewRequest(http.MethodPost, "/me/agents", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if fc.registeredAgent.Name != "" {
+		t.Errorf("service should not be called; got %+v", fc.registeredAgent)
+	}
+	if !strings.Contains(rr.Body.String(), "agent name is required") {
+		t.Errorf("expected validation banner; body: %q", rr.Body.String())
+	}
+}
+
+// TestRegisterAgentError: a coord rejection surfaces as a banner
+// on a 200 with the form repopulated, not a 5xx.
+func TestRegisterAgentError(t *testing.T) {
+	fc := &fakeFC{
+		username:         "tamer",
+		registerAgentErr: fmt.Errorf("username already taken in this tenant"),
+	}
+	s := newTestServer(t, fc)
+	body := strings.NewReader("name=Dup&username=rev-bot")
+	req := httptest.NewRequest(http.MethodPost, "/me/agents", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body2 := rr.Body.String()
+	if !strings.Contains(body2, "username already taken in this tenant") {
+		t.Errorf("expected coord error bannered; body: %q", body2)
+	}
+	if !strings.Contains(body2, `value="Dup"`) {
+		t.Errorf("expected the submitted name repopulated")
 	}
 }
 
