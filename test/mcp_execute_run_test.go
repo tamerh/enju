@@ -683,3 +683,51 @@ tasks:
 	}
 
 }
+
+// TestMCPComputeTaskModelIsNull pins the model-as-label rule for
+// compute: a script (echo) produced the work — no LLM ran — so
+// task_claims.model must be NULL, even though this runs from an
+// MCP session that HAS a model configured (the harness session
+// model is "test-model"). model reflects WHAT produced the work,
+// not WHO triggered it. Regression for the compute_step false
+// credit where the session model leaked onto script work via the
+// claim (which an empty submit then COALESCEs over).
+func TestMCPComputeTaskModelIsNull(t *testing.T) {
+	h := newMCPHarness(t, "ComputeModelNull")
+	projectID := h.createTestProject()
+
+	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
+		"scripts/say.sh": {body: "#!/bin/bash\necho ok\n", mode: 0o755},
+	}, "seed script")
+
+	yaml := `name: "compute-model-null"
+version: 1
+tasks:
+  - id: only
+    action: compute
+    script: scripts/say.sh
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+
+	res := h.callOK(t, "enju_execute_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+	})
+	if text := mcpText(res); !strings.Contains(text, "Stop reason: no_ready_compute") {
+		t.Fatalf("compute run did not drain:\n%s", text)
+	}
+
+	taskID := fmt.Sprintf("%d:1:only", projectID)
+	subs, err := h.store.ListVoteSubmissions(taskID)
+	if err != nil {
+		t.Fatalf("list claims for %s: %v", taskID, err)
+	}
+	if len(subs) == 0 {
+		t.Fatalf("no claim row for compute task %s", taskID)
+	}
+	for _, c := range subs {
+		if c.Model != "" {
+			t.Errorf("compute task model = %q, want empty/NULL — a script produced it, no LLM ran; the session model must not leak via the claim", c.Model)
+		}
+	}
+}

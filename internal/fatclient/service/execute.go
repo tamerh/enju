@@ -398,9 +398,13 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	reportBody := map[string]interface{}{
 		"commit_sha":  res.CommitSHA,
 		"result_path": resultDir,
-		"model":       s.modelName,
-		"username":    s.coord.Username(),
-		"content":     res.Content,
+		// A compute task is script-produced — no LLM ran — so the
+		// model is empty (NULL), never the triggering session's
+		// model. `model` reflects what produced the work, not who
+		// launched it (the operator citizen records who).
+		"model":    "",
+		"username": s.coord.Username(),
+		"content":  res.Content,
 	}
 	if len(res.ArtifactsWritten) > 0 {
 		reportBody["artifacts_written"] = res.ArtifactsWritten
@@ -675,9 +679,13 @@ func (s *FatClient) claimWithTransientRetry(ctx context.Context, taskID string) 
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// A compute task is script-produced — claim with an empty
+		// model so task_claims.model is NULL from the start.
+		// (Submit COALESCEs, so a model stamped here would survive
+		// an empty submit — this is the load-bearing site.)
 		claimData, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/claim", map[string]string{
 			"username": s.coord.Username(),
-			"model":    s.modelName,
+			"model":    "",
 		})
 		if err != nil {
 			if !isTransientTransportError(err) {
