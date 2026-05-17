@@ -1952,6 +1952,52 @@ func cleanYAML(raw string) string {
 	return strings.TrimSpace(s)
 }
 
+// TestGetRunIncludeYAMLOptIn pins the run-detail YAML exposure:
+// the source workflow YAML is omitted from the default payload
+// (the run page polls this endpoint, YAML is dead weight there)
+// and returned only when the caller explicitly asks via
+// ?include=yaml. The opt-in token is specific — an unrelated
+// include value must not leak it.
+func TestGetRunIncludeYAMLOptIn(t *testing.T) {
+	s := newTestServer(t)
+	pid := s.createTestProject()
+
+	runYAML := `name: "YAML exposure probe"
+version: 1
+tasks:
+  - id: only
+    action: answer
+    prompt: "Hello"
+`
+	resp := s.post(fmt.Sprintf("/api/v1/projects/%d/runs", pid),
+		map[string]string{"yaml": runYAML, "branch": s.allocateTestBranch(pid)})
+	seqF, _ := resp["seq"].(float64)
+	if seqF == 0 {
+		t.Fatalf("run creation failed: %v", resp)
+	}
+	base := fmt.Sprintf("/api/v1/projects/%d/runs/%d", pid, int(seqF))
+
+	// Default: no yaml key.
+	if got := s.get(base); got["yaml"] != nil {
+		t.Fatalf("default run-detail must omit yaml, got: %v", got["yaml"])
+	}
+
+	// Opt-in: yaml present and byte-identical to what created the run.
+	withYAML := s.get(base + "?include=yaml")
+	gotYAML, ok := withYAML["yaml"].(string)
+	if !ok {
+		t.Fatalf("?include=yaml must return a yaml string, got: %v (%T)", withYAML["yaml"], withYAML["yaml"])
+	}
+	if gotYAML != runYAML {
+		t.Fatalf("yaml mismatch:\n--- got ---\n%s\n--- want ---\n%s", gotYAML, runYAML)
+	}
+
+	// Opt-in is specific: an unrelated include token must not leak it.
+	if got := s.get(base + "?include=cost"); got["yaml"] != nil {
+		t.Fatalf("?include=cost must not return yaml, got: %v", got["yaml"])
+	}
+}
+
 // TestCoordinatorRejectsMalformedCommitSHA verifies the REST
 // submit path rejects commit_sha values that aren't shaped like
 // git SHAs (40 or 64 hex chars). Trust-the-client doesn't mean

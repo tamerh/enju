@@ -647,6 +647,19 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if p.SourceCommitSHA != "" {
 		resp["source_commit_sha"] = p.SourceCommitSHA
 	}
+	// Opt-in only: the full source YAML is a few KB and the run
+	// page polls this endpoint for live state, so it stays out of
+	// the default payload and is returned only on explicit
+	// ?include=yaml. It's the raw source recipe (pre-param
+	// substitution) the run was created from — populated for every
+	// run, inline or template, since run creation rejects empty
+	// YAML. The membership check above already gates who sees it.
+	for _, inc := range strings.Split(r.URL.Query().Get("include"), ",") {
+		if strings.TrimSpace(inc) == "yaml" {
+			resp["yaml"] = p.YAMLData
+			break
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
