@@ -112,6 +112,17 @@ func cmdStart(args []string) {
 	fmt.Fprintf(os.Stderr, "Coordinator started  PID %-7d  %s\n", coordPID, coordURL)
 	fmt.Fprintf(os.Stderr, "  logs → %s\n", coordLog)
 
+	// Auto-register from git global config if no credentials exist yet.
+	// This makes `enju start` zero-friction on first run — the user
+	// never has to run a separate registration step.
+	credsPath := resolveCredentialsPath("")
+	registered := false
+	if creds := loadCredentialsAt(coordURL, credsPath); creds == nil {
+		registered = autoRegister(coordURL, credsPath)
+	} else {
+		registered = true
+	}
+
 	rec := &startRecord{
 		CoordPID:  coordPID,
 		CoordPort: *port,
@@ -119,7 +130,7 @@ func cmdStart(args []string) {
 	}
 
 	if !*noUI {
-		creds := loadCredentialsAt(coordURL, resolveCredentialsPath(""))
+		creds := loadCredentialsAt(coordURL, credsPath)
 		if creds != nil && creds.Token != "" {
 			uiLog := filepath.Join(logsDir, "ui.log")
 			uiArgs := []string{"ui",
@@ -135,11 +146,13 @@ func cmdStart(args []string) {
 				rec.UIPID = uiPID
 				rec.UIPort = *uiPort
 			}
-		} else {
-			fmt.Fprintln(os.Stderr, "Web UI skipped — no credentials found.")
-			fmt.Fprintf(os.Stderr, "  Register:  enju mcp --coordinator %s --name \"Your Name\"\n", coordURL)
-			fmt.Fprintf(os.Stderr, "  Then:      enju ui --coordinator %s\n", coordURL)
+		} else if registered {
+			// registered=true but no token means registration returned credentials
+			// without a token — shouldn't happen, but surface it clearly.
+			fmt.Fprintln(os.Stderr, "Web UI skipped — could not load credentials after registration.")
+			fmt.Fprintf(os.Stderr, "  Run manually: enju ui --coordinator %s\n", coordURL)
 		}
+		// If !registered, autoRegister already printed the reason — no duplicate.
 	}
 
 	if err := saveStartRecord(pidPath, rec); err != nil {
