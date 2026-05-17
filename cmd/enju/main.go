@@ -82,8 +82,6 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "serve":
-		cmdServe(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
 	case "ui":
@@ -106,6 +104,10 @@ func main() {
 		cmdRuns(os.Args[2:])
 	case "dag":
 		cmdDag(os.Args[2:])
+	case "start":
+		cmdStart(os.Args[2:])
+	case "stop":
+		cmdStop(os.Args[2:])
 	case "version":
 		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -119,9 +121,10 @@ func printUsage() {
 	fmt.Println(`Enju (槐) — Content-Neutral Coordinator for Human–AI Collaborative DAGs
 
 Usage:
- enju serve   Start the coordinator server
+ enju start   Start coordinator + web UI (background; --foreground for deployment)
+ enju stop    Stop background processes started by 'enju start'
  enju mcp    Start the MCP server (for Claude Desktop/Code)
- enju ui     Start the web UI (browser, peer to enju mcp)
+ enju ui     Start the web UI
  enju go     Run a workflow YAML end-to-end (register + create + execute)
  enju status  Snapshot of current project's state
  enju runs   List runs for the active project (with filters)
@@ -129,7 +132,7 @@ Usage:
  enju validate Check a workflow YAML without running it
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
- enju agent  Agent lifecycle (setup, run, status — see 'enju agent')
+ enju agent  Agent lifecycle (setup, run — see 'enju agent')
  enju wrap-task Run a compute task's script + commit (internal)
  enju version  Print version
 
@@ -191,6 +194,12 @@ func cmdServe(args []string) {
 	logger := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
 
 	stateDBPath := expandPath(cfg.Data.StateDB)
+	if stateDBPath != ":memory:" {
+		if err := os.MkdirAll(filepath.Dir(stateDBPath), 0755); err != nil {
+			logger.Error("creating database directory", "path", filepath.Dir(stateDBPath), "error", err)
+			os.Exit(1)
+		}
+	}
 	st, err := store.New(stateDBPath)
 	if err != nil {
 		logger.Error("opening database", "error", err)

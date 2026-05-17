@@ -36,6 +36,7 @@ test/enju/
 .idea/
 .vscode/
 docs/
+docsold/
 dist/
 examples/
 example_bots/
@@ -43,3 +44,11 @@ node_modules/
 package-lock.json
 package.json
 
+# BEGIN enju-untracked (managed by enju — do not edit)
+.enju/agents/
+.enju/bigfiles/
+.enju/events/
+.enju/logs/
+.enju/runs/*/snapshot/
+.enju/scratch/
+# END enju-untracked

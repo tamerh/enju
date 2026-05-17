@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+
 // ServerConfig is the on-disk shape for `enju serve` configuration.
 // Everything is optional: a missing file (or any unset key) falls
 // back to defaults equivalent to the pre-config CLI behavior.
@@ -63,13 +64,17 @@ type PerformanceConfig struct {
 // runs as without any config file or flags.
 func defaultServerConfig() *ServerConfig {
 	enabled := true
+	defaultDB := "enju.db"
+	if home, err := os.UserHomeDir(); err == nil {
+		defaultDB = filepath.Join(home, ".enju", "db", "enju.db")
+	}
 	return &ServerConfig{
 		Coordinator: CoordinatorConfig{
-			Bind: "",         // empty = bind all interfaces (preserves pre-config behavior)
-			Port: 8000,
+			Bind: "",
+			Port: 8333,
 		},
 		Data: DataConfig{
-			StateDB:  "enju.db",
+			StateDB:  defaultDB,
 			EventsDB: "",
 		},
 		Events: EventsConfig{
