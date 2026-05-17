@@ -1,9 +1,9 @@
 package store
 
 // Contract tests for the identity model: tenant scoping, per-kind
-// uniqueness, and fail-closed agent registration. These pin the
-// load-bearing §4/§4a invariants at the apply layer where the
-// behavior is deterministic (no HTTP / no client call-order).
+// uniqueness, and fail-closed agent registration. Pinned at the
+// apply layer where the behavior is deterministic (no HTTP, no
+// client call-order).
 
 import (
 	"strings"
@@ -64,8 +64,8 @@ func TestAgentInheritsOwnerTenant(t *testing.T) {
 	}
 }
 
-// TestTwoTenantsEachRegisterSameAgentHandle is the spec's
-// multi-tenant property: two tenant roots each register "dev-bot"
+// TestTwoTenantsEachRegisterSameAgentHandle — the multi-tenant
+// property: two tenant roots each register "dev-bot"
 // — BOTH succeed (no collision), and the handle resolves to the
 // correct agent within each tenant.
 func TestTwoTenantsEachRegisterSameAgentHandle(t *testing.T) {
@@ -117,9 +117,9 @@ func TestSameTenantDuplicateAgentHandleRejected(t *testing.T) {
 	}
 }
 
-// TestRegisterAgentFailsClosedOnUnresolvedOwner is the §4a
-// invariant: an agent whose owner can't be resolved is rejected
-// with ZERO rows written — never coerced into some other shape.
+// TestRegisterAgentFailsClosedOnUnresolvedOwner — an agent whose
+// owner can't be resolved is rejected with ZERO rows written,
+// never coerced into some other shape.
 func TestRegisterAgentFailsClosedOnUnresolvedOwner(t *testing.T) {
 	s := newTestStore(t)
 

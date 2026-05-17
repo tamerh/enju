@@ -743,13 +743,13 @@ func cmdBotRun(args []string) {
 		AuthToken:   creds.Token,
 		Logger:      logger,
 	})
-	// Provenance ("model") is the named producer of the bot's
-	// output, not necessarily an LLM — the coord auto-registers
-	// whatever string it gets and only requires that a bot name
-	// SOMETHING (requireModelForBot). An LLM bot names its model;
-	// a non-LLM script handler's producer IS its script, so
-	// derive it when no model is declared and the handler isn't
-	// the claude/stub default. Without this a script-handler bot
+	// Provenance ("model") is the named producer of the agent's
+	// output, not necessarily an LLM — a free-form label stored
+	// verbatim (no registration); the coord only requires that an
+	// agent name SOMETHING. An LLM agent names its model; a
+	// non-LLM script handler's producer IS its script, so derive
+	// it when no model is declared and the handler isn't the
+	// claude/stub default. Without this a script-handler agent
 	// sends an empty model and the coord rightly refuses every
 	// claim/submit. Citizen identity is unchanged — this only
 	// fills the provenance slot.

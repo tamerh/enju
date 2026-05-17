@@ -234,7 +234,14 @@ func (s *Store) initSchema() error {
 		-- Populated on registration only; not updated per-request
 		-- (the per-API UPDATE was costly with no readers). See
 		-- CitizenRecord.LastSeen in models.go.
-		last_seen TIMESTAMP NOT NULL
+		last_seen TIMESTAMP NOT NULL,
+		-- tenant_id is the root-owner citizen at the top of the
+		-- parent_id chain — the tenancy seam for a future Org (no
+		-- Org entity is built). A human root's tenant is itself;
+		-- an agent's tenant is its owner's. Set at creation,
+		-- never changed. Self-host = exactly one tenant, so
+		-- per-tenant uniqueness equals global uniqueness.
+		tenant_id INTEGER REFERENCES citizens(id)
 	);
 
 	CREATE TABLE IF NOT EXISTS tasks (
@@ -306,7 +313,13 @@ func (s *Store) initSchema() error {
 		deadline TIMESTAMP NOT NULL,
 		outcome TEXT,
 		submitted_at TIMESTAMP,
-		option TEXT NOT NULL DEFAULT ''
+		option TEXT NOT NULL DEFAULT '',
+		-- model is the normalized model-name LABEL that produced
+		-- the words for this claim — a string, not a citizen FK
+		-- (a model has no identity). NULL/'' when no LLM produced
+		-- it (script tasks, unaided humans); agents must always
+		-- carry a model, enforced by requireModelForAgent.
+		model TEXT
 	);
 
 	-- Phase 6c — task_submissions captures per-attempt
@@ -556,27 +569,12 @@ func (s *Store) initSchema() error {
 		// doesn't advertise the template origin.
 		`ALTER TABLE runs ADD COLUMN slug TEXT NOT NULL DEFAULT 'run'`,
 		`ALTER TABLE tasks ADD COLUMN run_slug TEXT NOT NULL DEFAULT 'run'`,
-		// Citizen kind discriminator + ownership chain. kind is
-		// 'human' or 'agent'. parent_id is the owning citizen for
-		// an agent (NULL for a human root). tenant_id is the
-		// root-owner citizen at the top of the parent_id chain —
-		// the seam for a future real Org (do NOT build an Org
-		// entity now). A human root's tenant is itself; an agent's
-		// tenant is its owner's tenant. Self-host = exactly one
-		// tenant, so per-tenant uniqueness ≡ global uniqueness:
-		// zero behavior change for single-operator setups.
+		// kind discriminator + ownership chain. kind is 'human'
+		// or 'agent'; parent_id is the owning citizen for an agent
+		// (NULL for a human root). (tenant_id and task_claims.model
+		// are declared directly in their CREATE TABLE, not here.)
 		`ALTER TABLE citizens ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'`,
 		`ALTER TABLE citizens ADD COLUMN parent_id INTEGER REFERENCES citizens(id)`,
-		`ALTER TABLE citizens ADD COLUMN tenant_id INTEGER REFERENCES citizens(id)`,
-		// task_claims.citizen_id is the operator (existing); model
-		// is the normalized model-name LABEL that produced the words
-		// for this submit — a string, not a citizen FK (a model has
-		// no identity). NULL/'' when no LLM produced it (script
-		// tasks, unaided humans); agents must always carry a model —
-		// enforced in applySetClaim / applyRecordSubmission
-		// (requireModelForAgent) since SQLite CHECK can't read
-		// another column conditionally.
-		`ALTER TABLE task_claims ADD COLUMN model TEXT`,
 		// Living-workflow phase 4 — per-run cycle budget. Caps how
 		// many tasks can be spawned into a run at runtime to prevent
 		// runaway loops where bot A spawns bot B spawns bot A.
@@ -739,17 +737,16 @@ func (s *Store) initSchema() error {
 		return fmt.Errorf("schema: create idx_runs_active_branch: %w", err)
 	}
 
-	// Citizen identity indexes. Created here (post-migration)
-	// rather than in the CREATE-TABLE block because they reference
-	// the kind / tenant_id columns added by the ALTER migrations
-	// above. email is the global identity for a human (mandatory
-	// + unique per kind='human'); agents have no email, so the
-	// partial WHERE kind='human' keeps two tenants' agents from
-	// colliding on an absent email. username is a tenant-scoped
-	// handle: unique per (tenant_id, username), NOT globally — two
-	// owners may each have a "dev-bot". Single-operator self-host
-	// has exactly one tenant, so this is identical to the old
-	// global-unique behavior (zero behavior change).
+	// Citizen identity indexes. They sit after the schema-setup
+	// block because the partial predicates filter on `kind` (a
+	// pre-existing column). email is the global identity for a
+	// human (mandatory + unique per kind='human'); agents have no
+	// email, so the partial WHERE kind='human' keeps two tenants'
+	// agents from colliding on an absent email. username is a
+	// tenant-scoped handle: unique per (tenant_id, username), NOT
+	// globally — two owners may each have a "dev-bot". Single-
+	// operator self-host has exactly one tenant, so this is
+	// identical to the old global-unique behavior.
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE kind = 'human'`); err != nil {
 		return fmt.Errorf("schema: create idx_citizens_email: %w", err)
 	}
