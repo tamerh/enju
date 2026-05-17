@@ -53,7 +53,7 @@ type Run struct {
 	// the legacy enju/bots.yaml file".
 	//
 	// Wiring status: Phase 7 lands the parser + conversion path
-	// only. The bot-start CLI (`enju bot run`) still reads from
+	// only. The bot-start CLI (`enju agent run`) still reads from
 	// enju/bots.yaml directly today; a follow-up will teach it
 	// to accept a workflow YAML and prefer its inline bots.
 	// Until then, inline declarations parse cleanly but don't

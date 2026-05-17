@@ -20,7 +20,7 @@ import (
 
 // ErrNoCloneSource indicates a project has neither a remote_url
 // nor a registered adopted-folder path, so the bot daemon (or
-// `enju bot setup`) cannot materialize a clone or push target.
+// `enju agent setup`) cannot materialize a clone or push target.
 // This is a permanent deployment-config error — retrying won't
 // help. Surfaced as a sentinel so the daemon's poll loop can
 // exit cleanly instead of looping forever on the same failure.

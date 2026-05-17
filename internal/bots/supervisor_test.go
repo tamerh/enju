@@ -32,7 +32,7 @@ func newTestSupervisor(t *testing.T, fakeBinary string) *Supervisor {
 }
 
 // writeFakeBinary creates a shell script standing in for
-// `enju bot run`. The script logs each invocation arg, then
+// `enju agent run`. The script logs each invocation arg, then
 // reads stdin until EOF (mimicking the real daemon's
 // watchStdinEOF). Optional behavior knobs let individual tests
 // inject delays or non-zero exits.
@@ -42,8 +42,8 @@ func writeFakeBinary(t *testing.T, behavior string) string {
 	path := filepath.Join(dir, "fake-enju")
 	script := `#!/bin/sh
 # Discriminate the supervisor's invocations: only react to
-# 'bot run' subcommand. Other invocations are an error.
-if [ "$1" != "bot" ] || [ "$2" != "run" ]; then
+# 'agent run' subcommand. Other invocations are an error.
+if [ "$1" != "agent" ] || [ "$2" != "run" ]; then
     echo "fake-enju: unexpected args: $@" 1>&2
     exit 99
 fi
@@ -388,7 +388,7 @@ func TestSupervisor_StartAllPartialFailure(t *testing.T) {
 	bin := filepath.Join(dir, "selective-fake")
 	script := `#!/bin/sh
 case "$3" in
-    --bot=b) echo "fake-enju refusing bot b" 1>&2; exit 7 ;;
+    --agent=b) echo "fake-enju refusing agent b" 1>&2; exit 7 ;;
 esac
 echo "fake-enju started: $@"
 while IFS= read -r line; do : ; done

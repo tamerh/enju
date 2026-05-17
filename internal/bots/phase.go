@@ -25,7 +25,7 @@ import (
 // The signal is best-effort: phase writes are appended to a
 // file named by ENJU_BOT_PHASE_FILE (set by the supervisor when
 // it spawns the daemon). When the env var is empty (the daemon
-// was started directly by an operator via `enju bot run`, not
+// was started directly by an operator via `enju agent run`, not
 // through the supervisor), WritePhase is a no-op. Phase reads
 // on a missing file return PhaseUnknown — semantically "we
 // can't see the bot yet."

@@ -52,7 +52,7 @@ type Config struct {
 
 	// LogName picks the trace log filename. The trace log lives at
 	// <projectRoot>/.enju/logs/<LogName>.log; one file per role.
-	// `enju mcp` passes "operator", `enju bot run` passes
+	// `enju mcp` passes "operator", `enju agent run` passes
 	// "bot-<botName>". Empty falls back to trace-<pid>.log so
 	// ad-hoc / test wirings still get a unique file.
 	LogName string

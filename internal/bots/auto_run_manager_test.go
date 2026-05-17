@@ -22,7 +22,7 @@ func newAutoRunTestSupervisor(t *testing.T) *Supervisor {
 	dir := t.TempDir()
 	binPath := filepath.Join(dir, "fake-enju")
 	script := `#!/bin/sh
-if [ "$1" != "bot" ] || [ "$2" != "run" ]; then
+if [ "$1" != "agent" ] || [ "$2" != "run" ]; then
     echo "fake-enju: unexpected args: $@" 1>&2
     exit 99
 fi

@@ -159,7 +159,7 @@ func NewSubprocessHandler(b *Bot, projectRoot string) *SubprocessHandler {
 // verbatim" (example_bots/bots.yaml), but both Preflight's
 // os.Stat and ProcessTask's exec resolve a relative path
 // against the PROCESS CWD — and a supervisor-spawned
-// `enju bot run` daemon's CWD is not the project clone root, so
+// `enju agent run` daemon's CWD is not the project clone root, so
 // the documented form would fail with "no such file or
 // directory". NewSubprocessHandler calls this UNCONDITIONALLY at
 // construction (projectRoot threaded in via NewHandler), so the

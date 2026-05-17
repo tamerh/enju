@@ -8,7 +8,7 @@
 // as citizens with kind=bot — registration, attribution, terminate
 // cascade. The manifest is a fatclient-local declaration of "what
 // bots does this workflow use, with what runtime configuration,"
-// read by `enju bot setup` and `enju bot run` against the workflow
+// read by `enju agent setup` and `enju agent run` against the workflow
 // YAML the operator passes via --workflow. Same status as
 // .gitignore: lives in the repo, used by the local tool, opaque
 // to the server.
@@ -232,7 +232,7 @@ type MCPTools struct {
 // LoadFromWorkflow reads a workflow YAML file and returns its
 // inline `bots:` section as a Manifest, fully resolved and
 // validated. workflowPath is the absolute or repo-relative path
-// to the workflow YAML; `enju bot setup` and `enju bot run`
+// to the workflow YAML; `enju agent setup` and `enju agent run`
 // receive it via --workflow.
 //
 // Returns (nil, nil) when the workflow YAML has no `bots:` block
@@ -296,7 +296,7 @@ func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 				if entry.Content[j].Value == "project_id" {
 					return nil, fmt.Errorf(
 						"inline agents[%d]: project_id is no longer accepted in bot manifests — "+
-							"pass via --project-id on the CLI (enju bot setup --project-id=N)", i)
+							"pass via --project-id on the CLI (enju agent setup --project-id=N)", i)
 				}
 			}
 		}
@@ -551,7 +551,7 @@ func (m *Manifest) ByName(name string) *Bot {
 
 // EnsureGitignored ensures the project's .gitignore lists the
 // machine-managed enju cache directories inside the existing
-// enju-managed block. Called by `enju bot setup` so the operator
+// enju-managed block. Called by `enju agent setup` so the operator
 // doesn't have to remember the gitignore step manually.
 //
 // Post-Phase-8.h: the .enju/ umbrella holds BOTH tracked audit

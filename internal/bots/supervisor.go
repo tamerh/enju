@@ -46,7 +46,7 @@ import (
 // Supervisor manages bot daemon subprocesses.
 type Supervisor struct {
 	// EnjuExec is the path to the `enju` binary the supervisor
-	// invokes for `enju bot run`. Defaults to os.Executable()
+	// invokes for `enju agent run`. Defaults to os.Executable()
 	// at construction so the supervisor invokes the same
 	// binary that's running it (no PATH ambiguity, no
 	// version skew between supervisor and daemon).
@@ -368,7 +368,7 @@ func (o StartOutcome) String() string {
 // declared bots may already be running from a manual start or
 // a prior auto-managed run.
 //
-// The daemon runs as `enju bot run --bot=<name>
+// The daemon runs as `enju agent run --agent=<name>
 // --workflow=<path> --coordinator=<url>` with stdin connected
 // so Stop can close it for graceful shutdown. Stdout/stderr go
 // to the per-bot log file, opened append-mode.
@@ -438,8 +438,8 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	}
 
 	args := []string{
-		"bot", "run",
-		"--bot=" + p.BotName,
+		"agent", "run",
+		"--agent=" + p.BotName,
 		"--workflow=" + p.WorkflowPath,
 		"--coordinator=" + p.Coordinator,
 	}

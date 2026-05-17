@@ -249,7 +249,7 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, 
 		// operator Ctrl-C out cleanly.
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "interrupted; auto-managed bots may still be running — use `enju bot list` and `enju_agent_stop` if needed")
+			fmt.Fprintln(os.Stderr, "interrupted; auto-managed bots may still be running — use `enju agent list` and `enju_agent_stop` if needed")
 			return 1
 		case <-time.After(pollInterval):
 		}
@@ -436,7 +436,7 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	if !autoBots && prep != nil && prep.LoadedTemplate != nil {
 		if m, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots); perr == nil && m != nil && len(m.Bots) > 0 {
 			fmt.Fprintf(os.Stderr,
-				"⚠ workflow declares %d bot(s); pass --auto-agents to start them automatically (or `enju bot run` per bot for manual control)\n",
+				"⚠ workflow declares %d bot(s); pass --auto-agents to start them automatically (or `enju agent run` per bot for manual control)\n",
 				len(m.Bots))
 		}
 	}
@@ -550,7 +550,7 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 			unhooked := autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
 			if len(unhooked) > 0 {
 				fmt.Fprintf(os.Stderr,
-					"⚠ auto_agents: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
+					"⚠ auto_agents: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju agent stop` manually if they're still running.\n",
 					len(unhooked), len(autoRunMgr.AutoBotNames()), strings.Join(unhooked, ", "))
 			}
 		}

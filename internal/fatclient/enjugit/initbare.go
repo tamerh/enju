@@ -25,7 +25,7 @@ import (
 // PromoteWorkingTreeToBare creates a bare repo at barePath that
 // mirrors the operator's working tree at workTreePath, and
 // rewires the working tree's `origin` remote to point at the
-// new bare. Used by `enju bot setup` when the project lacks a
+// new bare. Used by `enju agent setup` when the project lacks a
 // real remote.
 //
 // Idempotent: if barePath already holds a valid bare, returns

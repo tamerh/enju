@@ -8,7 +8,7 @@
 // recognize.
 //
 // Layering note: the supervisor manages OS processes only —
-// it spawns `enju bot run --bot=<name> ...`, captures the
+// it spawns `enju agent run --agent=<name> ...`, captures the
 // PID, tails the log, and signals on shutdown. The daemon's
 // internals (FatClient consumer, Handler interface, all the
 // Phase 7 architecture) are opaque to the supervisor; from
@@ -66,7 +66,7 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 	//
 	// We don't pass the human's auth token to the daemon —
 	// the daemon authenticates via its own credentials file
-	// written by `enju bot setup` and resolved from the
+	// written by `enju agent setup` and resolved from the
 	// manifest's credentials path.
 	manifest, err := bots.LoadFromWorkflow(workflowPath)
 	if err != nil {
