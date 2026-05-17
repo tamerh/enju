@@ -7,10 +7,9 @@ import (
 	"strings"
 )
 
-// resolveIdentity fills name/email/username from git global config for
-// any field that wasn't explicitly passed and credentials.json doesn't
-// already have. Called before registration in every command that needs
-// a citizen identity, so the MCP config and CLI flags can stay minimal:
+// resolveIdentity fills name/email from git global config for any field
+// that is currently empty. Called before registration so the MCP config
+// and CLI flags can stay minimal:
 //
 //	{"command": "enju", "args": ["mcp", "-coordinator", "..."]}
 //
@@ -27,23 +26,26 @@ func resolveIdentity(name, email, username *string) {
 	// one from the display name if the caller doesn't supply it.
 }
 
+// hasFullIdentity reports whether name and email are both non-empty.
+// The coordinator requires both: email is the globally-unique key for
+// human citizens; name is required for display. A partial config
+// (name-only or email-only) would reach registerCitizen and fail with
+// a 400, giving the user a generic error instead of actionable guidance.
+func hasFullIdentity(name, email string) bool {
+	return name != "" && email != ""
+}
+
 // autoRegister attempts to register the user against coordURL using
 // name and email from git global config. Saves credentials to credsPath
-// on success. Prints a clear message either way so the operator knows
-// what happened without having to read a log file.
-//
-// Called by cmdStart after the coordinator comes up — if credentials
-// already exist this is never called, so it is safe to call on every
-// start without re-registering an existing user.
-// autoRegister returns true if registration succeeded (credentials are
-// now saved), false otherwise. Callers use the return value to decide
-// whether to skip follow-up messages about missing credentials.
+// on success. Returns true if registration succeeded, false otherwise.
+// Callers use the return value to suppress follow-up messages when this
+// function has already printed the reason for failure.
 func autoRegister(coordURL, credsPath string) bool {
 	name := gitGlobalConfig("user.name")
 	email := gitGlobalConfig("user.email")
 
-	if name == "" && email == "" {
-		fmt.Fprintln(os.Stderr, "Auto-register skipped — git config user.name and user.email are not set.")
+	if !hasFullIdentity(name, email) {
+		fmt.Fprintln(os.Stderr, "Auto-register skipped — git config user.name and user.email are both required.")
 		fmt.Fprintln(os.Stderr, "  git config --global user.name  \"Your Name\"")
 		fmt.Fprintln(os.Stderr, "  git config --global user.email \"you@example.com\"")
 		fmt.Fprintln(os.Stderr, "  Then restart: enju stop && enju start")

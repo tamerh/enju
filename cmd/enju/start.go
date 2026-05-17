@@ -85,8 +85,10 @@ func cmdStart(args []string) {
 	// git config to auto-register from. Starting the coordinator in this state
 	// leaves it running but unusable — the user would have to stop it anyway.
 	if loadCredentialsAt(coordURL, credsPath) == nil {
-		if gitGlobalConfig("user.name") == "" && gitGlobalConfig("user.email") == "" {
-			fmt.Fprintln(os.Stderr, "Cannot start: no credentials found and git config user.name/user.email are not set.")
+		name := gitGlobalConfig("user.name")
+		email := gitGlobalConfig("user.email")
+		if !hasFullIdentity(name, email) {
+			fmt.Fprintln(os.Stderr, "Cannot start: no credentials found and git config user.name/user.email are both required.")
 			fmt.Fprintln(os.Stderr, "  git config --global user.name  \"Your Name\"")
 			fmt.Fprintln(os.Stderr, "  git config --global user.email \"you@example.com\"")
 			fmt.Fprintln(os.Stderr, "  Then run: enju start")
