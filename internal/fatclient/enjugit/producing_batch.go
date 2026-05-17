@@ -241,6 +241,20 @@ func (w *Workflow) SubmitBatch(reqs []SubmitRequest) (*BatchResult, error) {
 		// remote-side rollback in v1).
 		for _, grp := range groups {
 			expectedSHA := result.Entries[grp.entryIdxs[len(grp.entryIdxs)-1]].CommitSHA
+			// Skipped when origin is unset — the commits already
+			// landed in this clone's object store, which IS the
+			// single store in a single-machine project with no
+			// remote. Still append one ordered Branches entry per
+			// group so the Phase-3 trailer scan can index by group.
+			if g.RemoteURL() == "" {
+				trace.okDetail("push:"+grp.branch, "skipped: no origin")
+				result.Branches = append(result.Branches, BatchBranchResult{
+					Name:         grp.branch,
+					PreBatchHead: lookupPreHead(touched, grp.branch),
+					Pushed:       false,
+				})
+				continue
+			}
 			if perr := g.PushWithVerify(grp.branch, expectedSHA); perr != nil {
 				wErr := trace.fail("push:"+grp.branch, translateGitError("push verify", perr))
 				// Flag every entry in THIS branch's group with

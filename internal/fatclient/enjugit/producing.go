@@ -119,13 +119,20 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		}
 
 		// Step 3: push-verify. The verify step catches the
-		// "commit reported but never landed" failure mode
-		// (TP53 Bug 1 reproducer). Origin always exists (managed
-		// bare for path-mode projects, real remote otherwise).
-		if perr := g.PushWithVerify(branchName, commitRes.SHA); perr != nil {
-			return trace.fail("push-verify", translateGitError("push verify", perr))
+		// "commit reported but never landed" failure mode.
+		// Skipped when origin is unset — the commit above already
+		// landed in this clone's object store, which IS the single
+		// store in a single-machine project with no remote, so
+		// there is nothing to push to. Sharing via push only
+		// applies when origin points at a real remote.
+		if g.RemoteURL() == "" {
+			trace.okDetail("push-verify", "skipped: no origin")
+		} else {
+			if perr := g.PushWithVerify(branchName, commitRes.SHA); perr != nil {
+				return trace.fail("push-verify", translateGitError("push verify", perr))
+			}
+			trace.ok("push-verify")
 		}
-		trace.ok("push-verify")
 		return nil
 	})
 	if werr != nil {
