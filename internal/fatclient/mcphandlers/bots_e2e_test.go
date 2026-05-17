@@ -90,7 +90,7 @@ func TestBotRegisterListFlowE2E(t *testing.T) {
 	// 1. Register a bot.
 	registerResp, err := c.handleRegisterBot(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name: "enju_register_bot",
+			Name: "enju_register_agent",
 			Arguments: map[string]interface{}{
 				"name":  "Tamer's Reviewer Bot",
 				"label": "laptop",
@@ -118,7 +118,7 @@ func TestBotRegisterListFlowE2E(t *testing.T) {
 	// 2. List bots — this is THE assertion that catches the
 	// CreateCitizen bug. Buggy code returns 0 bots.
 	listResp, err := c.handleListMyBots(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{Name: "enju_list_my_bots"},
+		Params: mcp.CallToolParams{Name: "enju_list_my_agents"},
 	})
 	if err != nil {
 		t.Fatalf("list_my_bots: %v", err)
@@ -147,7 +147,7 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 	// Register the bot and capture its token from the response.
 	registerResp, err := c.handleRegisterBot(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "enju_register_bot",
+			Name:      "enju_register_agent",
 			Arguments: map[string]interface{}{"name": "Test Bot"},
 		},
 	})

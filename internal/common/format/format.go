@@ -3839,7 +3839,7 @@ func TerminateRunResult(data []byte) string {
 
 // BotList renders the JSON returned by GET /citizens/me/bots
 // (and the equivalent native MCP handler). Empty list returns
-// the friendly bootstrap hint pointing at enju_register_bot.
+// the friendly bootstrap hint pointing at enju_register_agent.
 //
 // Wire shape: {"bots":[{id,username,name,role,registered,
 // tokens:[{id,label,issued_at,revoked_at?}]}]}.
@@ -3862,7 +3862,7 @@ func BotList(data []byte) string {
 		return string(data)
 	}
 	if len(resp.Bots) == 0 {
-		return "You don't own any bots yet. Use enju_register_bot to create one."
+		return "You don't own any bots yet. Use enju_register_agent to create one."
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Your bots (%d):\n", len(resp.Bots))

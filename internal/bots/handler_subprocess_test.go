@@ -602,7 +602,7 @@ func TestSubprocessHandler_ArgsTemplateSubstitution(t *testing.T) {
 
 // TestSubprocessHandler_SystemPromptRelativeToClaimCWD pins the
 // showcase_v15 fix: `system_prompt: prompts/dev-bot2.md` declared
-// inline in a workflow's bots: block is a repo-relative path and
+// inline in a workflow's agents: block is a repo-relative path and
 // must be opened relative to the per-claim materialized CWD,
 // NOT the daemon's process CWD.
 //
@@ -621,7 +621,7 @@ func TestSubprocessHandler_SystemPromptRelativeToClaimCWD(t *testing.T) {
 
 	// Simulate the per-claim materialized CWD shape:
 	// <project>/.enju/bots/<bot>/scratch/<task-iter>/prompts/dev-bot2.md
-	claimCWD := filepath.Join(dir, ".enju", "bots", "dev-bot2", "scratch", "7-1-summarize-iter-1")
+	claimCWD := filepath.Join(dir, ".enju", "agents", "dev-bot2", "scratch", "7-1-summarize-iter-1")
 	promptDir := filepath.Join(claimCWD, "prompts")
 	if err := os.MkdirAll(promptDir, 0o755); err != nil {
 		t.Fatal(err)

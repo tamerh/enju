@@ -35,7 +35,7 @@ import (
 // for future schema bumps so older readers can detect-and-warn.
 type Manifest struct {
 	Version int   `yaml:"version,omitempty"`
-	Bots    []Bot `yaml:"bots"`
+	Bots    []Bot `yaml:"agents"`
 }
 
 // Bot is one entry in the manifest. Every field has either a
@@ -270,7 +270,7 @@ func LoadFromWorkflow(workflowPath string) (*Manifest, error) {
 // expand-resolve-validate pipeline.
 //
 // Errors: malformed inline content surfaces with a clear
-// "inline bots:" prefix.
+// "inline agents:" prefix.
 func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 	// Zero-value Node (no `bots:` key in the workflow YAML) →
 	// no inline manifest. Kind==0 is the unset state.
@@ -295,7 +295,7 @@ func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 			for j := 0; j < len(entry.Content); j += 2 {
 				if entry.Content[j].Value == "project_id" {
 					return nil, fmt.Errorf(
-						"inline bots[%d]: project_id is no longer accepted in bot manifests — "+
+						"inline agents[%d]: project_id is no longer accepted in bot manifests — "+
 							"pass via --project-id on the CLI (enju bot setup --project-id=N)", i)
 				}
 			}
@@ -303,7 +303,7 @@ func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 	}
 	var bots []Bot
 	if err := node.Decode(&bots); err != nil {
-		return nil, fmt.Errorf("parsing inline bots: %w", err)
+		return nil, fmt.Errorf("parsing inline agents: %w", err)
 	}
 	m := &Manifest{
 		// Version defaults to 1 (the only known schema) — the
@@ -315,13 +315,13 @@ func FromInlineNode(node yamlv3.Node) (*Manifest, error) {
 		Bots:    bots,
 	}
 	if err := m.expandReplicas(); err != nil {
-		return nil, fmt.Errorf("inline bots: %w", err)
+		return nil, fmt.Errorf("inline agents: %w", err)
 	}
 	if err := m.Resolve(); err != nil {
-		return nil, fmt.Errorf("inline bots: %w", err)
+		return nil, fmt.Errorf("inline agents: %w", err)
 	}
 	if err := m.Validate(); err != nil {
-		return nil, fmt.Errorf("inline bots: %w", err)
+		return nil, fmt.Errorf("inline agents: %w", err)
 	}
 	return m, nil
 }
@@ -592,7 +592,7 @@ func EnsureGitignored(projectRoot string) (bool, error) {
 	}
 	updated, changed := gitignore.UpdateManagedBlock(existing, []string{
 		corelayout.StateDirRoot + "/runs/*/snapshot/",
-		corelayout.StateDirRoot + "/bots/",
+		corelayout.StateDirRoot + "/agents/",
 		corelayout.StateDirRoot + "/bigfiles/",
 		corelayout.StateDirRoot + "/events/",
 		corelayout.StateDirRoot + "/logs/",

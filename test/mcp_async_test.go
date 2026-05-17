@@ -1201,14 +1201,14 @@ exit 1
 	// into its CWD must still be on disk.
 	root := h.workspaceDirForProject(projectID)
 	var sentinel string
-	filepath.Walk(filepath.Join(root, ".enju", "bots"), func(p string, fi os.FileInfo, err error) error {
+	filepath.Walk(filepath.Join(root, ".enju", "agents"), func(p string, fi os.FileInfo, err error) error {
 		if err == nil && fi != nil && !fi.IsDir() && filepath.Base(p) == "sentinel-marker.txt" {
 			sentinel = p
 		}
 		return nil
 	})
 	if sentinel == "" {
-		t.Errorf("scratch wiped on script failure — sentinel-marker.txt missing under %s/.enju/bots (Slice 4 regression)", root)
+		t.Errorf("scratch wiped on script failure — sentinel-marker.txt missing under %s/.enju/agents (Slice 4 regression)", root)
 	}
 
 	// (b) fail_reason carries the TAIL of stderr, not the head.

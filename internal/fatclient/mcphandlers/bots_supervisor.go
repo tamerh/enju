@@ -43,7 +43,7 @@ func resolveWorkflowPath(arg string) (string, error) {
 }
 
 func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	botName := req.GetString("bot", "")
+	botName := req.GetString("agent", "")
 	workflowPath, err := resolveWorkflowPath(req.GetString("workflow", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("resolve workflow: %v", err)), nil
@@ -129,7 +129,7 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (c *apiClient) handleBotStop(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	botName := req.GetString("bot", "")
+	botName := req.GetString("agent", "")
 	if botName == "" {
 		return mcp.NewToolResultError("bot is required"), nil
 	}
@@ -161,10 +161,10 @@ func (c *apiClient) handleBotStatus(ctx context.Context, req mcp.CallToolRequest
 	// Compose the status report. Both buckets matter — running
 	// answers "what's alive?", exits answer "did anything just
 	// crash?" Empty-on-empty surfaces a hint pointing the
-	// operator at enju_bot_logs for history.
+	// operator at enju_agent_logs for history.
 	switch {
 	case len(running) == 0 && len(exits) == 0:
-		return mcp.NewToolResultText("(no bots running and no recent exits in this fatclient session — use enju_bot_logs <name> if you want to inspect a bot's prior session)"), nil
+		return mcp.NewToolResultText("(no bots running and no recent exits in this fatclient session — use enju_agent_logs <name> if you want to inspect a bot's prior session)"), nil
 	case len(running) == 0:
 		body, _ := json.MarshalIndent(exits, "", "  ")
 		return mcp.NewToolResultText(fmt.Sprintf("0 bots running.\n%d recent exit(s):\n%s", len(exits), string(body))), nil
@@ -181,7 +181,7 @@ func (c *apiClient) handleBotStatus(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (c *apiClient) handleBotLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	botName := req.GetString("bot", "")
+	botName := req.GetString("agent", "")
 	if botName == "" {
 		return mcp.NewToolResultError("bot is required"), nil
 	}

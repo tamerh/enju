@@ -17,7 +17,7 @@ import (
 // etc.) over stdio; the client captures the subprocess's stderr
 // and never shows it to the operator. A bare slog→os.Stderr
 // handler is therefore a black hole — the supervisor /
-// auto_bots / handler debug stream vanishes (this is what made
+// auto_agents / handler debug stream vanishes (this is what made
 // the auto_stop bug take seven rounds to pin down).
 //
 // Scope rule (mirrors the oplog verb ledger in

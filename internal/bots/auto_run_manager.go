@@ -1,6 +1,6 @@
 package bots
 
-// AutoRunManager bundles the auto_bots preflight + rollback +
+// AutoRunManager bundles the auto_agents preflight + rollback +
 // post-POST hookup that enju_create_run runs around the coord
 // /runs POST. Used by both the MCP handler (handleCreateRun)
 // and the CLI (cmd/enju/go.go:createRun) so the two paths can't
@@ -33,8 +33,8 @@ import (
 
 // AutoRunReadyTimeout is the per-bot Preflight wait used by
 // both create_run call sites (MCP handler + CLI `enju go
-// --auto-bots`). Defaults to 30s; tunable in production via
-// ENJU_AUTO_BOTS_TIMEOUT for first-touch demos with cold
+// --auto-agents`). Defaults to 30s; tunable in production via
+// ENJU_AUTO_AGENTS_TIMEOUT for first-touch demos with cold
 // claude-CLI subprocesses that need longer warmup.
 //
 // Test path: tests construct AutoRunManager directly via
@@ -43,7 +43,7 @@ import (
 // timeout without depending on global env. The env-override
 // path is for operator use; tests don't go through it.
 func AutoRunReadyTimeout() time.Duration {
-	if v := os.Getenv("ENJU_AUTO_BOTS_TIMEOUT"); v != "" {
+	if v := os.Getenv("ENJU_AUTO_AGENTS_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
@@ -51,7 +51,7 @@ func AutoRunReadyTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-// AutoRunManager owns the auto_bots state machine for one
+// AutoRunManager owns the auto_agents state machine for one
 // create_run invocation. Construct once per call; supervisor
 // is shared across calls and outlives the manager.
 type AutoRunManager struct {
@@ -154,7 +154,7 @@ func (m *AutoRunManager) Rollback(ctx context.Context) {
 }
 
 // AutoBotNames returns the bots that completed preflight. The
-// caller uses this for the result-text summary ("auto_bots: N of M
+// caller uses this for the result-text summary ("auto_agents: N of M
 // bot(s) lost their auto-stop hook") and for any downstream
 // processing that wants to know which bots were involved.
 //
@@ -169,7 +169,7 @@ func (m *AutoRunManager) AutoBotNames() []string {
 // HookRunSeq records the assigned run seq on each preflighted
 // bot's pid file (so the live.jsonl tailer can decrement when
 // the run finishes) and starts the project-event tailer. The
-// tailer is idempotent across concurrent auto_bots runs in the
+// tailer is idempotent across concurrent auto_agents runs in the
 // same project.
 //
 // Returns the bots whose MarkAutoRun failed — typically the

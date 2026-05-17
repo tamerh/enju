@@ -13,7 +13,7 @@ import (
 )
 
 // auto_stop.go — the live.jsonl tailer that drives the
-// auto_bots reference-counted lifecycle.
+// auto_agents reference-counted lifecycle.
 //
 // Flow: NDA.3's enju_create_run starts each bot with
 // StartedBy="auto_run" and marks the run's seq on its pid
@@ -112,7 +112,7 @@ func runSeqFromMetadata(md map[string]any) int64 {
 // is always long before the run reaches a terminal state. A
 // request-scoped tailer therefore dies within one poll
 // interval and never sees the run_completed event, leaking
-// every auto_bots-managed bot (the symptom this detach fixes).
+// every auto_agents-managed bot (the symptom this detach fixes).
 // WithoutCancel keeps any context values but strips
 // cancellation + deadline, so the tailer outlives the request
 // and is bounded only by fat-client process exit — exactly the
@@ -138,8 +138,8 @@ func (s *Supervisor) WatchProjectEvents(ctx context.Context, projectDir string, 
 	// WatchProjectEvents returning and the goroutine being
 	// scheduled get skipped (the os.Stat inside the goroutine
 	// would see the post-write size and seek past them).
-	// Starting at EOF matches operator intent: auto_bots only
-	// manages runs created with auto_bots=true, which are
+	// Starting at EOF matches operator intent: auto_agents only
+	// manages runs created with auto_agents=true, which are
 	// future from this point.
 	path := filepath.Join(projectDir, ".enju", "events", "live.jsonl")
 	var offset int64
@@ -165,7 +165,7 @@ func (s *Supervisor) runEventTailer(ctx context.Context, path string, offset int
 		}
 		next, err := s.consumeEventTail(path, offset, projectID)
 		if err != nil {
-			s.logger().Warn("auto_bots event tailer: read failed", "path", path, "error", err)
+			s.logger().Warn("auto_agents event tailer: read failed", "path", path, "error", err)
 		}
 		offset = next
 		select {
@@ -214,7 +214,7 @@ func (s *Supervisor) consumeEventTail(path string, offset int64, projectID int64
 		newOffset += int64(len(line)) + 1 // \n
 		var ev tailEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
-			s.logger().Warn("auto_bots tailer: malformed jsonl line, skipping", "error", err)
+			s.logger().Warn("auto_agents tailer: malformed jsonl line, skipping", "error", err)
 			continue
 		}
 		if !runTerminalTypes[ev.Type] {
@@ -222,7 +222,7 @@ func (s *Supervisor) consumeEventTail(path string, offset int64, projectID int64
 		}
 		runSeq := runSeqFromMetadata(ev.Metadata)
 		if runSeq == 0 {
-			s.logger().Warn("auto_bots tailer: terminal event has no run_seq metadata",
+			s.logger().Warn("auto_agents tailer: terminal event has no run_seq metadata",
 				"type", ev.Type, "seq", ev.Seq)
 			continue
 		}
@@ -257,7 +257,7 @@ type IsRunTerminal func(ctx context.Context, projectID, runSeq int64) (bool, err
 //
 // Concurrent-Start interaction: Reconcile runs as a fire-and-
 // forget goroutine from botSupervisor's lazy ctor, so an
-// operator may issue enju_create_run auto_bots=true before the
+// operator may issue enju_create_run auto_agents=true before the
 // sweep finishes. Two safeguards keep that benign: (1) pid
 // files for a fresh bot are written under procsMu by Start,
 // so Reconcile either sees the pre-Start absence (early-skip
@@ -334,7 +334,7 @@ func (s *Supervisor) Reconcile(ctx context.Context, lookup IsRunTerminal) error 
 func (s *Supervisor) onRunTerminal(projectID, runSeq int64, eventType string) {
 	entries, err := os.ReadDir(s.PIDDir)
 	if err != nil {
-		s.logger().Warn("auto_bots: reading pid dir", "error", err)
+		s.logger().Warn("auto_agents: reading pid dir", "error", err)
 		return
 	}
 	for _, ent := range entries {
@@ -353,21 +353,21 @@ func (s *Supervisor) onRunTerminal(projectID, runSeq int64, eventType string) {
 			continue
 		}
 		if err := s.UnmarkAutoRun(entry.Name, runSeq); err != nil {
-			s.logger().Warn("auto_bots: unmark failed", "bot", entry.Name, "run_seq", runSeq, "error", err)
+			s.logger().Warn("auto_agents: unmark failed", "bot", entry.Name, "run_seq", runSeq, "error", err)
 			continue
 		}
 		eligible, err := s.EligibleForAutoStop(entry.Name)
 		if err != nil {
-			s.logger().Warn("auto_bots: eligibility check failed", "bot", entry.Name, "error", err)
+			s.logger().Warn("auto_agents: eligibility check failed", "bot", entry.Name, "error", err)
 			continue
 		}
 		if !eligible {
 			continue
 		}
-		s.logger().Info("auto_bots: stopping bot — last referencing run completed",
+		s.logger().Info("auto_agents: stopping bot — last referencing run completed",
 			"bot", entry.Name, "run_seq", runSeq, "event", eventType)
 		if _, err := s.Stop(context.Background(), entry.Name); err != nil {
-			s.logger().Warn("auto_bots: stop failed", "bot", entry.Name, "error", err)
+			s.logger().Warn("auto_agents: stop failed", "bot", entry.Name, "error", err)
 		}
 	}
 }

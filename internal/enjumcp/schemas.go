@@ -283,8 +283,8 @@ If you don't have a project yet, create one first with enju_create_project.`),
 		mcp.WithString("branch",
 			mcp.Description(`Git branch this run commits to. Omit to use the project's default branch. Pass "auto" to have the coordinator pick an unused name — for template runs this is "<bundle>-1", "<bundle>-2", ... (e.g. path="enju/templates/gene-mapping" → "gene-mapping-1"); for inline YAML it falls back to "run-1", "run-2", .... Useful for parallel parameter sweeps. Pass an explicit name ("experiment-2", "enju/work") for a named isolated branch. The coordinator enforces SERIAL runs per branch: a second run on the same branch is refused until the first finishes. To run several variants at once, give each its own branch.`),
 		),
-		mcp.WithBoolean("auto_bots",
-			mcp.Description(`Opt-in: spin up every bot declared in the workflow's inline bots: section before the run starts, and stop them automatically when the run reaches a terminal state. Reference-counted so concurrent runs that share bots are safe — the last-finishing run triggers the stop. Bots started manually with enju_bot_start are left alone (manual wins). Requires path= mode; inline yaml= has no on-disk workflow file for the bot daemons to read. Default false: the operator drives bot lifecycle explicitly with enju_bot_start / enju_bot_stop_all.`),
+		mcp.WithBoolean("auto_agents",
+			mcp.Description(`Opt-in: spin up every agent declared in the workflow's inline agents: section before the run starts, and stop them automatically when the run reaches a terminal state. Reference-counted so concurrent runs that share agents are safe — the last-finishing run triggers the stop. Agents started manually with enju_agent_start are left alone (manual wins). Requires path= mode; inline yaml= has no on-disk workflow file for the agent daemons to read. Default false: the operator drives agent lifecycle explicitly with enju_agent_start / enju_agent_stop_all.`),
 		),
 		mcp.WithString("sync_mode_override",
 			mcp.Description(`Override the workflow YAML's sync: block for this run. Controls what happens to the run branch when the run completes. "merge": merge the run branch into base_branch locally (default if not set in YAML). "push": merge locally then push base_branch to origin. "none": skip both — useful for dry runs or workflows where you manage branching yourself. Omit to use the workflow's own sync: setting.`),
@@ -509,7 +509,7 @@ To migrate from a managed bare to a real GitHub/GitLab remote later, use enju_se
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description(`Absolute path for the project's working tree. Folder may be empty, populated, or already a git repo — see tool description for what each state triggers. The folder will hold all of Enju's per-project state under enju/ (templates, runs, events, bot state). Mutually exclusive with remote_url.`),
+			mcp.Description(`Absolute path for the project's working tree. Folder may be empty, populated, or already a git repo — see tool description for what each state triggers. The folder will hold all of Enju's per-project state under enju/ (templates, runs, events, agent state). Mutually exclusive with remote_url.`),
 		),
 		mcp.WithString("description",
 			mcp.Description("Optional project description"),
@@ -528,7 +528,7 @@ To migrate from a managed bare to a real GitHub/GitLab remote later, use enju_se
 
 func FileIssue() mcp.Tool {
 	return mcp.NewTool("enju_file_issue",
-		mcp.WithDescription(`File a project-level issue (living-workflow phase 3). Issues outlive runs — file in run #2, fix in run #7 is normal. Tester bots use this to record structured findings (one issue per failure mode); humans use it for ad-hoc bug reports. Filing ≠ fixing — triage and fix-task linkage are separate steps. Emits an issue_filed event.`),
+		mcp.WithDescription(`File a project-level issue (living-workflow phase 3). Issues outlive runs — file in run #2, fix in run #7 is normal. Tester agents use this to record structured findings (one issue per failure mode); humans use it for ad-hoc bug reports. Filing ≠ fixing — triage and fix-task linkage are separate steps. Emits an issue_filed event.`),
 		mcp.WithNumber("project_id", mcp.Required(),
 			mcp.Description("The project to file the issue against"),
 		),
@@ -647,29 +647,29 @@ func ShowEvents() mcp.Tool {
 	)
 }
 
-// toolRequestClarification is the bot-asks-human idiom — the
+// toolRequestClarification is the agent-asks-human idiom — the
 // natural complement to notifications. Encapsulates the spawn
-// pattern that bots use mid-task when they hit ambiguity:
-// "should X mean A or B?" Without this tool, every bot author
+// pattern that agents use mid-task when they hit ambiguity:
+// "should X mean A or B?" Without this tool, every agent author
 // has to learn the spawn_task shape (action=answer, citizens=1,
 // assign_to=<human>, etc.). With it, the idiom is one line.
 //
 // Mechanics: a thin wrapper over enju_spawn_task with sensible
-// defaults (action=answer, citizens=1, trigger=bot). The
+// defaults (action=answer, citizens=1, trigger=agent). The
 // resulting task is assigned to the named human; when they
-// answer, a task_completed event fires. The bot can either
+// answer, a task_completed event fires. The agent can either
 // poll, subscribe via the notification subsystem (Phase 4), or
 // rely on parent_task_id linkage to discover the resolution.
 //
-// In v1 the tool does NOT auto-pause the calling bot's task —
+// In v1 the tool does NOT auto-pause the calling agent's task —
 // that requires post-creation dependency mutation which Enju's
-// engine doesn't support today. Pattern for the bot's prompt:
+// engine doesn't support today. Pattern for the agent's prompt:
 // "If you need clarification, call enju_request_clarification
 // then submit your current task with a 'pending clarification'
 // marker; reviewer will request_changes once the answer lands."
 func RequestClarification() mcp.Tool {
 	return mcp.NewTool("enju_request_clarification",
-		mcp.WithDescription(`Bot-asks-human pattern: spawn a clarification task assigned to a named human, encapsulating the spawn-task idiom in one tool call. Use mid-task when you hit ambiguity in the spec, the upstream content, or the user's intent. The clarification task is action=answer, single-citizen, assigned to the human you name. Their answer becomes a normal task result the audit log records. Returns the new task ID. Note: in v1 this does NOT auto-pause your current task — submit your current work with a 'awaiting clarification' marker, or wait for the human's task_completed event before resuming. Future notification-bot work will auto-resume on answer.`),
+		mcp.WithDescription(`Agent-asks-human pattern: spawn a clarification task assigned to a named human, encapsulating the spawn-task idiom in one tool call. Use mid-task when you hit ambiguity in the spec, the upstream content, or the user's intent. The clarification task is action=answer, single-citizen, assigned to the human you name. Their answer becomes a normal task result the audit log records. Returns the new task ID. Note: in v1 this does NOT auto-pause your current task — submit your current work with a 'awaiting clarification' marker, or wait for the human's task_completed event before resuming. Future notification-agent work will auto-resume on answer.`),
 		mcp.WithNumber("project_id", mcp.Required(),
 			mcp.Description("The project ID"),
 		),
@@ -700,7 +700,7 @@ func RequestClarification() mcp.Tool {
 //   - Smaller default limit (20 vs 100) — recent context, not
 //     full history.
 //   - Concise output formatting suited for inline conversation
-//     ("Run #5 completed at 14:32; @bot submitted task X") vs
+//     ("Run #5 completed at 14:32; @agent submitted task X") vs
 //     show_events' raw JSONL.
 //
 // Both tools call the same underlying endpoint; the difference
@@ -814,7 +814,7 @@ func SpawnTask() mcp.Tool {
 			mcp.Description("Optional parent task id whose output triggered this spawn — recorded as lineage in the task_spawned event"),
 		),
 		mcp.WithString("trigger",
-			mcp.Description(`"human" (default) | "bot" | "template_rule" | "auto_triage"`),
+			mcp.Description(`"human" (default) | "agent" | "template_rule" | "auto_triage"`),
 		),
 		mcp.WithString("depends_on",
 			mcp.Description("Optional comma-separated list of fully-qualified task ids the spawned task waits on. Empty = task starts ready."),
@@ -879,7 +879,7 @@ func ResumeRun() mcp.Tool {
 
 func TerminateRun() mcp.Tool {
 	return mcp.NewTool("enju_terminate_run",
-		mcp.WithDescription(`Irreversibly abandon a run. Use when a run is structurally stuck (bot looping on request_changes, requirements changed mid-run, design flaw discovered) and continuing isn't the answer — pause is reversible, terminate is not.
+		mcp.WithDescription(`Irreversibly abandon a run. Use when a run is structurally stuck (agent looping on request_changes, requirements changed mid-run, design flaw discovered) and continuing isn't the answer — pause is reversible, terminate is not.
 
 Effect: run state moves to "terminated"; every non-terminal task in the run is cascade-marked "skipped" with skip_reason="run_terminated"; every open claim closes with outcome="abandoned". Topic branches stay in git (immutable audit). Late-arriving submits — compute that was running when terminate fired — are refused at the coordinator with a clear error; the work is honestly lost.
 
@@ -899,7 +899,7 @@ Refused on already-terminal runs (completed / failed / terminated). Pause→term
 			mcp.Description("The run sequence number within the project"),
 		),
 		mcp.WithString("reason",
-			mcp.Description(`Optional free-text explanation, capped at 500 chars (longer strings are silently truncated). Lands verbatim in the run_terminated event metadata for audit. Examples: "bot stuck in request_changes loop on review:gate", "requirements changed after kickoff", "design flaw — restarting with the new template".`),
+			mcp.Description(`Optional free-text explanation, capped at 500 chars (longer strings are silently truncated). Lands verbatim in the run_terminated event metadata for audit. Examples: "agent stuck in request_changes loop on review:gate", "requirements changed after kickoff", "design flaw — restarting with the new template".`),
 		),
 	)
 }
@@ -1141,16 +1141,16 @@ The tally response includes the current counts, whether the task resolved, and i
 	)
 }
 
-// --- operator/model design: bot + model registration ---
+// --- operator/model design: agent + model registration ---
 
 func RegisterBot() mcp.Tool {
-	return mcp.NewTool("enju_register_bot",
-		mcp.WithDescription(`Register a bot citizen owned by you. Returns the bot's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the bot's launcher (CI env var, daemon config, ~/.enju/bot-credentials.json) so the bot can authenticate as itself.
+	return mcp.NewTool("enju_register_agent",
+		mcp.WithDescription(`Register a agent citizen owned by you. Returns the agent's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the agent's launcher (CI env var, daemon config, ~/.enju/agent-credentials.json) so the agent can authenticate as itself.
 
-Use cases: autonomous overnight agents, CI runners, role-bots (developer-bot / reviewer-bot / tester-bot for the living-workflow pattern). The bot acts under its own identity in audit logs but ownership chains back to you for accountability. Multiple bots per parent are allowed — clone freely for parallel workloads or A/B testing. See docs/operator-model-design.md.`),
+Use cases: autonomous overnight agents, CI runners, role-agents (developer-agent / reviewer-agent / tester-agent for the living-workflow pattern). The agent acts under its own identity in audit logs but ownership chains back to you for accountability. Multiple agents per parent are allowed — clone freely for parallel workloads or A/B testing. See docs/operator-model-design.md.`),
 		mcp.WithString("name",
 			mcp.Required(),
-			mcp.Description("Display name (e.g. \"Tamer's Reviewer Bot\")"),
+			mcp.Description("Display name (e.g. \"Tamer's Reviewer Agent\")"),
 		),
 		mcp.WithString("username",
 			mcp.Description("Optional explicit username (slug-form, GitHub-username regex). Auto-slugified from name if omitted."),
@@ -1165,19 +1165,19 @@ Use cases: autonomous overnight agents, CI runners, role-bots (developer-bot / r
 }
 
 func ListMyBots() mcp.Tool {
-	return mcp.NewTool("enju_list_my_bots",
-		mcp.WithDescription("List every bot you own, with each bot's active and revoked tokens (token VALUES are not returned — only labels and timestamps; token strings are shown once at registration). Paste the output verbatim in your reply — it's pre-formatted."),
+	return mcp.NewTool("enju_list_my_agents",
+		mcp.WithDescription("List every agent you own, with each agent's active and revoked tokens (token VALUES are not returned — only labels and timestamps; token strings are shown once at registration). Paste the output verbatim in your reply — it's pre-formatted."),
 	)
 }
 
 func RevokeToken() mcp.Tool {
 	return mcp.NewTool("enju_revoke_token",
-		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of a bot whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_bots)."),
+		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of a agent whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_agents)."),
 		mcp.WithString("token",
 			mcp.Description("Raw token string. Use this when the token leaked into logs / a CI env / your shell history."),
 		),
 		mcp.WithNumber("token_id",
-			mcp.Description("Token row id from enju_list_my_bots. Use this when revoking a labeled deployment (e.g. \"the ci-server token\")."),
+			mcp.Description("Token row id from enju_list_my_agents. Use this when revoking a labeled deployment (e.g. \"the ci-server token\")."),
 		),
 	)
 }
@@ -1203,60 +1203,60 @@ Note: unknown model names passed to -model auto-register on first use, so explic
 	)
 }
 
-// --- Bot supervisor (Phase 4) ---
+// --- Agent supervisor (Phase 4) ---
 //
-// These tools are fatclient-side: they manage local bot daemon
-// subprocesses. The coordinator never sees them — bot lifecycle
+// These tools are fatclient-side: they manage local agent daemon
+// subprocesses. The coordinator never sees them — agent lifecycle
 // is fatclient-local per the design memo (project_bot_execution_architecture.md).
 
 func BotStart() mcp.Tool {
-	return mcp.NewTool("enju_bot_start",
-		mcp.WithDescription(`Start a bot daemon defined inline in a workflow YAML's bots: section. The fatclient forks 'enju bot run --bot=<name> --workflow=<path>' as a subprocess, captures stdout/stderr to a per-bot log file (~/.enju/bots/logs/<name>.log), and tracks the PID for graceful stop.
+	return mcp.NewTool("enju_agent_start",
+		mcp.WithDescription(`Start a agent daemon defined inline in a workflow YAML's agents: section. The fatclient forks 'enju agent run --agent=<name> --workflow=<path>' as a subprocess, captures stdout/stderr to a per-agent log file (~/.enju/agents/logs/<name>.log), and tracks the PID for graceful stop.
 
-One daemon per (machine, bot) for v1. Calling start on an already-running bot returns an error — call enju_bot_stop first if you want to restart.
+One daemon per (machine, agent) for v1. Calling start on an already-running agent returns an error — call enju_agent_stop first if you want to restart.
 
-Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this bot and submitting verdicts. The daemon outlives this MCP tool call — call enju_bot_status / _stop to manage it.
+Run-mode notes: the daemon polls the coordinator continuously, claiming tasks assigned to this agent and submitting verdicts. The daemon outlives this MCP tool call — call enju_agent_status / _stop to manage it.
 
-When the workflow declares exactly one bot, the 'bot' argument may be omitted — the supervisor uses that single entry.`),
-		mcp.WithString("bot",
-			mcp.Description("Bot name from the workflow's inline bots: section. Optional when the workflow declares exactly one bot."),
+When the workflow declares exactly one agent, the 'agent' argument may be omitted — the supervisor uses that single entry.`),
+		mcp.WithString("agent",
+			mcp.Description("Agent name from the workflow's inline agents: section. Optional when the workflow declares exactly one agent."),
 		),
 		mcp.WithString("workflow",
 			mcp.Required(),
-			mcp.Description("Path to the workflow YAML whose inline bots: section declares this fleet."),
+			mcp.Description("Path to the workflow YAML whose inline agents: section declares this fleet."),
 		),
 		mcp.WithNumber("project_id",
-			mcp.Description("Optional project id to scope task discovery (0 / omitted = across every project the bot is a member of)"),
+			mcp.Description("Optional project id to scope task discovery (0 / omitted = across every project the agent is a member of)"),
 		),
 	)
 }
 
 func BotStop() mcp.Tool {
-	return mcp.NewTool("enju_bot_stop",
-		mcp.WithDescription(`Gracefully stop a running bot daemon. The supervisor closes the daemon's stdin pipe, which triggers its watchStdinEOF goroutine to cancel the run loop and release any in-flight claim. Falls back to hard-kill (SIGKILL on Unix, TerminateProcess on Windows) after a 5s graceful timeout if the daemon is unresponsive.
+	return mcp.NewTool("enju_agent_stop",
+		mcp.WithDescription(`Gracefully stop a running agent daemon. The supervisor closes the daemon's stdin pipe, which triggers its watchStdinEOF goroutine to cancel the run loop and release any in-flight claim. Falls back to hard-kill (SIGKILL on Unix, TerminateProcess on Windows) after a 5s graceful timeout if the daemon is unresponsive.
 
-Returns an error if the named bot isn't running (or wasn't started by this fatclient session — bots started by a previous fatclient instance are orphans the operator must kill manually).`),
-		mcp.WithString("bot",
+Returns an error if the named agent isn't running (or wasn't started by this fatclient session — agents started by a previous fatclient instance are orphans the operator must kill manually).`),
+		mcp.WithString("agent",
 			mcp.Required(),
-			mcp.Description("Bot name (must match a previously-started daemon)"),
+			mcp.Description("Agent name (must match a previously-started daemon)"),
 		),
 	)
 }
 
 func BotStatus() mcp.Tool {
-	return mcp.NewTool("enju_bot_status",
-		mcp.WithDescription(`List every bot daemon the fatclient is currently supervising. For each: name, PID, started_at timestamp, log file path. Use this to confirm what's running before reading logs or deciding to stop.
+	return mcp.NewTool("enju_agent_status",
+		mcp.WithDescription(`List every agent daemon the fatclient is currently supervising. For each: name, PID, started_at timestamp, log file path. Use this to confirm what's running before reading logs or deciding to stop.
 
-Empty list = no bots running in this fatclient session.`),
+Empty list = no agents running in this fatclient session.`),
 	)
 }
 
 func BotLogs() mcp.Tool {
-	return mcp.NewTool("enju_bot_logs",
-		mcp.WithDescription(`Tail the most recent N lines of a bot daemon's log file. Logs are append-mode across restarts so post-crash investigation can read what the bot was doing before it died. Returns the empty list when the bot was never started (no log file exists yet).`),
-		mcp.WithString("bot",
+	return mcp.NewTool("enju_agent_logs",
+		mcp.WithDescription(`Tail the most recent N lines of a agent daemon's log file. Logs are append-mode across restarts so post-crash investigation can read what the agent was doing before it died. Returns the empty list when the agent was never started (no log file exists yet).`),
+		mcp.WithString("agent",
 			mcp.Required(),
-			mcp.Description("Bot name"),
+			mcp.Description("Agent name"),
 		),
 		mcp.WithNumber("lines",
 			mcp.Description("How many trailing lines to return (default 50, max 10000)"),
@@ -1265,11 +1265,11 @@ func BotLogs() mcp.Tool {
 }
 
 func BotStartAll() mcp.Tool {
-	return mcp.NewTool("enju_bot_start_all",
-		mcp.WithDescription(`Start every bot declared inline in a workflow YAML's bots: section. Convenience for first-touch demos where the operator wants the whole fleet up in one command. Skips bots that are already running. Returns the per-bot result list.`),
+	return mcp.NewTool("enju_agent_start_all",
+		mcp.WithDescription(`Start every agent declared inline in a workflow YAML's agents: section. Convenience for first-touch demos where the operator wants the whole fleet up in one command. Skips agents that are already running. Returns the per-agent result list.`),
 		mcp.WithString("workflow",
 			mcp.Required(),
-			mcp.Description("Path to the workflow YAML whose inline bots: section declares this fleet."),
+			mcp.Description("Path to the workflow YAML whose inline agents: section declares this fleet."),
 		),
 		mcp.WithNumber("project_id",
 			mcp.Description("Optional project id passed through to each daemon"),
@@ -1278,7 +1278,7 @@ func BotStartAll() mcp.Tool {
 }
 
 func BotStopAll() mcp.Tool {
-	return mcp.NewTool("enju_bot_stop_all",
-		mcp.WithDescription(`Stop every bot the supervisor is currently tracking. Best-effort — individual stop failures are reported per-bot but don't short-circuit the loop. Useful at session end so the operator's bots don't outlive their fatclient.`),
+	return mcp.NewTool("enju_agent_stop_all",
+		mcp.WithDescription(`Stop every agent the supervisor is currently tracking. Best-effort — individual stop failures are reported per-agent but don't short-circuit the loop. Useful at session end so the operator's agents don't outlive their fatclient.`),
 	)
 }

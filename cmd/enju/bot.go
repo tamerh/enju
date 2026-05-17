@@ -26,16 +26,16 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
-// cmdBot is the parent dispatcher for `enju bot <subcommand>`.
+// cmdBot is the parent dispatcher for `enju agent <subcommand>`.
 // Subcommands cluster every bot-side concern under one verb so
 // the help surface stays predictable as more land:
 //
-//	enju bot setup           # register manifest bots, stash tokens
-//	enju bot run --bot=NAME  # (next phase) run the daemon loop
-//	enju bot status          # (later) list local bot processes
+//	enju agent setup           # register manifest bots, stash tokens
+//	enju agent run --agent=NAME  # (next phase) run the daemon loop
+//	enju agent status          # (later) list local bot processes
 //
 // The bot subsystem is fatclient-local; the coordinator only knows
-// bots as kind=bot citizens. See docs/bots.md for the architecture.
+// bots as kind=agent citizens. See docs/agents.md for the architecture.
 func cmdBot(args []string) {
 	if len(args) < 1 {
 		printBotUsage()
@@ -46,15 +46,15 @@ func cmdBot(args []string) {
 		cmdBotSetup(args[1:])
 	case "run":
 		cmdBotRun(args[1:])
-	// Stop / status / logs are MCP tools (enju_bot_stop,
-	// enju_bot_status, enju_bot_logs) rather than CLI
+	// Stop / status / logs are MCP tools (enju_agent_stop,
+	// enju_agent_status, enju_agent_logs) rather than CLI
 	// subcommands — operators manage the running fleet through
 	// the same MCP host they use for every other coord
 	// interaction. CLI subcommand mirrors aren't planned for
 	// v1; if a CLI-only operator workflow appears the dispatcher
 	// is the place to add them.
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown bot subcommand: %s\n", args[0])
+		fmt.Fprintf(os.Stderr, "Unknown agent subcommand: %s\n", args[0])
 		printBotUsage()
 		os.Exit(1)
 	}
@@ -62,23 +62,23 @@ func cmdBot(args []string) {
 
 func printBotUsage() {
 	fmt.Println(`Usage:
- enju bot setup --workflow path/to/workflow.yaml
+ enju agent setup --workflow path/to/workflow.yaml
             Register every bot declared inline in the workflow
-            YAML's bots: section against the coordinator and
+            YAML's agents: section against the coordinator and
             stash each bot's auth token at the manifest's
             credentials path. Idempotent — bots whose credentials
             file already exists are skipped.
 
- enju bot run --workflow path/to/workflow.yaml --bot <name>
+ enju agent run --workflow path/to/workflow.yaml --agent <name>
             Run the bot daemon — polls the coordinator for ready
             tasks assigned to the bot, invokes the handler, and
             submits the result.
 
-Run 'enju bot <command> -h' for command-specific help.`)
+Run 'enju agent <command> -h' for command-specific help.`)
 }
 
 // cmdBotSetup registers every bot declared inline in the workflow
-// YAML's bots: section that doesn't already have a stashed
+// YAML's agents: section that doesn't already have a stashed
 // credentials file. Owner identity comes from the operator's default
 // credentials (~/.enju/credentials.json by default) — bots are
 // parented to the registering owner via the coord's parent_id
@@ -92,7 +92,7 @@ Run 'enju bot <command> -h' for command-specific help.`)
 // will surface the issue with a clearer error than a setup-time
 // liveness check would. Re-running setup never re-registers a
 // bot whose credentials file exists; operators rotate tokens via
-// TODO(future-phase): `enju bot rotate-token --bot=NAME`.
+// TODO(future-phase): `enju agent rotate-token --agent=NAME`.
 //
 // Partial-failure recovery: if registerBot fails AFTER the coord
 // created the bot row but BEFORE the response landed, re-running
@@ -100,14 +100,14 @@ Run 'enju bot <command> -h' for command-specific help.`)
 // via generateUniqueUsername, so the operator ends up with both
 // `developer-bot` (orphaned, no creds locally) and
 // `developer-bot-1` (creds at the manifest's developer-bot.json
-// path). Manual cleanup: list owned bots with enju_list_my_bots,
+// path). Manual cleanup: list owned bots with enju_list_my_agents,
 // revoke the orphan via enju_revoke_token. Atomic
 // register-or-rollback is out of scope for Phase 1.
 func cmdBotSetup(args []string) {
-	fs := flag.NewFlagSet("bot setup", flag.ExitOnError)
+	fs := flag.NewFlagSet("agent setup", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
 	credsPath := fs.String("credentials", "", "Path to OWNER credentials.json (default ~/.enju/credentials.json). Used only to authenticate the registration calls — bot tokens land at each bot's manifest-declared path.")
-	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline bots: section declares this fleet (required)")
+	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline agents: section declares this fleet (required)")
 	projectIDFlag := fs.Int64("project-id", 0, "Project id to add bots to as members. 0 = no auto-add; operator must call enju_add_project_member manually.")
 	dryRun := fs.Bool("dry-run", false, "Print what would happen without registering or writing files")
 	fs.Parse(args)
@@ -247,21 +247,21 @@ func cmdBotSetup(args []string) {
 // botSetupResult summarizes setupBotIfNeeded's outcome so callers
 // can render a one-line status without re-running the existence
 // check. Status mirrors the cmdBotSetup tally vocabulary so
-// `enju bot run`'s self-heal output stays visually consistent
-// with `enju bot setup`.
+// `enju agent run`'s self-heal output stays visually consistent
+// with `enju agent setup`.
 type botSetupResult struct {
 	Status    string // "registered", "already-set-up", or empty on no-op
 	Username  string // coord-assigned username (may differ from b.Name on collision)
 	AddedToPr bool   // true when project membership was newly added (vs already-member)
 }
 
-// setupBotIfNeeded performs the per-bot work `enju bot setup`
+// setupBotIfNeeded performs the per-bot work `enju agent setup`
 // does — register against the coord if no credentials file
 // exists at b.Credentials, write the credentials file, and
 // optionally add the bot to a project. Idempotent: a present
 // credentials file short-circuits to "already-set-up" without
-// touching the coord. Used by both `enju bot setup` (looped
-// over every manifest entry) and `enju bot run` (lazy self-
+// touching the coord. Used by both `enju agent setup` (looped
+// over every manifest entry) and `enju agent run` (lazy self-
 // heal for the one bot the operator named).
 //
 // owner.Token authenticates the registration. effectiveProjectID
@@ -355,7 +355,7 @@ func registerBot(ctx context.Context, coordURL, ownerToken string, b *bots.Bot) 
 }
 
 // ensureBotMembership best-effort adds botUsername to projectID
-// using owner's token. Called on every `enju bot run` startup —
+// using owner's token. Called on every `enju agent run` startup —
 // not just on first registration — because a previously-set-up
 // bot may be starting against a different project than setup
 // ran for, or the manifest's project_id may have been 0 at
@@ -506,13 +506,13 @@ func findGitRoot(start string) (string, error) {
 // One process = one bot. ProjectID > 0 scopes to a single
 // project; ProjectID == 0 polls every project the bot is a
 // member of. Multi-bot fleets run multiple processes (one per
-// manifest entry) — the supervisor MCP tools (enju_bot_start
+// manifest entry) — the supervisor MCP tools (enju_agent_start
 // / start_all) are the recommended way to orchestrate.
 func cmdBotRun(args []string) {
-	fs := flag.NewFlagSet("bot run", flag.ExitOnError)
+	fs := flag.NewFlagSet("agent run", flag.ExitOnError)
 	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL (defaults to value in ~/.enju/credentials.json, else http://localhost:8000)")
-	botName := fs.String("bot", "", "Bot name from the workflow's inline bots: section (required)")
-	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline bots: section declares this fleet (required)")
+	botName := fs.String("agent", "", "Agent name from the workflow's inline agents: section (required)")
+	workflowPath := fs.String("workflow", "", "Path to the workflow YAML whose inline agents: section declares this fleet (required)")
 	projectID := fs.Int64("project-id", 0, "Project id to scope task discovery (0 = every project the bot is a member of)")
 	registryPath := fs.String("registry", "", "Path to the project registry (default ~/.enju/projects.json).")
 	once := fs.Bool("once", false, "Run a single iteration then exit (for first-touch testing)")
@@ -527,7 +527,7 @@ func cmdBotRun(args []string) {
 	fs.Parse(args)
 
 	if *botName == "" {
-		fmt.Fprintln(os.Stderr, "--bot=<name> is required (must match a bot declared inline in the workflow YAML)")
+		fmt.Fprintln(os.Stderr, "--agent=<name> is required (must match a bot declared inline in the workflow YAML)")
 		os.Exit(1)
 	}
 	if *workflowPath == "" {
@@ -539,7 +539,7 @@ func cmdBotRun(args []string) {
 	// to a bot identity. Auto_bots in the supervisor reads
 	// this file (path via ENJU_BOT_PHASE_FILE) to decide when
 	// create_run can unblock. No-op when the env var is empty
-	// (operator launched `enju bot run` directly, not through
+	// (operator launched `enju agent run` directly, not through
 	// the supervisor).
 	_ = bots.WritePhase(bots.PhaseStarting)
 
@@ -604,7 +604,7 @@ func cmdBotRun(args []string) {
 
 	// Self-heal: if the bot has no credentials file yet, register
 	// it on the spot using the operator's owner credentials. Saves
-	// the operator one explicit `enju bot setup` round-trip — for
+	// the operator one explicit `enju agent setup` round-trip — for
 	// solo projects with one operator + a few bots that's the
 	// dominant case. Owner credentials default to
 	// ~/.enju/credentials.json; an explicit --owner-credentials
@@ -628,7 +628,7 @@ func cmdBotRun(args []string) {
 			setupCancel()
 			fmt.Fprintf(os.Stderr, "no credentials for bot %q at %s, and no owner credentials at %s for %s either.\n",
 				bot.Name, bot.Credentials, resolveCredentialsPath(""), *coordinator)
-			fmt.Fprintln(os.Stderr, "Register your own identity first by running `enju mcp` once, then re-run `enju bot run --bot=...`.")
+			fmt.Fprintln(os.Stderr, "Register your own identity first by running `enju mcp` once, then re-run `enju agent run --agent=...`.")
 			os.Exit(1)
 		}
 		// Membership: --project-id flag scopes the bot to one
@@ -853,7 +853,7 @@ func splitAllowTools(s string) []string {
 //   - Stdin is /dev/null (e.g. nohup): read returns EOF
 //     immediately, daemon shuts down at startup. Operators who
 //     want a detached daemon should set up a long-lived stdin
-//     (e.g. `enju bot run < /dev/null` is the wrong answer; use
+//     (e.g. `enju agent run < /dev/null` is the wrong answer; use
 //     a pipe from a supervisor or a service manager).
 //   - Stdin is a pipe but the writer never closes: read blocks;
 //     shutdown via SIGINT/SIGTERM still works. Win-win.

@@ -578,7 +578,7 @@ func TestSupervisor_PIDFileRecordsStartedBy(t *testing.T) {
 	defer s.StopAll(context.Background())
 
 	// Operator-start defaults StartedBy to "operator" so an
-	// auto_bots run that rides along can't accidentally claim
+	// auto_agents run that rides along can't accidentally claim
 	// the bot as auto-managed.
 	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "manual", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",

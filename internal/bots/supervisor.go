@@ -3,7 +3,7 @@
 //
 // One Supervisor instance lives for the fatclient's lifetime
 // and tracks every bot daemon the operator started through
-// the MCP tools (enju_bot_start / _stop / _status / _logs).
+// the MCP tools (enju_agent_start / _stop / _status / _logs).
 // Each daemon runs as a child subprocess of the fatclient,
 // stdin/stdout/stderr piped so the supervisor can:
 //
@@ -11,7 +11,7 @@
 //     watchStdinEOF graceful shutdown (cross-platform stdlib
 //     only; see cmd/enju/bot.go).
 //   - capture log output to a per-bot file the operator
-//     reads via enju_bot_logs.
+//     reads via enju_agent_logs.
 //   - hard-kill via Process.Kill() when graceful timeout
 //     expires.
 //
@@ -85,8 +85,8 @@ type Supervisor struct {
 
 	// tailMu guards `tailing`, the set of project dirs whose
 	// live.jsonl this supervisor is already tailing for
-	// auto_bots terminal events (NDA.4). WatchProjectEvents
-	// uses it to stay idempotent across concurrent auto_bots
+	// auto_agents terminal events (NDA.4). WatchProjectEvents
+	// uses it to stay idempotent across concurrent auto_agents
 	// runs in the same project.
 	tailMu  sync.Mutex
 	tailing map[string]bool
@@ -95,7 +95,7 @@ type Supervisor struct {
 // recentExitsMax bounds the in-memory exit-event ring buffer.
 // Deliberately small: the ring's purpose is "did my bot just
 // crash?" — a few entries is enough. Operators wanting deeper
-// history read enju_bot_logs.
+// history read enju_agent_logs.
 const recentExitsMax = 16
 
 // ExitEvent records a bot daemon's exit for the recently-
@@ -179,8 +179,8 @@ func NewSupervisor() (*Supervisor, error) {
 	}
 	s := &Supervisor{
 		EnjuExec:        exe,
-		PIDDir:          filepath.Join(home, ".enju", "bots", "pids"),
-		LogDir:          filepath.Join(home, ".enju", "bots", "logs"),
+		PIDDir:          filepath.Join(home, ".enju", "agents", "pids"),
+		LogDir:          filepath.Join(home, ".enju", "agents", "logs"),
 		GracefulTimeout: 5 * time.Second,
 		Logger:          slog.Default(),
 		procs:           make(map[string]*botProcess),
@@ -257,7 +257,7 @@ func (s *Supervisor) pruneStalePIDFiles() {
 // pruneOrphanPhase removes the phase file paired with a stale
 // pid file. Without this, a crashed daemon's "ready" phase
 // would survive across fatclient restarts and lie to the next
-// auto_bots wait.
+// auto_agents wait.
 func (s *Supervisor) pruneOrphanPhase(botName string) {
 	if err := os.Remove(s.phasePathFor(botName)); err != nil && !os.IsNotExist(err) {
 		s.logger().Warn("removing orphan phase file", "bot", botName, "error", err)
@@ -289,8 +289,8 @@ type StartParams struct {
 	// StartedBy records who initiated this Start call so the
 	// supervisor can decide later whether the bot is eligible
 	// for auto-stop. Two values: "operator" (manual
-	// enju_bot_start; auto-stop ignores it — manual wins) and
-	// "auto_run" (the create_run auto_bots flow started it;
+	// enju_agent_start; auto-stop ignores it — manual wins) and
+	// "auto_run" (the create_run auto_agents flow started it;
 	// auto-stop fires when its AutoRunIDs list empties). Empty
 	// defaults to "operator" so existing callers stay correct
 	// without changes. Only consulted on the StartedFresh
@@ -310,7 +310,7 @@ type RunningBot struct {
 // pidFileEntry is what we write to disk per bot. Plain JSON
 // for grep-ability; readable by `cat ~/.enju/bots/pids/x.json`.
 //
-// StartedBy and AutoRunIDs power the auto_bots lifecycle:
+// StartedBy and AutoRunIDs power the auto_agents lifecycle:
 // StartedBy="auto_run" + empty AutoRunIDs means the bot is
 // eligible for auto-stop (the run that brought it up has
 // finished). StartedBy="operator" means manual start — auto-stop
@@ -326,7 +326,7 @@ type pidFileEntry struct {
 	// for run #N arrives — we only act on bots whose ProjectID
 	// matches the event's project, since run seqs are
 	// per-project not globally unique. Zero = bot is not scoped
-	// to a project (cross-project poll mode); auto_bots always
+	// to a project (cross-project poll mode); auto_agents always
 	// passes a real project id, so the field is always set on
 	// pid files written by the auto-run flow.
 	ProjectID int64 `json:"project_id,omitempty"`
@@ -337,8 +337,8 @@ type pidFileEntry struct {
 // AlreadyRunning means a daemon for that bot was already up
 // and Start was a no-op (idempotent). Both are success — the
 // post-condition "the bot is running" holds either way. Callers
-// that want to distinguish them (the auto_bots flow reporting
-// per-bot status, or enju_bot_start_all classifying results)
+// that want to distinguish them (the auto_agents flow reporting
+// per-bot status, or enju_agent_start_all classifying results)
 // branch on the outcome; callers that just want "the bot is
 // up" can ignore it.
 type StartOutcome int
@@ -364,7 +364,7 @@ func (o StartOutcome) String() string {
 // Idempotent at the result surface: callers that want to bring
 // the post-condition "this bot is running" into effect can call
 // Start unconditionally and branch on outcome only for
-// diagnostics. Required for auto_bots, where a workflow's
+// diagnostics. Required for auto_agents, where a workflow's
 // declared bots may already be running from a manual start or
 // a prior auto-managed run.
 //
@@ -421,7 +421,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	pidPath := filepath.Join(s.PIDDir, p.BotName+".json")
 	phasePath := s.phasePathFor(p.BotName)
 	// Stale phase file from a previous daemon run would lie to
-	// the next auto_bots wait — claim it as ready before the
+	// the next auto_agents wait — claim it as ready before the
 	// fresh process has actually reached the loop. Remove
 	// before spawn; the daemon will rewrite it through the
 	// lifecycle transitions.
@@ -431,7 +431,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 
 	// O_APPEND: successive starts of the same bot keep the
 	// log history. Useful when a bot crashes; the operator
-	// reading enju_bot_logs after a restart sees the lead-up.
+	// reading enju_agent_logs after a restart sees the lead-up.
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, StartedFresh, fmt.Errorf("opening log file: %w", err)
@@ -715,7 +715,7 @@ func (s *Supervisor) reapOnExit(bp *botProcess, logFile *os.File) {
 		s.logger().Warn("removing pid file", "bot", bp.Name, "error", err)
 	}
 	// Drop the phase file too — a stale "ready" left over from
-	// a crashed daemon would mislead the next auto_bots wait.
+	// a crashed daemon would mislead the next auto_agents wait.
 	// Best-effort: missing file is fine.
 	if err := os.Remove(s.phasePathFor(bp.Name)); err != nil && !os.IsNotExist(err) {
 		s.logger().Warn("removing phase file", "bot", bp.Name, "error", err)
@@ -813,7 +813,7 @@ func (s *Supervisor) Phase(botName string) (Phase, error) {
 
 // WaitForReady blocks until the bot's phase reaches
 // PhaseReady or timeout elapses. Used by create_run's
-// auto_bots flow to fail fast when a bot's startup wedges
+// auto_agents flow to fail fast when a bot's startup wedges
 // (bad handler binary, network self-heal stuck, etc.) rather
 // than letting the run start with a non-functioning fleet.
 //
@@ -845,7 +845,7 @@ func (s *Supervisor) WaitForReady(ctx context.Context, botName string, timeout t
 	}
 }
 
-// MarkAutoRun records that the auto_bots flow for run runSeq
+// MarkAutoRun records that the auto_agents flow for run runSeq
 // is keeping botName alive. Idempotent: re-marking the same
 // run is a no-op. Does NOT change StartedBy — if the bot was
 // started manually, it stays operator-owned even when later

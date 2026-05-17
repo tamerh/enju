@@ -10,7 +10,7 @@ import (
 )
 
 // writeWorkflowWithBots wraps body (the YAML for the workflow's
-// version + bots: section) in a minimal workflow YAML that the
+// version + agents: section) in a minimal workflow YAML that the
 // parser accepts, writes it to a fresh temp dir, and returns
 // the workflow file's path. Callers feed that path to
 // LoadFromWorkflow.
@@ -43,7 +43,7 @@ func TestLoadFromWorkflow_MissingFile(t *testing.T) {
 }
 
 func TestLoadFromWorkflow_NoInlineBots(t *testing.T) {
-	// Workflow YAML with no bots: section parses cleanly and
+	// Workflow YAML with no agents: section parses cleanly and
 	// returns a nil manifest — the workflow may use system
 	// citizens only (humans / pre-registered bots) and not
 	// declare any inline.
@@ -63,7 +63,7 @@ func TestLoadFromWorkflow_NoInlineBots(t *testing.T) {
 }
 
 func TestLoadFromWorkflow_MalformedYAML(t *testing.T) {
-	path := writeWorkflowWithBots(t, "bots: not-a-list: oops")
+	path := writeWorkflowWithBots(t, "agents: not-a-list: oops")
 	_, err := LoadFromWorkflow(path)
 	if err == nil {
 		t.Fatal("expected parse error on malformed YAML, got nil")
@@ -73,7 +73,7 @@ func TestLoadFromWorkflow_MalformedYAML(t *testing.T) {
 func TestLoad_HappyPath_DefaultsResolved(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: developer-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -120,7 +120,7 @@ func TestLoad_MCPToolsOmitted_NilPointer(t *testing.T) {
 	// "all tools" rather than "empty allowlist."
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -142,7 +142,7 @@ func TestValidate_RejectsExplicitEmptyAllow(t *testing.T) {
 	// motivated allowlist.
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -165,7 +165,7 @@ func TestLoad_MissingVersionDefaultsToOne(t *testing.T) {
 	// Backwards compat: existing manifests without version: 1
 	// continue to load (Resolve sets version=1 silently).
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -198,7 +198,7 @@ func TestEnsureGitignored_PreservesMode(t *testing.T) {
 
 func TestLoad_TildeExpansion(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -217,7 +217,7 @@ bots:
 
 func TestValidate_RejectsMissingName(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - model: m
 `)
 	_, err := LoadFromWorkflow(path)
@@ -228,7 +228,7 @@ bots:
 
 func TestValidate_RejectsMissingModel(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
 `)
 	_, err := LoadFromWorkflow(path)
@@ -252,7 +252,7 @@ bots:
 func TestValidate_RejectsClaudeHandlerWithoutArgs(t *testing.T) {
 	for _, h := range []string{"", "claude"} {
 		t.Run("handler="+h, func(t *testing.T) {
-			body := "bots:\n  - name: x\n    model: m\n"
+			body := "agents:\n  - name: x\n    model: m\n"
 			if h != "" {
 				body += "    handler: " + h + "\n"
 			}
@@ -274,7 +274,7 @@ func TestValidate_RejectsClaudeHandlerWithoutArgs(t *testing.T) {
 // for tests that don't even invoke the binary.
 func TestValidate_StubHandlerSkipsArgsGate(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     handler: stub
@@ -287,7 +287,7 @@ bots:
 func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 	for _, h := range []string{"", "claude", "stub"} {
 		t.Run("handler="+h, func(t *testing.T) {
-			body := "bots:\n  - name: x\n    model: m\n"
+			body := "agents:\n  - name: x\n    model: m\n"
 			if h != "" {
 				body += "    handler: " + h + "\n"
 			}
@@ -313,7 +313,7 @@ func TestValidate_AcceptsKnownHandlerTypes(t *testing.T) {
 func TestValidate_RejectsUnknownArgsTemplate(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: x
     model: m
     args:
@@ -337,7 +337,7 @@ bots:
 func TestValidate_RejectsMalformedArgsTemplate(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: x
     model: m
     args:
@@ -357,7 +357,7 @@ bots:
 func TestValidate_AcceptsKnownArgsVars(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: x
     model: m
     args:
@@ -388,7 +388,7 @@ func TestValidate_AcceptsArbitraryHandlerBinary(t *testing.T) {
 	for _, h := range []string{"gemini", "shell", "./bin/lint-bot.sh", "/usr/local/bin/foo"} {
 		t.Run("handler="+h, func(t *testing.T) {
 			path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     args: ["-p"]
     handler: `+h+`
@@ -405,7 +405,7 @@ func TestValidate_StubHandlerNoModelRequired(t *testing.T) {
 	// or rule-bot wouldn't have a model to declare; insisting
 	// would be cargo from the LLM-only past.
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     handler: stub
 `)
@@ -416,7 +416,7 @@ bots:
 
 func TestValidate_RejectsDuplicateName(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -434,7 +434,7 @@ func TestValidate_RejectsBadName(t *testing.T) {
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
 			path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: "`+name+`"
     model: m
     args: ["-p"]
@@ -449,7 +449,7 @@ bots:
 
 func TestValidate_RejectsAbsoluteSystemPrompt(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -463,7 +463,7 @@ bots:
 
 func TestValidate_RejectsParentTraversal(t *testing.T) {
 	path := writeWorkflowWithBots(t, `
-bots:
+agents:
   - name: x
     model: m
     args: ["-p"]
@@ -545,7 +545,7 @@ func TestExpandReplicas(t *testing.T) {
 	t.Run("absent: single entry unchanged", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: only-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -562,7 +562,7 @@ bots:
 	t.Run("replicas: 1 stays single (sentinel for explicit single)", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: solo-dev
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -586,7 +586,7 @@ bots:
 	t.Run("replicas: 3 expands to 3 suffixed entries", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: dev-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -616,7 +616,7 @@ bots:
 	t.Run("replicas share authored prompt, separate credentials", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: dev-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -653,7 +653,7 @@ bots:
 	t.Run("replicas: -1 rejected", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: dev-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -671,7 +671,7 @@ bots:
 	t.Run("replicas exceeding cap rejected", func(t *testing.T) {
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: dev-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -691,7 +691,7 @@ bots:
 		// the explicit dev-bot-1 below collides.
 		path := writeWorkflowWithBots(t, `
 version: 1
-bots:
+agents:
   - name: dev-bot
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -730,11 +730,11 @@ func TestByName(t *testing.T) {
 // inlineNode parses a YAML fragment as a sequence of Bot
 // entries and returns the resulting yamlv3.Node — the same
 // shape captured by yaml.Run.Bots when a workflow YAML carries
-// an inline `bots:` block.
+// an inline `agents:` block.
 func inlineNode(t *testing.T, body string) yamlv3.Node {
 	t.Helper()
 	var wrapper struct {
-		Bots yamlv3.Node `yaml:"bots"`
+		Bots yamlv3.Node `yaml:"agents"`
 	}
 	if err := yamlv3.Unmarshal([]byte(body), &wrapper); err != nil {
 		t.Fatalf("parsing test inline fragment: %v", err)
@@ -743,7 +743,7 @@ func inlineNode(t *testing.T, body string) yamlv3.Node {
 }
 
 // TestFromInlineNode_AbsentBlock pins the zero-value Node
-// shape: when a workflow YAML has no `bots:` key, the Run
+// shape: when a workflow YAML has no `agents:` key, the Run
 // struct's Bots field is the empty yamlv3.Node (Kind==0).
 // FromInlineNode must return (nil, nil) so callers can chain
 // to the legacy Load path without special casing.
@@ -759,12 +759,12 @@ func TestFromInlineNode_AbsentBlock(t *testing.T) {
 }
 
 // TestFromInlineNode_EmptySequence pins the explicit empty
-// shape (`bots: []`): same outcome as absent — fall back to
+// shape (`agents: []`): same outcome as absent — fall back to
 // legacy file. Authors who want to actively suppress bots
 // should leave the block out entirely; an explicit empty list
 // is treated as "no inline" for forward-compat.
 func TestFromInlineNode_EmptySequence(t *testing.T) {
-	node := inlineNode(t, "bots: []\n")
+	node := inlineNode(t, "agents: []\n")
 	m, err := FromInlineNode(node)
 	if err != nil {
 		t.Errorf("empty sequence should be silent, got: %v", err)
@@ -782,12 +782,12 @@ func TestFromInlineNode_EmptySequence(t *testing.T) {
 // TestFromInlineNode_RunsResolveAndValidate makes sure the
 // inline path goes through the same expand-resolve-validate
 // pipeline as Load. An invalid bot in the inline block must
-// surface a validation error (with an "inline bots:" prefix
+// surface a validation error (with an "inline agents:" prefix
 // so it's attributable), not produce a silently-bad Manifest.
 func TestFromInlineNode_RunsResolveAndValidate(t *testing.T) {
 	// Missing model on a claude-handler bot fails Validate.
 	body := `
-bots:
+agents:
   - name: broken
     handler: claude
 `
@@ -795,7 +795,7 @@ bots:
 	if err == nil {
 		t.Fatal("expected validation error for claude bot with no model")
 	}
-	if !strings.Contains(err.Error(), "inline bots:") {
+	if !strings.Contains(err.Error(), "inline agents:") {
 		t.Errorf("error should be attributed to inline bots, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "model is required") {
@@ -809,7 +809,7 @@ bots:
 // with suffixed names.
 func TestFromInlineNode_ExpandsReplicas(t *testing.T) {
 	body := `
-bots:
+agents:
   - name: dev
     model: claude-sonnet-4-6
     args: ["-p"]
@@ -833,6 +833,6 @@ bots:
 
 // (Removed: TestLoadPreferringInline_* tests. Phase 8.h.3 dropped
 // LoadPreferringInline and the standalone bots.yaml fallback it
-// bridged to. Workflow YAML's inline bots: is the only source of
+// bridged to. Workflow YAML's inline agents: is the only source of
 // truth; tests above cover that path directly via LoadFromWorkflow
 // + FromInlineNode.)

@@ -33,7 +33,7 @@ import (
 // pure-string `version` command are exempt.
 func needsGit(subcommand string) bool {
 	switch subcommand {
-	case "mcp", "ui", "wrap-task", "inbox", "review", "bot", "go", "status", "runs", "dag":
+	case "mcp", "ui", "wrap-task", "inbox", "review", "agent", "go", "status", "runs", "dag":
 		return true
 	}
 	return false
@@ -81,7 +81,7 @@ func main() {
 		cmdInbox(os.Args[2:])
 	case "review":
 		cmdReview(os.Args[2:])
-	case "bot":
+	case "agent":
 		cmdBot(os.Args[2:])
 	case "validate":
 		cmdValidate(os.Args[2:])
@@ -116,7 +116,7 @@ Usage:
  enju validate Check a workflow YAML without running it
  enju inbox   Show tasks waiting on you in a project
  enju review  Submit a verdict on a claimed review task
- enju bot    Bot lifecycle (setup, run, status — see 'enju bot')
+ enju agent  Agent lifecycle (setup, run, status — see 'enju agent')
  enju wrap-task Run a compute task's script + commit (internal)
  enju version  Print version
 
@@ -517,7 +517,7 @@ func cmdMCP(args []string) {
 	// MCP client) over stdio; its stderr is captured by the client
 	// and never surfaced to the operator, so a bare
 	// slog→os.Stderr handler is a black hole — supervisor /
-	// auto_bots / handler debug logs vanish.
+	// auto_agents / handler debug logs vanish.
 	//
 	// Scope rule (matches the oplog ledger): project-scoped logs
 	// live under <project>/.enju/logs/. The slog follows: it

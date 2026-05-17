@@ -62,7 +62,7 @@ tasks:
   - id: ingest
     action: compute
     script: scripts/ingest.sh
-bots:
+agents:
   - name: dev-bot
     handler: claude
 `,

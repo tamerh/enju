@@ -191,7 +191,7 @@ echo "ready" > "$ENJU_BOT_PHASE_FILE"
 	defer s.StopAll(context.Background())
 
 	// Operator started this bot directly — StartedBy defaults
-	// to "operator." The auto_bots flow rides along by marking
+	// to "operator." The auto_agents flow rides along by marking
 	// the run seq, but the bot is NOT eligible for auto-stop.
 	if _, _, err := s.Start(context.Background(), StartParams{
 		BotName: "manual", WorkflowPath: "/tmp/p/workflow.yaml", Coordinator: "http://x",
@@ -221,7 +221,7 @@ echo "ready" > "$ENJU_BOT_PHASE_FILE"
 		t.Errorf("operator-started bot should not be auto-stopped; status: %+v", s.Status())
 	}
 	// Ref should be cleared even though the bot wasn't stopped —
-	// useful so a later auto_bots run doesn't double-count.
+	// useful so a later auto_agents run doesn't double-count.
 	entry, err := readPIDFile(s.pidPathFor("manual"))
 	if err != nil {
 		t.Fatal(err)

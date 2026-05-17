@@ -26,7 +26,7 @@ type BotInfo struct {
 	Tokens     []BotTokenInfo `json:"tokens"`
 }
 
-// BotListResponse is the wire shape for enju_list_my_bots /
+// BotListResponse is the wire shape for enju_list_my_agents /
 // GET /citizens/me/bots. Wrapped in a {"bots":...} envelope so
 // the formatter can disambiguate between empty list and decode
 // failure.

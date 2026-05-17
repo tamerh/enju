@@ -37,7 +37,7 @@ func TestNoOrphanHandlers_Spot(t *testing.T) {
 	c := &apiClient{}
 	for _, name := range []string{
 		"enju_list_runs", "enju_get_task", "enju_claim_task",
-		"enju_submit_result", "enju_register_bot",
+		"enju_submit_result", "enju_register_agent",
 	} {
 		if _, ok := c.handlerByToolName(name); !ok {
 			t.Errorf("expected handlerByToolName(%q) to find a handler", name)
@@ -116,17 +116,17 @@ var allToolFactories = []struct {
 	{"enju_retry_task", enjumcp.RetryTask},
 	{"enju_tally_task", enjumcp.TallyTask},
 	// operator/model design — bot + model registration tools.
-	{"enju_register_bot", enjumcp.RegisterBot},
-	{"enju_list_my_bots", enjumcp.ListMyBots},
+	{"enju_register_agent", enjumcp.RegisterBot},
+	{"enju_list_my_agents", enjumcp.ListMyBots},
 	{"enju_revoke_token", enjumcp.RevokeToken},
 	{"enju_list_models", enjumcp.ListModels},
 	{"enju_register_model", enjumcp.RegisterModel},
-	{"enju_bot_start", enjumcp.BotStart},
-	{"enju_bot_stop", enjumcp.BotStop},
-	{"enju_bot_status", enjumcp.BotStatus},
-	{"enju_bot_logs", enjumcp.BotLogs},
-	{"enju_bot_start_all", enjumcp.BotStartAll},
-	{"enju_bot_stop_all", enjumcp.BotStopAll},
+	{"enju_agent_start", enjumcp.BotStart},
+	{"enju_agent_stop", enjumcp.BotStop},
+	{"enju_agent_status", enjumcp.BotStatus},
+	{"enju_agent_logs", enjumcp.BotLogs},
+	{"enju_agent_start_all", enjumcp.BotStartAll},
+	{"enju_agent_stop_all", enjumcp.BotStopAll},
 }
 
 // TestAllToolsValidShape invokes every tool-schema factory and

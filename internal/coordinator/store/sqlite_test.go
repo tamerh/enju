@@ -774,7 +774,7 @@ func TestSpawnTask_BasicHappyPath(t *testing.T) {
 		TaskDefID:  "remediation_1",
 		Action:    "answer",
 		Prompt:    "fix what review flagged",
-		Trigger:   "bot",
+		Trigger:   string(CitizenKindBot),
 		SpawnedBy:  alice,
 	})
 	if err != nil {

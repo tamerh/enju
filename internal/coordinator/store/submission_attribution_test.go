@@ -159,8 +159,8 @@ func TestBotRequiresModelOnClaim(t *testing.T) {
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'bot', ?)`,
-		"claude-tamer-bot", "Tamer's Claude bot", "tok-bot", now, now, humanID,
+		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
+		"claude-tamer-bot", "Tamer's Claude bot", "tok-bot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -198,8 +198,8 @@ func TestBotRequiresModelOnSubmit(t *testing.T) {
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'bot', ?)`,
-		"reviewer-bot", "Reviewer Bot", "tok-rbot", now, now, humanID,
+		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
+		"reviewer-bot", "Reviewer Bot", "tok-rbot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestBotRequiresModelOnSubmit(t *testing.T) {
 	}
 }
 
-// TestBotWithModelSucceeds — the happy path for bots: declare the
+// TestBotWithModelSucceeds — the happy path for agents: declare the
 // model, both phases apply cleanly, model_id round-trips through
 // the read path.
 func TestBotWithModelSucceeds(t *testing.T) {
@@ -248,8 +248,8 @@ func TestBotWithModelSucceeds(t *testing.T) {
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'bot', ?)`,
-		"developer-bot", "Developer Bot", "tok-dbot", now, now, humanID,
+		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
+		"developer-bot", "Developer Bot", "tok-dbot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)

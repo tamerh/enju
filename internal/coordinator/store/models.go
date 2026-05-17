@@ -465,7 +465,7 @@ type TaskRecord struct {
 	// SpawnedFrom and SpawnTrigger record runtime spawn provenance
 	// (living-workflow phase 4). SpawnedFrom is the parent task's
 	// full id (empty for tasks authored at run-create time);
-	// SpawnTrigger is one of "human", "bot", "template_rule",
+	// SpawnTrigger is one of "human", "agent", "template_rule",
 	// "auto_triage" describing which mechanism fired the spawn.
 	// The detailed audit lives in events as
 	// task_spawned; these columns make lineage queryable in a
@@ -681,7 +681,7 @@ type CitizenRecord struct {
 	// it, re-add the writes deliberately at that point.
 	LastSeen    time.Time
 	// operator/model design — citizen kind discriminator.
-	// "human" (default for everyone pre-migration), "bot" (owned by a
+	// "human" (default for everyone pre-migration), "agent" (owned by a
 	// human or project, has its own token), "model" (LLM catalog
 	// entry, no token, attribution-only). See
 	// docs/operator-model-design.md.

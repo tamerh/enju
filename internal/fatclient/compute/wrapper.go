@@ -32,10 +32,28 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
+// taskScratchRoot is the SINGLE owner of the on-disk scratch path
+// segment. ResolveTaskScratchDir (writer of per-iter dirs) and
+// sweepStaleScratchOlderThan (the startup reaper) both derive from
+// this one function — so "writer and reader agree on the path" is
+// structurally guaranteed, not a convention that can drift (the
+// exact failure mode spec-bot-to-agent §3 is organized around).
+// The `agents` segment lives here and nowhere else.
+//
+//	<projectRoot>/.enju/agents/<botUsername>/scratch
+//
+// Empty projectRoot or botUsername returns "" (legacy/test opt-out).
+func taskScratchRoot(projectRoot, botUsername string) string {
+	if projectRoot == "" || botUsername == "" {
+		return ""
+	}
+	return filepath.Join(projectRoot, ".enju", "agents", botUsername, "scratch")
+}
+
 // ResolveTaskScratchDir returns the canonical absolute path for a
 // compute task's per-iteration scratch dir:
 //
-//	<projectRoot>/.enju/bots/<botUsername>/scratch/<task_id_safe>-iter-<iterSeq>
+//	<projectRoot>/.enju/agents/<botUsername>/scratch/<task_id_safe>-iter-<iterSeq>
 //
 // task_id_safe replaces ':' (the task ID separator) with '-' so the
 // path is filesystem-friendly. projectRoot is the user-facing project
@@ -60,7 +78,7 @@ func ResolveTaskScratchDir(projectRoot, botUsername, taskID string, iterSeq int)
 	if iterSeq < 1 {
 		iterSeq = 1
 	}
-	return filepath.Join(projectRoot, ".enju", "bots", botUsername, "scratch",
+	return filepath.Join(taskScratchRoot(projectRoot, botUsername),
 		fmt.Sprintf("%s-iter-%d", safe, iterSeq))
 }
 

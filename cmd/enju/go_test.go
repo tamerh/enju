@@ -348,7 +348,7 @@ func TestRunIdentityFromCreateResponseMissingFields(t *testing.T) {
 	}
 }
 
-// TestShouldRenderPoll covers the --auto-bots poll-dedup logic.
+// TestShouldRenderPoll covers the --auto-agents poll-dedup logic.
 // A long-running bot turn (5+ minute review) would otherwise
 // spam stdout with 150 identical "next gate: <task_id>" lines
 // at the 2s poll cadence. Render only when something changed.

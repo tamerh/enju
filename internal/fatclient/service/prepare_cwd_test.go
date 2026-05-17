@@ -129,7 +129,7 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	// Pin the shape so a future revert doesn't silently regress to
 	// the machine-scoped path (which broke single-machine no-origin
 	// projects on showcase_v14).
-	wantPrefix := "/.enju/bots/dev-bot2/scratch/"
+	wantPrefix := "/.enju/agents/dev-bot2/scratch/"
 	if !strings.Contains(path, wantPrefix) {
 		t.Errorf("scratch path %q should contain %q (project-scoped layout)", path, wantPrefix)
 	}

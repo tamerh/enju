@@ -19,7 +19,16 @@ type CitizenKind string
 
 const (
 	CitizenKindHuman CitizenKind = "human"
-	CitizenKindBot   CitizenKind = "bot"
+	// CitizenKindBot is the unattended-citizen kind. The Go
+	// identifier keeps the historical "Bot" name (internal,
+	// pure churn to rename — see spec-bot-to-agent §5) while
+	// the wire VALUE is "agent": an agent is an unattended
+	// citizen that claims and executes tasks; its handler may
+	// be an LLM or a script. The name≠value asymmetry is
+	// deliberate, not a bug — every consumer compares against
+	// this constant, never the literal, so this is the single
+	// source of the string.
+	CitizenKindBot   CitizenKind = "agent"
 	CitizenKindModel CitizenKind = "model"
 )
 

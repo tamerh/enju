@@ -42,7 +42,7 @@ func cmdGo(args []string) {
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
-	autoBots := fs.Bool("auto-bots", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_bots flag.")
+	autoBots := fs.Bool("auto-agents", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_agents flag.")
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
 	syncMode := fs.String("sync", "", `Sync mode at run completion: none | merge | push. Overrides the workflow YAML's sync: block. "merge" merges the run branch into base_branch locally; "push" also pushes base_branch to origin; "none" skips both. Defaults to the YAML setting, or "merge" if the YAML has no sync: block.`)
 	fs.Parse(args)
@@ -159,7 +159,7 @@ func cmdGo(args []string) {
 	}
 }
 
-// driveAutoBotsRun is the --auto-bots execution loop. Cycles
+// driveAutoBotsRun is the --auto-agents execution loop. Cycles
 // ExecuteRun + terminal-state polling until the coord reports
 // the run completed / failed / terminated. Returns the shell
 // exit code (0 = success, 1 = compute or git failure).
@@ -249,7 +249,7 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, 
 		// operator Ctrl-C out cleanly.
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "interrupted; auto-managed bots may still be running — use `enju bot list` and `enju_bot_stop` if needed")
+			fmt.Fprintln(os.Stderr, "interrupted; auto-managed bots may still be running — use `enju bot list` and `enju_agent_stop` if needed")
 			return 1
 		case <-time.After(pollInterval):
 		}
@@ -386,7 +386,7 @@ func projectRootCandidate(workflowAbs string) string {
 }
 
 // createRun runs the path= flavor of enju_create_run from CLI:
-// PrepareRunTemplate → (optional auto_bots Preflight) → POST →
+// PrepareRunTemplate → (optional auto_agents Preflight) → POST →
 // EnsureRunBranch → MaterializeRunFromData → (optional HookRunSeq) →
 // TouchProject. Mirrors mcphandlers/run.go:handleCreateRun for
 // the path= branch (the snapshot writeback uses the modern
@@ -395,7 +395,7 @@ func projectRootCandidate(workflowAbs string) string {
 //
 // PARITY: this is the second site implementing the same path=
 // create_run sequence. The first is mcphandlers/run.go's
-// handleCreateRun. The auto_bots state machine is shared via
+// handleCreateRun. The auto_agents state machine is shared via
 // bots.AutoRunManager so both sites can't drift on bot-lifecycle
 // fixes; the surrounding POST + snapshot + ensure-branch
 // sequence is still duplicated (a future
@@ -428,7 +428,7 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	}
 
 	// Warn when the workflow declares bots but the operator
-	// didn't opt in to --auto-bots. Without this, `enju go
+	// didn't opt in to --auto-agents. Without this, `enju go
 	// workflow.yaml` on a bots-using workflow stops at the first
 	// citizen gate with "next gate: <task_id>" and an operator
 	// may not realize the workflow's own bots could have
@@ -436,35 +436,35 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	if !autoBots && prep != nil && prep.LoadedTemplate != nil {
 		if m, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots); perr == nil && m != nil && len(m.Bots) > 0 {
 			fmt.Fprintf(os.Stderr,
-				"⚠ workflow declares %d bot(s); pass --auto-bots to start them automatically (or `enju bot run` per bot for manual control)\n",
+				"⚠ workflow declares %d bot(s); pass --auto-agents to start them automatically (or `enju bot run` per bot for manual control)\n",
 				len(m.Bots))
 		}
 	}
 
-	// auto_bots preflight (mirrors handleCreateRun). Same
+	// auto_agents preflight (mirrors handleCreateRun). Same
 	// AutoRunManager type so any bug fix in bot lifecycle
 	// lands in both places automatically.
 	var autoRunMgr *bots.AutoRunManager
 	if autoBots {
 		if prep == nil || prep.LoadedTemplate == nil {
-			return 0, 0, fmt.Errorf("auto_bots: workflow prep is empty (internal error)")
+			return 0, 0, fmt.Errorf("auto_agents: workflow prep is empty (internal error)")
 		}
 		manifest, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots)
 		if perr != nil {
-			return 0, 0, fmt.Errorf("auto_bots: parsing bots: %w", perr)
+			return 0, 0, fmt.Errorf("auto_agents: parsing bots: %w", perr)
 		}
 		if manifest == nil || len(manifest.Bots) == 0 {
-			return 0, 0, fmt.Errorf("--auto-bots set but workflow at %s declares no bots in its inline bots: section", templatePath)
+			return 0, 0, fmt.Errorf("--auto-agents set but workflow at %s declares no bots in its inline bots: section", templatePath)
 		}
 		sup, perr := sess.Supervisor()
 		if perr != nil {
-			return 0, 0, fmt.Errorf("auto_bots: supervisor init: %w", perr)
+			return 0, 0, fmt.Errorf("auto_agents: supervisor init: %w", perr)
 		}
 		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
 		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, fc.Coord().BaseURL(), projectID, bots.AutoRunReadyTimeout())
 		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
 			autoRunMgr.Rollback(ctx)
-			return 0, 0, fmt.Errorf("auto_bots: %w", perr)
+			return 0, 0, fmt.Errorf("auto_agents: %w", perr)
 		}
 	}
 
@@ -543,14 +543,14 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	// the tailer was missing for cross-process inspection.)
 	if autoRunMgr != nil {
 		if prep == nil {
-			fmt.Fprintf(os.Stderr, "⚠ auto_bots: prep is nil, tailer will not start (internal error)\n")
+			fmt.Fprintf(os.Stderr, "⚠ auto_agents: prep is nil, tailer will not start (internal error)\n")
 		} else if prep.Workflow == nil {
-			fmt.Fprintf(os.Stderr, "⚠ auto_bots: prep.Workflow is nil, tailer will not start (internal error)\n")
+			fmt.Fprintf(os.Stderr, "⚠ auto_agents: prep.Workflow is nil, tailer will not start (internal error)\n")
 		} else {
 			unhooked := autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
 			if len(unhooked) > 0 {
 				fmt.Fprintf(os.Stderr,
-					"⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
+					"⚠ auto_agents: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use `enju bot stop` manually if they're still running.\n",
 					len(unhooked), len(autoRunMgr.AutoBotNames()), strings.Join(unhooked, ", "))
 			}
 		}

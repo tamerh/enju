@@ -291,7 +291,7 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleListProjectMembers, true
 	case "enju_list_artifacts":
 		return c.handleListArtifacts, true
-	case "enju_list_my_bots":
+	case "enju_list_my_agents":
 		return c.handleListMyBots, true
 	case "enju_list_models":
 		return c.handleListModels, true
@@ -413,23 +413,23 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleExportRunEvents, true
 
 	// Bot + model registration
-	case "enju_register_bot":
+	case "enju_register_agent":
 		return c.handleRegisterBot, true
 	case "enju_revoke_token":
 		return c.handleRevokeToken, true
 	case "enju_register_model":
 		return c.handleRegisterModel, true
-	case "enju_bot_start":
+	case "enju_agent_start":
 		return c.handleBotStart, true
-	case "enju_bot_stop":
+	case "enju_agent_stop":
 		return c.handleBotStop, true
-	case "enju_bot_status":
+	case "enju_agent_status":
 		return c.handleBotStatus, true
-	case "enju_bot_logs":
+	case "enju_agent_logs":
 		return c.handleBotLogs, true
-	case "enju_bot_start_all":
+	case "enju_agent_start_all":
 		return c.handleBotStartAll, true
-	case "enju_bot_stop_all":
+	case "enju_agent_stop_all":
 		return c.handleBotStopAll, true
 	}
 	return nil, false

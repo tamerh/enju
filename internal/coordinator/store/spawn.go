@@ -59,7 +59,7 @@ type SpawnSpec struct {
 	AssignTo    []string // optional — restrict claim to specific usernames
 	RequireRole  string  // optional
 	ResultType   string  // "text" | "json"; defaults to "text"
-	Trigger    string  // "human" | "bot" | "template_rule" | "auto_triage"
+	Trigger    string  // "human" | "agent" | "template_rule" | "auto_triage"
 	SpawnedBy   int64  // citizen ID for attribution; 0 for system
 	ClosesIssueSeq int   // > 0 when this is an auto-triage fix task; on accept, the named issue auto-closes (phase 4c)
 }

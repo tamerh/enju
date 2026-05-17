@@ -139,7 +139,9 @@ func sweepStaleScratchOlderThan(projectRoot, botUsername string, minAge time.Dur
 	if projectRoot == "" || botUsername == "" {
 		return 0, nil
 	}
-	root := filepath.Join(projectRoot, ".enju", "bots", botUsername, "scratch")
+	// Single-owner: derive from the same function the writer uses
+	// (taskScratchRoot) — never re-hardcode the path segment here.
+	root := taskScratchRoot(projectRoot, botUsername)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {

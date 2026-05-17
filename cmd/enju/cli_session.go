@@ -33,7 +33,7 @@ type cliSession struct {
 	Creds *credentials
 
 	// Bot supervisor — lazily constructed by Supervisor()
-	// because only the auto_bots code path needs it. Sharing
+	// because only the auto_agents code path needs it. Sharing
 	// the same lazy-init shape as mcphandlers/client.go's
 	// botSupervisor so the cross-session reconcile (pruning
 	// stale auto_run_ids from a prior fatclient session) fires
@@ -60,7 +60,7 @@ func (s *cliSession) Supervisor() (*bots.Supervisor, error) {
 	}
 	s.supervisor = sup
 	// Fire reconcile in a goroutine — coord round-trip would
-	// otherwise block every auto-bots invocation on startup.
+	// otherwise block every auto-agents invocation on startup.
 	// Stale refs that survive this pass are GC'd lazily by the
 	// next terminal event the tailer observes.
 	go func() {

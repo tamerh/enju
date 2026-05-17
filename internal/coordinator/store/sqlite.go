@@ -2311,8 +2311,11 @@ func (s *Store) upsertModelCitizen(username, displayName string) error {
 // if the parent has no bots — not an error.
 func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT `+citizenColumns+` FROM citizens WHERE kind = 'bot' AND parent_id = ? ORDER BY registered_at DESC`,
-		parentID,
+		// kind bound as a parameter from the constant — never a
+		// SQL literal — so the value is single-source (see
+		// CitizenKindBot / spec-bot-to-agent §4).
+		`SELECT `+citizenColumns+` FROM citizens WHERE kind = ? AND parent_id = ? ORDER BY registered_at DESC`,
+		string(CitizenKindBot), parentID,
 	)
 	if err != nil {
 		return nil, err

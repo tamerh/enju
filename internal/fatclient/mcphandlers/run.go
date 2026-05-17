@@ -44,7 +44,7 @@ func autoBotsReadyTimeout() time.Duration {
 func rollbackAutoStarts(ctx context.Context, sup *bots.Supervisor, freshStarts []string) {
 	for _, name := range freshStarts {
 		if _, err := sup.Stop(ctx, name); err != nil {
-			slog.Default().Warn("auto_bots rollback: stop failed", "bot", name, "error", err)
+			slog.Default().Warn("auto_agents rollback: stop failed", "bot", name, "error", err)
 		}
 	}
 }
@@ -619,7 +619,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		body["sync_mode_override"] = sm
 	}
 
-	// auto_bots preflight (NDA.3). Spin up every bot declared
+	// auto_agents preflight (NDA.3). Spin up every bot declared
 	// in the workflow's inline bots: section before the run is
 	// created, and block until each reports PhaseReady. On
 	// partial failure, roll back the fresh starts (leave
@@ -630,39 +630,39 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	// handler and cmd/enju/go.go can't drift. The manager owns
 	// the freshStarts slice internally — Rollback reads from
 	// there, callers can't pass the wrong list (REV.1).
-	autoBots := req.GetBool("auto_bots", false)
+	autoBots := req.GetBool("auto_agents", false)
 	var autoRunMgr *bots.AutoRunManager
 	if autoBots {
 		if templatePath == "" {
-			return mcp.NewToolResultError("auto_bots=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
+			return mcp.NewToolResultError("auto_agents=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
 		}
 		if prep == nil || prep.LoadedTemplate == nil {
-			return mcp.NewToolResultError("auto_bots=true: workflow prep is empty (internal error — should not happen with path= set)"), nil
+			return mcp.NewToolResultError("auto_agents=true: workflow prep is empty (internal error — should not happen with path= set)"), nil
 		}
 		manifest, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots)
 		if perr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: parsing bots: %v", perr)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("auto_agents: parsing bots: %v", perr)), nil
 		}
 		if manifest == nil || len(manifest.Bots) == 0 {
-			return mcp.NewToolResultError(fmt.Sprintf("auto_bots=true but workflow at %s declares no bots in its inline bots: section", templatePath)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("auto_agents=true but workflow at %s declares no bots in its inline bots: section", templatePath)), nil
 		}
 		sup, perr := c.botSupervisor()
 		if perr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("auto_bots: supervisor init: %v", perr)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("auto_agents: supervisor init: %v", perr)), nil
 		}
 		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
 		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, c.fc.Coord().BaseURL(), int64(projectID), bots.AutoRunReadyTimeout())
 
 		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
 			autoRunMgr.Rollback(ctx)
-			return mcp.NewToolResultError("auto_bots: " + perr.Error()), nil
+			return mcp.NewToolResultError("auto_agents: " + perr.Error()), nil
 		}
 	}
 
 	apiPath := fmt.Sprintf("/api/v1/projects/%d/runs", projectID)
 	data, err := c.post(ctx, apiPath, body)
 	if err != nil {
-		// POST failed AFTER the auto_bots preflight already
+		// POST failed AFTER the auto_agents preflight already
 		// spun up the fleet. Roll back so a coord-side failure
 		// doesn't leak running bots that no run will ever
 		// reference — manager.Rollback only touches the strict
@@ -673,7 +673,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// auto_bots: now that the coord has assigned a run seq,
+	// auto_agents: now that the coord has assigned a run seq,
 	// hook each preflighted bot to the live.jsonl tailer so
 	// terminal events fire auto-stop. Bots whose MarkAutoRun
 	// fails (typically: the daemon crashed between
@@ -687,19 +687,19 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		if len(autoBotNames) > 0 {
 			var resp map[string]interface{}
 			if jerr := json.Unmarshal(data, &resp); jerr != nil {
-				slog.Default().Warn("auto_bots: failed to parse run response, tailer will not start",
+				slog.Default().Warn("auto_agents: failed to parse run response, tailer will not start",
 					"bots", autoBotNames, "error", jerr)
 			} else if seq, ok := resp["seq"].(float64); !ok {
-				slog.Default().Warn("auto_bots: run response missing or invalid seq field, tailer will not start",
+				slog.Default().Warn("auto_agents: run response missing or invalid seq field, tailer will not start",
 					"bots", autoBotNames, "seq_type", fmt.Sprintf("%T", resp["seq"]))
 			} else if prep == nil {
-				slog.Default().Warn("auto_bots: prep is nil, cannot start tailer (internal error)",
+				slog.Default().Warn("auto_agents: prep is nil, cannot start tailer (internal error)",
 					"bots", autoBotNames, "seq", int64(seq))
 			} else if prep.Workflow == nil {
-				slog.Default().Warn("auto_bots: prep.Workflow is nil, cannot start tailer (internal error)",
+				slog.Default().Warn("auto_agents: prep.Workflow is nil, cannot start tailer (internal error)",
 					"bots", autoBotNames, "seq", int64(seq))
 			} else {
-				slog.Default().Warn("auto_bots: hooking bots to live.jsonl tailer", "bots", autoBotNames, "run_seq", int64(seq))
+				slog.Default().Warn("auto_agents: hooking bots to live.jsonl tailer", "bots", autoBotNames, "run_seq", int64(seq))
 				autoBotsUnhooked = autoRunMgr.HookRunSeq(ctx, int64(seq), prep.Workflow.WorkDir())
 			}
 		}
@@ -753,7 +753,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 		text += fmt.Sprintf("\n⚠ Snapshot %s\n", snapshotWarning)
 	}
 	if len(autoBotsUnhooked) > 0 {
-		text += fmt.Sprintf("\n⚠ auto_bots: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use enju_bot_stop manually if they're still running.\n",
+		text += fmt.Sprintf("\n⚠ auto_agents: %d of %d bot(s) lost their auto-stop hook (%s) — likely crashed between WaitForReady and pid-file write. They will NOT auto-stop on run completion; use enju_agent_stop manually if they're still running.\n",
 			len(autoBotsUnhooked), len(autoBotNames), strings.Join(autoBotsUnhooked, ", "))
 	}
 	return mcp.NewToolResultText(text), nil

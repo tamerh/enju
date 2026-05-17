@@ -2636,9 +2636,9 @@ tasks:
 }
 
 // TestParseAcceptsInlineBots pins the post-Phase-7 contract: a
-// `bots:` section at the top level of a workflow YAML parses
+// `agents:` section at the top level of a workflow YAML parses
 // cleanly through the strict-fields decoder. Phase 8.h.3 wired
-// the inline bots: section to the daemon CLI; if the yaml.Run
+// the inline agents: section to the daemon CLI; if the yaml.Run
 // struct ever loses the Bots field (or grows the strict
 // decoder a typo), `enju_create_run` would refuse every
 // workflow YAML that declares inline bots — which is now the
@@ -2647,7 +2647,7 @@ func TestParseAcceptsInlineBots(t *testing.T) {
 	body := []byte(`name: research-analysis
 version: 1
 base_branch: main
-bots:
+agents:
   - name: developer-bot
     model: claude-sonnet-4-6
     handler: claude
@@ -2667,7 +2667,7 @@ tasks:
 `)
 	parsed, err := Parse(body)
 	if err != nil {
-		t.Fatalf("Parse rejected inline bots: %v", err)
+		t.Fatalf("Parse rejected inline agents: %v", err)
 	}
 	if parsed == nil || parsed.Run == nil {
 		t.Fatal("Parse returned nil ParsedRun")

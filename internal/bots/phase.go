@@ -5,7 +5,7 @@ import (
 )
 
 // Phase classifies a bot daemon's lifecycle stage so the
-// supervisor can decide when create_run's auto_bots wait should
+// supervisor can decide when create_run's auto_agents wait should
 // unblock. Three states:
 //
 //   PhaseStarting    — process is up; flags parsed; pre-flight
@@ -20,7 +20,7 @@ import (
 //   PhaseReady       — startup recovery is done, the poll loop
 //                      has entered. Claim attempts are firing.
 //                      This is the post-condition create_run
-//                      auto_bots is waiting on.
+//                      auto_agents is waiting on.
 //
 // The signal is best-effort: phase writes are appended to a
 // file named by ENJU_BOT_PHASE_FILE (set by the supervisor when

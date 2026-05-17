@@ -105,7 +105,7 @@ const includeKey = "include"
 var listMergeKeys = map[string]string{
 	"tasks":  "id",
 	"params": "name",
-	"bots":   "name",
+	"agents": "name",
 }
 
 // FlattenIncludes resolves a flat `include:` directive in the entry
@@ -252,9 +252,9 @@ func (a *includeAcc) mergeFile(p string, preRead []byte, isEntry bool, entryDir 
 
 		default:
 			// Singleton / unknown top-level key. Allowed only in
-			// the entry file — a fragment is tasks/params/bots.
+			// the entry file — a fragment is tasks/params/agents.
 			if !isEntry {
-				return fmt.Errorf("%s: an included fragment may only set include/tasks/params/bots, not %q (that's a workflow-level setting — keep it in the entry file)", p, key)
+				return fmt.Errorf("%s: an included fragment may only set include/tasks/params/agents, not %q (that's a workflow-level setting — keep it in the entry file)", p, key)
 			}
 			if _, seen := a.singletons[key]; !seen {
 				a.order = append(a.order, key)
@@ -279,7 +279,7 @@ func (a *includeAcc) marshal(sources []string) ([]byte, error) {
 	}
 	// Stable order for the merged sequences so the flattened
 	// document is deterministic regardless of map iteration.
-	for _, k := range []string{"params", "bots", "tasks"} {
+	for _, k := range []string{"params", "agents", "tasks"} {
 		if a.seq[k] != nil && len(a.seq[k].Content) > 0 {
 			put(k, a.seq[k])
 		}

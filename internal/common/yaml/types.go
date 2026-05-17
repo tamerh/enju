@@ -59,7 +59,7 @@ type Run struct {
 	// Until then, inline declarations parse cleanly but don't
 	// drive the daemon — keep both forms in sync if you author
 	// inline bots before the CLI catches up.
-	Bots         yamlv3.Node            `yaml:"bots,omitempty"`
+	Bots         yamlv3.Node            `yaml:"agents,omitempty"`
 	Params       []ParamDef             `yaml:"params,omitempty"` // top-level run params, substituted into {{param}} refs at submission
 	ForEach      ForEachMap             `yaml:"for_each,omitempty"`
 	Defaults     TaskDefaults           `yaml:"defaults,omitempty"`

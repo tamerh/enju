@@ -175,7 +175,7 @@ func TestAutoRunManagerAlreadyRunningBotSurvivesRollback(t *testing.T) {
 
 // TestAutoRunManagerEmptyManifestRejected — defensive: callers
 // must pre-check the manifest is non-empty (the user-facing
-// "workflow declares no bots:" message fires there). The
+// "workflow declares no agents:" message fires there). The
 // manager itself errors instead of silently no-op'ing so a
 // future caller refactor can't bypass the check.
 func TestAutoRunManagerEmptyManifestRejected(t *testing.T) {

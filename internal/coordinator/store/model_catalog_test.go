@@ -175,8 +175,8 @@ func TestListModelCitizensReturnsOnlyModels(t *testing.T) {
 	humanID := createTestCitizen(t, s, "alice", "tok-alice-listcheck")
 	if _, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, datetime('now'), datetime('now'), 'bot', ?)`,
-		"alice-bot", "Alice's bot", "tok-alice-bot", humanID,
+		 VALUES (?, ?, '', 'citizen', ?, 0, datetime('now'), datetime('now'), ?, ?)`,
+		"alice-bot", "Alice's bot", "tok-alice-bot", string(CitizenKindBot), humanID,
 	); err != nil {
 		t.Fatal(err)
 	}
