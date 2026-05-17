@@ -54,7 +54,7 @@ func (c *apiClient) handleRegisterBot(ctx context.Context, req mcp.CallToolReque
 	// is the ONE TIME the caller sees it, so we make sure they
 	// can't miss it.
 	var b strings.Builder
-	fmt.Fprintf(&b, "✓ Bot registered: @%s (%s)\n", resp["username"], resp["name"])
+	fmt.Fprintf(&b, "✓ Agent registered: @%s (%s)\n", resp["username"], resp["name"])
 	fmt.Fprintf(&b, "  Owned by: @%s\n", resp["parent_name"])
 	if label, _ := resp["label"].(string); label != "" {
 		fmt.Fprintf(&b, "  Label:    %s\n", label)

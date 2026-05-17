@@ -1145,7 +1145,7 @@ The tally response includes the current counts, whether the task resolved, and i
 
 func RegisterBot() mcp.Tool {
 	return mcp.NewTool("enju_register_agent",
-		mcp.WithDescription(`Register a agent citizen owned by you. Returns the agent's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the agent's launcher (CI env var, daemon config, ~/.enju/agent-credentials.json) so the agent can authenticate as itself.
+		mcp.WithDescription(`Register an agent citizen owned by you. Returns the agent's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the agent's launcher (CI env var, daemon config, ~/.enju/agent-credentials.json) so the agent can authenticate as itself.
 
 Use cases: autonomous overnight agents, CI runners, role-agents (developer-agent / reviewer-agent / tester-agent for the living-workflow pattern). The agent acts under its own identity in audit logs but ownership chains back to you for accountability. Multiple agents per parent are allowed — clone freely for parallel workloads or A/B testing. See docs/operator-model-design.md.`),
 		mcp.WithString("name",
@@ -1172,7 +1172,7 @@ func ListMyBots() mcp.Tool {
 
 func RevokeToken() mcp.Tool {
 	return mcp.NewTool("enju_revoke_token",
-		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of a agent whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_agents)."),
+		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of an agent whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_agents)."),
 		mcp.WithString("token",
 			mcp.Description("Raw token string. Use this when the token leaked into logs / a CI env / your shell history."),
 		),
@@ -1211,7 +1211,7 @@ Note: unknown model names passed to -model auto-register on first use, so explic
 
 func BotStart() mcp.Tool {
 	return mcp.NewTool("enju_agent_start",
-		mcp.WithDescription(`Start a agent daemon defined inline in a workflow YAML's agents: section. The fatclient forks 'enju agent run --agent=<name> --workflow=<path>' as a subprocess, captures stdout/stderr to a per-agent log file (~/.enju/agents/logs/<name>.log), and tracks the PID for graceful stop.
+		mcp.WithDescription(`Start an agent daemon defined inline in a workflow YAML's agents: section. The fatclient forks 'enju agent run --agent=<name> --workflow=<path>' as a subprocess, captures stdout/stderr to a per-agent log file (~/.enju/agents/logs/<name>.log), and tracks the PID for graceful stop.
 
 One daemon per (machine, agent) for v1. Calling start on an already-running agent returns an error — call enju_agent_stop first if you want to restart.
 
@@ -1253,7 +1253,7 @@ Empty list = no agents running in this fatclient session.`),
 
 func BotLogs() mcp.Tool {
 	return mcp.NewTool("enju_agent_logs",
-		mcp.WithDescription(`Tail the most recent N lines of a agent daemon's log file. Logs are append-mode across restarts so post-crash investigation can read what the agent was doing before it died. Returns the empty list when the agent was never started (no log file exists yet).`),
+		mcp.WithDescription(`Tail the most recent N lines of an agent daemon's log file. Logs are append-mode across restarts so post-crash investigation can read what the agent was doing before it died. Returns the empty list when the agent was never started (no log file exists yet).`),
 		mcp.WithString("agent",
 			mcp.Required(),
 			mcp.Description("Agent name"),

@@ -464,7 +464,7 @@ func (s *Supervisor) Start(ctx context.Context, p StartParams) (*RunningBot, Sta
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = logFile.Close()
-		return nil, StartedFresh, fmt.Errorf("spawning bot daemon: %w", err)
+		return nil, StartedFresh, fmt.Errorf("spawning agent daemon: %w", err)
 	}
 
 	now := time.Now()
@@ -532,7 +532,7 @@ func (s *Supervisor) Stop(ctx context.Context, botName string) (StopResult, erro
 	bp, ok := s.procs[botName]
 	s.procsMu.Unlock()
 	if !ok {
-		return StopResult{}, fmt.Errorf("bot %q is not running (or wasn't started by this supervisor session)", botName)
+		return StopResult{}, fmt.Errorf("agent %q is not running (or wasn't started by this supervisor session)", botName)
 	}
 	// Closing stdin triggers the daemon's watchStdinEOF
 	// goroutine, which cancels its ctx and lets the runner's
@@ -706,9 +706,9 @@ func (s *Supervisor) reapOnExit(bp *botProcess, logFile *os.File) {
 	s.procsMu.Unlock()
 
 	if waitErr != nil {
-		s.logger().Info("bot daemon exited", "bot", bp.Name, "reason", reason, "exit_error", waitErr)
+		s.logger().Info("agent daemon exited", "bot", bp.Name, "reason", reason, "exit_error", waitErr)
 	} else {
-		s.logger().Info("bot daemon exited cleanly", "bot", bp.Name, "reason", reason)
+		s.logger().Info("agent daemon exited cleanly", "bot", bp.Name, "reason", reason)
 	}
 
 	if err := os.Remove(bp.PIDPath); err != nil && !os.IsNotExist(err) {

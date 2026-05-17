@@ -548,7 +548,7 @@ func cmdBotRun(args []string) {
 	// Catch a missing binary at startup rather than mid-submit
 	// where the error is buried in a hook log.
 	if _, err := exec.LookPath("git"); err != nil {
-		fmt.Fprintln(os.Stderr, "`git` not found on PATH — install git (https://git-scm.com/downloads) before running enju bots.")
+		fmt.Fprintln(os.Stderr, "`git` not found on PATH — install git (https://git-scm.com/downloads) before running enju agent.")
 		os.Exit(1)
 	}
 
@@ -598,7 +598,7 @@ func cmdBotRun(args []string) {
 	}
 	bot := manifest.ByName(*botName)
 	if bot == nil {
-		fmt.Fprintf(os.Stderr, "bot %q not found in %s\n", *botName, absWorkflow)
+		fmt.Fprintf(os.Stderr, "agent %q not found in %s\n", *botName, absWorkflow)
 		os.Exit(1)
 	}
 
@@ -643,7 +643,7 @@ func cmdBotRun(args []string) {
 		}
 		switch res.Status {
 		case "registered":
-			fmt.Fprintf(os.Stderr, "self-heal: registered bot %q as %s, credentials at %s\n", bot.Name, res.Username, bot.Credentials)
+			fmt.Fprintf(os.Stderr, "self-heal: registered agent %q as %s, credentials at %s\n", bot.Name, res.Username, bot.Credentials)
 			if effectiveProjectID > 0 && res.AddedToPr {
 				fmt.Fprintf(os.Stderr, "self-heal: added to project #%d as member\n", effectiveProjectID)
 			}
@@ -783,7 +783,7 @@ func cmdBotRun(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "Bot %q running against %s (model=%s, project_id=%d, handler=%s)\n",
+	fmt.Fprintf(os.Stderr, "Agent %q running against %s (model=%s, project_id=%d, handler=%s)\n",
 		bot.Name, *coordinator, bot.Model, *projectID, bot.Handler)
 
 	// Two graceful-shutdown triggers feeding the same cancel:
@@ -811,10 +811,10 @@ func cmdBotRun(args []string) {
 		return
 	}
 	if err := daemon.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "bot daemon exited: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agent daemon exited: %v\n", err)
 		os.Exit(2)
 	}
-	fmt.Fprintln(os.Stderr, "bot daemon stopped (signal or stdin EOF received)")
+	fmt.Fprintln(os.Stderr, "agent daemon stopped (signal or stdin EOF received)")
 }
 
 // splitAllowTools parses the --allow-tools comma-separated

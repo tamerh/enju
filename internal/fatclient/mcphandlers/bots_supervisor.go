@@ -96,7 +96,7 @@ func (c *apiClient) handleBotStart(ctx context.Context, req mcp.CallToolRequest)
 	}
 	bot := manifest.ByName(botName)
 	if bot == nil {
-		return mcp.NewToolResultError(fmt.Sprintf("bot %q not found in %s", botName, workflowPath)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("agent %q not found in %s", botName, workflowPath)), nil
 	}
 	var allowTools []string
 	if bot.MCPTools != nil {
@@ -142,12 +142,12 @@ func (c *apiClient) handleBotStop(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("✗ " + err.Error()), nil
 	}
 	if res.Graceful {
-		return mcp.NewToolResultText(fmt.Sprintf("✓ bot %q stopped gracefully", botName)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("✓ agent %q stopped gracefully", botName)), nil
 	}
 	// Not graceful — surface this so operators know the
 	// daemon was holding work it couldn't release. Phase 5's
 	// stress tests will key off this signal.
-	return mcp.NewToolResultText(fmt.Sprintf("⚠ bot %q hard-killed (graceful timeout exceeded — daemon was likely mid-LLM-call or hung; check the log)", botName)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("⚠ agent %q hard-killed (graceful timeout exceeded — daemon was likely mid-LLM-call or hung; check the log)", botName)), nil
 }
 
 func (c *apiClient) handleBotStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -164,20 +164,20 @@ func (c *apiClient) handleBotStatus(ctx context.Context, req mcp.CallToolRequest
 	// operator at enju_agent_logs for history.
 	switch {
 	case len(running) == 0 && len(exits) == 0:
-		return mcp.NewToolResultText("(no bots running and no recent exits in this fatclient session — use enju_agent_logs <name> if you want to inspect a bot's prior session)"), nil
+		return mcp.NewToolResultText("(no agents running and no recent exits in this fatclient session — use enju_agent_logs <name> if you want to inspect an agent's prior session)"), nil
 	case len(running) == 0:
 		body, _ := json.MarshalIndent(exits, "", "  ")
-		return mcp.NewToolResultText(fmt.Sprintf("0 bots running.\n%d recent exit(s):\n%s", len(exits), string(body))), nil
+		return mcp.NewToolResultText(fmt.Sprintf("0 agents running.\n%d recent exit(s):\n%s", len(exits), string(body))), nil
 	case len(exits) == 0:
 		body, _ := json.MarshalIndent(running, "", "  ")
-		return mcp.NewToolResultText(fmt.Sprintf("%d bot(s) running:\n%s", len(running), string(body))), nil
+		return mcp.NewToolResultText(fmt.Sprintf("%d agent(s) running:\n%s", len(running), string(body))), nil
 	}
 	combo := map[string]interface{}{
 		"running":       running,
 		"recent_exits":  exits,
 	}
 	body, _ := json.MarshalIndent(combo, "", "  ")
-	return mcp.NewToolResultText(fmt.Sprintf("%d bot(s) running, %d recent exit(s):\n%s", len(running), len(exits), string(body))), nil
+	return mcp.NewToolResultText(fmt.Sprintf("%d agent(s) running, %d recent exit(s):\n%s", len(running), len(exits), string(body))), nil
 }
 
 func (c *apiClient) handleBotLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -195,13 +195,13 @@ func (c *apiClient) handleBotLogs(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("✗ " + err.Error()), nil
 	}
 	if len(got) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("(no log file for bot %q yet)", botName)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("(no log file for agent %q yet)", botName)), nil
 	}
 	body := ""
 	for _, line := range got {
 		body += line + "\n"
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("--- last %d lines from bot %q ---\n%s", len(got), botName, body)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("--- last %d lines from agent %q ---\n%s", len(got), botName, body)), nil
 }
 
 // handleBotStartAll iterates the workflow's inline bots,
@@ -270,7 +270,7 @@ func (c *apiClient) handleBotStopAll(ctx context.Context, req mcp.CallToolReques
 	}
 	errs := sup.StopAll(ctx)
 	if len(errs) == 0 {
-		return mcp.NewToolResultText("✓ all bots stopped"), nil
+		return mcp.NewToolResultText("✓ all agents stopped"), nil
 	}
 	msg := fmt.Sprintf("%d stop error(s):\n", len(errs))
 	for _, e := range errs {

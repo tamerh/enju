@@ -3678,7 +3678,7 @@ func RegisterBotResult(data []byte) string {
 		return string(data)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "✓ Bot registered: @%s (%s)\n", resp.Username, resp.Name)
+	fmt.Fprintf(&b, "✓ Agent registered: @%s (%s)\n", resp.Username, resp.Name)
 	fmt.Fprintf(&b, "  Owned by: @%s\n", resp.ParentName)
 	if resp.Label != "" {
 		fmt.Fprintf(&b, "  Label:    %s\n", resp.Label)
@@ -3862,7 +3862,7 @@ func BotList(data []byte) string {
 		return string(data)
 	}
 	if len(resp.Bots) == 0 {
-		return "You don't own any bots yet. Use enju_register_agent to create one."
+		return "You don't own any agents yet. Use enju_register_agent to create one."
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Your bots (%d):\n", len(resp.Bots))

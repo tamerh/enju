@@ -101,7 +101,7 @@ func TestBotRegisterListFlowE2E(t *testing.T) {
 		t.Fatalf("register_bot: %v", err)
 	}
 	regText := mcpResultText(t, registerResp)
-	if !strings.Contains(regText, "Bot registered") {
+	if !strings.Contains(regText, "Agent registered") {
 		t.Fatalf("register output missing success marker: %s", regText)
 	}
 	if !strings.Contains(regText, "TOKEN") {
@@ -124,7 +124,7 @@ func TestBotRegisterListFlowE2E(t *testing.T) {
 		t.Fatalf("list_my_bots: %v", err)
 	}
 	listText := mcpResultText(t, listResp)
-	if strings.Contains(listText, "don't own any bots") {
+	if strings.Contains(listText, "don't own any agents") {
 		t.Fatal("list_my_bots returned empty — CreateCitizen dropped Kind/ParentID, so the bot doesn't show up under its parent")
 	}
 	if !strings.Contains(listText, "tamers-reviewer-bot") {

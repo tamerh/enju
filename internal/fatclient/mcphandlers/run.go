@@ -634,7 +634,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	var autoRunMgr *bots.AutoRunManager
 	if autoBots {
 		if templatePath == "" {
-			return mcp.NewToolResultError("auto_agents=true requires path= mode — inline yaml= has no on-disk workflow file for the bot daemons to read"), nil
+			return mcp.NewToolResultError("auto_agents=true requires path= mode — inline yaml= has no on-disk workflow file for the agent daemons to read"), nil
 		}
 		if prep == nil || prep.LoadedTemplate == nil {
 			return mcp.NewToolResultError("auto_agents=true: workflow prep is empty (internal error — should not happen with path= set)"), nil
