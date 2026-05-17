@@ -78,16 +78,13 @@ tasks:
 	// harness's MCP client uses. Mirrors the production wiring
 	// in mcphandlers.New, minus the workspace + registry (this
 	// test is read-only against coord).
-	citizen, err := h.store.GetCitizenByUsername(h.username)
-	if err != nil || citizen == nil {
-		t.Fatalf("lookup citizen: %v", err)
-	}
+	authToken := firstActiveToken(t, h.store, h.username)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fc := service.New(service.Config{
 		Coord: coord.New(coord.Config{
 			BaseURL:   h.url,
 			Username:  h.username,
-			AuthToken: citizen.Token,
+			AuthToken: authToken,
 			Logger:    logger,
 		}),
 		Logger: logger,

@@ -74,15 +74,17 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 	res, err := s.store.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
-			store.CreateCitizen{Citizen: store.CitizenRecord{
-				Username:     username,
-				Name:         req.Name,
-				Email:        req.Email,
-				Role:         "citizen",
-				Token:        token,
-				RegisteredAt: now,
-				LastSeen:     now,
-			}},
+			store.CreateCitizen{
+				Citizen: store.CitizenRecord{
+					Username:     username,
+					Name:         req.Name,
+					Email:        req.Email,
+					Role:         "citizen",
+					RegisteredAt: now,
+					LastSeen:     now,
+				},
+				Token: token,
+			},
 		},
 	})
 	if err != nil {

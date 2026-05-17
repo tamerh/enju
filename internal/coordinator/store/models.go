@@ -655,16 +655,10 @@ type CitizenRecord struct {
 	Name      string
 	Email      string
 	Role      string // "citizen", "author", "reviewer"
-	// Token is the LEGACY MIRROR of the originally-issued token —
-	// authentication lives in the tokens table now. It
-	// stays populated for backward compatibility with old reads
-	// but is NOT updated on revocation: a revoked token's value
-	// remains in this field even though it no longer
-	// authenticates. New code should use ListTokensByCitizen and
-	// the tokens table for any "is this token still valid" check.
-	// This field is kept for one migration cycle and will be
-	// dropped once no callers read it.
-	Token      string
+	// A citizen row carries no token. Authentication is the
+	// tokens table exclusively (issued, labelled, revocable,
+	// multiple per citizen). Use ListTokensByCitizen / the tokens
+	// table for anything token-related.
 	Score      float64
 	TasksCompleted int
 	TasksRejected  int

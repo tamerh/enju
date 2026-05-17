@@ -66,9 +66,9 @@ func TestCitizenKindReadAfterDirectInsert(t *testing.T) {
 	// CreateBot helper; for now we exercise the raw schema.
 	now := time.Now()
 	_, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"claude-tamer-bot", "Claude (tamer's bot)", "tok-bot", now, now, string(CitizenKindBot), humanID,
+		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
+		"claude-tamer-bot", "Claude (tamer's bot)", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatalf("insert bot: %v", err)
@@ -115,12 +115,11 @@ func TestCreateCitizenHonorsKindAndParent(t *testing.T) {
 	botID, err := helperCreateCitizen(s, &CitizenRecord{
 		Username:     "claude-tamer-bot",
 		Name:         "Tamer's Claude bot",
-		Token:        "tok-bot",
 		RegisteredAt: now,
 		LastSeen:     now,
 		Kind:         CitizenKindBot,
 		ParentID:     &humanID,
-	})
+	}, "tok-bot")
 	if err != nil {
 		t.Fatalf("CreateCitizen: %v", err)
 	}

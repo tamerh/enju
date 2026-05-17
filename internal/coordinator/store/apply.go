@@ -1696,20 +1696,23 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 		kind = CitizenKindHuman
 	}
 	res, err := tx.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
-		c.Username, c.Name, c.Email, role, c.Token, c.RegisteredAt, c.LastSeen, kind, nullableInt64(c.ParentID),
+		`INSERT INTO citizens (username, name, email, role, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
+		c.Username, c.Name, c.Email, role, c.RegisteredAt, c.LastSeen, kind, nullableInt64(c.ParentID),
 	)
 	if err != nil {
 		return 0, err
 	}
 	newID, _ := res.LastInsertId()
-	// Mirror the initial token into the tokens table — the auth
-	// path joins through there. Skipped when no token is supplied.
-	if c.Token != "" {
+	// Seed the initial bearer token into the tokens table — the
+	// only auth authority (citizens has no token column). The
+	// token rides on the mutation, not the persisted citizen row.
+	// Skipped when no token is supplied (the citizen then can't
+	// authenticate until one is issued).
+	if m.Token != "" {
 		if _, err := tx.Exec(
 			`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
-			newID, c.Token, m.TokenLabel, c.RegisteredAt,
+			newID, m.Token, m.TokenLabel, c.RegisteredAt,
 		); err != nil {
 			return 0, fmt.Errorf("issue initial token: %w", err)
 		}

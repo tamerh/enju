@@ -146,9 +146,9 @@ func TestAgentRequiresModelOnClaim(t *testing.T) {
 
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"claude-tamer-bot", "Tamer's Claude agent", "tok-bot", now, now, string(CitizenKindBot), humanID,
+		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
+		"claude-tamer-bot", "Tamer's Claude agent", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -183,9 +183,9 @@ func TestAgentRequiresModelOnSubmit(t *testing.T) {
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"reviewer-bot", "Reviewer Agent", "tok-rbot", now, now, string(CitizenKindBot), humanID,
+		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
+		"reviewer-bot", "Reviewer Agent", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -230,9 +230,9 @@ func TestAgentWithModelSucceeds(t *testing.T) {
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"developer-bot", "Developer Agent", "tok-dbot", now, now, string(CitizenKindBot), humanID,
+		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
+		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
+		"developer-bot", "Developer Agent", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)

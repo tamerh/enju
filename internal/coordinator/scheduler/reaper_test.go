@@ -81,13 +81,15 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 	citRes, err := s.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{
-			store.CreateCitizen{Citizen: store.CitizenRecord{
-				Username:     "alice-" + taskID,
-				Name:         "alice",
-				Token:        "tok-" + taskID,
-				RegisteredAt: now,
-				LastSeen:     now,
-			}},
+			store.CreateCitizen{
+				Citizen: store.CitizenRecord{
+					Username:     "alice-" + taskID,
+					Name:         "alice",
+					RegisteredAt: now,
+					LastSeen:     now,
+				},
+				Token: "tok-" + taskID,
+			},
 		},
 	})
 	if err != nil {

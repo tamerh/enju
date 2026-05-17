@@ -218,7 +218,6 @@ func (s *Store) initSchema() error {
 		name TEXT NOT NULL,
 		email TEXT,
 		role TEXT NOT NULL DEFAULT 'citizen',
-		token TEXT UNIQUE NOT NULL,
 		score REAL NOT NULL DEFAULT 0,
 		tasks_completed INTEGER NOT NULL DEFAULT 0,
 		tasks_rejected INTEGER NOT NULL DEFAULT 0,
@@ -391,13 +390,11 @@ func (s *Store) initSchema() error {
 	-- are a strict consumer of the system, never on the
 	-- critical path. See docs/event-log.md.
 
-	-- operator/model design — tokens move out of the
-	-- citizens row into their own table. Multiple tokens per
-	-- citizen (rotation, per-deployment labels), revocable
-	-- (revoked_at IS NULL = active), audit-preserved (revoke =
-	-- mark, never delete). The citizens.token column is left
-	-- intact as a legacy mirror until a future cleanup phase can
-	-- safely drop it. See docs/operator-model-design.md.
+	-- Tokens live in their own table — the sole auth authority.
+	-- Multiple tokens per citizen (rotation, per-deployment
+	-- labels), revocable (revoked_at IS NULL = active),
+	-- audit-preserved (revoke = mark, never delete). citizens has
+	-- no token column: a token is never stored on the citizen row.
 	CREATE TABLE IF NOT EXISTS tokens (
 		id       INTEGER PRIMARY KEY AUTOINCREMENT,
 		citizen_id   INTEGER NOT NULL REFERENCES citizens(id),
@@ -445,7 +442,6 @@ func (s *Store) initSchema() error {
 	 ON tasks(run_id, reviews_target)
 	 WHERE reviews_target != '' AND action = 'review';
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
-	CREATE INDEX IF NOT EXISTS idx_citizens_token ON citizens(token);
 	CREATE INDEX IF NOT EXISTS idx_tokens_citizen ON tokens(citizen_id);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE email IS NOT NULL AND email != '';
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_username ON citizens(username);
@@ -702,21 +698,6 @@ func (s *Store) initSchema() error {
 		}
 	}
 
-	// operator/model design — backfill the tokens table
-	// from existing citizens.token values. Idempotent: only inserts
-	// rows that don't already exist (keyed on citizen_id, since each
-	// pre-migration citizen had exactly one token). After this
-	// runs, existing humans authenticate via the tokens table the
-	// same way they authenticate today via citizens.token.
-	if _, err := s.db.Exec(`
-		INSERT INTO tokens (citizen_id, token, label, issued_at)
-		SELECT id, token, 'legacy', registered_at
-		FROM citizens
-		WHERE token != ''
-		 AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.citizen_id = citizens.id)
-	`); err != nil {
-		return fmt.Errorf("schema: backfill tokens: %w", err)
-	}
 
 	// Seed the cosmetic model_catalog (pretty display names
 	// only). Not correctness-bearing: a model is a label on the
@@ -2055,7 +2036,7 @@ func (s *Store) GetExpiredClaims() ([]TaskClaimRecord, error) {
 // for plain `FROM citizens` queries and for joins where another
 // table has overlapping column names (notably tokens.id and
 // tokens.token, which would collide otherwise).
-const citizenColumns = `citizens.id, citizens.username, citizens.name, citizens.email, citizens.role, citizens.token, citizens.score, citizens.tasks_completed, citizens.tasks_rejected, citizens.tasks_timed_out, citizens.tasks_released, citizens.tokens_contributed, citizens.registered_at, citizens.last_seen, citizens.kind, citizens.parent_id`
+const citizenColumns = `citizens.id, citizens.username, citizens.name, citizens.email, citizens.role, citizens.score, citizens.tasks_completed, citizens.tasks_rejected, citizens.tasks_timed_out, citizens.tasks_released, citizens.tokens_contributed, citizens.registered_at, citizens.last_seen, citizens.kind, citizens.parent_id`
 
 // scanCitizen reads one citizen row into a CitizenRecord. Used by
 // GetCitizen, GetCitizenByUsername, GetCitizenByToken.
@@ -2064,7 +2045,7 @@ func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	var email, role sql.NullString
 	var parentID sql.NullInt64
 	err := row.Scan(
-		&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
+		&p.ID, &p.Username, &p.Name, &email, &role, &p.Score,
 		&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
 		&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
 		&p.Kind, &parentID,
@@ -2094,15 +2075,11 @@ func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 // the UpdateCitizenProfile mutation and calls ApplyPlan.
 
 // GetCitizenByToken resolves a token to its owning citizen for
-// authentication. Reads from the tokens table and
-// rejects revoked tokens — `revoked_at IS NULL` is the active
-// filter. Returns (nil, nil) when the token doesn't exist OR has
-// been revoked; the auth middleware treats both the same way.
-//
-// The citizens.token column is no longer consulted on this path.
-// It remains populated as a legacy mirror until a future cleanup
-// phase drops it; new revocations / rotations only show up on the
-// tokens table.
+// authentication. The tokens table is the sole authority — there
+// is no token column on citizens. Rejects revoked tokens
+// (`revoked_at IS NULL` is the active filter). Returns (nil, nil)
+// when the token doesn't exist OR has been revoked; the auth
+// middleware treats both the same way.
 func (s *Store) GetCitizenByToken(token string) (*CitizenRecord, error) {
 	return scanCitizen(s.db.QueryRow(
 		`SELECT `+citizenColumns+`
@@ -2294,7 +2271,7 @@ func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 		var email, role sql.NullString
 		var pid sql.NullInt64
 		if err := rows.Scan(
-			&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
+			&p.ID, &p.Username, &p.Name, &email, &role, &p.Score,
 			&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
 			&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
 			&p.Kind, &pid,

@@ -662,3 +662,26 @@ tasks:
 		t.Errorf("profile missing username: %s", prof)
 	}
 }
+
+// firstActiveToken resolves a citizen's current bearer token from
+// the tokens table (a citizen row carries no token). Used by test
+// harnesses that need to authenticate as an already-registered
+// citizen they didn't create the token for.
+func firstActiveToken(t *testing.T, st store.CoordinatorStore, username string) string {
+	t.Helper()
+	cz, err := st.GetCitizenByUsername(username)
+	if err != nil || cz == nil {
+		t.Fatalf("lookup citizen %q: %v", username, err)
+	}
+	toks, err := st.ListTokensByCitizen(cz.ID)
+	if err != nil {
+		t.Fatalf("list tokens for %q: %v", username, err)
+	}
+	for _, tk := range toks {
+		if tk.RevokedAt == nil {
+			return tk.Token
+		}
+	}
+	t.Fatalf("no active token for citizen %q", username)
+	return ""
+}

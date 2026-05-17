@@ -551,12 +551,16 @@ type DeleteArtifact struct {
 
 func (DeleteArtifact) mutationKind() MutationKind { return MutDeleteArtifact }
 
-// CreateCitizen registers a new citizen plus its initial
-// token. TokenLabel is the optional label for the auto-issued
-// token row (e.g. "primary", "rotation-2026-05"). Empty label
-// matches the historical default for unlabeled tokens.
+// CreateCitizen registers a new citizen plus its initial bearer
+// token. Token is the bearer token to seed into the tokens table
+// (the only auth authority); it is NOT stored on the citizen row —
+// citizens has no token column. Empty Token = no token row issued
+// (the citizen can't authenticate until one is). TokenLabel is the
+// optional label for that initial token row (e.g. "primary",
+// "rotation-2026-05"); empty matches the historical default.
 type CreateCitizen struct {
 	Citizen    CitizenRecord
+	Token      string
 	TokenLabel string
 }
 

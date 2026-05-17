@@ -241,12 +241,13 @@ func helperEvaluateRunState(s *Store, runID int64) (RunState, error) {
 	return r.State, nil
 }
 
-// helperCreateCitizen wraps the CreateCitizen mutation:
-// takes a *CitizenRecord, returns (id, error).
-func helperCreateCitizen(s *Store, c *CitizenRecord) (int64, error) {
+// helperCreateCitizen wraps the CreateCitizen mutation: takes a
+// *CitizenRecord plus the bearer token to seed into the tokens
+// table (a citizen row carries no token), returns (id, error).
+func helperCreateCitizen(s *Store, c *CitizenRecord, token string) (int64, error) {
 	res, err := s.ApplyPlan(Plan{
-		Version:  testEngineVersion,
-		Mutations: []Mutation{CreateCitizen{Citizen: *c}},
+		Version:   testEngineVersion,
+		Mutations: []Mutation{CreateCitizen{Citizen: *c, Token: token}},
 	})
 	if err != nil {
 		return 0, err

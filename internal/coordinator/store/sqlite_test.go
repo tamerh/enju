@@ -118,10 +118,9 @@ func createTestCitizen(t *testing.T, s *Store, username, token string) int64 {
 	id, err := helperCreateCitizen(s, &CitizenRecord{
 		Username:   username,
 		Name:     username,
-		Token:    token,
 		RegisteredAt: now,
 		LastSeen:   now,
-	})
+	}, token)
 	if err != nil {
 		t.Fatal(err)
 	}

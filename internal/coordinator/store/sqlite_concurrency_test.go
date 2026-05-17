@@ -140,9 +140,8 @@ func TestConcurrentWritesDoNotHitSQLITE_BUSY(t *testing.T) {
 				_, err := helperCreateCitizen(s, &CitizenRecord{
 					Username:     name,
 					Name:         name,
-					Token:        name + "-token",
 					RegisteredAt: time.Now(),
-				})
+				}, name+"-token")
 				if err != nil {
 					errCh <- err
 					return

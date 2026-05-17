@@ -277,10 +277,20 @@ func (s *testServer) tokenFor(username string) string {
 		return tok
 	}
 	if cz, err := s.store.GetCitizenByUsername(username); err == nil && cz != nil {
-		s.muAuth.Lock()
-		s.tokens[username] = cz.Token
-		s.muAuth.Unlock()
-		return cz.Token
+		// A citizen row carries no token; resolve the active
+		// bearer from the tokens table (the sole auth authority).
+		toks, terr := s.store.ListTokensByCitizen(cz.ID)
+		if terr != nil {
+			return ""
+		}
+		for _, tk := range toks {
+			if tk.RevokedAt == nil {
+				s.muAuth.Lock()
+				s.tokens[username] = tk.Token
+				s.muAuth.Unlock()
+				return tk.Token
+			}
+		}
 	}
 	return ""
 }

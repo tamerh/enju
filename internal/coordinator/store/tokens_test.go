@@ -1,34 +1,26 @@
 package store
 
-// contract tests — tokens migrate to their own table.
-// The load-bearing claims that this milestone makes:
+// Contract tests — tokens live in their own table, the sole auth
+// authority. A citizen row carries no token. Load-bearing claims:
 //
-//   - Existing humans authenticate after the migration runs (the
-//     backfill copies citizens.token into tokens, the auth path
-//     reads from tokens, and the answer is unchanged).
+//   - The initial token supplied to CreateCitizen lands in the
+//     tokens table (the auth path reads from there).
 //   - Multiple tokens per citizen work, so rotation (issue new,
-//     distribute, revoke old) doesn't cost the bot its identity.
-//   - Revoked tokens stop authenticating immediately, even though
-//     the citizens.token column still holds the value.
+//     distribute, revoke old) doesn't cost the agent its identity.
+//   - Revoked tokens stop authenticating immediately.
 //   - The label survives round-trip so per-deployment auditing
 //     ("which token did the leak come from — laptop or ci-server?")
 //     works.
-//
-// See docs/operator-model-design.md for the design doc that drives
-// these properties.
 
 import (
 	"testing"
 	"time"
 )
 
-// TestTokensTableBackfilledFromCitizens covers the migration path:
-// pre-1.2 databases have a populated citizens.token column and an
-// empty tokens table. The migration's INSERT…SELECT must populate
-// tokens with one row per citizen, label them 'legacy' (so the
-// audit trail shows where they came from), and leave subsequent
-// migration runs idempotent.
-func TestTokensTableBackfilledFromCitizens(t *testing.T) {
+// TestInitialTokenLandsInTokensTable: the bearer token passed to
+// CreateCitizen is seeded into the tokens table (citizens has no
+// token column), active, exactly one row.
+func TestInitialTokenLandsInTokensTable(t *testing.T) {
 	s := newTestStore(t)
 	cid := createTestCitizen(t, s, "tamer", "tok-tamer")
 
@@ -45,60 +37,6 @@ func TestTokensTableBackfilledFromCitizens(t *testing.T) {
 	}
 	if got.RevokedAt != nil {
 		t.Errorf("token revoked at creation: %v", got.RevokedAt)
-	}
-	// Label is empty string for CreateCitizen path (the issue
-	// site doesn't yet pass a label); the 'legacy' label only
-	// applies to the migration backfill, exercised below in
-	// TestLegacyTokensGetMigratedLabelOnBackfill.
-}
-
-// TestLegacyTokensGetMigratedLabelOnBackfill simulates a pre-1.2
-// database — citizens row exists but no tokens row — and verifies
-// the migration backfill copies the value across with label='legacy'
-// so operators can tell which tokens predate the rotation feature.
-func TestLegacyTokensGetMigratedLabelOnBackfill(t *testing.T) {
-	s := newTestStore(t)
-
-	// Insert a citizen WITHOUT going through CreateCitizen, so the
-	// matching tokens row doesn't get created by the tx insert.
-	// This is what an old DB looks like after the schema is added
-	// but before the backfill runs.
-	now := time.Now()
-	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen) VALUES (?, ?, '', 'citizen', ?, 0, ?, ?)`,
-		"alice", "Alice", "tok-alice-legacy", now, now,
-	)
-	if err != nil {
-		t.Fatalf("insert legacy citizen: %v", err)
-	}
-	cid, _ := res.LastInsertId()
-
-	// Re-run the backfill explicitly. In production it runs once
-	// during initSchema(); calling it again proves idempotency.
-	for i := 0; i < 2; i++ {
-		if _, err := s.db.Exec(`
-			INSERT INTO tokens (citizen_id, token, label, issued_at)
-			SELECT id, token, 'legacy', registered_at
-			FROM citizens
-			WHERE token != ''
-			  AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.citizen_id = citizens.id)
-		`); err != nil {
-			t.Fatalf("backfill iter %d: %v", i, err)
-		}
-	}
-
-	tokens, err := s.ListTokensByCitizen(cid)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(tokens) != 1 {
-		t.Fatalf("idempotent backfill must produce exactly 1 row, got %d", len(tokens))
-	}
-	if tokens[0].Label != "legacy" {
-		t.Errorf("label=%q, want %q", tokens[0].Label, "legacy")
-	}
-	if tokens[0].Token != "tok-alice-legacy" {
-		t.Errorf("token round-trip mismatch: %q", tokens[0].Token)
 	}
 }
 
