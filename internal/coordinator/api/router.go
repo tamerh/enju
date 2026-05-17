@@ -239,8 +239,8 @@ func (s *Server) Router() http.Handler {
 		// are kind='model' catalog entries with no token,
 		// referenced for per-submit attribution. See
 		// docs/operator-model-design.md.
-		r.Post("/citizens/me/bots", s.handleRegisterBot)
-		r.Get("/citizens/me/bots", s.handleListMyBots)
+		r.Post("/citizens/me/agents", s.handleRegisterBot)
+		r.Get("/citizens/me/agents", s.handleListMyBots)
 		r.Post("/tokens/revoke", s.handleRevokeToken)
 		r.Get("/models", s.handleListModels)
 		r.Post("/models", s.handleRegisterModel)

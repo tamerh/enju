@@ -383,7 +383,7 @@ func TestMCPRequestClarification(t *testing.T) {
 
 // TestMCPRequestClarificationBotCaller pins the bot-caller arm
 // of the kind-derived trigger fix. Registers a kind=bot citizen
-// (via the same /citizens/me/bots endpoint real bots use), runs
+// (via the same /citizens/me/agents endpoint real bots use), runs
 // the clarification request as that bot, and verifies the spawn
 // event's subtype is "bot". Without this, a regression that
 // dropped the citizenKind() branch in handleRequestClarification
@@ -398,7 +398,7 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 	// Spawn a bot owned by the harness's parent human via the
 	// real registration endpoint. Returns the bot's token, which
 	// we plug into a separate TestClient.
-	resp := h.post("/api/v1/citizens/me/bots", map[string]string{
+	resp := h.post("/api/v1/citizens/me/agents", map[string]string{
 		"name": "Notify Bot",
 	})
 	botUsername, _ := resp["username"].(string)

@@ -27,11 +27,11 @@ type BotInfo struct {
 }
 
 // BotListResponse is the wire shape for enju_list_my_agents /
-// GET /citizens/me/bots. Wrapped in a {"bots":...} envelope so
+// GET /citizens/me/agents. Wrapped in a {"agents":...} envelope so
 // the formatter can disambiguate between empty list and decode
 // failure.
 type BotListResponse struct {
-	Bots []BotInfo `json:"bots"`
+	Bots []BotInfo `json:"agents"`
 }
 
 // ListMyBots returns the bots the caller parents, each with

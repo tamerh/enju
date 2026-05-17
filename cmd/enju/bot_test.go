@@ -29,7 +29,7 @@ type fakeCoord struct {
 func newFakeCoord(t *testing.T, ownerToken string) (*httptest.Server, *fakeCoord) {
 	fc := &fakeCoord{t: t, mu: map[string]int{}, wantOwnerTok: ownerToken}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/citizens/me/bots" || r.Method != "POST" {
+		if r.URL.Path != "/api/v1/citizens/me/agents" || r.Method != "POST" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			http.Error(w, "not found", 404)
 			return

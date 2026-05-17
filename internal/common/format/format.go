@@ -3664,7 +3664,7 @@ func UpdateProfileResult(data []byte, fallbackLabel string) string {
 }
 
 // RegisterBotResult renders the JSON returned by POST
-// /citizens/me/bots. Token shown ONCE — formatter highlights
+// /citizens/me/agents. Token shown ONCE — formatter highlights
 // it so the caller can't miss it.
 func RegisterBotResult(data []byte) string {
 	var resp struct {
@@ -3837,11 +3837,11 @@ func TerminateRunResult(data []byte) string {
 	return out
 }
 
-// BotList renders the JSON returned by GET /citizens/me/bots
+// BotList renders the JSON returned by GET /citizens/me/agents
 // (and the equivalent native MCP handler). Empty list returns
 // the friendly bootstrap hint pointing at enju_register_agent.
 //
-// Wire shape: {"bots":[{id,username,name,role,registered,
+// Wire shape: {"agents":[{id,username,name,role,registered,
 // tokens:[{id,label,issued_at,revoked_at?}]}]}.
 func BotList(data []byte) string {
 	var resp struct {
@@ -3856,7 +3856,7 @@ func BotList(data []byte) string {
 				IssuedAt  string `json:"issued_at"`
 				RevokedAt string `json:"revoked_at,omitempty"`
 			} `json:"tokens"`
-		} `json:"bots"`
+		} `json:"agents"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return string(data)

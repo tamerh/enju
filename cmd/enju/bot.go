@@ -306,7 +306,7 @@ func setupBotIfNeeded(ctx context.Context, coordinator string, owner *credential
 	return res, nil
 }
 
-// registerBot POSTs to /api/v1/citizens/me/bots and returns the
+// registerBot POSTs to /api/v1/citizens/me/agents and returns the
 // freshly-issued token + the username the coord assigned. The
 // owner's bearer authenticates the call; the coord parents the
 // new bot citizen to the owner's id.
@@ -326,7 +326,7 @@ func registerBot(ctx context.Context, coordURL, ownerToken string, b *bots.Bot) 
 		"username": b.Name,
 	}
 	jsonBody, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", coordURL+"/api/v1/citizens/me/bots", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", coordURL+"/api/v1/citizens/me/agents", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", "", err
 	}

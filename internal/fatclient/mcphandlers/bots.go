@@ -38,7 +38,7 @@ func (c *apiClient) handleRegisterBot(ctx context.Context, req mcp.CallToolReque
 	if body["name"] == nil {
 		return mcp.NewToolResultError("name is required"), nil
 	}
-	data, err := c.post(ctx, "/api/v1/citizens/me/bots", body)
+	data, err := c.post(ctx, "/api/v1/citizens/me/agents", body)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -66,7 +66,7 @@ func (c *apiClient) handleRegisterBot(ctx context.Context, req mcp.CallToolReque
 }
 
 func (c *apiClient) handleListMyBots(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/citizens/me/bots")
+	data, err := c.get(ctx, "/api/v1/citizens/me/agents")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
