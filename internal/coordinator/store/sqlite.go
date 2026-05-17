@@ -2136,6 +2136,22 @@ func (s *Store) GetCitizenByUsername(username string) (*CitizenRecord, error) {
 	))
 }
 
+// GetCitizenByEmail resolves a human's global identity. email is
+// mandatory + unique for kind='human', so it is the idempotency
+// key for human registration (re-registering the same person
+// returns the same citizen, never a duplicate). Scoped to
+// kind='human' since only humans have an email. Returns (nil, nil)
+// when no human has that email.
+func (s *Store) GetCitizenByEmail(email string) (*CitizenRecord, error) {
+	if email == "" {
+		return nil, nil
+	}
+	return scanCitizen(s.db.QueryRow(
+		`SELECT `+citizenColumns+` FROM citizens WHERE email = ? AND kind = ?`,
+		email, string(CitizenKindHuman),
+	))
+}
+
 // GetCitizenByUsernameInTenant resolves a tenant-scoped handle to
 // its citizen. username is unique per (tenant_id, username), so
 // this pair is unambiguous where a bare username is not. Used by

@@ -1061,7 +1061,9 @@ func MyDashboard() mcp.Tool {
 
 func MyProfile() mcp.Tool {
 	return mcp.NewTool("enju_my_profile",
-		mcp.WithDescription("Show your own citizen profile. Paste the output verbatim in your reply — it's pre-formatted."),
+		mcp.WithDescription(`Show your own citizen profile. Paste the output verbatim in your reply — it's pre-formatted.
+
+Identity model (so you don't get confused): a human's global identity is their EMAIL — mandatory and unique. Your username is just a tenant-scoped handle, not a global id; two different owners may each have a "dev-bot". Registration is idempotent by email: if your citizen was wiped, re-registering with the same email returns the SAME citizen with a fresh token — it never duplicates you and never errors with "already exists". A model (claude-opus-4-7, etc.) is NOT a citizen — it has no profile; it's just a label stamped on the work.`),
 	)
 }
 
@@ -1145,9 +1147,9 @@ The tally response includes the current counts, whether the task resolved, and i
 
 func RegisterBot() mcp.Tool {
 	return mcp.NewTool("enju_register_agent",
-		mcp.WithDescription(`Register an agent citizen owned by you. Returns the agent's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the agent's launcher (CI env var, daemon config, ~/.enju/agent-credentials.json) so the agent can authenticate as itself.
+		mcp.WithDescription(`Register an agent citizen owned by you (the authenticated caller). Returns the agent's username AND its initial token — STASH THE TOKEN NOW, it cannot be retrieved later. Drop it into the agent's launcher (CI env var, daemon config, ~/.enju/agent-credentials.json) so the agent can authenticate as itself.
 
-Use cases: autonomous overnight agents, CI runners, role-agents (developer-agent / reviewer-agent / tester-agent for the living-workflow pattern). The agent acts under its own identity in audit logs but ownership chains back to you for accountability. Multiple agents per parent are allowed — clone freely for parallel workloads or A/B testing. See docs/operator-model-design.md.`),
+Ownership & identity (so you don't get confused): you MUST be authenticated for this to work — the agent is owned by you and the call fails closed (hard error, nothing written) if the owner can't be resolved; an ownerless agent cannot exist. The agent's username is a tenant-scoped HANDLE, not a global identity: it only needs to be unique among YOUR agents, and a different owner may have an agent with the same name. An agent has no email (no real-world identity); a human's email is the global identity, an agent's owner chain is. The agent acts under its own identity in audit logs but accountability chains back to you. Multiple agents per owner are fine — clone freely for parallel workloads.`),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Display name (e.g. \"Tamer's Reviewer Agent\")"),

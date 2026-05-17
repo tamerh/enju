@@ -91,6 +91,7 @@ type CoordinatorStore interface {
 	GetCitizen(id int64) (*CitizenRecord, error)
 	GetCitizenByUsername(username string) (*CitizenRecord, error)
 	GetCitizenByUsernameInTenant(username string, tenantID int64) (*CitizenRecord, error)
+	GetCitizenByEmail(email string) (*CitizenRecord, error)
 	GetCitizenByToken(token string) (*CitizenRecord, error)
 	ListCitizenActiveTasks(citizenID int64) ([]TaskRecord, error)
 	ListCitizenCompletedTasks(citizenID int64, limit int) ([]TaskRecord, error)

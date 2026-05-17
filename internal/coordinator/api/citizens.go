@@ -62,6 +62,37 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotent by the human's global identity (email). This is
+	// the load-bearing fix for the registration race: a client
+	// whose citizen was wiped re-registers via this auth-exempt
+	// endpoint, possibly concurrently with other calls. Making the
+	// ONLY writer of a human row idempotent — same email returns
+	// the same citizen with a fresh token, never a 409, never a
+	// duplicate — means the race cannot mint a malformed survivor
+	// (the agent path separately fails closed rather than coerce).
+	// One atomic ApplyPlan either way.
+	if existing, lerr := s.store.GetCitizenByEmail(req.Email); lerr == nil && existing != nil {
+		token := uuid.New().String()
+		if _, err := s.store.ApplyPlan(store.Plan{
+			Version: engine.EngineVersion,
+			Mutations: []store.Mutation{
+				store.IssueToken{CitizenID: existing.ID, Token: token},
+			},
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "re-issue token: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"id":       existing.ID,
+			"username": existing.Username,
+			"name":     existing.Name,
+			"email":    existing.Email,
+			"role":     existing.Role,
+			"token":    token,
+		})
+		return
+	}
+
 	// Validate or generate username. An explicit username is required
 	// to match the GitHub rules; an auto-generated one comes from
 	// slugifying the display name and is unique by construction.

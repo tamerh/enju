@@ -133,6 +133,14 @@ func RegisterBot(s store.CoordinatorStore, caller *store.CitizenRecord, p Regist
 		if strings.Contains(err.Error(), "already taken") {
 			return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
 		}
+		// Fail closed: an agent whose owner can't be resolved (or
+		// has no tenant) is a contradiction the registration path
+		// forbids. Surface it as a clear client error, not a 500.
+		if strings.Contains(err.Error(), "ownerless") ||
+			strings.Contains(err.Error(), "tenantless") ||
+			strings.Contains(err.Error(), "owner citizen") {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
+		}
 		return nil, err
 	}
 	id := res.CitizenID

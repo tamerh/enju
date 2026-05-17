@@ -1651,18 +1651,40 @@ func TestCitizenRegistrationWithEmail(t *testing.T) {
 	}
 }
 
-func TestDuplicateEmailRejected(t *testing.T) {
+// TestDuplicateEmailIsIdempotent pins Option A: email IS the
+// human's identity, so re-registering the same email is not an
+// error — it returns the SAME citizen with a FRESH token (the
+// post-wipe / concurrent re-register path). This is what makes
+// the registration race unable to mint a malformed survivor.
+func TestDuplicateEmailIsIdempotent(t *testing.T) {
 	s := newTestServer(t)
 
-	s.registerWithEmail("Alice", "alice@example.com")
-
-	// Try registering with same email
-	resp := s.post("/api/v1/citizens/register", map[string]string{
-		"name":  "Fake Alice",
-		"email": "alice@example.com",
+	first := s.post("/api/v1/citizens/register", map[string]string{
+		"name": "Alice", "email": "alice@example.com",
 	})
-	if _, hasErr := resp["error"]; !hasErr {
-		t.Fatal("expected error for duplicate email")
+	firstID, _ := first["id"].(float64)
+	firstUser, _ := first["username"].(string)
+	firstTok, _ := first["token"].(string)
+	if firstUser == "" || firstTok == "" {
+		t.Fatalf("first register failed: %v", first)
+	}
+
+	// Same email again — idempotent: same citizen, fresh token,
+	// no error.
+	resp := s.post("/api/v1/citizens/register", map[string]string{
+		"name": "Alice Again", "email": "alice@example.com",
+	})
+	if _, hasErr := resp["error"]; hasErr {
+		t.Fatalf("re-register with same email should be idempotent, got error: %v", resp)
+	}
+	if id, _ := resp["id"].(float64); id != firstID {
+		t.Errorf("idempotent re-register returned a different citizen id: %v != %v", id, firstID)
+	}
+	if u, _ := resp["username"].(string); u != firstUser {
+		t.Errorf("idempotent re-register changed username: %q != %q", u, firstUser)
+	}
+	if tok, _ := resp["token"].(string); tok == "" || tok == firstTok {
+		t.Errorf("idempotent re-register must return a fresh non-empty token (got %q, first %q)", tok, firstTok)
 	}
 }
 
