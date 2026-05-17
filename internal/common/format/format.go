@@ -3704,19 +3704,6 @@ func RevokeTokenResult(data []byte) string {
 	return "Token state unchanged."
 }
 
-// RegisterModelResult renders the JSON returned by POST
-// /models.
-func RegisterModelResult(data []byte) string {
-	var resp struct {
-		Username    string `json:"username"`
-		DisplayName string `json:"display_name"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return string(data)
-	}
-	return fmt.Sprintf("✓ Model registered: %s (%s)", resp.Username, resp.DisplayName)
-}
-
 // FileIssueResult renders the JSON returned by POST
 // /projects/{p}/issues. Single-line confirmation with the
 // canonical ISSUE-NNN slug and the title.
@@ -3884,34 +3871,6 @@ func BotList(data []byte) string {
 			fmt.Fprintf(&b, "  token #%d  %s  issued %s  [%s]\n", t.ID, label, t.IssuedAt, status)
 		}
 	}
-	return b.String()
-}
-
-// ModelList renders the model catalog JSON. Empty list returns
-// the catalog-empty hint (the migration seeds 10 popular models;
-// empty means something's wrong server-side).
-//
-// Wire shape: {"models":[{id,username,name}]}.
-func ModelList(data []byte) string {
-	var resp struct {
-		Models []struct {
-			ID       int64  `json:"id"`
-			Username string `json:"username"`
-			Name     string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return string(data)
-	}
-	if len(resp.Models) == 0 {
-		return "Catalog is empty. (Unexpected — the migration seeds 10 popular models. Check coordinator logs.)"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Model catalog (%d):\n", len(resp.Models))
-	for _, m := range resp.Models {
-		fmt.Fprintf(&b, "  %-30s  %s\n", m.Username, m.Name)
-	}
-	b.WriteString("\nUse the username (left column) as the -model flag value.\n")
 	return b.String()
 }
 

@@ -83,17 +83,13 @@ func (c *Coordinator) AcceptComputeTaskCore(
 	if err != nil {
 		return nil, err
 	}
-	// Resolve optional model attribution. Empty model is fine
-	// for human operators (unaided); bots without a model are
-	// rejected at apply time. Unknown-but-valid names auto-
-	// register — see ResolveModelByUsername for the rationale.
-	modelID, err := ResolveModelByUsername(c.Store, model)
-	if err != nil {
-		return nil, err
-	}
+	// The model is a normalized name label stamped automatically
+	// by the submitter from its runtime identity — stored as-is,
+	// no citizen lookup. Empty is fine for scripts and unaided
+	// humans; an agent with no model is rejected at apply time.
 	submitOutcome, err := eng.ComputeSubmission(
 		task.ID, submitterID, resultPath, req.CommitSHA,
-		decision, voteChoice, req.Content, req.TokensUsed, modelID,
+		decision, voteChoice, req.Content, req.TokensUsed, model,
 	)
 	if err != nil {
 		return nil, err

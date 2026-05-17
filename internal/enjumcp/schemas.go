@@ -134,7 +134,7 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
 		),
 		mcp.WithString("model",
-			mcp.Description(`Optional per-call override for which model produced this result. Defaults to the model name from the session's -model flag. Use this when you switch models mid-session (e.g. opened MCP with claude-opus-4-7 but produced this specific result with claude-sonnet-4-6) so attribution lines up with reality. Unknown model names are auto-registered into the catalog on first use; pre-register via enju_register_model if you want a prettier display name. Ignored when empty — the session default applies.`),
+			mcp.Description(`Optional per-call override for which model produced this result. Defaults to the model name from the session's -model flag. Use this when you switch models mid-session (e.g. opened MCP with claude-opus-4-7 but produced this specific result with claude-sonnet-4-6) so attribution lines up with reality. A model is a free-form label on the work, not a registered entity — any string is accepted as-is and stored verbatim; there is no model registration and no catalog requirement (a name with no display entry just renders raw). Ignored when empty — the session default applies; an agent must resolve to a non-empty model or the submit is rejected.`),
 		),
 	)
 }
@@ -1182,26 +1182,6 @@ func RevokeToken() mcp.Tool {
 	)
 }
 
-func ListModels() mcp.Tool {
-	return mcp.NewTool("enju_list_models",
-		mcp.WithDescription("Browse the model catalog. Returns every kind='model' citizen — the seeded popular models (Claude Opus / Sonnet / Haiku, GPT-4o, Gemini, Llama, etc.) plus any custom models registered locally. Use before submitting if you're unsure what -model name to pass."),
-	)
-}
-
-func RegisterModel() mcp.Tool {
-	return mcp.NewTool("enju_register_model",
-		mcp.WithDescription(`Register a custom model in the catalog so submits can attribute work to it. Local-mode use case: you're running Ollama / llama.cpp / a lab-internal finetune that the seed catalog doesn't cover. Any authenticated citizen can register in local mode; hosted-mode policy gating is deferred.
-
-Note: unknown model names passed to -model auto-register on first use, so explicit registration is mostly for picking nice display names.`),
-		mcp.WithString("username",
-			mcp.Required(),
-			mcp.Description("Slug-form identifier (e.g. \"ollama-llama-3-1-70b\"). Must match the GitHub-username regex (lowercase alphanumerics + hyphen)."),
-		),
-		mcp.WithString("display_name",
-			mcp.Description("Human-readable name (e.g. \"Llama 3.1 70B (local)\"). Defaults to the username."),
-		),
-	)
-}
 
 // --- Agent supervisor (Phase 4) ---
 //

@@ -1,10 +1,11 @@
 package mcphandlers
 
-// Bot + model registration handlers (operator/model design).
-// Five MCP tools that wire to the corresponding API endpoints —
-// each handler is a thin marshal-call-format shim. Heavy logic
-// stays in the API layer where the auth context is, with this
-// file translating MCP arg shapes to JSON request bodies.
+// Agent registration handlers. Thin MCP tools that wire to the
+// corresponding API endpoints — each handler is a marshal-call-
+// format shim. Heavy logic stays in the API layer where the auth
+// context is; this file translates MCP arg shapes to JSON request
+// bodies. A model is not a citizen and has no registration tool —
+// it is a label stamped on the work at submit time.
 
 import (
 	"context"
@@ -111,43 +112,3 @@ func (c *apiClient) handleRevokeToken(ctx context.Context, req mcp.CallToolReque
 	return mcp.NewToolResultText("✓ Token revoked. It will no longer authenticate."), nil
 }
 
-func (c *apiClient) handleListModels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/models")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	if msg := errorFromResponse(data); msg != "" {
-		return mcp.NewToolResultError(msg), nil
-	}
-	return mcp.NewToolResultText(format.ModelList(data)), nil
-}
-
-func (c *apiClient) handleRegisterModel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	body := map[string]interface{}{}
-	if v, ok := args["username"]; ok {
-		if s, _ := v.(string); s != "" {
-			body["username"] = s
-		}
-	}
-	if v, ok := args["display_name"]; ok {
-		if s, _ := v.(string); s != "" {
-			body["display_name"] = s
-		}
-	}
-	if body["username"] == nil {
-		return mcp.NewToolResultError("username is required"), nil
-	}
-	data, err := c.post(ctx, "/api/v1/models", body)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	var resp map[string]interface{}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return mcp.NewToolResultError("decode: " + err.Error()), nil
-	}
-	if errMsg, ok := resp["error"].(string); ok {
-		return mcp.NewToolResultError(errMsg), nil
-	}
-	return mcp.NewToolResultText(fmt.Sprintf("✓ Model registered: %s (%s)", resp["username"], resp["display_name"])), nil
-}

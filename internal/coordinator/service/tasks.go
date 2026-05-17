@@ -368,9 +368,7 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 	if t.Citizens <= 1 && store.TaskState(t.State) == store.TaskAccepted {
 		if subs, err := s.ListVoteSubmissions(t.ID); err == nil && len(subs) > 0 {
 			latest := subs[len(subs)-1]
-			if latest.ModelID != nil {
-				resp.Model = CitizenUsername(s, *latest.ModelID)
-			}
+			resp.Model = latest.Model
 		}
 	}
 
@@ -397,9 +395,7 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 				if sub.SubmittedAt != nil {
 					ref.SubmittedAt = sub.SubmittedAt.Format(time.RFC3339)
 				}
-				if sub.ModelID != nil {
-					ref.Model = CitizenUsername(s, *sub.ModelID)
-				}
+				ref.Model = sub.Model
 				resp.VoteSubmissions = append(resp.VoteSubmissions, ref)
 			}
 		}
@@ -562,9 +558,7 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 						row.DurationMS = d
 					}
 				}
-				if it.ModelID != nil {
-					row.Model = CitizenUsername(s, *it.ModelID)
-				}
+				row.Model = it.Model
 				resp.Iterations = append(resp.Iterations, row)
 			}
 		}

@@ -314,7 +314,7 @@ func (s *Store) initSchema() error {
 	-- here, hung off the claim row by claim_id.
 	--
 	-- Coexistence with the denormalized fields on task_claims
-	-- (submitted_at, commit_sha, option, decision, model_id):
+	-- (submitted_at, commit_sha, option, decision, model):
 	-- applyRecordSubmission writes both. The task_submissions
 	-- row is the audit-of-record (each attempt is preserved);
 	-- the task_claims fields hold the "latest attempt"
@@ -341,9 +341,24 @@ func (s *Store) initSchema() error {
 		commit_sha TEXT NOT NULL DEFAULT '',
 		decision TEXT NOT NULL DEFAULT '',
 		option TEXT NOT NULL DEFAULT '',
-		model_id INTEGER REFERENCES citizens(id)
+		-- model is the normalized model-name LABEL on the work
+		-- (NULL/'' when no LLM produced it). Not a citizen, not an
+		-- FK — a model has no identity. Stamped automatically at
+		-- submit from the submitter's runtime identity.
+		model TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_submissions_claim ON task_submissions(claim_id);
+
+	-- model_catalog is a PURELY COSMETIC display-name lookup.
+	-- It is NOT correctness-bearing: a missing entry just renders
+	-- the raw model name. A model is never a citizen, never
+	-- authenticates, has no lifecycle — this table only makes
+	-- "claude-opus-4-7" render as "Claude Opus 4.7" on dashboards.
+	-- Static lookup, no race possible. Seeded in seedModelCatalog.
+	CREATE TABLE IF NOT EXISTS model_catalog (
+		name TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL DEFAULT ''
+	);
 
 	-- Project membership (Phase J — project_members). Flat two-tier
 	-- role model: 'owner' (can remove members, promote/demote,
@@ -550,14 +565,15 @@ func (s *Store) initSchema() error {
 		// docs/operator-model-design.md.
 		`ALTER TABLE citizens ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'`,
 		`ALTER TABLE citizens ADD COLUMN parent_id INTEGER REFERENCES citizens(id)`,
-		// operator/model design — submission attribution.
-		// task_claims.citizen_id is the operator (existing); model_id
-		// is the LLM that produced the words for this submit (new).
-		// Nullable: humans may submit without an LLM (hand-review);
-		// bots must always have a model — that constraint is enforced
-		// in applySetClaim / applyRecordSubmission since SQLite CHECK
-		// constraints can't reference another table's columns.
-		`ALTER TABLE task_claims ADD COLUMN model_id INTEGER REFERENCES citizens(id)`,
+		// task_claims.citizen_id is the operator (existing); model
+		// is the normalized model-name LABEL that produced the words
+		// for this submit — a string, not a citizen FK (a model has
+		// no identity). NULL/'' when no LLM produced it (script
+		// tasks, unaided humans); agents must always carry a model —
+		// enforced in applySetClaim / applyRecordSubmission
+		// (requireModelForAgent) since SQLite CHECK can't read
+		// another column conditionally.
+		`ALTER TABLE task_claims ADD COLUMN model TEXT`,
 		// Living-workflow phase 4 — per-run cycle budget. Caps how
 		// many tasks can be spawned into a run at runtime to prevent
 		// runaway loops where bot A spawns bot B spawns bot A.
@@ -702,14 +718,13 @@ func (s *Store) initSchema() error {
 		return fmt.Errorf("schema: backfill tokens: %w", err)
 	}
 
-	// operator/model design — seed a hand-curated model
-	// catalog so submit-attribution has real model
-	// citizens to reference. OpenRouter auto-fetch is deferred —
-	// see docs/operator-model-design.md "OpenRouter catalog fetch"
-	// in the deferred section. Local-mode users add their own
-	// (Ollama, internal finetunes) via enju_register_model.
-	if err := s.seedModelCitizens(); err != nil {
-		return fmt.Errorf("schema: seed model citizens: %w", err)
+	// Seed the cosmetic model_catalog (pretty display names
+	// only). Not correctness-bearing: a model is a label on the
+	// work, not a citizen. A missing entry renders the raw name;
+	// local-mode users (Ollama, internal finetunes) just get the
+	// raw name, no registration.
+	if err := s.seedModelCatalog(); err != nil {
+		return fmt.Errorf("schema: seed model catalog: %w", err)
 	}
 
 	// Serial-runs-per-branch invariant enforced at the DB
@@ -1508,10 +1523,9 @@ func (s *Store) ListOpenClaimsForCitizen(citizenID int64) ([]TaskClaimRecord, er
 }
 
 // taskClaimColumns is the canonical column list for task_claims
-// reads. model_id is the current attribution column; future
-// operator/model-design columns (route, model_resolved, paid_by)
-// extend this list when they ship.
-const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, model_id, branch, commit_sha, decision, iter_seq`
+// reads. `model` is the normalized model-name label on the work
+// (a string, not a citizen FK — a model has no identity).
+const taskClaimColumns = `id, task_id, citizen_id, claimed_at, deadline, outcome, submitted_at, option, model, branch, commit_sha, decision, iter_seq`
 
 // scanTaskClaims is the shared scanner used by ListVoteSubmissions
 // and ListActiveClaims. Centralizing the scan keeps the two paths
@@ -1522,11 +1536,11 @@ func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 		var r TaskClaimRecord
 		var outcome sql.NullString
 		var submittedAt sql.NullTime
-		var modelID sql.NullInt64
+		var model sql.NullString
 		var iterSeq sql.NullInt64
 		if err := rows.Scan(
 			&r.ID, &r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
-			&outcome, &submittedAt, &r.Option, &modelID,
+			&outcome, &submittedAt, &r.Option, &model,
 			&r.Branch, &r.CommitSHA, &r.Decision, &iterSeq,
 		); err != nil {
 			return nil, err
@@ -1540,9 +1554,8 @@ func scanTaskClaims(rows *sql.Rows) ([]TaskClaimRecord, error) {
 		if submittedAt.Valid {
 			r.SubmittedAt = &submittedAt.Time
 		}
-		if modelID.Valid {
-			v := modelID.Int64
-			r.ModelID = &v
+		if model.Valid {
+			r.Model = model.String
 		}
 		out = append(out, r)
 	}
@@ -2188,41 +2201,30 @@ func (s *Store) ListTokensByCitizen(citizenID int64) ([]TokenRecord, error) {
 	return out, rows.Err()
 }
 
-// --- Model catalog ---
+// --- Model catalog (cosmetic) ---
 //
-// operator/model design — model citizens are LLM catalog
-// entries (kind='model'), passive: no token, can't claim, can't
-// submit. They exist to be REFERENCED on submission rows for
-// per-submit attribution. Seeded with a hand-curated list at
-// first migration; users extend the catalog via the
-// enju_register_model MCP tool for local models the seed
-// doesn't cover (Ollama, lab finetunes, etc.).
+// A model is NOT a citizen — it has no identity, no row in
+// citizens, no token, no lifecycle. It is a normalized name
+// stamped as a label on the work at submit time
+// (task_claims.model). The only thing here is a display-name
+// lookup so dashboards can render "Claude Opus 4.7" instead of
+// "claude-opus-4-7". Not correctness-bearing: a name with no
+// catalog entry just renders raw. No registration, no race.
 
-// modelCatalogSeed is the hand-curated set of popular models inserted
-// at first migration. Versions match the model identifiers users
-// would type at the -model flag today; "Display Name" is the
-// human-readable form for run_status / dashboards. Adding to this
-// list is non-breaking — seedModelCitizens is idempotent (skips
-// usernames already in the table), so a coordinator restart picks
-// up new entries without touching existing ones.
+// modelCatalogSeed is the hand-curated set of popular model names
+// with pretty display strings. PURELY COSMETIC: a model is a
+// label on the work, not a citizen. The seed only
+// makes "claude-opus-4-7" render as "Claude Opus 4.7"; a model not
+// in the list just renders its raw name. Adding entries is
+// non-breaking — seedModelCatalog is idempotent (INSERT OR IGNORE).
 //
-// Models with provider-prefixed identifiers (e.g. OpenRouter's
-// "anthropic/claude-opus-4-7") are stored without the prefix here.
-// Provider routing is in the deferred section of the design doc;
-// when it ships, the prefix becomes a separate column on the
-// submission row, not part of the model's identity.
-//
-// Same principle for snapshot/version drift: providers silently
-// update weights under the same nominal name (today's
-// claude-opus-4-7 ≠ next year's claude-opus-4-7). The catalog
-// stays one bucket per logical model; when the model_resolved
-// column ships (also deferred), each submit records the literal
-// identifier the API echoed back ("anthropic/claude-opus-4-7-
-// 20260415"). Both deferred items in docs/operator-model-design.md
-// — "Provider routing" and "Model drift / snapshot pinning".
+// Provider-prefixed identifiers (e.g. "anthropic/claude-opus-4-7")
+// and snapshot/version drift are non-concerns here: the catalog is
+// display-only, the authoritative model string is whatever the
+// submitter stamped at submit time (task_claims.model).
 var modelCatalogSeed = []struct {
-	Username string
-	Name   string
+	Name        string
+	DisplayName string
 }{
 	{"claude-opus-4-7", "Claude Opus 4.7"},
 	{"claude-sonnet-4-6", "Claude Sonnet 4.6"},
@@ -2236,74 +2238,39 @@ var modelCatalogSeed = []struct {
 	{"qwen-2-5-72b", "Qwen 2.5 72B"},
 }
 
-// seedModelCitizens inserts the hand-curated catalog entries that
-// don't already exist. Idempotent on username collision. Called from
-// initSchema() after schema is in place.
-func (s *Store) seedModelCitizens() error {
+// seedModelCatalog populates the cosmetic model_catalog table.
+// Idempotent (INSERT OR IGNORE) and not correctness-bearing — a
+// missing row just means the raw model name is rendered. Called
+// from initSchema() after the schema is in place. No race possible:
+// it's a static lookup with no runtime writers.
+func (s *Store) seedModelCatalog() error {
 	for _, m := range modelCatalogSeed {
-		if err := s.upsertModelCitizen(m.Username, m.Name); err != nil {
-			return fmt.Errorf("seed %s: %w", m.Username, err)
+		if _, err := s.db.Exec(
+			`INSERT OR IGNORE INTO model_catalog (name, display_name) VALUES (?, ?)`,
+			m.Name, m.DisplayName,
+		); err != nil {
+			return fmt.Errorf("seed %s: %w", m.Name, err)
 		}
 	}
 	return nil
 }
 
-// upsertModelCitizen inserts a model-kind citizen if no row with the
-// given username exists. The token column gets a non-functional
-// placeholder ("model:<username>") to satisfy the legacy NOT NULL
-// UNIQUE constraint on citizens.token; the placeholder NEVER
-// authenticates because the auth path queries the tokens table
-// and we deliberately don't insert a tokens row for
-// model citizens.
-//
-// SECURITY GOTCHA-OF-FUTURE: the placeholder string is PREDICTABLE
-// ("model:gpt-4o", "model:claude-opus-4-7", etc. — derivable from
-// the public catalog). If a future maintainer "fixes" the auth path
-// to fall back to citizens.token (e.g., for backward compatibility
-// during a migration), every model citizen's token becomes
-// guessable instantly. Anyone who could enumerate model usernames
-// could authenticate as them and submit on their behalf.
-//
-// Mitigation: never restore citizens.token as an auth source. The
-// tokens table is the only authority. The legacy column is on a
-// path to be dropped entirely in a future cleanup phase. If you're
-// touching auth and considering "fall back to citizens.token" — DO
-// NOT. Read this comment first; the placeholder rule depends on it.
-//
-// CHOKEPOINT EXEMPTION: ONLY called from initSchema() at startup,
-// before the EventStore is attached and before any service
-// caller can issue an ApplyPlan. This direct write deliberately
-// bypasses the chokepoint because the schema-seeding phase
-// runs serially with no contention and predates the EventSink
-// contract (no mutation event would have anywhere to land).
-// DO NOT call this at runtime; route runtime model registration
-// through service.RegisterModel → CreateCitizen{Kind:"model"}.
-func (s *Store) upsertModelCitizen(username, displayName string) error {
-	if err := ValidateUsername(username); err != nil {
-		return err
+// ModelDisplayName returns the pretty display string for a model
+// name, or the raw name when there is no catalog entry (or name is
+// empty). Pure cosmetic lookup — never fails the caller; on any DB
+// error it falls back to the raw name.
+func (s *Store) ModelDisplayName(name string) string {
+	if name == "" {
+		return ""
 	}
-	var existingID int64
-	err := s.db.QueryRow(`SELECT id FROM citizens WHERE username = ?`, username).Scan(&existingID)
-	if err == nil {
-		return nil // already in the catalog
+	var dn sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT display_name FROM model_catalog WHERE name = ?`, name,
+	).Scan(&dn); err != nil || !dn.Valid || dn.String == "" {
+		return name
 	}
-	if err != sql.ErrNoRows {
-		return err
-	}
-	now := time.Now()
-	_, err = s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'model')`,
-		username, displayName, "model:"+username, now, now,
-	)
-	return err
+	return dn.String
 }
-
-// CreateModelCitizen logic absorbed into applyCreateCitizen with
-// kind="model" — callers build a CreateCitizen mutation with that
-// kind and the synthetic "model:<username>" token convention.
-// See service/citizens_write.go RegisterModel for the canonical
-// caller shape.
 
 // ListBotsByParent returns every kind='bot' citizen whose parent_id
 // matches the given citizen, ordered by registration time (newest
@@ -2402,43 +2369,6 @@ func (s *Store) GetOpenClaimIterSeq(taskID string) (int64, error) {
 		return 0, err
 	}
 	return n.Int64, nil
-}
-
-// ListModelCitizens returns all kind='model' citizens in
-// alphabetical-by-username order. Used by run_status / dashboard /
-// `enju_list_models` to render the catalog. Filters out
-// soft-deleted models when that's a concept (not yet — flagged for
-// future).
-func (s *Store) ListModelCitizens() ([]CitizenRecord, error) {
-	rows, err := s.db.Query(
-		`SELECT ` + citizenColumns + ` FROM citizens WHERE kind = 'model' ORDER BY username`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []CitizenRecord
-	for rows.Next() {
-		var p CitizenRecord
-		var email, role sql.NullString
-		var parentID sql.NullInt64
-		if err := rows.Scan(
-			&p.ID, &p.Username, &p.Name, &email, &role, &p.Token, &p.Score,
-			&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
-			&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
-			&p.Kind, &parentID,
-		); err != nil {
-			return nil, err
-		}
-		p.Email = email.String
-		p.Role = role.String
-		if parentID.Valid {
-			v := parentID.Int64
-			p.ParentID = &v
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
 }
 
 // --- Helpers ---

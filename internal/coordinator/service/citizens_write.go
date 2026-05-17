@@ -191,57 +191,6 @@ func RevokeToken(s store.CoordinatorStore, caller *store.CitizenRecord, token st
 	return &RevokeTokenResponse{Revoked: true}, nil
 }
 
-// RegisterModelResponse is the wire shape.
-type RegisterModelResponse struct {
-	ID          int64             `json:"id"`
-	Username    string            `json:"username"`
-	DisplayName string            `json:"display_name"`
-	Kind        store.CitizenKind `json:"kind"`
-}
-
-// RegisterModel creates a new kind='model' citizen in the
-// catalog. DisplayName defaults to Username when empty.
-// Idempotent on duplicate (returns ErrConflict).
-//
-// Open to any authenticated citizen (per design doc's free-form
-// + soft validation stance for local mode).
-func RegisterModel(s store.CoordinatorStore, caller *store.CitizenRecord, username, displayName string) (*RegisterModelResponse, error) {
-	if username == "" {
-		return nil, fmt.Errorf("%w: username is required (e.g. 'ollama-llama-3-1-70b')", ErrInvalidArgument)
-	}
-	if displayName == "" {
-		displayName = username
-	}
-	now := time.Now()
-	res, err := s.ApplyPlan(store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.CreateCitizen{Citizen: store.CitizenRecord{
-				Username:     username,
-				Name:         displayName,
-				Role:         "citizen",
-				Token:        "model:" + username,
-				RegisteredAt: now,
-				LastSeen:     now,
-				Kind:         store.CitizenKindModel,
-			}},
-		},
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "already taken") {
-			return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
-		}
-		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
-	}
-	id := res.CitizenID
-	return &RegisterModelResponse{
-		ID:          id,
-		Username:    username,
-		DisplayName: displayName,
-		Kind:        store.CitizenKindModel,
-	}, nil
-}
-
 // generateUniqueUsername picks an unused slug derived from
 // displayName. Mirrors api.Server.generateUniqueUsername.
 func generateUniqueUsername(s store.CoordinatorStore, displayName string) string {

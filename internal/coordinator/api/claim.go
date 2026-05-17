@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
-	"github.com/enju-ai/enju/internal/coordinator/engine"
 	"github.com/enju-ai/enju/internal/coordinator/service"
 	"github.com/enju-ai/enju/internal/coordinator/store"
 	"github.com/go-chi/chi/v5"
@@ -24,71 +22,6 @@ type claimRequest struct {
 	// Server resolves the username to a model citizen ID via
 	// resolveModelByUsername.
 	Model string `json:"model,omitempty"`
-}
-
-// resolveModelByUsername looks up a model citizen by username and
-// returns its ID. Empty input → (nil, nil), the unaided-human case
-// (apply-layer enforces "bots must have model" so empty for a bot
-// fails downstream with a clear message).
-//
-// Per the operator/model design doc's "free-form + soft validation"
-// stance, unknown-but-valid model names are AUTO-REGISTERED as new
-// kind='model' catalog entries on first use. This matches local-mode
-// philosophy: someone running Ollama with a custom finetune
-// shouldn't have to ceremonially pre-register before they can submit.
-// Hosted-mode policy gating (require pre-registration / admin
-// approval) is deferred — see the design doc.
-//
-// The one defense kept: reject if the username resolves to a
-// non-model citizen (kind ∈ {human, bot}). Without this, a caller
-// could attribute their submit to a teammate's account, blurring
-// who-did-what.
-func (s *Server) resolveModelByUsername(modelName string) (*int64, error) {
-	if modelName == "" {
-		return nil, nil
-	}
-	c, err := s.store.GetCitizenByUsername(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("look up model %q: %w", modelName, err)
-	}
-	if c != nil {
-		if c.Kind != store.CitizenKindModel {
-			return nil, fmt.Errorf("citizen %q has kind %q, not %q — operators cannot be self-attributed as their own model", modelName, c.Kind, "model")
-		}
-		return &c.ID, nil
-	}
-	// Unknown model — auto-register. Display name defaults to the
-	// username; explicit registration via enju_register_model gives
-	// callers a chance to set a prettier display name.
-	//
-	// Known limitation: typos pollute the catalog. A submit with
-	// model=clude-opus-4-7 (typo) creates a permanent ghost entry.
-	// No cleanup tool ships today. Acceptable for now since
-	// (a) the catalog is small, (b) typos surface in
-	// enju_list_models so the user can spot them, (c) ghost models
-	// don't authenticate or grant access. A "delete unused model"
-	// admin tool can land later if catalog hygiene becomes a real
-	// problem in hosted mode.
-	now := time.Now()
-	res, err := s.store.ApplyPlan(store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.CreateCitizen{Citizen: store.CitizenRecord{
-				Username:     modelName,
-				Name:         modelName,
-				Role:         "citizen",
-				Token:        "model:" + modelName,
-				RegisteredAt: now,
-				LastSeen:     now,
-				Kind:         store.CitizenKindModel,
-			}},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("auto-register model %q: %w", modelName, err)
-	}
-	id := res.CitizenID
-	return &id, nil
 }
 
 // resolveCitizen looks up a caller by username and returns the

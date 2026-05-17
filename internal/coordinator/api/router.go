@@ -233,17 +233,15 @@ func (s *Server) Router() http.Handler {
 		r.Put("/citizens/by-username/{username}/profile", s.handleUpdateProfile)
 		r.Get("/citizens/by-username/{username}", s.handleGetCitizenByUsername)
 
-		// operator/model design — bot + model
-		// registration tools. Bots are kind='bot' citizens
-		// owned by a parent (the registering human). Models
-		// are kind='model' catalog entries with no token,
-		// referenced for per-submit attribution. See
-		// docs/operator-model-design.md.
+		// Agent registration. An agent is an unattended citizen
+		// (kind='agent') owned by the registering human, with its
+		// own token, that claims and executes tasks. A model is
+		// NOT a citizen — it has no identity and no registration;
+		// it is a normalized name stamped as a label on the work
+		// at submit time.
 		r.Post("/citizens/me/agents", s.handleRegisterBot)
 		r.Get("/citizens/me/agents", s.handleListMyBots)
 		r.Post("/tokens/revoke", s.handleRevokeToken)
-		r.Get("/models", s.handleListModels)
-		r.Post("/models", s.handleRegisterModel)
 	})
 
 	return r

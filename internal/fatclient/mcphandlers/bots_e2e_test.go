@@ -156,13 +156,14 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 	}
 	botToken := extractBotToken(t, mcpResultText(t, registerResp))
 
-	// The bot's token should authenticate (we route a list_models
-	// call through it as a probe — it's the cheapest authenticated
-	// endpoint). Handlers return tool-error results, not Go errors,
-	// for auth failures, so we check IsError on the result.
+	// The bot's token should authenticate (we route a
+	// list_my_agents call through it as a probe — a cheap
+	// authenticated endpoint). Handlers return tool-error results,
+	// not Go errors, for auth failures, so we check IsError on the
+	// result.
 	botClient := newE2EClient(url, "", botToken)
-	preResp, err := botClient.handleListModels(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{Name: "enju_list_models"},
+	preResp, err := botClient.handleListMyBots(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "enju_list_my_agents"},
 	})
 	if err != nil {
 		t.Fatalf("transport error before revoke: %v", err)
@@ -190,8 +191,8 @@ func TestBotRevokeFlowE2E(t *testing.T) {
 	// the 401 "invalid or expired token" message from the auth
 	// middleware. If IsError is false, leaked tokens stay live
 	// forever — the security regression.
-	postResp, err := botClient.handleListModels(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{Name: "enju_list_models"},
+	postResp, err := botClient.handleListMyBots(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "enju_list_my_agents"},
 	})
 	if err != nil {
 		// Transport error is also fine — auth failed and the
@@ -230,48 +231,6 @@ func TestEffectiveModelPrecedence(t *testing.T) {
 	// Both empty → empty (the unaided-human case).
 	if got := c2.fc.EffectiveModel(""); got != "" {
 		t.Errorf("both empty: got %q, want empty (unaided human)", got)
-	}
-}
-
-// TestModelRegisterAndListE2E covers the catalog extension path:
-// list shows the seed; register adds; list shows the new entry.
-func TestModelRegisterAndListE2E(t *testing.T) {
-	url, username, token := startTestCoordinator(t)
-	c := newE2EClient(url, username, token)
-
-	// Initial list — must include the seed catalog.
-	listResp, _ := c.handleListModels(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{Name: "enju_list_models"},
-	})
-	initial := mcpResultText(t, listResp)
-	if !strings.Contains(initial, "claude-opus-4-7") {
-		t.Errorf("seeded catalog missing claude-opus-4-7: %s", initial)
-	}
-
-	// Register a custom model.
-	regResp, err := c.handleRegisterModel(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name: "enju_register_model",
-			Arguments: map[string]interface{}{
-				"username":     "ollama-llama-3-1-70b",
-				"display_name": "Llama 3.1 70B (local Ollama)",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(mcpResultText(t, regResp), "Model registered") {
-		t.Fatalf("register failed: %s", mcpResultText(t, regResp))
-	}
-
-	// List again — new entry must appear alongside the seed.
-	listResp, _ = c.handleListModels(context.Background(), mcp.CallToolRequest{
-		Params: mcp.CallToolParams{Name: "enju_list_models"},
-	})
-	updated := mcpResultText(t, listResp)
-	if !strings.Contains(updated, "ollama-llama-3-1-70b") {
-		t.Errorf("custom model not in catalog after register: %s", updated)
 	}
 }
 

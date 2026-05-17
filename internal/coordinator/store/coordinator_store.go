@@ -94,7 +94,6 @@ type CoordinatorStore interface {
 	ListCitizenActiveTasks(citizenID int64) ([]TaskRecord, error)
 	ListCitizenCompletedTasks(citizenID int64, limit int) ([]TaskRecord, error)
 	ListBotsByParent(parentID int64) ([]CitizenRecord, error)
-	ListModelCitizens() ([]CitizenRecord, error)
 	ListTokensByCitizen(citizenID int64) ([]TokenRecord, error)
 	LookupTokenOwner(token string, tokenID int64) (int64, error)
 

@@ -115,12 +115,11 @@ var allToolFactories = []struct {
 	{"enju_invalidate_task", enjumcp.InvalidateTask},
 	{"enju_retry_task", enjumcp.RetryTask},
 	{"enju_tally_task", enjumcp.TallyTask},
-	// operator/model design — bot + model registration tools.
+	// Agent registration tools. There is no model registration
+	// tool — a model is a label on the work, not a citizen.
 	{"enju_register_agent", enjumcp.RegisterBot},
 	{"enju_list_my_agents", enjumcp.ListMyBots},
 	{"enju_revoke_token", enjumcp.RevokeToken},
-	{"enju_list_models", enjumcp.ListModels},
-	{"enju_register_model", enjumcp.RegisterModel},
 	{"enju_agent_start", enjumcp.BotStart},
 	{"enju_agent_stop", enjumcp.BotStop},
 	{"enju_agent_status", enjumcp.BotStatus},

@@ -13,7 +13,7 @@ func TestComputeSubmissionSingleCitizen(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	out, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, nil)
+	out, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestComputeSubmissionMultiCitizen(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	out, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, nil)
+	out, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestComputeSubmissionMultiCitizenNoClaim(t *testing.T) {
 		// No active claims for citizen 1.
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, nil)
+	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "content", 100, "")
 	if err == nil {
 		t.Fatal("expected no-claim error")
 	}
@@ -74,7 +74,7 @@ func TestComputeSubmissionRejectsAlreadyResolved(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "", 0, nil)
+	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "", 0, "")
 	if err == nil {
 		t.Fatal("expected already-resolved error")
 	}
@@ -90,7 +90,7 @@ func TestComputeSubmissionRejectsNonClaimable(t *testing.T) {
 		},
 	}
 	e := New(ms, nil)
-	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "", 0, nil)
+	_, err := e.ComputeSubmission("t1", 1, "path", "sha", "", "", "", 0, "")
 	if err == nil {
 		t.Fatal("expected non-claimable error")
 	}

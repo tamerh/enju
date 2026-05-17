@@ -47,7 +47,6 @@ type CitizenKind = types.CitizenKind
 const (
 	CitizenKindHuman = types.CitizenKindHuman
 	CitizenKindBot   = types.CitizenKindBot
-	CitizenKindModel = types.CitizenKindModel
 )
 
 // IsValidCitizenKind re-exports types.IsValidCitizenKind.
@@ -561,7 +560,7 @@ type IterationRecord struct {
 	CommitSHA   string // the task's commit at submit time; "" until submitted
 	ReviewDecision ReviewDecision // approve | request_changes | reject | comment | "" (no decision yet)
 	Option     string // vote choice (vote tasks)
-	ModelID    *int64 // attribution (per-claim model)
+	Model      string // normalized model-name label (per-claim attribution; "" when no LLM)
 	// Branch is the iteration-scoped topic branch identifier
 	// (living-workflow phase 6a). Format:
 	// "<run-slug>/<task_def_id>/iter-<N>". Empty for
@@ -680,15 +679,14 @@ type CitizenRecord struct {
 	// production reads this value. When a future feature needs
 	// it, re-add the writes deliberately at that point.
 	LastSeen    time.Time
-	// operator/model design — citizen kind discriminator.
-	// "human" (default for everyone pre-migration), "agent" (owned by a
-	// human or project, has its own token), "model" (LLM catalog
-	// entry, no token, attribution-only). See
-	// docs/operator-model-design.md.
+	// Kind is the citizen-kind discriminator: "human" (a person)
+	// or "agent" (an unattended citizen owned by a human, with
+	// its own token, that claims and executes tasks). A model is
+	// NOT a kind — it has no identity and is a label on the work.
 	Kind      CitizenKind // empty string = legacy/normalized to Human at read time
-	// ParentID is the owner chain for bots. Non-nil for kind='bot'
-	// (points at the citizen that owns this bot); nil for humans
-	// and models. Used by enju_my_bots and revocation cascades.
+	// ParentID is the owner chain for agents. Non-nil for
+	// kind='agent' (points at the citizen that owns this agent);
+	// nil for humans. Used by enju_my_agents and revocation cascades.
 	ParentID    *int64
 }
 
@@ -724,11 +722,11 @@ type TaskClaimRecord struct {
 	// task. Empty for non-vote submissions and for claims that
 	// haven't submitted yet.
 	Option string
-	// ModelID is the
-	// model citizen credited for this submission's text. nil for
-	// pre-1.4 rows and for human submits with no LLM ("hand-
-	// reviewed contested item" case in the design doc).
-	ModelID *int64
+	// Model is the normalized model-name label credited for this
+	// submission's text — a plain string, not a citizen (a model
+	// has no identity). Empty for script tasks and for human
+	// submits with no LLM (hand-reviewed work).
+	Model string
 	// Branch is the per-iteration topic branch this claim writes
 	// to (e.g. "myrun/expand/iter-1"). Generated at claim time
 	// from (run-slug, task-def-id, prior-claim-count). Empty for

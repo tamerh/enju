@@ -987,10 +987,10 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 		citizens = 1
 	}
 
-	// operator/model design — enforce "bots must have a
-	// model" at apply time (SQLite CHECK can't cross-table-reference
-	// to look up citizens.kind). Human operators may submit unaided.
-	if err := requireModelForBot(tx, m.CitizenID, m.ModelID, "set_claim"); err != nil {
+	// Enforce "an agent must name a model" at apply time (SQLite
+	// CHECK can't conditionally read citizens.kind). Humans and
+	// scripts may act with no model.
+	if err := requireModelForAgent(tx, m.CitizenID, m.Model, "set_claim"); err != nil {
 		return err
 	}
 
@@ -1136,8 +1136,8 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 
 	// Insert the claim row with the branch identifier.
 	_, err := tx.Exec(
-		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model_id, branch, iter_seq) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		m.TaskID, m.CitizenID, now, m.Deadline, nullableInt64(m.ModelID), branch, iterSeq,
+		`INSERT INTO task_claims (task_id, citizen_id, claimed_at, deadline, model, branch, iter_seq) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.TaskID, m.CitizenID, now, m.Deadline, nullableStr(m.Model), branch, iterSeq,
 	)
 	if err != nil {
 		return fmt.Errorf("set_claim: %w", err)
@@ -1354,10 +1354,9 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		citizens = 1
 	}
 
-	// operator/model design — same constraint as the
-	// claim path. Bots can't submit without naming a model; humans
-	// can.
-	if err := requireModelForBot(tx, m.CitizenID, m.ModelID, "submit"); err != nil {
+	// Same constraint as the claim path: an agent can't submit
+	// without naming a model; humans and scripts can.
+	if err := requireModelForAgent(tx, m.CitizenID, m.Model, "submit"); err != nil {
 		return err
 	}
 
@@ -1403,8 +1402,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		// level. Readers needing prose use workspace.Project.
 		// ReadFileAtCommit against the fat-client's clone.
 		if _, err := tx.Exec(
-			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, model_id) VALUES (?, ?, ?, ?, ?, ?)`,
-			claimRowID.Int64, now, m.CommitSHA, m.Decision, choice, nullableInt64(m.ModelID),
+			`INSERT INTO task_submissions (claim_id, submitted_at, commit_sha, decision, option, model) VALUES (?, ?, ?, ?, ?, ?)`,
+			claimRowID.Int64, now, m.CommitSHA, m.Decision, choice, nullableStr(m.Model),
 		); err != nil {
 			return fmt.Errorf("submit: record submission: %w", err)
 		}
@@ -1503,8 +1502,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 
 		if claimRowID.Valid && !stayOpen {
 			if _, err := tx.Exec(
-				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
-				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
+				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model = COALESCE(?, model) WHERE id = ?`,
+				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableStr(m.Model), claimRowID.Int64,
 			); err != nil {
 				return err
 			}
@@ -1544,8 +1543,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 			// task_submissions yet) see the latest attempt.
 			// outcome stays NULL.
 			if _, err := tx.Exec(
-				`UPDATE task_claims SET submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
-				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
+				`UPDATE task_claims SET submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model = COALESCE(?, model) WHERE id = ?`,
+				now, m.VoteChoice, m.CommitSHA, m.Decision, nullableStr(m.Model), claimRowID.Int64,
 			); err != nil {
 				return err
 			}
@@ -1572,8 +1571,8 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		}
 		if claimRowID.Valid {
 			tx.Exec(
-				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model_id = COALESCE(?, model_id) WHERE id = ?`,
-				now, choice, m.CommitSHA, m.Decision, nullableInt64(m.ModelID), claimRowID.Int64,
+				`UPDATE task_claims SET outcome = 'completed', submitted_at = ?, option = ?, commit_sha = ?, decision = ?, model = COALESCE(?, model) WHERE id = ?`,
+				now, choice, m.CommitSHA, m.Decision, nullableStr(m.Model), claimRowID.Int64,
 			)
 			// Multi-citizen: this citizen's iteration just
 			// closed. The task itself stays in COLLECTING until
@@ -1705,10 +1704,8 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 		return 0, err
 	}
 	newID, _ := res.LastInsertId()
-	// Mirror the initial token into the tokens table (auth path
-	// joins through there). Model citizens have synthetic tokens
-	// like "model:<username>" that aren't real bearer tokens but
-	// still get a row for join symmetry.
+	// Mirror the initial token into the tokens table — the auth
+	// path joins through there. Skipped when no token is supplied.
 	if c.Token != "" {
 		if _, err := tx.Exec(
 			`INSERT INTO tokens (citizen_id, token, label, issued_at) VALUES (?, ?, ?, ?)`,
@@ -1719,7 +1716,7 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 	}
 	// Subtype carries the kind discriminator so consumers
 	// (audit views, attribution dashboards) can split humans
-	// vs bots vs models without re-querying.
+	// vs agents without re-querying.
 	meta := map[string]any{
 		"username": c.Username,
 		"role":     role,
@@ -2123,19 +2120,20 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 	return next == RunCompleted, nil
 }
 
-// requireModelForBot enforces the operator/model rule from
-// docs/operator-model-design.md: a bot operator must always name
-// the model that produced the words for its action; a human
-// operator may submit unaided. Used by both applySetClaim and
-// applyRecordSubmission so the constraint kicks in whether the
-// bot lies about its model at claim time or at submit time.
+// requireModelForAgent enforces the operator/model rule: an agent
+// operator must always name the model that produced the words for
+// its action; a human (or a script) may act with no model. Used by
+// both applySetClaim and applyRecordSubmission so the constraint
+// kicks in whether the agent omits its model at claim time or at
+// submit time.
 //
-// Implemented in Go (not SQL CHECK) because SQLite CHECK can't
-// reference another table, and we need to read citizens.kind to
-// decide. The query is small (one row by primary key) and runs
-// inside the apply transaction, so consistency is preserved.
-func requireModelForBot(tx *sql.Tx, operatorID int64, modelID *int64, op string) error {
-	if modelID != nil {
+// This is now a trivial check — the actor's kind plus a string
+// presence test, no model-citizen lookup. Implemented in Go (not
+// SQL CHECK) because SQLite CHECK can't conditionally read the
+// operator's kind. The query is small (one row by primary key) and
+// runs inside the apply transaction, so consistency is preserved.
+func requireModelForAgent(tx *sql.Tx, operatorID int64, model, op string) error {
+	if model != "" {
 		return nil // model named — fine for any operator kind
 	}
 	var rawKind string
@@ -2143,7 +2141,7 @@ func requireModelForBot(tx *sql.Tx, operatorID int64, modelID *int64, op string)
 		return fmt.Errorf("%s: read operator kind: %w", op, err)
 	}
 	if CitizenKind(rawKind) == CitizenKindBot {
-		return fmt.Errorf("%s: operator citizen %d is a bot — model_id is required (bots cannot act without naming a model)", op, operatorID)
+		return fmt.Errorf("%s: operator citizen %d is an agent — model is required (an agent cannot act without naming a model)", op, operatorID)
 	}
 	return nil
 }
@@ -2152,12 +2150,24 @@ func requireModelForBot(tx *sql.Tx, operatorID int64, modelID *int64, op string)
 // nullable INTEGER columns. Passing a typed nil through database/
 // sql works for some drivers but is brittle; sql.NullInt64 with
 // Valid=false is the portable form. Callers use this for
-// task_claims.model_id and other nullable FKs.
+// nullable FK columns.
 func nullableInt64(p *int64) interface{} {
 	if p == nil {
 		return nil
 	}
 	return *p
+}
+
+// nullableStr maps an empty string to SQL NULL and any non-empty
+// value to itself. Used for task_claims.model / task_submissions.
+// model so that "no model" is a real NULL — this keeps the
+// multi-attempt COALESCE(?, model) preserve-prior-model semantics
+// working (an empty later attempt doesn't blank an earlier model).
+func nullableStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // applyEmitEvent handles the EmitEvent mutation: pure pass-

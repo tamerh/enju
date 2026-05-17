@@ -252,7 +252,7 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 		`SELECT
 		  tc.task_id, tc.citizen_id, tc.claimed_at, tc.deadline,
 		  COALESCE(tc.outcome, '') AS outcome,
-		  tc.submitted_at, tc.option, tc.model_id,
+		  tc.submitted_at, tc.option, tc.model,
 		  COALESCE(c.username, '') AS username,
 		  COALESCE(tc.commit_sha, '') AS commit_sha,
 		  COALESCE(tc.decision, '') AS decision,
@@ -275,10 +275,10 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 		seq++
 		var r IterationRecord
 		var submittedAt sql.NullTime
-		var modelID sql.NullInt64
+		var model sql.NullString
 		if err := rows.Scan(
 			&r.TaskID, &r.CitizenID, &r.ClaimedAt, &r.Deadline,
-			&r.Outcome, &submittedAt, &r.Option, &modelID,
+			&r.Outcome, &submittedAt, &r.Option, &model,
 			&r.Username, &r.CommitSHA, &r.ReviewDecision, &r.Branch,
 			&r.IterSeq,
 		); err != nil {
@@ -289,9 +289,8 @@ func (s *Store) ListTaskIterations(taskID string) ([]IterationRecord, error) {
 			t := submittedAt.Time
 			r.SubmittedAt = &t
 		}
-		if modelID.Valid {
-			id := modelID.Int64
-			r.ModelID = &id
+		if model.Valid {
+			r.Model = model.String
 		}
 		out = append(out, r)
 	}

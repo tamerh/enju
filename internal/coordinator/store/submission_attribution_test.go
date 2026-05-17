@@ -1,23 +1,22 @@
 package store
 
-// contract tests — submission attribution (operator,
-// model). The properties this milestone pins:
+// Contract tests — submission attribution (operator, model).
+// The properties pinned here:
 //
-//   - task_claims.citizen_id is the operator (existing); model_id
-//     is the new column carrying which LLM produced the words.
-//   - SetClaim and RecordSubmission carry ModelID through to the
-//     row, both on insert (claim) and on update (submit).
-//   - The kind-based constraint applies at apply time (since
-//     SQLite CHECK can't reference citizens.kind):
-//       human + nil model_id  → allowed (hand-review case)
-//       human + non-nil model → allowed (typical: human at keyboard with Claude)
-//       bot   + nil model_id  → REJECTED (bots can't think alone)
-//       bot   + non-nil model → allowed
-//   - The constraint fires on BOTH paths (claim and submit), so a
-//     bot that lies about its model gets caught regardless of when
-//     it tries to.
-//
-// See docs/operator-model-design.md.
+//   - task_claims.citizen_id is the operator; `model` is the
+//     normalized model-name LABEL that produced the words. It is
+//     a plain string, NOT a citizen reference — a model has no
+//     identity.
+//   - SetClaim and RecordSubmission carry the model string through
+//     to the row, both on insert (claim) and on update (submit).
+//   - The kind-based constraint applies at apply time (SQLite
+//     CHECK can't conditionally read citizens.kind):
+//       human + ""    → allowed (hand-review / script case)
+//       human + named → allowed (human at keyboard with an LLM)
+//       agent + ""    → REJECTED (an agent can't act with no model)
+//       agent + named → allowed
+//   - The constraint fires on BOTH paths (claim and submit), so an
+//     agent that drops its model gets caught regardless of when.
 
 import (
 	"strings"
@@ -26,28 +25,25 @@ import (
 )
 
 // applyClaimSubmit drives a SetClaim + RecordSubmission cycle for
-// the test task `taskID`, against the given operator/model. Returns
-// the ApplyPlan error from whichever step fails (or nil on full
-// success). Centralizing this lets each test focus on the (operator
-// kind, model nil-ness) matrix without re-staging plumbing.
-func applyClaimSubmit(t *testing.T, s *Store, taskID string, operatorID int64, modelID *int64) error {
+// the test task `taskID`, against the given operator/model string.
+// Returns the ApplyPlan error from whichever step fails (or nil on
+// full success).
+func applyClaimSubmit(t *testing.T, s *Store, taskID string, operatorID int64, model string) error {
 	t.Helper()
 
-	// Claim.
 	if _, err := s.ApplyPlan(Plan{
 		Mutations: []Mutation{
 			SetClaim{
 				TaskID:    taskID,
 				CitizenID: operatorID,
 				Deadline:  time.Now().Add(time.Hour),
-				ModelID:   modelID,
+				Model:     model,
 			},
 		},
 	}); err != nil {
 		return err
 	}
 
-	// Submit.
 	if _, err := s.ApplyPlan(Plan{
 		Mutations: []Mutation{
 			RecordSubmission{
@@ -55,7 +51,7 @@ func applyClaimSubmit(t *testing.T, s *Store, taskID string, operatorID int64, m
 				CitizenID:  operatorID,
 				ResultPath: "runs/1/test/result.md",
 				CommitSHA:  "abc1234567890",
-				ModelID:    modelID,
+				Model:      model,
 			},
 		},
 	}); err != nil {
@@ -65,9 +61,8 @@ func applyClaimSubmit(t *testing.T, s *Store, taskID string, operatorID int64, m
 }
 
 // stageTaskForClaim creates the bare minimum project + run + task
-// scaffolding that a SetClaim mutation needs. Returns the task
-// ID. Done with raw SQL so each test gets a clean slate without
-// pulling in the whole engine.
+// scaffolding that a SetClaim mutation needs. Raw SQL so each test
+// gets a clean slate without pulling in the whole engine.
 func stageTaskForClaim(t *testing.T, s *Store, taskID string) {
 	t.Helper()
 	now := time.Now()
@@ -91,19 +86,19 @@ func stageTaskForClaim(t *testing.T, s *Store, taskID string) {
 	}
 }
 
-// TestHumanCanSubmitWithoutModel — the explicit design carve-out:
-// a human reviewer who hand-decides without invoking an LLM submits
-// with model_id=nil. No error; row stored cleanly.
+// TestHumanCanSubmitWithoutModel — the explicit carve-out: a human
+// reviewer who hand-decides without invoking an LLM (or a script
+// task) submits with an empty model. No error; row stored cleanly
+// with model NULL.
 func TestHumanCanSubmitWithoutModel(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 	stageTaskForClaim(t, s, "t1")
 
-	if err := applyClaimSubmit(t, s, "t1", humanID, nil); err != nil {
-		t.Fatalf("human + nil model should succeed, got: %v", err)
+	if err := applyClaimSubmit(t, s, "t1", humanID, ""); err != nil {
+		t.Fatalf("human + empty model should succeed, got: %v", err)
 	}
 
-	// Verify the row landed with model_id NULL.
 	subs, err := s.ListVoteSubmissions("t1")
 	if err != nil {
 		t.Fatal(err)
@@ -111,8 +106,8 @@ func TestHumanCanSubmitWithoutModel(t *testing.T) {
 	if len(subs) != 1 {
 		t.Fatalf("got %d submissions, want 1", len(subs))
 	}
-	if subs[0].ModelID != nil {
-		t.Errorf("model_id=%d, want nil for unaided human", *subs[0].ModelID)
+	if subs[0].Model != "" {
+		t.Errorf("model=%q, want empty for unaided human", subs[0].Model)
 	}
 	if subs[0].CitizenID != humanID {
 		t.Errorf("operator (citizen_id)=%d, want %d", subs[0].CitizenID, humanID)
@@ -120,47 +115,40 @@ func TestHumanCanSubmitWithoutModel(t *testing.T) {
 }
 
 // TestHumanWithModelRecordsBoth — typical case: human at keyboard
-// using Claude. Both citizen_id (operator) and model_id are
-// populated and round-trip through the read path.
+// using Claude. Both citizen_id (operator) and the model string
+// round-trip through the read path. The model is a literal label,
+// not a citizen — no catalog lookup needed.
 func TestHumanWithModelRecordsBoth(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
-
-	// Look up Opus from the seeded catalog.
-	opus, err := s.GetCitizenByUsername("claude-opus-4-7")
-	if err != nil || opus == nil {
-		t.Fatalf("seed lookup: %v / %v", err, opus)
-	}
 	stageTaskForClaim(t, s, "t1")
 
-	if err := applyClaimSubmit(t, s, "t1", humanID, &opus.ID); err != nil {
-		t.Fatalf("human + Opus should succeed: %v", err)
+	if err := applyClaimSubmit(t, s, "t1", humanID, "claude-opus-4-7"); err != nil {
+		t.Fatalf("human + model should succeed: %v", err)
 	}
 
 	subs, _ := s.ListVoteSubmissions("t1")
 	if len(subs) != 1 {
 		t.Fatalf("got %d submissions, want 1", len(subs))
 	}
-	if subs[0].ModelID == nil || *subs[0].ModelID != opus.ID {
-		t.Errorf("model_id=%v, want %d (Opus)", subs[0].ModelID, opus.ID)
+	if subs[0].Model != "claude-opus-4-7" {
+		t.Errorf("model=%q, want %q", subs[0].Model, "claude-opus-4-7")
 	}
 }
 
-// TestBotRequiresModelOnClaim — the load-bearing constraint. A bot
-// operator MUST name a model. The check fires at SetClaim (the
-// earliest enforcement point) so a bot can't even start work
-// without declaring its model.
-func TestBotRequiresModelOnClaim(t *testing.T) {
+// TestAgentRequiresModelOnClaim — the load-bearing constraint. An
+// agent operator MUST name a model. The check fires at SetClaim
+// (the earliest point) so an agent can't even start work without
+// declaring its model.
+func TestAgentRequiresModelOnClaim(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 
-	// Insert a bot owned by tamer (future helpers may wrap this in a
-	// proper helper; for now raw SQL).
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"claude-tamer-bot", "Tamer's Claude bot", "tok-bot", now, now, string(CitizenKindBot), humanID,
+		"claude-tamer-bot", "Tamer's Claude agent", "tok-bot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -168,38 +156,36 @@ func TestBotRequiresModelOnClaim(t *testing.T) {
 	botID, _ := res.LastInsertId()
 	stageTaskForClaim(t, s, "t1")
 
-	// Bot tries to claim without naming a model → must reject.
 	_, err = s.ApplyPlan(Plan{
 		Mutations: []Mutation{
 			SetClaim{
 				TaskID:    "t1",
 				CitizenID: botID,
 				Deadline:  time.Now().Add(time.Hour),
-				ModelID:   nil,
+				Model:     "",
 			},
 		},
 	})
 	if err == nil {
-		t.Fatal("bot claim with nil model_id was accepted; expected rejection")
+		t.Fatal("agent claim with empty model was accepted; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "bot") || !strings.Contains(err.Error(), "model_id is required") {
-		t.Errorf("error wording should mention bot + model requirement; got: %v", err)
+	if !strings.Contains(err.Error(), "agent") || !strings.Contains(err.Error(), "model is required") {
+		t.Errorf("error wording should mention agent + model requirement; got: %v", err)
 	}
 }
 
-// TestBotRequiresModelOnSubmit — defense in depth. Even if a
-// human-with-model claims a task and then the bot somehow tries
-// to submit (shouldn't happen, but the constraint must hold),
-// applyRecordSubmission also rejects. Tests claim-time AND
-// submit-time enforcement so a bot can't slip through either.
-func TestBotRequiresModelOnSubmit(t *testing.T) {
+// TestAgentRequiresModelOnSubmit — defense in depth. Even if the
+// claim somehow carried a model, applyRecordSubmission also rejects
+// an empty model for an agent, so an agent can't drop attribution
+// mid-flow.
+func TestAgentRequiresModelOnSubmit(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"reviewer-bot", "Reviewer Bot", "tok-rbot", now, now, string(CitizenKindBot), humanID,
+		"reviewer-bot", "Reviewer Agent", "tok-rbot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -207,19 +193,16 @@ func TestBotRequiresModelOnSubmit(t *testing.T) {
 	botID, _ := res.LastInsertId()
 	stageTaskForClaim(t, s, "t1")
 
-	// First, claim WITH a model (Opus). the apply path lets that
-	// land cleanly.
-	opus, _ := s.GetCitizenByUsername("claude-opus-4-7")
+	// Claim WITH a model — that lands cleanly.
 	if _, err := s.ApplyPlan(Plan{
 		Mutations: []Mutation{
-			SetClaim{TaskID: "t1", CitizenID: botID, Deadline: time.Now().Add(time.Hour), ModelID: &opus.ID},
+			SetClaim{TaskID: "t1", CitizenID: botID, Deadline: time.Now().Add(time.Hour), Model: "claude-opus-4-7"},
 		},
 	}); err != nil {
 		t.Fatalf("setup claim with model: %v", err)
 	}
 
-	// Now submit WITHOUT a model — the constraint must catch this
-	// too (defense in depth: bot can't drop attribution mid-flow).
+	// Submit WITHOUT a model — the constraint must catch this too.
 	_, err = s.ApplyPlan(Plan{
 		Mutations: []Mutation{
 			RecordSubmission{
@@ -227,39 +210,38 @@ func TestBotRequiresModelOnSubmit(t *testing.T) {
 				CitizenID:  botID,
 				ResultPath: "runs/1/test/result.md",
 				CommitSHA:  "abc",
-				ModelID:    nil,
+				Model:      "",
 			},
 		},
 	})
 	if err == nil {
-		t.Fatal("bot submit with nil model_id was accepted; expected rejection")
+		t.Fatal("agent submit with empty model was accepted; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "bot") {
-		t.Errorf("error should name the bot constraint; got: %v", err)
+	if !strings.Contains(err.Error(), "agent") {
+		t.Errorf("error should name the agent constraint; got: %v", err)
 	}
 }
 
-// TestBotWithModelSucceeds — the happy path for agents: declare the
-// model, both phases apply cleanly, model_id round-trips through
-// the read path.
-func TestBotWithModelSucceeds(t *testing.T) {
+// TestAgentWithModelSucceeds — the happy path for agents: declare
+// the model, both phases apply cleanly, the model string
+// round-trips through the read path.
+func TestAgentWithModelSucceeds(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 	now := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, ?, ?)`,
-		"developer-bot", "Developer Bot", "tok-dbot", now, now, string(CitizenKindBot), humanID,
+		"developer-bot", "Developer Agent", "tok-dbot", now, now, string(CitizenKindBot), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	botID, _ := res.LastInsertId()
-	sonnet, _ := s.GetCitizenByUsername("claude-sonnet-4-6")
 	stageTaskForClaim(t, s, "t1")
 
-	if err := applyClaimSubmit(t, s, "t1", botID, &sonnet.ID); err != nil {
-		t.Fatalf("bot + Sonnet should succeed: %v", err)
+	if err := applyClaimSubmit(t, s, "t1", botID, "claude-sonnet-4-6"); err != nil {
+		t.Fatalf("agent + model should succeed: %v", err)
 	}
 
 	subs, _ := s.ListVoteSubmissions("t1")
@@ -267,9 +249,9 @@ func TestBotWithModelSucceeds(t *testing.T) {
 		t.Fatalf("got %d submissions, want 1", len(subs))
 	}
 	if subs[0].CitizenID != botID {
-		t.Errorf("operator=%d, want bot id %d", subs[0].CitizenID, botID)
+		t.Errorf("operator=%d, want agent id %d", subs[0].CitizenID, botID)
 	}
-	if subs[0].ModelID == nil || *subs[0].ModelID != sonnet.ID {
-		t.Errorf("model_id=%v, want sonnet id %d", subs[0].ModelID, sonnet.ID)
+	if subs[0].Model != "claude-sonnet-4-6" {
+		t.Errorf("model=%q, want %q", subs[0].Model, "claude-sonnet-4-6")
 	}
 }

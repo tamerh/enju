@@ -21,13 +21,13 @@ type ClaimTaskParams struct {
 	// citizens, so the lookup is by username, not by token.
 	Username string
 
-	// Model is the optional LLM citizen username producing the
-	// words for this claim (operator/model split). Empty for
-	// unaided humans; bots that omit it are rejected by the
-	// apply layer with a clear "bots must declare a model"
-	// message. Unknown-but-valid names auto-register as new
-	// kind='model' citizens — see ResolveModelByUsername for
-	// the rationale.
+	// Model is the normalized model-name label that produced the
+	// words for this claim — a plain string, not a citizen (a
+	// model has no identity). Empty for scripts and unaided
+	// humans; agents that omit it are rejected by the apply layer
+	// with a clear "an agent must name a model" message. Stamped
+	// automatically by the submitter from its runtime identity,
+	// never declared in workflow YAML.
 	Model string
 }
 
@@ -108,13 +108,8 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 
 	deadline := time.Now().Add(taskClaimTimeout(task))
 
-	modelID, err := ResolveModelByUsername(s, params.Model)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
-	}
-
 	eng := engine.New(s, logger)
-	plan, err := eng.ComputeClaim(taskID, caller.ID, deadline, modelID)
+	plan, err := eng.ComputeClaim(taskID, caller.ID, deadline, params.Model)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrConflict, err.Error())
 	}
@@ -131,50 +126,6 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 		resp.Task = &tr
 	}
 	return resp, nil
-}
-
-// ResolveModelByUsername mirrors the legacy api helper. Empty
-// input returns (nil, nil) for the unaided-human case. Unknown
-// names auto-register a kind='model' citizen — local-mode
-// philosophy: don't make Ollama users pre-register before they
-// can submit. Reject if the username resolves to a non-model
-// citizen so callers can't attribute their submit to a teammate's
-// account. Hosted-mode policy gating (require pre-registration)
-// is deferred — see the operator/model design doc.
-func ResolveModelByUsername(s store.CoordinatorStore, modelName string) (*int64, error) {
-	if modelName == "" {
-		return nil, nil
-	}
-	c, err := s.GetCitizenByUsername(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("look up model %q: %w", modelName, err)
-	}
-	if c != nil {
-		if c.Kind != store.CitizenKindModel {
-			return nil, fmt.Errorf("citizen %q has kind %q, not %q — operators cannot be self-attributed as their own model", modelName, c.Kind, "model")
-		}
-		return &c.ID, nil
-	}
-	now := time.Now()
-	res, err := s.ApplyPlan(store.Plan{
-		Version: engine.EngineVersion,
-		Mutations: []store.Mutation{
-			store.CreateCitizen{Citizen: store.CitizenRecord{
-				Username:     modelName,
-				Name:         modelName,
-				Role:         "citizen",
-				Token:        "model:" + modelName,
-				RegisteredAt: now,
-				LastSeen:     now,
-				Kind:         store.CitizenKindModel,
-			}},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("auto-register model %q: %w", modelName, err)
-	}
-	id := res.CitizenID
-	return &id, nil
 }
 
 // IsClaimContention reports whether the error is the engine's

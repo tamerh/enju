@@ -196,10 +196,6 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleListMyBots(ctx, req)
 	case "enju_revoke_token":
 		return t.c.handleRevokeToken(ctx, req)
-	case "enju_list_models":
-		return t.c.handleListModels(ctx, req)
-	case "enju_register_model":
-		return t.c.handleRegisterModel(ctx, req)
 	case "enju_agent_start":
 		return t.c.handleBotStart(ctx, req)
 	case "enju_agent_stop":

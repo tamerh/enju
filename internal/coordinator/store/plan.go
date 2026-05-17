@@ -435,17 +435,19 @@ func (CreateRun) mutationKind() MutationKind { return MutCreateRun }
 // gets one slot; the coordinator validates slot availability
 // at apply time.
 //
-// ModelID attributes the claim to a model citizen
-// when known at claim time. Optional for humans (a hand-review
-// has no model); REQUIRED for bot operators — applySetClaim
-// rejects bot claims with model_id=NULL because bots can't
-// think on their own. The constraint is enforced at apply
-// time, not in SQLite, since CHECK can't cross-table-reference.
+// Model is the normalized model-name label that produced the
+// words for this claim, when known at claim time. A plain string,
+// not a citizen reference — a model has no identity. Empty for
+// humans (a hand-review has no model) and scripts; REQUIRED for
+// agent operators — applySetClaim rejects agent claims with an
+// empty model (an agent can't think on its own). Enforced at
+// apply time, not in SQLite, since CHECK can't cross-reference
+// the operator's kind.
 type SetClaim struct {
-	TaskID  string
+	TaskID    string
 	CitizenID int64
-	Deadline time.Time
-	ModelID  *int64
+	Deadline  time.Time
+	Model     string
 }
 
 func (SetClaim) mutationKind() MutationKind { return MutSetClaim }
@@ -518,12 +520,14 @@ type RecordSubmission struct {
 	// (SUM(json_extract(metadata, '$.estimated_tokens')))
 	// stay populated.
 	EstimatedTokens int64
-	// ModelID attributes the submission to a model
-	// citizen. Optional for human operators (a hand-review has
-	// no model); REQUIRED for bot operators — applyRecordSubmission
-	// rejects bot submissions with model_id=NULL. The constraint
-	// is enforced at apply time (SQLite CHECK can't cross-table).
-	ModelID *int64
+	// Model is the normalized model-name label that produced the
+	// words for this submission. A plain string, not a citizen
+	// reference — a model has no identity. Empty for human
+	// operators (a hand-review has no model) and scripts; REQUIRED
+	// for agent operators — applyRecordSubmission rejects agent
+	// submissions with an empty model. Enforced at apply time
+	// (SQLite CHECK can't cross-reference the operator's kind).
+	Model string
 }
 
 func (RecordSubmission) mutationKind() MutationKind { return MutRecordSubmission }

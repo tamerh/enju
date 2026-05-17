@@ -64,9 +64,7 @@ func ListTaskIterations(s store.CoordinatorStore, caller *store.CitizenRecord, t
 				row.DurationMS = d
 			}
 		}
-		if it.ModelID != nil {
-			row.Model = CitizenUsername(s, *it.ModelID)
-		}
+		row.Model = it.Model
 		out = append(out, row)
 	}
 	return out, nil

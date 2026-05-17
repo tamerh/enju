@@ -254,33 +254,6 @@ func helperCreateCitizen(s *Store, c *CitizenRecord) (int64, error) {
 	return res.CitizenID, nil
 }
 
-// helperCreateModelCitizen registers a kind='model' citizen
-// with the conventional "model:<username>" synthetic token.
-func helperCreateModelCitizen(s *Store, username, displayName string) (int64, error) {
-	if displayName == "" {
-		displayName = username
-	}
-	now := time.Now()
-	res, err := s.ApplyPlan(Plan{
-		Version: testEngineVersion,
-		Mutations: []Mutation{
-			CreateCitizen{Citizen: CitizenRecord{
-				Username:    username,
-				Name:        displayName,
-				Role:        "citizen",
-				Token:       "model:" + username,
-				RegisteredAt: now,
-				LastSeen:     now,
-				Kind:        "model",
-			}},
-		},
-	})
-	if err != nil {
-		return 0, err
-	}
-	return res.CitizenID, nil
-}
-
 // helperRevokeTokenByValue revokes a token by string value
 // via ApplyPlan.
 func helperRevokeTokenByValue(s *Store, token string) error {

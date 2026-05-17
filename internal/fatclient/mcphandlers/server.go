@@ -293,8 +293,6 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleListArtifacts, true
 	case "enju_list_my_agents":
 		return c.handleListMyBots, true
-	case "enju_list_models":
-		return c.handleListModels, true
 	case "enju_list_issues":
 		return c.handleListIssues, true
 	case "enju_recent_events":
@@ -417,8 +415,6 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleRegisterBot, true
 	case "enju_revoke_token":
 		return c.handleRevokeToken, true
-	case "enju_register_model":
-		return c.handleRegisterModel, true
 	case "enju_agent_start":
 		return c.handleBotStart, true
 	case "enju_agent_stop":

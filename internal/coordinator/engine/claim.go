@@ -60,14 +60,13 @@ func CheckTaskAccess(task *store.TaskRecord, caller *store.CitizenRecord) error 
 	return nil
 }
 
-// ComputeClaim's modelID parameter is the
-// model citizen ID being credited for this claim. Pass nil for
-// human-without-LLM (hand-claim) — the apply path enforces "bots
-// must have a model" so human nil is always fine, bot nil is
-// always rejected. Callers who only have a model name (string)
-// should resolve it to a citizen ID via GetCitizenByUsername and
-// verify kind='model' before passing through.
-func (e *Engine) ComputeClaim(taskID string, citizenID int64, deadline time.Time, modelID *int64) (*store.Plan, error) {
+// ComputeClaim's model parameter is the normalized model-name
+// label credited for this claim — a plain string, not a citizen
+// reference (a model has no identity). Pass "" for a script or a
+// human-without-LLM (hand-claim); the apply path enforces "an
+// agent must name a model" so an empty model is always fine for a
+// human/script and always rejected for an agent.
+func (e *Engine) ComputeClaim(taskID string, citizenID int64, deadline time.Time, model string) (*store.Plan, error) {
 	task, err := e.store.GetTask(taskID)
 	if err != nil || task == nil {
 		return nil, fmt.Errorf("task %q not found", taskID)
@@ -113,7 +112,7 @@ func (e *Engine) ComputeClaim(taskID string, citizenID int64, deadline time.Time
 				TaskID:    taskID,
 				CitizenID: citizenID,
 				Deadline:  deadline,
-				ModelID:   modelID,
+				Model:     model,
 			},
 		},
 	}, nil

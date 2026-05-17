@@ -68,33 +68,3 @@ func ListMyBots(s store.CoordinatorStore, caller *store.CitizenRecord) (*BotList
 	return out, nil
 }
 
-// ModelInfo is one entry in the model catalog.
-type ModelInfo struct {
-	ID       int64  `json:"id"`
-	Username string `json:"username"`
-	Name     string `json:"name"`
-}
-
-// ModelListResponse is the wire shape for enju_list_models /
-// GET /models. Wrapped in {"models":...}.
-type ModelListResponse struct {
-	Models []ModelInfo `json:"models"`
-}
-
-// ListModels returns the model catalog. Open to any
-// authenticated citizen — the catalog is public information.
-func ListModels(s store.CoordinatorStore) (*ModelListResponse, error) {
-	models, err := s.ListModelCitizens()
-	if err != nil {
-		return nil, err
-	}
-	out := &ModelListResponse{Models: make([]ModelInfo, 0, len(models))}
-	for _, m := range models {
-		out.Models = append(out.Models, ModelInfo{
-			ID:       m.ID,
-			Username: m.Username,
-			Name:     m.Name,
-		})
-	}
-	return out, nil
-}

@@ -53,12 +53,11 @@ func TestCitizenKindDefaultsToHuman(t *testing.T) {
 	}
 }
 
-// TestCitizenKindReadAfterDirectInsert covers the bot/model insert
-// shape that bot/model registration uses. CreateCitizen doesn't expose
-// kind or parent_id yet, so this test goes through the raw db.Exec
-// path the same way later phases will. Pinning that the scan path
-// reads both fields correctly means 1.5 and 1.3 won't silently lose
-// data when they start using these columns.
+// TestCitizenKindReadAfterDirectInsert covers the agent insert
+// shape that agent registration uses. This test goes through the
+// raw db.Exec path; pinning that the scan path reads kind +
+// parent_id correctly guards against silently losing that data.
+// A model is not a citizen, so there is no model-citizen case.
 func TestCitizenKindReadAfterDirectInsert(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
@@ -87,31 +86,6 @@ func TestCitizenKindReadAfterDirectInsert(t *testing.T) {
 	}
 	if *bot.ParentID != humanID {
 		t.Errorf("parent_id=%d, want %d", *bot.ParentID, humanID)
-	}
-
-	// And a model citizen — the migration already seeds the popular
-	// catalog (claude-opus-4-7, gpt-4o, etc.) so this test uses
-	// a name that's not in the seed list to avoid collision.
-	// The point is just to pin the read-path mechanics for
-	// kind='model' rows; the seed itself is covered by separate
-	// separate model-catalog tests.
-	_, err = s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, token, score, registered_at, last_seen, kind)
-		 VALUES (?, ?, '', 'citizen', ?, 0, ?, ?, 'model')`,
-		"my-custom-llm", "My Custom LLM", "model:my-custom-llm", now, now,
-	)
-	if err != nil {
-		t.Fatalf("insert model: %v", err)
-	}
-	model, err := s.GetCitizenByUsername("my-custom-llm")
-	if err != nil || model == nil {
-		t.Fatalf("model lookup: %v / %v", err, model)
-	}
-	if model.Kind != "model" {
-		t.Errorf("kind=%q, want %q", model.Kind, "model")
-	}
-	if model.ParentID != nil {
-		t.Errorf("parent_id=%v, want nil for model (catalog entry, not owned)", *model.ParentID)
 	}
 }
 
