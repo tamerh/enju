@@ -41,6 +41,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,6 +56,10 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
 )
+
+// testEmailSeq makes every name-only test registration get a
+// unique synthetic email (a human's global identity is its email).
+var testEmailSeq int64
 
 // TestMain cleans the shared output directory before running
 // tests. Also routes `test.binary wrap-task …` invocations to
@@ -457,7 +462,14 @@ func (s *testServer) postAs(username, path string, body interface{}) map[string]
 // use the citizen id.
 func (s *testServer) register(name string) string {
 	s.t.Helper()
-	resp := s.post("/api/v1/citizens/register", map[string]string{"name": name})
+	// A human's global identity is its email (mandatory + unique).
+	// Tests that register by name only get a per-call-unique
+	// synthetic email so duplicate-name registrations still
+	// produce distinct citizens (username auto-suffixed) exactly
+	// as before — the email is the new identity, the username is
+	// a tenant-scoped handle.
+	email := fmt.Sprintf("c%d@test.local", atomic.AddInt64(&testEmailSeq, 1))
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": name, "email": email})
 	username, ok := resp["username"].(string)
 	if !ok {
 		s.t.Fatalf("register failed: %v", resp)
@@ -1654,15 +1666,14 @@ func TestDuplicateEmailRejected(t *testing.T) {
 	}
 }
 
-func TestRegisterWithoutEmailAllowed(t *testing.T) {
+func TestRegisterWithoutEmailRejected(t *testing.T) {
 	s := newTestServer(t)
 
-	// Multiple citizens without email — all should succeed
-	a := s.register("Alice")
-	b := s.register("Bob")
-
-	if a == b {
-		t.Fatal("expected different IDs")
+	// A human's global identity is its email — registering a
+	// human without one is rejected (no anonymous human citizen).
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": "Alice"})
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("expected error registering a human with no email, got %v", resp)
 	}
 }
 
@@ -1705,22 +1716,24 @@ func TestArtifactWriteRejectedForTraversal(t *testing.T) {
 func TestRegisterGeneratesUsernameFromName(t *testing.T) {
 	s := newTestServer(t)
 
-	// Simple name → slug is identical.
-	resp := s.post("/api/v1/citizens/register", map[string]string{"name": "alice"})
+	// Simple name → slug is identical. (Email is the human's
+	// global identity and is mandatory; distinct per call.)
+	resp := s.post("/api/v1/citizens/register", map[string]string{"name": "alice", "email": "a1@test.local"})
 	if u, _ := resp["username"].(string); u != "alice" {
 		t.Fatalf("expected username 'alice', got %v", resp["username"])
 	}
 
 	// Multi-word display name → slug with hyphens.
-	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "Tamer Gur"})
+	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "Tamer Gur", "email": "a2@test.local"})
 	if u, _ := resp["username"].(string); u != "tamer-gur" {
 		t.Fatalf("expected username 'tamer-gur', got %v", resp["username"])
 	}
 
-	// Collision on the same slug → -2 suffix.
-	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "alice"})
+	// Same display name, different person (distinct email) → the
+	// handle slug is still kept readable with a -2 suffix.
+	resp = s.post("/api/v1/citizens/register", map[string]string{"name": "alice", "email": "a3@test.local"})
 	if u, _ := resp["username"].(string); u != "alice-2" {
-		t.Fatalf("expected username 'alice-2' on collision, got %v", resp["username"])
+		t.Fatalf("expected username 'alice-2' on slug collision, got %v", resp["username"])
 	}
 }
 
@@ -1732,6 +1745,7 @@ func TestRegisterWithExplicitUsername(t *testing.T) {
 	resp := s.post("/api/v1/citizens/register", map[string]string{
 		"name":     "Tamer Gur",
 		"username": "tamerh",
+		"email":    "tamerh@test.local",
 	})
 	if u, _ := resp["username"].(string); u != "tamerh" {
 		t.Fatalf("expected username 'tamerh', got %v", resp["username"])
@@ -1741,18 +1755,28 @@ func TestRegisterWithExplicitUsername(t *testing.T) {
 	resp = s.post("/api/v1/citizens/register", map[string]string{
 		"name":     "Bob",
 		"username": "BobTheBuilder",
+		"email":    "bob@test.local",
 	})
 	if _, hasErr := resp["error"]; !hasErr {
 		t.Fatalf("expected error for invalid username format, got %v", resp)
 	}
 
-	// Already-taken username is rejected.
+	// A different person (distinct email) reusing the same handle
+	// is ACCEPTED: username is a tenant-scoped handle, not a
+	// global identity. Each human root is its own tenant, so
+	// (tenant_id, username) does not collide. The thing that's
+	// globally unique for a human is the email (covered by
+	// TestDuplicateEmailRejected).
 	resp = s.post("/api/v1/citizens/register", map[string]string{
-		"name":     "Impersonator",
+		"name":     "Different Person",
 		"username": "tamerh",
+		"email":    "different@test.local",
 	})
-	if _, hasErr := resp["error"]; !hasErr {
-		t.Fatalf("expected error for taken username, got %v", resp)
+	if _, hasErr := resp["error"]; hasErr {
+		t.Fatalf("a distinct human reusing a handle should be accepted (handle is tenant-scoped), got %v", resp)
+	}
+	if u, _ := resp["username"].(string); u != "tamerh" {
+		t.Fatalf("expected the reused handle 'tamerh', got %v", resp["username"])
 	}
 }
 

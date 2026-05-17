@@ -214,7 +214,12 @@ func (s *Store) initSchema() error {
 
 	CREATE TABLE IF NOT EXISTS citizens (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		username TEXT NOT NULL UNIQUE,
+		-- username is a tenant-scoped HANDLE, not a global identity.
+		-- Uniqueness is per (tenant_id, username) via a composite
+		-- unique index — two owners may each have a "dev-bot". The
+		-- global identity differs by kind: an agent has none (no
+		-- real-world identity), a human has a globally-unique email.
+		username TEXT NOT NULL,
 		name TEXT NOT NULL,
 		email TEXT,
 		role TEXT NOT NULL DEFAULT 'citizen',
@@ -443,8 +448,6 @@ func (s *Store) initSchema() error {
 	 WHERE reviews_target != '' AND action = 'review';
 	CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id);
 	CREATE INDEX IF NOT EXISTS idx_tokens_citizen ON tokens(citizen_id);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE email IS NOT NULL AND email != '';
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_username ON citizens(username);
 	CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 	CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id);
 	`
@@ -553,14 +556,18 @@ func (s *Store) initSchema() error {
 		// doesn't advertise the template origin.
 		`ALTER TABLE runs ADD COLUMN slug TEXT NOT NULL DEFAULT 'run'`,
 		`ALTER TABLE tasks ADD COLUMN run_slug TEXT NOT NULL DEFAULT 'run'`,
-		// operator/model design — citizen kind discriminator
-		// + bot-ownership chain. Existing rows default to kind='human'
-		// (the only kind that existed pre-migration) and parent_id=NULL.
-		// Bots set parent_id to the owner citizen's id; models stay NULL
-		// (they belong to the catalog, not to any owner). See
-		// docs/operator-model-design.md.
+		// Citizen kind discriminator + ownership chain. kind is
+		// 'human' or 'agent'. parent_id is the owning citizen for
+		// an agent (NULL for a human root). tenant_id is the
+		// root-owner citizen at the top of the parent_id chain —
+		// the seam for a future real Org (do NOT build an Org
+		// entity now). A human root's tenant is itself; an agent's
+		// tenant is its owner's tenant. Self-host = exactly one
+		// tenant, so per-tenant uniqueness ≡ global uniqueness:
+		// zero behavior change for single-operator setups.
 		`ALTER TABLE citizens ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'`,
 		`ALTER TABLE citizens ADD COLUMN parent_id INTEGER REFERENCES citizens(id)`,
+		`ALTER TABLE citizens ADD COLUMN tenant_id INTEGER REFERENCES citizens(id)`,
 		// task_claims.citizen_id is the operator (existing); model
 		// is the normalized model-name LABEL that produced the words
 		// for this submit — a string, not a citizen FK (a model has
@@ -730,6 +737,24 @@ func (s *Store) initSchema() error {
 	}
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_branch ON runs(project_id, branch) WHERE state IN ('active', 'waiting', 'paused')`); err != nil {
 		return fmt.Errorf("schema: create idx_runs_active_branch: %w", err)
+	}
+
+	// Citizen identity indexes. Created here (post-migration)
+	// rather than in the CREATE-TABLE block because they reference
+	// the kind / tenant_id columns added by the ALTER migrations
+	// above. email is the global identity for a human (mandatory
+	// + unique per kind='human'); agents have no email, so the
+	// partial WHERE kind='human' keeps two tenants' agents from
+	// colliding on an absent email. username is a tenant-scoped
+	// handle: unique per (tenant_id, username), NOT globally — two
+	// owners may each have a "dev-bot". Single-operator self-host
+	// has exactly one tenant, so this is identical to the old
+	// global-unique behavior (zero behavior change).
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_email ON citizens(email) WHERE kind = 'human'`); err != nil {
+		return fmt.Errorf("schema: create idx_citizens_email: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_tenant_username ON citizens(tenant_id, username)`); err != nil {
+		return fmt.Errorf("schema: create idx_citizens_tenant_username: %w", err)
 	}
 
 	// Branch-per-run artifact index migration. SQLite can't
@@ -2036,19 +2061,19 @@ func (s *Store) GetExpiredClaims() ([]TaskClaimRecord, error) {
 // for plain `FROM citizens` queries and for joins where another
 // table has overlapping column names (notably tokens.id and
 // tokens.token, which would collide otherwise).
-const citizenColumns = `citizens.id, citizens.username, citizens.name, citizens.email, citizens.role, citizens.score, citizens.tasks_completed, citizens.tasks_rejected, citizens.tasks_timed_out, citizens.tasks_released, citizens.tokens_contributed, citizens.registered_at, citizens.last_seen, citizens.kind, citizens.parent_id`
+const citizenColumns = `citizens.id, citizens.username, citizens.name, citizens.email, citizens.role, citizens.score, citizens.tasks_completed, citizens.tasks_rejected, citizens.tasks_timed_out, citizens.tasks_released, citizens.tokens_contributed, citizens.registered_at, citizens.last_seen, citizens.kind, citizens.parent_id, citizens.tenant_id`
 
 // scanCitizen reads one citizen row into a CitizenRecord. Used by
 // GetCitizen, GetCitizenByUsername, GetCitizenByToken.
 func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	var p CitizenRecord
 	var email, role sql.NullString
-	var parentID sql.NullInt64
+	var parentID, tenantID sql.NullInt64
 	err := row.Scan(
 		&p.ID, &p.Username, &p.Name, &email, &role, &p.Score,
 		&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
 		&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
-		&p.Kind, &parentID,
+		&p.Kind, &parentID, &tenantID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2061,6 +2086,10 @@ func scanCitizen(row *sql.Row) (*CitizenRecord, error) {
 	if parentID.Valid {
 		v := parentID.Int64
 		p.ParentID = &v
+	}
+	if tenantID.Valid {
+		v := tenantID.Int64
+		p.TenantID = &v
 	}
 	return &p, nil
 }
@@ -2104,6 +2133,19 @@ func (s *Store) GetCitizen(id int64) (*CitizenRecord, error) {
 func (s *Store) GetCitizenByUsername(username string) (*CitizenRecord, error) {
 	return scanCitizen(s.db.QueryRow(
 		`SELECT `+citizenColumns+` FROM citizens WHERE username = ?`, username,
+	))
+}
+
+// GetCitizenByUsernameInTenant resolves a tenant-scoped handle to
+// its citizen. username is unique per (tenant_id, username), so
+// this pair is unambiguous where a bare username is not. Used by
+// the assign_to / claim path so "dev-bot" means the dev-bot of
+// THIS project's tenant. Returns (nil, nil) when no such handle
+// exists in the tenant.
+func (s *Store) GetCitizenByUsernameInTenant(username string, tenantID int64) (*CitizenRecord, error) {
+	return scanCitizen(s.db.QueryRow(
+		`SELECT `+citizenColumns+` FROM citizens WHERE username = ? AND tenant_id = ?`,
+		username, tenantID,
 	))
 }
 
@@ -2269,12 +2311,12 @@ func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 	for rows.Next() {
 		var p CitizenRecord
 		var email, role sql.NullString
-		var pid sql.NullInt64
+		var pid, tid sql.NullInt64
 		if err := rows.Scan(
 			&p.ID, &p.Username, &p.Name, &email, &role, &p.Score,
 			&p.TasksCompleted, &p.TasksRejected, &p.TasksTimedOut, &p.TasksReleased,
 			&p.TokensContrib, &p.RegisteredAt, &p.LastSeen,
-			&p.Kind, &pid,
+			&p.Kind, &pid, &tid,
 		); err != nil {
 			return nil, err
 		}
@@ -2283,6 +2325,10 @@ func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 		if pid.Valid {
 			v := pid.Int64
 			p.ParentID = &v
+		}
+		if tid.Valid {
+			v := tid.Int64
+			p.TenantID = &v
 		}
 		out = append(out, p)
 	}

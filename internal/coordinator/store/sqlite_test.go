@@ -110,16 +110,19 @@ func createTestRun(t *testing.T, s *Store) int64 {
 	return id
 }
 
-// createTestCitizen creates a citizen with the given username and a
-// unique token, returning the generated int64 primary key.
+// createTestCitizen creates a human citizen with the given username
+// and a unique token, returning the generated int64 primary key. A
+// synthetic per-username email is supplied because a human's global
+// identity is its email (mandatory + unique for kind='human').
 func createTestCitizen(t *testing.T, s *Store, username, token string) int64 {
 	t.Helper()
 	now := time.Now()
 	id, err := helperCreateCitizen(s, &CitizenRecord{
-		Username:   username,
-		Name:     username,
+		Username:     username,
+		Name:         username,
+		Email:        username + "@test.local",
 		RegisteredAt: now,
-		LastSeen:   now,
+		LastSeen:     now,
 	}, token)
 	if err != nil {
 		t.Fatal(err)

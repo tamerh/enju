@@ -682,6 +682,12 @@ type CitizenRecord struct {
 	// kind='agent' (points at the citizen that owns this agent);
 	// nil for humans. Used by enju_my_agents and revocation cascades.
 	ParentID    *int64
+	// TenantID is the root-owner citizen at the top of the
+	// parent_id chain — the tenancy seam. A human root's tenant
+	// is itself; an agent's tenant is its owner's tenant. Set at
+	// creation and never changed. Populated for every row after
+	// creation (nil only on an unsaved in-memory record).
+	TenantID    *int64
 }
 
 // TokenRecord is one row from the tokens table — an issued bearer

@@ -162,7 +162,7 @@ func TestStateMutationsSurviveBrokenEventStore(t *testing.T) {
 	//  Record(). State must survive the simulated emission
 	//  failure.
 	alice, err := helperCreateCitizen(s, &CitizenRecord{
-		Username: "alice-broken", Name: "Alice",
+		Username: "alice-broken", Name: "Alice", Email: "alice-broken@test.local",
 		RegisteredAt: now, LastSeen: now,
 	}, "tok-broken")
 	if err != nil {

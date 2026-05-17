@@ -54,6 +54,13 @@ func (s *Server) handleRegisterCitizen(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	// A human's global identity is its email — mandatory and
+	// globally unique. Self-host already has it (the operator's
+	// address); there is no anonymous human citizen.
+	if req.Email == "" {
+		writeError(w, http.StatusBadRequest, "email is required to register a human citizen")
+		return
+	}
 
 	// Validate or generate username. An explicit username is required
 	// to match the GitHub rules; an auto-generated one comes from

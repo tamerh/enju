@@ -123,6 +123,7 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	regBody, _ := json.Marshal(map[string]string{
 		"username": "merge-e2e",
 		"name":     "Merge E2E",
+		"email":    "merge-e2e@test.local",
 	})
 	regResp, err := http.Post(coordSrv.URL+"/api/v1/citizens/register",
 		"application/json", bytes.NewReader(regBody))

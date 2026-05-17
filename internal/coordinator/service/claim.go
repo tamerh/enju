@@ -76,13 +76,6 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 	if params.Username == "" {
 		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
 	}
-	caller, err := s.GetCitizenByUsername(params.Username)
-	if err != nil {
-		return nil, err
-	}
-	if caller == nil {
-		return nil, fmt.Errorf("%w: citizen %q not found", ErrNotFound, params.Username)
-	}
 
 	task, err := s.GetTask(taskID)
 	if err != nil {
@@ -98,6 +91,29 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 	if run == nil {
 		return nil, fmt.Errorf("%w: run for task %q not found", ErrNotFound, taskID)
 	}
+
+	// Resolve the caller within the project's tenant — username is
+	// a tenant-scoped handle (assign_to: dev-bot), never a global
+	// identity, and never prefixed in YAML. Two owners may each
+	// have a "dev-bot"; the right one is the one in this project's
+	// tenant. Single-operator self-host has exactly one tenant, so
+	// this is identical to a global lookup — zero behavior change.
+	// When the project's tenant can't be determined (no owner row,
+	// e.g. minimal test scaffolding) fall back to the global
+	// lookup so existing single-tenant flows are unaffected.
+	var caller *store.CitizenRecord
+	if projTenant, ok := tenantOfProject(s, run.ProjectID); ok {
+		caller, err = s.GetCitizenByUsernameInTenant(params.Username, projTenant)
+	} else {
+		caller, err = s.GetCitizenByUsername(params.Username)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if caller == nil {
+		return nil, fmt.Errorf("%w: citizen %q not found", ErrNotFound, params.Username)
+	}
+
 	if !CanReadProject(s, run.ProjectID, caller.ID) {
 		return nil, fmt.Errorf("%w: not a member of this project", ErrNotMember)
 	}
@@ -126,6 +142,31 @@ func ClaimTask(s store.CoordinatorStore, logger *slog.Logger, taskID string, par
 		resp.Task = &tr
 	}
 	return resp, nil
+}
+
+// tenantOfProject returns the tenant of a project — the tenant of
+// its owning citizen (the root of the parent_id chain). The tenant
+// is the seam the assign_to handle resolves within: "dev-bot" in a
+// project means the dev-bot owned by that project's tenant. Returns
+// (0, false) when the project has no resolvable owner (minimal test
+// scaffolding) so the caller can fall back to a global lookup and
+// single-tenant flows stay unaffected.
+func tenantOfProject(s store.CoordinatorStore, projectID int64) (int64, bool) {
+	members, err := s.ListProjectMembers(projectID)
+	if err != nil {
+		return 0, false
+	}
+	for _, m := range members {
+		if m.Role != store.ProjectRoleOwner {
+			continue
+		}
+		owner, err := s.GetCitizen(m.CitizenID)
+		if err != nil || owner == nil || owner.TenantID == nil {
+			return 0, false
+		}
+		return *owner.TenantID, true
+	}
+	return 0, false
 }
 
 // IsClaimContention reports whether the error is the engine's

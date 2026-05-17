@@ -59,7 +59,7 @@ func startTestCoordinator(t *testing.T) (string, string, string) {
 	// Register a citizen via the bootstrap endpoint (the only
 	// unauthenticated route).
 	resp, err := ts.Client().Post(ts.URL+"/api/v1/citizens/register", "application/json",
-		strings.NewReader(`{"name":"Tamer","username":"tamer"}`))
+		strings.NewReader(`{"name":"Tamer","username":"tamer","email":"tamer@test.local"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

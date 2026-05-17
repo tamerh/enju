@@ -85,6 +85,7 @@ func seedClaimedTask(t *testing.T, s *store.Store, taskID string, deadline time.
 				Citizen: store.CitizenRecord{
 					Username:     "alice-" + taskID,
 					Name:         "alice",
+					Email:        "alice-" + taskID + "@test.local",
 					RegisteredAt: now,
 					LastSeen:     now,
 				},

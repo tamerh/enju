@@ -1668,21 +1668,6 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 	if err := ValidateUsername(c.Username); err != nil {
 		return 0, err
 	}
-	// Email + username uniqueness checks. Pre-INSERT so we can
-	// surface a friendly error instead of an opaque CONSTRAINT
-	// violation. Same logic the legacy Store.CreateCitizen had.
-	if c.Email != "" {
-		var count int
-		_ = tx.QueryRow(`SELECT COUNT(*) FROM citizens WHERE email = ?`, c.Email).Scan(&count)
-		if count > 0 {
-			return 0, fmt.Errorf("a citizen with this email already exists")
-		}
-	}
-	var uCount int
-	_ = tx.QueryRow(`SELECT COUNT(*) FROM citizens WHERE username = ?`, c.Username).Scan(&uCount)
-	if uCount > 0 {
-		return 0, fmt.Errorf("username %q is already taken", c.Username)
-	}
 
 	role := c.Role
 	if role == "" {
@@ -1690,11 +1675,72 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 	}
 	// kind + parent_id MUST be in the INSERT or the schema's
 	// column defaults silently override the caller's intent
-	// (kind=>'human', parent_id=>NULL). Phase 1.1 bug history.
+	// (kind=>'human', parent_id=>NULL).
 	kind := c.Kind
 	if kind == "" {
 		kind = CitizenKindHuman
 	}
+
+	// Resolve the tenant. A human root (no parent) is its own
+	// tenant — stamped post-insert once its id exists. An agent
+	// inherits its owner's tenant; the owner MUST resolve to a
+	// real tenant or we reject with ZERO rows written. An
+	// ownerless / tenantless agent is a contradiction the
+	// registration path must forbid (fail closed) — prevention
+	// belongs in the coordinator, not in client call-order
+	// etiquette.
+	var ownerTenant int64
+	isRoot := c.ParentID == nil
+	if !isRoot {
+		var pt sql.NullInt64
+		err := tx.QueryRow(`SELECT tenant_id FROM citizens WHERE id = ?`, *c.ParentID).Scan(&pt)
+		if err == sql.ErrNoRows {
+			return 0, fmt.Errorf("owner citizen %d not found — refusing to create an ownerless agent", *c.ParentID)
+		}
+		if err != nil {
+			return 0, fmt.Errorf("resolve owner tenant: %w", err)
+		}
+		if !pt.Valid {
+			return 0, fmt.Errorf("owner citizen %d has no tenant — refusing to create a tenantless agent", *c.ParentID)
+		}
+		ownerTenant = pt.Int64
+	}
+
+	// A human's global identity IS its email: mandatory and
+	// globally unique per kind='human'. An agent has no email
+	// (no real-world identity — the original "agents have no
+	// email" tell).
+	if kind == CitizenKindHuman {
+		if c.Email == "" {
+			return 0, fmt.Errorf("email is required for a human citizen")
+		}
+		var eCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM citizens WHERE email = ? AND kind = ?`,
+			c.Email, string(CitizenKindHuman),
+		).Scan(&eCount)
+		if eCount > 0 {
+			return 0, fmt.Errorf("a citizen with this email already exists")
+		}
+	}
+
+	// username is unique per (tenant, username). For an agent the
+	// tenant is known now (the owner's). A root is its own tenant,
+	// so its (tenant, username) pair is unique by construction —
+	// its identity is the email checked above. Pre-INSERT so the
+	// error is friendly; the composite unique index is the
+	// backstop.
+	if !isRoot {
+		var uCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM citizens WHERE username = ? AND tenant_id = ?`,
+			c.Username, ownerTenant,
+		).Scan(&uCount)
+		if uCount > 0 {
+			return 0, fmt.Errorf("username %q is already taken in this tenant", c.Username)
+		}
+	}
+
 	res, err := tx.Exec(
 		`INSERT INTO citizens (username, name, email, role, score, tasks_completed, tasks_rejected, tasks_timed_out, tasks_released, tokens_contributed, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
@@ -1704,6 +1750,18 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 		return 0, err
 	}
 	newID, _ := res.LastInsertId()
+
+	// Stamp the tenant: root = self, agent = owner's tenant. The
+	// composite unique index (tenant_id, username) enforces
+	// per-tenant handle uniqueness here as the backstop to the
+	// friendly pre-check above.
+	tenant := ownerTenant
+	if isRoot {
+		tenant = newID
+	}
+	if _, err := tx.Exec(`UPDATE citizens SET tenant_id = ? WHERE id = ?`, tenant, newID); err != nil {
+		return 0, fmt.Errorf("set tenant: %w", err)
+	}
 	// Seed the initial bearer token into the tokens table — the
 	// only auth authority (citizens has no token column). The
 	// token rides on the mutation, not the persisted citizen row.
