@@ -53,6 +53,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Version and help are flag-style shortcuts that work before
+	// subcommand dispatch so users coming from docker/curl muscle
+	// memory aren't surprised. `enju version` and `enju help`
+	// still work as subcommands for the same reason.
+	switch os.Args[1] {
+	case "--version", "-version":
+		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
+		return
+	case "--help", "-help", "-h", "help":
+		printUsage()
+		return
+	}
+
 	// Subcommands that touch enjugit/gitcli verbs need a system
 	// `git` binary new enough for the load-bearing primitives
 	// (notably merge-tree --write-tree --name-only, used by
@@ -103,7 +116,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`Enju (槐) — Distributed Human-AI Collaborative Problem Solving
+	fmt.Println(`Enju (槐) — Content-Neutral Coordinator for Human–AI Collaborative DAGs
 
 Usage:
  enju serve   Start the coordinator server
@@ -270,6 +283,22 @@ func cmdServe(args []string) {
 		logger.Info("received shutdown signal, draining HTTP server")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		// Tick progress lines every second so an operator who hit
+		// Ctrl-C can see the drain is actively running and not hung.
+		go func() {
+			tick := time.NewTicker(1 * time.Second)
+			defer tick.Stop()
+			elapsed := 0
+			for {
+				select {
+				case <-tick.C:
+					elapsed++
+					logger.Info("graceful shutdown in progress, waiting for in-flight requests to complete", "elapsed_s", elapsed)
+				case <-shutdownCtx.Done():
+					return
+				}
+			}
+		}()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
