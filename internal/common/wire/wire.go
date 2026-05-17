@@ -92,6 +92,14 @@ type Run struct {
 	// Surface readers (enju_run_status renderer) check
 	// state==waiting before parsing.
 	BlockedBy string `json:"blocked_by,omitempty"`
+	// YAML is the raw source recipe (pre-param-substitution)
+	// the run was created from. Opt-in only: the coordinator
+	// returns it solely on GET .../runs/{seq}?include=yaml, so
+	// it is empty on the default run payload and on older
+	// coordinators. Populated for every run (inline or
+	// template) when requested. Surfaced read-only on the run
+	// page beside the DAG.
+	YAML string `json:"yaml,omitempty"`
 }
 
 // Member is the JSON shape for one project membership row.

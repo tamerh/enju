@@ -1139,6 +1139,37 @@ func TestRunViewBadSeq(t *testing.T) {
 	}
 }
 
+// TestRunViewWorkflowYAML: the frozen-YAML disclosure renders
+// when the run carries YAML (coord honored ?include=yaml) and
+// is omitted otherwise (older coord / not requested).
+func TestRunViewWorkflowYAML(t *testing.T) {
+	withYAML := newTestServer(t, &fakeFC{
+		username: "tamer",
+		runDetail: &service.RunDetail{
+			Run: wire.Run{
+				Seq: 1, Name: "r", State: "active",
+				YAML: "name: smoke\nversion: 1\ntasks:\n  - id: t\n    action: answer",
+			},
+		},
+	})
+	rr := httptest.NewRecorder()
+	withYAML.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/r/1", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "Workflow YAML") || !strings.Contains(body, "name: smoke") {
+		t.Errorf("expected workflow-yaml disclosure with content; body: %q", body)
+	}
+
+	noYAML := newTestServer(t, &fakeFC{
+		username:  "tamer",
+		runDetail: &service.RunDetail{Run: wire.Run{Seq: 1, Name: "r", State: "active"}},
+	})
+	rr2 := httptest.NewRecorder()
+	noYAML.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1/r/1", nil))
+	if strings.Contains(rr2.Body.String(), "Workflow YAML") {
+		t.Errorf("disclosure must be omitted when run has no YAML")
+	}
+}
+
 // TestExportRun: GET /p/{pid}/r/{seq}/export.md streams the
 // Markdown report as an attachment with the right headers, and
 // the run page links to it.

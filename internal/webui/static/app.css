@@ -792,6 +792,19 @@ details summary {
   user-select: none;
 }
 
+/* Run-page frozen workflow YAML disclosure: sits under the DAG,
+   collapsed by default. The <pre> reuses .result-content. */
+.workflow-yaml {
+  margin-top: 1rem;
+}
+.workflow-yaml > summary {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.workflow-yaml .result-content {
+  margin-top: 0.6rem;
+}
+
 .iter-body {
   margin: 0.5rem 0 0;
   padding: 0.75rem;

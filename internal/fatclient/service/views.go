@@ -185,7 +185,11 @@ func (s *FatClient) ListRuns(ctx context.Context, projectID int64) ([]wire.Run, 
 // TODO(latency): parallelize the two GETs once a real workload
 // shows the sequential cost matters.
 func (s *FatClient) GetRun(ctx context.Context, projectID int64, runSeq int) (*RunDetail, error) {
-	runData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	// ?include=yaml opts into the run's source recipe (a few KB,
+	// off the default payload). The web run page renders it
+	// beside the DAG; one fetch per page navigation, not a hot
+	// poll, so always requesting it here is fine.
+	runData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d?include=yaml", projectID, runSeq))
 	if err != nil {
 		return nil, err
 	}

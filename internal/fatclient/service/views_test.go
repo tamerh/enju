@@ -196,6 +196,10 @@ func TestGetRun(t *testing.T) {
 			"branch":     "feature-x",
 			"task_count": 2,
 			"created_at": "2026-05-02T10:00:00Z",
+			// Coord returns this only because GetRun requests
+			// ?include=yaml; ServeMux ignores the query so the
+			// route still matches.
+			"yaml": "name: review\nversion: 1\n",
 		},
 		"/api/v1/projects/7/runs/2/tasks": []map[string]any{
 			{
@@ -224,6 +228,9 @@ func TestGetRun(t *testing.T) {
 	}
 	if got.Seq != 2 || got.State != "in_progress" {
 		t.Errorf("run mismatch: %+v", got.Run)
+	}
+	if got.YAML != "name: review\nversion: 1\n" {
+		t.Errorf("run YAML not decoded from ?include=yaml: %q", got.YAML)
 	}
 	if len(got.Tasks) != 2 {
 		t.Fatalf("want 2 tasks, got %d", len(got.Tasks))
