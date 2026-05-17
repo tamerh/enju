@@ -523,9 +523,13 @@ func cmdMCP(args []string) {
 		fmt.Fprintf(os.Stderr, "Welcome back, %s (@%s)\n", creds.Name, creds.Username)
 	}
 
+	// Fill any still-empty identity fields from git global config so
+	// the MCP config needs no -name / -email flags when git is set up.
+	resolveIdentity(name, email, username)
+
 	if *name == "" && *username == "" {
-		fmt.Fprintln(os.Stderr, "At least one of -name or -username is required")
-		fs.Usage()
+		fmt.Fprintln(os.Stderr, "Neither -name nor -username was provided and git config user.name is not set.")
+		fmt.Fprintln(os.Stderr, "Either pass -name \"Your Name\" or run: git config --global user.name \"Your Name\"")
 		os.Exit(1)
 	}
 
@@ -834,3 +838,4 @@ func registerCitizen(coordinatorURL, name, username, email string) (string, stri
 	token, _ := result["token"].(string)
 	return got, token, nil
 }
+

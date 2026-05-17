@@ -91,9 +91,11 @@ func cmdUI(args []string) {
 		}
 		fmt.Fprintf(os.Stderr, "Welcome back, %s (@%s)\n", creds.Name, creds.Username)
 	}
+	resolveIdentity(name, email, username)
+
 	if *name == "" && *username == "" {
-		fmt.Fprintln(os.Stderr, "At least one of -name or -username is required")
-		fs.Usage()
+		fmt.Fprintln(os.Stderr, "Neither -name nor -username was provided and git config user.name is not set.")
+		fmt.Fprintln(os.Stderr, "Either pass -name \"Your Name\" or run: git config --global user.name \"Your Name\"")
 		os.Exit(1)
 	}
 
