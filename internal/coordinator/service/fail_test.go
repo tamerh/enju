@@ -53,19 +53,19 @@ func TestFailTaskOwnershipOK(t *testing.T) {
 	}{
 		{
 			name:    "bot is the claimant → allowed (process+submit budget path)",
-			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindBot, Username: "dev-bot"},
+			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindAgent, Username: "dev-bot"},
 			task:    &store.TaskRecord{ID: "p:1:t", ClaimedBy: botID},
 			wantErr: false,
 		},
 		{
 			name:    "bot is NOT the claimant → ErrForbidden (claim-path cascade blocked)",
-			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindBot, Username: "lint-bot"},
+			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindAgent, Username: "lint-bot"},
 			task:    &store.TaskRecord{ID: "p:1:t", ClaimedBy: otherID},
 			wantErr: true,
 		},
 		{
 			name:    "bot, task unclaimed (the real lint-bot scenario) → ErrForbidden",
-			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindBot, Username: "lint-bot"},
+			caller:  &store.CitizenRecord{ID: botID, Kind: store.CitizenKindAgent, Username: "lint-bot"},
 			task:    &store.TaskRecord{ID: "p:1:t", ClaimedBy: 0},
 			wantErr: true,
 		},

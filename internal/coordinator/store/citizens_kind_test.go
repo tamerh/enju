@@ -68,7 +68,7 @@ func TestCitizenKindReadAfterDirectInsert(t *testing.T) {
 	_, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
-		"claude-tamer-bot", "Claude (tamer's bot)", now, now, string(CitizenKindBot), humanID,
+		"claude-tamer-bot", "Claude (tamer's bot)", now, now, string(CitizenKindAgent), humanID,
 	)
 	if err != nil {
 		t.Fatalf("insert bot: %v", err)
@@ -78,8 +78,8 @@ func TestCitizenKindReadAfterDirectInsert(t *testing.T) {
 	if err != nil || bot == nil {
 		t.Fatalf("bot lookup: %v / %v", err, bot)
 	}
-	if bot.Kind != CitizenKindBot {
-		t.Errorf("kind=%q, want %q", bot.Kind, CitizenKindBot)
+	if bot.Kind != CitizenKindAgent {
+		t.Errorf("kind=%q, want %q", bot.Kind, CitizenKindAgent)
 	}
 	if bot.ParentID == nil {
 		t.Fatal("parent_id is nil; want pointer to humanID")
@@ -117,7 +117,7 @@ func TestCreateCitizenHonorsKindAndParent(t *testing.T) {
 		Name:         "Tamer's Claude bot",
 		RegisteredAt: now,
 		LastSeen:     now,
-		Kind:         CitizenKindBot,
+		Kind:         CitizenKindAgent,
 		ParentID:     &humanID,
 	}, "tok-bot")
 	if err != nil {
@@ -130,8 +130,8 @@ func TestCreateCitizenHonorsKindAndParent(t *testing.T) {
 	if err != nil || bot == nil {
 		t.Fatalf("lookup: %v / %v", err, bot)
 	}
-	if bot.Kind != CitizenKindBot {
-		t.Errorf("kind=%q, want %q (CreateCitizen dropped Kind — schema default took over)", bot.Kind, CitizenKindBot)
+	if bot.Kind != CitizenKindAgent {
+		t.Errorf("kind=%q, want %q (CreateCitizen dropped Kind — schema default took over)", bot.Kind, CitizenKindAgent)
 	}
 	if bot.ParentID == nil {
 		t.Fatal("parent_id is nil — CreateCitizen dropped ParentID")

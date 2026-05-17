@@ -316,9 +316,11 @@ func (s *Store) initSchema() error {
 		option TEXT NOT NULL DEFAULT '',
 		-- model is the normalized model-name LABEL that produced
 		-- the words for this claim — a string, not a citizen FK
-		-- (a model has no identity). NULL/'' when no LLM produced
-		-- it (script tasks, unaided humans); agents must always
-		-- carry a model, enforced by requireModelForAgent.
+		-- (a model has no identity). Optional attribution: NULL/''
+		-- when no LLM produced the work (a script / compute task,
+		-- an unaided human), regardless of whether a human or an
+		-- agent ran it. Never forced — agent-ness does not imply
+		-- an LLM ran (an agent may run a script).
 		model TEXT
 	);
 
@@ -2319,9 +2321,9 @@ func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 	rows, err := s.db.Query(
 		// kind bound as a parameter from the constant — never a
 		// SQL literal — so the value is single-source (see
-		// CitizenKindBot / spec-bot-to-agent §4).
+		// CitizenKindAgent / spec-bot-to-agent §4).
 		`SELECT `+citizenColumns+` FROM citizens WHERE kind = ? AND parent_id = ? ORDER BY registered_at DESC`,
-		string(CitizenKindBot), parentID,
+		string(CitizenKindAgent), parentID,
 	)
 	if err != nil {
 		return nil, err

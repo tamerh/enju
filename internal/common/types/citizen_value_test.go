@@ -1,12 +1,11 @@
 package types
 
-// Pins the on-the-wire CitizenKind values. These are a product/API
-// surface: the Go identifier CitizenKindBot deliberately keeps its
-// historical name while its VALUE is "agent". Anyone who "fixes"
-// the name≠value mismatch by editing the value trips this test —
-// that is the point. It is the LOUD guard that makes the
-// single-source flip safe. There are exactly two kinds: a model is
-// NOT a kind (it has no identity; it is a label on the work).
+// Pins the on-the-wire CitizenKind values — an API/DB contract.
+// "human" and "agent" are persisted and cross the wire; changing
+// either string is a breaking change, so this LOUD guard trips if
+// someone edits a value. The legacy literal "bot" and the removed
+// "model" kind must NOT validate: there are exactly two kinds, and
+// a model is NOT one (it has no identity; it's a label on work).
 
 import "testing"
 
@@ -16,7 +15,7 @@ func TestCitizenKindWireValues(t *testing.T) {
 		want string
 	}{
 		{CitizenKindHuman, "human"},
-		{CitizenKindBot, "agent"}, // name keeps "Bot", wire value is "agent"
+		{CitizenKindAgent, "agent"},
 	}
 	for _, c := range cases {
 		if string(c.got) != c.want {

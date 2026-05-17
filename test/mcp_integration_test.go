@@ -489,9 +489,9 @@ func TestMCPRequestClarificationBotCaller(t *testing.T) {
 	if clarifySpawn == nil {
 		t.Fatalf("no task_spawned event for %s", clarifyTaskID)
 	}
-	if clarifySpawn.Subtype != string(store.CitizenKindBot) {
+	if clarifySpawn.Subtype != string(store.CitizenKindAgent) {
 		t.Errorf("bot caller: spawn subtype = %q, want %q (kind-derived trigger broken on the bot arm)",
-			clarifySpawn.Subtype, string(store.CitizenKindBot))
+			clarifySpawn.Subtype, string(store.CitizenKindAgent))
 	}
 	// Citizen field carries the actual handle regardless — sanity check.
 	if clarifySpawn.Citizen != botUsername {

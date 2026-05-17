@@ -3852,7 +3852,7 @@ func BotList(data []byte) string {
 		return "You don't own any agents yet. Use enju_register_agent to create one."
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Your bots (%d):\n", len(resp.Bots))
+	fmt.Fprintf(&b, "Your agents (%d):\n", len(resp.Bots))
 	for _, bot := range resp.Bots {
 		fmt.Fprintf(&b, "\n@%s — %s (role: %s)\n", bot.Username, bot.Name, bot.Role)
 		if len(bot.Tokens) == 0 {

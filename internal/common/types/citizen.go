@@ -5,11 +5,11 @@ package types
 //   - Human: a person. Default for rows where Kind="" — the
 //     discriminator was added later, so legacy/unset rows are
 //     normalized to "human" at read time.
-//   - Bot: an unattended citizen owned by a human (ParentID
+//   - Agent: an unattended citizen owned by a human (ParentID
 //     set), with its own token, that claims and executes tasks;
-//     its handler may be an LLM or a script. It MUST attribute
-//     its work to a model — the apply layer rejects agent
-//     submissions with an empty model.
+//     its handler may be an LLM or a script. Model attribution
+//     is optional, not forced by kind — a script/lint agent
+//     produces no LLM output and carries no model.
 //
 // A model is NOT a citizen kind. A model has no identity, no
 // row, no lifecycle — it is a normalized name stamped as a
@@ -18,13 +18,11 @@ type CitizenKind string
 
 const (
 	CitizenKindHuman CitizenKind = "human"
-	// CitizenKindBot is the unattended-citizen kind. The Go
-	// identifier keeps the historical "Bot" name (internal-only;
-	// renaming it would be pure churn) while the wire VALUE is
-	// "agent". The name≠value asymmetry is deliberate, not a bug
-	// — every consumer compares against this constant, never the
-	// literal, so this is the single source of the string.
-	CitizenKindBot CitizenKind = "agent"
+	// CitizenKindAgent is the unattended-citizen kind. The wire
+	// VALUE "agent" is the API/DB contract; every consumer
+	// compares against this constant, never the literal, so this
+	// is the single source of the string.
+	CitizenKindAgent CitizenKind = "agent"
 )
 
 // IsValidCitizenKind reports whether s is one of the declared
@@ -33,7 +31,7 @@ const (
 // CitizenKindHuman before calling.
 func IsValidCitizenKind(s string) bool {
 	switch CitizenKind(s) {
-	case CitizenKindHuman, CitizenKindBot:
+	case CitizenKindHuman, CitizenKindAgent:
 		return true
 	}
 	return false

@@ -134,7 +134,7 @@ After submitting, call enju_run_status to show the human the updated DAG tree �
 			mcp.Description(`Required for action:vote tasks: one of the declared option ids from the task's 'options:' YAML list (as shown in the claim response's Options block). Ignored on non-vote tasks.`),
 		),
 		mcp.WithString("model",
-			mcp.Description(`Optional per-call override for which model produced this result. Defaults to the model name from the session's -model flag. Use this when you switch models mid-session (e.g. opened MCP with claude-opus-4-7 but produced this specific result with claude-sonnet-4-6) so attribution lines up with reality. A model is a free-form label on the work, not a registered entity — any string is accepted as-is and stored verbatim; there is no model registration and no catalog requirement (a name with no display entry just renders raw). Ignored when empty — the session default applies; an agent must resolve to a non-empty model or the submit is rejected.`),
+			mcp.Description(`OPTIONAL attribution: which LLM produced this result. Supply it if you want the work credited to a model; leave it empty if no LLM produced it (a script / compute step, an unaided hand-decision) — empty is stored as "no model", never an error. It is never required: being an agent does not imply an LLM ran (an agent may run a script). A model is a free-form label, not a registered entity — any string is stored verbatim; there is no model registration and no catalog requirement (an unknown name just renders raw). Use it to switch models mid-session (e.g. opened with claude-opus-4-7 but produced this result with claude-sonnet-4-6) so the credit matches reality; empty falls back to the session -model default.`),
 		),
 	)
 }

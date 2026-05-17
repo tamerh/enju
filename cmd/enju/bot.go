@@ -743,22 +743,13 @@ func cmdBotRun(args []string) {
 		AuthToken:   creds.Token,
 		Logger:      logger,
 	})
-	// Provenance ("model") is the named producer of the agent's
-	// output, not necessarily an LLM — a free-form label stored
-	// verbatim (no registration); the coord only requires that an
-	// agent name SOMETHING. An LLM agent names its model; a
-	// non-LLM script handler's producer IS its script, so derive
-	// it when no model is declared and the handler isn't the
-	// claude/stub default. Without this a script-handler agent
-	// sends an empty model and the coord rightly refuses every
-	// claim/submit. Citizen identity is unchanged — this only
-	// fills the provenance slot.
+	// Provenance ("model") is an OPTIONAL attribution label — the
+	// LLM that produced the words, when one did. An LLM agent
+	// declares its model; a script-handler agent has none (its
+	// producer is the script, not an LLM) and correctly sends an
+	// empty model, stored as NULL. No derivation, no forcing:
+	// agent-ness does not imply an LLM ran.
 	modelName := bot.Model
-	if modelName == "" {
-		if h := strings.TrimSpace(bot.Handler); h != "" && h != "claude" && h != "stub" {
-			modelName = nonLLMModelName(h)
-		}
-	}
 	fc := service.New(service.Config{
 		Coord:           coordClient,
 		WorkspaceRoot:   wsRoot,

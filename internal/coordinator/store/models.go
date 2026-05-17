@@ -46,7 +46,7 @@ type CitizenKind = types.CitizenKind
 
 const (
 	CitizenKindHuman = types.CitizenKindHuman
-	CitizenKindBot   = types.CitizenKindBot
+	CitizenKindAgent   = types.CitizenKindAgent
 )
 
 // IsValidCitizenKind re-exports types.IsValidCitizenKind.

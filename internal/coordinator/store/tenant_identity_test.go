@@ -28,7 +28,7 @@ func mkAgent(t *testing.T, s *Store, username string, ownerID int64) (int64, err
 	now := time.Now()
 	return helperCreateCitizen(s, &CitizenRecord{
 		Username: username, Name: username,
-		Kind: CitizenKindBot, ParentID: &ownerID,
+		Kind: CitizenKindAgent, ParentID: &ownerID,
 		RegisteredAt: now, LastSeen: now,
 	}, "tok-"+username+"-"+time.Now().Format("150405.000000"))
 }

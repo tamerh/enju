@@ -121,7 +121,7 @@ func RegisterBot(s store.CoordinatorStore, caller *store.CitizenRecord, p Regist
 					Role:         role,
 					RegisteredAt: now,
 					LastSeen:     now,
-					Kind:         store.CitizenKindBot,
+					Kind:         store.CitizenKindAgent,
 					ParentID:     &caller.ID,
 				},
 				Token:      token,
@@ -148,7 +148,7 @@ func RegisterBot(s store.CoordinatorStore, caller *store.CitizenRecord, p Regist
 		ID:         id,
 		Username:   username,
 		Name:       p.Name,
-		Kind:       store.CitizenKindBot,
+		Kind:       store.CitizenKindAgent,
 		ParentID:   caller.ID,
 		ParentName: caller.Username,
 		Token:      token,
@@ -180,7 +180,7 @@ func RevokeToken(s store.CoordinatorStore, caller *store.CitizenRecord, token st
 	}
 	if ownerID != caller.ID {
 		owner, _ := s.GetCitizen(ownerID)
-		if owner == nil || owner.Kind != store.CitizenKindBot || owner.ParentID == nil || *owner.ParentID != caller.ID {
+		if owner == nil || owner.Kind != store.CitizenKindAgent || owner.ParentID == nil || *owner.ParentID != caller.ID {
 			return nil, fmt.Errorf("%w: you don't own this token", ErrForbidden)
 		}
 	}

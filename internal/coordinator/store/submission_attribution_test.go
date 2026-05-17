@@ -9,17 +9,16 @@ package store
 //     identity.
 //   - SetClaim and RecordSubmission carry the model string through
 //     to the row, both on insert (claim) and on update (submit).
-//   - The kind-based constraint applies at apply time (SQLite
-//     CHECK can't conditionally read citizens.kind):
-//       human + ""    → allowed (hand-review / script case)
+//   - model is OPTIONAL attribution, never forced by kind. Every
+//     combination is allowed; the model is just stored (or NULL):
+//       human + ""    → allowed (hand-review / script — no LLM)
 //       human + named → allowed (human at keyboard with an LLM)
-//       agent + ""    → REJECTED (an agent can't act with no model)
-//       agent + named → allowed
-//   - The constraint fires on BOTH paths (claim and submit), so an
-//     agent that drops its model gets caught regardless of when.
+//       agent + ""    → allowed (a script / lint agent — no LLM)
+//       agent + named → allowed (an LLM agent)
+//     agent-ness does NOT imply an LLM ran; there is no claim-time
+//     or submit-time model requirement.
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -136,11 +135,14 @@ func TestHumanWithModelRecordsBoth(t *testing.T) {
 	}
 }
 
-// TestAgentRequiresModelOnClaim — the load-bearing constraint. An
-// agent operator MUST name a model. The check fires at SetClaim
-// (the earliest point) so an agent can't even start work without
-// declaring its model.
-func TestAgentRequiresModelOnClaim(t *testing.T) {
+// TestAgentMayActWithoutModel — the model is OPTIONAL attribution,
+// never forced by kind. An agent can run a script (a lint-agent, a
+// compute step) where no LLM produced the work; agent-ness does
+// not imply an LLM ran. Claim AND submit with an empty model must
+// be accepted, and the stored model stays empty (NULL) — same as a
+// compute task. This pins the removal of the old "an agent must
+// name a model" rule (it falsely credited script work to a model).
+func TestAgentMayActWithoutModel(t *testing.T) {
 	s := newTestStore(t)
 	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
 
@@ -148,7 +150,7 @@ func TestAgentRequiresModelOnClaim(t *testing.T) {
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
-		"claude-tamer-bot", "Tamer's Claude agent", now, now, string(CitizenKindBot), humanID,
+		"lint-agent", "Lint Agent (script handler)", now, now, string(CitizenKindAgent), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -156,69 +158,20 @@ func TestAgentRequiresModelOnClaim(t *testing.T) {
 	botID, _ := res.LastInsertId()
 	stageTaskForClaim(t, s, "t1")
 
-	_, err = s.ApplyPlan(Plan{
-		Mutations: []Mutation{
-			SetClaim{
-				TaskID:    "t1",
-				CitizenID: botID,
-				Deadline:  time.Now().Add(time.Hour),
-				Model:     "",
-			},
-		},
-	})
-	if err == nil {
-		t.Fatal("agent claim with empty model was accepted; expected rejection")
-	}
-	if !strings.Contains(err.Error(), "agent") || !strings.Contains(err.Error(), "model is required") {
-		t.Errorf("error wording should mention agent + model requirement; got: %v", err)
-	}
-}
-
-// TestAgentRequiresModelOnSubmit — defense in depth. Even if the
-// claim somehow carried a model, applyRecordSubmission also rejects
-// an empty model for an agent, so an agent can't drop attribution
-// mid-flow.
-func TestAgentRequiresModelOnSubmit(t *testing.T) {
-	s := newTestStore(t)
-	humanID := createTestCitizen(t, s, "tamer", "tok-tamer")
-	now := time.Now()
-	res, err := s.db.Exec(
-		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
-		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
-		"reviewer-bot", "Reviewer Agent", now, now, string(CitizenKindBot), humanID,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	botID, _ := res.LastInsertId()
-	stageTaskForClaim(t, s, "t1")
-
-	// Claim WITH a model — that lands cleanly.
-	if _, err := s.ApplyPlan(Plan{
-		Mutations: []Mutation{
-			SetClaim{TaskID: "t1", CitizenID: botID, Deadline: time.Now().Add(time.Hour), Model: "claude-opus-4-7"},
-		},
-	}); err != nil {
-		t.Fatalf("setup claim with model: %v", err)
+	// Claim with NO model — accepted (a script agent has none).
+	if err := applyClaimSubmit(t, s, "t1", botID, ""); err != nil {
+		t.Fatalf("agent claim+submit with empty model must be accepted, got: %v", err)
 	}
 
-	// Submit WITHOUT a model — the constraint must catch this too.
-	_, err = s.ApplyPlan(Plan{
-		Mutations: []Mutation{
-			RecordSubmission{
-				TaskID:     "t1",
-				CitizenID:  botID,
-				ResultPath: "runs/1/test/result.md",
-				CommitSHA:  "abc",
-				Model:      "",
-			},
-		},
-	})
-	if err == nil {
-		t.Fatal("agent submit with empty model was accepted; expected rejection")
+	subs, _ := s.ListVoteSubmissions("t1")
+	if len(subs) != 1 {
+		t.Fatalf("got %d submissions, want 1", len(subs))
 	}
-	if !strings.Contains(err.Error(), "agent") {
-		t.Errorf("error should name the agent constraint; got: %v", err)
+	if subs[0].Model != "" {
+		t.Errorf("script agent's model = %q, want empty (no LLM produced the work)", subs[0].Model)
+	}
+	if subs[0].CitizenID != botID {
+		t.Errorf("operator = %d, want lint-agent %d", subs[0].CitizenID, botID)
 	}
 }
 
@@ -232,7 +185,7 @@ func TestAgentWithModelSucceeds(t *testing.T) {
 	res, err := s.db.Exec(
 		`INSERT INTO citizens (username, name, email, role, score, registered_at, last_seen, kind, parent_id)
 		 VALUES (?, ?, '', 'citizen', 0, ?, ?, ?, ?)`,
-		"developer-bot", "Developer Agent", now, now, string(CitizenKindBot), humanID,
+		"developer-bot", "Developer Agent", now, now, string(CitizenKindAgent), humanID,
 	)
 	if err != nil {
 		t.Fatal(err)

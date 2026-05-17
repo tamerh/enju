@@ -289,14 +289,13 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		AuthorName:  s.coord.CitizenName(),
 		AuthorEmail: s.coord.CitizenEmail(),
 		Username:    s.coord.Username(),
-		// Compute attribution uses the session model unconditionally,
-		// no per-call override path. Rationale: a citizen-action
-		// submit attributes the LLM that produced the words, which
-		// genuinely varies per turn. A compute submit attributes the
-		// citizen who LAUNCHED THE SCRIPT — the script itself
-		// produces deterministic bytes from code + inputs, not LLM
-		// output. The "who initiated" answer doesn't change mid-run.
-		Model:            s.modelName,
+		// A compute task is script-produced — no LLM ran — so the
+		// model attribution is empty. `model` answers "what
+		// produced the words", not "who launched it" (the operator
+		// citizen already records who). Stamping the session model
+		// here is a false credit: an `echo` step is not Opus
+		// output. Empty regardless of who ran it (human or agent).
+		Model:            "",
 		Container:        meta.Container,
 		ContainerRuntime: meta.ContainerRuntime,
 		Volumes:          meta.Volumes,

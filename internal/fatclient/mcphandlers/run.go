@@ -389,8 +389,8 @@ func (c *apiClient) handleRequestClarification(ctx context.Context, req mcp.Call
 	// author for context); we don't want their spawn event
 	// mislabeled.
 	trigger := string(types.CitizenKindHuman)
-	if c.citizenKind(ctx) == string(types.CitizenKindBot) {
-		trigger = string(types.CitizenKindBot)
+	if c.citizenKind(ctx) == string(types.CitizenKindAgent) {
+		trigger = string(types.CitizenKindAgent)
 	}
 
 	body := map[string]interface{}{

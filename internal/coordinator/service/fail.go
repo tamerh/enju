@@ -215,7 +215,7 @@ type FailTaskResponse struct {
 // broken." Path-independent — defends against any non-owning
 // caller, not just the daemon's claim path.
 func failTaskOwnershipOK(caller *store.CitizenRecord, task *store.TaskRecord) error {
-	if caller.Kind == store.CitizenKindBot && task.ClaimedBy != caller.ID {
+	if caller.Kind == store.CitizenKindAgent && task.ClaimedBy != caller.ID {
 		return fmt.Errorf(
 			"%w: bot %q is not the claimant of task %q (claimed_by=%d); a bot may only fail a task it holds",
 			ErrForbidden, caller.Username, task.ID, task.ClaimedBy)

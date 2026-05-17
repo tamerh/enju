@@ -987,12 +987,6 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 		citizens = 1
 	}
 
-	// Enforce "an agent must name a model" at apply time (SQLite
-	// CHECK can't conditionally read citizens.kind). Humans and
-	// scripts may act with no model.
-	if err := requireModelForAgent(tx, m.CitizenID, m.Model, "set_claim"); err != nil {
-		return err
-	}
 
 	// Phase 6c — iter_seq computation + reuse-on-reopen.
 	// Single-citizen reuse: if there's an open claim row for
@@ -1354,11 +1348,6 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		citizens = 1
 	}
 
-	// Same constraint as the claim path: an agent can't submit
-	// without naming a model; humans and scripts can.
-	if err := requireModelForAgent(tx, m.CitizenID, m.Model, "submit"); err != nil {
-		return err
-	}
 
 	// Phase 6c — find the open claim row for THIS citizen (or
 	// the latest one for single-citizen tasks where the
@@ -2191,32 +2180,6 @@ func applyCompleteRun(tx *sql.Tx, m CompleteRun, sink EventSink) (bool, error) {
 		CreatedAt: now,
 	})
 	return next == RunCompleted, nil
-}
-
-// requireModelForAgent enforces the operator/model rule: an agent
-// operator must always name the model that produced the words for
-// its action; a human (or a script) may act with no model. Used by
-// both applySetClaim and applyRecordSubmission so the constraint
-// kicks in whether the agent omits its model at claim time or at
-// submit time.
-//
-// This is now a trivial check — the actor's kind plus a string
-// presence test, no model-citizen lookup. Implemented in Go (not
-// SQL CHECK) because SQLite CHECK can't conditionally read the
-// operator's kind. The query is small (one row by primary key) and
-// runs inside the apply transaction, so consistency is preserved.
-func requireModelForAgent(tx *sql.Tx, operatorID int64, model, op string) error {
-	if model != "" {
-		return nil // model named — fine for any operator kind
-	}
-	var rawKind string
-	if err := tx.QueryRow(`SELECT kind FROM citizens WHERE id = ?`, operatorID).Scan(&rawKind); err != nil {
-		return fmt.Errorf("%s: read operator kind: %w", op, err)
-	}
-	if CitizenKind(rawKind) == CitizenKindBot {
-		return fmt.Errorf("%s: operator citizen %d is an agent — model is required (an agent cannot act without naming a model)", op, operatorID)
-	}
-	return nil
 }
 
 // nullableInt64 converts a *int64 to a value suitable for SQL
