@@ -756,6 +756,13 @@ func (s *Store) initSchema() error {
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_tenant_username ON citizens(tenant_id, username)`); err != nil {
 		return fmt.Errorf("schema: create idx_citizens_tenant_username: %w", err)
 	}
+	// A person's handle is globally unique too (policy on top of
+	// email-as-identity: no two humans share a username). Scoped
+	// to kind='human' so agents stay tenant-scoped — two owners
+	// may each have a "dev-bot".
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citizens_human_username ON citizens(username) WHERE kind = 'human'`); err != nil {
+		return fmt.Errorf("schema: create idx_citizens_human_username: %w", err)
+	}
 
 	// Branch-per-run artifact index migration. SQLite can't
 	// alter a PRIMARY KEY in place, so: check if the artifacts

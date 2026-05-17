@@ -1783,22 +1783,20 @@ func TestRegisterWithExplicitUsername(t *testing.T) {
 		t.Fatalf("expected error for invalid username format, got %v", resp)
 	}
 
-	// A different person (distinct email) reusing the same handle
-	// is ACCEPTED: username is a tenant-scoped handle, not a
-	// global identity. Each human root is its own tenant, so
-	// (tenant_id, username) does not collide. The thing that's
-	// globally unique for a human is the email (covered by
-	// TestDuplicateEmailRejected).
+	// A different person (distinct email) reusing an existing
+	// human handle is REJECTED: a person's username is globally
+	// unique — no two humans share a handle, so a bare @handle is
+	// unambiguous for people. (Agents stay tenant-scoped: two
+	// owners may each have a "dev-bot" — see the store-level
+	// tenant_identity tests. Email is still the hard identity:
+	// TestDuplicateEmailIsIdempotent.)
 	resp = s.post("/api/v1/citizens/register", map[string]string{
 		"name":     "Different Person",
 		"username": "tamerh",
 		"email":    "different@test.local",
 	})
-	if _, hasErr := resp["error"]; hasErr {
-		t.Fatalf("a distinct human reusing a handle should be accepted (handle is tenant-scoped), got %v", resp)
-	}
-	if u, _ := resp["username"].(string); u != "tamerh" {
-		t.Fatalf("expected the reused handle 'tamerh', got %v", resp["username"])
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("a distinct human reusing an existing handle must be rejected (human handle is globally unique), got %v", resp)
 	}
 }
 

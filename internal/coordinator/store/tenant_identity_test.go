@@ -143,6 +143,29 @@ func TestRegisterAgentFailsClosedOnUnresolvedOwner(t *testing.T) {
 	}
 }
 
+// TestHumanUsernameGloballyUnique — a person's handle is globally
+// unique (policy on top of email-as-identity: no two humans share
+// a username). Distinct from agents, which stay tenant-scoped
+// (TestTwoTenantsEachRegisterSameAgentHandle proves two owners can
+// each have a "dev-bot"). This is the asymmetry: humans global,
+// agents per-tenant.
+func TestHumanUsernameGloballyUnique(t *testing.T) {
+	s := newTestStore(t)
+	mkRoot(t, s, "tamer", "tamer-1@example.com")
+
+	now := time.Now()
+	_, err := helperCreateCitizen(s, &CitizenRecord{
+		Username: "tamer", Name: "Other Tamer", Email: "tamer-2@example.com",
+		RegisteredAt: now, LastSeen: now,
+	}, "tok-tamer-2")
+	if err == nil {
+		t.Fatal("a second human reusing an existing handle must be rejected")
+	}
+	if !strings.Contains(err.Error(), "already taken") {
+		t.Errorf("error should explain the handle collision; got: %v", err)
+	}
+}
+
 // TestEmailMandatoryForHuman — a human's global identity is its
 // email; creating one without an email is rejected.
 func TestEmailMandatoryForHuman(t *testing.T) {

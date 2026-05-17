@@ -1722,6 +1722,18 @@ func applyCreateCitizen(tx *sql.Tx, m CreateCitizen, sink EventSink) (int64, err
 		if eCount > 0 {
 			return 0, fmt.Errorf("a citizen with this email already exists")
 		}
+		// A person's handle is also globally unique (a policy on
+		// top of email-as-identity: no two people share a username,
+		// so a bare @handle is unambiguous for humans). Agents stay
+		// tenant-scoped — two owners may each have a "dev-bot".
+		var huCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM citizens WHERE username = ? AND kind = ?`,
+			c.Username, string(CitizenKindHuman),
+		).Scan(&huCount)
+		if huCount > 0 {
+			return 0, fmt.Errorf("username %q is already taken", c.Username)
+		}
 	}
 
 	// username is unique per (tenant, username). For an agent the
