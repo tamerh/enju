@@ -117,6 +117,15 @@ type TaskMeta struct {
 	// checks this out before writing + pushing so runs on
 	// parallel branches don't stomp on each other's files.
 	Branch string
+	// RunBaseSHA is the run's pinned base commit (project HEAD at
+	// create_run; the run snapshot is materialized from it). Used
+	// to validate that an iteration branch actually belongs to
+	// THIS run before materializing the agent claim CWD from it —
+	// iter-branch names collide across runs that share a slug, so
+	// a same-named ref left by a prior run must be rejected (it
+	// does not descend from this run's base). Empty for
+	// inline-yaml runs (no pinned source).
+	RunBaseSHA string
 	// IterationBranch is the per-iteration topic branch this
 	// citizen's claim writes to (e.g. "myrun/expand/iter-1").
 	// Forked from Branch (the run branch) at checkout time.
@@ -334,6 +343,9 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 	}
 	if v, ok := raw["run_branch"].(string); ok {
 		meta.Branch = v
+	}
+	if v, ok := raw["run_source_commit_sha"].(string); ok {
+		meta.RunBaseSHA = v
 	}
 	// iteration_branches is a username → topic-branch map
 	// from /tasks/{id}; pick out the branch for this citizen

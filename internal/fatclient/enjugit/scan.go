@@ -76,6 +76,15 @@ func (w *Workflow) LocalBranchHash(branch string) (string, error) {
 	return sha, translateGitError("local branch hash", err)
 }
 
+// IsAncestor reports whether `ancestor` is an ancestor of
+// `descendant` (git merge-base --is-ancestor). Empty or unknown
+// SHAs resolve to (false, nil), matching LocalBranchHash's
+// tolerant contract — callers branch on the bool, not the error.
+func (w *Workflow) IsAncestor(ancestor, descendant string) (bool, error) {
+	ok, err := w.git.IsAncestor(ancestor, descendant)
+	return ok, translateGitError("is ancestor", err)
+}
+
 // CheckoutBranch is a no-op when branch is "" (matches the
 // reconcile path's "skip switch when empty" semantics), else
 // equivalent to Checkout.

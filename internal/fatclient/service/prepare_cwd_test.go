@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -116,7 +117,7 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	runBranch := "main"
 
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
-		11, "dev-bot2", "11:1:summarize", 1, iterBranch, runBranch)
+		11, "dev-bot2", "11:1:summarize", 1, iterBranch, runBranch, "")
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD with absent iter branch ref: %v", err)
 	}
@@ -141,5 +142,178 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	}
 	if _, err := os.Stat(filepath.Join(path, "enju.yaml")); err != nil {
 		t.Errorf("enju.yaml not materialized in CWD %q: %v", path, err)
+	}
+}
+
+// prepareCWDFixture spins up the same ws/registry/fatclient shape
+// the test above uses, returning a workflow handle (for seeding
+// git state) and the fatclient (for the call under test).
+func prepareCWDFixture(t *testing.T, projectID int64) (*enjugit.Workflow, *FatClient) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := newProjectMetaServer(t, projectID, "main")
+	t.Cleanup(srv.Close)
+
+	wsRoot := t.TempDir()
+	regPath := filepath.Join(t.TempDir(), "projects.json")
+	reg := projectreg.Open(regPath)
+	projectPath := filepath.Join(wsRoot, "p")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Upsert(projectreg.Entry{ID: projectID, LocalPath: projectPath}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws, err := enjugit.NewWorkspace(wsRoot, enjugit.NewProductionConventions(), enjugit.WithLogger(logger), enjugit.WithRegistry(reg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf, err := ws.ForProject(projectID, "")
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+	fc := New(Config{
+		WorkspaceRoot:   ws.RootDir(),
+		ProjectRegistry: projectreg.Open(regPath),
+		Coord: coord.New(coord.Config{
+			BaseURL: srv.URL, Username: "dev-agent", AuthToken: "test", Logger: logger,
+		}),
+		Logger: logger,
+	})
+	return wf, fc
+}
+
+// gitT runs git in dir with a fixed identity, failing the test on
+// error. Used to build precise commit/branch topology directly —
+// enjugit's CommitArbitraryFiles/CheckoutBranchFrom don't compose
+// into "a commit on an arbitrary branch", so the per-iter-branch
+// scenarios need raw git.
+func gitT(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	c.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@e",
+		"GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@e")
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func writeRepoFile(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPrepareLLMClaimCWD_StaleIterBranch_NotDescendingFromBase_Rejected
+// is the regression for the run-reproducibility bug the bot→agent
+// rename surfaced. Iter-branch names (`<run-slug>/<task>/iter-N`)
+// collide across runs sharing a slug (slugs recur across coord
+// wipes), so a prior run leaves `1-test/review_summary/iter-1`
+// pinned to an OLD (pre-rename) tree. The trust test is descent
+// from THIS run's pinned base commit, which catches the
+// high-severity class: a prior run whose HEAD advanced has a
+// DIFFERENT baseSHA, so its leftover ref does not descend from
+// this run's base. This pins the *divergent* flavor — a ref left
+// by a failed/terminated prior run, never merged, so NOT an
+// ancestor of the run branch — which the ancestor-of-runBranch
+// heuristic missed and which recurred live on `review_summary`.
+// (Known residual, not covered here: two runs from an unchanged
+// HEAD share a baseSHA, so a same-base leftover still descends and
+// is trusted — lower severity, structural cure is run-unique
+// iter-branch names; see fatclient.go PrepareLLMClaimCWD.)
+// baseSHA set + ref not descending from it ⇒ reject ⇒ materialize
+// the pinned run tree.
+func TestPrepareLLMClaimCWD_StaleIterBranch_NotDescendingFromBase_Rejected(t *testing.T) {
+	wf, fc := prepareCWDFixture(t, 12)
+	wd := wf.WorkDir()
+
+	// OLD commit on main (pre-rename tree).
+	gitT(t, wd, "checkout", "-B", "main")
+	writeRepoFile(t, wd, "enju.yaml", "name: test\nversion: 1\n")
+	writeRepoFile(t, wd, "prompts/reviewer-bot2.md", "# old\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "old tree")
+
+	// A PRIOR run's iter branch forked at OLD, then DIVERGED with
+	// its own commit — never merged ⇒ NOT an ancestor of main (the
+	// flavor the ancestor-of-runBranch heuristic missed).
+	gitT(t, wd, "checkout", "-b", "1-test/review_summary/iter-1")
+	writeRepoFile(t, wd, "stale-marker.md", "# from a prior failed run\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "prior-run divergent submit")
+	gitT(t, wd, "checkout", "main")
+
+	// THIS run's pinned base = main after the rename.
+	writeRepoFile(t, wd, "prompts/reviewer-agent.md", "# renamed\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "rename prompt")
+	baseSHA := gitT(t, wd, "rev-parse", "HEAD")
+
+	path, err := fc.PrepareLLMClaimCWD(context.Background(),
+		12, "reviewer-agent", "12:1:review_summary", 1,
+		"1-test/review_summary/iter-1", "main", baseSHA)
+	if err != nil {
+		t.Fatalf("PrepareLLMClaimCWD: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected materialized CWD path, got empty")
+	}
+	// Stale ref does NOT descend from baseSHA ⇒ rejected ⇒ pinned
+	// run tree materialized (has the renamed prompt, not the stale
+	// divergent marker).
+	if _, err := os.Stat(filepath.Join(path, "prompts/reviewer-agent.md")); err != nil {
+		t.Errorf("prompts/reviewer-agent.md missing in CWD %q — materialized the STALE divergent iter branch (the recurred bug): %v", path, err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "stale-marker.md")); err == nil {
+		t.Errorf("stale-marker.md present in CWD %q — stale prior-run iter tree leaked in", path)
+	}
+}
+
+// TestPrepareLLMClaimCWD_GenuineInRunIterBranch_Used pins the other
+// side: a genuine re-claim's iter branch IS `baseSHA + this run's
+// submit`, so baseSHA is in its ancestry → it must still be used.
+// The fix must not regress the legitimate iter-branch fast-path.
+func TestPrepareLLMClaimCWD_GenuineInRunIterBranch_Used(t *testing.T) {
+	wf, fc := prepareCWDFixture(t, 13)
+	wd := wf.WorkDir()
+
+	// THIS run's pinned base.
+	gitT(t, wd, "checkout", "-B", "main")
+	writeRepoFile(t, wd, "enju.yaml", "name: test\nversion: 1\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "base")
+	baseSHA := gitT(t, wd, "rev-parse", "HEAD")
+
+	// Genuine in-run iteration: forked FROM base + this run's
+	// submit commit ⇒ descends from baseSHA (unmerged, so also not
+	// an ancestor of main — but baseSHA-descent is what matters).
+	gitT(t, wd, "checkout", "-b", "1-test/summarize/iter-1")
+	writeRepoFile(t, wd, "iter-only.md", "# in-progress iteration\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "iteration work")
+	gitT(t, wd, "checkout", "main")
+
+	path, err := fc.PrepareLLMClaimCWD(context.Background(),
+		13, "dev-agent", "13:1:summarize", 2,
+		"1-test/summarize/iter-1", "main", baseSHA)
+	if err != nil {
+		t.Fatalf("PrepareLLMClaimCWD: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected materialized CWD path, got empty")
+	}
+	// baseSHA is in the iter branch's ancestry ⇒ kept ⇒ the
+	// iteration's own file is present.
+	if _, err := os.Stat(filepath.Join(path, "iter-only.md")); err != nil {
+		t.Errorf("iter-only.md missing in CWD %q — the fix wrongly skipped a genuine in-run iter branch: %v", path, err)
 	}
 }

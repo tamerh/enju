@@ -356,7 +356,7 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 // git object missing). Callers log + fall back to the
 // persistent worktree to keep workflows progressing under
 // transient i/o trouble.
-func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch string) (string, error) {
+func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string) (string, error) {
 	if s.enjugit == nil || botUsername == "" || taskID == "" {
 		return "", nil
 	}
@@ -378,10 +378,68 @@ func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, bot
 	// branch has no ref on first iter-N claim (coord-assigned
 	// name, ref deferred until submit); run branch is the fork
 	// base and is guaranteed live by EnsureRunBranch at run create.
+	//
+	// CRITICAL: an iter-branch ref EXISTING is not enough to trust
+	// it. Iter-branch names are `<run-slug>/<task>/iter-N` and
+	// COLLIDE across different runs that share a slug (every run #1
+	// of a given workflow gets the same slug; slugs recur across
+	// coord wipes). A same-named ref left by a PRIOR run points at
+	// that run's (possibly stale) tree — materializing from it
+	// silently runs the wrong repo state (e.g. pre-rename prompt
+	// files), breaking run reproducibility for agent claims.
+	//
+	// Trust test: the iter branch must descend from THIS run's
+	// pinned base commit. A genuine in-run iteration branch is
+	// `baseSHA + this run's submit`, so baseSHA is in its history.
+	// This catches the HIGH-severity class — a prior run whose
+	// HEAD has since advanced has a DIFFERENT baseSHA, so its
+	// leftover same-named ref does not descend from this run's
+	// baseSHA (covers both flavors: merged into that prior run, or
+	// diverged from a failed/terminated one). The ancestor-of-
+	// runBranch heuristic caught only the merged flavor; baseSHA-
+	// descent catches both of these.
+	//
+	// KNOWN RESIDUAL (lower severity): two runs created from an
+	// UNCHANGED project HEAD share the same baseSHA (coord
+	// wiped+rerun without a project edit — the routine coord-vs-
+	// disk drift case). A prior run's leftover ref then DOES
+	// descend from the shared base, so this test trusts it and
+	// leaks that run's iteration edits. It is not the high-
+	// severity bug (same base ⇒ same project tree, so no stale
+	// pre-rename project code — that needs HEAD to move, which
+	// changes baseSHA and IS caught). The true cure is structural:
+	// iter-branch names are keyed on the recurring slug, a
+	// colliding namespace; run-unique names would close it
+	// entirely. baseSHA-descent is a detection layer over that
+	// namespace, not the fix for it — see [[project_coord_vs_disk_split]].
+	//
+	// baseSHA is empty for inline-yaml runs: those are UNPINNED by
+	// design (no source commit to be reproducible against), so
+	// there is nothing to anchor to — fall back to the prior
+	// best-effort heuristic (reject only an already-integrated
+	// ancestor ref). Whenever the iter branch is rejected, fall
+	// back to runBranch — the pinned, reproducible source the
+	// compute path also uses.
 	materializeFrom := iterBranch
 	if materializeFrom != "" {
-		if sha, _ := wf.LocalBranchHash(materializeFrom); sha == "" {
+		iterSHA, _ := wf.LocalBranchHash(materializeFrom)
+		if iterSHA == "" {
 			materializeFrom = ""
+		} else if baseSHA != "" {
+			// Correct anchor: trust the iter branch only if this
+			// run's pinned base commit is in its ancestry.
+			if anc, _ := wf.IsAncestor(baseSHA, iterSHA); !anc {
+				materializeFrom = ""
+			}
+		} else if runBranch != "" {
+			// Inline-yaml fallback (no baseSHA): best-effort —
+			// reject a same-named ref that is already-integrated
+			// history (ancestor of the run branch).
+			if runSHA, _ := wf.LocalBranchHash(runBranch); runSHA != "" {
+				if anc, _ := wf.IsAncestor(iterSHA, runSHA); anc {
+					materializeFrom = ""
+				}
+			}
 		}
 	}
 	if materializeFrom == "" {

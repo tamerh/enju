@@ -70,6 +70,13 @@ type TaskResponse struct {
 	SkipReason               string                 `json:"skip_reason,omitempty"`
 	ParkedFromState          string                 `json:"parked_from_state,omitempty"`
 	RunSourcePath            string                 `json:"run_source_path,omitempty"`
+	// RunSourceCommitSHA is the run's pinned base commit (project
+	// HEAD at create_run). Denormalized here alongside RunBranch so
+	// the fat-client can validate that an iteration branch belongs
+	// to THIS run — iter-branch names collide across runs that
+	// share a slug, and a same-named ref from a prior run does not
+	// descend from this run's base. Empty for inline-yaml runs.
+	RunSourceCommitSHA       string                 `json:"run_source_commit_sha,omitempty"`
 	RunBranch                string                 `json:"run_branch,omitempty"`
 	RunParams                map[string]interface{} `json:"run_params,omitempty"`
 	InstanceParamsMap        map[string]interface{} `json:"instance_params_map,omitempty"`
@@ -268,14 +275,16 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		runSeq        int
 		remoteURL     string
 		projectName   string
-		runSourcePath string
-		runBranch     string
-		runParams     map[string]interface{}
+		runSourcePath      string
+		runSourceCommitSHA string
+		runBranch          string
+		runParams          map[string]interface{}
 	)
 	if run, _ := s.GetRun(t.RunID); run != nil {
 		projectID = run.ProjectID
 		runSeq = run.Seq
 		runSourcePath = run.SourcePath
+		runSourceCommitSHA = run.SourceCommitSHA
 		runBranch = run.Branch
 		if run.Params != "" {
 			_ = json.Unmarshal([]byte(run.Params), &runParams)
@@ -336,8 +345,9 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		FailReason:        t.FailReason,
 		SkipReason:        t.SkipReason,
 		ParkedFromState:   t.ParkedFromState,
-		RunSourcePath:     runSourcePath,
-		RunBranch:         runBranch,
+		RunSourcePath:      runSourcePath,
+		RunSourceCommitSHA: runSourceCommitSHA,
+		RunBranch:          runBranch,
 		RunParams:         runParams,
 		InstanceParamsMap: instanceParams,
 		Env:               UnmarshalStringMapField(t.Env),
