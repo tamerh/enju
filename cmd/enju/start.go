@@ -78,6 +78,22 @@ func cmdStart(args []string) {
 	}
 	os.Remove(pidPath)
 
+	coordURL := fmt.Sprintf("http://localhost:%d", *port)
+	credsPath := resolveCredentialsPath("")
+
+	// Fail fast before starting anything if there are no credentials and no
+	// git config to auto-register from. Starting the coordinator in this state
+	// leaves it running but unusable — the user would have to stop it anyway.
+	if loadCredentialsAt(coordURL, credsPath) == nil {
+		if gitGlobalConfig("user.name") == "" && gitGlobalConfig("user.email") == "" {
+			fmt.Fprintln(os.Stderr, "Cannot start: no credentials found and git config user.name/user.email are not set.")
+			fmt.Fprintln(os.Stderr, "  git config --global user.name  \"Your Name\"")
+			fmt.Fprintln(os.Stderr, "  git config --global user.email \"you@example.com\"")
+			fmt.Fprintln(os.Stderr, "  Then run: enju start")
+			os.Exit(1)
+		}
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "start: resolve executable: %v\n", err)
@@ -104,7 +120,6 @@ func cmdStart(args []string) {
 		os.Exit(1)
 	}
 
-	coordURL := fmt.Sprintf("http://localhost:%d", *port)
 	if !waitForHTTP(coordURL+"/health", 5*time.Second) {
 		fmt.Fprintf(os.Stderr, "start: coordinator (PID %d) did not come up within 5s — check logs: %s\n", coordPID, coordLog)
 		os.Exit(1)
@@ -115,7 +130,6 @@ func cmdStart(args []string) {
 	// Auto-register from git global config if no credentials exist yet.
 	// This makes `enju start` zero-friction on first run — the user
 	// never has to run a separate registration step.
-	credsPath := resolveCredentialsPath("")
 	registered := false
 	if creds := loadCredentialsAt(coordURL, credsPath); creds == nil {
 		registered = autoRegister(coordURL, credsPath)
