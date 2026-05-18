@@ -486,7 +486,7 @@ func TestReportMergeE2E_DropBeforeHandler_SelfHeals(t *testing.T) {
 	})
 	fc := New(Config{Coord: c, Logger: logger})
 
-	if err := fc.reportMerge(context.Background(),
+	if _, err := fc.reportMerge(context.Background(),
 		fx.projectID, int64(fx.runSeq),
 		fx.taskID, fx.topic, fx.runBranch, fx.mergeSHA); err != nil {
 		t.Fatalf("reportMerge after retry must succeed, got: %v", err)
@@ -556,7 +556,7 @@ func TestReportMergeE2E_ForwardThenDropResponse_Idempotent(t *testing.T) {
 	})
 	fc := New(Config{Coord: c, Logger: logger})
 
-	if err := fc.reportMerge(context.Background(),
+	if _, err := fc.reportMerge(context.Background(),
 		fx.projectID, int64(fx.runSeq),
 		fx.taskID, fx.topic, fx.runBranch, fx.mergeSHA); err != nil {
 		t.Fatalf("reportMerge should self-heal via retry, got: %v", err)

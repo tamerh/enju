@@ -90,7 +90,7 @@ func TestReportMerge_RetriesOn503ThenSucceeds(t *testing.T) {
 	defer srv.Close()
 
 	fc := newReportMergeClient(t, srv.URL)
-	err := fc.reportMerge(context.Background(), 4, 6,
+	_, err := fc.reportMerge(context.Background(), 4, 6,
 		"4:1:i42:s4", "topic/run-6/4:1:i42:s4",
 		"run-6", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 	if err != nil {
@@ -127,7 +127,7 @@ func TestReportMerge_ExhaustsRetriesReturnsError(t *testing.T) {
 	defer srv.Close()
 
 	fc := newReportMergeClient(t, srv.URL)
-	err := fc.reportMerge(context.Background(), 4, 6,
+	_, err := fc.reportMerge(context.Background(), 4, 6,
 		"4:1:i42:s4", "topic/x", "run-6",
 		"cafef00dcafef00dcafef00dcafef00dcafef00d")
 	if err == nil {
@@ -172,7 +172,7 @@ func TestReportMerge_CtxCancellationBreaksOut(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err := fc.reportMerge(ctx, 4, 6, "4:1:i42:s4", "topic/x", "run-6", "deadbeef")
+	_, err := fc.reportMerge(ctx, 4, 6, "4:1:i42:s4", "topic/x", "run-6", "deadbeef")
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error on cancelled ctx")

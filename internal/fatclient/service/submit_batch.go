@@ -307,6 +307,13 @@ func (s *FatClient) reportBatchEntryToCoord(ctx context.Context, prep *preparedF
 	if mergeErr := s.applyAcceptedMerges(ctx, prep.Workflow, data); mergeErr != nil {
 		return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "error", Message: "auto-merging accepted topic branch: " + mergeErr.Error()}
 	}
+	// Parity with the single-submit path: the entry that completes
+	// the run must also run the run-completion sync (run branch →
+	// base merge/push from the workflow's sync: setting). Without
+	// this, a run whose final task lands via a batch submit would
+	// complete but never merge into the default branch.
+	// applyRunCompletion no-ops unless data carries run_completed.
+	s.applyRunCompletion(ctx, mergeWorkflowOrNil(prep.Workflow), prep.Meta, data)
 	return SubmitBatchEntryResult{TaskID: prep.TaskID, Status: "accepted", Message: string(data)}
 }
 

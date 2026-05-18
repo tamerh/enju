@@ -464,6 +464,17 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}, nil
 	}
 
+	// Run-completion sync (FF-merge the run branch into base, then
+	// push when sync:push) must fire on whichever path reports the
+	// final task result. The citizen single-submit path does this
+	// after its accepted-merges step; the compute path is reached
+	// by enju_execute_task and the enju_execute_run cascade, so
+	// without this a compute-final pipeline would complete but its
+	// branch would silently never merge into the default branch,
+	// regardless of the workflow's sync: setting. applyRunCompletion
+	// no-ops unless the report response carries run_completed.
+	s.applyRunCompletion(ctx, mergeWorkflowOrNil(wf), meta, reportData)
+
 	out := &ExecuteOutcome{
 		TaskID:           taskID,
 		Script:           meta.Script,

@@ -828,7 +828,12 @@ var reportMergeRetryBackoffs = []time.Duration{
 // can surface the failure through ExecuteOutcome — silent stall
 // is the failure mode this guards against. ctx cancellation
 // short-circuits the backoff sleep cleanly.
-func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) error {
+// Returns the coordinator's /merges response body on success. For
+// a task that landed on a per-iteration topic branch, the run
+// completes HERE (the SUBMITTED→ACCEPTED gate fires on /merges
+// receipt), so this body — not the submit response — is the one
+// that carries run_completed + the resolved sync mode.
+func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, mergeSHA string) ([]byte, error) {
 	body := map[string]interface{}{
 		"topic_branch": topicBranch,
 		"run_branch":   runBranch,
@@ -841,7 +846,7 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 	var lastErr error
 	for attempt := 0; attempt <= len(reportMergeRetryBackoffs); attempt++ {
 		if ctx.Err() != nil {
-			return fmt.Errorf("reportMerge cancelled (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
+			return nil, fmt.Errorf("reportMerge cancelled (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
 		}
 		data, err := s.coord.Post(ctx, path, body)
 		// The coord HTTP client doesn't surface non-2xx as a Go
@@ -862,7 +867,7 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 					"task_id", taskID, "topic_branch", topicBranch,
 					"merge_sha", mergeSHA, "attempts", attempt+1)
 			}
-			return nil
+			return data, nil
 		}
 		lastErr = err
 		if attempt == len(reportMergeRetryBackoffs) {
@@ -875,11 +880,11 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 			"backoff", backoff, "error", err)
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("reportMerge cancelled mid-backoff (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
+			return nil, fmt.Errorf("reportMerge cancelled mid-backoff (task=%s topic=%s): %w", taskID, topicBranch, ctx.Err())
 		case <-time.After(backoff):
 		}
 	}
-	return fmt.Errorf("reportMerge exhausted retries (task=%s topic=%s merge=%s): %w",
+	return nil, fmt.Errorf("reportMerge exhausted retries (task=%s topic=%s merge=%s): %w",
 		taskID, topicBranch, mergeSHA, lastErr)
 }
 
@@ -1129,10 +1134,21 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 	// loud failure via ExecuteOutcome instead.
 	if reportProjectID > 0 && reportRunSeq > 0 {
 		for _, rep := range reports {
-			if err := s.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
-				rep.topicBranch, rep.runBranch, rep.mergeSHA); err != nil {
+			mergeResp, err := s.reportMerge(ctx, reportProjectID, reportRunSeq, rep.taskID,
+				rep.topicBranch, rep.runBranch, rep.mergeSHA)
+			if err != nil {
 				return fmt.Errorf("post-merge report to coord: %w", err)
 			}
+			// For a topic-branch task the run completes HERE, not at
+			// submit — so the run-completion sync (run branch → base
+			// merge/push from the workflow's sync: setting) must be
+			// driven off the merge-report response. applyRunCompletion
+			// no-ops unless this body carries run_completed, so it's
+			// safe to call for every reported merge; it fires once,
+			// on the merge that finalized the run.
+			s.applyRunCompletion(ctx, mergeWorkflowOrNil(wf),
+				&TaskMeta{Branch: rep.runBranch, ProjectID: reportProjectID, RunSeq: int(reportRunSeq)},
+				mergeResp)
 		}
 	}
 	return nil

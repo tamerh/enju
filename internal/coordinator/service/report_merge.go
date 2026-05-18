@@ -29,6 +29,14 @@ type ReportMergeResponse struct {
 	MergeSHA     string             `json:"merge_sha"`
 	NewlyReady   []store.ReadiedTask `json:"newly_ready,omitempty"`
 	RunCompleted bool               `json:"run_completed,omitempty"`
+	// SyncMode/SyncRemote are the resolved run-completion sync
+	// config, populated only when RunCompleted=true. For tasks that
+	// land on a per-iteration topic branch, the run completes here
+	// (at the merge-report), not at submit — so the fat-client
+	// needs the sync mode on THIS response to drive the run-branch
+	// → base merge/push. Mirrors the submit response's fields.
+	SyncMode   string `json:"sync_mode,omitempty"`
+	SyncRemote string `json:"sync_remote,omitempty"`
 }
 
 // ReportMerge handles a successful FF/merge-commit landing of a
@@ -210,6 +218,14 @@ func ReportMerge(c *Coordinator, caller *store.CitizenRecord, projectID int64, r
 				}
 			}
 		}
+	}
+
+	// When this merge completed the run, resolve the sync config so
+	// the fat-client can run the run-completion sync off this
+	// response (the submit response never carried run_completed for
+	// a topic-branch task).
+	if resp.RunCompleted {
+		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
 	}
 
 	return resp, nil

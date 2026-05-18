@@ -826,6 +826,12 @@ tasks:
 // `lane-a` inherited lane-a's commits because CheckoutBranch
 // forked from current workspace HEAD. Post-fix, new branches
 // fork from `origin/main` (the project base), not from HEAD.
+//
+// The lane runs use sync:none so this isolates the fork-base
+// invariant: with run-completion sync active (the default,
+// merge), a completed lane-a would correctly land on main, and
+// lane-b forking from main would then legitimately contain it —
+// which would mask, not test, the HEAD-vs-base ancestry property.
 func TestMCPBranchForksFromProjectBaseNotWorkspaceHEAD(t *testing.T) {
 	h := newMCPHarness(t, "BranchAncestry")
 	projectID := h.createTestProject()
@@ -867,6 +873,11 @@ tasks:
     prompt: "x"
 `,
 		"branch": branch,
+		// Lane runs are branch-state scaffolding, not sync tests —
+		// keep their completion off the default branch so callers
+		// can assert branch ancestry without run-completion merge
+		// confounding the result.
+		"sync_mode_override": "none",
 	})
 	if err != nil || res.IsError {
 		t.Fatalf("create_run %q: err=%v body=%s", branch, err, mcpText(res))
