@@ -109,6 +109,21 @@
   {{end}}
 </header>
 
+{{/* The frozen source recipe this run was created from
+     (pre-param-substitution). Placed above the live region so
+     it's easy to consult while reading task progress, and
+     OUTSIDE #run-live so the 20s poll never collapses it.
+     Collapsed by default; empty only on older coordinators
+     that don't honor ?include=yaml. */}}
+{{if .Run.YAML}}
+<section>
+  <details class="workflow-yaml">
+    <summary>Workflow YAML <span class="muted small">— the recipe this run was created from</span></summary>
+    <pre class="result-content yaml-code" data-lang="yaml">{{.Run.YAML}}</pre>
+  </details>
+</section>
+{{end}}
+
 {{/* Live region: DAG + task table auto-refresh while the run
      is non-terminal. hx-select pulls just #run-live out of the
      normal full-page response (no dedicated endpoint), so the
@@ -177,18 +192,4 @@
   {{end}}
 </section>
 </div>
-
-{{/* The frozen source recipe this run was created from
-     (pre-param-substitution). OUTSIDE #run-live on purpose: a
-     20s poll must not collapse it while it's expanded.
-     Read-only; collapsed by default. Empty only on older
-     coordinators that don't honor ?include=yaml. */}}
-{{if .Run.YAML}}
-<section>
-  <details class="workflow-yaml">
-    <summary>Workflow YAML <span class="muted small">— the recipe this run was created from</span></summary>
-    <pre class="result-content">{{.Run.YAML}}</pre>
-  </details>
-</section>
-{{end}}
 {{end}}

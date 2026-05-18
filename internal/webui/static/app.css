@@ -835,6 +835,20 @@ details summary {
   margin-top: 0.6rem;
 }
 
+/* Minimal YAML token colors (set by the highlighter in app.js
+   on <pre data-lang="yaml">). Tuned for the light default;
+   dark overrides keep contrast on near-black. */
+.y-key     { color: #1d4ed8; font-weight: 600; }
+.y-str     { color: #047857; }
+.y-num     { color: #b45309; }
+.y-comment { color: #6b7280; font-style: italic; }
+.y-punct   { color: #6b7280; }
+[data-theme="dark"] .y-key     { color: #93c5fd; }
+[data-theme="dark"] .y-str     { color: #6ee7b7; }
+[data-theme="dark"] .y-num     { color: #fcd34d; }
+[data-theme="dark"] .y-comment { color: #9ca3af; }
+[data-theme="dark"] .y-punct   { color: #9ca3af; }
+
 .iter-body {
   margin: 0.5rem 0 0;
   padding: 0.75rem;
