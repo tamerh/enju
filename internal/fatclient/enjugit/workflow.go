@@ -118,6 +118,14 @@ func (w *Workflow) DefaultBranch() string {
 	return w.convs.DefaultRunBranch
 }
 
+// CurrentBranch returns the short name of the branch the worktree
+// is checked out on, "" for a detached HEAD. Errors only when
+// HEAD itself can't be resolved (empty/corrupt repo).
+func (w *Workflow) CurrentBranch() (string, error) {
+	_, branch, err := w.git.Head()
+	return branch, err
+}
+
 // WorkDir returns the worktree path for this workflow's clone.
 // Delegates to the underlying git.Ops; fakes return whatever
 // they're configured with.

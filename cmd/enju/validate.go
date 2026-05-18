@@ -44,6 +44,10 @@ type validateReport struct {
 	OK       bool     `json:"ok"`
 	Error    string   `json:"error,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
+	// RepoAdvisory: non-fatal git-state notes (parked on a run
+	// branch, uncommitted workflow). Separate from the workflow
+	// verdict — never affects OK or the exit code.
+	RepoAdvisory []string `json:"repo_advisory,omitempty"`
 }
 
 // validateOne returns true when the YAML at path is acceptable
@@ -70,6 +74,10 @@ func validateOne(path string, strict, asJSON bool) bool {
 	rep.Warnings = parsed.Warnings
 	hasWarnings := len(rep.Warnings) > 0
 	rep.OK = !(strict && hasWarnings)
+	// Best-effort env advisory — the workflow is fine; this is
+	// purely about the git state a run would execute against.
+	// Never feeds rep.OK / the exit code.
+	rep.RepoAdvisory = repoAdvisory(path)
 	emitReport(rep, asJSON)
 	return rep.OK
 }
@@ -95,5 +103,13 @@ func emitReport(r validateReport, asJSON bool) {
 	fmt.Printf("✓ %s\n", rel)
 	for _, w := range r.Warnings {
 		fmt.Printf("  ⚠ %s\n", w)
+	}
+	// Environment advisory — visually separated from the workflow
+	// verdict above so a clean ✓ is never muddied. Non-fatal.
+	if len(r.RepoAdvisory) > 0 {
+		fmt.Printf("\n⚠ environment (workflow is valid; this is your git state):\n")
+		for _, a := range r.RepoAdvisory {
+			fmt.Printf("  - %s\n", a)
+		}
 	}
 }

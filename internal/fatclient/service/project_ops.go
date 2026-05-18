@@ -139,6 +139,12 @@ type CreateProjectResult struct {
 	// fully materialized; the operator needs to retry or fix
 	// the on-disk inconsistency before the project is usable.
 	InitWarning string
+	// DefaultBranchWarning is a separate non-fatal advisory: the
+	// default branch was auto-detected from a HEAD parked on an
+	// enju run/iter branch, so the recorded default is likely
+	// wrong. Distinct from InitWarning (different cause, different
+	// remedy) so each surfaces with its own accurate framing.
+	DefaultBranchWarning string
 }
 
 // CreateProject creates a project on the coordinator and
@@ -208,7 +214,18 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 			initWarning = ierr.Error()
 		}
 	}
-	return &CreateProjectResult{CoordResponse: data, ProjectID: pid, InitWarning: initWarning}, nil
+	// Warn (don't silently accept) when the default branch was
+	// auto-detected from a HEAD parked on an enju run/iter branch.
+	var branchWarning string
+	if params.DefaultBranch == "" && target != nil {
+		branchWarning = suspiciousAdoptedDefaultBranch(target.DefaultBranch)
+	}
+	return &CreateProjectResult{
+		CoordResponse:        data,
+		ProjectID:            pid,
+		InitWarning:          initWarning,
+		DefaultBranchWarning: branchWarning,
+	}, nil
 }
 
 // AdoptionTarget classifies the on-disk state of a directory the

@@ -64,6 +64,9 @@ func (c *apiClient) handleCreateProject(ctx context.Context, req mcp.CallToolReq
 	if res.InitWarning != "" {
 		text += fmt.Sprintf("\n\n⚠ Local workspace not initialized — %s", res.InitWarning)
 	}
+	if res.DefaultBranchWarning != "" {
+		text += fmt.Sprintf("\n\n⚠ Default branch — %s", res.DefaultBranchWarning)
+	}
 	return mcp.NewToolResultText(text), nil
 }
 

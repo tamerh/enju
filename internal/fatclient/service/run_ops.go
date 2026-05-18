@@ -165,6 +165,17 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 		return nil, err
 	}
 
+	// Fail closed before EnsureBundleOnDefault if the worktree is
+	// parked on a non-default branch: that step enumerates the
+	// checked-out branch's index, and a run branch's committed
+	// output would otherwise surface as a cryptic git-ignored
+	// failure. This runs before any coordinator persist, so a
+	// rejected create_run leaves no ghost run.
+	cur, _ := wf.CurrentBranch()
+	if gerr := runTemplateBranchGuard(cur, wf.DefaultBranch(), wf.WorkDir()); gerr != nil {
+		return nil, gerr
+	}
+
 	// Template-as-recipe invariant: templates live on the
 	// project's default branch. If the bundle files aren't
 	// tracked there yet, auto-commit to default before the run
