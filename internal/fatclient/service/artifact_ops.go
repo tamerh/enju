@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -134,7 +135,7 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 	}
 	coordPath := fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path)
 	if branch != "" {
-		coordPath += "?branch=" + branch
+		coordPath += "?branch=" + url.QueryEscape(branch)
 	}
 	metaRaw, err := s.coord.Get(ctx, coordPath)
 	if err != nil {
@@ -201,7 +202,7 @@ func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, pat
 
 	coordPath := fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path)
 	if branch != "" {
-		coordPath += "?branch=" + branch
+		coordPath += "?branch=" + url.QueryEscape(branch)
 	}
 	currentCommitSHA := ""
 	if artData, err := s.coord.Get(ctx, coordPath); err == nil {
@@ -335,7 +336,7 @@ func (s *FatClient) ListUntrackedArtifacts(ctx context.Context, projectID int64,
 	}
 	listPath := fmt.Sprintf("/api/v1/projects/%d/artifacts", projectID)
 	if branch != "" {
-		listPath += "?branch=" + branch
+		listPath += "?branch=" + url.QueryEscape(branch)
 	}
 	data, err := s.coord.Get(ctx, listPath)
 	if err != nil {

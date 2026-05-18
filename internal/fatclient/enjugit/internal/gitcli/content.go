@@ -231,6 +231,9 @@ func (c *Clone) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit BlobVisitor)
 func (c *Clone) LogFile(relPath, branch string) ([]CommitInfo, error) {
 	args := []string{"log", "--format=%H%n%ct%n%an%n%B" + recordSep}
 	if branch != "" {
+		if strings.HasPrefix(branch, "--") {
+			return nil, fmt.Errorf("invalid branch name: %q", branch)
+		}
 		args = append(args, branch)
 	}
 	args = append(args, "--", relPath)

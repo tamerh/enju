@@ -576,6 +576,46 @@ func TestLogFileReturnsTouchingCommits(t *testing.T) {
 	}
 }
 
+// TestLogFileBranchParam is the load-bearing test for the branch
+// argument: a file committed only on a side branch must appear when
+// that branch is passed and must NOT appear when walking from HEAD
+// (the default branch). A regression that silently drops the branch
+// arg from the git-log invocation would pass the empty-branch case
+// but fail the branch case — exactly the gap this feature fixes.
+func TestLogFileBranchParam(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	commitWithMessage(t, dir, "base.txt", "x", "base commit")
+
+	// Create side branch and commit a file that never reaches main.
+	gitRun(t, dir, "checkout", "-b", "run-1")
+	commitWithMessage(t, dir, "result.txt", "output", "run-1 result")
+	gitRun(t, dir, "checkout", "main")
+
+	c, _ := OpenClone(dir, "", nullLogger())
+
+	// Walking from HEAD (main) must NOT see the run-1 commit.
+	infosMain, err := c.LogFile("result.txt", "")
+	if err != nil {
+		t.Fatalf("LogFile HEAD: %v", err)
+	}
+	if len(infosMain) != 0 {
+		t.Errorf("expected 0 entries from HEAD for branch-only file, got %d", len(infosMain))
+	}
+
+	// Walking from run-1 MUST see the commit.
+	infosRun, err := c.LogFile("result.txt", "run-1")
+	if err != nil {
+		t.Fatalf("LogFile run-1: %v", err)
+	}
+	if len(infosRun) != 1 {
+		t.Fatalf("expected 1 entry from run-1, got %d: %+v", len(infosRun), infosRun)
+	}
+	if !strings.Contains(infosRun[0].Message, "run-1 result") {
+		t.Errorf("unexpected commit message: %q", infosRun[0].Message)
+	}
+}
+
 // --- ScanBranchSince ---
 
 func TestScanBranchSinceBaselineReturnsTipNoVisits(t *testing.T) {
