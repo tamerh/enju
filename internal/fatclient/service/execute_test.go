@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/coord"
 )
 
@@ -182,18 +183,66 @@ func TestBuildComputeEnvHonorsTaskScratchDir(t *testing.T) {
 
 	envWith := buildComputeEnv("1:1:fetch",
 		"/some/work", ".enju/runs/1/fetch", "", "", "",
-		"/scratch/abc-iter-1", meta)
+		"/scratch/abc-iter-1", nil, meta)
 	if !containsEnv(envWith, "ENJU_TASK_DIR=/scratch/abc-iter-1") {
 		t.Errorf("ENJU_TASK_DIR missing or wrong: %v", envWith)
 	}
 
 	envWithout := buildComputeEnv("1:1:fetch",
 		"/some/work", ".enju/runs/1/fetch", "", "", "",
-		"", meta)
+		"", nil, meta)
 	for _, e := range envWithout {
 		if strings.HasPrefix(e, "ENJU_TASK_DIR=") {
 			t.Errorf("ENJU_TASK_DIR should be suppressed when scratch dir is empty, got: %v", e)
 		}
+	}
+}
+
+// TestBuildComputeEnvExportsWrites pins the ENJU_WRITES contract:
+// every declared output path (tracked AND track:false) is exported
+// newline-joined in declaration order, so a script learns where to
+// write without re-deriving from {{params}} or parsing context.json.
+// Always set — empty value when the task declares no writes — so a
+// script can rely on the var existing.
+func TestBuildComputeEnvExportsWrites(t *testing.T) {
+	meta := &TaskMeta{
+		WritesArtifacts: enjuYaml.WriteArtifacts{
+			{Path: "data/a/seed.txt", Track: true},
+			{Path: "out/big.bam", Track: false},
+		},
+	}
+	env := buildComputeEnv("1:1:gen",
+		"/some/work", ".enju/runs/1/gen", "", "", "",
+		"/scratch/x-iter-1", nil, meta)
+	if !containsEnv(env, "ENJU_WRITES=data/a/seed.txt\nout/big.bam") {
+		t.Errorf("ENJU_WRITES missing or wrong order/contents: %v", env)
+	}
+
+	envEmpty := buildComputeEnv("1:1:gen",
+		"/some/work", ".enju/runs/1/gen", "", "", "",
+		"/scratch/x-iter-1", nil, &TaskMeta{})
+	if !containsEnv(envEmpty, "ENJU_WRITES=") {
+		t.Errorf("ENJU_WRITES should be present (empty) with no declared writes: %v", envEmpty)
+	}
+}
+
+// TestBuildComputeEnvExportsReads mirrors the ENJU_WRITES pin for
+// its sibling: resolved declared input paths, newline-joined,
+// always set (empty when none) so a script can rely on the var.
+func TestBuildComputeEnvExportsReads(t *testing.T) {
+	env := buildComputeEnv("1:1:gen",
+		"/some/work", ".enju/runs/1/gen", "", "", "",
+		"/scratch/x-iter-1",
+		[]string{"data/a/seed.txt", "data/b/seed.txt"}, &TaskMeta{})
+	if !containsEnv(env, "ENJU_READS=data/a/seed.txt\ndata/b/seed.txt") {
+		t.Errorf("ENJU_READS missing or wrong order/contents: %v", env)
+	}
+
+	envEmpty := buildComputeEnv("1:1:gen",
+		"/some/work", ".enju/runs/1/gen", "", "", "",
+		"/scratch/x-iter-1", nil, &TaskMeta{})
+	if !containsEnv(envEmpty, "ENJU_READS=") {
+		t.Errorf("ENJU_READS should be present (empty) with no declared reads: %v", envEmpty)
 	}
 }
 

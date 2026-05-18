@@ -185,9 +185,10 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
 	}
 
-	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir, meta)
-
-	// context.json — structured companion to the env vars.
+	// Declared reads from the task record — resolved before the
+	// env is built so buildComputeEnv can export ENJU_READS
+	// alongside ENJU_WRITES (one place, symmetric, unit-testable);
+	// also feeds the reads materializer below.
 	var readsArtifacts []string
 	if rawTask, rerr := s.coord.Get(ctx, "/api/v1/tasks/"+taskID); rerr == nil {
 		var tm map[string]interface{}
@@ -201,6 +202,8 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 			}
 		}
 	}
+
+	env := buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir, readsArtifacts, meta)
 	// Phase 2.2 — resolve the run-branch tip so the wrapper can
 	// materialize each declared reads_artifacts entry from a
 	// pinned commit. Reading from the run-branch (not the
@@ -222,6 +225,19 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}
 	}
 
+	// writes_artifacts carries the per-entry track flag (object
+	// form) so a script can tell which of its declared outputs is
+	// untracked — it can't otherwise, and tracked vs track:false
+	// have different destinations. Non-nil → marshals as [] not
+	// null. These are the declared entries (glob/dir expansion
+	// against the worktree happens post-script in the wrapper).
+	writesCtx := make([]map[string]interface{}, 0, len(meta.WritesArtifacts))
+	for _, w := range meta.WritesArtifacts {
+		writesCtx = append(writesCtx, map[string]interface{}{
+			"path":  w.Path,
+			"track": w.Track,
+		})
+	}
 	contextPayload := map[string]interface{}{
 		"task_id":          taskID,
 		"task_def_id":      meta.TaskDefID,
@@ -229,7 +245,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		"iteration":        meta.InstanceParams,
 		"params":           meta.RunParams,
 		"reads_artifacts":  stringSliceNonNil(readsArtifacts),
-		"writes_artifacts": stringSliceNonNil(meta.WritesArtifacts.Paths()),
+		"writes_artifacts": writesCtx,
 	}
 	contextBytes, _ := json.MarshalIndent(contextPayload, "", "  ")
 	// Phase 2.6 — context.json lives in scratch (production) so the
@@ -576,7 +592,7 @@ func resolveSnapshotDirs(wf *enjugit.Workflow, meta *TaskMeta) (repoSnapshotDir,
 // ENJU_TASK_DIR so scripts can opt in to writing under a
 // per-task isolated location. Empty string suppresses the
 // export.
-func buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir string, meta *TaskMeta) []string {
+func buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, bigfilesDir, taskScratchDir string, reads []string, meta *TaskMeta) []string {
 	// Phase 2.3 / 2.5 — point ENJU_PROJECT_DIR at the scratch
 	// dir whenever scratch is set, regardless of execution mode.
 	// Direct-exec scripts run with cmd.Dir = scratch and see the
@@ -648,6 +664,18 @@ func buildComputeEnv(taskID, workDir, resultDir, templateDir, repoSnapshotDir, b
 	if taskScratchDir != "" {
 		env = append(env, "ENJU_SCRATCH="+taskScratchDir)
 	}
+	// ENJU_WRITES — the task's declared output paths, one per
+	// line, in declaration order. enju has already resolved these
+	// ({{param}}/{{item}} substituted); handing them over saves
+	// the script from re-deriving or parsing context.json for the
+	// common "where do I write" case. Single-output degenerates to
+	// a bare path. Per-entry track:false lives in context.json
+	// (env can't carry the flag).
+	env = append(env, "ENJU_WRITES="+strings.Join(meta.WritesArtifacts.Paths(), "\n"))
+	// ENJU_READS — the resolved declared input paths, the
+	// materialized-into-CWD counterpart of ENJU_WRITES. Same
+	// always-set contract (empty when none declared).
+	env = append(env, "ENJU_READS="+strings.Join(reads, "\n"))
 	for k, v := range meta.RunParams {
 		env = append(env, "ENJU_PARAM_"+k+"="+encodeParamEnv(v))
 	}

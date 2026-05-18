@@ -6741,16 +6741,41 @@ printf 'task_id=%s\n' "$(jq -r '.task_id' "$CTX")"
 	if iter == nil || iter["sha"] != "abc123" {
 		t.Errorf("context.iteration.sha = %v, want abc123", iter)
 	}
-	// reads/writes_artifacts always arrays, never null —
-	// even when the task declares neither (makes script
-	// consumers' null-checks simpler).
-	if _, ok := ctx["reads_artifacts"].([]interface{}); !ok {
+	// reads/writes_artifacts always arrays, never null — even
+	// when the task declares neither (script consumers' null-
+	// checks stay simple). The two are deliberately asymmetric:
+	// reads entries are plain path strings; writes entries are
+	// {path:string, track:bool} objects (track is a writes-only
+	// flag a script needs to know which outputs go to bigfiles).
+	// Asserting the element shape, not just "is an array", so a
+	// regression to flat strings can't pass silently.
+	rA, ok := ctx["reads_artifacts"].([]interface{})
+	if !ok {
 		t.Errorf("context.reads_artifacts should be an array (empty OK), got %T: %v",
 			ctx["reads_artifacts"], ctx["reads_artifacts"])
 	}
-	if _, ok := ctx["writes_artifacts"].([]interface{}); !ok {
+	for i, e := range rA {
+		if _, isStr := e.(string); !isStr {
+			t.Errorf("reads_artifacts[%d] should be a string, got %T: %v", i, e, e)
+		}
+	}
+	wA, ok := ctx["writes_artifacts"].([]interface{})
+	if !ok {
 		t.Errorf("context.writes_artifacts should be an array, got %T: %v",
 			ctx["writes_artifacts"], ctx["writes_artifacts"])
+	}
+	for i, e := range wA {
+		m, isObj := e.(map[string]interface{})
+		if !isObj {
+			t.Errorf("writes_artifacts[%d] should be a {path,track} object, got %T: %v", i, e, e)
+			continue
+		}
+		if _, isStr := m["path"].(string); !isStr {
+			t.Errorf("writes_artifacts[%d].path should be a string, got %T", i, m["path"])
+		}
+		if _, isBool := m["track"].(bool); !isBool {
+			t.Errorf("writes_artifacts[%d].track should be a bool, got %T", i, m["track"])
+		}
 	}
 
 }

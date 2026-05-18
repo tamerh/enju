@@ -813,13 +813,14 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// this list so the commit message body and the Enju-Artifacts
 	// trailer accurately reflect "what's in this commit" —
 	// untracked paths are never mentioned at the git layer.
-	// Tracked entries are walked against the worktree (where the
-	// script wrote them, and where the commit will pick them up).
-	// Untracked entries (track:false) are walked against the
-	// bigfiles dir — the per-branch sibling of the worktree where
-	// big data lives. Splitting the declaration list by Track
-	// flag and running ExpandAgainstWorkdir against the right
-	// root gives each kind its own home with no .gitignore trick.
+	// Both kinds are written cwd-relative by the script. Tracked
+	// entries are resolved against the CWD and read into the
+	// commit. Untracked entries (track:false) are first relocated
+	// CWD→bigfiles (relocateUntrackedToBigfiles, just below) then
+	// resolved against the bigfiles dir — the per-branch sibling
+	// of the worktree where big data lives, kept out of git with
+	// no .gitignore trick. Splitting by Track flag drives the two
+	// destinations from one declaration list.
 	trackedDecls, untrackedDecls := splitArtifactsByTrack(spec.WritesArtifacts)
 
 	// Tracked writes_artifacts expand against scratch when it's
@@ -847,6 +848,19 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	if len(untrackedDecls) > 0 && spec.BigfilesDir == "" {
 		res.Error = "BigfilesDir not set on Spec but task declares track:false outputs"
 		return res
+	}
+	// Option A: track:false outputs are written cwd-relative
+	// (same as tracked); relocate each into the bigfiles dir
+	// before resolving below. A file written straight to
+	// $ENJU_BIGFILES isn't in outputDir → left in place and
+	// still found by the resolve below (escape hatch). Runs
+	// before the commit so the worktree is clean of untracked
+	// files at checkout/merge (the Phase-2.6 invariant).
+	if len(untrackedDecls) > 0 {
+		if relErr := relocateUntrackedToBigfiles(outputDir, spec.BigfilesDir, untrackedDecls); relErr != nil {
+			res.Error = fmt.Sprintf("relocating untracked writes_artifacts: %v", relErr)
+			return res
+		}
 	}
 	untracked, missingU, expandErr := untrackedDecls.ExpandAgainstWorkdir(spec.BigfilesDir)
 	if expandErr != nil {

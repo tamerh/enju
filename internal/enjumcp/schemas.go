@@ -361,7 +361,7 @@ Environment variables exposed to the script:
   ENJU_TEMPLATE_DIR  — template snapshot dir, when instantiated from a bundle
   ENJU_PARAM_<name>  — every run param + for_each iteration var (lists comma-joined)
 
-Also writes $ENJU_RUN_DIR/context.json with structured task context (task_id, iteration, params, reads_artifacts, writes_artifacts) for scripts that need typed access beyond env vars. Read via jq/json in any language.
+Also writes $ENJU_RUN_DIR/context.json with structured task context (task_id, iteration, params, reads_artifacts, writes_artifacts) for scripts that need typed access beyond env vars — notably typed params (a list<string> stays a JSON array here, vs the comma-joined ENJU_PARAM_* string). Read via jq/json in any language. reads_artifacts is an array of path strings; writes_artifacts is an array of {"path": str, "track": bool} objects — the asymmetry is intentional (track is a writes-only flag telling a script which outputs are untracked/bigfiles).
 
 Declared writes paths are picked up from disk post-exit-0 and registered in the artifact index.
 
