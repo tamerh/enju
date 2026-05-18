@@ -913,9 +913,12 @@ details summary {
   font-size: 0.9rem;
   font-weight: 500;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--fg);
+  /* Soft accent treatment at rest (was a blank white pill).
+     Tinted fill + accent text + accent-tinted border — clearly
+     "a button", not loud like .btn-primary's solid fill. */
+  border: 1px solid rgba(37, 99, 235, 0.35);
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--accent);
   cursor: pointer;
   font-family: inherit;
   text-decoration: none;
@@ -923,7 +926,7 @@ details summary {
 }
 
 .btn:hover {
-  background: rgba(37, 99, 235, 0.08);
+  background: rgba(37, 99, 235, 0.16);
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -946,6 +949,12 @@ details summary {
 .btn-secondary {
   background: var(--bg);
   color: var(--muted);
+  border-color: var(--border);
+}
+.btn-secondary:hover {
+  background: rgba(37, 99, 235, 0.06);
+  color: var(--fg);
+  border-color: var(--muted);
 }
 
 .btn-danger {
@@ -956,7 +965,9 @@ details summary {
 .btn-danger:hover { background: #b91c1c; color: #fff; border-color: #b91c1c; }
 
 
-  [data-theme="dark"] .btn:hover { background: rgba(37, 99, 235, 0.18); }
+  [data-theme="dark"] .btn { background: rgba(37, 99, 235, 0.16); border-color: rgba(37, 99, 235, 0.5); color: #93c5fd; }
+  [data-theme="dark"] .btn:hover { background: rgba(37, 99, 235, 0.28); border-color: #93c5fd; color: #bfdbfe; }
+  [data-theme="dark"] .btn-secondary { background: transparent; color: var(--muted); border-color: var(--border); }
 
 
 /* .btn-row groups buttons horizontally with consistent gap.
