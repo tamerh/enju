@@ -81,6 +81,35 @@ func (c *apiClient) handleListMyBots(ctx context.Context, req mcp.CallToolReques
 	return mcp.NewToolResultText(format.BotList(data)), nil
 }
 
+func (c *apiClient) handleReissueAgentToken(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	username, _ := args["username"].(string)
+	if username == "" {
+		return mcp.NewToolResultError("username is required"), nil
+	}
+	body := map[string]interface{}{}
+	if label, _ := args["label"].(string); label != "" {
+		body["label"] = label
+	}
+	data, err := c.post(ctx, "/api/v1/citizens/me/agents/"+username+"/reissue", body)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return mcp.NewToolResultError("decode: " + err.Error()), nil
+	}
+	if errMsg, ok := resp["error"].(string); ok {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "✓ Token rotated for agent @%s\n", username)
+	fmt.Fprintf(&b, "\n  TOKEN (stash this NOW — cannot be retrieved later):\n  %s\n", resp["token"])
+	fmt.Fprintf(&b, "\n  All previous tokens for this agent have been revoked.\n")
+	return mcp.NewToolResultText(b.String()), nil
+}
+
 func (c *apiClient) handleRevokeToken(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	body := map[string]interface{}{}

@@ -464,6 +464,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case RevokeAllCitizenTokens:
+			if err := applyRevokeAllCitizenTokens(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		case SetAutoTriageTemplate:
 			if err := applySetAutoTriageTemplate(tx, m, sink); err != nil {
 				return result, err
@@ -1948,6 +1953,29 @@ func applyRevokeTokenByValue(tx *sql.Tx, m RevokeTokenByValue, sink EventSink) e
 			"token_id": tokenID,
 		}),
 		CreatedAt: time.Now(),
+	})
+	return nil
+}
+
+func applyRevokeAllCitizenTokens(tx *sql.Tx, m RevokeAllCitizenTokens, sink EventSink) error {
+	res, err := tx.Exec(
+		`UPDATE tokens SET revoked_at = ? WHERE citizen_id = ? AND revoked_at IS NULL`,
+		time.Now(), m.CitizenID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		sink.SkipEvents("revoke_all_citizen_tokens: no active tokens")
+		return nil
+	}
+	sink.Emit(Event{
+		CitizenID:    m.CitizenID,
+		EventType:    "tokens_revoked",
+		EventSubtype: "all",
+		Metadata:     MarshalMetadata(map[string]any{"count": n}),
+		CreatedAt:    time.Now(),
 	})
 	return nil
 }

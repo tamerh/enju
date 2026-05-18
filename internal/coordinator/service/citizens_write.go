@@ -199,6 +199,49 @@ func RevokeToken(s store.CoordinatorStore, caller *store.CitizenRecord, token st
 	return &RevokeTokenResponse{Revoked: true}, nil
 }
 
+// ReissueBotTokenResponse is the wire shape for enju_reissue_agent_token.
+type ReissueBotTokenResponse struct {
+	Token   string `json:"token"`
+	Warning string `json:"warning"`
+}
+
+// ReissueBotToken revokes all active tokens for the named agent and
+// issues a fresh one in a single atomic plan. Caller must parent the
+// agent (kind=agent, parent_id == caller.ID) — anyone else gets 403.
+// A leaked token cannot outlive rotation: old tokens are revoked
+// before the new one is created.
+func ReissueBotToken(s store.CoordinatorStore, caller *store.CitizenRecord, username string, label string) (*ReissueBotTokenResponse, error) {
+	if username == "" {
+		return nil, fmt.Errorf("%w: username is required", ErrInvalidArgument)
+	}
+	agent, err := s.GetCitizenByUsername(username)
+	if err != nil {
+		return nil, err
+	}
+	if agent == nil {
+		return nil, ErrNotFound
+	}
+	if agent.Kind != store.CitizenKindAgent || agent.ParentID == nil || *agent.ParentID != caller.ID {
+		return nil, fmt.Errorf("%w: you don't own this agent", ErrForbidden)
+	}
+	newToken := uuid.New().String()
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			// RevokeAllCitizenTokens is evaluated inside the tx,
+			// so no token issued concurrently can slip through.
+			store.RevokeAllCitizenTokens{CitizenID: agent.ID},
+			store.IssueToken{CitizenID: agent.ID, Token: newToken, Label: label},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return &ReissueBotTokenResponse{
+		Token:   newToken,
+		Warning: "Stash this token now — it cannot be retrieved later. Revoke + re-issue if lost.",
+	}, nil
+}
+
 // generateUniqueUsername picks an unused slug derived from
 // displayName. Mirrors api.Server.generateUniqueUsername.
 func generateUniqueUsername(s store.CoordinatorStore, displayName string) string {

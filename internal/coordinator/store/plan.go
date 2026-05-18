@@ -247,6 +247,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutRevokeTokenByValue:
 		var m RevokeTokenByValue
 		return m, json.Unmarshal(data, &m)
+	case MutRevokeAllCitizenTokens:
+		var m RevokeAllCitizenTokens
+		return m, json.Unmarshal(data, &m)
 	case MutSetAutoTriageTemplate:
 		var m SetAutoTriageTemplate
 		return m, json.Unmarshal(data, &m)
@@ -300,9 +303,10 @@ const (
 
 	MutSetCitizenRole       MutationKind = "set_citizen_role"
 	MutUpdateCitizenProfile MutationKind = "update_citizen_profile"
-	MutIssueToken           MutationKind = "issue_token"
-	MutRevokeToken          MutationKind = "revoke_token"
-	MutRevokeTokenByValue   MutationKind = "revoke_token_by_value"
+	MutIssueToken              MutationKind = "issue_token"
+	MutRevokeToken             MutationKind = "revoke_token"
+	MutRevokeTokenByValue      MutationKind = "revoke_token_by_value"
+	MutRevokeAllCitizenTokens  MutationKind = "revoke_all_citizen_tokens"
 
 	MutSetAutoTriageTemplate MutationKind = "set_auto_triage_template"
 )
@@ -354,6 +358,7 @@ var AllMutationKinds = []MutationKind{
 	MutIssueToken,
 	MutRevokeToken,
 	MutRevokeTokenByValue,
+	MutRevokeAllCitizenTokens,
 	MutSetAutoTriageTemplate,
 }
 
@@ -870,6 +875,18 @@ type RevokeTokenByValue struct {
 }
 
 func (RevokeTokenByValue) mutationKind() MutationKind { return MutRevokeTokenByValue }
+
+// RevokeAllCitizenTokens revokes every active token for a citizen
+// atomically inside the plan transaction. Using this instead of
+// pre-reading + per-token RevokeToken eliminates the TOCTOU window
+// where a token issued between the read and the plan write would
+// survive rotation. Evaluated via a single UPDATE ... WHERE
+// citizen_id = ? AND revoked_at IS NULL.
+type RevokeAllCitizenTokens struct {
+	CitizenID int64
+}
+
+func (RevokeAllCitizenTokens) mutationKind() MutationKind { return MutRevokeAllCitizenTokens }
 
 // SetAutoTriageTemplate persists the run-level auto-triage
 // rule (JSON-encoded RemediationTemplate). Empty TemplateJSON

@@ -242,6 +242,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/citizens/me/agents", s.handleRegisterBot)
 		r.Get("/citizens/me/agents", s.handleListMyBots)
 		r.Post("/tokens/revoke", s.handleRevokeToken)
+		r.Post("/citizens/me/agents/{username}/reissue", s.handleReissueBotToken)
 	})
 
 	return r

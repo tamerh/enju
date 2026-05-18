@@ -415,6 +415,8 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleRegisterBot, true
 	case "enju_revoke_token":
 		return c.handleRevokeToken, true
+	case "enju_reissue_agent_token":
+		return c.handleReissueAgentToken, true
 	case "enju_agent_start":
 		return c.handleBotStart, true
 	case "enju_agent_stop":

@@ -1182,6 +1182,19 @@ func ListMyBots() mcp.Tool {
 	)
 }
 
+func ReissueAgentToken() mcp.Tool {
+	return mcp.NewTool("enju_reissue_agent_token",
+		mcp.WithDescription("Rotate an agent's token: revokes all active tokens for the named agent and issues a fresh one in a single atomic operation. Caller must parent the agent. The new token appears once in the response — stash it immediately."),
+		mcp.WithString("username",
+			mcp.Required(),
+			mcp.Description("Agent username (from enju_list_my_agents)."),
+		),
+		mcp.WithString("label",
+			mcp.Description("Optional label for the fresh token (e.g. \"ci-server\", \"laptop\")."),
+		),
+	)
+}
+
 func RevokeToken() mcp.Tool {
 	return mcp.NewTool("enju_revoke_token",
 		mcp.WithDescription("Revoke a token. The token is preserved for audit (revoked_at timestamp set, row never deleted) but stops authenticating immediately. Self-service: callable by the token's owner directly — humans rotating their own session, or the parent of an agent whose token leaked. Pass either token (the raw string) OR token_id (from enju_list_my_agents)."),

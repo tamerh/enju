@@ -59,6 +59,7 @@ var Registry = []mcp.Tool{
 	RegisterBot(),
 	ListMyBots(),
 	RevokeToken(),
+	ReissueAgentToken(),
 	BotStart(),
 	BotStop(),
 	BotStatus(),

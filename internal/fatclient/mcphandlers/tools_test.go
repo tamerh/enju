@@ -120,6 +120,7 @@ var allToolFactories = []struct {
 	{"enju_register_agent", enjumcp.RegisterBot},
 	{"enju_list_my_agents", enjumcp.ListMyBots},
 	{"enju_revoke_token", enjumcp.RevokeToken},
+	{"enju_reissue_agent_token", enjumcp.ReissueAgentToken},
 	{"enju_agent_start", enjumcp.BotStart},
 	{"enju_agent_stop", enjumcp.BotStop},
 	{"enju_agent_status", enjumcp.BotStatus},

@@ -44,6 +44,8 @@ func cmdBot(args []string) {
 	switch args[0] {
 	case "setup":
 		cmdBotSetup(args[1:])
+	case "rotate":
+		cmdBotRotate(args[1:])
 	case "run":
 		cmdBotRun(args[1:])
 	// Stop / status / logs are MCP tools (enju_agent_stop,
@@ -68,6 +70,11 @@ func printBotUsage() {
             stash each bot's auth token at the manifest's
             credentials path. Idempotent — bots whose credentials
             file already exists are skipped.
+
+ enju agent rotate <username>
+            Revoke all active tokens for the named agent and mint
+            a fresh one. Stash the new token immediately — it is
+            shown once and cannot be retrieved.
 
  enju agent run --workflow path/to/workflow.yaml --agent <name>
             Run the bot daemon — polls the coordinator for ready
@@ -244,6 +251,92 @@ func cmdBotSetup(args []string) {
 	}
 }
 
+// cmdBotRotate revokes all active tokens for the named agent and
+// mints a fresh one, then stashes it at the credential file path
+// recorded when the agent was set up. Useful when a token leaks:
+// the old token stops working immediately and the new one is
+// stashed in place of the old file.
+func cmdBotRotate(args []string) {
+	fs := flag.NewFlagSet("agent rotate", flag.ExitOnError)
+	coordinator := fs.String("coordinator", defaultCoordinatorURL(), "Coordinator URL")
+	credsPath := fs.String("credentials", "", "Path to owner credentials.json (default ~/.enju/credentials.json)")
+	label := fs.String("label", "", "Optional label for the fresh token")
+	credsDest := fs.String("dest", "", "Path to write the new bot credentials file. If omitted, the token is printed to stdout for manual stashing.")
+	botName := fs.String("name", "", "Bot display name for the credentials file (optional — only used when writing a new credentials file)")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: enju agent rotate <username> [flags]")
+		os.Exit(1)
+	}
+	username := fs.Arg(0)
+
+	resolvedOwnerCreds := resolveCredentialsPath(*credsPath)
+	owner := loadCredentialsAt(*coordinator, resolvedOwnerCreds)
+	if owner == nil || owner.Token == "" {
+		fmt.Fprintf(os.Stderr, "No owner credentials found at %s — run `enju mcp` once to register your identity first.\n", resolvedOwnerCreds)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	body := map[string]string{}
+	if *label != "" {
+		body["label"] = *label
+	}
+	jsonBody, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", *coordinator+"/api/v1/citizens/me/agents/"+username+"/reissue", bytes.NewReader(jsonBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build request: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+owner.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reissue request: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "reissue failed (%d): %s\n", resp.StatusCode, string(respBody))
+		os.Exit(1)
+	}
+	var out struct {
+		Token   string `json:"token"`
+		Warning string `json:"warning"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil || out.Token == "" {
+		fmt.Fprintf(os.Stderr, "decoding response: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Stash the new token if --dest was supplied; otherwise print it
+	// for manual stashing.
+	destPath := *credsDest
+	displayName := *botName
+	if displayName == "" {
+		displayName = username
+	}
+
+	if destPath != "" {
+		if err := writeBotCredentials(destPath, *coordinator, username, displayName, out.Token); err != nil {
+			fmt.Fprintf(os.Stderr, "\nWARNING: credential file could not be written: %v\n", err)
+			fmt.Fprintf(os.Stderr, "SAVE THIS TOKEN NOW — it cannot be retrieved later:\n\n  %s\n\nTo recover later: enju agent rotate %s\n", out.Token, username)
+			os.Exit(2)
+		}
+		fmt.Printf("✓ Token rotated for @%s — new credentials at %s\n", username, destPath)
+	} else {
+		// No destination path supplied: print the token with the
+		// one-time warning so the operator can stash it manually.
+		fmt.Printf("✓ Token rotated for @%s\n", username)
+		fmt.Printf("\nTOKEN (stash this NOW — cannot be retrieved later):\n\n  %s\n\n", out.Token)
+		fmt.Printf("To stash: enju agent rotate %s --dest=<path/to/bot.json>\n", username)
+	}
+}
+
 // botSetupResult summarizes setupBotIfNeeded's outcome so callers
 // can render a one-line status without re-running the existence
 // check. Status mirrors the cmdBotSetup tally vocabulary so
@@ -292,10 +385,38 @@ func setupBotIfNeeded(ctx context.Context, coordinator string, owner *credential
 
 	token, username, err := registerBot(ctx, coordinator, owner.Token, b)
 	if err != nil {
+		// 409 means a citizen with that username already exists.
+		// Check whether the caller owns it — if yes, rotate the
+		// token so setup becomes idempotent even when the local
+		// credentials file was lost. If someone else owns it,
+		// surface the conflict so the operator can pick a different
+		// name.
+		if strings.Contains(err.Error(), "coord 409") {
+			token, err2 := reissueBotToken(ctx, coordinator, owner.Token, b.Name)
+			if err2 != nil {
+				// 403 = someone else owns that username — real conflict.
+				// 404 = username doesn't exist as an agent owned by us.
+				// Either way: surface the original 409 message.
+				return botSetupResult{}, fmt.Errorf("register: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "  Agent already registered — rotating token.\n")
+			if writeErr := writeBotCredentials(b.Credentials, coordinator, b.Name, b.Name, token); writeErr != nil {
+				warnStashFailure(b.Credentials, b.Name, token, writeErr)
+				return botSetupResult{}, fmt.Errorf("credential file could not be written (token shown above)")
+			}
+			res := botSetupResult{Status: "registered", Username: b.Name}
+			if effectiveProjectID > 0 {
+				if err := addBotToProject(ctx, coordinator, owner.Token, effectiveProjectID, b.Name); err == nil {
+					res.AddedToPr = true
+				}
+			}
+			return res, nil
+		}
 		return botSetupResult{}, fmt.Errorf("register: %w", err)
 	}
 	if err := writeBotCredentials(b.Credentials, coordinator, username, b.Name, token); err != nil {
-		return botSetupResult{}, fmt.Errorf("token issued by coord but couldn't be written to %s: %w (token: %s — stash this NOW or the bot is unrecoverable)", b.Credentials, err, token)
+		warnStashFailure(b.Credentials, username, token, err)
+		return botSetupResult{}, fmt.Errorf("credential file could not be written (token shown above)")
 	}
 	res := botSetupResult{Status: "registered", Username: username}
 	if effectiveProjectID > 0 {
@@ -352,6 +473,48 @@ func registerBot(ctx context.Context, coordURL, ownerToken string, b *bots.Bot) 
 		return "", "", fmt.Errorf("coord returned empty token")
 	}
 	return out.Token, out.Username, nil
+}
+
+// warnStashFailure prints the loud banner the operator needs when a
+// server-side token was minted but the local credentials file write
+// failed. The token is printed to stdout so it can be captured by
+// scripts or piped to a file even if stderr is redirected.
+func warnStashFailure(credPath, username, token string, writeErr error) {
+	fmt.Fprintf(os.Stderr, "\nWARNING: credential file could not be written: %v\n", writeErr)
+	fmt.Printf("SAVE THIS TOKEN NOW — it cannot be retrieved later:\n\n  %s\n\nTo recover later: enju agent rotate %s\n", token, username)
+}
+
+// reissueBotToken calls POST /api/v1/bots/{username}/reissue and
+// returns the fresh token. Returns an error when the caller doesn't
+// own the agent (403) or the username doesn't exist as an owned
+// agent (404 or other non-200). Used by setupBotIfNeeded's 409
+// self-heal path to rotate tokens when a credentials file was lost.
+func reissueBotToken(ctx context.Context, coordURL, ownerToken, username string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", coordURL+"/api/v1/citizens/me/agents/"+username+"/reissue", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ownerToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("coord %d: %s", resp.StatusCode, string(respBody))
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return "", fmt.Errorf("decoding response: %w", err)
+	}
+	if out.Token == "" {
+		return "", fmt.Errorf("coord returned empty token")
+	}
+	return out.Token, nil
 }
 
 // ensureBotMembership best-effort adds botUsername to projectID

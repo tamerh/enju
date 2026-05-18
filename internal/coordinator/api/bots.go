@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/enju-ai/enju/internal/coordinator/service"
@@ -72,6 +73,48 @@ func (s *Server) handleListMyBots(w http.ResponseWriter, r *http.Request) {
 	resp, err := service.ListMyBots(s.store, caller)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list bots: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type reissueTokenRequest struct {
+	Label string `json:"label,omitempty"` // optional label for the fresh token
+}
+
+// handleReissueBotToken revokes every active token for the named
+// agent and issues a fresh one atomically. Caller must parent the
+// agent — ownership enforced in the service layer. The new token
+// appears ONCE in the response; treat it the same as a registration
+// token.
+func (s *Server) handleReissueBotToken(w http.ResponseWriter, r *http.Request) {
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	username := r.PathValue("username")
+	if username == "" {
+		writeError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	var req reissueTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	resp, err := service.ReissueBotToken(s.store, caller, username, req.Label)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrForbidden):
+			writeError(w, http.StatusForbidden, err.Error())
+		case err == service.ErrNotFound:
+			writeError(w, http.StatusNotFound, "agent not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "reissue: "+err.Error())
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
