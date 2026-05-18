@@ -85,9 +85,43 @@
     document.querySelectorAll('pre:not(.mermaid):not([data-copy-attached="1"])').forEach(attachCopyButton);
   }
 
+  // Light/dark toggle. Light is the default (no attribute);
+  // dark sets data-theme="dark" on <html> and persists to
+  // localStorage. The no-flash head script in layout.html
+  // applies the saved choice before paint; this only wires the
+  // button + keeps its glyph in sync. The button lives in the
+  // topnav (outside #main), so it survives HTMX swaps — wire
+  // once.
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'dark'
+      ? 'dark' : 'light';
+  }
+  function syncToggleGlyph(btn) {
+    // Show the action, not the state: 🌙 = "switch to dark",
+    // ☀️ = "switch to light".
+    btn.textContent = currentTheme() === 'dark' ? '☀️' : '🌙';
+  }
+  function initThemeToggle() {
+    const btn = document.getElementById('theme-toggle');
+    if (!btn || btn.dataset.wired === '1') return;
+    btn.dataset.wired = '1';
+    syncToggleGlyph(btn);
+    btn.addEventListener('click', function () {
+      const next = currentTheme() === 'dark' ? 'light' : 'dark';
+      if (next === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      } else {
+        document.documentElement.removeAttribute('data-theme');
+      }
+      try { localStorage.setItem('enjuTheme', next); } catch (e) {}
+      syncToggleGlyph(btn);
+    });
+  }
+
   function init() {
     prefetchIcons();
     attachAll();
+    initThemeToggle();
   }
 
   if (document.readyState === 'loading') {

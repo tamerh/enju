@@ -12,14 +12,14 @@
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
+
+  :root[data-theme="dark"] {
     --fg: #f3f4f6;
     --bg: #0b0b0c;
     --muted: #9ca3af;
     --border: #27272a;
   }
-}
+
 
 body {
   margin: 0;
@@ -57,6 +57,23 @@ body {
 }
 .topnav .who:hover { color: var(--accent); }
 
+/* Light/dark toggle — small icon button on the right of the
+   topnav. Light is the default; this opt-in flips data-theme
+   on <html> and persists it (see app.js + the no-flash head
+   script in layout.html). */
+.theme-toggle {
+  margin-left: 1rem;
+  padding: 0.2rem 0.45rem;
+  font-size: 0.95rem;
+  line-height: 1;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.theme-toggle:hover { border-color: var(--accent); }
+
 /* Compact list of task links — used by the Me page's
    active-claims and recent-completions sections. Same shape
    as a bulleted list but tighter spacing and smaller font. */
@@ -83,9 +100,9 @@ body {
   color: #065f46;
   border: 1px solid #6ee7b7;
 }
-@media (prefers-color-scheme: dark) {
-  .banner-success { background: #064e3b; color: #d1fae5; border-color: #047857; }
-}
+
+  [data-theme="dark"] .banner-success { background: #064e3b; color: #d1fae5; border-color: #047857; }
+
 
 /* Banner warn variant — non-fatal yaml.Parse advisories on the
    new-run page (author can still create the run). */
@@ -99,9 +116,9 @@ body {
   border: 1px solid #fcd34d;
 }
 .banner-warn ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
-@media (prefers-color-scheme: dark) {
-  .banner-warn { background: #78350f; color: #fef3c7; border-color: #b45309; }
-}
+
+  [data-theme="dark"] .banner-warn { background: #78350f; color: #fef3c7; border-color: #b45309; }
+
 
 main {
   max-width: 960px;
@@ -331,14 +348,14 @@ main {
 .state-paused    { background: #fef3c7; color: #92400e; }
 .state-terminated { background: #f3f4f6; color: #4b5563; }
 
-@media (prefers-color-scheme: dark) {
-  .state-active   { background: #1e3a8a; color: #dbeafe; }
-  .state-waiting  { background: #312e81; color: #e0e7ff; }
-  .state-completed { background: #064e3b; color: #d1fae5; }
-  .state-failed    { background: #7f1d1d; color: #fee2e2; }
-  .state-paused    { background: #78350f; color: #fef3c7; }
-  .state-terminated { background: #374151; color: #f3f4f6; }
-}
+
+  [data-theme="dark"] .state-active { background: #1e3a8a; color: #dbeafe; }
+  [data-theme="dark"] .state-waiting { background: #312e81; color: #e0e7ff; }
+  [data-theme="dark"] .state-completed { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .state-failed { background: #7f1d1d; color: #fee2e2; }
+  [data-theme="dark"] .state-paused { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .state-terminated { background: #374151; color: #f3f4f6; }
+
 
 /* Alpine.js x-cloak: hide elements until Alpine has initialized
    so the inline-confirm form doesn't flash visible during page
@@ -412,16 +429,16 @@ main {
   padding-top: 0.75rem;
 }
 
-@media (prefers-color-scheme: dark) {
-  .terminate-form {
+
+  [data-theme="dark"] .terminate-form {
     border-color: #b91c1c;
     border-left-color: #ef4444;
     background: rgba(239, 68, 68, 0.08);
   }
-  .terminate-title { color: #fca5a5; }
-  .terminate-warn strong { color: #fca5a5; }
-  .terminate-actions { border-top-color: rgba(185, 28, 28, 0.4); }
-}
+  [data-theme="dark"] .terminate-title { color: #fca5a5; }
+  [data-theme="dark"] .terminate-warn strong { color: #fca5a5; }
+  [data-theme="dark"] .terminate-actions { border-top-color: rgba(185, 28, 28, 0.4); }
+
 
 /* Run view */
 .run-header { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
@@ -469,10 +486,10 @@ pre.mermaid {
   border-radius: 3px;
 }
 
-@media (prefers-color-scheme: dark) {
-  .task-table code { background: rgba(255, 255, 255, 0.06); }
-  pre.mermaid { background: rgba(37, 99, 235, 0.08); }
-}
+
+  [data-theme="dark"] .task-table code { background: rgba(255, 255, 255, 0.06); }
+  [data-theme="dark"] pre.mermaid { background: rgba(37, 99, 235, 0.08); }
+
 
 /* Severity badges for issues. Same pill shape as .state. */
 .severity {
@@ -491,12 +508,12 @@ pre.mermaid {
 .severity-high     { background: #fef3c7; color: #92400e; }
 .severity-critical { background: #fee2e2; color: #991b1b; }
 
-@media (prefers-color-scheme: dark) {
-  .severity-low      { background: #064e3b; color: #d1fae5; }
-  .severity-medium   { background: #1e3a8a; color: #dbeafe; }
-  .severity-high     { background: #78350f; color: #fef3c7; }
-  .severity-critical { background: #7f1d1d; color: #fee2e2; }
-}
+
+  [data-theme="dark"] .severity-low { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .severity-medium { background: #1e3a8a; color: #dbeafe; }
+  [data-theme="dark"] .severity-high { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .severity-critical { background: #7f1d1d; color: #fee2e2; }
+
 
 /* Issue status states (open / triaged / closed / wontfix) */
 .state-open    { background: #dbeafe; color: #1e40af; }
@@ -504,12 +521,12 @@ pre.mermaid {
 .state-closed  { background: #d1fae5; color: #065f46; }
 .state-wontfix { background: #f3f4f6; color: #4b5563; }
 
-@media (prefers-color-scheme: dark) {
-  .state-open    { background: #1e3a8a; color: #dbeafe; }
-  .state-triaged { background: #78350f; color: #fef3c7; }
-  .state-closed  { background: #064e3b; color: #d1fae5; }
-  .state-wontfix { background: #374151; color: #f3f4f6; }
-}
+
+  [data-theme="dark"] .state-open { background: #1e3a8a; color: #dbeafe; }
+  [data-theme="dark"] .state-triaged { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .state-closed { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .state-wontfix { background: #374151; color: #f3f4f6; }
+
 
 /* Templates list — card grid like the project list */
 .template-list {
@@ -628,9 +645,9 @@ pre.mermaid {
   gap: 1rem;
 }
 
-@media (prefers-color-scheme: dark) {
-  .file-issue-form { background: rgba(37, 99, 235, 0.08); }
-}
+
+  [data-theme="dark"] .file-issue-form { background: rgba(37, 99, 235, 0.08); }
+
 
 /* Per-state colors used by the task state machine.
  * Phase 8.x added two new in-flight states between the old
@@ -648,14 +665,14 @@ pre.mermaid {
 .state-skipped    { background: #f3f4f6; color: #6b7280; }
 .state-parked     { background: #f3f4f6; color: #6b7280; }
 
-@media (prefers-color-scheme: dark) {
-  .state-ready      { background: #78350f; color: #fef3c7; }
-  .state-claimed    { background: #1e3a8a; color: #dbeafe; }
-  .state-running    { background: #4c1d95; color: #ddd6fe; }
-  .state-submitted  { background: #155e75; color: #cffafe; }
-  .state-accepted   { background: #064e3b; color: #d1fae5; }
-  .state-collecting { background: #4c1d95; color: #ede9fe; }
-}
+
+  [data-theme="dark"] .state-ready { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .state-claimed { background: #1e3a8a; color: #dbeafe; }
+  [data-theme="dark"] .state-running { background: #4c1d95; color: #ddd6fe; }
+  [data-theme="dark"] .state-submitted { background: #155e75; color: #cffafe; }
+  [data-theme="dark"] .state-accepted { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .state-collecting { background: #4c1d95; color: #ede9fe; }
+
 
 /* iter-count-badge — shown next to a task ID in the run table
  * when IterCount > 1 (Phase 8.6: tasks that bounced through
@@ -675,9 +692,9 @@ pre.mermaid {
   color: #92400e;
   vertical-align: middle;
 }
-@media (prefers-color-scheme: dark) {
-  .iter-count-badge { background: #78350f; color: #fef3c7; }
-}
+
+  [data-theme="dark"] .iter-count-badge { background: #78350f; color: #fef3c7; }
+
 
 /* blocked-by — Phase 8.5 waiting-state explainer banner. Same
  * muted treatment as a meta line; full-width so the message
@@ -696,9 +713,9 @@ pre.mermaid {
   padding: 0;
   color: inherit;
 }
-@media (prefers-color-scheme: dark) {
-  .blocked-by { background: rgba(255,255,255,0.03); }
-}
+
+  [data-theme="dark"] .blocked-by { background: rgba(255,255,255,0.03); }
+
 
 /* Task view */
 .task-header { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
@@ -831,23 +848,23 @@ details summary {
   overflow-y: auto;
 }
 
-@media (prefers-color-scheme: dark) {
-  .iter-badge.iter-outcome-completed { background: #064e3b; color: #d1fae5; }
-  .iter-badge.iter-outcome-rejected  { background: #7f1d1d; color: #fee2e2; }
-  .iter-badge.iter-outcome-abandoned { background: #78350f; color: #fef3c7; }
-  .iter-badge.iter-outcome-active    { background: #1e3a8a; color: #dbeafe; }
-  .iter-badge.iter-decision-approve         { background: #064e3b; color: #d1fae5; }
-  .iter-badge.iter-decision-request_changes { background: #78350f; color: #fef3c7; }
-  .iter-badge.iter-decision-reject          { background: #7f1d1d; color: #fee2e2; }
-  .iter-badge.iter-decision-comment         { background: #4c1d95; color: #ede9fe; }
-  .iter-badge.iter-option                   { background: #4c1d95; color: #ede9fe; }
-  .iter-body { background: rgba(255, 255, 255, 0.04); }
-}
 
-@media (prefers-color-scheme: dark) {
-  .prompt { background: rgba(255, 255, 255, 0.04); }
-  .result-content { background: rgba(16, 185, 129, 0.08); }
-}
+  [data-theme="dark"] .iter-badge.iter-outcome-completed { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .iter-badge.iter-outcome-rejected { background: #7f1d1d; color: #fee2e2; }
+  [data-theme="dark"] .iter-badge.iter-outcome-abandoned { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .iter-badge.iter-outcome-active { background: #1e3a8a; color: #dbeafe; }
+  [data-theme="dark"] .iter-badge.iter-decision-approve { background: #064e3b; color: #d1fae5; }
+  [data-theme="dark"] .iter-badge.iter-decision-request_changes { background: #78350f; color: #fef3c7; }
+  [data-theme="dark"] .iter-badge.iter-decision-reject { background: #7f1d1d; color: #fee2e2; }
+  [data-theme="dark"] .iter-badge.iter-decision-comment { background: #4c1d95; color: #ede9fe; }
+  [data-theme="dark"] .iter-badge.iter-option { background: #4c1d95; color: #ede9fe; }
+  [data-theme="dark"] .iter-body { background: rgba(255, 255, 255, 0.04); }
+
+
+
+  [data-theme="dark"] .prompt { background: rgba(255, 255, 255, 0.04); }
+  [data-theme="dark"] .result-content { background: rgba(16, 185, 129, 0.08); }
+
 
 .small { font-size: 0.85rem; }
 
@@ -938,9 +955,9 @@ details summary {
 }
 .btn-danger:hover { background: #b91c1c; color: #fff; border-color: #b91c1c; }
 
-@media (prefers-color-scheme: dark) {
-  .btn:hover { background: rgba(37, 99, 235, 0.18); }
-}
+
+  [data-theme="dark"] .btn:hover { background: rgba(37, 99, 235, 0.18); }
+
 
 /* .btn-row groups buttons horizontally with consistent gap.
  * Used wherever multiple buttons appear side-by-side
@@ -1021,9 +1038,9 @@ details summary {
   align-self: flex-start;
 }
 
-@media (prefers-color-scheme: dark) {
-  .submit-form { background: rgba(37, 99, 235, 0.08); }
-}
+
+  [data-theme="dark"] .submit-form { background: rgba(37, 99, 235, 0.08); }
+
 
 /* Auto-attached copy button on every <pre> block.
    The wrap is position:relative so the button can park
@@ -1066,9 +1083,9 @@ details summary {
   opacity: 1 !important;
 }
 
-@media (prefers-color-scheme: dark) {
-  .copy-btn { background: rgba(255, 255, 255, 0.04); }
-}
+
+  [data-theme="dark"] .copy-btn { background: rgba(255, 255, 255, 0.04); }
+
 
 /* Banner used by action error responses */
 .banner {
@@ -1102,10 +1119,10 @@ details summary {
   overflow-y: auto;
 }
 
-@media (prefers-color-scheme: dark) {
-  .banner-error { background: #7f1d1d; color: #fee2e2; border-color: #b91c1c; }
-  .banner-error pre { background: rgba(255, 255, 255, 0.06); }
-}
+
+  [data-theme="dark"] .banner-error { background: #7f1d1d; color: #fee2e2; border-color: #b91c1c; }
+  [data-theme="dark"] .banner-error pre { background: rgba(255, 255, 255, 0.06); }
+
 
 /* Events table */
 .events-table {
@@ -1141,9 +1158,9 @@ details summary {
   overflow-y: auto;
 }
 
-@media (prefers-color-scheme: dark) {
-  .events-table .meta-block { background: rgba(255, 255, 255, 0.06); }
-}
+
+  [data-theme="dark"] .events-table .meta-block { background: rgba(255, 255, 255, 0.06); }
+
 
 /* Notifications */
 .notify-list {
@@ -1234,6 +1251,6 @@ details summary {
   overflow-y: auto;
 }
 
-@media (prefers-color-scheme: dark) {
-  .inbox-upstream details { background: rgba(255, 255, 255, 0.04); }
-}
+
+  [data-theme="dark"] .inbox-upstream details { background: rgba(255, 255, 255, 0.04); }
+

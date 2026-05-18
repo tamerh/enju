@@ -1,9 +1,21 @@
 {{define "layout"}}<!doctype html>
-<html lang="en" data-theme="auto">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{block "title" .}}Enju{{end}}</title>
+  {{/* No-flash theme: light is the default (no attribute).
+       A returning user who chose dark gets data-theme="dark"
+       set synchronously here, before the stylesheet applies, so
+       there's no light→dark flash. Inline + first in <head> on
+       purpose — do not move below the stylesheet link. */}}
+  <script>
+    try {
+      if (localStorage.getItem('enjuTheme') === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    } catch (e) {}
+  </script>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script src="/static/alpine.min.js" defer></script>
@@ -19,6 +31,8 @@
       <a href="/events" hx-get="/events" hx-target="#main" hx-push-url="true">Events</a>
     </nav>
     <a class="who" href="/me" hx-get="/me" hx-target="#main" hx-push-url="true">@{{.Username}}</a>
+    <button type="button" id="theme-toggle" class="theme-toggle"
+            title="Toggle light / dark" aria-label="Toggle light / dark theme">🌙</button>
   </header>
 
   <main id="main">
