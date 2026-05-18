@@ -98,6 +98,56 @@ func TestCommitFilesStagePathsSubsetEnforced(t *testing.T) {
 	}
 }
 
+// TestCommitFilesForceStagesGitignoredPaths reproduces the
+// production defect: an operator-submitted review (project #10,
+// prisma-review) failed to commit because its only output —
+// .enju/runs/<run>/<task>/result.md + metadata.json — falls under
+// the project's `.gitignore` (`.enju/`), and CommitFiles stages with
+// a plain `git add --`, which refuses an explicitly-named ignored
+// path and fails the whole commit.
+//
+// StagePaths is an explicit, enju-decided allowlist ("we never
+// `git add .`"); enju-managed result files must commit regardless of
+// the project's .gitignore. Answer/compute tasks dodged this only
+// because their StagePaths are the tracked declared writes (data/…);
+// a review task has no tracked write, so the bug surfaces.
+func TestCommitFilesForceStagesGitignoredPaths(t *testing.T) {
+	dir := t.TempDir()
+	gitInit(t, dir)
+	seedCommitOnMain(t, dir, "seed.txt", "seed")
+	// Standard usecase setup: project .gitignore ignores .enju/.
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(".enju/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".gitignore")
+	gitRun(t, dir, "-c", "user.name=T", "-c", "user.email=t@t",
+		"commit", "-m", "ignore .enju")
+
+	c, _ := OpenClone(dir, "", nullLogger())
+	res, err := c.CommitFiles(CommitRequest{
+		Files: []FileWrite{
+			{RepoRelPath: ".enju/runs/r1/review_x/result.md", Content: []byte("verdict")},
+			{RepoRelPath: ".enju/runs/r1/review_x/metadata.json", Content: []byte("{}")},
+		},
+		Message:     "task result",
+		AuthorName:  "Tester",
+		AuthorEmail: "test@example.com",
+	})
+	if err != nil {
+		t.Fatalf("CommitFiles must force-stage enju-managed paths despite "+
+			"project .gitignore, got: %v", err)
+	}
+	if res.NoOp || !isHexSHA(res.SHA) {
+		t.Fatalf("expected a real commit, got NoOp=%v SHA=%q", res.NoOp, res.SHA)
+	}
+	for _, p := range []string{
+		".enju/runs/r1/review_x/result.md",
+		".enju/runs/r1/review_x/metadata.json",
+	} {
+		gitRun(t, dir, "cat-file", "-e", "HEAD:"+p) // fatals if not in commit
+	}
+}
+
 func TestCommitFilesPlaceholderAuthorWhenEmpty(t *testing.T) {
 	dir := t.TempDir()
 	gitInit(t, dir)

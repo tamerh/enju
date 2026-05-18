@@ -83,9 +83,17 @@ func (c *Clone) CommitFiles(req CommitRequest) (CommitResult, error) {
 		}
 	}
 
-	// Stage the explicit paths. Args list ends with `--` then
-	// paths so git can't mistake paths for refs.
-	addArgs := append([]string{"add", "--"}, req.StagePaths...)
+	// Stage the explicit paths. `-f` (force): StagePaths is an
+	// enju-decided allowlist (we never `git add .`), and enju's own
+	// managed result files live under .enju/runs/<run>/<task>/ —
+	// which every project's .gitignore intentionally ignores. A
+	// plain `git add --` of an explicitly-named ignored path fails
+	// the whole commit (a review task, whose only output is
+	// .enju/.../result.md, can't commit at all). The project's
+	// .gitignore must not veto enju's own explicit commit set.
+	// Args list ends with `--` then paths so git can't mistake
+	// paths for refs.
+	addArgs := append([]string{"add", "-f", "--"}, req.StagePaths...)
 	if _, err := runGit(c.workDir, addArgs, runOpts{}); err != nil {
 		return CommitResult{}, fmt.Errorf("git: stage: %w", err)
 	}
