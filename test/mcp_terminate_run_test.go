@@ -240,3 +240,85 @@ tasks:
 		t.Errorf("after stale CompleteRun, state: got %v, want still terminated", run)
 	}
 }
+
+// TestMCPTerminateRunSkipsClaimedReviewTask reproduces the
+// production defect (mustache-engine project #9, run #1). Event-log
+// reconstruction:
+//
+//	develop_renderer SUBMITTED → review_renderer READY
+//	review_renderer CLAIMED (iter1, active iteration)
+//	run_terminated
+//	~2 min later the NEW run's project-scoped reviewer daemon
+//	  iteration_started/REOPEN-ed 9:1:review_renderer (a terminated
+//	  run's task) and the coordinator ACCEPTED the submit (✅).
+//
+// TestMCPTerminateRunCascade already covers a *pending* review
+// (never claimed) — that path refuses correctly. The uncovered hole
+// is a review that was CLAIMED in an active iteration at terminate
+// (its target already submitted): it is left claimable, a fresh
+// claim re-opens it, and the submit is accepted on a dead run.
+//
+// The coordinator is the authoritative gate (your point: a daemon
+// can't close the terminate-vs-claim race). Two invariants:
+//  1. terminate durably skips a CLAIMED review task.
+//  2. a fresh claim of any task whose run is terminal is refused.
+func TestMCPTerminateRunSkipsClaimedReviewTask(t *testing.T) {
+	h := newMCPHarness(t, "ClaimedReview")
+	reviewer := h.newMCPClientAs(t, "LeftoverClaimer")
+	projectID := h.createTestProject()
+	yaml := `name: "claimed-review-after-terminate"
+version: 1
+tasks:
+  - id: draft
+    action: answer
+    prompt: "Write something."
+  - id: gate
+    action: review
+    reviews: draft
+    prompt: "Approve or request changes."
+`
+	h.mcpCreateRunInline(t, projectID, yaml)
+	gateID := h.taskID("gate")
+
+	// Drive draft to SUBMITTED so the review gate becomes READY —
+	// exactly the state develop_renderer/review_renderer were in.
+	h.mcpClaimOK(t, "draft")
+	h.mcpSubmitText(t, "draft", "draft content")
+	if st := mustGetTaskState(t, h.store, gateID); st != store.TaskReady {
+		t.Fatalf("pre-claim gate state: got %s, want ready", st)
+	}
+
+	// Reviewer CLAIMS the gate → active iteration open at terminate
+	// (review_renderer iter1).
+	h.mcpClaimAs(t, reviewer, "gate")
+	if st := mustGetTaskState(t, h.store, gateID); st != store.TaskClaimed {
+		t.Fatalf("pre-terminate gate state: got %s, want claimed", st)
+	}
+
+	h.callOK(t, "enju_terminate_run", map[string]any{
+		"project_id": float64(projectID),
+		"run_id":     float64(h.lastRunSeq),
+		"reason":     "repro: claimed review task at terminate",
+	})
+
+	// Invariant 1: a claimed review task must be durably skipped by
+	// terminate (its sibling develop_renderer was; review_renderer
+	// was NOT — this is the bug).
+	gate, _ := h.store.GetTask(gateID)
+	if gate == nil || gate.State != store.TaskSkipped {
+		t.Errorf("claimed review left un-skipped by terminate: got %v, want skipped", gate)
+	}
+
+	// Invariant 2: a fresh claim on the leftover (what the new
+	// run's project-scoped reviewer daemon did) must be refused
+	// because the run is terminal — not reopen the task.
+	res := h.mcpCallVia(t, reviewer, "enju_claim_task", map[string]any{"task_id": gateID})
+	if !strings.Contains(strings.ToLower(mcpText(res)), "terminal") &&
+		!strings.Contains(strings.ToLower(mcpText(res)), "terminated") {
+		t.Errorf("fresh claim of a terminated run's review task wasn't refused: %s", mcpText(res))
+	}
+	gate, _ = h.store.GetTask(gateID)
+	if gate == nil || gate.State != store.TaskSkipped {
+		t.Errorf("fresh claim resurrected the review off a terminated run: got %v, want still skipped", gate)
+	}
+}

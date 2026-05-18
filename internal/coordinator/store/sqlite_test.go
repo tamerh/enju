@@ -302,6 +302,67 @@ func TestReleaseTask(t *testing.T) {
 	}
 }
 
+// TestExpireClaimDoesNotResurrectTerminatedRunTask reproduces the
+// production defect (mustache-engine project #9). Mechanism, traced
+// from the live event log + code:
+//
+//   - The 30m claim lease + slow haiku tasks → claim deadlines
+//     lapse (we saw develop_parser iteration_completed/timed_out).
+//   - scheduler/reaper.go sweeps expired claims on a TIMER and
+//     applies ExpireClaim{...} per claim.
+//   - applyExpireClaim blindly does `UPDATE tasks SET state='ready'`
+//     with NO run-terminal guard.
+//
+// So a slow task on an already-TERMINATED run gets resurrected to
+// READY by the reaper, and the next run's project-scoped daemon
+// then claims the zombie. This models the reaper-vs-terminate race
+// state directly: run terminal + task skipped, but the claim row's
+// outcome is still NULL (the window the reaper fires in). The
+// invariant: a re-ready mutation must never resurrect a task whose
+// run is terminal.
+func TestExpireClaimDoesNotResurrectTerminatedRunTask(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+
+	helperCreateTask(s, &TaskRecord{
+		ID: "task-1", RunID: runID, Seq: 1, TaskDefID: "step1",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, CreatedAt: now,
+	})
+	alice := createTestCitizen(t, s, "alice", "tok-1")
+	helperClaimTask(s, "task-1", alice, now.Add(30*time.Minute))
+
+	// The reaper-race state: terminate has flipped the run terminal
+	// and the task skipped, but this claim's outcome is still NULL
+	// (the reaper's GetExpiredClaims window). Constructed via raw
+	// UPDATEs so the test pins applyExpireClaim's invariant, not
+	// terminate's abandon timing.
+	if _, err := s.db.Exec(`UPDATE runs SET state = 'terminated' WHERE id = ?`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE tasks SET state = 'skipped', skip_reason = 'run_terminated' WHERE id = ?`, "task-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reaper fires ExpireClaim on the lapsed claim.
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{ExpireClaim{TaskID: "task-1", CitizenID: alice}},
+	}); err != nil {
+		t.Fatalf("ExpireClaim apply: %v", err)
+	}
+
+	// INVARIANT: a task whose run is terminal must NOT be
+	// resurrected to ready. Pre-fix this fails — applyExpireClaim
+	// blindly sets state='ready', putting the task back in the
+	// claimable pool on a dead run.
+	task, _ := s.GetTask("task-1")
+	if task == nil || task.State != TaskSkipped {
+		t.Fatalf("ExpireClaim resurrected a terminated run's task: got %v, want still skipped", task.State)
+	}
+}
+
 // --- Run-state evaluator (living-workflow phase 1) ---
 
 // makeTask is a tiny helper for the run-state tests below.

@@ -1185,6 +1185,20 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 	return err
 }
 
+// runStateTerminal reports whether a run state string is one of the
+// terminal states (completed / failed / terminated). The
+// re-ready claim mutations gate on this: once a run is terminal its
+// tasks must never be resurrected back into the claimable pool —
+// the reaper / release / daemon-sweep paths would otherwise put a
+// dead run's task back in front of a project-scoped daemon.
+func runStateTerminal(s string) bool {
+	switch RunState(s) {
+	case RunCompleted, RunFailed, RunTerminated:
+		return true
+	}
+	return false
+}
+
 func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim, sink EventSink) error {
 	// Capture iter_seq + run/project context BEFORE the claim
 	// row's outcome flips, so the iteration_completed event
@@ -1193,12 +1207,28 @@ func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim, sink EventSink) error {
 	var iterSeq sql.NullInt64
 	var commitSHA sql.NullString
 	var runID, projectID int64
+	var runState string
 	_ = tx.QueryRow(
-		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id
+		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id, r.state
 		 FROM task_claims c JOIN tasks t ON c.task_id = t.id JOIN runs r ON t.run_id = r.id
 		 WHERE c.task_id = ? AND c.citizen_id = ? AND c.outcome IS NULL`,
 		m.TaskID, m.CitizenID,
-	).Scan(&iterSeq, &commitSHA, &runID, &projectID)
+	).Scan(&iterSeq, &commitSHA, &runID, &projectID, &runState)
+
+	// Run-terminal gate (authoritative, defense-in-depth): never
+	// resurrect a task whose run is terminal. Close the dangling
+	// open claim so the reaper stops re-selecting it, but leave the
+	// task in its terminal (skipped) state — do NOT flip it ready.
+	if runStateTerminal(runState) {
+		if _, err := tx.Exec(
+			`UPDATE task_claims SET outcome = 'abandoned' WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+			m.TaskID, m.CitizenID,
+		); err != nil {
+			return err
+		}
+		sink.SkipEvents("release_claim: run terminal — claim closed, task left as-is")
+		return nil
+	}
 
 	// Reset the task to READY only if this citizen actually
 	// holds the claim. Guard prevents one citizen accidentally
@@ -1264,12 +1294,32 @@ func applyExpireClaim(tx *sql.Tx, m ExpireClaim, sink EventSink) error {
 	var iterSeq sql.NullInt64
 	var commitSHA sql.NullString
 	var runID, projectID int64
+	var runState string
 	_ = tx.QueryRow(
-		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id
+		`SELECT c.iter_seq, COALESCE(c.commit_sha, ''), t.run_id, r.project_id, r.state
 		 FROM task_claims c JOIN tasks t ON c.task_id = t.id JOIN runs r ON t.run_id = r.id
 		 WHERE c.task_id = ? AND c.citizen_id = ? AND c.outcome IS NULL`,
 		m.TaskID, m.CitizenID,
-	).Scan(&iterSeq, &commitSHA, &runID, &projectID)
+	).Scan(&iterSeq, &commitSHA, &runID, &projectID, &runState)
+
+	// Run-terminal gate (authoritative): the reaper expires claims
+	// on a timer; once the run is terminal its tasks must never be
+	// flipped back to ready (that put a dead run's task in front of
+	// the next run's project-scoped daemon). Close the dangling
+	// open claim so the reaper stops re-selecting it, leave the
+	// task in its terminal state, and don't apply the timeout
+	// penalty — the operator terminated the run, the citizen didn't
+	// time out on real work.
+	if runStateTerminal(runState) {
+		if _, err := tx.Exec(
+			`UPDATE task_claims SET outcome = 'abandoned' WHERE task_id = ? AND citizen_id = ? AND outcome IS NULL`,
+			m.TaskID, m.CitizenID,
+		); err != nil {
+			return err
+		}
+		sink.SkipEvents("expire_claim: run terminal — claim closed, task left as-is")
+		return nil
+	}
 
 	if _, err := tx.Exec(
 		`UPDATE tasks SET state = 'ready', claimed_by = NULL, claimed_at = NULL WHERE id = ?`,
