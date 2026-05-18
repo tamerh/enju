@@ -1244,6 +1244,37 @@ func TestRunViewWorkflowYAML(t *testing.T) {
 	}
 }
 
+// TestRunLivePollGatedOnNonTerminal: the #run-live region
+// auto-polls (hx-trigger every 20s) while the run is active,
+// and carries NO poll attribute once terminal so the swap
+// self-stops.
+func TestRunLivePollGatedOnNonTerminal(t *testing.T) {
+	mk := func(state string) string {
+		s := newTestServer(t, &fakeFC{
+			username:  "tamer",
+			runDetail: &service.RunDetail{Run: wire.Run{Seq: 1, Name: "r", State: state}},
+		})
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/r/1", nil))
+		return rr.Body.String()
+	}
+	active := mk("active")
+	if !strings.Contains(active, `id="run-live"`) {
+		t.Fatal("expected #run-live wrapper")
+	}
+	if !strings.Contains(active, `hx-trigger="every 20s"`) ||
+		!strings.Contains(active, `hx-select="#run-live"`) {
+		t.Errorf("active run should auto-poll #run-live; body: %q", active)
+	}
+	done := mk("completed")
+	if strings.Contains(done, `hx-trigger="every 20s"`) {
+		t.Errorf("terminal run must not carry the poll attribute (self-stop)")
+	}
+	if !strings.Contains(done, `id="run-live"`) {
+		t.Errorf("the #run-live wrapper should still render for a terminal run")
+	}
+}
+
 // TestExportRun: GET /p/{pid}/r/{seq}/export.md streams the
 // Markdown report as an attachment with the right headers, and
 // the run page links to it.

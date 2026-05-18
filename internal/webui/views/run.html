@@ -109,6 +109,19 @@
   {{end}}
 </header>
 
+{{/* Live region: DAG + task table auto-refresh while the run
+     is non-terminal. hx-select pulls just #run-live out of the
+     normal full-page response (no dedicated endpoint), so the
+     header controls + terminate-confirm form and the Workflow
+     YAML disclosure (both OUTSIDE this div) are never clobbered
+     mid-interaction. The poll attributes are gated on
+     not-terminal, so once the run finishes the swapped-in
+     #run-live carries no hx-trigger and polling self-stops. */}}
+<div id="run-live"
+     {{if not $isTerminal}}hx-get="/p/{{.ProjectID}}/r/{{.Run.Seq}}"
+     hx-trigger="every 20s"
+     hx-select="#run-live"
+     hx-swap="outerHTML"{{end}}>
 <section>
   <h2>DAG</h2>
   {{if .Run.DiagramMermaid}}
@@ -118,19 +131,6 @@
   </script>
   {{else}}
   <p class="muted">(no diagram available)</p>
-  {{end}}
-
-  {{/* The frozen source recipe this run was created from
-       (pre-param-substitution), beside the DAG: the picture +
-       the source of truth that produced it. Read-only;
-       collapsed by default so it doesn't dominate the page.
-       Empty only on older coordinators that don't honor
-       ?include=yaml. */}}
-  {{if .Run.YAML}}
-  <details class="workflow-yaml">
-    <summary>Workflow YAML <span class="muted small">— the recipe this run was created from</span></summary>
-    <pre class="result-content">{{.Run.YAML}}</pre>
-  </details>
   {{end}}
 </section>
 
@@ -176,4 +176,19 @@
   <p class="muted">(no tasks)</p>
   {{end}}
 </section>
+</div>
+
+{{/* The frozen source recipe this run was created from
+     (pre-param-substitution). OUTSIDE #run-live on purpose: a
+     20s poll must not collapse it while it's expanded.
+     Read-only; collapsed by default. Empty only on older
+     coordinators that don't honor ?include=yaml. */}}
+{{if .Run.YAML}}
+<section>
+  <details class="workflow-yaml">
+    <summary>Workflow YAML <span class="muted small">— the recipe this run was created from</span></summary>
+    <pre class="result-content">{{.Run.YAML}}</pre>
+  </details>
+</section>
+{{end}}
 {{end}}
