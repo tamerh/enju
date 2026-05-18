@@ -14,96 +14,113 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// projectPage is the data shape consumed by views/project.html.
-// Embeds pageData for {{.Username}}; carries the project detail
-// (name, description, members, etc.) and the run list shown
-// inline as the page's primary content.
-//
-// Tabs (Inbox / Runs / Members / Settings) are deferred to the
-// iteration that ships their own pages — until then this page
-// is the project's single overview surface.
+// projectPage backs views/project.html — the OVERVIEW surface.
+// Runs-first (the reason you visit a project); a compact
+// read-only members strip for context; no admin controls. All
+// project administration moved to the Settings page so the
+// everyday view stays uncluttered (the everyday-loop-vs-admin
+// split, applied to layout).
 type projectPage struct {
 	pageData
 	Project *service.ProjectDetail
 	Runs    []wire.Run
-	// Notice / NoticeError surface the outcome of any
-	// project-page write (sync, membership change, …) inline on
-	// the re-rendered page. Notice is the success one-liner
-	// (e.g. the format.ProjectSyncResult text the CLI prints);
-	// NoticeError is a hard failure. At most one is non-empty.
-	Notice      string
-	NoticeError string
-	// IsOwner is true when the calling citizen holds the owner
-	// role on this project. Gates the membership-management
-	// controls in the template — non-owners still see the
-	// roster, just no add/remove/promote/demote (the coord
-	// would reject them anyway; hiding avoids a misleading UI).
-	IsOwner bool
-	// RemoteStatus is the format.ProjectRemoteStatus one-liner
-	// (local-vs-remote ahead/behind), rendered server-side like
-	// the CLI. Empty when no remote is configured or the
-	// best-effort RemoteStatusReport errored (MCP-client mode /
-	// no workspace) — the template just omits the line then.
+}
+
+// projectSettingsPage backs views/project-settings.html — the
+// ADMIN surface (members management, general config, remote
+// maintenance, danger zone). Owner-gated controls; non-owners
+// see read-only state. Notice / NoticeError carry the outcome
+// of a settings write inline on the re-rendered page (the
+// project write handlers all re-render here now, not the
+// overview).
+type projectSettingsPage struct {
+	pageData
+	Project      *service.ProjectDetail
+	Notice       string
+	NoticeError  string
+	IsOwner      bool
 	RemoteStatus string
 }
 
-// handleProjectView renders /p/{projectID} — project overview
-// with header + members + runs list. Two FatClient calls
-// (GetProject, ListRuns) issued sequentially. Parallelizing
-// is mechanical (errgroup) when latency justifies it.
-//
-// Bad project ID parses → 400. Coord 4xx (not a member, not
-// found) surfaces as 502 today; refining to 404/403 with
-// typed errors from FatClient is a follow-up.
+// handleProjectView renders /p/{projectID} — the overview:
+// runs + a read-only members strip. Pure read, no write
+// actions live here anymore.
 func (s *Server) handleProjectView(w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil || pid <= 0 {
 		http.Error(w, "invalid project id", http.StatusBadRequest)
 		return
 	}
-	s.renderProjectPage(w, r, pid, "", "")
+	s.renderProjectOverview(w, r, pid)
 }
 
-// renderProjectPage does the GetProject + ListRuns fetch and
-// renders project.html. Shared by handleProjectView (no banner)
-// and the project-page write handlers (sync, membership), which
-// pass their outcome as notice / noticeErr. On a hard fetch
-// error it writes the error response itself and returns —
-// callers must not write after calling it.
-func (s *Server) renderProjectPage(w http.ResponseWriter, r *http.Request, pid int64, notice, noticeErr string) {
-	ctx := r.Context()
-	proj, err := s.fc.GetProject(ctx, pid)
+// handleProjectSettings renders GET /p/{projectID}/settings —
+// the admin surface. Also the re-render target for every
+// project write handler (membership, branch, remote, sync,
+// leave-keep) so their outcome banners land where the forms are.
+func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
+	pid, ok := s.projectIDOrBadRequest(w, r)
+	if !ok {
+		return
+	}
+	s.renderProjectSettings(w, r, pid, "", "")
+}
+
+// loadProjectAndOwner fetches the project and computes whether
+// the caller is an owner — shared by both renderers. On a hard
+// fetch error it writes the response itself and returns
+// ok=false (callers must not write after).
+func (s *Server) loadProjectAndOwner(w http.ResponseWriter, r *http.Request, pid int64) (proj *service.ProjectDetail, isOwner, ok bool) {
+	proj, err := s.fc.GetProject(r.Context(), pid)
 	if err != nil {
 		s.logger.Error("GetProject failed", "project_id", pid, "error", err)
 		http.Error(w, "failed to load project: "+err.Error(), http.StatusBadGateway)
-		return
+		return nil, false, false
 	}
 	if proj == nil {
 		http.Error(w, "project not found", http.StatusNotFound)
-		return
+		return nil, false, false
 	}
-	runs, err := s.fc.ListRuns(ctx, pid)
-	if err != nil {
-		s.logger.Warn("ListRuns failed; rendering with empty list",
-			"project_id", pid, "error", err)
-		runs = nil
-	}
-	// Newest first — most-recent runs are what users care
-	// about when they land on the project page. Sorted
-	// client-side so we don't depend on the coord's ordering
-	// promise.
-	sort.Slice(runs, func(i, j int) bool { return runs[i].Seq > runs[j].Seq })
-
-	// Owner gate for the membership-management controls. The
-	// coord is the real authority (it rejects non-owner writes);
-	// this just keeps the UI honest about what the viewer can do.
 	me := s.fc.Username()
-	isOwner := false
 	for _, m := range proj.Members {
 		if m.Username == me && m.Role == "owner" {
 			isOwner = true
 			break
 		}
+	}
+	return proj, isOwner, true
+}
+
+// renderProjectOverview renders the runs-first overview.
+func (s *Server) renderProjectOverview(w http.ResponseWriter, r *http.Request, pid int64) {
+	proj, _, ok := s.loadProjectAndOwner(w, r, pid)
+	if !ok {
+		return
+	}
+	runs, err := s.fc.ListRuns(r.Context(), pid)
+	if err != nil {
+		s.logger.Warn("ListRuns failed; rendering with empty list",
+			"project_id", pid, "error", err)
+		runs = nil
+	}
+	// Newest first — most-recent runs are what users care about
+	// when they land here. Sorted client-side so we don't depend
+	// on the coord's ordering promise.
+	sort.Slice(runs, func(i, j int) bool { return runs[i].Seq > runs[j].Seq })
+	s.render(w, r, "project.html", projectPage{
+		pageData: s.commonPageData(),
+		Project:  proj,
+		Runs:     runs,
+	})
+}
+
+// renderProjectSettings renders the admin surface. notice /
+// noticeErr carry a just-performed write's outcome. On a hard
+// fetch error it writes the response itself and returns.
+func (s *Server) renderProjectSettings(w http.ResponseWriter, r *http.Request, pid int64, notice, noticeErr string) {
+	proj, isOwner, ok := s.loadProjectAndOwner(w, r, pid)
+	if !ok {
+		return
 	}
 	// Remote status is a read-only local-vs-remote comparison.
 	// Best-effort, same contract as the untracked-artifact
@@ -111,18 +128,16 @@ func (s *Server) renderProjectPage(w http.ResponseWriter, r *http.Request, pid i
 	// any error just omits the line rather than failing the page.
 	var remoteStatus string
 	if proj.RemoteURL != "" {
-		if rpt, rerr := s.fc.RemoteStatusReport(ctx, pid); rerr != nil {
+		if rpt, rerr := s.fc.RemoteStatusReport(r.Context(), pid); rerr != nil {
 			s.logger.Info("RemoteStatusReport unavailable; omitting line",
 				"project_id", pid, "error", rerr)
 		} else if data, merr := json.Marshal(rpt); merr == nil {
 			remoteStatus = format.ProjectRemoteStatus(data)
 		}
 	}
-
-	s.render(w, r, "project.html", projectPage{
+	s.render(w, r, "project-settings.html", projectSettingsPage{
 		pageData:     s.commonPageData(),
 		Project:      proj,
-		Runs:         runs,
 		Notice:       notice,
 		NoticeError:  noticeErr,
 		IsOwner:      isOwner,
@@ -151,11 +166,11 @@ func (s *Server) handleProjectSync(w http.ResponseWriter, r *http.Request) {
 	if serr != nil {
 		s.logger.Info("SyncProjectToRemote returned error",
 			"project_id", pid, "force", force, "error", serr)
-		s.renderProjectPage(w, r, pid, "", serr.Error())
+		s.renderProjectSettings(w, r, pid, "", serr.Error())
 		return
 	}
 	data, _ := json.Marshal(resp)
-	s.renderProjectPage(w, r, pid, format.ProjectSyncResult(data), "")
+	s.renderProjectSettings(w, r, pid, format.ProjectSyncResult(data), "")
 }
 
 // projectIDOrBadRequest parses {projectID}; on a bad value it
@@ -182,20 +197,20 @@ func (s *Server) handleAddProjectMember(w http.ResponseWriter, r *http.Request) 
 	}
 	username := strings.TrimSpace(r.FormValue("username"))
 	if username == "" {
-		s.renderProjectPage(w, r, pid, "", "username is required to add a member")
+		s.renderProjectSettings(w, r, pid, "", "username is required to add a member")
 		return
 	}
 	role := strings.TrimSpace(r.FormValue("role"))
 	if err := s.fc.AddProjectMember(r.Context(), pid, username, role); err != nil {
 		s.logger.Info("AddProjectMember failed", "project_id", pid, "username", username, "error", err)
-		s.renderProjectPage(w, r, pid, "", "add member failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "add member failed: "+err.Error())
 		return
 	}
 	shown := role
 	if shown == "" {
 		shown = "member"
 	}
-	s.renderProjectPage(w, r, pid,
+	s.renderProjectSettings(w, r, pid,
 		fmt.Sprintf("✓ Added @%s to the project as %s", username, shown), "")
 }
 
@@ -209,15 +224,15 @@ func (s *Server) handleRemoveProjectMember(w http.ResponseWriter, r *http.Reques
 	}
 	username := chi.URLParam(r, "username")
 	if username == "" {
-		s.renderProjectPage(w, r, pid, "", "username is required")
+		s.renderProjectSettings(w, r, pid, "", "username is required")
 		return
 	}
 	if err := s.fc.RemoveProjectMember(r.Context(), pid, username); err != nil {
 		s.logger.Info("RemoveProjectMember failed", "project_id", pid, "username", username, "error", err)
-		s.renderProjectPage(w, r, pid, "", "remove member failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "remove member failed: "+err.Error())
 		return
 	}
-	s.renderProjectPage(w, r, pid, fmt.Sprintf("✓ Removed @%s from the project", username), "")
+	s.renderProjectSettings(w, r, pid, fmt.Sprintf("✓ Removed @%s from the project", username), "")
 }
 
 // handleSetProjectMemberRole is POST
@@ -233,17 +248,17 @@ func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Reque
 	username := chi.URLParam(r, "username")
 	role := strings.TrimSpace(r.FormValue("role"))
 	if role != "owner" && role != "member" {
-		s.renderProjectPage(w, r, pid, "", `role must be "owner" or "member"`)
+		s.renderProjectSettings(w, r, pid, "", `role must be "owner" or "member"`)
 		return
 	}
 	changed, err := s.fc.SetProjectMemberRole(r.Context(), pid, username, role)
 	if err != nil {
 		s.logger.Info("SetProjectMemberRole failed", "project_id", pid, "username", username, "role", role, "error", err)
-		s.renderProjectPage(w, r, pid, "", "role change failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "role change failed: "+err.Error())
 		return
 	}
 	if !changed {
-		s.renderProjectPage(w, r, pid,
+		s.renderProjectSettings(w, r, pid,
 			fmt.Sprintf("• @%s is already %s — no change", username, role), "")
 		return
 	}
@@ -251,7 +266,7 @@ func (s *Server) handleSetProjectMemberRole(w http.ResponseWriter, r *http.Reque
 	if role == "member" {
 		verb = "demoted to member"
 	}
-	s.renderProjectPage(w, r, pid, fmt.Sprintf("✓ @%s %s", username, verb), "")
+	s.renderProjectSettings(w, r, pid, fmt.Sprintf("✓ @%s %s", username, verb), "")
 }
 
 // handleSetProjectDefaultBranch is POST
@@ -266,20 +281,20 @@ func (s *Server) handleSetProjectDefaultBranch(w http.ResponseWriter, r *http.Re
 	}
 	branch := strings.TrimSpace(r.FormValue("branch"))
 	if branch == "" {
-		s.renderProjectPage(w, r, pid, "", "branch is required")
+		s.renderProjectSettings(w, r, pid, "", "branch is required")
 		return
 	}
 	warning, err := s.fc.SetProjectDefaultBranch(r.Context(), pid, branch)
 	if err != nil {
 		s.logger.Info("SetProjectDefaultBranch failed", "project_id", pid, "branch", branch, "error", err)
-		s.renderProjectPage(w, r, pid, "", "set default branch failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "set default branch failed: "+err.Error())
 		return
 	}
 	msg := fmt.Sprintf("✓ Default branch set to %q", branch)
 	if warning != "" {
 		msg += " — ⚠ " + warning
 	}
-	s.renderProjectPage(w, r, pid, msg, "")
+	s.renderProjectSettings(w, r, pid, msg, "")
 }
 
 // handleSetProjectRemote is POST /p/{projectID}/remote (mirror
@@ -294,20 +309,20 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 	}
 	remoteURL := strings.TrimSpace(r.FormValue("remote_url"))
 	if remoteURL == "" {
-		s.renderProjectPage(w, r, pid, "", "remote_url is required")
+		s.renderProjectSettings(w, r, pid, "", "remote_url is required")
 		return
 	}
 	warning, err := s.fc.SetProjectRemote(r.Context(), pid, remoteURL)
 	if err != nil {
 		s.logger.Info("SetProjectRemote failed", "project_id", pid, "error", err)
-		s.renderProjectPage(w, r, pid, "", "set remote failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "set remote failed: "+err.Error())
 		return
 	}
 	msg := fmt.Sprintf("✓ Remote set to %s", remoteURL)
 	if warning != "" {
 		msg += " — ⚠ " + warning
 	}
-	s.renderProjectPage(w, r, pid, msg, "")
+	s.renderProjectSettings(w, r, pid, msg, "")
 }
 
 // handleLeaveProject is POST /p/{projectID}/leave (mirror of
@@ -328,12 +343,12 @@ func (s *Server) handleLeaveProject(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.fc.LeaveProject(r.Context(), pid, keep)
 	if err != nil {
 		s.logger.Info("LeaveProject failed", "project_id", pid, "keep_membership", keep, "error", err)
-		s.renderProjectPage(w, r, pid, "", "leave project failed: "+err.Error())
+		s.renderProjectSettings(w, r, pid, "", "leave project failed: "+err.Error())
 		return
 	}
 	if keep {
 		// Membership intact — the project is still viewable.
-		s.renderProjectPage(w, r, pid, "✓ "+summary, "")
+		s.renderProjectSettings(w, r, pid, "✓ "+summary, "")
 		return
 	}
 	// Membership gone: the project page would 4xx for this

@@ -14,213 +14,19 @@
     <a class="btn" href="/p/{{.Project.ID}}/issues">Issues</a>
     <a class="btn" href="/p/{{.Project.ID}}/templates">Templates</a>
     <a class="btn" href="/p/{{.Project.ID}}/artifacts">Artifacts</a>
+    <a class="btn" href="/p/{{.Project.ID}}/settings">Settings</a>
   </p>
   <dl class="meta-list">
     <div><dt>ID</dt><dd>{{.Project.ID}}</dd></div>
     <div><dt>Default branch</dt><dd>{{.Project.DefaultBranch}}</dd></div>
     <div><dt>Runs</dt><dd>{{.Project.RunCount}}</dd></div>
-    <div><dt>Members</dt><dd>{{len .Project.Members}}</dd></div>
-    {{if .Project.RemoteURL}}<div><dt>Remote</dt><dd>{{.Project.RemoteURL}}</dd></div>{{end}}
+    <div><dt>Remote</dt><dd>{{if .Project.RemoteURL}}✓{{else}}<span class="muted">— (local only)</span>{{end}}</dd></div>
   </dl>
-
-  {{if .Notice}}<div class="banner banner-success">{{.Notice}}</div>{{end}}
-  {{if .NoticeError}}<div class="banner banner-error">{{.NoticeError}}</div>{{end}}
-
-  {{/* project_sync — manual catch-up push of local HEAD to the
-       coord-known remote, no new commit. NOT the per-run sync:
-       policy (none/merge/push) — that folds each run into the
-       default branch automatically on completion. This is the
-       repair path for when that automatic push got stuck
-       (push failure, mode:merge merged locally but never
-       pushed, an invalidation that didn't push). Label + help
-       say so explicitly because "sync" is overloaded. Hidden
-       when no remote is configured (no-origin is first-class
-       post-Phase-8). Force-push is destructive — behind a
-       disclosure, same treatment as the run terminate-form. */}}
-  {{if .Project.RemoteURL}}
-  <section class="sync-block">
-    <h2>Remote push</h2>
-    <p class="muted small">
-      Completed runs already fold into the remote automatically,
-      per the workflow's <code>sync:</code> policy
-      (<code>none</code>/<code>merge</code>/<code>push</code>).
-      Use this only as a manual catch-up when a push got stuck
-      and the remote is behind your local history — it pushes
-      local <code>HEAD</code> with no new commit.
-    </p>
-  <div class="btn-row" x-data="{forcing: false}">
-    <form method="POST" action="/p/{{.Project.ID}}/sync"
-          hx-post="/p/{{.Project.ID}}/sync" hx-target="#main">
-      <button type="submit" class="btn">Push local commits to remote</button>
-    </form>
-    <button type="button" class="btn" x-show="!forcing" @click="forcing = true">Force-push…</button>
-    <form x-show="forcing" x-cloak
-          method="POST" action="/p/{{.Project.ID}}/sync"
-          hx-post="/p/{{.Project.ID}}/sync" hx-target="#main"
-          class="terminate-form">
-      <input type="hidden" name="force" value="true">
-      <h3 class="terminate-title">Force-push project #{{.Project.ID}} to remote?</h3>
-      <p class="terminate-warn">
-        <strong>This is destructive.</strong>
-        A force-push overwrites the remote branch even when
-        histories have diverged — it can discard remote-side
-        contributions. Use only when you intentionally want the
-        local history to win. A normal sync refuses a diverged
-        remote instead.
-      </p>
-      <div class="btn-row terminate-actions">
-        <button type="submit" class="btn btn-primary">Confirm force-push</button>
-        <button type="button" class="btn" @click="forcing = false">Cancel</button>
-      </div>
-    </form>
-  </div>
-  </section>
-  {{else}}
-  <p class="muted small">
-    No remote configured — this is a single-machine project
-    (no-origin is first-class). Runs stay local; there's nothing
-    to push. Wire a remote with <code>enju_set_project_remote</code>
-    if you want off-machine sync.
-  </p>
-  {{end}}
 </header>
 
-<section>
-  <h2>Members</h2>
-  {{if .Project.Members}}
-  <ul class="member-list">
-    {{range .Project.Members}}
-    <li>
-      <strong>@{{.Username}}</strong>{{if .Name}} <span class="muted">({{.Name}})</span>{{end}}
-      <span class="role">{{.Role}}</span>
-      {{/* Owner-only roster controls. The coord enforces the
-           real rules (can't remove the last owner, etc.); we
-           show the actions and surface any refusal as a
-           banner. */}}
-      {{if $.IsOwner}}
-      <span class="member-actions">
-        {{if eq .Role "owner"}}
-        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/role"
-              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/role" hx-target="#main">
-          <input type="hidden" name="role" value="member">
-          <button type="submit" class="btn btn-small">Demote to member</button>
-        </form>
-        {{else}}
-        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/role"
-              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/role" hx-target="#main">
-          <input type="hidden" name="role" value="owner">
-          <button type="submit" class="btn btn-small">Promote to owner</button>
-        </form>
-        {{end}}
-        <form method="POST" action="/p/{{$.Project.ID}}/members/{{.Username}}/remove"
-              hx-post="/p/{{$.Project.ID}}/members/{{.Username}}/remove" hx-target="#main">
-          <button type="submit" class="btn btn-small btn-secondary">Remove</button>
-        </form>
-      </span>
-      {{end}}
-    </li>
-    {{end}}
-  </ul>
-  {{else}}
-  <p class="muted">(no members listed)</p>
-  {{end}}
-
-  {{if .IsOwner}}
-  <form class="add-member" method="POST" action="/p/{{.Project.ID}}/members"
-        hx-post="/p/{{.Project.ID}}/members" hx-target="#main">
-    <h3>Add member</h3>
-    <div class="add-member-row">
-      <input type="text" name="username" placeholder="username" required>
-      <select name="role">
-        <option value="">member (default)</option>
-        <option value="owner">owner</option>
-      </select>
-      <button type="submit" class="btn">Add</button>
-    </div>
-    <p class="muted small">
-      The citizen must already be registered on the coordinator.
-      Owner-only — non-owners can't change the roster.
-    </p>
-  </form>
-  {{end}}
-</section>
-
-{{/* Project settings — default branch + remote. Owner-gated
-     (coord enforces; hiding avoids a misleading UI). Remote
-     status is read-only and shown to everyone when available.
-     enju_set_project_default_branch / set_project_remote /
-     project_remote_status. */}}
-<section>
-  <h2>Settings</h2>
-  {{if .RemoteStatus}}
-  <p class="muted small">Remote status: {{.RemoteStatus}}</p>
-  {{end}}
-  {{if .IsOwner}}
-  <form class="settings-form" method="POST" action="/p/{{.Project.ID}}/default-branch"
-        hx-post="/p/{{.Project.ID}}/default-branch" hx-target="#main">
-    <label>Default branch
-      <input type="text" name="branch" value="{{.Project.DefaultBranch}}"
-             placeholder="main" required>
-    </label>
-    <button type="submit" class="btn">Set default branch</button>
-    <p class="muted small">
-      Owner-only. A brand-new branch is forked from the current
-      default and materialized locally so future runs can use it.
-    </p>
-  </form>
-
-  <form class="settings-form" method="POST" action="/p/{{.Project.ID}}/remote"
-        hx-post="/p/{{.Project.ID}}/remote" hx-target="#main">
-    <label>Remote URL
-      <input type="text" name="remote_url" value="{{.Project.RemoteURL}}"
-             placeholder="git@host:org/repo.git" required>
-    </label>
-    <button type="submit" class="btn">Set remote</button>
-    <p class="muted small">
-      Owner-only. The local clone's origin is reconfigured and
-      every local branch pushed to seed the new remote. Clearing
-      it is refused — it silently forks multi-machine teams; to
-      stop using this project here, leave the project instead.
-    </p>
-  </form>
-  {{else}}
-  <p class="muted small">
-    Default branch: <code>{{.Project.DefaultBranch}}</code>{{if .Project.RemoteURL}} ·
-    remote <code>{{.Project.RemoteURL}}</code>{{end}}.
-    Changing these is owner-only.
-  </p>
-  {{end}}
-
-  {{/* Leave project — destructive, any member (not owner-gated;
-       the coord refuses only a sole owner). Disclosure +
-       confirm, same treatment as the run terminate-form.
-       keep_membership wipes just the local clone. */}}
-  <div class="btn-row" x-data="{leaving: false}">
-    <button type="button" class="btn" x-show="!leaving" @click="leaving = true">Leave project…</button>
-    <form x-show="leaving" x-cloak
-          method="POST" action="/p/{{.Project.ID}}/leave"
-          hx-post="/p/{{.Project.ID}}/leave" hx-target="#main"
-          class="terminate-form">
-      <h3 class="terminate-title">Leave project #{{.Project.ID}}?</h3>
-      <p class="terminate-warn">
-        <strong>This is destructive.</strong>
-        Your membership row is removed and your local clone is
-        wiped to reclaim disk. The remote repo is untouched —
-        other members keep their access. Refused if you are the
-        sole remaining owner (promote another member first).
-      </p>
-      <label class="leave-keep">
-        <input type="checkbox" name="keep_membership" value="true">
-        Keep my membership — only wipe the local clone
-      </label>
-      <div class="btn-row terminate-actions">
-        <button type="submit" class="btn btn-primary">Confirm leave</button>
-        <button type="button" class="btn" @click="leaving = false">Cancel</button>
-      </div>
-    </form>
-  </div>
-</section>
-
+{{/* Runs are the hero — the reason you visit a project. First
+     content, above everything administrative (which lives on
+     the Settings page now). */}}
 <section>
   <h2>Runs</h2>
   <p class="btn-row">
@@ -253,7 +59,22 @@
     </tbody>
   </table>
   {{else}}
-  <p class="muted">No runs yet. Create one with <code>enju_create_run</code> in your MCP session.</p>
+  <p class="muted">No runs yet. Start one with <strong>New run from YAML</strong> above, or <code>enju_create_run</code> in your MCP session.</p>
   {{end}}
+</section>
+
+{{/* Read-only members strip — context, not control. Full
+     roster management (add / promote / remove) lives on the
+     Settings page. */}}
+<section>
+  <h2>Members <span class="muted small">({{len .Project.Members}})</span></h2>
+  {{if .Project.Members}}
+  <p class="member-strip">
+    {{range $i, $m := .Project.Members}}{{if $i}} · {{end}}<strong>@{{$m.Username}}</strong> <span class="role">{{$m.Role}}</span>{{end}}
+  </p>
+  {{else}}
+  <p class="muted">(no members listed)</p>
+  {{end}}
+  <p><a class="muted small" href="/p/{{.Project.ID}}/settings">Manage members & settings →</a></p>
 </section>
 {{end}}

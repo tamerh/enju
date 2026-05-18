@@ -197,6 +197,19 @@ main {
   letter-spacing: 0.04em;
 }
 
+/* Read-only members strip on the project overview — compact,
+   no controls (management lives on the Settings page). */
+.member-strip {
+  line-height: 1.8;
+}
+.member-strip .role {
+  margin-left: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* Owner-only roster controls. Forms are inline so the
  * per-member row stays one line until it wraps. */
 .member-actions {

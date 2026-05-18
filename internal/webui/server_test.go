@@ -568,7 +568,7 @@ func projDetailWithRemote() *service.ProjectDetail {
 func TestProjectSyncShowsButtonOnlyWithRemote(t *testing.T) {
 	withRemote := newTestServer(t, &fakeFC{username: "tamer", projDetail: projDetailWithRemote()})
 	rr := httptest.NewRecorder()
-	withRemote.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	withRemote.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	if !strings.Contains(rr.Body.String(), "/p/1/sync") {
 		t.Errorf("expected sync form when remote configured")
 	}
@@ -580,7 +580,7 @@ func TestProjectSyncShowsButtonOnlyWithRemote(t *testing.T) {
 		},
 	})
 	rr2 := httptest.NewRecorder()
-	noRemote.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	noRemote.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	body := rr2.Body.String()
 	if strings.Contains(body, `action="/p/1/sync"`) {
 		t.Errorf("sync form should be hidden with no remote")
@@ -684,7 +684,7 @@ func ownerProjDetail() *service.ProjectDetail {
 func TestProjectMemberControlsOwnerGated(t *testing.T) {
 	owner := newTestServer(t, &fakeFC{username: "tamer", projDetail: ownerProjDetail()})
 	rr := httptest.NewRecorder()
-	owner.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	owner.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	body := rr.Body.String()
 	for _, want := range []string{
 		`action="/p/1/members"`,
@@ -700,7 +700,7 @@ func TestProjectMemberControlsOwnerGated(t *testing.T) {
 	// Same project, viewer is a plain member → no controls.
 	viewer := newTestServer(t, &fakeFC{username: "bob", projDetail: ownerProjDetail()})
 	rr2 := httptest.NewRecorder()
-	viewer.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	viewer.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	if strings.Contains(rr2.Body.String(), `action="/p/1/members"`) {
 		t.Errorf("non-owner should not see roster controls")
 	}
@@ -960,7 +960,7 @@ func TestProjectRemoteStatusLine(t *testing.T) {
 	}
 	s := newTestServer(t, fc)
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	body := rr.Body.String()
 	if !strings.Contains(body, "Remote status:") {
 		t.Errorf("expected remote status line; body: %q", body)
@@ -987,7 +987,7 @@ func TestProjectSettingsNonOwner(t *testing.T) {
 	}
 	s := newTestServer(t, fc)
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	body := rr.Body.String()
 	if strings.Contains(body, `action="/p/1/default-branch"`) {
 		t.Errorf("non-owner should not see settings forms")
@@ -1012,9 +1012,62 @@ func TestProjectShowsLeaveButton(t *testing.T) {
 	}
 	s := newTestServer(t, fc)
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
 	if !strings.Contains(rr.Body.String(), `action="/p/1/leave"`) {
 		t.Errorf("expected leave form for a plain member")
+	}
+}
+
+// TestProjectOverviewIsAdminFree: the overview is runs-first and
+// carries no admin write forms — those moved to /settings. It
+// links to settings and shows a read-only members strip.
+func TestProjectOverviewIsAdminFree(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username:   "tamer",
+		projDetail: ownerProjDetail(),
+		runs:       []wire.Run{{Seq: 1, Name: "Hello", State: "active", Branch: "main"}},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1", nil))
+	body := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	// Runs are present; a settings link is present; the
+	// read-only roster shows members.
+	for _, want := range []string{"Hello", "/p/1/new-run", "/p/1/settings", "@tamer"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("overview missing %q", want)
+		}
+	}
+	// No admin write forms leak onto the overview.
+	for _, gone := range []string{
+		`action="/p/1/members"`, `action="/p/1/default-branch"`,
+		`action="/p/1/remote"`, `action="/p/1/sync"`, `action="/p/1/leave"`,
+	} {
+		if strings.Contains(body, gone) {
+			t.Errorf("overview must not contain admin form %q", gone)
+		}
+	}
+}
+
+// TestProjectSettingsSections: the settings page renders the
+// four section headings for an owner.
+func TestProjectSettingsSections(t *testing.T) {
+	s := newTestServer(t, &fakeFC{username: "tamer", projDetail: projDetailWithRemote()})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{
+		"<h2>Members</h2>", "<h2>General</h2>",
+		"<h2>Maintenance</h2>", "<h2>Danger zone</h2>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("settings page missing section %q", want)
+		}
 	}
 }
 

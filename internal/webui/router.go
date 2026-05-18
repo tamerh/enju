@@ -31,6 +31,7 @@ func (s *Server) router() http.Handler {
 	r.Post("/me/profile", s.handleUpdateProfile)
 	r.Post("/me/agents", s.handleRegisterAgent)
 	r.Get("/p/{projectID}", s.handleProjectView)
+	r.Get("/p/{projectID}/settings", s.handleProjectSettings)
 	r.Get("/p/{projectID}/r/{runSeq}", s.handleRunView)
 	r.Get("/p/{projectID}/r/{runSeq}/export.md", s.handleExportRun)
 	r.Get("/p/{projectID}/t/{taskID}", s.handleTaskView)
