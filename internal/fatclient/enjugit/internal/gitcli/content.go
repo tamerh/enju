@@ -228,11 +228,14 @@ func (c *Clone) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit BlobVisitor)
 //
 // Returns []CommitInfo with Hash / Message / Author name /
 // Author time per commit.
-func (c *Clone) LogFile(relPath string) ([]CommitInfo, error) {
+func (c *Clone) LogFile(relPath, branch string) ([]CommitInfo, error) {
+	args := []string{"log", "--format=%H%n%ct%n%an%n%B" + recordSep}
+	if branch != "" {
+		args = append(args, branch)
+	}
+	args = append(args, "--", relPath)
 	// Per-commit format: SHA \n ctime \n authorname \n body \x1e
-	out, err := runGit(c.workDir,
-		[]string{"log", "--format=%H%n%ct%n%an%n%B" + recordSep, "--", relPath},
-		runOpts{})
+	out, err := runGit(c.workDir, args, runOpts{})
 	if err != nil {
 		return nil, fmt.Errorf("git: log %s: %w", relPath, err)
 	}

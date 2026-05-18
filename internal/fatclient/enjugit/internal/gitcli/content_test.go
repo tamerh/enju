@@ -557,7 +557,7 @@ func TestLogFileReturnsTouchingCommits(t *testing.T) {
 	commitWithMessage(t, dir, "a.txt", "v2", "update a")
 
 	c, _ := OpenClone(dir, "", nullLogger())
-	infos, err := c.LogFile("a.txt")
+	infos, err := c.LogFile("a.txt", "")
 	if err != nil {
 		t.Fatalf("LogFile: %v", err)
 	}

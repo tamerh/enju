@@ -121,8 +121,8 @@ type fatClient interface {
 
 	// Artifacts — read only (list / get / history)
 	ListArtifacts(ctx context.Context, projectID int64, opts service.ListArtifactsOpts) ([]service.ArtifactResponse, error)
-	GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error)
-	GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error)
+	GetArtifactContent(ctx context.Context, projectID int64, path, branch string) ([]byte, error)
+	GetArtifactHistory(ctx context.Context, projectID int64, path, branch string) ([]byte, error)
 	// ListUntrackedArtifacts is the local-workspace visibility
 	// diagnostic (mirror of enju_list_untracked_artifacts):
 	// per untracked artifact, is the byte payload actually

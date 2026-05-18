@@ -128,11 +128,15 @@ func indexOfNewline(s string) int {
 // retries. So no explicit pre-pull is needed for the common
 // case. The worktree-fallback path (commit_sha empty) reads
 // whatever the on-disk clone currently shows.
-func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, path string) ([]byte, error) {
+func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, path, branch string) ([]byte, error) {
 	if s.enjugit == nil {
 		return nil, fmt.Errorf("get_artifact requires a local workspace (MCP client mode)")
 	}
-	metaRaw, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path))
+	coordPath := fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path)
+	if branch != "" {
+		coordPath += "?branch=" + branch
+	}
+	metaRaw, err := s.coord.Get(ctx, coordPath)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +181,7 @@ func (s *FatClient) GetArtifactContent(ctx context.Context, projectID int64, pat
 // superseded annotations by cross-referencing the coordinator's
 // artifact index and the task state machine. Returns the
 // marshaled JSON ready for format.ArtifactHistory.
-func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, path string) ([]byte, error) {
+func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, path, branch string) ([]byte, error) {
 	if s.enjugit == nil {
 		return nil, fmt.Errorf("get_artifact_history requires a local workspace (MCP client mode)")
 	}
@@ -190,13 +194,17 @@ func (s *FatClient) GetArtifactHistory(ctx context.Context, projectID int64, pat
 	// us with whatever local state we have — still useful.
 	_ = wf.FetchAllRefs()
 
-	history, err := wf.LogFile(enjugit.ArtifactPath(path))
+	history, err := wf.LogFile(enjugit.ArtifactPath(path), branch)
 	if err != nil {
 		return nil, fmt.Errorf("reading git history: %w", err)
 	}
 
+	coordPath := fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path)
+	if branch != "" {
+		coordPath += "?branch=" + branch
+	}
 	currentCommitSHA := ""
-	if artData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/artifacts/%s", projectID, path)); err == nil {
+	if artData, err := s.coord.Get(ctx, coordPath); err == nil {
 		var art map[string]interface{}
 		if json.Unmarshal(artData, &art) == nil {
 			if str, ok := art["commit_sha"].(string); ok {

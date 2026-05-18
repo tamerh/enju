@@ -137,7 +137,8 @@ func (s *Server) handleArtifactView(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	raw, err := s.fc.GetArtifactContent(r.Context(), pid, path)
+	branch := strings.TrimSpace(r.URL.Query().Get("branch"))
+	raw, err := s.fc.GetArtifactContent(r.Context(), pid, path, branch)
 	if err != nil {
 		s.logger.Error("GetArtifactContent failed", "project_id", pid, "path", path, "error", err)
 		http.Error(w, "failed to load artifact: "+err.Error(), http.StatusBadGateway)
@@ -168,7 +169,8 @@ func (s *Server) handleArtifactHistory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	raw, err := s.fc.GetArtifactHistory(r.Context(), pid, path)
+	branch := strings.TrimSpace(r.URL.Query().Get("branch"))
+	raw, err := s.fc.GetArtifactHistory(r.Context(), pid, path, branch)
 	if err != nil {
 		s.logger.Error("GetArtifactHistory failed", "project_id", pid, "path", path, "error", err)
 		http.Error(w, "failed to load artifact history: "+err.Error(), http.StatusBadGateway)

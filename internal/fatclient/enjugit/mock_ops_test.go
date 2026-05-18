@@ -240,7 +240,7 @@ func (f *fakeOps) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit git.BlobVi
 	return nil
 }
 
-func (f *fakeOps) LogFile(relPath string) ([]git.CommitInfo, error) {
+func (f *fakeOps) LogFile(relPath, branch string) ([]git.CommitInfo, error) {
 	f.record("LogFile", relPath)
 	return nil, f.checkErr("LogFile")
 }

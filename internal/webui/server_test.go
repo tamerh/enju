@@ -327,11 +327,11 @@ func (f *fakeFC) ListArtifacts(ctx context.Context, pid int64, opts service.List
 	f.listedArtifactsPrefix = opts.Prefix
 	return f.artifacts, f.listArtifactsErr
 }
-func (f *fakeFC) GetArtifactContent(ctx context.Context, pid int64, path string) ([]byte, error) {
+func (f *fakeFC) GetArtifactContent(ctx context.Context, pid int64, path, branch string) ([]byte, error) {
 	f.gotArtifactPath = path
 	return f.artifactContent, f.getArtifactErr
 }
-func (f *fakeFC) GetArtifactHistory(ctx context.Context, pid int64, path string) ([]byte, error) {
+func (f *fakeFC) GetArtifactHistory(ctx context.Context, pid int64, path, branch string) ([]byte, error) {
 	return f.artifactHistory, f.getArtifactHistoryErr
 }
 func (f *fakeFC) ListUntrackedArtifacts(ctx context.Context, pid int64, branch string) (*service.UntrackedArtifactReport, error) {
@@ -1427,6 +1427,64 @@ func TestTaskViewWithResult(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
+	}
+}
+
+// TestTaskViewProducedFiles: a task that wrote artifacts shows
+// a "Files produced" section listing only its own outputs
+// (artifact-index last_task_id == this task), each linking to
+// the artifact viewer. A different task's artifact is excluded.
+func TestTaskViewProducedFiles(t *testing.T) {
+	tracked := true
+	fc := &fakeFC{
+		username: "tamer",
+		taskMeta: &service.TaskMeta{
+			ID: "1:1:plot", ProjectID: 1, RunSeq: 1, TaskDefID: "plot",
+			State: "accepted", Action: "compute", Branch: "mustache-engine-1",
+		},
+		artifacts: []service.ArtifactResponse{
+			{Path: "figures/fig1.png", LastTaskID: "1:1:plot", CommitSHA: "abc1234567890def", Tracked: &tracked, UpdatedAt: "2026-05-18"},
+			{Path: "data/raw.csv", LastTaskID: "1:1:ingest", CommitSHA: "ffff000011112222", Tracked: &tracked, UpdatedAt: "2026-05-17"},
+		},
+	}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodGet, "/p/1/t/1:1:plot", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	body := rr.Body.String()
+	// The index is branch-keyed; the task page must query the
+	// task's run branch, not the project default.
+	if fc.listedArtifactsBranch != "mustache-engine-1" {
+		t.Errorf("ListArtifacts branch: got %q, want the task's run branch", fc.listedArtifactsBranch)
+	}
+	if !strings.Contains(body, "Files produced") {
+		t.Errorf("expected Files produced section")
+	}
+	if !strings.Contains(body, "figures/fig1.png") ||
+		!strings.Contains(body, "/p/1/artifacts/show/figures/fig1.png") {
+		t.Errorf("expected this task's artifact linked to the viewer; body: %q", body)
+	}
+	if strings.Contains(body, "data/raw.csv") {
+		t.Errorf("another task's artifact must not appear here")
+	}
+}
+
+// TestTaskViewNoProducedFiles: an answer task that wrote
+// nothing has no Files-produced section (it just hides).
+func TestTaskViewNoProducedFiles(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		taskMeta: &service.TaskMeta{
+			ID: "1:1:draft", ProjectID: 1, RunSeq: 1, TaskDefID: "draft",
+			State: "accepted", Action: "answer",
+		},
+		// artifacts left nil — nothing produced.
+	})
+	req := httptest.NewRequest(http.MethodGet, "/p/1/t/1:1:draft", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if strings.Contains(rr.Body.String(), "Files produced") {
+		t.Errorf("no-artifact task should not show the Files produced section")
 	}
 }
 

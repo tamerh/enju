@@ -46,7 +46,8 @@ func (c *apiClient) handleGetArtifact(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	out, err := c.fc.GetArtifactContent(ctx, int64(projectID), path)
+	branch := req.GetString("branch", "")
+	out, err := c.fc.GetArtifactContent(ctx, int64(projectID), path, branch)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -66,7 +67,8 @@ func (c *apiClient) handleGetArtifactHistory(ctx context.Context, req mcp.CallTo
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	out, err := c.fc.GetArtifactHistory(ctx, int64(projectID), path)
+	branch := req.GetString("branch", "")
+	out, err := c.fc.GetArtifactHistory(ctx, int64(projectID), path, branch)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

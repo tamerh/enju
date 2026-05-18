@@ -616,8 +616,8 @@ func (w *Workflow) Head() (sha, branch string, err error) {
 // service-layer view of "commit history" doesn't depend on
 // internal/git's struct shape — internal git changes can't ripple
 // out without an explicit translation step here.
-func (w *Workflow) LogFile(relPath string) ([]CommitInfo, error) {
-	out, err := w.git.LogFile(relPath)
+func (w *Workflow) LogFile(relPath, branch string) ([]CommitInfo, error) {
+	out, err := w.git.LogFile(relPath, branch)
 	if err != nil {
 		return nil, translateGitError("log file", err)
 	}

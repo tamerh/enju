@@ -181,6 +181,9 @@ func GetArtifact() mcp.Tool {
 			mcp.Required(),
 			mcp.Description("The artifact path relative to the artifacts/ directory (e.g., 'src/analyze.py')"),
 		),
+		mcp.WithString("branch",
+			mcp.Description("Branch to read from. Defaults to the project's default branch. Pass the run's branch to read artifacts from an in-flight or un-merged run."),
+		),
 	)
 }
 
@@ -194,6 +197,9 @@ func GetArtifactHistory() mcp.Tool {
 		mcp.WithString("path",
 			mcp.Required(),
 			mcp.Description("The artifact path relative to the artifacts/ directory"),
+		),
+		mcp.WithString("branch",
+			mcp.Description("Branch to read history from. Defaults to the project's default branch. Pass the run's branch to see commits from an in-flight or un-merged run."),
 		),
 	)
 }

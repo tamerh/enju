@@ -42,8 +42,9 @@ type Ops interface {
 	WalkCommitsFrom(fromSHA string, maxWalk int, visit func(sha, message string) bool) error
 
 	// LogFile returns commits that touched relPath, newest-first.
-	// Used by per-file history readers (enju_get_artifact_history).
-	LogFile(relPath string) ([]CommitInfo, error)
+	// branch is the ref to walk from (e.g. a run branch); empty
+	// string walks from HEAD (the checked-out default branch).
+	LogFile(relPath, branch string) ([]CommitInfo, error)
 
 	// Refs / branches — acquire the lock.
 	CreateBranchAt(name, baseSHA string) error
