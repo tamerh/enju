@@ -1875,7 +1875,100 @@ func TestSetProjectRemoteRejectsEmptyURL(t *testing.T) {
 	}
 }
 
-// Note: TestClaimTransientRetryRecovers and
-// TestClaimTransientRetrySkipsSubstantiveErrors moved to
-// internal/fatclient/service/execute_test.go alongside the
-// claimWithTransientRetry implementation.
+// TestProjectSyncCleanupRunsOnNoRemoteProject is the regression
+// test for the blocker where cleanup=prune/archive was silently
+// unreachable on no-remote (local-only) projects.
+//
+// Before the fix, handleProjectSync returned the SyncProjectToRemote
+// error immediately even when cleanup != none, so the cleanup branch
+// was never reached. The fix: a sync error only blocks when
+// cleanup==none; otherwise it is surfaced in the result and cleanup
+// continues as a purely local git operation.
+//
+// Setup: a no-remote git repo with a completed run's branch merged
+// into main. The coordinator stub advertises remote_url="" and returns
+// one terminal run on branch "run-1". The handler must:
+//   - not return IsError=true
+//   - delete the merged run-1 branch (cleanup ran)
+//   - include the no-remote sync error in the result text
+func TestProjectSyncCleanupRunsOnNoRemoteProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// Git repo: main with two commits (seed then merge of run-1),
+	// so run-1's tip is a proper ancestor of main after the merge.
+	workDir := t.TempDir()
+	gittest.Init(t, workDir)
+	gittest.CommitAs(t, workDir, "seed.md", "seed", "initial commit", "Test", "t@t")
+	// Create run-1 branch and add a commit.
+	gittest.Run(t, workDir, "checkout", "-b", "run-1")
+	gittest.CommitAs(t, workDir, "result.md", "run output", "run-1 work", "Test", "t@t")
+	// Go back to main and merge run-1 with --no-ff so run-1's tip
+	// becomes a strict ancestor of main (not equal after FF).
+	gittest.Run(t, workDir, "checkout", "main")
+	gittest.Run(t, workDir, "-c", "user.name=Test", "-c", "user.email=t@t",
+		"merge", "--no-ff", "-m", "merge run-1", "run-1")
+
+	// Coordinator stub: project has no remote; one completed run on run-1.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1,"name":"tp53","remote_url":"","default_branch":"main"}`))
+	})
+	mux.HandleFunc("/api/v1/projects/1/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":1,"seq":1,"branch":"run-1","state":"completed","slug":"work","project_id":1}]`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ws, err := enjugit.NewWorkspace(t.TempDir(), enjugit.NewProductionConventions(), enjugit.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("new workspace: %v", err)
+	}
+	reg := projectreg.Open(filepath.Join(t.TempDir(), "projects.json"))
+	if err := reg.Upsert(projectreg.Entry{ID: 1, LocalPath: workDir}); err != nil {
+		t.Fatalf("registry upsert: %v", err)
+	}
+	ws.AttachRegistry(reg)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := newAPIClientForTest(TestClientConfig{
+		Coord: coord.New(coord.Config{
+			BaseURL:  ts.URL,
+			Username: "tester",
+			Logger:   logger,
+		}),
+		WorkspaceRoot:   ws.RootDir(),
+		Logger:          logger,
+		ProjectRegistry: reg,
+	})
+
+	result, err := c.handleProjectSync(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "enju_project_sync",
+			Arguments: map[string]interface{}{
+				"project_id": float64(1),
+				"cleanup":    "prune",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleProjectSync transport error: %v", err)
+	}
+	// Must not return IsError — cleanup ran even though sync failed.
+	if result != nil && result.IsError {
+		t.Fatalf("expected success result (cleanup ran), got IsError=true: %s", mcpResultText(t, result))
+	}
+
+	// run-1 must be gone — confirms cleanup actually executed.
+	if _, rerr := gittest.RunOK(t, workDir, "rev-parse", "--verify", "refs/heads/run-1"); rerr == nil {
+		t.Error("expected run-1 branch to be pruned, but it still exists")
+	}
+
+	// Result text must surface the no-remote sync error so the
+	// operator knows why sync was skipped.
+	text := mcpResultText(t, result)
+	if !strings.Contains(text, "no remote URL") && !strings.Contains(text, "remote") {
+		t.Errorf("expected no-remote error in result text, got: %s", text)
+	}
+}

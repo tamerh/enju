@@ -97,18 +97,27 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(fmt.Sprintf("cleanup: unrecognised mode %q — valid values: none, archive, prune", cleanupStr)), nil
 	}
 
-	resp, err := c.fc.SyncProjectToRemote(ctx, int64(projectID), force)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	resp, syncErr := c.fc.SyncProjectToRemote(ctx, int64(projectID), force)
+	// Hard sync error (e.g. no remote configured) must not block cleanup —
+	// cleanup is a purely local git operation that works whether or not a
+	// remote exists. Surface the sync error in the result and continue.
+	if syncErr != nil {
+		if cleanupMode == enjugit.CleanupModeNone {
+			return mcp.NewToolResultError(syncErr.Error()), nil
+		}
+		resp = map[string]interface{}{
+			"project_id": int64(projectID),
+			"result":     "failed",
+			"error":      syncErr.Error(),
+		}
 	}
 
 	var cleanupResult *enjugit.BranchCleanupResult
 	if cleanupMode != enjugit.CleanupModeNone {
-		cleanupResult, err = c.fc.CleanupRunBranches(ctx, int64(projectID), cleanupMode)
-		if err != nil {
-			// Non-fatal: cleanup error is surfaced in the result but
-			// does not override a successful push.
-			resp["cleanup_error"] = err.Error()
+		var cleanupErr error
+		cleanupResult, cleanupErr = c.fc.CleanupRunBranches(ctx, int64(projectID), cleanupMode)
+		if cleanupErr != nil {
+			resp["cleanup_error"] = cleanupErr.Error()
 		}
 	}
 
