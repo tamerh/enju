@@ -252,3 +252,45 @@ func TestCleanupRunBranches_EmptySlugSkipsIterScan(t *testing.T) {
 		t.Errorf("expected 1 archived (run branch only), got %v", res.Archived)
 	}
 }
+
+// TestCleanupRunBranches_DefaultBranchNeverCleaned is the regression
+// test for the live-production defect where cleanup archived/pruned the
+// project's own default branch.
+//
+// Root cause: a run created without an explicit branch (the common
+// default) records run.Branch == defaultBranch (e.g. "main"). The
+// default branch is trivially an ancestor of itself, so it passed
+// both the terminal-run gate and the ancestor gate. The fix: skip any
+// candidate equal to baseBranch in CleanupRunBranches, and guard
+// again in cleanupBranch as belt-and-suspenders.
+func TestCleanupRunBranches_DefaultBranchNeverCleaned(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	const baseSHA = "base000000000000000000000000000000000001"
+
+	// The default branch IS the run branch — the common case when
+	// create_run omits an explicit branch=.
+	fake.branches = []string{"main"}
+	fake.resolveMap["refs/heads/main"] = baseSHA
+	// IsAncestor(baseSHA, baseSHA) would return true — the default
+	// branch is trivially an ancestor of itself.
+	fake.perAncestorResult = map[string]bool{baseSHA: true}
+
+	// Terminal run recorded on the default branch.
+	runs := []wire.Run{terminalRun(4, "work", "main")}
+
+	for _, mode := range []CleanupMode{CleanupModeArchive, CleanupModePrune} {
+		t.Run(string(mode), func(t *testing.T) {
+			res, err := wf.CleanupRunBranches(runs, mode)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(res.Archived)+len(res.Pruned) != 0 {
+				t.Errorf("default branch must never be cleaned up; got archived=%v pruned=%v",
+					res.Archived, res.Pruned)
+			}
+			if fake.callCount("DeleteBranchCAS")+fake.callCount("DeleteBranch") != 0 {
+				t.Errorf("no delete calls expected when only candidate is the default branch")
+			}
+		})
+	}
+}

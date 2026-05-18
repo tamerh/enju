@@ -142,7 +142,11 @@ func (w *Workflow) CleanupRunBranches(runs []wire.Run, mode CleanupMode) (*Branc
 		//   2. All iter/topic branches whose name starts with "<seq>-<slug>/".
 		var candidates []string
 
-		if run.Branch != "" && localSet[run.Branch] {
+		// The base branch must never be a cleanup candidate — a run
+		// created on the default branch records run.Branch == baseBranch,
+		// and baseBranch is trivially an ancestor of itself, so it would
+		// sail through the ancestor gate and be deleted.
+		if run.Branch != "" && run.Branch != baseBranch && localSet[run.Branch] {
 			candidates = append(candidates, run.Branch)
 		}
 
@@ -168,6 +172,12 @@ func (w *Workflow) CleanupRunBranches(runs []wire.Run, mode CleanupMode) (*Branc
 // cleanupBranch handles a single candidate branch: checks ancestry,
 // then archives or prunes if merged. Appends to res in-place.
 func (w *Workflow) cleanupBranch(branch, baseSHA string, mode CleanupMode, res *BranchCleanupResult) error {
+	// Belt-and-suspenders: never operate on the base branch itself,
+	// regardless of how the candidate entered this function.
+	if branch == w.DefaultBranch() {
+		return nil
+	}
+
 	branchSHA, err := w.git.LocalBranchHash(branch)
 	if err != nil || branchSHA == "" {
 		// Branch disappeared between the list and now — skip quietly.
