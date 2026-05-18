@@ -2,6 +2,8 @@ package webui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -186,6 +188,29 @@ type Server struct {
 	logger   *slog.Logger
 	dev      bool
 	port     int
+	// assetVer is a short content hash of app.css + app.js,
+	// computed once at startup. Appended as ?v= to those URLs
+	// in the layout so the immutable-1y static cache busts
+	// automatically when a rebuild changes the assets — the
+	// "build-versioned URLs" the static.go cache-header comment
+	// always assumed but never had.
+	assetVer string
+}
+
+// computeAssetVer hashes the cache-busted static assets so the
+// ?v= query changes iff their bytes change. Best-effort: on any
+// read error returns "dev" (un-versioned-equivalent — the
+// browser revalidates more, never serves stale wrong code).
+func computeAssetVer(staticFS fs.FS) string {
+	h := sha256.New()
+	for _, name := range []string{"app.css", "app.js"} {
+		b, err := fs.ReadFile(staticFS, name)
+		if err != nil {
+			return "dev"
+		}
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
 // New constructs a Server from cfg. Parses templates (in
@@ -221,6 +246,7 @@ func New(cfg Config) (*Server, error) {
 		logger:   logger,
 		dev:      cfg.Dev,
 		port:     cfg.Port,
+		assetVer: computeAssetVer(staticFS),
 	}, nil
 }
 

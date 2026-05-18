@@ -235,6 +235,7 @@ func (s *Server) renderTaskActionError(w http.ResponseWriter, r *http.Request, p
 		ClaimedByMe: meta.State == "claimed" && meta.ClaimedBy == s.fc.Username(),
 		Result:      result,
 		Iterations:  iterations,
+		Produced:    s.producedArtifacts(r, meta),
 		ActionError: msg,
 	})
 }
@@ -266,6 +267,7 @@ func (s *Server) renderTaskAfterAction(w http.ResponseWriter, r *http.Request, p
 		ClaimedByMe: meta.State == "claimed" && meta.ClaimedBy == s.fc.Username(),
 		Result:      result,
 		Iterations:  iterations,
+		Produced:    s.producedArtifacts(r, meta),
 	})
 }
 

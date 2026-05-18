@@ -16,10 +16,12 @@
       }
     } catch (e) {}
   </script>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/hljs.css">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVer}}">
   <script src="/static/htmx.min.js" defer></script>
   <script src="/static/alpine.min.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/highlight.min.js" defer></script>
+  <script src="/static/app.js?v={{.AssetVer}}" defer></script>
   {{block "scripts" .}}{{end}}
 </head>
 <body>

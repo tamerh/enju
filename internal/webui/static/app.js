@@ -118,59 +118,29 @@
     });
   }
 
-  // Minimal, dependency-free YAML highlighter for read-only
-  // <pre data-lang="yaml"> blocks (the run page's Workflow
-  // YAML). Deliberately conservative: a line that doesn't match
-  // is emitted escaped + uncolored — never wrong text, just
-  // less color. textContent is preserved (escaped entities
-  // decode back), so the auto-attached copy button still yields
-  // the exact original. Idempotent via data-hl.
-  function esc(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-  function hlValue(v) {
-    var t = v.trim();
-    if (t === '') return esc(v);
-    // quoted string
-    if (/^(".*"|'.*')$/.test(t)) {
-      return esc(v).replace(esc(t), '<span class="y-str">' + esc(t) + '</span>');
+  // Syntax highlighting via vendored highlight.js (static/
+  // highlight.min.js + hljs.css). Server emits the read-only
+  // file blocks as <pre data-lang="..."> (the data-lang tokens
+  // py/sh/ts/go/yaml/json/… are hljs language aliases, passed
+  // straight through as a language-* class). hljs.highlightElement
+  // preserves textContent, so the auto-attached copy button
+  // still yields the exact original. Idempotent via data-hl;
+  // graceful no-op if the script failed to load.
+  var hljsConfigured = false;
+  function highlightAll() {
+    if (!window.hljs) return;
+    if (!hljsConfigured) {
+      window.hljs.configure({ ignoreUnescapedHTML: true });
+      hljsConfigured = true;
     }
-    if (/^(true|false|null|~|-?\d+(\.\d+)?)$/.test(t)) {
-      return esc(v).replace(esc(t), '<span class="y-num">' + esc(t) + '</span>');
-    }
-    return esc(v);
-  }
-  function hlLine(line) {
-    // Split off a trailing comment (# at line start or after
-    // whitespace, not inside quotes).
-    var inS = false, inD = false, ci = -1;
-    for (var i = 0; i < line.length; i++) {
-      var c = line[i];
-      if (c === "'" && !inD) inS = !inS;
-      else if (c === '"' && !inS) inD = !inD;
-      else if (c === '#' && !inS && !inD && (i === 0 || /\s/.test(line[i - 1]))) { ci = i; break; }
-    }
-    var code = ci >= 0 ? line.slice(0, ci) : line;
-    var comment = ci >= 0 ? line.slice(ci) : '';
-    var out;
-    // key:  (optionally after indentation + a list dash)
-    var m = code.match(/^(\s*(?:-\s+)?)([^\s#'":][^:#]*?)(:)(\s.*|)$/);
-    if (m) {
-      out = esc(m[1]) +
-        '<span class="y-key">' + esc(m[2]) + '</span>' +
-        '<span class="y-punct">' + esc(m[3]) + '</span>' +
-        hlValue(m[4]);
-    } else {
-      out = esc(code);
-    }
-    if (comment) out += '<span class="y-comment">' + esc(comment) + '</span>';
-    return out;
-  }
-  function highlightYAML() {
-    document.querySelectorAll('pre[data-lang="yaml"]:not([data-hl="1"])').forEach(function (pre) {
+    document.querySelectorAll('pre[data-lang]:not([data-hl="1"])').forEach(function (pre) {
+      var lang = pre.getAttribute('data-lang');
+      if (!lang) return;
       pre.dataset.hl = '1';
-      var lines = pre.textContent.split('\n');
-      pre.innerHTML = lines.map(hlLine).join('\n');
+      pre.classList.add('language-' + lang);
+      try {
+        window.hljs.highlightElement(pre);
+      } catch (e) { /* leave plain on any grammar error */ }
     });
   }
 
@@ -178,7 +148,7 @@
     prefetchIcons();
     attachAll();
     initThemeToggle();
-    highlightYAML();
+    highlightAll();
   }
 
   if (document.readyState === 'loading') {
@@ -188,6 +158,6 @@
   }
   document.addEventListener('htmx:afterSwap', function () {
     attachAll();
-    highlightYAML();
+    highlightAll();
   });
 })();

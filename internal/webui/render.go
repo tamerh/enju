@@ -16,6 +16,10 @@ import (
 // every embedding page gets them for free.
 type pageData struct {
 	Username string
+	// AssetVer is the static-asset content hash, appended as
+	// ?v= to app.css/app.js in the layout so the immutable-1y
+	// browser cache busts automatically on a rebuild.
+	AssetVer string
 }
 
 // commonPageData returns a populated pageData for the current
@@ -32,7 +36,7 @@ type pageData struct {
 //	}
 //	s.render(w, r, "landing.html", data)
 func (s *Server) commonPageData() pageData {
-	return pageData{Username: s.fc.Username()}
+	return pageData{Username: s.fc.Username(), AssetVer: s.assetVer}
 }
 
 // renderFull renders the full layout shell with the page's

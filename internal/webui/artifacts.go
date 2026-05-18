@@ -56,6 +56,62 @@ type artifactDetailPage struct {
 	Path      string
 	Meta      map[string]interface{}
 	Content   string
+	// Lang is the highlighter token for the content <pre>:
+	// "yaml" (key-aware) or a short language tag the app.js
+	// generic highlighter maps to a comment style (py/sh →ʼ#ʼ,
+	// js/go/c →ʼ//ʼ, json → none, …). "" = plain (markdown/
+	// text/unknown — never risk mis-coloring prose). Derived
+	// from the path extension.
+	Lang string
+}
+
+// artifactLang maps a file extension to the highlighter token
+// the app.js dispatcher understands. Conservative: anything not
+// clearly code/yaml renders plain.
+func artifactLang(path string) string {
+	switch strings.ToLower(filepathExt(path)) {
+	case ".yaml", ".yml":
+		return "yaml"
+	case ".py":
+		return "py"
+	case ".sh", ".bash":
+		return "sh"
+	case ".rb":
+		return "rb"
+	case ".toml":
+		return "toml"
+	case ".json":
+		return "json"
+	case ".js", ".jsx":
+		return "js"
+	case ".ts", ".tsx":
+		return "ts"
+	case ".go":
+		return "go"
+	case ".rs":
+		return "rs"
+	case ".c", ".h", ".cpp", ".hpp", ".cc":
+		return "c"
+	case ".java":
+		return "java"
+	case ".css":
+		return "css"
+	case ".sql":
+		return "sql"
+	default:
+		return ""
+	}
+}
+
+// filepathExt is path.Ext without importing path just for this
+// (the artifact path is always forward-slash, repo-relative).
+func filepathExt(p string) string {
+	for i := len(p) - 1; i >= 0 && p[i] != '/'; i-- {
+		if p[i] == '.' {
+			return p[i:]
+		}
+	}
+	return ""
 }
 
 // artifactHistoryPage is the data shape for views/artifact-history.html.
@@ -158,6 +214,7 @@ func (s *Server) handleArtifactView(w http.ResponseWriter, r *http.Request) {
 		Path:      path,
 		Meta:      meta,
 		Content:   content,
+		Lang:      artifactLang(path),
 	})
 }
 

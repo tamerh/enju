@@ -172,6 +172,24 @@
 </section>
 {{end}}
 
+{{/* Prompt first — it's the instruction the task answered;
+     reading order is ask → result → produced files. */}}
+<section>
+  <h2>Prompt</h2>
+  {{if .Task.Prompt}}
+  <pre class="prompt">{{.Task.Prompt}}</pre>
+  <p class="muted small">Raw template — <code>{{"{{...}}"}}</code> placeholders are resolved client-side at claim time.</p>
+  {{else}}
+  <p class="muted">(no prompt declared)</p>
+  {{end}}
+</section>
+
+{{/* The submitted result.md — conceptually one of the files
+     this task produced, but kept as the distinct, default-shown
+     headline (every answer/review/vote/compute task has one;
+     it's the narrative). Highlighted as markdown for parity
+     with the artifact viewer; "Files produced" below is the
+     declared-artifacts list. */}}
 {{if .Result}}
 <section>
   <h2>Submitted result</h2>
@@ -179,7 +197,47 @@
     Read from <code>{{.Task.ResultDir}}/result.md</code>
     {{if .Task.CommitSHA}}at commit <code>{{slice .Task.CommitSHA 0 12}}</code>{{end}}.
   </p>
-  <pre class="result-content">{{.Result}}</pre>
+  <pre class="result-content" data-lang="markdown">{{.Result}}</pre>
+</section>
+{{end}}
+
+{{/* Files this task committed via writes: — distinct from the
+     result.md prose above. Sourced from the project artifact
+     index (last_task_id == this task). Each row is collapsible
+     and lazy: the content fragment is fetched (HTMX) only when
+     you expand it, so a task with many/large outputs stays
+     cheap until you actually look. A link-out keeps history /
+     metadata / big-file handling on the dedicated page.
+     Section hides for tasks that declare no writes. */}}
+{{if .Produced}}
+<section>
+  <h2>Files produced <span class="muted small">({{len .Produced}})</span></h2>
+  {{/* Carry the task's run branch through: the index row + file
+       live on the run branch; content/history endpoints take
+       ?branch=. Empty branch → coord falls back to default. */}}
+  {{$brq := ""}}{{if $.Task.Branch}}{{$brq = printf "&branch=%s" (urlquery $.Task.Branch)}}{{end}}
+  {{$brShow := ""}}{{if $.Task.Branch}}{{$brShow = printf "?branch=%s" (urlquery $.Task.Branch)}}{{end}}
+  {{range .Produced}}
+  <details class="produced-file">
+    <summary>
+      <span class="pf-row">
+        <code>{{.Path}}</code>
+        <span class="muted small">
+          {{if .CommitSHA}}{{slice .CommitSHA 0 12}}{{end}}{{if .UpdatedAt}} · {{.UpdatedAt}}{{end}}
+        </span>
+        <a class="muted small produced-open" href="/p/{{$.ProjectID}}/artifacts/show/{{.Path}}{{$brShow}}">full page ↗</a>
+      </span>
+    </summary>
+    {{/* <details> fires `toggle` on open; `once` makes the
+         fetch happen exactly the first time it's expanded. */}}
+    <div class="produced-body"
+         hx-get="/p/{{$.ProjectID}}/t/{{$.Task.ID}}/file?path={{urlquery .Path}}{{$brq}}"
+         hx-trigger="toggle once from:closest details"
+         hx-swap="innerHTML">
+      <p class="muted small">Expand to load…</p>
+    </div>
+  </details>
+  {{end}}
 </section>
 {{end}}
 
@@ -206,7 +264,7 @@
       {{if .Body}}
       <details>
         <summary>view content</summary>
-        <pre class="iter-body">{{.Body}}</pre>
+        <pre class="iter-body" data-lang="markdown">{{.Body}}</pre>
       </details>
       {{else if .CommitSHA}}
       <p class="muted small">(content unavailable — commit unreachable from this clone)</p>
@@ -216,16 +274,6 @@
   </ol>
 </section>
 {{end}}
-
-<section>
-  <h2>Prompt</h2>
-  {{if .Task.Prompt}}
-  <pre class="prompt">{{.Task.Prompt}}</pre>
-  <p class="muted small">Raw template — <code>{{"{{...}}"}}</code> placeholders are resolved client-side at claim time.</p>
-  {{else}}
-  <p class="muted">(no prompt declared)</p>
-  {{end}}
-</section>
 
 {{if eq .Task.Action "review"}}
 <section>

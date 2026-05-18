@@ -52,6 +52,13 @@ type taskPage struct {
 	// iter without separate clicks. Empty slice when the task
 	// hasn't been claimed yet.
 	Iterations []iterationView
+	// Produced is the subset of the project artifact index this
+	// task most-recently wrote (last_task_id == this task). The
+	// result.md is the LLM's prose; this is the files it
+	// committed via writes:. Each links to the artifact viewer
+	// (content + history). Empty for tasks that produce no
+	// declared artifacts (answer/review/vote) — section hides.
+	Produced []service.ArtifactResponse
 }
 
 // iterationView is the per-iteration shape templates consume.
@@ -117,7 +124,88 @@ func (s *Server) handleTaskView(w http.ResponseWriter, r *http.Request) {
 		ClaimedByMe: meta.State == "claimed" && meta.ClaimedBy == s.fc.Username(),
 		Result:      result,
 		Iterations:  iterations,
+		Produced:    s.producedArtifacts(r, meta),
 	})
+}
+
+// producedArtifacts returns the project's artifact-index rows
+// this task most-recently wrote (last_task_id == task ID). The
+// artifact index is the source of truth for "what files did
+// this task commit"; we just surface the link the artifacts
+// page already exposes the other direction. Best-effort: a
+// ListArtifacts failure (no clone, coord error) returns nil so
+// the section hides rather than failing the task page. Empty
+// for answer/review/vote tasks that declare no writes.
+func (s *Server) producedArtifacts(r *http.Request, meta *service.TaskMeta) []service.ArtifactResponse {
+	if meta == nil || meta.ProjectID == 0 {
+		return nil
+	}
+	// Query the artifact index on the TASK'S run branch, not the
+	// project default. The index is keyed (project, branch,
+	// path) and rows are written under the run branch; an empty
+	// branch makes the coord fall back to the default branch, so
+	// a completed/in-flight run's declared artifacts wouldn't
+	// match. The task already knows its branch.
+	all, err := s.fc.ListArtifacts(r.Context(), meta.ProjectID,
+		service.ListArtifactsOpts{Branch: meta.Branch})
+	if err != nil {
+		s.logger.Info("ListArtifacts unavailable; omitting produced-files section",
+			"task_id", meta.ID, "branch", meta.Branch, "error", err)
+		return nil
+	}
+	var mine []service.ArtifactResponse
+	for _, a := range all {
+		if a.LastTaskID == meta.ID {
+			mine = append(mine, a)
+		}
+	}
+	return mine
+}
+
+// handleTaskFileFragment is GET /p/{projectID}/t/{taskID}/file
+// ?path=&branch= — the lazy body for one collapsible "Files
+// produced" row. Returns a bare HTML fragment (not the layout):
+// a highlighter-ready <pre> with the file content, or a muted
+// note when empty/unreadable. Loaded by HTMX only when the user
+// expands the <details>, so a task with many/large outputs
+// stays cheap until you actually look. branch comes from the
+// query (the task page passes the run branch); reuses the
+// branch-aware GetArtifactContent.
+func (s *Server) handleTaskFileFragment(w http.ResponseWriter, r *http.Request) {
+	pid, _, ok := parseTaskRoute(w, r)
+	if !ok {
+		return
+	}
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	branch := strings.TrimSpace(r.URL.Query().Get("branch"))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if path == "" {
+		_, _ = w.Write([]byte(`<p class="muted small">(no path)</p>`))
+		return
+	}
+	raw, err := s.fc.GetArtifactContent(r.Context(), pid, path, branch)
+	if err != nil {
+		s.logger.Info("task file fragment: GetArtifactContent failed",
+			"project_id", pid, "path", path, "branch", branch, "error", err)
+		_, _ = w.Write([]byte(`<p class="muted small">Couldn't load this file here — open it in the full artifact page.</p>`))
+		return
+	}
+	var meta map[string]interface{}
+	_ = json.Unmarshal(raw, &meta)
+	content, _ := meta["content"].(string)
+	if content == "" {
+		_, _ = w.Write([]byte(`<p class="muted small">(empty, binary, or untracked — content not viewable here; try the full artifact page)</p>`))
+		return
+	}
+	lang := artifactLang(path)
+	langAttr := ""
+	if lang != "" {
+		langAttr = ` data-lang="` + lang + `"`
+	}
+	// Escaped content; the app.js highlighter (re-run on
+	// htmx:afterSwap) decodes textContent so the auto-attached
+	// copy button still yields the exact original.
+	_, _ = w.Write([]byte(`<pre class="result-content"` + langAttr + `>` + htmlEscape(content) + `</pre>`))
 }
 
 // loadIterationViews fetches the iteration list and reads each

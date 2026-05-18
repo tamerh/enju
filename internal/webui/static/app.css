@@ -835,19 +835,63 @@ details summary {
   margin-top: 0.6rem;
 }
 
-/* Minimal YAML token colors (set by the highlighter in app.js
-   on <pre data-lang="yaml">). Tuned for the light default;
-   dark overrides keep contrast on near-black. */
-.y-key     { color: #1d4ed8; font-weight: 600; }
-.y-str     { color: #047857; }
-.y-num     { color: #b45309; }
-.y-comment { color: #6b7280; font-style: italic; }
-.y-punct   { color: #6b7280; }
-[data-theme="dark"] .y-key     { color: #93c5fd; }
-[data-theme="dark"] .y-str     { color: #6ee7b7; }
-[data-theme="dark"] .y-num     { color: #fcd34d; }
-[data-theme="dark"] .y-comment { color: #9ca3af; }
-[data-theme="dark"] .y-punct   { color: #9ca3af; }
+/* Artifact viewer: same collapsible affordance as the workflow
+   YAML, but `open` by default (the file is the page's point).
+   The <pre> reuses .result-content + the .y-* token classes. */
+.file-view > summary {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.file-view .result-content {
+  margin-top: 0.6rem;
+}
+
+/* Task page "Files produced": one collapsible per file,
+   lazy-loaded on expand. Collapsed by default — cheap until
+   you look. */
+.produced-file {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0.5rem 0;
+}
+/* A flex summary (needed to right-align "full page ↗") drops
+   the browser's native disclosure marker, so we draw our own
+   rotating ▸ via ::before. Same affordance as the workflow
+   YAML / .file-view disclosures, kept on one line. */
+.produced-file > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88rem;
+  list-style: none;
+}
+.produced-file > summary::-webkit-details-marker { display: none; }
+.produced-file > summary::before {
+  content: "▸";
+  flex: none;
+  color: var(--muted);
+  transition: transform 0.12s ease;
+}
+.produced-file[open] > summary::before { transform: rotate(90deg); }
+.produced-file > summary .pf-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex: 1;
+  min-width: 0;
+}
+.produced-file > summary code { background: none; padding: 0; }
+.pf-row > code { overflow: hidden; text-overflow: ellipsis; }
+.produced-open { margin-left: auto; flex: none; white-space: nowrap; }
+.produced-body { padding: 0 0.75rem 0.75rem; }
+.produced-body .result-content { margin-top: 0.5rem; }
+
+/* Syntax-highlight token colors now come from the vendored
+   highlight.js theme (static/hljs.css — GitHub light, dark
+   scoped under [data-theme="dark"]). The old hand-rolled .y-*
+   classes were removed with the hand-rolled highlighter. */
 
 .iter-body {
   margin: 0.5rem 0 0;

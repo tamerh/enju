@@ -35,6 +35,7 @@ func (s *Server) router() http.Handler {
 	r.Get("/p/{projectID}/r/{runSeq}", s.handleRunView)
 	r.Get("/p/{projectID}/r/{runSeq}/export.md", s.handleExportRun)
 	r.Get("/p/{projectID}/t/{taskID}", s.handleTaskView)
+	r.Get("/p/{projectID}/t/{taskID}/file", s.handleTaskFileFragment)
 	r.Get("/p/{projectID}/inbox", s.handleProjectInbox)
 	r.Get("/inbox", s.handleGlobalInbox)
 	r.Get("/p/{projectID}/events", s.handleEvents)

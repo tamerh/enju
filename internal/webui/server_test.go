@@ -146,6 +146,7 @@ type fakeFC struct {
 	artifactContent       []byte
 	getArtifactErr        error
 	gotArtifactPath       string
+	gotArtifactBranch     string
 	artifactHistory       []byte
 	getArtifactHistoryErr error
 	untracked             *service.UntrackedArtifactReport
@@ -329,6 +330,7 @@ func (f *fakeFC) ListArtifacts(ctx context.Context, pid int64, opts service.List
 }
 func (f *fakeFC) GetArtifactContent(ctx context.Context, pid int64, path, branch string) ([]byte, error) {
 	f.gotArtifactPath = path
+	f.gotArtifactBranch = branch
 	return f.artifactContent, f.getArtifactErr
 }
 func (f *fakeFC) GetArtifactHistory(ctx context.Context, pid int64, path, branch string) ([]byte, error) {
@@ -461,6 +463,18 @@ func TestLandingFullPage(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
 		}
+	}
+	// Static assets must be cache-busted (?v=<hash>) so the
+	// immutable-1y browser cache refetches them after a rebuild.
+	// Un-versioned bare URLs would mean stale app.js/app.css.
+	for _, bare := range []string{`href="/static/app.css"`, `src="/static/app.js"`} {
+		if strings.Contains(body, bare) {
+			t.Errorf("asset URL %s is not cache-busted (missing ?v=)", bare)
+		}
+	}
+	if !strings.Contains(body, "/static/app.css?v=") ||
+		!strings.Contains(body, "/static/app.js?v=") {
+		t.Errorf("expected ?v= cache-bust on app.css/app.js; body: %q", body)
 	}
 }
 
@@ -1460,12 +1474,63 @@ func TestTaskViewProducedFiles(t *testing.T) {
 	if !strings.Contains(body, "Files produced") {
 		t.Errorf("expected Files produced section")
 	}
-	if !strings.Contains(body, "figures/fig1.png") ||
-		!strings.Contains(body, "/p/1/artifacts/show/figures/fig1.png") {
-		t.Errorf("expected this task's artifact linked to the viewer; body: %q", body)
+	if !strings.Contains(body, `<details class="produced-file">`) ||
+		!strings.Contains(body, "figures/fig1.png") {
+		t.Errorf("expected a collapsible produced-file row; body: %q", body)
+	}
+	// Lazy body fetches the content fragment on expand, carrying
+	// path + the task's run branch; trigger is the details toggle.
+	if !strings.Contains(body, `hx-get="/p/1/t/1:1:plot/file?path=figures%2Ffig1.png`) ||
+		!strings.Contains(body, "branch=mustache-engine-1") ||
+		!strings.Contains(body, `hx-trigger="toggle once from:closest details"`) {
+		t.Errorf("expected lazy hx-get for the file content on its run branch; body: %q", body)
+	}
+	// Full-page link-out still available (history/metadata).
+	if !strings.Contains(body, `href="/p/1/artifacts/show/figures/fig1.png?branch=mustache-engine-1"`) {
+		t.Errorf("expected the full-page link-out on the run branch; body: %q", body)
 	}
 	if strings.Contains(body, "data/raw.csv") {
 		t.Errorf("another task's artifact must not appear here")
+	}
+}
+
+// TestTaskFileFragment: the lazy endpoint returns a bare
+// highlighter-ready <pre> (data-lang by extension) with the
+// content, and a muted note when empty.
+func TestTaskFileFragment(t *testing.T) {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"path": "src/context.py", "content": "def f():\n    return 1\n",
+	})
+	fc := &fakeFC{username: "tamer", artifactContent: raw}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodGet,
+		"/p/1/t/1:1:plot/file?path=src/context.py&branch=mustache-engine-1", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	// Bare fragment — no layout shell.
+	if strings.Contains(body, "<html") {
+		t.Errorf("fragment must not include the layout; got: %q", body)
+	}
+	if !strings.Contains(body, `<pre class="result-content" data-lang="py">`) ||
+		!strings.Contains(body, "def f():") {
+		t.Errorf("expected highlighter-ready pre with content; got: %q", body)
+	}
+	if fc.gotArtifactBranch != "mustache-engine-1" {
+		t.Errorf("fragment should pass the run branch through; got %q", fc.gotArtifactBranch)
+	}
+
+	// Empty content → muted note, not an empty <pre>.
+	empty, _ := json.Marshal(map[string]interface{}{"path": "x.bin", "content": ""})
+	s2 := newTestServer(t, &fakeFC{username: "tamer", artifactContent: empty})
+	rr2 := httptest.NewRecorder()
+	s2.Handler().ServeHTTP(rr2,
+		httptest.NewRequest(http.MethodGet, "/p/1/t/1:1:plot/file?path=x.bin", nil))
+	if !strings.Contains(rr2.Body.String(), "not viewable here") {
+		t.Errorf("empty content should yield a muted note; got: %q", rr2.Body.String())
 	}
 }
 
@@ -2751,6 +2816,41 @@ func TestArtifactView(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
+	}
+}
+
+// TestArtifactViewCollapsibleAndLang: a source file renders
+// inside the collapsible .file-view (open) with the right
+// data-lang; a markdown/text file gets no data-lang (plain).
+func TestArtifactViewCollapsibleAndLang(t *testing.T) {
+	mk := func(path string) string {
+		raw, _ := json.Marshal(map[string]interface{}{
+			"path": path, "content": "x = 1  # hi\n",
+		})
+		s := newTestServer(t, &fakeFC{username: "tamer", artifactContent: raw})
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr,
+			httptest.NewRequest(http.MethodGet, "/p/1/artifacts/show/"+path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: status %d", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+
+	py := mk("src/context.py")
+	if !strings.Contains(py, `<details class="file-view" open>`) {
+		t.Errorf("python artifact should be in an open collapsible; body: %q", py)
+	}
+	if !strings.Contains(py, `data-lang="py"`) {
+		t.Errorf("python artifact should carry data-lang=py")
+	}
+
+	md := mk("README.md")
+	if !strings.Contains(md, `<details class="file-view" open>`) {
+		t.Errorf("markdown should still be collapsible")
+	}
+	if strings.Contains(md, "data-lang=") {
+		t.Errorf("markdown must NOT get a highlighter lang (plain): %q", md)
 	}
 }
 

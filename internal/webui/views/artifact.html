@@ -32,7 +32,16 @@
 <section>
   <h2>Content</h2>
   {{if .Content}}
-  <pre class="result-content">{{.Content}}</pre>
+  {{/* Collapsible like the run page's Workflow YAML, but `open`
+       by default — viewing the file is the whole point of this
+       page; collapsing is for getting a long file out of the
+       way. data-lang drives the app.js highlighter (yaml =
+       key-aware, code = generic strings/comments/numbers,
+       absent = plain markdown/text). */}}
+  <details class="file-view" open>
+    <summary>{{.Path}} <span class="muted small">— click to collapse</span></summary>
+    <pre class="result-content"{{if .Lang}} data-lang="{{.Lang}}"{{end}}>{{.Content}}</pre>
+  </details>
   {{else}}
   <p class="muted">(empty or untracked — content lives only on the producing citizen's disk; pull from <code>$ENJU_SHARED_ROOT</code> if configured, otherwise unavailable here)</p>
   {{end}}
