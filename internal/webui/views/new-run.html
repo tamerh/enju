@@ -49,6 +49,8 @@
     <div class="btn-row">
       <button type="submit" name="action" value="validate" class="btn">Validate</button>
       <button type="submit" name="action" value="create" class="btn btn-primary">Create run</button>
+      <a class="btn btn-secondary" href="/p/{{.ProjectID}}"
+         hx-get="/p/{{.ProjectID}}" hx-target="#main" hx-push-url="true">Cancel</a>
     </div>
   </form>
 </section>
