@@ -944,13 +944,23 @@ func ProjectRemoteStatus() mcp.Tool {
 
 func ProjectSync() mcp.Tool {
 	return mcp.NewTool("enju_project_sync",
-		mcp.WithDescription("Push a project's local HEAD to its configured remote without requiring a new commit. Safe by default: a fast-forward push succeeds, a diverged remote is REFUSED unless force=true. Use this to sweep stuck commits (e.g. after a push failure or an earlier invalidation that didn't push). Set force=true ONLY when you intentionally want to overwrite the remote — force-push is destructive and can discard remote-side contributions."),
+		mcp.WithDescription(`Push a project's local HEAD to its configured remote without requiring a new commit. Safe by default: a fast-forward push succeeds, a diverged remote is REFUSED unless force=true. Use this to sweep stuck commits (e.g. after a push failure or an earlier invalidation that didn't push). Set force=true ONLY when you intentionally want to overwrite the remote — force-push is destructive and can discard remote-side contributions.
+
+cleanup controls post-run branch hygiene (default "none" — no changes):
+  "none"    — leave all branches untouched
+  "archive" — move merged run/iter refs to refs/enju/archive/runs/… (reversible; recommended)
+  "prune"   — delete merged run/iter refs entirely
+
+Only branches that are strict ancestors of the project's base branch are touched — unmerged iter branches (rejected iterations, aborted runs) are always preserved. Runs that are still active are skipped. cleanup runs independently of the push step and works even when no remote is configured.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project to push"),
 		),
 		mcp.WithBoolean("force",
 			mcp.Description("If true, do a force-push that overwrites the remote branch even when histories have diverged. Default false — diverged remotes are refused with guidance to reconcile manually."),
+		),
+		mcp.WithString("cleanup",
+			mcp.Description(`Branch cleanup mode for terminal runs. "none" (default) leaves branches untouched. "archive" moves merged run/iter refs to refs/enju/archive/runs/ (reversible). "prune" deletes merged refs entirely. Only ancestors of the base branch are affected; unmerged branches are always preserved.`),
 		),
 	)
 }

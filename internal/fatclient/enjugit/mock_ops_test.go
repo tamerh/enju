@@ -2,6 +2,7 @@ package enjugit
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"sync"
@@ -75,6 +76,12 @@ type fakeOps struct {
 	// + ancestorReturn=false.
 	ancestorReturnSet bool
 	ancestorReturn    bool
+	// perAncestorResult overrides the global ancestorReturn for
+	// specific ancestor SHAs (keyed by the `ancestor` argument to
+	// IsAncestor). When a key exists, it takes precedence over
+	// ancestorReturnSet/ancestorReturn. Used by cleanup tests that
+	// need mixed "merged / unmerged" scenarios.
+	perAncestorResult map[string]bool
 
 	// remoteURL controls what RemoteURL() returns. Defaults to a
 	// non-empty placeholder in newFakeOps so the canonical fetch/
@@ -278,12 +285,30 @@ func (f *fakeOps) DeleteBranch(name string) error {
 	return f.checkErr("DeleteBranch")
 }
 
+func (f *fakeOps) DeleteBranchCAS(name, expectedSHA string) error {
+	f.record("DeleteBranchCAS", name, expectedSHA)
+	if current := f.resolveMap["refs/heads/"+name]; current != expectedSHA {
+		return fmt.Errorf("git: DeleteBranchCAS: CAS mismatch on %s: got %s, expected %s", name, current, expectedSHA)
+	}
+	delete(f.resolveMap, "refs/heads/"+name)
+	return f.checkErr("DeleteBranchCAS")
+}
+
 func (f *fakeOps) SetBranchTo(name, sha string) error {
 	f.record("SetBranchTo", name, sha)
 	if err := f.checkErr("SetBranchTo"); err != nil {
 		return err
 	}
 	f.resolveMap["refs/heads/"+name] = sha
+	return nil
+}
+
+func (f *fakeOps) CreateRef(fullRef, sha string) error {
+	f.record("CreateRef", fullRef, sha)
+	if err := f.checkErr("CreateRef"); err != nil {
+		return err
+	}
+	f.resolveMap[fullRef] = sha
 	return nil
 }
 
@@ -296,6 +321,9 @@ func (f *fakeOps) IsAncestor(ancestor, descendant string) (bool, error) {
 	f.record("IsAncestor", ancestor, descendant)
 	if err := f.checkErr("IsAncestor"); err != nil {
 		return false, err
+	}
+	if v, ok := f.perAncestorResult[ancestor]; ok {
+		return v, nil
 	}
 	if f.ancestorReturnSet {
 		return f.ancestorReturn, nil

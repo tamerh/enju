@@ -46,6 +46,28 @@ func (c *Clone) CreateBranchAt(name, baseSHA string) error {
 	return nil
 }
 
+// CreateRef creates or overwrites an arbitrary ref to sha.
+// The ref must be a full path (e.g. "refs/enju/archive/runs/run-3").
+// Unlike UpdateRef (which is limited to refs/heads/), this operates
+// on any ref namespace, enabling archive operations that move
+// branches out of refs/heads/ into a recoverable namespace.
+func (c *Clone) CreateRef(fullRef, sha string) error {
+	defer c.lock()()
+	if fullRef == "" {
+		return fmt.Errorf("git: CreateRef: fullRef required")
+	}
+	if !strings.HasPrefix(fullRef, "refs/") {
+		return fmt.Errorf("git: CreateRef: fullRef must start with refs/")
+	}
+	if sha == "" {
+		return fmt.Errorf("git: CreateRef: sha required")
+	}
+	if _, err := runGit(c.workDir, []string{"update-ref", fullRef, sha}, runOpts{}); err != nil {
+		return fmt.Errorf("git: create ref %s: %w", fullRef, err)
+	}
+	return nil
+}
+
 // DeleteBranch removes the local branch ref. Idempotent — git's
 // `update-ref -d` returns exit 0 when the ref is already missing.
 func (c *Clone) DeleteBranch(name string) error {
@@ -56,6 +78,29 @@ func (c *Clone) DeleteBranch(name string) error {
 	_, err := runGit(c.workDir, []string{"update-ref", "-d", "refs/heads/" + name}, runOpts{})
 	if err != nil {
 		return fmt.Errorf("git: delete branch %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteBranchCAS removes the local branch ref only when its current
+// value equals expectedSHA (compare-and-swap delete). Errors when
+// the ref has advanced since the caller vetted it, closing the
+// TOCTOU window between an ancestor check and deletion.
+//
+// `git update-ref -d refs/heads/<name> <expectedSHA>` is git's
+// native CAS-delete: it succeeds iff the current value matches,
+// so any concurrent advance (claim, submit, push) causes a clean
+// failure instead of silently destroying newer commits.
+func (c *Clone) DeleteBranchCAS(name, expectedSHA string) error {
+	defer c.lock()()
+	if name == "" {
+		return fmt.Errorf("git: DeleteBranchCAS: name required")
+	}
+	if expectedSHA == "" {
+		return fmt.Errorf("git: DeleteBranchCAS: expectedSHA required")
+	}
+	if _, err := runGit(c.workDir, []string{"update-ref", "-d", "refs/heads/" + name, expectedSHA}, runOpts{}); err != nil {
+		return fmt.Errorf("git: delete branch %s (CAS %s): %w", name, expectedSHA[:8], err)
 	}
 	return nil
 }

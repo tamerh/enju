@@ -48,7 +48,14 @@ type Ops interface {
 	// Refs / branches — acquire the lock.
 	CreateBranchAt(name, baseSHA string) error
 	DeleteBranch(name string) error
+	// DeleteBranchCAS deletes refs/heads/<name> only if its current
+	// value equals expectedSHA. Closes the TOCTOU window between an
+	// ancestor check and the delete for irreversible prune operations.
+	DeleteBranchCAS(name, expectedSHA string) error
 	SetBranchTo(name, sha string) error
+	// CreateRef creates or overwrites an arbitrary ref (any refs/ namespace).
+	// Used for archive operations that move branches to refs/enju/archive/...
+	CreateRef(fullRef, sha string) error
 
 	// IsAncestor reports whether `ancestor` is reachable from
 	// `descendant` by walking parents. Used by branch-prep's

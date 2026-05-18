@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/enju-ai/enju/internal/common/format"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -89,12 +90,70 @@ func (c *apiClient) handleProjectSync(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError("project_id is required"), nil
 	}
 	force := req.GetBool("force", false)
+
+	cleanupStr := req.GetString("cleanup", "none")
+	cleanupMode, ok := enjugit.ParseCleanupMode(cleanupStr)
+	if !ok {
+		return mcp.NewToolResultError(fmt.Sprintf("cleanup: unrecognised mode %q — valid values: none, archive, prune", cleanupStr)), nil
+	}
+
 	resp, err := c.fc.SyncProjectToRemote(ctx, int64(projectID), force)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+
+	var cleanupResult *enjugit.BranchCleanupResult
+	if cleanupMode != enjugit.CleanupModeNone {
+		cleanupResult, err = c.fc.CleanupRunBranches(ctx, int64(projectID), cleanupMode)
+		if err != nil {
+			// Non-fatal: cleanup error is surfaced in the result but
+			// does not override a successful push.
+			resp["cleanup_error"] = err.Error()
+		}
+	}
+
 	data, _ := json.Marshal(resp)
-	return mcp.NewToolResultText(format.ProjectSyncResult(data)), nil
+	return mcp.NewToolResultText(format.ProjectSyncResult(data) + formatCleanupSummary(cleanupResult)), nil
+}
+
+// formatCleanupSummary renders a BranchCleanupResult as a terse
+// human-readable addendum to the sync result. Returns "" when
+// result is nil (cleanup was not requested or mode=none).
+func formatCleanupSummary(r *enjugit.BranchCleanupResult) string {
+	if r == nil {
+		return ""
+	}
+	total := len(r.Archived) + len(r.Pruned)
+	if total == 0 && len(r.Skipped) == 0 && len(r.Errors) == 0 {
+		return "\n• No merged run branches found to clean up."
+	}
+	var b strings.Builder
+	switch r.Mode {
+	case enjugit.CleanupModeArchive:
+		if len(r.Archived) > 0 {
+			fmt.Fprintf(&b, "\n✓ Archived %d branch(es) → refs/enju/archive/runs/:", len(r.Archived))
+			for _, name := range r.Archived {
+				fmt.Fprintf(&b, "\n  • %s", name)
+			}
+		}
+	case enjugit.CleanupModePrune:
+		if len(r.Pruned) > 0 {
+			fmt.Fprintf(&b, "\n✓ Pruned %d merged branch(es):", len(r.Pruned))
+			for _, name := range r.Pruned {
+				fmt.Fprintf(&b, "\n  • %s", name)
+			}
+		}
+	}
+	if len(r.Skipped) > 0 {
+		fmt.Fprintf(&b, "\n• Preserved %d unmerged branch(es) (rejected iters / aborted runs):", len(r.Skipped))
+		for _, name := range r.Skipped {
+			fmt.Fprintf(&b, "\n  • %s", name)
+		}
+	}
+	for _, e := range r.Errors {
+		fmt.Fprintf(&b, "\n⚠ cleanup error: %s", e)
+	}
+	return b.String()
 }
 
 // handleLeaveProject removes the caller's membership on the
