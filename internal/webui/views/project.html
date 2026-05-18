@@ -24,9 +24,22 @@
   </dl>
 </header>
 
-{{/* Runs are the hero — the reason you visit a project. First
-     content, above everything administrative (which lives on
-     the Settings page now). */}}
+{{/* Read-only members strip — context, not control. Full
+     roster management (add / promote / remove) lives on the
+     Settings page (reachable from the nav above). */}}
+<section>
+  <h2>Members <span class="muted small">({{len .Project.Members}})</span></h2>
+  {{if .Project.Members}}
+  <p class="member-strip">
+    {{range $i, $m := .Project.Members}}{{if $i}} · {{end}}<strong>@{{$m.Username}}</strong> <span class="role">{{$m.Role}}</span>{{end}}
+  </p>
+  {{else}}
+  <p class="muted">(no members listed)</p>
+  {{end}}
+</section>
+
+{{/* Runs — the primary content. Everything administrative
+     lives on the Settings page now. */}}
 <section>
   <h2>Runs</h2>
   <p class="btn-row">
@@ -61,20 +74,5 @@
   {{else}}
   <p class="muted">No runs yet. Start one with <strong>New run from YAML</strong> above, or <code>enju_create_run</code> in your MCP session.</p>
   {{end}}
-</section>
-
-{{/* Read-only members strip — context, not control. Full
-     roster management (add / promote / remove) lives on the
-     Settings page. */}}
-<section>
-  <h2>Members <span class="muted small">({{len .Project.Members}})</span></h2>
-  {{if .Project.Members}}
-  <p class="member-strip">
-    {{range $i, $m := .Project.Members}}{{if $i}} · {{end}}<strong>@{{$m.Username}}</strong> <span class="role">{{$m.Role}}</span>{{end}}
-  </p>
-  {{else}}
-  <p class="muted">(no members listed)</p>
-  {{end}}
-  <p><a class="muted small" href="/p/{{.Project.ID}}/settings">Manage members & settings →</a></p>
 </section>
 {{end}}
