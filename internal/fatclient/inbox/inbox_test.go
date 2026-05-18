@@ -264,6 +264,41 @@ func TestBuildInbox_OwnSubmitTerminatesMyView(t *testing.T) {
 	}
 }
 
+// TestBuildInbox_RunTerminatedRetiresReadyTasks pins the bug
+// fix: enju_terminate_run emits ONE coarse run_terminated event
+// (run_seq in metadata, no task_id) instead of N per-task
+// task_skipped. A task that was task_ready+me in that run must
+// drop out of the inbox — it's skipped, not actionable.
+func TestBuildInbox_RunTerminatedRetiresReadyTasks(t *testing.T) {
+	livePath := writeLog(t, []string{
+		// oldest first; file read newest-first.
+		`{"type":"task_ready","subtype":"answer","task_id":"3:7:draft","assign_to":"tamer"}`,
+		`{"type":"task_ready","subtype":"review","task_id":"3:8:keep","assign_to":"tamer"}`,
+		`{"type":"run_terminated","metadata":{"run_seq":7,"reason":"aborted"}}`,
+	})
+	rows, err := BuildInbox(livePath, "tamer", &fakeGit{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Run 7's ready task is retired; run 8's is untouched.
+	if len(rows) != 1 || rows[0].TaskID != "3:8:keep" {
+		t.Errorf("run_terminated(7) should retire 3:7:draft but keep 3:8:keep; got %+v", rows)
+	}
+}
+
+// TestBuildInbox_RunTerminatedOnlyScopesItsRun: a run_terminated
+// for an unrelated run must not retire a ready task in a live run.
+func TestBuildInbox_RunTerminatedOnlyScopesItsRun(t *testing.T) {
+	livePath := writeLog(t, []string{
+		`{"type":"run_terminated","metadata":{"run_seq":9}}`,
+		`{"type":"task_ready","subtype":"answer","task_id":"3:7:draft","assign_to":"tamer"}`,
+	})
+	rows, _ := BuildInbox(livePath, "tamer", &fakeGit{})
+	if len(rows) != 1 || rows[0].TaskID != "3:7:draft" {
+		t.Errorf("run_terminated(9) must not affect run 7's ready task; got %+v", rows)
+	}
+}
+
 // TestFormatInbox_Empty pins the no-items rendering — assistants
 // pattern-match this to skip rendering an empty inbox.
 func TestFormatInbox_Empty(t *testing.T) {

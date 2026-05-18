@@ -117,11 +117,28 @@ func BuildInbox(livePath, username string, deps Deps) ([]InboxRow, error) {
 		return nil, nil
 	}
 	decided := map[string]bool{}
+	// Runs retired by a coarse run-scoped terminal. enju_terminate_run
+	// deliberately emits ONE run_terminated event (with skipped-task
+	// counts in metadata) instead of N per-task task_skipped events
+	// — see store/apply.go. Without honoring it here, a task that
+	// was task_ready+me and then run-terminate-skipped keeps
+	// task_ready as its newest task-scoped event and wrongly lingers
+	// in the inbox. The scan is newest→oldest, so a run_terminated
+	// is always seen before the older task_ready it retires.
+	terminatedRuns := map[string]bool{}
 	var rows []InboxRow
 
 	err := tailJSONL(livePath, func(line []byte) bool {
 		var ev inboxEvent
 		if json.Unmarshal(line, &ev) != nil {
+			return false
+		}
+		// Run-scoped terminal: no task_id, so it must be handled
+		// before the per-task short-circuit below.
+		if ev.Type == "run_terminated" {
+			if seq := runSeqFromMetadata(ev.Metadata); seq != "" {
+				terminatedRuns[seq] = true
+			}
 			return false
 		}
 		if ev.TaskID == "" || decided[ev.TaskID] {
@@ -133,6 +150,14 @@ func BuildInbox(livePath, username string, deps Deps) ([]InboxRow, error) {
 			// for someone else doesn't disqualify us — keep
 			// scanning back for our own ready.
 			if ev.AssignTo != username {
+				return false
+			}
+			// The task's run was terminated after this ready (we
+			// saw run_terminated earlier in the newest-first
+			// scan): the task is skipped, not actionable. Decide
+			// it so no older event re-adds it.
+			if terminatedRuns[runSeqOfTask(ev.TaskID)] {
+				decided[ev.TaskID] = true
 				return false
 			}
 			decided[ev.TaskID] = true
@@ -161,6 +186,35 @@ func BuildInbox(livePath, username string, deps Deps) ([]InboxRow, error) {
 		return nil, err
 	}
 	return rows, nil
+}
+
+// runSeqOfTask extracts the run-seq segment from a task ID.
+// Task IDs are "{project}:{run}:{taskdef}"; the middle segment
+// is the per-project run seq. Returns "" on an unexpected shape
+// (then it simply won't match any terminated run — safe).
+func runSeqOfTask(taskID string) string {
+	parts := strings.Split(taskID, ":")
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return ""
+}
+
+// runSeqFromMetadata pulls run_seq out of a run_terminated
+// event's metadata. json.Number so an integer seq renders as
+// "2", not "2" vs 2.0 — matched against the task ID's string
+// segment. Returns "" when absent/unparseable.
+func runSeqFromMetadata(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m struct {
+		RunSeq json.Number `json:"run_seq"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	return m.RunSeq.String()
 }
 
 // buildRow turns one task_ready event into an InboxRow with each
