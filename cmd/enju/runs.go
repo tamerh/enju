@@ -60,6 +60,11 @@ func cmdRuns(args []string) {
 		return
 	}
 
+	// B-3: registry never stored the project name, so the table
+	// header rendered "(unnamed)". Pull it from coord (source of
+	// truth) before rendering; no-op when already known.
+	backfillProjectName(ctx, sess, entry)
+
 	runs, err := sess.FC.ListRuns(ctx, entry.ID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runs: %v\n", err)

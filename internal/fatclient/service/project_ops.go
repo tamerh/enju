@@ -214,6 +214,18 @@ func (s *FatClient) CreateProject(ctx context.Context, params CreateProjectParam
 			initWarning = ierr.Error()
 		}
 	}
+	// B-3: persist the project name into the local registry at
+	// creation time. EagerInitProjectClone registers {id,
+	// local_path} only, so without this every `enju status` /
+	// `enju runs` header rendered "(unnamed)". Upsert merges
+	// non-zero fields, so this just adds the name onto the row
+	// the init above created (and is a harmless no-op when no
+	// path/registry is in play). The CLI also has a coord
+	// backfill for already-registered pre-fix rows; this closes
+	// the gap going forward so the common path never needs it.
+	if pid > 0 && params.Name != "" {
+		s.RegisterProject(projectreg.Entry{ID: pid, Name: params.Name})
+	}
 	// Warn (don't silently accept) when the default branch was
 	// auto-detected from a HEAD parked on an enju run/iter branch.
 	var branchWarning string

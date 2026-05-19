@@ -88,6 +88,43 @@ func resolveActiveProject(sess *cliSession, override int64) (*projectreg.Entry, 
 	return nil, fmt.Errorf("no registered project covers %s; pass --project ID or run `enju status --all`", cwd)
 }
 
+// backfillProjectName fills entry.Name from the coordinator when
+// the local registry never recorded it (bug hunt B-3:
+// ~/.enju/projects.json was written with only {id, local_path,
+// last_touched} — no name — so every `enju status` / `enju runs`
+// header rendered "(unnamed)"). The coordinator is the source of
+// truth for the name (the registry doc says cached fields can
+// drift and coord wins), and status/runs/dag already round-trip
+// to coord in the same command, so this adds at most one cheap
+// list call and only when the name is actually missing.
+//
+// The resolved name is written back to the registry so the next
+// invocation is fast and correct even offline. Best-effort
+// throughout: a coord miss or a registry-write failure leaves
+// the name blank (the pre-fix behavior) rather than failing the
+// command — orientation output should degrade, not error.
+func backfillProjectName(ctx context.Context, sess *cliSession, entry *projectreg.Entry) {
+	if entry == nil || entry.Name != "" {
+		return
+	}
+	projs, err := sess.FC.ListProjects(ctx)
+	if err != nil {
+		return
+	}
+	for _, p := range projs {
+		if p.ID == entry.ID && p.Name != "" {
+			entry.Name = p.Name
+			if reg := sess.FC.ProjectRegistry(); reg != nil {
+				// Upsert merges non-zero fields onto the existing
+				// row (see projectreg.Upsert) — this only adds the
+				// name, it doesn't disturb local_path/last_touched.
+				_ = reg.Upsert(projectreg.Entry{ID: entry.ID, Name: p.Name})
+			}
+			return
+		}
+	}
+}
+
 type statusReport struct {
 	ProjectID     int64      `json:"project_id"`
 	ProjectName   string     `json:"project_name"`
@@ -101,6 +138,10 @@ type statusReport struct {
 }
 
 func renderProjectStatus(ctx context.Context, sess *cliSession, entry *projectreg.Entry, asJSON bool) error {
+	// B-3: the local registry historically stored no name, so
+	// pull it from coord (source of truth) when missing before
+	// rendering the header. No-op when the name is already known.
+	backfillProjectName(ctx, sess, entry)
 	rep := statusReport{
 		ProjectID:     entry.ID,
 		ProjectName:   entry.Name,
@@ -221,6 +262,33 @@ func renderAllProjects(ctx context.Context, sess *cliSession, asJSON bool) error
 	entries, err := reg.List()
 	if err != nil {
 		return err
+	}
+	// B-3: backfill any missing names from coord in ONE list
+	// call (the per-entry helper would fan out N calls). Best-
+	// effort — a coord miss leaves those rows "(unnamed)" as
+	// before; a hit also persists the name back to the registry.
+	if needName := func() bool {
+		for i := range entries {
+			if entries[i].Name == "" {
+				return true
+			}
+		}
+		return false
+	}(); needName {
+		if projs, perr := sess.FC.ListProjects(ctx); perr == nil {
+			byID := make(map[int64]string, len(projs))
+			for _, p := range projs {
+				byID[p.ID] = p.Name
+			}
+			for i := range entries {
+				if entries[i].Name == "" {
+					if n := byID[entries[i].ID]; n != "" {
+						entries[i].Name = n
+						_ = reg.Upsert(projectreg.Entry{ID: entries[i].ID, Name: n})
+					}
+				}
+			}
+		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].LastTouched.After(entries[j].LastTouched) })
 

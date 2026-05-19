@@ -152,6 +152,42 @@ func TestNew_RegistryStaleEntry_Skipped(t *testing.T) {
 	}
 }
 
+// TestRegisterProject_PersistsNameThenSurvivesPathOnlyUpsert is
+// the bug hunt B-3 regression. ~/.enju/projects.json historically
+// stored only {id, local_path, last_touched} — no name — so every
+// `enju status` / `enju runs` header rendered "(unnamed)". The
+// fix registers the name at create time; this pins (1) a named
+// RegisterProject persists the name, and (2) the later
+// path-only registration EagerInitProjectClone does (id +
+// local_path, no name) MERGES rather than clobbering — the name
+// must survive so the CLI header is correct without a coord
+// round-trip.
+func TestRegisterProject_PersistsNameThenSurvivesPathOnlyUpsert(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tmp := t.TempDir()
+	regPath := filepath.Join(tmp, "projects.json")
+	fc := New(Config{ProjectRegistry: projectreg.Open(regPath), Logger: logger})
+
+	// Create-time: name recorded (the B-3 fix in CreateProject).
+	fc.RegisterProject(projectreg.Entry{ID: 7, Name: "my-project"})
+	// Init-time (EagerInitProjectClone) registers path only.
+	fc.RegisterProject(projectreg.Entry{ID: 7, LocalPath: filepath.Join(tmp, "wt")})
+
+	// Registry.Get filters rows whose LocalPath is missing on
+	// disk; create the dir so the row resolves.
+	_ = os.MkdirAll(filepath.Join(tmp, "wt"), 0o755)
+	got, err := projectreg.Open(regPath).Get(7)
+	if err != nil || got == nil {
+		t.Fatalf("Get(7): err=%v entry=%v", err, got)
+	}
+	if got.Name != "my-project" {
+		t.Errorf("B-3: name not persisted/clobbered: got %q, want my-project", got.Name)
+	}
+	if got.LocalPath != filepath.Join(tmp, "wt") {
+		t.Errorf("local_path lost by the named upsert: %q", got.LocalPath)
+	}
+}
+
 // initRealCloneWithAuthor is initRealClone but with an
 // explicit author. The vanilla helper relies on git reading
 // the operator's ~/.gitconfig for user.name/user.email; tests
