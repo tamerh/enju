@@ -46,6 +46,51 @@ import (
 //	Blocked by: human claim — `task-id` (assigned: bob)
 //	Blocked by: artifact — `task-id` waiting on `path`
 //	Blocked by: stuck — <detail>
+// RenderSyncConflict turns the runs.sync_status JSON blob into a
+// single unmissable line for the run_status / runs text surfaces
+// (bughunt B1). Parsed with a local minimal struct (not
+// store.ParseSyncStatus) so `format` stays a leaf package — and,
+// like ParseSyncStatus, it is forward-compat: unknown future
+// fields are ignored, malformed/empty/non-conflict JSON renders
+// nothing (returns ""). The contract: a run whose output did NOT
+// reach the base branch must never be presented as cleanly
+// "completed" without this contradiction next to it.
+func RenderSyncConflict(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var s struct {
+		Kind          string   `json:"kind"`
+		RunBranch     string   `json:"run_branch"`
+		BaseBranch    string   `json:"base_branch"`
+		ConflictFiles []string `json:"conflict_files"`
+		Hint          string   `json:"hint"`
+	}
+	if err := json.Unmarshal([]byte(raw), &s); err != nil || s.Kind == "" {
+		return ""
+	}
+	// Only "conflict" is operator-actionable data-loss today;
+	// other future kinds render nothing until taught here.
+	if s.Kind != "conflict" {
+		return ""
+	}
+	base := s.BaseBranch
+	if base == "" {
+		base = "the base branch"
+	}
+	msg := fmt.Sprintf("⚠ SYNC CONFLICT — run output did NOT reach %s", base)
+	if n := len(s.ConflictFiles); n > 0 {
+		msg += fmt.Sprintf(" (%d file(s) need manual merge)", n)
+	}
+	if s.Hint != "" {
+		msg += "\n  Resolve: " + s.Hint
+	} else if s.RunBranch != "" && s.BaseBranch != "" {
+		msg += fmt.Sprintf("\n  Resolve: git checkout %s && git merge %s", s.BaseBranch, s.RunBranch)
+	}
+	return msg
+}
+
 func RenderBlockedBy(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -420,8 +465,17 @@ func RunList(data []byte) string {
 		seq, _ := p["seq"].(float64)
 
 		icon := StateIcon(state)
-		b.WriteString(fmt.Sprintf("  %s project #%s → run #%d  %-30s [%s]  %d tasks\n",
-			icon, projectID, int(seq), name, state, int(taskCount)))
+		line := fmt.Sprintf("  %s project #%s → run #%d  %-30s [%s]  %d tasks",
+			icon, projectID, int(seq), name, state, int(taskCount))
+		// B1: a run that lost its output to a sync conflict must
+		// not list as a clean [completed]. Compact tag here; the
+		// full resolve hint is in `enju_run_status`.
+		if syncRaw, _ := p["sync_status"].(string); syncRaw != "" {
+			if RenderSyncConflict(syncRaw) != "" {
+				line += "  ⚠ SYNC CONFLICT (output not on base — see enju_run_status)"
+			}
+		}
+		b.WriteString(line + "\n")
 	}
 
 	return b.String()
@@ -444,7 +498,18 @@ func ReadyTasks(data []byte) string {
 	byRun := map[string][]map[string]interface{}{}
 	runOrder := []string{}
 	for _, t := range tasks {
-		runNum := JsonID(t["run_id"])
+		// B4 (secondary): group/label by the per-project run seq,
+		// not the internal global run_id — "── Run #7 ──" must
+		// mean the same #7 the operator sees everywhere else.
+		// Fall back to run_id only if run_seq is absent (older
+		// payloads) so this can't render "Run #0".
+		runNum := ""
+		if v, ok := t["run_seq"]; ok && v != nil {
+			runNum = JsonID(v)
+		}
+		if runNum == "" || runNum == "0" {
+			runNum = JsonID(t["run_id"])
+		}
 		if _, seen := byRun[runNum]; !seen {
 			runOrder = append(runOrder, runNum)
 		}
@@ -1680,6 +1745,18 @@ func RunStatus(runData []byte, tasksData []byte, viewer ...string) string {
 			if line := RenderBlockedBy(blockedRaw); line != "" {
 				b.WriteString(line + "\n")
 			}
+		}
+	}
+	// Run-completion sync conflict (bughunt B1). MUST render even
+	// (especially) when state == "completed": the run-branch →
+	// base merge failed, so a bare "Status: completed 100%" is a
+	// lie — the output never reached the default branch and the
+	// data-loss outlives the run. Surfaced unmissably right under
+	// the progress bar so the operator can't read "done" without
+	// also seeing "but the result didn't land — resolve manually".
+	if syncRaw, _ := run["sync_status"].(string); syncRaw != "" {
+		if line := RenderSyncConflict(syncRaw); line != "" {
+			b.WriteString(line + "\n")
 		}
 	}
 	b.WriteString("\n")
