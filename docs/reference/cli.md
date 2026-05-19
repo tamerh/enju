@@ -5,6 +5,7 @@ The `enju` binary is the single entry point for every role. This page is the ope
 ```
 enju start       Start coordinator + web UI (background)
 enju stop        Stop background processes started by 'enju start'
+enju serve       Run the coordinator in the foreground (team/server deployment)
 enju mcp         Start the MCP server (connect your LLM)
 enju go          Run a workflow YAML end-to-end
 enju status      Snapshot of the current project's state
@@ -46,6 +47,50 @@ Stop background processes started by `enju start`.
 ```sh
 enju stop
 ```
+
+---
+
+## `enju serve`
+
+Run the coordinator in the foreground — the lower-level command for team or server deployment. Unlike `enju start`, it does not fork to the background and does not start the web UI automatically.
+
+```sh
+enju serve
+enju serve --port 8333 --db /var/enju/state.db
+enju serve --config /etc/enju/enju.conf
+```
+
+Configuration can be set via a YAML config file. The default path is `~/.enju/enju.conf`; copy `enju.conf.example` from the repo to get started. CLI flags always override config file values.
+
+**Config file (`~/.enju/enju.conf`):**
+
+```yaml
+coordinator:
+  port: 8333
+
+data:
+  state_db: "~/.enju/local.db"   # events DB derived automatically as a sibling
+
+events:
+  emission_enabled: true    # kill-switch; flip without restart via SIGHUP
+
+logging:
+  level: "info"             # debug | info | warn | error
+  output: "stdout"          # stdout | stderr | /path/to/file
+
+performance:
+  reaper_interval: "60s"
+  http_request_timeout: "30s"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config PATH` | `~/.enju/enju.conf` | Config file path. Missing file is fine — built-in defaults apply. |
+| `--port N` | from config, else 8000 | Coordinator port |
+| `--db PATH` | from config, else `enju.db` | SQLite state database path |
+| `--events-enabled` | `true` | Enable the event store at boot |
+
+For team deployment, run `enju serve` under systemd or Docker on a shared server. Each team member then connects with `enju mcp --coordinator http://your-server:8333`.
 
 ---
 
