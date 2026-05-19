@@ -105,14 +105,24 @@ func (c *Coordinator) RetryTask(caller *store.CitizenRecord, taskID string, from
 			"%w: only failed_retryable tasks can be retried; task %q is %s",
 			ErrInvalidArgument, taskID, task.State)
 	}
-	// Defensive: failed_retryable is only ever entered by a
-	// compute-script failure, so Script is always set here — but
-	// guard anyway so a future state-machine change can't quietly
-	// route a non-compute task into a path that has no script.
-	if task.Script == "" {
+	// failed_retryable is no longer compute-exclusive: a citizen
+	// task that exhausted its layer-① verify-fail cap is parked in
+	// the same recoverable state (see performCitizenVerifyFailure).
+	// The re-open composition below is type-agnostic — it only flips
+	// state→ready + ClearClaim and lets the DAG resume — so the old
+	// `Script == ""` rejection is dropped. The failed_retryable gate
+	// above is the only precondition; it already excludes terminal
+	// `failed` and every non-parked state.
+	//
+	// Multi-claimant guard (v1): N-claimant vote/review retry
+	// semantics (whose attempt re-opens? do all peers reset?) are
+	// out of scope. Reject clearly rather than re-open a task whose
+	// claim model this path was not designed for.
+	if task.Citizens > 1 {
 		return nil, fmt.Errorf(
-			"%w: task %q is not a compute task (no script) — cannot retry",
-			ErrInvalidArgument, taskID)
+			"%w: retry is not supported for multi-claimant tasks "+
+				"(task %q has citizens=%d); N-claimant retry semantics are deferred",
+			ErrInvalidArgument, taskID, task.Citizens)
 	}
 
 	plan := store.Plan{

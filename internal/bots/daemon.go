@@ -74,6 +74,7 @@ type fatClient interface {
 	ClaimTask(ctx context.Context, params service.ClaimParams) (*service.ClaimResult, error)
 	ReleaseTask(ctx context.Context, taskID string) error
 	FailTask(ctx context.Context, taskID, reason string) error
+	ReportCitizenVerifyFail(ctx context.Context, taskID, reason string) (*service.CitizenVerifyFailResponse, error)
 	ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAllMyOpenClaimsResponse, error)
 	FetchTaskMeta(ctx context.Context, taskID string) (*service.TaskMeta, error)
 	SubmitTaskResult(ctx context.Context, params service.SubmitParams) *service.SubmitResult
@@ -240,6 +241,19 @@ type Daemon struct {
 	failReason    map[string]string
 	maxFailStreak int
 }
+
+// errCitizenVerifyFail is the sentinel processAndSubmit returns
+// when a CITIZEN task (meta.Script == "", so not a compute task)
+// fails the layer-① writes-artifacts contract gate. runOnce routes
+// it to ReportCitizenVerifyFail instead of the daemon-local
+// failStreak: the durable COORDINATOR-side counter — not an
+// ephemeral per-daemon streak that resets on restart — must govern
+// escalation, and the daemon must never drive a citizen task to
+// terminal FAILED via this path (that would cascade-SKIP
+// descendants; the contract miss is recoverable).
+type errCitizenVerifyFail struct{ reason string }
+
+func (e *errCitizenVerifyFail) Error() string { return e.reason }
 
 // defaultMaxFailStreak is the consecutive-failure bound after
 // which a task is driven to FAILED instead of retried. 3 is
@@ -570,6 +584,19 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 	}
 
 	if err := d.processAndSubmit(ctx, taskID, claim); err != nil {
+		// Layer-① contract-gate miss on a CITIZEN task: route to
+		// the coordinator's durable, cross-restart counter instead
+		// of the ephemeral daemon-local failStreak. The coordinator
+		// decides count-vs-escalate; the daemon never drives a
+		// citizen task to terminal FAILED here (that would
+		// cascade-SKIP descendants — the miss is recoverable).
+		// Checked BEFORE the failStreak block so a verify miss
+		// never consumes the terminal-fail budget.
+		var cvf *errCitizenVerifyFail
+		if errors.As(err, &cvf) {
+			return d.reportCitizenVerifyFail(ctx, taskID, cvf.reason)
+		}
+
 		// Cap the maps before growing them. Orphaned partial
 		// streaks are never individually evicted (see
 		// maxFailStreakEntries); drop wholesale if pathological.
@@ -630,6 +657,58 @@ func (d *Daemon) failTaskTerminally(ctx context.Context, taskID, reason string) 
 	// Task is resolved (FAILED) — not an open error for the loop
 	// to re-log at WARN or back off on. The ERROR above is the
 	// single, correct signal.
+	return true, nil
+}
+
+// reportCitizenVerifyFail handles a layer-① contract-gate miss on a
+// citizen task by reporting it to the coordinator's durable
+// counter, NOT the daemon-local failStreak and NEVER terminal
+// FAILED. The coordinator's verdict drives the next move:
+//
+//   - "escalated": the coordinator hit the cap and parked the task
+//     failed_retryable. The task is resolved (recoverable via
+//     enju_retry_task); clear the active claim and stop.
+//   - "counted": under the cap. Release the claim so the daemon
+//     re-claims on the next poll and the agent gets another attempt
+//     (LLM work is non-deterministic — the next try may deliver).
+//
+// If the report POST itself fails, fall back to a SINGLE failStreak
+// increment (a transient coord outage), explicitly NOT terminal
+// FAILED — escalation is the coordinator's job and must not be
+// pre-empted by the daemon on a network blip. The streak is not
+// allowed to drive this citizen task terminal: the
+// errCitizenVerifyFail routing in runOnce always re-routes here, so
+// the streak only paces backoff during the outage.
+func (d *Daemon) reportCitizenVerifyFail(ctx context.Context, taskID, reason string) (bool, error) {
+	resp, err := d.fc.ReportCitizenVerifyFail(ctx, taskID, reason)
+	if err != nil {
+		d.logger.Warn("citizen-verify-fail report failed; will retry on next pass (no terminal fail)",
+			"task_id", taskID, "error", err)
+		if len(d.failStreak) >= maxFailStreakEntries {
+			d.failStreak = make(map[string]int)
+			d.failReason = make(map[string]string)
+		}
+		d.failStreak[taskID]++
+		return true, fmt.Errorf("citizen-verify-fail POST failed (task %s): %w", taskID, err)
+	}
+	// The report path supersedes any prior streak for this task.
+	delete(d.failStreak, taskID)
+	delete(d.failReason, taskID)
+
+	if resp.Status == "escalated" {
+		d.logger.Info("citizen task parked failed_retryable after verify-fail cap",
+			"task_id", taskID, "count", resp.FailCount, "cap", resp.Cap)
+		d.activeClaim = ""
+		return true, nil
+	}
+	// "counted" — release so the daemon re-claims and retries.
+	d.logger.Info("citizen verify-fail counted; releasing claim for another attempt",
+		"task_id", taskID, "count", resp.FailCount, "cap", resp.Cap)
+	if rerr := d.fc.ReleaseTask(ctx, taskID); rerr != nil {
+		d.logger.Warn("ReleaseTask after citizen-verify-fail count failed",
+			"task_id", taskID, "error", rerr)
+	}
+	d.activeClaim = ""
 	return true, nil
 }
 
@@ -973,7 +1052,17 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 			return fmt.Errorf("expanding writes_artifacts: %w", err)
 		}
 		if len(missing) > 0 {
-			return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", strings.Join(missing, ", "))
+			msg := fmt.Sprintf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", strings.Join(missing, ", "))
+			// Citizen task (no script): a missing declared write is
+			// a layer-① contract-gate miss — route to the
+			// coordinator's durable counter, not the failStreak.
+			// Compute tasks keep the plain error (their failStreak
+			// → terminal path is correct: a script that can't
+			// produce its output is deterministically broken).
+			if meta.Script == "" {
+				return &errCitizenVerifyFail{reason: msg}
+			}
+			return fmt.Errorf("%s", msg)
 		}
 		// Tracked / untracked split:
 		// Tracked files: read content from handlerCWD into
@@ -991,7 +1080,11 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 			if e.Track {
 				body, rerr := os.ReadFile(filepath.Join(handlerCWD, e.Path))
 				if rerr != nil {
-					return fmt.Errorf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", e.Path)
+					msg := fmt.Sprintf("required writes_artifacts missing on disk (declare `optional: true` if absence is acceptable): %s", e.Path)
+					if meta.Script == "" {
+						return &errCitizenVerifyFail{reason: msg}
+					}
+					return fmt.Errorf("%s", msg)
 				}
 				artifactContents[e.Path] = string(body)
 				continue

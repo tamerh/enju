@@ -490,6 +490,42 @@ type TaskRecord struct {
 	// `closed`. 0 on every other task.
 	ClosesIssueSeq int
 
+	// Layer-① contract-gate recovery (citizen-task-retryable).
+	//
+	// VerifyFailCount is the durable per-task count of CONSECUTIVE
+	// completed iterations that ended in layer-① non-delivery: the
+	// claimant never produced the declared writes_artifacts, so the
+	// submission was refused before any reviewer saw it. It is
+	// bumped at most once per iteration (see VerifyFailCountedIter)
+	// by EITHER the fat-client's ReportCitizenVerifyFail report OR
+	// the coordinator reaper observing the lease expire with no
+	// submission recorded for that iter_seq — the coordinator is the
+	// enforcement boundary, the client only accelerates. Resets to 0
+	// on any delivery (submission accepted, invalidate-reopen,
+	// retry-reopen) so it measures CONSECUTIVE non-delivery: a task
+	// that flaked twice then delivered must not be left one expiry
+	// from escalation on some later unrelated reopen. NEVER bumped by
+	// request_changes — that path is submitted→accepted→review
+	// (layer ① already passed, count already reset at accept).
+	VerifyFailCount int
+
+	// VerifyRetryCap is the per-task cap on consecutive layer-①
+	// non-delivery iterations before the coordinator parks the task
+	// as failed_retryable. 0 means "use the coordinator's global
+	// defaultVerifyFailCap const." Populated from the YAML task
+	// definition's verify_retry_cap: (and the workflow defaults:
+	// verify_retry_cap:) at run-create time. Mirrors how Timeout is
+	// resolved: per-task wins over defaults wins over the const.
+	VerifyRetryCap int
+
+	// VerifyFailCountedIter is the highest claim iter_seq for which
+	// VerifyFailCount has already been incremented. The increment
+	// mutation is gated `verify_fail_counted_iter < :iter`, making it
+	// idempotent on (task_id, iter_seq) so the client report and the
+	// reaper backstop can never double-count the same iteration.
+	// Reset to 0 alongside VerifyFailCount on every delivery.
+	VerifyFailCountedIter int
+
 	CreatedAt time.Time
 }
 

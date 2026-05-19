@@ -698,6 +698,29 @@ func (s *Store) initSchema() error {
 		// local/host path is unchanged by their absence.
 		`ALTER TABLE tasks ADD COLUMN executor TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN resources TEXT NOT NULL DEFAULT ''`,
+		// Layer-① contract-gate recovery (citizen-task-retryable).
+		// verify_fail_count is the durable per-task counter of
+		// CONSECUTIVE iterations that ended in layer-① non-delivery
+		// (the agent never produced the declared writes_artifacts).
+		// It is bumped at most once per iteration — see
+		// verify_fail_counted_iter — by either the fat-client report
+		// or the coordinator reaper observing the lease expire with
+		// no submission for that iter_seq. At verify_retry_cap (or
+		// the defaultVerifyFailCap const when cap==0) the coordinator
+		// parks the task as failed_retryable so an operator can
+		// recover with enju_retry_task. Resets to 0 on any delivery
+		// (accept / invalidate / retry) so it measures CONSECUTIVE
+		// non-delivery — a task that flaked then delivered does not
+		// carry a stale count into a later unrelated reopen.
+		// verify_fail_counted_iter is the highest claim iter_seq
+		// already counted; the increment is gated `< :iter` so the
+		// client report and the reaper backstop can never
+		// double-count the same iteration. verify_retry_cap is
+		// copied from the YAML task definition at run-create time;
+		// 0 means "use the coordinator's default const."
+		`ALTER TABLE tasks ADD COLUMN verify_fail_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tasks ADD COLUMN verify_retry_cap INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tasks ADD COLUMN verify_fail_counted_iter INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -1149,7 +1172,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_fail_count, verify_retry_cap, verify_fail_counted_iter, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1168,6 +1191,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
+		&t.VerifyFailCount, &t.VerifyRetryCap, &t.VerifyFailCountedIter,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2435,6 +2459,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&anonymizeInt, &t.Visibility, &t.FailReason, &t.SkipReason, &t.ParkedFromState, &t.Env, &t.Mode, &t.RunSlug,
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
+			&t.VerifyFailCount, &t.VerifyRetryCap, &t.VerifyFailCountedIter,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

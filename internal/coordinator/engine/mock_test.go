@@ -22,6 +22,7 @@ type mockStore struct {
 	claimCounts  map[string]int
 	artifacts    map[string]*store.ArtifactRecord // "projectID:path" → record
 	tasksByRun   map[int64][]store.TaskRecord
+	openClaimIterSeq map[string]int64 // taskID → current open claim iter_seq
 }
 
 func (m *mockStore) GetTask(id string) (*store.TaskRecord, error) {
@@ -84,6 +85,10 @@ func (m *mockStore) HasActiveClaim(taskID string, citizenID int64) (bool, error)
 
 func (m *mockStore) ListOpenClaimsForCitizen(citizenID int64) ([]store.TaskClaimRecord, error) {
 	return nil, nil
+}
+
+func (m *mockStore) GetOpenClaimIterSeq(taskID string) (int64, error) {
+	return m.openClaimIterSeq[taskID], nil
 }
 
 func (m *mockStore) CountActiveClaims(taskID string) (int, error) {

@@ -681,6 +681,14 @@ func (s *FatClient) prepareFatSubmit(ctx context.Context, params SubmitParams) (
 		// definition and part of the metadata-on-coord surface
 		// tracked under "metadata privacy gap" in TODO.
 		"content": content,
+		// iter_seq the daemon claimed under (surfaced by the
+		// coordinator at claim time). The coordinator uses it as a
+		// single-citizen superseded-claim guard: if a citizen
+		// verify-fail escalation closed this looping claim and a
+		// retry advanced iter_seq, a late submit from this stale
+		// attempt carries the OLD value and is refused — no
+		// double-accept onto the new claimant's iteration.
+		"iter_seq": meta.IterSeq,
 	}
 
 	if len(outputLists) > 0 {

@@ -25,6 +25,11 @@ type failRecord struct {
 	Reason string
 }
 
+type cvfRecord struct {
+	TaskID string
+	Reason string
+}
+
 type fakeFC struct {
 	mu sync.Mutex
 
@@ -44,6 +49,14 @@ type fakeFC struct {
 	claimErr  error
 	submitErr string
 	failErr   error
+
+	// Citizen verify-fail report stubbing. cvfCalls records every
+	// ReportCitizenVerifyFail invocation; cvfStatus is the verdict
+	// the fake coordinator returns ("counted" default, or
+	// "escalated"); cvfErr forces the POST-failed fallback path.
+	cvfCalls  []cvfRecord
+	cvfStatus string
+	cvfErr    error
 
 	// Inputs JSON returned by ClaimTask. Same key as ready map.
 	claimInputs map[string][]byte
@@ -167,6 +180,22 @@ func (f *fakeFC) FailTask(ctx context.Context, taskID, reason string) error {
 	}
 	f.fails = append(f.fails, failRecord{TaskID: taskID, Reason: reason})
 	return nil
+}
+
+func (f *fakeFC) ReportCitizenVerifyFail(ctx context.Context, taskID, reason string) (*service.CitizenVerifyFailResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cvfCalls = append(f.cvfCalls, cvfRecord{TaskID: taskID, Reason: reason})
+	if f.cvfErr != nil {
+		return nil, f.cvfErr
+	}
+	status := f.cvfStatus
+	if status == "" {
+		status = "counted"
+	}
+	return &service.CitizenVerifyFailResponse{
+		Status: status, TaskID: taskID, FailCount: len(f.cvfCalls), Cap: 3,
+	}, nil
 }
 
 func (f *fakeFC) ReleaseAllMyOpenClaims(ctx context.Context) (*service.ReleaseAllMyOpenClaimsResponse, error) {
@@ -626,7 +655,15 @@ func TestDaemon_RunOnce_OptionalMissingArtifactSucceeds(t *testing.T) {
 // fails the iteration so the bot's "I'm done" doesn't silently
 // land. Pre-fix this scenario submitted result.md only and the
 // task transitioned to ACCEPTED with the missing file unrecorded.
-func TestDaemon_RunOnce_FailsWhenDeclaredArtifactMissing(t *testing.T) {
+// A CITIZEN (answer) task whose declared writes_artifacts are
+// missing is a layer-① contract-gate miss. Post citizen-task-
+// retryable it must route to the coordinator's durable verify-fail
+// counter (ReportCitizenVerifyFail), NOT the daemon-local failStreak
+// and NEVER terminal FAILED — driving a citizen task terminal here
+// would cascade-SKIP descendants, but the miss is recoverable. The
+// submit must still NOT happen (the original bug: accept with a
+// phantom artifact list, file gone).
+func TestDaemon_RunOnce_CitizenMissingArtifact_RoutesToVerifyFailReport(t *testing.T) {
 	ws := t.TempDir() // intentionally empty — no out/missing.md
 
 	fc := newFCWithTask("bot1", "answer", "")
@@ -636,17 +673,33 @@ func TestDaemon_RunOnce_FailsWhenDeclaredArtifactMissing(t *testing.T) {
 	}
 
 	d, _ := New(Config{FC: fc, Handler: &recordingHandler{response: "done"}, Bot: scenarioBot(), ProjectID: 1})
-	_, err := d.RunOnce(context.Background())
-	if err == nil {
-		t.Fatal("expected error from missing artifact, got nil")
+	worked, err := d.RunOnce(context.Background())
+	// "counted" verdict → the daemon released and will retry next
+	// pass; not an open error for the loop to back off on.
+	if err != nil {
+		t.Fatalf("verify-fail 'counted' must not surface as a daemon error; got %v", err)
 	}
-	if !strings.Contains(err.Error(), "out/missing.md") {
-		t.Errorf("error should name the missing path; got %q", err.Error())
+	if !worked {
+		t.Fatal("expected worked=true (the daemon did handle the claim)")
 	}
-	// The submit MUST NOT happen — if it did, the bug would be back:
-	// task accepted with phantom artifact_written list, file gone.
+	if len(fc.cvfCalls) != 1 {
+		t.Fatalf("expected exactly 1 citizen-verify-fail report; got %d", len(fc.cvfCalls))
+	}
+	if !strings.Contains(fc.cvfCalls[0].Reason, "out/missing.md") {
+		t.Errorf("verify-fail reason should name the missing path; got %q", fc.cvfCalls[0].Reason)
+	}
+	// MUST NOT submit (phantom-artifact bug) and MUST NOT drive the
+	// task terminal via FailTask (that path is for compute scripts).
 	if len(fc.submits) != 0 {
 		t.Errorf("submit must NOT be called when artifacts are missing; got %d submits", len(fc.submits))
+	}
+	if len(fc.fails) != 0 {
+		t.Errorf("citizen verify-fail must NEVER call FailTask (terminal); got %d", len(fc.fails))
+	}
+	// "counted" releases the claim so the daemon re-claims and the
+	// agent gets another bounded attempt.
+	if len(fc.releases) != 1 || fc.releases[0] != "1:1:t" {
+		t.Errorf("expected the claim released for retry; got releases=%v", fc.releases)
 	}
 }
 

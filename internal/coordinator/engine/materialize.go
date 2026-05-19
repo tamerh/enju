@@ -567,6 +567,7 @@ func (e *Engine) ComputeMaterialization(
 			Volumes:          marshalStringSlice(ti.Volumes),
 			Executor:         ti.Executor,
 			Resources:        marshalResources(ti.Resources),
+			VerifyRetryCap:   ti.VerifyRetryCap,
 			OnReviewReject:         ti.OnReviewReject,
 			OnReviewRequestChanges: ti.OnReviewRequestChanges,
 			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
@@ -891,6 +892,7 @@ func (e *Engine) ComputeMaterialization(
 			Volumes:          marshalStringSlice(ti.Volumes),
 			Executor:         ti.Executor,
 			Resources:        marshalResources(ti.Resources),
+			VerifyRetryCap:   ti.VerifyRetryCap,
 			OnReviewReject:         ti.OnReviewReject,
 			OnReviewRequestChanges: ti.OnReviewRequestChanges,
 			RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
@@ -1015,6 +1017,13 @@ func BuildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInst, run *enjuYam
 	}
 	if ti.Timeout == "" {
 		ti.Timeout = run.Defaults.Timeout
+	}
+	// Same precedence as Timeout: a dynamically materialized /
+	// for_each-expanded task inherits the workflow default cap
+	// unless it set its own. Per-task wins; the coordinator const
+	// applies only when both are 0.
+	if ti.VerifyRetryCap == 0 {
+		ti.VerifyRetryCap = run.Defaults.VerifyRetryCap
 	}
 	return ti
 }

@@ -26,6 +26,10 @@ type SubmitResultParams struct {
 	Option      string // vote choice
 	Content     string // reviewer prose for {{review.feedback}}
 	OutputLists   map[string][]string
+	// IterSeq is the claim iter_seq the submitting client worked
+	// under (0 if not supplied). Single-citizen superseded-claim
+	// guard only — see engine.SubmitRequest.IterSeq.
+	IterSeq int
 }
 
 // SubmitResultResponse is the wire shape for the submit result.
@@ -139,6 +143,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 		TokensUsed:    params.TokensUsed,
 		ArtifactsWritten: params.ArtifactsWritten,
 		OutputLists:   params.OutputLists,
+		IterSeq:      params.IterSeq,
 	}
 	core, err := c.AcceptComputeTaskCore(task, run, engineReq, params.Model)
 	if err != nil {

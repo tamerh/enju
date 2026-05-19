@@ -253,6 +253,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutSetAutoTriageTemplate:
 		var m SetAutoTriageTemplate
 		return m, json.Unmarshal(data, &m)
+	case MutIncrementVerifyFailCount:
+		var m IncrementVerifyFailCount
+		return m, json.Unmarshal(data, &m)
 	}
 	return nil, fmt.Errorf("unknown mutation kind %q", kind)
 }
@@ -309,6 +312,14 @@ const (
 	MutRevokeAllCitizenTokens  MutationKind = "revoke_all_citizen_tokens"
 
 	MutSetAutoTriageTemplate MutationKind = "set_auto_triage_template"
+
+	// Layer-① contract-gate failure counter (citizen-task-retryable).
+	// Bumped — idempotent on (task_id, iter_seq) — when a citizen
+	// task's iteration ends in non-delivery, by either the
+	// fat-client report or the coordinator reaper. At the per-task
+	// cap the ReportCitizenVerifyFail / reaper path also issues the
+	// failed_retryable park composition.
+	MutIncrementVerifyFailCount MutationKind = "increment_verify_fail_count"
 )
 
 // AllMutationKinds enumerates every supported MutationKind.
@@ -360,6 +371,7 @@ var AllMutationKinds = []MutationKind{
 	MutRevokeTokenByValue,
 	MutRevokeAllCitizenTokens,
 	MutSetAutoTriageTemplate,
+	MutIncrementVerifyFailCount,
 }
 
 // --- Concrete mutation types ---
@@ -898,3 +910,23 @@ type SetAutoTriageTemplate struct {
 }
 
 func (SetAutoTriageTemplate) mutationKind() MutationKind { return MutSetAutoTriageTemplate }
+
+// IncrementVerifyFailCount bumps the per-task layer-① contract-gate
+// failure counter, idempotent on (TaskID, IterSeq): applied as
+// `verify_fail_count += 1, verify_fail_counted_iter = IterSeq
+//  WHERE verify_fail_counted_iter < IterSeq`, so the same iteration
+// charged by BOTH the fat-client report and the coordinator reaper
+// is counted exactly once. IterSeq is the open claim's iter_seq for
+// the non-delivery iteration being charged. When the resulting count
+// reaches the task's effective verify_retry_cap, the caller
+// (ReportCitizenVerifyFail or the reaper backstop) also issues the
+// MarkOpenClaimsFailed + SetTaskState{failed_retryable} park in the
+// same plan. No-op for any task whose iteration was already counted.
+type IncrementVerifyFailCount struct {
+	TaskID  string
+	IterSeq int
+}
+
+func (IncrementVerifyFailCount) mutationKind() MutationKind {
+	return MutIncrementVerifyFailCount
+}

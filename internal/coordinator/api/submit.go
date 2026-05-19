@@ -75,6 +75,15 @@ type submitResultRequest struct {
 	// task's git-committed result files — only list<string>
 	// outputs need to round-trip through the coordinator.
 	OutputLists map[string][]string `json:"output_lists,omitempty"`
+
+	// IterSeq is the claim iter_seq the submitting client worked
+	// under (the fat-client sends meta.IterSeq, surfaced at claim
+	// time). Single-citizen superseded-claim guard only: a
+	// submission whose iter_seq is strictly older than the task's
+	// current open claim is from an attempt that was superseded by
+	// a retry+reclaim and is refused to avoid a double-accept.
+	// Omitted/0 by pre-iter-seq clients → guard skipped.
+	IterSeq int `json:"iter_seq,omitempty"`
 }
 
 // handleSubmitResult is the metadata-only submit path. The client
@@ -223,6 +232,7 @@ func (s *Server) handleSubmitResultReport(w http.ResponseWriter, r *http.Request
 		Option:      req.Option,
 		Content:     req.Content,
 		OutputLists:   req.OutputLists,
+		IterSeq:      req.IterSeq,
 	})
 	if err != nil {
 		// Validation errors land as 400; anything else (apply

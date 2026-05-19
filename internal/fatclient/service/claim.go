@@ -158,6 +158,43 @@ func (s *FatClient) FailTask(ctx context.Context, taskID, reason string) error {
 	return nil
 }
 
+// CitizenVerifyFailResponse mirrors the coordinator's wire shape
+// for POST /api/v1/tasks/{id}/citizen-verify-failed.
+type CitizenVerifyFailResponse struct {
+	Status    string `json:"status"` // "counted" | "escalated"
+	TaskID    string `json:"task_id"`
+	FailCount int    `json:"fail_count"`
+	Cap       int    `json:"cap"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// ReportCitizenVerifyFail posts a layer-① writes-verify failure to
+// the coordinator. The coordinator owns the durable per-task
+// counter and the failed_retryable escalation; the daemon only
+// detects and reports (it never drives a citizen task to terminal
+// FAILED via this path). Returns the coordinator's verdict so the
+// daemon knows whether to clear its active claim (escalated) or
+// release it for the next attempt (counted). The daemon never sets
+// force — that is the operator escape hatch only.
+func (s *FatClient) ReportCitizenVerifyFail(ctx context.Context, taskID, reason string) (*CitizenVerifyFailResponse, error) {
+	if taskID == "" {
+		return nil, fmt.Errorf("task_id is required")
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("reason is required")
+	}
+	data, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/citizen-verify-failed",
+		map[string]string{"reason": reason})
+	if err != nil {
+		return nil, err
+	}
+	var resp CitizenVerifyFailResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decoding citizen-verify-failed response: %w", err)
+	}
+	return &resp, nil
+}
+
 // ReleaseAllMyOpenClaimsResponse is the fat-client mirror of
 // the coord's wire shape for POST /api/v1/me/release-claims.
 type ReleaseAllMyOpenClaimsResponse struct {

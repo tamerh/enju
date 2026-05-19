@@ -233,14 +233,18 @@ func cmdServe(args []string) {
 	}
 	store.SetEventDrainBudget(parseDurationOr(cfg.Performance.EventDrainBudget, 100*time.Millisecond))
 
-	// Start task reaper at the operator-configured interval.
-	reaper := scheduler.NewReaper(st, parseDurationOr(cfg.Performance.ReaperInterval, 60*time.Second), logger)
-	reaper.Start()
-	defer reaper.Stop()
-
 	srv := api.NewServerWithOptions(st, logger, api.ServerOptions{
 		HTTPRequestTimeout: parseDurationOr(cfg.Performance.HTTPRequestTimeout, 30*time.Second),
 	})
+
+	// Start task reaper at the operator-configured interval. Wire
+	// the server's shared Coordinator as the escalator so the
+	// citizen layer-① verify-fail backstop fires on the lease
+	// cadence even if the fat-client never reports (spec D3).
+	reaper := scheduler.NewReaper(st, parseDurationOr(cfg.Performance.ReaperInterval, 60*time.Second), logger)
+	reaper.SetEscalator(srv.Coordinator())
+	reaper.Start()
+	defer reaper.Stop()
 
 	// SIGHUP reload: re-read enju.conf and apply the subset of
 	// changes that are safe to mutate live (events kill-switch,
@@ -479,11 +483,12 @@ func cmdMCP(args []string) {
 			fmt.Fprintf(os.Stderr, "Local mode: event store booted disabled — emissions and reads no-op until toggled.\n")
 		}
 
+		srv := api.NewServer(st, logger)
+
 		reaper := scheduler.NewReaper(st, 60*time.Second, logger)
+		reaper.SetEscalator(srv.Coordinator())
 		reaper.Start()
 		defer reaper.Stop()
-
-		srv := api.NewServer(st, logger)
 
 		// Pinned port. Stable URL = no sentinel needed for the
 		// credentials key. Bind failure prints a clear hint.

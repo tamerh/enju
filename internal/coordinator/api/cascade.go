@@ -121,6 +121,45 @@ func (s *Server) handleFailTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleReportCitizenVerifyFail records a layer-① contract-gate
+// failure (the agent never produced the declared writes_artifacts,
+// so the fat-client refused to submit). The coordinator owns the
+// durable per-task counter and the failed_retryable escalation —
+// the client only reports. force=true is the operator escape hatch
+// (D5): escalate now into the same recoverable state, never
+// terminal failed.
+func (s *Server) handleReportCitizenVerifyFail(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+
+	var req struct {
+		Reason string `json:"reason"`
+		// force=true: operator-initiated immediate escalation,
+		// bypassing the counter but NOT the recovery semantics.
+		// The fat-client daemon always leaves this false.
+		Force bool `json:"force,omitempty"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+
+	resp, err := s.coord.ReportCitizenVerifyFail(caller, taskID, req.Reason, req.Force)
+	if err != nil {
+		writeFailErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleTallyTask forces a tally evaluation on a collecting
 // vote or review task. Any user can trigger it; it runs the
 // same tally logic as a submission would, resolves if the

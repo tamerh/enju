@@ -25,6 +25,18 @@ type SubmitRequest struct {
 	TokensUsed       int64
 	ArtifactsWritten []string
 	OutputLists      map[string][]string
+	// IterSeq is the claim iter_seq the submitting client believes
+	// it is working under (fat-client: meta.IterSeq, surfaced at
+	// claim time). Used only as a superseded-claim guard for
+	// single-citizen tasks: if the task's current open claim has a
+	// STRICTLY NEWER iter_seq, this submission is from an attempt
+	// that was already superseded (e.g. a citizen verify-fail
+	// escalation closed the looping claim, the task was retried,
+	// and a fresh claim advanced iter_seq) — accepting it would
+	// double-accept onto the new claimant's iteration. 0 = client
+	// did not supply it → guard is skipped (no regression for
+	// pre-iter-seq clients / MCP-human / compute paths).
+	IterSeq int
 }
 
 // ValidateSubmitRequest checks artifact paths, result_path
@@ -133,6 +145,29 @@ func (e *Engine) ValidateSubmitRequest(
 		submitterID = citizen.ID
 	} else {
 		submitterID = task.ClaimedBy
+
+		// Superseded-claim guard (single-citizen). Active-run
+		// analog of the terminate-quiesce runStateTerminal gate:
+		// that one keys on the run being terminal; here the run is
+		// ACTIVE, so we key on the SUPERSEDED CLAIM/ITER instead.
+		// If the submitter's iteration is strictly older than the
+		// task's current open-claim iter_seq, a newer claim took
+		// over (a citizen verify-fail escalation closed the looping
+		// claim → retry → fresh claim advanced iter_seq). Binding
+		// this stale submission to the new claim would double-accept
+		// the zombie's work onto the new claimant's iteration. Only
+		// enforced when the client supplied an iter_seq AND the task
+		// has a current open claim — pre-iter-seq clients and the
+		// no-open-claim cases fall through to the existing state
+		// gate in ComputeSubmission, which already refuses
+		// non-CLAIMED/RUNNING tasks.
+		if req.IterSeq > 0 {
+			if curIter, derr := e.store.GetOpenClaimIterSeq(task.ID); derr == nil && curIter > 0 && int64(req.IterSeq) < curIter {
+				return "", "", "", 0, fmt.Errorf(
+					"submission for task %q is from a superseded attempt (submitted iter_seq=%d, current open claim iter_seq=%d) — this claim was reclaimed after a retry; the stale result is refused to avoid a double-accept",
+					task.ID, req.IterSeq, curIter)
+			}
+		}
 	}
 
 	return resultPath, decision, voteChoice, submitterID, nil

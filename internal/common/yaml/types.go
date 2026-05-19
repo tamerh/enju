@@ -188,6 +188,16 @@ type ParamDef struct {
 type TaskDefaults struct {
 	Timeout string `yaml:"timeout,omitempty"` // e.g., "30m", "2h"
 
+	// VerifyRetryCap seeds every task's verify_retry_cap when the
+	// per-task field is 0 (unset). Resolution mirrors Timeout
+	// exactly: per-task wins over defaults, defaults wins over the
+	// coordinator's built-in const (defaultVerifyFailCap). 0 means
+	// "let the coordinator use its built-in default." It caps how
+	// many CONSECUTIVE layer-① non-delivery iterations a citizen
+	// task may accrue before the coordinator parks it
+	// failed_retryable.
+	VerifyRetryCap int `yaml:"verify_retry_cap,omitempty"`
+
 	// AssignTo seeds every task whose assign_to is unset. Scalar
 	// or list (yamlStringList), same as TaskDef.AssignTo. Defaulted
 	// in resolveDefaults before the emit-time assign_to event
@@ -727,6 +737,16 @@ type TaskDef struct {
 
 	ResultType string            `yaml:"result_type,omitempty"`
 	Timeout    string            `yaml:"timeout,omitempty"`
+
+	// VerifyRetryCap caps how many CONSECUTIVE layer-① non-delivery
+	// iterations the coordinator tolerates for this task before
+	// parking it failed_retryable (recoverable via enju_retry_task).
+	// 0 means "use defaults: verify_retry_cap, or the coordinator's
+	// built-in const if that is also 0." Per-task wins over
+	// defaults — same precedence as timeout, for the same reason:
+	// a hard extraction is flakier than a one-line confirm.
+	VerifyRetryCap int `yaml:"verify_retry_cap,omitempty"`
+
 	Outputs      map[string]OutputSpec  `yaml:"outputs,omitempty"`
 	Requirements map[string]interface{} `yaml:"requirements,omitempty"` // task-level requirements (replaces project-level)
 	Config       map[string]interface{} `yaml:"config,omitempty"`

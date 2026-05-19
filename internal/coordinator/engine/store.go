@@ -55,6 +55,10 @@ type ReadStore interface {
 	EarliestClaimTime(taskID string) (time.Time, error)
 	HasActiveClaim(taskID string, citizenID int64) (bool, error)
 	CountActiveClaims(taskID string) (int, error)
+	// GetOpenClaimIterSeq returns the iter_seq of the most recent
+	// open claim for the task (0 if none). Used by the
+	// single-citizen superseded-claim guard in ValidateSubmitRequest.
+	GetOpenClaimIterSeq(taskID string) (int64, error)
 
 	// Citizens
 	GetCitizen(id int64) (*store.CitizenRecord, error)

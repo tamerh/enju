@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/enju-ai/enju/internal/coordinator/store"
@@ -164,5 +165,43 @@ func TestValidateSubmitRequestVoteOption(t *testing.T) {
 	}
 	if choice != "a" {
 		t.Errorf("expected a, got %q", choice)
+	}
+}
+
+// Superseded-claim guard (single-citizen). Active-run analog of the
+// terminate-quiesce runStateTerminal gate, keyed on the SUPERSEDED
+// CLAIM/ITER instead of run state: a stale submission whose
+// iter_seq is strictly older than the task's current open claim
+// (i.e. a citizen verify-fail escalation closed the looping claim,
+// the task was retried, and a fresh claim advanced iter_seq) is
+// refused so the zombie's work cannot double-accept onto the new
+// claimant's iteration.
+func TestValidateSubmitRequestSupersededClaimRefused(t *testing.T) {
+	ms := &mockStore{
+		tasks: map[string]*store.TaskRecord{
+			"t1": {ID: "t1", Action: "answer", Citizens: 1, ClaimedBy: 2, State: store.TaskClaimed},
+		},
+		// Current open claim is iteration 3 (held by the new claimant).
+		openClaimIterSeq: map[string]int64{"t1": 3},
+	}
+	e := New(ms, nil)
+	task := ms.tasks["t1"]
+	run := &store.RunRecord{ProjectID: 1, Seq: 1}
+
+	// Stale submit from the superseded attempt (iter 1 < current 3).
+	_, _, _, _, err := e.ValidateSubmitRequest(task, run, &SubmitRequest{TaskID: "t1", IterSeq: 1})
+	if err == nil || !strings.Contains(err.Error(), "superseded") {
+		t.Fatalf("stale iter_seq=1 vs current 3 must be refused as superseded; got %v", err)
+	}
+
+	// Submit from the current iteration is accepted.
+	if _, _, _, _, err := e.ValidateSubmitRequest(task, run, &SubmitRequest{TaskID: "t1", IterSeq: 3}); err != nil {
+		t.Fatalf("current iter_seq=3 must pass; got %v", err)
+	}
+
+	// Pre-iter-seq client (IterSeq=0) is NOT regressed — guard
+	// skipped, falls through to the existing state gate.
+	if _, _, _, _, err := e.ValidateSubmitRequest(task, run, &SubmitRequest{TaskID: "t1", IterSeq: 0}); err != nil {
+		t.Fatalf("IterSeq=0 (pre-iter-seq client) must not be refused; got %v", err)
 	}
 }

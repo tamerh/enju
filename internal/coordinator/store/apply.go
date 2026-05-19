@@ -474,6 +474,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case IncrementVerifyFailCount:
+			if err := applyIncrementVerifyFailCount(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		default:
 			return result, fmt.Errorf("unknown mutation type: %T", mut)
 		}
@@ -591,7 +596,14 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 		// an empty fail_reason and the operator genuinely flew
 		// blind. Preserving it here is the load-bearing half of
 		// "don't fly blind".
-		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = ?, skip_reason = ?`
+		// verify_fail_count / verify_fail_counted_iter reset to 0
+		// here: this ClearClaim path is taken by retry_task (and the
+		// citizen-verify-fail park itself). Zeroing on re-open is
+		// what makes VerifyFailCount measure CONSECUTIVE layer-①
+		// non-delivery — a retried task starts its count fresh, and
+		// a later unrelated reopen cannot inherit a stale count that
+		// would leave it one expiry from a spurious escalation.
+		q := `UPDATE tasks SET state = ?, claimed_by = NULL, claimed_at = NULL, submitted_at = NULL, result_path = NULL, commit_sha = '', review_decision = '', vote_choice = '', fail_reason = ?, skip_reason = ?, verify_fail_count = 0, verify_fail_counted_iter = 0`
 		args := []interface{}{m.NewState, m.FailReason, m.SkipReason}
 		// depends_on rewrite (singleton-reopen case): the
 		// caller supplies a new edge set when a reconciled
@@ -825,8 +837,8 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 		anonymize = 1
 	}
 	_, err := tx.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_retry_cap, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
@@ -835,6 +847,7 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 		anonymize, t.Visibility, t.Env, t.Mode, t.RunSlug,
 		t.OnReviewReject, t.OnReviewRequestChanges, t.RemediationTemplate,
 		t.ClosesIssueSeq, t.Container, t.ContainerRuntime, t.Volumes, t.Executor, t.Resources,
+		t.VerifyRetryCap,
 		t.CreatedAt,
 	)
 	if err != nil {
@@ -1508,8 +1521,20 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		// downstream review will weigh in (stayOpen below) —
 		// orthogonal to the task-level state flip; a claim
 		// that closes here does NOT mean the task is accepted.
+		// A recorded submission is the layer-① delivery: the
+		// declared writes_artifacts existed and were committed, so
+		// the contract gate passed for this iteration. Reset the
+		// verify-fail counter (and its idempotency watermark) to 0
+		// here — NOT at accept — so the count measures CONSECUTIVE
+		// layer-① non-delivery. This is also what makes
+		// request_changes structurally unable to bump the counter:
+		// request_changes is submitted→accepted→review, and the
+		// submission that precedes it already zeroed the count, so a
+		// post-request_changes iteration starts a fresh count from
+		// 0 (a healthy review round can never feed a layer-①
+		// livelock escalation — the D4 separation, enforced here).
 		_, err := tx.Exec(
-			`UPDATE tasks SET state = 'submitted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ? WHERE id = ?`,
+			`UPDATE tasks SET state = 'submitted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ?, verify_fail_count = 0, verify_fail_counted_iter = 0 WHERE id = ?`,
 			now, m.ResultPath, m.CommitSHA, m.Decision, m.VoteChoice, m.TaskID,
 		)
 		if err != nil {
@@ -3239,5 +3264,38 @@ func applySetAutoTriageTemplate(tx *sql.Tx, m SetAutoTriageTemplate, sink EventS
 		return err
 	}
 	sink.SkipEvents("auto_triage_template is run metadata, not a contribution event")
+	return nil
+}
+
+// applyIncrementVerifyFailCount bumps the per-task layer-① gate
+// failure counter, idempotent on (task_id, iter_seq).
+//
+// The `verify_fail_counted_iter < ?` guard is load-bearing: this
+// same increment is issued from TWO independent producers — the
+// fat-client's ReportCitizenVerifyFail and the coordinator reaper
+// that observes a citizen lease expire with no submission for the
+// iteration. Without the guard a single non-delivery iteration that
+// is BOTH reported by the client AND swept by the reaper would
+// count twice. Gating on the iter_seq makes the increment exactly
+// "at most once per iteration" regardless of how many producers
+// fire for that iteration, which is also what makes the count a
+// faithful tally of CONSECUTIVE non-delivery iterations.
+//
+// IterSeq is the open claim's iter_seq for the iteration being
+// charged. A zero/negative IterSeq can never satisfy `0 < iter`
+// (counted_iter defaults to 0), so a malformed call is a safe
+// no-op rather than an unbounded increment.
+func applyIncrementVerifyFailCount(tx *sql.Tx, m IncrementVerifyFailCount, sink EventSink) error {
+	if _, err := tx.Exec(
+		`UPDATE tasks
+		    SET verify_fail_count = verify_fail_count + 1,
+		        verify_fail_counted_iter = ?
+		  WHERE id = ?
+		    AND verify_fail_counted_iter < ?`,
+		m.IterSeq, m.TaskID, m.IterSeq,
+	); err != nil {
+		return err
+	}
+	sink.SkipEvents("verify_fail_count increment is internal counter state, not a contribution event")
 	return nil
 }

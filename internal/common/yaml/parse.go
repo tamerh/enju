@@ -126,6 +126,15 @@ func resolveDefaults(p *Run) {
 			copy(seeded, p.Defaults.AssignTo)
 			p.Tasks[i].AssignTo = seeded
 		}
+
+		// Seed verify_retry_cap from the workflow default only when
+		// the task left it unset (0). An explicit per-task value
+		// always wins; the workflow default wins over the
+		// coordinator's built-in const. Same precedence model as
+		// timeout (resolved later, at run-create / materialize).
+		if p.Tasks[i].VerifyRetryCap == 0 && p.Defaults.VerifyRetryCap > 0 {
+			p.Tasks[i].VerifyRetryCap = p.Defaults.VerifyRetryCap
+		}
 	}
 }
 // substituteParamsInPlace merges supplied parameter values with declared

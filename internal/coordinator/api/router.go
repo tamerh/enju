@@ -83,6 +83,14 @@ func NewServerWithOptions(st store.CoordinatorStore, logger *slog.Logger, opts S
 	}
 }
 
+// Coordinator exposes the server's shared *service.Coordinator so
+// out-of-band drivers (the reaper's citizen verify-fail backstop)
+// converge on the SAME instance the HTTP handlers use — same cache,
+// same per-project triage mutex. Constructing a second Coordinator
+// would split triageMu and reintroduce the concurrent-spawn race
+// it guards.
+func (s *Server) Coordinator() *service.Coordinator { return s.coord }
+
 // engine creates a lightweight Engine instance for
 // pure-computation calls. One per request — no caching
 // needed since Engine holds no state.
@@ -225,6 +233,7 @@ func (s *Server) Router() http.Handler {
 		r.Post("/tasks/{taskID}/retry", s.handleRetryTask)
 		r.Post("/tasks/{taskID}/tally", s.handleTallyTask)
 		r.Post("/tasks/{taskID}/fail", s.handleFailTask)
+		r.Post("/tasks/{taskID}/citizen-verify-failed", s.handleReportCitizenVerifyFail)
 
 		// Citizens
 		r.Post("/citizens/register", s.handleRegisterCitizen)
