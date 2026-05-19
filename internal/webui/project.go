@@ -74,7 +74,7 @@ func (s *Server) loadProjectAndOwner(w http.ResponseWriter, r *http.Request, pid
 	proj, err := s.fc.GetProject(r.Context(), pid)
 	if err != nil {
 		s.logger.Error("GetProject failed", "project_id", pid, "error", err)
-		http.Error(w, "failed to load project: "+err.Error(), http.StatusBadGateway)
+		s.writeFetchError(w, "project", err)
 		return nil, false, false
 	}
 	if proj == nil {

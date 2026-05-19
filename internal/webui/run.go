@@ -42,7 +42,7 @@ func (s *Server) handleRunView(w http.ResponseWriter, r *http.Request) {
 	run, err := s.fc.GetRun(r.Context(), pid, seq)
 	if err != nil {
 		s.logger.Error("GetRun failed", "project_id", pid, "run_seq", seq, "error", err)
-		http.Error(w, "failed to load run: "+err.Error(), http.StatusBadGateway)
+		s.writeFetchError(w, "run", err)
 		return
 	}
 	if run == nil {

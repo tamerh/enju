@@ -1498,20 +1498,35 @@ func TestTaskViewProducedFiles(t *testing.T) {
 // highlighter-ready <pre> (data-lang by extension) with the
 // content, and a muted note when empty.
 func TestTaskFileFragment(t *testing.T) {
+	// D4: the fragment now requires the task to exist AND the
+	// path to be one of its produced artifacts; content is read
+	// on the task's OWN run branch, not a caller ?branch=.
+	tracked := true
+	taskMeta := func() *service.TaskMeta {
+		return &service.TaskMeta{
+			ID: "1:1:plot", ProjectID: 1, RunSeq: 1, TaskDefID: "plot",
+			State: "accepted", Action: "compute", Branch: "mustache-engine-1",
+		}
+	}
+	owned := []service.ArtifactResponse{
+		{Path: "src/context.py", LastTaskID: "1:1:plot", Tracked: &tracked},
+	}
+
+	// Happy path: real task, owned path → highlighted pre, read
+	// on the task's run branch (the caller's ?branch is ignored).
 	raw, _ := json.Marshal(map[string]interface{}{
 		"path": "src/context.py", "content": "def f():\n    return 1\n",
 	})
-	fc := &fakeFC{username: "tamer", artifactContent: raw}
+	fc := &fakeFC{username: "tamer", taskMeta: taskMeta(),
+		artifacts: owned, artifactContent: raw}
 	s := newTestServer(t, fc)
-	req := httptest.NewRequest(http.MethodGet,
-		"/p/1/t/1:1:plot/file?path=src/context.py&branch=mustache-engine-1", nil)
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet,
+		"/p/1/t/1:1:plot/file?path=src/context.py&branch=attacker-supplied", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	// Bare fragment — no layout shell.
 	if strings.Contains(body, "<html") {
 		t.Errorf("fragment must not include the layout; got: %q", body)
 	}
@@ -1520,17 +1535,47 @@ func TestTaskFileFragment(t *testing.T) {
 		t.Errorf("expected highlighter-ready pre with content; got: %q", body)
 	}
 	if fc.gotArtifactBranch != "mustache-engine-1" {
-		t.Errorf("fragment should pass the run branch through; got %q", fc.gotArtifactBranch)
+		t.Errorf("must read on the task's run branch, not caller ?branch; got %q", fc.gotArtifactBranch)
 	}
 
-	// Empty content → muted note, not an empty <pre>.
-	empty, _ := json.Marshal(map[string]interface{}{"path": "x.bin", "content": ""})
-	s2 := newTestServer(t, &fakeFC{username: "tamer", artifactContent: empty})
+	// Unknown task → (task not found); no content fetch.
+	noTask := &fakeFC{username: "tamer", getTaskErr: fmt.Errorf("task not found")}
+	s2 := newTestServer(t, noTask)
 	rr2 := httptest.NewRecorder()
-	s2.Handler().ServeHTTP(rr2,
-		httptest.NewRequest(http.MethodGet, "/p/1/t/1:1:plot/file?path=x.bin", nil))
-	if !strings.Contains(rr2.Body.String(), "not viewable here") {
-		t.Errorf("empty content should yield a muted note; got: %q", rr2.Body.String())
+	s2.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet,
+		"/p/1/t/bogus/file?path=secret.txt", nil))
+	if !strings.Contains(rr2.Body.String(), "task not found") {
+		t.Errorf("unknown task should be rejected; got: %q", rr2.Body.String())
+	}
+	if noTask.gotArtifactPath != "" {
+		t.Errorf("must not fetch content for an unknown task; fetched %q", noTask.gotArtifactPath)
+	}
+
+	// Real task but a path it did NOT produce → rejected. The
+	// taskID segment is no longer a decorative pass-through to
+	// arbitrary repo files.
+	fc3 := &fakeFC{username: "tamer", taskMeta: taskMeta(), artifacts: owned}
+	s3 := newTestServer(t, fc3)
+	rr3 := httptest.NewRecorder()
+	s3.Handler().ServeHTTP(rr3, httptest.NewRequest(http.MethodGet,
+		"/p/1/t/1:1:plot/file?path=../../etc/passwd", nil))
+	if !strings.Contains(rr3.Body.String(), "not a file this task produced") {
+		t.Errorf("unowned path must be rejected; got: %q", rr3.Body.String())
+	}
+	if fc3.gotArtifactPath != "" {
+		t.Errorf("must not fetch an unowned path; fetched %q", fc3.gotArtifactPath)
+	}
+
+	// Owned but empty/binary → muted note, not an empty <pre>.
+	empty, _ := json.Marshal(map[string]interface{}{"path": "src/context.py", "content": ""})
+	fc4 := &fakeFC{username: "tamer", taskMeta: taskMeta(),
+		artifacts: owned, artifactContent: empty}
+	s4 := newTestServer(t, fc4)
+	rr4 := httptest.NewRecorder()
+	s4.Handler().ServeHTTP(rr4, httptest.NewRequest(http.MethodGet,
+		"/p/1/t/1:1:plot/file?path=src/context.py", nil))
+	if !strings.Contains(rr4.Body.String(), "not viewable here") {
+		t.Errorf("empty content should yield a muted note; got: %q", rr4.Body.String())
 	}
 }
 

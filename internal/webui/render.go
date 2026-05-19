@@ -1,8 +1,26 @@
 package webui
 
 import (
+	"errors"
 	"net/http"
+
+	"github.com/enju-ai/enju/internal/fatclient/service"
 )
+
+// writeFetchError maps a FatClient read error to the right HTTP
+// status: a not-found (service.ErrNotFound, set by GetRun /
+// GetProject when the coordinator answered 404) → a clean 404;
+// anything else → 502 (upstream/decoding failure). Centralizes
+// the decision so view handlers stop blanket-502-ing a clean
+// coord 404 (and never leak an internal decode-error string as
+// the body). `what` is the resource noun, e.g. "run".
+func (s *Server) writeFetchError(w http.ResponseWriter, what string, err error) {
+	if errors.Is(err, service.ErrNotFound) {
+		http.Error(w, what+" not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, "failed to load "+what+": "+err.Error(), http.StatusBadGateway)
+}
 
 // pageData carries the common header fields every page renders.
 // Page-specific structs embed it so templates can access both

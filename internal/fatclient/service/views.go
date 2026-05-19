@@ -137,9 +137,20 @@ func (s *FatClient) ListProjects(ctx context.Context) ([]wire.Project, error) {
 // TODO(latency): parallelize the two GETs once a real workload
 // shows the sequential cost matters.
 func (s *FatClient) GetProject(ctx context.Context, projectID int64) (*ProjectDetail, error) {
-	pData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d", projectID))
+	// coord.Get swallows the status and returns 4xx bodies with
+	// err==nil; without GetStatus a missing project decodes into
+	// a zero-value wire.Project and we'd hand back a non-nil
+	// ghost ProjectDetail (blank 200 page). Recover the 404 and
+	// guard the error-shaped body like ListRuns does.
+	pData, status, err := s.coord.GetStatus(ctx, fmt.Sprintf("/api/v1/projects/%d", projectID))
 	if err != nil {
 		return nil, err
+	}
+	if status == 404 { // http.StatusNotFound — literal keeps net/http out of the data layer
+		return nil, fmt.Errorf("project %d: %w", projectID, ErrNotFound)
+	}
+	if msg := coord.ExtractError(pData); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var p wire.Project
 	if err := json.Unmarshal(pData, &p); err != nil {
@@ -149,6 +160,9 @@ func (s *FatClient) GetProject(ctx context.Context, projectID int64) (*ProjectDe
 	mData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/members", projectID))
 	if err != nil {
 		return nil, err
+	}
+	if msg := coord.ExtractError(mData); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var members []wire.Member
 	if err := json.Unmarshal(mData, &members); err != nil {
@@ -189,9 +203,21 @@ func (s *FatClient) GetRun(ctx context.Context, projectID int64, runSeq int) (*R
 	// off the default payload). The web run page renders it
 	// beside the DAG; one fetch per page navigation, not a hot
 	// poll, so always requesting it here is fine.
-	runData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d?include=yaml", projectID, runSeq))
+	// GetStatus (not Get) so a missing run is a clean 404, not
+	// a {"error":...} body that decodes into a zero-value
+	// wire.Run and only blows up later as "decode tasks: cannot
+	// unmarshal object into []service.taskWire" (leaking the Go
+	// type to the browser via the 502 path). Same guard ListRuns
+	// already has.
+	runData, status, err := s.coord.GetStatus(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d?include=yaml", projectID, runSeq))
 	if err != nil {
 		return nil, err
+	}
+	if status == 404 { // http.StatusNotFound — literal keeps net/http out of the data layer
+		return nil, fmt.Errorf("run %d:%d: %w", projectID, runSeq, ErrNotFound)
+	}
+	if msg := coord.ExtractError(runData); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var r wire.Run
 	if err := json.Unmarshal(runData, &r); err != nil {
@@ -201,6 +227,11 @@ func (s *FatClient) GetRun(ctx context.Context, projectID int64, runSeq int) (*R
 	tasksData, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runSeq))
 	if err != nil {
 		return nil, err
+	}
+	// Defensive: even though the run GET is now guarded, never
+	// feed an error-shaped body into the []taskWire decode.
+	if msg := coord.ExtractError(tasksData); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var taskWires []taskWire
 	if err := json.Unmarshal(tasksData, &taskWires); err != nil {

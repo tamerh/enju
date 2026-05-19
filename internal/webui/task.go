@@ -172,27 +172,52 @@ func (s *Server) producedArtifacts(r *http.Request, meta *service.TaskMeta) []se
 // query (the task page passes the run branch); reuses the
 // branch-aware GetArtifactContent.
 func (s *Server) handleTaskFileFragment(w http.ResponseWriter, r *http.Request) {
-	pid, _, ok := parseTaskRoute(w, r)
+	pid, taskID, ok := parseTaskRoute(w, r)
 	if !ok {
 		return
 	}
 	path := strings.TrimSpace(r.URL.Query().Get("path"))
-	branch := strings.TrimSpace(r.URL.Query().Get("branch"))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if path == "" {
 		_, _ = w.Write([]byte(`<p class="muted small">(no path)</p>`))
 		return
 	}
-	raw, err := s.fc.GetArtifactContent(r.Context(), pid, path, branch)
+	// The taskID path segment was decorative — any string served
+	// any repo file (path traversal aside, which is blocked
+	// downstream). Tie the fragment to a real task and to a file
+	// that task actually produced: resolve the task, then serve
+	// only a path in its produced-artifact set, on the task's
+	// own run branch (not a caller-supplied ?branch).
+	meta, merr := s.fc.FetchTaskMeta(r.Context(), taskID)
+	if merr != nil || meta == nil {
+		s.logger.Info("task file fragment: task not found",
+			"project_id", pid, "task_id", taskID, "error", merr)
+		_, _ = w.Write([]byte(`<p class="muted small">(task not found)</p>`))
+		return
+	}
+	owned := false
+	for _, a := range s.producedArtifacts(r, meta) {
+		if a.Path == path {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		s.logger.Info("task file fragment: path not produced by task",
+			"project_id", pid, "task_id", taskID, "path", path)
+		_, _ = w.Write([]byte(`<p class="muted small">(not a file this task produced)</p>`))
+		return
+	}
+	raw, err := s.fc.GetArtifactContent(r.Context(), pid, path, meta.Branch)
 	if err != nil {
 		s.logger.Info("task file fragment: GetArtifactContent failed",
-			"project_id", pid, "path", path, "branch", branch, "error", err)
+			"project_id", pid, "path", path, "branch", meta.Branch, "error", err)
 		_, _ = w.Write([]byte(`<p class="muted small">Couldn't load this file here — open it in the full artifact page.</p>`))
 		return
 	}
-	var meta map[string]interface{}
-	_ = json.Unmarshal(raw, &meta)
-	content, _ := meta["content"].(string)
+	var blob map[string]interface{}
+	_ = json.Unmarshal(raw, &blob)
+	content, _ := blob["content"].(string)
 	if content == "" {
 		_, _ = w.Write([]byte(`<p class="muted small">(empty, binary, or untracked — content not viewable here; try the full artifact page)</p>`))
 		return

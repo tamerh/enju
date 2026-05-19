@@ -11,6 +11,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -580,6 +581,54 @@ func TestRegisterAndList_RoundTrip(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ProjectID != 7 || got[0].Path != dir {
 		t.Errorf("round-trip mismatch: %+v", got)
+	}
+}
+
+// notFoundServer returns 404 + {"error": msg} for every
+// request — coord's real shape for a missing run/project. Used
+// to pin that GetRun/GetProject recover the status via
+// GetStatus and wrap ErrNotFound (instead of decoding the
+// error body into a zero-value struct).
+func notFoundServer(t *testing.T, msg string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": msg})
+	}))
+}
+
+// TestGetRunNotFound (D1): a missing run → ErrNotFound, not a
+// zero-value run that later explodes as "decode tasks: …
+// []service.taskWire" (the internal Go type that leaked to the
+// browser via the 502 path).
+func TestGetRunNotFound(t *testing.T) {
+	srv := notFoundServer(t, "run not found")
+	defer srv.Close()
+	got, err := newViewClient(t, srv.URL).GetRun(context.Background(), 1, 999)
+	if got != nil {
+		t.Errorf("want nil run on 404, got %+v", got)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if strings.Contains(err.Error(), "taskWire") {
+		t.Errorf("internal Go type leaked into the error: %v", err)
+	}
+}
+
+// TestGetProjectNotFound (D2): a missing project → ErrNotFound,
+// not a non-nil zero-value *ProjectDetail (which rendered as a
+// blank 200 page because the proj==nil→404 branch never fired).
+func TestGetProjectNotFound(t *testing.T) {
+	srv := notFoundServer(t, "project not found")
+	defer srv.Close()
+	got, err := newViewClient(t, srv.URL).GetProject(context.Background(), 999)
+	if got != nil {
+		t.Errorf("want nil project on 404, got %+v", got)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
 
