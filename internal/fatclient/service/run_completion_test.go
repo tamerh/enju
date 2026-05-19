@@ -1,14 +1,17 @@
 package service
 
 // Tests for FatClient.applyRunCompletion — the run-completion sync
-// step that merges the run branch into base_branch and optionally
-// pushes. These tests focus on the orchestration logic (mode routing,
-// guard clauses) using the nil-workflow / nil-meta fast paths.
-// The actual merge behavior is tested in enjugit/merge_run_into_base_test.go.
+// step that publishes the run's declared output set onto the base
+// branch and, in push mode, shares { base, run branch } (+ topic
+// branches only when opted in). These focus on the orchestration
+// logic (mode routing, guard clauses, request shaping). The actual
+// git publish behavior is tested in
+// enjugit/publish_run_artifacts_test.go.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,46 +25,34 @@ import (
 )
 
 // fakeWorkflow implements mergeWorkflow for service-layer tests.
-// Controls return values for MergeRunIntoBase and PushBranch so tests
-// can assert which branches were merged/pushed without a real git repo.
+// Records the PublishRunArtifacts request so tests can assert what
+// applyRunCompletion asked for without a real git repo.
 type fakeWorkflow struct {
 	defaultBranch string
 	remoteURL     string
 
-	mergeErr    error
-	mergeResult *enjugit.MergeResult
-
-	pushErr error
+	publishErr    error
+	publishResult *enjugit.PublishRunArtifactsResult
 
 	// recorded call args
-	mergedRun  string
-	mergedBase string
-	pushBranch string
-	mergeCalls int
-	pushCalls  int
+	gotReq       enjugit.PublishRunArtifactsRequest
+	publishCalls int
 }
 
 func (f *fakeWorkflow) DefaultBranch() string { return f.defaultBranch }
-func (f *fakeWorkflow) RemoteURL() string      { return f.remoteURL }
+func (f *fakeWorkflow) RemoteURL() string     { return f.remoteURL }
 
-func (f *fakeWorkflow) MergeRunIntoBase(run, base string, _ enjugit.MergeAuthor) (*enjugit.MergeResult, error) {
-	f.mergeCalls++
-	f.mergedRun = run
-	f.mergedBase = base
-	if f.mergeErr != nil {
-		return nil, f.mergeErr
+func (f *fakeWorkflow) PublishRunArtifacts(req enjugit.PublishRunArtifactsRequest) (*enjugit.PublishRunArtifactsResult, error) {
+	f.publishCalls++
+	f.gotReq = req
+	if f.publishErr != nil {
+		return nil, f.publishErr
 	}
-	res := f.mergeResult
+	res := f.publishResult
 	if res == nil {
-		res = &enjugit.MergeResult{FastForwarded: true, NewTip: "abc123"}
+		res = &enjugit.PublishRunArtifactsResult{CommitSHA: "abc123"}
 	}
 	return res, nil
-}
-
-func (f *fakeWorkflow) PushBranch(branch string) error {
-	f.pushCalls++
-	f.pushBranch = branch
-	return f.pushErr
 }
 
 func nullFatClient() *FatClient {
@@ -77,6 +68,21 @@ func completionBody(t *testing.T, runCompleted bool, syncMode string) []byte {
 	}
 	if syncMode != "" {
 		m["sync_mode"] = syncMode
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+// completionBodyFull builds a completion response with the declared
+// publish set + the topic-push opt-in, the shape the coordinator
+// sends on a real run completion.
+func completionBodyFull(t *testing.T, syncMode string, paths []string, pushTopics bool) []byte {
+	t.Helper()
+	m := map[string]interface{}{
+		"run_completed": true,
+		"sync_mode":     syncMode,
+		"publish_paths": paths,
+		"push_topics":   pushTopics,
 	}
 	b, _ := json.Marshal(m)
 	return b
@@ -106,11 +112,14 @@ func TestApplyRunCompletion_SkipsWhenNilMeta(t *testing.T) {
 }
 
 // TestApplyRunCompletion_SkipsWhenModeNone — mode=none means
-// operator opted out; no merge should be attempted.
+// operator opted out; no publish should be attempted.
 func TestApplyRunCompletion_SkipsWhenModeNone(t *testing.T) {
 	fc := nullFatClient()
-	// nil wf — would panic if we tried to merge.
-	fc.applyRunCompletion(context.Background(), nil, &TaskMeta{Branch: "run-1"}, completionBody(t, true, "none"))
+	wf := &fakeWorkflow{defaultBranch: "main"}
+	fc.applyRunCompletion(context.Background(), wf, &TaskMeta{Branch: "run-1"}, completionBody(t, true, "none"))
+	if wf.publishCalls != 0 {
+		t.Errorf("mode=none must not publish: got %d calls", wf.publishCalls)
+	}
 }
 
 // TestApplyRunCompletion_SkipsWhenEmptyResponseBody — empty body
@@ -121,20 +130,25 @@ func TestApplyRunCompletion_SkipsWhenEmptyResponseBody(t *testing.T) {
 	fc.applyRunCompletion(context.Background(), nil, &TaskMeta{}, []byte{})
 }
 
-// TestRunCompletion_ModeDefaultsToMerge — response has run_completed=true
-// but no sync_mode field; applyRunCompletion defaults to "merge".
+// TestRunCompletion_ModeDefaultsToMerge — response has
+// run_completed=true but no sync_mode; defaults to "merge" (publish,
+// no push).
 func TestRunCompletion_ModeDefaultsToMerge(t *testing.T) {
 	fc := nullFatClient()
-	// nil wf skips at the nil guard, not at the mode=none guard.
-	// Passing a non-nil meta with empty Branch exercises the
-	// "missing branch names" warning path instead.
-	fc.applyRunCompletion(context.Background(), nil, &TaskMeta{Branch: "run-1"}, completionBody(t, true, ""))
-	// No panic and no attempt to merge (wf=nil guard fires first) = correct.
+	wf := &fakeWorkflow{defaultBranch: "main"}
+	fc.applyRunCompletion(context.Background(), wf,
+		&TaskMeta{Branch: "run-1"}, completionBody(t, true, ""))
+	if wf.publishCalls != 1 {
+		t.Fatalf("default mode must publish once: got %d", wf.publishCalls)
+	}
+	if wf.gotReq.Push {
+		t.Errorf("default (merge) mode must not push")
+	}
 }
 
-// TestApplyRunCompletion_MergeSuccess — mode=merge calls MergeRunIntoBase
-// with the right branches and does NOT push.
-func TestApplyRunCompletion_MergeSuccess(t *testing.T) {
+// TestApplyRunCompletion_MergePublishesNoPush — mode=merge publishes
+// the declared set onto base with the right branches and Push=false.
+func TestApplyRunCompletion_MergePublishesNoPush(t *testing.T) {
 	fc := nullFatClient()
 	wf := &fakeWorkflow{
 		defaultBranch: "main",
@@ -142,25 +156,52 @@ func TestApplyRunCompletion_MergeSuccess(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBody(t, true, "merge"))
+		completionBodyFull(t, "merge", []string{"results/out.csv"}, false))
 
-	if wf.mergeCalls != 1 {
-		t.Errorf("MergeRunIntoBase calls: got %d, want 1", wf.mergeCalls)
+	if wf.publishCalls != 1 {
+		t.Fatalf("PublishRunArtifacts calls: got %d, want 1", wf.publishCalls)
 	}
-	if wf.mergedRun != "run-1" {
-		t.Errorf("mergedRun: got %q, want %q", wf.mergedRun, "run-1")
+	if wf.gotReq.RunBranch != "run-1" || wf.gotReq.BaseBranch != "main" {
+		t.Errorf("branches: got run=%q base=%q", wf.gotReq.RunBranch, wf.gotReq.BaseBranch)
 	}
-	if wf.mergedBase != "main" {
-		t.Errorf("mergedBase: got %q, want %q", wf.mergedBase, "main")
+	if len(wf.gotReq.Paths) != 1 || wf.gotReq.Paths[0] != "results/out.csv" {
+		t.Errorf("publish paths not passed through: %v", wf.gotReq.Paths)
 	}
-	if wf.pushCalls != 0 {
-		t.Errorf("PushBranch should not be called for mode=merge, got %d calls", wf.pushCalls)
+	if wf.gotReq.Push {
+		t.Errorf("mode=merge must not push (Push=true)")
 	}
 }
 
-// TestApplyRunCompletion_PushSuccess — mode=push merges then pushes
-// the base branch.
-func TestApplyRunCompletion_PushSuccess(t *testing.T) {
+// TestApplyRunCompletion_PushSharesBaseAndRunBranch — mode=push asks
+// for the push of { base, run branch }; push_topics defaults off.
+func TestApplyRunCompletion_PushSharesBaseAndRunBranch(t *testing.T) {
+	fc := nullFatClient()
+	wf := &fakeWorkflow{
+		defaultBranch: "main",
+		remoteURL:     "https://example.com/repo.git",
+		publishResult: &enjugit.PublishRunArtifactsResult{
+			CommitSHA: "deadbeef",
+			Pushed:    []string{"main", "run-1"},
+		},
+	}
+	fc.applyRunCompletion(context.Background(), wf,
+		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
+		completionBodyFull(t, "push", []string{"results/out.csv"}, false))
+
+	if wf.publishCalls != 1 {
+		t.Fatalf("publish calls: got %d, want 1", wf.publishCalls)
+	}
+	if !wf.gotReq.Push {
+		t.Errorf("mode=push must set Push=true")
+	}
+	if wf.gotReq.PushTopics {
+		t.Errorf("push_topics must default off")
+	}
+}
+
+// TestApplyRunCompletion_PushTopicsPassedThrough — sync.push_topics
+// surfaces on the request so the enjugit layer also pushes topics.
+func TestApplyRunCompletion_PushTopicsPassedThrough(t *testing.T) {
 	fc := nullFatClient()
 	wf := &fakeWorkflow{
 		defaultBranch: "main",
@@ -168,22 +209,18 @@ func TestApplyRunCompletion_PushSuccess(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBody(t, true, "push"))
+		completionBodyFull(t, "push", []string{"out.txt"}, true))
 
-	if wf.mergeCalls != 1 {
-		t.Errorf("MergeRunIntoBase calls: got %d, want 1", wf.mergeCalls)
-	}
-	if wf.pushCalls != 1 {
-		t.Errorf("PushBranch calls: got %d, want 1", wf.pushCalls)
-	}
-	if wf.pushBranch != "main" {
-		t.Errorf("push branch: got %q, want %q", wf.pushBranch, "main")
+	if !wf.gotReq.Push || !wf.gotReq.PushTopics {
+		t.Errorf("push_topics opt-in not threaded: Push=%v PushTopics=%v",
+			wf.gotReq.Push, wf.gotReq.PushTopics)
 	}
 }
 
-// TestApplyRunCompletion_PushSkippedWithNoRemote — mode=push but no
-// remote configured; merge still happens, push is skipped.
-func TestApplyRunCompletion_PushSkippedWithNoRemote(t *testing.T) {
+// TestApplyRunCompletion_PushNoRemotePublishesLocal — mode=push but
+// no remote: still publishes locally, with Push downgraded to false
+// (base gets the artifacts-only update; operator pushes by hand).
+func TestApplyRunCompletion_PushNoRemotePublishesLocal(t *testing.T) {
 	fc := nullFatClient()
 	wf := &fakeWorkflow{
 		defaultBranch: "main",
@@ -191,24 +228,41 @@ func TestApplyRunCompletion_PushSkippedWithNoRemote(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1"},
-		completionBody(t, true, "push"))
+		completionBodyFull(t, "push", []string{"out.txt"}, false))
 
-	if wf.mergeCalls != 1 {
-		t.Errorf("merge should still run: got %d calls", wf.mergeCalls)
+	if wf.publishCalls != 1 {
+		t.Fatalf("publish should still run locally: got %d calls", wf.publishCalls)
 	}
-	if wf.pushCalls != 0 {
-		t.Errorf("push should be skipped when no remote: got %d calls", wf.pushCalls)
+	if wf.gotReq.Push {
+		t.Errorf("push must be downgraded to false when no remote configured")
 	}
 }
 
-// TestApplyRunCompletion_ConflictReported — bug hunt B-1: a
-// run-completion merge conflict is logged AND reported to the
-// coordinator (POST /projects/{p}/runs/{r}/sync-conflict) so the
-// otherwise log-only data-loss surfaces on coordinator surfaces.
-// Push must still NOT fire after a conflict. (Pre-B-1 this test
-// asserted "no coord POST is made" — the contract deliberately
-// changed; this is the client-side half of the B-1 regression.)
-func TestApplyRunCompletion_ConflictReported(t *testing.T) {
+// TestApplyRunCompletion_PublishErrorNonFatal — a hard publish
+// failure is logged, not panicked or returned. (applyRunCompletion
+// has no error return; the contract is best-effort.)
+func TestApplyRunCompletion_PublishErrorNonFatal(t *testing.T) {
+	fc := nullFatClient()
+	wf := &fakeWorkflow{
+		defaultBranch: "main",
+		publishErr:    errors.New("read declared artifact: object missing"),
+	}
+	fc.applyRunCompletion(context.Background(), wf,
+		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
+		completionBodyFull(t, "merge", []string{"out.txt"}, false))
+	if wf.publishCalls != 1 {
+		t.Errorf("publish should be attempted once: got %d", wf.publishCalls)
+	}
+	// No panic / no second attempt = correct best-effort handling.
+}
+
+// TestReportRunSyncConflict_PostsSignal exercises the retained
+// run_sync_conflict client directly. applyRunCompletion no longer
+// auto-fires it (a curated per-path publish cannot 3-way conflict,
+// and the run branch is kept+pushed so output is never stranded),
+// but the helper + coordinator endpoint remain for the operator /
+// straggler path — so its wire contract still needs coverage.
+func TestReportRunSyncConflict_PostsSignal(t *testing.T) {
 	var (
 		mu         sync.Mutex
 		gotPath    string
@@ -231,25 +285,14 @@ func TestApplyRunCompletion_ConflictReported(t *testing.T) {
 		BaseURL: srv.URL, Username: "bot1", AuthToken: "t", Logger: logger,
 	}), Logger: logger})
 
-	wf := &fakeWorkflow{
-		defaultBranch: "main",
-		mergeErr:      &enjugit.ErrConflict{Paths: []string{"data/results.csv", "README.md"}},
-	}
-	fc.applyRunCompletion(context.Background(), wf,
-		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBody(t, true, "merge"))
-
-	if wf.mergeCalls != 1 {
-		t.Errorf("MergeRunIntoBase should be called once: got %d", wf.mergeCalls)
-	}
-	if wf.pushCalls != 0 {
-		t.Errorf("push must not be called after conflict: got %d calls", wf.pushCalls)
-	}
+	fc.reportRunSyncConflict(context.Background(), 42, 3,
+		"run-1", "main", []string{"data/results.csv", "README.md"},
+		"git checkout main && git merge run-1")
 
 	mu.Lock()
 	defer mu.Unlock()
 	if !postCalled {
-		t.Fatal("B-1 regression: conflict was NOT reported to coord (silent data-loss)")
+		t.Fatal("sync-conflict signal was NOT posted to coord")
 	}
 	if !strings.HasSuffix(gotPath, "/projects/42/runs/3/sync-conflict") {
 		t.Errorf("reported to wrong path: %q", gotPath)

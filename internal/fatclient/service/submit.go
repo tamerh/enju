@@ -778,11 +778,18 @@ func (s *FatClient) reportMergeConflict(ctx context.Context, projectID, runSeq i
 // the coordinator stamps a durable run-level sync_status flag +
 // run_sync_conflict event rather than spawning a task.
 //
-// Best-effort, never bubbles up — mirrors reportMerge. The
-// caller already logged an actionable ERROR with the manual
-// merge hint; this POST is the bit that makes the data-loss
-// visible on enju_run_status / enju runs / the event log
-// instead of being buried in the per-run operator log.
+// Best-effort, never bubbles up — mirrors reportMerge. This POST
+// is the bit that makes the data-loss visible on enju_run_status
+// / enju runs / the event log instead of being buried in the
+// per-run operator log.
+//
+// Retained intentionally: the normal completion path no longer
+// whole-branch-merges (it publishes the declared output set and
+// keeps+pushes the run branch), so it cannot strand a completed
+// run's output and does not call this. The coordinator endpoint
+// and this client stay for the operator/straggler path — a manual
+// `git merge` of a run branch into base for an interrupted or
+// pre-policy repo can still hit a content conflict worth surfacing.
 func (s *FatClient) reportRunSyncConflict(ctx context.Context, projectID, runSeq int64, runBranch, baseBranch string, conflictFiles []string, hint string) {
 	body := map[string]interface{}{
 		"run_branch":     runBranch,
@@ -934,8 +941,7 @@ func (s *FatClient) reportMerge(ctx context.Context, projectID, runSeq int64, ta
 type mergeWorkflow interface {
 	DefaultBranch() string
 	RemoteURL() string
-	MergeRunIntoBase(runBranch, baseBranch string, author enjugit.MergeAuthor) (*enjugit.MergeResult, error)
-	PushBranch(branch string) error
+	PublishRunArtifacts(req enjugit.PublishRunArtifactsRequest) (*enjugit.PublishRunArtifactsResult, error)
 }
 
 // mergeWorkflowOrNil converts a concrete *enjugit.Workflow to the
@@ -954,31 +960,44 @@ func mergeWorkflowOrNil(wf *enjugit.Workflow) mergeWorkflow {
 // after applyAcceptedMerges when RunCompleted=true comes back in
 // the coordinator's submit response. Non-fatal: failures are logged
 // and surfaced as warnings, not returned as submit errors (the local
-// commit already landed; the merge/push is a best-effort step).
+// commit already landed; the publish/push is a best-effort step).
 //
 // Sync modes (from the workflow's sync: block, defaulting to "merge"):
 //
 //	none  — no-op.
-//	merge — FF-merge run-branch into base_branch locally.
-//	push  — same as merge, then push base_branch to remote.
+//	merge — publish the run's declared outputs onto the base branch
+//	        locally; push nothing.
+//	push  — same publish, then push exactly { base, run branch }
+//	        (and topic branches only when push_topics is set).
 //
-// On a run-branch → base merge CONFLICT the run branch is
-// preserved for a manual git merge AND a run_sync_conflict is
-// reported to the coordinator (bug hunt B-1): it stamps a
-// durable runs.sync_status flag + event so enju_run_status /
-// enju runs / the event log stop reporting an unqualified
-// "completed 100%" for a run that silently lost its output to
-// the default branch. The report is best-effort (the local git
-// state is unchanged regardless); the ERROR log line remains the
-// tail-able fallback if the POST is dropped.
+// The base branch receives ONLY the run's declared output set
+// (read from the run-branch tip) — never a whole-branch merge of
+// the run branch, which would drag enju's .enju/ provenance trail
+// onto the deliverable branch. The run branch is kept and, in push
+// mode, pushed: it is the full record the events.db ↔ git audit
+// resolves against, so nothing is lost — the trail just moves off
+// the deliverable branch.
+//
+// There is deliberately no merge-conflict / lost-output reporting
+// here anymore. The old whole-branch merge could leave a completed
+// run's output stranded on the run branch with base unchanged (a
+// silent "completed 100%" that lost its deliverable). A curated
+// per-path publish cannot 3-way conflict, and the run branch is now
+// kept+pushed, so that failure mode is structurally gone rather than
+// detected after the fact. The coordinator's run_sync_conflict
+// endpoint stays for the operator/straggler path (interrupted runs,
+// pre-policy repos) but is no longer auto-fired from a clean
+// completion.
 func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, meta *TaskMeta, responseBody []byte) {
 	if wf == nil || meta == nil || len(responseBody) == 0 {
 		return
 	}
 	var resp struct {
-		RunCompleted bool   `json:"run_completed"`
-		SyncMode     string `json:"sync_mode"`
-		SyncRemote   string `json:"sync_remote"`
+		RunCompleted bool     `json:"run_completed"`
+		SyncMode     string   `json:"sync_mode"`
+		SyncRemote   string   `json:"sync_remote"`
+		PublishPaths []string `json:"publish_paths"`
+		PushTopics   bool     `json:"push_topics"`
 	}
 	if err := json.Unmarshal(responseBody, &resp); err != nil || !resp.RunCompleted {
 		return
@@ -997,71 +1016,42 @@ func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, me
 			"run_branch", runBranch, "base_branch", baseBranch)
 		return
 	}
-	author := enjugit.MergeAuthor{AutoOrManual: "auto"}
-	_, err := wf.MergeRunIntoBase(runBranch, baseBranch, author)
+	push := mode == "push"
+	if push && wf.RemoteURL() == "" {
+		// Publish locally anyway (base still gets the artifacts-only
+		// update); just can't share. Operator retries with git push.
+		s.logger.Warn("applyRunCompletion: push requested but no remote configured; publishing locally only",
+			"base_branch", baseBranch)
+		push = false
+	}
+	res, err := wf.PublishRunArtifacts(enjugit.PublishRunArtifactsRequest{
+		RunBranch:  runBranch,
+		BaseBranch: baseBranch,
+		Paths:      resp.PublishPaths,
+		Author:     enjugit.MergeAuthor{AutoOrManual: "auto"},
+		Push:       push,
+		PushTopics: resp.PushTopics,
+	})
 	if err != nil {
-		var conflict *enjugit.ErrConflict
-		if errors.As(err, &conflict) {
-			// Run completed; the conflict is an operational git
-			// concern. The run branch is intact and base_branch is
-			// unchanged — but the run's output never reached the
-			// default branch. This is bug hunt B-1: the documented
-			// parallel `branch: auto` sweep makes every sibling
-			// after the first conflict on shared output paths, and
-			// the only trace used to be this ERROR line — every
-			// coordinator surface still said "completed 100%".
-			//
-			// Report it so the coordinator stamps a durable
-			// runs.sync_status flag + run_sync_conflict event:
-			// enju_run_status / enju runs / the event log now show
-			// the lost output instead of an unqualified green
-			// checkmark. Best-effort POST (mirrors reportMerge):
-			// the local git state is unchanged either way, and the
-			// ERROR log remains the operator's tail-able fallback.
-			hint := "git checkout " + baseBranch + " && git merge " + runBranch
-			s.logger.Error("applyRunCompletion: run-branch merge conflict — resolve manually",
-				"run_branch", runBranch, "base_branch", baseBranch,
-				"conflict_files", conflict.Paths,
-				"hint", hint,
-				"project_id", meta.ProjectID, "run_seq", meta.RunSeq)
-			if meta.ProjectID > 0 && meta.RunSeq > 0 {
-				s.reportRunSyncConflict(ctx,
-					meta.ProjectID, int64(meta.RunSeq),
-					runBranch, baseBranch, conflict.Paths, hint)
-			} else {
-				s.logger.Warn("dropped run_sync_conflict report: project_id/run_seq missing from meta",
-					"run_branch", runBranch, "conflict_files", conflict.Paths)
-			}
-			return
-		}
-		s.logger.Warn("applyRunCompletion: merge failed",
+		// Hard failure (run-tip resolve, base prepare, blob read, or
+		// commit). The local commit on the run branch already landed
+		// and the run branch is intact — non-fatal, operator can
+		// finish the publish by hand. There is no conflict variant:
+		// a per-path publish overwrites, it does not 3-way merge.
+		s.logger.Warn("applyRunCompletion: artifact publish failed; run branch intact, base not updated",
 			"run_branch", runBranch, "base_branch", baseBranch, "err", err)
 		return
 	}
-
-	if mode != "push" {
-		s.logger.Info("applyRunCompletion: run merged into base branch",
-			"run_branch", runBranch, "base_branch", baseBranch)
+	if !push {
+		s.logger.Info("applyRunCompletion: run artifacts published to base branch (local)",
+			"run_branch", runBranch, "base_branch", baseBranch,
+			"declared_paths", len(resp.PublishPaths), "no_op", res.NoOp)
 		return
 	}
-	remote := resp.SyncRemote
-	if remote == "" {
-		remote = "origin"
-	}
-	if wf.RemoteURL() == "" {
-		s.logger.Warn("applyRunCompletion: push requested but no remote configured",
-			"base_branch", baseBranch)
-		return
-	}
-	// Push base_branch to the configured remote. Non-fatal on failure —
-	// local merge already landed; operator retries with `git push`.
-	if err := wf.PushBranch(baseBranch); err != nil {
-		s.logger.Warn("applyRunCompletion: push failed; run merged locally but not shared",
-			"base_branch", baseBranch, "remote", remote, "err", err)
-		return
-	}
-	s.logger.Info("applyRunCompletion: run merged and pushed",
-		"run_branch", runBranch, "base_branch", baseBranch, "remote", remote)
+	s.logger.Info("applyRunCompletion: run artifacts published and pushed",
+		"run_branch", runBranch, "base_branch", baseBranch,
+		"remote", resp.SyncRemote, "pushed_refs", res.Pushed,
+		"push_topics", resp.PushTopics, "no_op", res.NoOp)
 }
 
 // applyAcceptedMerges drives the post-submit auto-merge of any

@@ -185,6 +185,53 @@ type MergeResult struct {
 	FastForwarded bool
 }
 
+// PublishRunArtifactsRequest packages inputs for
+// Workflow.PublishRunArtifacts — the run-completion publish of a
+// run's declared output set onto the base (deliverable) branch.
+type PublishRunArtifactsRequest struct {
+	RunBranch  string
+	BaseBranch string
+
+	// Paths is the run's declared output set, repo-relative and
+	// already filtered of enju's .enju/ provenance by the
+	// coordinator. The run-branch-tip content of exactly these
+	// paths is laid onto the base branch — never a whole-branch
+	// merge of the run branch (that is what drags the .enju/ trail
+	// onto a branch the project's .gitignore says to ignore).
+	Paths  []string
+	Author MergeAuthor
+
+	// Push additionally pushes { base, run branch } to origin
+	// after the local publish — the run branch is kept and pushed
+	// so every provenance/iteration commit stays reachable for the
+	// events.db ↔ git audit. PushTopics extends the push set to
+	// the run's per-task topic branches (opt-in; default off,
+	// because pushing them makes the shared branch list unusable
+	// and the run branch already carries the accepted line).
+	Push       bool
+	PushTopics bool
+}
+
+// PublishRunArtifactsResult is what Workflow.PublishRunArtifacts
+// returns. Same typed-result convention as MergeResult.
+type PublishRunArtifactsResult struct {
+	// CommitSHA is the curated publish commit on the base branch,
+	// or the pre-call base tip when NoOp.
+	CommitSHA string
+
+	// NoOp is true when the base branch already held identical
+	// content for every declared path (idempotent re-run) or the
+	// run declared no file outputs (a citizen-content-only run:
+	// its deliverable is the .enju/.../result.md carried on the
+	// kept run branch, not the base branch).
+	NoOp bool
+
+	// Pushed lists the refs actually pushed to origin (a subset of
+	// { base, run branch, topic branches }). Empty when Push is
+	// false or no remote is configured.
+	Pushed []string
+}
+
 // MergeAuthor identifies the actor whose ACCEPT triggered an
 // auto-merge. Used for commit author + Enju-Triggered-By trailer.
 type MergeAuthor struct {

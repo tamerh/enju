@@ -37,6 +37,14 @@ type ReportMergeResponse struct {
 	// → base merge/push. Mirrors the submit response's fields.
 	SyncMode   string `json:"sync_mode,omitempty"`
 	SyncRemote string `json:"sync_remote,omitempty"`
+	// PublishPaths/PushTopics carry the same run-completion publish
+	// policy as the submit response (declared output set + the
+	// topic-push opt-in), populated only when RunCompleted=true.
+	// For a topic-branch task the run completes at the merge-report,
+	// so the fat-client needs them on THIS response to drive the
+	// artifacts-only base publish.
+	PublishPaths []string `json:"publish_paths,omitempty"`
+	PushTopics   bool     `json:"push_topics,omitempty"`
 }
 
 // ReportMerge handles a successful FF/merge-commit landing of a
@@ -225,7 +233,8 @@ func ReportMerge(c *Coordinator, caller *store.CitizenRecord, projectID int64, r
 	// response (the submit response never carried run_completed for
 	// a topic-branch task).
 	if resp.RunCompleted {
-		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
+		resp.SyncMode, resp.SyncRemote, resp.PushTopics = parseSyncConfig(run)
+		resp.PublishPaths = c.declaredArtifactPaths(run)
 	}
 
 	return resp, nil

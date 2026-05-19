@@ -459,6 +459,170 @@ func (w *Workflow) MergeRunIntoBase(runBranch, baseBranch string, author MergeAu
 	return result, nil
 }
 
+// PublishRunArtifacts updates the base (deliverable) branch with a
+// run's declared output set on run completion, and — in push mode —
+// shares exactly the right refs.
+//
+// Why this exists instead of MergeRunIntoBase: a whole-branch merge
+// of the run branch into base drags enju's .enju/ provenance trail
+// onto the deliverable branch (force-committed there even though the
+// project's .gitignore ignores it) and, with topic pushes, litters
+// the shared remote with ~13 stray refs per run. Instead this lays
+// the run-branch-tip content of exactly the declared paths onto base
+// — a curated publish commit — so base stays a clean deliverable.
+//
+// The run branch itself is the full record (artifacts + .enju/ +
+// the FF-merged iteration history) and is KEPT and, in push mode,
+// pushed: the events.db ↔ git audit resolves SHAs against it, so
+// nothing is destroyed — the trail just moves off the deliverable
+// branch, not away. Per-task topic branches are local-only unless
+// PushTopics is set; enju never deletes any branch here (lifecycle
+// is operator territory).
+//
+// Idempotent: a re-run after a fat-client restart finds base already
+// holding the same content (CommitFiles NoOp) and re-pushes the same
+// SHAs (a no-op on the remote).
+//
+// Push is best-effort and non-fatal: the local publish is the source
+// of truth; a push blip is the operator's to retry with `git push`.
+// Hard failures (run-tip resolve, base prepare, blob read, commit)
+// are returned.
+//
+// File mode note: declared outputs are republished at the default
+// 0644 — the run-tip executable bit is not carried (the blob read
+// surfaces content only). Acceptable for data/text deliverables; a
+// future need for exec artifacts would extend the blob read to mode.
+func (w *Workflow) PublishRunArtifacts(req PublishRunArtifactsRequest) (*PublishRunArtifactsResult, error) {
+	if req.RunBranch == "" || req.BaseBranch == "" {
+		return nil, fmt.Errorf("enjugit: PublishRunArtifacts: RunBranch and BaseBranch required")
+	}
+	authorName, authorEmail := w.mergeAuthorIdentity(req.Author)
+	subject := fmt.Sprintf("Publish run %s artifacts to %s", req.RunBranch, req.BaseBranch)
+	message := composeCommitMessage(w.convs, subject, "", buildMergeTrailers(req.Author))
+
+	trace := startTrace("PublishRunArtifacts")
+	defer trace.emit(w.logger, w.traceFile)
+	trace.ctx("run_branch", req.RunBranch)
+	trace.ctx("base_branch", req.BaseBranch)
+
+	result := &PublishRunArtifactsResult{}
+	werr := w.git.WithLock(func(g git.Ops) error {
+		// Resolve the run-branch tip up front: the declared content
+		// is read from this exact commit, not from whatever the
+		// worktree holds after the base checkout below.
+		runTip, err := g.ResolveRef(req.RunBranch)
+		if err != nil {
+			return trace.fail("resolve-run-tip", translateGitError("resolve run branch", err))
+		}
+		trace.okDetail("resolve-run-tip", shortSHA(runTip))
+
+		// Check out base with the same multi-step fallback the
+		// arbitrary-files commit path uses (no preferred fork base —
+		// this is a deliverable commit, not a review topic).
+		if err := w.prepareBranchForCommit(g, req.BaseBranch, ""); err != nil {
+			return trace.fail("prepare-base", err)
+		}
+		trace.ok("prepare-base")
+
+		// Collect the declared content from the run tip. A declared
+		// path absent at the run tip is tolerated (a conditionally-
+		// produced output, or one a downstream task removed): it is
+		// simply not part of this publish. The .enju/ guard is
+		// belt-and-suspenders — the coordinator already excludes it.
+		var files []FileWrite
+		var stage []string
+		for _, p := range req.Paths {
+			if p == "" || strings.HasPrefix(p, ".enju/") {
+				continue
+			}
+			content, found, rerr := g.ReadFileAtCommit(runTip, p)
+			if rerr != nil {
+				return trace.fail("read-declared", translateGitError("read declared artifact", rerr))
+			}
+			if !found {
+				continue
+			}
+			files = append(files, FileWrite{RepoRelPath: p, Content: content})
+			stage = append(stage, p)
+		}
+
+		if len(files) == 0 {
+			// No file deliverable (citizen-content-only run, or every
+			// declared path absent at the run tip). Base is left as
+			// it is; the run branch is the deliverable+audit. Still a
+			// success — the push step below shares { base, run branch }
+			// so the run is durable on the remote (acceptance: origin
+			// carries base + the run branch even for such runs).
+			result.NoOp = true
+			if tip, _, herr := g.Head(); herr == nil {
+				result.CommitSHA = tip
+			}
+			trace.okDetail("commit", "no-op (no declared file outputs)")
+		} else {
+			commitRes, cerr := g.CommitFiles(git.CommitRequest{
+				Files:       files,
+				StagePaths:  stage,
+				Message:     message,
+				AuthorName:  authorName,
+				AuthorEmail: authorEmail,
+			})
+			if cerr != nil {
+				return trace.fail("commit", translateGitError("commit", cerr))
+			}
+			result.CommitSHA = commitRes.SHA
+			result.NoOp = commitRes.NoOp
+			if commitRes.NoOp {
+				trace.okDetail("commit", "no-op (base already current)")
+			} else {
+				trace.okDetail("commit", shortSHA(commitRes.SHA))
+			}
+		}
+
+		if !req.Push {
+			trace.okDetail("push", "skipped: mode != push")
+			return nil
+		}
+		if w.git.RemoteURL() == "" {
+			trace.okDetail("push", "skipped: no origin")
+			return nil
+		}
+
+		// Push exactly { base, run branch } — and topic branches
+		// only when opted in. Each push is best-effort: the local
+		// publish already landed, so a failure is logged and the
+		// remaining refs are still attempted rather than aborting.
+		pushRefs := []string{req.BaseBranch, req.RunBranch}
+		if req.PushTopics {
+			if locals, lerr := g.LocalBranches(); lerr == nil {
+				prefix := req.RunBranch + "/"
+				for _, b := range locals {
+					if strings.HasPrefix(b, prefix) {
+						pushRefs = append(pushRefs, b)
+					}
+				}
+			} else {
+				w.logger.Warn("enjugit: PublishRunArtifacts: cannot enumerate topic branches for push-topics",
+					"run_branch", req.RunBranch, "error", lerr)
+			}
+		}
+		for _, ref := range pushRefs {
+			if perr := g.Push(ref); perr != nil {
+				trace.appendStep(Step{Name: "push:" + ref, Status: "failed", Detail: perr.Error()})
+				w.logger.Warn("enjugit: PublishRunArtifacts: push failed; landed locally only",
+					"ref", ref, "error", perr)
+				continue
+			}
+			result.Pushed = append(result.Pushed, ref)
+			trace.ok("push:" + ref)
+		}
+		return nil
+	})
+	if werr != nil {
+		return nil, werr
+	}
+	return result, nil
+}
+
 // CommitArbitraryFiles commits a set of files to a target
 // branch. Used for non-task commits — diagram exports, event
 // timeline JSONLs, README updates — anything that belongs in

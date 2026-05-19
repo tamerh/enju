@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,6 +59,18 @@ type SubmitResultResponse struct {
 	// SyncRemote is the remote name to push to when SyncMode="push".
 	// Defaults to "origin" when the workflow omits sync.remote.
 	SyncRemote      string        `json:"sync_remote,omitempty"`
+	// PublishPaths is the run's declared output artifact set — the
+	// tracked artifact-index paths written on the run branch,
+	// excluding enju's own .enju/ provenance. On completion the
+	// base branch is updated with exactly these paths (read from
+	// the run-branch tip), so the deliverable branch never carries
+	// the provenance trail. Populated only when RunCompleted=true.
+	PublishPaths     []string       `json:"publish_paths,omitempty"`
+	// PushTopics mirrors the resolved sync.push_topics policy. When
+	// false (default) a push-mode completion pushes exactly the
+	// base branch and the run branch; topic branches stay local.
+	// Populated only when RunCompleted=true.
+	PushTopics      bool         `json:"push_topics,omitempty"`
 	AcceptedMerges    []AcceptedMergeView   `json:"accepted_merges,omitempty"`
 	ProjectID       int64          `json:"project_id,omitempty"`
 	RunSeq        int           `json:"run_seq,omitempty"`
@@ -468,7 +481,8 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 	if completed {
 		resp.RunCompleted = true
-		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
+		resp.SyncMode, resp.SyncRemote, resp.PushTopics = parseSyncConfig(run)
+		resp.PublishPaths = c.declaredArtifactPaths(run)
 		resp.ProjectID = run.ProjectID
 		resp.RunSeq = run.Seq
 	}
@@ -483,29 +497,39 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	return resp, nil
 }
 
-// parseSyncConfig resolves (mode, remote) for the run-completion sync
-// step. Resolution is two independent passes so --sync only controls
-// the mode; sync.remote is always honored regardless of override:
+// parseSyncConfig resolves (mode, remote, pushTopics) for the
+// run-completion sync step. Resolution is two independent passes so
+// --sync only controls the mode; sync.remote is always honored
+// regardless of override:
 //
-//  1. YAML pass: read sync.mode and sync.remote from stored YAML.
+//  1. YAML pass: read sync.mode, sync.remote, sync.push_topics.
 //  2. Override pass: if SyncModeOverride is a known value it wins the
-//     mode; remote is unchanged (still from YAML or default "origin").
+//     mode; remote/push_topics are unchanged (still from YAML/default).
 //
 // Unknown overrides and unknown YAML modes fall back to "merge" —
 // the single chokepoint that catches MCP typos and direct DB edits.
-func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
+//
+// pushTopics defaults off: a completed run publishes exactly the base
+// branch and the run branch; per-task topic branches stay local on the
+// machine that ran the run. It is the only opt-in here because pushing
+// topic branches makes the shared remote unusable (~13 stray refs per
+// run) and the run branch already carries the accepted-line audit; the
+// opt-in exists for runs that need rejected-attempt history durable
+// off-machine too.
+func parseSyncConfig(run *store.RunRecord) (mode, remote string, pushTopics bool) {
 	mode, remote = "merge", "origin"
 	if run == nil {
 		return
 	}
 
-	// Pass 1 — YAML: apply both mode and remote.
+	// Pass 1 — YAML: apply mode, remote, push_topics.
 	if run.YAMLData != "" {
 		var r enjuYaml.Run
 		if err := yamlv3.Unmarshal([]byte(run.YAMLData), &r); err == nil && r.Sync != nil {
 			if r.Sync.Remote != "" {
 				remote = r.Sync.Remote
 			}
+			pushTopics = r.Sync.PushTopics
 			switch r.Sync.Mode {
 			case "none", "merge", "push":
 				mode = r.Sync.Mode
@@ -526,6 +550,54 @@ func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
 	}
 
 	return
+}
+
+// declaredArtifactPaths returns the run's declared output set — the
+// sorted, deduplicated tracked artifact-index paths written on the
+// run branch by this run, with enju's own .enju/ provenance excluded.
+//
+// This is what gets published to the base branch on completion: the
+// deliverable is the declared outputs, not a whole-branch merge of
+// the run branch (which would drag the .enju/ trail onto a branch the
+// project's .gitignore says to ignore). The .enju/ guard is defensive
+// — declared writes never name that prefix — so a future stray entry
+// can't leak provenance onto the deliverable branch. Untracked
+// artifacts (track:false: large data referenced in place, never in
+// git) carry no committable bytes and are correctly omitted.
+//
+// Best-effort: an index read error yields an empty set rather than
+// failing the submit. The fat-client treats an empty set as "no
+// file outputs" (a citizen-content-only run's deliverable is its
+// .enju/.../result.md on the kept run branch, not the base branch).
+func (c *Coordinator) declaredArtifactPaths(run *store.RunRecord) []string {
+	if run == nil {
+		return nil
+	}
+	rows, err := c.Store.ListArtifactsByProject(run.ProjectID, run.Branch, "")
+	if err != nil {
+		if c.Logger != nil {
+			c.Logger.Warn("declaredArtifactPaths: artifact-index read failed; publishing no file outputs",
+				"project_id", run.ProjectID, "run_branch", run.Branch, "error", err)
+		}
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rows))
+	var paths []string
+	for _, a := range rows {
+		if a.LastRunID != run.ID || !a.Tracked {
+			continue
+		}
+		if a.Path == "" || strings.HasPrefix(a.Path, ".enju/") {
+			continue
+		}
+		if _, dup := seen[a.Path]; dup {
+			continue
+		}
+		seen[a.Path] = struct{}{}
+		paths = append(paths, a.Path)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // RemediationOrInvalidation collapses the two shapes the
