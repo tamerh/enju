@@ -432,6 +432,81 @@ func TestMaterializeRunRepo_WholeTreeIncludingBaseAndTemplate(t *testing.T) {
 	}
 }
 
+// TestMaterializeRunRepo_ExcludesPriorRunResultTrail is the B5
+// regression: the run branch's tree force-carries every prior
+// run's committed result trail under
+// .enju/runs/<seq>-<slug>/<taskDefID>/. Materializing all of it
+// into each new run's snapshot made snapshot size grow linearly
+// with the project's cumulative run history (the bug hunt
+// measured 40K → 1.3M over 14 small runs). The materializer must
+// skip the result trail while still keeping the recipe
+// (template-snapshot/) and ordinary source files.
+func TestMaterializeRunRepo_ExcludesPriorRunResultTrail(t *testing.T) {
+	bare := initBareForWorkspaceTest(t)
+	ws, _ := newWorkspaceForIDs(t, 303)
+	wf, err := ws.ForProject(303, bare)
+	if err != nil {
+		t.Fatalf("ForProject: %v", err)
+	}
+
+	priorResultDir := filepath.Join(corelayout.RunDir(1, "prev"), "analyze")
+	curSnapshot := corelayout.RunTemplateSnapshotDir(2, "cur")
+	tmplYAML := []byte("name: cur\ntasks:\n  - id: t1\n    action: compute\n    script: ./run.sh\n")
+	bigResult := make([]byte, 64*1024) // a fat prior result.md
+	for i := range bigResult {
+		bigResult[i] = 'x'
+	}
+
+	if _, err := wf.CommitArbitraryFilesPlumbing(CommitArbitraryFilesRequest{
+		Files: []FileWrite{
+			// Ordinary source file — must survive.
+			{RepoRelPath: "src/lib.go", Content: []byte("package lib\n")},
+			// Prior run #1's force-committed result trail — must
+			// NOT appear in run #2's snapshot.
+			{RepoRelPath: filepath.Join(priorResultDir, "result.md"), Content: bigResult},
+			{RepoRelPath: filepath.Join(priorResultDir, "metadata.json"), Content: []byte(`{"ok":true}`)},
+			{RepoRelPath: filepath.Join(priorResultDir, "script.log"), Content: []byte("noise\n")},
+			// Current run #2's recipe snapshot — must survive.
+			{RepoRelPath: filepath.Join(curSnapshot, "enju.yaml"), Content: tmplYAML},
+			{RepoRelPath: filepath.Join(curSnapshot, "run.sh"), Content: []byte("#!/bin/sh\necho hi\n"), Mode: 0o755},
+		},
+		Branch:  "main",
+		Subject: "Seed src + prior-run trail + current recipe",
+	}); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	mainSHA, err := wf.LocalBranchHash("main")
+	if err != nil || mainSHA == "" {
+		t.Fatalf("LocalBranchHash main: %v sha=%q", err, mainSHA)
+	}
+	if err := wf.git.CreateBranchAt("run-2", mainSHA); err != nil {
+		t.Fatalf("CreateBranchAt run-2: %v", err)
+	}
+
+	target := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := wf.MaterializeRunRepo("run-2", target); err != nil {
+		t.Fatalf("MaterializeRunRepo: %v", err)
+	}
+
+	// Source file: present.
+	if _, err := os.Stat(filepath.Join(target, "src", "lib.go")); err != nil {
+		t.Errorf("source src/lib.go should be materialized: %v", err)
+	}
+	// Recipe snapshot: present (scripts resolve from here).
+	if _, err := os.Stat(filepath.Join(target, curSnapshot, "enju.yaml")); err != nil {
+		t.Errorf("recipe enju.yaml should be materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, curSnapshot, "run.sh")); err != nil {
+		t.Errorf("recipe run.sh should be materialized: %v", err)
+	}
+	// Prior run's result trail: ABSENT (this is the fix).
+	for _, p := range []string{"result.md", "metadata.json", "script.log"} {
+		if _, err := os.Stat(filepath.Join(target, priorResultDir, p)); !os.IsNotExist(err) {
+			t.Errorf("prior-run result trail %s should be excluded from the snapshot (err=%v)", p, err)
+		}
+	}
+}
+
 // (silence unused-import warnings — sort retained for future
 // use in expanding the parity check above)
 var _ = sort.Strings

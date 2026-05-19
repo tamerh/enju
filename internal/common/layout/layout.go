@@ -180,6 +180,55 @@ func RunStateRunsRoot() string {
 	return filepath.Join(StateDirRoot, "runs")
 }
 
+// IsRunResultTrailPath reports whether a repo-relative path is a
+// per-run committed audit-trail file — i.e. it lives under
+// `.enju/runs/<seq>-<slug>/` but is NOT inside that run's
+// `template-snapshot/` recipe subtree.
+//
+// Why this exists: enju force-stages each task's result trail
+// (`result.md`, `metadata.json`, `script.log`, `context.json`)
+// into git under `.enju/runs/<seq>-<slug>/<taskDefID>/` so the
+// branch carries the authoritative audit history. A side effect
+// is that materializing a run branch's whole tree into a fresh
+// per-run on-disk snapshot drags in EVERY prior run's result
+// trail (the tree at HEAD accumulates them), so each new run's
+// snapshot grows linearly with cumulative project history. The
+// snapshot only needs the recipe (`template-snapshot/`) plus the
+// repo's own source files — never any run's result trail. The
+// materializer skips paths this predicate matches so snapshot
+// size stays bounded by the recipe, not by run count.
+//
+// The predicate is intentionally seq-agnostic: a snapshot needs
+// the recipe of THIS run, and result trails of NO run (this run's
+// own results are written live at execute time, not read from the
+// frozen snapshot). So "under .enju/runs/<anything>/ and not a
+// template-snapshot/ segment" is exactly the dead-weight set.
+//
+// Input is normalized to forward slashes by the caller (git tree
+// walks already yield slash-relative paths).
+func IsRunResultTrailPath(repoRelSlashPath string) bool {
+	p := strings.TrimPrefix(repoRelSlashPath, "./")
+	prefix := filepath.ToSlash(RunStateRunsRoot()) + "/" // ".enju/runs/"
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	rest := p[len(prefix):] // "<seq>-<slug>/<...>"
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		// A file directly under .enju/runs/ (no per-run dir) —
+		// not a recognized result trail; leave it alone.
+		return false
+	}
+	tail := rest[slash+1:] // path within the per-run dir
+	// Keep the recipe snapshot; drop everything else under the
+	// per-run dir (task result dirs, exports, scratch leftovers).
+	if tail == TemplateSnapshotDirName ||
+		strings.HasPrefix(tail, TemplateSnapshotDirName+"/") {
+		return false
+	}
+	return true
+}
+
 // RunDir renders the per-run root segment
 // (enju/runs/{seq}-{slug}/) used by every path the run owns —
 // task result dirs, the template snapshot, and sibling

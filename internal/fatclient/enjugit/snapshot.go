@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	corelayout "github.com/enju-ai/enju/internal/common/layout"
 )
 
 // MaterializeRunRepo writes the entire commit tree at branch's
@@ -52,11 +54,19 @@ import (
 //
 // Every tracked blob is materialized — including dotfiles
 // (.gitignore, .mcp.json, .editorconfig, .github/workflows/*,
-// .env.example, …) and the entire .enju/ subtree (which holds
-// the audit trail post-Phase-8.h). Tracking is the user's
-// decision; the materializer doesn't second-guess it. See
-// gitcli.WalkSubtreeBlobsAtCommit for the rationale on dropping
-// the old hidden-segment skip.
+// .env.example, …) — with ONE bounded-growth exception: the
+// per-run result trail force-committed under
+// .enju/runs/<seq>-<slug>/<taskDefID>/ is skipped (see
+// corelayout.IsRunResultTrailPath). The run branch's tree
+// accumulates every prior run's result files; replaying all of
+// them into each new run's snapshot made snapshot size grow
+// linearly with the project's run count for zero benefit (no
+// script reads a prior run's result.md from the frozen
+// snapshot). The recipe — .enju/runs/<seq>-<slug>/template-
+// snapshot/ — is kept, as is every non-.enju source file.
+// Tracking is otherwise the user's decision; the materializer
+// doesn't second-guess it. See gitcli.WalkSubtreeBlobsAtCommit
+// for the rationale on dropping the old hidden-segment skip.
 func (w *Workflow) MaterializeRunRepo(branch, targetDir string) (int, error) {
 	if branch == "" {
 		return 0, fmt.Errorf("enjugit: MaterializeRunRepo: branch required")
@@ -76,6 +86,17 @@ func (w *Workflow) MaterializeRunRepo(branch, targetDir string) (int, error) {
 	}
 	count := 0
 	walkErr := w.git.WalkSubtreeBlobsAtCommit(sha, "", func(rel string, mode os.FileMode, content []byte) error {
+		// Bounded-snapshot rule: the run branch's tree carries
+		// every prior run's force-committed result trail under
+		// .enju/runs/<seq>-<slug>/<taskDefID>/. A snapshot only
+		// needs the recipe (template-snapshot/) plus the repo's
+		// own source — never any run's result trail. Skipping it
+		// here keeps each new run's on-disk snapshot bounded by
+		// the recipe size instead of growing linearly with the
+		// project's cumulative run history.
+		if corelayout.IsRunResultTrailPath(filepath.ToSlash(rel)) {
+			return nil
+		}
 		full := filepath.Join(targetDir, rel)
 		parent := filepath.Dir(full)
 		if err := os.MkdirAll(parent, 0o755); err != nil {
