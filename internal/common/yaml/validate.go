@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/enju-ai/enju/internal/common/artifactpath"
 	"github.com/enju-ai/enju/internal/common/template"
 )
 
@@ -66,6 +67,9 @@ func validate(p *Run) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateNoParamForEachCollision(p); err != nil {
+		return nil, err
+	}
 	ids, hasTaskLevelForEach, err := validateTasks(p)
 	if err != nil {
 		return nil, err
@@ -82,6 +86,9 @@ func validate(p *Run) ([]string, error) {
 	reviewWarnings := injectReviewGating(p)
 	injectVoteActivation(p)
 	if err := validateNoParallelSiblingWrites(p); err != nil {
+		return nil, err
+	}
+	if err := validateArtifactDeclarations(p); err != nil {
 		return nil, err
 	}
 	if err := validateTemplateReferences(p, ids); err != nil {
@@ -451,6 +458,36 @@ func validateRunForEach(p *Run) error {
 					return fmt.Errorf("run for_each: variable %q references list<record> param %q — multi-variable for_each with a list<record> source is not yet supported; use a single for_each variable", varName, paramName)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// validateNoParamForEachCollision rejects a name declared as
+// BOTH a top-level param and a run-level for_each variable.
+//
+// Why this is its own hard error: param substitution wins the
+// {{name}} precedence battle, so the for_each variable gets
+// resolved to the param value and is never seen as "referenced".
+// The downstream unused-for_each-variable check then fired with
+// a flatly false message — `"{{disease}} is declared but never
+// referenced in any task prompt — remove it or reference it via
+// {{disease}}"` — even though the prompt literally contained
+// `{{disease}}`, and it recommended two fixes that both miss the
+// real problem. The collision itself is the error (it makes the
+// run's intent ambiguous: iterate, or substitute once?), so name
+// it directly here, before the misleading heuristic can run.
+func validateNoParamForEachCollision(p *Run) error {
+	if len(p.ForEach) == 0 || len(p.Params) == 0 {
+		return nil
+	}
+	for i := range p.Params {
+		name := p.Params[i].Name
+		if _, clash := p.ForEach[name]; clash {
+			return fmt.Errorf(
+				"%q is declared as BOTH a top-level param and a run-level for_each variable — these collide (param substitution shadows the for_each variable, making the run's intent ambiguous). Rename one of them: a param if you want a single caller-supplied value, or the for_each variable if you want to fan out over a list",
+				name,
+			)
 		}
 	}
 	return nil
@@ -1156,6 +1193,121 @@ func validateNoParallelSiblingWrites(p *Run) error {
 	return nil
 }
 
+// validateArtifactDeclarations enforces the artifact-path safety
+// floor + list-expansion shape at PARSE time, so `enju validate`
+// and `enju go --dry-run` reject the exact YAML the create path
+// (engine.ValidateRunCreation) rejects. Before this existed the
+// pre-flight was materially weaker than create despite the docs
+// promising they "flatten identically": validate blessed `[*]` on
+// a scalar param, double-`[*]`, `../outside`, `/etc/passwd`, and
+// reserved-dir writes that create then refused — a false green.
+//
+// Two classes of check:
+//
+//  1. List-expansion shape (`{{p[*]}}`). Decidable from declared
+//     param TYPES alone (no values needed): >1 ref per element is
+//     rejected; a ref to an undeclared param is rejected; a ref to
+//     a non-list<…> param is rejected. The wording matches the
+//     substitution-time messages so the verdict is identical
+//     whichever path the author hit.
+//
+//  2. Path safety floor (relative, no `..`, no reserved prefix).
+//     Applied to the literal skeleton — every `{{…}}` segment is
+//     replaced with an inert token first, so a still-templated
+//     path like `state/{{x[*]}}.json` is checked on `state/_.json`
+//     while `/etc/passwd` / `../x` / `enju/x` (no templates) are
+//     caught verbatim. Param values can only ever make a path
+//     MORE specific within a segment; they cannot retroactively
+//     remove a literal `..` or a literal reserved prefix the
+//     author wrote, so the parse-time verdict is a safe lower
+//     bound on the create-time one.
+func validateArtifactDeclarations(p *Run) error {
+	declared := make(map[string]*ParamDef, len(p.Params))
+	for i := range p.Params {
+		declared[p.Params[i].Name] = &p.Params[i]
+	}
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		for _, w := range t.WritesArtifacts {
+			if err := checkStarRefShape(w.Path, declared); err != nil {
+				return fmt.Errorf("task %q.writes: %v", t.ID, err)
+			}
+			if err := artifactpath.ValidateDeclaration(literalSkeleton(w.Path)); err != nil {
+				return fmt.Errorf("task %q: invalid writes_artifacts path %q: %v", t.ID, w.Path, err)
+			}
+		}
+		for _, r := range t.ReadsArtifacts {
+			if err := checkStarRefShape(r, declared); err != nil {
+				return fmt.Errorf("task %q.reads: %v", t.ID, err)
+			}
+			if err := artifactpath.ValidateLiteral(literalSkeleton(r)); err != nil {
+				return fmt.Errorf("task %q: invalid reads_artifacts path %q: %v", t.ID, r, err)
+			}
+		}
+	}
+	return nil
+}
+
+// checkStarRefShape statically validates the `{{p[*]}}` list-
+// expansion refs in a single declaration element using only the
+// declared param TYPES — the same rules expandOneStarElement /
+// starExpansionValues enforce at substitution time, but decided
+// before values exist. Returns nil for elements with no `[*]`.
+func checkStarRefShape(item string, declared map[string]*ParamDef) error {
+	matches := starRefPattern.FindAllStringSubmatch(item, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("element %q contains multiple [*] refs; only one is supported per element", item)
+	}
+	full := matches[0][0]
+	name := matches[0][1]
+	field := matches[0][2] // "" for the bare form
+	pd, ok := declared[name]
+	if !ok {
+		return fmt.Errorf("%s references unknown parameter %q — [*] list-expansion requires a declared list<string> or list<record> parameter", full, name)
+	}
+	switch pd.Type {
+	case "list<string>":
+		if field != "" {
+			return fmt.Errorf("{{%s[*].%s}} uses .field, which requires a list<record> parameter; %q is list<string>", name, field, name)
+		}
+	case "list<record>":
+		// Field defaulting + unknown-field rejection happen at
+		// substitution time against the actual records; the only
+		// statically-decidable error is an explicitly-named field
+		// that isn't a declared fields: entry.
+		if field != "" {
+			if _, df := pd.Fields.TypeOf(field); !df {
+				return fmt.Errorf("{{%s[*].%s}} references unknown field %q on list<record> %q; declared fields: %s",
+					name, field, field, name, strings.Join(pd.Fields.Names(), ", "))
+			}
+		}
+	default:
+		return fmt.Errorf("{{%s[*]}} requires a list<string> parameter; got %s", name, pd.Type)
+	}
+	return nil
+}
+
+// starSkeletonPattern matches any `{{…}}` template segment so the
+// path-safety floor runs against the literal skeleton. Anchored on
+// the same brace syntax the substituter uses; the inner body is
+// intentionally permissive (covers {{p}}, {{p[*]}}, {{p[*].f}},
+// {{t.field}}, {{artifact:x}}).
+var starSkeletonPattern = regexp.MustCompile(`\{\{[^}]*\}\}`)
+
+// literalSkeleton replaces every `{{…}}` segment with an inert
+// token so the path-safety floor (`..`, leading `/`, reserved
+// prefix) is checked on the author's literal text without a
+// templated segment masking or fabricating a violation. The
+// token is a single safe path char — it can't be empty (which
+// could collapse `a/{{x}}/b` into `a//b`) and can't introduce a
+// metacharacter or a `..`.
+func literalSkeleton(pathExpr string) string {
+	return starSkeletonPattern.ReplaceAllString(pathExpr, "_")
+}
+
 // artifactRefPaths extracts every literal path referenced by
 // `{{artifact:<path>}}` in `text`. Used by the parallel-sibling
 // lint to recognize implicit reads that wireArtifactDeps will
@@ -1272,7 +1424,7 @@ func validateActionFields(t *TaskDef) error {
 		}
 		if t.Deadline != "" {
 			if _, err := time.ParseDuration(t.Deadline); err != nil {
-				return fmt.Errorf("task %q: invalid deadline %q (expected a Go duration like 2h, 30m, 1d is NOT supported — use 24h): %w", t.ID, t.Deadline, err)
+				return fmt.Errorf("task %q: invalid deadline %q (expected a Go duration string such as %q or %q; bare numbers and day units are not accepted — use %q, not %q): %w", t.ID, t.Deadline, "2h", "30m", "24h", "1d", err)
 			}
 		}
 		citizens := t.Citizens

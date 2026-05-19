@@ -7,8 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/enju-ai/enju/internal/coordinator/store"
+	"github.com/enju-ai/enju/internal/common/artifactpath"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // ValidateRunCreation checks pre-flight constraints that
@@ -57,8 +58,13 @@ func (e *Engine) ValidateRunCreation(parsed *enjuYaml.ParsedRun) error {
 // pattern-syntax markers (`*`, `?`, `[`, trailing `/`).
 //
 // Exported so both engine and router can call it.
+//
+// Delegates to the shared core in internal/common/artifactpath
+// so the create path, the `enju validate` pre-flight, and the
+// yaml parser all enforce byte-identical rules — they used to
+// diverge (validate was a materially weaker pass).
 func ValidateArtifactPath(p string) error {
-	return validateArtifactPathCore(p, false)
+	return artifactpath.ValidateLiteral(p)
 }
 
 // ValidateArtifactDeclaration is the writes_artifacts variant
@@ -77,45 +83,7 @@ func ValidateArtifactPath(p string) error {
 // trigger nor bypass the safety rules; what matters is the
 // prefix path (no `..`, no `.git/`, no `enju/`).
 func ValidateArtifactDeclaration(p string) error {
-	return validateArtifactPathCore(p, true)
-}
-
-func validateArtifactPathCore(p string, allowPatterns bool) error {
-	if p == "" {
-		return fmt.Errorf("empty path")
-	}
-	if strings.HasPrefix(p, "/") {
-		return fmt.Errorf("must be relative (no leading /)")
-	}
-	if strings.Contains(p, "..") {
-		return fmt.Errorf("must not contain '..'")
-	}
-	// Strip the directory marker before running reserved-dir
-	// checks. `enju/foo/` is rejected by the same rule that
-	// rejects `enju/foo`; the trailing slash is purely a
-	// classification hint at the syntactic level.
-	check := p
-	if allowPatterns && strings.HasSuffix(check, "/") {
-		check = strings.TrimSuffix(check, "/")
-		if check == "" {
-			return fmt.Errorf("path is just a slash")
-		}
-	}
-	if !allowPatterns && strings.ContainsAny(check, "*?[") {
-		return fmt.Errorf("must not contain glob metacharacters (this path must be literal)")
-	}
-	// Block reserved directories — artifacts live at natural repo
-	// paths so we must prevent writing into Enju's own state dirs
-	// or git internals.
-	if check == ResultDirRoot || strings.HasPrefix(check, ResultDirRoot+"/") || strings.HasPrefix(check, ResultDirRoot+`\`) {
-		return fmt.Errorf("must not write into %s/ (reserved for Enju state)", ResultDirRoot)
-	}
-	if strings.HasPrefix(check, ".git/") || strings.HasPrefix(check, ".git\\") || check == ".git" {
-		return fmt.Errorf("must not write into .git/")
-	}
-	// enju/templates/ is covered by the ResultDirRoot check above;
-	// no separate guard needed now that templates live under enju/.
-	return nil
+	return artifactpath.ValidateDeclaration(p)
 }
 
 // BuildRunTasks converts a ParsedRun's ExpandedTasks into
@@ -167,48 +135,48 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 			}
 
 			records = append(records, store.TaskRecord{
-				ID:              runPrefix + ti.FullID,
-				RunID:           runID,
-				Seq:             taskSeq,
-				TaskDefID:       ti.ID,
-				InstanceKey:     instanceKey,
-				InstanceParams:  paramsJSON,
-				RunSlug:         runSlug,
-				Ref:             ti.Ref,
-				Action:          ti.Action,
-				Prompt:          ti.Prompt,
-				UserPrompt:      ti.UserPrompt,
-				Script:          ti.Script,
-				Outputs:         marshalOutputs(ti.Outputs),
-				Requirements:    marshalRequirements(ti.Requirements),
-				ResultType:      resultType,
-				Timeout:         timeout,
-				State:           state,
-				DependsOn:       strings.Join(deps, ","),
-				ReadsArtifacts:  marshalStringSlice(ti.ReadsArtifacts),
-				WritesArtifacts: marshalWriteArtifacts(ti.WritesArtifacts),
-				AssignTo:        marshalStringSlice([]string(ti.AssignTo)),
-				RequireRole:     ti.RequireRole,
-				ReviewsTarget:   ti.Reviews,
+				ID:                     runPrefix + ti.FullID,
+				RunID:                  runID,
+				Seq:                    taskSeq,
+				TaskDefID:              ti.ID,
+				InstanceKey:            instanceKey,
+				InstanceParams:         paramsJSON,
+				RunSlug:                runSlug,
+				Ref:                    ti.Ref,
+				Action:                 ti.Action,
+				Prompt:                 ti.Prompt,
+				UserPrompt:             ti.UserPrompt,
+				Script:                 ti.Script,
+				Outputs:                marshalOutputs(ti.Outputs),
+				Requirements:           marshalRequirements(ti.Requirements),
+				ResultType:             resultType,
+				Timeout:                timeout,
+				State:                  state,
+				DependsOn:              strings.Join(deps, ","),
+				ReadsArtifacts:         marshalStringSlice(ti.ReadsArtifacts),
+				WritesArtifacts:        marshalWriteArtifacts(ti.WritesArtifacts),
+				AssignTo:               marshalStringSlice([]string(ti.AssignTo)),
+				RequireRole:            ti.RequireRole,
+				ReviewsTarget:          ti.Reviews,
 				OnReviewReject:         ti.OnReviewReject,
 				OnReviewRequestChanges: ti.OnReviewRequestChanges,
 				RemediationTemplate:    marshalRemediationTemplate(ti.RemediationTemplate),
-				VoteOptions:     marshalVoteOptions(ti.Options),
-				Citizens:        ti.Citizens,
-				MinQuorum:       ti.MinQuorum,
-				VoteThreshold:   ti.Threshold,
-				VoteDeadline:    ti.Deadline,
-				Anonymize:       ti.Anonymize,
-				Visibility:      ti.Visibility,
-				Env:              marshalStringMap(ti.Env),
-				Mode:             ti.Mode,
-				Container:        ti.Container,
-				ContainerRuntime: ti.ContainerRuntime,
-				Volumes:          marshalStringSlice(ti.Volumes),
-				Executor:         ti.Executor,
-				Resources:        marshalResources(ti.Resources),
-				VerifyRetryCap:   ti.VerifyRetryCap,
-				CreatedAt:        now,
+				VoteOptions:            marshalVoteOptions(ti.Options),
+				Citizens:               ti.Citizens,
+				MinQuorum:              ti.MinQuorum,
+				VoteThreshold:          ti.Threshold,
+				VoteDeadline:           ti.Deadline,
+				Anonymize:              ti.Anonymize,
+				Visibility:             ti.Visibility,
+				Env:                    marshalStringMap(ti.Env),
+				Mode:                   ti.Mode,
+				Container:              ti.Container,
+				ContainerRuntime:       ti.ContainerRuntime,
+				Volumes:                marshalStringSlice(ti.Volumes),
+				Executor:               ti.Executor,
+				Resources:              marshalResources(ti.Resources),
+				VerifyRetryCap:         ti.VerifyRetryCap,
+				CreatedAt:              now,
 			})
 		}
 	}

@@ -35,6 +35,7 @@ func ParseFile(path string) (*ParsedRun, error) {
 	}
 	return Parse(data)
 }
+
 // Parse parses run YAML bytes without substituting any top-level
 // `params:` values. Any {{param}} references in task prompts are
 // left as literal placeholders — this is the right entry point
@@ -45,6 +46,7 @@ func ParseFile(path string) (*ParsedRun, error) {
 func Parse(data []byte) (*ParsedRun, error) {
 	return parseInternal(data, nil, false)
 }
+
 // ParseWithParams parses run YAML bytes and substitutes the
 // supplied parameter values into every `{{param}}` reference in
 // task prompts. Required params with no supplied value and no
@@ -58,18 +60,19 @@ func Parse(data []byte) (*ParsedRun, error) {
 func ParseWithParams(data []byte, paramValues map[string]interface{}) (*ParsedRun, error) {
 	return parseInternal(data, paramValues, true)
 }
+
 // parseInternal is the linear pipeline every Parse entry point
 // funnels through:
 //
-//   1. decode:           YAML bytes → raw Run struct.
-//   2. resolveDefaults:  fill in missing defaults (e.g. action).
-//      Pure mutation — no errors, no checks.
-//   3. validate:         shape checks + implicit-edge derivation.
-//      Returns fatal errors + non-fatal author warnings.
-//   4. substituteParams: resolve {{paramname}} refs against the
-//      supplied values (only when called via ParseWithParams).
-//   5. build:            assemble the ParsedRun (DAG +
-//      TaskInstances + DeferredTaskDefs).
+//  1. decode:           YAML bytes → raw Run struct.
+//  2. resolveDefaults:  fill in missing defaults (e.g. action).
+//     Pure mutation — no errors, no checks.
+//  3. validate:         shape checks + implicit-edge derivation.
+//     Returns fatal errors + non-fatal author warnings.
+//  4. substituteParams: resolve {{paramname}} refs against the
+//     supplied values (only when called via ParseWithParams).
+//  5. build:            assemble the ParsedRun (DAG +
+//     TaskInstances + DeferredTaskDefs).
 //
 // Each stage is a top-level function in its own file; this
 // function is just the orchestrator. Readers tracing behavior
@@ -137,6 +140,7 @@ func resolveDefaults(p *Run) {
 		}
 	}
 }
+
 // substituteParamsInPlace merges supplied parameter values with declared
 // defaults, validates required params are present and types
 // match, and substitutes `{{param}}` references in every task
@@ -302,12 +306,12 @@ func substituteParamsInPlace(p *Run, supplied map[string]interface{}) (map[strin
 // list-valued fields (writes_artifacts, reads_artifacts,
 // assign_to, depends_on):
 //
-//   {{name[*]}}          list<string>: one entry per string.
-//                        list<record>: one entry per record,
-//                        value = the record's key: field.
-//   {{name[*].field}}    list<record>: one entry per record,
-//                        value = record[field] (field must be
-//                        a declared fields: entry).
+//	{{name[*]}}          list<string>: one entry per string.
+//	                     list<record>: one entry per record,
+//	                     value = the record's key: field.
+//	{{name[*].field}}    list<record>: one entry per record,
+//	                     value = record[field] (field must be
+//	                     a declared fields: entry).
 //
 // Each list element containing a `[*]` ref expands into N
 // entries. Group 1 = param name; group 2 = optional record
@@ -365,7 +369,7 @@ func expandOneStarElement(item string, merged map[string]interface{}, declared m
 	if len(matches) > 1 {
 		return nil, fmt.Errorf("%s: element %q contains multiple [*] refs; only one is supported per element", scope, item)
 	}
-	full := matches[0][0]  // the exact `{{name[*]}}` or `{{name[*].field}}` text
+	full := matches[0][0] // the exact `{{name[*]}}` or `{{name[*].field}}` text
 	name := matches[0][1]
 	field := matches[0][2] // "" for the bare form
 	raw, ok := merged[name]
@@ -576,6 +580,7 @@ func ResolveWriteArtifacts(ws WriteArtifacts, strMap map[string]string) WriteArt
 	}
 	return out
 }
+
 // stringifyParamValue renders a YAML-decoded parameter value as
 // a string suitable for in-prompt substitution. The goal is a
 // readable result in the final LLM prompt, not a round-trippable
@@ -604,12 +609,14 @@ func stringifyParamValue(v interface{}) string {
 	}
 	return fmt.Sprintf("%v", v)
 }
+
 // resolveAction sets default action if not specified.
 func resolveAction(t *TaskDef) {
 	if t.Action == "" {
 		t.Action = "answer"
 	}
 }
+
 // validateTemplateReferences walks every task's prompt and user_prompt
 // and enforces:
 //   - bare {{var}} must match a for_each variable in scope
@@ -633,6 +640,17 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 		paramByName[p.Params[i].Name] = &p.Params[i]
 	}
 	paramReferenced := make(map[string]bool, len(p.Params))
+
+	// taskByID lets the {{task.field}} check below validate the
+	// FIELD against the producer's declared outputs:, not just
+	// the task id. Without it an unknown field on a known task
+	// (e.g. {{a.gene_list}} when a only declares `summary`)
+	// slipped past the static pre-flight and only failed at
+	// claim time — even though it's statically decidable.
+	taskByID := make(map[string]*TaskDef, len(p.Tasks))
+	for i := range p.Tasks {
+		taskByID[p.Tasks[i].ID] = &p.Tasks[i]
+	}
 
 	// forEachVarParam maps a for_each variable name to the list<record>
 	// ParamDef it iterates over (nil if the source is not a record param).
@@ -754,6 +772,29 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 						t.ID, ref.TaskID, ref.Field,
 					)
 				}
+				// Known task id — also validate the FIELD when the
+				// producer declares an explicit outputs: block.
+				// {{X.content}} / {{X.responses}} are always valid
+				// (built-in result projections, resolved client-side
+				// regardless of outputs:); any other field must be a
+				// declared named output. A typo here is statically
+				// decidable, so catch it now instead of deferring to
+				// claim time ("template reference missing field").
+				if prod, known := taskByID[ref.TaskID]; known && len(prod.Outputs) > 0 {
+					if !isBuiltinResultField(ref.Field) {
+						if _, declared := prod.Outputs[ref.Field]; !declared {
+							names := make([]string, 0, len(prod.Outputs))
+							for n := range prod.Outputs {
+								names = append(names, n)
+							}
+							sort.Strings(names)
+							return fmt.Errorf(
+								"task %q: prompt references {{%s.%s}} but task %q declares no output %q (declared outputs: %s; or use {{%s.content}})",
+								t.ID, ref.TaskID, ref.Field, ref.TaskID, ref.Field, strings.Join(names, ", "), ref.TaskID,
+							)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -789,4 +830,20 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 	}
 
 	return nil
+}
+
+// isBuiltinResultField reports whether `field` is one of the
+// always-available result projections the client-side resolver
+// (internal/common/template extractField) synthesizes from any
+// task's result regardless of its declared outputs::
+//
+//   - content:   the whole result (string, or JSON of the
+//     named-output object).
+//   - responses: per-citizen blocks for multi-citizen tasks.
+//
+// A {{X.content}} / {{X.responses}} ref is therefore valid even
+// when X declares an explicit outputs: block that doesn't list
+// them — only OTHER fields must be declared named outputs.
+func isBuiltinResultField(field string) bool {
+	return field == "content" || field == "responses"
 }

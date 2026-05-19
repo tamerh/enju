@@ -15,9 +15,10 @@ import (
 // safe to run in CI against arbitrary YAML files.
 //
 // Exit codes:
-//   0  YAML parsed cleanly (warnings ignored unless --strict)
-//   2  bad usage / missing args
-//   4  parse failed, or --strict and warnings present
+//
+//	0  YAML parsed cleanly (warnings ignored unless --strict)
+//	2  bad usage / missing args
+//	4  parse failed, or --strict and warnings present
 func cmdValidate(args []string) {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
 	strict := fs.Bool("strict", false, "Treat warnings as failures (CI mode)")
@@ -98,6 +99,19 @@ func emitReport(r validateReport, asJSON bool) {
 	}
 	if r.Error != "" {
 		fmt.Printf("✗ %s\n  %s\n", rel, r.Error)
+		return
+	}
+	// Glyph tracks the actual verdict (r.OK), not just "did it
+	// parse". Under -strict a warning-bearing file FAILS (exit 4
+	// and ok:false in -json), so the human glyph must be ✗ too —
+	// printing ✓ while exiting non-zero was a silent self-
+	// contradiction only visible via `echo $?`.
+	if !r.OK {
+		fmt.Printf("✗ %s\n", rel)
+		for _, w := range r.Warnings {
+			fmt.Printf("  ⚠ %s\n", w)
+		}
+		fmt.Printf("  ✗ failed: -strict treats the warning(s) above as errors\n")
 		return
 	}
 	fmt.Printf("✓ %s\n", rel)

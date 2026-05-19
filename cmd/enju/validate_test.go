@@ -1,8 +1,10 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +39,69 @@ func TestValidateOneMissingFile(t *testing.T) {
 	if validateOne(filepath.Join(t.TempDir(), "nonexistent.yaml"), false, true) {
 		t.Fatalf("expected validateOne to reject a missing file")
 	}
+}
+
+// TestStrictPlainTextGlyphMatchesVerdict — C4. Under -strict a
+// warning-bearing file FAILS (exit 4, ok:false in -json). The
+// human-mode glyph must be ✗, not the success ✓ it used to print
+// while exiting non-zero (a self-contradiction only visible via
+// `echo $?`).
+func TestStrictPlainTextGlyphMatchesVerdict(t *testing.T) {
+	// `params:` with no description emits a non-fatal warning,
+	// which -strict promotes to a failure.
+	p := writeTempYAML(t, `
+name: warns
+version: 1
+params:
+  - { name: foo, type: string, required: true }
+tasks:
+  - id: t
+    action: answer
+    prompt: "use {{foo}}"
+`)
+
+	plain := captureStdout(t, func() {
+		if validateOne(p, false, false) != true {
+			t.Errorf("non-strict: warning-bearing file should still pass (ok=true)")
+		}
+	})
+	if !strings.Contains(plain, "✓") || strings.Contains(plain, "✗") {
+		t.Errorf("non-strict plain output should show ✓, got:\n%s", plain)
+	}
+
+	strict := captureStdout(t, func() {
+		if validateOne(p, true, false) != false {
+			t.Errorf("strict: warning-bearing file must fail (ok=false)")
+		}
+	})
+	if strings.Contains(strict, "✓ "+filepath.Base(p)) || strings.Contains(strict, "✓ "+p) {
+		t.Errorf("strict plain output must NOT show the success glyph for a failing file, got:\n%s", strict)
+	}
+	if !strings.Contains(strict, "✗") {
+		t.Errorf("strict plain output must show ✗ for a failing file, got:\n%s", strict)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and
+// returns everything it wrote. emitReport prints via fmt.Printf
+// (package-level os.Stdout), so the redirect is the only seam.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	fn()
+	_ = w.Close()
+	os.Stdout = orig
+	return <-done
 }
 
 func writeTempYAML(t *testing.T, content string) string {
