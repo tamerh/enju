@@ -26,6 +26,7 @@ func (s *Server) router() http.Handler {
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/", s.handleLanding)
+	r.Get("/archived", s.handleArchivedProjects)
 	r.Post("/projects", s.handleCreateProject)
 	r.Get("/me", s.handleMe)
 	r.Post("/me/profile", s.handleUpdateProfile)
@@ -90,6 +91,8 @@ func (s *Server) router() http.Handler {
 	r.Post("/p/{projectID}/default-branch", s.handleSetProjectDefaultBranch)
 	r.Post("/p/{projectID}/remote", s.handleSetProjectRemote)
 	r.Post("/p/{projectID}/leave", s.handleLeaveProject)
+	r.Post("/p/{projectID}/archive", s.handleArchiveProject)
+	r.Post("/p/{projectID}/restore", s.handleRestoreProject)
 
 	// Static asset serving. The path prefix is stripped by
 	// chi.StripPrefix so /static/app.css maps to app.css inside

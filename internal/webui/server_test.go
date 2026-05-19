@@ -26,6 +26,12 @@ type fakeFC struct {
 	username    string
 	projects    []wire.Project
 	matz        []service.MaterializedProject
+	archivedProjects  []wire.Project
+	archivedErr       error
+	setArchivedID     int64
+	setArchivedFlag   bool
+	setArchivedResult *service.ProjectArchiveResult
+	setArchivedErr    error
 	projDetail  *service.ProjectDetail
 	runs        []wire.Run
 	runDetail   *service.RunDetail
@@ -173,6 +179,24 @@ func (f *fakeFC) ListProjects(ctx context.Context) ([]wire.Project, error) {
 }
 func (f *fakeFC) ListMaterializedProjects() ([]service.MaterializedProject, error) {
 	return f.matz, nil
+}
+func (f *fakeFC) ListArchivedProjects(ctx context.Context) ([]wire.Project, error) {
+	return f.archivedProjects, f.archivedErr
+}
+func (f *fakeFC) SetProjectArchived(ctx context.Context, id int64, archive bool) (*service.ProjectArchiveResult, error) {
+	f.setArchivedID = id
+	f.setArchivedFlag = archive
+	if f.setArchivedErr != nil {
+		return nil, f.setArchivedErr
+	}
+	if f.setArchivedResult != nil {
+		return f.setArchivedResult, nil
+	}
+	st := "restored"
+	if archive {
+		st = "archived"
+	}
+	return &service.ProjectArchiveResult{Name: "proj", Status: st}, nil
 }
 func (f *fakeFC) GetProject(ctx context.Context, id int64) (*service.ProjectDetail, error) {
 	return f.projDetail, f.getProjErr
@@ -1082,6 +1106,132 @@ func TestProjectSettingsSections(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("settings page missing section %q", want)
 		}
+	}
+}
+
+// ownerProjArchived returns an owner-viewed project detail with
+// the archived flag toggled.
+func ownerProjArchived(archived bool) *service.ProjectDetail {
+	return &service.ProjectDetail{
+		Project: wire.Project{ID: 1, Name: "webui-toy", DefaultBranch: "main", Archived: archived},
+		Members: []wire.Member{{Username: "tamer", Role: "owner"}},
+	}
+}
+
+// TestLandingHidesArchivedWithFooterLink: the default landing
+// shows active projects + a forward link to /archived; it never
+// fetches archived itself.
+func TestLandingHidesArchivedWithFooterLink(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		projects: []wire.Project{{ID: 1, Name: "active-one"}},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "active-one") {
+		t.Errorf("expected active project listed")
+	}
+	if !strings.Contains(body, `href="/archived"`) ||
+		!strings.Contains(body, "View archived projects") {
+		t.Errorf("expected forward link to /archived; body: %q", body)
+	}
+}
+
+// TestArchivedProjectsView: /archived lists archived projects in
+// the archived-mode landing (heading + back link, no create
+// form, no forward link).
+func TestArchivedProjectsView(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username:         "tamer",
+		archivedProjects: []wire.Project{{ID: 9, Name: "old-thing", Archived: true}},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/archived", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"Archived projects", "old-thing", `href="/p/9"`, "← Active projects"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("archived view missing %q", want)
+		}
+	}
+	if strings.Contains(body, `action="/projects"`) {
+		t.Errorf("archived view must not show the create-project form")
+	}
+}
+
+// TestSettingsArchiveControls: owner sees the Archive
+// disclosure on an active project, and Restore + an archived
+// banner on an archived one.
+func TestSettingsArchiveControls(t *testing.T) {
+	active := newTestServer(t, &fakeFC{username: "tamer", projDetail: ownerProjArchived(false)})
+	rr := httptest.NewRecorder()
+	active.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
+	b := rr.Body.String()
+	if !strings.Contains(b, `action="/p/1/archive"`) || !strings.Contains(b, "Archive project") {
+		t.Errorf("active project should offer Archive; body: %q", b)
+	}
+	if strings.Contains(b, `action="/p/1/restore"`) {
+		t.Errorf("active project must not offer Restore")
+	}
+
+	arch := newTestServer(t, &fakeFC{username: "tamer", projDetail: ownerProjArchived(true)})
+	rr2 := httptest.NewRecorder()
+	arch.Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1/settings", nil))
+	b2 := rr2.Body.String()
+	if !strings.Contains(b2, `action="/p/1/restore"`) || !strings.Contains(b2, "is <strong>archived</strong>") {
+		t.Errorf("archived project should show Restore + banner; body: %q", b2)
+	}
+	if strings.Contains(b2, `action="/p/1/archive"`) {
+		t.Errorf("archived project must not offer Archive")
+	}
+}
+
+// TestArchiveRestoreActions: POST archive/restore call the
+// service with the right flag and banner the coord status; a
+// coord refusal is a banner, not a 5xx.
+func TestArchiveRestoreActions(t *testing.T) {
+	fc := &fakeFC{username: "tamer", projDetail: ownerProjArchived(false)}
+	s := newTestServer(t, fc)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/archive", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	if fc.setArchivedID != 1 || !fc.setArchivedFlag {
+		t.Errorf("archive: SetProjectArchived(pid=%d, archive=%v)", fc.setArchivedID, fc.setArchivedFlag)
+	}
+	if !strings.Contains(rr.Body.String(), "Project archived") {
+		t.Errorf("expected archived banner; body: %q", rr.Body.String())
+	}
+
+	fc2 := &fakeFC{username: "tamer", projDetail: ownerProjArchived(true)}
+	s2 := newTestServer(t, fc2)
+	req2 := httptest.NewRequest(http.MethodPost, "/p/1/restore", nil)
+	req2.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr2 := httptest.NewRecorder()
+	s2.Handler().ServeHTTP(rr2, req2)
+	if fc2.setArchivedFlag {
+		t.Errorf("restore should call SetProjectArchived(archive=false)")
+	}
+
+	// Coord refusal (e.g. non-terminal runs) → banner on 200.
+	fc3 := &fakeFC{username: "tamer", projDetail: ownerProjArchived(false),
+		setArchivedErr: fmt.Errorf("project has 2 non-terminal runs")}
+	s3 := newTestServer(t, fc3)
+	req3 := httptest.NewRequest(http.MethodPost, "/p/1/archive", nil)
+	req3.Header.Set("Origin", "http://127.0.0.1:8080")
+	rr3 := httptest.NewRecorder()
+	s3.Handler().ServeHTTP(rr3, req3)
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("refusal status: got %d, want 200", rr3.Code)
+	}
+	if !strings.Contains(rr3.Body.String(), "non-terminal runs") {
+		t.Errorf("expected coord refusal bannered; body: %q", rr3.Body.String())
 	}
 }
 

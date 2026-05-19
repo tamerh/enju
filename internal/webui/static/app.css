@@ -153,6 +153,9 @@ main {
 .project-card .meta { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
 .project-card .desc { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; }
 
+/* Footer link between the active and archived project rosters. */
+.archived-link { margin-top: 1.5rem; }
+
 /* Project view */
 .crumbs {
   margin-bottom: 1rem;

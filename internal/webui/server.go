@@ -30,6 +30,15 @@ type fatClient interface {
 	// Read-side views (the v1 gap-fills + existing reads)
 	ListProjects(ctx context.Context) ([]wire.Project, error)
 	ListMaterializedProjects() ([]service.MaterializedProject, error)
+	// ListArchivedProjects is the archived-only roster (the
+	// default ListProjects already excludes archived
+	// server-side). SetProjectArchived archives/restores a
+	// project (mirror of enju_archive_project /
+	// enju_restore_project); owner-gating + the non-terminal-run
+	// precondition + idempotency are coord-enforced and surface
+	// as the error / Status.
+	ListArchivedProjects(ctx context.Context) ([]wire.Project, error)
+	SetProjectArchived(ctx context.Context, projectID int64, archive bool) (*service.ProjectArchiveResult, error)
 	GetProject(ctx context.Context, projectID int64) (*service.ProjectDetail, error)
 	ListRuns(ctx context.Context, projectID int64) ([]wire.Run, error)
 	GetRun(ctx context.Context, projectID int64, runSeq int) (*service.RunDetail, error)

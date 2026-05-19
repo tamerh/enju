@@ -325,6 +325,52 @@ func (s *Server) handleSetProjectRemote(w http.ResponseWriter, r *http.Request) 
 	s.renderProjectSettings(w, r, pid, msg, "")
 }
 
+// handleArchiveProject / handleRestoreProject are
+// POST /p/{projectID}/archive | /restore (mirror of
+// enju_archive_project / enju_restore_project). Owner-gating
+// and the non-terminal-run precondition are coord-enforced; a
+// refusal or an idempotent no-op is bannered on the re-rendered
+// settings page (proj.Archived flips so the Danger-zone block
+// swaps Archive↔Restore).
+func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
+	s.setArchived(w, r, true)
+}
+
+func (s *Server) handleRestoreProject(w http.ResponseWriter, r *http.Request) {
+	s.setArchived(w, r, false)
+}
+
+func (s *Server) setArchived(w http.ResponseWriter, r *http.Request, archive bool) {
+	pid, ok := s.projectIDOrBadRequest(w, r)
+	if !ok {
+		return
+	}
+	res, err := s.fc.SetProjectArchived(r.Context(), pid, archive)
+	if err != nil {
+		verb := "archive"
+		if !archive {
+			verb = "restore"
+		}
+		s.logger.Info("SetProjectArchived failed", "project_id", pid, "archive", archive, "error", err)
+		s.renderProjectSettings(w, r, pid, "", verb+" failed: "+err.Error())
+		return
+	}
+	var notice string
+	switch res.Status {
+	case "archived":
+		notice = "✓ Project archived — hidden from the default project list; restore it here anytime."
+	case "restored":
+		notice = "✓ Project restored — back in the default project list."
+	case "already_archived":
+		notice = "• Project is already archived (no change)."
+	case "already_restored":
+		notice = "• Project is not archived (no change)."
+	default:
+		notice = "✓ Done."
+	}
+	s.renderProjectSettings(w, r, pid, notice, "")
+}
+
 // handleLeaveProject is POST /p/{projectID}/leave (mirror of
 // enju_leave_project). Destructive: removes the caller's
 // membership and wipes the local clone. `keep_membership`

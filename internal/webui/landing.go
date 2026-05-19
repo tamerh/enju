@@ -22,6 +22,12 @@ type landingPage struct {
 	Materialized []service.MaterializedProject
 	Error        string
 	Submitted    service.CreateProjectParams
+	// Archived switches landing.html to the archived-only view:
+	// heading + title change, the create-project form and the
+	// local-clone count are suppressed, and the footer link
+	// points back to the active list instead of forward to the
+	// archived one. Projects then holds the archived set.
+	Archived bool
 }
 
 // handleLanding is the cross-project landing page (GET /). For
@@ -51,6 +57,24 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 		pageData:     s.commonPageData(),
 		Projects:     projects,
 		Materialized: materialized,
+	})
+}
+
+// handleArchivedProjects is GET /archived — the archived-only
+// roster. Reuses landing.html in Archived mode. Pure read; no
+// local-clone walk (archived projects aren't part of the
+// everyday "what's on disk" view).
+func (s *Server) handleArchivedProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.fc.ListArchivedProjects(r.Context())
+	if err != nil {
+		s.logger.Error("ListArchivedProjects failed", "error", err)
+		s.writeFetchError(w, "archived projects", err)
+		return
+	}
+	s.render(w, r, "landing.html", landingPage{
+		pageData: s.commonPageData(),
+		Projects: projects,
+		Archived: true,
 	})
 }
 

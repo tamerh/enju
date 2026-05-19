@@ -181,6 +181,47 @@
 {{/* ── Danger zone ───────────────────────────────────────── */}}
 <section>
   <h2>Danger zone</h2>
+
+  {{/* Archive / Restore — reversible. Owner-only (coord-gated).
+       Archived projects drop out of the default project list
+       (reachable via the "archived" link there). Archive is
+       refused while the project has non-terminal runs — the
+       coordinator says so and we banner it. */}}
+  {{if .Project.Archived}}
+  <div class="banner banner-warn">This project is <strong>archived</strong> — hidden from the default project list.</div>
+  {{if .IsOwner}}
+  <div class="btn-row">
+    <form method="POST" action="/p/{{.Project.ID}}/restore"
+          hx-post="/p/{{.Project.ID}}/restore" hx-target="#main">
+      <button type="submit" class="btn btn-primary">Restore project</button>
+    </form>
+  </div>
+  {{else}}
+  <p class="muted small">Restoring is owner-only.</p>
+  {{end}}
+  {{else if .IsOwner}}
+  <div class="btn-row" x-data="{archiving: false}">
+    <button type="button" class="btn" x-show="!archiving" @click="archiving = true">Archive project…</button>
+    <form x-show="archiving" x-cloak
+          method="POST" action="/p/{{.Project.ID}}/archive"
+          hx-post="/p/{{.Project.ID}}/archive" hx-target="#main"
+          class="terminate-form">
+      <h3 class="terminate-title">Archive project #{{.Project.ID}}?</h3>
+      <p class="terminate-warn">
+        <strong>Reversible.</strong>
+        The project disappears from the default project list (still
+        reachable via the “archived” link, and restorable here).
+        Nothing is deleted. Refused while the project has
+        non-terminal runs — terminate or finish them first.
+      </p>
+      <div class="btn-row terminate-actions">
+        <button type="submit" class="btn btn-primary">Confirm archive</button>
+        <button type="button" class="btn" @click="archiving = false">Cancel</button>
+      </div>
+    </form>
+  </div>
+  {{end}}
+
   {{/* Leave project — destructive, any member (not owner-gated;
        the coord refuses only a sole owner). keep_membership
        wipes just the local clone. */}}

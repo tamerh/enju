@@ -1,15 +1,21 @@
-{{define "title"}}Projects · Enju{{end}}
+{{define "title"}}{{if .Archived}}Archived projects{{else}}Projects{{end}} · Enju{{end}}
 
 {{define "main"}}
 <section x-data="{creating: false}">
   <header class="task-header">
+    {{if .Archived}}
+    <h1>Archived projects</h1>
+    <p class="muted">{{len .Projects}} archived project(s). Open one to restore it from its Settings page.</p>
+    {{else}}
     <h1>Projects</h1>
     <p class="muted">{{len .Projects}} project(s); {{len .Materialized}} with local clone.</p>
     <p class="btn-row">
       <button type="button" class="btn btn-primary" x-show="!creating" @click="creating = true">New project</button>
     </p>
+    {{end}}
   </header>
 
+  {{if not .Archived}}
   <form x-show="creating || {{if .Error}}true{{else}}false{{end}}" x-cloak
         method="POST" action="/projects"
         hx-post="/projects"
@@ -52,6 +58,7 @@
       <button type="button" class="btn" @click="creating = false">Cancel</button>
     </div>
   </form>
+  {{end}}
 
   {{if .Projects}}
   <ul class="project-list">
@@ -66,7 +73,18 @@
     {{end}}
   </ul>
   {{else}}
+  {{if .Archived}}
+  <p class="muted">No archived projects.</p>
+  {{else}}
   <p>No projects yet. Click <strong>New project</strong> above to create one — or run <code>enju mcp</code> in a Claude session and call <code>enju_create_project</code> for advanced flows (custom path, external git remote).</p>
   {{end}}
+  {{end}}
+
+  {{/* Archived access is rare — a footer link keeps the
+       everyday list clean (no toggle chrome, no extra fetch on
+       the default page). */}}
+  <p class="muted small archived-link">
+    {{if .Archived}}<a href="/">← Active projects</a>{{else}}<a href="/archived">View archived projects →</a>{{end}}
+  </p>
 </section>
 {{end}}

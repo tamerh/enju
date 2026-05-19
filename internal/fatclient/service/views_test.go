@@ -632,6 +632,52 @@ func TestGetProjectNotFound(t *testing.T) {
 	}
 }
 
+// TestSetProjectArchived: archive POSTs /archive and restore
+// POSTs /restore; the coord {name,status} is returned verbatim
+// (status drives the UI's transition-vs-noop banner).
+func TestSetProjectArchived(t *testing.T) {
+	srv := fakeCoord(t, map[string]any{
+		"/api/v1/projects/1/archive": map[string]any{"name": "P", "status": "archived"},
+		"/api/v1/projects/1/restore": map[string]any{"name": "P", "status": "restored"},
+	})
+	defer srv.Close()
+	fc := newViewClient(t, srv.URL)
+
+	got, err := fc.SetProjectArchived(context.Background(), 1, true)
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if got.Status != "archived" || got.Name != "P" {
+		t.Errorf("archive result: %+v", got)
+	}
+	got, err = fc.SetProjectArchived(context.Background(), 1, false)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got.Status != "restored" {
+		t.Errorf("restore status: %q", got.Status)
+	}
+}
+
+// TestListArchivedProjects: requests include_archived and
+// returns ONLY the archived rows (the archived-only view).
+func TestListArchivedProjects(t *testing.T) {
+	srv := fakeCoord(t, map[string]any{
+		"/api/v1/projects": []map[string]any{
+			{"id": int64(1), "name": "Active", "created_at": "2026-05-01T10:00:00Z"},
+			{"id": int64(2), "name": "Old", "archived": true, "created_at": "2026-05-02T10:00:00Z"},
+		},
+	})
+	defer srv.Close()
+	got, err := newViewClient(t, srv.URL).ListArchivedProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListArchivedProjects: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "Old" || !got[0].Archived {
+		t.Errorf("want only the archived project, got %+v", got)
+	}
+}
+
 // (Removed: TestParseProjectIDFromDir. The helper it covered
 // only existed to parse "<id>-<slug>" workspace-managed dir
 // names — a concept the project-home layout eliminated.)
