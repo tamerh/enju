@@ -117,9 +117,25 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 	// error (vs. the misleading "idle run" the main loop would
 	// produce for an empty /ready on a nonexistent run) and
 	// caches the branch for the cold-reconcile fallback below.
-	runBranch, err := s.fetchRunBranch(ctx, p.ProjectID, p.RunSeq)
+	runBranch, runState, err := s.fetchRunBranch(ctx, p.ProjectID, p.RunSeq)
 	if err != nil {
 		return nil, err
+	}
+	// B-2: refuse to drive a PAUSED run. PAUSED is the operator's
+	// circuit-breaker ("stop progress so I can inspect"); the
+	// coord-side claim/submit gating that would enforce this is
+	// an acknowledged deferred gap (see enju_pause_run docs), so
+	// without this guard enju_execute_run blew straight through a
+	// pause and drove every task to ACCEPTED — then the run sat
+	// stuck at "paused 100%" until a manual resume re-evaluated
+	// it. Fail closed with an actionable error instead; the
+	// operator resumes deliberately when they're ready.
+	if runState == "paused" {
+		return nil, fmt.Errorf(
+			"run %d:%d is paused — enju_execute_run will not advance a paused run "+
+				"(pause is a circuit-breaker). Resume it first with "+
+				"enju_resume_run(project_id=%d, run_id=%d), then re-run.",
+			p.ProjectID, p.RunSeq, p.ProjectID, p.RunSeq)
 	}
 
 	if p.Parallel > 1 {
@@ -400,25 +416,27 @@ func pickAllEligibleCompute(ready []map[string]interface{}, username string, dis
 }
 
 // fetchRunBranch resolves (project_id, run_id) to the run's
-// branch name. Doubles as a pre-flight existence check:
-// a nonexistent run surfaces as a clear "run not found" error
-// here rather than bleeding through the main loop as a
-// misleading "no_ready_compute" (empty /ready).
-func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runSeq int) (string, error) {
+// branch name AND state. Doubles as a pre-flight existence
+// check: a nonexistent run surfaces as a clear "run not found"
+// error here rather than bleeding through the main loop as a
+// misleading "no_ready_compute" (empty /ready). The state lets
+// ExecuteRun refuse to drive a PAUSED run (bug hunt B-2).
+func (s *FatClient) fetchRunBranch(ctx context.Context, projectID, runSeq int) (branch, state string, err error) {
 	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq)
-	data, err := s.coord.Get(ctx, path)
-	if err != nil {
-		return "", fmt.Errorf("run %d:%d not found: %w", projectID, runSeq, err)
+	data, gerr := s.coord.Get(ctx, path)
+	if gerr != nil {
+		return "", "", fmt.Errorf("run %d:%d not found: %w", projectID, runSeq, gerr)
 	}
 	var resp map[string]interface{}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", fmt.Errorf("decoding run response: %w", err)
+	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+		return "", "", fmt.Errorf("decoding run response: %w", uerr)
 	}
 	if errMsg, _ := resp["error"].(string); errMsg != "" {
-		return "", fmt.Errorf("run %d:%d: %s", projectID, runSeq, errMsg)
+		return "", "", fmt.Errorf("run %d:%d: %s", projectID, runSeq, errMsg)
 	}
-	branch, _ := resp["branch"].(string)
-	return branch, nil
+	branch, _ = resp["branch"].(string)
+	state, _ = resp["state"].(string)
+	return branch, state, nil
 }
 
 // ListReadyTasks returns the READY tasks for a (project, run)
