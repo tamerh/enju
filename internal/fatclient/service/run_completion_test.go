@@ -74,15 +74,14 @@ func completionBody(t *testing.T, runCompleted bool, syncMode string) []byte {
 }
 
 // completionBodyFull builds a completion response with the declared
-// publish set + the topic-push opt-in, the shape the coordinator
-// sends on a real run completion.
-func completionBodyFull(t *testing.T, syncMode string, paths []string, pushTopics bool) []byte {
+// publish set, the shape the coordinator sends on a real run
+// completion.
+func completionBodyFull(t *testing.T, syncMode string, paths []string) []byte {
 	t.Helper()
 	m := map[string]interface{}{
 		"run_completed": true,
 		"sync_mode":     syncMode,
 		"publish_paths": paths,
-		"push_topics":   pushTopics,
 	}
 	b, _ := json.Marshal(m)
 	return b
@@ -156,7 +155,7 @@ func TestApplyRunCompletion_MergePublishesNoPush(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBodyFull(t, "merge", []string{"results/out.csv"}, false))
+		completionBodyFull(t, "merge", []string{"results/out.csv"}))
 
 	if wf.publishCalls != 1 {
 		t.Fatalf("PublishRunArtifacts calls: got %d, want 1", wf.publishCalls)
@@ -173,7 +172,7 @@ func TestApplyRunCompletion_MergePublishesNoPush(t *testing.T) {
 }
 
 // TestApplyRunCompletion_PushSharesBaseAndRunBranch — mode=push asks
-// for the push of { base, run branch }; push_topics defaults off.
+// for the push of exactly { base, run branch }.
 func TestApplyRunCompletion_PushSharesBaseAndRunBranch(t *testing.T) {
 	fc := nullFatClient()
 	wf := &fakeWorkflow{
@@ -186,34 +185,13 @@ func TestApplyRunCompletion_PushSharesBaseAndRunBranch(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBodyFull(t, "push", []string{"results/out.csv"}, false))
+		completionBodyFull(t, "push", []string{"results/out.csv"}))
 
 	if wf.publishCalls != 1 {
 		t.Fatalf("publish calls: got %d, want 1", wf.publishCalls)
 	}
 	if !wf.gotReq.Push {
 		t.Errorf("mode=push must set Push=true")
-	}
-	if wf.gotReq.PushTopics {
-		t.Errorf("push_topics must default off")
-	}
-}
-
-// TestApplyRunCompletion_PushTopicsPassedThrough — sync.push_topics
-// surfaces on the request so the enjugit layer also pushes topics.
-func TestApplyRunCompletion_PushTopicsPassedThrough(t *testing.T) {
-	fc := nullFatClient()
-	wf := &fakeWorkflow{
-		defaultBranch: "main",
-		remoteURL:     "https://example.com/repo.git",
-	}
-	fc.applyRunCompletion(context.Background(), wf,
-		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBodyFull(t, "push", []string{"out.txt"}, true))
-
-	if !wf.gotReq.Push || !wf.gotReq.PushTopics {
-		t.Errorf("push_topics opt-in not threaded: Push=%v PushTopics=%v",
-			wf.gotReq.Push, wf.gotReq.PushTopics)
 	}
 }
 
@@ -228,7 +206,7 @@ func TestApplyRunCompletion_PushNoRemotePublishesLocal(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1"},
-		completionBodyFull(t, "push", []string{"out.txt"}, false))
+		completionBodyFull(t, "push", []string{"out.txt"}))
 
 	if wf.publishCalls != 1 {
 		t.Fatalf("publish should still run locally: got %d calls", wf.publishCalls)
@@ -249,7 +227,7 @@ func TestApplyRunCompletion_PublishErrorNonFatal(t *testing.T) {
 	}
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
-		completionBodyFull(t, "merge", []string{"out.txt"}, false))
+		completionBodyFull(t, "merge", []string{"out.txt"}))
 	if wf.publishCalls != 1 {
 		t.Errorf("publish should be attempted once: got %d", wf.publishCalls)
 	}

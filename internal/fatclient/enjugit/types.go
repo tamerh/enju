@@ -204,12 +204,11 @@ type PublishRunArtifactsRequest struct {
 	// Push additionally pushes { base, run branch } to origin
 	// after the local publish — the run branch is kept and pushed
 	// so every provenance/iteration commit stays reachable for the
-	// events.db ↔ git audit. PushTopics extends the push set to
-	// the run's per-task topic branches (opt-in; default off,
-	// because pushing them makes the shared branch list unusable
-	// and the run branch already carries the accepted line).
-	Push       bool
-	PushTopics bool
+	// events.db ↔ git audit. Per-task topic branches are pushed
+	// during the run by the submit path, not here; cleaning them
+	// off the remote is operator territory (enju_project_sync
+	// prune), not run-completion logic.
+	Push bool
 }
 
 // PublishRunArtifactsResult is what Workflow.PublishRunArtifacts

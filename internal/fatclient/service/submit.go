@@ -967,8 +967,7 @@ func mergeWorkflowOrNil(wf *enjugit.Workflow) mergeWorkflow {
 //	none  — no-op.
 //	merge — publish the run's declared outputs onto the base branch
 //	        locally; push nothing.
-//	push  — same publish, then push exactly { base, run branch }
-//	        (and topic branches only when push_topics is set).
+//	push  — same publish, then push exactly { base, run branch }.
 //
 // The base branch receives ONLY the run's declared output set
 // (read from the run-branch tip) — never a whole-branch merge of
@@ -997,7 +996,6 @@ func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, me
 		SyncMode     string   `json:"sync_mode"`
 		SyncRemote   string   `json:"sync_remote"`
 		PublishPaths []string `json:"publish_paths"`
-		PushTopics   bool     `json:"push_topics"`
 	}
 	if err := json.Unmarshal(responseBody, &resp); err != nil || !resp.RunCompleted {
 		return
@@ -1030,7 +1028,6 @@ func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, me
 		Paths:      resp.PublishPaths,
 		Author:     enjugit.MergeAuthor{AutoOrManual: "auto"},
 		Push:       push,
-		PushTopics: resp.PushTopics,
 	})
 	if err != nil {
 		// Hard failure (run-tip resolve, base prepare, blob read, or
@@ -1051,7 +1048,7 @@ func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, me
 	s.logger.Info("applyRunCompletion: run artifacts published and pushed",
 		"run_branch", runBranch, "base_branch", baseBranch,
 		"remote", resp.SyncRemote, "pushed_refs", res.Pushed,
-		"push_topics", resp.PushTopics, "no_op", res.NoOp)
+		"no_op", res.NoOp)
 }
 
 // applyAcceptedMerges drives the post-submit auto-merge of any

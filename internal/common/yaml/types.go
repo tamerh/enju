@@ -94,13 +94,6 @@ type SyncConfig struct {
 	// Remote is the git remote to push to when mode=push.
 	// Defaults to "origin" when empty.
 	Remote string `yaml:"remote,omitempty"`
-	// PushTopics opts the run additionally into pushing every
-	// per-task topic branch to the remote. Default (false) keeps
-	// topic branches local-only: a completed run publishes exactly
-	// the base branch and the run branch. Set true only when the
-	// rejected/superseded iteration content that lives solely on
-	// topic branches must be durable on the shared remote too.
-	PushTopics bool `yaml:"push_topics,omitempty"`
 }
 
 // RecordFields is an ordered map from field name to scalar type

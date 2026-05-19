@@ -475,9 +475,10 @@ func (w *Workflow) MergeRunIntoBase(runBranch, baseBranch string, author MergeAu
 // the FF-merged iteration history) and is KEPT and, in push mode,
 // pushed: the events.db ↔ git audit resolves SHAs against it, so
 // nothing is destroyed — the trail just moves off the deliverable
-// branch, not away. Per-task topic branches are local-only unless
-// PushTopics is set; enju never deletes any branch here (lifecycle
-// is operator territory).
+// branch, not away. Per-task topic branches are pushed during the
+// run by the submit path and are NOT touched here; enju never
+// deletes a branch (cleaning topic refs off the remote is the
+// operator's enju_project_sync prune, not run-completion logic).
 //
 // Idempotent: a re-run after a fat-client restart finds base already
 // holding the same content (CommitFiles NoOp) and re-pushes the same
@@ -587,24 +588,15 @@ func (w *Workflow) PublishRunArtifacts(req PublishRunArtifactsRequest) (*Publish
 			return nil
 		}
 
-		// Push exactly { base, run branch } — and topic branches
-		// only when opted in. Each push is best-effort: the local
-		// publish already landed, so a failure is logged and the
-		// remaining refs are still attempted rather than aborting.
+		// Push exactly { base, run branch }. Per-task topic
+		// branches are not touched here — they're pushed during
+		// the run by the submit path; pruning them off the remote
+		// is the operator's job (enju_project_sync), not
+		// run-completion lifecycle logic. Each push is best-effort:
+		// the local publish already landed, so a failure is logged
+		// and the remaining ref is still attempted rather than
+		// aborting.
 		pushRefs := []string{req.BaseBranch, req.RunBranch}
-		if req.PushTopics {
-			if locals, lerr := g.LocalBranches(); lerr == nil {
-				prefix := req.RunBranch + "/"
-				for _, b := range locals {
-					if strings.HasPrefix(b, prefix) {
-						pushRefs = append(pushRefs, b)
-					}
-				}
-			} else {
-				w.logger.Warn("enjugit: PublishRunArtifacts: cannot enumerate topic branches for push-topics",
-					"run_branch", req.RunBranch, "error", lerr)
-			}
-		}
 		for _, ref := range pushRefs {
 			if perr := g.Push(ref); perr != nil {
 				trace.appendStep(Step{Name: "push:" + ref, Status: "failed", Detail: perr.Error()})

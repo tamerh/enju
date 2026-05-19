@@ -66,11 +66,6 @@ type SubmitResultResponse struct {
 	// the run-branch tip), so the deliverable branch never carries
 	// the provenance trail. Populated only when RunCompleted=true.
 	PublishPaths     []string       `json:"publish_paths,omitempty"`
-	// PushTopics mirrors the resolved sync.push_topics policy. When
-	// false (default) a push-mode completion pushes exactly the
-	// base branch and the run branch; topic branches stay local.
-	// Populated only when RunCompleted=true.
-	PushTopics      bool         `json:"push_topics,omitempty"`
 	AcceptedMerges    []AcceptedMergeView   `json:"accepted_merges,omitempty"`
 	ProjectID       int64          `json:"project_id,omitempty"`
 	RunSeq        int           `json:"run_seq,omitempty"`
@@ -481,7 +476,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 	if completed {
 		resp.RunCompleted = true
-		resp.SyncMode, resp.SyncRemote, resp.PushTopics = parseSyncConfig(run)
+		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
 		resp.PublishPaths = c.declaredArtifactPaths(run)
 		resp.ProjectID = run.ProjectID
 		resp.RunSeq = run.Seq
@@ -497,39 +492,30 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	return resp, nil
 }
 
-// parseSyncConfig resolves (mode, remote, pushTopics) for the
-// run-completion sync step. Resolution is two independent passes so
-// --sync only controls the mode; sync.remote is always honored
-// regardless of override:
+// parseSyncConfig resolves (mode, remote) for the run-completion
+// sync step. Resolution is two independent passes so --sync only
+// controls the mode; sync.remote is always honored regardless of
+// override:
 //
-//  1. YAML pass: read sync.mode, sync.remote, sync.push_topics.
+//  1. YAML pass: read sync.mode, sync.remote.
 //  2. Override pass: if SyncModeOverride is a known value it wins the
-//     mode; remote/push_topics are unchanged (still from YAML/default).
+//     mode; remote is unchanged (still from YAML/default).
 //
 // Unknown overrides and unknown YAML modes fall back to "merge" —
 // the single chokepoint that catches MCP typos and direct DB edits.
-//
-// pushTopics defaults off: a completed run publishes exactly the base
-// branch and the run branch; per-task topic branches stay local on the
-// machine that ran the run. It is the only opt-in here because pushing
-// topic branches makes the shared remote unusable (~13 stray refs per
-// run) and the run branch already carries the accepted-line audit; the
-// opt-in exists for runs that need rejected-attempt history durable
-// off-machine too.
-func parseSyncConfig(run *store.RunRecord) (mode, remote string, pushTopics bool) {
+func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
 	mode, remote = "merge", "origin"
 	if run == nil {
 		return
 	}
 
-	// Pass 1 — YAML: apply mode, remote, push_topics.
+	// Pass 1 — YAML: apply mode + remote.
 	if run.YAMLData != "" {
 		var r enjuYaml.Run
 		if err := yamlv3.Unmarshal([]byte(run.YAMLData), &r); err == nil && r.Sync != nil {
 			if r.Sync.Remote != "" {
 				remote = r.Sync.Remote
 			}
-			pushTopics = r.Sync.PushTopics
 			switch r.Sync.Mode {
 			case "none", "merge", "push":
 				mode = r.Sync.Mode

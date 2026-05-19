@@ -131,41 +131,6 @@ func TestPublishRunArtifacts_PushSharesBaseAndRun(t *testing.T) {
 	}
 }
 
-// TestPublishRunArtifacts_PushTopicsIncludesTopicBranches — opt-in
-// push_topics additionally pushes the run's per-task topic branches
-// (prefix "<run>/"), but never sibling runs.
-func TestPublishRunArtifacts_PushTopicsIncludesTopicBranches(t *testing.T) {
-	wf, fake, runTip := publishHarness(t)
-	fake.readContent[runTip+":out.txt"] = []byte("x")
-	fake.branches = []string{
-		"main", "run-1",
-		"run-1/build/iter-1", "run-1/test/iter-2",
-		"run-2", "run-2/build/iter-1",
-	}
-
-	_, err := wf.PublishRunArtifacts(PublishRunArtifactsRequest{
-		RunBranch: "run-1", BaseBranch: "main",
-		Paths: []string{"out.txt"}, Author: systemAuthor,
-		Push: true, PushTopics: true,
-	})
-	if err != nil {
-		t.Fatalf("PublishRunArtifacts: %v", err)
-	}
-	got := pushedRefs(fake)
-	want := map[string]bool{
-		"main": true, "run-1": true,
-		"run-1/build/iter-1": true, "run-1/test/iter-2": true,
-	}
-	if len(got) != len(want) {
-		t.Fatalf("pushed refs = %v, want the 2 base/run refs + 2 run-1 topics", got)
-	}
-	for _, r := range got {
-		if !want[r] {
-			t.Errorf("unexpected pushed ref %q (sibling run / its topics must not be pushed)", r)
-		}
-	}
-}
-
 // TestPublishRunArtifacts_NoDeclaredFilesNoOp — a citizen-content-
 // only run declares no file outputs: no publish commit is made, but
 // in push mode { base, run branch } are still shared (the run branch
