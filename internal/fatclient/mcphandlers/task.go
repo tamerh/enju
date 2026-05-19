@@ -71,11 +71,25 @@ func (c *apiClient) handleListIterations(ctx context.Context, req mcp.CallToolRe
 }
 
 func (c *apiClient) handleListReadyTasks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// B-4: forward project_id and run_id INDEPENDENTLY. The old
+	// code only appended them when BOTH were set, so
+	// enju_list_ready_tasks(project_id=N) (no run_id) sent a
+	// bare /tasks/ready and the coordinator returned every
+	// project's ready tasks — the documented project filter was
+	// silently ignored. The coordinator already scopes correctly
+	// when project_id alone is passed (service.ListReadyTasks).
 	path := "/api/v1/tasks/ready"
 	pid := req.GetInt("project_id", 0)
 	rid := req.GetInt("run_id", 0)
-	if pid > 0 && rid > 0 {
-		path += fmt.Sprintf("?project_id=%d&run_id=%d", pid, rid)
+	params := make([]string, 0, 2)
+	if pid > 0 {
+		params = append(params, fmt.Sprintf("project_id=%d", pid))
+	}
+	if rid > 0 {
+		params = append(params, fmt.Sprintf("run_id=%d", rid))
+	}
+	if len(params) > 0 {
+		path += "?" + strings.Join(params, "&")
 	}
 	data, err := c.get(ctx, path)
 	if err != nil {
