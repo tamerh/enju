@@ -278,6 +278,22 @@ type RunRecord struct {
 	//   {"kind":"artifact",     "task":"...","awaiting_path":"..."}
 	//   {"kind":"stuck",        "detail":"..."}
 	BlockedBy string
+	// SyncStatus carries a JSON description of a run-completion
+	// sync that needs operator attention — set when the
+	// fat-client's run-branch → base merge hit a conflict and
+	// could NOT integrate the run's output into the default
+	// branch. Unlike BlockedBy (which is gated on RunWaiting and
+	// cleared on every other transition), SyncStatus persists
+	// across the terminal-completed state: a run can be
+	// `completed` AND still have lost output that never reached
+	// base. Empty string = sync clean / not yet attempted /
+	// mode:none. Set once by the run_sync_conflict report; not
+	// auto-cleared (the operator resolving the merge by hand is
+	// out-of-band — a future enju_resolve_sync could clear it).
+	//
+	// Shape (JSON): {"kind":"conflict","run_branch":"...",
+	//   "base_branch":"...","conflict_files":[...],"hint":"..."}
+	SyncStatus string
 	// SyncModeOverride is the operator-supplied sync mode from the
 	// CLI `--sync` flag (or the `sync_mode_override` MCP param).
 	// When non-empty, it takes precedence over the workflow YAML's

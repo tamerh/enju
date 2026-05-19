@@ -11,8 +11,13 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
+	"github.com/enju-ai/enju/internal/fatclient/coord"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
@@ -196,15 +201,40 @@ func TestApplyRunCompletion_PushSkippedWithNoRemote(t *testing.T) {
 	}
 }
 
-// TestApplyRunCompletion_ConflictLogged — merge conflict is logged as
-// an error with the conflict files; no coord POST is made.
-func TestApplyRunCompletion_ConflictLogged(t *testing.T) {
-	fc := nullFatClient()
+// TestApplyRunCompletion_ConflictReported — bug hunt B-1: a
+// run-completion merge conflict is logged AND reported to the
+// coordinator (POST /projects/{p}/runs/{r}/sync-conflict) so the
+// otherwise log-only data-loss surfaces on coordinator surfaces.
+// Push must still NOT fire after a conflict. (Pre-B-1 this test
+// asserted "no coord POST is made" — the contract deliberately
+// changed; this is the client-side half of the B-1 regression.)
+func TestApplyRunCompletion_ConflictReported(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		gotPath    string
+		gotBody    map[string]interface{}
+		postCalled bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		postCalled = true
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"recorded"}`))
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fc := New(Config{Coord: coord.New(coord.Config{
+		BaseURL: srv.URL, Username: "bot1", AuthToken: "t", Logger: logger,
+	}), Logger: logger})
+
 	wf := &fakeWorkflow{
 		defaultBranch: "main",
 		mergeErr:      &enjugit.ErrConflict{Paths: []string{"data/results.csv", "README.md"}},
 	}
-	// Must not panic; the test asserts no panic by completing.
 	fc.applyRunCompletion(context.Background(), wf,
 		&TaskMeta{Branch: "run-1", ProjectID: 42, RunSeq: 3},
 		completionBody(t, true, "merge"))
@@ -214,5 +244,24 @@ func TestApplyRunCompletion_ConflictLogged(t *testing.T) {
 	}
 	if wf.pushCalls != 0 {
 		t.Errorf("push must not be called after conflict: got %d calls", wf.pushCalls)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !postCalled {
+		t.Fatal("B-1 regression: conflict was NOT reported to coord (silent data-loss)")
+	}
+	if !strings.HasSuffix(gotPath, "/projects/42/runs/3/sync-conflict") {
+		t.Errorf("reported to wrong path: %q", gotPath)
+	}
+	if rb, _ := gotBody["run_branch"].(string); rb != "run-1" {
+		t.Errorf("run_branch in report = %v, want run-1", gotBody["run_branch"])
+	}
+	if bb, _ := gotBody["base_branch"].(string); bb != "main" {
+		t.Errorf("base_branch in report = %v, want main", gotBody["base_branch"])
+	}
+	files, _ := gotBody["conflict_files"].([]interface{})
+	if len(files) != 2 {
+		t.Errorf("conflict_files = %v, want 2 entries", gotBody["conflict_files"])
 	}
 }

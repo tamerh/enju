@@ -184,6 +184,16 @@ func (s *Server) Router() http.Handler {
 		// the failure in run_status / event log so the bug is
 		// visible without tailing daemon log files.
 		r.Post("/projects/{projectID}/runs/{runSeq}/push-verify-failed", s.handleReportPushVerifyFailed)
+		// Run-completion sync conflict (bug hunt B-1). The
+		// run-branch → default-branch merge at run completion
+		// hit a content conflict — the run's output never
+		// reached the default branch. The run is already
+		// terminal; this stamps a durable runs.sync_status flag
+		// + run_sync_conflict event so the otherwise log-only
+		// data-loss surfaces on run_status / runs / the event
+		// log. Distinct from /merges/conflicts (post-submit
+		// topic→run-branch auto-merge, which spawns merge_resolve).
+		r.Post("/projects/{projectID}/runs/{runSeq}/sync-conflict", s.handleReportRunSyncConflict)
 		r.Get("/projects/{projectID}/events", s.handleShowEvents)
 
 		// Issues — project-level structured artifacts

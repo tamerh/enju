@@ -721,6 +721,15 @@ func (s *Store) initSchema() error {
 		`ALTER TABLE tasks ADD COLUMN verify_fail_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN verify_retry_cap INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN verify_fail_counted_iter INTEGER NOT NULL DEFAULT 0`,
+		// sync_status — JSON describing a run-completion sync that
+		// needs operator attention (run-branch → base merge hit a
+		// conflict; the run's output never reached the default
+		// branch). Distinct from blocked_by: NOT cleared on the
+		// terminal-completed transition, because the data-loss
+		// outlives the run. Empty = clean / not attempted. Surface
+		// readers gate on non-empty before parsing.
+		//   {"kind":"conflict","run_branch","base_branch","conflict_files","hint"}
+		`ALTER TABLE runs ADD COLUMN sync_status TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, q := range altered {
 		if _, err := s.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -934,7 +943,7 @@ func (s *Store) ListProjects() ([]ProjectRecord, error) {
 // ListRunsByProject returns all runs in a project, ordered by seq.
 func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_mode_override, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_status, sync_mode_override, created_at, updated_at
 		 FROM runs WHERE project_id = ? ORDER BY seq ASC`, projectID,
 	)
 	if err != nil {
@@ -946,7 +955,7 @@ func (s *Store) ListRunsByProject(projectID int64) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var ref, blocked sql.NullString
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.SyncModeOverride, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.SyncStatus, &r.SyncModeOverride, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Ref = ref.String
@@ -1065,8 +1074,8 @@ func (s *Store) GetRun(id int64) (*RunRecord, error) {
 	var p RunRecord
 	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_mode_override, created_at, updated_at FROM runs WHERE id = ?`, id,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_status, sync_mode_override, created_at, updated_at FROM runs WHERE id = ?`, id,
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncStatus, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1080,9 +1089,9 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 	var p RunRecord
 	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_mode_override, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_status, sync_mode_override, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND seq = ?`, projectID, seq,
-	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncStatus, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1092,7 +1101,7 @@ func (s *Store) GetRunByProjectSeq(projectID int64, seq int) (*RunRecord, error)
 }
 
 func (s *Store) ListRuns() ([]RunRecord, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_mode_override, created_at, updated_at FROM runs ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_status, sync_mode_override, created_at, updated_at FROM runs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1102,7 +1111,7 @@ func (s *Store) ListRuns() ([]RunRecord, error) {
 	for rows.Next() {
 		var p RunRecord
 		var ref, blocked sql.NullString
-		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Seq, &p.Name, &ref, &p.YAMLData, &p.RepoURL, &p.State, &p.SourcePath, &p.SourceCommitSHA, &p.Params, &p.Branch, &p.Slug, &blocked, &p.SyncStatus, &p.SyncModeOverride, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Ref = ref.String
@@ -1131,11 +1140,11 @@ func (s *Store) ActiveRunOnBranch(projectID int64, branch string) (*RunRecord, e
 	var r RunRecord
 	var ref, blocked sql.NullString
 	err := s.db.QueryRow(
-		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_mode_override, created_at, updated_at
+		`SELECT id, project_id, seq, name, ref, yaml_data, repo_url, state, source_path, source_commit_sha, params, branch, slug, blocked_by, sync_status, sync_mode_override, created_at, updated_at
 		 FROM runs WHERE project_id = ? AND branch = ? AND state IN ('active', 'waiting', 'paused')
 		 ORDER BY seq ASC LIMIT 1`,
 		projectID, branch,
-	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.SyncModeOverride, &r.CreatedAt, &r.UpdatedAt)
+	).Scan(&r.ID, &r.ProjectID, &r.Seq, &r.Name, &ref, &r.YAMLData, &r.RepoURL, &r.State, &r.SourcePath, &r.SourceCommitSHA, &r.Params, &r.Branch, &r.Slug, &blocked, &r.SyncStatus, &r.SyncModeOverride, &r.CreatedAt, &r.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

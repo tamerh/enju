@@ -479,6 +479,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case SetRunSyncStatus:
+			if err := applySetRunSyncStatus(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		default:
 			return result, fmt.Errorf("unknown mutation type: %T", mut)
 		}
@@ -2910,6 +2915,52 @@ func applyResumeRun(tx *sql.Tx, m ResumeRun, sink EventSink) error {
 		ProjectID:    projectID,
 		Metadata:     MarshalMetadata(map[string]any{"from": "paused", "to": "active"}),
 		CreatedAt:    now,
+	})
+	return nil
+}
+
+// applySetRunSyncStatus persists a run-completion sync
+// annotation and emits the run_sync_conflict event in one
+// transaction. Deliberately does NOT gate on run state: the
+// run-branch → base merge runs AFTER the run reaches
+// completed/failed, so the flag must be settable on a terminal
+// run (that's exactly the case the bug hunt's B-1 surfaces — a
+// run shows `completed 100%` while its output never reached the
+// default branch). Idempotent at the row level (a re-reported
+// conflict just rewrites the same blob); the event layer is
+// best-effort like every other emit, so a duplicate POST
+// produces a duplicate event but no state corruption.
+func applySetRunSyncStatus(tx *sql.Tx, m SetRunSyncStatus, sink EventSink) error {
+	var projectID int64
+	if err := tx.QueryRow(
+		`SELECT project_id FROM runs WHERE id = ?`, m.RunID,
+	).Scan(&projectID); err != nil {
+		return fmt.Errorf("set_run_sync_status: run %d: %w", m.RunID, err)
+	}
+	now := time.Now()
+	if _, err := tx.Exec(
+		`UPDATE runs SET sync_status = ?, updated_at = ? WHERE id = ?`,
+		m.StatusJSON, now, m.RunID,
+	); err != nil {
+		return fmt.Errorf("set_run_sync_status: update run %d: %w", m.RunID, err)
+	}
+	// Clearing the flag (empty StatusJSON) is a quiet state
+	// change — no event, the operator resolved it out of band.
+	if strings.TrimSpace(m.StatusJSON) == "" {
+		sink.SkipEvents("set_run_sync_status: cleared (no event on clear)")
+		return nil
+	}
+	meta := m.EventMetadata
+	if meta == "" {
+		meta = "{}"
+	}
+	sink.Emit(Event{
+		CitizenID: m.CitizenID,
+		EventType: "run_sync_conflict",
+		RunID:     m.RunID,
+		ProjectID: projectID,
+		Metadata:  meta,
+		CreatedAt: now,
 	})
 	return nil
 }

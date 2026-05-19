@@ -25,6 +25,14 @@ type RunStatusRun struct {
 	SourcePath      string `json:"source_path,omitempty"`
 	SourceCommitSHA string `json:"source_commit_sha,omitempty"`
 	TaskCount       int    `json:"task_count"`
+	// SyncStatus is the JSON-encoded run-completion sync
+	// annotation (store.SyncStatus). Non-empty when the
+	// run-branch → default-branch merge hit a content conflict
+	// and the run's output never reached the default branch
+	// (bug hunt B-1). Carried here so format.RunStatus can stop
+	// rendering an unqualified "completed 100%" for a run that
+	// silently lost output. Empty = clean sync.
+	SyncStatus string `json:"sync_status,omitempty"`
 }
 
 // RunStatusTask is the task-shape format.RunStatus and
@@ -92,6 +100,7 @@ func GetRunStatus(s store.CoordinatorStore, caller *store.CitizenRecord, project
 			SourcePath:      run.SourcePath,
 			SourceCommitSHA: run.SourceCommitSHA,
 			TaskCount:       len(tasks),
+			SyncStatus:      run.SyncStatus,
 		},
 		Tasks: make([]RunStatusTask, 0, len(tasks)),
 	}

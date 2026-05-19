@@ -769,6 +769,37 @@ func (s *FatClient) reportMergeConflict(ctx context.Context, projectID, runSeq i
 	}
 }
 
+// reportRunSyncConflict POSTs a run_sync_conflict report when
+// the run-COMPLETION sync (run branch → default branch) hit a
+// content conflict. Distinct from reportMergeConflict (the
+// post-submit auto-merge of an ACCEPTED topic onto the run
+// branch, which spawns a merge_resolve task): here the run is
+// already terminal and the unit of the failure is the run, so
+// the coordinator stamps a durable run-level sync_status flag +
+// run_sync_conflict event rather than spawning a task.
+//
+// Best-effort, never bubbles up — mirrors reportMerge. The
+// caller already logged an actionable ERROR with the manual
+// merge hint; this POST is the bit that makes the data-loss
+// visible on enju_run_status / enju runs / the event log
+// instead of being buried in the per-run operator log.
+func (s *FatClient) reportRunSyncConflict(ctx context.Context, projectID, runSeq int64, runBranch, baseBranch string, conflictFiles []string, hint string) {
+	body := map[string]interface{}{
+		"run_branch":     runBranch,
+		"base_branch":    baseBranch,
+		"conflict_files": conflictFiles,
+	}
+	if hint != "" {
+		body["hint"] = hint
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d/runs/%d/sync-conflict", projectID, runSeq)
+	if _, err := s.coord.Post(ctx, path, body); err != nil {
+		s.logger.Warn("reportRunSyncConflict post: sync-conflict signal not recorded on coord",
+			"project_id", projectID, "run_seq", runSeq,
+			"run_branch", runBranch, "post_error", err)
+	}
+}
+
 // reportMergeFailed POSTs a merge_failed report to the
 // coordinator for non-conflict failures of the post-submit
 // auto-merge. the brief routes these terminal-merge
@@ -931,10 +962,16 @@ func mergeWorkflowOrNil(wf *enjugit.Workflow) mergeWorkflow {
 //	merge — FF-merge run-branch into base_branch locally.
 //	push  — same as merge, then push base_branch to remote.
 //
-// Conflicts are surfaced via fat-client logs only by design — the run
-// branch is preserved for manual git merge; there is intentionally no
-// coord-side signal (enju_run_status shows the run completed normally).
-func (s *FatClient) applyRunCompletion(_ context.Context, wf mergeWorkflow, meta *TaskMeta, responseBody []byte) {
+// On a run-branch → base merge CONFLICT the run branch is
+// preserved for a manual git merge AND a run_sync_conflict is
+// reported to the coordinator (bug hunt B-1): it stamps a
+// durable runs.sync_status flag + event so enju_run_status /
+// enju runs / the event log stop reporting an unqualified
+// "completed 100%" for a run that silently lost its output to
+// the default branch. The report is best-effort (the local git
+// state is unchanged regardless); the ERROR log line remains the
+// tail-able fallback if the POST is dropped.
+func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, meta *TaskMeta, responseBody []byte) {
 	if wf == nil || meta == nil || len(responseBody) == 0 {
 		return
 	}
@@ -965,16 +1002,36 @@ func (s *FatClient) applyRunCompletion(_ context.Context, wf mergeWorkflow, meta
 	if err != nil {
 		var conflict *enjugit.ErrConflict
 		if errors.As(err, &conflict) {
-			// Run completed; the conflict is an operational git concern.
-			// The run branch is intact and base_branch is unchanged.
-			// No coord-side signal is emitted — by design for v1 (see
-			// docstring). A future contributor should not add a coord
-			// POST here without a dedicated endpoint + run state.
+			// Run completed; the conflict is an operational git
+			// concern. The run branch is intact and base_branch is
+			// unchanged — but the run's output never reached the
+			// default branch. This is bug hunt B-1: the documented
+			// parallel `branch: auto` sweep makes every sibling
+			// after the first conflict on shared output paths, and
+			// the only trace used to be this ERROR line — every
+			// coordinator surface still said "completed 100%".
+			//
+			// Report it so the coordinator stamps a durable
+			// runs.sync_status flag + run_sync_conflict event:
+			// enju_run_status / enju runs / the event log now show
+			// the lost output instead of an unqualified green
+			// checkmark. Best-effort POST (mirrors reportMerge):
+			// the local git state is unchanged either way, and the
+			// ERROR log remains the operator's tail-able fallback.
+			hint := "git checkout " + baseBranch + " && git merge " + runBranch
 			s.logger.Error("applyRunCompletion: run-branch merge conflict — resolve manually",
 				"run_branch", runBranch, "base_branch", baseBranch,
 				"conflict_files", conflict.Paths,
-				"hint", "git checkout "+baseBranch+" && git merge "+runBranch,
+				"hint", hint,
 				"project_id", meta.ProjectID, "run_seq", meta.RunSeq)
+			if meta.ProjectID > 0 && meta.RunSeq > 0 {
+				s.reportRunSyncConflict(ctx,
+					meta.ProjectID, int64(meta.RunSeq),
+					runBranch, baseBranch, conflict.Paths, hint)
+			} else {
+				s.logger.Warn("dropped run_sync_conflict report: project_id/run_seq missing from meta",
+					"run_branch", runBranch, "conflict_files", conflict.Paths)
+			}
 			return
 		}
 		s.logger.Warn("applyRunCompletion: merge failed",

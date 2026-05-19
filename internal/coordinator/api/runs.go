@@ -567,6 +567,55 @@ func (s *Server) handleReportPushVerifyFailed(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// reportRunSyncConflictRequest is the body shape for
+// POST /projects/{p}/runs/{r}/sync-conflict. The fat-client
+// posts this when its run-completion sync (run branch → default
+// branch) hit a content conflict, so the run's output never
+// reached the default branch. The run itself already reached a
+// terminal state; this makes the otherwise-invisible data-loss
+// visible on coordinator surfaces (bug hunt B-1).
+type reportRunSyncConflictRequest struct {
+	RunBranch     string   `json:"run_branch"`
+	BaseBranch    string   `json:"base_branch"`
+	ConflictFiles []string `json:"conflict_files"`
+	Hint          string   `json:"hint,omitempty"`
+}
+
+// handleReportRunSyncConflict — endpoint. Stamps
+// runs.sync_status + emits run_sync_conflict so the lost output
+// stops being invisible on every coordinator surface. See
+// service.ReportRunSyncConflict for the design rationale.
+func (s *Server) handleReportRunSyncConflict(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	runSeq, _ := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	var req reportRunSyncConflictRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	caller := citizenFromRequest(r)
+	resp, err := service.ReportRunSyncConflict(s.store, caller, projectID, runSeq, service.ReportRunSyncConflictParams{
+		RunBranch:     req.RunBranch,
+		BaseBranch:    req.BaseBranch,
+		ConflictFiles: req.ConflictFiles,
+		Hint:          req.Hint,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidArgument):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrNotMember):
+			writeError(w, http.StatusForbidden, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleReportMerge — endpoint. Emits branch_merged with
 // topic + run_branch + merge_sha. Body-of-truth in service.
 func (s *Server) handleReportMerge(w http.ResponseWriter, r *http.Request) {
@@ -646,6 +695,15 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.SourceCommitSHA != "" {
 		resp["source_commit_sha"] = p.SourceCommitSHA
+	}
+	// Run-completion sync conflict (B-1). Surfaced on the single-
+	// run GET (unlike blocked_by, which is a WAITING-only list
+	// concern) because the data-loss outlives the run: a
+	// `completed` run can still have lost its output to a merge
+	// conflict, and this is the endpoint enju dag / the webui /
+	// `enju runs --json` round-trip through. Empty = clean sync.
+	if p.SyncStatus != "" {
+		resp["sync_status"] = p.SyncStatus
 	}
 	// Opt-in only: the full source YAML is a few KB and the run
 	// page polls this endpoint for live state, so it stays out of

@@ -214,6 +214,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutTerminateRun:
 		var m TerminateRun
 		return m, json.Unmarshal(data, &m)
+	case MutSetRunSyncStatus:
+		var m SetRunSyncStatus
+		return m, json.Unmarshal(data, &m)
 	case MutCreateIssue:
 		var m CreateIssue
 		return m, json.Unmarshal(data, &m)
@@ -296,6 +299,13 @@ const (
 	MutResumeRun    MutationKind = "resume_run"
 	MutTerminateRun MutationKind = "terminate_run"
 
+	// MutSetRunSyncStatus persists a run-completion sync-conflict
+	// annotation on the run row AND emits the run_sync_conflict
+	// event. Unlike the WAITING-gated blocked_by, sync_status
+	// survives the terminal-completed state so the lost-output
+	// signal doesn't vanish the moment the run finishes.
+	MutSetRunSyncStatus MutationKind = "set_run_sync_status"
+
 	MutCreateIssue         MutationKind = "create_issue"
 	MutTriageIssue         MutationKind = "triage_issue"
 	MutMarkIssueInProgress MutationKind = "mark_issue_in_progress"
@@ -358,6 +368,7 @@ var AllMutationKinds = []MutationKind{
 	MutPauseRun,
 	MutResumeRun,
 	MutTerminateRun,
+	MutSetRunSyncStatus,
 	MutCreateIssue,
 	MutTriageIssue,
 	MutMarkIssueInProgress,
@@ -771,6 +782,38 @@ type TerminateRun struct {
 }
 
 func (TerminateRun) mutationKind() MutationKind { return MutTerminateRun }
+
+// SetRunSyncStatus stamps a run-completion sync annotation onto
+// runs.sync_status and emits one run_sync_conflict event. The
+// fat-client's run-branch → base merge can fail by content
+// conflict at run-completion time (overwhelmingly common in the
+// documented parallel `branch: auto` sweep, where the
+// first-finisher advances base and every sibling then conflicts
+// on shared output paths). Before this, the only trace was an
+// ERROR line in the per-run operator log — every coordinator
+// surface still said "completed 100%". This mutation makes the
+// run carry a durable needs-attention flag (read by
+// enju_run_status / enju runs / wire.Run) plus an event the
+// timeline shows.
+//
+// StatusJSON is the marshaled sync-status blob (shape:
+// {"kind":"conflict","run_branch","base_branch","conflict_files",
+// "hint"}). Empty StatusJSON clears the flag (a future
+// resolve-sync path). RunID is the global run id; CitizenID
+// attributes the reporting fat-client. The event metadata
+// duplicates the structured fields so the audit log is
+// self-contained without a runs-table join.
+type SetRunSyncStatus struct {
+	RunID      int64
+	CitizenID  int64
+	StatusJSON string
+	// EventMetadata is the pre-marshaled metadata blob for the
+	// emitted run_sync_conflict event. Built by the service
+	// layer so the store stays free of sync-shape knowledge.
+	EventMetadata string
+}
+
+func (SetRunSyncStatus) mutationKind() MutationKind { return MutSetRunSyncStatus }
 
 // CreateIssue inserts a new issue. Returns the new issue's
 // (id, seq) via ApplyResult.IssueID and ApplyResult.IssueSeq.

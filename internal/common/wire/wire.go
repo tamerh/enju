@@ -92,6 +92,15 @@ type Run struct {
 	// Surface readers (enju_run_status renderer) check
 	// state==waiting before parsing.
 	BlockedBy string `json:"blocked_by,omitempty"`
+	// SyncStatus is the JSON-encoded run-completion sync
+	// annotation (see store.SyncStatus + ParseSyncStatus). Set
+	// when the run-branch → default-branch merge hit a content
+	// conflict, so the run's output never reached the default
+	// branch. UNLIKE BlockedBy this is NOT gated on a run state
+	// — a `completed` run can still carry it (that's exactly the
+	// silent-data-loss the flag exists to surface). Empty for a
+	// clean sync / mode:none / older coordinators.
+	SyncStatus string `json:"sync_status,omitempty"`
 	// YAML is the raw source recipe (pre-param-substitution)
 	// the run was created from. Opt-in only: the coordinator
 	// returns it solely on GET .../runs/{seq}?include=yaml, so
