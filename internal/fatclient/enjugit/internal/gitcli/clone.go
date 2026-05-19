@@ -207,6 +207,65 @@ func (c *Clone) HeadCommitTime() time.Time {
 	return time.Unix(secs, 0)
 }
 
+// Project-lock contention cadence. acquireFileLock NEVER proceeds
+// without the flock (fail-open would let two processes mutate one
+// git repo concurrently), so a held lock is waited out — but the
+// wait is now observable rather than the old silent forever-block.
+const (
+	lockContentionRetryDelay    = 100 * time.Millisecond
+	lockContentionReLogInterval = 15 * time.Second
+)
+
+// acquireFileLock takes the cross-process project flock, or no-ops
+// when cross-process locking is disabled (lockPath==""; test
+// fixtures). It is the safety boundary for "one writer per git
+// repo across processes": it must not return until it holds the
+// lock.
+//
+// Previously this was `_ = c.fileLock.Lock()` — a blocking acquire
+// with the error discarded and no diagnostic. A lingering stale
+// process holding the flock (a wedged daemon/mcp that didn't exit)
+// turned every other process's first git op into an INVISIBLE,
+// unbounded, uninterruptible hang: no log, no timeout, not even
+// ctx-cancellable (the agent-lifecycle bug seen as prisma run #4 —
+// a fresh daemon "started, then never claimed for 9+ min"). This
+// keeps the exact safety (still waits as long as it takes; never
+// fail-open) but makes the wait LOUD: a WARN naming the lock path
+// the moment contention is detected, re-logged periodically with
+// the elapsed wait, and a close-out line on acquisition. The
+// operator now sees "blocked on the project lock held by another
+// enju process" and can kill the stale holder, instead of staring
+// at a silent process.
+func (c *Clone) acquireFileLock() {
+	if c.fileLock == nil {
+		return
+	}
+	if ok, err := c.fileLock.TryLock(); ok && err == nil {
+		return
+	}
+	start := time.Now()
+	c.logger.Warn("blocked acquiring project lock; another enju process holds it — waiting (kill the stale daemon/mcp if this persists)",
+		"lock_path", c.fileLock.Path())
+	lastLog := start
+	for {
+		ok, err := c.fileLock.TryLock()
+		if ok && err == nil {
+			c.logger.Warn("project lock acquired after contention",
+				"lock_path", c.fileLock.Path(),
+				"waited", time.Since(start).Round(time.Second).String())
+			return
+		}
+		if time.Since(lastLog) >= lockContentionReLogInterval {
+			c.logger.Warn("still blocked acquiring project lock",
+				"lock_path", c.fileLock.Path(),
+				"waited", time.Since(start).Round(time.Second).String(),
+				"try_err", err)
+			lastLog = time.Now()
+		}
+		time.Sleep(lockContentionRetryDelay)
+	}
+}
+
 // lock acquires both mu and (when configured) the flock. No-op
 // when the calling goroutine already holds the lock (reentrant
 // fast path). Returns a function the caller must call to release.
@@ -217,9 +276,7 @@ func (c *Clone) lock() func() {
 		return func() {}
 	}
 	c.mu.Lock()
-	if c.fileLock != nil {
-		_ = c.fileLock.Lock()
-	}
+	c.acquireFileLock()
 	c.holder.Store(me)
 	return func() {
 		c.holder.Store(0)
@@ -242,9 +299,7 @@ func (c *Clone) WithLock(fn func(Ops) error) error {
 		return fn(c)
 	}
 	c.mu.Lock()
-	if c.fileLock != nil {
-		_ = c.fileLock.Lock()
-	}
+	c.acquireFileLock()
 	c.holder.Store(me)
 	defer func() {
 		c.holder.Store(0)

@@ -199,6 +199,39 @@ wait
 	}
 }
 
+// TestNewSupervisor_GracefulTimeoutEnvOverride pins the
+// agent-lifecycle knob: an operator can lengthen the
+// shutdown-grace window (so a daemon stopped mid-handler has more
+// room to wind down) via ENJU_AGENT_GRACEFUL_TIMEOUT, mirroring
+// ENJU_AUTO_AGENTS_TIMEOUT. HOME is redirected to a temp dir so
+// NewSupervisor's home-dir resolution + stale-PID prune don't
+// touch the real ~/.enju.
+func TestNewSupervisor_GracefulTimeoutEnvOverride(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ENJU_AGENT_GRACEFUL_TIMEOUT", "12s")
+	s, err := NewSupervisor()
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	if s.GracefulTimeout != 12*time.Second {
+		t.Fatalf("ENJU_AGENT_GRACEFUL_TIMEOUT ignored: GracefulTimeout=%v, want 12s", s.GracefulTimeout)
+	}
+}
+
+// TestNewSupervisor_GracefulTimeoutDefault pins the unchanged
+// default when the env knob is unset / unparseable.
+func TestNewSupervisor_GracefulTimeoutDefault(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ENJU_AGENT_GRACEFUL_TIMEOUT", "") // explicitly unset
+	s, err := NewSupervisor()
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	if s.GracefulTimeout != 5*time.Second {
+		t.Fatalf("default GracefulTimeout=%v, want 5s", s.GracefulTimeout)
+	}
+}
+
 func TestSupervisor_StopUnknownBot(t *testing.T) {
 	bin := writeFakeBinary(t, "")
 	s := newTestSupervisor(t, bin)

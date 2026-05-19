@@ -1014,6 +1014,21 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 		// payload. Tracked as a follow-up to P4b.
 	})
 	if err != nil {
+		// Distinguish an operator-initiated shutdown from a real
+		// handler crash. enju_agent_stop / supervisor teardown
+		// cancels the daemon ctx, which SIGKILLs the in-flight
+		// handler subprocess (exec.CommandContext) — discarding
+		// minutes of compute/LLM work. That is NOT a task failure;
+		// the deferred ReleaseActiveClaim returns the task cleanly
+		// for the next daemon. Pre-fix this surfaced only a generic
+		// "handler: <err>", indistinguishable in the log/audit from
+		// a handler that genuinely broke ("no trace" of the abort).
+		// Emit a distinct, identifiable signal instead.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			d.logger.Warn("handler aborted by agent shutdown; in-flight work discarded, releasing claim",
+				"task_id", taskID, "handler_err", err.Error(), "ctx_err", ctxErr)
+			return fmt.Errorf("handler aborted by agent shutdown: %w", ctxErr)
+		}
 		return fmt.Errorf("handler: %w", err)
 	}
 

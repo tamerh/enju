@@ -168,6 +168,22 @@ type botProcess struct {
 // manually by the operator) but leaving stale PID files around
 // would mislead external diagnostic tools that read the
 // directory. Best-effort: errors are logged, not fatal.
+// gracefulTimeoutFromEnv resolves the shutdown-grace window. The
+// default (5s) is plenty for a daemon BETWEEN iterations to wind
+// down; an operator who wants a daemon stopped MID-handler to have
+// more room before the hard SIGKILL (e.g. to let an in-flight
+// compute/LLM call reach a checkpoint) can lengthen it via
+// ENJU_AGENT_GRACEFUL_TIMEOUT. Mirrors ENJU_AUTO_AGENTS_TIMEOUT.
+// Unset / unparseable / non-positive → the 5s default.
+func gracefulTimeoutFromEnv() time.Duration {
+	if v := os.Getenv("ENJU_AGENT_GRACEFUL_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Second
+}
+
 func NewSupervisor() (*Supervisor, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -181,7 +197,7 @@ func NewSupervisor() (*Supervisor, error) {
 		EnjuExec:        exe,
 		PIDDir:          filepath.Join(home, ".enju", "agents", "pids"),
 		LogDir:          filepath.Join(home, ".enju", "agents", "logs"),
-		GracefulTimeout: 5 * time.Second,
+		GracefulTimeout: gracefulTimeoutFromEnv(),
 		Logger:          slog.Default(),
 		procs:           make(map[string]*botProcess),
 	}

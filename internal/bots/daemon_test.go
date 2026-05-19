@@ -1343,6 +1343,50 @@ func TestDaemon_ReleaseActiveClaim_OnShutdown(t *testing.T) {
 	}
 }
 
+// TestDaemon_HandlerAbortedByShutdown_DistinctSignal reproduces the
+// run #3 gap: a daemon stopped mid-handler (enju_agent_stop /
+// supervisor teardown cancels the daemon ctx → the in-flight LLM
+// handler is SIGKILL'd) surfaced only a generic "handler: <err>"
+// that is indistinguishable, in the log/audit, from a real handler
+// crash — minutes of LLM work discarded "with no trace". The claim
+// release already worked (TestDaemon_ReleaseActiveClaim_OnShutdown);
+// the missing piece is a DISTINCT, identifiable signal.
+func TestDaemon_HandlerAbortedByShutdown_DistinctSignal(t *testing.T) {
+	fc := newFCWithTask("bot1", "review", "")
+	hang := &hangingHandler{entered: make(chan struct{}), released: make(chan struct{})}
+	d, _ := New(Config{FC: fc, Handler: hang, Bot: scenarioBot(), ProjectID: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var runErr error
+	go func() {
+		_, runErr = d.RunOnce(ctx)
+		close(hang.released)
+	}()
+
+	select {
+	case <-hang.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never entered")
+	}
+	cancel() // simulate agent-stop / supervisor teardown mid-handler
+	select {
+	case <-hang.released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon didn't return after cancel")
+	}
+
+	if runErr == nil {
+		t.Fatal("expected an error from the shutdown-aborted handler")
+	}
+	if !strings.Contains(runErr.Error(), "aborted by agent shutdown") {
+		t.Fatalf("a shutdown-aborted handler must surface a DISTINCT signal "+
+			"(not a generic handler crash), got: %v", runErr)
+	}
+	if len(fc.releases) != 1 {
+		t.Errorf("claim must still be released cleanly on shutdown-abort, got %d", len(fc.releases))
+	}
+}
+
 func TestDaemon_RunOnce_SubmitFailureSurfacesAsError(t *testing.T) {
 	fc := newFCWithTask("bot1", "answer", "")
 	fc.submitErr = "coord rejected: bad commit"
