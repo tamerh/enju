@@ -6,6 +6,8 @@
 /enju
 /enju-coord
 mytmpwork/
+todo.txt
+.claude/
 
 # Database (SQLite + WAL-mode sidecars). go test occasionally
 # spawns these in the repo root via stray store.New(":memory:")
@@ -51,3 +53,4 @@ package.json
 .enju/runs/*/snapshot/
 .enju/scratch/
 # END enju-untracked
+

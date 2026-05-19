@@ -362,123 +362,6 @@ cmd_lint() {
     cmd_check_chokepoint
 }
 
-# ---------------------------------------------------------------
-# Dev workflow: restart coordinator with wiped state.
-# ---------------------------------------------------------------
-
-# Build and restart coordinator. Preserves DB + workspaces by
-# default — pass --wipe to clean state for a fresh-install dev
-# loop. Credentials at ~/.enju/credentials.json are NEVER
-# wiped (re-registering would invalidate the MCP client).
-#
-# Usage: ./build.sh dev-restart [PORT] [--wipe]
-cmd_dev_restart() {
-    local port="8333"
-    local wipe=false
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --wipe) wipe=true ;;
-            *)      port="$1" ;;
-        esac
-        shift
-    done
-
-    cmd_build
-    echo "==> Stopping existing enju coordinator..."
-    # Targeted pattern — only matches the renamed coord binary,
-    # never matches bots/ui/fat-client mcp processes.
-    pkill -f "enju-coord serve" 2>/dev/null || true
-    sleep 1
-
-    if $wipe; then
-        echo "==> --wipe: clearing DB + events DB + git-dir + workspaces + notify state (keeping credentials)..."
-        rm -f ~/.enju/enju.db ~/.enju/enju.db-wal ~/.enju/enju.db-shm
-        rm -f ~/.enju/enju-events.db ~/.enju/enju-events.db-wal ~/.enju/enju-events.db-shm
-        # Live notify state is project-scoped (under each clone's
-        # enju/events/) and goes with the workspaces wipe below.
-        # Defensively clean any legacy ~/.enju/notify-* files left
-        # behind from pre-redesign installs — once cleared, notify
-        # never recreates them.
-        rm -f ~/.enju/notify-state-*.json ~/.enju/notify-active.json ~/.enju/notify.yaml
-        rm -rf ~/.enju/git-dir ~/.enju/workspaces
-    else
-        echo "==> Preserving DB + workspaces (pass --wipe for fresh state)"
-    fi
-
-    # Capture stdout+stderr to a known log file so panics, stack
-    # traces, and slog output survive a crash. Without this the
-    # backgrounded `&` sends output to the controlling tty, which
-    # is lost the moment the shell scrolls or exits — leaving
-    # "coordinator suddenly crashed" un-diagnosable. Rotate by
-    # truncate (>) so each restart starts a clean log; previous
-    # crash output, if any, is preserved at $log.prev.
-    # Log lives next to the dev DB at ~/.enju/ — same dir the
-    # --wipe target uses, so coord state and coord logs stay
-    # collocated. Pre-2026-05 the log lived in the repo root; the
-    # move was so the project tree stays clean and tail-friends
-    # always know where to look regardless of the operator's cwd.
-    mkdir -p ~/.enju
-    local log="$HOME/.enju/enju-coord.log"
-    if [ -f "$log" ]; then
-        mv "$log" "${log}.prev"
-    fi
-    echo "==> Starting coordinator on port $port (logs: $log, prior run: ${log}.prev)..."
-    # setsid puts the coord in its own session and process
-    # group, fully detached from the controlling terminal.
-    # This is the only thing that actually protects against
-    # SIGTERM from a parent process (terminal emulator
-    # closing a tab, IDE reloading its terminal panel, etc.).
-    # nohup only blocks SIGHUP, not SIGTERM. disown only
-    # hides the job from bash. Without setsid, anything that
-    # fires "kill all my children" reaches the coord too.
-    # < /dev/null severs stdin so the coord doesn't block
-    # waiting for terminal input or get EOF on tty hangup.
-    setsid nohup ./enju-coord serve --port "$port" >"$log" 2>&1 < /dev/null &
-    local pid=$!
-    disown "$pid" 2>/dev/null || true
-    echo "==> Coordinator running on :$port (PID $pid)"
-    echo "==> Tail with: tail -f $log"
-
-    # Kill-source tracer. bpftrace at the kernel level captures
-    # every signal sent to the coord PID with sender PID + comm
-    # + parent PID. Filters out SIGURG (sig 23 — Go runtime
-    # goroutine preemption noise, dozens per second) so the log
-    # stays readable.
-    #
-    # Requires NOPASSWD sudoers entry for bpftrace:
-    #   tamer ALL=(ALL) NOPASSWD: /usr/bin/bpftrace
-    # When that's not configured (or sudo cache is cold), the
-    # `sudo -n true` precheck skips the tracer silently — coord
-    # still starts fine.
-    # Sibling log of enju-coord.log; same rationale for living
-    # under ~/.enju/ rather than the repo root.
-    local sig_log="$HOME/.enju/enju-coord-signals.log"
-    if [ -f "$sig_log" ]; then
-        mv "$sig_log" "${sig_log}.prev"
-    fi
-    # Probe sudo with bpftrace itself, not `true` — the NOPASSWD
-    # sudoers entry whitelists bpftrace specifically, so `sudo -n
-    # true` would fail (no NOPASSWD for /usr/bin/true) even when
-    # `sudo -n bpftrace` works fine.
-    if command -v bpftrace >/dev/null 2>&1 && sudo -n bpftrace --version >/dev/null 2>&1; then
-        # nohup runs as tamer (no sudo needed for nohup itself);
-        # nohup then invokes sudo bpftrace, which IS whitelisted.
-        # Reverse order (sudo nohup) would try to run nohup under
-        # sudo and fail — NOPASSWD whitelist names bpftrace, not
-        # every shell utility we wrap it in.
-        nohup sudo bpftrace -e "
-          tracepoint:signal:signal_generate /args->pid == $pid && args->sig != 23/ {
-            time(\"%H:%M:%S \");
-            printf(\"sig=%d to coord from pid=%d (%s) ppid=%d\\n\",
-              args->sig, pid, comm, curtask->real_parent->tgid);
-          }
-        " >"$sig_log" 2>&1 < /dev/null &
-        disown $! 2>/dev/null || true
-        echo "==> Kill-source tracer running (logs: $sig_log)"
-    else
-        echo "==> Kill-source tracer NOT running (no NOPASSWD sudoers for bpftrace)"
-    fi
-}
 
 # ---------------------------------------------------------------
 # Help / dispatch
@@ -510,12 +393,6 @@ Release:
                      → GitHub release. Requires 'gh' authenticated.
                      Example: ./build.sh release v1.0.0-alpha
 
-Dev workflow:
-  dev-restart [PORT] [--wipe]
-                     Build + restart coordinator (default port 8333).
-                     Preserves DB + workspaces by default. Pass --wipe
-                     to clear state (credentials always preserved).
-
   help               Show this message.
 EOF
 }
@@ -534,7 +411,6 @@ case "$cmd" in
     check-chokepoint) cmd_check_chokepoint "$@" ;;
     lint)             cmd_lint "$@" ;;
     release)          cmd_release "$@" ;;
-    dev-restart)      cmd_dev_restart "$@" ;;
     help|-h|--help)   cmd_help ;;
     *)
         echo "unknown command: $cmd" >&2
