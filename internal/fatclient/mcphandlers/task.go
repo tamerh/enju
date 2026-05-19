@@ -277,7 +277,27 @@ func formatExecuteOutcome(out *service.ExecuteOutcome) string {
 	case "async_started":
 		return formatAsyncKickoff(out.TaskID, out.Script, out.Async)
 	case "failed":
-		b.WriteString(fmt.Sprintf("✗ Script failed (exit %d, %s)\n", out.ExitCode, elapsed))
+		// Two sub-cases share Status="failed": a script that
+		// exited non-zero, and a wrapper-level abort (exit 0 but
+		// the contract/runtime failed — required writes not
+		// produced, container runtime missing, reads-
+		// materialization error). The header must not claim
+		// "Script failed (exit 0)" for the latter — the script
+		// didn't fail, the wrapper aborted before/around it.
+		if out.ExitCode != 0 {
+			b.WriteString(fmt.Sprintf("✗ Script failed (exit %d, %s)\n", out.ExitCode, elapsed))
+		} else {
+			b.WriteString(fmt.Sprintf("✗ Compute task aborted (%s)\n", elapsed))
+		}
+		// ErrorMessage carries the actionable reason in BOTH
+		// sub-cases (the friendly "docker missing — install …"
+		// message, or "required writes_artifacts not produced:
+		// [...]"). Surfacing it is load-bearing: without it a
+		// wrapper-abort rendered as a bare "✗ … (exit 0, 0s)"
+		// with no hint why — the exact cryptic-failure trap.
+		if out.ErrorMessage != "" {
+			b.WriteString(fmt.Sprintf("  Reason: %s\n", out.ErrorMessage))
+		}
 		if out.Stderr != "" {
 			b.WriteString(fmt.Sprintf("  stderr: %s\n", out.Stderr))
 		}
@@ -287,7 +307,9 @@ func formatExecuteOutcome(out *service.ExecuteOutcome) string {
 		if out.ScratchDir != "" {
 			b.WriteString(fmt.Sprintf("  Scratch (preserved for inspection, auto-cleaned after ~24h): %s\n", out.ScratchDir))
 		}
-		b.WriteString(fmt.Sprintf("  Task %s failed — downstream tasks blocked.\n", out.TaskID))
+		// Recoverable: the coordinator parked it failed_retryable
+		// (claim closed, descendants PENDING) — not stranded.
+		b.WriteString(fmt.Sprintf("  Task %s parked failed_retryable — fix the cause, then enju_retry_task. Downstream stays PENDING (not skipped).\n", out.TaskID))
 	case "git_failed":
 		// Distinct from "failed" so the user knows the script
 		// itself ran fine — the failure is at the git layer

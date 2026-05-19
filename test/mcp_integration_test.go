@@ -7827,16 +7827,35 @@ tasks:
 	res := h.call(t, "enju_execute_task", map[string]any{
 		"task_id": h.taskID("needs_docker"),
 	})
-	if !res.IsError {
-		t.Fatalf("expected tool error when docker missing, got success:\n%s", mcpText(res))
-	}
+
+	// Behavior change (bughunt A1): a wrapper-level abort —
+	// container runtime missing, exit 0, res.Error set — used to
+	// `return nil, err` WITHOUT posting /fail. The friendly message
+	// reached this caller, but the COORDINATOR task was left
+	// stranded in RUNNING with the claim held: never
+	// failed_retryable, enju_retry_task refused it, and the reaper
+	// re-ran it forever. The old test only checked the message and
+	// never caught the strand. Now it must (a) still surface the
+	// actionable diagnostic AND (b) leave the task recoverable.
 	msg := mcpText(res)
 	for _, want := range []string{"docker", "install", "container", "alpine:3.19"} {
 		if !strings.Contains(msg, want) {
-			t.Errorf("error should mention %q, got:\n%s", want, msg)
+			t.Errorf("response must still surface the actionable diagnostic %q, got:\n%s", want, msg)
 		}
 	}
+	// It is a failure surface, not a silent success — and not the
+	// misleading "Script failed (exit 0)" (the script never ran).
+	if !strings.Contains(msg, "✗") || !strings.Contains(msg, "Reason:") {
+		t.Errorf("missing-docker must render as a clearly-flagged abort with a Reason; got:\n%s", msg)
+	}
 
+	// The A1 fix proper: the task is now parked failed_retryable
+	// (claim closed, descendants PENDING) — recoverable via
+	// enju_retry_task — NOT stranded in running.
+	td := h.taskGet("needs_docker")
+	if state, _ := td["state"].(string); state != "failed_retryable" {
+		t.Fatalf("missing-docker wrapper abort must park failed_retryable (recoverable), not strand; got state=%q\n%s", state, msg)
+	}
 }
 
 // requireApptainer skips the test unless apptainer is on PATH

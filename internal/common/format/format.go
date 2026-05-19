@@ -1994,6 +1994,13 @@ func RenderTemplateSummary(tasks []map[string]interface{}) string {
 
 		// Build status description.
 		parked := info.byState["parked"]
+		// failed_retryable is NON-terminal (recoverable via
+		// enju_retry_task) so it never enters the allTerminal
+		// branch — without an explicit bucket below it contributes
+		// to info.total but to no status part, rendering a blank /
+		// short row that hides a run blocked on a recoverable
+		// failure. Surfaced prominently as needs-attention.
+		failedRetryable := info.byState["failed_retryable"]
 
 		var statusParts []string
 		switch {
@@ -2023,6 +2030,14 @@ func RenderTemplateSummary(tasks []map[string]interface{}) string {
 				statusParts = append(statusParts, fmt.Sprintf("%d 🔴 failed", failed))
 			}
 		default:
+			// Lead with recoverable failures — a run sitting on a
+			// failed_retryable task is blocked until the operator
+			// runs enju_retry_task (or fixes + fresh run). ↻ marks
+			// "needs attention, recoverable" — distinct from 🔴
+			// terminal failed.
+			if failedRetryable > 0 {
+				statusParts = append(statusParts, fmt.Sprintf("%d ↻ failed_retryable (enju_retry_task)", failedRetryable))
+			}
 			if n := info.byState["claimed"] + info.byState["running"]; n > 0 {
 				statusParts = append(statusParts, fmt.Sprintf("%d in progress", n))
 			}
@@ -2343,6 +2358,11 @@ func RenderMermaidBody(runData []byte, tasksData []byte) string {
 	b.WriteString("    classDef ready fill:#fff3cd,stroke:#ffc107,color:#000\n")
 	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
 	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
+	// Recoverable failure — amber + dashed stroke: visually
+	// distinct from terminal `failed` (solid red) and `ready`
+	// (yellow). Signals "needs operator action, but the run is
+	// not dead" (enju_retry_task).
+	b.WriteString("    classDef retryable fill:#ffe5cc,stroke:#fd7e14,stroke-dasharray:3 2,color:#000\n")
 	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
 	b.WriteString("    classDef parked fill:#e7e3f4,stroke:#6f42c1,stroke-dasharray:2 2,color:#000\n")
 	return b.String()
@@ -2511,6 +2531,11 @@ func MermaidStateClass(state string) string {
 		return "pending"
 	case "failed":
 		return "failed"
+	case "failed_retryable":
+		// Distinct class from terminal "failed": recoverable,
+		// needs operator action (enju_retry_task). Without this it
+		// returned "" → no :::class → unstyled node + "?" glyph.
+		return "retryable"
 	case "skipped":
 		return "skipped"
 	case "parked":
@@ -3527,6 +3552,13 @@ func StateIconFor(state, skipReason string) string {
 		// WILL come back — either restored to its prior state
 		// on matching re-accept, or deleted on non-match.
 		return "⏸"
+	case "failed_retryable":
+		// ↻ — recoverable failure, needs operator action
+		// (enju_retry_task). Deliberately NOT 🔴: distinct from a
+		// terminal/decisive failure so the operator sees "this is
+		// recoverable" at a glance. Matches the run_status text
+		// bucket and the lifecycle doc's ↻.
+		return "↻"
 	default:
 		return "?"
 	}

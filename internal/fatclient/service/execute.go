@@ -80,6 +80,99 @@ func ResolvedMode(meta *TaskMeta) string {
 	return enjuYaml.ResolvedModeFields(meta.Action, meta.Mode, meta.Executor)
 }
 
+// computeClassification is the post-compute.Run decision. Outcome
+// nil means "script succeeded — caller continues to commit/report".
+// A non-nil Outcome is returned from ExecuteComputeTask as-is;
+// PostFail (only with a "failed" Outcome) tells the caller to POST
+// /tasks/{id}/fail kind=compute_error first so the coordinator
+// parks the task failed_retryable.
+type computeClassification struct {
+	Outcome  *ExecuteOutcome
+	PostFail bool
+	Reason   string
+}
+
+// classifyComputeResult is the post-compute.Run truth table,
+// extracted as a pure function (cf. failTaskOwnershipOK) so each
+// arm is unit-pinned independent of the live workspace +
+// coordinator. The arms, in order:
+//
+//  1. git_failed — script exited 0 but the post-script git op
+//     failed (commit/push exhausted, "object not found" on a fresh
+//     remote). Distinct recovery: the work product is on disk, fix
+//     the git state, don't re-run. Checked FIRST so it is not
+//     shadowed by (2); it formerly sat after an `if res.Error != ""
+//     { return }` early-out, which both made the HasPrefix fallback
+//     dead code AND stranded the wrapper-abort case (see (2)).
+//  2. failed — script exited non-zero, OR a wrapper-level abort
+//     (required writes_artifacts not produced, undeclared-path
+//     rejection, work_dir / reads-materialization error,
+//     spec/script-not-found) which sets res.Error with ExitCode==0.
+//     BOTH are recoverable and BOTH must POST /fail
+//     kind=compute_error (PostFail=true) so the task parks
+//     failed_retryable and enju_retry_task can recover it. The
+//     res.Error!="" half previously returned a raw error WITHOUT
+//     the POST → task stuck RUNNING, claim held, retry refused,
+//     reaper re-ran it forever (the bughunt A1 livelock). Unifying
+//     it with the verified-correct ExitCode!=0 path removes the
+//     asymmetry.
+//  3. success — Outcome nil; caller falls through to commit/report.
+func classifyComputeResult(res compute.Result, taskID, script, branch, scratchDir string) computeClassification {
+	gitErrMsg := res.GitError
+	if gitErrMsg == "" && res.Error != "" && strings.HasPrefix(res.Error, compute.GitSubmitFailedPrefix) {
+		gitErrMsg = res.Error
+	}
+	if gitErrMsg != "" {
+		return computeClassification{Outcome: &ExecuteOutcome{
+			TaskID:        taskID,
+			Script:        script,
+			Status:        "git_failed",
+			ElapsedMS:     res.ElapsedMS,
+			ContentLen:    len(res.Content),
+			ScriptLogPath: res.ScriptLogPath,
+			ErrorMessage:  gitErrMsg,
+			Branch:        branch,
+		}}
+	}
+
+	if res.ExitCode != 0 || res.Error != "" {
+		stderr := compute.StderrTail(res.Stderr, 1000)
+		var reason string
+		if res.ExitCode != 0 {
+			// Tail, not head: the error is at the bottom of stderr.
+			reason = fmt.Sprintf("script %s exited with code %d", script, res.ExitCode)
+			if stderr != "" {
+				reason += ": " + stderr
+			}
+		} else {
+			// Wrapper-level abort, script exit 0 (e.g.
+			// "required writes_artifacts not produced: [...]").
+			reason = res.Error
+		}
+		return computeClassification{
+			Outcome: &ExecuteOutcome{
+				TaskID:        taskID,
+				Script:        script,
+				Status:        "failed",
+				ExitCode:      res.ExitCode,
+				ElapsedMS:     res.ElapsedMS,
+				ScriptLogPath: res.ScriptLogPath,
+				// Scratch is preserved on failure (the wrapper only
+				// wipes on a clean run) — surface it so the operator
+				// knows where to look instead of flying blind.
+				ScratchDir:   scratchDir,
+				ErrorMessage: reason,
+				Stderr:       stderr,
+				Branch:       branch,
+			},
+			PostFail: true,
+			Reason:   reason,
+		}
+	}
+
+	return computeClassification{} // success — caller continues
+}
+
 // ExecuteComputeTask runs one action:compute task end-to-end:
 // reconcile → claim (if needed) → script execution → result
 // report.
@@ -349,64 +442,30 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// in-process Mutex rather than falling through to the
 	// slower cross-process flock.
 	res := compute.Run(ctx, wf, spec, env, s.logger)
-	if res.Error != "" {
-		return nil, fmt.Errorf("%s", res.Error)
-	}
 
-	// Script ran fine but the post-script git operation failed
-	// (commit/push retry exhausted, "object not found" on a
-	// freshly-added remote, etc.). Surface as Status="git_failed"
-	// so batch callers route to a distinct stop_reason instead
-	// of conflating with script-failed — the work product is
-	// still on disk in spec.ResultDir; recovery is fix-the-git-
-	// state, not re-run-the-script.
-	gitErrMsg := res.GitError
-	if gitErrMsg == "" && res.Error != "" && strings.HasPrefix(res.Error, compute.GitSubmitFailedPrefix) {
-		gitErrMsg = res.Error
-	}
-	if gitErrMsg != "" {
-		return &ExecuteOutcome{
-			TaskID:        taskID,
-			Script:        meta.Script,
-			Status:        "git_failed",
-			ElapsedMS:     res.ElapsedMS,
-			ContentLen:    len(res.Content),
-			ScriptLogPath: res.ScriptLogPath,
-			ErrorMessage:  gitErrMsg,
-			Branch:        meta.Branch,
-		}, nil
-	}
-
-	if res.ExitCode != 0 {
-		// Tail, not head: the error is at the bottom of stderr.
-		stderr := compute.StderrTail(res.Stderr, 1000)
-		reason := fmt.Sprintf("script %s exited with code %d", meta.Script, res.ExitCode)
-		if stderr != "" {
-			reason += ": " + stderr
+	// Post-run classification is a three-way truth table
+	// (git_failed / failed / continue-to-success) extracted as a
+	// pure function so every arm is unit-pinned independent of the
+	// live workspace + coordinator. A missing arm here is exactly
+	// how the wrapper-abort livelock shipped: the old inline code
+	// returned a raw error on res.Error!="" *before* the /fail POST,
+	// so a script that exited 0 but didn't produce its declared
+	// writes stranded the task in RUNNING (claim held, never
+	// failed_retryable, enju_retry_task refused it, reaper re-ran
+	// it forever).
+	if cls := classifyComputeResult(res, taskID, meta.Script, meta.Branch, taskScratchDir); cls.Outcome != nil {
+		if cls.PostFail {
+			// Recoverable compute failure (script non-zero exit OR
+			// wrapper-level abort). POST kind=compute_error so the
+			// coordinator parks it failed_retryable (run stays
+			// alive, descendants PENDING) — operator fixes +
+			// enju_retry_task.
+			s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
+				"reason": cls.Reason,
+				"kind":   "compute_error",
+			})
 		}
-		s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/fail", map[string]string{
-			"reason": reason,
-			// Recoverable: script exited non-zero. Park as
-			// failed_retryable (run stays alive) rather than the
-			// terminal fail cascade — operator fixes + retries.
-			"kind": "compute_error",
-		})
-		return &ExecuteOutcome{
-			TaskID:        taskID,
-			Script:        meta.Script,
-			Status:        "failed",
-			ExitCode:      res.ExitCode,
-			ElapsedMS:     res.ElapsedMS,
-			ScriptLogPath: res.ScriptLogPath,
-			// Scratch is now preserved on script failure (the
-			// wrapper only wipes on a clean run) — surface it so
-			// the operator knows where to look instead of flying
-			// blind.
-			ScratchDir:   taskScratchDir,
-			ErrorMessage: reason,
-			Stderr:       stderr,
-			Branch:       meta.Branch,
-		}, nil
+		return cls.Outcome, nil
 	}
 
 	// Exit 0 → wrapper committed + pushed. Report the landed
