@@ -117,7 +117,7 @@ func TestPrepareLLMClaimCWD_IterBranchRefAbsent_FallsBackToRunBranch(t *testing.
 	runBranch := "main"
 
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
-		11, "dev-bot2", "11:1:summarize", 1, iterBranch, runBranch, "")
+		11, "dev-bot2", "11:1:summarize", 1, iterBranch, runBranch, "", nil)
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD with absent iter branch ref: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestPrepareLLMClaimCWD_StaleIterBranch_NotDescendingFromBase_Rejected(t *te
 
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
 		12, "reviewer-agent", "12:1:review_summary", 1,
-		"1-test/review_summary/iter-1", "main", baseSHA)
+		"1-test/review_summary/iter-1", "main", baseSHA, nil)
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD: %v", err)
 	}
@@ -275,6 +275,109 @@ func TestPrepareLLMClaimCWD_StaleIterBranch_NotDescendingFromBase_Rejected(t *te
 	}
 	if _, err := os.Stat(filepath.Join(path, "stale-marker.md")); err == nil {
 		t.Errorf("stale-marker.md present in CWD %q — stale prior-run iter tree leaked in", path)
+	}
+}
+
+// TestPrepareLLMClaimCWD_DeclaredRead_BoundToProducingCommit is the
+// reproduction of the cross-run isolation defect: a tracked output
+// path committed by a PRIOR run sits in the bulk-materialize source
+// (a local run-branch ref that lags the upstream's merge, or the
+// create-time frozen snapshot). THIS run's upstream re-produces the
+// same path with different content on its own commit. The downstream
+// consumer's declared `reads:` must materialize the producing
+// commit's bytes in its claim CWD — never the prior run's stale
+// bytes the bulk tree carries. (Observed live: prisma run #3's
+// screener read run #2's 99 nanopore records instead of run #3
+// deduplicate's 120 FMT records.)
+func TestPrepareLLMClaimCWD_DeclaredRead_BoundToProducingCommit(t *testing.T) {
+	wf, fc := prepareCWDFixture(t, 14)
+	wd := wf.WorkDir()
+
+	const staleNanopore = "{\"id\":1,\"src\":\"nanopore\"}\n" // run N (99 records, abbreviated)
+	const freshFMT = "{\"id\":1,\"src\":\"FMT-rCDI\"}\n"      // run N+1 (120 records, abbreviated)
+	const readPath = "data/unique_records.jsonl"
+
+	// Run N residue: the tracked output committed on the shared
+	// branch by a prior run. This is exactly what MaterializeRunRepo
+	// copies into the claim CWD (the run-branch local ref still
+	// points here — the lag — and the frozen snapshot froze it too).
+	gitT(t, wd, "checkout", "-B", "main")
+	writeRepoFile(t, wd, "enju.yaml", "name: test\nversion: 1\n")
+	writeRepoFile(t, wd, readPath, staleNanopore)
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "run N: nanopore dedup output")
+	baseSHA := gitT(t, wd, "rev-parse", "HEAD")
+
+	// Run N+1's upstream `deduplicate` re-produces the same tracked
+	// path with different content on its own commit. This SHA is
+	// what the coordinator's artifact index records as the producing
+	// commit for the downstream's declared read.
+	gitT(t, wd, "checkout", "-b", "1-test/deduplicate/iter-1")
+	writeRepoFile(t, wd, readPath, freshFMT)
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "run N+1: FMT dedup output")
+	producingSHA := gitT(t, wd, "rev-parse", "HEAD")
+	// Local run-branch ref stays at the stale base — the lag that
+	// makes the bulk-tree copy serve run N's bytes.
+	gitT(t, wd, "checkout", "main")
+
+	// Downstream consumer (the screener) claims in run N+1. Its
+	// declared read resolves — via the artifact index, threaded into
+	// the claim — to deduplicate's producing commit.
+	path, err := fc.PrepareLLMClaimCWD(context.Background(),
+		14, "screener-agent", "14:3:screen_abstracts", 1,
+		"1-test/screen_abstracts/iter-1", "main", baseSHA,
+		[]enjugit.ArtifactRef{{Path: readPath, CommitSHA: producingSHA}})
+	if err != nil {
+		t.Fatalf("PrepareLLMClaimCWD: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected materialized CWD path, got empty")
+	}
+
+	got, rerr := os.ReadFile(filepath.Join(path, filepath.FromSlash(readPath)))
+	if rerr != nil {
+		t.Fatalf("declared read %q not in claim CWD %q: %v", readPath, path, rerr)
+	}
+	if string(got) != freshFMT {
+		t.Fatalf("ISOLATION BUG: declared read in claim CWD = the PRIOR run's bytes, "+
+			"not this run's producing commit.\n got=%q\n want=%q", got, freshFMT)
+	}
+	if strings.Contains(string(got), "nanopore") {
+		t.Fatalf("cross-run leak: claim CWD declared read still carries the prior run's content (%q)", got)
+	}
+}
+
+// TestPrepareLLMClaimCWD_UntrackedRead_KeepsBulkTreeCopy pins the
+// non-regression: a declared read with NO producing commit (empty
+// SHA — untracked big-data referenced in place, or not-yet-produced)
+// must be left as the bulk-tree copy, not blown away. The overlay
+// only rebinds reads that actually have a run-scoped producing
+// commit.
+func TestPrepareLLMClaimCWD_UntrackedRead_KeepsBulkTreeCopy(t *testing.T) {
+	wf, fc := prepareCWDFixture(t, 15)
+	wd := wf.WorkDir()
+
+	gitT(t, wd, "checkout", "-B", "main")
+	writeRepoFile(t, wd, "enju.yaml", "name: test\nversion: 1\n")
+	writeRepoFile(t, wd, "data/local.csv", "from-bulk-tree\n")
+	gitT(t, wd, "add", "-A")
+	gitT(t, wd, "commit", "-m", "base")
+	baseSHA := gitT(t, wd, "rev-parse", "HEAD")
+
+	path, err := fc.PrepareLLMClaimCWD(context.Background(),
+		15, "agent", "15:1:consume", 1,
+		"1-test/consume/iter-1", "main", baseSHA,
+		[]enjugit.ArtifactRef{{Path: "data/local.csv", CommitSHA: ""}})
+	if err != nil {
+		t.Fatalf("PrepareLLMClaimCWD: %v", err)
+	}
+	got, rerr := os.ReadFile(filepath.Join(path, "data/local.csv"))
+	if rerr != nil {
+		t.Fatalf("untracked declared read should remain from the bulk tree: %v", rerr)
+	}
+	if string(got) != "from-bulk-tree\n" {
+		t.Errorf("untracked read (empty producing SHA) must keep the bulk-tree copy, got %q", got)
 	}
 }
 
@@ -304,7 +407,7 @@ func TestPrepareLLMClaimCWD_GenuineInRunIterBranch_Used(t *testing.T) {
 
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
 		13, "dev-agent", "13:1:summarize", 2,
-		"1-test/summarize/iter-1", "main", baseSHA)
+		"1-test/summarize/iter-1", "main", baseSHA, nil)
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD: %v", err)
 	}

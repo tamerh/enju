@@ -40,6 +40,7 @@ import (
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/common/wire"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
@@ -112,7 +113,7 @@ type fatClient interface {
 	// lazily at submit time). Returns "" only when neither
 	// branch is materializable — caller falls back to the
 	// persistent worktree path.
-	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string) (string, error)
+	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error)
 
 	// CleanupLLMClaimCWD applies the success/fail lifecycle to
 	// the ephemeral CWD per Phase 5's pattern: rm on success,
@@ -955,7 +956,15 @@ func (d *Daemon) processAndSubmit(ctx context.Context, taskID string, claim *ser
 	var claimCWD string
 	if optOut, ok := d.handler.(ClaimCWDOptOut); !ok || !optOut.SkipClaimCWD() {
 		var cwdErr error
-		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch, meta.Branch, meta.RunBaseSHA)
+		// declaredReads carries each declared reads_artifacts path
+		// with its producing-task commit SHA (from the artifact
+		// index, threaded through the resolved claim inputs). The
+		// CWD prep overlays these from their producing commits so a
+		// stale bulk-materialized tree (a lagging local run-branch
+		// ref, or the create-time frozen snapshot) can't shadow a
+		// declared input with a prior run's bytes.
+		declaredReads := extractArtifactReads(claim.Inputs)
+		claimCWD, cwdErr = d.fc.PrepareLLMClaimCWD(ctx, meta.ProjectID, d.fc.Username(), taskID, meta.IterSeq, meta.IterationBranch, meta.Branch, meta.RunBaseSHA, declaredReads)
 		if cwdErr != nil {
 			d.logger.Warn("prepare LLM claim CWD failed (handler will run with empty cwd)",
 				"task_id", taskID, "error", cwdErr)
@@ -1231,6 +1240,40 @@ func extractResolvedPrompt(inputs []byte) string {
 		return s
 	}
 	return ""
+}
+
+// extractArtifactReads pulls the declared reads_artifacts and their
+// producing-task commit SHAs out of the claim inputs JSON. Present
+// in both inputs shapes — the fat-client resolved payload and the
+// raw coordinator descriptor — as `artifact_reads: [{path,
+// commit_sha}]`. Used to rebind on-disk declared reads in the claim
+// CWD to the producing commit (run-scoped provenance) so a stale
+// bulk-materialized tree can't shadow them. Empty/malformed → nil
+// (CWD prep then just uses the bulk tree, the pre-fix behavior).
+func extractArtifactReads(inputs []byte) []enjugit.ArtifactRef {
+	if len(inputs) == 0 {
+		return nil
+	}
+	var m struct {
+		ArtifactReads []struct {
+			Path      string `json:"path"`
+			CommitSHA string `json:"commit_sha"`
+		} `json:"artifact_reads"`
+	}
+	if err := json.Unmarshal(inputs, &m); err != nil {
+		return nil
+	}
+	if len(m.ArtifactReads) == 0 {
+		return nil
+	}
+	out := make([]enjugit.ArtifactRef, 0, len(m.ArtifactReads))
+	for _, a := range m.ArtifactReads {
+		if a.Path == "" {
+			continue
+		}
+		out = append(out, enjugit.ArtifactRef{Path: a.Path, CommitSHA: a.CommitSHA})
+	}
+	return out
 }
 
 // parseReviewResponse extracts the verdict + rationale from a

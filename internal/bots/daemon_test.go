@@ -13,6 +13,7 @@ import (
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/common/wire"
+	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
@@ -79,6 +80,10 @@ type fakeFC struct {
 	// on disk.
 	llmClaimCWDPath string
 	llmClaimCWDErr  error
+	// llmClaimCWDReads captures the declaredReads the daemon
+	// threaded into PrepareLLMClaimCWD (the artifact-index
+	// producing-commit binding for the task's reads:).
+	llmClaimCWDReads []enjugit.ArtifactRef
 
 	// projectGitDir is returned from ProjectGitDir. Optional;
 	// default "" means the handler env-var $ENJU_GIT_DIR is
@@ -211,7 +216,10 @@ func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int6
 func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
 	return "", nil
 }
-func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string) (string, error) {
+func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error) {
+	f.mu.Lock()
+	f.llmClaimCWDReads = declaredReads
+	f.mu.Unlock()
 	return f.llmClaimCWDPath, f.llmClaimCWDErr
 }
 func (f *fakeFC) ProjectGitDir(ctx context.Context, projectID int64) (string, error) {
@@ -1628,5 +1636,44 @@ func TestDaemon_Iter2_ChecksOutTopicWipesAndPrependsFeedback(t *testing.T) {
 	if !strings.Contains(in.Prompt, "Implement the foo module.") {
 		t.Errorf("prompt missing original task brief:\n%s", in.Prompt)
 	}
+}
+
+// TestExtractArtifactReads covers the daemon's half of the
+// reads-binding wiring: pulling each declared read + its producing
+// commit SHA out of the claim inputs so PrepareLLMClaimCWD can
+// rebind on-disk inputs to the producing commit. Both inputs shapes
+// (fat-client resolved payload, raw coordinator descriptor) carry
+// the same `artifact_reads: [{path, commit_sha}]` key.
+func TestExtractArtifactReads(t *testing.T) {
+	t.Run("resolved+descriptor shape", func(t *testing.T) {
+		in := []byte(`{"resolved_prompt":"hi","artifact_reads":[` +
+			`{"path":"data/unique_records.jsonl","commit_sha":"48a24d0"},` +
+			`{"path":"models/m.bin","commit_sha":""}]}`)
+		got := extractArtifactReads(in)
+		if len(got) != 2 {
+			t.Fatalf("got %d reads, want 2: %+v", len(got), got)
+		}
+		if got[0].Path != "data/unique_records.jsonl" || got[0].CommitSHA != "48a24d0" {
+			t.Errorf("read[0] = %+v, want the producing commit binding", got[0])
+		}
+		// Empty SHA (untracked / not-yet-produced) is preserved so
+		// the overlay can deliberately skip it (keeps bulk-tree copy).
+		if got[1].Path != "models/m.bin" || got[1].CommitSHA != "" {
+			t.Errorf("read[1] = %+v, want path kept with empty SHA", got[1])
+		}
+	})
+	t.Run("entry with empty path skipped", func(t *testing.T) {
+		got := extractArtifactReads([]byte(`{"artifact_reads":[{"path":"","commit_sha":"x"},{"path":"a.txt","commit_sha":"y"}]}`))
+		if len(got) != 1 || got[0].Path != "a.txt" {
+			t.Errorf("got %+v, want only the named-path entry", got)
+		}
+	})
+	t.Run("absent / empty / malformed → nil", func(t *testing.T) {
+		for _, in := range [][]byte{nil, {}, []byte(`{"resolved_prompt":"x"}`), []byte(`not json`), []byte(`{"artifact_reads":[]}`)} {
+			if got := extractArtifactReads(in); got != nil {
+				t.Errorf("input %q: got %+v, want nil (CWD prep then uses the bulk tree)", in, got)
+			}
+		}
+	})
 }
 

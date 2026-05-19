@@ -119,3 +119,69 @@ func (w *Workflow) MaterializeRunRepo(branch, targetDir string) (int, error) {
 	return count, nil
 }
 
+// OverlayDeclaredReads rebinds a task's declared `reads:` inputs
+// in an already-materialized claim CWD to the *upstream producing
+// task's commit* — the run-scoped provenance the artifact index
+// records and the prompt resolver already trusts.
+//
+// Why this is required on top of MaterializeRunRepo: that function
+// bulk-copies a whole branch tree from a *local ref* (iter/run).
+// A local ref can lag the upstream's just-merged commit, and the
+// create-time snapshot is frozen at the run's base SHA — so a
+// tracked output path that an upstream task RE-produced this run
+// (e.g. `data/unique_records.jsonl`) can still hold a PRIOR run's
+// committed bytes in the bulk-copied tree. An agent that reads
+// that declared input from disk would then process another run's
+// data. Overlaying each declared read from its producing commit
+// SHA makes the on-disk inputs deterministic and run-scoped,
+// exactly matching what the inlined-prompt path already does — the
+// stale tree/snapshot can no longer shadow declared reads.
+//
+// Per-read contract:
+//   - Empty CommitSHA → skipped. Untracked artifacts (track:false:
+//     large data referenced in place, never in git) and
+//     not-yet-produced reads carry no producing commit; the
+//     bulk-tree copy / param path is correct for them.
+//   - A non-empty CommitSHA whose blob can't be read at that
+//     commit is logged and skipped (mirrors the resolver's
+//     missing-artifact behavior). It is NOT a hard error: failing
+//     CWD prep here would drop the caller back to the persistent
+//     worktree, which is even staler. The common path — the
+//     upstream committed+merged and this clone pulled it — writes
+//     the authoritative bytes.
+//
+// targetDir must already exist (MaterializeRunRepo created it).
+// Returns the number of reads actually overlaid.
+func (w *Workflow) OverlayDeclaredReads(targetDir string, reads []ArtifactRef) (int, error) {
+	if targetDir == "" {
+		return 0, fmt.Errorf("enjugit: OverlayDeclaredReads: targetDir required")
+	}
+	overlaid := 0
+	for _, ref := range reads {
+		if ref.Path == "" || ref.CommitSHA == "" {
+			continue
+		}
+		repoPath := ArtifactPath(ref.Path)
+		content, ok, err := w.git.ReadFileAtCommit(ref.CommitSHA, repoPath)
+		if err != nil || !ok {
+			if w.logger != nil {
+				w.logger.Warn("enjugit: OverlayDeclaredReads: declared read not readable at its producing commit; leaving bulk-tree copy",
+					"path", ref.Path, "commit", shortSHA(ref.CommitSHA), "found", ok, "error", err)
+			}
+			continue
+		}
+		full := filepath.Join(targetDir, filepath.FromSlash(repoPath))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return overlaid, fmt.Errorf("enjugit: OverlayDeclaredReads: mkdir for %s: %w", ref.Path, err)
+		}
+		// Remove first so a chmod-readonly survivor from the bulk
+		// pass can't reject the rebinding write.
+		_ = os.Remove(full)
+		if err := os.WriteFile(full, content, 0o644); err != nil {
+			return overlaid, fmt.Errorf("enjugit: OverlayDeclaredReads: write %s: %w", ref.Path, err)
+		}
+		overlaid++
+	}
+	return overlaid, nil
+}
+

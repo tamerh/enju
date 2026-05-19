@@ -702,6 +702,19 @@ func (s *FatClient) FetchAndResolveLocally(ctx context.Context, meta *TaskMeta) 
 	if len(resolved.MissingArtifacts) > 0 {
 		out["missing_artifacts"] = resolved.MissingArtifacts
 	}
+	// Surface each declared read with its producing-task commit SHA
+	// (the artifact-index provenance the prompt was just resolved
+	// against). The daemon uses these to rebind the on-disk declared
+	// reads in the claim CWD to the producing commit, so a stale
+	// bulk-materialized tree can't shadow them. Same key + shape the
+	// raw coordinator descriptor uses, so the daemon parses one form.
+	if len(input.ArtifactReads) > 0 {
+		ar := make([]map[string]string, 0, len(input.ArtifactReads))
+		for _, a := range input.ArtifactReads {
+			ar = append(ar, map[string]string{"path": a.Path, "commit_sha": a.CommitSHA})
+		}
+		out["artifact_reads"] = ar
+	}
 
 	// Review-task surfacing: when the caller is claiming an
 	// action:review task, show the reviewed target's content

@@ -301,7 +301,14 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 
 // PrepareLLMClaimCWD creates the per-claim ephemeral working
 // directory for an LLM task's handler invocation and
-// materializes the iter-branch tip's whole tree into it.
+// materializes the iter-branch tip's whole tree into it, then
+// rebinds the task's declared reads_artifacts to their producing
+// commits (declaredReads, each {path, producing commit SHA} as
+// recorded by the artifact index). The whole-tree pass keeps a
+// project-shaped CWD so existing relative-path prompts work; the
+// overlay guarantees declared inputs are the run's own producing
+// output, never a stale tree's prior-run bytes. declaredReads nil
+// is the pre-overlay behavior (bulk tree only).
 //
 // Path shape: <wsRoot>/scratch/<botUsername>/<taskID>-iter-<N>/
 // (the same path compute scratch already uses, so the unified
@@ -356,7 +363,7 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 // git object missing). Callers log + fall back to the
 // persistent worktree to keep workflows progressing under
 // transient i/o trouble.
-func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string) (string, error) {
+func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error) {
 	if s.enjugit == nil || botUsername == "" || taskID == "" {
 		return "", nil
 	}
@@ -453,6 +460,23 @@ func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, bot
 	// (writes are file-by-file).
 	if _, merr := wf.MaterializeRunRepo(materializeFrom, path); merr != nil {
 		return "", fmt.Errorf("materialize claim CWD from %q: %w", materializeFrom, merr)
+	}
+	// Rebind declared reads to their producing commits. The bulk
+	// tree above comes from a LOCAL branch ref (or, for handlers
+	// that read $ENJU_REPO_DIR, the create-time frozen snapshot) —
+	// both can lag the upstream's just-merged output, so a tracked
+	// path an upstream RE-produced this run can still hold a PRIOR
+	// run's bytes in that tree. Overlaying each declared read from
+	// the producing commit the artifact index recorded makes the
+	// on-disk inputs deterministic + run-scoped, exactly matching
+	// the inlined-prompt path. Best-effort: a failure leaves the
+	// (possibly stale) bulk copy rather than dropping the whole CWD
+	// back to the persistent worktree, which is staler still.
+	if len(declaredReads) > 0 {
+		if n, oerr := wf.OverlayDeclaredReads(path, declaredReads); oerr != nil {
+			s.logger.Warn("overlay declared reads onto claim CWD failed; declared inputs may reflect a stale tree",
+				"task_id", taskID, "overlaid", n, "error", oerr)
+		}
 	}
 	return path, nil
 }
