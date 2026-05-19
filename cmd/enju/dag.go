@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // cmdDag renders a run's DAG. Three output formats:
@@ -39,7 +40,13 @@ func cmdDag(args []string) {
 	format := fs.String("format", "default",
 		"Output format: default, mermaid, or json. mermaid emits raw flowchart TD; see the default-mode output for render hints (mermaid.live / mmdc / GitHub).")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
-	fs.Parse(args)
+	// Go's flag package stops parsing at the first non-flag arg,
+	// so `enju dag 15 --format json` (the command's own
+	// documented positional-first syntax) would leave --format at
+	// its default and fail NArg. Hoist flags ahead of positionals
+	// before Parse so flag order doesn't matter — the documented
+	// invocation just works (bug hunt B-6).
+	fs.Parse(hoistFlagsBeforePositionals(args))
 
 	if fs.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "usage: enju dag <run-seq> [--project N] [--format mermaid|json]")
@@ -96,4 +103,54 @@ func cmdDag(args []string) {
 		fmt.Fprintf(os.Stderr, "dag: unknown --format %q (use default, mermaid, or json)\n", *format)
 		os.Exit(2)
 	}
+}
+
+// hoistFlagsBeforePositionals reorders argv so every flag (and
+// the value it consumes) precedes every positional, leaving the
+// relative order within each group intact. This makes Go's
+// stop-at-first-positional flag parser accept the documented
+// positional-first invocation `enju dag <seq> --format json`
+// (bug hunt B-6) — without it, any flag after the run-seq is
+// silently dropped and the command exits 2 on its own usage
+// string.
+//
+// Value-vs-bool: dag's flags (--project, --format, --coordinator)
+// all take a value, so a bare `--format` consumes the next token.
+// The list is kept here (not derived from the FlagSet) so the
+// rule is obvious at the call site and this helper stays a pure
+// arg-slice transform with no flag-package coupling — important
+// because cmd/enju/main.go's own arg handling is owned by another
+// concern; this stays a local, dag-scoped reorder.
+//
+// `--` ends flag processing per convention: everything after it
+// is treated as a positional verbatim (so a literal arg that
+// looks like a flag still works).
+func hoistFlagsBeforePositionals(args []string) []string {
+	valueFlags := map[string]bool{
+		"-project": true, "--project": true,
+		"-format": true, "--format": true,
+		"-coordinator": true, "--coordinator": true,
+	}
+	var flagsPart, posPart []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			// End of flags by convention: everything after is a
+			// positional, verbatim.
+			posPart = append(posPart, args[i+1:]...)
+			break
+		}
+		if len(a) > 1 && a[0] == '-' {
+			flagsPart = append(flagsPart, a)
+			// `--flag=value` is self-contained. A bare
+			// value-taking flag consumes the following token.
+			if !strings.Contains(a, "=") && valueFlags[a] && i+1 < len(args) {
+				flagsPart = append(flagsPart, args[i+1])
+				i++
+			}
+			continue
+		}
+		posPart = append(posPart, a)
+	}
+	return append(flagsPart, posPart...)
 }
