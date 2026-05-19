@@ -102,9 +102,11 @@ func validate(p *Run) ([]string, error) {
 	}
 	computeWarnings := validateComputeDependsDeclared(p)
 	contentRefWarnings := validateComputeContentRefs(p)
+	collectsWarnings := validateCollectsConsumed(p)
 	warnings := append(paramWarnings, reviewWarnings...)
 	warnings = append(warnings, computeWarnings...)
 	warnings = append(warnings, contentRefWarnings...)
+	warnings = append(warnings, collectsWarnings...)
 	return warnings, nil
 }
 
@@ -317,6 +319,81 @@ func validateComputeContentRefs(p *Run) []string {
 					strings.Join(paths, ", "),
 					paths[0]))
 			}
+		}
+	}
+	return warnings
+}
+
+// validateCollectsConsumed flags an aggregator (`collects: T`)
+// whose collected fan-in is never consumed anywhere — no
+// `{{T.<field>}}` / `{{T[*]}}` template ref and no `reads:` of a
+// path T writes. Such a task does pointless fan-in waiting and
+// surfaces zero content: a footgun the other (hard-error)
+// collects rules don't catch because the wiring is structurally
+// valid, just useless. Non-fatal hint (escalated by -strict),
+// mirroring the compute-content lint's shape.
+//
+// Conservative by construction — a single reference of ANY kind
+// to T (any field, any index, or an artifact read of T's writes)
+// suppresses it, so a correctly-wired aggregator never warns. The
+// collects-target-exists / target-is-fanned hard errors run
+// before warnings, so T is a real, fanned task here.
+func validateCollectsConsumed(p *Run) []string {
+	var warnings []string
+	for _, agg := range p.Tasks {
+		target := agg.Aggregates
+		if target == "" {
+			continue
+		}
+		// {{target.<field>}} / {{target[...]}} / {{target}} in any
+		// prompt-shaped string the resolver touches. No whitespace
+		// tolerance — matches the resolver, same as contentRefPattern.
+		refRE := regexp.MustCompile(`\{\{` + regexp.QuoteMeta(target) + `(\.|\[|\}\})`)
+		// Artifact-read consumption: any task that reads a path
+		// the target declares it writes is consuming the fan-in.
+		var targetWrites []string
+		for _, t := range p.Tasks {
+			if t.ID == target {
+				targetWrites = t.WritesArtifacts.Paths()
+				break
+			}
+		}
+		consumed := false
+		for _, t := range p.Tasks {
+			for _, text := range []string{t.Prompt, t.UserPrompt} {
+				if text != "" && refRE.MatchString(text) {
+					consumed = true
+					break
+				}
+			}
+			if consumed {
+				break
+			}
+			if len(targetWrites) > 0 {
+				for _, r := range t.ReadsArtifacts {
+					for _, w := range targetWrites {
+						if r == w {
+							consumed = true
+							break
+						}
+					}
+					if consumed {
+						break
+					}
+				}
+			}
+			if consumed {
+				break
+			}
+		}
+		if !consumed {
+			warnings = append(warnings, fmt.Sprintf(
+				"task %q: collects %q but nothing references the collected fan-in "+
+					"(no {{%s.content}} / {{%s.<field>}} / {{%s[*]}} template ref, "+
+					"no reads: of a path %q writes) — the aggregator waits on the "+
+					"full fan-out and yields zero content. Reference it (e.g. "+
+					"{{%s.content}} in this task's prompt) or drop the collects:.",
+				agg.ID, target, target, target, target, target, target))
 		}
 	}
 	return warnings
