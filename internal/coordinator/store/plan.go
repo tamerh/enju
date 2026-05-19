@@ -259,6 +259,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutIncrementVerifyFailCount:
 		var m IncrementVerifyFailCount
 		return m, json.Unmarshal(data, &m)
+	case MutSetProjectArchived:
+		var m SetProjectArchived
+		return m, json.Unmarshal(data, &m)
 	}
 	return nil, fmt.Errorf("unknown mutation kind %q", kind)
 }
@@ -330,6 +333,12 @@ const (
 	// cap the ReportCitizenVerifyFail / reaper path also issues the
 	// failed_retryable park composition.
 	MutIncrementVerifyFailCount MutationKind = "increment_verify_fail_count"
+
+	// Reversible project archive. One mutation drives both archive
+	// and restore (Archived bool); the EmitEvent rides the same
+	// Plan so the audit signal is a property of the write, not of
+	// caller memory.
+	MutSetProjectArchived MutationKind = "set_project_archived"
 )
 
 // AllMutationKinds enumerates every supported MutationKind.
@@ -383,6 +392,7 @@ var AllMutationKinds = []MutationKind{
 	MutRevokeAllCitizenTokens,
 	MutSetAutoTriageTemplate,
 	MutIncrementVerifyFailCount,
+	MutSetProjectArchived,
 }
 
 // --- Concrete mutation types ---
@@ -972,4 +982,23 @@ type IncrementVerifyFailCount struct {
 
 func (IncrementVerifyFailCount) mutationKind() MutationKind {
 	return MutIncrementVerifyFailCount
+}
+
+// SetProjectArchived is the single write path for reversible
+// project archive/restore.
+// Archived=true archives (stamps ArchivedAt=now / ArchivedBy=By);
+// Archived=false restores (flips the flag off but DELIBERATELY
+// keeps archived_at/archived_by as last-archive provenance). The
+// caller (service.ArchiveProject/RestoreProject) only issues this
+// when the state actually transitions, so applySetProjectArchived
+// can unconditionally emit the project_archived/project_restored
+// event (no duplicate-event gating needed inside apply).
+type SetProjectArchived struct {
+	ProjectID int64
+	Archived  bool
+	By        string // citizen ID performing the change
+}
+
+func (SetProjectArchived) mutationKind() MutationKind {
+	return MutSetProjectArchived
 }

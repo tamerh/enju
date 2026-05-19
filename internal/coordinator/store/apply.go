@@ -356,6 +356,11 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 				return result, err
 			}
 
+		case SetProjectArchived:
+			if err := applySetProjectArchived(tx, m, sink); err != nil {
+				return result, err
+			}
+
 		case AddProjectMember:
 			if err := applyAddProjectMember(tx, m, sink); err != nil {
 				return result, err
@@ -1210,9 +1215,10 @@ func applySetClaim(tx *sql.Tx, m SetClaim, sink EventSink) error {
 // the reaper / release / daemon-sweep paths would otherwise put a
 // dead run's task back in front of a project-scoped daemon.
 func runStateTerminal(s string) bool {
-	switch RunState(s) {
-	case RunCompleted, RunFailed, RunTerminated:
-		return true
+	for _, ts := range TerminalRunStates {
+		if RunState(s) == ts {
+			return true
+		}
 	}
 	return false
 }
@@ -2372,6 +2378,57 @@ func applySetProjectDefaultBranch(tx *sql.Tx, m SetProjectDefaultBranch, sink Ev
 		ProjectID:    m.ProjectID,
 		Metadata:     MarshalMetadata(map[string]any{"default_branch": branch}),
 		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+// applySetProjectArchived is the single write path for reversible
+// project archive/restore. One mutation, one UPDATE, one event —
+// all in the caller's Plan/tx so the audit signal can't be
+// forgotten. Archive stamps archived_at/by; restore flips the flag
+// off but KEEPS archived_at/by as last-archive provenance (a
+// future irreversible-purge tombstone will want them). The service
+// layer only issues this on a real state transition, so the event
+// can emit unconditionally here (no duplicate-event gating needed).
+func applySetProjectArchived(tx *sql.Tx, m SetProjectArchived, sink EventSink) error {
+	now := time.Now()
+	var name string
+	// Name for the audit metadata; also confirms the row exists
+	// (service already checked, but this is the tx-consistent read).
+	if err := tx.QueryRow(`SELECT name FROM projects WHERE id = ?`, m.ProjectID).Scan(&name); err != nil {
+		return err
+	}
+	if m.Archived {
+		if _, err := tx.Exec(
+			`UPDATE projects SET archived = 1, archived_at = ?, archived_by = ?, updated_at = ? WHERE id = ?`,
+			now, m.By, now, m.ProjectID,
+		); err != nil {
+			return err
+		}
+	} else {
+		// Restore: only the flag flips. archived_at/archived_by are
+		// intentionally left as the last-archive record.
+		if _, err := tx.Exec(
+			`UPDATE projects SET archived = 0, updated_at = ? WHERE id = ?`,
+			now, m.ProjectID,
+		); err != nil {
+			return err
+		}
+	}
+	evt := "project_restored"
+	if m.Archived {
+		evt = "project_archived"
+	}
+	sink.Emit(Event{
+		EventType: evt,
+		ProjectID: m.ProjectID,
+		Metadata: MarshalMetadata(map[string]any{
+			"project_id": m.ProjectID,
+			"name":       name,
+			"by":         m.By,
+			"at":         now.Format(time.RFC3339),
+		}),
+		CreatedAt: now,
 	})
 	return nil
 }

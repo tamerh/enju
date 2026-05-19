@@ -145,6 +145,10 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleMyDashboard(ctx, req)
 	case "enju_list_projects":
 		return t.c.handleListProjects(ctx, req)
+	case "enju_archive_project":
+		return t.c.handleArchiveProject(ctx, req)
+	case "enju_restore_project":
+		return t.c.handleRestoreProject(ctx, req)
 	case "enju_update_profile":
 		return t.c.handleUpdateProfile(ctx, req)
 	case "enju_project_remote_status":

@@ -44,6 +44,103 @@ func SetProjectDefaultBranch(s store.CoordinatorStore, caller *store.CitizenReco
 	}, nil
 }
 
+// ArchiveProjectResponse is the wire shape for
+// enju_archive_project / enju_restore_project. Status is
+// "archived" | "restored" | "already_archived" |
+// "already_restored" so the caller can tell a real transition
+// from an idempotent no-op.
+type ArchiveProjectResponse struct {
+	ProjectID int64  `json:"project_id"`
+	Name      string `json:"name"`
+	Archived  bool   `json:"archived"`
+	Status    string `json:"status"`
+}
+
+// ArchiveProject hides a project from enju_list_projects' default
+// view. Reversible (RestoreProject). Owner-gated. Fail-closed on
+// non-terminal runs — it composes with enju_terminate_run rather
+// than tearing runs down itself. Idempotent.
+func ArchiveProject(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64) (*ArchiveProjectResponse, error) {
+	return setProjectArchived(s, caller, projectID, true)
+}
+
+// RestoreProject un-hides an archived project. Owner-gated, no
+// precondition (it only un-hides), idempotent.
+func RestoreProject(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64) (*ArchiveProjectResponse, error) {
+	return setProjectArchived(s, caller, projectID, false)
+}
+
+func setProjectArchived(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, archived bool) (*ArchiveProjectResponse, error) {
+	// Unknown project → ErrNotFound, checked before the owner gate
+	// (can't own a project that doesn't exist).
+	p, err := s.GetProject(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, fmt.Errorf("%w: project %d not found", ErrNotFound, projectID)
+	}
+	if err := requireOwner(s, projectID, caller.ID); err != nil {
+		return nil, err
+	}
+
+	// Archive precondition, fail-closed: a project with live runs
+	// can't be archived. Restore has none (it only un-hides; the
+	// runs were never touched).
+	if archived {
+		n, err := s.CountNonTerminalRunsByProject(projectID)
+		if err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			return nil, fmt.Errorf(
+				"%w: project %d has %d non-terminal run(s); terminate or finish them first",
+				ErrInvalidArgument, projectID, n)
+		}
+	}
+
+	// Idempotent. Already in the requested state → no-op success:
+	// no Plan, so no mutation and (correctly) no duplicate event.
+	if p.Archived == archived {
+		return &ArchiveProjectResponse{
+			ProjectID: projectID, Name: p.Name, Archived: archived,
+			Status: archiveStatus(archived, true),
+		}, nil
+	}
+
+	// Single write path: the one mutation + its EmitEvent ride the
+	// same Plan through ApplyPlan.
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetProjectArchived{
+				ProjectID: projectID,
+				Archived:  archived,
+				By:        fmt.Sprintf("%d", caller.ID),
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return &ArchiveProjectResponse{
+		ProjectID: projectID, Name: p.Name, Archived: archived,
+		Status: archiveStatus(archived, false),
+	}, nil
+}
+
+func archiveStatus(archived, noop bool) string {
+	switch {
+	case archived && noop:
+		return "already_archived"
+	case archived:
+		return "archived"
+	case noop:
+		return "already_restored"
+	default:
+		return "restored"
+	}
+}
+
 // AddMemberResponse is the wire shape for enju_add_project_member.
 type AddMemberResponse struct {
 	Username string `json:"username"`

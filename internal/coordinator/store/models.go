@@ -178,6 +178,14 @@ const (
 	RunTerminated RunState = "terminated"
 )
 
+// TerminalRunStates is the single source of truth for which run
+// states are terminal (a run that will never run more tasks).
+// Both the terminal-state predicate (runStateTerminal) and the
+// archive precondition's "any non-terminal run?" query derive
+// from this slice, so adding a future terminal state can't
+// silently desync the two.
+var TerminalRunStates = []RunState{RunCompleted, RunFailed, RunTerminated}
+
 // IsAlive reports whether a run still owns its (project, branch)
 // slot — i.e. is not in a terminal state. The unique-branch index
 // keys off the same predicate so two alive runs can't collide on
@@ -207,8 +215,21 @@ type ProjectRecord struct {
 	// "enju/work" at project creation time. See
 	// docs/runs-and-branches.md for the full rationale.
 	DefaultBranch string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+
+	// Reversible archive. Archived hides the project from
+	// enju_list_projects' default view; it is NOT deletion — no row
+	// removal, no on-disk effect, fully restorable. ArchivedAt/
+	// ArchivedBy are last-archive provenance: set on archive and
+	// DELIBERATELY KEPT on restore (cheap, and a future
+	// irreversible-purge tombstone will want them). Legacy rows
+	// scan archived=false / zero time / "". Zero ArchivedAt
+	// (time.Time{}) reads as "never archived".
+	Archived   bool
+	ArchivedAt time.Time
+	ArchivedBy string // citizen ID that archived it
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // RunRecord is a run stored in the database.

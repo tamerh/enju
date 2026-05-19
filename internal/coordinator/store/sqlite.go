@@ -548,6 +548,15 @@ func (s *Store) initSchema() error {
 		// migration projects and runs keep working unchanged.
 		// See docs/runs-and-branches.md.
 		`ALTER TABLE projects ADD COLUMN default_branch TEXT NOT NULL DEFAULT 'main'`,
+		// Reversible archive: a flag, not deletion. Legacy rows
+		// default archived=0; archived_at NULL / archived_by ''
+		// read as "never archived". On restore, archived flips to 0
+		// but archived_at/by are kept (last-archive provenance — a
+		// future irreversible-purge tombstone will want them). The
+		// duplicate-column tolerance below makes the re-run a no-op.
+		`ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE projects ADD COLUMN archived_at TIMESTAMP`,
+		`ALTER TABLE projects ADD COLUMN archived_by TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'`,
 		// Compute-task execution mode (Phase 4 of async compute).
 		// Values: '' (non-compute or default-sync), 'sync', 'async'.
@@ -875,19 +884,26 @@ func columnExists(db *sql.DB, table, column string) (bool, error) {
 // projectSelectColumns is the canonical SELECT list for project rows,
 // kept in one place so every scanner pulls the same set in the same
 // order.
-const projectSelectColumns = `id, name, description, created_by, remote_url, default_branch, created_at, updated_at`
+const projectSelectColumns = `id, name, description, created_by, remote_url, default_branch, archived, archived_at, archived_by, created_at, updated_at`
 
 // scanProject reads one project row from a scanner into p.
 func scanProject(row interface {
 	Scan(dest ...interface{}) error
 }, p *ProjectRecord) error {
-	var desc, createdBy, remote sql.NullString
-	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.DefaultBranch, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var desc, createdBy, remote, archivedBy sql.NullString
+	var archivedInt int
+	var archivedAt sql.NullTime
+	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.DefaultBranch, &archivedInt, &archivedAt, &archivedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return err
 	}
 	p.Description = desc.String
 	p.CreatedBy = createdBy.String
 	p.RemoteURL = remote.String
+	p.Archived = archivedInt != 0
+	if archivedAt.Valid {
+		p.ArchivedAt = archivedAt.Time
+	}
+	p.ArchivedBy = archivedBy.String
 	return nil
 }
 
@@ -1020,6 +1036,34 @@ func (s *Store) CountProjectOwners(projectID int64) (int, error) {
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM project_members WHERE project_id = ? AND role = ?`,
 		projectID, string(ProjectRoleOwner),
+	).Scan(&n)
+	return n, err
+}
+
+// CountNonTerminalRunsByProject returns how many of a project's
+// runs are NOT in a terminal state (the inverse of
+// runStateTerminal: completed / failed / terminated). The
+// fail-closed archive precondition refuses when this is > 0 —
+// archive composes with enju_terminate_run rather than tearing
+// runs down itself.
+func (s *Store) CountNonTerminalRunsByProject(projectID int64) (int, error) {
+	// Build the NOT IN list from TerminalRunStates so this stays
+	// the exact inverse of runStateTerminal — a future terminal
+	// state added there flows here automatically rather than
+	// silently being treated as "non-terminal" (which would block
+	// archive forever).
+	args := make([]any, 0, 1+len(TerminalRunStates))
+	args = append(args, projectID)
+	placeholders := make([]string, len(TerminalRunStates))
+	for i, ts := range TerminalRunStates {
+		placeholders[i] = "?"
+		args = append(args, string(ts))
+	}
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM runs WHERE project_id = ? AND state NOT IN (`+
+			strings.Join(placeholders, ", ")+`)`,
+		args...,
 	).Scan(&n)
 	return n, err
 }

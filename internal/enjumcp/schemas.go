@@ -493,7 +493,30 @@ func DescribeTemplate() mcp.Tool {
 
 func ListProjects() mcp.Tool {
 	return mcp.NewTool("enju_list_projects",
-		mcp.WithDescription("List all long-lived projects. Paste the output verbatim in your reply — it's pre-formatted."),
+		mcp.WithDescription("List all long-lived projects. Paste the output verbatim in your reply — it's pre-formatted. Archived projects are hidden by default; pass include_archived=true to also show them (rendered with an [archived] tag)."),
+		mcp.WithBoolean("include_archived",
+			mcp.Description("Include archived projects in the listing (default false). Shown rows are tagged [archived]."),
+		),
+	)
+}
+
+func ArchiveProject() mcp.Tool {
+	return mcp.NewTool("enju_archive_project",
+		mcp.WithDescription(`Archive a project: hide it from enju_list_projects' default view. Reversible (enju_restore_project) — this is NOT deletion: no rows removed, no on-disk change, the project's runs stay queryable by id. Owner-only. Refused if the project has any non-terminal run (terminate or finish them first — archive composes with enju_terminate_run, it doesn't tear runs down). Idempotent: archiving an already-archived project is a no-op success.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to archive"),
+		),
+	)
+}
+
+func RestoreProject() mcp.Tool {
+	return mcp.NewTool("enju_restore_project",
+		mcp.WithDescription(`Restore an archived project: it reappears in enju_list_projects. Owner-only. No precondition (it only un-hides). Idempotent: restoring a non-archived project is a no-op success.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project to restore"),
+		),
 	)
 }
 

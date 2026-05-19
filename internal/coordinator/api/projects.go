@@ -124,9 +124,43 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	resp, err := service.ListProjects(s.store, caller)
+	// Archived projects are excluded unless ?include_archived is
+	// truthy. Kept a GET query param (not a body) so the
+	// existing endpoint and every other caller stay unchanged.
+	includeArchived := r.URL.Query().Get("include_archived") == "true"
+	resp, err := service.ListProjects(s.store, caller, includeArchived)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list projects")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleArchiveProject(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	resp, err := service.ArchiveProject(s.store, caller, projectID)
+	if err != nil {
+		writeMembershipErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleRestoreProject(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	resp, err := service.RestoreProject(s.store, caller, projectID)
+	if err != nil {
+		writeMembershipErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)

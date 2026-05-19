@@ -128,6 +128,8 @@ func (s *Server) Router() http.Handler {
 		r.Get("/projects/{projectID}", s.handleGetProject)
 		r.Put("/projects/{projectID}/remote", s.handleSetProjectRemote)
 		r.Put("/projects/{projectID}/default_branch", s.handleSetProjectDefaultBranch)
+		r.Post("/projects/{projectID}/archive", s.handleArchiveProject)
+		r.Post("/projects/{projectID}/restore", s.handleRestoreProject)
 		r.Get("/projects/{projectID}/runs", s.handleListProjectRuns)
 		r.Get("/projects/{projectID}/artifacts", s.handleListArtifacts)
 		r.Get("/projects/{projectID}/artifacts/*", s.handleGetArtifact)

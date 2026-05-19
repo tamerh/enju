@@ -22,8 +22,58 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+func (c *apiClient) handleArchiveProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return c.setProjectArchived(ctx, req, "archive")
+}
+
+func (c *apiClient) handleRestoreProject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return c.setProjectArchived(ctx, req, "restore")
+}
+
+// setProjectArchived is the shared body of archive + restore: both
+// POST an empty body to /projects/{id}/{action} and report the
+// coordinator's status verbatim (it distinguishes a real
+// transition from an idempotent no-op). Owner-gating, the
+// non-terminal-run precondition, and idempotency are all enforced
+// coordinator-side.
+func (c *apiClient) setProjectArchived(ctx context.Context, req mcp.CallToolRequest, action string) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	data, err := c.post(ctx, fmt.Sprintf("/api/v1/projects/%d/%s", projectID, action), map[string]any{})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var resp struct {
+		Error  string `json:"error"`
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(data, &resp) == nil && resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+	switch resp.Status {
+	case "archived":
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Archived project #%d (%s) — hidden from enju_list_projects; restore with enju_restore_project.", projectID, resp.Name)), nil
+	case "restored":
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Restored project #%d (%s) — back in enju_list_projects.", projectID, resp.Name)), nil
+	case "already_archived":
+		return mcp.NewToolResultText(fmt.Sprintf("• Project #%d (%s) is already archived (no change).", projectID, resp.Name)), nil
+	case "already_restored":
+		return mcp.NewToolResultText(fmt.Sprintf("• Project #%d (%s) is not archived (no change).", projectID, resp.Name)), nil
+	default:
+		return mcp.NewToolResultText(fmt.Sprintf("✓ Project #%d %s.", projectID, action)), nil
+	}
+}
+
 func (c *apiClient) handleListProjects(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	data, err := c.get(ctx, "/api/v1/projects")
+	// Archived projects are hidden unless explicitly revealed.
+	path := "/api/v1/projects"
+	if req.GetBool("include_archived", false) {
+		path += "?include_archived=true"
+	}
+	data, err := c.get(ctx, path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

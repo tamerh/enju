@@ -98,6 +98,8 @@ var allToolFactories = []struct {
 	{"enju_list_templates", enjumcp.ListTemplates},
 	{"enju_describe_template", enjumcp.DescribeTemplate},
 	{"enju_list_projects", enjumcp.ListProjects},
+	{"enju_archive_project", enjumcp.ArchiveProject},
+	{"enju_restore_project", enjumcp.RestoreProject},
 	{"enju_create_project", enjumcp.CreateProject},
 	{"enju_set_project_default_branch", enjumcp.SetProjectDefaultBranch},
 	{"enju_set_project_remote", enjumcp.SetProjectRemote},

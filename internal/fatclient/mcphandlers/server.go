@@ -287,6 +287,10 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleListIterations, true
 	case "enju_list_projects":
 		return c.handleListProjects, true
+	case "enju_archive_project":
+		return c.handleArchiveProject, true
+	case "enju_restore_project":
+		return c.handleRestoreProject, true
 	case "enju_list_project_members":
 		return c.handleListProjectMembers, true
 	case "enju_list_artifacts":

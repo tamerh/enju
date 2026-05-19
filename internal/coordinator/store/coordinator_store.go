@@ -84,6 +84,9 @@ type CoordinatorStore interface {
 	ListProjectMembers(projectID int64) ([]ProjectMemberRecord, error)
 	CountProjectOwners(projectID int64) (int, error)
 	CountProjectMembers(projectID int64) (int, error)
+	// CountNonTerminalRunsByProject backs the fail-closed archive
+	// precondition: a project with live runs can't be archived.
+	CountNonTerminalRunsByProject(projectID int64) (int, error)
 	ListProjectsForCitizen(citizenID int64) ([]ProjectRecord, error)
 	CountProjectsThisMonth(citizenID int64) (int, error)
 

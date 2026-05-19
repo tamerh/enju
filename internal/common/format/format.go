@@ -258,6 +258,12 @@ func ProjectList(data []byte) string {
 		if desc != "" {
 			b.WriteString(fmt.Sprintf("  — %s", desc))
 		}
+		// An archived row only ever appears here when the caller
+		// passed include_archived; tag it unmistakably so archived
+		// vs active is never ambiguous in a mixed listing.
+		if archived, _ := p["archived"].(bool); archived {
+			b.WriteString("  [archived]")
+		}
 		b.WriteString("\n")
 
 		// Surface git remote + push status so silent divergence

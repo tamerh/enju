@@ -52,6 +52,13 @@ type Project struct {
 	RunCount      int       `json:"run_count"`
 	CreatedAt     time.Time `json:"created_at"`
 
+	// Archived is the reversible-archive flag. The default list
+	// view filters these out server-side; with include_archived
+	// they're returned and format.ProjectList tags them
+	// [archived]. omitempty keeps the common (false) case off the
+	// wire.
+	Archived bool `json:"archived,omitempty"`
+
 	// LastPushAt / LastPushError are populated client-side by
 	// DecorateProjectListWithPushStatus (in fatclient/service/
 	// project_ops.go) before format.ProjectList consumes the
