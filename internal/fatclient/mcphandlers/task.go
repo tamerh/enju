@@ -221,8 +221,9 @@ func (c *apiClient) handleRetryTask(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	var resp struct {
-		Error string `json:"error"`
-		From  string `json:"from"`
+		Error     string `json:"error"`
+		From      string `json:"from"`
+		IsCompute bool   `json:"is_compute"`
 	}
 	json.Unmarshal(data, &resp)
 	if resp.Error != "" {
@@ -230,6 +231,23 @@ func (c *apiClient) handleRetryTask(ctx context.Context, req mcp.CallToolRequest
 	}
 	if resp.From != "" {
 		from = resp.From // coordinator-normalized intent
+	}
+
+	// Two-half composition: the coordinator already re-opened the
+	// task (failed_retryable → READY). The SECOND half — client-
+	// side execute via the compute path — only applies to compute
+	// tasks. A citizen task (answer/review/vote) is re-open ONLY:
+	// its assignee re-claims and re-runs; there is no operator-
+	// driven execute step, so calling RetryComputeTask here would
+	// surface a spurious "action=… not compute — use
+	// enju_submit_result" error even though the recovery already
+	// succeeded (the user-facing command would lie about success).
+	if !resp.IsCompute {
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"↻ Retried %s — re-opened to READY (from=%s — %s).\n\n"+
+				"Citizen task: its assignee re-claims and re-runs (no operator "+
+				"execute step). PENDING descendants auto-promote once it delivers.",
+			taskID, from, retryFromBlurb(from))), nil
 	}
 
 	outcome, err := c.fc.RetryComputeTask(ctx, taskID, from)

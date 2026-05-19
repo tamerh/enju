@@ -49,6 +49,14 @@ type RetryTaskResponse struct {
 	From     RetryFrom `json:"from"`
 	NewState string    `json:"new_state"` // always "ready"
 	RunID    int64     `json:"run_id"`
+	// IsCompute tells the fat-client handler whether retry's
+	// second half (client-side execute via the compute path) even
+	// applies. Compute tasks re-run operator-driven; citizen
+	// tasks (answer/review/vote) are re-open ONLY — the assignee
+	// re-claims, there is no execute step. Without this the
+	// handler blindly called ExecuteComputeTask and a successful
+	// citizen recovery surfaced a spurious "not compute" error.
+	IsCompute bool `json:"is_compute"`
 }
 
 // RetryTask sends a failed-but-recoverable compute task back to
@@ -181,10 +189,11 @@ func (c *Coordinator) RetryTask(caller *store.CitizenRecord, taskID string, from
 	)
 
 	return &RetryTaskResponse{
-		Status:   "retrying",
-		TaskID:   taskID,
-		From:     from,
-		NewState: string(store.TaskReady),
-		RunID:    task.RunID,
+		Status:    "retrying",
+		TaskID:    taskID,
+		From:      from,
+		NewState:  string(store.TaskReady),
+		RunID:     task.RunID,
+		IsCompute: task.Script != "", // the established compute discriminator
 	}, nil
 }
