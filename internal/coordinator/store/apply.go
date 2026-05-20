@@ -1615,7 +1615,9 @@ func applyRecordSubmission(tx *sql.Tx, m RecordSubmission, sink EventSink) error
 		// submission that precedes it already zeroed the count, so a
 		// post-request_changes iteration starts a fresh count from
 		// 0 (a healthy review round can never feed a layer-①
-		// livelock escalation — the D4 separation, enforced here).
+		// livelock escalation — the separation between healthy
+		// review iterations and the livelock counter is enforced
+		// here).
 		_, err := tx.Exec(
 			`UPDATE tasks SET state = 'submitted', submitted_at = ?, result_path = ?, commit_sha = ?, review_decision = ?, vote_choice = ?, verify_fail_count = 0, verify_fail_counted_iter = 0 WHERE id = ?`,
 			now, m.ResultPath, m.CommitSHA, m.Decision, m.VoteChoice, m.TaskID,
