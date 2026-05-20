@@ -48,7 +48,11 @@ type fakeFC struct {
 	fails     []failRecord
 	metaByID  map[string]*service.TaskMeta
 	claimErr  error
-	submitErr string
+	// claimErrByTaskID overrides claimErr per task — used to
+	// simulate "claim succeeds for some tasks, fails persistently
+	// for one specific task" (the daemon-starvation repro).
+	claimErrByTaskID map[string]error
+	submitErr        string
 	failErr   error
 
 	// Citizen verify-fail report stubbing. cvfCalls records every
@@ -161,6 +165,9 @@ func (f *fakeFC) ClaimTask(ctx context.Context, p service.ClaimParams) (*service
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claims = append(f.claims, p)
+	if err, ok := f.claimErrByTaskID[p.TaskID]; ok {
+		return nil, err
+	}
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
@@ -1719,5 +1726,106 @@ func TestExtractArtifactReads(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestDaemon_FindWork_SticktySkipsTasksOverFailStreakThreshold is
+// the mustache-engine starvation repro (project #9, narrator-agent
+// looped 10h on 9:3:narrate_run with `ref not found` while
+// 9:4:narrate_run sat ready on the active run). The daemon already
+// classifies persistent non-race claim failures loudly
+// ("persistent non-race claim failure ... attempts=N") but ignores
+// its own classification — findWork keeps returning the same task,
+// so the loop never escapes to a sibling ready task.
+//
+// Two ready tasks both assigned to the same bot. "bad" always
+// fails claim (e.g. ref not found from a pruned branch); "good"
+// claims and processes fine. After maxFailStreak attempts on
+// "bad", findWork should skip it and pick "good".
+func TestDaemon_FindWork_SticktySkipsTasksOverFailStreakThreshold(t *testing.T) {
+	fc := &fakeFC{
+		username: "bot1",
+		runs:     map[int64][]wire.Run{1: {{ID: 99, Seq: 10}}},
+		ready: map[string][]map[string]interface{}{
+			keyOf(1, 10): {
+				readyTask("1:1:bad", []string{"bot1"}),
+				readyTask("1:1:good", []string{"bot1"}),
+			},
+		},
+		metaByID: map[string]*service.TaskMeta{
+			"1:1:bad":  {ID: "1:1:bad", Action: "answer", Prompt: "x", ProjectID: 1, RunSeq: 1},
+			"1:1:good": {ID: "1:1:good", Action: "answer", Prompt: "y", ProjectID: 1, RunSeq: 1},
+		},
+		claimErrByTaskID: map[string]error{
+			// Non-race claim error — the daemon's classifier
+			// (isAlreadyClaimedError) returns false for this, so
+			// the failStreak counter ticks up on each attempt.
+			"1:1:bad": errors.New("pre-claim reconcile for task 1:1:bad: ref not found: stale-branch"),
+		},
+	}
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "ok"}, Bot: scenarioBot(), ProjectID: 1})
+	d.maxFailStreak = 2 // tighten for fast test
+
+	// Drive the loop until either "good" gets processed or we
+	// exhaust the budget. A healthy daemon should escape to "good"
+	// well within this; pre-fix it loops on "bad" forever.
+	const maxIters = 20
+	for i := 0; i < maxIters; i++ {
+		worked, _ := d.RunOnce(context.Background())
+		if worked {
+			break
+		}
+	}
+
+	badAttempts, goodAttempts := 0, 0
+	for _, c := range fc.claims {
+		switch c.TaskID {
+		case "1:1:bad":
+			badAttempts++
+		case "1:1:good":
+			goodAttempts++
+		}
+	}
+
+	if goodAttempts == 0 {
+		t.Fatalf("daemon never tried 1:1:good (starved on 1:1:bad for %d attempts) — the field bug: one persistently-failing task blocks every other ready task assigned to this daemon", badAttempts)
+	}
+	if badAttempts > d.maxFailStreak {
+		t.Errorf("daemon kept retrying 1:1:bad past the failStreak threshold (got %d attempts, want ≤ %d) — the loud ERROR is supposed to be a one-shot signal, not a forever-loop", badAttempts, d.maxFailStreak)
+	}
+	if len(fc.submits) == 0 {
+		t.Errorf("1:1:good never reached submit — sticky-skip recovered findWork but submit didn't fire")
+	}
+}
+
+// TestDaemon_FindWork_TransientClaimBlipDoesNotStarve pins the
+// claim-fail-streak reset: a TRANSIENT non-race blip on a task,
+// followed by a successful claim of that same task, must NOT
+// leave the counter ticking — otherwise a future blip on the
+// same task accumulates against a stale streak and the
+// sticky-skip fires too early.
+func TestDaemon_FindWork_TransientClaimBlipDoesNotStarve(t *testing.T) {
+	fc := newFCWithTask("bot1", "answer", "do work")
+	d, _ := New(Config{FC: fc, Handler: &StubHandler{Response: "ok"}, Bot: scenarioBot(), ProjectID: 1})
+	d.maxFailStreak = 3
+
+	// Two blips then recovery, all on the same task.
+	fc.claimErrByTaskID = map[string]error{
+		"1:1:t": errors.New("pre-claim reconcile: transient network blip"),
+	}
+	for i := 0; i < 2; i++ {
+		_, _ = d.RunOnce(context.Background())
+	}
+	if d.claimFailStreak["1:1:t"] != 2 {
+		t.Fatalf("blip count: got %d, want 2", d.claimFailStreak["1:1:t"])
+	}
+
+	// Network recovers; next claim should succeed AND clear streak.
+	delete(fc.claimErrByTaskID, "1:1:t")
+	if _, err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce after recovery: %v", err)
+	}
+	if got := d.claimFailStreak["1:1:t"]; got != 0 {
+		t.Errorf("claimFailStreak not cleared on successful claim: got %d", got)
+	}
 }
 

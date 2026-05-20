@@ -241,6 +241,22 @@ type Daemon struct {
 	// reconstruct it. Same lifetime as failStreak.
 	failReason    map[string]string
 	maxFailStreak int
+
+	// claimFailStreak counts CONSECUTIVE NON-RACE claim failures
+	// per task id — distinct from failStreak (which is post-claim
+	// process+submit). The two are semantically different: a
+	// post-claim deterministic failure is the daemon's job to
+	// drive to FAILED (and findWork must keep returning the task
+	// so the FailTask POST can retry under coord outages); a
+	// pre-claim failure (pruned branch ref, role mis-config, the
+	// task is wedged) is NOT the daemon's to fail — only the
+	// operator can resolve it. After maxFailStreak consecutive
+	// non-race claim errors, findWork sticky-skips this task and
+	// moves to other ready tasks. Without that, one zombie task
+	// starves the agent project-wide (mustache run #3
+	// narrate_run: 10h loop while a sibling waited). Session-
+	// scoped; the maxFailStreakEntries cap below applies.
+	claimFailStreak map[string]int
 }
 
 // errCitizenVerifyFail is the sentinel processAndSubmit returns
@@ -312,9 +328,10 @@ func New(cfg Config) (*Daemon, error) {
 		pollFloor:    pollFloor,
 		backoffMax:   backoffMax,
 		logger:       logger,
-		failStreak:    make(map[string]int),
-		failReason:    make(map[string]string),
-		maxFailStreak: defaultMaxFailStreak,
+		failStreak:      make(map[string]int),
+		failReason:      make(map[string]string),
+		maxFailStreak:   defaultMaxFailStreak,
+		claimFailStreak: make(map[string]int),
 	}, nil
 }
 
@@ -550,14 +567,13 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 		// actionable bot-level ERROR instead of an infinite
 		// WARN. process+submit is never reached, so no expensive
 		// work re-runs for an unclaimable task.
-		if len(d.failStreak) >= maxFailStreakEntries {
-			d.failStreak = make(map[string]int)
-			d.failReason = make(map[string]string)
+		if len(d.claimFailStreak) >= maxFailStreakEntries {
+			d.claimFailStreak = make(map[string]int)
 		}
-		d.failStreak[taskID]++
-		if d.failStreak[taskID] >= d.maxFailStreak {
+		d.claimFailStreak[taskID]++
+		if d.claimFailStreak[taskID] >= d.maxFailStreak {
 			d.logger.Error("bot cannot claim task — persistent non-race claim failure; NOT failing the task (bot is not its owner)",
-				"task_id", taskID, "attempts", d.failStreak[taskID], "error", err,
+				"task_id", taskID, "attempts", d.claimFailStreak[taskID], "error", err,
 				"likely_cause", "this bot lacks the task's require_role, is mis-configured "+
 					"(e.g. no model for an LLM handler), or the task is wedged",
 				"action", "fix the bot/manifest or have an operator fail/invalidate the task; "+
@@ -573,6 +589,10 @@ func (d *Daemon) runOnce(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("claim %s: %w", taskID, err)
 	}
 	d.activeClaim = taskID
+	// A successful claim clears any prior non-race claim-fail
+	// streak for this task. A transient blip that then succeeds
+	// must NOT count toward the sticky-skip threshold.
+	delete(d.claimFailStreak, taskID)
 
 	// Budget already exhausted on a prior pass, but FailTask
 	// couldn't reach coord then. Retry ONLY the FailTask POST —
@@ -778,13 +798,41 @@ func (d *Daemon) findWork(ctx context.Context) (taskID string, projectID int64, 
 				if !taskAssignableTo(t, username) {
 					continue
 				}
-				if id, _ := t["id"].(string); id != "" {
-					// Return the (taskID, projectID) pair so
-					// runOnce can pre-warm the bot's managed
-					// clone for this project before the claim
-					// fires (see runOnce comment).
-					return id, pid, nil
+				id, _ := t["id"].(string)
+				if id == "" {
+					continue
 				}
+				// Sticky-skip: a task that has accumulated
+				// `maxFailStreak` consecutive NON-RACE CLAIM
+				// failures has already produced the loud
+				// "persistent non-race claim failure" ERROR;
+				// the daemon must move on to other ready
+				// tasks rather than loop on it forever. The
+				// failure cause is something only an operator
+				// can resolve (pruned branch / wedged task /
+				// role mis-config). Without this, one zombie
+				// task starves the agent across the whole
+				// project (mustache run #3 narrate_run: 10h
+				// loop while a sibling task waited).
+				//
+				// Keyed on claimFailStreak, NOT failStreak:
+				// the latter is for process+submit failures
+				// the daemon DOES drive to FAILED (via line
+				// ~599's FailTask retry path), and that path
+				// REQUIRES findWork to keep returning the
+				// task so a coord outage doesn't prevent the
+				// retry. The two counters separate those
+				// semantics. Session-scoped; the map's
+				// wholesale-wipe cap at maxFailStreakEntries
+				// keeps memory bounded.
+				if d.claimFailStreak[id] >= d.maxFailStreak {
+					continue
+				}
+				// Return the (taskID, projectID) pair so
+				// runOnce can pre-warm the bot's managed
+				// clone for this project before the claim
+				// fires (see runOnce comment).
+				return id, pid, nil
 			}
 		}
 	}
