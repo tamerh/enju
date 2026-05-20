@@ -153,6 +153,35 @@ main {
 .project-card .meta { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
 .project-card .desc { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; }
 
+/* Project list as a table. Denser than .project-list cards;
+   sortable-by-activity scan view for operators with many
+   projects. The .num class right-aligns the run count. */
+.project-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+}
+.project-table th,
+.project-table td {
+  text-align: left;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.project-table th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.project-table tbody tr:hover { background: var(--bg-subtle, rgba(0,0,0,0.025)); }
+.project-table .num { text-align: right; width: 5rem; }
+.project-table .proj-cell a { color: var(--fg); text-decoration: none; }
+.project-table .proj-cell a:hover { color: var(--accent); }
+.project-table .proj-cell .desc { margin-top: 0.2rem; }
+
 /* Footer link between the active and archived project rosters. */
 .archived-link { margin-top: 1.5rem; }
 

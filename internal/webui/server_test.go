@@ -1162,6 +1162,67 @@ func TestArchivedProjectsView(t *testing.T) {
 	}
 }
 
+// TestLandingSortsByActivity: the project table orders rows by
+// last activity descending, flooring zero LastActivityAt to
+// CreatedAt so older-coord/no-activity projects still sort.
+func TestLandingSortsByActivity(t *testing.T) {
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	mid := time.Now().Add(-2 * 24 * time.Hour)
+	fresh := time.Now().Add(-15 * time.Minute)
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		projects: []wire.Project{
+			{ID: 1, Name: "stale-one", CreatedAt: old, LastActivityAt: old},
+			{ID: 2, Name: "hot-one", CreatedAt: mid, LastActivityAt: fresh},
+			{ID: 3, Name: "warm-one", CreatedAt: mid, LastActivityAt: mid},
+			// LastActivityAt zero → must floor to CreatedAt.
+			{ID: 4, Name: "legacy-floor", CreatedAt: time.Now().Add(-1 * time.Hour)},
+		},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+	order := []string{"hot-one", "legacy-floor", "warm-one", "stale-one"}
+	prev := 0
+	for _, name := range order {
+		idx := strings.Index(body, name)
+		if idx < 0 {
+			t.Fatalf("missing %q in body", name)
+		}
+		if idx < prev {
+			t.Fatalf("wrong sort order: %q appeared before previous; want order %v", name, order)
+		}
+		prev = idx
+	}
+}
+
+// TestRelativeTime: the human label coarsens correctly across
+// the breakpoints (minute / hour / day / week+) and floors a
+// zero time to a dash.
+func TestRelativeTime(t *testing.T) {
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		t    time.Time
+		want string
+	}{
+		{"zero", time.Time{}, "—"},
+		{"sub-minute", now.Add(-30 * time.Second), "just now"},
+		{"minutes", now.Add(-5 * time.Minute), "5m ago"},
+		{"hours", now.Add(-3 * time.Hour), "3h ago"},
+		{"days", now.Add(-2 * 24 * time.Hour), "2d ago"},
+		{"week-plus drops to date", now.Add(-30 * 24 * time.Hour), "Apr 20"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := relativeTime(now, c.t)
+			if got != c.want {
+				t.Errorf("relativeTime(%v) = %q, want %q", c.t, got, c.want)
+			}
+		})
+	}
+}
+
 // TestSettingsArchiveControls: owner sees the Archive
 // disclosure on an active project, and Restore + an archived
 // banner on an archived one.

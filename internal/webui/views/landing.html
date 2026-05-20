@@ -5,10 +5,10 @@
   <header class="task-header">
     {{if .Archived}}
     <h1>Archived projects</h1>
-    <p class="muted">{{len .Projects}} archived project(s). Open one to restore it from its Settings page.</p>
+    <p class="muted">{{.ProjectCount}} archived project(s). Open one to restore it from its Settings page.</p>
     {{else}}
     <h1>Projects</h1>
-    <p class="muted">{{len .Projects}} project(s); {{len .Materialized}} with local clone.</p>
+    <p class="muted">{{.ProjectCount}} project(s); {{len .Materialized}} with local clone. Sorted by most recent activity.</p>
     <p class="btn-row">
       <button type="button" class="btn btn-primary" x-show="!creating" @click="creating = true">New project</button>
     </p>
@@ -60,18 +60,31 @@
   </form>
   {{end}}
 
-  {{if .Projects}}
-  <ul class="project-list">
-    {{range .Projects}}
-    <li class="project-card">
-      <a href="/p/{{.ID}}">
-        <strong>{{.Name}}</strong>
-        <span class="meta">id {{.ID}} · {{.RunCount}} run(s){{if .DefaultBranch}} · branch {{.DefaultBranch}}{{end}}</span>
-        {{if .Description}}<p class="desc">{{.Description}}</p>{{end}}
-      </a>
-    </li>
-    {{end}}
-  </ul>
+  {{if .Rows}}
+  <table class="project-table">
+    <thead>
+      <tr>
+        <th>Project</th>
+        <th class="num">Runs</th>
+        <th>Branch</th>
+        <th>Last activity</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Rows}}
+      <tr>
+        <td class="proj-cell">
+          <a href="/p/{{.ID}}"><strong>{{.Name}}</strong></a>
+          <span class="muted small"> · id {{.ID}}</span>
+          {{if .Description}}<div class="desc muted small">{{.Description}}</div>{{end}}
+        </td>
+        <td class="num">{{.RunCount}}</td>
+        <td>{{if .DefaultBranch}}<code>{{.DefaultBranch}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td><span title="{{.ActivityISO}}">{{.ActivityRel}}</span></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
   {{else}}
   {{if .Archived}}
   <p class="muted">No archived projects.</p>

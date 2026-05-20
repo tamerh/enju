@@ -1,9 +1,12 @@
 package webui
 
 import (
+	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/enju-ai/enju/internal/common/wire"
 	"github.com/enju-ai/enju/internal/fatclient/service"
@@ -18,7 +21,8 @@ import (
 // pattern as the issues list page's file-form failure path.
 type landingPage struct {
 	pageData
-	Projects     []wire.Project
+	Rows         []projectRow
+	ProjectCount int
 	Materialized []service.MaterializedProject
 	Error        string
 	Submitted    service.CreateProjectParams
@@ -26,8 +30,72 @@ type landingPage struct {
 	// heading + title change, the create-project form and the
 	// local-clone count are suppressed, and the footer link
 	// points back to the active list instead of forward to the
-	// archived one. Projects then holds the archived set.
+	// archived one. Rows then holds the archived set.
 	Archived bool
+}
+
+// projectRow is the table-row view of a project: the raw
+// wire.Project plus a precomputed display string for the "last
+// activity" column. Sort key is also derived here so the
+// template stays branch-free.
+type projectRow struct {
+	wire.Project
+	// ActivityAt is max(LastActivityAt, CreatedAt) — the wire
+	// contract says LastActivityAt is zero on older coords / for
+	// projects with no activity since the column was added, and
+	// callers must floor to CreatedAt.
+	ActivityAt time.Time
+	// ActivityRel is the short human label ("3m ago", "2d ago",
+	// "Apr 2"); ActivityISO is the full timestamp for the
+	// title= tooltip. Both honor ActivityAt's floored value.
+	ActivityRel string
+	ActivityISO string
+}
+
+// buildProjectRows sorts the projects by last activity (newest
+// first) and precomputes the display fields for the table.
+func buildProjectRows(projects []wire.Project, now time.Time) []projectRow {
+	rows := make([]projectRow, len(projects))
+	for i, p := range projects {
+		at := p.LastActivityAt
+		if at.IsZero() || p.CreatedAt.After(at) {
+			at = p.CreatedAt
+		}
+		rows[i] = projectRow{
+			Project:     p,
+			ActivityAt:  at,
+			ActivityRel: relativeTime(now, at),
+			ActivityISO: at.Format(time.RFC3339),
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].ActivityAt.After(rows[j].ActivityAt)
+	})
+	return rows
+}
+
+// relativeTime renders a compact "how long ago" label. Granular
+// for fresh events (the operator-useful range), coarsening to
+// date-only past a week. Zero time → "—".
+func relativeTime(now, t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := now.Sub(t)
+	switch {
+	case d < 0:
+		return t.Format("Jan 2")
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return t.Format("Jan 2")
+	}
 }
 
 // handleLanding is the cross-project landing page (GET /). For
@@ -55,7 +123,8 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, r, "landing.html", landingPage{
 		pageData:     s.commonPageData(),
-		Projects:     projects,
+		Rows:         buildProjectRows(projects, time.Now()),
+		ProjectCount: len(projects),
 		Materialized: materialized,
 	})
 }
@@ -72,9 +141,10 @@ func (s *Server) handleArchivedProjects(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.render(w, r, "landing.html", landingPage{
-		pageData: s.commonPageData(),
-		Projects: projects,
-		Archived: true,
+		pageData:     s.commonPageData(),
+		Rows:         buildProjectRows(projects, time.Now()),
+		ProjectCount: len(projects),
+		Archived:     true,
 	})
 }
 
@@ -139,7 +209,8 @@ func (s *Server) renderCreateProjectError(w http.ResponseWriter, r *http.Request
 	materialized, _ := s.fc.ListMaterializedProjects()
 	s.render(w, r, "landing.html", landingPage{
 		pageData:     s.commonPageData(),
-		Projects:     projects,
+		Rows:         buildProjectRows(projects, time.Now()),
+		ProjectCount: len(projects),
 		Materialized: materialized,
 		Error:        msg,
 		Submitted:    submitted,
