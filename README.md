@@ -12,7 +12,7 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
 
 
 ```
-╔═════════════════════ COORDINATOR · DAG state engine ═════════════════════╗
+╔═════════════════════ Coordinator · DAG state engine ═════════════════════╗
 ║                                                                          ║
 ║                ✓ ──→ ✓                                                   ║
 ║                       ╲                                                  ║
@@ -54,7 +54,7 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
        └──
 
                                        ▲▼
-╔══════════════════════════ REMOTE GIT · content ══════════════════════════╗
+╔══════════════════════════ Remote git · content ══════════════════════════╗
 ║                                                                          ║
 ║   workflow-2/<task>                            ●   ●                     ║
 ║                                                 ╲ ╱                      ║
