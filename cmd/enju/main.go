@@ -108,6 +108,8 @@ func main() {
 		cmdStart(os.Args[2:])
 	case "stop":
 		cmdStop(os.Args[2:])
+	case "upgrade":
+		cmdUpgrade(os.Args[2:])
 	case "version":
 		fmt.Printf("enju %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -134,6 +136,7 @@ Usage:
  enju review  Submit a verdict on a claimed review task
  enju agent  Agent lifecycle (setup, run — see 'enju agent')
  enju wrap-task Run a compute task's script + commit (internal)
+ enju upgrade  Replace this binary with the latest GitHub release (Linux/macOS)
  enju version  Print version
 
 Run 'enju <command> -h' for command-specific help.`)
