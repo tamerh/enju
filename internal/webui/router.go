@@ -51,11 +51,12 @@ func (s *Server) router() http.Handler {
 	r.Post("/p/{projectID}/issues/{issueSeq}/triage", s.handleTriageIssue)
 	r.Post("/p/{projectID}/issues/{issueSeq}/close", s.handleCloseIssue)
 
-	// Templates — list, describe, create-run-from. Wildcard
-	// captures the repo-relative path (which contains /).
-	r.Get("/p/{projectID}/templates", s.handleTemplatesList)
-	r.Get("/p/{projectID}/templates/show/*", s.handleTemplateDetail)
-	r.Post("/p/{projectID}/templates/run/*", s.handleCreateRunFromTemplate)
+	// Workflows — list (paths), describe (parsed), create-run-from.
+	// Wildcard captures the repo-relative YAML path (which contains
+	// /). A workflow is any *.yaml on the project's default branch.
+	r.Get("/p/{projectID}/workflows", s.handleWorkflowsList)
+	r.Get("/p/{projectID}/workflows/show/*", s.handleWorkflowDetail)
+	r.Post("/p/{projectID}/workflows/run/*", s.handleCreateRunFromWorkflow)
 
 	// New run from inline YAML — the paste-a-workflow authoring
 	// path. GET renders the form (read); POST validates and

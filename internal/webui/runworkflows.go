@@ -9,70 +9,72 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// Templates surface — read (list + describe) and write (create
-// run from template). Templates live in the project repo at
-// enju/templates/<bundle>/. A bundle has a manifest enju.yaml
-// plus optional scripts/data/.
+// Workflows surface — read (list + describe) and write (create
+// run from workflow). Workflows are any *.yaml file in the project
+// repo on the default branch (root-level enju.yaml is the common
+// case; nested workflows/<name>/ is also fine).
 //
-//   GET  /p/{projectID}/templates       — list bundles
-//   GET  /p/{projectID}/templates/*     — describe one (path is the
-//                                         repo-relative path, slashes
-//                                         intact via chi wildcard)
-//   POST /p/{projectID}/templates/*/run — create a run; form carries
-//                                         params + optional branch
+//   GET  /p/{projectID}/workflows        — list paths
+//   GET  /p/{projectID}/workflows/show/* — describe one (path is
+//                                          the repo-relative path,
+//                                          slashes intact via chi
+//                                          wildcard)
+//   POST /p/{projectID}/workflows/run/*  — create a run; form carries
+//                                          params + optional branch
 //
-// The detail page hosts the create-run form — the user picks
-// values for declared params and submits, the handler calls
-// Session.CreateRunFromTemplate which prepares the bundle,
-// posts to coord, and freezes a snapshot. Success → redirect
-// to /p/{pid}/r/{seq}.
+// List is path-only — picking which YAML is "actually" a workflow
+// is the operator's call. The detail page parses the file and
+// hosts the create-run form (declared params → form fields). On
+// submit the handler calls Session.CreateRunFromTemplate which
+// snapshots the bundle, posts to coord, and freezes the per-run
+// copy. Success → redirect to /p/{pid}/r/{seq}.
 
-// templatesListPage is the data shape for views/templates.html.
-type templatesListPage struct {
+// workflowsListPage is the data shape for views/workflows.html.
+type workflowsListPage struct {
 	pageData
 	ProjectID int64
-	Templates []service.TemplateSummary
+	Workflows []service.WorkflowSummary
 }
 
-// templateDetailPage is the data shape for views/template.html.
+// workflowDetailPage is the data shape for views/workflow.html.
 // Error / Submitted carry create-run failure state so the form
 // repopulates rather than getting wiped (same pattern as the
 // issues list page's file-form failure path).
-type templateDetailPage struct {
+type workflowDetailPage struct {
 	pageData
-	ProjectID    int64
-	Path         string
-	Template     *service.LoadedTemplate
-	Error        string
+	ProjectID       int64
+	Path            string
+	Workflow        *service.LoadedWorkflow
+	Error           string
 	SubmittedBranch string
 	SubmittedParams map[string]string
 }
 
-// handleTemplatesList renders /p/{pid}/templates.
-func (s *Server) handleTemplatesList(w http.ResponseWriter, r *http.Request) {
+// handleWorkflowsList renders /p/{pid}/workflows.
+func (s *Server) handleWorkflowsList(w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil || pid <= 0 {
 		http.Error(w, "invalid project id", http.StatusBadRequest)
 		return
 	}
-	tmpls, err := s.fc.ListTemplates(r.Context(), pid)
+	wfs, err := s.fc.ListWorkflows(r.Context(), pid)
 	if err != nil {
-		s.logger.Error("ListTemplates failed", "project_id", pid, "error", err)
-		http.Error(w, "failed to list templates: "+err.Error(), http.StatusBadGateway)
+		s.logger.Error("ListWorkflows failed", "project_id", pid, "error", err)
+		http.Error(w, "failed to list workflows: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	s.render(w, r, "templates.html", templatesListPage{
+	s.render(w, r, "workflows.html", workflowsListPage{
 		pageData:  s.commonPageData(),
 		ProjectID: pid,
-		Templates: tmpls,
+		Workflows: wfs,
 	})
 }
 
-// handleTemplateDetail renders /p/{pid}/templates/{path...}.
-// The wildcard captures the repo-relative path
-// (e.g. "enju/templates/llm_eval"). DescribeTemplate accepts
-// either the bundle dir or the manifest path.
-func (s *Server) handleTemplateDetail(w http.ResponseWriter, r *http.Request) {
+// handleWorkflowDetail renders /p/{pid}/workflows/show/{path...}.
+// The wildcard captures the repo-relative path (e.g.
+// "workflows/gwas/enju.yaml" or just "enju.yaml"). DescribeWorkflow
+// parses the file for declared params.
+func (s *Server) handleWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil || pid <= 0 {
 		http.Error(w, "invalid project id", http.StatusBadRequest)
@@ -80,25 +82,25 @@ func (s *Server) handleTemplateDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	path := chi.URLParam(r, "*")
 	if path == "" {
-		http.Error(w, "template path is required", http.StatusBadRequest)
+		http.Error(w, "workflow path is required", http.StatusBadRequest)
 		return
 	}
-	loaded, err := s.fc.DescribeTemplate(r.Context(), pid, path)
+	loaded, err := s.fc.DescribeWorkflow(r.Context(), pid, path)
 	if err != nil {
-		s.logger.Error("DescribeTemplate failed", "project_id", pid, "path", path, "error", err)
-		http.Error(w, "failed to load template: "+err.Error(), http.StatusBadGateway)
+		s.logger.Error("DescribeWorkflow failed", "project_id", pid, "path", path, "error", err)
+		http.Error(w, "failed to load workflow: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	s.render(w, r, "template.html", templateDetailPage{
+	s.render(w, r, "workflow.html", workflowDetailPage{
 		pageData:  s.commonPageData(),
 		ProjectID: pid,
 		Path:      path,
-		Template:  loaded,
+		Workflow:  loaded,
 	})
 }
 
-// handleCreateRunFromTemplate is POST
-// /p/{pid}/templates/{path...}/run. Form carries:
+// handleCreateRunFromWorkflow is POST
+// /p/{pid}/workflows/run/{path...}. Form carries:
 //
 //   branch   — optional run branch override
 //   p_<name> — one entry per declared param (e.g. p_disease=tp53)
@@ -107,7 +109,7 @@ func (s *Server) handleTemplateDetail(w http.ResponseWriter, r *http.Request) {
 // separated strings; we split + trim. On success redirects to
 // /p/{pid}/r/{seq}; on failure re-renders the detail page with
 // the form repopulated.
-func (s *Server) handleCreateRunFromTemplate(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateRunFromWorkflow(w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil || pid <= 0 {
 		http.Error(w, "invalid project id", http.StatusBadRequest)
@@ -115,7 +117,7 @@ func (s *Server) handleCreateRunFromTemplate(w http.ResponseWriter, r *http.Requ
 	}
 	path := chi.URLParam(r, "*")
 	if path == "" {
-		http.Error(w, "template path is required", http.StatusBadRequest)
+		http.Error(w, "workflow path is required", http.StatusBadRequest)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -124,20 +126,20 @@ func (s *Server) handleCreateRunFromTemplate(w http.ResponseWriter, r *http.Requ
 	}
 	branch := strings.TrimSpace(r.FormValue("branch"))
 
-	// Re-fetch the template to know its declared params shape.
+	// Re-fetch the workflow to know its declared params shape.
 	// Required to (a) coerce list<string> values from the
 	// comma-separated input, (b) repopulate on error.
-	loaded, lerr := s.fc.DescribeTemplate(r.Context(), pid, path)
+	loaded, lerr := s.fc.DescribeWorkflow(r.Context(), pid, path)
 	if lerr != nil {
-		s.logger.Error("DescribeTemplate failed during create-run", "project_id", pid, "path", path, "error", lerr)
-		http.Error(w, "failed to load template: "+lerr.Error(), http.StatusBadGateway)
+		s.logger.Error("DescribeWorkflow failed during create-run", "project_id", pid, "path", path, "error", lerr)
+		http.Error(w, "failed to load workflow: "+lerr.Error(), http.StatusBadGateway)
 		return
 	}
 
 	submitted := make(map[string]string)
 	params := make(map[string]interface{})
 	if loaded != nil {
-		for _, p := range loaded.Summary.Params {
+		for _, p := range loaded.Details.Params {
 			raw := r.FormValue("p_" + p.Name)
 			submitted[p.Name] = raw
 			if raw == "" {
@@ -151,11 +153,11 @@ func (s *Server) handleCreateRunFromTemplate(w http.ResponseWriter, r *http.Requ
 	res, err := s.fc.CreateRunFromTemplate(r.Context(), pid, path, params, branch, authorName, authorEmail)
 	if err != nil {
 		s.logger.Error("CreateRunFromTemplate failed", "project_id", pid, "path", path, "error", err)
-		s.render(w, r, "template.html", templateDetailPage{
+		s.render(w, r, "workflow.html", workflowDetailPage{
 			pageData:        s.commonPageData(),
 			ProjectID:       pid,
 			Path:            path,
-			Template:        loaded,
+			Workflow:        loaded,
 			Error:           "create run failed: " + err.Error(),
 			SubmittedBranch: branch,
 			SubmittedParams: submitted,

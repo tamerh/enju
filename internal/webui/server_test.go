@@ -93,11 +93,11 @@ type fakeFC struct {
 	closedByTaskID     string
 	closeIssueErr      error
 
-	// Templates captures
-	templates           []service.TemplateSummary
-	listTemplatesErr    error
-	loadedTemplate      *service.LoadedTemplate
-	describeTemplateErr error
+	// Workflows captures
+	workflows           []service.WorkflowSummary
+	listWorkflowsErr    error
+	loadedWorkflow      *service.LoadedWorkflow
+	describeWorkflowErr error
 	createdFromPath     string
 	createdParams       map[string]interface{}
 	createdBranch       string
@@ -300,11 +300,11 @@ func (f *fakeFC) CloseIssue(ctx context.Context, pid int64, seq int, status, clo
 	f.closedByTaskID = closedByTaskID
 	return f.issue, f.closeIssueErr
 }
-func (f *fakeFC) ListTemplates(ctx context.Context, pid int64) ([]service.TemplateSummary, error) {
-	return f.templates, f.listTemplatesErr
+func (f *fakeFC) ListWorkflows(ctx context.Context, pid int64) ([]service.WorkflowSummary, error) {
+	return f.workflows, f.listWorkflowsErr
 }
-func (f *fakeFC) DescribeTemplate(ctx context.Context, pid int64, path string) (*service.LoadedTemplate, error) {
-	return f.loadedTemplate, f.describeTemplateErr
+func (f *fakeFC) DescribeWorkflow(ctx context.Context, pid int64, path string) (*service.LoadedWorkflow, error) {
+	return f.loadedWorkflow, f.describeWorkflowErr
 }
 func (f *fakeFC) CreateRunFromTemplate(ctx context.Context, pid int64, path string, params map[string]interface{}, branch, name, email string) (*service.CreateRunFromTemplateResult, error) {
 	f.createdFromPath = path
@@ -1073,7 +1073,7 @@ func TestProjectOverviewIsAdminFree(t *testing.T) {
 	}
 	// Runs are present; a settings link is present; the
 	// read-only roster shows members.
-	for _, want := range []string{"Hello", "/p/1/new-run", "/p/1/settings", "@tamer"} {
+	for _, want := range []string{"Hello", "/p/1/workflows", "/p/1/settings", "@tamer"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("overview missing %q", want)
 		}
@@ -3336,42 +3336,45 @@ func TestCreateProjectError(t *testing.T) {
 	}
 }
 
-// --- Templates ---
+// --- Workflows ---
 
-// TestTemplatesList: GET /p/{pid}/templates renders the cards.
-func TestTemplatesList(t *testing.T) {
+// TestWorkflowsList: GET /p/{pid}/workflows lists the YAML paths
+// (path-only — no parse on list, so no Name/Description/Params).
+func TestWorkflowsList(t *testing.T) {
 	s := newTestServer(t, &fakeFC{
 		username: "tamer",
-		templates: []service.TemplateSummary{
-			{Path: "enju/templates/llm_eval/enju.yaml", Name: "LLM Eval", Description: "judge benchmark items"},
-			{Path: "enju/templates/gwas/enju.yaml", Name: "GWAS"},
+		workflows: []service.WorkflowSummary{
+			{Path: "enju.yaml"},
+			{Path: "workflows/gwas/enju.yaml"},
 		},
 	})
-	req := httptest.NewRequest(http.MethodGet, "/p/1/templates", nil)
+	req := httptest.NewRequest(http.MethodGet, "/p/1/workflows", nil)
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	for _, want := range []string{"LLM Eval", "GWAS", "judge benchmark items", "enju/templates/llm_eval/enju.yaml"} {
+	for _, want := range []string{"Workflows", "enju.yaml", "workflows/gwas/enju.yaml",
+		`href="/p/1/workflows/show/enju.yaml"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
 	}
 }
 
-// TestTemplateDetail: GET /p/{pid}/templates/show/{path}
-// renders the detail page with declared params.
-func TestTemplateDetail(t *testing.T) {
+// TestWorkflowDetail: GET /p/{pid}/workflows/show/{path}
+// renders the detail page with the parsed details + declared
+// params (DescribeWorkflow DOES parse).
+func TestWorkflowDetail(t *testing.T) {
 	s := newTestServer(t, &fakeFC{
 		username: "tamer",
-		loadedTemplate: &service.LoadedTemplate{
-			Path:      "enju/templates/llm_eval/enju.yaml",
-			BundleDir: "enju/templates/llm_eval",
+		loadedWorkflow: &service.LoadedWorkflow{
+			Path:      "enju.yaml",
+			BundleDir: ".",
 			Raw:       []byte("name: LLM Eval\nversion: 1\n"),
-			Summary: service.TemplateSummary{
-				Path:        "enju/templates/llm_eval/enju.yaml",
+			Details: service.WorkflowDetails{
+				Path:        "enju.yaml",
 				Name:        "LLM Eval",
 				Description: "judge benchmark items",
 				Params: []service.ParamSummary{
@@ -3380,7 +3383,7 @@ func TestTemplateDetail(t *testing.T) {
 			},
 		},
 	})
-	req := httptest.NewRequest(http.MethodGet, "/p/1/templates/show/enju/templates/llm_eval/enju.yaml", nil)
+	req := httptest.NewRequest(http.MethodGet, "/p/1/workflows/show/enju.yaml", nil)
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -3394,16 +3397,16 @@ func TestTemplateDetail(t *testing.T) {
 	}
 }
 
-// TestCreateRunFromTemplate: form submit flows params + branch
-// into CreateRunFromTemplate; success → 303 redirect to new
-// run.
-func TestCreateRunFromTemplate(t *testing.T) {
+// TestCreateRunFromWorkflow: form submit flows params + branch
+// into CreateRunFromTemplate (service method retained its name);
+// success → 303 redirect to new run.
+func TestCreateRunFromWorkflow(t *testing.T) {
 	fc := &fakeFC{
 		username: "tamer",
-		loadedTemplate: &service.LoadedTemplate{
-			Path:      "enju/templates/llm_eval/enju.yaml",
-			BundleDir: "enju/templates/llm_eval",
-			Summary: service.TemplateSummary{
+		loadedWorkflow: &service.LoadedWorkflow{
+			Path:      "enju.yaml",
+			BundleDir: ".",
+			Details: service.WorkflowDetails{
 				Params: []service.ParamSummary{
 					{Name: "items", Type: "list<string>"},
 					{Name: "judge", Type: "string"},
@@ -3416,7 +3419,7 @@ func TestCreateRunFromTemplate(t *testing.T) {
 	}
 	s := newTestServer(t, fc)
 	body := strings.NewReader("p_items=i01,i02,i03&p_judge=strict&branch=auto")
-	req := httptest.NewRequest(http.MethodPost, "/p/1/templates/run/enju/templates/llm_eval/enju.yaml", body)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/workflows/run/enju.yaml", body)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Origin", "http://127.0.0.1:8080")
 	rr := httptest.NewRecorder()
@@ -3428,13 +3431,12 @@ func TestCreateRunFromTemplate(t *testing.T) {
 	if loc := rr.Header().Get("Location"); loc != "/p/1/r/7" {
 		t.Errorf("redirect: got %q, want /p/1/r/7", loc)
 	}
-	if fc.createdFromPath != "enju/templates/llm_eval/enju.yaml" {
+	if fc.createdFromPath != "enju.yaml" {
 		t.Errorf("path: got %q", fc.createdFromPath)
 	}
 	if fc.createdBranch != "auto" {
 		t.Errorf("branch: got %q, want auto", fc.createdBranch)
 	}
-	// list<string> coercion
 	items, ok := fc.createdParams["items"].([]string)
 	if !ok || len(items) != 3 || items[0] != "i01" {
 		t.Errorf("items param: got %#v, want [i01 i02 i03]", fc.createdParams["items"])
@@ -3444,15 +3446,15 @@ func TestCreateRunFromTemplate(t *testing.T) {
 	}
 }
 
-// TestCreateRunFromTemplateError: failure re-renders detail
-// page with banner + repopulated form, no redirect.
-func TestCreateRunFromTemplateError(t *testing.T) {
+// TestCreateRunFromWorkflowError: failure re-renders detail page
+// with banner + repopulated form, no redirect.
+func TestCreateRunFromWorkflowError(t *testing.T) {
 	fc := &fakeFC{
 		username: "tamer",
-		loadedTemplate: &service.LoadedTemplate{
-			Path:      "enju/templates/llm_eval/enju.yaml",
-			BundleDir: "enju/templates/llm_eval",
-			Summary: service.TemplateSummary{
+		loadedWorkflow: &service.LoadedWorkflow{
+			Path:      "enju.yaml",
+			BundleDir: ".",
+			Details: service.WorkflowDetails{
 				Params: []service.ParamSummary{{Name: "items", Type: "list<string>"}},
 			},
 		},
@@ -3460,7 +3462,7 @@ func TestCreateRunFromTemplateError(t *testing.T) {
 	}
 	s := newTestServer(t, fc)
 	body := strings.NewReader("p_items=&branch=")
-	req := httptest.NewRequest(http.MethodPost, "/p/1/templates/run/enju/templates/llm_eval/enju.yaml", body)
+	req := httptest.NewRequest(http.MethodPost, "/p/1/workflows/run/enju.yaml", body)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Origin", "http://127.0.0.1:8080")
 	rr := httptest.NewRecorder()

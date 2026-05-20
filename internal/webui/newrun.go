@@ -33,9 +33,9 @@ type newRunPage struct {
 // empty paste-a-workflow form. This is the UI's authoring
 // entry point: inline YAML, validated locally before it ever
 // reaches the coordinator (mirror of enju_create_run yaml=
-// mode). Parameterized workflows still go through templates;
-// this is the straightforward "I have an enju.yaml, run it"
-// path.
+// mode). Parameterized workflows still go through the workflows
+// surface; this is the straightforward "I have an enju.yaml, run
+// it" path.
 func (s *Server) handleNewRunForm(w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
 	if err != nil || pid <= 0 {

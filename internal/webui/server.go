@@ -70,13 +70,16 @@ type fatClient interface {
 	TriageIssue(ctx context.Context, projectID int64, seq int, severity string) (*service.IssueResponse, error)
 	CloseIssue(ctx context.Context, projectID int64, seq int, status, closedByTaskID string) (*service.IssueResponse, error)
 
-	// Templates — list, describe, instantiate. Identity is read
-	// from the FatClient's coord client (no need to thread
-	// authorName/authorEmail through the interface here — the
-	// CreateRunFromTemplate signature carries them because
-	// commit identity is Caller responsibility, not coord).
-	ListTemplates(ctx context.Context, projectID int64) ([]service.TemplateSummary, error)
-	DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*service.LoadedTemplate, error)
+	// Workflows — list (path-only), describe (parsed), instantiate.
+	// Workflows are any *.yaml in the project repo; ListWorkflows
+	// just enumerates paths, DescribeWorkflow parses one file for
+	// name/description/declared params. CreateRunFromTemplate
+	// kept its name on the service surface (snapshot semantics
+	// unchanged) but is invoked via the workflows surface here.
+	// Identity (authorName/authorEmail) is Caller responsibility,
+	// not coord — threaded through CreateRunFromTemplate.
+	ListWorkflows(ctx context.Context, projectID int64) ([]service.WorkflowSummary, error)
+	DescribeWorkflow(ctx context.Context, projectID int64, workflowPath string) (*service.LoadedWorkflow, error)
 	CreateRunFromTemplate(ctx context.Context, projectID int64, templatePath string, params map[string]interface{}, branch, authorName, authorEmail string) (*service.CreateRunFromTemplateResult, error)
 	// CreateRunFromYAML creates a run from an inline YAML
 	// definition (mirror of enju_create_run yaml= mode). No

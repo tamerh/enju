@@ -1,4 +1,4 @@
-{{define "title"}}{{if .Template}}{{if .Template.Summary.Name}}{{.Template.Summary.Name}}{{else}}{{.Path}}{{end}}{{else}}{{.Path}}{{end}} · template · Enju{{end}}
+{{define "title"}}{{if .Workflow}}{{if .Workflow.Details.Name}}{{.Workflow.Details.Name}}{{else}}{{.Path}}{{end}}{{else}}{{.Path}}{{end}} · workflow · Enju{{end}}
 
 {{define "main"}}
 <nav class="crumbs">
@@ -6,29 +6,29 @@
   <span> / </span>
   <a href="/p/{{.ProjectID}}">project #{{.ProjectID}}</a>
   <span> / </span>
-  <a href="/p/{{.ProjectID}}/templates">templates</a>
+  <a href="/p/{{.ProjectID}}/workflows">workflows</a>
   <span> / </span>
   <span><code>{{.Path}}</code></span>
 </nav>
 
-{{if .Template}}
+{{if .Workflow}}
 <header class="task-header">
-  <h1>{{if .Template.Summary.Name}}{{.Template.Summary.Name}}{{else}}{{.Path}}{{end}}</h1>
+  <h1>{{if .Workflow.Details.Name}}{{.Workflow.Details.Name}}{{else}}{{.Path}}{{end}}</h1>
   <p class="muted small"><code>{{.Path}}</code></p>
-  {{if .Template.Summary.Description}}<p>{{.Template.Summary.Description}}</p>{{end}}
+  {{if .Workflow.Details.Description}}<p>{{.Workflow.Details.Description}}</p>{{end}}
 </header>
 
 <section>
-  <h2>Create run from this template</h2>
+  <h2>Create run from this workflow</h2>
   {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
-  <form method="POST" action="/p/{{.ProjectID}}/templates/run/{{.Path}}"
-        hx-post="/p/{{.ProjectID}}/templates/run/{{.Path}}"
+  <form method="POST" action="/p/{{.ProjectID}}/workflows/run/{{.Path}}"
+        hx-post="/p/{{.ProjectID}}/workflows/run/{{.Path}}"
         hx-target="#main"
         class="submit-form">
 
-    {{if .Template.Summary.Params}}
+    {{if .Workflow.Details.Params}}
     <h3 class="muted small">Parameters</h3>
-    {{range .Template.Summary.Params}}
+    {{range .Workflow.Details.Params}}
     {{$submitted := index $.SubmittedParams .Name}}
     <label>
       <span>
@@ -52,7 +52,7 @@
     </label>
     {{end}}
     {{else}}
-    <p class="muted small">This template declares no parameters.</p>
+    <p class="muted small">This workflow declares no parameters.</p>
     {{end}}
 
     <label>
@@ -62,23 +62,23 @@
 
     <div class="btn-row">
       <button type="submit" class="btn btn-primary">Create run</button>
-      <a class="btn" href="/p/{{.ProjectID}}/templates">Cancel</a>
+      <a class="btn" href="/p/{{.ProjectID}}/workflows">Cancel</a>
     </div>
   </form>
 </section>
 
-{{if .Template.Raw}}
+{{if .Workflow.Raw}}
 <section>
-  <h2>Raw template</h2>
+  <h2>Raw workflow</h2>
   <details>
-    <summary>view <code>enju.yaml</code></summary>
-    <pre class="result-content">{{printf "%s" .Template.Raw}}</pre>
+    <summary>view <code>{{.Path}}</code></summary>
+    <pre class="result-content" data-lang="yaml">{{printf "%s" .Workflow.Raw}}</pre>
   </details>
 </section>
 {{end}}
 {{else}}
 <section>
-  <p class="muted">(template did not load — check the path)</p>
+  <p class="muted">(workflow did not load — check the path)</p>
 </section>
 {{end}}
 {{end}}

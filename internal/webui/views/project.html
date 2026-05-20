@@ -12,7 +12,7 @@
     <a class="btn" href="/p/{{.Project.ID}}/inbox">Inbox</a>
     <a class="btn" href="/p/{{.Project.ID}}/events">Events</a>
     <a class="btn" href="/p/{{.Project.ID}}/issues">Issues</a>
-    <a class="btn" href="/p/{{.Project.ID}}/templates">Templates</a>
+    <a class="btn" href="/p/{{.Project.ID}}/workflows">Workflows</a>
     <a class="btn" href="/p/{{.Project.ID}}/artifacts">Artifacts</a>
     <a class="btn" href="/p/{{.Project.ID}}/settings">Settings</a>
   </p>
@@ -43,8 +43,7 @@
 <section>
   <h2>Runs</h2>
   <p class="btn-row">
-    <a class="btn btn-primary" href="/p/{{.Project.ID}}/new-run">New run from YAML</a>
-    <a class="btn" href="/p/{{.Project.ID}}/templates">Run from template</a>
+    <a class="btn btn-primary" href="/p/{{.Project.ID}}/workflows">Start new run</a>
   </p>
   {{if .Runs}}
   <table class="run-table">
