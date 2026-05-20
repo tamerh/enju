@@ -66,7 +66,6 @@
       <tr>
         <th>Project</th>
         <th class="num">Runs</th>
-        <th>Branch</th>
         <th>Last activity</th>
       </tr>
     </thead>
@@ -79,7 +78,6 @@
           {{if .Description}}<div class="desc muted small">{{.Description}}</div>{{end}}
         </td>
         <td class="num">{{.RunCount}}</td>
-        <td>{{if .DefaultBranch}}<code>{{.DefaultBranch}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
         <td><span title="{{.ActivityISO}}">{{.ActivityRel}}</span></td>
       </tr>
       {{end}}
