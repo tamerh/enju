@@ -498,6 +498,41 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 		pendingEvents = append(pendingEvents, sink.events...)
 	}
 
+	// Bump projects.last_activity_at for every project whose state
+	// changed in this Plan. Derived from the emitted events (each
+	// state-change mutation stamps event.project_id), so we get
+	// "any task transition / run transition / submission / review
+	// / issue activity counts" for free without enumerating mutation
+	// types. Atomic with the rest of the Plan in the same tx — no
+	// cross-DB query at read time, no separate write path to keep
+	// consistent. Floor and surface conversion happen at the read
+	// side (ToProjectResponse). Best-effort: a failure to bump
+	// freshness does not fail the Plan (the audit/state writes that
+	// matter already landed); this is only the freshness signal.
+	touched := map[int64]struct{}{}
+	for _, e := range pendingEvents {
+		if e.ProjectID != 0 {
+			touched[e.ProjectID] = struct{}{}
+		}
+	}
+	if len(touched) > 0 {
+		ids := make([]interface{}, 0, len(touched)+1)
+		now := time.Now()
+		ids = append(ids, now)
+		placeholders := make([]string, 0, len(touched))
+		for id := range touched {
+			placeholders = append(placeholders, "?")
+			ids = append(ids, id)
+		}
+		q := `UPDATE projects SET last_activity_at = ? WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+		if _, err := tx.Exec(q, ids...); err != nil {
+			// Don't fail the Plan; log-equivalent via the sink is
+			// not available here, but the caller-side logger will
+			// see the missing freshness only as a stale sort key.
+			_ = err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("commit: %w", err)
 	}

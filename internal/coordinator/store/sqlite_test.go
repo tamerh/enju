@@ -1619,3 +1619,110 @@ func TestRunStateAlivePredicateBlocksDuplicateBranchRun(t *testing.T) {
 		t.Fatal("expected unique-index error creating second run on same branch while first is idle")
 	}
 }
+
+// TestApplyPlan_BumpsProjectLastActivityAtOnEmittedEvents pins the
+// freshness-signal contract: every Plan that emits an event with a
+// non-zero project_id (essentially every task state transition,
+// claim, submit, review, accept, skip, etc.) bumps
+// projects.last_activity_at in the SAME tx. The web-UI sorts the
+// project list on this; surface readers (ToProjectResponse) floor
+// at CreatedAt for legacy/zero rows.
+//
+// Note: CreateRun and PENDING CreateTask deliberately don't emit at
+// the apply layer (their service-layer caller emits after the full
+// plan commits). That's by design and not what this test pins —
+// state transitions are where the freshness signal lives.
+func TestApplyPlan_BumpsProjectLastActivityAtOnEmittedEvents(t *testing.T) {
+	s := newTestStore(t)
+
+	// Setup: project + run + a READY task. helperCreateProject's
+	// CreateProject mutation emits project_created with ProjectID,
+	// so LastActivityAt is set after step (1). createTestRun does
+	// NOT emit (intentional — see applyCreateRun comment).
+	runID := createTestRun(t, s)
+	var pid int64
+	if r, _ := s.GetRun(runID); r != nil {
+		pid = r.ProjectID
+	}
+	if pid == 0 {
+		t.Fatalf("could not resolve project id from runID=%d", runID)
+	}
+	p1, _ := s.GetProject(pid)
+	if p1.LastActivityAt.IsZero() {
+		t.Fatalf("LastActivityAt zero after CreateProject — bump didn't fire on the project_created event")
+	}
+	firstActivity := p1.LastActivityAt
+
+	// State transition that DOES emit (birth-ready event with
+	// project_id) — this is the kind of mutation that drives the
+	// freshness signal in production.
+	time.Sleep(2 * time.Millisecond)
+	if err := helperCreateTask(s, &TaskRecord{
+		ID: "1:1:t", RunID: runID, Seq: 1, TaskDefID: "step",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("helperCreateTask: %v", err)
+	}
+	p2, _ := s.GetProject(pid)
+	if !p2.LastActivityAt.After(firstActivity) {
+		t.Errorf("LastActivityAt did not advance on a state-change emit: first=%v, after=%v", firstActivity, p2.LastActivityAt)
+	}
+}
+
+// TestApplyPlan_DoesNotBumpUnrelatedProjects ensures the
+// maintenance query targets ONLY projects whose events fired in
+// this Plan — not every project in the DB.
+func TestApplyPlan_DoesNotBumpUnrelatedProjects(t *testing.T) {
+	s := newTestStore(t)
+
+	// Two projects each with a run + ready task baseline. We then
+	// fire an emitting mutation only on project B and assert
+	// project A's freshness is untouched.
+	pidA, err := helperCreateProject(s, &ProjectRecord{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runA, _, err := helperCreateRun(s, &RunRecord{
+		ProjectID: pidA, Name: "rA", State: RunActive,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidB, err := helperCreateProject(s, &ProjectRecord{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, _, err := helperCreateRun(s, &RunRecord{
+		ProjectID: pidB, Name: "rB", State: RunActive,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = runA
+	pA1, _ := s.GetProject(pidA)
+	pB1, _ := s.GetProject(pidB)
+	aBefore := pA1.LastActivityAt
+
+	time.Sleep(2 * time.Millisecond)
+	// Emitting activity ONLY on project B (READY task → birth-
+	// ready event with ProjectID=pidB).
+	if err := helperCreateTask(s, &TaskRecord{
+		ID: "b:1:t", RunID: runB, Seq: 1, TaskDefID: "step",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pA2, _ := s.GetProject(pidA)
+	pB2, _ := s.GetProject(pidB)
+	if !pA2.LastActivityAt.Equal(aBefore) {
+		t.Errorf("unrelated project A bumped: was %v, now %v", aBefore, pA2.LastActivityAt)
+	}
+	if !pB2.LastActivityAt.After(pB1.LastActivityAt) {
+		t.Errorf("touched project B did not advance: was %v, now %v", pB1.LastActivityAt, pB2.LastActivityAt)
+	}
+}

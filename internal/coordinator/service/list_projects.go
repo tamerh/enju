@@ -16,15 +16,26 @@ type ProjectResponse = wire.Project
 // functions (single-project reads, dashboards) can produce
 // the same shape from a single record.
 func ToProjectResponse(p store.ProjectRecord, runCount int) ProjectResponse {
+	// Floor LastActivityAt at CreatedAt: legacy rows / pre-first-
+	// mutation projects have a zero column. The contract on
+	// wire.Project is that a non-zero value reflects real activity;
+	// where there is none, the operator wants project creation as
+	// the freshness fallback (matches the original spec for the
+	// webui sort).
+	lastActivity := p.LastActivityAt
+	if lastActivity.Before(p.CreatedAt) {
+		lastActivity = p.CreatedAt
+	}
 	return ProjectResponse{
-		ID:            p.ID,
-		Name:          p.Name,
-		Description:   p.Description,
-		RemoteURL:     p.RemoteURL,
-		DefaultBranch: p.DefaultBranch,
-		RunCount:      runCount,
-		CreatedAt:     p.CreatedAt,
-		Archived:      p.Archived,
+		ID:             p.ID,
+		Name:           p.Name,
+		Description:    p.Description,
+		RemoteURL:      p.RemoteURL,
+		DefaultBranch:  p.DefaultBranch,
+		RunCount:       runCount,
+		CreatedAt:      p.CreatedAt,
+		Archived:       p.Archived,
+		LastActivityAt: lastActivity,
 	}
 }
 

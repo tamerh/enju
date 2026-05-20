@@ -228,6 +228,15 @@ type ProjectRecord struct {
 	ArchivedAt time.Time
 	ArchivedBy string // citizen ID that archived it
 
+	// LastActivityAt is bumped to time.Now() by ApplyPlan at the
+	// end of any Plan that emitted an event touching this project
+	// (every state-changing mutation hits it). Surfaced on
+	// wire.Project so the web-UI's project sort has a freshness
+	// signal that beats CreatedAt for long-running projects.
+	// Zero (legacy rows pre-first-mutation) — readers floor to
+	// CreatedAt.
+	LastActivityAt time.Time
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

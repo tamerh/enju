@@ -557,6 +557,16 @@ func (s *Store) initSchema() error {
 		`ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE projects ADD COLUMN archived_at TIMESTAMP`,
 		`ALTER TABLE projects ADD COLUMN archived_by TEXT NOT NULL DEFAULT ''`,
+		// last_activity_at is the most-recent moment anything
+		// happened in this project — bumped by ApplyPlan whenever
+		// any mutation in the plan emits an event with a non-zero
+		// project_id (i.e. essentially every state-changing
+		// mutation). Surfaced on wire.Project so the web-UI's
+		// project sort has a freshness signal that beats CreatedAt
+		// for long-running projects. Legacy rows are NULL until
+		// the first state-change on them; readers floor to
+		// CreatedAt in that case.
+		`ALTER TABLE projects ADD COLUMN last_activity_at TIMESTAMP`,
 		`ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'`,
 		// Compute-task execution mode (Phase 4 of async compute).
 		// Values: '' (non-compute or default-sync), 'sync', 'async'.
@@ -884,7 +894,7 @@ func columnExists(db *sql.DB, table, column string) (bool, error) {
 // projectSelectColumns is the canonical SELECT list for project rows,
 // kept in one place so every scanner pulls the same set in the same
 // order.
-const projectSelectColumns = `id, name, description, created_by, remote_url, default_branch, archived, archived_at, archived_by, created_at, updated_at`
+const projectSelectColumns = `id, name, description, created_by, remote_url, default_branch, archived, archived_at, archived_by, last_activity_at, created_at, updated_at`
 
 // scanProject reads one project row from a scanner into p.
 func scanProject(row interface {
@@ -892,8 +902,8 @@ func scanProject(row interface {
 }, p *ProjectRecord) error {
 	var desc, createdBy, remote, archivedBy sql.NullString
 	var archivedInt int
-	var archivedAt sql.NullTime
-	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.DefaultBranch, &archivedInt, &archivedAt, &archivedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var archivedAt, lastActivityAt sql.NullTime
+	if err := row.Scan(&p.ID, &p.Name, &desc, &createdBy, &remote, &p.DefaultBranch, &archivedInt, &archivedAt, &archivedBy, &lastActivityAt, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return err
 	}
 	p.Description = desc.String
@@ -904,6 +914,9 @@ func scanProject(row interface {
 		p.ArchivedAt = archivedAt.Time
 	}
 	p.ArchivedBy = archivedBy.String
+	if lastActivityAt.Valid {
+		p.LastActivityAt = lastActivityAt.Time
+	}
 	return nil
 }
 

@@ -59,6 +59,18 @@ type Project struct {
 	// wire.
 	Archived bool `json:"archived,omitempty"`
 
+	// LastActivityAt is the most recent moment anything happened
+	// in the project — bumped by ApplyPlan whenever a mutation in
+	// the plan emits an event with this project's id (i.e.
+	// essentially every state-changing mutation: task transitions,
+	// run transitions, submissions, reviews, issues). The web-UI
+	// sorts the projects list on this for a freshness signal that
+	// beats CreatedAt for long-running projects. Zero on older
+	// coordinators OR for projects with no activity since the
+	// column was added — readers must floor to CreatedAt in that
+	// case.
+	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
+
 	// LastPushAt / LastPushError are populated client-side by
 	// DecorateProjectListWithPushStatus (in fatclient/service/
 	// project_ops.go) before format.ProjectList consumes the
