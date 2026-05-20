@@ -32,6 +32,7 @@ type fakeOps struct {
 	// bundles, or arbitrary subtrees from a commit's tree.
 	treeEntries map[string][]git.TreeEntry                                            // sha+":"+dirPath → entries (nil = ok=false)
 	walkBlobs   map[string]map[string]struct{ Mode os.FileMode; Content []byte }     // sha+":"+dirPath → relPath → blob
+	blobPaths   map[string][]string                                                  // sha → []relPath (whole tree, blobs only)
 
 	// Commit-walk fake for WalkRecentCommits. Visited newest-first;
 	// the slice is treated as "most recent at index 0".
@@ -118,6 +119,7 @@ func newFakeOps() *fakeOps {
 		errOnCall:   make(map[string]error),
 		treeEntries: make(map[string][]git.TreeEntry),
 		walkBlobs:   make(map[string]map[string]struct{ Mode os.FileMode; Content []byte }),
+		blobPaths:   make(map[string][]string),
 		state:       git.StateClean,
 		headSHA:     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		headBranch:  "main",
@@ -238,6 +240,15 @@ func (f *fakeOps) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit git.BlobVi
 		}
 	}
 	return nil
+}
+
+func (f *fakeOps) ListBlobPathsAtCommit(sha string) ([]string, error) {
+	f.record("ListBlobPathsAtCommit", sha)
+	if err := f.checkErr("ListBlobPathsAtCommit"); err != nil {
+		return nil, err
+	}
+	paths := append([]string(nil), f.blobPaths[sha]...)
+	return paths, nil
 }
 
 func (f *fakeOps) LogFile(relPath, branch string) ([]git.CommitInfo, error) {

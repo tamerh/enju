@@ -19,7 +19,6 @@ import (
 // in-tree callers don't churn during the boundary refactor.
 const (
 	ResultDirRoot           = layout.ResultDirRoot
-	DefaultTemplatesDir     = layout.DefaultTemplatesDir
 	BundleManifestName      = layout.BundleManifestName
 	TemplateSnapshotDirName = layout.TemplateSnapshotDirName
 )

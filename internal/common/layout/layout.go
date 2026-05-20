@@ -61,15 +61,8 @@ const EventsDir = StateDirRoot + "/events"
 // untracked content post-Phase-8.
 const LogsDir = StateDirRoot + "/logs"
 
-// DefaultTemplatesDir is a soft convention for where template
-// bundles tend to live. After Phase 8 LoadTemplate accepts any
-// path, so this constant is just a fallback hint for tooling
-// that wants "the conventional spot." User can put workflow
-// YAMLs anywhere.
-const DefaultTemplatesDir = "enju/templates"
-
 // BundleManifestName is the canonical filename at the root of
-// every template bundle directory. Scoped by role (not by
+// every workflow bundle directory. Scoped by role (not by
 // enclosing folder, so bundle dirs can be renamed freely) and
 // distinctive enough that a grep for "enju.yaml" in a mixed
 // repo won't collide with GitHub Actions / Ansible / etc.

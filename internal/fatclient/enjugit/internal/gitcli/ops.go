@@ -25,6 +25,11 @@ type Ops interface {
 	ReadTreeEntriesAtCommit(sha, dirPath string) (entries []TreeEntry, ok bool, err error)
 	WalkSubtreeBlobsAtCommit(sha, dirPath string, visit BlobVisitor) error
 
+	// ListBlobPathsAtCommit returns every blob path in sha's tree,
+	// path-only (no content reads), forward-slash separated.
+	// Cheap on big repos. Submodules / non-blobs are skipped.
+	ListBlobPathsAtCommit(sha string) ([]string, error)
+
 	// WalkRecentCommits walks HEAD newest-first, calling visit for
 	// up to maxWalk commits. visit returns false to stop early.
 	// maxWalk <= 0 walks the whole history. Used by enjugit's

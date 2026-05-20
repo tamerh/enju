@@ -185,10 +185,10 @@ func (t *TestClient) Call(ctx context.Context, toolName string, args map[string]
 		return t.c.handleExportDiagram(ctx, req)
 	case "enju_export_run_events":
 		return t.c.handleExportRunEvents(ctx, req)
-	case "enju_list_templates":
-		return t.c.handleListTemplates(ctx, req)
-	case "enju_describe_template":
-		return t.c.handleDescribeTemplate(ctx, req)
+	case "enju_list_workflows":
+		return t.c.handleListWorkflows(ctx, req)
+	case "enju_describe_workflow":
+		return t.c.handleDescribeWorkflow(ctx, req)
 	case "enju_execute_task":
 		return t.c.handleExecuteTask(ctx, req)
 	case "enju_execute_run":

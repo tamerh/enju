@@ -1,10 +1,10 @@
 package service
 
-// Template-discovery orchestration. enju_list_templates and
-// enju_describe_template are pure client-side reads (the
-// coordinator doesn't know about templates beyond a run's
+// Workflow-discovery orchestration. enju_list_workflows and
+// enju_describe_workflow are pure client-side reads (the
+// coordinator doesn't know about workflows beyond a run's
 // source_path provenance column), but each opens the project
-// clone and runs a best-effort pull so templates pushed by
+// clone and runs a best-effort pull so workflows pushed by
 // other citizens since the last update show up. Bodies are
 // nearly identical — extracted here so handlers stay one-liners
 // and any future change to the open+pull dance has one home.
@@ -18,48 +18,108 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 )
 
-// Type aliases re-export the workspace template shapes through
-// the service surface. Lets in-process consumers (web UI) use
-// service.TemplateSummary without importing workspace —
+// Type aliases re-export the workspace workflow shapes through
+// the service surface. Lets in-process consumers use
+// service.WorkflowSummary without importing enjugit —
 // keeps the published FatClient API self-contained at the
 // fatclient/service boundary.
-type TemplateSummary = enjugit.TemplateSummary
+type WorkflowSummary = enjugit.WorkflowSummary
+type LoadedWorkflow = enjugit.LoadedWorkflow
+type WorkflowDetails = enjugit.WorkflowDetails
 type ParamSummary = enjugit.ParamSummary
+
+// TemplateSummary / LoadedTemplate are the legacy aliases kept
+// for callers still on the "template" vocabulary (currently the
+// webui). The list path no longer populates Name/Description/
+// Params on these shims — ListTemplates returns paths only,
+// adapted from ListWorkflows.
+//
+// Deprecated: use WorkflowSummary.
+type TemplateSummary = enjugit.TemplateSummary
+
+// Deprecated: use LoadedWorkflow.
 type LoadedTemplate = enjugit.LoadedTemplate
 
-// ListTemplates opens the project clone, best-effort pulls,
-// and returns the list of template entries. A failed pull is
-// logged at Debug and the scan proceeds against whatever's on
-// disk — the user still gets a menu, and the error surfaces
-// on the next branch-touching tool call if it's load-bearing.
-func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]TemplateSummary, error) {
+// ListWorkflows opens the project clone, best-effort pulls, and
+// returns every *.yaml / *.yml path on the default branch outside
+// hidden directories. No content is read — picking the right file
+// (workflow vs. unrelated YAML) is the caller's responsibility.
+// A failed pull is logged at Debug and the scan proceeds against
+// whatever's on disk.
+func (s *FatClient) ListWorkflows(ctx context.Context, projectID int64) ([]WorkflowSummary, error) {
 	if s.enjugit == nil {
-		return nil, fmt.Errorf("enju_list_templates requires a local workspace (MCP client mode)")
+		return nil, fmt.Errorf("enju_list_workflows requires a local workspace (MCP client mode)")
 	}
 	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	if perr := wf.PullBranch(""); perr != nil {
-		s.logger.Debug("list_templates pull failed, scanning local state", "err", perr)
+		s.logger.Debug("list_workflows pull failed, scanning local state", "err", perr)
 	}
-	return wf.ListTemplates()
+	return wf.ListWorkflows()
 }
 
-// DescribeTemplate opens the project clone, best-effort pulls,
-// and loads one template by path.
-func (s *FatClient) DescribeTemplate(ctx context.Context, projectID int64, templatePath string) (*LoadedTemplate, error) {
+// DescribeWorkflow opens the project clone, best-effort pulls,
+// and loads one workflow YAML by path. Unlike ListWorkflows this
+// DOES parse the file — that's the contract for describe: the
+// caller wants the name, description, and declared params.
+func (s *FatClient) DescribeWorkflow(ctx context.Context, projectID int64, workflowPath string) (*LoadedWorkflow, error) {
 	if s.enjugit == nil {
-		return nil, fmt.Errorf("enju_describe_template requires a local workspace (MCP client mode)")
+		return nil, fmt.Errorf("enju_describe_workflow requires a local workspace (MCP client mode)")
 	}
 	wf, _, _, _, err := s.OpenWorkflow(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	if perr := wf.PullBranch(""); perr != nil {
-		s.logger.Debug("describe_template pull failed, reading local state", "err", perr)
+		s.logger.Debug("describe_workflow pull failed, reading local state", "err", perr)
 	}
-	return wf.LoadTemplate(templatePath)
+	return wf.LoadWorkflow(workflowPath)
+}
+
+// ListTemplates is the deprecated alias kept so the webui keeps
+// compiling. Returns the new path-only WorkflowSummary entries
+// adapted into the rich TemplateSummary shape with empty Name/
+// Description/Params — the old "we list bundles with their declared
+// params" contract is gone, but the field set survives the
+// rename pass.
+//
+// Deprecated: use ListWorkflows.
+func (s *FatClient) ListTemplates(ctx context.Context, projectID int64) ([]TemplateSummary, error) {
+	out, err := s.ListWorkflows(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	tmpls := make([]TemplateSummary, len(out))
+	for i, w := range out {
+		tmpls[i] = TemplateSummary{Path: w.Path}
+	}
+	return tmpls, nil
+}
+
+// DescribeTemplate is the deprecated alias for DescribeWorkflow.
+// Returns LoadedTemplate adapted from LoadedWorkflow — keeps the
+// webui's existing call site compiling unchanged.
+//
+// Deprecated: use DescribeWorkflow.
+func (s *FatClient) DescribeTemplate(ctx context.Context, projectID int64, workflowPath string) (*LoadedTemplate, error) {
+	loaded, err := s.DescribeWorkflow(ctx, projectID, workflowPath)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedTemplate{
+		Path:      loaded.Path,
+		BundleDir: loaded.BundleDir,
+		Raw:       loaded.Raw,
+		Summary: TemplateSummary{
+			Path:        loaded.Details.Path,
+			Name:        loaded.Details.Name,
+			Description: loaded.Details.Description,
+			Params:      loaded.Details.Params,
+		},
+		Parsed: loaded.Parsed,
+	}, nil
 }
 
 // CreateRunFromTemplateResult bundles the coord response body

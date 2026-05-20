@@ -95,8 +95,8 @@ var allToolFactories = []struct {
 	{"enju_export_run_events", enjumcp.ExportRunEvents},
 	{"enju_export_diagram", enjumcp.ExportDiagram},
 	{"enju_export_run", enjumcp.ExportRun},
-	{"enju_list_templates", enjumcp.ListTemplates},
-	{"enju_describe_template", enjumcp.DescribeTemplate},
+	{"enju_list_workflows", enjumcp.ListWorkflows},
+	{"enju_describe_workflow", enjumcp.DescribeWorkflow},
 	{"enju_list_projects", enjumcp.ListProjects},
 	{"enju_archive_project", enjumcp.ArchiveProject},
 	{"enju_restore_project", enjumcp.RestoreProject},
@@ -267,8 +267,8 @@ func TestKeySchemasHaveRequiredArgs(t *testing.T) {
 		{"enju_invalidate_task", enjumcp.InvalidateTask, []string{"task_id"}},
 		{"enju_execute_task", enjumcp.ExecuteTask, []string{"task_id"}},
 		{"enju_execute_run", enjumcp.ExecuteRun, []string{"project_id", "run_id"}},
-		{"enju_describe_template", enjumcp.DescribeTemplate, []string{"project_id", "path"}},
-		{"enju_list_templates", enjumcp.ListTemplates, []string{"project_id"}},
+		{"enju_describe_workflow", enjumcp.DescribeWorkflow, []string{"project_id", "path"}},
+		{"enju_list_workflows", enjumcp.ListWorkflows, []string{"project_id"}},
 		{"enju_create_run", enjumcp.CreateRun, []string{"project_id"}},
 	}
 	for _, tc := range cases {

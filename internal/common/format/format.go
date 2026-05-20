@@ -2925,12 +2925,12 @@ func TaskDetail(taskData []byte, inputsData []byte, viewer string) string {
 	return b.String()
 }
 
-// ListTemplates renders the enju_list_templates response
-// as a scannable menu. Each entry includes the template's path,
-// name, one-line description snippet, and a compact param
-// summary ("disease, tissue=whole blood") so the LLM can pick
-// a recipe without drilling into each one.
-func ListTemplates(data []byte) string {
+// ListWorkflows renders the enju_list_workflows response as a
+// plain numbered list of paths. The verb is path-only by design
+// (Enju doesn't parse YAMLs at list time), so this renderer is
+// likewise minimal — names, descriptions, and param schemas come
+// from enju_describe_workflow on a chosen path.
+func ListWorkflows(data []byte) string {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return string(data)
@@ -2938,69 +2938,27 @@ func ListTemplates(data []byte) string {
 	if errMsg, ok := resp["error"].(string); ok {
 		return "✗ " + errMsg
 	}
-	templates, _ := resp["templates"].([]interface{})
-	if len(templates) == 0 {
-		return "No templates found in this project.\n\nTemplates are reusable run recipes stored under enju/templates/*.yaml in the project git repo. To add one, commit a YAML file to enju/templates/ with a top-level params: block. Any existing run YAML can be promoted to a template by copying it into enju/templates/."
+	workflows, _ := resp["workflows"].([]interface{})
+	if len(workflows) == 0 {
+		return "No YAML files found in this project's default-branch tree.\n\nWorkflows conventionally live at the project root as enju.yaml or under workflows/<name>/enju.yaml. Commit a YAML and try again."
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("── Templates (%d) — enju_list_templates ──\n", len(templates)))
-	for _, t := range templates {
-		m, _ := t.(map[string]interface{})
+	b.WriteString(fmt.Sprintf("── YAML files (%d) — enju_list_workflows ──\n", len(workflows)))
+	for _, w := range workflows {
+		m, _ := w.(map[string]interface{})
 		path, _ := m["path"].(string)
-		name, _ := m["name"].(string)
-		desc, _ := m["description"].(string)
-		params, _ := m["params"].([]interface{})
-		parseErr, _ := m["parse_error"].(string)
-
-		if parseErr != "" {
-			// Surface parse failures inline. Users deserve to
-			// see their template + the reason it's unusable,
-			// not a menu that silently skipped it.
-			b.WriteString(fmt.Sprintf("✗ %s  (unparseable — %s)\n", path, parseErr))
-			continue
-		}
-
 		b.WriteString(fmt.Sprintf("▸ %s\n", path))
-		if name != "" {
-			b.WriteString(fmt.Sprintf("  Name:   %s\n", name))
-		}
-		if desc != "" {
-			// Show the first line of the description as a preview;
-			// full text comes from enju_describe_template.
-			first := strings.SplitN(strings.TrimSpace(desc), "\n", 2)[0]
-			b.WriteString(fmt.Sprintf("  About:  %s\n", first))
-		}
-		if len(params) > 0 {
-			var parts []string
-			for _, p := range params {
-				pm, _ := p.(map[string]interface{})
-				pname, _ := pm["name"].(string)
-				required, _ := pm["required"].(bool)
-				def := pm["default"]
-				switch {
-				case required:
-					parts = append(parts, pname+"*")
-				case def != nil:
-					parts = append(parts, fmt.Sprintf("%s=%v", pname, def))
-				default:
-					parts = append(parts, pname)
-				}
-			}
-			b.WriteString(fmt.Sprintf("  Params: %s\n", strings.Join(parts, ", ")))
-		}
-		b.WriteString("\n")
 	}
 	b.WriteString("────────────────────────────────────────────\n")
-	b.WriteString("Starred params (*) are required. Call enju_describe_template <path> for full parameter docs, or enju_create_run path=... params={...} to instantiate.")
+	b.WriteString("Enju does not validate which YAMLs are workflows — pick the one whose path looks right and call enju_describe_workflow <path> to see its declared params, then enju_create_run path=<path> params={...} to instantiate.")
 	return b.String()
 }
 
-// DescribeTemplate renders the full metadata for one
-// template as a drill-down view. This is what the LLM reads
-// right before gathering param values from the user: it has
-// the full description prose, plus every param's type,
-// default, and human-readable description.
-func DescribeTemplate(data []byte) string {
+// DescribeWorkflow renders the full metadata for one workflow as
+// a drill-down view. This is what the LLM reads right before
+// gathering param values from the user: full description prose,
+// plus every param's type, default, and human-readable description.
+func DescribeWorkflow(data []byte) string {
 	var tmpl map[string]interface{}
 	if err := json.Unmarshal(data, &tmpl); err != nil {
 		return string(data)
@@ -3014,7 +2972,7 @@ func DescribeTemplate(data []byte) string {
 	params, _ := tmpl["params"].([]interface{})
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("── Template: %s ──\n", path))
+	b.WriteString(fmt.Sprintf("── Workflow: %s ──\n", path))
 	if name != "" {
 		b.WriteString(fmt.Sprintf("Name:        %s\n", name))
 	}
@@ -3025,7 +2983,7 @@ func DescribeTemplate(data []byte) string {
 		}
 	}
 	if len(params) == 0 {
-		b.WriteString("\nThis template declares no parameters — it can be instantiated with enju_create_run path=" + path + " and no params.")
+		b.WriteString("\nThis workflow declares no parameters — it can be instantiated with enju_create_run path=" + path + " and no params.")
 		return b.String()
 	}
 	b.WriteString(fmt.Sprintf("\nParameters (%d):\n", len(params)))

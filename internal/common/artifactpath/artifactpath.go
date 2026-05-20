@@ -53,12 +53,13 @@ func ValidateDeclaration(p string) error {
 //     (StateDirRoot == ResultDirRoot in internal/common/layout).
 //     A write here clobbers the machinery running the workflow.
 //   - ".git"  — the operator's object store.
-//   - "enju"  — the conventional template-bundle root
-//     (layout.DefaultTemplatesDir == "enju/templates"); a write
-//     here can corrupt the workflow definitions an in-flight run
-//     reads from. Kept reserved even after the visible/hidden
-//     ".enju" consolidation precisely because bundles still live
-//     under "enju/".
+//   - "enju"  — the conventional workflow-bundle root. Workflow
+//     YAMLs and their sibling scripts often live under "enju/"
+//     (e.g. "enju/workflows/<name>/enju.yaml"), and a write here
+//     can corrupt the recipe an in-flight run reads from. The
+//     prefix is reserved even after the visible/hidden ".enju"
+//     consolidation; workflow YAMLs can live anywhere in the
+//     repo but writes from inside a run never can.
 //
 // Held as literals (not layout constants) to keep this package a
 // dependency-free leaf; these are stable on-disk names.

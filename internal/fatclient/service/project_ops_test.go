@@ -23,7 +23,6 @@ import (
 	"strings"
 	"testing"
 
-	corelayout "github.com/enju-ai/enju/internal/common/layout"
 	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/testutil/gittest"
@@ -46,14 +45,15 @@ func initRepoWithCommit(t *testing.T, dir string, withEnjuMarker bool) {
 		t.Fatal(err)
 	}
 	if withEnjuMarker {
-		// enju/templates/.gitkeep — the marker DetectPopulatedUnrelatedRepo
-		// looks for. Differentiates "previously adopted by Enju, safe to
-		// re-adopt" from "totally unrelated user repo, refuse without force".
-		tmplDir := filepath.Join(dir, corelayout.DefaultTemplatesDir)
-		if err := os.MkdirAll(tmplDir, 0o755); err != nil {
+		// An `enju/` subdirectory is one of the markers
+		// DetectPopulatedUnrelatedRepo accepts as "previously adopted
+		// by Enju, safe to re-adopt." Distinguishes that case from
+		// "totally unrelated user repo, refuse without force."
+		enjuDir := filepath.Join(dir, "enju")
+		if err := os.MkdirAll(enjuDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(tmplDir, ".gitkeep"), nil, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(enjuDir, ".gitkeep"), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -45,7 +45,7 @@ params:
 | `type` | yes | `string`, `int`, `float`, `bool`, `list<string>`, `list<record>` |
 | `required` | no | If `true`, run creation fails without this param. Default: `false`. |
 | `default` | no | Value used when param is absent. Mutually exclusive with `required: true`. |
-| `description` | no | Shown in `enju_describe_template` output and `enju validate` errors. |
+| `description` | no | Shown in `enju_describe_workflow` output and `enju validate` errors. |
 
 ---
 

@@ -223,6 +223,45 @@ func (c *Clone) WalkSubtreeBlobsAtCommit(sha, dirPath string, visit BlobVisitor)
 	return nil
 }
 
+// ListBlobPathsAtCommit returns every blob path in the tree at
+// sha, forward-slash separated, sorted by git's tree order.
+// Path-only: no blob contents are read, so this is cheap on big
+// repos. Submodules and other non-blob entries are skipped.
+//
+// Lazy fetch on missing commit, same as ReadFileAtCommit. A
+// path resolving to a non-tree at the root is impossible (the
+// root of a commit is always a tree), so no ok-flag is needed.
+func (c *Clone) ListBlobPathsAtCommit(sha string) ([]string, error) {
+	if err := c.ensureCommitLocal(sha); err != nil {
+		return nil, err
+	}
+	treeish := sha + "^{tree}"
+	out, err := runGit(c.workDir, []string{"ls-tree", "-r", "-z", treeish}, runOpts{})
+	if err != nil {
+		return nil, fmt.Errorf("git: ls-tree -r %s: %w", treeish, err)
+	}
+	var paths []string
+	for _, rec := range strings.Split(string(out), "\x00") {
+		if rec == "" {
+			continue
+		}
+		head, relPath, ok := strings.Cut(rec, "\t")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(head)
+		if len(fields) != 3 {
+			continue
+		}
+		if fields[1] != "blob" {
+			// Submodule / commit — skip.
+			continue
+		}
+		paths = append(paths, relPath)
+	}
+	return paths, nil
+}
+
 // LogFile returns commits that touched relPath, newest-first.
 // Used by per-file history readers (enju_get_artifact_history).
 //

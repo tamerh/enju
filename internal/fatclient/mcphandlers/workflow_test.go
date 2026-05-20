@@ -11,11 +11,11 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// Template handlers take the client down three short pre-check
+// Workflow handlers take the client down three short pre-check
 // branches — missing args or absent workspace — before ever hitting
-// git or the coordinator. Covering those here keeps template.go's
-// coverage nonzero and pins the "tool-level errors don't panic"
-// contract without booting a real workspace.
+// git or the coordinator. Covering those here keeps the handler
+// file's coverage nonzero and pins the "tool-level errors don't
+// panic" contract without booting a real workspace.
 
 func newClientNoWorkspace() *apiClient {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -34,9 +34,9 @@ func callTool(fn func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult
 
 // Reuses toolResultText from server_test.go.
 
-func TestHandleListTemplatesMissingProjectID(t *testing.T) {
+func TestHandleListWorkflowsMissingProjectID(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleListTemplates, map[string]any{})
+	res, err := callTool(c.handleListWorkflows, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)
 	}
@@ -48,9 +48,9 @@ func TestHandleListTemplatesMissingProjectID(t *testing.T) {
 	}
 }
 
-func TestHandleListTemplatesWithoutWorkspace(t *testing.T) {
+func TestHandleListWorkflowsWithoutWorkspace(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleListTemplates, map[string]any{"project_id": float64(1)})
+	res, err := callTool(c.handleListWorkflows, map[string]any{"project_id": float64(1)})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)
 	}
@@ -62,9 +62,9 @@ func TestHandleListTemplatesWithoutWorkspace(t *testing.T) {
 	}
 }
 
-func TestHandleDescribeTemplateMissingProjectID(t *testing.T) {
+func TestHandleDescribeWorkflowMissingProjectID(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleDescribeTemplate, map[string]any{"path": "enju/templates/x.yaml"})
+	res, err := callTool(c.handleDescribeWorkflow, map[string]any{"path": "workflows/x/enju.yaml"})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)
 	}
@@ -76,9 +76,9 @@ func TestHandleDescribeTemplateMissingProjectID(t *testing.T) {
 	}
 }
 
-func TestHandleDescribeTemplateMissingPath(t *testing.T) {
+func TestHandleDescribeWorkflowMissingPath(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleDescribeTemplate, map[string]any{"project_id": float64(1)})
+	res, err := callTool(c.handleDescribeWorkflow, map[string]any{"project_id": float64(1)})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)
 	}
@@ -89,18 +89,18 @@ func TestHandleDescribeTemplateMissingPath(t *testing.T) {
 	if !strings.Contains(msg, "path is required") {
 		t.Errorf("expected path-required error, got %q", msg)
 	}
-	// Post-Phase-8: workflow YAMLs can live anywhere. The hint
-	// should mention an example path so the LLM knows the shape.
+	// Workflow YAMLs can live anywhere. The hint should mention an
+	// example path so the LLM knows the shape.
 	if !strings.Contains(msg, "enju.yaml") {
 		t.Errorf("expected path error to include an example path hint, got %q", msg)
 	}
 }
 
-func TestHandleDescribeTemplateWithoutWorkspace(t *testing.T) {
+func TestHandleDescribeWorkflowWithoutWorkspace(t *testing.T) {
 	c := newClientNoWorkspace()
-	res, err := callTool(c.handleDescribeTemplate, map[string]any{
+	res, err := callTool(c.handleDescribeWorkflow, map[string]any{
 		"project_id": float64(1),
-		"path":       "enju/templates/x.yaml",
+		"path":       "workflows/x/enju.yaml",
 	})
 	if err != nil {
 		t.Fatalf("unexpected go error: %v", err)

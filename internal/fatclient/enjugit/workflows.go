@@ -14,23 +14,40 @@ import (
 	git "github.com/enju-ai/enju/internal/fatclient/enjugit/internal/gitcli"
 )
 
-// templates.go — template discovery + bundle reading on the
-// fat-client side. Source-of-truth invariant: every template
-// read goes through the default-branch tree, not the worktree
-// filesystem. So enju_list_templates returns the same set
-// regardless of which run branch the workspace is checked out
-// on, and per-run snapshots are deterministic.
+// workflows.go — workflow discovery + bundle reading on the
+// fat-client side. Source-of-truth invariant: every workflow read
+// goes through the default-branch tree, not the worktree filesystem.
+// So enju_list_workflows returns the same set regardless of which
+// run branch the workspace is checked out on, and per-run snapshots
+// are deterministic.
 //
-// Workflow holds no project-level state (default branch,
-// configured templates roots) — service passes those per call.
-// That keeps the Workflow type stateless w.r.t. project config:
-// service owns the project record and forwards as needed.
+// Discovery is intentionally dumb: walk the default-branch tree
+// for every *.yaml/*.yml file outside hidden directories. We do
+// NOT parse or sniff content to decide whether a file is a workflow
+// — that's the operator's call. The MCP description names the
+// convention (root-level enju.yaml or workflows/<name>/) without
+// enforcing it. A heuristic that opened files to check for `tasks:`
+// would make the contract fuzzy ("usually skipped, sometimes not").
+//
+// Workflow holds no project-level state — service passes the
+// default branch per call.
 
-// TemplateSummary is the lightweight shape returned by
-// ListTemplates — enough for an LLM to pick a template from a
-// menu without parsing the full YAML. ParseError populated when
-// a discovered template's YAML failed to decode/validate, so
-// the menu shows it as broken instead of silently dropping it.
+// WorkflowSummary is the path-only shape returned by ListWorkflows.
+// Just a path — no name, description, or param schema, because
+// list doesn't parse. Use enju_describe_workflow (which loads and
+// parses one file) for the richer view.
+type WorkflowSummary struct {
+	Path string `json:"path"`
+}
+
+// TemplateSummary is the legacy listing shape kept as a deprecated
+// alias for callers that still expect rich fields (currently the
+// webui). The new ListWorkflows path returns WorkflowSummary;
+// service.ListTemplates adapts and leaves Name/Description/Params
+// empty (no parse on list).
+//
+// Deprecated: use WorkflowSummary; the rich fields are no longer
+// populated by listing.
 type TemplateSummary struct {
 	Path        string         `json:"path"`
 	Name        string         `json:"name,omitempty"`
@@ -39,9 +56,10 @@ type TemplateSummary struct {
 	ParseError  string         `json:"parse_error,omitempty"`
 }
 
-// ParamSummary is the per-param shape embedded in a TemplateSummary.
-// Compressed view of the YAML ParamDef — just the fields the LLM
-// needs when deciding whether a template fits a request.
+// ParamSummary is the per-param shape embedded in a LoadedWorkflow's
+// details. Compressed view of the YAML ParamDef — the fields a
+// caller needs when deciding whether a workflow fits a request or
+// when building a param-entry form.
 type ParamSummary struct {
 	Name        string      `json:"name"`
 	Type        string      `json:"type"`
@@ -50,14 +68,36 @@ type ParamSummary struct {
 	Description string      `json:"description,omitempty"`
 }
 
-// LoadedTemplate is the full parsed view of a template bundle.
+// WorkflowDetails is the rich-shape view of one workflow returned
+// by LoadWorkflow / enju_describe_workflow. Unlike WorkflowSummary
+// (list shape, path only), this DOES require a parse — it's the
+// per-file detail view.
+type WorkflowDetails struct {
+	Path        string         `json:"path"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Params      []ParamSummary `json:"params,omitempty"`
+}
+
+// LoadedWorkflow is the full parsed view of a workflow bundle.
 // Path is the manifest YAML's repo-relative path; BundleDir is
 // the enclosing dir, used by snapshot-on-instantiate to enumerate
 // every file to copy.
 //
 // Parsed is the result of yaml.Parse on Raw; exposed so callers
 // don't re-parse to read fields like the inline `bots:` block.
-// Pre-Phase-7 callers that only needed Summary can ignore it.
+type LoadedWorkflow struct {
+	Path      string
+	BundleDir string
+	Raw       []byte
+	Details   WorkflowDetails
+	Parsed    *enjuYaml.ParsedRun
+}
+
+// LoadedTemplate is the deprecated alias kept for callers (webui)
+// still on the old field name. New code uses LoadedWorkflow.
+//
+// Deprecated: use LoadedWorkflow.
 type LoadedTemplate struct {
 	Path      string
 	BundleDir string
@@ -79,103 +119,73 @@ type resolvedBundle struct {
 // would bloat every subsequent run commit.
 const maxTemplateBundleBytes = 10 * 1024 * 1024
 
-// ListTemplates scans the default template root on the default
-// branch and returns one summary per directory bundle. The root
-// is corelayout.DefaultTemplatesDir; the branch is the workflow's
-// default (set via SetDefaultBranch, falling back to
-// convs.DefaultRunBranch).
+// ListWorkflows returns every *.yaml / *.yml path in the default-
+// branch tree, modulo paths whose any directory component starts
+// with a dot (so .git/, .enju/, .github/, .vscode/, etc. never
+// appear). Path-only — no content read, no parse. The caller picks
+// which file is "actually" a workflow; Enju does not validate.
 //
-// Directories without an enju.yaml are skipped silently. A
-// bundle whose enju.yaml fails to parse appears with ParseError
-// populated. Loose `.yaml` files directly under a templates
-// root produce a migration-hint entry so the author isn't left
-// with an empty menu.
-func (w *Workflow) ListTemplates() ([]TemplateSummary, error) {
-	roots := []string{corelayout.DefaultTemplatesDir}
+// Convention (not enforced): a workflow YAML lives at the repo
+// root as `enju.yaml` or under `workflows/<name>/enju.yaml`. The
+// MCP tool description names that convention; users are free to
+// store workflows elsewhere.
+//
+// Returns nil when the default branch has no commits yet — not
+// an error, just nothing to list.
+func (w *Workflow) ListWorkflows() ([]WorkflowSummary, error) {
 	sha, err := w.resolveDefaultBranchSHA(w.DefaultBranch())
 	if err != nil {
 		return nil, err
 	}
 	if sha == "" {
-		// Default branch has no commits yet — not an error,
-		// just nothing to list.
 		return nil, nil
 	}
-	var out []TemplateSummary
-	seen := map[string]bool{}
-	for _, root := range roots {
-		items, err := w.scanTemplateRoot(sha, root)
-		if err != nil {
-			return nil, err
+	paths, err := w.git.ListBlobPathsAtCommit(sha)
+	if err != nil {
+		return nil, fmt.Errorf("listing workflows: %w", err)
+	}
+	out := make([]WorkflowSummary, 0, len(paths))
+	for _, p := range paths {
+		if !hasYAMLExt(p) {
+			continue
 		}
-		for _, it := range items {
-			if seen[it.Path] {
-				continue
-			}
-			seen[it.Path] = true
-			out = append(out, it)
+		if hasHiddenComponent(p) {
+			continue
 		}
+		out = append(out, WorkflowSummary{Path: p})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
 }
 
-// scanTemplateRoot walks one template root in the default-branch
-// tree. Splits to keep ListTemplates' fan-over-multiple-roots
-// loop readable.
-func (w *Workflow) scanTemplateRoot(sha, root string) ([]TemplateSummary, error) {
-	entries, ok, err := w.git.ReadTreeEntriesAtCommit(sha, root)
-	if err != nil {
-		return nil, fmt.Errorf("reading templates dir %s: %w", root, err)
-	}
-	if !ok {
-		return nil, nil
-	}
-	var out []TemplateSummary
-	for _, e := range entries {
-		if e.IsDir {
-			// Possible bundle — check for the manifest inside.
-			subPath := filepath.ToSlash(filepath.Join(root, e.Name))
-			manifestPath := subPath + "/" + corelayout.BundleManifestName
-			data, found, ferr := w.git.ReadFileAtCommit(sha, manifestPath)
-			if ferr != nil {
-				return nil, fmt.Errorf("reading template manifest %s: %w", manifestPath, ferr)
-			}
-			if !found {
-				// Subdir without a manifest — not a bundle, skip.
-				continue
-			}
-			summary := summaryFromManifestBytes(manifestPath, data)
-			out = append(out, summary)
-			continue
-		}
-		// File at the root level — the legacy single-file shape.
-		// Surface ONE migration-hint per offender so the author
-		// doesn't see an empty menu.
-		if strings.HasSuffix(e.Name, ".yaml") || strings.HasSuffix(e.Name, ".yml") {
-			legacyRel := filepath.ToSlash(filepath.Join(root, e.Name))
-			base := strings.TrimSuffix(strings.TrimSuffix(e.Name, ".yaml"), ".yml")
-			out = append(out, TemplateSummary{
-				Path: legacyRel,
-				ParseError: fmt.Sprintf(
-					"legacy single-file template layout — move %s to %s/%s/%s",
-					legacyRel, root, base, corelayout.BundleManifestName),
-			})
-		}
-	}
-	return out, nil
+// hasYAMLExt is the file-extension half of the workflow-list
+// filter. Plain suffix check — not case-folded; git paths are
+// case-sensitive and the conventional extensions are lowercase.
+func hasYAMLExt(p string) bool {
+	return strings.HasSuffix(p, ".yaml") || strings.HasSuffix(p, ".yml")
 }
 
-// summaryFromManifestBytes parses a manifest blob and returns
-// either a populated TemplateSummary or one with ParseError set.
-// Never returns an error — bad templates appear in the menu as
-// broken so the author can find the typo.
-func summaryFromManifestBytes(path string, data []byte) TemplateSummary {
-	parsed, err := enjuYaml.Parse(data)
-	if err != nil {
-		return TemplateSummary{Path: path, ParseError: err.Error()}
+// hasHiddenComponent reports whether any forward-slash-separated
+// component of p starts with '.'. Used to exclude .git/, .enju/,
+// .github/, .vscode/, and any other dotted directory regardless
+// of depth. A leading-dot FILE at the repo root (e.g. `.enju.yaml`)
+// is also excluded by this rule — symmetric, no special case.
+func hasHiddenComponent(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return true
+		}
 	}
-	return TemplateSummary{
+	return false
+}
+
+// detailsFromManifestBytes parses a manifest blob into the rich
+// describe-shape. Used by LoadWorkflow (not by the list path).
+// Never returns an error here: a parse failure is signalled by
+// the empty Name/Description; LoadWorkflow's own parse path
+// surfaces the typed parse error to the caller.
+func detailsFromManifestBytes(path string, parsed *enjuYaml.ParsedRun) WorkflowDetails {
+	return WorkflowDetails{
 		Path:        path,
 		Name:        parsed.Run.Name,
 		Description: parsed.Run.Description,
@@ -197,26 +207,24 @@ func paramSummaries(ps []enjuYaml.ParamDef) []ParamSummary {
 	return out
 }
 
-// LoadTemplate reads a workflow YAML by either:
+// LoadWorkflow reads a workflow YAML by either:
 //   - its directory path (e.g. "workflows/gwas-analysis") —
 //     the YAML inside is named enju.yaml by convention
 //   - the full path to the YAML file (e.g. "workflows/gwas-analysis/enju.yaml",
 //     or any "*.yaml" anywhere in the repo)
 //
 // Tree-first, worktree-fallback: primary source is the
-// default-branch tree (so LoadTemplate works from any workspace
+// default-branch tree (so LoadWorkflow works from any workspace
 // branch). The worktree fallback supports the author-on-disk
 // UX — a user writes the YAML into the worktree without
 // committing, then create_run's EnsureBundleOnDefault auto-commits.
 //
-// Default branch and workdir are read from workflow state —
-// set the default branch via SetDefaultBranch after Workflow
-// construction. Workflow YAMLs can live anywhere in the repo
-// at any depth.
-func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
+// Workflow YAMLs can live anywhere in the repo at any depth;
+// LoadWorkflow only enforces a no-traversal path-shape guard.
+func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
 	clean := filepath.ToSlash(filepath.Clean(repoRelPath))
 	if strings.Contains(clean, "../") || clean != repoRelPath {
-		return nil, fmt.Errorf("template path %q contains disallowed path components", repoRelPath)
+		return nil, fmt.Errorf("workflow path %q contains disallowed path components", repoRelPath)
 	}
 	bundleDir, manifestPath, err := resolveBundlePathShape(repoRelPath)
 	if err != nil {
@@ -248,19 +256,39 @@ func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
 	}
 	parsed, err := enjuYaml.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("parsing template %s: %w", rb.manifestPath, err)
+		return nil, fmt.Errorf("parsing workflow %s: %w", rb.manifestPath, err)
 	}
-	return &LoadedTemplate{
+	return &LoadedWorkflow{
 		Path:      rb.manifestPath,
 		BundleDir: rb.bundleDir,
 		Raw:       raw,
+		Details:   detailsFromManifestBytes(rb.manifestPath, parsed),
+		Parsed:    parsed,
+	}, nil
+}
+
+// LoadTemplate is the deprecated alias for LoadWorkflow, kept so
+// callers still on the old name (currently the webui) compile
+// unchanged. Internally returns a LoadedTemplate adapted from the
+// LoadedWorkflow result.
+//
+// Deprecated: use LoadWorkflow.
+func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
+	loaded, err := w.LoadWorkflow(repoRelPath)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedTemplate{
+		Path:      loaded.Path,
+		BundleDir: loaded.BundleDir,
+		Raw:       loaded.Raw,
 		Summary: TemplateSummary{
-			Path:        rb.manifestPath,
-			Name:        parsed.Run.Name,
-			Description: parsed.Run.Description,
-			Params:      paramSummaries(parsed.Run.Params),
+			Path:        loaded.Details.Path,
+			Name:        loaded.Details.Name,
+			Description: loaded.Details.Description,
+			Params:      loaded.Details.Params,
 		},
-		Parsed: parsed,
+		Parsed: loaded.Parsed,
 	}, nil
 }
 
@@ -290,7 +318,7 @@ func (w *Workflow) readBundleManifest(defaultBranch, bundleDir, manifestPath, wo
 		return nil, rerr
 	}
 	if !found {
-		return nil, fmt.Errorf("template %q not found on default branch or in worktree — check `enju_list_templates` for available recipes", manifestPath)
+		return nil, fmt.Errorf("workflow %q not found on default branch or in worktree — check `enju_list_workflows` for available YAML files", manifestPath)
 	}
 	return &resolvedBundle{
 		bundleDir:    bundleDir,

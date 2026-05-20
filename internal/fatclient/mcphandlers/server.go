@@ -321,10 +321,10 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleGetArtifactHistory, true
 	case "enju_list_untracked_artifacts":
 		return c.handleListUntrackedArtifacts, true
-	case "enju_list_templates":
-		return c.handleListTemplates, true
-	case "enju_describe_template":
-		return c.handleDescribeTemplate, true
+	case "enju_list_workflows":
+		return c.handleListWorkflows, true
+	case "enju_describe_workflow":
+		return c.handleDescribeWorkflow, true
 
 	// Run admin
 	case "enju_pause_run":

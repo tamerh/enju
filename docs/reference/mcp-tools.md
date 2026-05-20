@@ -61,8 +61,8 @@ When starting a session, these tools give you a quick picture of state:
 | `enju_terminate_run` | Terminate a run — cascade-skips non-terminal tasks, abandons open claims. Irreversible. |
 | `enju_set_cycle_budget` | Set or adjust the agent cycle budget for a run (limits total agent iterations). |
 | `enju_execute_run` | Drive compute tasks in a run — claims and executes all ready compute tasks. Used by `enju go` internally. |
-| `enju_list_templates` | List available workflow templates (files under `enju/templates/`). |
-| `enju_describe_template` | Show a template's params, description, and task summary. |
+| `enju_list_workflows` | List every YAML file in the project repo on the default branch (paths only, hidden dirs excluded; picking which file is a workflow is the caller's call). |
+| `enju_describe_workflow` | Show one workflow's name, description, and declared params. Parses the YAML. |
 
 ---
 

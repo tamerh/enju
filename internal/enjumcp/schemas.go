@@ -247,8 +247,8 @@ func CreateRun() mcp.Tool {
 		mcp.WithDescription(`Create a new Enju run. Three ways to provide the run definition, pick one:
 
 1. WRITE IT DIRECTLY: pass "yaml" with the full run definition — use this for one-off runs the user is authoring from scratch.
-2. FROM A SAVED TEMPLATE: pass "path" pointing at a bundle dir (enju/templates/<name>) or its enju.yaml manifest. At create_run, the bundle is snapshotted into enju/runs/{seq}/template-snapshot/ and the run is pinned to that frozen copy — later edits to the live template don't affect this run. Script paths resolve from the snapshot. Supply "params" with the values the template declares; see enju_list_templates.
-3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a template file first.
+2. FROM A SAVED WORKFLOW: pass "path" pointing at a workflow YAML in the repo (e.g. "enju.yaml", "workflows/gwas-analysis", or "workflows/gwas-analysis/enju.yaml"). At create_run, the workflow's directory is snapshotted into enju/runs/{seq}/template-snapshot/ and the run is pinned to that frozen copy — later edits to the live YAML don't affect this run. Script paths resolve from the snapshot. Supply "params" with the values the workflow declares; see enju_list_workflows.
+3. DIRECT + PARAMS: pass "yaml" AND "params" together — a one-off run whose prompts reference top-level {{param}} values. Less common; mostly useful when the LLM is composing a parameterized run programmatically without saving it as a workflow file first.
 
 YAML format (same for inline and template files):
   name: "Run name"
@@ -266,7 +266,7 @@ YAML format (same for inline and template files):
       action: answer
       prompt: "Analyze {{disease}} using {{other_task.content}}."
 
-To browse available templates in a project, call enju_list_templates first. To see a specific template's parameter docs before filling them in, call enju_describe_template.
+To browse available workflows in a project, call enju_list_workflows first. To see a specific workflow's parameter docs before filling them in, call enju_describe_workflow.
 
 Dependencies between tasks are inferred automatically from {{task_id.content}} references. Tasks without references to other tasks run in parallel.
 
@@ -453,40 +453,40 @@ func ExportRun() mcp.Tool {
 	)
 }
 
-func ListTemplates() mcp.Tool {
-	return mcp.NewTool("enju_list_templates",
-		mcp.WithDescription(`List reusable run recipes (templates) in a project. Use before hand-writing YAML — a template usually matches a user's request.
+func ListWorkflows() mcp.Tool {
+	return mcp.NewTool("enju_list_workflows",
+		mcp.WithDescription(`List every YAML file in the project's repo on the default branch (paths only — Enju does not parse or validate which files are workflows; that's your call).
 
-A template is a directory bundle under enju/templates/ with enju.yaml at its root and any supporting scripts/data bundled alongside:
-  enju/templates/
-    gwas-analysis/
-      enju.yaml        # the manifest
-      scripts/analyze.py   # bundled, picked up by the snapshot
+Workflows conventionally live at the project root as enju.yaml, or under workflows/<name>/enju.yaml with any sibling scripts/data:
 
-Scripts + data travel with the manifest as one unit, so a compute task's script: is always co-located. Loose .yaml files directly under enju/templates/ are the legacy single-file shape — they surface with a migration hint in the listing, not a usable template.
+  enju.yaml                          # single-file workflow at the root
+  workflows/gwas-analysis/
+    enju.yaml                        # the manifest
+    scripts/analyze.py               # bundled, picked up by the snapshot
 
-Call enju_describe_template for a template's parameters; enju_create_run with path=<bundle> to instantiate.`),
+Neither convention is enforced — workflows can live anywhere. Hidden directories (.git, .enju, .github, .vscode, …) are skipped. Pick the path that looks right for the user's request and call enju_describe_workflow on it to see its declared params, then enju_create_run with path=<that path> to instantiate.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The project whose enju/templates/ directory to scan"),
+			mcp.Description("The project whose default-branch tree to scan for YAML files"),
 		),
 	)
 }
 
-// toolDescribeTemplate returns the full parameter block for a
-// single template so the LLM can turn each param into a
+// DescribeWorkflow returns the full parameter block for a
+// single workflow so the LLM can turn each param into a
 // user-facing question ("which disease?", "which tissue?")
-// before filling in values and calling enju_create_run.
-func DescribeTemplate() mcp.Tool {
-	return mcp.NewTool("enju_describe_template",
-		mcp.WithDescription(`Show full metadata for one template bundle: name, description, declared params with types/defaults/descriptions. Use after picking a template from enju_list_templates to gather param values before enju_create_run.`),
+// before filling in values and calling enju_create_run. Unlike
+// enju_list_workflows, this DOES parse the YAML.
+func DescribeWorkflow() mcp.Tool {
+	return mcp.NewTool("enju_describe_workflow",
+		mcp.WithDescription(`Show full metadata for one workflow YAML: name, description, declared params with types/defaults/descriptions. Use after picking a workflow from enju_list_workflows to gather param values before enju_create_run.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
-			mcp.Description("The project whose template to describe"),
+			mcp.Description("The project whose workflow to describe"),
 		),
 		mcp.WithString("path",
 			mcp.Required(),
-			mcp.Description("Bundle reference — either the bundle dir ('enju/templates/gwas-analysis') or the full manifest path ('enju/templates/gwas-analysis/enju.yaml'). Both resolve to the same bundle."),
+			mcp.Description("Repo-relative path to the workflow YAML, or its containing directory (the default manifest name is enju.yaml). Examples: 'enju.yaml', 'workflows/gwas-analysis', 'workflows/gwas-analysis/enju.yaml'."),
 		),
 	)
 }
