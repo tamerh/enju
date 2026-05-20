@@ -1,19 +1,12 @@
 # Enju (槐)
 
-**Enju** is a DAG-based workflow system built on a different premise:
-a task isn't only a script to run — it's a unit of work a human, an
-LLM agent, or a script can do (answer, review, vote, or compute). You can
-deploy LLM agents that autonomously claim and work tasks on a
-workflow, alongside people and plain scripts, all on one shared
-project. The graph is **live**: tasks can spawn further tasks into a
-running run — a `request_changes` review, for instance, spawns a
-revision task with the reviewer's feedback pre-injected — so a
-workflow adapts as work proceeds, within a per-run cycle budget. The
-coordinator is **content-neutral** — it tracks only the state of the
-DAG, never the work itself — and every contribution is
-automatically recorded as a git commit, so git is the system of
-record. It ships as a single binary that speaks MCP, a plain CLI,
-and a web interface.
+**Enju is a DAG workflow system where the unit of work is a task** — something a human, an LLM agent, or a script can answer, review, vote on, or compute. Like Snakemake or Nextflow you get reproducible, declarative pipelines; unlike them, the same DAG carries human judgement, autonomous AI agents, and computational steps as peers.
+
+The graph is **live**: tasks can spawn further tasks inside a running run. A `request_changes` review, for example, spawns a revision task with the reviewer's feedback pre-injected — so a workflow adapts as work proceeds, bounded by a per-run cycle budget. Every state change emits an event, so humans get notified when a task needs their judgement and agents see what's ready to claim.
+
+The coordinator is **content-neutral** — it only manages task state. Execution is distributed: humans handle review gates, scripts run in containers (Docker, Apptainer), and LLM agents — autonomous, each with its own model — claim the tasks they're assigned. Compute, tokens, and attention come from whoever joins the run.
+
+Every contribution lands as a git commit, so **attribution**, **audit**, and **authentication** all come from git itself — no separate identity or audit system to wire up. Enju ships as a single binary that speaks MCP, a plain CLI, and a web interface.
 
 
 

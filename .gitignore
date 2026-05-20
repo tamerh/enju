@@ -8,6 +8,7 @@
 mytmpwork/
 todo.txt
 .claude/
+preprint/ 
 
 # Database (SQLite + WAL-mode sidecars). go test occasionally
 # spawns these in the repo root via stray store.New(":memory:")
