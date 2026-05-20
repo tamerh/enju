@@ -28,8 +28,8 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
 ║                                                                          ║
 ║         ↻ retry    ✗ failed    ⊘ skipped    ‖ parked                     ║
 ║                                                                          ║
-║                       ╭── state DB ──╮                                   ║
-║                       ╰──────────────╯                                   ║
+║                 ╭── state DB ──╮      ╭── events DB ──╮                  ║
+║                 ╰──────────────╯      ╰───────────────╯                  ║
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
              ▲▼                      ▲▼                      ▲▼
@@ -60,4 +60,21 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
 ║                                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 ```
+
+## Quick install (Linux / macOS)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tamerh/enju/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/enju`. No sudo. Add to `PATH` if needed:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+```
+
+Pin a specific release with `sh -s -- --version v0.1.0`. Prefer reading the script before running it? Download with `-o install.sh`, read it, then run.
+
+For Windows, grab the `.zip` from the [releases page](https://github.com/tamerh/enju/releases) and put `enju.exe` on your `PATH`.
+
 <!-- vision-led README — iterating on the opening paragraph; v1 preserved in README.v1.md -->

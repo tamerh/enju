@@ -136,6 +136,22 @@ cmd_release() {
     done
     echo
 
+    # SHA256SUMS — published alongside the archives so install.sh
+    # can verify the download before extracting. Single file with
+    # one line per archive in the format `sha256sum -c` accepts.
+    # macOS lacks GNU sha256sum but ships `shasum -a 256`; the
+    # output format is identical, so the file is portable either way.
+    echo "==> Generating SHA256SUMS..."
+    (
+        cd dist
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -- *.tar.gz *.zip > SHA256SUMS
+        else
+            shasum -a 256 -- *.tar.gz *.zip > SHA256SUMS
+        fi
+    )
+    echo
+
     echo "==> Archives in dist/:"
     ls -lh dist/
     echo
