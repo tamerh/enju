@@ -40,7 +40,6 @@ import (
 	"github.com/enju-ai/enju/internal/common/types"
 	"github.com/enju-ai/enju/internal/common/wire"
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
-	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
@@ -113,7 +112,7 @@ type fatClient interface {
 	// lazily at submit time). Returns "" only when neither
 	// branch is materializable — caller falls back to the
 	// persistent worktree path.
-	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error)
+	PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []service.DeclaredRead) (string, error)
 
 	// CleanupLLMClaimCWD applies the success/fail lifecycle to
 	// the ephemeral CWD per Phase 5's pattern: rm on success,
@@ -1313,7 +1312,7 @@ func extractResolvedPrompt(inputs []byte) string {
 // CWD to the producing commit (run-scoped provenance) so a stale
 // bulk-materialized tree can't shadow them. Empty/malformed → nil
 // (CWD prep then just uses the bulk tree, the pre-fix behavior).
-func extractArtifactReads(inputs []byte) []enjugit.ArtifactRef {
+func extractArtifactReads(inputs []byte) []service.DeclaredRead {
 	if len(inputs) == 0 {
 		return nil
 	}
@@ -1329,12 +1328,12 @@ func extractArtifactReads(inputs []byte) []enjugit.ArtifactRef {
 	if len(m.ArtifactReads) == 0 {
 		return nil
 	}
-	out := make([]enjugit.ArtifactRef, 0, len(m.ArtifactReads))
+	out := make([]service.DeclaredRead, 0, len(m.ArtifactReads))
 	for _, a := range m.ArtifactReads {
 		if a.Path == "" {
 			continue
 		}
-		out = append(out, enjugit.ArtifactRef{Path: a.Path, CommitSHA: a.CommitSHA})
+		out = append(out, service.DeclaredRead{Path: a.Path, CommitSHA: a.CommitSHA})
 	}
 	return out
 }

@@ -363,7 +363,20 @@ func (s *FatClient) SweepRunStateDirsForProject(ctx context.Context, projectID i
 // git object missing). Callers log + fall back to the
 // persistent worktree to keep workflows progressing under
 // transient i/o trouble.
-func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error) {
+// DeclaredRead is the service-layer boundary type for a task's
+// declared `reads:` artifact: a repo-relative path + the producing
+// task's commit SHA recorded by the coordinator's artifact index.
+// Surfaced here (not via enjugit.ArtifactRef) so the daemon layer
+// — which is allowed to import internal/fatclient/service but NOT
+// internal/fatclient/enjugit — can describe declared reads without
+// crossing the layering rule. Convert to enjugit.ArtifactRef in
+// the implementation, never above.
+type DeclaredRead struct {
+	Path      string
+	CommitSHA string
+}
+
+func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []DeclaredRead) (string, error) {
 	if s.enjugit == nil || botUsername == "" || taskID == "" {
 		return "", nil
 	}
@@ -473,7 +486,13 @@ func (s *FatClient) PrepareLLMClaimCWD(ctx context.Context, projectID int64, bot
 	// (possibly stale) bulk copy rather than dropping the whole CWD
 	// back to the persistent worktree, which is staler still.
 	if len(declaredReads) > 0 {
-		if n, oerr := wf.OverlayDeclaredReads(path, declaredReads); oerr != nil {
+		// Convert service-layer DeclaredRead → enjugit.ArtifactRef
+		// at the boundary; bots/ must not see enjugit types.
+		refs := make([]enjugit.ArtifactRef, len(declaredReads))
+		for i, d := range declaredReads {
+			refs[i] = enjugit.ArtifactRef{Path: d.Path, CommitSHA: d.CommitSHA}
+		}
+		if n, oerr := wf.OverlayDeclaredReads(path, refs); oerr != nil {
 			s.logger.Warn("overlay declared reads onto claim CWD failed; declared inputs may reflect a stale tree",
 				"task_id", taskID, "overlaid", n, "error", oerr)
 		}

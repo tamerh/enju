@@ -13,7 +13,6 @@ import (
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/common/wire"
-	"github.com/enju-ai/enju/internal/fatclient/enjugit"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
 
@@ -87,7 +86,7 @@ type fakeFC struct {
 	// llmClaimCWDReads captures the declaredReads the daemon
 	// threaded into PrepareLLMClaimCWD (the artifact-index
 	// producing-commit binding for the task's reads:).
-	llmClaimCWDReads []enjugit.ArtifactRef
+	llmClaimCWDReads []service.DeclaredRead
 
 	// projectGitDir is returned from ProjectGitDir. Optional;
 	// default "" means the handler env-var $ENJU_GIT_DIR is
@@ -223,7 +222,7 @@ func (f *fakeFC) SweepRunStateDirsForProject(ctx context.Context, projectID int6
 func (f *fakeFC) RunSnapshotDir(ctx context.Context, projectID int64, runSeq int, runSlug string) (string, error) {
 	return "", nil
 }
-func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []enjugit.ArtifactRef) (string, error) {
+func (f *fakeFC) PrepareLLMClaimCWD(ctx context.Context, projectID int64, botUsername, taskID string, iter int, iterBranch, runBranch, baseSHA string, declaredReads []service.DeclaredRead) (string, error) {
 	f.mu.Lock()
 	f.llmClaimCWDReads = declaredReads
 	f.mu.Unlock()

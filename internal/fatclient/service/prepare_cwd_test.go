@@ -327,7 +327,7 @@ func TestPrepareLLMClaimCWD_DeclaredRead_BoundToProducingCommit(t *testing.T) {
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
 		14, "screener-agent", "14:3:screen_abstracts", 1,
 		"1-test/screen_abstracts/iter-1", "main", baseSHA,
-		[]enjugit.ArtifactRef{{Path: readPath, CommitSHA: producingSHA}})
+		[]DeclaredRead{{Path: readPath, CommitSHA: producingSHA}})
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestPrepareLLMClaimCWD_UntrackedRead_KeepsBulkTreeCopy(t *testing.T) {
 	path, err := fc.PrepareLLMClaimCWD(context.Background(),
 		15, "agent", "15:1:consume", 1,
 		"1-test/consume/iter-1", "main", baseSHA,
-		[]enjugit.ArtifactRef{{Path: "data/local.csv", CommitSHA: ""}})
+		[]DeclaredRead{{Path: "data/local.csv", CommitSHA: ""}})
 	if err != nil {
 		t.Fatalf("PrepareLLMClaimCWD: %v", err)
 	}
