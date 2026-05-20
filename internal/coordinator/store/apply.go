@@ -552,10 +552,30 @@ type ApplyResult struct {
 // --- Per-mutation apply functions ---
 
 func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink EventSink) error {
-	// Validate: task exists and check current state.
+	// Validate: task exists, capture state + run_id (the latter for
+	// the post-terminate ready-guard below).
 	var currentState string
-	if err := tx.QueryRow(`SELECT state FROM tasks WHERE id = ?`, m.TaskID).Scan(&currentState); err != nil {
+	var runID int64
+	if err := tx.QueryRow(`SELECT state, run_id FROM tasks WHERE id = ?`, m.TaskID).Scan(&currentState, &runID); err != nil {
 		return fmt.Errorf("set_task_state: task %q not found", m.TaskID)
+	}
+
+	// Defense in depth (sibling of 0be3e97): refuse to write a
+	// non-terminal task state on a terminal run. Any late mutation
+	// (a request_changes / unfail / cascade-pending arriving after
+	// the operator pulled the plug) would otherwise resurrect a
+	// task into the claimable pool — a later project-scoped daemon
+	// then loops on the zombie. Terminal writes (e.g. marking
+	// `skipped`/`failed`) on a terminal run are still allowed.
+	if !taskStateIsTerminal(m.NewState) {
+		terminated, err := runIsOperatorTerminated(tx, runID)
+		if err != nil {
+			return fmt.Errorf("set_task_state: run-state lookup: %w", err)
+		}
+		if terminated {
+			sink.SkipEvents(fmt.Sprintf("set_task_state: run %d is terminated — refusing to write non-terminal state %q on task %q", runID, m.NewState, m.TaskID))
+			return nil
+		}
 	}
 
 	if m.ClearClaim {
@@ -838,6 +858,24 @@ func applySetTaskState(tx *sql.Tx, m SetTaskState, result *ApplyResult, sink Eve
 
 func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 	t := &m.Task
+
+	// Defense in depth (sibling of 0be3e97): refuse to create a
+	// non-terminal task on a terminal run. enju_spawn_task / any
+	// automatic spawn path that races with terminate must not land
+	// a fresh ready/pending task on a dead run, or a later
+	// project-scoped daemon loops on the zombie. Terminal seeds
+	// (skipped/failed) are still allowed for replay/restore.
+	if !taskStateIsTerminal(t.State) {
+		terminated, err := runIsOperatorTerminated(tx, t.RunID)
+		if err != nil {
+			return fmt.Errorf("create_task: run-state lookup: %w", err)
+		}
+		if terminated {
+			sink.SkipEvents(fmt.Sprintf("create_task: run %d is terminated — refusing to insert non-terminal task %q in state %q", t.RunID, t.ID, t.State))
+			return nil
+		}
+	}
+
 	citizens := t.Citizens
 	if citizens == 0 {
 		citizens = 1
@@ -1221,6 +1259,40 @@ func runStateTerminal(s string) bool {
 		}
 	}
 	return false
+}
+
+// taskStateIsTerminal mirrors applyTerminateRun's cascade exclusion
+// list: the states the cascade leaves alone are "resolved" and may
+// still be legitimately written (e.g. marking a task `skipped` on a
+// terminated run is fine; marking it `ready` is not). Used by the
+// post-terminate ready-guard helper below to permit terminal writes
+// while refusing non-terminal ones.
+func taskStateIsTerminal(s TaskState) bool {
+	switch string(s) {
+	case "accepted", "rejected", "invalid", "invalidated", "skipped", "failed":
+		return true
+	}
+	return false
+}
+
+// runIsOperatorTerminated reports whether the run for runID is in
+// RunTerminated specifically — the human-pulled-the-plug state.
+// Distinct from runStateTerminal(): the post-terminate ready-guards
+// (applySetTaskState / applyCreateTask / applyUpdateReadyTasks) gate
+// ONLY on operator-initiated termination, not on RunCompleted or
+// RunFailed. Those two are computed by the run-state evaluator from
+// current task states and can transiently flicker mid-Plan — e.g.
+// during a request_changes verdict the evaluator briefly sees "all
+// tasks terminal" before the cascade reopens the upstream; gating
+// against RunCompleted would refuse the very reopen mutation that
+// flips the run back to active. Terminated is irreversible and
+// operator-driven, so it is the right scope for this defense.
+func runIsOperatorTerminated(tx *sql.Tx, runID int64) (bool, error) {
+	var s string
+	if err := tx.QueryRow(`SELECT state FROM runs WHERE id = ?`, runID).Scan(&s); err != nil {
+		return false, err
+	}
+	return RunState(s) == RunTerminated, nil
 }
 
 func applyReleaseClaim(tx *sql.Tx, m ReleaseClaim, sink EventSink) error {
@@ -2067,6 +2139,20 @@ func applyRevokeAllCitizenTokens(tx *sql.Tx, m RevokeAllCitizenTokens, sink Even
 }
 
 func applyUpdateReadyTasks(tx *sql.Tx, s *Store, m UpdateReadyTasks, sink EventSink) ([]ReadiedTask, error) {
+	// Defense in depth (sibling of 0be3e97): refuse to run the
+	// PENDING → READY promotion cascade on a terminal run.
+	// updateReadyTasksOn's SELECT filters state='pending', so
+	// post-terminate-cascade there's nothing promotable — but
+	// gating here closes the path under any future state drift
+	// (e.g. a late SetTaskState that's permitted to write `pending`
+	// then a cascade fires before the eventual fix lands).
+	if terminated, err := runIsOperatorTerminated(tx, m.RunID); err != nil {
+		return nil, fmt.Errorf("update_ready_tasks: run-state lookup: %w", err)
+	} else if terminated {
+		sink.SkipEvents(fmt.Sprintf("update_ready_tasks: run %d is terminated — skipping promotion cascade", m.RunID))
+		return nil, nil
+	}
+
 	// Run the cascade against the open tx so it sees in-tx
 	// writes (e.g. an upstream task's accept transition earlier
 	// in the same Plan) and shares the SQLite write lock for

@@ -363,6 +363,157 @@ func TestExpireClaimDoesNotResurrectTerminatedRunTask(t *testing.T) {
 	}
 }
 
+// TestTerminateRunSkipsReadyUnclaimedTask is the repro for the
+// 0be3e97 sibling escape (mustache-engine project #9, 2026-05-20):
+// a task that was READY-unclaimed at terminate time stayed
+// `available` on the terminated run instead of being skipped, and
+// a later run's project-scoped daemon kept trying to claim it for
+// ~10 hours (`ref not found` on the deleted run-branch).
+//
+// The reported "most likely root cause" — that the cascade only
+// skips PENDING, not READY — is explicitly UNCONFIRMED by the
+// reporter; their spec says confirm-before-fixing. The cascade SQL
+// in applyTerminateRun excludes only terminal states
+// (accepted/rejected/invalid/invalidated/skipped/failed), which on
+// its face SHOULD cascade ready → skipped. So this test pins the
+// invariant directly and tells us which way the bug actually
+// lies: red here → the hypothesis is right and the cascade is
+// missing READY; green here → the cascade is fine and the
+// re-ready happens elsewhere (e.g. a downstream auto_triage / spawn
+// path post-terminate), and we look there.
+func TestTerminateRunSkipsReadyUnclaimedTask(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+	alice := createTestCitizen(t, s, "alice", "tok-1")
+
+	// Field shape: A completed before terminate; B was READY-unclaimed.
+	// State constructed directly because we're testing the cascade's
+	// treatment of an existing READY task, not how it got there.
+	helperCreateTask(s, &TaskRecord{
+		ID: "task-a", RunID: runID, Seq: 1, TaskDefID: "a",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, CreatedAt: now,
+	})
+	helperCreateTask(s, &TaskRecord{
+		ID: "task-b", RunID: runID, Seq: 2, TaskDefID: "b",
+		Action: "answer", ResultType: "text",
+		State: TaskReady, CreatedAt: now,
+	})
+
+	if _, err := s.ApplyPlan(Plan{
+		Version:   testEngineVersion,
+		Mutations: []Mutation{TerminateRun{RunID: runID, CitizenID: alice, Reason: "test"}},
+	}); err != nil {
+		t.Fatalf("TerminateRun apply: %v", err)
+	}
+
+	a, _ := s.GetTask("task-a")
+	if a == nil || a.State != TaskAccepted {
+		t.Errorf("task-a: terminal state must be left alone, got %v", a.State)
+	}
+	b, _ := s.GetTask("task-b")
+	if b == nil || b.State != TaskSkipped {
+		t.Fatalf("TerminateRun left a READY-unclaimed task claimable on a terminated run: got %v, want skipped (the field bug: a project-scoped daemon then loops forever on the zombie)", b.State)
+	}
+}
+
+// TestSetTaskStateDoesNotResurrectTerminatedRunTask is the
+// (real-world) sibling repro: applySetTaskState's clear-claim
+// branch writes `state = ?` parameterized — when ? is TaskReady,
+// it resurrects a task on a terminated run with no gate. This is
+// the request_changes / unfail / cascade-pending path. 0be3e97
+// gated only applyExpireClaim + applyReleaseClaim; this one was
+// missed.
+func TestSetTaskStateDoesNotResurrectTerminatedRunTask(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+
+	// Field shape: the task was already accepted before terminate.
+	// applyTerminateRun's cascade leaves accepted alone (it's in the
+	// exclusion list), so the post-terminate state is: run terminal
+	// + task accepted. A SetTaskState pre-existing state-transition
+	// guard refuses skipped → ready, which is what incidentally
+	// protected the simpler shape; accepted → ready is the
+	// permitted transition (used by request_changes / unfail) and
+	// the one with no run-terminal gate.
+	helperCreateTask(s, &TaskRecord{
+		ID: "task-1", RunID: runID, Seq: 1, TaskDefID: "step1",
+		Action: "answer", ResultType: "text",
+		State: TaskAccepted, CreatedAt: now,
+	})
+	if _, err := s.db.Exec(`UPDATE runs SET state = 'terminated' WHERE id = ?`, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now a SetTaskState mutation fires post-terminate (e.g. a
+	// late-arriving request_changes verdict on a review whose
+	// target was this task). Pre-fix this writes
+	// `state = 'ready'` ungated → zombie on a dead run.
+	_, _ = s.ApplyPlan(Plan{
+		Version: testEngineVersion,
+		Mutations: []Mutation{SetTaskState{
+			TaskID: "task-1", NewState: TaskReady, ClearClaim: true,
+		}},
+	})
+
+	// INVARIANT: a task on a terminal run must NEVER end up in a
+	// non-terminal state. Today this fails — state flips to ready.
+	task, _ := s.GetTask("task-1")
+	if task == nil {
+		t.Fatal("task disappeared")
+	}
+	if !isTerminalForTest(TaskState(task.State)) {
+		t.Fatalf("SetTaskState resurrected a terminated run's task: got %v, want a terminal state (accepted/skipped/failed)", task.State)
+	}
+}
+
+// TestCreateTaskRefusesNonTerminalOnTerminatedRun is the second
+// real-world sibling repro: applyCreateTask has no run-state
+// guard, so a spawn-task (`enju_spawn_task`, automatic spawn
+// paths) can insert a task at any state on a terminated run.
+// Outcome the invariant requires: no non-terminal task ever sits
+// on a terminated run.
+func TestCreateTaskRefusesNonTerminalOnTerminatedRun(t *testing.T) {
+	s := newTestStore(t)
+	runID := createTestRun(t, s)
+	now := time.Now()
+
+	if _, err := s.db.Exec(`UPDATE runs SET state = 'terminated' WHERE id = ?`, runID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A spawn-task lands a new task on the terminated run.
+	_, _ = s.ApplyPlan(Plan{
+		Version: testEngineVersion,
+		Mutations: []Mutation{CreateTask{Task: TaskRecord{
+			ID: "spawned-1", RunID: runID, Seq: 99, TaskDefID: "narrate",
+			Action: "answer", ResultType: "text",
+			State: TaskReady, CreatedAt: now,
+		}}},
+	})
+
+	task, _ := s.GetTask("spawned-1")
+	if task == nil {
+		return // structural fix chose "refuse → no row" — invariant holds
+	}
+	if !isTerminalForTest(TaskState(task.State)) {
+		t.Fatalf("CreateTask landed a non-terminal task on a terminated run: got state=%v (the field bug: a project-scoped daemon then loops forever on this zombie)", task.State)
+	}
+}
+
+// isTerminalForTest mirrors the apply-layer's exclusion set for
+// the cascade — kept local to these tests so the invariant is
+// expressed in the test, not borrowed from the code under test.
+func isTerminalForTest(s TaskState) bool {
+	switch s {
+	case TaskAccepted, TaskSkipped, TaskFailed:
+		return true
+	}
+	return false
+}
+
 // --- Run-state evaluator (living-workflow phase 1) ---
 
 // makeTask is a tiny helper for the run-state tests below.
