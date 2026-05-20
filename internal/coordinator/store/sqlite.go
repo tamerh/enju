@@ -2409,9 +2409,9 @@ func (s *Store) ModelDisplayName(name string) string {
 // if the parent has no bots — not an error.
 func (s *Store) ListBotsByParent(parentID int64) ([]CitizenRecord, error) {
 	rows, err := s.db.Query(
-		// kind bound as a parameter from the constant — never a
-		// SQL literal — so the value is single-source (see
-		// CitizenKindAgent / spec-bot-to-agent §4).
+		// kind bound as a parameter from the CitizenKindAgent
+		// constant — never a SQL literal — so a typo or rename can
+		// only fail at compile time, not silently miss rows here.
 		`SELECT `+citizenColumns+` FROM citizens WHERE kind = ? AND parent_id = ? ORDER BY registered_at DESC`,
 		string(CitizenKindAgent), parentID,
 	)
