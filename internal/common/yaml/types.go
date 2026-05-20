@@ -155,8 +155,8 @@ func (rf RecordFields) FirstName() string {
 // ParamDef declares a single top-level run parameter. A run with
 // `params:` declared is a reusable recipe: the same YAML file can
 // be submitted directly (with values provided at submission time)
-// or dropped under `templates/` for the LLM to instantiate on
-// behalf of a user via enju_list_templates + enju_submit_run.
+// or committed anywhere in the repo for the LLM to instantiate on
+// behalf of a user via enju_list_workflows + enju_create_run.
 //
 // The prose Description is the field the LLM reads when turning
 // a template into a conversation with the user — keep it

@@ -9632,8 +9632,8 @@ tasks:
 // gene/topic/file list"). Pre-fix, Run.ForEach was typed
 // map[string][]string so YAML decode failed before validation
 // or substitution could even run — the parser couldn't even
-// load the template, which cascaded into enju_list_templates
-// silently dropping it.
+// load the workflow YAML, which cascaded into the list tool
+// silently dropping it from the discovery menu.
 func TestMCPTemplateParamInRunLevelForEach(t *testing.T) {
 	h := newMCPHarness(t, "RunLevelParamForEach")
 	projectID := h.createTestProject()

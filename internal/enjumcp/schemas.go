@@ -277,10 +277,10 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description("The run definition in YAML format. Required unless 'path' is provided."),
 		),
 		mcp.WithString("path",
-			mcp.Description("Template bundle reference. Accepts either the bundle dir ('enju/templates/gwas-analysis') or its manifest ('enju/templates/gwas-analysis/enju.yaml'). The bundle is snapshotted into the run's enju/runs/{seq}/template-snapshot/ for reproducibility. Mutually exclusive with 'yaml'."),
+			mcp.Description("Repo-relative path to a workflow YAML, or its containing directory (the default manifest name is enju.yaml). Examples: 'enju.yaml', 'workflows/gwas-analysis', 'workflows/gwas-analysis/enju.yaml'. The workflow's directory is snapshotted into the run's enju/runs/{seq}/template-snapshot/ for reproducibility. Mutually exclusive with 'yaml'."),
 		),
 		mcp.WithObject("params",
-			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_template to see what a template expects."),
+			mcp.Description("Parameter values for a run that declares a top-level 'params:' block. Keys are parameter names; values must match the declared types. Use enju_describe_workflow to see what a workflow expects."),
 		),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
@@ -464,7 +464,7 @@ Workflows conventionally live at the project root as enju.yaml, or under workflo
     enju.yaml                        # the manifest
     scripts/analyze.py               # bundled, picked up by the snapshot
 
-Neither convention is enforced — workflows can live anywhere. Hidden directories (.git, .enju, .github, .vscode, …) are skipped. Pick the path that looks right for the user's request and call enju_describe_workflow on it to see its declared params, then enju_create_run with path=<that path> to instantiate.`),
+Neither convention is enforced — workflows can live anywhere EXCEPT inside a directory whose name starts with '.' (so .git, .enju, .github, .vscode, .workflows, etc. are all skipped). If you want a workflow visible to this tool, commit it outside any dotdir. Pick the path that looks right for the user's request and call enju_describe_workflow on it to see its declared params, then enju_create_run with path=<that path> to instantiate.`),
 		mcp.WithNumber("project_id",
 			mcp.Required(),
 			mcp.Description("The project whose default-branch tree to scan for YAML files"),
