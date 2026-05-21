@@ -33,7 +33,7 @@ BIN_NAME="enju"
 # Pinned fallback version used only when the GitHub API call fails
 # (rate-limit, offline, etc.). Bump this when you cut a new release
 # so curl|sh users without API access still get something recent.
-FALLBACK_VERSION="v0.1.0"
+FALLBACK_VERSION="v1.0.0"
 
 # ---------------------------------------------------------------
 # Parse flags
