@@ -97,6 +97,8 @@ Three reference workflows — clone, install, run:
 
 See [docs/](docs/) — [getting started](docs/getting-started/), [guides](docs/guides/), [reference](docs/reference/), or [how it works](docs/how-it-works.md).
 
+For the design and motivation, see the preprint: [sugi.bio/enju](https://sugi.bio/enju).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
