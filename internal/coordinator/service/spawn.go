@@ -78,6 +78,21 @@ func SpawnTask(s store.CoordinatorStore, caller *store.CitizenRecord, projectID 
 		return nil, fmt.Errorf("%w: not a member of this project", ErrNotMember)
 	}
 
+	// Validate assign_to against the citizen roster, mirroring
+	// engine.ValidateRunCreation. A spawned task bypasses that
+	// create-time check, so without this a typoed assignee would
+	// land a task nobody can claim (the bug-hunt L4 "stuck task"
+	// hole, on the spawn path). Spawn assignees are always concrete
+	// usernames — no templating to skip.
+	for _, uname := range params.AssignTo {
+		if err := store.ValidateUsername(uname); err != nil {
+			return nil, fmt.Errorf("%w: invalid assign_to username %q: %v", ErrInvalidArgument, uname, err)
+		}
+		if c, _ := s.GetCitizenByUsername(uname); c == nil {
+			return nil, fmt.Errorf("%w: assign_to citizen %q is not registered", ErrInvalidArgument, uname)
+		}
+	}
+
 	res, err := s.ApplyPlan(store.Plan{
 		Version: engine.EngineVersion,
 		Mutations: []store.Mutation{

@@ -40,6 +40,38 @@ func (e *Engine) ValidateRunCreation(parsed *enjuYaml.ParsedRun) error {
 			}
 		}
 	}
+
+	// Deferred (dynamic for_each) tasks aren't in ExpandedTasks at
+	// create time, so the loop above never sees their assign_to.
+	// Validate the literal entries here from the source TaskDef so a
+	// typoed assignee fails fast at creation instead of landing an
+	// unclaimable task when the task later materializes mid-run
+	// (bug-hunt L4, deferred path). Templated entries ({{var}}) can
+	// only be resolved per-instance after expansion, so skip them —
+	// those resolve against the roster at materialization.
+	if parsed.Run != nil && len(parsed.DeferredTaskDefs) > 0 {
+		defByID := make(map[string]*enjuYaml.TaskDef, len(parsed.Run.Tasks))
+		for i := range parsed.Run.Tasks {
+			defByID[parsed.Run.Tasks[i].ID] = &parsed.Run.Tasks[i]
+		}
+		for _, d := range parsed.DeferredTaskDefs {
+			td := defByID[d.TaskDefID]
+			if td == nil {
+				continue
+			}
+			for _, uname := range td.AssignTo {
+				if strings.Contains(uname, "{{") {
+					continue // resolved per-instance at materialization
+				}
+				if err := store.ValidateUsername(uname); err != nil {
+					return fmt.Errorf("task %q: invalid assign_to username %q: %v", d.TaskDefID, uname, err)
+				}
+				if c, _ := e.store.GetCitizenByUsername(uname); c == nil {
+					return fmt.Errorf("task %q: assign_to citizen %q is not registered", d.TaskDefID, uname)
+				}
+			}
+		}
+	}
 	return nil
 }
 

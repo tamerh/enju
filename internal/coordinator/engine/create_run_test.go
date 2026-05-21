@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
+	"github.com/enju-ai/enju/internal/coordinator/store"
 )
 
 // TestValidateRunCreation_RecordStarMixedWithScalarParams pins the
@@ -95,5 +96,103 @@ tasks:
 		if !seen {
 			t.Errorf("expected resolved aggregator read %q to appear", path)
 		}
+	}
+}
+
+// TestValidateRunCreation_DeferredTaskAssignTo pins the bug-hunt L4
+// deferred-path fix: a dynamic-for_each (deferred) task isn't in
+// ExpandedTasks at create time, so its literal assign_to must be
+// validated from the source TaskDef — a typoed assignee should fail
+// fast at creation, not land an unclaimable task at materialization.
+func TestValidateRunCreation_DeferredTaskAssignTo(t *testing.T) {
+	const y = `
+name: deferred assign
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "list the work items"
+    outputs:
+      items:
+        format: list<string>
+  - id: work
+    action: answer
+    for_each:
+      item: "{{discover.items}}"
+    assign_to: ghost-agent
+    prompt: "do {{item}}"
+`
+	parsed, err := enjuYaml.Parse([]byte(y))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(parsed.DeferredTaskDefs) == 0 {
+		t.Fatalf("expected 'work' to be deferred (dynamic for_each), got none")
+	}
+
+	// Roster has alice but NOT ghost-agent.
+	st := &mockStore{citizensByUN: map[string]*store.CitizenRecord{
+		"alice": {Username: "alice"},
+	}}
+	err = New(st, nil).ValidateRunCreation(parsed)
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("expected the deferred task's ghost assignee to be rejected, got: %v", err)
+	}
+}
+
+// Positive control: a deferred task assigned to a registered citizen
+// passes; a templated assign_to ({{var}}) is skipped (resolved per
+// instance at materialization).
+func TestValidateRunCreation_DeferredTaskAssignTo_OKAndTemplated(t *testing.T) {
+	const registered = `
+name: deferred assign ok
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "list items"
+    outputs:
+      items:
+        format: list<string>
+  - id: work
+    action: answer
+    for_each:
+      item: "{{discover.items}}"
+    assign_to: alice
+    prompt: "do {{item}}"
+`
+	parsed, err := enjuYaml.Parse([]byte(registered))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	st := &mockStore{citizensByUN: map[string]*store.CitizenRecord{"alice": {Username: "alice"}}}
+	if err := New(st, nil).ValidateRunCreation(parsed); err != nil {
+		t.Fatalf("registered deferred assignee should pass: %v", err)
+	}
+
+	// Templated assignee — skipped even with an empty roster.
+	const templated = `
+name: deferred assign templated
+version: 1
+tasks:
+  - id: discover
+    action: answer
+    prompt: "list assignees"
+    outputs:
+      items:
+        format: list<string>
+  - id: work
+    action: answer
+    for_each:
+      item: "{{discover.items}}"
+    assign_to: "{{item}}"
+    prompt: "review {{item}}"
+`
+	parsedT, err := enjuYaml.Parse([]byte(templated))
+	if err != nil {
+		t.Fatalf("parse templated: %v", err)
+	}
+	if err := New(&mockStore{}, nil).ValidateRunCreation(parsedT); err != nil {
+		t.Fatalf("templated assign_to must be skipped at create time, got: %v", err)
 	}
 }
