@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 )
@@ -73,6 +74,13 @@ func validateOne(path string, strict, asJSON bool) bool {
 	}
 
 	rep.Warnings = parsed.Warnings
+	// L2: a compute task's script: is resolvable relative to the
+	// workflow YAML's directory — flag one that doesn't exist on
+	// disk so the author finds the typo here rather than at
+	// execute-time on the agent's machine. Appended to Warnings so
+	// --strict catches it in CI; skipped for templated paths we
+	// can't resolve statically.
+	rep.Warnings = append(rep.Warnings, missingScriptWarnings(path, parsed)...)
 	hasWarnings := len(rep.Warnings) > 0
 	rep.OK = !(strict && hasWarnings)
 	// Best-effort env advisory — the workflow is fine; this is
@@ -126,4 +134,37 @@ func emitReport(r validateReport, asJSON bool) {
 			fmt.Printf("  - %s\n", a)
 		}
 	}
+}
+
+// missingScriptWarnings (L2) returns one warning per compute task
+// whose script: doesn't resolve to a file on disk. Scripts resolve
+// relative to the workflow YAML's directory (the same root the run
+// snapshot uses), so the path is statically checkable from `enju
+// validate`. Templated paths (containing {{...}}) are skipped — they
+// can't be resolved before param substitution. Absolute paths are
+// checked as-is.
+func missingScriptWarnings(workflowPath string, parsed *enjuYaml.ParsedRun) []string {
+	if parsed == nil || parsed.Run == nil {
+		return nil
+	}
+	dir := filepath.Dir(workflowPath)
+	var warnings []string
+	for _, t := range parsed.Run.Tasks {
+		if t.Action != "compute" || t.Script == "" {
+			continue
+		}
+		if strings.Contains(t.Script, "{{") {
+			continue // templated path — resolved only after param substitution
+		}
+		scriptPath := t.Script
+		if !filepath.IsAbs(scriptPath) {
+			scriptPath = filepath.Join(dir, t.Script)
+		}
+		if _, err := os.Stat(scriptPath); err != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"compute task %q: script %q not found at %s — it will fail at execute-time unless it exists on the agent's machine",
+				t.ID, t.Script, scriptPath))
+		}
+	}
+	return warnings
 }

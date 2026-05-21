@@ -832,6 +832,69 @@ func validateTemplateReferences(p *Run, taskIDs map[string]bool) error {
 	return nil
 }
 
+// warnUndeclaredOutputFieldRefs flags a prompt that references a
+// named field on a task that declares NO outputs: block (L3). The
+// hard error in validateTemplateReferences only fires when outputs:
+// IS declared (then the valid set is known); when it's absent, only
+// {{X.content}}/{{X.responses}} are guaranteed and any other field
+// resolves to the literal `{{X.field}}` unless X's result happens to
+// be JSON with that key. That's usually a typo — but JSON extraction
+// is a legitimate pattern, so this is a non-fatal warning, not an
+// error. Returns one warning per offending reference.
+func warnUndeclaredOutputFieldRefs(p *Run, taskIDs map[string]bool) []string {
+	taskByID := make(map[string]*TaskDef, len(p.Tasks))
+	for i := range p.Tasks {
+		taskByID[p.Tasks[i].ID] = &p.Tasks[i]
+	}
+	// for_each record-field refs ({{var.field}}) are not task refs;
+	// skip any ref whose head is an in-scope for_each variable.
+	forEachVars := make(map[string]bool, len(p.ForEach))
+	for name := range p.ForEach {
+		forEachVars[name] = true
+	}
+	var warnings []string
+	seen := make(map[string]bool) // dedupe identical task.field across prompts
+	for i := range p.Tasks {
+		t := &p.Tasks[i]
+		fevars := forEachVars
+		if len(fevars) == 0 && len(t.ForEach) > 0 {
+			fevars = make(map[string]bool, len(t.ForEach))
+			for name := range t.ForEach {
+				fevars[name] = true
+			}
+		}
+		for _, field := range []string{t.Prompt, t.UserPrompt} {
+			if field == "" {
+				continue
+			}
+			for _, ref := range template.ExtractReferences(field) {
+				if fevars[ref.TaskID] {
+					continue // for_each record-field ref, not a task output
+				}
+				if !taskIDs[ref.TaskID] {
+					continue // unknown task id — already a hard error elsewhere
+				}
+				if isBuiltinResultField(ref.Field) {
+					continue
+				}
+				prod, known := taskByID[ref.TaskID]
+				if !known || len(prod.Outputs) > 0 {
+					continue // declared-outputs case is the hard-error path
+				}
+				key := ref.TaskID + "." + ref.Field
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				warnings = append(warnings, fmt.Sprintf(
+					"task %q: prompt references {{%s.%s}} but task %q declares no outputs: — only {{%s.content}} and {{%s.responses}} are guaranteed; {{%s.%s}} resolves only if %q's result is JSON with that key, otherwise the literal marker leaks into the prompt. Declare an outputs: block or use {{%s.content}}.",
+					t.ID, ref.TaskID, ref.Field, ref.TaskID, ref.TaskID, ref.TaskID, ref.TaskID, ref.Field, ref.TaskID, ref.TaskID))
+			}
+		}
+	}
+	return warnings
+}
+
 // isBuiltinResultField reports whether `field` is one of the
 // always-available result projections the client-side resolver
 // (internal/common/template extractField) synthesizes from any

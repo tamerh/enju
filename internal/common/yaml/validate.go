@@ -103,10 +103,20 @@ func validate(p *Run) ([]string, error) {
 	computeWarnings := validateComputeDependsDeclared(p)
 	contentRefWarnings := validateComputeContentRefs(p)
 	collectsWarnings := validateCollectsConsumed(p)
+	outputRefWarnings := warnUndeclaredOutputFieldRefs(p, ids)
 	warnings := append(paramWarnings, reviewWarnings...)
 	warnings = append(warnings, computeWarnings...)
 	warnings = append(warnings, contentRefWarnings...)
 	warnings = append(warnings, collectsWarnings...)
+	warnings = append(warnings, outputRefWarnings...)
+	// Unknown schema version (L1): version is currently always 1.
+	// A higher number means the YAML was authored against a schema
+	// this build doesn't know — warn so a future schema roll has a
+	// clean upgrade signal instead of silently mis-parsing. Omitted
+	// (0) is tolerated as "unspecified, assume 1" and doesn't warn.
+	if p.Version != 0 && p.Version != 1 {
+		warnings = append(warnings, fmt.Sprintf("unknown schema version %d — this build understands version 1; proceeding as version 1", p.Version))
+	}
 	return warnings, nil
 }
 
@@ -534,7 +544,21 @@ func validateRunForEach(p *Run) error {
 		}
 		switch {
 		case src.Ref != "":
-			if _, ok := parseForEachParamRef(src.Ref); ok {
+			if paramName, ok := parseForEachParamRef(src.Ref); ok {
+				// for_each fans out over the elements of a list. A
+				// scalar param (string/int/bool) can't drive a
+				// fan-out — catch it statically here (M6) instead of
+				// letting it pass validate and fail at run
+				// materialization with "must be a list (got string)".
+				for i := range p.Params {
+					if p.Params[i].Name != paramName {
+						continue
+					}
+					if !strings.HasPrefix(p.Params[i].Type, "list<") {
+						return fmt.Errorf("run for_each: variable %q references param %q of type %q — for_each requires a list param (list<string> or list<record>)", name, paramName, p.Params[i].Type)
+					}
+					break
+				}
 				continue // substitution resolves it later
 			}
 			if _, _, ok := parseForEachRef(src.Ref); ok {

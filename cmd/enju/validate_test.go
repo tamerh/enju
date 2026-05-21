@@ -82,6 +82,58 @@ tasks:
 	}
 }
 
+// TestValidateOne_MissingScriptWarns — L2. A compute task whose
+// script: doesn't resolve on disk warns (and -strict promotes it to
+// a failure), so the author finds the typo at validate time instead
+// of execute time.
+func TestValidateOne_MissingScriptWarns(t *testing.T) {
+	p := writeTempYAML(t, `
+name: missing script
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: scripts/nope.sh
+    prompt: x
+`)
+	out := captureStdout(t, func() {
+		if !validateOne(p, false, false) {
+			t.Errorf("a missing script is a non-fatal warning in non-strict mode")
+		}
+	})
+	if !strings.Contains(out, "script") || !strings.Contains(out, "not found") {
+		t.Errorf("expected a missing-script warning, got:\n%s", out)
+	}
+}
+
+// TestValidateOne_PresentScriptNoWarn is the no-false-positive twin:
+// when the script exists next to the workflow, no warning fires.
+func TestValidateOne_PresentScriptNoWarn(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "scripts", "run.sh"), []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "wf.yaml")
+	if err := os.WriteFile(p, []byte(`
+name: present script
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: scripts/run.sh
+    prompt: x
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { validateOne(p, false, false) })
+	if strings.Contains(out, "not found") {
+		t.Errorf("a present script must not warn, got:\n%s", out)
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and
 // returns everything it wrote. emitReport prints via fmt.Printf
 // (package-level os.Stdout), so the redirect is the only seam.
