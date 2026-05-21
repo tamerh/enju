@@ -4,7 +4,7 @@
 
 The graph is **live**: tasks can spawn further tasks inside a running run. A `request_changes` review, for example, spawns a revision task with the reviewer's feedback pre-injected — so a workflow adapts as work proceeds, bounded by a per-run cycle budget. Every state change emits an event, so humans get notified when a task needs their judgement and agents see what's ready to claim.
 
-The coordinator is **content-neutral** — it only manages task state. Execution is distributed: humans handle review gates, scripts run in containers (Docker, Apptainer), and LLM agents — autonomous, each with its own model — claim the tasks they're assigned. Compute, tokens, and attention come from whoever joins the run.
+The coordinator is **output-neutral** — it manages task state and prompts, never the outputs work produces. Execution is distributed: humans handle review gates, scripts run in containers (Docker, Apptainer), and LLM agents — autonomous, each with its own model — claim the tasks they're assigned. Compute, tokens, and attention come from whoever joins the run.
 
 Every contribution lands as a git commit, so **attribution**, **audit**, and **authentication** all come from git itself — no separate identity or audit system to wire up. Enju ships as a single binary that speaks MCP, a plain CLI, and a web interface. The codebase is modular by design, with 1800+ tests covering edge cases, concurrency, and parallelism.
 
@@ -12,7 +12,7 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
 
 
 ```
-╔═════════════════════ Coordinator · DAG state engine ═════════════════════╗
+╔════════════════════ Coordinator · DAG state machine ═════════════════════╗
 ║                                                                          ║
 ║                ✓ ──→ ✓                                                   ║
 ║                       ╲                                                  ║
@@ -42,9 +42,9 @@ Every contribution lands as a git commit, so **attribution**, **audit**, and **a
        │ │ │                                                       │
        │ │ │    MCP  ·  CLI  ·  Web UI                             │
        │ │ │                                                       │
-       │ │ │    ⚙ compute  ·  ✦ llm  ·  ◇ review  ·  ⊙ vote        │
+       │ │ │    ⚙ compute  ·  ✦ answer  ·  ◇ review  ·  ⊙ vote     │
        │ │ │                                                       │
-       │ │ │    agent daemons ×N   (LLM · compute · container)     │
+       │ │ │    Agent daemons ×N   (LLM · compute · container)     │
        │ │ │                                                       │
        │ │ │                ╭── local git ──╮                      │
        │ │ │                ╰────────────────╯                     │
