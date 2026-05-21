@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,27 @@ import (
 	"github.com/enju-ai/enju/internal/fatclient/service"
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+// validTaskIDFormat reports whether taskID has the canonical
+// <project_id>:<run_seq>:<task_name> shape — two leading numeric
+// segments and a non-empty task name (which may itself contain
+// colons, e.g. "1:1:a:review"). Used to tell a malformed id apart
+// from a well-formed-but-missing one (L6): the coord returns the
+// same "task not found" for both, which steers the operator toward
+// the wrong fix.
+func validTaskIDFormat(taskID string) bool {
+	parts := strings.SplitN(taskID, ":", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	if _, err := strconv.Atoi(parts[0]); err != nil {
+		return false
+	}
+	if _, err := strconv.Atoi(parts[1]); err != nil {
+		return false
+	}
+	return parts[2] != ""
+}
 
 func (c *apiClient) handleInvalidateTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	taskID, err := req.RequireString("task_id")
@@ -122,6 +144,9 @@ func (c *apiClient) handleGetTask(ctx context.Context, req mcp.CallToolRequest) 
 	taskID, err := req.RequireString("task_id")
 	if err != nil {
 		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	if !validTaskIDFormat(taskID) {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid task_id %q — expected format <project_id>:<run_seq>:<task_name> (e.g. 26:1:analyze)", taskID)), nil
 	}
 
 	data, err := c.get(ctx, "/api/v1/tasks/"+taskID)

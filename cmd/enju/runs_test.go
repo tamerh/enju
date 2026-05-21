@@ -38,6 +38,21 @@ func TestParseStatusFilter_LiteralStates(t *testing.T) {
 	}
 }
 
+// L5: unknown --status tokens are surfaced so a typo doesn't silently
+// filter to nothing.
+func TestUnknownStatusTokens(t *testing.T) {
+	if got := unknownStatusTokens("active,completed,failed"); len(got) != 0 {
+		t.Errorf("all-valid input should report no unknowns, got %v", got)
+	}
+	got := unknownStatusTokens("acvtive,completed")
+	if len(got) != 1 || got[0] != "acvtive" {
+		t.Errorf("expected [acvtive], got %v", got)
+	}
+	if u := unknownStatusTokens(""); len(u) != 0 {
+		t.Errorf("empty input should report no unknowns, got %v", u)
+	}
+}
+
 func TestFilterRuns_OrderingAndCap(t *testing.T) {
 	runs := []wire.Run{
 		{Seq: 1, State: "completed"},

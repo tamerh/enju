@@ -71,6 +71,15 @@ func cmdRuns(args []string) {
 		os.Exit(1)
 	}
 
+	// L5: warn on --status tokens that match no run state or alias
+	// (e.g. a typo'd "acvtive") rather than silently filtering to
+	// nothing. Non-fatal — we still filter by any recognized tokens.
+	if unknown := unknownStatusTokens(*statusFilter); len(unknown) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"runs: ignoring unrecognized --status value(s): %s (valid: active, waiting, idle, paused, completed, failed, aborted, terminated; aliases: live, done)\n",
+			strings.Join(unknown, ", "))
+	}
+
 	filtered := filterRuns(runs, parseStatusFilter(*statusFilter), *last)
 
 	if *asJSON {
@@ -112,6 +121,34 @@ func parseStatusFilter(raw string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// knownRunStatusToken reports whether t (already lowercased) is a
+// run state or a recognized --status alias.
+func knownRunStatusToken(t string) bool {
+	switch t {
+	case "active", "live", "waiting", "idle", "paused",
+		"completed", "done", "failed", "aborted", "terminated":
+		return true
+	}
+	return false
+}
+
+// unknownStatusTokens returns the --status tokens that match no run
+// state or alias, so cmdRuns can warn on a typo (L5) instead of
+// letting it silently filter to an empty list.
+func unknownStatusTokens(raw string) []string {
+	var unknown []string
+	for _, tok := range strings.Split(raw, ",") {
+		t := strings.TrimSpace(strings.ToLower(tok))
+		if t == "" {
+			continue
+		}
+		if !knownRunStatusToken(t) {
+			unknown = append(unknown, strings.TrimSpace(tok))
+		}
+	}
+	return unknown
 }
 
 // filterRuns drops runs whose state isn't in `wanted` (nil = no

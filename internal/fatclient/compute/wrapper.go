@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -528,7 +529,13 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 			// missing-script contract).
 			if res.GitError != "" || res.ExitCode != 0 {
 				if logger != nil {
-					logger.Warn("preserving scratch for inspection/retry",
+					// Debug, not Warn: preserving scratch on a
+					// ran-but-failed task is the designed behavior
+					// (failed_retryable), not an anomaly. At Warn it
+					// interleaved with `enju go`'s pretty ▶/✓/✗ stream
+					// (L7); the failure itself is already surfaced by
+					// the task's ✗ line.
+					logger.Debug("preserving scratch for inspection/retry",
 						"path", spec.TaskScratchDir,
 						"task_id", spec.TaskID,
 						"exit_code", res.ExitCode,
@@ -928,6 +935,31 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 		res.ArtifactsWritten = append(res.ArtifactsWritten, e.Path)
 	}
 
+	// M5: a script that writes a file alongside a declared output
+	// but forgets to declare it gets that file silently discarded
+	// with the scratch dir. Surface it so the author can debug
+	// "where did my file go?". Scoped to declared-output
+	// directories — this targets the forgot-to-declare-a-sibling
+	// footgun without nagging about every intermediate temp file a
+	// script leaves elsewhere in scratch. Non-fatal: strict
+	// enforcement (only declared paths commit) is unchanged; we
+	// just stop being silent about it.
+	if logger != nil {
+		declared := make(map[string]bool, len(tracked)+len(untracked))
+		for _, e := range tracked {
+			declared[enjugit.ArtifactPath(e.Path)] = true
+		}
+		for _, e := range untracked {
+			declared[enjugit.ArtifactPath(e.Path)] = true
+		}
+		if undeclared := undeclaredSiblingOutputs(outputDir, declared); len(undeclared) > 0 {
+			logger.Warn("compute task produced files not declared in writes_artifacts — they will be discarded",
+				"task_id", spec.TaskID,
+				"undeclared", undeclared,
+				"hint", "add these paths to the task's writes: to commit them")
+		}
+	}
+
 	// Trailers carry the machine-parseable task-complete
 	// signal the reconcile endpoint + fetch-path scanner key
 	// on. Exit is always set to 0 here (the failure branch
@@ -1158,4 +1190,44 @@ func WrapMain(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// undeclaredSiblingOutputs returns regular files present in outputDir
+// that live in the SAME directory as a declared output but aren't
+// themselves declared (M5). Scoping to declared-output directories
+// is deliberate: it catches the "wrote results/extra.txt next to the
+// declared results/main.txt" footgun without flagging every
+// intermediate temp file a script leaves elsewhere in scratch.
+// Known scratch bookkeeping and dotfiles are excluded so a
+// root-level declared output doesn't surface context.json et al.
+func undeclaredSiblingOutputs(outputDir string, declared map[string]bool) []string {
+	bookkeeping := map[string]bool{
+		"context.json": true, "script.log": true,
+		"result.md": true, "metadata.json": true,
+	}
+	dirs := make(map[string]bool)
+	for p := range declared {
+		dirs[filepath.Dir(p)] = true
+	}
+	var undeclared []string
+	for dir := range dirs {
+		entries, err := os.ReadDir(filepath.Join(outputDir, dir))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || strings.HasPrefix(e.Name(), ".") || bookkeeping[e.Name()] {
+				continue
+			}
+			rel := e.Name()
+			if dir != "." {
+				rel = dir + "/" + e.Name()
+			}
+			if !declared[rel] {
+				undeclared = append(undeclared, rel)
+			}
+		}
+	}
+	sort.Strings(undeclared)
+	return undeclared
 }

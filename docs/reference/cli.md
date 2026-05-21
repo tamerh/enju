@@ -299,10 +299,15 @@ The task must already be claimed (claim via the web UI or MCP first).
 Render a run's task graph.
 
 ```sh
-enju dag --run 3 --project 7              # default text format
-enju dag --run 3 --project 7 --mermaid   # Mermaid diagram source
-enju dag --run 3 --project 7 --json      # JSON adjacency list
+enju dag 3                          # run seq 3 in the active project, default text
+enju dag 3 --project 7              # run seq 3 in project 7
+enju dag 3 --format mermaid         # Mermaid diagram source
+enju dag 3 --format json           # JSON adjacency list
 ```
+
+The run sequence is a positional argument. `--project` is optional
+(defaults to the project that owns the current directory). `--format`
+takes `mermaid` or `json`; omit it for the default text rendering.
 
 ---
 

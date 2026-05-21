@@ -37,7 +37,8 @@ func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
 	branch := fs.String("branch", "", `Run branch: "auto" (client-resolved to <slug>-N), an explicit name to isolate this run, or empty for the project default. The run forks from the project default and merges back per -sync.`)
-	paramsArg := fs.String("params", "", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split.")
+	var paramsArg repeatableParams
+	fs.Var(&paramsArg, "params", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split. Repeatable: pass --params more than once and the sets merge (later flags win per key).")
 	paramsFile := fs.String("params-file", "", "Path to a JSON object of typed params (the MCP-shaped params payload). Merged UNDER --params: inline keys win per key, even when the two forms differ (e.g. an inline string overrides a file list<record> of the same name). The clean route for list<record> and nested params the k=v grammar can't express.")
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
@@ -58,10 +59,18 @@ func cmdGo(args []string) {
 		os.Exit(2)
 	}
 
-	params, perr := parseParamsArg(*paramsArg)
-	if perr != nil {
-		fmt.Fprintf(os.Stderr, "--params: %v\n", perr)
-		os.Exit(2)
+	// --params is additive across repeated flags (M4): each
+	// occurrence is parsed independently and merged, later flags
+	// winning per key. The doc demonstrated this shape; the prior
+	// single-string flag silently took only the last occurrence.
+	var params map[string]interface{}
+	for _, chunk := range paramsArg {
+		p, perr := parseParamsArg(chunk)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "--params: %v\n", perr)
+			os.Exit(2)
+		}
+		params = mergeParams(params, p)
 	}
 	if *paramsFile != "" {
 		fileParams, ferr := loadParamsFile(*paramsFile)
@@ -652,6 +661,20 @@ func validateSyncFlag(v string) error {
 	default:
 		return fmt.Errorf("invalid value %q (must be none, merge, or push)", v)
 	}
+}
+
+// repeatableParams is a flag.Value that accumulates every --params
+// occurrence so the flag is additive (M4): `--params a=1 --params
+// b=2` collects ["a=1", "b=2"], which cmdGo parses + merges. Pre-fix
+// --params was a plain string flag and the last occurrence silently
+// won, contradicting the doc that demonstrated the additive form.
+type repeatableParams []string
+
+func (r *repeatableParams) String() string { return strings.Join(*r, " ") }
+
+func (r *repeatableParams) Set(v string) error {
+	*r = append(*r, v)
+	return nil
 }
 
 // parseParamsArg parses the --params shorthand: a comma-separated

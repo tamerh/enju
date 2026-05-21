@@ -106,3 +106,45 @@ func TestCoerceCLIParams_NonStringPassthrough(t *testing.T) {
 		t.Errorf("typed passthrough: got %v", got["n"])
 	}
 }
+
+// TestRepeatableParamsAdditive — M4. Repeated --params flags
+// accumulate and merge (later wins per key) instead of last-occurrence
+// silently clobbering the earlier set.
+func TestRepeatableParamsAdditive(t *testing.T) {
+	var rp repeatableParams
+	_ = rp.Set("items=[\"a\",\"b\"]")
+	_ = rp.Set("work_ms=50")
+	if len(rp) != 2 {
+		t.Fatalf("expected 2 accumulated chunks, got %d: %v", len(rp), rp)
+	}
+
+	var merged map[string]interface{}
+	for _, chunk := range rp {
+		p, err := parseParamsArg(chunk)
+		if err != nil {
+			t.Fatalf("parse %q: %v", chunk, err)
+		}
+		merged = mergeParams(merged, p)
+	}
+	if _, ok := merged["items"]; !ok {
+		t.Errorf("merged params lost 'items' (the pre-fix last-wins bug): %v", merged)
+	}
+	if _, ok := merged["work_ms"]; !ok {
+		t.Errorf("merged params missing 'work_ms': %v", merged)
+	}
+}
+
+// Later --params wins per key.
+func TestRepeatableParamsLaterWins(t *testing.T) {
+	var rp repeatableParams
+	_ = rp.Set("x=1")
+	_ = rp.Set("x=2")
+	var merged map[string]interface{}
+	for _, chunk := range rp {
+		p, _ := parseParamsArg(chunk)
+		merged = mergeParams(merged, p)
+	}
+	if merged["x"] != "2" {
+		t.Errorf("later --params should win per key; got x=%v", merged["x"])
+	}
+}
