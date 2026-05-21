@@ -372,7 +372,14 @@ func validateCollectsConsumed(p *Run) []string {
 			if len(targetWrites) > 0 {
 				for _, r := range t.ReadsArtifacts {
 					for _, w := range targetWrites {
-						if r == w {
+						// Compare with template expressions collapsed to a
+						// wildcard (M7): the canonical fan-in reads the
+						// glob path `data/{{items[*]}}/x` while the target
+						// writes the per-iteration `data/{{item}}/x`; both
+						// normalize to `data/*/x` and match. Literal paths
+						// normalize to themselves, so the direct case is
+						// unaffected.
+						if r == w || normalizeTemplatePath(r) == normalizeTemplatePath(w) {
 							consumed = true
 							break
 						}
@@ -397,6 +404,29 @@ func validateCollectsConsumed(p *Run) []string {
 		}
 	}
 	return warnings
+}
+
+// normalizeTemplatePath collapses every `{{...}}` expression in a
+// repo-relative path to a single "*" wildcard. Lets the collects
+// reachability check (M7) match a glob fan-in read
+// (`data/{{items[*]}}/analysis.txt`) against the per-iteration
+// write that feeds it (`data/{{item}}/analysis.txt`) — both
+// normalize to `data/*/analysis.txt`. Only used to SUPPRESS a
+// non-fatal warning, so over-matching is the safe direction.
+func normalizeTemplatePath(p string) string {
+	var b strings.Builder
+	for i := 0; i < len(p); {
+		if i+1 < len(p) && p[i] == '{' && p[i+1] == '{' {
+			if j := strings.Index(p[i:], "}}"); j >= 0 {
+				b.WriteByte('*')
+				i += j + 2
+				continue
+			}
+		}
+		b.WriteByte(p[i])
+		i++
+	}
+	return b.String()
 }
 
 // hasArtifactRefFor reports whether `text` contains a
@@ -601,11 +631,40 @@ func validateParams(p *Run) ([]string, error) {
 				return nil, err
 			}
 		}
-		if pp.Description == "" {
+		// The "needs prose" warning only makes sense for a param an
+		// LLM/human task actually reads in a prompt — that's when the
+		// description becomes a follow-up question. A param used only
+		// as a for_each fan-out axis or in compute paths (the canonical
+		// pure-compute pipeline) is never turned into a question, so a
+		// missing description there is not a defect (L8).
+		if pp.Description == "" && paramReferencedInPromptableTask(p, pp.Name) {
 			warnings = append(warnings, fmt.Sprintf("param %q has no description — the LLM needs prose to turn this into a question for the user", pp.Name))
 		}
 	}
 	return warnings, nil
+}
+
+// paramReferencedInPromptableTask reports whether `name` is
+// referenced (as `{{name}}` or `{{name[...]}}`) in the prompt or
+// user_prompt of any task whose action surfaces text to a human or
+// LLM. compute tasks are excluded — a param consumed only by a
+// compute script (via env / paths) or as a for_each axis never
+// becomes an LLM question, so its missing description (L8) is not a
+// defect. Whitespace-free match, mirroring the prompt resolver.
+func paramReferencedInPromptableTask(p *Run, name string) bool {
+	bare := "{{" + name + "}}"
+	indexed := "{{" + name + "["
+	for _, t := range p.Tasks {
+		if t.Action == "compute" {
+			continue
+		}
+		for _, text := range []string{t.Prompt, t.UserPrompt} {
+			if strings.Contains(text, bare) || strings.Contains(text, indexed) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validateParamDef enforces the list<record>-specific shape rules
