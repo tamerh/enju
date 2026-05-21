@@ -3827,6 +3827,40 @@ tasks:
 
 }
 
+// TestMCPFileIssueRejectsNonexistentProject pins the bug-hunt H2
+// fix: enju_file_issue must refuse a project_id that doesn't exist
+// rather than filing an orphan issue. CanReadProject treats a
+// zero-member project as open, and a non-existent project trivially
+// has zero members — so without an explicit existence guard a typoed
+// id sailed through and persisted an issue against nothing. Mirrors
+// the not-found behavior enju_archive_project already had.
+func TestMCPFileIssueRejectsNonexistentProject(t *testing.T) {
+	h := newMCPHarness(t, "FileIssueGhostProject")
+	// Create a real project so the registry/coord are warm, then
+	// file against a different, never-created id.
+	_ = h.createTestProject()
+
+	errText := h.callExpectError(t, "enju_file_issue", map[string]any{
+		"project_id": float64(99999),
+		"title":      "ghost project issue",
+	})
+	if !strings.Contains(errText, "not found") {
+		t.Fatalf("expected a not-found error for a ghost project, got: %s", errText)
+	}
+
+	// Confirm nothing was persisted. list_issues doesn't itself
+	// guard project existence (it returns an empty list for a
+	// project with no issues, which a ghost trivially is) — so the
+	// proof is that the listing is empty, i.e. no ISSUE- slug
+	// leaked through from the rejected file call.
+	listText := mcpText(h.callOK(t, "enju_list_issues", map[string]any{
+		"project_id": float64(99999),
+	}))
+	if strings.Contains(listText, "ISSUE-") {
+		t.Fatalf("expected no issues persisted against a ghost project, got: %s", listText)
+	}
+}
+
 // TestMCPAutoTriageFileAfterCompletedRun exercises the
 // reviewer-flagged gap: an issue filed AFTER a run with
 // auto_triage_template has already reached "completed" must

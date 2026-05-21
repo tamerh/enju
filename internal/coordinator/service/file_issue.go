@@ -42,6 +42,20 @@ func FileIssue(s store.CoordinatorStore, caller *store.CitizenRecord, p FileIssu
 	if p.Title == "" {
 		return nil, fmt.Errorf("%w: title is required", ErrInvalidArgument)
 	}
+	// Existence check BEFORE the membership gate. CanReadProject
+	// treats a zero-member project as open (the self-hosted
+	// single-machine case), and a non-existent project trivially
+	// has zero members — so without this guard a typoed project_id
+	// sails through CanReadProject and files an orphan issue against
+	// a project that doesn't exist. Mirror archive/restore's
+	// not-found-before-gate ordering.
+	proj, err := s.GetProject(p.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	if proj == nil {
+		return nil, fmt.Errorf("%w: project %d not found", ErrNotFound, p.ProjectID)
+	}
 	if !CanReadProject(s, p.ProjectID, caller.ID) {
 		return nil, ErrNotMember
 	}

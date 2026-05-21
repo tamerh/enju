@@ -72,7 +72,20 @@ func resolveActiveProject(sess *cliSession, override int64) (*projectreg.Entry, 
 		return nil, fmt.Errorf("no project registry configured")
 	}
 	if override > 0 {
-		return reg.Get(override)
+		entry, err := reg.Get(override)
+		if err != nil {
+			return nil, err
+		}
+		// reg.Get returns (nil, nil) for an id that isn't in the
+		// registry (or whose on-disk path no longer stats). Map
+		// that to a usage error rather than passing nil downstream
+		// — every caller (status, runs, dag) dereferences the
+		// returned entry, so a silent nil is a segfault on a typoed
+		// or stale --project id.
+		if entry == nil {
+			return nil, fmt.Errorf("no registered project with id %d on this machine; run `enju status --all` to list known projects", override)
+		}
+		return entry, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
