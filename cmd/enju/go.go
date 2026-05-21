@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/enju-ai/enju/internal/bots"
+	enjuYaml "github.com/enju-ai/enju/internal/common/yaml"
 	"github.com/enju-ai/enju/internal/fatclient/service"
-
 )
 
 // cmdGo wires register-if-needed + create_run + execute_run into
@@ -100,6 +100,29 @@ func cmdGo(args []string) {
 		os.Exit(2)
 	}
 
+	// Validate the workflow BEFORE registering the project (M4).
+	// Auto-registration used to run first, so a YAML that failed
+	// to parse/validate still left a phantom project behind in
+	// `enju status --all`. Parse from disk with the same two-pass
+	// param coercion --dry-run uses; a failure here exits before
+	// any project mutation.
+	parsed, verr := parseWorkflowForGo(workflowAbs, params)
+	if verr != nil {
+		fmt.Fprintf(os.Stderr, "workflow %s: %v\n", workflowArg, verr)
+		os.Exit(4)
+	}
+
+	// --auto-agents on a workflow that declares no agents (M1):
+	// there's nothing to manage, so degrade to a plain run instead
+	// of hard-failing. Detected from the validated parse above.
+	autoAgents := *autoBots
+	if autoAgents {
+		if m, perr := bots.FromInlineNode(parsed.Run.Bots); perr != nil || m == nil || len(m.Bots) == 0 {
+			fmt.Fprintln(os.Stderr, "ℹ --auto-agents: workflow declares no agents; running without agent management")
+			autoAgents = false
+		}
+	}
+
 	projectID, projectRoot, err := resolveOrRegisterProject(ctx, sess, workflowAbs, *name, *asJSON)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolve project: %v\n", err)
@@ -114,14 +137,14 @@ func cmdGo(args []string) {
 	logf(*asJSON, "▶ project %d at %s", projectID, projectRoot)
 	logf(*asJSON, "▶ workflow %s", templatePath)
 
-	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, *autoBots, *syncMode)
+	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, autoAgents, *syncMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create run: %v\n", err)
 		os.Exit(1)
 	}
 	logf(*asJSON, "▶ run #%d created (id=%d)", runSeq, runID)
 
-	if *autoBots {
+	if autoAgents {
 		// Bot-driven runs cycle until the run reaches a
 		// terminal state. ExecuteRun drains compute until a
 		// citizen gate; the bot daemons resolve those gates;
@@ -436,7 +459,7 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 	if !autoBots && prep != nil && prep.LoadedTemplate != nil {
 		if m, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots); perr == nil && m != nil && len(m.Bots) > 0 {
 			fmt.Fprintf(os.Stderr,
-				"⚠ workflow declares %d bot(s); pass --auto-agents to start them automatically (or `enju agent run` per bot for manual control)\n",
+				"⚠ workflow declares %d agent(s); pass --auto-agents to start them automatically (or `enju agent run` per agent for manual control)\n",
 				len(m.Bots))
 		}
 	}
@@ -451,20 +474,25 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		}
 		manifest, perr := bots.FromInlineNode(prep.LoadedTemplate.Parsed.Run.Bots)
 		if perr != nil {
-			return 0, 0, fmt.Errorf("auto_agents: parsing bots: %w", perr)
+			return 0, 0, fmt.Errorf("auto_agents: parsing agents: %w", perr)
 		}
 		if manifest == nil || len(manifest.Bots) == 0 {
-			return 0, 0, fmt.Errorf("--auto-agents set but workflow at %s declares no bots in its inline bots: section", templatePath)
-		}
-		sup, perr := sess.Supervisor()
-		if perr != nil {
-			return 0, 0, fmt.Errorf("auto_agents: supervisor init: %w", perr)
-		}
-		absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
-		autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, fc.Coord().BaseURL(), projectID, bots.AutoRunReadyTimeout())
-		if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
-			autoRunMgr.Rollback(ctx)
-			return 0, 0, fmt.Errorf("auto_agents: %w", perr)
+			// No agents to manage — degrade to a plain run rather
+			// than failing (M1). cmdGo normally downgrades autoBots
+			// before reaching here; this guard is the defensive twin
+			// so a direct createRun call behaves the same way.
+			autoBots = false
+		} else {
+			sup, perr := sess.Supervisor()
+			if perr != nil {
+				return 0, 0, fmt.Errorf("auto_agents: supervisor init: %w", perr)
+			}
+			absWorkflow := filepath.Join(prep.Workflow.WorkDir(), prep.LoadedTemplate.Path)
+			autoRunMgr = bots.NewAutoRunManager(sup, absWorkflow, fc.Coord().BaseURL(), projectID, bots.AutoRunReadyTimeout())
+			if perr := autoRunMgr.Preflight(ctx, manifest); perr != nil {
+				autoRunMgr.Rollback(ctx)
+				return 0, 0, fmt.Errorf("auto_agents: %w", perr)
+			}
 		}
 	}
 
@@ -584,6 +612,33 @@ func errorFromCoord(data []byte) string {
 		return s
 	}
 	return ""
+}
+
+// parseWorkflowForGo parses + validates the workflow YAML at path
+// using the same two-pass param-coercion the --dry-run path uses,
+// so `enju go` catches a malformed workflow BEFORE registering a
+// project (M4). Returns the parsed run on success. The error is
+// already user-readable (it's the validator's own message); callers
+// prefix it with the workflow path.
+func parseWorkflowForGo(path string, params map[string]interface{}) (*enjuYaml.ParsedRun, error) {
+	data, err := enjuYaml.FlattenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// Two-pass when params present: parse bare to learn declared
+	// types, coerce string CLI values, then parse for real.
+	if len(params) > 0 {
+		bare, perr := enjuYaml.Parse(data)
+		if perr != nil {
+			return nil, perr
+		}
+		coerced, cerr := coerceCLIParams(params, bare.Run.Params)
+		if cerr != nil {
+			return nil, cerr
+		}
+		params = coerced
+	}
+	return enjuYaml.ParseWithParams(data, params)
 }
 
 // validateSyncFlag returns an error when v is not one of the valid

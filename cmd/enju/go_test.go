@@ -7,9 +7,91 @@ import (
 	"testing"
 	"time"
 
+	"github.com/enju-ai/enju/internal/bots"
 	"github.com/enju-ai/enju/internal/fatclient/projectreg"
 	"github.com/enju-ai/enju/internal/fatclient/service"
 )
+
+// TestParseWorkflowForGo_RejectsInvalid pins bug-hunt M4: `enju go`
+// validates the workflow BEFORE registering a project, so a YAML
+// that fails validation can't leave a phantom project behind. This
+// covers the gate (the ordering is structural — parse precedes
+// resolveOrRegisterProject in cmdGo).
+func TestParseWorkflowForGo_RejectsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	wf := filepath.Join(dir, "enju.yaml")
+	// writes path escaping the repo — the tester's escape probe.
+	yml := `name: escape
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: scripts/escape.sh
+    prompt: x
+    writes:
+      - ../../etc/escaped.txt
+`
+	if err := os.WriteFile(wf, []byte(yml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseWorkflowForGo(wf, nil); err == nil {
+		t.Fatal("expected validation error for a writes path with '..', got nil")
+	}
+}
+
+// TestParseWorkflowForGo_AcceptsValid is the no-false-positive twin.
+func TestParseWorkflowForGo_AcceptsValid(t *testing.T) {
+	dir := t.TempDir()
+	wf := filepath.Join(dir, "enju.yaml")
+	yml := `name: ok
+version: 1
+tasks:
+  - id: t
+    action: answer
+    prompt: hi
+`
+	if err := os.WriteFile(wf, []byte(yml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseWorkflowForGo(wf, nil)
+	if err != nil {
+		t.Fatalf("valid workflow rejected: %v", err)
+	}
+	if parsed == nil || parsed.Run.Name != "ok" {
+		t.Fatalf("unexpected parse result: %+v", parsed)
+	}
+}
+
+// TestZeroAgentWorkflowDowngradesAutoAgents pins the predicate
+// behind bug-hunt M1: a workflow with no agents: section yields an
+// empty manifest, which cmdGo uses to degrade --auto-agents to a
+// plain run instead of hard-failing.
+func TestZeroAgentWorkflowDowngradesAutoAgents(t *testing.T) {
+	dir := t.TempDir()
+	wf := filepath.Join(dir, "enju.yaml")
+	yml := `name: pure-compute
+version: 1
+tasks:
+  - id: t
+    action: compute
+    script: scripts/run.sh
+    prompt: x
+`
+	if err := os.WriteFile(wf, []byte(yml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseWorkflowForGo(wf, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	m, perr := bots.FromInlineNode(parsed.Run.Bots)
+	if perr != nil {
+		t.Fatalf("FromInlineNode: %v", perr)
+	}
+	if m != nil && len(m.Bots) > 0 {
+		t.Fatalf("expected zero agents, got %d", len(m.Bots))
+	}
+}
 
 // TestPickWorkflowArg exercises Snakemake-style auto-discovery:
 // the ./enju.yaml fallback when no positional path is supplied.
