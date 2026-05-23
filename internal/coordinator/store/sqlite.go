@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -76,6 +77,16 @@ func SlugifyName(name string) string {
 type Store struct {
 	db   *sql.DB
 	events EventStore
+
+	// dbPath is the on-disk path New opened (":memory:" for the
+	// in-memory store). dbInfo is the file identity captured at
+	// open time. Together they let StorageIntact detect the
+	// "ghost DB" condition: the file being unlinked or replaced
+	// out from under the running process (e.g. a dev wipe of
+	// ~/.enju/ while the coordinator is up), where the process
+	// keeps serving from a deleted file descriptor.
+	dbPath string
+	dbInfo os.FileInfo
 }
 
 // New creates a new Store and initializes the schema.
@@ -131,11 +142,45 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("setting busy_timeout: %w", err)
 	}
 
-	s := &Store{db: db}
+	s := &Store{db: db, dbPath: dbPath}
 	if err := s.initSchema(); err != nil {
 		return nil, fmt.Errorf("schema init: %w", err)
 	}
+	// Capture the file identity now (after the file exists on
+	// disk) so StorageIntact can later tell whether the file was
+	// unlinked or swapped underneath us. Best-effort: a stat
+	// failure here just leaves the check existence-only.
+	if dbPath != "" && dbPath != ":memory:" {
+		if fi, statErr := os.Stat(dbPath); statErr == nil {
+			s.dbInfo = fi
+		}
+	}
 	return s, nil
+}
+
+// StorageIntact reports whether the database file New opened still
+// exists at its path and is the same file. It returns a non-nil
+// error when the file has been unlinked or replaced underneath the
+// running process — the "ghost DB" condition, in which the
+// coordinator keeps serving from a deleted file descriptor while a
+// fresh process opening the same path sees a different (empty)
+// database. Wiping ~/.enju/ while the coordinator runs is the
+// common trigger. In-memory stores (":memory:") are always intact.
+func (s *Store) StorageIntact() error {
+	if s.dbPath == "" || s.dbPath == ":memory:" {
+		return nil
+	}
+	cur, err := os.Stat(s.dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("state database %s was unlinked while the coordinator is running; it is now serving from a deleted file descriptor and on-disk state will diverge — restart the coordinator", s.dbPath)
+		}
+		return fmt.Errorf("stat state database %s: %w", s.dbPath, err)
+	}
+	if s.dbInfo != nil && !os.SameFile(s.dbInfo, cur) {
+		return fmt.Errorf("state database %s was replaced (a different file now occupies the path) while the coordinator is running; the open process and a fresh one see different databases — restart the coordinator", s.dbPath)
+	}
+	return nil
 }
 
 // AttachEventStore wires an EventStore (typically opened via

@@ -249,6 +249,16 @@ func cmdServe(args []string) {
 	reaper.Start()
 	defer reaper.Stop()
 
+	// Ghost-DB watcher. If the state database file is wiped or
+	// swapped out from under this process (e.g. clearing ~/.enju/
+	// during a dev restart without stopping the coordinator), the
+	// server keeps serving stale state from a deleted file
+	// descriptor with no other signal. /health reports it, but an
+	// operator watching logs gets no warning; this loop logs once
+	// when the file goes missing so the cause is visible without a
+	// health probe.
+	go watchStorageIntact(st, logger)
+
 	// SIGHUP reload: re-read enju.conf and apply the subset of
 	// changes that are safe to mutate live (events kill-switch,
 	// log level). Bind/port and DB paths require restart — we
@@ -319,6 +329,30 @@ func cmdServe(args []string) {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 		logger.Info("Enju coordinator stopped")
+	}
+}
+
+// watchStorageIntact polls the state store's on-disk file identity
+// and logs a single warning when it goes missing or is replaced
+// underneath the running process (the ghost-DB condition). It logs
+// only on the healthy→degraded transition so a persistently-wiped
+// file doesn't spam the log every tick; it re-arms once the path is
+// intact again. Returns immediately for an in-memory store, which
+// has no file to watch.
+func watchStorageIntact(st *store.Store, logger *slog.Logger) {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	degraded := false
+	for range tick.C {
+		err := st.StorageIntact()
+		switch {
+		case err != nil && !degraded:
+			degraded = true
+			logger.Error("state database storage is no longer intact", "error", err)
+		case err == nil && degraded:
+			degraded = false
+			logger.Info("state database storage is intact again")
+		}
 	}
 }
 

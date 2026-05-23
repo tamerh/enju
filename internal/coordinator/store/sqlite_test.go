@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1724,5 +1725,59 @@ func TestApplyPlan_DoesNotBumpUnrelatedProjects(t *testing.T) {
 	}
 	if !pB2.LastActivityAt.After(pB1.LastActivityAt) {
 		t.Errorf("touched project B did not advance: was %v, now %v", pB1.LastActivityAt, pB2.LastActivityAt)
+	}
+}
+
+// TestStorageIntact covers the ghost-DB detection: a store keeps an
+// open handle to a file that may be unlinked or replaced underneath
+// it (the dev-wipe-while-running footgun). StorageIntact must report
+// the path being gone or swapped, and stay quiet for an intact file
+// or an in-memory store.
+func TestStorageIntact(t *testing.T) {
+	// In-memory store is always intact (no file to watch).
+	mem, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New(:memory:): %v", err)
+	}
+	defer mem.Close()
+	if err := mem.StorageIntact(); err != nil {
+		t.Errorf(":memory: store should always be intact, got: %v", err)
+	}
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New(%s): %v", dbPath, err)
+	}
+	defer s.Close()
+
+	// Freshly opened, on-disk: intact.
+	if err := s.StorageIntact(); err != nil {
+		t.Fatalf("freshly opened store should be intact, got: %v", err)
+	}
+
+	// Unlink the file out from under the open handle (the wipe).
+	// The handle stays valid (deleted-but-open), but the path is
+	// now empty — StorageIntact must flag it.
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("remove db file: %v", err)
+	}
+	if err := s.StorageIntact(); err == nil {
+		t.Fatal("expected StorageIntact to flag the unlinked file, got nil")
+	} else if !strings.Contains(err.Error(), "unlinked") {
+		t.Errorf("expected an unlinked message, got: %v", err)
+	}
+
+	// Replace the path with a different file (a fresh process's
+	// new DB). Same path, different inode — StorageIntact must
+	// flag the swap, not pass.
+	if err := os.WriteFile(dbPath, []byte("not the original db"), 0o644); err != nil {
+		t.Fatalf("recreate db path: %v", err)
+	}
+	if err := s.StorageIntact(); err == nil {
+		t.Fatal("expected StorageIntact to flag the replaced file, got nil")
+	} else if !strings.Contains(err.Error(), "replaced") {
+		t.Errorf("expected a replaced message, got: %v", err)
 	}
 }
