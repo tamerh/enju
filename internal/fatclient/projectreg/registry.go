@@ -153,8 +153,15 @@ func (r *Registry) Upsert(e Entry) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	found := false
+	idx = applyUpsert(idx, e, time.Now().UTC())
+	return r.saveLocked(idx)
+}
+
+// applyUpsert inserts or merges e into idx by ID and returns the
+// updated index. Field-preserving: zero-valued fields in e keep the
+// existing entry's values. Shared by Upsert and Register; the caller
+// holds the lock.
+func applyUpsert(idx Index, e Entry, now time.Time) Index {
 	for i, existing := range idx.Projects {
 		if existing.ID != e.ID {
 			continue
@@ -178,15 +185,44 @@ func (r *Registry) Upsert(e Entry) error {
 			merged.LastTouched = now
 		}
 		idx.Projects[i] = merged
-		found = true
-		break
+		return idx
 	}
-	if !found {
-		if e.LastTouched.IsZero() {
-			e.LastTouched = now
+	if e.LastTouched.IsZero() {
+		e.LastTouched = now
+	}
+	idx.Projects = append(idx.Projects, e)
+	return idx
+}
+
+// Register records a path-anchored project, keeping the registry to
+// one entry per LocalPath. If other entries already point at
+// e.LocalPath under a *different* ID, they are dropped: a directory
+// maps to exactly one project, so a same-path/different-id entry is
+// a stale prior generation — typically a re-adoption after the
+// coordinator assigned a new id (e.g. its DB was wiped). Without
+// this, re-adoption appended a second row and path resolution could
+// land on the dead id ("No runs yet") instead of the live project.
+//
+// Falls back to a plain upsert when e.LocalPath is empty (a partial,
+// field-only update with no path to dedupe on, e.g. a name backfill).
+func (r *Registry) Register(e Entry) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx, err := r.loadLocked()
+	if err != nil {
+		return err
+	}
+	if e.LocalPath != "" {
+		kept := idx.Projects[:0]
+		for _, ex := range idx.Projects {
+			if ex.LocalPath == e.LocalPath && ex.ID != e.ID {
+				continue // stale entry for this path under a dead id
+			}
+			kept = append(kept, ex)
 		}
-		idx.Projects = append(idx.Projects, e)
+		idx.Projects = kept
 	}
+	idx = applyUpsert(idx, e, time.Now().UTC())
 	return r.saveLocked(idx)
 }
 
@@ -304,8 +340,23 @@ func (r *Registry) FindContaining(absPath string) (*Entry, error) {
 		if err != nil || strings.HasPrefix(rel, "..") {
 			continue
 		}
-		if best == nil || len(idx.Projects[i].LocalPath) > len(best.LocalPath) {
+		if best == nil {
 			best = &idx.Projects[i]
+			continue
+		}
+		// Prefer the deepest match so nested layouts resolve to the
+		// closest project. On a tie — two entries with the SAME path,
+		// which happens when a re-adoption left a stale duplicate
+		// under a dead id — prefer the most-recently-touched entry,
+		// since the live re-adoption carries the newer timestamp.
+		// Without this tiebreak, resolution kept whichever entry came
+		// first in the file (the older, dead one).
+		cur := &idx.Projects[i]
+		switch {
+		case len(cur.LocalPath) > len(best.LocalPath):
+			best = cur
+		case len(cur.LocalPath) == len(best.LocalPath) && cur.LastTouched.After(best.LastTouched):
+			best = cur
 		}
 	}
 	return best, nil

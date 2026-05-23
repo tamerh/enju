@@ -275,3 +275,86 @@ func TestFindContaining(t *testing.T) {
 		t.Errorf("expected nil for entry whose dir was deleted, got %+v", got)
 	}
 }
+
+// TestRegister_ReplacesStaleSamePathEntry pins the coord-wipe
+// re-adoption fix: registering a project at a path that already has
+// an entry under a different (now dead) id must REPLACE it, not
+// append a duplicate. Otherwise path resolution can land on the dead
+// id ("No runs yet") instead of the live project.
+func TestRegister_ReplacesStaleSamePathEntry(t *testing.T) {
+	r := newTempRegistry(t)
+	dir := t.TempDir()
+
+	// Original adoption: id 7 at dir.
+	if err := r.Register(Entry{ID: 7, LocalPath: dir, Name: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	// Coord DB wiped; re-adoption assigns a fresh id 42 at the SAME dir.
+	if err := r.Register(Entry{ID: 42, LocalPath: dir, Name: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one entry per path after re-adoption, got %d: %+v", len(got), got)
+	}
+	if got[0].ID != 42 {
+		t.Errorf("expected the live id 42 to survive, got %d", got[0].ID)
+	}
+}
+
+// TestRegister_KeepsDistinctPaths is the no-false-positive twin: two
+// real projects at different paths must both survive (dedupe is by
+// path, not a blanket replace).
+func TestRegister_KeepsDistinctPaths(t *testing.T) {
+	r := newTempRegistry(t)
+	a, b := t.TempDir(), t.TempDir()
+	if err := r.Register(Entry{ID: 1, LocalPath: a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(Entry{ID: 2, LocalPath: b}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected both distinct-path projects to survive, got %d: %+v", len(got), got)
+	}
+}
+
+// TestFindContaining_PrefersFresherOnSamePath pins the resolution
+// tiebreak: when duplicate entries share a path (e.g. a registry that
+// predates the Register dedupe), FindContaining must return the
+// most-recently-touched one — the live re-adoption — not whichever
+// came first in the file.
+func TestFindContaining_PrefersFresherOnSamePath(t *testing.T) {
+	r := newTempRegistry(t)
+	dir := t.TempDir()
+	old := time.Now().UTC().Add(-time.Hour)
+	recent := time.Now().UTC()
+
+	// Seed two entries at the same path via bare Upsert (bypassing
+	// Register's dedupe) to simulate a pre-existing duplicated registry.
+	if err := r.Upsert(Entry{ID: 7, LocalPath: dir, LastTouched: old}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Upsert(Entry{ID: 42, LocalPath: dir, LastTouched: recent}); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := r.FindContaining(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("expected a match for the path")
+	}
+	if entry.ID != 42 {
+		t.Errorf("expected the fresher entry (id 42), got id %d", entry.ID)
+	}
+}

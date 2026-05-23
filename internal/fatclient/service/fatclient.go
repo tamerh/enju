@@ -169,19 +169,26 @@ func New(cfg Config) *FatClient {
 // read-only setups).
 func (s *FatClient) ProjectRegistry() *projectreg.Registry { return s.projectRegistry }
 
-// RegisterProject upserts a registry entry. Called from the
+// RegisterProject records a registry entry. Called from the
 // project-creation path (EagerInitProjectClone) so the UI's
 // cross-project landing finds the project on next render,
 // including external dirs that aren't discoverable from the
 // workspace root.
+//
+// Uses Register (not bare Upsert) so a re-adoption at a path that
+// already has an entry under a now-dead id (e.g. after the
+// coordinator's DB was wiped and reassigned ids) replaces the stale
+// row rather than appending a duplicate — otherwise path resolution
+// could land on the dead id. Register no-ops the dedupe when
+// LocalPath is empty, so name-only updates still merge by id.
 //
 // No-op when no registry is configured.
 func (s *FatClient) RegisterProject(e projectreg.Entry) {
 	if s.projectRegistry == nil {
 		return
 	}
-	if err := s.projectRegistry.Upsert(e); err != nil {
-		s.logger.Warn("project registry upsert failed",
+	if err := s.projectRegistry.Register(e); err != nil {
+		s.logger.Warn("project registry register failed",
 			"id", e.ID, "path", e.LocalPath, "error", err)
 	}
 }
