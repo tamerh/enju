@@ -28,9 +28,10 @@ const (
 	maxExecuteRunLimit     = 1000
 	// Parallel-dispatch knob. Default 4 (sweet spot for the
 	// typical bio fan-out: 4-way judges, 4-way alignment
-	// pipelines), cap at 32 for power users with beefy hosts.
+	// pipelines). The ceiling lives at service.MaxParallel —
+	// shared with the `enju go --parallel` CLI so the two front
+	// doors to ExecuteRun can't drift on the cap.
 	defaultParallel = 4
-	maxParallel     = 32
 )
 
 func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -60,10 +61,10 @@ func (c *apiClient) handleExecuteRun(ctx context.Context, req mcp.CallToolReques
 	if parallel <= 0 {
 		parallel = defaultParallel
 	}
-	if parallel > maxParallel {
+	if parallel > service.MaxParallel {
 		return mcp.NewToolResultError(fmt.Sprintf(
 			"parallel %d exceeds hard cap %d — diminishing returns past the proj.Lock contention point on git commit/push, and bio scripts can be RAM-heavy. If you genuinely need more, split the cascade across multiple enju_execute_run calls.",
-			parallel, maxParallel)), nil
+			parallel, service.MaxParallel)), nil
 	}
 
 	res, err := c.fc.ExecuteRun(ctx, service.ExecuteRunParams{

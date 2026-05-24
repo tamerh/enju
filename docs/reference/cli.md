@@ -156,6 +156,7 @@ enju go --dry-run enju.yaml
 | `--base BRANCH` | project default | Branch the run forks **from** and reads the workflow from. `HEAD` (or `.`) = the current checked-out branch. Distinct from `--run-branch`. |
 | `--sync none\|merge\|push` | from YAML | Override the workflow's sync mode for this run |
 | `--max-tasks N` | 1000 | Safety cap on compute tasks drained per call. `0` = create run without draining. |
+| `--parallel N` | 1 | Run up to N compute tasks concurrently. With `mode: sync` this drains a fanned-out run to completion N-at-a-time in one invocation; commits serialize through the project lock. Capped at 32. |
 | `--dry-run` | off | Parse and resolve the workflow, print the DAG, exit without touching the coordinator |
 | `--coordinator URL` | from `credentials.json` | Coordinator URL override |
 | `--json` | off | NDJSON output — one record per task plus a summary record |

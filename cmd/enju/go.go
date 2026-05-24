@@ -30,9 +30,6 @@ import (
 //	              at all (the bot auto-lifecycle is in-flight
 //	              in a sibling spec). Compute tasks drain;
 //	              citizen-action gates surface as Blocker.
-//	--parallel    ExecuteRun supports it but the multi-task
-//	              commit-author / scratch-dir contention story
-//	              isn't worth surfacing on the CLI yet.
 func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
@@ -44,6 +41,7 @@ func cmdGo(args []string) {
 	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
+	parallel := fs.Int("parallel", 1, "Run up to N compute tasks concurrently (default 1 = serial). With mode: sync this drains a fanned-out run to completion N-at-a-time in a single invocation; commits serialize through the project lock. Capped at 32.")
 	autoBots := fs.Bool("auto-agents", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_agents flag.")
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
 	syncMode := fs.String("sync", "", `Sync mode at run completion: none | merge | push. Overrides the workflow YAML's sync: block. "merge" merges the run branch into base_branch locally; "push" also pushes base_branch to origin; "none" skips both. Defaults to the YAML setting, or "merge" if the YAML has no sync: block.`)
@@ -59,6 +57,13 @@ func cmdGo(args []string) {
 		fmt.Fprintf(os.Stderr, "--sync: %v\n", err)
 		os.Exit(2)
 	}
+
+	parallelN, perr := normalizeParallelFlag(*parallel)
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "--parallel: %v\n", perr)
+		os.Exit(2)
+	}
+	*parallel = parallelN
 
 	// --params is additive across repeated flags (M4): each
 	// occurrence is parsed independently and merged, later flags
@@ -163,7 +168,7 @@ func cmdGo(args []string) {
 		// completed/failed/terminated, at which point the
 		// supervisor's tailer has fired auto-stop on every
 		// auto-managed bot.
-		if exit := driveAutoBotsRun(ctx, sess, int(projectID), runSeq, *maxTasks, *asJSON); exit != 0 {
+		if exit := driveAutoBotsRun(ctx, sess, int(projectID), runSeq, *maxTasks, *parallel, *asJSON); exit != 0 {
 			os.Exit(exit)
 		}
 		return
@@ -177,7 +182,7 @@ func cmdGo(args []string) {
 		ProjectID: int(projectID),
 		RunSeq:    runSeq,
 		MaxTasks:  *maxTasks,
-		Parallel:  1,
+		Parallel:  *parallel,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
@@ -208,7 +213,7 @@ func cmdGo(args []string) {
 // runs don't hammer coord, short enough that humans don't
 // perceive lag between bot work completing and the next
 // compute round kicking off.
-func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, maxTasks int, asJSON bool) int {
+func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, maxTasks, parallel int, asJSON bool) int {
 	const (
 		pollInterval     = 2 * time.Second
 		coordWarnEvery   = 10 // emit a warning every Nth consecutive failure
@@ -227,7 +232,7 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, 
 			ProjectID: projectID,
 			RunSeq:    runSeq,
 			MaxTasks:  maxTasks,
-			Parallel:  1,
+			Parallel:  parallel,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
@@ -338,11 +343,11 @@ func pickWorkflowArg(args []string) (string, error) {
 		}
 		return "", fmt.Errorf(
 			"no workflow path supplied and ./%s not found.\n"+
-				"  usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>\n"+
+				"  usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--parallel N] [--dry-run] [--json] <workflow.yaml>\n"+
 				"  (flags must precede the workflow path), or run from a directory that contains an %s file.",
 			defaultName, defaultName)
 	default:
-		return "", fmt.Errorf("usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>  (flags must precede the path; got %d positional args, expected 0 or 1 — a flag placed AFTER the workflow path is the usual cause)", len(args))
+		return "", fmt.Errorf("usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--parallel N] [--dry-run] [--json] <workflow.yaml>  (flags must precede the path; got %d positional args, expected 0 or 1 — a flag placed AFTER the workflow path is the usual cause)", len(args))
 	}
 }
 
@@ -649,6 +654,25 @@ func parseWorkflowForGo(path string, params map[string]interface{}) (*enjuYaml.P
 		params = coerced
 	}
 	return enjuYaml.ParseWithParams(data, params)
+}
+
+// normalizeParallelFlag clamps a <1 value to serial (1) and rejects
+// anything above service.MaxParallel — the single shared ceiling both
+// this CLI flag and the MCP enju_execute_run handler reference, so the
+// bound is structural rather than two literals that can drift. The CLI
+// default differs (serial, so `enju go` is unchanged unless the
+// operator opts in); only the ceiling is shared. Extracted from cmdGo
+// (which owns the os.Exit) so the bounds are testable.
+func normalizeParallelFlag(n int) (int, error) {
+	if n < 1 {
+		return 1, nil
+	}
+	if n > service.MaxParallel {
+		return 0, fmt.Errorf(
+			"%d exceeds hard cap %d — diminishing returns past the project-lock contention point on git commit/push, and compute scripts can be RAM-heavy",
+			n, service.MaxParallel)
+	}
+	return n, nil
 }
 
 // validateSyncFlag returns an error when v is not one of the valid

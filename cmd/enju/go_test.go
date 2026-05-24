@@ -507,3 +507,31 @@ func TestValidateSyncFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeParallelFlag(t *testing.T) {
+	// <1 clamps to serial (1) without erroring — the operator who
+	// passes 0 or a negative gets the default behavior, not a hard
+	// stop. The unset default (1) and any value up to the cap pass
+	// through unchanged.
+	for _, in := range []int{-5, 0, 1} {
+		got, err := normalizeParallelFlag(in)
+		if err != nil {
+			t.Errorf("normalizeParallelFlag(%d): unexpected error %v", in, err)
+		}
+		if in >= 1 && got != in {
+			t.Errorf("normalizeParallelFlag(%d): got %d, want %d", in, got, in)
+		}
+		if in < 1 && got != 1 {
+			t.Errorf("normalizeParallelFlag(%d): got %d, want clamp to 1", in, got)
+		}
+	}
+	if got, err := normalizeParallelFlag(service.MaxParallel); err != nil || got != service.MaxParallel {
+		t.Errorf("normalizeParallelFlag(%d): got (%d,%v), want (%d,nil) — the cap itself is allowed", service.MaxParallel, got, err, service.MaxParallel)
+	}
+	// Above the cap is a usage error (returns 0 so cmdGo exits 2),
+	// matching the MCP enju_execute_run ceiling rather than silently
+	// throttling.
+	if _, err := normalizeParallelFlag(service.MaxParallel + 1); err == nil {
+		t.Errorf("normalizeParallelFlag(%d): expected an over-cap error, got nil", service.MaxParallel+1)
+	}
+}

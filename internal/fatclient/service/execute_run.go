@@ -71,6 +71,14 @@ const (
 	StopContextCancelled   = "context_cancelled"
 )
 
+// MaxParallel is the hard ceiling on ExecuteRunParams.Parallel,
+// shared by every front door to ExecuteRun (the MCP enju_execute_run
+// handler and the `enju go --parallel` CLI flag) so the bound is
+// structural, not duplicated per caller. Past this point the
+// project-lock contention on git commit/push dominates and compute
+// scripts can be RAM-heavy.
+const MaxParallel = 32
+
 // ExecuteRunParams is the input for FatClient.ExecuteRun.
 //
 // RunSeq is the run's PER-PROJECT sequence number (the "#11" a
