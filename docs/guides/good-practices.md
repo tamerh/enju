@@ -161,7 +161,7 @@ Don't use `for_each` to express a serial sequence. If task B must happen after t
   prompt: Synthesize across all analyses: {{analyze.content}}
 ```
 
-**Avoid:** using `for_each` with a single item just to get a unique branch name. Use a named run branch via `--branch` instead.
+**Avoid:** using `for_each` with a single item just to get a unique branch name. Use a named run branch via `--run-branch` instead.
 
 ---
 

@@ -36,7 +36,7 @@ import (
 func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
-	branch := fs.String("branch", "", `Run branch: "auto" (client-resolved to <slug>-N), an explicit name to isolate this run, or empty for the project default. The run forks from the project default and merges back per -sync.`)
+	runBranch := fs.String("run-branch", "", `The run's own branch — where this run's commits land before merging back per --sync. "auto" generates an isolated name (<slug>-N); empty commits on the base branch directly. Distinct from --base, which is the branch the run forks FROM.`)
 	base := fs.String("base", "", `Fork this run from <branch> instead of the project default, reading the workflow from that branch's committed tree. "HEAD" (or ".") means the currently checked-out branch — "run the workflow from where I am." Distinct from --branch, which names the run branch. The workflow must be committed on the base branch.`)
 	var paramsArg repeatableParams
 	fs.Var(&paramsArg, "params", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split. Repeatable: pass --params more than once and the sets merge (later flags win per key).")
@@ -147,7 +147,7 @@ func cmdGo(args []string) {
 	logf(*asJSON, "▶ project %d at %s", projectID, projectRoot)
 	logf(*asJSON, "▶ workflow %s", templatePath)
 
-	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *branch, *base, autoAgents, *syncMode)
+	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *runBranch, *base, autoAgents, *syncMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create run: %v\n", err)
 		os.Exit(1)

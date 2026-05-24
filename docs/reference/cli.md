@@ -152,7 +152,8 @@ enju go --dry-run enju.yaml
 | `--params k=v[,k=v]` | — | Run parameter values. Comma-separated key=value pairs. Values starting with `[` or `{` are parsed as JSON. |
 | `--params-file FILE` | — | JSON object of typed params. Merged under `--params` (inline keys win). |
 | `--name NAME` | cwd basename | Project name when auto-registering |
-| `--branch NAME` | project default | Run branch name |
+| `--run-branch NAME` | base branch | The run's own branch (where its commits land before merging back). `auto` generates an isolated `<slug>-N` name. |
+| `--base BRANCH` | project default | Branch the run forks **from** and reads the workflow from. `HEAD` (or `.`) = the current checked-out branch. Distinct from `--run-branch`. |
 | `--sync none\|merge\|push` | from YAML | Override the workflow's sync mode for this run |
 | `--max-tasks N` | 1000 | Safety cap on compute tasks drained per call. `0` = create run without draining. |
 | `--dry-run` | off | Parse and resolve the workflow, print the DAG, exit without touching the coordinator |
