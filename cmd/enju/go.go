@@ -37,7 +37,7 @@ func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
 	runBranch := fs.String("run-branch", "", `The run's own branch — where this run's commits land before merging back per --sync. "auto" generates an isolated name (<slug>-N); empty commits on the base branch directly. Distinct from --base, which is the branch the run forks FROM.`)
-	base := fs.String("base", "", `Fork this run from <branch> instead of the project default, reading the workflow from that branch's committed tree. "HEAD" (or ".") means the currently checked-out branch — "run the workflow from where I am." Distinct from --branch, which names the run branch. The workflow must be committed on the base branch.`)
+	base := fs.String("base", "", `Fork this run from <branch> instead of the project default, reading the workflow from that branch's committed tree. "HEAD" (or ".") means the currently checked-out branch — "run the workflow from where I am." Distinct from --run-branch, which names the run's own branch. The workflow must be committed on the base branch.`)
 	var paramsArg repeatableParams
 	fs.Var(&paramsArg, "params", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split. Repeatable: pass --params more than once and the sets merge (later flags win per key).")
 	paramsFile := fs.String("params-file", "", "Path to a JSON object of typed params (the MCP-shaped params payload). Merged UNDER --params: inline keys win per key, even when the two forms differ (e.g. an inline string overrides a file list<record> of the same name). The clean route for list<record> and nested params the k=v grammar can't express.")
@@ -338,11 +338,11 @@ func pickWorkflowArg(args []string) (string, error) {
 		}
 		return "", fmt.Errorf(
 			"no workflow path supplied and ./%s not found.\n"+
-				"  usage: enju go [--name X] [--branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>\n"+
+				"  usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>\n"+
 				"  (flags must precede the workflow path), or run from a directory that contains an %s file.",
 			defaultName, defaultName)
 	default:
-		return "", fmt.Errorf("usage: enju go [--name X] [--branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>  (flags must precede the path; got %d positional args, expected 0 or 1 — a flag placed AFTER the workflow path is the usual cause)", len(args))
+		return "", fmt.Errorf("usage: enju go [--name X] [--run-branch X] [--params k=v,k=v] [--params-file f.json] [--dry-run] [--json] <workflow.yaml>  (flags must precede the path; got %d positional args, expected 0 or 1 — a flag placed AFTER the workflow path is the usual cause)", len(args))
 	}
 }
 

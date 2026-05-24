@@ -60,20 +60,19 @@ func cmdProjectDefaultBranch(args []string) {
 	branch := fs.Arg(0)
 
 	sess := openCLISession(*coordOverride)
-	ctx := context.Background()
 
-	entry, err := resolveActiveProject(sess, *projectID)
+	projID, warning, err := runProjectDefaultBranch(sess, *projectID, branch)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "project: %v\n", err)
-		os.Exit(2)
-	}
-
-	warning, err := sess.FC.SetProjectDefaultBranch(ctx, entry.ID, branch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "set default branch: %v\n", err)
+		fmt.Fprintf(os.Stderr, "project default-branch: %v\n", err)
+		// Resolution failures (bad/unregistered --project, no
+		// registry) are usage errors (exit 2); a coord-side failure
+		// is exit 1. resolveActiveProject is the only exit-2 source.
+		if projID == 0 {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
-	fmt.Printf("✓ project %d default branch set to %q\n", entry.ID, branch)
+	fmt.Printf("✓ project %d default branch set to %q\n", projID, branch)
 	if warning != "" {
 		// Non-fatal: the coord update landed; only the local
 		// materialize step had trouble (e.g. forking a brand-new
@@ -81,4 +80,19 @@ func cmdProjectDefaultBranch(args []string) {
 		// may need attention before the next run forks cleanly.
 		fmt.Fprintf(os.Stderr, "  ⚠ %s\n", warning)
 	}
+}
+
+// runProjectDefaultBranch resolves the target project and sets its
+// default branch. Split from cmdProjectDefaultBranch (which owns flag
+// parsing, printing, and exit codes) so the resolve-then-set logic is
+// testable without os.Exit. Returns the resolved project id (0 when
+// resolution itself failed — the usage-error vs coord-error
+// discriminator the caller uses for its exit code).
+func runProjectDefaultBranch(sess *cliSession, projectID int64, branch string) (int64, string, error) {
+	entry, err := resolveActiveProject(sess, projectID)
+	if err != nil {
+		return 0, "", err
+	}
+	warning, err := sess.FC.SetProjectDefaultBranch(context.Background(), entry.ID, branch)
+	return entry.ID, warning, err
 }

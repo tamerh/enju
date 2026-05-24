@@ -165,13 +165,6 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 	// workflow from that branch's committed tree. "HEAD"/"." resolve
 	// to the currently checked-out branch ("run from where I am").
 	if baseBranch != "" {
-		if baseBranch == "HEAD" || baseBranch == "." {
-			cur, cerr := wf.CurrentBranch()
-			if cerr != nil || cur == "" {
-				return nil, fmt.Errorf("--base %s: could not resolve the current branch: %v", baseBranch, cerr)
-			}
-			baseBranch = cur
-		}
 		return s.prepareRunFromBase(wf, templatePath, baseBranch)
 	}
 
@@ -226,6 +219,15 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 // committed-only load is what makes the run reproducible here, not the
 // worktree state).
 func (s *FatClient) prepareRunFromBase(wf *enjugit.Workflow, templatePath, baseBranch string) (*RunTemplatePrep, error) {
+	// "HEAD"/"." resolve to the currently checked-out branch
+	// ("run from where I am").
+	if baseBranch == "HEAD" || baseBranch == "." {
+		cur, cerr := wf.CurrentBranch()
+		if cerr != nil || cur == "" {
+			return nil, fmt.Errorf("--base %s: could not resolve the current branch: %v", baseBranch, cerr)
+		}
+		baseBranch = cur
+	}
 	// Point the loader + SHA resolution at the chosen base.
 	wf.SetDefaultBranch(baseBranch)
 

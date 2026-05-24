@@ -225,15 +225,16 @@ func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
 	return w.loadWorkflowFrom(repoRelPath, w.WorkDir())
 }
 
-// LoadWorkflowCommitted loads the workflow strictly from the default
-// branch's committed tree, ignoring the worktree entirely. Use it
-// when the base branch is chosen explicitly (e.g. `enju go --base X`)
-// and may differ from whatever is checked out: the normal LoadWorkflow
-// compares the committed bytes against the worktree and refuses on a
-// mismatch (the showcase_v16 trap guard), which would misfire when the
-// caller deliberately reads a branch other than the one on disk. Here
-// the committed tree IS the intended source, so there is no worktree
-// to reconcile against.
+// LoadWorkflowCommitted loads the workflow strictly from the branch
+// the Workflow is pointed at (w.DefaultBranch(), which callers set via
+// SetDefaultBranch — for `enju go --base X` that is X), reading only
+// its committed tree and ignoring the worktree entirely. Use it when
+// the branch is chosen explicitly and may differ from whatever is
+// checked out: the normal LoadWorkflow compares the committed bytes
+// against the worktree and refuses on a mismatch (the showcase_v16
+// trap guard), which would misfire when the caller deliberately reads
+// a branch other than the one on disk. Here the committed tree IS the
+// intended source, so there is no worktree to reconcile against.
 func (w *Workflow) LoadWorkflowCommitted(repoRelPath string) (*LoadedWorkflow, error) {
 	return w.loadWorkflowFrom(repoRelPath, "")
 }
