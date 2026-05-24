@@ -103,6 +103,11 @@ type FatClient struct {
 	// SLURM dispatch→reap→host-commit loop is cluster-free
 	// testable purely by setting this field.
 	executorOverride func(kind string) (executor.Executor, error)
+
+	// reconcileOwn elects this process as the single reconcile-
+	// ticker owner per project (see OwnsReconcile). Holds one
+	// flock per owned project for the FatClient's lifetime.
+	reconcileOwn reconcileOwners
 }
 
 // pickExecutor resolves the launcher for an executor kind. Tests

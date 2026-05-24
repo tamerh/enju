@@ -325,6 +325,21 @@ func LockPathFor(projectPath string) string {
 	return filepath.Join(projectPath, ".enju", "locks", "project.lock")
 }
 
+// ReconcileLockPathFor returns the flock path that elects the single
+// reconcile-ticker owner for a project rooted at projectPath:
+// <projectPath>/.enju/locks/reconcile.lock. It is distinct from the
+// project write lock (LockPathFor) — holding it means "I am the
+// process that runs the periodic git fetch/merge for this project,"
+// not "I am writing the index right now." Whichever MCP server grabs
+// it first is the sole reconciler; the rest stand their tickers down,
+// so duplicate servers (e.g. piled up across /mcp reconnects) stop
+// contending on the project write lock. The OS releases the flock
+// when its holder exits, so a dead owner's lease frees automatically
+// and another server takes over — no heartbeat or stale-file logic.
+func ReconcileLockPathFor(projectPath string) string {
+	return filepath.Join(projectPath, ".enju", "locks", "reconcile.lock")
+}
+
 // newWorkflowFromClone wraps a *git.Clone in a Workflow with the
 // Workspace's conventions. Used by ForProject and friends.
 //

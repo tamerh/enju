@@ -128,6 +128,14 @@ func (c *apiClient) runReconcileTicker(ctx context.Context) {
 			}
 
 			for id := range ids {
+				// Only the elected reconcile owner for this project
+				// does the git fetch/merge. Duplicate MCP servers
+				// (piled up across /mcp reconnects) stand their
+				// tickers down here instead of all contending on the
+				// project write lock.
+				if !c.fc.OwnsReconcile(id) {
+					continue
+				}
 				c.reconcileActiveRuns(ctx, id)
 			}
 		}

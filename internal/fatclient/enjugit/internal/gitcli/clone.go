@@ -245,7 +245,8 @@ func (c *Clone) acquireFileLock() {
 	}
 	start := time.Now()
 	c.logger.Warn("blocked acquiring project lock; another enju process holds it — waiting (kill the stale daemon/mcp if this persists)",
-		"lock_path", c.fileLock.Path())
+		"lock_path", c.fileLock.Path(),
+		"holder_pid", c.lockOwnerPID())
 	lastLog := start
 	for {
 		ok, err := c.fileLock.TryLock()
@@ -259,11 +260,52 @@ func (c *Clone) acquireFileLock() {
 			c.logger.Warn("still blocked acquiring project lock",
 				"lock_path", c.fileLock.Path(),
 				"waited", time.Since(start).Round(time.Second).String(),
+				"holder_pid", c.lockOwnerPID(),
 				"try_err", err)
 			lastLog = time.Now()
 		}
 		time.Sleep(lockContentionRetryDelay)
 	}
+}
+
+// lockOwnerPath is the sidecar file naming the pid that currently
+// holds the project flock — written on acquire, removed on release.
+// flock itself doesn't expose the holder, so this is how a blocked
+// process can name the pid to kill in its contention WARN.
+func (c *Clone) lockOwnerPath() string {
+	return c.fileLock.Path() + ".owner"
+}
+
+// writeLockOwner records this process as the lock holder. Best-effort:
+// the pid is a diagnostic hint, never load-bearing for correctness.
+func (c *Clone) writeLockOwner() {
+	if c.fileLock == nil {
+		return
+	}
+	_ = os.WriteFile(c.lockOwnerPath(), []byte(strconv.Itoa(os.Getpid())), 0o644)
+}
+
+// clearLockOwner removes the holder sidecar on release. A holder that
+// crashes leaves a stale file; the next acquirer overwrites it, and a
+// waiter reading the dead pid in the meantime is actually a useful
+// "this is the wedged process" pointer.
+func (c *Clone) clearLockOwner() {
+	if c.fileLock == nil {
+		return
+	}
+	_ = os.Remove(c.lockOwnerPath())
+}
+
+// lockOwnerPID reads the holder sidecar; "" when absent/unreadable.
+func (c *Clone) lockOwnerPID() string {
+	if c.fileLock == nil {
+		return ""
+	}
+	b, err := os.ReadFile(c.lockOwnerPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // lock acquires both mu and (when configured) the flock. No-op
@@ -278,7 +320,9 @@ func (c *Clone) lock() func() {
 	c.mu.Lock()
 	c.acquireFileLock()
 	c.holder.Store(me)
+	c.writeLockOwner()
 	return func() {
+		c.clearLockOwner()
 		c.holder.Store(0)
 		if c.fileLock != nil {
 			_ = c.fileLock.Unlock()
