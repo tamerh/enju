@@ -244,7 +244,7 @@ func (c *Clone) acquireFileLock() {
 		return
 	}
 	start := time.Now()
-	c.logger.Warn("blocked acquiring project lock; another enju process holds it — waiting (kill the stale daemon/mcp if this persists)",
+	c.logger.Warn("blocked acquiring project lock; another enju process holds it — waiting (if this persists, verify holder_pid is a live enju process and kill it)",
 		"lock_path", c.fileLock.Path(),
 		"holder_pid", c.lockOwnerPID())
 	lastLog := start
