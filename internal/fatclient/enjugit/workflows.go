@@ -222,6 +222,26 @@ func paramSummaries(ps []enjuYaml.ParamDef) []ParamSummary {
 // Workflow YAMLs can live anywhere in the repo at any depth;
 // LoadWorkflow only enforces a no-traversal path-shape guard.
 func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
+	return w.loadWorkflowFrom(repoRelPath, w.WorkDir())
+}
+
+// LoadWorkflowCommitted loads the workflow strictly from the default
+// branch's committed tree, ignoring the worktree entirely. Use it
+// when the base branch is chosen explicitly (e.g. `enju go --base X`)
+// and may differ from whatever is checked out: the normal LoadWorkflow
+// compares the committed bytes against the worktree and refuses on a
+// mismatch (the showcase_v16 trap guard), which would misfire when the
+// caller deliberately reads a branch other than the one on disk. Here
+// the committed tree IS the intended source, so there is no worktree
+// to reconcile against.
+func (w *Workflow) LoadWorkflowCommitted(repoRelPath string) (*LoadedWorkflow, error) {
+	return w.loadWorkflowFrom(repoRelPath, "")
+}
+
+// loadWorkflowFrom is the shared body. workdir="" reads committed-only
+// (no worktree comparison or fallback); workdir=w.WorkDir() keeps the
+// tree-first/worktree-fallback behavior LoadWorkflow documents.
+func (w *Workflow) loadWorkflowFrom(repoRelPath, workdir string) (*LoadedWorkflow, error) {
 	clean := filepath.ToSlash(filepath.Clean(repoRelPath))
 	if strings.Contains(clean, "../") || clean != repoRelPath {
 		return nil, fmt.Errorf("workflow path %q contains disallowed path components", repoRelPath)
@@ -230,7 +250,7 @@ func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
 	if err != nil {
 		return nil, err
 	}
-	rb, err := w.readBundleManifest(w.DefaultBranch(), bundleDir, manifestPath, w.WorkDir())
+	rb, err := w.readBundleManifest(w.DefaultBranch(), bundleDir, manifestPath, workdir)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +260,6 @@ func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
 	// byte-identical, so existing single-file workflows are
 	// unaffected.
 	sha, _ := w.resolveDefaultBranchSHA(w.DefaultBranch())
-	workdir := w.WorkDir()
 	raw, err := enjuYaml.FlattenIncludes(rb.manifestPath, func(p string) ([]byte, error) {
 		data, found, rerr := w.readPinnedRepoFile(sha, workdir, p)
 		if rerr != nil {
@@ -274,7 +293,20 @@ func (w *Workflow) LoadWorkflow(repoRelPath string) (*LoadedWorkflow, error) {
 //
 // Deprecated: use LoadWorkflow.
 func (w *Workflow) LoadTemplate(repoRelPath string) (*LoadedTemplate, error) {
-	loaded, err := w.LoadWorkflow(repoRelPath)
+	return adaptLoadedTemplate(w.LoadWorkflow(repoRelPath))
+}
+
+// LoadTemplateCommitted is the committed-only twin of LoadTemplate,
+// returning the legacy *LoadedTemplate shape. Used by the create-run
+// base-override path (enju go --base) which must read the chosen base
+// branch's committed tree regardless of what's checked out.
+//
+// Deprecated: use LoadWorkflowCommitted.
+func (w *Workflow) LoadTemplateCommitted(repoRelPath string) (*LoadedTemplate, error) {
+	return adaptLoadedTemplate(w.LoadWorkflowCommitted(repoRelPath))
+}
+
+func adaptLoadedTemplate(loaded *LoadedWorkflow, err error) (*LoadedTemplate, error) {
 	if err != nil {
 		return nil, err
 	}

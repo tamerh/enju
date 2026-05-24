@@ -260,6 +260,38 @@ func TestLoadTemplate_DeprecatedAliasStillWorks(t *testing.T) {
 	}
 }
 
+// TestLoadWorkflowCommitted_IgnoresWorktreeDivergence pins the crux
+// of `enju go --base`: the committed-only load reads the chosen
+// branch's committed tree and does NOT reconcile against the worktree.
+// The same divergent setup that makes LoadWorkflow refuse (the
+// showcase_v16 trap guard) must load cleanly here, since the base
+// branch is explicitly the intended source — the worktree may be a
+// different branch entirely.
+func TestLoadWorkflowCommitted_IgnoresWorktreeDivergence(t *testing.T) {
+	wf, fake := makeWorkflow(t)
+	fake.resolveMap["refs/heads/main"] = "tipsha"
+	fake.readContent["tipsha:enju.yaml"] = []byte("name: committed-version\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: hi\n")
+
+	// Worktree holds a DIVERGENT version. LoadWorkflow would reject
+	// (see TestLoadWorkflow_RejectsUncommittedDivergence);
+	// LoadWorkflowCommitted must ignore it and use the committed tree.
+	tmp := t.TempDir()
+	if err := os.WriteFile(tmp+"/enju.yaml",
+		[]byte("name: worktree-version\nversion: 1\ntasks:\n  - id: t\n    action: answer\n    prompt: hi\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake.workDir = tmp
+
+	loaded, err := wf.LoadWorkflowCommitted("enju.yaml")
+	if err != nil {
+		t.Fatalf("committed-only load must ignore worktree divergence: %v", err)
+	}
+	if loaded.Details.Name != "committed-version" {
+		t.Errorf("expected the committed version, got %q", loaded.Details.Name)
+	}
+}
+
 func TestReadBundleFiles_Empty(t *testing.T) {
 	wf, _ := makeWorkflow(t)
 	// No commits on default branch → friendly error.

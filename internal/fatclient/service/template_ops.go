@@ -166,7 +166,7 @@ func (s *FatClient) CreateRunFromTemplate(ctx context.Context, projectID int64, 
 		return nil, fmt.Errorf("template_path is required")
 	}
 
-	prep, err := s.PrepareRunTemplate(ctx, projectID, templatePath, authorName, authorEmail)
+	prep, err := s.PrepareRunTemplate(ctx, projectID, templatePath, "", authorName, authorEmail)
 	if err != nil {
 		return nil, err
 	}

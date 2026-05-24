@@ -566,7 +566,7 @@ func (c *apiClient) handleCreateRun(ctx context.Context, req mcp.CallToolRequest
 	var sourceCommitSHA string
 	if templatePath != "" {
 		authorName, authorEmail := c.commitAuthor(ctx)
-		p, err := c.fc.PrepareRunTemplate(ctx, int64(projectID), templatePath, authorName, authorEmail)
+		p, err := c.fc.PrepareRunTemplate(ctx, int64(projectID), templatePath, "", authorName, authorEmail)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

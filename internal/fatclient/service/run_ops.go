@@ -146,7 +146,7 @@ type RunTemplatePrep struct {
 // source-commit SHA for provenance, and a prep handle the
 // caller passes to CommitRunTemplateSnapshot after the
 // coordinator assigns the run's seq.
-func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, authorName, authorEmail string) (*RunTemplatePrep, error) {
+func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, templatePath, baseBranch, authorName, authorEmail string) (*RunTemplatePrep, error) {
 	if s.enjugit == nil {
 		return nil, fmt.Errorf("enju_create_run with 'path' requires a local workspace (MCP client mode)")
 	}
@@ -159,6 +159,21 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 	// loader will surface a clear "template not found" if the
 	// file truly isn't there yet.
 	_ = wf.PullBranch("")
+
+	// Base-branch override (enju go --base): fork this run from the
+	// named branch instead of the project default, reading the
+	// workflow from that branch's committed tree. "HEAD"/"." resolve
+	// to the currently checked-out branch ("run from where I am").
+	if baseBranch != "" {
+		if baseBranch == "HEAD" || baseBranch == "." {
+			cur, cerr := wf.CurrentBranch()
+			if cerr != nil || cur == "" {
+				return nil, fmt.Errorf("--base %s: could not resolve the current branch: %v", baseBranch, cerr)
+			}
+			baseBranch = cur
+		}
+		return s.prepareRunFromBase(wf, templatePath, baseBranch)
+	}
 
 	loaded, err := wf.LoadTemplate(templatePath)
 	if err != nil {
@@ -199,6 +214,35 @@ func (s *FatClient) PrepareRunTemplate(ctx context.Context, projectID int64, tem
 		prep.SourceCommit = head
 	}
 	return prep, nil
+}
+
+// prepareRunFromBase is the --base override path. The workflow must
+// already be committed on baseBranch (that's the premise of an
+// explicit base), so we read it from that branch's committed tree and
+// fork from its tip — never auto-committing to a default branch. This
+// deliberately skips EnsureBundleOnDefault (it would commit the
+// checked-out branch's files onto baseBranch, corrupting it when the
+// worktree sits elsewhere) and the worktree branch guard (the
+// committed-only load is what makes the run reproducible here, not the
+// worktree state).
+func (s *FatClient) prepareRunFromBase(wf *enjugit.Workflow, templatePath, baseBranch string) (*RunTemplatePrep, error) {
+	// Point the loader + SHA resolution at the chosen base.
+	wf.SetDefaultBranch(baseBranch)
+
+	sha, err := wf.LocalBranchHash(baseBranch)
+	if err != nil || sha == "" {
+		return nil, fmt.Errorf("--base %q: branch not found or has no commits on this machine (fetch it, or check the name)", baseBranch)
+	}
+	loaded, err := wf.LoadTemplateCommitted(templatePath)
+	if err != nil {
+		return nil, fmt.Errorf("loading %s from base branch %q: %w", templatePath, baseBranch, err)
+	}
+	return &RunTemplatePrep{
+		Workflow:       wf,
+		LoadedTemplate: loaded,
+		YAMLContent:    string(loaded.Raw),
+		SourceCommit:   sha,
+	}, nil
 }
 
 // CommitRunTemplateSnapshot freezes the loaded bundle into the
