@@ -327,11 +327,7 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 				trace.okDetail("push", "skipped: no origin")
 				return nil
 			}
-			if perr := g.Push(target); perr != nil {
-				return trace.fail("push", translateGitError("push", perr))
-			}
-			trace.ok("push")
-			return nil
+			return w.pushTargetWithCatchUp(g, target, author, result, trace)
 		} else if !errors.Is(err, git.ErrPushNonFF) {
 			// Real failure (not "non-FF"; non-FF is the
 			// expected fall-through to merge-commit).
@@ -375,16 +371,102 @@ func (w *Workflow) MergeAcceptedTopic(topic, target string, author MergeAuthor) 
 			trace.okDetail("push", "skipped: no origin")
 			return nil
 		}
-		if perr := g.Push(target); perr != nil {
-			return trace.fail("push", translateGitError("push", perr))
-		}
-		trace.ok("push")
-		return nil
+		return w.pushTargetWithCatchUp(g, target, author, result, trace)
 	})
 	if werr != nil {
 		return nil, werr
 	}
 	return result, nil
+}
+
+// pushTargetWithCatchUp pushes target to origin and, on a
+// non-fast-forward rejection, catches up to origin before retrying —
+// bounded. This closes the parallel push race
+// (parallel-push-race.bug.md): MergeAcceptedTopic's pre-merge fetch
+// advances only the remote-tracking ref, while the merge advances the
+// LOCAL target — so when a sibling task's push moves origin between
+// our fetch and our push, local target is behind and the push is
+// rejected non-FF. Here we merge origin/<target> (the sibling commit
+// we missed) into local target and re-push.
+//
+// The catch-up merge is worktree-free (MergeWithCommit writes the
+// commit object and advances the ref directly), so afterward we
+// reconcile the shared worktree to the new tip — both call sites enter
+// with HEAD on target, and the next task on the same clone would
+// otherwise see the sibling's files as phantom deletes. result.NewTip
+// is updated to the caught-up tip so the caller reports the commit
+// that actually landed.
+func (w *Workflow) pushTargetWithCatchUp(g git.Ops, target string, author MergeAuthor, result *MergeResult, trace *stepTrace) error {
+	// maxPushAttempts = 1 initial + (maxPushAttempts-1) catch-up
+	// retries. A handful is plenty: each retry only loses to a sibling
+	// that pushed in the same narrow window, and pushes serialize under
+	// the project lock, so contention drains quickly.
+	const maxPushAttempts = 4
+	var perr error
+	for attempt := 1; attempt <= maxPushAttempts; attempt++ {
+		if perr = g.Push(target); perr == nil {
+			trace.ok("push")
+			return nil
+		}
+		if !errors.Is(perr, git.ErrPushNonFF) {
+			// A real push failure (auth, transport, bad remote) — not
+			// a race. Surface it; the catch-up dance can't help.
+			return trace.fail("push", translateGitError("push", perr))
+		}
+		if attempt == maxPushAttempts {
+			break
+		}
+
+		trace.appendStep(Step{
+			Name: "push", Status: "retry",
+			Detail: fmt.Sprintf("non-fast-forward; merging origin/%s and retrying (attempt %d/%d)",
+				target, attempt, maxPushAttempts-1),
+		})
+		// Fetch downloads origin's objects (all heads); resolve the
+		// tip by SHA via ls-remote rather than a remote-tracking ref
+		// name, since the merge helpers merge by SHA and the SHA is
+		// local once fetched.
+		if ferr := g.Fetch(); ferr != nil {
+			return trace.fail("push-catchup-fetch", translateGitError("fetch for push catch-up", ferr))
+		}
+		originTip, rerr := g.RemoteBranchHash(target)
+		if rerr != nil {
+			return trace.fail("push-catchup-fetch", translateGitError("resolve origin tip for push catch-up", rerr))
+		}
+		if originTip == "" {
+			// Origin no longer carries target (deleted out from under
+			// us) — not a race we can resolve by merging. Surface the
+			// original non-FF push error.
+			return trace.fail("push", translateGitError("push", perr))
+		}
+		// FF first (origin merely ahead, our commit not yet present);
+		// otherwise a real merge commit combining our tip with the
+		// sibling's. A genuine content conflict here is *not* a race —
+		// it bubbles up as the merge error (→ ErrConflict path).
+		if tip, ffErr := g.MergeFFOrFail(target, originTip); ffErr == nil {
+			result.NewTip = tip
+		} else if !errors.Is(ffErr, git.ErrPushNonFF) {
+			return trace.fail("push-catchup-merge", translateGitError("fast-forward origin for push catch-up", ffErr))
+		} else {
+			subject := fmt.Sprintf("Merge origin/%s into %s (push catch-up)", target, target)
+			msg := composeCommitMessage(w.convs, subject, "", buildMergeTrailers(author))
+			authorName, authorEmail := w.mergeAuthorIdentity(author)
+			tip, merr := g.MergeWithCommit(target, originTip, msg, authorName, authorEmail)
+			if merr != nil {
+				return trace.fail("push-catchup-merge", translateGitError("merge origin for push catch-up", merr))
+			}
+			result.NewTip = tip
+		}
+		// Worktree-free merge advanced the ref but not the worktree;
+		// reconcile so a following task on this shared clone doesn't
+		// trip on phantom deletes. Best-effort: the push needs only the
+		// ref, so a worktree blip must not fail the merge.
+		if rerr := g.ReconcileWorktreeToHead(); rerr != nil {
+			w.logger.Warn("enjugit: worktree reconcile after push catch-up failed; ref advanced, worktree may lag",
+				"target", target, "error", rerr)
+		}
+	}
+	return trace.fail("push", translateGitError("push", perr))
 }
 
 // MergeRunIntoBase merges a completed run branch into the project's

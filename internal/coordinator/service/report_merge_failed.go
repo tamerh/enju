@@ -22,6 +22,15 @@ type ReportMergeFailedParams struct {
 	RunBranch   string
 	Error       string // verbatim from the underlying git error
 	TaskID      string
+	// Transient marks a recoverable infra failure — a push rejected
+	// non-fast-forward (the parallel push race) or a transport blip —
+	// as opposed to a genuine misconfig (bad remote, auth) or an Enju
+	// bug. The fat client sets this from the git error class. When
+	// true the task parks failed_retryable (recover with
+	// enju_retry_task) instead of terminally failing + skip-cascading
+	// its descendants. Content conflicts never reach here — they take
+	// the ReportMergeConflict path.
+	Transient bool
 }
 
 // ReportMergeFailedResponse is the wire shape returned to the
@@ -68,11 +77,17 @@ type ReportMergeFailedResponse struct {
 //     caller can render them in enju_execute_run's failure
 //     line.
 //
-// Per the design discussion: merge_failed is TERMINAL. The
-// claim isn't reopened for retry — git-level non-conflict
-// failures are operator misconfig / Enju bugs / infrastructure
-// problems, not "the citizen will fix it on retry." Operator
-// must invalidate to retry.
+// Classification (params.Transient): a non-conflict merge failure
+// is either a genuine, non-recoverable problem (bad remote, auth,
+// Enju bug) — TERMINAL, descendants skip-cascade, operator must
+// invalidate to retry — or a transient infra blip (push rejected
+// non-fast-forward under the parallel push race, transport timeout)
+// — RECOVERABLE, parks failed_retryable with descendants left
+// PENDING, recover with enju_retry_task. The fat client sets
+// Transient from the git error class; the original "merge_failed is
+// always terminal" rule predated `enju go --parallel`, which
+// introduced a benign push race that terminal classification never
+// anticipated.
 func ReportMergeFailed(c *Coordinator, caller *store.CitizenRecord, projectID int64, runSeq int, params ReportMergeFailedParams) (*ReportMergeFailedResponse, error) {
 	run, err := c.Store.GetRunByProjectSeq(projectID, runSeq)
 	if err != nil {
@@ -132,11 +147,61 @@ func ReportMergeFailed(c *Coordinator, caller *store.CitizenRecord, projectID in
 				"run_branch":   params.RunBranch,
 				"run_seq":      run.Seq,
 				"error":        params.Error,
+				"transient":    params.Transient,
 			}),
 			CreatedAt: time.Now(),
 		}}},
 	}); err != nil {
 		return nil, fmt.Errorf("recording merge_failed event: %w", err)
+	}
+
+	// Transient infra failure (push race / transport blip): park
+	// failed_retryable instead of terminally cascading. performCompute
+	// Failure rolls back the failed attempt's partial writes, closes
+	// the claim ledger, leaves descendants PENDING (so the run stays
+	// WAITING, not dead), and emits cascade_fired{compute_error}. The
+	// operator (or the drive loop) recovers with enju_retry_task. Same
+	// machinery the kind=compute_error script-failure path uses, so a
+	// push race recovers exactly like an error_max_turns blip.
+	if params.Transient {
+		rollbacks, ferr := c.performComputeFailure(params.TaskID, reason)
+		if ferr != nil {
+			return nil, fmt.Errorf("%w: parking merge failure as retryable: %s", ErrInvalidArgument, ferr.Error())
+		}
+		if updated, _ := c.Store.GetTask(params.TaskID); updated != nil && updated.ClaimedBy > 0 {
+			c.Store.RecordContributionEvent(&store.ContributionEvent{
+				CitizenID: updated.ClaimedBy,
+				EventType: "task_failed",
+				TaskID:    params.TaskID,
+				RunID:     updated.RunID,
+				ProjectID: run.ProjectID,
+				Metadata: store.MarshalMetadata(map[string]any{
+					"reason":     reason,
+					"merge_fail": true,
+					"retryable":  true,
+				}),
+				CreatedAt: time.Now(),
+			})
+		}
+		rb := make([]ArtifactRollbackView, 0, len(rollbacks))
+		for _, r := range rollbacks {
+			v := ArtifactRollbackView{Path: r.Path}
+			if r.Deleted {
+				v.Deleted = true
+			} else {
+				v.RestoredFromTask = r.RestoredFromTask
+				v.RestoredFromCommit = r.RestoredFromCommit
+			}
+			rb = append(rb, v)
+		}
+		return &ReportMergeFailedResponse{
+			Status: "failed_retryable",
+			TaskID: params.TaskID,
+			Reason: reason,
+			// No SkippedDescendants: they stay PENDING, blocked on this
+			// task by ordinary dependency-not-satisfied until the retry.
+			Rollbacks: rb,
+		}, nil
 	}
 
 	// Engine pre-validates the fail-ability (state guard); the

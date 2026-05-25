@@ -475,6 +475,11 @@ type reportMergeFailedRequest struct {
 	RunBranch   string `json:"run_branch"`
 	Error       string `json:"error"`
 	TaskID      string `json:"task_id"`
+	// Transient: the fat client classified the underlying git error
+	// as a recoverable infra blip (push non-fast-forward race /
+	// transport) rather than a genuine failure. Drives a
+	// failed_retryable park instead of a terminal cascade.
+	Transient bool `json:"transient"`
 }
 
 // handleReportMergeFailed — endpoint for non-conflict
@@ -498,6 +503,7 @@ func (s *Server) handleReportMergeFailed(w http.ResponseWriter, r *http.Request)
 		RunBranch:   req.RunBranch,
 		Error:       req.Error,
 		TaskID:      req.TaskID,
+		Transient:   req.Transient,
 	})
 	if err != nil {
 		switch {

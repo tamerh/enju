@@ -822,11 +822,16 @@ func (s *FatClient) reportRunSyncConflict(ctx context.Context, projectID, runSeq
 // can manually invalidate the SUBMITTED task to recover. Logs
 // at Warn (not silent) because the report failure compounds
 // the original problem.
-func (s *FatClient) reportMergeFailed(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, errMsg string) {
+func (s *FatClient) reportMergeFailed(ctx context.Context, projectID, runSeq int64, taskID, topicBranch, runBranch, errMsg string, transient bool) {
 	body := map[string]interface{}{
 		"topic_branch": topicBranch,
 		"run_branch":   runBranch,
 		"error":        errMsg,
+		// transient = a recoverable infra failure (push non-FF race /
+		// transport) the coord should park failed_retryable rather than
+		// terminally cascade. Classified by the caller from the git
+		// error; see applyAcceptedMerges.
+		"transient": transient,
 	}
 	if taskID != "" {
 		body["task_id"] = taskID
@@ -962,10 +967,10 @@ func mergeWorkflowOrNil(wf *enjugit.Workflow) mergeWorkflow {
 // and surfaced as warnings, not returned as submit errors (the local
 // commit already landed; the publish/push is a best-effort step).
 //
-// Sync modes (from the workflow's sync: block, defaulting to "merge"):
+// Publish modes (from the workflow's publish: block, defaulting to "local"):
 //
 //	none  — no-op.
-//	merge — publish the run's declared outputs onto the base branch
+//	local — publish the run's declared outputs onto the base branch
 //	        locally; push nothing.
 //	push  — same publish, then push exactly { base, run branch }.
 //
@@ -1002,7 +1007,7 @@ func (s *FatClient) applyRunCompletion(ctx context.Context, wf mergeWorkflow, me
 	}
 	mode := resp.SyncMode
 	if mode == "" {
-		mode = "merge"
+		mode = "local"
 	}
 	if mode == "none" {
 		return
@@ -1156,9 +1161,18 @@ func (s *FatClient) applyAcceptedMerges(ctx context.Context, wf *enjugit.Workflo
 			// closes. After the report, the caller
 			// gets the underlying error and surfaces it via
 			// the ExecuteOutcome chain.
+			// Classify: a push rejected non-fast-forward is a
+			// transient race (after MergeAcceptedTopic's own bounded
+			// catch-up retry has been exhausted, it means persistent
+			// contention — still recoverable, not misconfig). The coord
+			// parks it failed_retryable so enju_retry_task / the drive
+			// loop recover, instead of terminally cascading the whole
+			// fan-out. Everything else (bad remote, auth, ref-not-found)
+			// stays terminal as before.
+			transient := errors.Is(mergeErr, enjugit.ErrPushNonFF)
 			if reportProjectID > 0 && reportRunSeq > 0 {
 				s.reportMergeFailed(ctx, reportProjectID, reportRunSeq, taskID,
-					topicBranch, runBranch, mergeErr.Error())
+					topicBranch, runBranch, mergeErr.Error(), transient)
 			} else {
 				s.logger.Error("dropped merge_failed report: project_id/run_seq missing from submit response",
 					"task", taskID,
