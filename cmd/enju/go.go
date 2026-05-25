@@ -33,7 +33,7 @@ import (
 func cmdGo(args []string) {
 	fs := flag.NewFlagSet("go", flag.ExitOnError)
 	name := fs.String("name", "", "Project name when auto-registering (default: cwd basename)")
-	runBranch := fs.String("run-branch", "", `The run's own branch — where this run's commits land before merging back per --sync. "auto" generates an isolated name (<slug>-N); empty commits on the base branch directly. Distinct from --base, which is the branch the run forks FROM.`)
+	runBranch := fs.String("run-branch", "", `The run's own branch — where this run's commits land before publishing back per --publish. "auto" generates an isolated name (<slug>-N); empty commits on the base branch directly. Distinct from --base, which is the branch the run forks FROM.`)
 	base := fs.String("base", "", `Fork this run from <branch> instead of the project default, reading the workflow from that branch's committed tree. "HEAD" (or ".") means the currently checked-out branch — "run the workflow from where I am." Distinct from --run-branch, which names the run's own branch. The workflow must be committed on the base branch.`)
 	var paramsArg repeatableParams
 	fs.Var(&paramsArg, "params", "k=v[,k=v...] template parameter values. list<string> uses pipes: k=a|b|c. A value beginning with [ or { is parsed as JSON (records/nested) — top-level commas inside it are not split. Repeatable: pass --params more than once and the sets merge (later flags win per key).")
@@ -44,7 +44,7 @@ func cmdGo(args []string) {
 	parallel := fs.Int("parallel", 1, "Run up to N compute tasks concurrently (default 1 = serial). With mode: sync this drains a fanned-out run to completion N-at-a-time in a single invocation; commits serialize through the project lock. Capped at 32.")
 	autoBots := fs.Bool("auto-agents", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_agents flag.")
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
-	syncMode := fs.String("sync", "", `Sync mode at run completion: none | merge | push. Overrides the workflow YAML's sync: block. "merge" merges the run branch into base_branch locally; "push" also pushes base_branch to origin; "none" skips both. Defaults to the YAML setting, or "merge" if the YAML has no sync: block.`)
+	publishMode := fs.String("publish", "", `Publish mode at run completion: none | local | push. Overrides the workflow YAML's publish: block. "local" writes the run's declared outputs onto base_branch as a curated commit, locally; "push" also pushes base_branch to origin; "none" skips both (the run branch keeps the outputs). Defaults to the YAML setting, or "local" if the YAML has no publish: block.`)
 	fs.Parse(args)
 
 	workflowArg, uerr := pickWorkflowArg(fs.Args())
@@ -53,8 +53,8 @@ func cmdGo(args []string) {
 		os.Exit(2)
 	}
 
-	if err := validateSyncFlag(*syncMode); err != nil {
-		fmt.Fprintf(os.Stderr, "--sync: %v\n", err)
+	if err := validatePublishFlag(*publishMode); err != nil {
+		fmt.Fprintf(os.Stderr, "--publish: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -152,7 +152,7 @@ func cmdGo(args []string) {
 	logf(*asJSON, "▶ project %d at %s", projectID, projectRoot)
 	logf(*asJSON, "▶ workflow %s", templatePath)
 
-	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *runBranch, *base, autoAgents, *syncMode)
+	runSeq, runID, err := createRun(ctx, sess, projectID, templatePath, params, *runBranch, *base, autoAgents, *publishMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create run: %v\n", err)
 		os.Exit(1)
@@ -442,7 +442,7 @@ func projectRootCandidate(workflowAbs string) string {
 // Returns the run's per-project seq and the global run_id from
 // the coord response. Surfaces ensure-branch / snapshot
 // warnings to stderr as the MCP handler does.
-func createRun(ctx context.Context, sess *cliSession, projectID int64, templatePath string, params map[string]interface{}, branch, base string, autoBots bool, syncMode string) (int, int64, error) {
+func createRun(ctx context.Context, sess *cliSession, projectID int64, templatePath string, params map[string]interface{}, branch, base string, autoBots bool, publishMode string) (int, int64, error) {
 	fc := sess.FC
 	authorName, authorEmail := fc.CommitAuthor(ctx)
 	prep, err := fc.PrepareRunTemplate(ctx, projectID, templatePath, base, authorName, authorEmail)
@@ -535,8 +535,10 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		}
 		body["branch"] = branch
 	}
-	if syncMode != "" {
-		body["sync_mode_override"] = syncMode
+	if publishMode != "" {
+		// Wire key retained from the pre-rename sync: block; carries
+		// the --publish mode override (none|local|push) to the coord.
+		body["sync_mode_override"] = publishMode
 	}
 
 	data, err := fc.Coord().Post(ctx, fmt.Sprintf("/api/v1/projects/%d/runs", projectID), body)
@@ -675,16 +677,16 @@ func normalizeParallelFlag(n int) (int, error) {
 	return n, nil
 }
 
-// validateSyncFlag returns an error when v is not one of the valid
-// sync modes. Empty string (flag not set) is accepted. Extracted so
+// validatePublishFlag returns an error when v is not one of the valid
+// publish modes. Empty string (flag not set) is accepted. Extracted so
 // tests can cover the validation logic independent of cmdGo's
 // flag.Parse / os.Exit plumbing.
-func validateSyncFlag(v string) error {
+func validatePublishFlag(v string) error {
 	switch v {
-	case "", "none", "merge", "push":
+	case "", "none", "local", "push":
 		return nil
 	default:
-		return fmt.Errorf("invalid value %q (must be none, merge, or push)", v)
+		return fmt.Errorf("invalid value %q (must be none, local, or push)", v)
 	}
 }
 

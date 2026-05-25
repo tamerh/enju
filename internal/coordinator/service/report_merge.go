@@ -231,7 +231,7 @@ func ReportMerge(c *Coordinator, caller *store.CitizenRecord, projectID int64, r
 	// response (the submit response never carried run_completed for
 	// a topic-branch task).
 	if resp.RunCompleted {
-		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
+		resp.SyncMode, resp.SyncRemote = parsePublishConfig(run)
 		resp.PublishPaths = c.declaredArtifactPaths(run)
 	}
 

@@ -22,10 +22,11 @@ type CreateRunParams struct {
 	SourceCommitSHA string
 	Username    string // citizen who created this run, for contribution tracking
 	Branch     string // empty | "auto" | explicit branch name
-	// SyncModeOverride is the CLI --sync flag value (or
+	// SyncModeOverride is the CLI --publish flag value (or
 	// enju_create_run's sync_mode_override param). When non-empty,
-	// takes precedence over the workflow YAML's sync: block at
-	// run-completion time. One of "none", "merge", "push".
+	// takes precedence over the workflow YAML's publish: block at
+	// run-completion time. One of "none", "local", "push". (Field +
+	// param name retained from the pre-rename sync: block.)
 	SyncModeOverride string
 }
 

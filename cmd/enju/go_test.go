@@ -494,16 +494,16 @@ func TestShouldRenderPoll(t *testing.T) {
 	}
 }
 
-// TestValidateSyncFlag pins the allowed sync mode values.
-func TestValidateSyncFlag(t *testing.T) {
-	for _, v := range []string{"", "none", "merge", "push"} {
-		if err := validateSyncFlag(v); err != nil {
-			t.Errorf("validateSyncFlag(%q): expected nil, got %v", v, err)
+// TestValidatePublishFlag pins the allowed publish mode values.
+func TestValidatePublishFlag(t *testing.T) {
+	for _, v := range []string{"", "none", "local", "push"} {
+		if err := validatePublishFlag(v); err != nil {
+			t.Errorf("validatePublishFlag(%q): expected nil, got %v", v, err)
 		}
 	}
-	for _, v := range []string{"psh", "PUSH", "Merge", "fast-forward", "auto", "1"} {
-		if err := validateSyncFlag(v); err == nil {
-			t.Errorf("validateSyncFlag(%q): expected error, got nil", v)
+	for _, v := range []string{"psh", "PUSH", "Local", "merge", "fast-forward", "auto", "1"} {
+		if err := validatePublishFlag(v); err == nil {
+			t.Errorf("validatePublishFlag(%q): expected error, got nil", v)
 		}
 	}
 }

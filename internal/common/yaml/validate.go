@@ -97,7 +97,7 @@ func validate(p *Run) ([]string, error) {
 	if err := validateDynamicForEach(p, ids); err != nil {
 		return nil, err
 	}
-	if err := validateSyncMode(p); err != nil {
+	if err := validatePublishMode(p); err != nil {
 		return nil, err
 	}
 	computeWarnings := validateComputeDependsDeclared(p)
@@ -853,19 +853,20 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 	return ids, hasTaskLevelForEach, nil
 }
 
-// validateSyncMode rejects unknown values in the run-level sync:
-// mode: field. Empty (omitted block) is always accepted — it defaults
-// to "merge" at run-completion time. Validated here so a bad mode in
-// the YAML file is caught at create_run, not silently at completion.
-func validateSyncMode(p *Run) error {
-	if p.Sync == nil || p.Sync.Mode == "" {
+// validatePublishMode rejects unknown values in the run-level
+// publish: mode: field. Empty (omitted block) is always accepted — it
+// defaults to "local" at run-completion time. Validated here so a bad
+// mode in the YAML file is caught at create_run, not silently at
+// completion.
+func validatePublishMode(p *Run) error {
+	if p.Publish == nil || p.Publish.Mode == "" {
 		return nil
 	}
-	switch p.Sync.Mode {
-	case "none", "merge", "push":
+	switch p.Publish.Mode {
+	case "none", "local", "push":
 		return nil
 	default:
-		return fmt.Errorf("sync: mode %q is invalid (must be \"none\", \"merge\", or \"push\")", p.Sync.Mode)
+		return fmt.Errorf("publish: mode %q is invalid (must be \"none\", \"local\", or \"push\")", p.Publish.Mode)
 	}
 }
 

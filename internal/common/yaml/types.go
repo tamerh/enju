@@ -76,20 +76,30 @@ type Run struct {
 	// {{issue.id}} are substituted at spawn time.
 	AutoTriage *RemediationTemplate `yaml:"auto_triage,omitempty"`
 
-	// Sync controls what happens when the run completes.
-	// See SyncConfig for the three modes. Optional; omitting the
-	// block is equivalent to `sync: mode: merge`.
-	Sync *SyncConfig `yaml:"sync,omitempty"`
+	// Publish controls whether the run's declared outputs land on the
+	// base (deliverable) branch when the run completes. See
+	// PublishConfig for the three modes. Optional; omitting the block
+	// is equivalent to `publish: mode: local`.
+	Publish *PublishConfig `yaml:"publish,omitempty"`
 }
 
-// SyncConfig is the per-workflow sync policy declared under the
-// optional `sync:` block. All fields apply only at run completion —
-// per-task topic and run-branch pushes are unaffected.
-type SyncConfig struct {
-	// Mode is one of "none", "merge", or "push".
-	//   none  — do nothing; run branch stays as-is; base_branch unchanged.
-	//   merge — FF-merge run-branch into base_branch locally (default when omitted).
-	//   push  — same as merge, then push base_branch to Remote.
+// PublishConfig is the per-workflow publish policy declared under the
+// optional `publish:` block. It governs ONLY whether the run's
+// declared outputs are written to the base branch at run completion
+// (and whether that is pushed). It does NOT govern the per-task topic
+// and run-branch pushes that happen during the run — those push
+// naturally for multi-citizen review and the git audit trail,
+// regardless of this setting.
+type PublishConfig struct {
+	// Mode is one of "none", "local", or "push".
+	//   none  — don't publish; base branch unchanged (the run branch
+	//           still holds the outputs + full audit trail).
+	//   local — write the run's declared outputs onto base_branch as a
+	//           curated commit, locally; push nothing (default when
+	//           omitted). NB: this is a selective copy of the declared
+	//           outputs, NOT a whole-branch merge of the run branch —
+	//           base stays a clean deliverable, free of .enju/ trail.
+	//   push  — same publish, then push { base_branch, run branch } to Remote.
 	Mode string `yaml:"mode,omitempty"`
 	// Remote is the git remote to push to when mode=push.
 	// Defaults to "origin" when empty.

@@ -744,9 +744,10 @@ func (s *Store) initSchema() error {
 		`ALTER TABLE runs ADD COLUMN blocked_by TEXT`,
 		`ALTER TABLE tasks ADD COLUMN container TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN container_runtime TEXT NOT NULL DEFAULT ''`,
-		// sync_mode_override stores the CLI --sync flag value so it
-		// survives fatclient restarts and is read by parseSyncConfig
-		// at run-completion time. Empty = use YAML sync: block.
+		// sync_mode_override stores the CLI --publish flag value so it
+		// survives fatclient restarts and is read by parsePublishConfig
+		// at run-completion time. Empty = use YAML publish: block.
+		// (Column name retained from the pre-rename sync: block.)
 		`ALTER TABLE runs ADD COLUMN sync_mode_override TEXT NOT NULL DEFAULT ''`,
 		// Task-level volumes: block — JSON-encoded []string of
 		// extra container bind mounts ("host[:container[:mode]]").

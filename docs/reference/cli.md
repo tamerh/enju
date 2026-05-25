@@ -154,7 +154,7 @@ enju go --dry-run enju.yaml
 | `--name NAME` | cwd basename | Project name when auto-registering |
 | `--run-branch NAME` | base branch | The run's own branch (where its commits land before merging back). `auto` generates an isolated `<slug>-N` name. |
 | `--base BRANCH` | project default | Branch the run forks **from** and reads the workflow from. `HEAD` (or `.`) = the current checked-out branch. Distinct from `--run-branch`. |
-| `--sync none\|merge\|push` | from YAML | Override the workflow's sync mode for this run |
+| `--publish none\|local\|push` | from YAML | Override the workflow's publish mode for this run (whether the run's declared outputs land on the base branch at completion, and whether that's pushed) |
 | `--max-tasks N` | 1000 | Safety cap on compute tasks drained per call. `0` = create run without draining. |
 | `--parallel N` | 1 | Run up to N compute tasks concurrently. With `mode: sync` this drains a fanned-out run to completion N-at-a-time in one invocation; commits serialize through the project lock. Capped at 32. |
 | `--dry-run` | off | Parse and resolve the workflow, print the DAG, exit without touching the coordinator |

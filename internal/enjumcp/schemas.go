@@ -293,7 +293,7 @@ If you don't have a project yet, create one first with enju_create_project.`),
 			mcp.Description(`Opt-in: spin up every agent declared in the workflow's inline agents: section before the run starts, and stop them automatically when the run reaches a terminal state. Reference-counted so concurrent runs that share agents are safe — the last-finishing run triggers the stop. Agents started manually with enju_agent_start are left alone (manual wins). Requires path= mode; inline yaml= has no on-disk workflow file for the agent daemons to read. Default false: the operator drives agent lifecycle explicitly with enju_agent_start / enju_agent_stop_all.`),
 		),
 		mcp.WithString("sync_mode_override",
-			mcp.Description(`Override the workflow YAML's sync: block for this run. Controls what happens to the run branch when the run completes. "merge": merge the run branch into base_branch locally (default if not set in YAML). "push": merge locally then push base_branch to origin. "none": skip both — useful for dry runs or workflows where you manage branching yourself. Omit to use the workflow's own sync: setting.`),
+			mcp.Description(`Override the workflow YAML's publish: block for this run. Controls whether the run's declared outputs are published to base_branch when the run completes. "local": write the declared outputs onto base_branch as a curated commit, locally (default if not set in YAML). "push": same publish, then push base_branch to origin. "none": skip both — the run branch keeps the outputs; useful for dry runs or workflows where you publish yourself. Omit to use the workflow's own publish: setting. (Param name retained from the pre-rename sync: block.)`),
 		),
 	)
 }

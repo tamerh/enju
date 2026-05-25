@@ -51,13 +51,14 @@ type SubmitResultResponse struct {
 	VoteResolution    *VoteResolutionView   `json:"vote_resolution,omitempty"`
 	ArtifactsWritten   []string        `json:"artifacts_written,omitempty"`
 	RunCompleted     bool          `json:"run_completed,omitempty"`
-	// SyncMode is the resolved sync mode for this run, included
+	// SyncMode is the resolved publish mode for this run, included
 	// only when RunCompleted=true so the fat-client knows what to
-	// do after the final accepted merge. One of "none", "merge",
-	// "push". Defaults to "merge" when the workflow omits sync:.
+	// do after the final accepted merge. One of "none", "local",
+	// "push". Defaults to "local" when the workflow omits publish:.
+	// (Field/JSON name retained from the pre-rename sync: block.)
 	SyncMode        string        `json:"sync_mode,omitempty"`
 	// SyncRemote is the remote name to push to when SyncMode="push".
-	// Defaults to "origin" when the workflow omits sync.remote.
+	// Defaults to "origin" when the workflow omits publish.remote.
 	SyncRemote      string        `json:"sync_remote,omitempty"`
 	// PublishPaths is the run's declared output artifact set — the
 	// tracked artifact-index paths written on the run branch,
@@ -476,7 +477,7 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	}
 	if completed {
 		resp.RunCompleted = true
-		resp.SyncMode, resp.SyncRemote = parseSyncConfig(run)
+		resp.SyncMode, resp.SyncRemote = parsePublishConfig(run)
 		resp.PublishPaths = c.declaredArtifactPaths(run)
 		resp.ProjectID = run.ProjectID
 		resp.RunSeq = run.Seq
@@ -492,19 +493,23 @@ func (c *Coordinator) SubmitTaskResult(task *store.TaskRecord, params SubmitResu
 	return resp, nil
 }
 
-// parseSyncConfig resolves (mode, remote) for the run-completion
-// sync step. Resolution is two independent passes so --sync only
-// controls the mode; sync.remote is always honored regardless of
+// parsePublishConfig resolves (mode, remote) for the run-completion
+// publish step. Resolution is two independent passes so --publish only
+// controls the mode; publish.remote is always honored regardless of
 // override:
 //
-//  1. YAML pass: read sync.mode, sync.remote.
+//  1. YAML pass: read publish.mode, publish.remote.
 //  2. Override pass: if SyncModeOverride is a known value it wins the
 //     mode; remote is unchanged (still from YAML/default).
 //
-// Unknown overrides and unknown YAML modes fall back to "merge" —
+// (SyncModeOverride is the legacy wire/column name for the publish-mode
+// override carried from the CLI --publish flag; the field name is
+// retained, the values are the publish modes below.)
+//
+// Unknown overrides and unknown YAML modes fall back to "local" —
 // the single chokepoint that catches MCP typos and direct DB edits.
-func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
-	mode, remote = "merge", "origin"
+func parsePublishConfig(run *store.RunRecord) (mode, remote string) {
+	mode, remote = "local", "origin"
 	if run == nil {
 		return
 	}
@@ -512,13 +517,13 @@ func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
 	// Pass 1 — YAML: apply mode + remote.
 	if run.YAMLData != "" {
 		var r enjuYaml.Run
-		if err := yamlv3.Unmarshal([]byte(run.YAMLData), &r); err == nil && r.Sync != nil {
-			if r.Sync.Remote != "" {
-				remote = r.Sync.Remote
+		if err := yamlv3.Unmarshal([]byte(run.YAMLData), &r); err == nil && r.Publish != nil {
+			if r.Publish.Remote != "" {
+				remote = r.Publish.Remote
 			}
-			switch r.Sync.Mode {
-			case "none", "merge", "push":
-				mode = r.Sync.Mode
+			switch r.Publish.Mode {
+			case "none", "local", "push":
+				mode = r.Publish.Mode
 			// Unknown YAML mode: leave the default. validate.go
 			// blocks bad modes at create_run; this guards DB edits.
 			}
@@ -527,7 +532,7 @@ func parseSyncConfig(run *store.RunRecord) (mode, remote string) {
 
 	// Pass 2 — override: mode only; remote is already resolved.
 	switch run.SyncModeOverride {
-	case "none", "merge", "push":
+	case "none", "local", "push":
 		mode = run.SyncModeOverride
 	case "":
 		// No override: keep YAML/default mode.
