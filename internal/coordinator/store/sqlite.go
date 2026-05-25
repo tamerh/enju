@@ -347,6 +347,11 @@ func (s *Store) initSchema() error {
 		-- The index still records provenance so downstream
 		-- readiness + history tools work uniformly.
 		tracked INTEGER NOT NULL DEFAULT 1,
+		-- published=1: a tracked artifact is laid onto the base
+		-- (deliverable) branch at run completion. published=0: tracked
+		-- intermediate (downstream reads it) kept off the deliverable.
+		-- Only meaningful when tracked=1.
+		published INTEGER NOT NULL DEFAULT 1,
 		PRIMARY KEY (project_id, branch, path)
 	);
 
@@ -624,6 +629,10 @@ func (s *Store) initSchema() error {
 		// default them to tracked=1 so the column's semantics
 		// stay uniform across old and new data.
 		`ALTER TABLE artifacts ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1`,
+		// published — tracked-but-not-published lever (deliverable
+		// filter). Existing rows default to published=1 (current
+		// behavior: every tracked artifact lands on the deliverable).
+		`ALTER TABLE artifacts ADD COLUMN published INTEGER NOT NULL DEFAULT 1`,
 		// Per-run slug for the self-documenting
 		// enju/runs/{seq}-{slug}/ directory layout. Stored on
 		// the run as the source of truth; denormalized onto
@@ -2635,12 +2644,12 @@ func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactReco
 	var a ArtifactRecord
 	var lastTaskID sql.NullString
 	var lastWriter, lastRunID sql.NullInt64
-	var trackedInt int
+	var trackedInt, publishedInt int
 	err := s.db.QueryRow(
-		`SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
+		`SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, published, created_at, updated_at
 		 FROM artifacts WHERE project_id = ? AND branch = ? AND path = ?`,
 		projectID, branch, path,
-	).Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &publishedInt, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2651,6 +2660,7 @@ func (s *Store) GetArtifact(projectID int64, branch, path string) (*ArtifactReco
 	a.LastTaskID = lastTaskID.String
 	a.LastRunID = lastRunID.Int64
 	a.Tracked = trackedInt != 0
+	a.Published = publishedInt != 0
 	return &a, nil
 }
 
@@ -2700,7 +2710,7 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 	// row including pending-merge writers; only the cascade's
 	// readiness check (applyUpdateReadyTasks) gates on writer
 	// state to avoid premature fan-out.
-	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at
+	query := `SELECT project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, published, created_at, updated_at
 	     FROM artifacts WHERE project_id = ? AND branch = ?`
 	args := []interface{}{projectID, branch}
 	if pathPrefix != "" {
@@ -2720,14 +2730,15 @@ func (s *Store) ListArtifactsByProject(projectID int64, branch, pathPrefix strin
 		var a ArtifactRecord
 		var lastTaskID sql.NullString
 		var lastWriter, lastRunID sql.NullInt64
-		var trackedInt int
-		if err := rows.Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		var trackedInt, publishedInt int
+		if err := rows.Scan(&a.ProjectID, &a.Branch, &a.Path, &lastWriter, &lastTaskID, &lastRunID, &a.CommitSHA, &trackedInt, &publishedInt, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.LastWriter = lastWriter.Int64
 		a.LastTaskID = lastTaskID.String
 		a.LastRunID = lastRunID.Int64
 		a.Tracked = trackedInt != 0
+		a.Published = publishedInt != 0
 		artifacts = append(artifacts, a)
 	}
 	return artifacts, rows.Err()

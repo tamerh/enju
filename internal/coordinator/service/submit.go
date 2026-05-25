@@ -578,6 +578,13 @@ func (c *Coordinator) declaredArtifactPaths(run *store.RunRecord) []string {
 		if a.LastRunID != run.ID || !a.Tracked {
 			continue
 		}
+		// publish:false — a tracked intermediate kept off the
+		// deliverable branch (downstream reads it on the run branch,
+		// but it shouldn't pollute the published set). Default true,
+		// so omitting publish: preserves "all tracked → published".
+		if !a.Published {
+			continue
+		}
 		if a.Path == "" || strings.HasPrefix(a.Path, ".enju/") {
 			continue
 		}

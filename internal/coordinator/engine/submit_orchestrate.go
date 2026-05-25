@@ -225,14 +225,24 @@ func (e *Engine) ComputePostSubmitActions(
 			_ = json.Unmarshal([]byte(task.WritesArtifacts), &decl)
 		}
 		trackByPath := make(map[string]bool, len(decl))
+		publishByPath := make(map[string]bool, len(decl))
 		for _, e := range decl {
 			trackByPath[e.Path] = e.Track
+			publishByPath[e.Path] = e.Publish
 		}
 		now := time.Now()
 		for _, path := range req.ArtifactsWritten {
 			tracked, known := trackByPath[path]
 			if !known {
 				tracked = true
+			}
+			// Published mirrors Tracked's sourcing: from the declared
+			// write entry, defaulting true for paths missing from the
+			// declaration (legacy / defense-in-depth). publish:false
+			// keeps a tracked intermediate off the deliverable branch.
+			published, knownPub := publishByPath[path]
+			if !knownPub {
+				published = true
 			}
 			commitSHA := req.CommitSHA
 			if !tracked {
@@ -252,6 +262,7 @@ func (e *Engine) ComputePostSubmitActions(
 					LastRunID:  task.RunID,
 					CommitSHA:  commitSHA,
 					Tracked:    tracked,
+					Published:  published,
 					CreatedAt:  now,
 					UpdatedAt:  now,
 				},

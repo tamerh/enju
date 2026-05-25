@@ -730,6 +730,13 @@ type ArtifactRecord struct {
 	// Defaults to true — the legacy bare-string form always lands
 	// as tracked.
 	Tracked  bool
+	// Published reports whether a TRACKED artifact is laid onto the
+	// base (deliverable) branch at run completion. Declared per-entry
+	// in YAML via `writes_artifacts: {path:..., publish:...}`. Defaults
+	// true; set false for tracked intermediates that downstream tasks
+	// read but that shouldn't pollute the deliverable. Meaningful only
+	// when Tracked (an untracked artifact has nothing to publish).
+	Published bool
 	UpdatedAt time.Time
 	CreatedAt time.Time
 }

@@ -58,6 +58,50 @@ func TestWriteArtifact_JSONObjectFormDefaultsTrackTrue(t *testing.T) {
 	}
 }
 
+// TestWriteArtifact_PublishDefaultsTrue pins the deliverable-filter
+// lever: publish defaults true (omitting it = current behavior, the
+// artifact lands on the deliverable), and publish:false sticks for a
+// tracked intermediate. Covered across the single-struct, bare-string,
+// and slice decoders since each pre-sets the default independently.
+func TestWriteArtifact_PublishDefaultsTrue(t *testing.T) {
+	// Single struct, object form, no publish: → true.
+	var w WriteArtifact
+	if err := json.Unmarshal([]byte(`{"path":"deliverable.md"}`), &w); err != nil {
+		t.Fatal(err)
+	}
+	if !w.Publish {
+		t.Errorf("object form without publish: want Publish:true, got %+v", w)
+	}
+	// Explicit publish:false sticks (tracked-but-not-published).
+	var w2 WriteArtifact
+	if err := json.Unmarshal([]byte(`{"path":"sections/intermediate.md","publish":false}`), &w2); err != nil {
+		t.Fatal(err)
+	}
+	if w2.Publish {
+		t.Errorf("explicit publish:false should stick: %+v", w2)
+	}
+	// Bare string → published true.
+	var w3 WriteArtifact
+	if err := json.Unmarshal([]byte(`"out/x.md"`), &w3); err != nil {
+		t.Fatal(err)
+	}
+	if !w3.Publish {
+		t.Errorf("bare-string: want Publish:true, got %+v", w3)
+	}
+	// Slice decoder (used when re-reading task.WritesArtifacts at submit):
+	// omitted publish → true; explicit false → false.
+	var ws WriteArtifacts
+	if err := json.Unmarshal([]byte(`[{"path":"a.md"},{"path":"b.md","publish":false},"c.md"]`), &ws); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"a.md": true, "b.md": false, "c.md": true}
+	for _, e := range ws {
+		if e.Publish != want[e.Path] {
+			t.Errorf("slice decode %s: Publish=%v, want %v", e.Path, e.Publish, want[e.Path])
+		}
+	}
+}
+
 // --- Pure pattern-detection helpers (no FS work) ---
 
 func TestIsGlob(t *testing.T) {

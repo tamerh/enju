@@ -270,10 +270,13 @@ Tasks declare what files they read and write so Enju can manage git commits and 
 - id: generate_report
   action: answer
   writes:
-    - report.md                       # simple path — tracked, committed to git
+    - report.md                       # simple path — tracked, committed, published to base
     - path: data/large_output.csv
       track: false                    # not committed — lands in .enju/bigfiles/
       optional: true                  # silent if file is missing at submit time
+    - path: sections/intermediate.md
+      publish: false                  # tracked + committed (downstream can reads: it),
+                                      # but kept OFF the deliverable branch at publish time
 
 - id: review_report
   action: review
@@ -285,6 +288,16 @@ Tasks declare what files they read and write so Enju can manage git commits and 
 ```
 
 Use `{{artifact:path}}` in prompts to inline file content from a previously committed artifact. Use `{{task.content}}` to reference a task's text output (the agent's reply or script stdout).
+
+Two independent per-write flags control where an artifact lives:
+
+| | committed to git? | on the deliverable branch at completion? |
+|---|---|---|
+| default | ✓ | ✓ |
+| `track: false` | ✗ (on disk / `.enju/bigfiles/`) | ✗ |
+| `publish: false` | ✓ | ✗ |
+
+`publish: false` is the **tracked-but-not-published** category: an inter-task intermediate that downstream tasks `reads:` (so it must be committed) but that shouldn't pollute the deliverable branch. See [Publish](#publish).
 
 ---
 
@@ -326,7 +339,8 @@ publish:
 
 Two things worth knowing:
 
-- **It's a curated copy, not a branch merge.** `local`/`push` lay *only* the declared output files (from `outputs:` / `collects:` / declared write artifacts) onto the base branch — never a whole-branch merge of the run branch. That keeps the deliverable branch clean: no `.enju/` provenance, no iteration history. The run branch remains the full record.
+- **It's a curated copy, not a branch merge.** `local`/`push` lay *only* the run's tracked write artifacts onto the base branch — never a whole-branch merge of the run branch. That keeps the deliverable branch clean: no `.enju/` provenance, no iteration history. The run branch remains the full record.
+- **Exclude intermediates with `publish: false`.** By default every tracked write artifact is published. Mark inter-task intermediates `publish: false` (see [Artifacts](#artifacts)) to keep them committed on the run branch — so downstream tasks can `reads:` them — yet off the deliverable. With for_each fan-out you mark a couple of write-template entries, not every expanded file.
 - **It does *not* govern pushes during the run.** Per-task run-branch and topic-branch pushes happen throughout the run regardless of this setting — that's how other citizens (and other machines) see and review work in progress. `publish:` is only about the final deliverable. So `publish: none` means "don't publish the deliverable to base," **not** "never push anything."
 
 Override per run from the CLI with `enju go --publish none|local|push`, or over MCP with `enju_create_run`'s `sync_mode_override`.

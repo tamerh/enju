@@ -1815,11 +1815,11 @@ func applyMoveArtifact(tx *sql.Tx, m MoveArtifact, sink EventSink) error {
 	// accumulating two rows. Same story for commit_sha, which
 	// is "" whenever tracked is false.
 	_, err := tx.Exec(
-		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_id, branch, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, tracked=?, updated_at=?`,
-		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.CreatedAt, a.UpdatedAt,
-		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), a.UpdatedAt,
+		`INSERT INTO artifacts (project_id, branch, path, last_writer, last_task_id, last_run_id, commit_sha, tracked, published, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, branch, path) DO UPDATE SET last_writer=?, last_task_id=?, last_run_id=?, commit_sha=?, tracked=?, published=?, updated_at=?`,
+		a.ProjectID, branch, a.Path, a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), boolToInt(a.Published), a.CreatedAt, a.UpdatedAt,
+		a.LastWriter, a.LastTaskID, a.LastRunID, a.CommitSHA, boolToInt(a.Tracked), boolToInt(a.Published), a.UpdatedAt,
 	)
 	// Artifact moves are bookkeeping for the index. Citizen-
 	// observable visibility is covered by the downstream

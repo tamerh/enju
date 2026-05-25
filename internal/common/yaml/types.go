@@ -419,9 +419,18 @@ func (o *OutputSpec) UnmarshalYAML(value *yamlv3.Node) error {
 // only when external deps are pulled, `requirements.lock`
 // only when pip locks were regenerated).
 type WriteArtifact struct {
-	Path     string `yaml:"path" json:"path"`
-	Track    bool   `yaml:"track" json:"track"`
-	Optional bool   `yaml:"optional,omitempty" json:"optional,omitempty"`
+	Path  string `yaml:"path" json:"path"`
+	Track bool   `yaml:"track" json:"track"`
+	// Publish reports whether a TRACKED artifact is laid onto the base
+	// (deliverable) branch at run completion (the publish: block).
+	// Defaults true. Set false for tracked intermediates — files
+	// downstream tasks reads: but that shouldn't pollute the
+	// deliverable: they stay committed on the run branch (full record)
+	// yet are excluded from the curated publish commit. Independent of
+	// Track: publish:false on an untracked artifact is a no-op (nothing
+	// to publish). The "tracked-but-not-published" category.
+	Publish  bool `yaml:"publish" json:"publish"`
+	Optional bool `yaml:"optional,omitempty" json:"optional,omitempty"`
 }
 
 // UnmarshalJSON mirrors UnmarshalYAML for the single-struct
@@ -449,10 +458,11 @@ func (w *WriteArtifact) UnmarshalJSON(data []byte) error {
 		}
 		w.Path = s
 		w.Track = true
+		w.Publish = true
 		return nil
 	}
 	type alias WriteArtifact
-	a := alias{Track: true}
+	a := alias{Track: true, Publish: true}
 	if err := json.Unmarshal(trimmed, &a); err != nil {
 		return err
 	}
@@ -469,6 +479,7 @@ func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
 	if value.Kind == yamlv3.ScalarNode {
 		w.Path = value.Value
 		w.Track = true
+		w.Publish = true
 		return nil
 	}
 	if value.Kind != yamlv3.MappingNode {
@@ -481,7 +492,7 @@ func (w *WriteArtifact) UnmarshalYAML(value *yamlv3.Node) error {
 	// matches the "must produce" contract — Go's zero value
 	// happens to be the right default here.
 	type alias WriteArtifact
-	a := alias{Track: true}
+	a := alias{Track: true, Publish: true}
 	if err := value.Decode(&a); err != nil {
 		return err
 	}
@@ -566,17 +577,18 @@ func (w *WriteArtifacts) UnmarshalJSON(data []byte) error {
 		}
 		switch e[0] {
 		case '"':
-			// Legacy bare string → {Path, Track: true}.
+			// Legacy bare string → {Path, Track: true, Publish: true}.
 			var s string
 			if err := json.Unmarshal(e, &s); err != nil {
 				return fmt.Errorf("writes_artifacts[%d]: %w", i, err)
 			}
-			out = append(out, WriteArtifact{Path: s, Track: true})
+			out = append(out, WriteArtifact{Path: s, Track: true, Publish: true})
 		case '{':
-			// Current object form. Pre-set Track=true so an
-			// omitted "track" key defaults correctly.
+			// Current object form. Pre-set Track/Publish=true so
+			// omitted keys default correctly (incl. rows persisted
+			// before the publish field existed).
 			type alias WriteArtifact
-			a := alias{Track: true}
+			a := alias{Track: true, Publish: true}
 			if err := json.Unmarshal(e, &a); err != nil {
 				return fmt.Errorf("writes_artifacts[%d]: %w", i, err)
 			}
