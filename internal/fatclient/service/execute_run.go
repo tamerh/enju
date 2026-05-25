@@ -231,7 +231,10 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 		if !coldReconcileTried && len(entries) == 0 && len(ready) == 0 && runBranch != "" {
 			coldReconcileTried = true
 			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(p.ProjectID)); perr == nil && wf != nil {
-				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(p.ProjectID), runBranch)
+				// No-checkout reconcile: the cascade is compute-only,
+				// so don't move the operator's worktree onto the run
+				// branch (see reconcileBranchWF).
+				s.reconcileBranchWF(ctx, wf, int64(p.ProjectID), runBranch)
 				ready, err = s.fetchReadyTasksForRun(ctx, p.ProjectID, p.RunSeq)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{
@@ -797,7 +800,8 @@ func (s *FatClient) runCascadeParallel(
 		if !coldReconcileTried && inFlight == 0 && len(entries) == 0 && len(ready) == 0 && runBranch != "" {
 			coldReconcileTried = true
 			if wf, _, _, _, perr := s.OpenWorkflow(ctx, int64(projectID)); perr == nil && wf != nil {
-				_ = s.PullBranchWithReconcileWF(ctx, wf, int64(projectID), runBranch)
+				// No-checkout reconcile (compute-only cascade).
+				s.reconcileBranchWF(ctx, wf, int64(projectID), runBranch)
 				ready, err = s.fetchReadyTasksForRun(ctx, projectID, runSeq)
 				if err != nil {
 					entries = append(entries, ExecuteRunEntry{

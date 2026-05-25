@@ -205,6 +205,15 @@ func executeRunAndRender(ctx context.Context, sess *cliSession, params service.E
 		return 1
 	}
 	renderExecuteResult(os.Stdout, res, asJSON)
+	// Compute-only by design: when the cascade reaches a human/citizen
+	// task it stops there (not a failure). Spell out the continue-
+	// manually loop so the operator knows the run isn't stuck — handle
+	// the gate, then `enju resume <seq>` drains the next compute wave.
+	if res.StopReason == service.StopCitizenTaskReady && res.Blocker != nil {
+		logf(asJSON, "\n▶ stopped at a human task — %s (%s). `enju go`/`resume` drive compute only; "+
+			"handle this task (`enju review`, an agent, or via MCP), then `enju resume %d` to continue.",
+			res.Blocker.TaskID, res.Blocker.Action, params.RunSeq)
+	}
 	// Exit 1 on a failure stop reason OR — the keep-going case — when
 	// the pass drained to no_ready_compute but recorded task failures
 	// along the way. Either way a script sees a non-zero exit.

@@ -336,6 +336,26 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 	if err != nil || wf == nil {
 		return
 	}
+	s.reconcileBranchWF(ctx, wf, projectID, branch)
+}
+
+// reconcileBranchWF is the no-checkout reconcile core: FetchBranch
+// (updates only refs/remotes/origin/<branch> — never moves the
+// operator's worktree or the local branch ref) + scan for trailers +
+// post /tasks/reconcile + advance the cursor + reap wrapper results.
+//
+// Shared by ReconcileRunBranch (run_status) and the `enju go` compute
+// cascade. Compute commits via the plumbing path (in-memory tree +
+// UpdateRef) and reads inputs from the materialized snapshot, so it
+// NEVER needs HEAD on the run branch — using this instead of
+// PullBranchWithReconcileWF (which does CheckoutBranch + PullBranch) is
+// what keeps `enju go` from commandeering the operator's working tree.
+// The porcelain citizen path still uses PullBranchWithReconcileWF; it
+// stages + commits in the worktree, so it genuinely needs the checkout.
+func (s *FatClient) reconcileBranchWF(ctx context.Context, wf *enjugit.Workflow, projectID int64, branch string) {
+	if wf == nil || branch == "" {
+		return
+	}
 	ferr := wf.FetchBranch(branch)
 	var trailers []enjugit.CommitTrailer
 	var newTip, preCursor string

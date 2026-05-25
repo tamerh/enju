@@ -209,7 +209,9 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// otherwise orphans downstream tasks because the coordinator
 	// hasn't yet seen the upstream completion commit. Best-effort;
 	// a reconcile failure here just means slightly stale state.
-	_ = s.PullBranchWithReconcileWF(ctx, wf, meta.ProjectID, meta.Branch)
+	// No-checkout: compute reads the snapshot + commits via plumbing,
+	// so this must not move the operator's worktree onto the run branch.
+	s.reconcileBranchWF(ctx, wf, meta.ProjectID, meta.Branch)
 
 	// Re-fetch so the claim decision sees the post-reconcile
 	// state (esp. for chained async tasks that just transitioned

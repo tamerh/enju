@@ -135,7 +135,9 @@ MCP config example for Claude Code:
 
 ## `enju go`
 
-Run a workflow YAML end-to-end: discover or register the project, create a run, and execute compute tasks. Stops at human gates (review, vote, answer tasks assigned to a human) unless `--auto-agents` is set.
+Run a workflow YAML end-to-end: discover or register the project, create a run, and execute compute tasks. Stops at human gates (review, vote, answer tasks assigned to a human) unless `--auto-agents` is set — at a gate it tells you to handle the task and `enju resume <seq>` to continue.
+
+Compute runs against an isolated snapshot (`.enju/runs/<seq>/…`) with per-task scratch dirs and commits go in via the plumbing path — so **`enju go` never checks out or moves your working tree**. You stay on your branch; you can keep using the repo while a run drains.
 
 ```sh
 enju go enju.yaml
