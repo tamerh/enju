@@ -560,6 +560,32 @@ func (s *FatClient) findSelfHeldStuckTasks(ctx context.Context, projectID, runSe
 	return stuck
 }
 
+// CountRunningTasks returns how many tasks in the run are in RUNNING
+// state — i.e. async compute subprocesses still in flight (a detached
+// `enju wrap-task` whose result the reaper hasn't picked up yet, or one
+// still executing). The `enju drive` loop uses this to tell "the run is
+// still cooking, keep waiting+reaping" apart from "nothing ready and
+// nothing in flight" (a genuine stall it should report rather than spin
+// on). Best-effort: any fetch/decode error returns (0, err) and the
+// caller treats it conservatively.
+func (s *FatClient) CountRunningTasks(ctx context.Context, projectID, runSeq int) (int, error) {
+	data, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d/tasks", projectID, runSeq))
+	if err != nil {
+		return 0, err
+	}
+	var tasks []map[string]interface{}
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, t := range tasks {
+		if state, _ := t["state"].(string); state == "running" {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // fetchReadyTasksForRun wraps the /api/v1/tasks/ready endpoint
 // scoped to (project, run).
 func (s *FatClient) fetchReadyTasksForRun(ctx context.Context, projectID, runSeq int) ([]map[string]interface{}, error) {

@@ -9,6 +9,8 @@ enju serve       Run the coordinator in the foreground (team/server deployment)
 enju mcp         Start the MCP server (connect your LLM)
 enju go          Run a workflow YAML end-to-end
 enju resume      Drain ready compute on an existing run (recover without forking a new run)
+enju retry       Re-open and re-run a single failed task
+enju drive       Drive an existing run to completion (loops launch + reap; for headless async)
 enju status      Snapshot of the current project's state
 enju runs        List runs for a project (with filters)
 enju validate    Pre-flight check a workflow YAML
@@ -226,6 +228,30 @@ enju retry <task-id> [--from head|snapshot] [--json]
 | `--coordinator URL` | from `credentials.json` | Coordinator URL override. |
 
 A compute task is re-opened and re-run in place. A citizen task (answer/review/vote) is re-opened to `READY` only — its assignee re-claims and re-runs. Exit: 0 on a successful re-open (+ re-run, for compute); 1 if the coordinator refuses (task not `failed_retryable`, not found) or the re-run fails.
+
+---
+
+## `enju drive`
+
+Drive an **existing** run to completion: loop *launch ready compute → wait → reap finished async* until the run is terminal. Where `enju resume` is a single pass, `enju drive` keeps going — it's the headless driver for `mode: async` compute, which `resume`/`go` only *start* (the reaper that *finishes* detached async tasks otherwise runs only inside an MCP session).
+
+```
+enju drive <seq> [--parallel N] [--max-tasks N] [--interval 5s] [--once] [--keep-going|--fail-fast] [--project id] [--json]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--interval D` | 5s | Wait between launch passes while async work is in flight. Ignored with `--once`. |
+| `--once` | off | Run exactly one reap+launch pass and exit (cron-friendly: `*/5 * * * * enju drive --once 7`). |
+| `--parallel N` | 1 | Compute tasks launched concurrently per pass. Capped at 32. |
+| `--keep-going` / `--fail-fast` | keep-going | As `enju go`. |
+| `--project id` | cwd's project | Operate on a specific project id. |
+
+**Re-attachable** — point it at a run started earlier (by an `enju go`, another operator, or an MCP session) and it picks up wherever the run is, reaping any already-finished subprocesses on the first pass.
+
+Stops when: the run reaches a terminal state (exit 0, or 1 if any task failed under keep-going); it hits a citizen gate (drive is compute-only — use `enju go --auto-agents` for citizen-gated runs); a driver-level error or `--fail-fast` failure occurs (exit 1); or the run is idle-but-not-terminal with nothing in flight (a stuck claim or gate — exit 1). Ctrl-C exits cleanly; detached async jobs keep running and can be re-attached.
+
+A pure-sync run is drained in one pass and exits immediately — `drive` then behaves like `resume`.
 
 ---
 

@@ -1,7 +1,8 @@
 # Spec: CLI resume / retry / drive
 
 Status: Layer A SHIPPED (A.1 resume, A.2 retry, A.3 keep-going); Layer B
-(drive) + Layer C (retries: auto-retry) pending.
+SHIPPED (drive loop + --once + --interval); Layer C (retries: auto-retry)
+pending.
 Scope: fat-client CLI only. No coordinator changes. No new engine
 capability — every behavior below already exists and is exercised
 over MCP; this surfaces it as `enju` subcommands and adds one loop.
@@ -388,8 +389,10 @@ Mirror-tests, no coverage lost (per repo convention):
 3. **A.3** ✅ `--keep-going` / `--fail-fast` — `ExecuteRunParams.KeepGoing`,
    `stopReasonForOutcome` (shared by serial + parallel loops),
    `failedTaskIDs` report block + exit-1 rule; on `go` and `resume`.
-4. **B** `enju drive <seq>` (the loop + `--once` + `--interval`,
-   generalized from `driveAutoBotsRun`).
+4. **B** ✅ `enju drive <seq>` — reap→launch→wait loop (reap-at-top
+   handles re-attach + the post-wait pickup); `--once` (cron tick),
+   `--interval`; stall guard via `CountRunningTasks`; reaps via
+   `ReconcileRunSeq`. Treats async_started as "keep looping."
 5. **C** `retries:` auto-retry (YAML schema + `validate` lint +
    coordinator re-admit on `compute_error` within budget + `auto_retry`
    event). Orthogonal — can land before, between, or after A/B.

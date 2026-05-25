@@ -382,6 +382,24 @@ func (s *FatClient) ReconcileRunBranch(ctx context.Context, projectID int64, run
 	s.ReapWrapperFailuresWF(ctx, wf)
 }
 
+// ReconcileRunSeq reaps a run by its per-project seq: fetch the run
+// payload, then run the read-only reconcile (fetch + scan + trailer
+// post + wrapper-result reaper) via ReconcileRunBranch. The CLI
+// `enju drive` loop calls this after its wait so a detached async
+// subprocess that finished during the interval gets turned into
+// coordinator state before the next launch pass. Best-effort: a
+// fetch/decode error is swallowed (the next pass retries).
+func (s *FatClient) ReconcileRunSeq(ctx context.Context, projectID, runSeq int64) {
+	if s.enjugit == nil {
+		return
+	}
+	data, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d/runs/%d", projectID, runSeq))
+	if err != nil {
+		return
+	}
+	s.ReconcileRunBranch(ctx, projectID, data)
+}
+
 // handleOneWrapperResult processes one wrapper result file.
 // Reads result + corresponding spec; routes by outcome:
 //

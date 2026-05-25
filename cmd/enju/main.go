@@ -33,7 +33,7 @@ import (
 // pure-string `version` command are exempt.
 func needsGit(subcommand string) bool {
 	switch subcommand {
-	case "mcp", "ui", "wrap-task", "inbox", "review", "agent", "go", "resume", "retry", "status", "runs", "dag", "project":
+	case "mcp", "ui", "wrap-task", "inbox", "review", "agent", "go", "resume", "retry", "drive", "status", "runs", "dag", "project":
 		return true
 	}
 	return false
@@ -102,6 +102,8 @@ func main() {
 		cmdResume(os.Args[2:])
 	case "retry":
 		cmdRetry(os.Args[2:])
+	case "drive":
+		cmdDrive(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "runs":
@@ -136,6 +138,7 @@ Usage:
  enju go     Run a workflow YAML end-to-end (register + create + execute)
  enju resume  Drain ready compute on an existing run (recover without forking a new run)
  enju retry   Re-open and re-run a single failed task
+ enju drive   Drive an existing run to completion (loops launch + reap; for headless async)
  enju status  Snapshot of current project's state
  enju runs   List runs for the active project (with filters)
  enju dag    Render a run's DAG (default | mermaid | json)
