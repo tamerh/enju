@@ -78,7 +78,7 @@ When you create a run, the coordinator:
 2. Forks a branch from your project's current HEAD
 3. Materialises the task graph — each task starts in `PENDING` or `READY`
 
-The run branch accumulates all commits produced during the run. When the run completes, Enju merges it back to the base branch.
+The run branch accumulates all commits produced during the run. When the run completes, Enju publishes the run's declared outputs onto the base branch as a curated commit (the run branch is kept as the full record) — see the `publish:` block in the workflow guide. The mode is configurable (`none` | `local` | `push`).
 
 ---
 

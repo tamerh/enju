@@ -90,7 +90,7 @@ enju: submit write_report
 
 This gives you complete history, attribution, and reproducibility — using infrastructure that already exists in every git repository.
 
-When a run completes, Enju merges the run branch back to the base branch. If the run fails, the branch stays for inspection.
+When a run completes, Enju publishes the run's declared outputs onto the base branch as a curated commit, keeping the run branch as the full record (controlled by the workflow's `publish:` block — `none` | `local` | `push`). If the run fails, the branch stays for inspection.
 
 ---
 

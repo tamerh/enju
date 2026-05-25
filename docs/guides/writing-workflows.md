@@ -48,6 +48,7 @@ defaults: {...}        # field defaults applied to every task
 agents: [...]          # agent roster
 tasks: [...]           # the work
 for_each: {...}        # run-level fan-out (see Fan-out)
+publish: {...}         # what lands on the base branch at completion (see Publish)
 ```
 
 ---
@@ -293,6 +294,31 @@ Outputs give a task's result a typed schema that downstream tasks and `for_each`
 ```
 
 Reference in downstream prompts as `{{discover_genes.gene_list}}`.
+
+---
+
+## Publish
+
+The `publish:` block controls **what happens to the base (deliverable) branch when the run completes** — specifically, whether the run's declared outputs get written onto it, and whether that's pushed to the remote.
+
+```yaml
+publish:
+  mode: local        # none | local | push   (default: local)
+  remote: origin     # remote to push to when mode: push (default: origin)
+```
+
+| mode | effect |
+|------|--------|
+| `none` | Don't touch the base branch. The run branch still holds all the outputs (and the full audit trail). |
+| `local` | Write the run's declared outputs onto the base branch as a single curated commit, locally. Push nothing. **(default)** |
+| `push` | Same publish, then push `{ base branch, run branch }` to the remote. |
+
+Two things worth knowing:
+
+- **It's a curated copy, not a branch merge.** `local`/`push` lay *only* the declared output files (from `outputs:` / `collects:` / declared write artifacts) onto the base branch — never a whole-branch merge of the run branch. That keeps the deliverable branch clean: no `.enju/` provenance, no iteration history. The run branch remains the full record.
+- **It does *not* govern pushes during the run.** Per-task run-branch and topic-branch pushes happen throughout the run regardless of this setting — that's how other citizens (and other machines) see and review work in progress. `publish:` is only about the final deliverable. So `publish: none` means "don't publish the deliverable to base," **not** "never push anything."
+
+Override per run from the CLI with `enju go --publish none|local|push`, or over MCP with `enju_create_run`'s `sync_mode_override`.
 
 ---
 
