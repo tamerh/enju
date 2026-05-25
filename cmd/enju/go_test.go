@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -533,5 +535,28 @@ func TestNormalizeParallelFlag(t *testing.T) {
 	// throttling.
 	if _, err := normalizeParallelFlag(service.MaxParallel + 1); err == nil {
 		t.Errorf("normalizeParallelFlag(%d): expected an over-cap error, got nil", service.MaxParallel+1)
+	}
+}
+
+// TestAnnotateSchemaSkew: a coordinator strict-YAML unknown-field
+// rejection gets the version-skew hint appended; unrelated errors and
+// nil pass through untouched.
+func TestAnnotateSchemaSkew(t *testing.T) {
+	skew := fmt.Errorf("invalid run definition: parsing YAML: yaml: unmarshal errors:\n  line 33: field publish not found in type yaml.Run")
+	got := annotateSchemaSkew(skew)
+	if got == nil || !strings.Contains(got.Error(), "OLDER build") || !strings.Contains(got.Error(), "Restart the coordinator") {
+		t.Errorf("expected a skew hint appended, got: %v", got)
+	}
+	// Original message must be preserved (wrapped).
+	if !strings.Contains(got.Error(), "field publish not found") {
+		t.Errorf("hint must preserve the original coord error, got: %v", got)
+	}
+
+	other := fmt.Errorf("run P:7 not found")
+	if got := annotateSchemaSkew(other); got.Error() != other.Error() {
+		t.Errorf("unrelated error must be untouched, got: %v", got)
+	}
+	if annotateSchemaSkew(nil) != nil {
+		t.Error("nil must stay nil")
 	}
 }

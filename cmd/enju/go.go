@@ -572,13 +572,13 @@ func createRun(ctx context.Context, sess *cliSession, projectID int64, templateP
 		if autoRunMgr != nil {
 			autoRunMgr.Rollback(ctx)
 		}
-		return 0, 0, err
+		return 0, 0, annotateSchemaSkew(err)
 	}
 	if msg := errorFromCoord(data); msg != "" {
 		if autoRunMgr != nil {
 			autoRunMgr.Rollback(ctx)
 		}
-		return 0, 0, fmt.Errorf("%s", msg)
+		return 0, 0, annotateSchemaSkew(fmt.Errorf("%s", msg))
 	}
 
 	if w := fc.EnsureRunBranch(ctx, projectID, data); w != "" {
@@ -650,6 +650,30 @@ func errorFromCoord(data []byte) string {
 		return s
 	}
 	return ""
+}
+
+// annotateSchemaSkew appends a version-skew hint when a create-run
+// error is the coordinator's strict-YAML unknown-field rejection — the
+// tell-tale of a NEWER cli (whose `enju validate` accepted the field)
+// talking to an OLDER coordinator that doesn't know it yet. yaml.v3
+// strict mode phrases these as "field X not found in type yaml.Y", so
+// the workflow looks wrong when it's really the running daemon that's
+// behind. Strict rejection is correct (an old coord silently ignoring
+// e.g. publish:/retries: would misbehave) — only the message needs the
+// context the client has and the coordinator lacks (it can't see the
+// client's version). Leaves every other error untouched.
+func annotateSchemaSkew(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "not found in type") {
+		return fmt.Errorf("%w\n\n"+
+			"hint: the running coordinator is likely an OLDER build that doesn't recognize "+
+			"these workflow field(s) yet — `enju validate` passed because it used this CLI's "+
+			"newer schema. Restart the coordinator so it picks up the new binary, then retry. "+
+			"(Run `enju version` and compare against the coordinator process.)", err)
+	}
+	return err
 }
 
 // parseWorkflowForGo parses + validates the workflow YAML at path
