@@ -34,8 +34,8 @@ func TestMCPRunCompletionSyncParity(t *testing.T) {
 	// operator clone's refs/heads/main, not the bare remote.
 	const computeYAML = `name: "sync parity compute"
 version: 1
-sync:
-  mode: merge
+publish:
+  mode: local
 tasks:
   - id: seed
     action: compute
@@ -135,8 +135,8 @@ tasks:
 		projectID := h.createTestProject()
 		const citizenYAML = `name: "sync parity citizen"
 version: 1
-sync:
-  mode: merge
+publish:
+  mode: local
 tasks:
   - id: emit
     action: answer
