@@ -661,8 +661,8 @@ type TaskDef struct {
 	// progress. In async mode the task transitions to running
 	// at kickoff; the wrapper commits + pushes on its own
 	// schedule; the fetch-path scanner reconciles completion
-	// the next time any fat client touches the project.
-	// See docs/async-compute.md.
+	// the next time any fat client touches the project. Headless,
+	// `enju drive` loops launch+reap until the async run completes.
 	Mode string `yaml:"mode,omitempty"`
 
 	// Retries is the number of EXTRA automatic re-runs the

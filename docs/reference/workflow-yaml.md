@@ -18,6 +18,7 @@ defaults: {...}        # field defaults applied to every task
 agents: [...]          # agent roster
 tasks: [...]           # the work graph
 for_each: {...}        # run-level fan-out
+publish: {...}         # what lands on the base branch at run completion
 ```
 
 ---
@@ -117,11 +118,20 @@ The task graph. Every task has at minimum an `id`, an `action`, and a `prompt`.
 
 ```yaml
 writes:
-  - results/summary.md          # simple path — tracked, commits to git
+  - results/summary.md          # simple path — tracked, committed, published to base
   - path: results/raw.bam
     track: false                # untracked — lands in .enju/bigfiles/<branch>/
     optional: true              # silent if missing at submit time
+  - path: results/intermediate.md
+    publish: false              # tracked + committed (downstream can reads: it),
+                                # but excluded from the deliverable branch at publish
 ```
+
+| Write flag | Default | Effect |
+|------------|---------|--------|
+| `track: false` | `track: true` | Not committed to git; recorded in the index, bytes on disk. |
+| `publish: false` | `publish: true` | Tracked + committed, but kept off the base/deliverable branch (see [`publish:`](#publish-run-completion)). The tracked-but-not-published category. |
+| `optional: true` | `optional: false` | No error if the path is missing/empty at submit time. |
 
 ### `outputs` (named typed outputs)
 
@@ -172,6 +182,7 @@ Runs a script or container deterministically — no LLM required.
 |-------|---------|-------------|
 | `script` | — | Path to script, relative to workflow YAML directory |
 | `mode` | `sync` | `sync` = blocks until exit; `async` = detaches for long-running jobs |
+| `retries` | `0` | Extra automatic re-runs on a transient failure before parking `failed_retryable` (Snakemake's `retries:`). `2` → up to 3 attempts; the re-run uses the pinned snapshot unchanged. Compute-only. |
 | `container` | — | Docker image to run the script inside |
 
 **Environment variables set for the script:**
@@ -313,6 +324,31 @@ References to `{{task_id.*}}` create implicit dependency edges — the task wait
 **Choosing between `.content` and `{{artifact:path}}`:**
 - `.content` → "what did the task report?" — stdout for compute, result text for answer/review
 - `{{artifact:path}}` → "what does this output file contain?" — use for compute tasks that write files
+
+---
+
+## `publish` (run completion)
+
+Controls whether the run's tracked output artifacts are written onto the base (deliverable) branch when the run completes — and whether that's pushed. Optional; omitting the block is equivalent to `publish: { mode: local }`.
+
+```yaml
+publish:
+  mode: local          # none | local | push   (default: local)
+  remote: origin       # remote to push to when mode: push (default: origin)
+```
+
+| `mode` | Effect |
+|--------|--------|
+| `none` | Don't touch the base branch. The run branch keeps the outputs (and the full audit trail). |
+| `local` | Write the run's tracked, published output artifacts onto the base branch as one curated commit, locally. Push nothing. **(default)** |
+| `push` | Same publish, then push `{ base branch, run branch }` to `remote`. |
+
+Notes:
+
+- It is a **curated copy of the tracked outputs**, not a whole-branch merge — the base branch never receives `.enju/` provenance or iteration history; the run branch remains the full record.
+- It governs **only** base-branch publishing at completion. Per-task run-branch and topic-branch pushes happen during the run regardless (for multi-citizen review + audit). So `none` means "don't publish the deliverable," not "never push anything."
+- Mark inter-task intermediates `publish: false` on their `writes:` entry to keep them committed on the run branch (readable by downstream tasks) yet excluded from the deliverable.
+- Override per run from the CLI with `enju go --publish none|local|push`.
 
 ---
 
