@@ -71,6 +71,40 @@ const (
 	StopContextCancelled   = "context_cancelled"
 )
 
+// stopReasonForOutcome maps a per-task outcome status to the stop
+// reason that should END the cascade, or "" to keep draining. The one
+// place both the serial loop and runCascadeParallel's recordEntry
+// consult, so the keep-going policy can't drift between them.
+//
+//   - failed / git_failed  → task-level, recoverable. Fatal by default;
+//     under keepGoing, "" (record it, keep going — the task parks
+//     failed_retryable and drops out of the next /ready scan).
+//   - error                → driver-level (claim/fetch/wrapper pre-exec).
+//     Always fatal: no progress is possible, keepGoing notwithstanding.
+//   - async_started        → a detached launch; the pass stops so the
+//     caller can reap (a drive loop treats this as "relaunch later").
+//   - anything else (completed/skipped) → "".
+func stopReasonForOutcome(status string, keepGoing bool) string {
+	switch status {
+	case "failed":
+		if keepGoing {
+			return ""
+		}
+		return StopComputeFailed
+	case "git_failed":
+		if keepGoing {
+			return ""
+		}
+		return StopGitOperationFailed
+	case "error":
+		return StopComputeErrored
+	case "async_started":
+		return StopAsyncTaskStarted
+	default:
+		return ""
+	}
+}
+
 // MaxParallel is the hard ceiling on ExecuteRunParams.Parallel,
 // shared by every front door to ExecuteRun (the MCP enju_execute_run
 // handler and the `enju go --parallel` CLI flag) so the bound is
@@ -94,6 +128,16 @@ type ExecuteRunParams struct {
 	RunSeq    int
 	MaxTasks  int
 	Parallel  int
+	// KeepGoing, when set, makes a task-level failure (compute_failed
+	// / git_failed) NON-fatal to the cascade: the failed entry is
+	// recorded but the loop keeps draining other ready tasks instead
+	// of stopping. The failed task parks failed_retryable and its
+	// descendants block by ordinary dependency-not-satisfied, so
+	// independent branches (e.g. sibling genes in a fan-out) still
+	// complete. Driver-level errors (compute_errored, context
+	// cancellation) and async launches still stop the pass regardless.
+	// Default false = stop on the first task-level failure (fail-fast).
+	KeepGoing bool
 }
 
 // ExecuteRunResult bundles the cascade result.
@@ -148,7 +192,7 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 
 	if p.Parallel > 1 {
 		entries, stopReason, blocker := s.runCascadeParallel(
-			ctx, p.ProjectID, p.RunSeq, runBranch, p.Parallel, p.MaxTasks,
+			ctx, p.ProjectID, p.RunSeq, runBranch, p.Parallel, p.MaxTasks, p.KeepGoing,
 		)
 		res := &ExecuteRunResult{Entries: entries, StopReason: stopReason, Blocker: blocker}
 		if stopReason == StopNoReadyCompute {
@@ -227,15 +271,8 @@ func (s *FatClient) ExecuteRun(ctx context.Context, p ExecuteRunParams) (*Execut
 		}
 		entries = append(entries, EntryFromOutcome(outcome))
 
-		switch outcome.Status {
-		case "failed":
-			stopReason = StopComputeFailed
-		case "git_failed":
-			stopReason = StopGitOperationFailed
-		case "async_started":
-			stopReason = StopAsyncTaskStarted
-		}
-		if stopReason != "" {
+		if r := stopReasonForOutcome(outcome.Status, p.KeepGoing); r != "" {
+			stopReason = r
 			break
 		}
 	}
@@ -642,6 +679,7 @@ func (s *FatClient) runCascadeParallel(
 	projectID, runSeq int,
 	runBranch string,
 	parallel, maxTasks int,
+	keepGoing bool,
 ) ([]ExecuteRunEntry, string, *ExecuteRunBlocker) {
 	type result struct {
 		outcome *ExecuteOutcome
@@ -676,16 +714,7 @@ func (s *FatClient) runCascadeParallel(
 		if stopReason != "" {
 			return
 		}
-		switch e.Status {
-		case "failed":
-			stopReason = StopComputeFailed
-		case "git_failed":
-			stopReason = StopGitOperationFailed
-		case "async_started":
-			stopReason = StopAsyncTaskStarted
-		case "error":
-			stopReason = StopComputeErrored
-		}
+		stopReason = stopReasonForOutcome(e.Status, keepGoing)
 	}
 
 	drainNonBlocking := func() {

@@ -42,6 +42,8 @@ func cmdGo(args []string) {
 	asJSON := fs.Bool("json", false, "Stream per-task status as JSONL on stdout")
 	maxTasks := fs.Int("max-tasks", 1000, "Cap on compute tasks drained in one go (safety net)")
 	parallel := fs.Int("parallel", 1, "Run up to N compute tasks concurrently (default 1 = serial). With mode: sync this drains a fanned-out run to completion N-at-a-time in a single invocation; commits serialize through the project lock. Capped at 32.")
+	keepGoing := fs.Bool("keep-going", true, "On a compute failure, record it and keep draining the rest of the run; report failures at the end (default). The failed task parks recoverable — fix it and `enju retry <id>`. A fan-out doesn't abandon good branches because one failed.")
+	failFast := fs.Bool("fail-fast", false, "Stop at the first compute failure (overrides --keep-going).")
 	autoBots := fs.Bool("auto-agents", false, "Spin up every bot in the workflow's bots: section, wait for ready, hook auto-stop on run completion. Mirrors the MCP enju_create_run auto_agents flag.")
 	dryRun := fs.Bool("dry-run", false, "Parse the workflow, substitute --params, render the resolved task DAG, and exit. No coord round-trip, no project mutation. Useful in CI and for previewing what `enju go` would create.")
 	publishMode := fs.String("publish", "", `Publish mode at run completion: none | local | push. Overrides the workflow YAML's publish: block. "local" writes the run's declared outputs onto base_branch as a curated commit, locally; "push" also pushes base_branch to origin; "none" skips both (the run branch keeps the outputs). Defaults to the YAML setting, or "local" if the YAML has no publish: block.`)
@@ -64,6 +66,9 @@ func cmdGo(args []string) {
 		os.Exit(2)
 	}
 	*parallel = parallelN
+
+	// keep-going is the default; --fail-fast wins when both are set.
+	keepGoingEff := *keepGoing && !*failFast
 
 	// --params is additive across repeated flags (M4): each
 	// occurrence is parsed independently and merged, later flags
@@ -168,7 +173,7 @@ func cmdGo(args []string) {
 		// completed/failed/terminated, at which point the
 		// supervisor's tailer has fired auto-stop on every
 		// auto-managed bot.
-		if exit := driveAutoBotsRun(ctx, sess, int(projectID), runSeq, *maxTasks, *parallel, *asJSON); exit != 0 {
+		if exit := driveAutoBotsRun(ctx, sess, int(projectID), runSeq, *maxTasks, *parallel, keepGoingEff, *asJSON); exit != 0 {
 			os.Exit(exit)
 		}
 		return
@@ -178,23 +183,38 @@ func cmdGo(args []string) {
 	// run endpoint is /projects/{pid}/runs/{seq}). Passing the
 	// global runID here was the long-standing bug that made every
 	// `enju go` invocation die with "run P:ID not found".
-	res, err := sess.FC.ExecuteRun(ctx, service.ExecuteRunParams{
+	os.Exit(executeRunAndRender(ctx, sess, service.ExecuteRunParams{
 		ProjectID: int(projectID),
 		RunSeq:    runSeq,
 		MaxTasks:  *maxTasks,
 		Parallel:  *parallel,
-	})
+		KeepGoing: keepGoingEff,
+	}, *asJSON))
+}
+
+// executeRunAndRender runs one ExecuteRun pass, renders the result to
+// stdout, and returns the process exit code: 1 on a compute/git/driver
+// failure stop reason, 0 otherwise (drained, or stopped at a citizen
+// gate — gates are not failures). Shared by `enju go` and `enju
+// resume` so both surface identical per-task output + exit semantics
+// off the one ExecuteRun call.
+func executeRunAndRender(ctx context.Context, sess *cliSession, params service.ExecuteRunParams, asJSON bool) int {
+	res, err := sess.FC.ExecuteRun(ctx, params)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	renderExecuteResult(os.Stdout, res, *asJSON)
-
+	renderExecuteResult(os.Stdout, res, asJSON)
+	// Exit 1 on a failure stop reason OR — the keep-going case — when
+	// the pass drained to no_ready_compute but recorded task failures
+	// along the way. Either way a script sees a non-zero exit.
 	if res.StopReason == service.StopComputeFailed ||
 		res.StopReason == service.StopComputeErrored ||
-		res.StopReason == service.StopGitOperationFailed {
-		os.Exit(1)
+		res.StopReason == service.StopGitOperationFailed ||
+		len(failedTaskIDs(res)) > 0 {
+		return 1
 	}
+	return 0
 }
 
 // driveAutoBotsRun is the --auto-agents execution loop. Cycles
@@ -213,7 +233,7 @@ func cmdGo(args []string) {
 // runs don't hammer coord, short enough that humans don't
 // perceive lag between bot work completing and the next
 // compute round kicking off.
-func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, maxTasks, parallel int, asJSON bool) int {
+func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, maxTasks, parallel int, keepGoing, asJSON bool) int {
 	const (
 		pollInterval     = 2 * time.Second
 		coordWarnEvery   = 10 // emit a warning every Nth consecutive failure
@@ -233,6 +253,7 @@ func driveAutoBotsRun(ctx context.Context, sess *cliSession, projectID, runSeq, 
 			RunSeq:    runSeq,
 			MaxTasks:  maxTasks,
 			Parallel:  parallel,
+			KeepGoing: keepGoing,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "execute run: %v\n", err)
@@ -870,6 +891,7 @@ func renderExecuteResult(w io.Writer, res *service.ExecuteRunResult, asJSON bool
 			"stop_reason":       res.StopReason,
 			"blocker":           res.Blocker,
 			"self_stuck_claims": res.SelfStuckClaims,
+			"failed_tasks":      failedTaskIDs(res),
 		}
 		b, _ := json.Marshal(summary)
 		fmt.Fprintln(w, string(b))
@@ -898,6 +920,32 @@ func renderExecuteResult(w io.Writer, res *service.ExecuteRunResult, asJSON bool
 			fmt.Fprintf(w, "    %s  (release with `enju mcp` → enju_release_task)\n", id)
 		}
 	}
+	// Under --keep-going the pass ends at no_ready_compute even though
+	// tasks failed; surface them explicitly with the recovery hint so a
+	// drained-but-imperfect batch isn't mistaken for a clean run.
+	if failed := failedTaskIDs(res); len(failed) > 0 {
+		fmt.Fprintf(w, "  %d task(s) failed (retry with `enju retry <id>`):\n", len(failed))
+		for _, id := range failed {
+			fmt.Fprintf(w, "    %s\n", id)
+		}
+	}
+}
+
+// failedTaskIDs collects the task ids of entries that ended in a
+// failure class (compute failure, git failure, or a driver-level
+// error). Used for the keep-going failure block and the exit-code
+// rule: a drained pass that recorded any task failure still exits 1.
+func failedTaskIDs(res *service.ExecuteRunResult) []string {
+	var ids []string
+	for _, e := range res.Entries {
+		switch service.ClassifyEntryStatus(e.Status) {
+		case service.EntryClassFailed, service.EntryClassGitFailed, service.EntryClassError, service.EntryClassUnknown:
+			if e.TaskID != "" {
+				ids = append(ids, e.TaskID)
+			}
+		}
+	}
+	return ids
 }
 
 // logf is a tiny shim that suppresses informational stderr noise

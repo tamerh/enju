@@ -50,3 +50,36 @@ func TestEntryFromOutcomeStatusesAreClassified(t *testing.T) {
 		}
 	}
 }
+
+// TestStopReasonForOutcome pins the keep-going policy that the serial
+// loop and runCascadeParallel both consult. The invariants:
+//   - task-level failures (failed/git_failed) stop fail-fast but are
+//     downgraded to "" (continue) under keepGoing,
+//   - driver-level errors stop regardless of keepGoing,
+//   - async launches always stop (the caller reaps),
+//   - non-terminal statuses never stop.
+func TestStopReasonForOutcome(t *testing.T) {
+	cases := []struct {
+		status    string
+		keepGoing bool
+		want      string
+	}{
+		{"failed", false, StopComputeFailed},
+		{"failed", true, ""}, // keep-going: record + continue
+		{"git_failed", false, StopGitOperationFailed},
+		{"git_failed", true, ""},
+		{"error", false, StopComputeErrored},
+		{"error", true, StopComputeErrored}, // driver-level: fatal even under keep-going
+		{"async_started", false, StopAsyncTaskStarted},
+		{"async_started", true, StopAsyncTaskStarted},
+		{"completed", false, ""},
+		{"completed", true, ""},
+		{"skipped", true, ""},
+	}
+	for _, c := range cases {
+		if got := stopReasonForOutcome(c.status, c.keepGoing); got != c.want {
+			t.Errorf("stopReasonForOutcome(%q, keepGoing=%v) = %q, want %q",
+				c.status, c.keepGoing, got, c.want)
+		}
+	}
+}

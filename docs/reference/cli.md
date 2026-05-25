@@ -8,6 +8,7 @@ enju stop        Stop background processes started by 'enju start'
 enju serve       Run the coordinator in the foreground (team/server deployment)
 enju mcp         Start the MCP server (connect your LLM)
 enju go          Run a workflow YAML end-to-end
+enju resume      Drain ready compute on an existing run (recover without forking a new run)
 enju status      Snapshot of the current project's state
 enju runs        List runs for a project (with filters)
 enju validate    Pre-flight check a workflow YAML
@@ -157,6 +158,8 @@ enju go --dry-run enju.yaml
 | `--publish none\|local\|push` | from YAML | Override the workflow's publish mode for this run (whether the run's declared outputs land on the base branch at completion, and whether that's pushed) |
 | `--max-tasks N` | 1000 | Safety cap on compute tasks drained per call. `0` = create run without draining. |
 | `--parallel N` | 1 | Run up to N compute tasks concurrently. With `mode: sync` this drains a fanned-out run to completion N-at-a-time in one invocation; commits serialize through the project lock. Capped at 32. |
+| `--keep-going` | on | On a compute failure, record it and keep draining the rest of the run; report failures at the end. The failed task parks recoverable — fix it and `enju retry <id>`. Exits 1 if any task failed. |
+| `--fail-fast` | off | Stop at the first compute failure (the pre-keep-going behavior). Overrides `--keep-going`. |
 | `--dry-run` | off | Parse and resolve the workflow, print the DAG, exit without touching the coordinator |
 | `--coordinator URL` | from `credentials.json` | Coordinator URL override |
 | `--json` | off | NDJSON output — one record per task plus a summary record |
@@ -171,6 +174,58 @@ enju go --dry-run enju.yaml
 | 1 | A compute task failed or git operations failed |
 | 2 | Bad usage or workflow not found |
 | 3 | No credentials for the coordinator — run `enju mcp` once to register |
+
+---
+
+## `enju resume`
+
+Drain ready compute tasks on an **existing** run, instead of `enju go` which always forks a *new* run. Use it to recover after a run stops (a failure, an async launch, or Ctrl-C) without re-spending the work a fresh `enju go` would redo.
+
+```
+enju resume <seq> [--parallel N] [--max-tasks N] [--keep-going|--fail-fast] [--project id] [--json]
+```
+
+`<seq>` is the run's per-project sequence number (the `#7` shown by `enju runs`). The project is resolved from `--project id`, else the project owning the current directory.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--parallel N` | 1 | Run up to N compute tasks concurrently. Capped at 32. |
+| `--max-tasks N` | 1000 | Cap on compute tasks drained in this call. |
+| `--keep-going` / `--fail-fast` | keep-going | Same as `enju go`: keep draining past a compute failure (default), or stop at the first one. |
+| `--project id` | cwd's project | Operate on a specific project id. |
+| `--json` | off | NDJSON output — one record per task plus a summary record. |
+| `--coordinator URL` | from `credentials.json` | Coordinator URL override. |
+
+Same per-task output and exit codes as `enju go`'s execute step (0 = drained or stopped at a citizen gate; 1 = a compute/git failure; 2 = bad `<seq>` or project resolution).
+
+Typical recovery loop:
+
+```
+enju go enju.yaml            # creates run #7, stops at a failed section
+enju retry 10:7:section_5    # re-run the failed task
+enju resume 7                # drain the rest of run #7
+```
+
+---
+
+## `enju retry`
+
+Re-open and re-run a single `failed_retryable` task. Pairs with `enju resume` for recovering a run after a task fails.
+
+```
+enju retry <task-id> [--from head|snapshot] [--json]
+```
+
+`<task-id>` is the full `project:run:task` id printed in failure output (e.g. `10:7:section_5`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--from head` | ✓ | Re-materialize the script from the run-branch tip. Commit your fix to the **run branch** first (the refresh is overwrite-in-place, so a delete/rename needs a fresh run). |
+| `--from snapshot` | | Re-run the pinned snapshot script **unchanged** — for a transient failure (flaky network, a busy box) where the code was never the problem. |
+| `--json` | off | Emit the retry outcome as a JSON record. |
+| `--coordinator URL` | from `credentials.json` | Coordinator URL override. |
+
+A compute task is re-opened and re-run in place. A citizen task (answer/review/vote) is re-opened to `READY` only — its assignee re-claims and re-runs. Exit: 0 on a successful re-open (+ re-run, for compute); 1 if the coordinator refuses (task not `failed_retryable`, not found) or the re-run fails.
 
 ---
 
