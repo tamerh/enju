@@ -102,6 +102,48 @@ func TestWriteArtifact_PublishDefaultsTrue(t *testing.T) {
 	}
 }
 
+// TestWriteArtifact_PublishSurvivesExpansion is the regression guard
+// for the publish-is-a-no-op-for-fan-out bug: the `publish:` field was
+// added to WriteArtifact + the decoders, but the expansion/resolution
+// paths that construct WriteArtifact literals (for_each materialize,
+// param substitution, glob expansion) dropped it — so every expanded
+// write defaulted to publish=false and got filtered out of the
+// deliverable set. Pin that Publish survives both expansion paths.
+func TestWriteArtifact_PublishSurvivesExpansion(t *testing.T) {
+	// ResolveWriteArtifacts — param substitution / dynamic for_each
+	// materialize (the biobtree case).
+	in := WriteArtifacts{
+		{Path: "hugo/content/{{gene}}.md", Track: true, Publish: true},
+		{Path: "sections/{{gene}}/x.md", Track: true, Publish: false},
+	}
+	out := ResolveWriteArtifacts(in, map[string]string{"gene": "tp53"})
+	if len(out) != 2 {
+		t.Fatalf("ResolveWriteArtifacts: got %d, want 2", len(out))
+	}
+	if out[0].Path != "hugo/content/tp53.md" || !out[0].Publish {
+		t.Errorf("deliverable lost Publish through resolution: %+v", out[0])
+	}
+	if !out[1].Track || out[1].Publish {
+		t.Errorf("publish:false intermediate not preserved: %+v", out[1])
+	}
+
+	// Glob expansion against the worktree.
+	dir := t.TempDir()
+	makeFiles(t, dir, "out/a.md", "out/b.md")
+	entries, _, err := WriteArtifacts{{Path: "out/*.md", Track: true, Publish: true}}.ExpandAgainstWorkdir(dir)
+	if err != nil {
+		t.Fatalf("Expand: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("glob matched nothing")
+	}
+	for _, e := range entries {
+		if !e.Publish {
+			t.Errorf("glob-expanded %s lost Publish", e.Path)
+		}
+	}
+}
+
 // --- Pure pattern-detection helpers (no FS work) ---
 
 func TestIsGlob(t *testing.T) {

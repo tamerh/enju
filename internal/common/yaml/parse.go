@@ -513,6 +513,7 @@ func expandStarRefsInWrites(ws WriteArtifacts, merged map[string]interface{}, de
 			out = append(out, WriteArtifact{
 				Path:     p,
 				Track:    w.Track,
+				Publish:  w.Publish,
 				Optional: w.Optional,
 			})
 		}
@@ -575,6 +576,7 @@ func ResolveWriteArtifacts(ws WriteArtifacts, strMap map[string]string) WriteArt
 		out[i] = WriteArtifact{
 			Path:     template.ResolveParams(e.Path, strMap),
 			Track:    e.Track,
+			Publish:  e.Publish,
 			Optional: e.Optional,
 		}
 	}

@@ -77,8 +77,9 @@ func (w WriteArtifacts) ExpandAgainstWorkdir(workDir string) ([]WriteArtifact, [
 		}
 		seen[repoRel] = struct{}{}
 		entries = append(entries, WriteArtifact{
-			Path:  repoRel,
-			Track: decl.Track,
+			Path:    repoRel,
+			Track:   decl.Track,
+			Publish: decl.Publish,
 		})
 	}
 
