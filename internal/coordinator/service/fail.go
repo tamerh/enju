@@ -338,6 +338,25 @@ func (c *Coordinator) FailComputeTaskRetryable(caller *store.CitizenRecord, task
 		return nil, fmt.Errorf("%w: task %q is %s, not running — compute_error requires a running compute task", ErrInvalidArgument, taskID, st)
 	}
 
+	// Auto-retry budget (Snakemake retries:): a compute_error within
+	// the task's retries budget re-admits to READY for another attempt
+	// instead of parking failed_retryable. The attempt number is the
+	// failing claim's iter_seq (claim 1 = first attempt), so a failure
+	// at iter_seq <= Retries grants a re-run; beyond it, fall through
+	// to the park below. The duplicate-report case is handled by the
+	// CLAIMED/RUNNING precondition above: once re-admitted the task is
+	// READY, so a re-posted failure for the same attempt is rejected.
+	if task.Retries > 0 {
+		if iter, ierr := c.Store.GetOpenClaimIterSeq(taskID); ierr == nil && iter > 0 && int(iter) <= task.Retries {
+			if aerr := c.performComputeAutoRetry(taskID, reason, int(iter), task.Retries); aerr != nil {
+				return nil, aerr
+			}
+			c.Logger.Info("compute task auto-retried",
+				"task_id", taskID, "attempt", iter, "of", task.Retries, "reason", reason)
+			return &FailTaskResponse{Status: "retrying", TaskID: taskID, Reason: reason}, nil
+		}
+	}
+
 	rollbacks, err := c.performComputeFailure(taskID, reason)
 	if err != nil {
 		return nil, err
@@ -463,4 +482,80 @@ func (c *Coordinator) performComputeFailure(taskID, reason string) ([]RollbackOu
 	// (failed_retryable counts as holding), never terminal.
 	c.EvaluateRunStateAndMaybeTriage(task.RunID)
 	return rollbacks, nil
+}
+
+// performComputeAutoRetry re-admits a transiently-failed compute task
+// to READY for another attempt instead of parking it failed_retryable
+// — the Snakemake `retries:` budget. Same rollback of the failed
+// attempt's partial writes as performComputeFailure (so the re-run
+// starts clean) and the same claim-ledger close (so the next claim
+// advances iter_seq, the attempt counter), but the task ends READY.
+//
+// The RUNNING → failed_retryable → READY transition runs as ONE
+// ApplyPlan: the intermediate park is mandatory (the ClearClaim→READY
+// gate only permits {accepted,submitted,failed,failed_retryable}→READY,
+// not RUNNING directly), and doing both in one transaction keeps the
+// run from being observed in the transient failed_retryable/WAITING
+// state by the single EvaluateRunStateAndMaybeTriage below (which sees
+// the final READY → ACTIVE and so never spurious-triages).
+func (c *Coordinator) performComputeAutoRetry(taskID, reason string, attempt, budget int) error {
+	task, err := c.Store.GetTask(taskID)
+	if err != nil || task == nil {
+		return fmt.Errorf("task %q not found", taskID)
+	}
+	d, err := c.Cache.GetDAG(task.RunID)
+	if err != nil {
+		return fmt.Errorf("loading DAG for run %d: %w", task.RunID, err)
+	}
+	run, err := c.Store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return fmt.Errorf("run not found for task %q", taskID)
+	}
+	parsed, _ := c.Cache.GetParsedRun(task.RunID)
+	claimant := task.ClaimedBy
+
+	outcome, err := engine.New(c.Store, c.Logger).ComputeInvalidation(task, run, d, parsed)
+	if err != nil {
+		return err
+	}
+
+	var mutations []store.Mutation
+	rolledBack := 0
+	for _, rbk := range outcome.ArtifactRollbacks {
+		if rbk.Delete {
+			mutations = append(mutations, store.DeleteArtifact{ProjectID: rbk.ProjectID, Branch: rbk.Branch, Path: rbk.Path})
+			rolledBack++
+		} else if rbk.RestoreTo != nil {
+			mutations = append(mutations, store.MoveArtifact{Artifact: *rbk.RestoreTo})
+			rolledBack++
+		}
+	}
+	mutations = append(mutations,
+		store.MarkOpenClaimsFailed{TaskID: taskID},
+		// RUNNING → failed_retryable (closes the claim, records reason).
+		store.SetTaskState{TaskID: taskID, NewState: store.TaskFailedRetryable, FailReason: reason, ClearClaim: true},
+		// failed_retryable → READY (the re-admit; same as enju_retry_task).
+		store.SetTaskState{TaskID: taskID, NewState: store.TaskReady, ClearClaim: true},
+		store.EmitEvent{Event: store.Event{
+			CitizenID: claimant,
+			EventType: "auto_retry",
+			TaskID:    taskID,
+			RunID:     task.RunID,
+			ProjectID: run.ProjectID,
+			Metadata: store.MarshalMetadata(map[string]any{
+				"attempt":   attempt,
+				"of":        budget,
+				"reason":    reason,
+				"rollbacks": rolledBack,
+			}),
+			CreatedAt: time.Now(),
+		}},
+	)
+	if _, err := c.Store.ApplyPlan(store.Plan{Version: engine.EngineVersion, Mutations: mutations}); err != nil {
+		return err
+	}
+	// Re-admitted task is now READY (an active blocker) → recompute run
+	// state so WAITING flips back to ACTIVE.
+	c.EvaluateRunStateAndMaybeTriage(task.RunID)
+	return nil
 }

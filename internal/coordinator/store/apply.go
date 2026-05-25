@@ -920,8 +920,8 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 		anonymize = 1
 	}
 	_, err := tx.Exec(
-		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_retry_cap, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, vote_options, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_retry_cap, retries, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.RunID, t.Seq, t.TaskDefID, t.InstanceKey, t.InstanceParams, t.Ref, t.Action,
 		t.Prompt, t.UserPrompt, t.Script, t.Outputs, t.Requirements, t.ResultType, t.Timeout,
 		t.State, t.DependsOn, t.ReadsArtifacts, t.WritesArtifacts,
@@ -930,7 +930,7 @@ func applyCreateTask(tx *sql.Tx, m CreateTask, sink EventSink) error {
 		anonymize, t.Visibility, t.Env, t.Mode, t.RunSlug,
 		t.OnReviewReject, t.OnReviewRequestChanges, t.RemediationTemplate,
 		t.ClosesIssueSeq, t.Container, t.ContainerRuntime, t.Volumes, t.Executor, t.Resources,
-		t.VerifyRetryCap,
+		t.VerifyRetryCap, t.Retries,
 		t.CreatedAt,
 	)
 	if err != nil {

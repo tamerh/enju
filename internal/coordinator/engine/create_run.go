@@ -208,6 +208,7 @@ func BuildRunTasks(parsed *enjuYaml.ParsedRun, runID int64, projectID int64, run
 				Executor:               ti.Executor,
 				Resources:              marshalResources(ti.Resources),
 				VerifyRetryCap:         ti.VerifyRetryCap,
+				Retries:                ti.Retries,
 				CreatedAt:              now,
 			})
 		}

@@ -786,6 +786,10 @@ func (s *Store) initSchema() error {
 		`ALTER TABLE tasks ADD COLUMN verify_fail_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN verify_retry_cap INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tasks ADD COLUMN verify_fail_counted_iter INTEGER NOT NULL DEFAULT 0`,
+		// retries — the compute auto-retry budget (Snakemake's
+		// retries:), copied from the YAML task def at run-create time.
+		// 0 = no auto-retry (park failed_retryable on first failure).
+		`ALTER TABLE tasks ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`,
 		// sync_status — JSON describing a run-completion sync that
 		// needs operator attention (run-branch → base merge hit a
 		// conflict; the run's output never reached the default
@@ -1284,7 +1288,7 @@ func (s *Store) ListRunBranches(projectID int64) ([]string, error) {
 
 // --- Tasks ---
 
-const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_fail_count, verify_retry_cap, verify_fail_counted_iter, created_at`
+const taskColumns = `id, run_id, seq, task_def_id, instance_key, instance_params, ref, action, prompt, user_prompt, script, outputs, requirements, result_type, timeout, state, claimed_by, claimed_at, submitted_at, result_path, commit_sha, depends_on, reads_artifacts, writes_artifacts, assign_to, require_role, reviews_target, review_decision, vote_options, vote_choice, citizens, min_quorum, vote_threshold, vote_deadline, anonymize, visibility, fail_reason, skip_reason, parked_from_state, env, mode, run_slug, on_review_reject, on_review_request_changes, remediation_template, closes_issue_seq, container, container_runtime, volumes, executor, resources, verify_fail_count, verify_retry_cap, verify_fail_counted_iter, retries, created_at`
 
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
@@ -1304,6 +1308,7 @@ func (s *Store) GetTask(id string) (*TaskRecord, error) {
 		&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 		&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
 		&t.VerifyFailCount, &t.VerifyRetryCap, &t.VerifyFailCountedIter,
+		&t.Retries,
 		&t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2572,6 +2577,7 @@ func scanTasks(rows *sql.Rows) ([]TaskRecord, error) {
 			&t.OnReviewReject, &t.OnReviewRequestChanges, &t.RemediationTemplate,
 			&t.ClosesIssueSeq, &t.Container, &t.ContainerRuntime, &t.Volumes, &t.Executor, &t.Resources,
 			&t.VerifyFailCount, &t.VerifyRetryCap, &t.VerifyFailCountedIter,
+			&t.Retries,
 			&t.CreatedAt); err != nil {
 			return nil, err
 		}

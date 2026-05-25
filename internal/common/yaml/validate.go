@@ -808,6 +808,9 @@ func validateTasks(p *Run) (ids map[string]bool, hasTaskLevelForEach bool, err e
 		if err := validateTaskMode(t); err != nil {
 			return nil, false, err
 		}
+		if err := validateTaskRetries(t); err != nil {
+			return nil, false, err
+		}
 		if err := validateTaskContainer(t); err != nil {
 			return nil, false, err
 		}
@@ -889,6 +892,22 @@ func validateTaskMode(t *TaskDef) error {
 	default:
 		return fmt.Errorf("task %q: mode %q is invalid (must be \"sync\" or \"async\")", t.ID, t.Mode)
 	}
+}
+
+// validateTaskRetries enforces the `retries:` field: non-negative,
+// and compute-only (citizen tasks recover via the contract-gate
+// verify_retry_cap path, not this one). 0 (the default) is always fine.
+func validateTaskRetries(t *TaskDef) error {
+	if t.Retries == 0 {
+		return nil
+	}
+	if t.Retries < 0 {
+		return fmt.Errorf("task %q: retries must be >= 0 (got %d)", t.ID, t.Retries)
+	}
+	if t.Action != "compute" {
+		return fmt.Errorf("task %q: retries: is only valid on action: compute tasks (got action: %s)", t.ID, t.Action)
+	}
+	return nil
 }
 
 // validateTaskContainer enforces the shape of the `container:`

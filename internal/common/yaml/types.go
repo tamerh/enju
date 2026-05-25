@@ -653,6 +653,17 @@ type TaskDef struct {
 	// See docs/async-compute.md.
 	Mode string `yaml:"mode,omitempty"`
 
+	// Retries is the number of EXTRA automatic re-runs the
+	// coordinator grants a compute task that fails transiently
+	// (kind=compute_error: script non-zero / wrapper abort) before
+	// parking it failed_retryable. Snakemake's `retries:`. Default 0
+	// (no auto-retry — fail straight to failed_retryable as before).
+	// retries: 2 → up to 3 attempts total. The re-run uses the pinned
+	// snapshot unchanged (a retry assumes transience). Only valid on
+	// action: compute; the validator rejects it elsewhere (citizen
+	// tasks recover via the contract-gate verify_retry_cap path).
+	Retries int `yaml:"retries,omitempty"`
+
 	// Container declares a Docker image that the compute task's
 	// script runs inside. When set, the wrapper invokes
 	// `docker run <image> /bin/sh -c <script>` with the

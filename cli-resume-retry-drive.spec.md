@@ -1,8 +1,8 @@
 # Spec: CLI resume / retry / drive
 
-Status: Layer A SHIPPED (A.1 resume, A.2 retry, A.3 keep-going); Layer B
-SHIPPED (drive loop + --once + --interval); Layer C (retries: auto-retry)
-pending.
+Status: ALL SHIPPED. Layer A (A.1 resume, A.2 retry, A.3 keep-going);
+Layer B (drive loop + --once + --interval); Layer C (retries: auto-retry,
+coordinator-side).
 Scope: fat-client CLI only. No coordinator changes. No new engine
 capability — every behavior below already exists and is exercised
 over MCP; this surfaces it as `enju` subcommands and adds one loop.
@@ -393,9 +393,13 @@ Mirror-tests, no coverage lost (per repo convention):
    handles re-attach + the post-wait pickup); `--once` (cron tick),
    `--interval`; stall guard via `CountRunningTasks`; reaps via
    `ReconcileRunSeq`. Treats async_started as "keep looping."
-5. **C** `retries:` auto-retry (YAML schema + `validate` lint +
-   coordinator re-admit on `compute_error` within budget + `auto_retry`
-   event). Orthogonal — can land before, between, or after A/B.
+5. **C** ✅ `retries:` auto-retry — YAML `retries:` (TaskDef) + `validate`
+   lint (non-negative, compute-only) + `retries` task column (mirrors
+   verify_retry_cap through materialize/create_run/store) + coord
+   re-admit in `FailComputeTaskRetryable` (`performComputeAutoRetry`:
+   RUNNING→failed_retryable→READY in one plan when the failing claim's
+   iter_seq ≤ Retries) + `auto_retry` event. No new attempt counter —
+   reuses the iter_seq ledger.
 
 After A.1–A.3 the sync fan-out repro fully recovers from the CLI; C makes
 the transient case (the actual repro trigger) self-heal without any

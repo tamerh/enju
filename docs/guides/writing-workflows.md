@@ -240,6 +240,17 @@ ENJU_PARAM_<NAME>   each workflow param as an env var
 
 Use `async` for jobs that outlast your MCP session — SLURM submissions, overnight pipelines, multi-hour analyses. The script commits and pushes its output on its own schedule; the next time any fat-client session touches the project, completion is reconciled automatically.
 
+**Auto-retry (`retries:`):**
+
+```yaml
+- id: section_5
+  action: compute
+  script: scripts/run.sh
+  retries: 2              # auto re-run up to 2 extra times before giving up (default 0)
+```
+
+When a compute script fails transiently (a flaky API, `error_max_turns`, a busy box), the coordinator automatically re-runs it — using the pinned snapshot unchanged — up to `retries` extra times before parking it `failed_retryable`. `retries: 2` means up to 3 attempts total. Default `0` (no auto-retry). The budget is enforced coordinator-side off the per-attempt count, so it holds even if the driving process dies. Compute-only; citizen tasks recover through review/voting, not this. Each auto-retry emits an `auto_retry` event. Once the budget is exhausted the task parks `failed_retryable` — recover it manually with `enju retry <id>`.
+
 **Container:**
 
 ```yaml

@@ -572,6 +572,16 @@ type TaskRecord struct {
 	// Reset to 0 alongside VerifyFailCount on every delivery.
 	VerifyFailCountedIter int
 
+	// Retries is the compute auto-retry budget (Snakemake's retries:):
+	// the number of EXTRA automatic re-runs the coordinator grants a
+	// compute task that fails transiently (kind=compute_error) before
+	// parking it failed_retryable. 0 = no auto-retry. Populated from
+	// the YAML task def at run-create time. The attempt count is the
+	// failing claim's iter_seq (no separate counter column): a failure
+	// at iter_seq <= Retries re-admits the task to READY; beyond it
+	// parks failed_retryable.
+	Retries int
+
 	CreatedAt time.Time
 }
 

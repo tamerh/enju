@@ -193,3 +193,25 @@ func TestResolvedModeNonComputeReturnsEmpty(t *testing.T) {
 		t.Errorf("review task: expected empty mode, got %q", got)
 	}
 }
+
+// TestValidateTaskRetries pins the retries: lint: non-negative and
+// compute-only (citizen tasks recover via the contract-gate path).
+func TestValidateTaskRetries(t *testing.T) {
+	// Valid: retries on a compute task; 0 anywhere.
+	okYAML := "name: t\nversion: 1\ntasks:\n  - id: c\n    action: compute\n    script: run.sh\n    retries: 2\n"
+	if _, err := Parse([]byte(okYAML)); err != nil {
+		t.Errorf("retries on compute should be accepted, got: %v", err)
+	}
+	// Rejected: retries on a non-compute (answer) task.
+	badAction := "name: t\nversion: 1\ntasks:\n  - id: a\n    action: answer\n    prompt: p\n    retries: 2\n"
+	if _, err := Parse([]byte(badAction)); err == nil {
+		t.Error("retries on action: answer should be rejected")
+	} else if !strings.Contains(err.Error(), "compute") {
+		t.Errorf("error should mention compute-only, got: %v", err)
+	}
+	// Rejected: negative.
+	negative := "name: t\nversion: 1\ntasks:\n  - id: c\n    action: compute\n    script: run.sh\n    retries: -1\n"
+	if _, err := Parse([]byte(negative)); err == nil {
+		t.Error("negative retries should be rejected")
+	}
+}
