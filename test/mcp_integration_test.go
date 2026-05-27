@@ -5299,9 +5299,9 @@ tasks:
 		t.Errorf("expected 2 edges in linear chain, got %d; output:\n%s", got, out)
 	}
 	// Class definitions are what make downstream renderers
-	// color nodes by state.
-	if !strings.Contains(out, "classDef accepted") {
-		t.Errorf("expected classDef declarations; got:\n%s", out)
+	// color nodes by task type.
+	if !strings.Contains(out, "classDef typeCompute") {
+		t.Errorf("expected type classDef declarations; got:\n%s", out)
 	}
 
 	// Default format should still render the textual summary
@@ -8148,18 +8148,17 @@ tasks:
 		t.Errorf("run_status should surface 'parked' count in progress line; got:\n%s", statusText)
 	}
 
-	// Mermaid format too: parked class should land on those nodes.
+	// Mermaid format too: fill now encodes task type, so the
+	// parked STATE rides the node's label glyph (⏸) rather than a
+	// :::parked fill class (which no longer exists).
 	mermaidRes := h.callOK(t, "enju_run_status", map[string]any{
 		"project_id": float64(projectID),
 		"run_id":     float64(1),
 		"format":     "mermaid",
 	})
 	mermaidText := mcpText(mermaidRes)
-	if !strings.Contains(mermaidText, ":::parked") {
-		t.Errorf("mermaid output should tag parked nodes with :::parked; got:\n%s", mermaidText)
-	}
-	if !strings.Contains(mermaidText, "classDef parked") {
-		t.Errorf("mermaid output should include classDef parked; got:\n%s", mermaidText)
+	if !strings.Contains(mermaidText, "⏸") {
+		t.Errorf("mermaid output should carry the ⏸ glyph on parked nodes; got:\n%s", mermaidText)
 	}
 
 }

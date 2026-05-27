@@ -85,6 +85,27 @@ func TestRenderTaskMeta_IterationsBlock_SuppressedOnSingleAttempt(t *testing.T) 
 	}
 }
 
+// TestSetMermaidDirection pins the orientation option: a matching
+// flowchart header flips to the requested (normalized) direction;
+// an unknown direction clamps to TD; a non-flowchart body passes
+// through untouched.
+func TestSetMermaidDirection(t *testing.T) {
+	cases := []struct{ body, dir, want string }{
+		{"flowchart TD\n  a --> b", "LR", "flowchart LR\n  a --> b"},
+		{"flowchart TD\n  a --> b", "lr", "flowchart LR\n  a --> b"},
+		{"flowchart LR\n  x", "TD", "flowchart TD\n  x"},
+		{"flowchart TD\n  x", "sideways", "flowchart TD\n  x"}, // unknown → TD
+		{"flowchart TD\n  x", "", "flowchart TD\n  x"},         // empty → TD
+		{"graph TD\n  a --> b", "LR", "graph TD\n  a --> b"},   // not a flowchart header
+		{"", "LR", ""},
+	}
+	for _, c := range cases {
+		if got := SetMermaidDirection(c.body, c.dir); got != c.want {
+			t.Errorf("SetMermaidDirection(%q, %q) = %q, want %q", c.body, c.dir, got, c.want)
+		}
+	}
+}
+
 func TestHumanDuration(t *testing.T) {
 	cases := []struct {
 		ms   int64

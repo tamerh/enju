@@ -1557,9 +1557,9 @@ func TestRenderYourQueueClipsLargeGroups(t *testing.T) {
 func TestFormatRunStatusMermaid(t *testing.T) {
 	runJSON := []byte(`{"project_id":1,"seq":1,"name":"demo","state":"active"}`)
 	tasksJSON := []byte(`[
-  {"id":"1:1:draft","task_def_id":"draft","state":"accepted","depends_on":""},
-  {"id":"1:1:check","task_def_id":"check","state":"claimed","depends_on":"1:1:draft"},
-  {"id":"1:1:publish","task_def_id":"publish","state":"pending","depends_on":"1:1:draft,1:1:check"}
+  {"id":"1:1:draft","task_def_id":"draft","action":"answer","state":"accepted","depends_on":""},
+  {"id":"1:1:check","task_def_id":"check","action":"review","state":"claimed","depends_on":"1:1:draft"},
+  {"id":"1:1:publish","task_def_id":"publish","action":"compute","state":"pending","depends_on":"1:1:draft,1:1:check"}
 ]`)
 	out := format.RunStatusMermaid(runJSON, tasksJSON)
 
@@ -1571,15 +1571,17 @@ func TestFormatRunStatusMermaid(t *testing.T) {
 		t.Errorf("missing flowchart TD header; got:\n%s", out)
 	}
 
-	// One node per task, labeled with state glyph + class suffix.
-	if !strings.Contains(out, "t_1_1_draft[\"draft ✅\"]:::accepted") {
-		t.Errorf("expected draft node with accepted class; got:\n%s", out)
+	// One node per task. Fill class = TYPE (action); state lives
+	// in the label glyph. All nodes are plain rectangles — color
+	// alone carries the type.
+	if !strings.Contains(out, "t_1_1_draft[\"draft ✅\"]:::typeAnswer") {
+		t.Errorf("expected draft answer node (typeAnswer); got:\n%s", out)
 	}
-	if !strings.Contains(out, "t_1_1_check[\"check 🔵\"]:::active") {
-		t.Errorf("expected check node with active class; got:\n%s", out)
+	if !strings.Contains(out, "t_1_1_check[\"check 🔵\"]:::typeReview") {
+		t.Errorf("expected check review node (typeReview); got:\n%s", out)
 	}
-	if !strings.Contains(out, "t_1_1_publish[\"publish ⚪\"]:::pending") {
-		t.Errorf("expected publish node with pending class; got:\n%s", out)
+	if !strings.Contains(out, "t_1_1_publish[\"publish ⚪\"]:::typeCompute") {
+		t.Errorf("expected publish compute node (typeCompute); got:\n%s", out)
 	}
 
 	// After transitive reduction: 2 edges remain
@@ -1594,8 +1596,8 @@ func TestFormatRunStatusMermaid(t *testing.T) {
 		t.Errorf("expected draft→publish to be reduced; got:\n%s", out)
 	}
 
-	// Class definitions present.
-	for _, cls := range []string{"classDef accepted", "classDef failed", "classDef skipped"} {
+	// Type class definitions present (fill = task type).
+	for _, cls := range []string{"classDef typeCompute", "classDef typeAnswer", "classDef typeReview"} {
 		if !strings.Contains(out, cls) {
 			t.Errorf("expected %q in class defs; got:\n%s", cls, out)
 		}

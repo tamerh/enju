@@ -2298,10 +2298,16 @@ type Edge struct {
 // omitted to keep the graph readable — depends_on is the
 // authoring-layer relation the user actually wrote down.
 //
-// Terminal states get CSS classes so the downstream renderer
-// can color-code accepted / failed / skipped branches at a
-// glance (mermaid.live, GitHub, and most editors honor the
-// class definitions).
+// Node FILL encodes the task TYPE (its `action`): compute,
+// answer, contribute, review, and vote each get a distinct fill
+// class so the downstream renderer (mermaid.live, GitHub, most
+// editors) color-codes the graph by who/what runs each node.
+// All nodes are plain rectangles — distinct shapes (diamond/
+// hexagon) were tried for the review/vote gates but made the
+// graph too tall, so color alone carries the type. STATE is
+// carried by the label glyph; failed / failed_retryable also get
+// a stroke override (solid red / orange dashed) so a blocked run
+// still stands out without spending the fill channel on state.
 //
 // Returns "" when the tasks JSON is malformed or the run
 // response carried an error — callers that want an error
@@ -2407,12 +2413,9 @@ func RenderMermaidBody(runData []byte, tasksData []byte) string {
 		if iterCount := IntFromJSON(t["iter_count"]); iterCount > 1 {
 			label += fmt.Sprintf(" (%d×)", iterCount)
 		}
-		cls := MermaidStateClass(state)
-		b.WriteString(fmt.Sprintf("    %s[\"%s\"]", nodeID[id], label))
-		if cls != "" {
-			b.WriteString(":::" + cls)
-		}
-		b.WriteString("\n")
+		action, _ := t["action"].(string)
+		b.WriteString(fmt.Sprintf("    %s[\"%s\"]:::%s\n",
+			nodeID[id], label, mermaidTypeClass(action)))
 	}
 
 	// Edges — intra-run depends_on only. Cross-run external
@@ -2430,25 +2433,94 @@ func RenderMermaidBody(runData []byte, tasksData []byte) string {
 		b.WriteString(fmt.Sprintf("    %s --> %s\n", from, to))
 	}
 
-	// Class definitions — one per terminal/active state. Colors
-	// are deliberately mild so the graph reads well on both
-	// white and dark backgrounds. External-artifact nodes use a
-	// dashed stroke so the viewer can tell them apart from
-	// in-run work at a glance.
+	// State strokes — fill is the type channel, so a blocked run
+	// is flagged with a per-node stroke override instead of a
+	// fill class. failed → solid red; failed_retryable → orange
+	// dashed (distinct, so a recoverable failure doesn't read as
+	// dead). Emitted AFTER the node's :::type class so the stroke
+	// wins while the type fill is preserved. Other states live in
+	// the label glyph only.
 	b.WriteString("\n")
-	b.WriteString("    classDef accepted fill:#d4edda,stroke:#28a745,color:#000\n")
-	b.WriteString("    classDef active fill:#cce5ff,stroke:#007bff,color:#000\n")
-	b.WriteString("    classDef ready fill:#fff3cd,stroke:#ffc107,color:#000\n")
-	b.WriteString("    classDef pending fill:#f8f9fa,stroke:#6c757d,color:#000\n")
-	b.WriteString("    classDef failed fill:#f8d7da,stroke:#dc3545,color:#000\n")
-	// Recoverable failure — amber + dashed stroke: visually
-	// distinct from terminal `failed` (solid red) and `ready`
-	// (yellow). Signals "needs operator action, but the run is
-	// not dead" (enju_retry_task).
-	b.WriteString("    classDef retryable fill:#ffe5cc,stroke:#fd7e14,stroke-dasharray:3 2,color:#000\n")
-	b.WriteString("    classDef skipped fill:#e2e3e5,stroke:#6c757d,stroke-dasharray:4 2,color:#000\n")
-	b.WriteString("    classDef parked fill:#e7e3f4,stroke:#6f42c1,stroke-dasharray:2 2,color:#000\n")
+	for _, t := range tasks {
+		id, _ := t["id"].(string)
+		if id == "" {
+			continue
+		}
+		state, _ := t["state"].(string)
+		switch MermaidStateClass(state) {
+		case "failed":
+			b.WriteString(fmt.Sprintf("    style %s stroke:#dc3545,stroke-width:2px\n", nodeID[id]))
+		case "retryable":
+			b.WriteString(fmt.Sprintf("    style %s stroke:#fd7e14,stroke-width:2px,stroke-dasharray:4 2\n", nodeID[id]))
+		}
+	}
+
+	// Type class definitions — fill encodes the task action.
+	// Colors are deliberately mild so the graph reads well on
+	// both white and dark backgrounds. compute=teal, answer=blue,
+	// contribute=violet, review/vote=orange gate (told apart by
+	// shape, not color). typeOther is the neutral fallback for
+	// unknown actions (e.g. merge_resolve).
+	b.WriteString("\n")
+	b.WriteString("    classDef typeCompute fill:#d1f0ec,stroke:#0c8577,color:#000\n")
+	b.WriteString("    classDef typeAnswer fill:#cce5ff,stroke:#1f6feb,color:#000\n")
+	b.WriteString("    classDef typeContribute fill:#e7dcfa,stroke:#7048c4,color:#000\n")
+	b.WriteString("    classDef typeReview fill:#ffe0c2,stroke:#fd7e14,color:#000\n")
+	b.WriteString("    classDef typeVote fill:#ffe9b3,stroke:#e0a800,color:#000\n")
+	b.WriteString("    classDef typeOther fill:#f8f9fa,stroke:#6c757d,color:#000\n")
 	return b.String()
+}
+
+// mermaidTypeClass maps a task action to its Mermaid fill class.
+// Fill encodes the task TYPE — see RenderMermaidBody. Unknown
+// actions (and merge_resolve) fall back to the neutral class.
+func mermaidTypeClass(action string) string {
+	switch action {
+	case "compute":
+		return "typeCompute"
+	case "answer":
+		return "typeAnswer"
+	case "contribute":
+		return "typeContribute"
+	case "review":
+		return "typeReview"
+	case "vote":
+		return "typeVote"
+	default:
+		return "typeOther"
+	}
+}
+
+// normalizeMermaidDir clamps a requested layout orientation to a
+// value the Mermaid flowchart header accepts. TD (top-down) is
+// the default and the only orientation RenderMermaidBody emits;
+// LR (left-right) is opt-in. Anything unrecognized falls back to
+// TD so a bad caller value can never produce invalid Mermaid.
+func normalizeMermaidDir(dir string) string {
+	switch strings.ToUpper(dir) {
+	case "LR":
+		return "LR"
+	default:
+		return "TD"
+	}
+}
+
+// SetMermaidDirection rewrites the leading `flowchart <dir>`
+// header of an already-rendered Mermaid body to the given
+// orientation (default TD for anything but LR). It lets a
+// consumer flip the layout WITHOUT re-rendering from JSON — the
+// web UI run page requests LR so wide fan-out graphs lay out
+// horizontally, while the CLI / MCP / committed .mmd surfaces
+// keep the default top-down. A body that doesn't start with a
+// recognized flowchart header passes through untouched.
+func SetMermaidDirection(body, dir string) string {
+	d := normalizeMermaidDir(dir)
+	for _, h := range []string{"flowchart TD", "flowchart LR"} {
+		if strings.HasPrefix(body, h) {
+			return "flowchart " + d + body[len(h):]
+		}
+	}
+	return body
 }
 
 // TransitivelyReduce removes edges whose endpoint is already

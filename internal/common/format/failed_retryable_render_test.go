@@ -49,16 +49,19 @@ func TestRenderMermaidBody_StylesFailedRetryable(t *testing.T) {
 	if !strings.Contains(body, "↻") {
 		t.Errorf("failed_retryable node should carry the ↻ glyph (not the '?' fallback); got:\n%s", body)
 	}
-	if !strings.Contains(body, ":::retryable") {
-		t.Errorf("failed_retryable node must get the :::retryable class; got:\n%s", body)
+	// Fill now encodes type; a recoverable failure is flagged with
+	// an orange DASHED stroke override (distinct from terminal
+	// failed's solid red), not a fill class.
+	if !strings.Contains(body, "style t_1_1_t stroke:#fd7e14,stroke-width:2px,stroke-dasharray:4 2") {
+		t.Errorf("failed_retryable node must get the orange dashed stroke override; got:\n%s", body)
 	}
-	if !strings.Contains(body, "classDef retryable ") {
-		t.Errorf("the retryable classDef must be emitted (was: defined-but-never-applied 'failed'); got:\n%s", body)
+	// It must NOT reuse the terminal failed (solid red) stroke.
+	if strings.Contains(body, "style t_1_1_t stroke:#dc3545") {
+		t.Errorf("failed_retryable must NOT reuse the terminal red failed stroke; got:\n%s", body)
 	}
-	// Distinct from terminal failed — the recoverable state must
-	// not reuse the red `failed` class.
-	if strings.Contains(body, "1:1:t") && strings.Contains(body, ":::failed\n") {
-		t.Errorf("failed_retryable must NOT reuse the terminal :::failed class; got:\n%s", body)
+	// State fill classes are gone entirely — fill is type now.
+	if strings.Contains(body, ":::retryable") || strings.Contains(body, "classDef retryable ") {
+		t.Errorf("state fill classes must no longer be emitted; got:\n%s", body)
 	}
 }
 
