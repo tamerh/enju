@@ -24,7 +24,7 @@
   <script src="/static/app.js?v={{.AssetVer}}" defer></script>
   {{block "scripts" .}}{{end}}
 </head>
-<body>
+<body class="{{block "bodyClass" .}}{{end}}">
   <header class="topnav">
     <a href="/" class="brand">Enju</a>
     <nav>

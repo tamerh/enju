@@ -22,6 +22,13 @@ type runPage struct {
 	ProjectID     int64
 	Run           *service.RunDetail
 	BlockedByText string
+	// TopDown drives the DAG orientation toggle. The page defaults
+	// to left-to-right (LR reads better for wide fan-out); the
+	// "?dag=td" query param (set by the legend checkbox) flips it
+	// to top-down. Threaded back into the template so the poll URL
+	// and the checkbox both reflect the current choice across the
+	// 20s auto-refresh.
+	TopDown bool
 }
 
 // handleRunView renders /p/{projectID}/r/{runSeq} — run header,
@@ -53,11 +60,75 @@ func (s *Server) handleRunView(w http.ResponseWriter, r *http.Request) {
 	if run.State == "waiting" {
 		blocked = format.RenderBlockedBy(run.BlockedBy)
 	}
+	// Orientation is a backend option (format.SetMermaidDirection,
+	// default TD). The run page defaults to LR — wide fan-out
+	// reads better in a browser — and the legend checkbox sets
+	// ?dag=td to flip back to top-down.
+	topDown := r.URL.Query().Get("dag") == "td"
+	dir := "LR"
+	if topDown {
+		dir = "TD"
+	}
+	run.DiagramMermaid = format.SetMermaidDirection(run.DiagramMermaid, dir)
 	s.render(w, r, "run.html", runPage{
 		pageData:      s.commonPageData(),
 		ProjectID:     pid,
 		Run:           run,
 		BlockedByText: blocked,
+		TopDown:       topDown,
+	})
+}
+
+// dagViewPage is the data shape for views/dag.html — the
+// full-bleed standalone DAG page. Same Run payload as the run
+// page, but this view defaults to top-down (TD) and the toggle
+// flips to LR (the inverse of the embedded run-page default),
+// because a dedicated full-width page has the room for a tall
+// TD graph that the narrow run-page column doesn't.
+type dagViewPage struct {
+	pageData
+	ProjectID int64
+	Run       *service.RunDetail
+	LeftRight bool
+}
+
+// handleRunDAGView renders /p/{projectID}/r/{runSeq}/dag — the
+// DAG alone on a full-width, chrome-light page so large graphs
+// can spread edge-to-edge (the run page's centered 960px column
+// boxes them in). Defaults to TD; ?dag=lr flips to LR. Opened in
+// a new tab from the run page's DAG section.
+func (s *Server) handleRunDAGView(w http.ResponseWriter, r *http.Request) {
+	pid, err := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	if err != nil || pid <= 0 {
+		http.Error(w, "invalid project id", http.StatusBadRequest)
+		return
+	}
+	seq, err := strconv.Atoi(chi.URLParam(r, "runSeq"))
+	if err != nil || seq <= 0 {
+		http.Error(w, "invalid run seq", http.StatusBadRequest)
+		return
+	}
+	run, err := s.fc.GetRun(r.Context(), pid, seq)
+	if err != nil {
+		s.logger.Error("GetRun failed", "project_id", pid, "run_seq", seq, "error", err)
+		s.writeFetchError(w, "run", err)
+		return
+	}
+	if run == nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+	leftRight := r.URL.Query().Get("dag") == "lr"
+	dir := "TD"
+	if leftRight {
+		dir = "LR"
+	}
+	run.DiagramMermaid = format.SetMermaidDirection(run.DiagramMermaid, dir)
+	s.render(w, r, "dag.html", dagViewPage{
+		pageData:  s.commonPageData(),
+		ProjectID: pid,
+		Run:       run,
+		LeftRight: leftRight,
 	})
 }
 

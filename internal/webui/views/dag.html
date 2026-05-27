@@ -1,0 +1,44 @@
+{{define "title"}}DAG · run #{{.Run.Seq}} · Enju{{end}}
+
+{{define "bodyClass"}}dag-fullpage{{end}}
+
+{{define "scripts"}}
+<script src="/static/mermaid.min.js" defer></script>
+<script defer>
+  document.addEventListener('DOMContentLoaded', () => {
+    if (window.mermaid) {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        theme: 'default',
+        flowchart: { useMaxWidth: false },
+        themeVariables: { fontSize: '18px' }
+      });
+      window.mermaid.run({querySelector: 'pre.mermaid'});
+    }
+  });
+</script>
+{{end}}
+
+{{define "main"}}
+<div class="dag-page-bar">
+  <a href="/p/{{.ProjectID}}/r/{{.Run.Seq}}">← Run #{{.Run.Seq}}</a>
+  {{if .Run.Name}}<span class="muted">{{.Run.Name}}</span>{{end}}
+  <span class="dag-page-spacer"></span>
+  {{/* This page defaults to TD; the toggle flips to LR via
+       ?dag=lr. Plain-JS navigation (full page, no #run-live
+       region) keeps it simple — checked → ?dag=lr, unchecked →
+       bare URL (TD). */}}
+  <label class="dag-toggle small">
+    <input type="checkbox" name="dag" value="lr" autocomplete="off"
+           {{if .LeftRight}}checked{{end}}
+           onchange="location.href='/p/{{.ProjectID}}/r/{{.Run.Seq}}/dag' + (this.checked ? '?dag=lr' : '')">
+    Left-to-right layout
+  </label>
+</div>
+
+{{if .Run.DiagramMermaid}}
+<pre class="mermaid dag-fullpage-graph">{{.Run.DiagramMermaid}}</pre>
+{{else}}
+<p class="muted">(no diagram available)</p>
+{{end}}
+{{end}}

@@ -153,6 +153,79 @@ main {
 .project-card .meta { display: block; font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
 .project-card .desc { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; }
 
+/* DAG legend — maps the mermaid node fills/strokes to task
+   semantics. Swatch colors mirror the type classDefs in
+   format.RenderMermaidBody; keep them in sync. */
+.dag-legend {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0 0.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.dag-legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.dag-legend .sw {
+  display: inline-block;
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle, #f8f9fa);
+}
+.dag-legend .sw-failed { border: 2px solid #dc3545; background: transparent; }
+.dag-legend .sw-retryable { border: 2px dashed #fd7e14; background: transparent; }
+
+/* DAG orientation toggle row — the LR/TD checkbox sits under the
+   legend, alongside the "fill = type" caption. */
+.dag-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+.dag-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* Full-bleed standalone DAG page (/p/{id}/r/{seq}/dag). Drops the
+   centered 960px column so a large graph can use the whole window
+   width; the graph itself fills the viewport and scrolls. */
+body.dag-fullpage main {
+  max-width: none;
+  margin: 0;
+  padding: 0.75rem 1rem;
+}
+.dag-page-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+.dag-page-spacer { flex: 1 1 auto; }
+.dag-fullpage-graph {
+  /* Use nearly the whole viewport; scroll rather than shrink. */
+  max-height: calc(100vh - 5rem);
+  width: 100%;
+}
+.dag-fullview-link {
+  margin-left: 0.6rem;
+  font-weight: normal;
+  color: var(--muted);
+}
+
 /* Project list as a table. Denser than .project-list cards;
    sortable-by-activity scan view for operators with many
    projects. The .num class right-aligns the run count. */
@@ -480,11 +553,15 @@ pre.mermaid {
   padding: 1rem;
   border: 1px solid var(--border);
   border-radius: 8px;
-  overflow-x: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85rem;
   line-height: 1.4;
   background: rgba(37, 99, 235, 0.04);
+  /* The diagram renders at natural size (mermaid useMaxWidth is
+     disabled in run.html); bound the viewport and scroll both
+     axes rather than shrink the graph to fit. */
+  overflow: auto;
+  max-height: 75vh;
 }
 
 /* Task table */

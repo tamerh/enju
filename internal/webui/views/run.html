@@ -5,7 +5,17 @@
 <script defer>
   document.addEventListener('DOMContentLoaded', () => {
     if (window.mermaid) {
-      window.mermaid.initialize({startOnLoad: false, theme: 'default'});
+      // useMaxWidth:false stops mermaid from scaling the SVG down
+      // to the container width — that shrink-to-fit is what made
+      // the nodes tiny. At natural size the graph keeps readable
+      // node text and the container (.mermaid) scrolls instead.
+      // fontSize bumps the label size for legibility.
+      window.mermaid.initialize({
+        startOnLoad: false,
+        theme: 'default',
+        flowchart: { useMaxWidth: false },
+        themeVariables: { fontSize: '18px' }
+      });
       window.mermaid.run({querySelector: 'pre.mermaid'});
     }
   });
@@ -133,17 +143,48 @@
      not-terminal, so once the run finishes the swapped-in
      #run-live carries no hx-trigger and polling self-stops. */}}
 <div id="run-live"
-     {{if not $isTerminal}}hx-get="/p/{{.ProjectID}}/r/{{.Run.Seq}}"
+     {{if not $isTerminal}}hx-get="/p/{{.ProjectID}}/r/{{.Run.Seq}}{{if .TopDown}}?dag=td{{end}}"
      hx-trigger="every 20s"
      hx-select="#run-live"
      hx-swap="outerHTML"{{end}}>
 <section>
-  <h2>DAG</h2>
+  <h2>DAG <a class="dag-fullview-link small" href="/p/{{.ProjectID}}/r/{{.Run.Seq}}/dag" target="_blank" rel="noopener">open full view ↗</a></h2>
   {{if .Run.DiagramMermaid}}
   <pre class="mermaid">{{.Run.DiagramMermaid}}</pre>
   <script>
     if (window.mermaid) { window.mermaid.run({querySelector: 'pre.mermaid'}); }
   </script>
+  {{/* Legend — keep swatch colors in sync with the type
+       classDefs in format.RenderMermaidBody. Fill = task type;
+       stroke flags a blocked node; the state itself is in each
+       node's glyph. */}}
+  <ul class="dag-legend" aria-label="DAG legend">
+    <li><span class="sw" style="background:#d1f0ec;border-color:#0c8577"></span>compute</li>
+    <li><span class="sw" style="background:#cce5ff;border-color:#1f6feb"></span>answer</li>
+    <li><span class="sw" style="background:#e7dcfa;border-color:#7048c4"></span>contribute</li>
+    <li><span class="sw" style="background:#ffe0c2;border-color:#fd7e14"></span>review</li>
+    <li><span class="sw" style="background:#ffe9b3;border-color:#e0a800"></span>vote</li>
+    <li><span class="sw sw-failed"></span>failed</li>
+    <li><span class="sw sw-retryable"></span>retryable</li>
+  </ul>
+  <div class="dag-controls">
+    <p class="muted small">Fill = task type · stroke flags failures · the glyph in each node is its state.</p>
+    {{/* Orientation toggle. Checked → ?dag=td (top-down); the
+         checkbox value rides the hx-get, so unchecked omits it and
+         the handler falls back to the LR default. Targets
+         #run-live so the swap (and the preserved poll URL) keep
+         the choice across the 20s auto-refresh. */}}
+    <label class="dag-toggle small">
+      <input type="checkbox" name="dag" value="td"
+             autocomplete="off"
+             {{if .TopDown}}checked{{end}}
+             hx-get="/p/{{.ProjectID}}/r/{{.Run.Seq}}"
+             hx-target="#run-live"
+             hx-select="#run-live"
+             hx-swap="outerHTML">
+      Top-down layout
+    </label>
+  </div>
   {{else}}
   <p class="muted">(no diagram available)</p>
   {{end}}

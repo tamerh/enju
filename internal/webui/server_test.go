@@ -1427,6 +1427,113 @@ func TestRunView(t *testing.T) {
 	}
 }
 
+// TestRunViewDAGIsLeftToRight: the web UI rewrites the shared
+// renderer's "flowchart TD" header to "flowchart LR" so wide
+// graphs lay out horizontally. The rewrite is prefix-only.
+func TestRunViewDAGIsLeftToRight(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		runDetail: &service.RunDetail{
+			Run:            wire.Run{ID: 10, ProjectID: 1, Seq: 1, Name: "wide", State: "active", Branch: "main"},
+			DiagramMermaid: "flowchart TD\n    a --> b\n",
+		},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/r/1", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "flowchart LR") {
+		t.Errorf("expected DAG rewritten to flowchart LR; got:\n%s", body)
+	}
+	if strings.Contains(body, "flowchart TD") {
+		t.Errorf("flowchart TD header should have been rewritten; got:\n%s", body)
+	}
+	// Default LR: the toggle is present but the poll URL carries
+	// no ?dag param (so refresh stays on the LR default).
+	if !strings.Contains(body, `name="dag" value="td"`) {
+		t.Errorf("expected the orientation toggle checkbox; got:\n%s", body)
+	}
+	if !strings.Contains(body, `hx-get="/p/1/r/1"`) {
+		t.Errorf("default poll URL should be param-free (LR); got:\n%s", body)
+	}
+}
+
+// TestRunViewDAGTopDownToggle: ?dag=td flips the DAG back to
+// top-down, checks the toggle, and carries the param into the
+// auto-refresh poll URL so the choice survives the 20s refresh.
+func TestRunViewDAGTopDownToggle(t *testing.T) {
+	s := newTestServer(t, &fakeFC{
+		username: "tamer",
+		runDetail: &service.RunDetail{
+			Run:            wire.Run{ID: 10, ProjectID: 1, Seq: 1, Name: "wide", State: "active", Branch: "main"},
+			DiagramMermaid: "flowchart TD\n    a --> b\n",
+		},
+	})
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/r/1?dag=td", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "flowchart TD") {
+		t.Errorf("?dag=td should keep the DAG top-down; got:\n%s", body)
+	}
+	if strings.Contains(body, "flowchart LR") {
+		t.Errorf("?dag=td must not produce an LR graph; got:\n%s", body)
+	}
+	// The poll URL preserves the choice.
+	if !strings.Contains(body, `hx-get="/p/1/r/1?dag=td"`) {
+		t.Errorf("poll URL should carry ?dag=td so refresh keeps top-down; got:\n%s", body)
+	}
+	// The checkbox renders checked.
+	if !strings.Contains(body, "checked") {
+		t.Errorf("toggle checkbox should be checked under ?dag=td; got:\n%s", body)
+	}
+}
+
+// TestRunDAGViewFullPage: the standalone /dag page renders
+// full-bleed, defaults to top-down, links back to the run, and
+// flips to LR under ?dag=lr.
+func TestRunDAGViewFullPage(t *testing.T) {
+	mk := func() *fakeFC {
+		return &fakeFC{
+			username: "tamer",
+			runDetail: &service.RunDetail{
+				Run:            wire.Run{ID: 10, ProjectID: 1, Seq: 2, Name: "big", State: "active", Branch: "main"},
+				DiagramMermaid: "flowchart TD\n    a --> b\n",
+			},
+		}
+	}
+
+	// Default: top-down, full-bleed body class, back link.
+	rr := httptest.NewRecorder()
+	newTestServer(t, mk()).Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/p/1/r/2/dag", nil))
+	body := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rr.Code)
+	}
+	for _, want := range []string{
+		`class="dag-fullpage"`, // full-bleed body
+		"flowchart TD",         // default orientation
+		`href="/p/1/r/2"`,      // back link
+		"Left-to-right layout", // the toggle
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("full DAG page missing %q; got:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "flowchart LR") {
+		t.Errorf("default full DAG page must be top-down; got:\n%s", body)
+	}
+
+	// ?dag=lr flips to LR and checks the toggle.
+	rr2 := httptest.NewRecorder()
+	newTestServer(t, mk()).Handler().ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "/p/1/r/2/dag?dag=lr", nil))
+	body2 := rr2.Body.String()
+	if !strings.Contains(body2, "flowchart LR") {
+		t.Errorf("?dag=lr should flip to LR; got:\n%s", body2)
+	}
+	if !strings.Contains(body2, "checked") {
+		t.Errorf("toggle should be checked under ?dag=lr; got:\n%s", body2)
+	}
+}
+
 // TestRunViewBadSeq: non-numeric run seq returns 400.
 func TestRunViewBadSeq(t *testing.T) {
 	s := newTestServer(t, &fakeFC{username: "tamer"})
