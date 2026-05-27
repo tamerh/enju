@@ -8,6 +8,10 @@ The coordinator is **output-neutral** — it manages task state and prompts, nev
 
 Every contribution lands as a git commit, so **attribution**, **audit**, and **authentication** all come from git itself — no separate identity or audit system to wire up. Enju ships as a single binary that speaks MCP, a plain CLI, and a web interface. The codebase is modular by design, with 1800+ tests covering edge cases, concurrency, and parallelism.
 
+<p align="center">
+  <img src="docs/figures/workflow.svg" alt="A representative enju run: discover fans out with for_each; each item is processed and checked; results collect into an aggregate; a human review gates the deliverable; publish lays it onto the base branch — every accepted task a git commit on the run branch." width="92%">
+</p>
+
 
 
 
