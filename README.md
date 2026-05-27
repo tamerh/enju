@@ -1,77 +1,54 @@
 # Enju (槐)
 
-**Enju is a DAG workflow system where the unit of work is a task** — something a human, an LLM agent, or a script can answer, review, vote on, or compute. Like Snakemake or Nextflow you get reproducible, declarative pipelines; unlike them, the same DAG carries human judgement, autonomous AI agents, and computational steps as peers.
+**Enju is a workflow system where humans, AI agents, and deterministic compute work the same DAG as peers.** The unit of work is a **task** — something any of them can `answer`, `review`, `vote` on, or `compute`. The graph is *live*: a task can spawn more tasks while a run is in flight, so a review that returns `request_changes` drops a revision task back into the graph with its feedback already attached, and the work cycles until it's approved.
 
-The graph is **live**: tasks can spawn further tasks inside a running run. A `request_changes` review, for example, spawns a revision task with the reviewer's feedback pre-injected — so a workflow adapts as work proceeds, bounded by a per-run cycle budget. Every state change emits an event, so humans get notified when a task needs their judgement and agents see what's ready to claim.
+What makes this work is where the lines are drawn. Review and voting are ordinary task actions, not out-of-band approvals — human judgement enters the graph as a recorded decision with the same standing as an agent's output. The coordinator is **output-neutral**: it tracks task state and decisions, never the content work produces. Every result is a git commit, so **attribution and audit fall out of git history** with nothing extra to wire up, and a plain git remote is the only thing moving content between machines. Enju ships as a single binary that speaks MCP, a CLI, and a web UI.
 
-The coordinator is **output-neutral** — it manages task state and prompts, never the outputs work produces. Execution is distributed: humans handle review gates, scripts run in containers (Docker, Apptainer), and LLM agents — autonomous, each with its own model — claim the tasks they're assigned. Compute, tokens, and attention come from whoever joins the run.
+<p align="center"><img src="docs/images/prisma-dag.png" alt="A PRISMA systematic-review workflow in Enju: compute, AI agents, and human review gates as peers on one DAG" width="900"></p>
+<p align="center"><em>A real Enju workflow — a PRISMA systematic review — where deterministic compute (teal), AI agents (blue), and human review gates (orange) are peers on one graph.<br>Any citizen can claim from this graph in parallel, each on its own model and tokens.</em></p>
 
-Every contribution lands as a git commit, so **attribution**, **audit**, and **authentication** all come from git itself — no separate identity or audit system to wire up. Enju ships as a single binary that speaks MCP, a plain CLI, and a web interface. The codebase is modular by design, with 1800+ tests covering edge cases, concurrency, and parallelism.
+## What a workflow looks like
 
-<p align="center">
-  <img src="docs/figures/workflow.svg" alt="A representative enju run: discover fans out with for_each; each item is processed and checked; results collect into an aggregate; a human review gates the deliverable; publish lays it onto the base branch — every accepted task a git commit on the run branch." width="92%">
-</p>
+A workflow is a DAG of tasks, written as YAML and committed to your repo. Here an agent drafts a report and a human gates it — two tasks, two different kinds of citizen, one graph:
 
+```yaml
+name: My First Workflow
 
+agents:
+  - name: writer
+    handler: claude
+    model: claude-sonnet-4-6
 
+tasks:
+  - id: write_report
+    action: answer            # an agent (or a human) produces work
+    assign_to: writer
+    writes: [report.md]
+    prompt: Write a short report on solar-energy adoption to report.md.
 
+  - id: human_review
+    action: review            # a human gate, equal standing in the graph
+    reviews: write_report      # approve · request_changes · reject
+    prompt: Approve if accurate; request_changes sends it back with feedback.
 ```
-╔════════════════════ Coordinator · DAG state machine ═════════════════════╗
-║                                                                          ║
-║                ✓ ──→ ✓                                                   ║
-║                       ╲                                                  ║
-║                        ◑ ──→ ◇  ↺                                        ║
-║                       ╱        ╲                                         ║
-║                ✓ ──→ ◐          ✓ ──→ ○                                  ║
-║                       ╲                                                  ║
-║                        · ──→ ·                                           ║
-║                                                                          ║
-║   · pending ─→ ○ ready ─→ ◐ claimed ─→ ◑ running ─→ ◇ review ─→ ✓ done   ║
-║                 ▲                                        │               ║
-║                 ╰─────────────────── ↺ ──────────────────╯               ║
-║                                                                          ║
-║         ↻ retry    ✗ failed    ⊘ skipped    ‖ parked                     ║
-║                                                                          ║
-║                 ╭── state DB ──╮      ╭── events DB ──╮                  ║
-║                 ╰──────────────╯      ╰───────────────╯                  ║
-║                                                                          ║
-╚══════════════════════════════════════════════════════════════════════════╝
-                                       ▲▼
 
-       ┌── Team machine X
-       │ ┌── Bob
-       │ │ ┌── Alice ──────────────────────────────────────────────┐
-       │ │ │                                                       │
-       │ │ │                      Fat Client                       │
-       │ │ │                                                       │
-       │ │ │    MCP  ·  CLI  ·  Web UI                             │
-       │ │ │                                                       │
-       │ │ │    ⚙ compute  ·  ✦ answer  ·  ◇ review  ·  ⊙ vote     │
-       │ │ │                                                       │
-       │ │ │    Agent daemons ×N   (LLM · compute · container)     │
-       │ │ │                                                       │
-       │ │ │                ╭── local git ──╮                      │
-       │ │ │                ╰────────────────╯                     │
-       │ │ │                                                       │
-       │ │ └───────────────────────────────────────────────────────┘
-       │ └─
-       └──
-
-                                       ▲▼
-╔══════════════════════════ Remote git · content ══════════════════════════╗
-║                                                                          ║
-║   workflow-2/<task>                            ●   ●                     ║
-║                                                 ╲ ╱                      ║
-║   workflow-2                                    ●─●─●─●                  ║
-║                                                ╱       ╲                 ║
-║   main             ●───●───●───●───●───●───●─●─────────●─●               ║
-║                     ╲                 ╱                                  ║
-║   workflow-1         ●───●───●───●───●                                   ║
-║                       ╲       ╲                                          ║
-║   workflow-1/<task>    ●       ●                                         ║
-║                                                                          ║
-╚══════════════════════════════════════════════════════════════════════════╝
+```sh
+enju go enju.yaml --auto-agents
 ```
+
+The agent claims `write_report`, runs its model, and commits `report.md`; `human_review` then waits in your inbox. Every step is a commit on the run's branch. → full walkthrough in the [quickstart](docs/getting-started/quickstart.md).
+
+## How it fits together
+
+<!-- ARCHITECTURE: PNG rendered from preprint Figure 1 -->
+<p align="center"><img src="docs/images/architecture.png" alt="Enju architecture" width="760"></p>
+
+The **coordinator** holds the task DAG and its lifecycle (`pending → ready → claimed → running → review → done`, with a revise loop) plus the state and events databases — but no produced content. Each citizen runs a **fat client** on their own machine exposing MCP/CLI/Web UI, forking agent daemons and committing to a local git clone. Multiple citizens work the **same DAG** as peers — and each runs its **own model on its own tokens**, so the compute and API cost is shared across whoever joins the run. **Remote git** holds everything produced and is the only cross-machine transport.
+
+<!-- TASK MODEL: PNG rendered from preprint Figure 2 -->
+<p align="center"><img src="docs/images/task-model.png" alt="The task model" width="760"></p>
+
+One primitive, interchangeable executors: a task's `action` selects whether a human, an LLM agent, or a script runs it — all the same kind of node. Edges carry typed data, `for_each` fans a task (or a whole run) out into parallel iterations, and a `review` verdict can approve, fail, or cycle the work back with feedback — every attempt kept as a commit.
 
 ## Quick install
 
@@ -87,15 +64,15 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
 
 Verify with `enju --version`.
 
-**Other platforms or specific versions:** download a binary directly from the [releases page](https://github.com/tamerh/enju/releases) and put it on your `PATH`.
+**Other platforms or specific versions:** download a binary from the [releases page](https://github.com/tamerh/enju/releases) and put it on your `PATH`.
 
 ## Examples
 
 Three reference workflows — clone, install, run:
 
-- **[mustache-engine-enju](https://github.com/tamerh/mustache-engine-enju)** — Build a Mustache template engine from spec. Six Sonnet agents gated by `request_changes` loops; 136/136 conformance tests pass.
-- **[nanopore-assembly-enju](https://github.com/tamerh/nanopore-assembly-enju)** — ONT phage genome assembly. Thirteen containerized compute tasks across two machines, git as transport.
+- **[mustache-engine-enju](https://github.com/tamerh/mustache-engine-enju)** — build a Mustache template engine from spec. Six Sonnet agents gated by `request_changes` loops; 136/136 conformance tests pass.
 - **[prisma-review-enju](https://github.com/tamerh/prisma-review-enju)** — PRISMA systematic review of FMT-for-rCDI RCTs. Four Sonnet agents + two human review gates produce a 14-RCT synthesis.
+- **[nanopore-assembly-enju](https://github.com/tamerh/nanopore-assembly-enju)** — ONT phage-genome assembly. Thirteen containerized compute tasks across two machines, git as transport.
 
 ## Docs
 
@@ -106,5 +83,3 @@ For the design and motivation, see the preprint: [sugi.bio/enju](https://sugi.bi
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-<!-- vision-led README — iterating on the opening paragraph; v1 preserved in README.v1.md -->
