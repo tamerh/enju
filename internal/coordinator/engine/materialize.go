@@ -998,6 +998,16 @@ func BuildDeferredInstance(def *enjuYaml.TaskDef, inst forEachInst, run *enjuYam
 	}
 	ti.Prompt = template.ResolveParams(def.Prompt, inst.Params)
 	ti.UserPrompt = template.ResolveParams(def.UserPrompt, inst.Params)
+	// Per-instance env: substitution — see build.go for the same
+	// rationale (env: was the only template-touching field skipped
+	// at materialize time; setting env: SYMBOL: "{{symbol}}" silently
+	// passed the literal "{{symbol}}" to the script).
+	if len(def.Env) > 0 {
+		ti.Env = make(map[string]string, len(def.Env))
+		for k, v := range def.Env {
+			ti.Env[k] = template.ResolveParams(v, inst.Params)
+		}
+	}
 	// Per-instance substitution for declared-artifact slots.
 	// Without this, `writes_artifacts: [summaries/{{stem}}.md]`
 	// would register literally on every instance row, the

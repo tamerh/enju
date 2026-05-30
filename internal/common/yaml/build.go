@@ -195,6 +195,19 @@ func buildRunLevel(p *Run) (*ParsedRun, error) {
 			}
 			ti.Prompt = resolvedPrompt
 			ti.UserPrompt = resolvedUserPrompt
+			// Per-instance env: substitution. Without this,
+			// `env: SYMBOL: "{{symbol}}"` would pass the literal
+			// "{{symbol}}" to the script — the silent-breakage
+			// class of bug the user is most likely to hit, since
+			// env: feels analogous to prompt: but skipped the
+			// per-instance substitute pass. New map per instance:
+			// the def's backing map is shared across siblings.
+			if len(taskDef.Env) > 0 {
+				ti.Env = make(map[string]string, len(taskDef.Env))
+				for k, v := range taskDef.Env {
+					ti.Env[k] = template.ResolveParams(v, resolveMap)
+				}
+			}
 			ti.DependsOn = resolvedDeps
 			// Qualify the review target with this iteration's
 			// instance key. The YAML carries a bare short ID
@@ -480,6 +493,14 @@ func buildTaskLevel(p *Run) (*ParsedRun, error) {
 		}
 		ti.Prompt = resolvedPrompt
 		ti.UserPrompt = resolvedUserPrompt
+		// Per-instance env: substitution — same rationale as the
+		// run-level for_each block above.
+		if len(taskDef.Env) > 0 {
+			ti.Env = make(map[string]string, len(taskDef.Env))
+			for k, v := range taskDef.Env {
+				ti.Env[k] = template.ResolveParams(v, resolveMap)
+			}
+		}
 		if ti.Requirements == nil {
 			ti.Requirements = p.Requirements
 		}
