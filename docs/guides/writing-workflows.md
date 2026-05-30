@@ -205,7 +205,7 @@ A `compute` task runs a script or container directly — no LLM required.
 ```yaml
 - id: run_analysis
   action: compute
-  script: scripts/analyze.sh          # path relative to enju.yaml's directory
+  script: src/analyze.sh              # project-root-relative (same as writes:/reads:)
   depends_on: [review_plan]
   prompt: "Run analysis on {{dataset}}"
   writes:
@@ -218,11 +218,27 @@ The script runs with these environment variables set:
 
 ```
 ENJU_TASK_ID        task identifier
-ENJU_PROJECT_DIR    root of the git repository
+ENJU_PROJECT_DIR    root of the git repository (live clone)
 ENJU_RUN_DIR        .enju/runs/<n>/ for this run
-ENJU_TEMPLATE_DIR   snapshot directory (workflow files at run-creation SHA)
-ENJU_PARAM_<NAME>   each workflow param as an env var
+ENJU_TEMPLATE_DIR   snapshot root (the frozen project tree at run-creation)
+ENJU_PARAM_<NAME>   each workflow param as a flattened string
 ```
+
+**For Python (or anything richer than bash), read `$ENJU_RUN_DIR/context.json`.** It carries the **typed** params (a real list, not a comma-flattened string), the iteration variable when fanning out, and the task's declared writes/reads with their `track:`/`publish:` flags. `ENJU_PARAM_*` is fine for shell; `context.json` is the canonical reading path for everything else.
+
+```python
+import json, os, pathlib
+
+ctx = json.load(open(os.path.join(os.environ["ENJU_RUN_DIR"], "context.json")))
+items = ctx["params"]["items"]            # real list — ["a","b","c"]
+gene  = ctx.get("iteration", {}).get("gene")   # for_each iteration var
+for w in ctx["writes_artifacts"]:
+    pathlib.Path(w["path"]).write_text(...)
+```
+
+A full reference Python compute is `enju_usecases/load-test/scripts/report.py`.
+
+**`env:` block** — values support template substitution per instance (params, `{{iteration_var}}`), so `env: SYMBOL: "{{gene}}"` becomes `SYMBOL=TP53` on the `TP53` iteration. Use `env:` for static config and small per-instance values; reach for `context.json` for typed lists/records.
 
 **Sync vs async:**
 
@@ -466,7 +482,7 @@ my-project/
     developer.md        # optional agent system prompts
 ```
 
-The workflow is snapshotted at run-creation time — edits to `enju.yaml` after a run starts do not affect that run. Scripts resolve relative to the workflow YAML's directory inside the snapshot.
+**The whole project tree is snapshotted at run-creation** and frozen — edits to anything in the repo (the workflow YAML, scripts, prompts) after a run starts do not affect that run. `script:` paths are **project-root-relative** (same as `writes:`/`reads:`), so a shared `src/` or `scripts/` at the project root works across many workflow YAMLs without duplication.
 
 ---
 

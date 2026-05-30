@@ -169,7 +169,7 @@ Runs a script or container deterministically — no LLM required.
 ```yaml
 - id: run_analysis
   action: compute
-  script: scripts/analyze.sh        # relative to the workflow YAML's directory
+  script: src/analyze.sh            # project-root-relative (same as writes:/reads:)
   mode: sync                        # sync (default) or async
   container: python:3.12-slim       # optional Docker image
   depends_on: [review_plan]
@@ -180,7 +180,7 @@ Runs a script or container deterministically — no LLM required.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `script` | — | Path to script, relative to workflow YAML directory |
+| `script` | — | Path to script, **project-root-relative** (same convention as `writes:`/`reads:`). The snapshot pins the whole project tree at create-run, so a shared `src/` works across many workflows. |
 | `mode` | `sync` | `sync` = blocks until exit; `async` = detaches for long-running jobs |
 | `retries` | `0` | Extra automatic re-runs on a transient failure before parking `failed_retryable` (Snakemake's `retries:`). `2` → up to 3 attempts; the re-run uses the pinned snapshot unchanged. Compute-only. |
 | `container` | — | Docker image to run the script inside |
@@ -354,7 +354,7 @@ Notes:
 
 ## Snapshot and git layout
 
-When a run is created, the workflow YAML is snapshotted at the current committed state. Later edits to the workflow do not affect in-flight runs. Scripts in `compute` tasks resolve relative to the workflow YAML's directory inside the snapshot.
+When a run is created, **the whole project tree at the current committed state is snapshotted**, frozen so later edits don't affect in-flight runs. `script:` paths in compute tasks resolve **project-root-relative** off that snapshot — same convention as `writes:`/`reads:`. A shared `src/` at the project root works across many workflow YAMLs.
 
 ```
 <project>/

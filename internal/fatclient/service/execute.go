@@ -254,7 +254,7 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 
 	taskScratchDir := compute.ResolveTaskScratchDir(wf.ProjectRoot(), s.coord.Username(), taskID, meta.IterSeq)
 
-	repoSnapshotDir, templateSnapshotDir := resolveSnapshotDirs(wf, meta)
+	repoSnapshotDir, _ := resolveSnapshotDirs(wf, meta)
 	if repoSnapshotDir != "" {
 		if _, statErr := os.Stat(repoSnapshotDir); os.IsNotExist(statErr) {
 			if _, merr := wf.MaterializeRunRepo(meta.Branch, repoSnapshotDir); merr != nil {
@@ -267,17 +267,35 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		_ = os.MkdirAll(bigfilesDir, 0755)
 	}
 
-	// Script path is task-specific (meta.Script varies per task def);
-	// templateSnapshotDir is the run-level snapshot dir where scripts live.
+	// Script paths are PROJECT-ROOT-relative — same addressing as
+	// writes:/reads:, resolved off the snapshot root (which IS the
+	// frozen project tree at create-run, since the snapshot already
+	// contains the whole repo). The pre-2026 workflow-dir-relative
+	// rule was dropped: one shared src/ across many workflows is the
+	// typical pattern, and forcing per-workflow scripts/ subdirectories
+	// was friction with no real payoff. ENJU_TEMPLATE_DIR now also
+	// points at the snapshot root.
 	var scriptPath, templateDir string
 	if meta.RunSourcePath != "" {
-		templateDir = templateSnapshotDir
-		scriptPath = filepath.Join(templateDir, meta.Script)
+		templateDir = repoSnapshotDir
+		scriptPath = filepath.Join(repoSnapshotDir, meta.Script)
 	} else {
+		// No snapshot (inline-YAML run): resolve against the live clone.
 		scriptPath = filepath.Join(workDir, meta.Script)
 	}
+	// Traversal guard: the resolved path must stay within the snapshot/
+	// project root. The convention change opened the addressing space
+	// from "this workflow's subtree" to "the whole project," so this
+	// guard takes over the implicit safety the old rule provided.
+	root := repoSnapshotDir
+	if root == "" {
+		root = workDir
+	}
+	if cleaned, err := filepath.Rel(root, scriptPath); err != nil || strings.HasPrefix(cleaned, "..") {
+		return nil, fmt.Errorf("script %q resolves outside the project root %q — script: paths are project-root-relative; remove any leading slash or '..' segments", meta.Script, root)
+	}
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("script %q not found at %s", meta.Script, scriptPath)
+		return nil, fmt.Errorf("script %q not found at %s — script: is project-root-relative (e.g. src/foo.py for a script at <project>/src/foo.py)", meta.Script, scriptPath)
 	}
 
 	// Declared reads from the task record — resolved before the

@@ -21,6 +21,6 @@ name: Scratch-tree-as-CWD demo
 tasks:
   - id: greet
     action: compute
-    script: entry.sh
+    script: examples/scratch-tree-hello/entry.sh
     writes:
       - greeting.txt

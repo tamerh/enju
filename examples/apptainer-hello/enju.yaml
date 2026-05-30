@@ -25,7 +25,7 @@ version: 1
 tasks:
   - id: greet
     action: compute
-    script: scripts/hello.sh
+    script: examples/apptainer-hello/scripts/hello.sh
     container: docker://alpine:latest
     container_runtime: apptainer
     writes:
