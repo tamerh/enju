@@ -43,6 +43,7 @@ var Registry = []mcp.Tool{
 	UpdateProfile(),
 	ListProjects(),
 	SetProjectDefaultBranch(),
+	SetProjectPushTopicBranches(),
 	ArchiveProject(),
 	RestoreProject(),
 	LeaveProject(),

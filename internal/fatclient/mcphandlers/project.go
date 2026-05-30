@@ -441,6 +441,30 @@ func (c *apiClient) handleSetProjectDefaultBranch(ctx context.Context, req mcp.C
 	return mcp.NewToolResultText(text), nil
 }
 
+// handleSetProjectPushTopicBranches flips the per-project
+// push_topic_branches lever. Owner-only (enforced coord-side).
+// The MCP surface mirrors `enju project push-topic-branches
+// <true|false>` so callers driving via MCP don't have to shell
+// out for what is otherwise a one-PUT setting flip.
+func (c *apiClient) handleSetProjectPushTopicBranches(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	projectID, err := req.RequireInt("project_id")
+	if err != nil {
+		return mcp.NewToolResultError("project_id is required"), nil
+	}
+	push, err := req.RequireBool("push")
+	if err != nil {
+		return mcp.NewToolResultError("push is required (true or false)"), nil
+	}
+	if err := c.fc.SetProjectPushTopicBranches(ctx, int64(projectID), push); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	verb := "ENABLED (multi-citizen default — topic branches pushed to origin)"
+	if !push {
+		verb = "DISABLED (solo bulk-pipeline mode — topic branches stay local)"
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✓ Project #%d topic-branch push %s", projectID, verb)), nil
+}
+
 // handleSetProjectRemote updates a project's remote URL in the
 // coordinator DB and, if a local clone exists, reconfigures its
 // origin remote to match. Kept as a single tool (not split between

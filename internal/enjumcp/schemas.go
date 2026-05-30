@@ -947,6 +947,20 @@ func SetProjectDefaultBranch() mcp.Tool {
 	)
 }
 
+func SetProjectPushTopicBranches() mcp.Tool {
+	return mcp.NewTool("enju_set_project_push_topic_branches",
+		mcp.WithDescription(`Toggle whether per-task topic branches get pushed to origin. Owner-only. Default is true — the multi-citizen contract: every per-task topic branch (e.g. "5-atlas-gene-page/TP53/collect_render/iter-1") is pushed so siblings see each other's WIP, async reconcile works across machines, and cross-machine review is possible. Flip to false for solo bulk-data pipelines (100K-run sweeps would otherwise fill origin's ref list with iter branches and make "git branch -r" unusable). When false, commits still land locally on the topic branch and auto-merge into the run branch on accept — only the push to origin is skipped. Local-only projects (no remote) are unaffected either way. The lever is snapshotted into the wrap-spec at task-execute time, so flipping it mid-run doesn't retroactively change in-flight jobs.`),
+		mcp.WithNumber("project_id",
+			mcp.Required(),
+			mcp.Description("The project whose push_topic_branches lever to set"),
+		),
+		mcp.WithBoolean("push",
+			mcp.Required(),
+			mcp.Description("true = push topic branches to origin (default, multi-citizen); false = keep topic branches local (solo bulk pipelines)"),
+		),
+	)
+}
+
 func SetProjectRemote() mcp.Tool {
 	return mcp.NewTool("enju_set_project_remote",
 		mcp.WithDescription("Set the external git remote URL for a project. Use this to graduate a path-mode project (currently using its local managed bare under <project>/enju/.bare.git/) to a real GitHub/GitLab/Gitea/self-hosted remote, or to migrate from one external remote to another. The fat-client pushes every local branch to the new remote and resets scan cursors so the artifact index catches up to the migrated history. Pass the new URL directly to migrate; use enju_leave_project to stop using the project on this machine. Empty strings are rejected — clearing a remote on a multi-machine project would silently fork the team."),

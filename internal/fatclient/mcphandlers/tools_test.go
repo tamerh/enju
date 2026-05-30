@@ -102,6 +102,7 @@ var allToolFactories = []struct {
 	{"enju_restore_project", enjumcp.RestoreProject},
 	{"enju_create_project", enjumcp.CreateProject},
 	{"enju_set_project_default_branch", enjumcp.SetProjectDefaultBranch},
+	{"enju_set_project_push_topic_branches", enjumcp.SetProjectPushTopicBranches},
 	{"enju_set_project_remote", enjumcp.SetProjectRemote},
 	{"enju_project_remote_status", enjumcp.ProjectRemoteStatus},
 	{"enju_project_sync", enjumcp.ProjectSync},

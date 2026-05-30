@@ -377,6 +377,8 @@ func (c *apiClient) handlerByToolName(name string) (server.ToolHandlerFunc, bool
 		return c.handleSetProjectRemote, true
 	case "enju_set_project_default_branch":
 		return c.handleSetProjectDefaultBranch, true
+	case "enju_set_project_push_topic_branches":
+		return c.handleSetProjectPushTopicBranches, true
 	case "enju_project_remote_status":
 		return c.handleProjectRemoteStatus, true
 	case "enju_project_sync":

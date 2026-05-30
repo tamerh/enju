@@ -38,6 +38,7 @@ When starting a session, these tools give you a quick picture of state:
 | `enju_restore_project` | Restore an archived project. |
 | `enju_set_project_remote` | Set or update the project's git remote URL. |
 | `enju_set_project_default_branch` | Change the project's default branch. |
+| `enju_set_project_push_topic_branches` | Toggle whether per-task topic branches push to origin (default true; flip to false for solo bulk pipelines). |
 | `enju_project_remote_status` | Check whether the local clone is in sync with the remote. |
 | `enju_project_sync` | Push/pull the project to/from its remote. |
 | `enju_add_project_member` | Add a citizen to the project. |
