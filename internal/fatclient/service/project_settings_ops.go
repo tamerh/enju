@@ -65,3 +65,27 @@ func (s *FatClient) SetProjectRemote(ctx context.Context, projectID int64, remot
 	}
 	return s.MirrorRemoteAfterSet(projectID, remoteURL), nil
 }
+
+// SetProjectPushTopicBranches flips the per-project lever that
+// decides whether per-task topic branches are pushed to origin.
+// The multi-citizen default is true (push — siblings see each
+// other's WIP, async reconcile, cross-machine review). Solo
+// bulk-data pipelines flip it to false to keep origin's ref list
+// clean at scale (100K runs × N topics → unusable `git
+// branch -r`); local-only projects (no remote) are unaffected
+// either way. Owner-only is enforced coord-side; the lever is
+// read from coord at task-execute time and snapshotted into the
+// wrap-spec so the in-flight job's intent survives a mid-run
+// flip.
+func (s *FatClient) SetProjectPushTopicBranches(ctx context.Context, projectID int64, push bool) error {
+	data, err := s.coord.Put(ctx,
+		fmt.Sprintf("/api/v1/projects/%d/push_topic_branches", projectID),
+		map[string]bool{"push": push})
+	if err != nil {
+		return err
+	}
+	if msg := coord.ExtractError(data); msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}

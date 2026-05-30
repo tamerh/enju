@@ -95,12 +95,16 @@ func CreateProject(s store.CoordinatorStore, caller *store.CitizenRecord, params
 	if effectiveBranch == "" {
 		effectiveBranch = "main"
 	}
+	// New projects default to PushTopicBranches=true (the multi-citizen
+	// model); the lever is flipped explicitly for solo bulk pipelines.
+	pushTopics := true
 	return &ProjectResponse{
-		ID:            id,
-		Name:          params.Name,
-		RemoteURL:     params.RemoteURL,
-		DefaultBranch: effectiveBranch,
-		CreatedAt:     now,
+		ID:                id,
+		Name:              params.Name,
+		RemoteURL:         params.RemoteURL,
+		DefaultBranch:     effectiveBranch,
+		PushTopicBranches: &pushTopics,
+		CreatedAt:         now,
 	}, nil
 }
 

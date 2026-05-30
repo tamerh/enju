@@ -165,6 +165,14 @@ func (w *Workflow) SubmitComputeTaskResult(req SubmitRequest) (*SubmitResult, er
 	// compute submits before.
 	if w.git.RemoteURL() == "" {
 		trace.okDetail("push-verify", "skipped: no origin")
+	} else if req.SkipTopicPush {
+		// Project setting push_topic_branches=false — topic ref
+		// advanced locally (atomicity preserved); the per-task push
+		// to origin is the bit being gated. Multi-citizen reviewers
+		// on other clones won't see this topic until the accepted
+		// merge lands on the run branch; in solo bulk pipelines
+		// there are no such reviewers, so the push is pure overhead.
+		trace.okDetail("push-verify", "skipped: push_topic_branches=false")
 	} else {
 		if err := w.git.PushWithVerify(branchName, commitSHA); err != nil {
 			return nil, trace.fail("push-verify", translateGitError("push verify", err))

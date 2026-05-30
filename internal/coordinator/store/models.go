@@ -216,6 +216,18 @@ type ProjectRecord struct {
 	// docs/runs-and-branches.md for the full rationale.
 	DefaultBranch string
 
+	// PushTopicBranches controls whether the fat client pushes the
+	// per-task topic refs (the per-iteration branches an accepted
+	// merge picks up from) to origin. Defaults to true: topics push
+	// naturally, matching the multi-citizen / multi-machine model
+	// (reviewers on other clones can `git fetch origin <topic>` to
+	// see WIP). Set false for solo bulk-generation pipelines where
+	// thousands of topics × runs become real GitHub overhead — topic
+	// refs are still created locally for per-task atomicity, only the
+	// push is skipped. Independent of the publish: block; this lever
+	// is about WIP visibility, not the deliverable.
+	PushTopicBranches bool
+
 	// Reversible archive. Archived hides the project from
 	// enju_list_projects' default view; it is NOT deletion — no row
 	// removal, no on-disk effect, fully restorable. ArchivedAt/

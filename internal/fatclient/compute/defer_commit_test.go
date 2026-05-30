@@ -100,7 +100,7 @@ func TestRunDeferCommitProducesButDoesNotCommit(t *testing.T) {
 
 	// The host-side reaper path: replaying the captured commit
 	// must produce a real SHA (byte-identical-commit contract).
-	sub, err := compute.CommitDeferred(wf, *dc)
+	sub, err := compute.CommitDeferred(wf, *dc, false)
 	if err != nil {
 		t.Fatalf("CommitDeferred (host-side replay): %v", err)
 	}

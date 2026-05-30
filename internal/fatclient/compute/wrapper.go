@@ -353,6 +353,12 @@ type Spec struct {
 	// host-side reaper replays Result.DeferredCommit verbatim, so
 	// the resulting commit is byte-identical to the local path.
 	DeferCommit bool `json:"defer_commit,omitempty"`
+
+	// SkipTopicPush mirrors enjugit.SubmitRequest.SkipTopicPush —
+	// the per-project push_topic_branches lever. Populated by the
+	// caller (execute.go) from the project setting; forwarded
+	// verbatim into the SubmitRequest below.
+	SkipTopicPush bool `json:"skip_topic_push,omitempty"`
 }
 
 // Result is the wrapper→handler contract. Returned as JSON via the
@@ -451,7 +457,7 @@ type DeferredCommit struct {
 // terminal-success. Single source of truth for "turn a
 // DeferredCommit into a commit", so the local and deferred
 // paths can never drift.
-func CommitDeferred(wf *enjugit.Workflow, dc DeferredCommit) (*enjugit.SubmitResult, error) {
+func CommitDeferred(wf *enjugit.Workflow, dc DeferredCommit, skipTopicPush bool) (*enjugit.SubmitResult, error) {
 	return wf.SubmitComputeTaskResult(enjugit.SubmitRequest{
 		TaskID:         dc.TaskID,
 		BranchOverride: dc.IterationBranch,
@@ -461,6 +467,7 @@ func CommitDeferred(wf *enjugit.Workflow, dc DeferredCommit) (*enjugit.SubmitRes
 		Citizen:        enjugit.Identity{Name: dc.AuthorName, Email: dc.AuthorEmail},
 		ModelName:      dc.Model,
 		CustomTrailers: dc.CustomTrailers,
+		SkipTopicPush:  skipTopicPush,
 	})
 }
 
@@ -1063,7 +1070,7 @@ func Run(ctx context.Context, wf *enjugit.Workflow, spec Spec, env []string, log
 	// LLM/bot tasks keep using SubmitTaskResult (porcelain) —
 	// they run in their own per-bot clone and need the worktree
 	// flow for tools that exec git commands inside the script.
-	submitRes, err := CommitDeferred(wf, dc)
+	submitRes, err := CommitDeferred(wf, dc, spec.SkipTopicPush)
 	if err != nil {
 		// Script ran fine; the failure is at the git layer
 		// (commit retry exhausted, push rejected, rebase

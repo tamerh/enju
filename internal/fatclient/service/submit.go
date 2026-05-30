@@ -254,6 +254,11 @@ func (s *FatClient) SubmitTaskResult(ctx context.Context, params SubmitParams) *
 		ModelName:      prep.EffectiveModel,
 		Verdict:        verdict,
 		CustomTrailers: customTrailers,
+		// Honor the per-project push_topic_branches lever. Read it
+		// inline here (one cheap GET per submit) rather than threading
+		// through every prep/spec/wrapper site — the topic-push gate
+		// is a per-project setting, not a per-task knob.
+		SkipTopicPush: !s.ProjectPushTopicBranches(ctx, prep.Meta.ProjectID),
 	}
 	var submitRes *enjugit.SubmitResult
 	var err error

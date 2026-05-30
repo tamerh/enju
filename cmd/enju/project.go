@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 )
 
 // cmdProject groups project-settings verbs that were previously
@@ -21,6 +22,8 @@ func cmdProject(args []string) {
 	switch args[0] {
 	case "default-branch":
 		cmdProjectDefaultBranch(args[1:])
+	case "push-topic-branches":
+		cmdProjectPushTopicBranches(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown project subcommand: %s\n", args[0])
 		printProjectUsage()
@@ -32,11 +35,16 @@ func printProjectUsage() {
 	fmt.Println(`Usage: enju project <subcommand> [args]
 
 Subcommands:
-  default-branch <branch>   Set the project's default branch (the branch runs
-                            fork from). Owner-only. Mirrors the MCP tool
-                            enju_set_project_default_branch.
+  default-branch <branch>          Set the project's default branch (the branch
+                                   runs fork from). Owner-only. Mirrors the MCP
+                                   tool enju_set_project_default_branch.
+  push-topic-branches <true|false> Toggle whether per-task topic branches are
+                                   pushed to origin. Default true (multi-citizen
+                                   collaboration); flip to false for solo bulk-
+                                   data pipelines to keep origin refs clean.
+                                   Owner-only.
 
-Flags (default-branch):
+Flags (all subcommands):
   --project <id>   Operate on a specific project id (default: the project
                    that owns the current directory).
   --coordinator <url>   Coordinator URL (default: from credentials.json).`)
@@ -95,4 +103,42 @@ func runProjectDefaultBranch(sess *cliSession, projectID int64, branch string) (
 	}
 	warning, err := sess.FC.SetProjectDefaultBranch(context.Background(), entry.ID, branch)
 	return entry.ID, warning, err
+}
+
+// cmdProjectPushTopicBranches is `enju project push-topic-branches <true|false>`.
+// Thin CLI mirror of FatClient.SetProjectPushTopicBranches: a one-PUT
+// flip of the per-project lever that decides whether per-task topic
+// branches are pushed to origin. Owner-only (enforced coord-side).
+func cmdProjectPushTopicBranches(args []string) {
+	fs := flag.NewFlagSet("project push-topic-branches", flag.ExitOnError)
+	projectID := fs.Int64("project", 0, "Override project resolution (numeric id)")
+	coordOverride := fs.String("coordinator", "", "Coordinator URL (default: from credentials.json)")
+	fs.Parse(args)
+
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: enju project push-topic-branches <true|false> [--project id]")
+		os.Exit(2)
+	}
+	push, err := strconv.ParseBool(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "project push-topic-branches: %q is not a valid boolean (use true/false)\n", fs.Arg(0))
+		os.Exit(2)
+	}
+
+	sess := openCLISession(*coordOverride)
+
+	entry, err := resolveActiveProject(sess, *projectID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "project push-topic-branches: %v\n", err)
+		os.Exit(2)
+	}
+	if err := sess.FC.SetProjectPushTopicBranches(context.Background(), entry.ID, push); err != nil {
+		fmt.Fprintf(os.Stderr, "project push-topic-branches: %v\n", err)
+		os.Exit(1)
+	}
+	verb := "ENABLED"
+	if !push {
+		verb = "DISABLED"
+	}
+	fmt.Printf("✓ project %d topic-branch push %s\n", entry.ID, verb)
 }

@@ -435,6 +435,11 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		ContainerRuntime: meta.ContainerRuntime,
 		Volumes:          meta.Volumes,
 		Env:              meta.Env,
+		// Per-project lever: solo bulk-data pipelines flip
+		// push_topic_branches=false to keep origin/refs clean.
+		// Defaults to false (= push) on lookup error, matching the
+		// multi-citizen default.
+		SkipTopicPush: !s.ProjectPushTopicBranches(ctx, meta.ProjectID),
 	}
 
 	// Phase 8.2 — signal CLAIMED → RUNNING just before kicking

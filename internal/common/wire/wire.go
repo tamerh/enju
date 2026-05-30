@@ -49,7 +49,13 @@ type Project struct {
 	Description   string    `json:"description,omitempty"`
 	RemoteURL     string    `json:"remote_url,omitempty"`
 	DefaultBranch string    `json:"default_branch,omitempty"`
-	RunCount      int       `json:"run_count"`
+	// PushTopicBranches: when false, the fat client builds per-task
+	// topic refs locally but skips the push to origin. Default true
+	// (multi-citizen). Wire field present even when true so a fat
+	// client can read it without inferring a default. Pointer so the
+	// wire shape distinguishes "unset" from "false" on older coords.
+	PushTopicBranches *bool `json:"push_topic_branches,omitempty"`
+	RunCount          int   `json:"run_count"`
 	CreatedAt     time.Time `json:"created_at"`
 
 	// Archived is the reversible-archive flag. The default list

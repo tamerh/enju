@@ -493,7 +493,11 @@ func (s *FatClient) handleOneWrapperResult(ctx context.Context, resultPath strin
 		// practice — a bounded host-side re-commit before failing
 		// is the natural follow-up.
 		if res.CommitSHA == "" && res.DeferredCommit != nil {
-			submitRes, cerr := compute.CommitDeferred(wf, *res.DeferredCommit)
+			// SkipTopicPush rides in the spec snapshot the kickoff
+			// wrote — same value the inline path would have used,
+			// so an operator flipping the project lever mid-run
+			// doesn't retroactively change in-flight SLURM jobs.
+			submitRes, cerr := compute.CommitDeferred(wf, *res.DeferredCommit, spec.SkipTopicPush)
 			if cerr != nil {
 				s.logger.Error("host-side deferred commit failed",
 					"task_id", spec.TaskID, "error", cerr)

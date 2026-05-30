@@ -44,6 +44,35 @@ func SetProjectDefaultBranch(s store.CoordinatorStore, caller *store.CitizenReco
 	}, nil
 }
 
+// SetPushTopicBranchesResponse is the wire shape for
+// enju_set_project_push_topic_branches / the CLI mirror.
+type SetPushTopicBranchesResponse struct {
+	ProjectID         int64 `json:"project_id"`
+	PushTopicBranches bool  `json:"push_topic_branches"`
+}
+
+// SetProjectPushTopicBranches flips the per-project "push the per-task
+// topic refs to origin" lever. Owner-only. Idempotent — re-applying the
+// current value still emits the audit event, so the audit log carries
+// the intent.
+func SetProjectPushTopicBranches(s store.CoordinatorStore, caller *store.CitizenRecord, projectID int64, push bool) (*SetPushTopicBranchesResponse, error) {
+	if err := requireOwner(s, projectID, caller.ID); err != nil {
+		return nil, err
+	}
+	if _, err := s.ApplyPlan(store.Plan{
+		Version: engine.EngineVersion,
+		Mutations: []store.Mutation{
+			store.SetProjectPushTopicBranches{ProjectID: projectID, Push: push},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return &SetPushTopicBranchesResponse{
+		ProjectID:         projectID,
+		PushTopicBranches: push,
+	}, nil
+}
+
 // ArchiveProjectResponse is the wire shape for
 // enju_archive_project / enju_restore_project. Status is
 // "archived" | "restored" | "already_archived" |

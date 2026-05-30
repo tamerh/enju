@@ -134,6 +134,26 @@ func (s *FatClient) FetchProjectMetaExpanded(ctx context.Context, projectID int6
 	return remoteURL, name, defaultBranch, nil
 }
 
+// ProjectPushTopicBranches reads the per-project push_topic_branches
+// setting. Defaults to true on any read error or on a coord that
+// predates the field — the safe default that preserves the multi-
+// citizen behavior. The fat client calls this at submit time to set
+// SubmitRequest.SkipTopicPush so SubmitComputeTaskResult /
+// SubmitTaskResult know whether to push the per-task topic ref.
+func (s *FatClient) ProjectPushTopicBranches(ctx context.Context, projectID int64) bool {
+	data, err := s.coord.Get(ctx, fmt.Sprintf("/api/v1/projects/%d", projectID))
+	if err != nil {
+		return true
+	}
+	var raw struct {
+		PushTopicBranches *bool `json:"push_topic_branches"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil || raw.PushTopicBranches == nil {
+		return true
+	}
+	return *raw.PushTopicBranches
+}
+
 // FetchAllRefsForBot brings every remote branch's refs +
 // objects into the project clone. Used by the daemon's pre-
 // claim path so claude-p sees fresh topic branches pushed by

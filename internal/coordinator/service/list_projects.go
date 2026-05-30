@@ -26,16 +26,18 @@ func ToProjectResponse(p store.ProjectRecord, runCount int) ProjectResponse {
 	if lastActivity.Before(p.CreatedAt) {
 		lastActivity = p.CreatedAt
 	}
+	pushTopics := p.PushTopicBranches
 	return ProjectResponse{
-		ID:             p.ID,
-		Name:           p.Name,
-		Description:    p.Description,
-		RemoteURL:      p.RemoteURL,
-		DefaultBranch:  p.DefaultBranch,
-		RunCount:       runCount,
-		CreatedAt:      p.CreatedAt,
-		Archived:       p.Archived,
-		LastActivityAt: lastActivity,
+		ID:                p.ID,
+		Name:              p.Name,
+		Description:       p.Description,
+		RemoteURL:         p.RemoteURL,
+		DefaultBranch:     p.DefaultBranch,
+		PushTopicBranches: &pushTopics,
+		RunCount:          runCount,
+		CreatedAt:         p.CreatedAt,
+		Archived:          p.Archived,
+		LastActivityAt:    lastActivity,
 	}
 }
 

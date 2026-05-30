@@ -127,6 +127,10 @@ func (w *Workflow) SubmitTaskResult(req SubmitRequest) (*SubmitResult, error) {
 		// applies when origin points at a real remote.
 		if g.RemoteURL() == "" {
 			trace.okDetail("push-verify", "skipped: no origin")
+		} else if req.SkipTopicPush {
+			// Project setting push_topic_branches=false — the topic
+			// branch advanced locally; the push to origin is gated.
+			trace.okDetail("push-verify", "skipped: push_topic_branches=false")
 		} else {
 			if perr := g.PushWithVerify(branchName, commitRes.SHA); perr != nil {
 				return trace.fail("push-verify", translateGitError("push verify", perr))

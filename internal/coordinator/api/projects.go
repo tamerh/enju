@@ -118,6 +118,30 @@ func (s *Server) handleSetProjectDefaultBranch(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleSetProjectPushTopicBranches flips the per-project
+// push_topic_branches lever. Owner-only.
+func (s *Server) handleSetProjectPushTopicBranches(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := strconv.ParseInt(chi.URLParam(r, "projectID"), 10, 64)
+	caller := citizenFromRequest(r)
+	if caller == nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req struct {
+		Push bool `json:"push"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	resp, err := service.SetProjectPushTopicBranches(s.store, caller, projectID, req.Push)
+	if err != nil {
+		writeMembershipErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	caller := citizenFromRequest(r)
 	if caller == nil {

@@ -396,6 +396,34 @@ takes `mermaid` or `json`; omit it for the default text rendering.
 
 ---
 
+## `enju project`
+
+Project-settings verbs that mirror their MCP counterparts so a
+CLI-only operator isn't forced through an MCP host for routine
+admin. Owner-only on the coord side.
+
+```sh
+# Set the branch new runs fork from (the project's "default").
+enju project default-branch main
+
+# Toggle whether per-task topic branches get pushed to origin.
+# Default is true (multi-citizen — siblings see each other's WIP,
+# async reconcile, cross-machine review). Flip to false for solo
+# bulk-data pipelines (100K runs × N topics would otherwise litter
+# origin's ref list).
+enju project push-topic-branches false
+enju project push-topic-branches true
+
+# Operate on a specific project (default: the one owning $PWD).
+enju project default-branch main --project 7
+```
+
+The lever read at task-execute time is snapshotted into the
+wrap-spec, so flipping it mid-run doesn't retroactively change
+in-flight SLURM jobs.
+
+---
+
 ## `enju agent`
 
 Agent lifecycle commands. See [Agents](../guides/agents.md) for the full guide.

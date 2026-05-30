@@ -163,7 +163,12 @@ func (s *FatClient) SubmitResultsBatch(ctx context.Context, params SubmitBatchPa
 		}
 		prepared = append(prepared, prep)
 		preparedIdx = append(preparedIdx, i)
-		submitReqs = append(submitReqs, buildBatchSubmitRequest(prep, e))
+		// Per-project push_topic_branches lever. Same per-task fetch
+		// pattern as the single-submit path — batch entries share
+		// one project, but the lookup is cheap enough to do per-entry
+		// and avoids threading the value into preparedFatSubmit.
+		skipTopicPush := !s.ProjectPushTopicBranches(ctx, prep.Meta.ProjectID)
+		submitReqs = append(submitReqs, buildBatchSubmitRequest(prep, e, skipTopicPush))
 	}
 
 	if len(prepared) > 0 {
@@ -327,7 +332,7 @@ func (s *FatClient) reportBatchEntryToCoord(ctx context.Context, prep *preparedF
 // SubmitBatch supports multi-branch batches by grouping reqs
 // by effective branch internally — the service just hands it
 // the heterogeneous list.
-func buildBatchSubmitRequest(prep *preparedFatSubmit, e SubmitBatchEntry) enjugit.SubmitRequest {
+func buildBatchSubmitRequest(prep *preparedFatSubmit, e SubmitBatchEntry, skipTopicPush bool) enjugit.SubmitRequest {
 	commitBranch := prep.Meta.Branch
 	baseBranch := ""
 	if prep.Meta.IterationBranch != "" {
@@ -360,6 +365,7 @@ func buildBatchSubmitRequest(prep *preparedFatSubmit, e SubmitBatchEntry) enjugi
 		ModelName:      prep.EffectiveModel,
 		Verdict:        verdict,
 		CustomTrailers: customTrailers,
+		SkipTopicPush:  skipTopicPush,
 	}
 }
 

@@ -346,6 +346,10 @@ func (s *Store) applyPlanOnce(plan Plan) (ApplyResult, error) {
 			}
 			result.ProjectID = id
 
+		case SetProjectPushTopicBranches:
+			if err := applySetProjectPushTopicBranches(tx, m, sink); err != nil {
+				return ApplyResult{}, err
+			}
 		case SetProjectDefaultBranch:
 			if err := applySetProjectDefaultBranch(tx, m, sink); err != nil {
 				return result, err
@@ -2462,10 +2466,21 @@ func applyCreateProject(tx *sql.Tx, m CreateProject, sink EventSink) (int64, err
 	if branch == "" {
 		branch = "main"
 	}
+	// New projects default push_topic_branches=true (preserve the
+	// multi-citizen behavior; solo bulk projects flip it off
+	// explicitly via SetProjectPushTopicBranches).
+	pushTopics := 1
+	if !p.PushTopicBranches && p.ID != 0 {
+		// Honored only when the caller pre-set it on a CreateProject
+		// from a restore path; CreateProject from fresh always lands
+		// true since p.PushTopicBranches' zero is false. Restoring an
+		// archived project preserves the persisted setting.
+		pushTopics = 0
+	}
 	res, err := tx.Exec(
-		`INSERT INTO projects (name, description, created_by, remote_url, default_branch, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.Name, p.Description, p.CreatedBy, remote, branch, p.CreatedAt, p.UpdatedAt,
+		`INSERT INTO projects (name, description, created_by, remote_url, default_branch, push_topic_branches, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.Name, p.Description, p.CreatedBy, remote, branch, pushTopics, p.CreatedAt, p.UpdatedAt,
 	)
 	if err != nil {
 		return 0, err
@@ -2500,6 +2515,31 @@ func applySetProjectDefaultBranch(tx *sql.Tx, m SetProjectDefaultBranch, sink Ev
 		EventSubtype: "default_branch",
 		ProjectID:    m.ProjectID,
 		Metadata:     MarshalMetadata(map[string]any{"default_branch": branch}),
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+// applySetProjectPushTopicBranches flips the per-project "push the
+// per-task topic refs to origin" lever. Persisted on the projects row
+// + an audit event. Topic refs are still created locally either way;
+// only the push is gated by this setting.
+func applySetProjectPushTopicBranches(tx *sql.Tx, m SetProjectPushTopicBranches, sink EventSink) error {
+	val := 0
+	if m.Push {
+		val = 1
+	}
+	if _, err := tx.Exec(
+		`UPDATE projects SET push_topic_branches = ?, updated_at = ? WHERE id = ?`,
+		val, time.Now(), m.ProjectID,
+	); err != nil {
+		return err
+	}
+	sink.Emit(Event{
+		EventType:    "project_settings_changed",
+		EventSubtype: "push_topic_branches",
+		ProjectID:    m.ProjectID,
+		Metadata:     MarshalMetadata(map[string]any{"push_topic_branches": m.Push}),
 		CreatedAt:    time.Now(),
 	})
 	return nil

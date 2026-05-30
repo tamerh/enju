@@ -98,6 +98,14 @@ type SubmitRequest struct {
 
 	// Push / retry knobs
 	MaxRetries int
+
+	// SkipTopicPush, when true, builds + advances the topic ref
+	// LOCALLY (per-task atomicity preserved) but skips pushing it to
+	// origin. Set by the fat client when the project's
+	// push_topic_branches setting is false — for solo bulk pipelines
+	// where 100k pushed refs become real overhead. Zero-value (false)
+	// preserves the current default of pushing topic refs.
+	SkipTopicPush bool
 }
 
 // SubmitResult is what Workflow.SubmitTaskResult returns.

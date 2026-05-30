@@ -184,6 +184,9 @@ func decodeMutation(kind MutationKind, data json.RawMessage) (Mutation, error) {
 	case MutSetProjectDefaultBranch:
 		var m SetProjectDefaultBranch
 		return m, json.Unmarshal(data, &m)
+	case MutSetProjectPushTopicBranches:
+		var m SetProjectPushTopicBranches
+		return m, json.Unmarshal(data, &m)
 	case MutSetProjectRemoteURL:
 		var m SetProjectRemoteURL
 		return m, json.Unmarshal(data, &m)
@@ -289,6 +292,7 @@ const (
 
 	MutCreateProject           MutationKind = "create_project"
 	MutSetProjectDefaultBranch MutationKind = "set_project_default_branch"
+	MutSetProjectPushTopicBranches MutationKind = "set_project_push_topic_branches"
 	MutSetProjectRemoteURL     MutationKind = "set_project_remote_url"
 	MutAddProjectMember        MutationKind = "add_project_member"
 	MutRemoveProjectMember     MutationKind = "remove_project_member"
@@ -367,6 +371,7 @@ var AllMutationKinds = []MutationKind{
 	MutEmitEvent,
 	MutCreateProject,
 	MutSetProjectDefaultBranch,
+	MutSetProjectPushTopicBranches,
 	MutSetProjectRemoteURL,
 	MutAddProjectMember,
 	MutRemoveProjectMember,
@@ -667,6 +672,18 @@ type SetProjectDefaultBranch struct {
 }
 
 func (SetProjectDefaultBranch) mutationKind() MutationKind { return MutSetProjectDefaultBranch }
+
+// SetProjectPushTopicBranches flips the per-project "push the per-task
+// topic refs to origin" lever. Default true (set at CreateProject) for
+// the multi-citizen model; flipped false for solo bulk pipelines where
+// the per-task topic pushes are pure overhead. Topic refs are still
+// created locally either way; only the push is gated.
+type SetProjectPushTopicBranches struct {
+	ProjectID int64
+	Push      bool
+}
+
+func (SetProjectPushTopicBranches) mutationKind() MutationKind { return MutSetProjectPushTopicBranches }
 
 // SetProjectRemoteURL updates (or clears, with empty string)
 // the project's external git remote URL.
