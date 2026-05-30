@@ -37,7 +37,7 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/async-ok/scripts/run.sh": {body: `#!/bin/bash
+		"scripts/run.sh": {body: `#!/bin/bash
 echo "hello from async"
 `, mode: 0o755},
 	}, "seed async template")
@@ -135,7 +135,7 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/async-starve/scripts/job.sh": {body: `#!/bin/bash
+		"scripts/job.sh": {body: `#!/bin/bash
 echo "async payload"
 `, mode: 0o755},
 	}, "seed async starve template")
@@ -195,7 +195,7 @@ tasks:
     script: scripts/job.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/simple-async/scripts/job.sh": {body: `#!/bin/bash
+		"scripts/job.sh": {body: `#!/bin/bash
 echo "async payload on named branch"
 `, mode: 0o755},
 	}, "seed simple-async template")
@@ -267,7 +267,7 @@ tasks:
     script: scripts/s.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/chain3/scripts/s.sh": {body: `#!/bin/bash
+		"scripts/s.sh": {body: `#!/bin/bash
 sleep 0.05
 echo "out-$(date +%s%N)"
 `, mode: 0o755},
@@ -354,7 +354,7 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-		"enju/templates/chain2/scripts/p.sh": {body: `#!/bin/bash
+		"scripts/p.sh": {body: `#!/bin/bash
 echo "payload-v1"
 `, mode: 0o755},
 	}, "seed chain2 template")
@@ -416,7 +416,7 @@ tasks:
     script: scripts/g.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/rerun/scripts/g.sh": {body: `#!/bin/bash
+		"scripts/g.sh": {body: `#!/bin/bash
 # 50ms sleep + nanosecond timestamp guarantees run2's output
 # differs from run1's even on fast systems. Without this the
 # commit can return "nothing to commit" when content is
@@ -523,7 +523,7 @@ tasks:
     reviews: gen
     prompt: "Review {{gen.content}}"
 `, mode: 0o644},
-		"enju/templates/gate/scripts/g.sh": {body: `#!/bin/bash
+		"scripts/g.sh": {body: `#!/bin/bash
 echo "content-at-$(date +%s%N)"
 `, mode: 0o755},
 	}, "seed gate template")
@@ -673,7 +673,7 @@ tasks:
     reviews: compute_data
     prompt: "Review"
 `, mode: 0o644},
-		"enju/templates/bug2/scripts/compute.sh": {body: `#!/bin/bash
+		"scripts/compute.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 # 50ms sleep guarantees the timestamp differs from any previous
 # run's output even on fast systems — nanosecond resolution is
@@ -827,7 +827,7 @@ tasks:
     depends_on: [produce]
     prompt: "consume {{produce.content}}"
 `, mode: 0o644},
-		"enju/templates/chain/scripts/p.sh": {body: `#!/bin/bash
+		"scripts/p.sh": {body: `#!/bin/bash
 echo "payload"
 `, mode: 0o755},
 	}, "seed chain template")
@@ -899,7 +899,7 @@ tasks:
     script: scripts/run.sh
     mode: async
 `, mode: 0o644},
-		"enju/templates/async-fail/scripts/run.sh": {body: `#!/bin/bash
+		"scripts/run.sh": {body: `#!/bin/bash
 echo "something went wrong" >&2
 exit 7
 `, mode: 0o755},
@@ -973,7 +973,7 @@ tasks:
     script: scripts/run.sh
     prompt: "flaky compute"
 `, mode: 0o644},
-		"enju/templates/flaky/scripts/run.sh": {body: `#!/bin/bash
+		"scripts/run.sh": {body: `#!/bin/bash
 # ENJU_REPO_DIR is the per-RUN snapshot dir — stable across
 # iterations (unlike ENJU_PROJECT_DIR, which is per-iter scratch)
 # and NOT re-materialized on a from=snapshot retry, so a marker
@@ -1065,7 +1065,7 @@ func TestMCPRetryFromHeadPicksUpCommittedFix(t *testing.T) {
 	h := newMCPHarness(t, "RetryHead")
 	projectID := h.createTestProject()
 
-	const scriptRel = "enju/templates/headfix/scripts/run.sh"
+	const scriptRel = "scripts/run.sh"
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
 		"enju/templates/headfix/enju.yaml": {body: `name: "headfix"
 version: 1
@@ -1167,7 +1167,7 @@ tasks:
     script: scripts/run.sh
     prompt: "boom"
 `, mode: 0o644},
-		"enju/templates/boom/scripts/run.sh": {body: `#!/bin/bash
+		"scripts/run.sh": {body: `#!/bin/bash
 # CWD is the task scratch dir — drop a sentinel so the test can
 # prove scratch survived the failure.
 touch sentinel-marker.txt

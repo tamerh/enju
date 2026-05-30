@@ -275,24 +275,30 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	// typical pattern, and forcing per-workflow scripts/ subdirectories
 	// was friction with no real payoff. ENJU_TEMPLATE_DIR now also
 	// points at the snapshot root.
-	var scriptPath, templateDir string
+	// Two run shapes, two scriptRoots:
+	//   - Templated run (RunSourcePath != ""): the workflow source —
+	//     including any committed scripts — is frozen into the per-
+	//     run snapshot at create-run. Resolve against repoSnapshotDir
+	//     so reads are reproducible and immune to later commits on
+	//     the run branch.
+	//   - Inline-YAML run: there is no frozen source. Scripts that an
+	//     upstream task `writes:` only exist on the live run-branch
+	//     clone (workDir), which is pulled before each claim — the
+	//     snapshot was materialized at run-start, before any upstream
+	//     commit, so it's stale for this case.
+	var scriptPath, templateDir, scriptRoot string
 	if meta.RunSourcePath != "" {
 		templateDir = repoSnapshotDir
-		scriptPath = filepath.Join(repoSnapshotDir, meta.Script)
+		scriptRoot = repoSnapshotDir
 	} else {
-		// No snapshot (inline-YAML run): resolve against the live clone.
-		scriptPath = filepath.Join(workDir, meta.Script)
+		scriptRoot = workDir
 	}
-	// Traversal guard: the resolved path must stay within the snapshot/
-	// project root. The convention change opened the addressing space
-	// from "this workflow's subtree" to "the whole project," so this
-	// guard takes over the implicit safety the old rule provided.
-	root := repoSnapshotDir
-	if root == "" {
-		root = workDir
-	}
-	if cleaned, err := filepath.Rel(root, scriptPath); err != nil || strings.HasPrefix(cleaned, "..") {
-		return nil, fmt.Errorf("script %q resolves outside the project root %q — script: paths are project-root-relative; remove any leading slash or '..' segments", meta.Script, root)
+	scriptPath = filepath.Join(scriptRoot, meta.Script)
+	// Traversal guard against the same root we resolved off, so the
+	// convention change ("project-root-relative, whole tree
+	// addressable") doesn't open up `../` escapes.
+	if cleaned, err := filepath.Rel(scriptRoot, scriptPath); err != nil || strings.HasPrefix(cleaned, "..") {
+		return nil, fmt.Errorf("script %q resolves outside the project root %q — script: paths are project-root-relative; remove any leading slash or '..' segments", meta.Script, scriptRoot)
 	}
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("script %q not found at %s — script: is project-root-relative (e.g. src/foo.py for a script at <project>/src/foo.py)", meta.Script, scriptPath)

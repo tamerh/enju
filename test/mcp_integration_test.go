@@ -6109,7 +6109,7 @@ tasks:
     script: scripts/noisy.sh
     prompt: "Run the noisy script"
 `, mode: 0o644},
-		"enju/templates/noisy/scripts/noisy.sh": {body: `#!/bin/bash
+		"scripts/noisy.sh": {body: `#!/bin/bash
 # Emit to both streams; script.log should interleave them.
 echo "ANSWER_LINE"                       # → stdout → result.md AND script.log
 echo "DEBUG_STDERR_1" >&2                # → stderr → script.log only
@@ -6348,7 +6348,7 @@ tasks:
       sha: "{{shas}}"
     prompt: "Analyze {{sha}}"
 `, mode: 0o644},
-		"enju/templates/echo-params/scripts/echo.sh": {body: `#!/bin/bash
+		"scripts/echo.sh": {body: `#!/bin/bash
 printf 'source_repo=%s\n' "$ENJU_PARAM_source_repo"
 printf 'shas=%s\n' "$ENJU_PARAM_shas"
 printf 'sha=%s\n' "$ENJU_PARAM_sha"
@@ -6419,7 +6419,7 @@ tasks:
     env:
       CLAUDE_EFFORT: low
 `, mode: 0o644},
-		"enju/templates/effort/scripts/echo_env.sh": {body: `#!/bin/bash
+		"scripts/echo_env.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 printf 'model_hint=%s\n' "${MODEL_HINT:-unset}"
 `, mode: 0o755},
@@ -6482,7 +6482,7 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju/templates/effort-param/scripts/echo_env.sh": {body: `#!/bin/bash
+		"scripts/echo_env.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 `, mode: 0o755},
 	}, "seed effort-param bundle")
@@ -6530,7 +6530,7 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju/templates/defaulted/scripts/echo.sh": {body: `#!/bin/bash
+		"scripts/echo.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 printf 'param_effort=%s\n' "${ENJU_PARAM_effort_override:-unset}"
 `, mode: 0o755},
@@ -6579,7 +6579,7 @@ tasks:
     env:
       CLAUDE_EFFORT: "{{effort_override}}"
 `, mode: 0o644},
-		"enju/templates/overridden/scripts/echo.sh": {body: `#!/bin/bash
+		"scripts/echo.sh": {body: `#!/bin/bash
 printf 'effort=%s\n' "${CLAUDE_EFFORT:-unset}"
 `, mode: 0o755},
 	}, "seed overridden bundle")
@@ -6618,7 +6618,7 @@ tasks:
     env:
       ENJU_TASK_ID: hijacked
 `, mode: 0o644},
-		"enju/templates/bad/scripts/noop.sh": {body: `#!/bin/bash
+		"scripts/noop.sh": {body: `#!/bin/bash
 true
 `, mode: 0o755},
 	}, "seed reserved-prefix bundle")
@@ -6703,7 +6703,7 @@ tasks:
       sha: "{{shas}}"
     prompt: "Process {{sha}}"
 `, mode: 0o644},
-		"enju/templates/ctx-demo/scripts/process.sh": {body: `#!/bin/bash
+		"scripts/process.sh": {body: `#!/bin/bash
 set -e
 CTX="$ENJU_RUN_DIR/context.json"
 # Prove we can read from the JSON dropoff — typed scalars
@@ -6855,7 +6855,7 @@ tasks:
       - "out/total.txt"
     prompt: "Run sum.sh"
 `, mode: 0o644},
-		"enju/templates/sum/scripts/sum.sh": {body: `#!/bin/bash
+		"scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "ORIGINAL BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran original"
@@ -6896,9 +6896,9 @@ echo "ran original"
 	if !strings.Contains(string(snapYAML), "sum runner") {
 		t.Errorf("snapshot enju.yaml missing expected content: %s", snapYAML)
 	}
-	snapScript, ok := readRepoFileOnBranch(t, remoteURL, runBranch, "enju/templates/sum/scripts/sum.sh")
+	snapScript, ok := readRepoFileOnBranch(t, remoteURL, runBranch, "scripts/sum.sh")
 	if !ok {
-		t.Fatalf("expected enju/templates/sum/scripts/sum.sh on run branch %q", runBranch)
+		t.Fatalf("expected scripts/sum.sh on run branch %q", runBranch)
 	}
 	if !strings.Contains(string(snapScript), "ORIGINAL BEHAVIOR") {
 		t.Errorf("snapshot script has wrong body: %s", snapScript)
@@ -6910,7 +6910,7 @@ echo "ran original"
 	// scripts silently became non-executable. The run-branch
 	// path inherits its tree from base SHA, so a regression in
 	// the seed→base→run-branch pipeline shows up here.
-	scriptPath := "enju/templates/sum/scripts/sum.sh"
+	scriptPath := "scripts/sum.sh"
 	bareDir := h.testServer.remoteFor(projectID)
 	lsOut := gittest.Run(t, bareDir, "ls-tree", "refs/heads/"+runBranch, "--", scriptPath)
 	// Format: "<mode> blob <sha>\t<path>"
@@ -6923,7 +6923,7 @@ echo "ran original"
 	// snapshot, not the live tree. The executor below should
 	// still see the original behavior.
 	h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-		"enju/templates/sum/scripts/sum.sh": {body: `#!/bin/bash
+		"scripts/sum.sh": {body: `#!/bin/bash
 mkdir -p "$ENJU_PROJECT_DIR/out"
 echo "MUTATED BEHAVIOR" > "$ENJU_PROJECT_DIR/out/total.txt"
 echo "ran mutated"

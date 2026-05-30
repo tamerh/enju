@@ -59,10 +59,13 @@ tasks:
 	seedComputeRun := func(t *testing.T, h *mcpHarness) (cloneDir, mainBefore string) {
 		t.Helper()
 		projectID := h.createTestProject()
+		// script: paths are project-root-relative — seed.sh / emit.sh
+		// land at <project>/scripts/, not under the workflow's template
+		// dir. Only the YAML itself goes inside enju/templates/p/.
 		h.writeRepoFilesWithMode(projectID, map[string]repoFileSpec{
-			"enju/templates/p/enju.yaml":       {body: computeYAML, mode: 0o644},
-			"enju/templates/p/scripts/seed.sh": {body: seedSh, mode: 0o755},
-			"enju/templates/p/scripts/emit.sh": {body: emitSh, mode: 0o755},
+			"enju/templates/p/enju.yaml": {body: computeYAML, mode: 0o644},
+			"scripts/seed.sh":            {body: seedSh, mode: 0o755},
+			"scripts/emit.sh":            {body: emitSh, mode: 0o755},
 		}, "seed compute bundle")
 		h.callOK(t, "enju_create_run", map[string]any{
 			"project_id": float64(projectID),

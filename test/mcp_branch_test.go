@@ -264,7 +264,7 @@ tasks:
     action: compute
     script: scripts/say.sh
 `, mode: 0o644},
-		"enju/templates/greet/scripts/say.sh": {body: `#!/bin/bash
+		"scripts/say.sh": {body: `#!/bin/bash
 echo "hi from $ENJU_TASK_ID"
 `, mode: 0o755},
 	}, "seed greet template")
@@ -594,7 +594,7 @@ tasks:
     action: compute
     script: scripts/echo.sh
 `, mode: 0o644},
-		"enju/templates/echo/scripts/echo.sh": {body: `#!/bin/bash
+		"scripts/echo.sh": {body: `#!/bin/bash
 echo "branch-test-ran"
 `, mode: 0o755},
 	}, "seed echo template")
