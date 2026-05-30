@@ -137,17 +137,19 @@ func emitReport(r validateReport, asJSON bool) {
 }
 
 // missingScriptWarnings (L2) returns one warning per compute task
-// whose script: doesn't resolve to a file on disk. Scripts resolve
-// relative to the workflow YAML's directory (the same root the run
-// snapshot uses), so the path is statically checkable from `enju
-// validate`. Templated paths (containing {{...}}) are skipped — they
-// can't be resolved before param substitution. Absolute paths are
-// checked as-is.
+// whose script: doesn't resolve to a file on disk. Scripts are
+// project-root-relative at runtime (post-22c36d5) — same addressing
+// as writes:/reads: — so the lint must walk up from the workflow
+// YAML to the project root (the nearest enclosing .git) and resolve
+// from there. Templated paths (containing {{...}}) are skipped —
+// they can't be resolved before param substitution. Absolute paths
+// are checked as-is.
 func missingScriptWarnings(workflowPath string, parsed *enjuYaml.ParsedRun) []string {
 	if parsed == nil || parsed.Run == nil {
 		return nil
 	}
 	dir := filepath.Dir(workflowPath)
+	scriptRoot := findProjectRoot(dir)
 	var warnings []string
 	for _, t := range parsed.Run.Tasks {
 		if t.Action != "compute" || t.Script == "" {
@@ -158,7 +160,7 @@ func missingScriptWarnings(workflowPath string, parsed *enjuYaml.ParsedRun) []st
 		}
 		scriptPath := t.Script
 		if !filepath.IsAbs(scriptPath) {
-			scriptPath = filepath.Join(dir, t.Script)
+			scriptPath = filepath.Join(scriptRoot, t.Script)
 		}
 		if _, err := os.Stat(scriptPath); err != nil {
 			warnings = append(warnings, fmt.Sprintf(
@@ -167,4 +169,23 @@ func missingScriptWarnings(workflowPath string, parsed *enjuYaml.ParsedRun) []st
 		}
 	}
 	return warnings
+}
+
+// findProjectRoot walks up from start looking for the nearest .git
+// (file or dir — submodules and worktrees use .git files). Falls
+// back to start when no .git is found, so a YAML validated outside
+// a repo still produces a deterministic resolution root rather than
+// a confusing "" — the file just won't exist there.
+func findProjectRoot(start string) string {
+	dir := start
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return start
+		}
+		dir = parent
+	}
 }
