@@ -64,6 +64,12 @@ type TaskMeta struct {
 	OutputsSchemaJSON string
 	// Script is the script path for action:compute tasks.
 	Script string
+	// Timeout is the task's declared `timeout:` duration string
+	// ("2h", "90m"), empty when undeclared. The coordinator
+	// anchors the claim lease with this same value (or its 30-min
+	// default); the fat-client derives its claim-heartbeat
+	// cadence from it (see startClaimHeartbeat).
+	Timeout string
 	// WritesArtifacts is the resolved list of artifact entries
 	// this task declares it produces. Each entry carries both
 	// the path (per-instance substituted — "summaries/alpha.md"
@@ -303,6 +309,9 @@ func (s *FatClient) parseTaskMetaFromMap(taskID string, raw map[string]interface
 	}
 	if v, ok := raw["script"].(string); ok {
 		meta.Script = v
+	}
+	if v, ok := raw["timeout"].(string); ok {
+		meta.Timeout = v
 	}
 	// writes_artifacts on the wire is the typed WriteArtifacts
 	// shape — [{"path":...,"track":...}]. For legacy DB rows

@@ -1,6 +1,60 @@
 # Bug: `enju go --parallel N` leaves run "active" with most tasks un-recorded after long (multi-hour) compute tasks complete
 
-Status: REPORTED (field report from a real run; not yet root-caused or repro'd in a test)
+Status: FIXED (uncommitted) — both halves, with regression tests in
+`test/longtask_lease_desync_test.go`:
+  - Fix #1 (claim heartbeat — prevents the trigger): new
+    `POST /api/v1/tasks/{id}/heartbeat` (engine `ComputeHeartbeatTask` → one
+    `SetClaimDeadline` mutation, lease = same `taskClaimTimeout` source as claim/started);
+    the fat-client renews every lease/3 while a sync compute script runs
+    (`fatclient/service/heartbeat.go`, wired around `compute.Run` in `execute.go`). The
+    lease becomes a true liveness signal: expiry means "fat-client process went silent",
+    not "script was slow". Task `timeout:` is now surfaced on the task wire response so
+    the client derives cadence from the same value the coordinator anchors with.
+    Test: `TestMCPExecuteRunParallelLongTaskHeartbeatSurvivesReaper` (REAL reaper at
+    200ms, 3s lease, script held 7s — stays claimed, run completes).
+  - Fix #2 (loud refusal — kills the silent desync): the `/result` report in
+    `fatclient/service/execute.go` now checks the response body's `{"error": ...}`
+    (coord.Post only errors on transport failures); a refused report surfaces as an
+    errored entry + stop_reason=compute_errored, naming the surviving commit SHA,
+    instead of rendering "✓ completed".
+    Test: `TestMCPExecuteRunForcedExpiryRefusalIsLoud`.
+  - Known remaining gap (accepted): async/wrap-task and bot/LLM executions don't
+    heartbeat yet — only the sync compute path (the field case) does. Their late
+    results have separate reap/report flows; extend if a field report shows the same
+    class there.
+
+## Root cause (confirmed by repro)
+
+Two layers, both needed to produce the field symptoms:
+
+1. **Trigger — claim lease expires under a still-running sync script.** A claim's lease is
+   `timeout:` if declared, else `defaultClaimTimeout` = 30 min
+   (`internal/coordinator/service/claim.go:59`). `/started` re-anchors the lease to
+   now + that same timeout (`service/start.go:47`), but nothing renews it afterwards —
+   there is no heartbeat while a sync compute script runs. A 5-hour script blows the
+   30-min lease; the reaper (`GetExpiredClaims` selects state IN (claimed, running),
+   `store/sqlite.go:2200`) applies `ExpireClaim`: task → READY ("available"),
+   `claimed_by` → NULL, claim outcome → `timed_out`.
+
+2. **Desync — the late submit's refusal is silently swallowed by the fat client.** When the
+   script eventually finishes, the wrapper commits fine (work lands in git), then
+   `execute.go` POSTs `/tasks/{id}/result`. The coordinator REFUSES it — with `claimed_by`
+   NULL the handler 400s "task has no active claimant" (`api/submit.go:174`). But
+   `coord.Client.Post` returns `(body, nil)` for any HTTP status; application errors are
+   only in the JSON body via `coord.ExtractError`, and the `/result` call site in
+   `internal/fatclient/service/execute.go` never checks it. The outcome is reported
+   "completed" → `enju go` prints `✓ task (Nms) commit=…` for work the coordinator never
+   recorded. This explains the field run's `✓` lines + `stopped: no_ready_compute`
+   (instead of a loud `compute_errored`).
+
+   The `stopped: no_ready_compute` with 22 tasks "available" is the parallel drain loop's
+   `dispatched` map: reaped tasks reappear in /ready but are skipped as already-dispatched
+   (`execute_run.go pickAllEligibleCompute`), so the loop exits "no ready compute" while
+   leaving them READY.
+
+So hypothesis 1 below was right (lease expiry → refused late submit), with the addendum
+that the refusal never surfaces client-side; hypothesis 2's "exited while in-flight" was
+wrong — the loop does wait for in-flight tasks.
 
 Reported via: `enju go --run-branch auto --parallel 8 --params-file <30 batches> workflows/pubmed-update/enju.yaml`
 on project #4 `bioyoda` (path-mode, managed bare, `push_topic_branches=false` solo mode), workflow `publish: none`.

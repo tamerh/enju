@@ -45,6 +45,12 @@ type TaskResponse struct {
 	Outputs                  string                 `json:"outputs,omitempty"`
 	Requirements             string                 `json:"requirements,omitempty"`
 	ResultType               string                 `json:"result_type"`
+	// Timeout is the task's declared `timeout:` duration string
+	// ("2h", "90m"), empty when undeclared (the coordinator then
+	// uses its 30-min default lease). Surfaced so the fat-client
+	// can derive its claim-heartbeat cadence (lease/3) from the
+	// same value the coordinator anchors leases with.
+	Timeout                  string                 `json:"timeout,omitempty"`
 	State                    string                 `json:"state"`
 	ClaimedBy                string                 `json:"claimed_by,omitempty"`
 	Model                    string                 `json:"model,omitempty"`
@@ -323,6 +329,7 @@ func ToTaskResponse(s store.CoordinatorStore, t store.TaskRecord) TaskResponse {
 		Outputs:           t.Outputs,
 		Requirements:      t.Requirements,
 		ResultType:        t.ResultType,
+		Timeout:           t.Timeout,
 		State:             string(t.State),
 		ClaimedBy:         CitizenUsername(s, t.ClaimedBy),
 		ResultPath:        t.ResultPath,

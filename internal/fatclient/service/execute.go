@@ -468,11 +468,21 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 		}, nil
 	}
 
+	// Renew the claim lease while the script runs — a sync compute
+	// script can legitimately run for hours, far past the lease
+	// guess (declared timeout or the 30-min default), and without
+	// renewal the reaper reaps it as a dead worker and the result
+	// report below gets refused. stop() before reporting so a ping
+	// can't race the submit's claim-state transition.
+	stopHeartbeat := s.startClaimHeartbeat(ctx, taskID, meta.Timeout)
+	defer stopHeartbeat()
+
 	// Pass the already-opened Workflow so compute.Run doesn't
 	// re-open one per task — concurrent goroutines share the
 	// in-process Mutex rather than falling through to the
 	// slower cross-process flock.
 	res := compute.Run(ctx, wf, spec, env, s.logger)
+	stopHeartbeat()
 
 	// Post-run classification is a three-way truth table
 	// (git_failed / failed / continue-to-success) extracted as a
@@ -518,6 +528,19 @@ func (s *FatClient) ExecuteComputeTask(ctx context.Context, taskID string) (*Exe
 	reportData, err := s.coord.Post(ctx, "/api/v1/tasks/"+taskID+"/result", reportBody)
 	if err != nil {
 		return nil, fmt.Errorf("coordinator report for %s: %w", taskID, err)
+	}
+	// coord.Post only errors on transport failures — an application-
+	// level refusal (4xx) comes back as {"error": ...} in the body.
+	// Without this check a refused report rendered as "✓ completed"
+	// while the coordinator recorded nothing: the longtask-parallel-
+	// run-desync bug, where the claim lease expired under a long
+	// sync script, the reaper re-readied the task, and the eventual
+	// report's "no active claimant" rejection was silently dropped.
+	// The work IS committed locally (res.CommitSHA), so name both
+	// facts: nothing to re-run, but the coordinator has no record.
+	if msg := extractErrorString(reportData); msg != "" {
+		return nil, fmt.Errorf("coordinator refused result for %s (script succeeded, commit %s exists, but the task was NOT recorded done): %s",
+			taskID, res.CommitSHA, msg)
 	}
 
 	// Apply any FF auto-merges the coordinator emitted in the

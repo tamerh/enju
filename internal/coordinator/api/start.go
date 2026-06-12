@@ -31,3 +31,28 @@ func (s *Server) handleMarkTaskStarted(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
+
+// handleHeartbeatTask re-anchors a claimed/running task's claim
+// lease. POSTed periodically by the fat-client while a sync
+// compute script runs so a legitimately long script isn't reaped
+// at the lease guess. Same plumbing shape as handleMarkTaskStarted.
+func (s *Server) handleHeartbeatTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskID")
+	member, ok := s.requireProjectMembershipForTask(w, r, taskID)
+	if !ok {
+		return
+	}
+	var caller *store.CitizenRecord
+	if member != nil {
+		caller, _ = s.store.GetCitizen(member.CitizenID)
+	}
+	if caller == nil {
+		caller = citizenFromRequest(r)
+	}
+	resp, err := s.coord.HeartbeatTask(caller, taskID)
+	if err != nil {
+		writeFailErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}

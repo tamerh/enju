@@ -54,3 +54,50 @@ func (c *Coordinator) MarkTaskRunning(caller *store.CitizenRecord, taskID string
 	}
 	return &MarkTaskRunningResponse{Status: string(store.TaskRunning), TaskID: taskID}, nil
 }
+
+// HeartbeatTaskResponse is the wire shape for
+// POST /api/v1/tasks/{id}/heartbeat.
+type HeartbeatTaskResponse struct {
+	Status   string    `json:"status"`
+	TaskID   string    `json:"task_id"`
+	Deadline time.Time `json:"deadline"`
+}
+
+// HeartbeatTask re-anchors a claimed/running task's claim lease to
+// now + the task's timeout — the same duration ClaimTask and
+// MarkTaskRunning anchor with, so all three lease anchor points
+// share one source (taskClaimTimeout). The fat-client posts this
+// periodically while a sync compute script runs so a legitimately
+// long script (hours) isn't reaped at the lease guess (30-min
+// default); see engine.ComputeHeartbeatTask for the full rationale.
+//
+// Caller must be a member of the task's parent project. Engine
+// pre-validates state ∈ {CLAIMED, RUNNING}; other states return
+// ErrInvalidArgument — the claim is gone (reaped/released/resolved)
+// and the client should stop renewing and expect its eventual
+// submit to be refused.
+func (c *Coordinator) HeartbeatTask(caller *store.CitizenRecord, taskID string) (*HeartbeatTaskResponse, error) {
+	if caller == nil {
+		return nil, fmt.Errorf("%w: authentication required", ErrForbidden)
+	}
+	task, err := c.Store.GetTask(taskID)
+	if err != nil || task == nil {
+		return nil, fmt.Errorf("%w: task %q not found", ErrNotFound, taskID)
+	}
+	run, err := c.Store.GetRun(task.RunID)
+	if err != nil || run == nil {
+		return nil, fmt.Errorf("%w: run for task %q not found", ErrNotFound, taskID)
+	}
+	if !CanReadProject(c.Store, run.ProjectID, caller.ID) {
+		return nil, fmt.Errorf("%w: not a member of this project", ErrForbidden)
+	}
+	deadline := time.Now().Add(taskClaimTimeout(task))
+	plan, err := engine.New(c.Store, c.Logger).ComputeHeartbeatTask(taskID, deadline)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
+	}
+	if _, err := c.Store.ApplyPlan(*plan); err != nil {
+		return nil, err
+	}
+	return &HeartbeatTaskResponse{Status: string(task.State), TaskID: taskID, Deadline: deadline}, nil
+}
